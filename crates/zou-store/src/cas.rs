@@ -42,6 +42,10 @@ pub enum CasError {
     Conflict { key: String },
     #[error("object {key} already exists and is immutable")]
     AlreadyExists { key: String },
+    /// The guard refused a versioned overwrite of a write-once key. Unlike
+    /// Conflict this is not retryable: no version makes it legal.
+    #[error("refusing to overwrite immutable object {key}")]
+    ImmutableOverwrite { key: String },
     #[error("io error on {key}: {source}")]
     Io {
         key: String,
