@@ -22,6 +22,7 @@ use crate::layout::TenantLayout;
 use crate::lease::{self, HeldLease, LeaseError};
 use crate::lsn::Lsn;
 use crate::manifest::WalTail;
+use crate::tier::{PureS3Target, WalTarget};
 use crate::wal::{Frame, MAX_BODY_LEN};
 
 /// Per-record overhead inside a frame payload: a u32 length prefix.
@@ -140,7 +141,112 @@ pub struct GroupCommit {
     flusher: Option<JoinHandle<()>>,
 }
 
+/// Everything the flusher thread needs beyond the shared buffer state.
+struct FlusherParams {
+    epoch: u64,
+    fence: u64,
+    target: Arc<dyn WalTarget>,
+    tail: Option<TailCtx>,
+}
+
+/// Assembles a [`GroupCommit`]. `session` or `lease` picks where epoch and
+/// fence come from, `target` picks the latency tier, defaulting to PureS3
+/// on the main store.
+pub struct GroupCommitBuilder {
+    store: Arc<dyn CasStore>,
+    layout: TenantLayout,
+    session: (u64, u64),
+    lease: Option<Arc<Mutex<HeldLease>>>,
+    start_lsn: Lsn,
+    config: GroupCommitConfig,
+    tail: TailConfig,
+    target: Option<Arc<dyn WalTarget>>,
+}
+
+impl GroupCommitBuilder {
+    /// Stamp frames with an explicit epoch and fence, no tail publishing.
+    pub fn session(mut self, epoch: u64, fence: u64) -> Self {
+        self.session = (epoch, fence);
+        self.lease = None;
+        self
+    }
+
+    /// Bind to a held lease: epoch and fence come from it, and sealed
+    /// segments are folded into manifest.wal_tail. Every publish doubles
+    /// as an ownership check, a stolen lease poisons the pipeline.
+    pub fn lease(mut self, held: Arc<Mutex<HeldLease>>) -> Self {
+        self.lease = Some(held);
+        self
+    }
+
+    pub fn start_lsn(mut self, lsn: Lsn) -> Self {
+        self.start_lsn = lsn;
+        self
+    }
+
+    pub fn config(mut self, config: GroupCommitConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn tail_config(mut self, tail: TailConfig) -> Self {
+        self.tail = tail;
+        self
+    }
+
+    /// Route frame uploads through a latency tier other than the default
+    /// PureS3 on the main store.
+    pub fn target(mut self, target: Arc<dyn WalTarget>) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    pub fn build(self) -> GroupCommit {
+        let target = self
+            .target
+            .unwrap_or_else(|| Arc::new(PureS3Target::new(Arc::clone(&self.store))));
+        let (epoch, fence, tail) = match self.lease {
+            Some(held) => {
+                let (epoch, fence) = {
+                    let held = held.lock().unwrap();
+                    (held.epoch, held.fence)
+                };
+                let tail = TailCtx {
+                    held,
+                    config: self.tail,
+                    from_lsn: self.start_lsn,
+                    segments: Vec::new(),
+                    bytes_since_publish: 0,
+                    last_publish: Instant::now(),
+                };
+                (epoch, fence, Some(tail))
+            }
+            None => (self.session.0, self.session.1, None),
+        };
+        let params = FlusherParams {
+            epoch,
+            fence,
+            target,
+            tail,
+        };
+        GroupCommit::start(self.store, self.layout, self.start_lsn, self.config, params)
+    }
+}
+
 impl GroupCommit {
+    pub fn builder(store: Arc<dyn CasStore>, layout: TenantLayout) -> GroupCommitBuilder {
+        GroupCommitBuilder {
+            store,
+            layout,
+            session: (0, 0),
+            lease: None,
+            start_lsn: Lsn(0),
+            config: GroupCommitConfig::default(),
+            tail: TailConfig::default(),
+            target: None,
+        }
+    }
+
     /// Start the pipeline for one writer session without tail publishing.
     /// Epoch and fence are stamped into every frame, `start_lsn` is where
     /// this session's WAL stream begins.
@@ -152,14 +258,15 @@ impl GroupCommit {
         start_lsn: Lsn,
         config: GroupCommitConfig,
     ) -> Self {
-        Self::start(store, layout, epoch, fence, start_lsn, config, None)
+        Self::builder(store, layout)
+            .session(epoch, fence)
+            .start_lsn(start_lsn)
+            .config(config)
+            .build()
     }
 
-    /// Start the pipeline bound to a held lease. Epoch and fence come from
-    /// the lease, and the flusher folds the sealed segment list into
-    /// manifest.wal_tail per `tail`, so a fresh attach can find the WAL
-    /// stream from the manifest alone. Every publish doubles as an
-    /// ownership check: a stolen lease poisons the pipeline.
+    /// Start the pipeline bound to a held lease. See
+    /// [`GroupCommitBuilder::lease`].
     pub fn with_lease(
         store: Arc<dyn CasStore>,
         layout: TenantLayout,
@@ -168,29 +275,20 @@ impl GroupCommit {
         config: GroupCommitConfig,
         tail: TailConfig,
     ) -> Self {
-        let (epoch, fence) = {
-            let held = held.lock().unwrap();
-            (held.epoch, held.fence)
-        };
-        let tail = TailCtx {
-            held,
-            config: tail,
-            from_lsn: start_lsn,
-            segments: Vec::new(),
-            bytes_since_publish: 0,
-            last_publish: Instant::now(),
-        };
-        Self::start(store, layout, epoch, fence, start_lsn, config, Some(tail))
+        Self::builder(store, layout)
+            .lease(held)
+            .start_lsn(start_lsn)
+            .config(config)
+            .tail_config(tail)
+            .build()
     }
 
     fn start(
         store: Arc<dyn CasStore>,
         layout: TenantLayout,
-        epoch: u64,
-        fence: u64,
         start_lsn: Lsn,
         config: GroupCommitConfig,
-        tail: Option<TailCtx>,
+        params: FlusherParams,
     ) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -209,7 +307,7 @@ impl GroupCommit {
         });
         let flusher = {
             let shared = Arc::clone(&shared);
-            std::thread::spawn(move || flusher_loop(&shared, &*store, &layout, epoch, fence, tail))
+            std::thread::spawn(move || flusher_loop(&shared, &*store, &layout, params))
         };
         Self {
             shared,
@@ -316,10 +414,14 @@ fn flusher_loop(
     shared: &Shared,
     store: &dyn CasStore,
     layout: &TenantLayout,
-    epoch: u64,
-    fence: u64,
-    mut tail: Option<TailCtx>,
+    params: FlusherParams,
 ) {
+    let FlusherParams {
+        epoch,
+        fence,
+        target,
+        mut tail,
+    } = params;
     let mut state = shared.state.lock().unwrap();
     loop {
         if state.pending.is_empty() {
@@ -385,7 +487,7 @@ fn flusher_loop(
         };
         let key = layout.wal_segment(epoch, Lsn(start_lsn));
         let encoded = frame.encode();
-        let result = upload_with_retry(store, &key, &encoded);
+        let result = target.put_frame(&key, &encoded);
 
         // Piggyback tail publishing on a successful flush, outside the
         // state lock so producers keep moving during the manifest CAS.
@@ -470,30 +572,6 @@ fn publish_tail(
     Err(CommitError::TailPublish {
         reason: last.expect("loop ran at least once").to_string(),
     })
-}
-
-/// Upload one immutable frame object. Retries transient errors with a short
-/// backoff, and treats an AlreadyExists holding our exact bytes as success,
-/// which makes a retry after an ack-lost upload idempotent.
-fn upload_with_retry(store: &dyn CasStore, key: &str, data: &[u8]) -> Result<(), CasError> {
-    const ATTEMPTS: u32 = 5;
-    let mut last = None;
-    for attempt in 0..ATTEMPTS {
-        match store.put_new(key, data) {
-            Ok(_) => return Ok(()),
-            Err(CasError::AlreadyExists { .. }) => {
-                return match store.get(key)? {
-                    Some((existing, _)) if existing == data => Ok(()),
-                    _ => Err(CasError::AlreadyExists {
-                        key: key.to_string(),
-                    }),
-                };
-            }
-            Err(e) => last = Some(e),
-        }
-        std::thread::sleep(Duration::from_millis(10 << attempt));
-    }
-    Err(last.expect("loop ran at least once"))
 }
 
 /// Split a frame payload back into the records that went in. Returns None
@@ -912,6 +990,30 @@ mod tests {
         assert!(matches!(err, CommitError::LeaseLost), "got: {err}");
         assert!(matches!(gc.append(b"after"), Err(CommitError::LeaseLost)));
         assert!(gc.close().is_err());
+    }
+
+    #[test]
+    fn the_builder_routes_frames_through_a_custom_target() {
+        let main_dir = tempfile::tempdir().unwrap();
+        let fast_dir = tempfile::tempdir().unwrap();
+        let main = Arc::new(LocalFsStore::new(main_dir.path()));
+        let fast = Arc::new(LocalFsStore::new(fast_dir.path()));
+        let layout = TenantLayout::new("t1");
+
+        let gc = GroupCommit::builder(Arc::clone(&main) as Arc<dyn CasStore>, layout.clone())
+            .session(1, 1)
+            .target(Arc::new(crate::tier::ExpressTarget::new(
+                Arc::clone(&fast) as Arc<dyn CasStore>
+            )))
+            .build();
+        gc.append(b"fast lane").unwrap().wait().unwrap();
+        gc.close().unwrap();
+
+        assert!(main.list("tenants/t1/wal/").unwrap().is_empty());
+        assert_eq!(
+            stored_records(&*fast, &layout, 1),
+            vec![b"fast lane".to_vec()]
+        );
     }
 
     #[test]
