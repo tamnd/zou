@@ -26,11 +26,11 @@ Early development. Nothing here is usable yet.
 
 The full design lives in the [architecture docs](docs/), and the implementation plan is tracked in the milestone issues:
 
-- [M1: Core engine, Postgres on object storage](https://github.com/tamnd/zou/issues)
-- M2: REST and Auth, supabase-js works unchanged
-- M3: Storage API, multi-tenant server, serverless, embedded bindings
-- M4: Realtime and edge functions
-- M5: Migration from Supabase, hardening, 1.0
+- [M1: Core engine, Postgres 18 on object storage](https://github.com/tamnd/zou/issues/1)
+- [M2: REST and Auth, supabase-js works unchanged](https://github.com/tamnd/zou/issues/2)
+- [M3: Storage API, multi tenant server, serverless, embedded bindings](https://github.com/tamnd/zou/issues/3)
+- [M4: Realtime and edge functions](https://github.com/tamnd/zou/issues/4)
+- [M5: Migration from Supabase, hardening, 1.0](https://github.com/tamnd/zou/issues/5)
 
 ## What it will look like
 
