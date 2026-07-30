@@ -7,6 +7,8 @@
 
 pub mod cas;
 pub mod commit;
+pub mod guard;
+pub mod heartbeat;
 pub mod layout;
 pub mod lease;
 pub mod lsn;
@@ -16,6 +18,8 @@ pub mod wal;
 
 pub use cas::{CasError, CasStore, LocalFsStore, Version};
 pub use commit::{CommitError, CommitTicket, GroupCommit, GroupCommitConfig, TailConfig};
+pub use guard::GuardedStore;
+pub use heartbeat::Heartbeat;
 pub use lease::{DEFAULT_TTL_SECS, HeldLease, LeaseError};
 pub use lsn::Lsn;
 pub use manifest::{MANIFEST_FORMAT, Manifest};
