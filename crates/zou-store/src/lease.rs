@@ -142,6 +142,25 @@ pub fn release(
     Ok(())
 }
 
+/// Mutate the manifest while holding the lease. Re-reads, verifies we are
+/// still the holder, applies `mutate`, and swaps. This is how the writer
+/// publishes wal_tail and checkpoint updates: every such write doubles as
+/// an ownership check, so a stolen lease surfaces as `Lost` here instead
+/// of silently corrupting the manifest.
+pub fn update_manifest(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    held: &mut HeldLease,
+    mutate: impl FnOnce(&mut Manifest),
+) -> Result<(), LeaseError> {
+    let key = layout.manifest();
+    let (mut manifest, version) = reread_checking_ownership(store, &key, held)?;
+    mutate(&mut manifest);
+    held.version = swap(store, &key, &manifest, &version)?;
+    held.manifest = manifest;
+    Ok(())
+}
+
 fn reread_checking_ownership(
     store: &dyn CasStore,
     key: &str,
