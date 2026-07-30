@@ -3,3 +3,10 @@
 *.pending-snap
 .DS_Store
 /data
+
+# cargo-fuzz
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+fuzz/Cargo.lock

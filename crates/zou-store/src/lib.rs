@@ -6,6 +6,7 @@
 //! compare-and-swap, which also carries the writer lease.
 
 pub mod cas;
+pub mod commit;
 pub mod layout;
 pub mod lease;
 pub mod lsn;
@@ -13,6 +14,7 @@ pub mod manifest;
 pub mod wal;
 
 pub use cas::{CasError, CasStore, LocalFsStore, Version};
+pub use commit::{CommitError, CommitTicket, GroupCommit, GroupCommitConfig};
 pub use lease::{DEFAULT_TTL_SECS, HeldLease, LeaseError};
 pub use lsn::Lsn;
 pub use manifest::{MANIFEST_FORMAT, Manifest};
