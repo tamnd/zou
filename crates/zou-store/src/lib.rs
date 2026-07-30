@@ -1,0 +1,15 @@
+//! Object storage engine for zou.
+//!
+//! A tenant is a self-contained prefix on an object store: a manifest that
+//! acts as the root of truth, immutable WAL segments, and immutable page
+//! checkpoints. The manifest is the only mutable object and is swapped with
+//! compare-and-swap, which also carries the writer lease.
+
+pub mod cas;
+pub mod layout;
+pub mod lsn;
+pub mod manifest;
+
+pub use cas::{CasError, CasStore, LocalFsStore, Version};
+pub use lsn::Lsn;
+pub use manifest::{MANIFEST_FORMAT, Manifest};
