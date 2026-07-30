@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use crate::cas::{CasError, CasStore};
 use crate::layout::TenantLayout;
+use crate::lease::{self, HeldLease, LeaseError};
 use crate::lsn::Lsn;
+use crate::manifest::WalTail;
 use crate::wal::{Frame, MAX_BODY_LEN};
 
 /// Per-record overhead inside a frame payload: a u32 length prefix.
@@ -46,6 +48,27 @@ impl Default for GroupCommitConfig {
     }
 }
 
+/// When to fold the accumulated segment list into manifest.wal_tail.
+/// Publishing piggybacks on flushes, there is no separate timer thread:
+/// an idle pipeline has nothing new to publish, and close always does a
+/// final publish so a clean shutdown leaves an exact tail behind.
+#[derive(Debug, Clone)]
+pub struct TailConfig {
+    /// Publish once this many bytes of frames sealed since the last publish.
+    pub seal_bytes: u64,
+    /// Publish once this much time passed since the last publish.
+    pub seal_interval: Duration,
+}
+
+impl Default for TailConfig {
+    fn default() -> Self {
+        Self {
+            seal_bytes: 16 * 1024 * 1024,
+            seal_interval: Duration::from_secs(60),
+        }
+    }
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CommitError {
     #[error("wal pipeline is closed")]
@@ -56,6 +79,12 @@ pub enum CommitError {
     /// past the durable watermark fails with this, none of them were acked.
     #[error("wal flush failed: {0}")]
     Flush(Arc<CasError>),
+    /// The manifest shows another writer took the lease. This node must
+    /// stop writing immediately, its epoch is dead.
+    #[error("writer lease lost, this node must stop writing")]
+    LeaseLost,
+    #[error("wal tail publish failed: {reason}")]
+    TailPublish { reason: String },
 }
 
 struct State {
@@ -112,8 +141,8 @@ pub struct GroupCommit {
 }
 
 impl GroupCommit {
-    /// Start the pipeline for one writer session. Epoch and fence come from
-    /// the held lease and are stamped into every frame, `start_lsn` is where
+    /// Start the pipeline for one writer session without tail publishing.
+    /// Epoch and fence are stamped into every frame, `start_lsn` is where
     /// this session's WAL stream begins.
     pub fn new(
         store: Arc<dyn CasStore>,
@@ -122,6 +151,46 @@ impl GroupCommit {
         fence: u64,
         start_lsn: Lsn,
         config: GroupCommitConfig,
+    ) -> Self {
+        Self::start(store, layout, epoch, fence, start_lsn, config, None)
+    }
+
+    /// Start the pipeline bound to a held lease. Epoch and fence come from
+    /// the lease, and the flusher folds the sealed segment list into
+    /// manifest.wal_tail per `tail`, so a fresh attach can find the WAL
+    /// stream from the manifest alone. Every publish doubles as an
+    /// ownership check: a stolen lease poisons the pipeline.
+    pub fn with_lease(
+        store: Arc<dyn CasStore>,
+        layout: TenantLayout,
+        held: Arc<Mutex<HeldLease>>,
+        start_lsn: Lsn,
+        config: GroupCommitConfig,
+        tail: TailConfig,
+    ) -> Self {
+        let (epoch, fence) = {
+            let held = held.lock().unwrap();
+            (held.epoch, held.fence)
+        };
+        let tail = TailCtx {
+            held,
+            config: tail,
+            from_lsn: start_lsn,
+            segments: Vec::new(),
+            bytes_since_publish: 0,
+            last_publish: Instant::now(),
+        };
+        Self::start(store, layout, epoch, fence, start_lsn, config, Some(tail))
+    }
+
+    fn start(
+        store: Arc<dyn CasStore>,
+        layout: TenantLayout,
+        epoch: u64,
+        fence: u64,
+        start_lsn: Lsn,
+        config: GroupCommitConfig,
+        tail: Option<TailCtx>,
     ) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
@@ -140,7 +209,7 @@ impl GroupCommit {
         });
         let flusher = {
             let shared = Arc::clone(&shared);
-            std::thread::spawn(move || flusher_loop(&shared, &*store, &layout, epoch, fence))
+            std::thread::spawn(move || flusher_loop(&shared, &*store, &layout, epoch, fence, tail))
         };
         Self {
             shared,
@@ -232,17 +301,41 @@ impl Drop for GroupCommit {
     }
 }
 
+/// Tail publishing state carried by the flusher for lease-bound pipelines.
+struct TailCtx {
+    held: Arc<Mutex<HeldLease>>,
+    config: TailConfig,
+    from_lsn: Lsn,
+    /// Segment file names written this session, oldest first.
+    segments: Vec<String>,
+    bytes_since_publish: u64,
+    last_publish: Instant,
+}
+
 fn flusher_loop(
     shared: &Shared,
     store: &dyn CasStore,
     layout: &TenantLayout,
     epoch: u64,
     fence: u64,
+    mut tail: Option<TailCtx>,
 ) {
     let mut state = shared.state.lock().unwrap();
     loop {
         if state.pending.is_empty() {
             if state.shutdown {
+                // A clean shutdown leaves an exact tail in the manifest.
+                if let Some(tail) = tail.as_mut()
+                    && tail.bytes_since_publish > 0
+                {
+                    drop(state);
+                    let result = publish_tail(store, layout, tail, epoch);
+                    state = shared.state.lock().unwrap();
+                    if let Err(e) = result {
+                        state.failure = Some(e);
+                        shared.progress.notify_all();
+                    }
+                }
                 return;
             }
             state = shared.work.wait(state).unwrap();
@@ -291,21 +384,92 @@ fn flusher_loop(
             payload,
         };
         let key = layout.wal_segment(epoch, Lsn(start_lsn));
-        let result = upload_with_retry(store, &key, &frame.encode());
+        let encoded = frame.encode();
+        let result = upload_with_retry(store, &key, &encoded);
+
+        // Piggyback tail publishing on a successful flush, outside the
+        // state lock so producers keep moving during the manifest CAS.
+        let tail_result = match (&result, tail.as_mut()) {
+            (Ok(()), Some(tail)) => {
+                let name = key.rsplit('/').next().expect("wal keys contain slashes");
+                tail.segments.push(name.to_string());
+                tail.bytes_since_publish += encoded.len() as u64;
+                let due = tail.bytes_since_publish >= tail.config.seal_bytes
+                    || tail.last_publish.elapsed() >= tail.config.seal_interval;
+                if due {
+                    publish_tail(store, layout, tail, epoch)
+                } else {
+                    Ok(())
+                }
+            }
+            _ => Ok(()),
+        };
 
         state = shared.state.lock().unwrap();
-        match result {
-            Ok(()) => {
+        match (result, tail_result) {
+            // A lost lease means this epoch is dead and the frame we just
+            // uploaded will never be replayed. Acking it would be a lie, so
+            // the durable watermark stays put and every waiter errors.
+            (Ok(()), Err(e @ CommitError::LeaseLost)) => {
+                state.failure = Some(e);
+                shared.progress.notify_all();
+                return;
+            }
+            // The frame is durable and the epoch still ours, so the ack is
+            // honest even though the pipeline stops over the failed publish.
+            (Ok(()), Err(e)) => {
+                state.durable_lsn = end_lsn;
+                state.failure = Some(e);
+                shared.progress.notify_all();
+                return;
+            }
+            (Ok(()), Ok(())) => {
                 state.durable_lsn = end_lsn;
                 shared.progress.notify_all();
             }
-            Err(e) => {
+            (Err(e), _) => {
                 state.failure = Some(CommitError::Flush(Arc::new(e)));
                 shared.progress.notify_all();
                 return;
             }
         }
     }
+}
+
+/// Fold the accumulated segment list into manifest.wal_tail under the
+/// lease. Races with the heartbeat renewer are expected and retried, a
+/// lost lease is fatal for this writer.
+fn publish_tail(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    tail: &mut TailCtx,
+    epoch: u64,
+) -> Result<(), CommitError> {
+    const ATTEMPTS: u32 = 5;
+    let wal_tail = WalTail {
+        epoch_dir: epoch,
+        from_lsn: tail.from_lsn,
+        segments: tail.segments.clone(),
+    };
+    let mut last: Option<LeaseError> = None;
+    for _ in 0..ATTEMPTS {
+        let mut held = tail.held.lock().unwrap();
+        let wal_tail = wal_tail.clone();
+        match lease::update_manifest(store, layout, &mut held, move |m| {
+            m.wal_tail = Some(wal_tail);
+        }) {
+            Ok(()) => {
+                tail.bytes_since_publish = 0;
+                tail.last_publish = Instant::now();
+                return Ok(());
+            }
+            Err(LeaseError::Lost { .. }) => return Err(CommitError::LeaseLost),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(CommitError::TailPublish {
+        reason: last.expect("loop ran at least once").to_string(),
+    })
 }
 
 /// Upload one immutable frame object. Retries transient errors with a short
@@ -637,6 +801,117 @@ mod tests {
             Err(CommitError::RecordTooLarge { .. })
         ));
         gc.close().unwrap();
+    }
+
+    fn lease_setup(
+        store: &Arc<LocalFsStore>,
+        layout: &TenantLayout,
+        now: u64,
+    ) -> Arc<Mutex<HeldLease>> {
+        store
+            .put_new(
+                &layout.manifest(),
+                &crate::manifest::Manifest::new("t1", 18).to_json(),
+            )
+            .unwrap();
+        let held = lease::acquire(&**store, layout, "node-a", 15, now).unwrap();
+        Arc::new(Mutex::new(held))
+    }
+
+    fn manifest_of(store: &dyn CasStore, layout: &TenantLayout) -> crate::manifest::Manifest {
+        let (data, _) = store.get(&layout.manifest()).unwrap().unwrap();
+        crate::manifest::Manifest::from_json(&data).unwrap()
+    }
+
+    #[test]
+    fn sealed_segments_are_published_to_the_manifest_tail() {
+        let (_d, store, layout) = setup();
+        let held = lease_setup(&store, &layout, 1000);
+        let epoch = held.lock().unwrap().epoch;
+        let gc = GroupCommit::with_lease(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout.clone(),
+            held,
+            Lsn(0),
+            GroupCommitConfig::default(),
+            TailConfig {
+                seal_bytes: 1,
+                ..TailConfig::default()
+            },
+        );
+
+        let records: Vec<Vec<u8>> = (0u8..4).map(|i| vec![i; 50]).collect();
+        for r in &records {
+            gc.append(r).unwrap().wait().unwrap();
+        }
+        gc.close().unwrap();
+
+        let tail = manifest_of(&*store, &layout)
+            .wal_tail
+            .expect("tail published");
+        assert_eq!(tail.epoch_dir, epoch);
+        assert_eq!(tail.from_lsn, Lsn(0));
+
+        // The manifest alone must be enough to find and replay the WAL.
+        let mut replayed = Vec::new();
+        for name in &tail.segments {
+            let key = format!("tenants/t1/wal/{epoch:016}/{name}");
+            let (data, _) = store.get(&key).unwrap().unwrap();
+            for frame in SegmentReader::new(&data, epoch) {
+                replayed.extend(split_records(&frame.unwrap().payload).unwrap());
+            }
+        }
+        assert_eq!(replayed, records);
+    }
+
+    #[test]
+    fn close_publishes_the_final_tail_even_below_thresholds() {
+        let (_d, store, layout) = setup();
+        let held = lease_setup(&store, &layout, 1000);
+        let gc = GroupCommit::with_lease(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout.clone(),
+            held,
+            Lsn(0),
+            GroupCommitConfig::default(),
+            TailConfig::default(),
+        );
+        for i in 0u8..3 {
+            gc.append(&[i]).unwrap().wait().unwrap();
+        }
+        // Nothing published yet, both thresholds are far away.
+        assert!(manifest_of(&*store, &layout).wal_tail.is_none());
+        gc.close().unwrap();
+        let tail = manifest_of(&*store, &layout)
+            .wal_tail
+            .expect("published on close");
+        assert!(!tail.segments.is_empty());
+    }
+
+    #[test]
+    fn a_stolen_lease_stops_the_pipeline_without_a_fake_ack() {
+        let (_d, store, layout) = setup();
+        let held = lease_setup(&store, &layout, 1000);
+        let gc = GroupCommit::with_lease(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout.clone(),
+            held,
+            Lsn(0),
+            GroupCommitConfig::default(),
+            TailConfig {
+                seal_bytes: 1,
+                ..TailConfig::default()
+            },
+        );
+
+        // node-b steals after the TTL. Our next publish must detect it,
+        // and the record flushed alongside it must not be acked: it lives
+        // in a dead epoch no successor will ever replay.
+        lease::acquire(&*store, &layout, "node-b", 15, 1015).unwrap();
+        let err = gc.append(b"zombie").unwrap().wait().unwrap_err();
+        assert!(matches!(err, CommitError::LeaseLost), "got: {err}");
+        assert!(matches!(gc.append(b"after"), Err(CommitError::LeaseLost)));
+        assert!(gc.close().is_err());
     }
 
     #[test]
