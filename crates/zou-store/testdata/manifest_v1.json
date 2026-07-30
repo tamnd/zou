@@ -1,0 +1,33 @@
+{
+  "format": 1,
+  "ref": "acme-prod",
+  "epoch": 42,
+  "lease": {
+    "holder": "node-7f3a",
+    "expires_unix": 1767100000,
+    "fence": 1042
+  },
+  "pg": {
+    "version": 18,
+    "timeline": 3
+  },
+  "checkpoints": [
+    {
+      "id": "chk-000121",
+      "lsn": "0/8A211000",
+      "kind": "full"
+    },
+    {
+      "id": "chk-000122",
+      "lsn": "0/8B000000",
+      "kind": "delta"
+    }
+  ],
+  "wal_tail": {
+    "epoch_dir": 42,
+    "from_lsn": "0/8B000000",
+    "segments": [
+      "000000008B000000.wal"
+    ]
+  }
+}
