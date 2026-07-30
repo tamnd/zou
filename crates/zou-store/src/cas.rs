@@ -120,7 +120,7 @@ impl KeyLock {
         loop {
             match fs::create_dir(&dir) {
                 Ok(()) => return Ok(Self { dir }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(e) if lock_busy(&e) => {
                     if Instant::now() > deadline {
                         return Err(LocalFsStore::io(
                             key,
@@ -136,6 +136,14 @@ impl KeyLock {
             }
         }
     }
+}
+
+/// Whether a failed lock mkdir means "held by someone else, wait". Windows
+/// reports a lock dir that its releasing thread has marked delete-pending
+/// as access denied rather than already-exists, so both count as busy there.
+fn lock_busy(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AlreadyExists
+        || (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied)
 }
 
 impl Drop for KeyLock {
