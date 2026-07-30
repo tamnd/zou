@@ -1,0 +1,2 @@
+# Golden file tests compare bytes, so checkouts must not rewrite line endings.
+* text=auto eol=lf

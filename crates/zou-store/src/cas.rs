@@ -120,7 +120,7 @@ impl KeyLock {
         loop {
             match fs::create_dir(&dir) {
                 Ok(()) => return Ok(Self { dir }),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(e) if lock_busy(&e) => {
                     if Instant::now() > deadline {
                         return Err(LocalFsStore::io(
                             key,
@@ -138,6 +138,14 @@ impl KeyLock {
     }
 }
 
+/// Whether a failed lock mkdir means "held by someone else, wait". Windows
+/// reports a lock dir that its releasing thread has marked delete-pending
+/// as access denied rather than already-exists, so both count as busy there.
+fn lock_busy(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::AlreadyExists
+        || (cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied)
+}
+
 impl Drop for KeyLock {
     fn drop(&mut self) {
         let _ = fs::remove_dir(&self.dir);
@@ -146,7 +154,14 @@ impl Drop for KeyLock {
 
 impl CasStore for LocalFsStore {
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, CasError> {
-        match fs::read(self.path_for(key)) {
+        let path = self.path_for(key);
+        // Windows cannot rename over a file another handle has open, so
+        // put_if_match briefly removes the destination there. Readers take
+        // the same key lock so they never observe that gap as a missing
+        // object. On unix the rename is atomic and no lock is needed.
+        #[cfg(windows)]
+        let _lock = KeyLock::acquire(&path, key)?;
+        match fs::read(&path) {
             Ok(data) => {
                 let version = Version::of(&data);
                 Ok(Some((data, version)))
@@ -180,6 +195,14 @@ impl CasStore for LocalFsStore {
         let mut f = fs::File::create(&tmp).map_err(|e| Self::io(key, e))?;
         f.write_all(data).map_err(|e| Self::io(key, e))?;
         f.sync_all().map_err(|e| Self::io(key, e))?;
+        drop(f);
+        // Windows refuses to rename over an existing file when any handle
+        // is open on it, so remove the destination first. Safe because both
+        // writers and windows readers hold the key lock here.
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| Self::io(key, e))?;
+        }
         fs::rename(&tmp, &path).map_err(|e| Self::io(key, e))?;
         Ok(Version::of(data))
     }
