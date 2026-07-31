@@ -7,7 +7,7 @@ PG_PREFIX := $(abspath build/pg)
 
 ZOU_PG_LIB := $(abspath target/release)
 
-.PHONY: demo test lint pg-init pg-patch pg-build pg-clean zou-pg-lib
+.PHONY: demo test lint pg-init pg-patch pg-build pg-vector pg-clean zou-pg-lib
 
 # End to end tour of the object layer on a local directory.
 demo:
@@ -19,9 +19,11 @@ test:
 lint:
 	cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-# Fetch the pinned Postgres source. Shallow, the full history is not needed.
+# Fetch the pinned Postgres and pgvector sources. Shallow, the full
+# history is not needed.
 pg-init:
 	git submodule update --init --depth 1 $(PG_SRC)
+	git submodule update --init --depth 1 vendor/pgvector
 
 # Reset the vendored tree to the pinned commit and apply the patch series.
 pg-patch: pg-init
@@ -34,9 +36,15 @@ zou-pg-lib:
 # Out of tree build so the submodule stays clean. LDFLAGS pulls in the
 # zou-pg staticlib for the smgr patch, see docs/postgres.md.
 pg-build: pg-patch zou-pg-lib
-	meson setup $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX) -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg" || meson setup --reconfigure $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX) -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg"
+	meson setup $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX) -Duuid=e2fs -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg" || meson setup --reconfigure $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX) -Duuid=e2fs -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg"
 	ninja -C $(PG_BUILD)
 	ninja -C $(PG_BUILD) install
+	$(MAKE) pg-vector
+
+# pgvector builds out of tree against the installed pg_config via pgxs.
+pg-vector:
+	$(MAKE) -C vendor/pgvector clean PG_CONFIG=$(PG_PREFIX)/bin/pg_config
+	$(MAKE) -C vendor/pgvector install PG_CONFIG=$(PG_PREFIX)/bin/pg_config
 
 pg-clean:
 	rm -rf $(PG_BUILD) $(PG_PREFIX)

@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config uuid-dev
       - name: Build with the patch series applied
         run: make pg-build
       - name: Smoke test on md
@@ -67,3 +67,29 @@ jobs:
           cat /tmp/zou-restored.log
       - name: kill -9 loop under pgbench load
         run: scripts/zou-crash-loop.sh 3
+      - name: Extension smoke on zou storage
+        run: |
+          export ZOU_TARGET=/tmp/zou-ext-store
+          mkdir -p "$ZOU_TARGET"
+          build/pg/bin/initdb -D /tmp/zou-ext-pgdata --set io_method=sync
+          REDO=$(build/pg/bin/pg_controldata -D /tmp/zou-ext-pgdata | grep "REDO location" | awk '{print $NF}')
+          target/release/zou-bootstrap "$ZOU_TARGET" /tmp/zou-ext-pgdata --redo "$REDO"
+          build/pg/bin/pg_ctl -D /tmp/zou-ext-pgdata -l /tmp/zou-ext.log -o "-c shared_preload_libraries=pg_stat_statements" start
+          build/pg/bin/psql -h /tmp -d postgres -v ON_ERROR_STOP=1 \
+            -c 'create extension vector' \
+            -c 'create extension pg_trgm' \
+            -c 'create extension pgcrypto' \
+            -c 'create extension "uuid-ossp"' \
+            -c 'create extension pg_stat_statements' \
+            -c "create table items(id int primary key, e vector(3))" \
+            -c "insert into items values (1,'[1,2,3]'),(2,'[4,5,6]'),(3,'[1,1,1]')" \
+            -c 'create index on items using hnsw (e vector_l2_ops)' \
+            -c "select similarity('zou store', 'zou storage') > 0.4" \
+            -c "select encode(digest('zou','sha256'),'hex')" \
+            -c 'select uuid_generate_v4() is not null' \
+            -c 'select count(*) > 0 from pg_stat_statements'
+          build/pg/bin/pg_ctl -D /tmp/zou-ext-pgdata restart -l /tmp/zou-ext.log -o "-c shared_preload_libraries=pg_stat_statements"
+          build/pg/bin/psql -h /tmp -d postgres -Atc "select id from items order by e <-> '[1,2,2]' limit 1" | tee /tmp/ext.txt
+          grep -qx 1 /tmp/ext.txt
+          build/pg/bin/pg_ctl -D /tmp/zou-ext-pgdata stop
+          cat /tmp/zou-ext.log

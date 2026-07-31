@@ -86,6 +86,13 @@ build/pg/bin/psql -h /tmp -d postgres -c 'create table t(id int)'
 find /tmp/zou-pg-store/tenants/local/pg -type f | head
 ```
 
+## Extensions
+
+The build ships the extension set a Supabase compatible stack leans on: pgvector, pg_trgm, pgcrypto, uuid-ossp, and pg_stat_statements.
+The contrib four come with the vendored source; `-Duuid=e2fs` in the meson setup enables uuid-ossp, which needs the util-linux uuid headers on Linux (`uuid-dev`) and the system uuid on macOS.
+pgvector is a second shallow submodule, `vendor/pgvector`, pinned to a release tag and built out of tree by `make pg-vector` against the installed `pg_config` via pgxs; `make pg-build` runs it as its last step.
+All five load and run with `ZOU_TARGET` set, hnsw index builds included, and CI smokes each one on zou storage on every server PR.
+
 ## CI
 
 The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, and reads the rows back from the object store, and one that restores a second data directory from the store with `zou-restore` and reads the same rows after crash recovery.
