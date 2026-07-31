@@ -592,12 +592,13 @@ pub unsafe extern "C" fn zou_wal_append(
     })
 }
 
-/// Fold the completed checkpoint at `redo` into a delta checkpoint and
+/// Fold the completed checkpoint at `redo` into a checkpoint object and
 /// truncate the mirrored tail, see [`fold::fold`]. Called by the pusher
 /// from the data directory when it is fully caught up, so relative paths
 /// resolve inside PGDATA. Writes the count of dropped sealed segments
-/// through `out_dropped`. Errors are transient, the caller retries after
-/// a backoff.
+/// through `out_dropped`. Returns 0 for a delta, 1 when the fold down
+/// policy promoted the capture to a full, negative on error. Errors are
+/// transient, the caller retries after a backoff.
 ///
 /// # Safety
 /// `out_dropped` must be a valid pointer.
@@ -620,7 +621,12 @@ pub unsafe extern "C" fn zou_wal_fold(redo: u64, out_dropped: *mut u32) -> i32 {
         match fold::fold(&*pipe.store, &pipe.layout, commit, Path::new("."), redo) {
             Ok(stats) => {
                 unsafe { *out_dropped = stats.dropped as u32 };
-                ZOU_OK
+                // 1 tells the pusher the fold down policy promoted this
+                // fold to a full capture, 0 is the everyday delta.
+                match stats.kind {
+                    zou_store::manifest::CheckpointKind::Full => 1,
+                    zou_store::manifest::CheckpointKind::Delta => ZOU_OK,
+                }
             }
             Err(e) => {
                 // The bgworker's stderr lands in the server log, which is

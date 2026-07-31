@@ -58,6 +58,12 @@ jobs:
           grep -q '"kind": "delta"' "$ZOU_TARGET/tenants/local/MANIFEST"
           grep -q "folded a delta checkpoint" /tmp/zou-pg.log
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
+          ZOU_FOLD_DOWN_FACTOR=0 build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
+          build/pg/bin/psql -h /tmp -d postgres -c "insert into t select g, 'row ' || g from generate_series(1001,2000) g" -c checkpoint
+          sleep 5
+          grep -q "folded a full checkpoint" /tmp/zou-pg.log
+          test "$(grep -c '"kind": "full"' $ZOU_TARGET/tenants/local/MANIFEST)" -ge 2
+          build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           cat /tmp/zou-pg.log
       - name: Restore and attach from the store alone
         run: |
@@ -66,7 +72,7 @@ jobs:
           build/pg/bin/pg_controldata -D /tmp/zou-restored | grep -q "in production"
           build/pg/bin/pg_ctl -D /tmp/zou-restored -l /tmp/zou-restored.log start
           build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/restored.txt
-          grep -q 500500 /tmp/restored.txt
+          grep -q 2001000 /tmp/restored.txt
           build/pg/bin/pg_ctl -D /tmp/zou-restored stop
           cat /tmp/zou-restored.log
       - name: kill -9 loop under pgbench load

@@ -38,10 +38,10 @@ index b885513..24c245d 100644
  		 */
 diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
 new file mode 100644
-index 0000000..76cabb8
+index 0000000..1e7c7e1
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,370 @@
+@@ -0,0 +1,371 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -354,11 +354,12 @@ index 0000000..76cabb8
 +				uint32		dropped = 0;
 +				int			rc = zou_wal_fold((uint64) redo, &dropped);
 +
-+				if (rc == 0)
++				if (rc >= 0)
 +				{
 +					folded = redo;
 +					ereport(LOG,
-+							(errmsg("zou wal pusher folded a delta checkpoint at %X/%X, dropped %u sealed segments",
++							(errmsg("zou wal pusher folded a %s checkpoint at %X/%X, dropped %u sealed segments",
++									rc == 1 ? "full" : "delta",
 +									LSN_FORMAT_ARGS(redo), dropped)));
 +				}
 +				else
