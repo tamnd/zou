@@ -1,9 +1,12 @@
 //! S3 compatible CAS backend, behind the `s3` feature.
 //!
-//! One client covers AWS S3, MinIO, and R2: they share the wire API and,
-//! since 2025, conditional writes. `If-None-Match: *` creates and
-//! `If-Match: <etag>` swaps, which is exactly the primitive the manifest
-//! CAS needs, so no coordination service enters the picture here either.
+//! One client covers AWS S3, MinIO, R2, and GCS. The first three share
+//! the wire API and, since 2025, conditional writes: `If-None-Match: *`
+//! creates and `If-Match: <etag>` swaps, which is exactly the primitive
+//! the manifest CAS needs, so no coordination service enters the picture
+//! here either. GCS accepts the same SigV4 signing with HMAC interop
+//! keys on its XML API and spells the same preconditions
+//! `x-goog-if-generation-match`, selected via [`Dialect`].
 //!
 //! The client is hand rolled on ureq and rustls rather than aws-sdk-s3.
 //! The SDK drags in tokio, and zou-store stays runtime free so the
@@ -24,19 +27,36 @@ use crate::cas::{CasError, CasStore, Version};
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// How the endpoint expresses conditional writes and versions. The wire
+/// format and signing are otherwise identical, GCS accepts SigV4 with
+/// HMAC interop keys on its XML API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dialect {
+    /// ETag versions, If-Match and If-None-Match preconditions. AWS S3,
+    /// MinIO, R2.
+    #[default]
+    S3,
+    /// Generation number versions, x-goog-if-generation-match with 0
+    /// meaning "must not exist". Google Cloud Storage.
+    Gcs,
+}
+
 /// Connection settings for one bucket. Path style addressing is used
-/// throughout because MinIO requires it and AWS and R2 accept it.
+/// throughout because MinIO requires it and AWS, R2, and GCS accept it.
 #[derive(Debug, Clone)]
 pub struct S3Config {
     /// Scheme plus authority, no trailing slash: `https://s3.us-east-1.amazonaws.com`
     /// for AWS, `http://127.0.0.1:9000` for a local MinIO,
-    /// `https://<account>.r2.cloudflarestorage.com` for R2.
+    /// `https://<account>.r2.cloudflarestorage.com` for R2,
+    /// `https://storage.googleapis.com` for GCS.
     pub endpoint: String,
-    /// `us-east-1` style region. MinIO accepts anything, R2 wants `auto`.
+    /// `us-east-1` style region. MinIO accepts anything, R2 and GCS want
+    /// `auto`.
     pub region: String,
     pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
+    pub dialect: Dialect,
 }
 
 pub struct S3Store {
@@ -89,11 +109,17 @@ impl S3Store {
     ) -> Result<(u16, Option<String>, Vec<u8>), CasError> {
         let payload_hash = body.map_or_else(|| EMPTY_SHA256.to_string(), sha256_hex);
         let (amz_date, datestamp) = amz_timestamp(SystemTime::now());
-        let signed_headers = [
+        // The condition headers are signed too. SigV4 allows signing any
+        // header, and GCS requires its x-goog-* headers in the signature.
+        let mut signed_headers = vec![
             ("host".to_string(), self.host.clone()),
             ("x-amz-content-sha256".to_string(), payload_hash.clone()),
             ("x-amz-date".to_string(), amz_date.clone()),
         ];
+        for (k, v) in extra_headers {
+            signed_headers.push((k.to_string(), v.to_string()));
+        }
+        signed_headers.sort();
         let auth = authorization(
             &self.cfg,
             method,
@@ -149,9 +175,13 @@ impl S3Store {
         let res = result.map_err(|e| Self::io(err_key, format!("transport: {e}")))?;
 
         let status = res.status().as_u16();
-        let etag = res
+        let version_header = match self.cfg.dialect {
+            Dialect::S3 => "etag",
+            Dialect::Gcs => "x-goog-generation",
+        };
+        let version = res
             .headers()
-            .get("etag")
+            .get(version_header)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
         let mut data = Vec::new();
@@ -159,7 +189,7 @@ impl S3Store {
             .into_reader()
             .read_to_end(&mut data)
             .map_err(|e| Self::io(err_key, format!("reading body: {e}")))?;
-        Ok((status, etag, data))
+        Ok((status, version, data))
     }
 }
 
@@ -171,11 +201,12 @@ fn error_snippet(body: &[u8]) -> String {
 impl CasStore for S3Store {
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, CasError> {
         let path = self.object_path(key);
-        let (status, etag, body) = self.request("GET", &path, "", None, &[], key)?;
+        let (status, version, body) = self.request("GET", &path, "", None, &[], key)?;
         match status {
             200 => {
-                let etag = etag.ok_or_else(|| Self::io(key, "response without etag".into()))?;
-                Ok(Some((body, Version::from_backend(etag))))
+                let version =
+                    version.ok_or_else(|| Self::io(key, "response without a version".into()))?;
+                Ok(Some((body, Version::from_backend(version))))
             }
             404 => Ok(None),
             s => Err(Self::io(
@@ -192,15 +223,18 @@ impl CasStore for S3Store {
         expected: Option<&Version>,
     ) -> Result<Version, CasError> {
         let path = self.object_path(key);
-        let cond: (&str, &str) = match expected {
-            Some(v) => ("if-match", v.as_str()),
-            None => ("if-none-match", "*"),
+        let cond: (&str, &str) = match (self.cfg.dialect, expected) {
+            (Dialect::S3, Some(v)) => ("if-match", v.as_str()),
+            (Dialect::S3, None) => ("if-none-match", "*"),
+            (Dialect::Gcs, Some(v)) => ("x-goog-if-generation-match", v.as_str()),
+            (Dialect::Gcs, None) => ("x-goog-if-generation-match", "0"),
         };
-        let (status, etag, body) = self.request("PUT", &path, "", Some(data), &[cond], key)?;
+        let (status, version, body) = self.request("PUT", &path, "", Some(data), &[cond], key)?;
         match status {
             200 => {
-                let etag = etag.ok_or_else(|| Self::io(key, "put response without etag".into()))?;
-                Ok(Version::from_backend(etag))
+                let version = version
+                    .ok_or_else(|| Self::io(key, "put response without a version".into()))?;
+                Ok(Version::from_backend(version))
             }
             // 412 is the precondition failing, 409 is S3 reporting a
             // concurrent conditional writer, 404 is If-Match against a key
@@ -397,6 +431,7 @@ mod tests {
             bucket: "examplebucket".into(),
             access_key: "AKIAIOSFODNN7EXAMPLE".into(),
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            dialect: Dialect::S3,
         }
     }
 
@@ -454,6 +489,25 @@ mod tests {
             auth.ends_with("34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"),
             "{auth}"
         );
+    }
+
+    /// GCS requires its x-goog-* headers inside the signature, so the
+    /// condition header must appear in SignedHeaders in sorted position.
+    #[test]
+    fn gcs_condition_headers_are_signed() {
+        let auth = authorization(
+            &example_cfg(),
+            "PUT",
+            "/obj",
+            "",
+            &signed_headers(&[("x-goog-if-generation-match", "42")]),
+            EMPTY_SHA256,
+            "20130524T000000Z",
+            "20130524",
+        );
+        assert!(auth.contains(
+            "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-goog-if-generation-match"
+        ));
     }
 
     #[test]

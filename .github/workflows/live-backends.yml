@@ -1,0 +1,63 @@
+name: Live backends
+
+# Runs the CAS contract against real cloud endpoints. Manual dispatch
+# because it needs account credentials in repo secrets and costs a few
+# requests. Backends without configured secrets skip cleanly, so this can
+# be enabled one backend at a time.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  contract:
+    name: contract (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: aws-s3
+            endpoint: ZOU_LIVE_AWS_ENDPOINT
+            bucket: ZOU_LIVE_AWS_BUCKET
+            access: ZOU_LIVE_AWS_ACCESS_KEY
+            secret: ZOU_LIVE_AWS_SECRET_KEY
+            region: us-east-1
+            dialect: s3
+          - backend: gcs
+            endpoint: ZOU_LIVE_GCS_ENDPOINT
+            bucket: ZOU_LIVE_GCS_BUCKET
+            access: ZOU_LIVE_GCS_ACCESS_KEY
+            secret: ZOU_LIVE_GCS_SECRET_KEY
+            region: auto
+            dialect: gcs
+          - backend: r2
+            endpoint: ZOU_LIVE_R2_ENDPOINT
+            bucket: ZOU_LIVE_R2_BUCKET
+            access: ZOU_LIVE_R2_ACCESS_KEY
+            secret: ZOU_LIVE_R2_SECRET_KEY
+            region: auto
+            dialect: s3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the CAS contract
+        env:
+          ZOU_S3_TEST_ENDPOINT: ${{ secrets[matrix.endpoint] }}
+          ZOU_S3_TEST_BUCKET: ${{ secrets[matrix.bucket] }}
+          ZOU_S3_TEST_ACCESS_KEY: ${{ secrets[matrix.access] }}
+          ZOU_S3_TEST_SECRET_KEY: ${{ secrets[matrix.secret] }}
+          ZOU_S3_TEST_REGION: ${{ matrix.region }}
+          ZOU_S3_TEST_DIALECT: ${{ matrix.dialect }}
+        run: |
+          if [ -z "$ZOU_S3_TEST_ENDPOINT" ]; then
+            echo "secrets for ${{ matrix.backend }} are not configured, skipping"
+            exit 0
+          fi
+          cargo test -p zou-store --features s3 --test cas_contract s3_backend
