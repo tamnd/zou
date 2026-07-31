@@ -12,6 +12,7 @@ crc32c = { workspace = true }
 hmac = { workspace = true, optional = true }
 log = { workspace = true }
 lz4_flex = { workspace = true }
+rusqlite = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"
@@ -20,6 +21,7 @@ ureq = { workspace = true, optional = true }
 
 [features]
 s3 = ["dep:hmac", "dep:ureq"]
+sqlite = ["dep:rusqlite"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -76,6 +76,7 @@ impl CasStore for PrefixStore {
 #[derive(Debug, PartialEq, Eq)]
 enum Parsed<'a> {
     Local(&'a str),
+    Sqlite(&'a str),
     Remote {
         scheme: &'a str,
         bucket: &'a str,
@@ -87,9 +88,15 @@ fn parse(target: &str) -> Result<Parsed<'_>, String> {
     let Some((scheme, rest)) = target.split_once("://") else {
         return Ok(Parsed::Local(target));
     };
+    if scheme == "sqlite" {
+        if rest.is_empty() {
+            return Err(format!("{target} names no database file"));
+        }
+        return Ok(Parsed::Sqlite(rest));
+    }
     if scheme != "s3" && scheme != "gs" {
         return Err(format!(
-            "unsupported store scheme {scheme}://, use a path, s3://, or gs://"
+            "unsupported store scheme {scheme}://, use a path, sqlite://, s3://, or gs://"
         ));
     }
     let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
@@ -112,7 +119,13 @@ pub fn open_store(target: &str) -> Result<Box<dyn CasStore>, String> {
         Parsed::Local(path) if path.ends_with(".zou") => {
             Box::new(crate::zoufile::ZouFileStore::open(path)?)
         }
+        Parsed::Local(path)
+            if path.ends_with(".db") || path.ends_with(".sqlite") || path.ends_with(".sqlite3") =>
+        {
+            open_sqlite(path)?
+        }
         Parsed::Local(path) => Box::new(LocalFsStore::new(path)),
+        Parsed::Sqlite(path) => open_sqlite(path)?,
         Parsed::Remote {
             scheme,
             bucket,
@@ -171,6 +184,18 @@ fn open_remote(scheme: &str, _bucket: &str) -> Result<Box<dyn CasStore>, String>
     ))
 }
 
+#[cfg(feature = "sqlite")]
+fn open_sqlite(path: &str) -> Result<Box<dyn CasStore>, String> {
+    Ok(Box::new(crate::sqlite::SqliteStore::open(path)?))
+}
+
+#[cfg(not(feature = "sqlite"))]
+fn open_sqlite(path: &str) -> Result<Box<dyn CasStore>, String> {
+    Err(format!(
+        "{path} needs the sqlite feature, which this build lacks"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,8 +234,13 @@ mod tests {
                 prefix: "store"
             }
         );
+        assert_eq!(
+            parse("sqlite:///var/lib/zou.db").unwrap(),
+            Parsed::Sqlite("/var/lib/zou.db")
+        );
         assert!(parse("s3://").is_err());
         assert!(parse("s3:///prefix-only").is_err());
+        assert!(parse("sqlite://").is_err());
         assert!(parse("http://host/bucket").is_err());
     }
 
