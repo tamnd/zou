@@ -52,6 +52,34 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo build --workspace
 
+  s3-contract:
+    name: s3 contract (minio)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=zou -e MINIO_ROOT_PASSWORD=zou-secret-key \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/ready && break
+            sleep 1
+          done
+      - name: Create bucket
+        run: |
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c \
+            "mc alias set local http://127.0.0.1:9000 zou zou-secret-key && mc mb local/zou-test"
+      - name: Run the CAS contract against MinIO
+        env:
+          ZOU_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          ZOU_S3_TEST_BUCKET: zou-test
+          ZOU_S3_TEST_ACCESS_KEY: zou
+          ZOU_S3_TEST_SECRET_KEY: zou-secret-key
+        run: cargo test -p zou-store --features s3 --test cas_contract
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

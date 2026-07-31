@@ -13,6 +13,8 @@ pub mod layout;
 pub mod lease;
 pub mod lsn;
 pub mod manifest;
+#[cfg(feature = "s3")]
+pub mod s3;
 pub mod tier;
 pub mod wal;
 
@@ -23,5 +25,7 @@ pub use heartbeat::Heartbeat;
 pub use lease::{DEFAULT_TTL_SECS, HeldLease, LeaseError};
 pub use lsn::Lsn;
 pub use manifest::{MANIFEST_FORMAT, Manifest};
+#[cfg(feature = "s3")]
+pub use s3::{S3Config, S3Store};
 pub use tier::{BufferedTarget, ExpressTarget, LatencyTier, PureS3Target, WalTarget};
 pub use wal::{Frame, SegmentReader, WAL_VERSION, WalDecodeError};
