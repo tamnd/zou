@@ -87,7 +87,14 @@ The cut sits at the segment boundary rather than at redo itself because the xlog
 The pusher only folds while fully caught up, pushed equal to the local flush, which guarantees the checkpoint record named by the captured pg_control is already durable in the store.
 Transaction status captured in the fold can run slightly ahead of the record stream for commits landing in the capture window, which is safe because those commits were never acked.
 Dropped segment objects stay in the bucket until the garbage collection job arrives, so a restore may overlay more WAL files than the manifest references, which recovery ignores because replay starts at the restored redo.
+
+Every fold also packs the checkpoint's pages into sorted runs under `chk/<redo>/`, so a reader can serve a point in time without walking the mutable page prefix object by object.
+A delta finds its pages by scanning the mirrored WAL between the previous checkpoint and redo for block references, which names every dirtied page because the write gate makes each page's WAL durable in the stream before the page itself can reach the store.
+A full skips the scan and lists the whole `pg/` prefix instead, recording every fork size alongside the pages.
+The pages land in `<n>.pages` objects of 1024 pages each in sorted block order, and a `PAGES` index records the run size and one line per packed block, so a reader locates any block with a binary search and one range read.
+Pages read at fold time can be slightly newer than redo, the same replay idempotence argument Postgres recovery itself rests on, a checkpoint is a consistent starting point rather than a point in time snapshot.
 The fold down policy keeps the chain short: once the deltas since the newest full outweigh it five times, the next fold captures a full instead, a whole data directory walk minus the wal segments the mirrored tail already owns and the per instance noise the server recreates.
+One wal segment file is kept in that walk, the segment holding the redo location, because the mirrored stream can begin mid segment, restore only rebuilds segment files from the first mirrored byte onward, and recovery refuses a segment file whose first page header reads as zeros.
 Restore then starts at that full and the superseded chain becomes garbage for the gc job.
 `ZOU_FOLD_DOWN_FACTOR` overrides the factor, which the CI smoke test uses to force a fold down without writing five fulls worth of deltas.
 

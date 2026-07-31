@@ -155,6 +155,7 @@ impl CommitTicket {
 
 pub struct GroupCommit {
     shared: Arc<Shared>,
+    epoch: u64,
     flusher: Option<JoinHandle<()>>,
 }
 
@@ -338,14 +339,24 @@ impl GroupCommit {
             progress: Condvar::new(),
             config,
         });
+        let epoch = params.epoch;
         let flusher = {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || flusher_loop(&shared, &*store, &layout, params))
         };
         Self {
             shared,
+            epoch,
             flusher: Some(flusher),
         }
+    }
+
+    /// The epoch stamped into this session's frames, which names the
+    /// `wal/<epoch>/` directory the session writes. Readers use it to
+    /// pick up segments uploaded after the last tail publish without
+    /// trusting any other epoch's unpublished objects.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Queue one record. Blocks while the buffer is full, errors if the

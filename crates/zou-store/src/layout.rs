@@ -5,7 +5,9 @@
 //!   MANIFEST                      current manifest, swapped with CAS
 //!   manifests/<epoch>.json        manifest history
 //!   wal/<epoch>/<start-lsn>.wal   sealed WAL segments, immutable
-//!   chk/<chk-id>/index            page location index for one checkpoint
+//!   chk/<chk-id>/INDEX            fs capture index for one checkpoint
+//!   chk/<chk-id>/fs/<path>        captured files
+//!   chk/<chk-id>/PAGES            page run index for one checkpoint
 //!   chk/<chk-id>/<n>.pages        sorted page images
 //!   files/<bucket>/<key>          Storage API user files
 //! ```
@@ -97,8 +99,17 @@ impl TenantLayout {
         format!("{}/pg/{spc}/{db}/{rel}/{fork}", self.prefix)
     }
 
-    pub fn checkpoint_index(&self, chk_id: &str) -> String {
-        format!("{}/chk/{chk_id}/index", self.prefix)
+    /// The whole relation page prefix. A full checkpoint lists this to
+    /// pack every page into its runs.
+    pub fn pg_dir(&self) -> String {
+        format!("{}/pg/", self.prefix)
+    }
+
+    /// The page run index of a checkpoint: which blocks its `.pages`
+    /// objects hold and in what order. Distinct from the fs capture
+    /// INDEX, which describes captured files.
+    pub fn checkpoint_page_index(&self, chk_id: &str) -> String {
+        format!("{}/chk/{chk_id}/PAGES", self.prefix)
     }
 
     pub fn checkpoint_pages(&self, chk_id: &str, n: u32) -> String {
@@ -134,8 +145,8 @@ mod tests {
             "tenants/acme-prod/wal/0000000000000042/000000008B000000.wal"
         );
         assert_eq!(
-            t.checkpoint_index("chk-000121"),
-            "tenants/acme-prod/chk/chk-000121/index"
+            t.checkpoint_page_index("chk-000121"),
+            "tenants/acme-prod/chk/chk-000121/PAGES"
         );
         assert_eq!(
             t.checkpoint_pages("chk-000121", 3),
@@ -161,7 +172,7 @@ mod tests {
         let t = TenantLayout::new("acme");
         assert!(!t.is_immutable(&t.manifest()));
         assert!(t.is_immutable(&t.wal_segment(1, Lsn(0))));
-        assert!(t.is_immutable(&t.checkpoint_index("chk-1")));
+        assert!(t.is_immutable(&t.checkpoint_page_index("chk-1")));
         assert!(t.is_immutable(&t.manifest_history(1)));
         assert!(!t.is_immutable("tenants/other/MANIFEST"));
     }

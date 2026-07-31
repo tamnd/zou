@@ -17,6 +17,7 @@
 pub mod capture;
 pub mod fold;
 pub mod restore;
+pub mod walscan;
 
 use std::ffi::{CStr, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
