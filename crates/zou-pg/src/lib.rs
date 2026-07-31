@@ -31,9 +31,7 @@ use std::time::SystemTime;
 use zou_store::heartbeat::Heartbeat;
 use zou_store::layout::TenantLayout;
 use zou_store::lease;
-use zou_store::{
-    CasStore, GroupCommit, GroupCommitConfig, LocalFsStore, Lsn, Manifest, TailConfig,
-};
+use zou_store::{CasStore, GroupCommit, GroupCommitConfig, Lsn, Manifest, TailConfig, open_store};
 
 /// Postgres BLCKSZ. The patch checks this against its own BLCKSZ at init.
 pub const ZOU_PAGE_SIZE: usize = 8192;
@@ -59,7 +57,7 @@ enum ReaderSlot {
 }
 
 struct Shim {
-    store: LocalFsStore,
+    store: Arc<dyn CasStore>,
     layout: TenantLayout,
     reader: Mutex<ReaderSlot>,
 }
@@ -90,7 +88,7 @@ fn chain_read(shim: &Shim, r: walscan::BlockRef, durable: u64) -> Option<Vec<u8>
         *slot = if std::env::var("ZOU_CHAIN_READER").is_ok_and(|v| v == "0") {
             ReaderSlot::Off
         } else {
-            match reader::ChainReader::attach(&shim.store, &shim.layout) {
+            match reader::ChainReader::attach(&*shim.store, &shim.layout) {
                 Ok(Some(rd)) => {
                     unsafe { atexit(log_cache_summary_at_exit) };
                     ReaderSlot::On(Box::new(rd))
@@ -104,7 +102,7 @@ fn chain_read(shim: &Shim, r: walscan::BlockRef, durable: u64) -> Option<Vec<u8>
         };
     }
     match &mut *slot {
-        ReaderSlot::On(rd) => rd.read(&shim.store, &shim.layout, r, durable),
+        ReaderSlot::On(rd) => rd.read(&*shim.store, &shim.layout, r, durable),
         _ => None,
     }
 }
@@ -171,7 +169,8 @@ fn block_index(key: &str) -> Option<u32> {
 
 /// Open the store for this process. Idempotent, every Postgres process
 /// (postmaster, backends, checkpointer) calls it on startup. The target
-/// is a local directory in v0, object store URLs arrive with the CLI.
+/// is a local directory or an object store URL like `s3://bucket/prefix`,
+/// see `zou_store::open_store` for the environment the URL forms read.
 ///
 /// # Safety
 /// `target` must be a valid NUL terminated C string.
@@ -184,13 +183,15 @@ pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
         let Ok(target) = unsafe { CStr::from_ptr(target) }.to_str() else {
             return ZOU_ERR_BAD_ARGUMENT;
         };
-        if target.contains("://") {
-            // Object store URLs need config (region, creds) that the CLI
-            // will own. Refuse loudly instead of guessing.
-            return ZOU_ERR_BAD_ARGUMENT;
-        }
+        let store = match open_store(target) {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("zou_pg_init: {e}");
+                return ZOU_ERR_BAD_ARGUMENT;
+            }
+        };
         let _ = SHIM.set(Shim {
-            store: LocalFsStore::new(target),
+            store: Arc::from(store),
             layout: TenantLayout::new("local"),
             reader: Mutex::new(ReaderSlot::Unset),
         });
@@ -557,7 +558,13 @@ fn resume_point(
 /// Returns the pipe plus the Postgres LSN to resume pushing from, zero
 /// when the store holds no WAL and pushing starts at `flush_lsn`.
 fn open_wal_pipe(target: &str, flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
-    let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(target));
+    let store: Arc<dyn CasStore> = match open_store(target) {
+        Ok(store) => Arc::from(store),
+        Err(e) => {
+            eprintln!("zou_wal_open: {e}");
+            return Err(ZOU_ERR_BAD_ARGUMENT);
+        }
+    };
     let layout = TenantLayout::new("local");
     let manifest_key = layout.manifest();
     match store.get(&manifest_key) {
@@ -659,9 +666,6 @@ pub unsafe extern "C" fn zou_wal_open(
         let Ok(target) = unsafe { CStr::from_ptr(target) }.to_str() else {
             return ZOU_ERR_BAD_ARGUMENT;
         };
-        if target.contains("://") {
-            return ZOU_ERR_BAD_ARGUMENT;
-        }
         if WAL.get().is_some() {
             return ZOU_ERR_BAD_ARGUMENT;
         }
@@ -787,6 +791,7 @@ pub extern "C" fn zou_wal_close() -> i32 {
 mod tests {
     use super::*;
     use std::ffi::CString;
+    use zou_store::LocalFsStore;
 
     /// One test drives the whole C ABI lifecycle, because the shim is a
     /// process global and tests share the process.

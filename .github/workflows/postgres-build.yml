@@ -106,6 +106,38 @@ jobs:
           cat /tmp/zou-restored.log
       - name: kill -9 loop under pgbench load
         run: scripts/zou-crash-loop.sh 3
+      - name: Smoke test on MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=zou -e MINIO_ROOT_PASSWORD=zou-secret-key \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/ready && break
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint sh minio/mc:latest -c \
+            "mc alias set local http://127.0.0.1:9000 zou zou-secret-key && mc mb local/zou-pg"
+          export ZOU_TARGET=s3://zou-pg/smoke
+          export ZOU_S3_ENDPOINT=http://127.0.0.1:9000
+          export AWS_ACCESS_KEY_ID=zou
+          export AWS_SECRET_ACCESS_KEY=zou-secret-key
+          build/pg/bin/initdb -D /tmp/minio-pgdata --set io_method=sync
+          REDO=$(build/pg/bin/pg_controldata -D /tmp/minio-pgdata | grep "REDO location" | awk '{print $NF}')
+          target/release/zou-bootstrap "$ZOU_TARGET" /tmp/minio-pgdata --redo "$REDO"
+          build/pg/bin/pg_ctl -D /tmp/minio-pgdata -l /tmp/minio-pg.log start
+          build/pg/bin/psql -h /tmp -d postgres -c "create table t(id int primary key)" -c "insert into t select g from generate_series(1,1000) g" -c checkpoint
+          sleep 5
+          grep -q "folded a" /tmp/minio-pg.log
+          build/pg/bin/pg_ctl -D /tmp/minio-pgdata restart -l /tmp/minio-pg.log
+          build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/minio.txt
+          grep -q 500500 /tmp/minio.txt
+          build/pg/bin/pg_ctl -D /tmp/minio-pgdata stop
+          target/release/zou-restore "$ZOU_TARGET" /tmp/minio-restored
+          build/pg/bin/pg_ctl -D /tmp/minio-restored -l /tmp/minio-restored.log start
+          build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/minio-restored.txt
+          grep -q 500500 /tmp/minio-restored.txt
+          build/pg/bin/pg_ctl -D /tmp/minio-restored stop
+          cat /tmp/minio-pg.log
       - name: Extension smoke on zou storage
         run: |
           export ZOU_TARGET=/tmp/zou-ext-store
