@@ -44,6 +44,9 @@ jobs:
           mkdir -p "$ZOU_TARGET"
           build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync
           test "$(find $ZOU_TARGET/tenants/local/pg -type f | wc -l)" -gt 1000
+          REDO=$(build/pg/bin/pg_controldata -D /tmp/zou-pgdata | grep "REDO location" | awk '{print $NF}')
+          target/release/zou-bootstrap "$ZOU_TARGET" /tmp/zou-pgdata --redo "$REDO"
+          test -s "$ZOU_TARGET/tenants/local/chk/genesis/INDEX"
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
           build/pg/bin/psql -h /tmp -d postgres -c "create table t(id int primary key, v text)" -c "insert into t select g, 'row ' || g from generate_series(1,1000) g"
           test "$(find $ZOU_TARGET/tenants/local/wal -type f | wc -l)" -ge 1

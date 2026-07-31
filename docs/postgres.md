@@ -50,7 +50,16 @@ Patch `0002-zou-wal.patch` adds the durability side.
 A background worker, the zou wal pusher, owns the zou-store writer lease and tails `pg_wal`: every flushed byte is appended to the group commit pipeline as a chunk prefixed with its Postgres LSN, and the durable LSN is published into shared memory.
 Committing backends block after their local flush until the store holds their commit record, the same contract as a synchronous replication ack, so an acked COMMIT is durable on object storage, not just on the local disk.
 The pusher lives in one process because zou-store has a single writer lease, while `XLogWrite` runs in whichever process holds `WALWriteLock`.
-Recovery from the mirrored stream and the bootstrap checkpoint capture are the next milestone steps.
+The `zou-bootstrap` tool completes the picture for a fresh cluster.
+Run once between `initdb` and the first server start, it captures the pristine data directory, pg_control, the SLRUs, the initial WAL segment, every config file and empty directory, as immutable objects under `chk/genesis/` plus an `INDEX`, and records a full checkpoint at the initdb redo location in the manifest.
+Relation pages are already in the store through the storage manager, so after bootstrap the store alone holds everything a node needs to attach.
+
+```sh
+REDO=$(build/pg/bin/pg_controldata -D /tmp/zou-pgdata | grep "REDO location" | awk '{print $NF}')
+target/release/zou-bootstrap /tmp/zou-pg-store /tmp/zou-pgdata --redo "$REDO"
+```
+
+Recovery, attaching from the manifest with no local state, is the next milestone step.
 
 ```sh
 mkdir -p /tmp/zou-pg-store
