@@ -13,6 +13,7 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 zou-store = { path = "../zou-store" }
+crc32c = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

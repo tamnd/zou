@@ -55,3 +55,13 @@ jobs:
           grep -q 500500 /tmp/reread.txt
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           cat /tmp/zou-pg.log
+      - name: Restore and attach from the store alone
+        run: |
+          export ZOU_TARGET=/tmp/zou-pg-store
+          target/release/zou-restore "$ZOU_TARGET" /tmp/zou-restored
+          build/pg/bin/pg_controldata -D /tmp/zou-restored | grep -q "in production"
+          build/pg/bin/pg_ctl -D /tmp/zou-restored -l /tmp/zou-restored.log start
+          build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/restored.txt
+          grep -q 500500 /tmp/restored.txt
+          build/pg/bin/pg_ctl -D /tmp/zou-restored stop
+          cat /tmp/zou-restored.log

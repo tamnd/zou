@@ -21,7 +21,7 @@ use crate::cas::{CasError, CasStore};
 use crate::layout::TenantLayout;
 use crate::lease::{self, HeldLease, LeaseError};
 use crate::lsn::Lsn;
-use crate::manifest::WalTail;
+use crate::manifest::{Manifest, WalTail};
 use crate::tier::{PureS3Target, WalTarget};
 use crate::wal::{Frame, MAX_BODY_LEN};
 
@@ -160,6 +160,7 @@ pub struct GroupCommitBuilder {
     start_lsn: Lsn,
     config: GroupCommitConfig,
     tail: TailConfig,
+    initial_tail: Option<WalTail>,
     target: Option<Arc<dyn WalTarget>>,
 }
 
@@ -194,6 +195,15 @@ impl GroupCommitBuilder {
         self
     }
 
+    /// Chain this session onto the WAL history already in the store,
+    /// normally the result of [`reconcile_tail`]. Published tails then
+    /// keep the earlier sessions' segments instead of replacing them,
+    /// which is what makes recovery across restarts possible.
+    pub fn initial_tail(mut self, tail: WalTail) -> Self {
+        self.initial_tail = Some(tail);
+        self
+    }
+
     /// Route frame uploads through a latency tier other than the default
     /// PureS3 on the main store.
     pub fn target(mut self, target: Arc<dyn WalTarget>) -> Self {
@@ -211,11 +221,15 @@ impl GroupCommitBuilder {
                     let held = held.lock().unwrap();
                     (held.epoch, held.fence)
                 };
+                let (from_lsn, segments) = match self.initial_tail {
+                    Some(prior) => (prior.from_lsn, prior.segments),
+                    None => (self.start_lsn, Vec::new()),
+                };
                 let tail = TailCtx {
                     held,
                     config: self.tail,
-                    from_lsn: self.start_lsn,
-                    segments: Vec::new(),
+                    from_lsn,
+                    segments,
                     bytes_since_publish: 0,
                     last_publish: Instant::now(),
                 };
@@ -243,6 +257,7 @@ impl GroupCommit {
             start_lsn: Lsn(0),
             config: GroupCommitConfig::default(),
             tail: TailConfig::default(),
+            initial_tail: None,
             target: None,
         }
     }
@@ -494,7 +509,7 @@ fn flusher_loop(
         let tail_result = match (&result, tail.as_mut()) {
             (Ok(()), Some(tail)) => {
                 let name = key.rsplit('/').next().expect("wal keys contain slashes");
-                tail.segments.push(name.to_string());
+                tail.segments.push(format!("{epoch:016}/{name}"));
                 tail.bytes_since_publish += encoded.len() as u64;
                 let due = tail.bytes_since_publish >= tail.config.seal_bytes
                     || tail.last_publish.elapsed() >= tail.config.seal_interval;
@@ -572,6 +587,62 @@ fn publish_tail(
     Err(CommitError::TailPublish {
         reason: last.expect("loop ran at least once").to_string(),
     })
+}
+
+/// Reconstruct the complete WAL tail visible in the store: everything the
+/// manifest lists plus segments uploaded after the last publish, including
+/// whole sessions that crashed before their first publish. Frames become
+/// durable, and acked, on upload, so the manifest list alone would lose
+/// the newest commits. Returns None when the store holds no WAL at all.
+pub fn reconcile_tail(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    manifest: &Manifest,
+) -> Result<Option<WalTail>, CasError> {
+    let dir = layout.wal_dir();
+    let mut segments: Vec<String> = store
+        .list(&dir)?
+        .into_iter()
+        .filter_map(|key| {
+            let rel = key.strip_prefix(&dir)?;
+            let (epoch, name) = rel.split_once('/')?;
+            (epoch.len() == 16
+                && epoch.parse::<u64>().is_ok()
+                && name.len() == 20
+                && name.ends_with(".wal"))
+            .then(|| rel.to_string())
+        })
+        .collect();
+    // Epoch and start LSN are fixed width hex, so the path sort is the
+    // session order and the stream order within each session.
+    segments.sort();
+    if segments.is_empty() {
+        return Ok(None);
+    }
+    let from_lsn = match &manifest.wal_tail {
+        Some(tail) => tail.from_lsn,
+        None => segment_start_lsn(&segments[0]).unwrap_or(Lsn(0)),
+    };
+    let epoch_dir = segment_epoch(segments.last().expect("nonempty")).unwrap_or(manifest.epoch);
+    Ok(Some(WalTail {
+        epoch_dir,
+        from_lsn,
+        segments,
+    }))
+}
+
+/// Epoch of an epoch qualified segment path. The directory component is
+/// zero padded decimal, matching [`TenantLayout::wal_epoch_dir`].
+pub fn segment_epoch(qualified: &str) -> Option<u64> {
+    let (epoch, _) = qualified.split_once('/')?;
+    epoch.parse().ok()
+}
+
+/// Stream start LSN encoded in a segment file name.
+pub fn segment_start_lsn(qualified: &str) -> Option<Lsn> {
+    let name = qualified.rsplit('/').next()?;
+    let hex = name.strip_suffix(".wal")?;
+    u64::from_str_radix(hex, 16).ok().map(Lsn)
 }
 
 /// Split a frame payload back into the records that went in. Returns None
@@ -939,16 +1010,126 @@ mod tests {
         assert_eq!(tail.epoch_dir, epoch);
         assert_eq!(tail.from_lsn, Lsn(0));
 
-        // The manifest alone must be enough to find and replay the WAL.
+        // The manifest alone must be enough to find and replay the WAL,
+        // each entry naming its own epoch directory.
         let mut replayed = Vec::new();
         for name in &tail.segments {
-            let key = format!("tenants/t1/wal/{epoch:016}/{name}");
-            let (data, _) = store.get(&key).unwrap().unwrap();
-            for frame in SegmentReader::new(&data, epoch) {
+            let seg_epoch = segment_epoch(name).expect("epoch qualified");
+            assert_eq!(seg_epoch, epoch);
+            let (data, _) = store.get(&layout.wal_segment_path(name)).unwrap().unwrap();
+            for frame in SegmentReader::new(&data, seg_epoch) {
                 replayed.extend(split_records(&frame.unwrap().payload).unwrap());
             }
         }
         assert_eq!(replayed, records);
+    }
+
+    #[test]
+    fn a_new_session_chains_onto_the_previous_tail() {
+        let (_d, store, layout) = setup();
+        let held = lease_setup(&store, &layout, 1000);
+        let first_epoch = held.lock().unwrap().epoch;
+        let gc = GroupCommit::with_lease(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout.clone(),
+            held,
+            Lsn(0),
+            GroupCommitConfig::default(),
+            TailConfig::default(),
+        );
+        gc.append(b"first session").unwrap().wait().unwrap();
+        gc.close().unwrap();
+
+        // A later session, as after a server restart. The lease above was
+        // never released, so steal it past its TTL.
+        let manifest = manifest_of(&*store, &layout);
+        let prior = reconcile_tail(&*store, &layout, &manifest)
+            .unwrap()
+            .expect("first session left segments");
+        let held = lease::acquire(&*store, &layout, "node-b", 15, 2000).unwrap();
+        let second_epoch = held.epoch;
+        let gc = GroupCommit::builder(Arc::clone(&store) as Arc<dyn CasStore>, layout.clone())
+            .lease(Arc::new(Mutex::new(held)))
+            .start_lsn(Lsn(prior.from_lsn.0 + 1000))
+            .initial_tail(prior)
+            .build();
+        gc.append(b"second session").unwrap().wait().unwrap();
+        gc.close().unwrap();
+
+        let tail = manifest_of(&*store, &layout)
+            .wal_tail
+            .expect("tail published");
+        assert_eq!(tail.epoch_dir, second_epoch);
+        assert_eq!(tail.from_lsn, Lsn(0), "from_lsn chains, it never resets");
+        let epochs: Vec<u64> = tail
+            .segments
+            .iter()
+            .map(|s| segment_epoch(s).unwrap())
+            .collect();
+        assert_eq!(epochs, vec![first_epoch, second_epoch]);
+
+        let mut replayed = Vec::new();
+        for name in &tail.segments {
+            let (data, _) = store.get(&layout.wal_segment_path(name)).unwrap().unwrap();
+            for frame in SegmentReader::new(&data, segment_epoch(name).unwrap()) {
+                replayed.extend(split_records(&frame.unwrap().payload).unwrap());
+            }
+        }
+        assert_eq!(
+            replayed,
+            vec![b"first session".to_vec(), b"second session".to_vec()]
+        );
+    }
+
+    #[test]
+    fn reconcile_finds_segments_the_manifest_never_learned_about() {
+        let (_d, store, layout) = setup();
+        store
+            .put_new(
+                &layout.manifest(),
+                &crate::manifest::Manifest::new("t1", 18).to_json(),
+            )
+            .unwrap();
+
+        // A session that crashes before any tail publish: frames exist in
+        // the store, the manifest knows nothing.
+        let gc = GroupCommit::new(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout.clone(),
+            4,
+            4,
+            Lsn(0x500),
+            GroupCommitConfig::default(),
+        );
+        gc.append(b"acked but unpublished").unwrap().wait().unwrap();
+        drop(gc);
+
+        let manifest = manifest_of(&*store, &layout);
+        assert!(manifest.wal_tail.is_none());
+        let tail = reconcile_tail(&*store, &layout, &manifest)
+            .unwrap()
+            .expect("scan finds the orphan session");
+        assert_eq!(tail.segments.len(), 1);
+        assert_eq!(segment_epoch(&tail.segments[0]), Some(4));
+        assert_eq!(tail.from_lsn, Lsn(0x500));
+        assert_eq!(tail.epoch_dir, 4);
+    }
+
+    #[test]
+    fn reconcile_of_an_empty_store_is_none() {
+        let (_d, store, layout) = setup();
+        store
+            .put_new(
+                &layout.manifest(),
+                &crate::manifest::Manifest::new("t1", 18).to_json(),
+            )
+            .unwrap();
+        let manifest = manifest_of(&*store, &layout);
+        assert!(
+            reconcile_tail(&*store, &layout, &manifest)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

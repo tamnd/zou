@@ -59,7 +59,18 @@ REDO=$(build/pg/bin/pg_controldata -D /tmp/zou-pgdata | grep "REDO location" | a
 target/release/zou-bootstrap /tmp/zou-pg-store /tmp/zou-pgdata --redo "$REDO"
 ```
 
-Recovery, attaching from the manifest with no local state, is the next milestone step.
+The `zou-restore` tool closes the loop: it rebuilds a data directory from the store alone.
+It writes the genesis capture back exactly as the INDEX describes it, flips the pg_control state from shut down to in production so the server runs crash recovery instead of trusting the old clean shutdown, and overlays every mirrored WAL record into the `pg_wal` segment file it came from.
+A plain server start then replays from the genesis checkpoint through the last durable record, and the node attaches with all committed data and no other local state.
+
+```sh
+target/release/zou-restore /tmp/zou-pg-store /tmp/zou-restored
+build/pg/bin/pg_controldata -D /tmp/zou-restored | grep "cluster state"
+ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/pg_ctl -D /tmp/zou-restored -l /tmp/zou-restored.log start
+```
+
+On restart or reattach the pusher resumes right after the store's last record rather than at the local flush pointer, because the previous session can exit before pushing its final bytes, the shutdown checkpoint record at least, which is written after background workers stop.
+The manifest tail chains segment lists across writer sessions, each entry named `<epoch>/<start-lsn>.wal`, and a session opening the store first reconciles the tail against a full listing of `wal/` so segments sealed by a crashed session are never lost.
 
 ```sh
 mkdir -p /tmp/zou-pg-store
@@ -71,7 +82,7 @@ find /tmp/zou-pg-store/tenants/local/pg -type f | head
 
 ## CI
 
-The `postgres-build` workflow builds the vendored source with the full series applied and runs two smoke tests, one on stock md storage and one with `ZOU_TARGET` set that creates a table, restarts the server, and reads the rows back from the object store.
+The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, and reads the rows back from the object store, and one that restores a second data directory from the store with `zou-restore` and reads the same rows after crash recovery.
 It triggers on any PR touching `vendor/`, `patches/`, the build scripts, the `zou-pg` or `zou-store` crates, or the Makefile, and on manual dispatch.
 A patch that breaks the build or changes `select version()` output gets caught in the same PR that introduces it.
 

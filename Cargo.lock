@@ -668,6 +668,7 @@ version = "0.0.1"
 name = "zou-pg"
 version = "0.0.1"
 dependencies = [
+ "crc32c",
  "tempfile",
  "zou-store",
 ]
