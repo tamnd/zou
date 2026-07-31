@@ -60,6 +60,25 @@ impl<S: CasStore> CasStore for GuardedStore<S> {
         self.inner.put_if_match(key, data, expected)
     }
 
+    fn put(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
+        // An unconditional write can overwrite, so immutable prefixes are
+        // off limits entirely. WAL and checkpoint objects go through
+        // put_new, which proves absence.
+        if overwrite_forbidden(key) {
+            return Err(CasError::ImmutableOverwrite {
+                key: key.to_string(),
+            });
+        }
+        self.inner.put(key, data)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), CasError> {
+        // Deletes pass through: GC legitimately removes old WAL and
+        // checkpoints once the safety window says so. The guard exists to
+        // stop overwrites, which are the corruption hazard.
+        self.inner.delete(key)
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
         self.inner.list(prefix)
     }

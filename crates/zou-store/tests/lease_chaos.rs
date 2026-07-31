@@ -103,6 +103,18 @@ impl CasStore for ChaosStore {
         }
     }
 
+    fn put(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
+        let apply_first = self.roll()?;
+        let result = self.inner.put(key, data);
+        if apply_first { result } else { Err(killed()) }
+    }
+
+    fn delete(&self, key: &str) -> Result<(), CasError> {
+        let apply_first = self.roll()?;
+        let result = self.inner.delete(key);
+        if apply_first { result } else { Err(killed()) }
+    }
+
     fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
         self.roll()?;
         self.inner.list(prefix)

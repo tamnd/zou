@@ -86,6 +86,26 @@ pub trait CasStore: Send + Sync {
         }
     }
 
+    /// Overwrite an object unconditionally. This is for mutable derived
+    /// data like relation page objects, never for the manifest or anything
+    /// under wal/ or chk/, which the guard refuses. The default emulates
+    /// it with a CAS retry loop, backends with a native unconditional
+    /// write override it.
+    fn put(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
+        loop {
+            let current = self.get(key)?.map(|(_, v)| v);
+            match self.put_if_match(key, data, current.as_ref()) {
+                Err(CasError::Conflict { .. }) => continue,
+                other => return other,
+            }
+        }
+    }
+
+    /// Delete an object. Deleting a missing key succeeds, so retries and
+    /// concurrent deleters are harmless. When history must be protected
+    /// that is the GC safety window's job, not the store's.
+    fn delete(&self, key: &str) -> Result<(), CasError>;
+
     /// List keys under a prefix, sorted.
     fn list(&self, prefix: &str) -> Result<Vec<String>, CasError>;
 }
@@ -217,6 +237,35 @@ impl CasStore for LocalFsStore {
         }
         fs::rename(&tmp, &path).map_err(|e| Self::io(key, e))?;
         Ok(Version::of(data))
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
+        let path = self.path_for(key);
+        let _lock = KeyLock::acquire(&path, key)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| Self::io(key, e))?;
+        }
+        let tmp = path.with_extension("tmp");
+        let mut f = fs::File::create(&tmp).map_err(|e| Self::io(key, e))?;
+        f.write_all(data).map_err(|e| Self::io(key, e))?;
+        f.sync_all().map_err(|e| Self::io(key, e))?;
+        drop(f);
+        #[cfg(windows)]
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| Self::io(key, e))?;
+        }
+        fs::rename(&tmp, &path).map_err(|e| Self::io(key, e))?;
+        Ok(Version::of(data))
+    }
+
+    fn delete(&self, key: &str) -> Result<(), CasError> {
+        let path = self.path_for(key);
+        let _lock = KeyLock::acquire(&path, key)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Self::io(key, e)),
+        }
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {

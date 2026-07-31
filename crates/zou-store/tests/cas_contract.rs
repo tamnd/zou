@@ -10,8 +10,20 @@ fn run_contract(store: Arc<dyn CasStore>) {
     create_requires_absence(&*store);
     swap_requires_the_current_version(&*store);
     immutable_objects_cannot_be_overwritten(&*store);
+    unconditional_put_overwrites_and_delete_removes(&*store);
     list_returns_sorted_keys_under_a_prefix(&*store);
     concurrent_swappers_never_lose_an_update(store);
+}
+
+fn unconditional_put_overwrites_and_delete_removes(store: &dyn CasStore) {
+    let key = "contract/mutable/page";
+    store.put(key, b"v1").unwrap();
+    store.put(key, b"v2").unwrap();
+    assert_eq!(store.get(key).unwrap().unwrap().0, b"v2");
+    store.delete(key).unwrap();
+    assert!(store.get(key).unwrap().is_none());
+    // Deleting a missing key succeeds, retries are harmless.
+    store.delete(key).unwrap();
 }
 
 fn missing_key_reads_as_none(store: &dyn CasStore) {
@@ -131,6 +143,14 @@ impl CasStore for PrefixedStore {
     ) -> Result<zou_store::Version, CasError> {
         self.inner
             .put_if_match(&format!("{}{key}", self.prefix), data, expected)
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> Result<zou_store::Version, CasError> {
+        self.inner.put(&format!("{}{key}", self.prefix), data)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), CasError> {
+        self.inner.delete(&format!("{}{key}", self.prefix))
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {

@@ -748,6 +748,9 @@ mod tests {
             drop(stalled);
             self.inner.put_if_match(key, data, expected)
         }
+        fn delete(&self, key: &str) -> Result<(), CasError> {
+            self.inner.delete(key)
+        }
         fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
             self.inner.list(prefix)
         }
@@ -831,6 +834,12 @@ mod tests {
             _data: &[u8],
             _expected: Option<&crate::cas::Version>,
         ) -> Result<crate::cas::Version, CasError> {
+            Err(CasError::Io {
+                key: key.to_string(),
+                source: std::io::Error::other("store is down"),
+            })
+        }
+        fn delete(&self, key: &str) -> Result<(), CasError> {
             Err(CasError::Io {
                 key: key.to_string(),
                 source: std::io::Error::other("store is down"),

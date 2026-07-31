@@ -1,0 +1,465 @@
+diff --git a/src/backend/storage/smgr/meson.build b/src/backend/storage/smgr/meson.build
+index 9288e35..b8ac849 100644
+--- a/src/backend/storage/smgr/meson.build
++++ b/src/backend/storage/smgr/meson.build
+@@ -4,4 +4,5 @@ backend_sources += files(
+   'bulk_write.c',
+   'md.c',
+   'smgr.c',
++  'zou_smgr.c',
+ )
+diff --git a/src/backend/storage/smgr/smgr.c b/src/backend/storage/smgr/smgr.c
+index 37b99fa..886d99e 100644
+--- a/src/backend/storage/smgr/smgr.c
++++ b/src/backend/storage/smgr/smgr.c
+@@ -71,6 +71,7 @@
+ #include "storage/ipc.h"
+ #include "storage/md.h"
+ #include "storage/smgr.h"
++#include "storage/zou_smgr.h"
+ #include "utils/hsearch.h"
+ #include "utils/inval.h"
+ 
+@@ -148,6 +149,29 @@ static const f_smgr smgrsw[] = {
+ 		.smgr_immedsync = mdimmedsync,
+ 		.smgr_registersync = mdregistersync,
+ 		.smgr_fd = mdfd,
++	},
++	/* zou object storage */
++	{
++		.smgr_init = zouinit,
++		.smgr_shutdown = NULL,
++		.smgr_open = zouopen,
++		.smgr_close = zouclose,
++		.smgr_create = zoucreate,
++		.smgr_exists = zouexists,
++		.smgr_unlink = zouunlink,
++		.smgr_extend = zouextend,
++		.smgr_zeroextend = zouzeroextend,
++		.smgr_prefetch = zouprefetch,
++		.smgr_maxcombine = zoumaxcombine,
++		.smgr_readv = zoureadv,
++		.smgr_startreadv = zoustartreadv,
++		.smgr_writev = zouwritev,
++		.smgr_writeback = zouwriteback,
++		.smgr_nblocks = zounblocks,
++		.smgr_truncate = zoutruncate,
++		.smgr_immedsync = zouimmedsync,
++		.smgr_registersync = zouregistersync,
++		.smgr_fd = zoufd,
+ 	}
+ };
+ 
+@@ -273,7 +297,7 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
+ 		reln->smgr_targblock = InvalidBlockNumber;
+ 		for (int i = 0; i <= MAX_FORKNUM; ++i)
+ 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
+-		reln->smgr_which = 0;	/* we only have md.c at present */
++		reln->smgr_which = zou_smgr_routable(reln) ? 1 : 0;
+ 
+ 		/* it is not pinned yet */
+ 		reln->pincount = 0;
+diff --git a/src/backend/storage/smgr/zou_smgr.c b/src/backend/storage/smgr/zou_smgr.c
+new file mode 100644
+index 0000000..b462b73
+--- /dev/null
++++ b/src/backend/storage/smgr/zou_smgr.c
+@@ -0,0 +1,298 @@
++/*-------------------------------------------------------------------------
++ *
++ * zou_smgr.c
++ *	  storage manager routing relation pages to zou-store objects.
++ *
++ *	  Activated by the ZOU_TARGET environment variable, which names the
++ *	  store root. Temp relations stay on md. Pages live as one object per
++ *	  block in the zou-pg Rust crate, linked in as a static library.
++ *
++ *	  Reads arrive through AIO. Since the AIO executor operates on file
++ *	  descriptors, zoustartreadv stages the pages into a per process
++ *	  scratch file (a region per IO handle id) and points the handle at
++ *	  it, so completion callbacks run unchanged. That confines v0 to
++ *	  io_method=sync, where the IO executes in this process; zouinit
++ *	  enforces it.
++ *
++ *	  Part of the zou patch series, not upstream PostgreSQL.
++ *
++ * src/backend/storage/smgr/zou_smgr.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <fcntl.h>
++#include <unistd.h>
++
++#include "miscadmin.h"
++#include "port/pg_iovec.h"
++#include "storage/aio.h"
++#include "storage/bufmgr.h"
++#include "storage/zou_smgr.h"
++
++/* C ABI of the zou-pg crate (crates/zou-pg). */
++extern int	zou_pg_init(const char *target);
++extern int	zou_smgr_create(uint32 spc, uint32 db, uint32 rel, uint32 fork);
++extern int	zou_smgr_exists(uint32 spc, uint32 db, uint32 rel, uint32 fork,
++							int32 *out);
++extern int	zou_smgr_nblocks(uint32 spc, uint32 db, uint32 rel, uint32 fork,
++							 uint32 *out);
++extern int	zou_smgr_read(uint32 spc, uint32 db, uint32 rel, uint32 fork,
++						  uint32 blk, uint8 *buf);
++extern int	zou_smgr_write(uint32 spc, uint32 db, uint32 rel, uint32 fork,
++						   uint32 blk, const uint8 *buf);
++extern int	zou_smgr_extend(uint32 spc, uint32 db, uint32 rel, uint32 fork,
++							uint32 blk, const uint8 *buf);
++extern int	zou_smgr_zeroextend(uint32 spc, uint32 db, uint32 rel,
++								uint32 fork, uint32 blk, uint32 count);
++extern int	zou_smgr_truncate(uint32 spc, uint32 db, uint32 rel, uint32 fork,
++							  uint32 nblocks);
++extern int	zou_smgr_unlink(uint32 spc, uint32 db, uint32 rel, uint32 fork);
++
++StaticAssertDecl(BLCKSZ == 8192, "the zou shim is built for BLCKSZ 8192");
++
++static int	zou_active = -1;
++static int	zou_scratch_fd = -1;
++
++#define ZOU_LOCATOR(reln) \
++	(uint32) (reln)->smgr_rlocator.locator.spcOid, \
++	(uint32) (reln)->smgr_rlocator.locator.dbOid, \
++	(uint32) (reln)->smgr_rlocator.locator.relNumber
++
++static void
++zou_check(int rc, const char *op, SMgrRelation reln, ForkNumber forknum)
++{
++	if (rc != 0)
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("zou smgr %s failed with %d on rel %u fork %d",
++						op, rc,
++						reln ? reln->smgr_rlocator.locator.relNumber : 0,
++						forknum)));
++}
++
++bool
++zou_smgr_routable(SMgrRelation reln)
++{
++	if (zou_active == -1)
++		zou_active = (getenv("ZOU_TARGET") != NULL);
++	return zou_active && !SmgrIsTemp(reln);
++}
++
++void
++zouinit(void)
++{
++	const char *target = getenv("ZOU_TARGET");
++
++	if (target == NULL)
++		return;
++	if (io_method != IOMETHOD_SYNC)
++		ereport(FATAL,
++				(errmsg("zou storage requires io_method=sync"),
++				 errhint("Add io_method=sync to postgresql.conf or -c options.")));
++	if (zou_pg_init(target) != 0)
++		ereport(FATAL,
++				(errmsg("zou storage failed to open target \"%s\"", target)));
++}
++
++void
++zouopen(SMgrRelation reln)
++{
++}
++
++void
++zouclose(SMgrRelation reln, ForkNumber forknum)
++{
++}
++
++void
++zoucreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
++{
++	zou_check(zou_smgr_create(ZOU_LOCATOR(reln), (uint32) forknum),
++			  "create", reln, forknum);
++}
++
++bool
++zouexists(SMgrRelation reln, ForkNumber forknum)
++{
++	int32		flag = 0;
++
++	zou_check(zou_smgr_exists(ZOU_LOCATOR(reln), (uint32) forknum, &flag),
++			  "exists", reln, forknum);
++	return flag != 0;
++}
++
++void
++zouunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
++{
++	uint32		spc = rlocator.locator.spcOid;
++	uint32		db = rlocator.locator.dbOid;
++	uint32		rel = rlocator.locator.relNumber;
++
++	if (forknum == InvalidForkNumber)
++	{
++		for (int fork = 0; fork <= MAX_FORKNUM; fork++)
++			(void) zou_smgr_unlink(spc, db, rel, (uint32) fork);
++	}
++	else
++		(void) zou_smgr_unlink(spc, db, rel, (uint32) forknum);
++	/* like mdunlink, unlink failures are not worth erroring over */
++}
++
++void
++zouextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++		  const void *buffer, bool skipFsync)
++{
++	zou_check(zou_smgr_extend(ZOU_LOCATOR(reln), (uint32) forknum,
++							  (uint32) blocknum, (const uint8 *) buffer),
++			  "extend", reln, forknum);
++}
++
++void
++zouzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++			  int nblocks, bool skipFsync)
++{
++	zou_check(zou_smgr_zeroextend(ZOU_LOCATOR(reln), (uint32) forknum,
++								  (uint32) blocknum, (uint32) nblocks),
++			  "zeroextend", reln, forknum);
++}
++
++bool
++zouprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++			int nblocks)
++{
++	return true;
++}
++
++uint32
++zoumaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
++{
++	/* one scratch region per IO bounds combining, see zoustartreadv */
++	return PG_IOV_MAX;
++}
++
++void
++zoureadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++		 void **buffers, BlockNumber nblocks)
++{
++	for (BlockNumber i = 0; i < nblocks; i++)
++		zou_check(zou_smgr_read(ZOU_LOCATOR(reln), (uint32) forknum,
++								(uint32) (blocknum + i),
++								(uint8 *) buffers[i]),
++				  "read", reln, forknum);
++}
++
++/*
++ * Stage the pages into this process's scratch file and hand the AIO
++ * executor an fd and offset that will produce them. Each IO handle id
++ * gets its own region so batched IOs cannot clobber each other before
++ * they execute.
++ */
++void
++zoustartreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
++			  BlockNumber blocknum, void **buffers, BlockNumber nblocks)
++{
++	off_t		region;
++	struct iovec *iov;
++	int			iovcnt;
++	uint8		page[BLCKSZ];
++
++	if (zou_scratch_fd < 0)
++	{
++		char		path[MAXPGPATH];
++
++		snprintf(path, sizeof(path), "%s/zou-scratch-%d",
++				 getenv("ZOU_TARGET"), MyProcPid);
++		zou_scratch_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
++		if (zou_scratch_fd < 0)
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("zou smgr could not open scratch file \"%s\": %m",
++							path)));
++		/* keep the fd, drop the name */
++		unlink(path);
++	}
++
++	region = (off_t) pgaio_io_get_id(ioh) * PG_IOV_MAX * BLCKSZ;
++	for (BlockNumber i = 0; i < nblocks; i++)
++	{
++		zou_check(zou_smgr_read(ZOU_LOCATOR(reln), (uint32) forknum,
++								(uint32) (blocknum + i), page),
++				  "read", reln, forknum);
++		if (pwrite(zou_scratch_fd, page, BLCKSZ, region + (off_t) i * BLCKSZ) != BLCKSZ)
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("zou smgr could not stage page: %m")));
++	}
++
++	iovcnt = pgaio_io_get_iovec(ioh, &iov);
++	Assert((int) nblocks <= iovcnt);
++	for (BlockNumber i = 0; i < nblocks; i++)
++	{
++		iov[i].iov_base = buffers[i];
++		iov[i].iov_len = BLCKSZ;
++	}
++
++	pgaio_io_set_flag(ioh, PGAIO_HF_BUFFERED);
++	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
++	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
++	pgaio_io_start_readv(ioh, zou_scratch_fd, (int) nblocks, region);
++}
++
++void
++zouwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++		  const void **buffers, BlockNumber nblocks, bool skipFsync)
++{
++	for (BlockNumber i = 0; i < nblocks; i++)
++		zou_check(zou_smgr_write(ZOU_LOCATOR(reln), (uint32) forknum,
++								 (uint32) (blocknum + i),
++								 (const uint8 *) buffers[i]),
++				  "write", reln, forknum);
++}
++
++void
++zouwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++			 BlockNumber nblocks)
++{
++}
++
++BlockNumber
++zounblocks(SMgrRelation reln, ForkNumber forknum)
++{
++	uint32		n = 0;
++
++	zou_check(zou_smgr_nblocks(ZOU_LOCATOR(reln), (uint32) forknum, &n),
++			  "nblocks", reln, forknum);
++	return (BlockNumber) n;
++}
++
++void
++zoutruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks,
++			BlockNumber nblocks)
++{
++	zou_check(zou_smgr_truncate(ZOU_LOCATOR(reln), (uint32) forknum,
++								(uint32) nblocks),
++			  "truncate", reln, forknum);
++}
++
++void
++zouimmedsync(SMgrRelation reln, ForkNumber forknum)
++{
++	/* every put is durable before it returns, nothing to sync */
++}
++
++void
++zouregistersync(SMgrRelation reln, ForkNumber forknum)
++{
++}
++
++int
++zoufd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++	  uint32 *off)
++{
++	/* only IO workers reopen by fd, and zouinit pins io_method=sync */
++	ereport(ERROR,
++			(errmsg("zou storage requires io_method=sync")));
++	return -1;
++}
+diff --git a/src/bin/initdb/initdb.c b/src/bin/initdb/initdb.c
+index f1a6db1..1ba4e28 100644
+--- a/src/bin/initdb/initdb.c
++++ b/src/bin/initdb/initdb.c
+@@ -2027,9 +2027,16 @@ make_template0(FILE *cmdfd)
+ 	 * are cheap. "STRATEGY = wal_log" would generate more WAL, which would be
+ 	 * a little bit slower and make the new cluster a little bit bigger.
+ 	 */
+-	PG_CMD_PUTS("CREATE DATABASE template0 IS_TEMPLATE = true ALLOW_CONNECTIONS = false"
+-				" OID = " CppAsString2(Template0DbOid)
+-				" STRATEGY = file_copy;\n\n");
++	/*
++	 * zou: file_copy duplicates databases with copydir(), which bypasses the
++	 * storage manager and so cannot see pages living in the zou object
++	 * store. wal_log copies block by block through shared buffers and works
++	 * with any smgr.
++	 */
++	PG_CMD_PRINTF("CREATE DATABASE template0 IS_TEMPLATE = true ALLOW_CONNECTIONS = false"
++				  " OID = " CppAsString2(Template0DbOid)
++				  " STRATEGY = %s;\n\n",
++				  getenv("ZOU_TARGET") ? "wal_log" : "file_copy");
+ 
+ 	/*
+ 	 * template0 shouldn't have any collation-dependent objects, so unset the
+@@ -2068,8 +2075,9 @@ make_postgres(FILE *cmdfd)
+ 	 * Just as we did for template0, and for the same reasons, assign a fixed
+ 	 * OID to postgres and select the file_copy strategy.
+ 	 */
+-	PG_CMD_PUTS("CREATE DATABASE postgres OID = " CppAsString2(PostgresDbOid)
+-				" STRATEGY = file_copy;\n\n");
++	PG_CMD_PRINTF("CREATE DATABASE postgres OID = " CppAsString2(PostgresDbOid)
++				  " STRATEGY = %s;\n\n",
++				  getenv("ZOU_TARGET") ? "wal_log" : "file_copy");
+ 	PG_CMD_PUTS("COMMENT ON DATABASE postgres IS 'default administrative connection database';\n\n");
+ }
+ 
+diff --git a/src/include/storage/zou_smgr.h b/src/include/storage/zou_smgr.h
+new file mode 100644
+index 0000000..766ca4c
+--- /dev/null
++++ b/src/include/storage/zou_smgr.h
+@@ -0,0 +1,58 @@
++/*-------------------------------------------------------------------------
++ *
++ * zou_smgr.h
++ *	  zou storage manager: routes relation pages to zou-store objects
++ *	  through the C ABI of the zou-pg Rust crate.
++ *
++ *	  Part of the zou patch series, not upstream PostgreSQL.
++ *
++ * src/include/storage/zou_smgr.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef ZOU_SMGR_H
++#define ZOU_SMGR_H
++
++#include "storage/aio.h"
++#include "storage/block.h"
++#include "storage/relfilelocator.h"
++#include "storage/smgr.h"
++
++/* Should this relation be routed to zou instead of md? */
++extern bool zou_smgr_routable(SMgrRelation reln);
++
++extern void zouinit(void);
++extern void zouopen(SMgrRelation reln);
++extern void zouclose(SMgrRelation reln, ForkNumber forknum);
++extern void zoucreate(SMgrRelation reln, ForkNumber forknum, bool isRedo);
++extern bool zouexists(SMgrRelation reln, ForkNumber forknum);
++extern void zouunlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
++					  bool isRedo);
++extern void zouextend(SMgrRelation reln, ForkNumber forknum,
++					  BlockNumber blocknum, const void *buffer, bool skipFsync);
++extern void zouzeroextend(SMgrRelation reln, ForkNumber forknum,
++						  BlockNumber blocknum, int nblocks, bool skipFsync);
++extern bool zouprefetch(SMgrRelation reln, ForkNumber forknum,
++						BlockNumber blocknum, int nblocks);
++extern uint32 zoumaxcombine(SMgrRelation reln, ForkNumber forknum,
++							BlockNumber blocknum);
++extern void zoureadv(SMgrRelation reln, ForkNumber forknum,
++					 BlockNumber blocknum, void **buffers,
++					 BlockNumber nblocks);
++extern void zoustartreadv(PgAioHandle *ioh, SMgrRelation reln,
++						  ForkNumber forknum, BlockNumber blocknum,
++						  void **buffers, BlockNumber nblocks);
++extern void zouwritev(SMgrRelation reln, ForkNumber forknum,
++					  BlockNumber blocknum, const void **buffers,
++					  BlockNumber nblocks, bool skipFsync);
++extern void zouwriteback(SMgrRelation reln, ForkNumber forknum,
++						 BlockNumber blocknum, BlockNumber nblocks);
++extern BlockNumber zounblocks(SMgrRelation reln, ForkNumber forknum);
++extern void zoutruncate(SMgrRelation reln, ForkNumber forknum,
++						BlockNumber old_blocks, BlockNumber nblocks);
++extern void zouimmedsync(SMgrRelation reln, ForkNumber forknum);
++extern void zouregistersync(SMgrRelation reln, ForkNumber forknum);
++extern int	zoufd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++				  uint32 *off);
++
++#endif							/* ZOU_SMGR_H */
