@@ -1,0 +1,409 @@
+diff --git a/src/backend/access/transam/meson.build b/src/backend/access/transam/meson.build
+index e8ae9b1..b7f28a9 100644
+--- a/src/backend/access/transam/meson.build
++++ b/src/backend/access/transam/meson.build
+@@ -15,6 +15,7 @@ backend_sources += files(
+   'twophase_rmgr.c',
+   'varsup.c',
+   'xact.c',
++  'zou_wal.c',
+   'xlog.c',
+   'xlogarchive.c',
+   'xlogbackup.c',
+diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
+index b885513..24c245d 100644
+--- a/src/backend/access/transam/xact.c
++++ b/src/backend/access/transam/xact.c
+@@ -29,6 +29,7 @@
+ #include "access/xact.h"
+ #include "access/xlog.h"
+ #include "access/xloginsert.h"
++#include "access/zou_wal.h"
+ #include "access/xlogrecovery.h"
+ #include "access/xlogutils.h"
+ #include "catalog/index.h"
+@@ -1501,6 +1502,13 @@ RecordTransactionCommit(void)
+ 	{
+ 		XLogFlush(XactLastRecEnd);
+ 
++		/*
++		 * zou: the local flush is not durability, the object store is.
++		 * Block until the wal pusher has the commit record durable there,
++		 * the same contract as a synchronous replication ack.
++		 */
++		ZouWalWaitForLSN(XactLastRecEnd);
++
+ 		/*
+ 		 * Now we may update the CLOG, if we wrote a COMMIT record above
+ 		 */
+diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
+new file mode 100644
+index 0000000..d35370f
+--- /dev/null
++++ b/src/backend/access/transam/zou_wal.c
+@@ -0,0 +1,253 @@
++/*-------------------------------------------------------------------------
++ *
++ * zou_wal.c
++ *	  mirrors flushed WAL into zou-store and gates COMMIT on the
++ *	  durable object storage flush.
++ *
++ *	  zou-store has a single writer lease per tenant, but XLogWrite runs
++ *	  in whichever process holds WALWriteLock, so the push cannot happen
++ *	  at the flush site. Instead one background worker, the zou wal
++ *	  pusher, owns the lease and tails pg_wal: it reads every byte the
++ *	  cluster has flushed locally, appends it to the zou group commit
++ *	  pipeline, and publishes the durable LSN into shared memory.
++ *	  Committing backends wait on that LSN after their local flush, the
++ *	  same shape as a synchronous replication ack.
++ *
++ *	  Part of the zou patch series, not upstream PostgreSQL.
++ *
++ * src/backend/access/transam/zou_wal.c
++ *
++ *-------------------------------------------------------------------------
++ */
++#include "postgres.h"
++
++#include <fcntl.h>
++#include <unistd.h>
++
++#include "access/xlog.h"
++#include "access/xlog_internal.h"
++#include "access/zou_wal.h"
++#include "miscadmin.h"
++#include "pgstat.h"
++#include "port/atomics.h"
++#include "postmaster/bgworker.h"
++#include "storage/condition_variable.h"
++#include "storage/fd.h"
++#include "storage/ipc.h"
++#include "storage/latch.h"
++#include "storage/shmem.h"
++#include "utils/wait_event.h"
++
++/* C ABI of the zou-pg crate (crates/zou-pg). */
++extern int	zou_wal_open(const char *target, uint64 start_lsn);
++extern int	zou_wal_append(const uint8 *data, size_t len, uint64 pg_lsn,
++						   uint64 *out_durable);
++extern int	zou_wal_close(void);
++
++#define ZOU_ERR_LEASE_HELD (-5)
++
++/* One chunk per append, small enough to stay under the frame body cap. */
++#define ZOU_WAL_CHUNK (1024 * 1024)
++
++typedef struct ZouWalShmemStruct
++{
++	pg_atomic_uint64 durable_lsn;
++	ConditionVariable durable_cv;
++} ZouWalShmemStruct;
++
++static ZouWalShmemStruct *ZouWalShmem;
++
++bool
++ZouWalActive(void)
++{
++	return getenv("ZOU_TARGET") != NULL;
++}
++
++Size
++ZouWalShmemSize(void)
++{
++	return sizeof(ZouWalShmemStruct);
++}
++
++void
++ZouWalShmemInit(void)
++{
++	bool		found;
++
++	ZouWalShmem = (ZouWalShmemStruct *)
++		ShmemInitStruct("zou wal", sizeof(ZouWalShmemStruct), &found);
++	if (!found)
++	{
++		pg_atomic_init_u64(&ZouWalShmem->durable_lsn, 0);
++		ConditionVariableInit(&ZouWalShmem->durable_cv);
++	}
++}
++
++void
++ZouWalRegister(void)
++{
++	BackgroundWorker bgw;
++
++	if (!ZouWalActive())
++		return;
++
++	memset(&bgw, 0, sizeof(bgw));
++	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
++	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
++	bgw.bgw_restart_time = 1;
++	snprintf(bgw.bgw_library_name, sizeof(bgw.bgw_library_name), "postgres");
++	snprintf(bgw.bgw_function_name, sizeof(bgw.bgw_function_name),
++			 "ZouWalPusherMain");
++	snprintf(bgw.bgw_name, BGW_MAXLEN, "zou wal pusher");
++	snprintf(bgw.bgw_type, BGW_MAXLEN, "zou wal pusher");
++	RegisterBackgroundWorker(&bgw);
++}
++
++/*
++ * Read [start, start + count) out of pg_wal into buf. The range is
++ * already flushed, so the segment files exist and are stable.
++ */
++static void
++zou_wal_read_range(XLogRecPtr start, size_t count, TimeLineID tli, char *buf)
++{
++	while (count > 0)
++	{
++		XLogSegNo	segno;
++		char		fname[MAXFNAMELEN];
++		char		path[MAXPGPATH];
++		uint32		off = XLogSegmentOffset(start, wal_segment_size);
++		size_t		n = Min(count, (size_t) wal_segment_size - off);
++		int			fd;
++		ssize_t		got;
++
++		XLByteToSeg(start, segno, wal_segment_size);
++		XLogFileName(fname, tli, segno, wal_segment_size);
++		snprintf(path, MAXPGPATH, XLOGDIR "/%s", fname);
++
++		fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
++		if (fd < 0)
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("zou wal pusher could not open \"%s\": %m", path)));
++		got = pg_pread(fd, buf, n, (off_t) off);
++		if (got != (ssize_t) n)
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("zou wal pusher short read in \"%s\": %zd of %zu at %u",
++							path, got, n, off)));
++		CloseTransientFile(fd);
++
++		start += n;
++		buf += n;
++		count -= n;
++	}
++}
++
++static void
++zou_wal_publish(XLogRecPtr durable)
++{
++	pg_atomic_write_u64(&ZouWalShmem->durable_lsn, (uint64) durable);
++	ConditionVariableBroadcast(&ZouWalShmem->durable_cv);
++}
++
++static void
++zou_wal_on_exit(int code, Datum arg)
++{
++	(void) zou_wal_close();
++}
++
++void
++ZouWalPusherMain(Datum main_arg)
++{
++	const char *target = getenv("ZOU_TARGET");
++	TimeLineID	tli;
++	XLogRecPtr	pushed;
++	char	   *buf;
++
++	BackgroundWorkerUnblockSignals();
++
++	if (target == NULL)
++		ereport(FATAL,
++				(errmsg("zou wal pusher started without ZOU_TARGET")));
++
++	/*
++	 * Mirroring starts at the current flush pointer. Bytes before this
++	 * point are covered by the bootstrap checkpoint capture, which is the
++	 * next milestone step.
++	 */
++	pushed = GetFlushRecPtr(&tli);
++
++	/*
++	 * Become the writer. After a crash the previous incarnation's lease
++	 * has to expire first, so retry until the store lets us in.
++	 */
++	for (;;)
++	{
++		int			rc = zou_wal_open(target, (uint64) pushed);
++
++		if (rc == 0)
++			break;
++		if (rc != ZOU_ERR_LEASE_HELD)
++			ereport(FATAL,
++					(errmsg("zou wal pusher failed to open store \"%s\": %d",
++							target, rc)));
++		ereport(LOG,
++				(errmsg("zou wal pusher waiting for the previous writer lease to expire")));
++		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
++						 1000, PG_WAIT_EXTENSION);
++		ResetLatch(MyLatch);
++	}
++	on_proc_exit(zou_wal_on_exit, (Datum) 0);
++
++	ereport(LOG,
++			(errmsg("zou wal pusher mirroring from %X/%X into \"%s\"",
++					LSN_FORMAT_ARGS(pushed), target)));
++	zou_wal_publish(pushed);
++
++	buf = palloc(ZOU_WAL_CHUNK);
++	for (;;)
++	{
++		XLogRecPtr	flush = GetFlushRecPtr(&tli);
++
++		if (flush > pushed)
++		{
++			size_t		n = Min((size_t) (flush - pushed), (size_t) ZOU_WAL_CHUNK);
++			uint64		durable;
++			int			rc;
++
++			zou_wal_read_range(pushed, n, tli, buf);
++			rc = zou_wal_append((const uint8 *) buf, n, (uint64) pushed, &durable);
++			if (rc != 0)
++				ereport(FATAL,
++						(errmsg("zou wal pusher append failed: %d", rc)));
++			pushed += n;
++			zou_wal_publish(pushed);
++		}
++		else
++		{
++			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
++							 5, PG_WAIT_EXTENSION);
++			ResetLatch(MyLatch);
++		}
++	}
++}
++
++/*
++ * Block until the object store holds WAL through lsn. Called by
++ * committing backends after their local flush. A no op for standalone
++ * processes (initdb, bootstrap) and clusters without ZOU_TARGET.
++ */
++void
++ZouWalWaitForLSN(XLogRecPtr lsn)
++{
++	if (!IsUnderPostmaster || ZouWalShmem == NULL || !ZouWalActive())
++		return;
++
++	if ((XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn) >= lsn)
++		return;
++
++	ConditionVariablePrepareToSleep(&ZouWalShmem->durable_cv);
++	while ((XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn) < lsn)
++		ConditionVariableSleep(&ZouWalShmem->durable_cv, PG_WAIT_EXTENSION);
++	ConditionVariableCancelSleep();
++}
+diff --git a/src/backend/postmaster/bgworker.c b/src/backend/postmaster/bgworker.c
+index 1ad65c2..b554337 100644
+--- a/src/backend/postmaster/bgworker.c
++++ b/src/backend/postmaster/bgworker.c
+@@ -18,6 +18,7 @@
+ #include "pgstat.h"
+ #include "port/atomics.h"
+ #include "postmaster/bgworker_internals.h"
++#include "access/zou_wal.h"
+ #include "postmaster/postmaster.h"
+ #include "replication/logicallauncher.h"
+ #include "replication/logicalworker.h"
+@@ -124,6 +125,9 @@ static const struct
+ 	{
+ 		"ApplyLauncherMain", ApplyLauncherMain
+ 	},
++	{
++		"ZouWalPusherMain", ZouWalPusherMain
++	},
+ 	{
+ 		"ApplyWorkerMain", ApplyWorkerMain
+ 	},
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 5124d39..2d2046f 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -92,6 +92,7 @@
+ #include "access/xlog.h"
+ #include "access/xlog_internal.h"
+ #include "access/xlogrecovery.h"
++#include "access/zou_wal.h"
+ #include "common/file_perm.h"
+ #include "common/pg_prng.h"
+ #include "lib/ilist.h"
+@@ -927,6 +928,9 @@ PostmasterMain(int argc, char *argv[])
+ 	 */
+ 	ApplyLauncherRegister();
+ 
++	/* Register the zou wal pusher if WAL mirroring is configured */
++	ZouWalRegister();
++
+ 	/*
+ 	 * process any libraries that should be preloaded at postmaster start
+ 	 */
+diff --git a/src/backend/storage/ipc/ipci.c b/src/backend/storage/ipc/ipci.c
+index 8d2b0f1..54a0df1 100644
+--- a/src/backend/storage/ipc/ipci.c
++++ b/src/backend/storage/ipc/ipci.c
+@@ -24,6 +24,7 @@
+ #include "access/twophase.h"
+ #include "access/xlogprefetcher.h"
+ #include "access/xlogrecovery.h"
++#include "access/zou_wal.h"
+ #include "commands/async.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
+@@ -142,6 +143,7 @@ CalculateShmemSize(int *num_semaphores)
+ 	size = add_size(size, WalSummarizerShmemSize());
+ 	size = add_size(size, PgArchShmemSize());
+ 	size = add_size(size, ApplyLauncherShmemSize());
++	size = add_size(size, ZouWalShmemSize());
+ 	size = add_size(size, BTreeShmemSize());
+ 	size = add_size(size, SyncScanShmemSize());
+ 	size = add_size(size, AsyncShmemSize());
+@@ -333,6 +335,7 @@ CreateOrAttachShmemStructs(void)
+ 	WalSummarizerShmemInit();
+ 	PgArchShmemInit();
+ 	ApplyLauncherShmemInit();
++	ZouWalShmemInit();
+ 	SlotSyncShmemInit();
+ 
+ 	/*
+diff --git a/src/include/access/zou_wal.h b/src/include/access/zou_wal.h
+new file mode 100644
+index 0000000..f0d4ae1
+--- /dev/null
++++ b/src/include/access/zou_wal.h
+@@ -0,0 +1,34 @@
++/*-------------------------------------------------------------------------
++ *
++ * zou_wal.h
++ *	  mirrors flushed WAL into zou-store and gates COMMIT on the
++ *	  durable object storage flush.
++ *
++ *	  Part of the zou patch series, not upstream PostgreSQL.
++ *
++ * src/include/access/zou_wal.h
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef ZOU_WAL_H
++#define ZOU_WAL_H
++
++#include "access/xlogdefs.h"
++
++/* Is WAL mirroring configured for this cluster? */
++extern bool ZouWalActive(void);
++
++/* Shared memory for the durable LSN handoff. */
++extern Size ZouWalShmemSize(void);
++extern void ZouWalShmemInit(void);
++
++/* Postmaster: register the pusher background worker. */
++extern void ZouWalRegister(void);
++
++/* Pusher worker entry point. */
++extern void ZouWalPusherMain(Datum main_arg);
++
++/* Backends: block until the store holds WAL through lsn. */
++extern void ZouWalWaitForLSN(XLogRecPtr lsn);
++
++#endif							/* ZOU_WAL_H */
