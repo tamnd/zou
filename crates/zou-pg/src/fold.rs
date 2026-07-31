@@ -54,6 +54,12 @@ use crate::walscan::{self, BlockRef};
 /// force a fold down without writing five fulls worth of deltas.
 const FOLD_DOWN_FACTOR: u64 = 5;
 
+/// The read amplification bound: a page read walks at most one full,
+/// this many deltas, and the WAL tail. A fold that would chain a fifth
+/// delta captures a full instead, whatever the byte ratio says, so the
+/// chain walk and a restore never touch more than five indexes.
+const MAX_DELTA_CHAIN: usize = 4;
+
 fn fold_down_factor() -> u64 {
     std::env::var("ZOU_FOLD_DOWN_FACTOR")
         .ok()
@@ -94,7 +100,8 @@ fn index_bytes(store: &dyn CasStore, layout: &TenantLayout, id: &str) -> Result<
 }
 
 /// The fold down policy: capture a full instead of a delta when the
-/// deltas since the newest full have grown past the factor times its
+/// chain since the newest full is already `MAX_DELTA_CHAIN` deltas
+/// long, or when those deltas have grown past the factor times its
 /// size. A manifest with no full at all also gets one, nothing to
 /// chain a delta onto.
 fn chain_wants_full(
@@ -109,6 +116,9 @@ fn chain_wants_full(
     else {
         return Ok(true);
     };
+    if manifest.checkpoints.len() - full > MAX_DELTA_CHAIN {
+        return Ok(true);
+    }
     let full_bytes = index_bytes(store, layout, &manifest.checkpoints[full].id)?;
     let mut delta_bytes = 0u64;
     for c in &manifest.checkpoints[full + 1..] {
@@ -770,5 +780,41 @@ mod tests {
         assert_eq!(run[ZOU_PAGE_SIZE], 0xDD);
 
         gc.close().unwrap();
+    }
+
+    #[test]
+    fn a_fifth_delta_folds_down_to_a_full_whatever_the_bytes_say() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let layout = TenantLayout::new("local");
+
+        // A huge full and tiny deltas, so the byte ratio alone would
+        // let the chain grow forever. The count cap must not.
+        let mut m = Manifest::new("local", 18);
+        m.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+        });
+        store
+            .put_new(&layout.chk_index("genesis"), b"f base/huge 1000000\n")
+            .unwrap();
+        for i in 1..=4u64 {
+            let id = format!("d{i}");
+            store
+                .put_new(&layout.chk_index(&id), b"f pg_xact/0000 1\n")
+                .unwrap();
+            m.checkpoints.push(CheckpointRef {
+                id,
+                lsn: Lsn(0x100 + i * 0x100),
+                kind: CheckpointKind::Delta,
+            });
+            let want_full = chain_wants_full(&store, &layout, &m).unwrap();
+            assert_eq!(
+                want_full,
+                i == 4,
+                "the chain holds {i} deltas, only the fourth fills it"
+            );
+        }
     }
 }

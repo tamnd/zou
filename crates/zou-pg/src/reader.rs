@@ -793,10 +793,12 @@ mod tests {
         }
     }
 
-    /// Delegating store that counts LIST and ranged GET calls, so the
-    /// tests can see the barrier skip and the slab cache at work.
+    /// Delegating store that counts GET, LIST, and ranged GET calls,
+    /// so the tests can see the barrier skip, the slab cache, and the
+    /// read amplification bound at work.
     struct CountingStore {
         inner: Arc<LocalFsStore>,
+        gets: std::sync::atomic::AtomicU64,
         lists: std::sync::atomic::AtomicU64,
         ranges: std::sync::atomic::AtomicU64,
     }
@@ -805,9 +807,14 @@ mod tests {
         fn new(inner: Arc<LocalFsStore>) -> Self {
             Self {
                 inner,
+                gets: 0.into(),
                 lists: 0.into(),
                 ranges: 0.into(),
             }
+        }
+
+        fn gets(&self) -> u64 {
+            self.gets.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         fn lists(&self) -> u64 {
@@ -824,6 +831,7 @@ mod tests {
             &self,
             key: &str,
         ) -> Result<Option<(Vec<u8>, zou_store::Version)>, zou_store::CasError> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.get(key)
         }
 
@@ -949,5 +957,90 @@ mod tests {
         rd.read(&counting, &layout, blk(16384, 1), 0x500).unwrap();
         rd.read(&counting, &layout, blk(16384, 0), 0x500).unwrap();
         assert_eq!(counting.ranges(), 1, "one slab covers both pages");
+    }
+
+    #[test]
+    fn a_page_read_touches_at_most_one_full_four_deltas_and_the_tail() {
+        let (_d, store, layout) = setup();
+        let floor = WAL_SEGMENT_SIZE;
+        // The longest chain the fold down policy allows: one full and
+        // four deltas. Block 0 lives only in the full, so serving it is
+        // the worst case walk through every index. Each delta packs one
+        // other block of the same relation.
+        put_chk(
+            &*store,
+            &layout,
+            "f1",
+            &[(blk(16384, 0), 0xF1), (blk(16384, 1), 0xF2)],
+            &[],
+        );
+        for (i, id) in ["d2", "d3", "d4", "d5"].iter().enumerate() {
+            put_chk(
+                &*store,
+                &layout,
+                id,
+                &[(blk(16384, 10 + i as u32), 0xD2 + i as u8)],
+                &[],
+            );
+        }
+        put_manifest(
+            &*store,
+            &layout,
+            &[
+                ("f1", 0x100, CheckpointKind::Full),
+                ("d2", 0x200, CheckpointKind::Delta),
+                ("d3", 0x300, CheckpointKind::Delta),
+                ("d4", 0x400, CheckpointKind::Delta),
+                ("d5", floor, CheckpointKind::Delta),
+            ],
+        );
+        let gc = commit(&store, &layout);
+        let mut wal = Builder::new(floor);
+        wal.record(&[(blk(50000, 0), false)], b"tail noise");
+        let (lsn, bytes) = wal.stream();
+        push(&gc, lsn, bytes);
+        let durable = floor + bytes.len() as u64;
+
+        let counting = CountingStore::new(Arc::clone(&store));
+        let mut rd = ChainReader::attach(&counting, &layout).unwrap().unwrap();
+        assert_eq!(
+            rd.chain.len(),
+            5,
+            "the whole walk is the full and four deltas"
+        );
+        assert_eq!(
+            counting.gets(),
+            6,
+            "attach reads the manifest and five indexes"
+        );
+
+        // The worst case read misses all four deltas and lands in the
+        // full: one LIST, one sealed segment GET for the tail, one
+        // ranged GET for the run slab, and nothing else.
+        let page = rd.read(&counting, &layout, blk(16384, 0), durable).unwrap();
+        assert!(page.iter().all(|b| *b == 0xF1));
+        assert_eq!(counting.lists(), 1);
+        assert_eq!(counting.gets(), 7, "the tail is one sealed segment");
+        assert_eq!(counting.ranges(), 1);
+
+        // Steady state: the durable LSN has not moved and the slab is
+        // warm, so the neighboring block costs zero store operations.
+        let page = rd.read(&counting, &layout, blk(16384, 1), durable).unwrap();
+        assert!(page.iter().all(|b| *b == 0xF2));
+        assert_eq!(counting.lists(), 1);
+        assert_eq!(counting.gets(), 7);
+        assert_eq!(counting.ranges(), 1);
+
+        // A delta hit stops the walk at its index and costs one ranged
+        // GET for that run object.
+        let page = rd
+            .read(&counting, &layout, blk(16384, 13), durable)
+            .unwrap();
+        assert!(page.iter().all(|b| *b == 0xD5));
+        assert_eq!(counting.lists(), 1);
+        assert_eq!(counting.gets(), 7);
+        assert_eq!(counting.ranges(), 2);
+        assert!(!rd.poisoned());
+        gc.close().unwrap();
     }
 }
