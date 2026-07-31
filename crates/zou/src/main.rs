@@ -1,10 +1,16 @@
+#[cfg(unix)]
 mod dev;
 
 use std::process::ExitCode;
 
+/// The postmaster child, unix sockets, and signal forwarding are all
+/// unix machinery, so the dev subcommand only exists there.
+pub const DEV_USAGE: &str =
+    "usage: zou dev <target> [--pg-bin <dir>] [--port <n>] [--runtime <dir>]";
+
 fn usage() -> ExitCode {
     eprintln!("zou {}", env!("CARGO_PKG_VERSION"));
-    eprintln!("{}", dev::USAGE);
+    eprintln!("{DEV_USAGE}");
     eprintln!("       zou --version");
     ExitCode::from(2)
 }
@@ -16,6 +22,7 @@ fn main() -> ExitCode {
             println!("zou {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        #[cfg(unix)]
         Some("dev") => {
             let args = match dev::parse(&argv[1..]) {
                 Ok(args) => args,
@@ -31,6 +38,11 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             }
+        }
+        #[cfg(not(unix))]
+        Some("dev") => {
+            eprintln!("zou: dev needs a unix platform");
+            ExitCode::FAILURE
         }
         _ => usage(),
     }

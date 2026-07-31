@@ -41,7 +41,7 @@ pub struct Args {
     pub runtime: PathBuf,
 }
 
-pub const USAGE: &str = "usage: zou dev <target> [--pg-bin <dir>] [--port <n>] [--runtime <dir>]";
+use crate::DEV_USAGE as USAGE;
 
 pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut target = None;
