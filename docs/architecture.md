@@ -68,3 +68,13 @@ A branch is a new manifest pointing at the same immutable checkpoint and WAL obj
 ## Deployment modes
 
 The same crates ship three ways. Embedded links into a host process like SQLite, with the local filesystem as just another object store backend, so the whole engine works offline. Single server mode is one static binary serving many tenants. Serverless mode runs the same binary on Lambda or Fly machines, attaching a tenant on demand in a few hundred milliseconds because attach only needs the manifest plus lazy page faults.
+
+## Embedded execution decision
+
+The M1 gate asked whether embedded zou runs Postgres in process as a single user session linked over the C ABI, or as a managed child postmaster on a unix socket loopback. Both were spiked against a real zou store with the patched build, `scripts/zou-spike-embed.sh` reproduces the run.
+
+Measured on a dev laptop against a local filesystem store: a postmaster cold start answers its first query in about 150 ms, a single user session in about 40 ms. Both modes commit through the store, the single user backend included, its inserts land in the WAL stream and survive the session. A SIGKILLed backend under the postmaster is recovered by the postmaster itself with the host process unaffected, and concurrent sessions just work. The single user backend is one session per process by design, and a crash of an in process session would take the host down with it.
+
+The decision is the managed child postmaster. Crash isolation decides it: Postgres treats a backend crash as a cluster event, reinitializes shared memory, and replays, and a host application that embeds zou must never die because one query hit a segfault in an extension. Multi session support comes for free, which the API layer needs, and the loopback is a unix socket in a private directory, so nothing is exposed. The 150 ms start sits comfortably inside the 500 ms cold attach target and the gap to 40 ms is postmaster initialization, not storage.
+
+A true in process link stays deferred, not rejected. The blockers are concrete: the backend assumes it owns the process, FATAL errors reach exit(), signal handlers are installed globally, and the global state cannot be reinitialized for a second session in one process lifetime, which is why PGlite runs the same single user mode inside a WASM sandbox instead of linking it natively. The single user backend itself earned a place as an internal tool for one shot maintenance against a store, it is the fastest path from nothing to an answered query.
