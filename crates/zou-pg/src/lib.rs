@@ -14,6 +14,8 @@
 //! Every function returns 0 for success or a negative ZOU_ERR code, and
 //! never unwinds into C. Postgres turns nonzero into ereport(ERROR).
 
+pub mod restore;
+
 use std::ffi::{CStr, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -370,24 +372,150 @@ fn now_unix() -> u64 {
 
 const WAL_LEASE_TTL_SECS: u64 = 15;
 
+/// Where a resuming pusher picks up: the Postgres LSN right after the last
+/// record in the store, and the zou stream position the next frame starts
+/// at. Computed by reading the newest segment back.
+struct ResumePoint {
+    pg_lsn: u64,
+    stream_lsn: u64,
+}
+
+/// Read the last segment of the reconciled tail and derive the resume
+/// point from its last record's Postgres LSN header. None means the store
+/// holds no WAL yet.
+fn resume_point(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    tail: Option<&zou_store::manifest::WalTail>,
+) -> Result<Option<ResumePoint>, i32> {
+    let Some(last) = tail.and_then(|t| t.segments.last()) else {
+        return Ok(None);
+    };
+    let epoch = zou_store::commit::segment_epoch(last).ok_or(ZOU_ERR_STORE)?;
+    let key = layout.wal_segment_path(last);
+    let (bytes, _) = store
+        .get(&key)
+        .map_err(|_| ZOU_ERR_STORE)?
+        .ok_or(ZOU_ERR_STORE)?;
+    // Segments are one frame uploaded atomically, but read them all and
+    // keep the newest anyway, torn history must fail loudly here.
+    let mut newest = None;
+    for frame in zou_store::SegmentReader::new(&bytes, epoch) {
+        newest = Some(frame.map_err(|_| ZOU_ERR_STORE)?);
+    }
+    let frame = newest.ok_or(ZOU_ERR_STORE)?;
+    let records = zou_store::commit::split_records(&frame.payload).ok_or(ZOU_ERR_STORE)?;
+    let record = records.last().ok_or(ZOU_ERR_STORE)?;
+    if record.len() < 8 {
+        return Err(ZOU_ERR_STORE);
+    }
+    let start = u64::from_le_bytes(record[..8].try_into().expect("checked length"));
+    Ok(Some(ResumePoint {
+        pg_lsn: start + (record.len() as u64 - 8),
+        stream_lsn: frame.end_lsn.0,
+    }))
+}
+
+/// The lease, heartbeat, and pipeline setup behind [`zou_wal_open`],
+/// separated so tests can run several writer sessions in one process.
+/// Returns the pipe plus the Postgres LSN to resume pushing from, zero
+/// when the store holds no WAL and pushing starts at `flush_lsn`.
+fn open_wal_pipe(target: &str, flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
+    let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(target));
+    let layout = TenantLayout::new("local");
+    let manifest_key = layout.manifest();
+    match store.get(&manifest_key) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let genesis = Manifest::new("local", 18);
+            // A racing genesis from another process is fine, someone won.
+            let _ = store.put_if_match(&manifest_key, &genesis.to_json(), None);
+        }
+        Err(_) => return Err(ZOU_ERR_STORE),
+    }
+    let holder = format!("pg-wal-{}", std::process::id());
+    let held = match lease::acquire(&*store, &layout, &holder, WAL_LEASE_TTL_SECS, now_unix()) {
+        Ok(held) => held,
+        Err(lease::LeaseError::Held { .. }) => return Err(ZOU_ERR_LEASE_HELD),
+        Err(_) => return Err(ZOU_ERR_STORE),
+    };
+    // The manifest tail can lag reality: frames become durable, and acked,
+    // on upload, and sessions can die before publishing. The scan is the
+    // truth, and seeding the pipeline with it makes the next publish carry
+    // the whole history forward.
+    let tail = zou_store::commit::reconcile_tail(&*store, &layout, held.manifest())
+        .map_err(|_| ZOU_ERR_STORE)?;
+    let resume = resume_point(&*store, &layout, tail.as_ref())?;
+    let (resume_pg, stream_start) = match &resume {
+        Some(point) => (point.pg_lsn, point.stream_lsn),
+        None => (0, flush_lsn),
+    };
+    let held = Arc::new(Mutex::new(held));
+    let heartbeat = Heartbeat::spawn(
+        Arc::clone(&store),
+        layout.clone(),
+        Arc::clone(&held),
+        WAL_LEASE_TTL_SECS,
+    );
+    let mut builder = GroupCommit::builder(store, layout)
+        .lease(held)
+        .start_lsn(Lsn(stream_start))
+        .config(GroupCommitConfig::default())
+        .tail_config(TailConfig::default());
+    if let Some(tail) = tail {
+        builder = builder.initial_tail(tail);
+    }
+    let commit = builder.build();
+    Ok((
+        WalPipe {
+            commit: Some(commit),
+            heartbeat: Some(heartbeat),
+        },
+        resume_pg,
+    ))
+}
+
+fn close_wal_pipe(pipe: &mut WalPipe) -> i32 {
+    let mut rc = ZOU_OK;
+    if let Some(commit) = pipe.commit.take()
+        && commit.close().is_err()
+    {
+        rc = ZOU_ERR_STORE;
+    }
+    if let Some(heartbeat) = pipe.heartbeat.take()
+        && heartbeat.detach().is_err()
+    {
+        rc = ZOU_ERR_LEASE_LOST;
+    }
+    rc
+}
+
 /// Open the WAL pipeline: genesis manifest if the store is empty, writer
-/// lease, heartbeat renewal, group commit. The stream starts at the
-/// Postgres LSN the caller will push from, so segment names in the store
-/// line up with where the mirrored history begins.
+/// lease, heartbeat renewal, group commit chained onto the WAL already in
+/// the store.
 ///
 /// Each appended record is a contiguous chunk of WAL prefixed with its
 /// Postgres start LSN, which makes the stream self describing for the
-/// recovery path.
+/// recovery path. When the store already holds WAL, `out_resume` receives
+/// the Postgres LSN right after its last record and the caller must push
+/// from there, re-reading its local pg_wal, so bytes flushed after the
+/// previous pusher died are not skipped. It stays zero when the store is
+/// empty and pushing starts at `flush_lsn`.
 ///
 /// Returns `ZOU_ERR_LEASE_HELD` while a previous holder's lease has not
 /// expired, the caller retries until the TTL passes.
 ///
 /// # Safety
-/// `target` must be a valid NUL terminated C string.
+/// `target` must be a valid NUL terminated C string and `out_resume` a
+/// valid pointer.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zou_wal_open(target: *const c_char, start_lsn: u64) -> i32 {
+pub unsafe extern "C" fn zou_wal_open(
+    target: *const c_char,
+    flush_lsn: u64,
+    out_resume: *mut u64,
+) -> i32 {
     wrap(|| {
-        if target.is_null() {
+        if target.is_null() || out_resume.is_null() {
             return ZOU_ERR_BAD_ARGUMENT;
         }
         let Ok(target) = unsafe { CStr::from_ptr(target) }.to_str() else {
@@ -399,44 +527,14 @@ pub unsafe extern "C" fn zou_wal_open(target: *const c_char, start_lsn: u64) -> 
         if WAL.get().is_some() {
             return ZOU_ERR_BAD_ARGUMENT;
         }
-        let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(target));
-        let layout = TenantLayout::new("local");
-        let manifest_key = layout.manifest();
-        match store.get(&manifest_key) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                let genesis = Manifest::new("local", 18);
-                // A racing genesis from another process is fine, someone won.
-                let _ = store.put_if_match(&manifest_key, &genesis.to_json(), None);
+        match open_wal_pipe(target, flush_lsn) {
+            Ok((pipe, resume)) => {
+                unsafe { *out_resume = resume };
+                let _ = WAL.set(Mutex::new(pipe));
+                ZOU_OK
             }
-            Err(_) => return ZOU_ERR_STORE,
+            Err(rc) => rc,
         }
-        let holder = format!("pg-wal-{}", std::process::id());
-        let held = match lease::acquire(&*store, &layout, &holder, WAL_LEASE_TTL_SECS, now_unix()) {
-            Ok(held) => held,
-            Err(lease::LeaseError::Held { .. }) => return ZOU_ERR_LEASE_HELD,
-            Err(_) => return ZOU_ERR_STORE,
-        };
-        let held = Arc::new(Mutex::new(held));
-        let heartbeat = Heartbeat::spawn(
-            Arc::clone(&store),
-            layout.clone(),
-            Arc::clone(&held),
-            WAL_LEASE_TTL_SECS,
-        );
-        let commit = GroupCommit::with_lease(
-            store,
-            layout,
-            held,
-            Lsn(start_lsn),
-            GroupCommitConfig::default(),
-            TailConfig::default(),
-        );
-        let _ = WAL.set(Mutex::new(WalPipe {
-            commit: Some(commit),
-            heartbeat: Some(heartbeat),
-        }));
-        ZOU_OK
     })
 }
 
@@ -497,18 +595,7 @@ pub extern "C" fn zou_wal_close() -> i32 {
             return ZOU_ERR_NOT_INITIALIZED;
         };
         let mut pipe = pipe.lock().expect("wal pipe mutex poisoned");
-        let mut rc = ZOU_OK;
-        if let Some(commit) = pipe.commit.take()
-            && commit.close().is_err()
-        {
-            rc = ZOU_ERR_STORE;
-        }
-        if let Some(heartbeat) = pipe.heartbeat.take()
-            && heartbeat.detach().is_err()
-        {
-            rc = ZOU_ERR_LEASE_LOST;
-        }
-        rc
+        close_wal_pipe(&mut pipe)
     })
 }
 
@@ -613,10 +700,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = CString::new(dir.path().to_str().unwrap()).unwrap();
         let start = 0x0100_0000_u64;
-        assert_eq!(unsafe { zou_wal_open(target.as_ptr(), start) }, ZOU_OK);
+        let mut resume = u64::MAX;
+        assert_eq!(
+            unsafe { zou_wal_open(target.as_ptr(), start, &mut resume) },
+            ZOU_OK
+        );
+        assert_eq!(resume, 0, "an empty store has nothing to resume from");
         // A second open in the same process is a bug in the caller.
         assert_eq!(
-            unsafe { zou_wal_open(target.as_ptr(), start) },
+            unsafe { zou_wal_open(target.as_ptr(), start, &mut resume) },
             ZOU_ERR_BAD_ARGUMENT
         );
 
@@ -637,8 +729,21 @@ mod tests {
 
         assert_eq!(zou_wal_close(), ZOU_OK);
 
-        // The manifest tail points at the epoch dir with the sealed bytes,
-        // and every record round trips with its pg LSN header.
+        // A later session, as after a server restart, resumes exactly
+        // where the stream ended, not at the caller's flush pointer.
+        let target_str = dir.path().to_str().unwrap();
+        let (mut pipe, resumed) = open_wal_pipe(target_str, start + 999).unwrap();
+        assert_eq!(resumed, start + 8 * 4096);
+        {
+            let commit = pipe.commit.as_ref().unwrap();
+            let mut record = resumed.to_le_bytes().to_vec();
+            record.extend_from_slice(&[9u8; 128]);
+            commit.append(&record).unwrap().wait().unwrap();
+        }
+        assert_eq!(close_wal_pipe(&mut pipe), ZOU_OK);
+
+        // The manifest tail chains both sessions, and every record round
+        // trips with its pg LSN header.
         let store = LocalFsStore::new(dir.path());
         let layout = TenantLayout::new("local");
         let (data, _) = store.get(&layout.manifest()).unwrap().unwrap();
@@ -646,23 +751,32 @@ mod tests {
         let tail = manifest.wal_tail.expect("tail published");
         assert!(!tail.segments.is_empty());
         assert!(manifest.lease.is_none(), "lease released on close");
+        let epochs: std::collections::BTreeSet<u64> = tail
+            .segments
+            .iter()
+            .map(|s| zou_store::commit::segment_epoch(s).unwrap())
+            .collect();
+        assert_eq!(epochs.len(), 2, "two writer sessions in one tail");
 
         let mut records = Vec::new();
         for name in &tail.segments {
-            let key = format!("{}{}", layout.wal_epoch_dir(tail.epoch_dir), name);
-            let (bytes, _) = store.get(&key).unwrap().unwrap();
-            for frame in zou_store::SegmentReader::new(&bytes, tail.epoch_dir) {
+            let epoch = zou_store::commit::segment_epoch(name).unwrap();
+            let (bytes, _) = store.get(&layout.wal_segment_path(name)).unwrap().unwrap();
+            for frame in zou_store::SegmentReader::new(&bytes, epoch) {
                 let frame = frame.expect("well formed frame");
                 records.extend(
                     zou_store::commit::split_records(&frame.payload).expect("well formed batch"),
                 );
             }
         }
-        assert_eq!(records.len(), 8);
-        for (i, record) in records.iter().enumerate() {
+        assert_eq!(records.len(), 9);
+        for (i, record) in records.iter().take(8).enumerate() {
             let lsn = u64::from_le_bytes(record[..8].try_into().unwrap());
             assert_eq!(lsn, start + i as u64 * 4096);
             assert_eq!(record.len(), 8 + 4096);
         }
+        let last = records.last().unwrap();
+        assert_eq!(u64::from_le_bytes(last[..8].try_into().unwrap()), resumed);
+        assert_eq!(last.len(), 8 + 128);
     }
 }

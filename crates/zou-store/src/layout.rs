@@ -55,6 +55,18 @@ impl TenantLayout {
         format!("{}/wal/{epoch:016}/", self.prefix)
     }
 
+    /// The whole WAL prefix across every epoch. Recovery scans this,
+    /// because acked frames can postdate the last manifest publish.
+    pub fn wal_dir(&self) -> String {
+        format!("{}/wal/", self.prefix)
+    }
+
+    /// Resolve an epoch qualified segment name from manifest.wal_tail,
+    /// like `0000000000000007/000000000B000000.wal`, back to its key.
+    pub fn wal_segment_path(&self, qualified: &str) -> String {
+        format!("{}/wal/{qualified}", self.prefix)
+    }
+
     /// One file inside a checkpoint's filesystem capture. Checkpoints are
     /// immutable, these go through put_new.
     pub fn chk_file(&self, id: &str, relpath: &str) -> String {

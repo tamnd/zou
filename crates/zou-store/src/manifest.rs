@@ -77,11 +77,14 @@ pub struct CheckpointRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalTail {
-    /// Epoch directory the tail segments live under.
+    /// Epoch of the session that last published this tail. Segments carry
+    /// their own epoch in their name, so the list can span sessions.
     pub epoch_dir: u64,
     /// Replay starts here, at or after the newest checkpoint LSN.
     pub from_lsn: Lsn,
-    /// Sealed segment names, oldest first.
+    /// Sealed segment paths relative to wal/, oldest first, each of the
+    /// form `<epoch>/<start-lsn>.wal`. The list chains across writer
+    /// sessions until a checkpoint folds it down.
     #[serde(default)]
     pub segments: Vec<String>,
 }

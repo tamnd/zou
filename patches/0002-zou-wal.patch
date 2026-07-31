@@ -38,10 +38,10 @@ index b885513..24c245d 100644
  		 */
 diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
 new file mode 100644
-index 0000000..d35370f
+index 0000000..ba6a929
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,295 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -75,6 +75,7 @@ index 0000000..d35370f
 +#include "pgstat.h"
 +#include "port/atomics.h"
 +#include "postmaster/bgworker.h"
++#include "postmaster/interrupt.h"
 +#include "storage/condition_variable.h"
 +#include "storage/fd.h"
 +#include "storage/ipc.h"
@@ -83,7 +84,8 @@ index 0000000..d35370f
 +#include "utils/wait_event.h"
 +
 +/* C ABI of the zou-pg crate (crates/zou-pg). */
-+extern int	zou_wal_open(const char *target, uint64 start_lsn);
++extern int	zou_wal_open(const char *target, uint64 flush_lsn,
++						 uint64 *out_resume);
 +extern int	zou_wal_append(const uint8 *data, size_t len, uint64 pg_lsn,
 +						   uint64 *out_durable);
 +extern int	zou_wal_close(void);
@@ -206,8 +208,14 @@ index 0000000..d35370f
 +	const char *target = getenv("ZOU_TARGET");
 +	TimeLineID	tli;
 +	XLogRecPtr	pushed;
++	uint64		resume = 0;
 +	char	   *buf;
 +
++	/*
++	 * A smart shutdown must not kill the pusher mid stream. Catch SIGTERM
++	 * and drain everything the cluster has flushed before exiting.
++	 */
++	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 +	BackgroundWorkerUnblockSignals();
 +
 +	if (target == NULL)
@@ -215,9 +223,9 @@ index 0000000..d35370f
 +				(errmsg("zou wal pusher started without ZOU_TARGET")));
 +
 +	/*
-+	 * Mirroring starts at the current flush pointer. Bytes before this
-+	 * point are covered by the bootstrap checkpoint capture, which is the
-+	 * next milestone step.
++	 * Mirroring starts at the current flush pointer on a fresh store.
++	 * Bytes before the first start are covered by the bootstrap
++	 * checkpoint capture.
 +	 */
 +	pushed = GetFlushRecPtr(&tli);
 +
@@ -227,7 +235,7 @@ index 0000000..d35370f
 +	 */
 +	for (;;)
 +	{
-+		int			rc = zou_wal_open(target, (uint64) pushed);
++		int			rc = zou_wal_open(target, (uint64) pushed, &resume);
 +
 +		if (rc == 0)
 +			break;
@@ -242,6 +250,28 @@ index 0000000..d35370f
 +		ResetLatch(MyLatch);
 +	}
 +	on_proc_exit(zou_wal_on_exit, (Datum) 0);
++
++	/*
++	 * On a store that already holds WAL, restart right after its last
++	 * record. The previous incarnation can have exited before pushing
++	 * everything, the shutdown checkpoint record at least, so the resume
++	 * point usually trails the local flush pointer and those bytes are
++	 * re-read from pg_wal now.
++	 */
++	if (resume != 0)
++	{
++		if ((XLogRecPtr) resume > pushed)
++			ereport(FATAL,
++					(errmsg("zou store holds WAL through %X/%X but local flush is only %X/%X",
++							LSN_FORMAT_ARGS((XLogRecPtr) resume),
++							LSN_FORMAT_ARGS(pushed))));
++		if ((XLogRecPtr) resume < pushed)
++			ereport(LOG,
++					(errmsg("zou wal pusher re-pushing %X/%X to %X/%X missed by the previous session",
++							LSN_FORMAT_ARGS((XLogRecPtr) resume),
++							LSN_FORMAT_ARGS(pushed))));
++		pushed = (XLogRecPtr) resume;
++	}
 +
 +	ereport(LOG,
 +			(errmsg("zou wal pusher mirroring from %X/%X into \"%s\"",
@@ -266,6 +296,18 @@ index 0000000..d35370f
 +						(errmsg("zou wal pusher append failed: %d", rc)));
 +			pushed += n;
 +			zou_wal_publish(pushed);
++		}
++		else if (ShutdownRequestPending)
++		{
++			/*
++			 * Fully drained and asked to stop. proc_exit runs
++			 * zou_wal_on_exit, which seals the tail and releases the
++			 * lease cleanly.
++			 */
++			ereport(LOG,
++					(errmsg("zou wal pusher drained through %X/%X, shutting down",
++							LSN_FORMAT_ARGS(pushed))));
++			proc_exit(0);
 +		}
 +		else
 +		{
