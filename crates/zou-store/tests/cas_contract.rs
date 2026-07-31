@@ -162,6 +162,15 @@ fn a_prefixed_store_passes_the_contract() {
     )));
 }
 
+#[cfg(feature = "sqlite")]
+#[test]
+fn sqlite_backend_passes_the_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    run_contract(Arc::new(
+        zou_store::SqliteStore::open(dir.path().join("contract.db")).unwrap(),
+    ));
+}
+
 /// Runs against any S3 compatible endpoint, MinIO in CI. Skips unless
 /// ZOU_S3_TEST_ENDPOINT is set so plain `cargo test` stays offline.
 #[cfg(feature = "s3")]
