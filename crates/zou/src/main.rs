@@ -1,5 +1,7 @@
+mod branch;
 #[cfg(unix)]
 mod dev;
+mod info;
 
 use std::process::ExitCode;
 
@@ -11,8 +13,20 @@ pub const DEV_USAGE: &str =
 fn usage() -> ExitCode {
     eprintln!("zou {}", env!("CARGO_PKG_VERSION"));
     eprintln!("{DEV_USAGE}");
+    eprintln!("       {}", branch::USAGE);
+    eprintln!("       {}", info::USAGE);
     eprintln!("       zou --version");
     ExitCode::from(2)
+}
+
+fn simple(result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("zou: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -44,6 +58,8 @@ fn main() -> ExitCode {
             eprintln!("zou: dev needs a unix platform");
             ExitCode::FAILURE
         }
+        Some("branch") => simple(branch::run(&argv[1..])),
+        Some("info") => simple(info::run(&argv[1..])),
         _ => usage(),
     }
 }

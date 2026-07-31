@@ -107,7 +107,7 @@ jobs:
           cat /tmp/zou-restored.log
       - name: kill -9 loop under pgbench load
         run: scripts/zou-crash-loop.sh 3
-      - name: zou dev end to end
+      - name: zou dev, branch, and info end to end
         run: |
           cargo build -p zou --release
           mkdir -p /tmp/zou-dev-store
@@ -140,6 +140,12 @@ jobs:
           kill -INT "$DEV2"
           wait "$DEV2"
           cat /tmp/zou-dev.log /tmp/zou-dev2.log
+          target/release/zou branch /tmp/zou-dev-store local dev2
+          target/release/zou info /tmp/zou-dev-store | tee /tmp/zou-info.txt
+          grep -q "ref local" /tmp/zou-info.txt
+          target/release/zou info /tmp/zou-dev-store dev2 | tee /tmp/zou-info2.txt
+          grep -q "branch of local" /tmp/zou-info2.txt
+          grep -q "owned by local" /tmp/zou-info2.txt
       - name: Smoke test on MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
