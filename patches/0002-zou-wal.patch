@@ -38,10 +38,10 @@ index b885513..24c245d 100644
  		 */
 diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
 new file mode 100644
-index 0000000..1e7c7e1
+index 0000000..64e2897
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,371 @@
+@@ -0,0 +1,387 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -413,6 +413,22 @@ index 0000000..1e7c7e1
 +		ConditionVariableSleep(&ZouWalShmem->durable_cv, PG_WAIT_EXTENSION);
 +	ConditionVariableCancelSleep();
 +}
++
++/*
++ * The durable LSN the pusher last published, InvalidXLogRecPtr when no
++ * pusher has published one yet. The chain reader in the storage manager
++ * uses it to skip its freshness barrier: the page write gate above reads
++ * the same value before a page object may mutate, so any page change is
++ * preceded by an advance of this LSN, and a reader that sees it
++ * unchanged since its last stream scan cannot be missing WAL.
++ */
++XLogRecPtr
++ZouWalDurableLSN(void)
++{
++	if (!IsUnderPostmaster || ZouWalShmem == NULL || !ZouWalActive())
++		return InvalidXLogRecPtr;
++	return (XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn);
++}
 diff --git a/src/backend/postmaster/bgworker.c b/src/backend/postmaster/bgworker.c
 index 1ad65c2..b554337 100644
 --- a/src/backend/postmaster/bgworker.c
@@ -487,10 +503,10 @@ index 8d2b0f1..54a0df1 100644
  	/*
 diff --git a/src/include/access/zou_wal.h b/src/include/access/zou_wal.h
 new file mode 100644
-index 0000000..f0d4ae1
+index 0000000..870ecc2
 --- /dev/null
 +++ b/src/include/access/zou_wal.h
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,37 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.h
@@ -523,5 +539,8 @@ index 0000000..f0d4ae1
 +
 +/* Backends: block until the store holds WAL through lsn. */
 +extern void ZouWalWaitForLSN(XLogRecPtr lsn);
++
++/* The published durable LSN, InvalidXLogRecPtr before the first publish. */
++extern XLogRecPtr ZouWalDurableLSN(void);
 +
 +#endif							/* ZOU_WAL_H */

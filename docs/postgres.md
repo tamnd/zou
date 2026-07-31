@@ -103,8 +103,12 @@ At first read it loads the PAGES index of every checkpoint from the newest full 
 Serving an immutable image is only correct if nothing changed the block since that checkpoint, and the freshness argument has three legs.
 The write gate guarantees any page change has its WAL durable in the mirrored stream before the page object can change.
 Postgres itself serializes buffer eviction against reads of the same block, so the evicting write finishes before a competing read of that block begins.
-Given those two, a per read listing of `wal/` is a sound barrier: the reader scans every stream segment it has not seen, across all epochs including zombie writers, and marks each referenced block dirty, and dirty blocks fall back to `pg/`.
-That per read LIST is the v0 barrier and it is slow; the follow up publishes the durable LSN in shared memory so reads only scan when the stream actually advanced, and puts a RAM and NVMe cache in front of the range reads.
+Given those two, a listing of `wal/` is a sound barrier: the reader scans every stream segment it has not seen, across all epochs including zombie writers, and marks each referenced block dirty, and dirty blocks fall back to `pg/`.
+Listing on every read would be the whole read cost, so the barrier is gated on the durable LSN the wal pusher publishes into shared memory: the write gate reads that same value before a page object may mutate, so any page change is preceded by an advance of the published LSN, and a read that sees it unchanged since its last scan skips the LIST outright.
+A zero, meaning no pusher has published yet, falls back to listing every time.
+Run slabs are cached in two tiers, a per process RAM tier with strict LRU eviction under a byte budget, `ZOU_READ_CACHE_RAM_MB`, default 64, and an optional disk tier shared by all backends when `ZOU_READ_CACHE_DIR` is set, sized by `ZOU_READ_CACHE_DISK_MB`, default 1024.
+Cache keys are the checkpoint id, run number, and slab offset, which is content addressing because run objects are immutable, so eviction is purely about space and invalidation does not exist.
+Each backend logs its hit rates every 65536 lookups and a summary on exit.
 Two cases need more than block references.
 A relation truncated or a relfilenode reused before the newest checkpoint leaves stale images in older chain entries with no WAL above the chain to flag them, so delta folds also persist smgr create and truncate events as `r` lines in PAGES and the chain walk stops for a relation at the first index naming it.
 Unlogged relations write their main fork without WAL, so no stream barrier can see those pages change; full folds skip any relation that has an init fork and their pages always come from `pg/`.

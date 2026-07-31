@@ -14,6 +14,7 @@
 //! Every function returns 0 for success or a negative ZOU_ERR code, and
 //! never unwinds into C. Postgres turns nonzero into ereport(ERROR).
 
+pub mod cache;
 pub mod capture;
 pub mod fold;
 pub mod reader;
@@ -67,14 +68,32 @@ static SHIM: OnceLock<Shim> = OnceLock::new();
 /// Serve one page from the checkpoint chain, `None` when pg/ must
 /// answer. `ZOU_CHAIN_READER=0` is the escape hatch that pins every
 /// read to pg/.
-fn chain_read(shim: &Shim, r: walscan::BlockRef) -> Option<Vec<u8>> {
+/// atexit hook logging the cache hit rate summary. The reader lives in
+/// a static, and statics never drop when a Postgres process leaves
+/// through C's exit(), so Drop cannot do this.
+extern "C" fn log_cache_summary_at_exit() {
+    if let Some(shim) = SHIM.get()
+        && let Ok(slot) = shim.reader.lock()
+        && let ReaderSlot::On(rd) = &*slot
+    {
+        rd.log_cache_summary();
+    }
+}
+
+fn chain_read(shim: &Shim, r: walscan::BlockRef, durable: u64) -> Option<Vec<u8>> {
+    unsafe extern "C" {
+        fn atexit(cb: extern "C" fn()) -> i32;
+    }
     let mut slot = shim.reader.lock().ok()?;
     if matches!(*slot, ReaderSlot::Unset) {
         *slot = if std::env::var("ZOU_CHAIN_READER").is_ok_and(|v| v == "0") {
             ReaderSlot::Off
         } else {
             match reader::ChainReader::attach(&shim.store, &shim.layout) {
-                Ok(Some(rd)) => ReaderSlot::On(Box::new(rd)),
+                Ok(Some(rd)) => {
+                    unsafe { atexit(log_cache_summary_at_exit) };
+                    ReaderSlot::On(Box::new(rd))
+                }
                 Ok(None) => ReaderSlot::Off,
                 Err(e) => {
                     eprintln!("zou chain reader attach failed, reads stay on pg/: {e}");
@@ -84,7 +103,7 @@ fn chain_read(shim: &Shim, r: walscan::BlockRef) -> Option<Vec<u8>> {
         };
     }
     match &mut *slot {
-        ReaderSlot::On(rd) => rd.read(&shim.store, &shim.layout, r),
+        ReaderSlot::On(rd) => rd.read(&shim.store, &shim.layout, r, durable),
         _ => None,
     }
 }
@@ -252,7 +271,10 @@ pub unsafe extern "C" fn zou_smgr_nblocks(
 
 /// Read one page into `buf`. An absent block object reads as zeros,
 /// matching md's file hole semantics for blocks extended but not yet
-/// written.
+/// written. `durable_lsn` is the wal pusher's published durable LSN at
+/// the moment of the call, zero when none is published; the chain
+/// reader uses it to skip its freshness barrier when the mirrored
+/// stream has not advanced.
 ///
 /// # Safety
 /// `buf` must be a valid pointer to ZOU_PAGE_SIZE writable bytes.
@@ -264,6 +286,7 @@ pub unsafe extern "C" fn zou_smgr_read(
     fork: u32,
     blk: u32,
     buf: *mut u8,
+    durable_lsn: u64,
 ) -> i32 {
     with_shim(|shim| {
         if buf.is_null() {
@@ -277,7 +300,7 @@ pub unsafe extern "C" fn zou_smgr_read(
             fork,
             blk,
         };
-        if let Some(page) = chain_read(shim, r) {
+        if let Some(page) = chain_read(shim, r, durable_lsn) {
             out.copy_from_slice(&page);
             return ZOU_OK;
         }
@@ -813,7 +836,7 @@ mod tests {
         let mut buf = [0u8; ZOU_PAGE_SIZE];
         for (blk, expect) in [(0u32, 1u8), (1, 0xAB), (2, 3)] {
             assert_eq!(
-                unsafe { zou_smgr_read(spc, db, rel, fork, blk, buf.as_mut_ptr()) },
+                unsafe { zou_smgr_read(spc, db, rel, fork, blk, buf.as_mut_ptr(), 0) },
                 ZOU_OK
             );
             assert!(buf.iter().all(|b| *b == expect), "block {blk}");
@@ -827,7 +850,7 @@ mod tests {
         );
         assert_eq!(n, 5);
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel, fork, 4, buf.as_mut_ptr()) },
+            unsafe { zou_smgr_read(spc, db, rel, fork, 4, buf.as_mut_ptr(), 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0));
@@ -840,7 +863,7 @@ mod tests {
         );
         assert_eq!(n, 1);
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel, fork, 0, buf.as_mut_ptr()) },
+            unsafe { zou_smgr_read(spc, db, rel, fork, 0, buf.as_mut_ptr(), 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 1));

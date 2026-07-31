@@ -73,11 +73,14 @@ jobs:
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           grep -q "^p 1663 5 $FILENODE 0 0$" "$ZOU_TARGET/tenants/local/chk/$FULL/PAGES"
           rm "$ZOU_TARGET/tenants/local/pg/1663/5/$FILENODE/0/00000000"
+          export ZOU_READ_CACHE_DIR=/tmp/zou-read-cache
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
           build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/runread.txt
           grep -q 2001000 /tmp/runread.txt
           ! grep -q "chain reader poisoned" /tmp/zou-pg.log
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
+          test "$(ls $ZOU_READ_CACHE_DIR | wc -l)" -ge 1
+          grep -q "zou read cache:" /tmp/zou-pg.log
           cat /tmp/zou-pg.log
       - name: Restore and attach from the store alone
         run: |

@@ -61,10 +61,10 @@ index 37b99fa..886d99e 100644
  		reln->pincount = 0;
 diff --git a/src/backend/storage/smgr/zou_smgr.c b/src/backend/storage/smgr/zou_smgr.c
 new file mode 100644
-index 0000000..f3595b0
+index 0000000..5efc248
 --- /dev/null
 +++ b/src/backend/storage/smgr/zou_smgr.c
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,316 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_smgr.c
@@ -108,7 +108,7 @@ index 0000000..f3595b0
 +extern int	zou_smgr_nblocks(uint32 spc, uint32 db, uint32 rel, uint32 fork,
 +							 uint32 *out);
 +extern int	zou_smgr_read(uint32 spc, uint32 db, uint32 rel, uint32 fork,
-+						  uint32 blk, uint8 *buf);
++						  uint32 blk, uint8 *buf, uint64 durable_lsn);
 +extern int	zou_smgr_write(uint32 spc, uint32 db, uint32 rel, uint32 fork,
 +						   uint32 blk, const uint8 *buf);
 +extern int	zou_smgr_extend(uint32 spc, uint32 db, uint32 rel, uint32 fork,
@@ -248,7 +248,8 @@ index 0000000..f3595b0
 +	for (BlockNumber i = 0; i < nblocks; i++)
 +		zou_check(zou_smgr_read(ZOU_LOCATOR(reln), (uint32) forknum,
 +								(uint32) (blocknum + i),
-+								(uint8 *) buffers[i]),
++								(uint8 *) buffers[i],
++								(uint64) ZouWalDurableLSN()),
 +				  "read", reln, forknum);
 +}
 +
@@ -287,7 +288,8 @@ index 0000000..f3595b0
 +	for (BlockNumber i = 0; i < nblocks; i++)
 +	{
 +		zou_check(zou_smgr_read(ZOU_LOCATOR(reln), (uint32) forknum,
-+								(uint32) (blocknum + i), page),
++								(uint32) (blocknum + i), page,
++								(uint64) ZouWalDurableLSN()),
 +				  "read", reln, forknum);
 +		if (pwrite(zou_scratch_fd, page, BLCKSZ, region + (off_t) i * BLCKSZ) != BLCKSZ)
 +			ereport(ERROR,
