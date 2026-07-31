@@ -14,10 +14,13 @@
 //! Every function returns 0 for success or a negative ZOU_ERR code, and
 //! never unwinds into C. Postgres turns nonzero into ereport(ERROR).
 
+pub mod capture;
+pub mod fold;
 pub mod restore;
 
 use std::ffi::{CStr, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
@@ -359,6 +362,8 @@ pub extern "C" fn zou_smgr_unlink(spc: u32, db: u32, rel: u32, fork: u32) -> i32
 struct WalPipe {
     commit: Option<GroupCommit>,
     heartbeat: Option<Heartbeat>,
+    store: Arc<dyn CasStore>,
+    layout: TenantLayout,
 }
 
 static WAL: OnceLock<Mutex<WalPipe>> = OnceLock::new();
@@ -457,7 +462,7 @@ fn open_wal_pipe(target: &str, flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         Arc::clone(&held),
         WAL_LEASE_TTL_SECS,
     );
-    let mut builder = GroupCommit::builder(store, layout)
+    let mut builder = GroupCommit::builder(Arc::clone(&store), layout.clone())
         .lease(held)
         .start_lsn(Lsn(stream_start))
         .config(GroupCommitConfig::default())
@@ -470,6 +475,8 @@ fn open_wal_pipe(target: &str, flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         WalPipe {
             commit: Some(commit),
             heartbeat: Some(heartbeat),
+            store,
+            layout,
         },
         resume_pg,
     ))
@@ -581,6 +588,46 @@ pub unsafe extern "C" fn zou_wal_append(
                 ZOU_OK
             }
             Err(_) => ZOU_ERR_STORE,
+        }
+    })
+}
+
+/// Fold the completed checkpoint at `redo` into a delta checkpoint and
+/// truncate the mirrored tail, see [`fold::fold`]. Called by the pusher
+/// from the data directory when it is fully caught up, so relative paths
+/// resolve inside PGDATA. Writes the count of dropped sealed segments
+/// through `out_dropped`. Errors are transient, the caller retries after
+/// a backoff.
+///
+/// # Safety
+/// `out_dropped` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zou_wal_fold(redo: u64, out_dropped: *mut u32) -> i32 {
+    wrap(|| {
+        if out_dropped.is_null() {
+            return ZOU_ERR_BAD_ARGUMENT;
+        }
+        let Some(pipe) = WAL.get() else {
+            return ZOU_ERR_NOT_INITIALIZED;
+        };
+        let pipe = pipe.lock().expect("wal pipe mutex poisoned");
+        if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
+            return ZOU_ERR_LEASE_LOST;
+        }
+        let Some(commit) = pipe.commit.as_ref() else {
+            return ZOU_ERR_NOT_INITIALIZED;
+        };
+        match fold::fold(&*pipe.store, &pipe.layout, commit, Path::new("."), redo) {
+            Ok(stats) => {
+                unsafe { *out_dropped = stats.dropped as u32 };
+                ZOU_OK
+            }
+            Err(e) => {
+                // The bgworker's stderr lands in the server log, which is
+                // the only channel this shim has for the error detail.
+                eprintln!("zou_wal_fold: {e}");
+                ZOU_ERR_STORE
+            }
         }
     })
 }

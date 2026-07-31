@@ -38,10 +38,10 @@ index b885513..24c245d 100644
  		 */
 diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
 new file mode 100644
-index 0000000..7ab25df
+index 0000000..76cabb8
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,370 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -88,6 +88,7 @@ index 0000000..7ab25df
 +						 uint64 *out_resume);
 +extern int	zou_wal_append(const uint8 *data, size_t len, uint64 pg_lsn,
 +						   uint64 *out_durable);
++extern int	zou_wal_fold(uint64 redo, uint32 *out_dropped);
 +extern int	zou_wal_close(void);
 +
 +#define ZOU_ERR_LEASE_HELD (-5)
@@ -208,6 +209,9 @@ index 0000000..7ab25df
 +	const char *target = getenv("ZOU_TARGET");
 +	TimeLineID	tli;
 +	XLogRecPtr	pushed;
++	XLogRecPtr	folded;
++	TimeLineID	foldtli;
++	int			fold_backoff = 0;
 +	uint64		resume = 0;
 +	char	   *buf;
 +
@@ -278,6 +282,13 @@ index 0000000..7ab25df
 +					LSN_FORMAT_ARGS(pushed), target)));
 +	zou_wal_publish(pushed);
 +
++	/*
++	 * Folding starts from the checkpoint already completed at startup, the
++	 * store either has its delta or the history back to genesis, either
++	 * way there is nothing new to fold yet.
++	 */
++	GetOldestRestartPoint(&folded, &foldtli);
++
 +	buf = palloc(ZOU_WAL_CHUNK);
 +	for (;;)
 +	{
@@ -328,6 +339,40 @@ index 0000000..7ab25df
 +		}
 +		else
 +		{
++			XLogRecPtr	redo;
++
++			/*
++			 * Fully caught up is the only safe moment to fold: everything
++			 * the completed checkpoint references, its own record
++			 * included, is durable in the store. GetOldestRestartPoint
++			 * reads the control file, so redo only moves once a
++			 * checkpoint has fully completed and flushed its pages.
++			 */
++			GetOldestRestartPoint(&redo, &foldtli);
++			if (redo > folded && pushed >= redo && fold_backoff == 0)
++			{
++				uint32		dropped = 0;
++				int			rc = zou_wal_fold((uint64) redo, &dropped);
++
++				if (rc == 0)
++				{
++					folded = redo;
++					ereport(LOG,
++							(errmsg("zou wal pusher folded a delta checkpoint at %X/%X, dropped %u sealed segments",
++									LSN_FORMAT_ARGS(redo), dropped)));
++				}
++				else
++				{
++					/* about five seconds of idle passes before a retry */
++					fold_backoff = 1000;
++					ereport(WARNING,
++							(errmsg("zou wal fold at %X/%X failed: %d, will retry",
++									LSN_FORMAT_ARGS(redo), rc)));
++				}
++			}
++			else if (fold_backoff > 0)
++				fold_backoff--;
++
 +			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 +							 5, PG_WAIT_EXTENSION);
 +			ResetLatch(MyLatch);
