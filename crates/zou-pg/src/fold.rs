@@ -10,6 +10,15 @@
 //! lie entirely before it. Restore applies the newest full capture, the
 //! deltas after it, and replays the remaining tail.
 //!
+//! Each checkpoint also carries sorted page runs: the blocks its WAL
+//! window dirtied, packed in (relation, block) order into immutable run
+//! objects with a PAGES index, which is what the read path range reads
+//! instead of one object per block. The pages are read from the live
+//! pg/ prefix at fold time, so a run can hold a block image slightly
+//! newer than redo; that is the same replay-idempotence argument
+//! Postgres recovery itself rests on, a checkpoint is a consistent
+//! starting point, not a point in time snapshot.
+//!
 //! The truncation cut is the 16MB pg_wal segment boundary below redo, not
 //! redo itself: the xlog reader validates the first page header of any
 //! segment file it opens, so the overlay must rebuild retained segment
@@ -31,10 +40,12 @@ use std::path::Path;
 
 use zou_store::layout::TenantLayout;
 use zou_store::manifest::{CheckpointKind, CheckpointRef};
-use zou_store::{CasStore, GroupCommit, Lsn, Manifest, SegmentReader};
+use zou_store::{CasError, CasStore, GroupCommit, Lsn, Manifest, SegmentReader};
 
+use crate::ZOU_PAGE_SIZE;
 use crate::capture;
 use crate::restore::{WAL_SEGMENT_SIZE, control_redo};
+use crate::walscan::{self, BlockRef};
 
 /// A new full checkpoint replaces the delta chain once the deltas
 /// outweigh the newest full by this factor. Restore cost stays bounded
@@ -56,6 +67,8 @@ pub struct FoldStats {
     pub kind: CheckpointKind,
     pub files: usize,
     pub bytes: u64,
+    pub pages: usize,
+    pub runs: usize,
     pub dropped: usize,
 }
 
@@ -135,6 +148,177 @@ fn segment_first_pg_lsn(
     ))
 }
 
+/// Pages per run object, 8MB runs in v0. The spec targets bigger runs
+/// once the read path range reads them, the index records the value so
+/// a reader never has to guess.
+const RUN_PAGES: usize = 1024;
+
+/// The stream segments worth scanning: the published tail plus this
+/// session's own segments uploaded after the last publish, which the
+/// manifest has not learned about yet. Unpublished objects from any
+/// other epoch stay untrusted, a zombie writer may still be uploading.
+fn scan_segments(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    manifest: &Manifest,
+    epoch: u64,
+) -> Result<Vec<String>, String> {
+    let mut segments: Vec<String> = manifest
+        .wal_tail
+        .as_ref()
+        .map(|t| t.segments.clone())
+        .unwrap_or_default();
+    for key in store
+        .list(&layout.wal_epoch_dir(epoch))
+        .map_err(|e| format!("store: {e}"))?
+    {
+        let name = key.rsplit('/').next().unwrap_or_default();
+        let qualified = format!("{epoch:016}/{name}");
+        if !segments.contains(&qualified) {
+            segments.push(qualified);
+        }
+    }
+    Ok(segments)
+}
+
+/// The blocks dirtied since the previous checkpoint, scanned out of the
+/// WAL the stream holds over that window. Completeness rests on the
+/// write gate: no page object mutates before its WAL is durable in the
+/// stream, so the stream names every page the fold must carry.
+fn delta_refs(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    manifest: &Manifest,
+    epoch: u64,
+    redo: u64,
+) -> Result<Vec<BlockRef>, String> {
+    let prev = manifest
+        .checkpoints
+        .last()
+        .map(|c| c.lsn.0)
+        .ok_or_else(|| "delta fold with no prior checkpoint".to_string())?;
+    let segments = scan_segments(store, layout, manifest, epoch)?;
+    let window = walscan::assemble_window(store, layout, &segments, prev, redo)?;
+    // Coverage can start after the previous checkpoint when that one
+    // predates the stream, the genesis capture does. Records in the gap
+    // are older than the stream's first push, so their page effects are
+    // already in the base capture.
+    let start = prev.max(window.covered_from);
+    walscan::scan_block_refs(&window, start, redo)
+}
+
+/// Every page and fork size the store holds, from a listing of the pg/
+/// prefix. Sizes ride along in the PAGES index so a reader of a full
+/// checkpoint has fork lengths without another source.
+#[allow(clippy::type_complexity)]
+fn all_pages(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+) -> Result<(Vec<BlockRef>, Vec<(u32, u32, u32, u32, u32)>), String> {
+    let prefix = layout.pg_dir();
+    let mut refs = Vec::new();
+    let mut sizes = Vec::new();
+    for key in store.list(&prefix).map_err(|e| format!("store: {e}"))? {
+        let rest = key.strip_prefix(&prefix).unwrap_or(&key);
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() != 5 {
+            continue;
+        }
+        let (Ok(spc), Ok(db), Ok(rel), Ok(fork)) = (
+            parts[0].parse(),
+            parts[1].parse(),
+            parts[2].parse(),
+            parts[3].parse(),
+        ) else {
+            continue;
+        };
+        if parts[4] == "SIZE" {
+            let Some((data, _)) = store.get(&key).map_err(|e| format!("store: {e}"))? else {
+                continue;
+            };
+            let n = <[u8; 4]>::try_from(data.as_slice())
+                .map(u32::from_le_bytes)
+                .map_err(|_| format!("bad SIZE object at {key}"))?;
+            sizes.push((spc, db, rel, fork, n));
+        } else if let Ok(blk) = u32::from_str_radix(parts[4], 16) {
+            refs.push(BlockRef {
+                spc,
+                db,
+                rel,
+                fork,
+                blk,
+            });
+        }
+    }
+    refs.sort();
+    Ok((refs, sizes))
+}
+
+/// Pack the pages into sorted run objects plus the PAGES index. Blocks
+/// the WAL names but the store no longer holds belonged to dropped
+/// relations and are skipped, the WAL that drops them is retained.
+/// Idempotent: an existing PAGES index means an earlier attempt of this
+/// checkpoint finished, and run objects it left behind are kept.
+fn pack_page_runs(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    id: &str,
+    refs: &[BlockRef],
+    sizes: &[(u32, u32, u32, u32, u32)],
+) -> Result<(usize, usize), String> {
+    if store
+        .get(&layout.checkpoint_page_index(id))
+        .map_err(|e| format!("store: {e}"))?
+        .is_some()
+    {
+        return Ok((0, 0));
+    }
+    let mut index = format!("runs {RUN_PAGES}\n");
+    let mut run: Vec<u8> = Vec::new();
+    let mut runs = 0u32;
+    let mut pages = 0usize;
+    let flush = |run: &mut Vec<u8>, runs: &mut u32| -> Result<(), String> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        match store.put_new(&layout.checkpoint_pages(id, *runs), run) {
+            Ok(_) | Err(CasError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(format!("put run {runs}: {e}")),
+        }
+        run.clear();
+        *runs += 1;
+        Ok(())
+    };
+    for r in refs {
+        let Some((data, _)) = store
+            .get(&layout.pg_block(r.spc, r.db, r.rel, r.fork, r.blk))
+            .map_err(|e| format!("store: {e}"))?
+        else {
+            continue;
+        };
+        if data.len() != ZOU_PAGE_SIZE {
+            return Err(format!("page object {r:?} holds {} bytes", data.len()));
+        }
+        run.extend_from_slice(&data);
+        pages += 1;
+        index.push_str(&format!(
+            "p {} {} {} {} {}\n",
+            r.spc, r.db, r.rel, r.fork, r.blk
+        ));
+        if run.len() >= RUN_PAGES * ZOU_PAGE_SIZE {
+            flush(&mut run, &mut runs)?;
+        }
+    }
+    flush(&mut run, &mut runs)?;
+    for (spc, db, rel, fork, n) in sizes {
+        index.push_str(&format!("s {spc} {db} {rel} {fork} {n}\n"));
+    }
+    match store.put_new(&layout.checkpoint_page_index(id), index.as_bytes()) {
+        Ok(_) | Err(CasError::AlreadyExists { .. }) => Ok((pages, runs as usize)),
+        Err(e) => Err(format!("put PAGES: {e}")),
+    }
+}
+
 /// Capture the checkpoint at `redo`, a delta normally or a full when
 /// the fold down policy says the chain has outgrown its base, and
 /// publish it together with the tail truncation. Idempotent per redo:
@@ -158,7 +342,7 @@ pub fn fold(
         CheckpointKind::Delta
     };
     let paths = match kind {
-        CheckpointKind::Full => capture::full_capture(pgdata)?,
+        CheckpointKind::Full => capture::full_capture(pgdata, redo)?,
         CheckpointKind::Delta => capture::delta_capture(pgdata)?,
     };
     let files = capture::read_files(&paths)?;
@@ -187,6 +371,21 @@ pub fn fold(
     {
         bytes = capture::upload(store, layout, &id, &files, &paths.dirs, true)?;
     }
+
+    // The sorted page runs: a delta packs the blocks the WAL dirtied
+    // since the previous checkpoint, a full packs every page the store
+    // holds. A failure here leaves fs and run objects behind for gc,
+    // the manifest still names nothing.
+    let (pages, runs) = match kind {
+        CheckpointKind::Delta => {
+            let refs = delta_refs(store, layout, &manifest, commit.epoch(), redo)?;
+            pack_page_runs(store, layout, &id, &refs, &[])?
+        }
+        CheckpointKind::Full => {
+            let (refs, sizes) = all_pages(store, layout)?;
+            pack_page_runs(store, layout, &id, &refs, &sizes)?
+        }
+    };
 
     // Droppable prefix of the published tail. A sealed segment goes once
     // its successor starts at or below the cut, everything it covers is
@@ -219,6 +418,8 @@ pub fn fold(
         kind,
         files: files.len(),
         bytes,
+        pages,
+        runs,
         dropped,
     })
 }
@@ -226,6 +427,7 @@ pub fn fold(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::walscan::testwal::Builder;
     use std::sync::{Arc, Mutex};
     use zou_store::{GroupCommitConfig, LocalFsStore, TailConfig, lease};
 
@@ -257,19 +459,56 @@ mod tests {
         let store = Arc::new(LocalFsStore::new(store_dir.path()));
         let layout = TenantLayout::new("local");
 
-        let redo = 2 * WAL_SEGMENT_SIZE + 0x50;
+        // Synthetic WAL in segment 2, starting mid page like a real
+        // resume point: two records before the fold dirtying blocks of
+        // relation 16384, a SAME_REL reference to a block the store no
+        // longer holds, and one record past the fold that must stay out
+        // of the runs.
+        let stream_base = 2 * WAL_SEGMENT_SIZE + 8;
+        let block = |rel: u32, blk: u32| BlockRef {
+            spc: 1663,
+            db: 5,
+            rel,
+            fork: 0,
+            blk,
+        };
+        let mut wal = Builder::new(stream_base);
+        wal.record(&[(block(16384, 1), false)], b"first");
+        wal.record(
+            &[(block(16384, 0), false), (block(16384, 5), true)],
+            b"second",
+        );
+        let redo = wal.pos();
+        wal.record(&[(block(99999, 9), false)], b"after the fold");
+
         std::fs::create_dir_all(pgdata.join("global")).unwrap();
         std::fs::create_dir_all(pgdata.join("pg_xact")).unwrap();
         let control = synthetic_control(redo);
         std::fs::write(pgdata.join("global/pg_control"), &control).unwrap();
         std::fs::write(pgdata.join("pg_xact/0000"), b"clog").unwrap();
 
+        // The two dirtied blocks exist in the page store, block 5 does
+        // not, a dropped relation the pack must skip.
+        store
+            .put(
+                &layout.pg_block(1663, 5, 16384, 0, 0),
+                &[0xAA; ZOU_PAGE_SIZE],
+            )
+            .unwrap();
+        store
+            .put(
+                &layout.pg_block(1663, 5, 16384, 0, 1),
+                &[0xBB; ZOU_PAGE_SIZE],
+            )
+            .unwrap();
+
         // A genesis full big enough that the deltas never trigger the
-        // fold down, this test is about the delta path.
+        // fold down, this test is about the delta path. Its lsn is the
+        // stream base, so the scan window is exactly the pushed WAL.
         let mut genesis = Manifest::new("local", 18);
         genesis.checkpoints.push(CheckpointRef {
             id: "genesis".into(),
-            lsn: Lsn(0x100),
+            lsn: Lsn(stream_base),
             kind: CheckpointKind::Full,
         });
         store
@@ -290,16 +529,18 @@ mod tests {
                 ..TailConfig::default()
             },
         );
-        // Three sealed segments: the first two lie entirely below the cut
-        // at the 16MB boundary under redo, the third starts above it.
-        let push = |pg_lsn: u64, len: usize| {
+        // Three sealed segments: two garbage chunks below the scan
+        // window that exist to exercise the drop logic, then the real
+        // WAL. Only the first lies entirely below the cut.
+        let push = |pg_lsn: u64, bytes: &[u8]| {
             let mut record = pg_lsn.to_le_bytes().to_vec();
-            record.extend(std::iter::repeat_n(0x5A, len));
+            record.extend_from_slice(bytes);
             gc.append(&record).unwrap().wait().unwrap();
         };
-        push(0x100, 100);
-        push(0x200, 100);
-        push(2 * WAL_SEGMENT_SIZE + 10, 100);
+        push(0x100, &[0x5A; 100]);
+        push(0x200, &[0x5A; 100]);
+        let (stream_lsn, stream_bytes) = wal.stream();
+        push(stream_lsn, stream_bytes);
         let before = manifest_of(&*store, &layout).wal_tail.unwrap();
         assert_eq!(before.segments.len(), 3);
 
@@ -310,6 +551,11 @@ mod tests {
         );
         assert_eq!(stats.kind, CheckpointKind::Delta);
         assert_eq!(stats.files, 2);
+        assert_eq!(
+            stats.pages, 2,
+            "block 5 is gone and the post fold record is out"
+        );
+        assert_eq!(stats.runs, 1);
 
         let m = manifest_of(&*store, &layout);
         let tail = m.wal_tail.unwrap();
@@ -329,6 +575,30 @@ mod tests {
         let (index, _) = store.get(&layout.chk_index(&chk.id)).unwrap().unwrap();
         let index = String::from_utf8(index).unwrap();
         assert!(index.contains("f pg_xact/0000 4"));
+
+        // The page runs: both present blocks packed in block order, the
+        // PAGES index describing exactly them.
+        let (pages_index, _) = store
+            .get(&layout.checkpoint_page_index(&chk.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(pages_index).unwrap(),
+            "runs 1024\np 1663 5 16384 0 0\np 1663 5 16384 0 1\n"
+        );
+        let (run, _) = store
+            .get(&layout.checkpoint_pages(&chk.id, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.len(), 2 * ZOU_PAGE_SIZE);
+        assert_eq!(run[0], 0xAA);
+        assert_eq!(run[ZOU_PAGE_SIZE], 0xBB);
+        assert!(
+            store
+                .get(&layout.checkpoint_pages(&chk.id, 1))
+                .unwrap()
+                .is_none()
+        );
 
         // Folding the same redo again is a no op on the manifest.
         let again = fold(&*store, &layout, &gc, pgdata, redo).unwrap();
@@ -360,7 +630,26 @@ mod tests {
         std::fs::write(pgdata.join("PG_VERSION"), b"18\n").unwrap();
         std::fs::write(pgdata.join("pg_xact/0000"), b"clog").unwrap();
         std::fs::write(pgdata.join("pg_wal/000000010000000000000001"), b"wal").unwrap();
+        std::fs::write(pgdata.join("pg_wal/000000010000000000000002"), b"wal2").unwrap();
         std::fs::write(pgdata.join("postmaster.pid"), b"123").unwrap();
+
+        // A full packs every page the store holds plus the fork sizes,
+        // no WAL scan involved.
+        store
+            .put(
+                &layout.pg_block(1663, 5, 16384, 0, 0),
+                &[0xCC; ZOU_PAGE_SIZE],
+            )
+            .unwrap();
+        store
+            .put(
+                &layout.pg_block(1663, 5, 16384, 0, 1),
+                &[0xDD; ZOU_PAGE_SIZE],
+            )
+            .unwrap();
+        store
+            .put(&layout.pg_size(1663, 5, 16384, 0), &2u32.to_le_bytes())
+            .unwrap();
 
         // The delta chain weighs 600 bytes against a 100 byte full, past
         // the factor of five, so the next fold must capture a full.
@@ -398,22 +687,42 @@ mod tests {
 
         let stats = fold(&*store, &layout, &gc, pgdata, redo).unwrap();
         assert_eq!(stats.kind, CheckpointKind::Full);
+        assert_eq!(stats.pages, 2);
+        assert_eq!(stats.runs, 1);
 
         let m2 = manifest_of(&*store, &layout);
         let last = m2.checkpoints.last().unwrap();
         assert_eq!(last.kind, CheckpointKind::Full);
         assert_eq!(last.id, format!("{redo:016x}"));
 
-        // The full walk keeps the skeleton, drops wal segments and the
-        // per instance noise, and resets the policy for the next fold.
+        // The full walk keeps the skeleton and the wal segment holding
+        // redo, drops later wal segments and the per instance noise, and
+        // resets the policy for the next fold. The redo segment stays
+        // because the mirrored stream can begin mid segment and recovery
+        // needs the segment file readable from its first page header.
         let (index, _) = store.get(&layout.chk_index(&stats.id)).unwrap().unwrap();
         let index = String::from_utf8(index).unwrap();
         assert!(index.contains("f PG_VERSION"));
         assert!(index.contains("f pg_xact/0000"));
-        assert!(!index.contains("000000010000000000000001"));
+        assert!(index.contains("f pg_wal/000000010000000000000001"));
+        assert!(!index.contains("000000010000000000000002"));
         assert!(!index.contains("postmaster.pid"));
-        assert!(index.contains("d pg_wal"));
         assert!(!chain_wants_full(&*store, &layout, &m2).unwrap());
+
+        let (pages_index, _) = store
+            .get(&layout.checkpoint_page_index(&stats.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(pages_index).unwrap(),
+            "runs 1024\np 1663 5 16384 0 0\np 1663 5 16384 0 1\ns 1663 5 16384 0 2\n"
+        );
+        let (run, _) = store
+            .get(&layout.checkpoint_pages(&stats.id, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(run[0], 0xCC);
+        assert_eq!(run[ZOU_PAGE_SIZE], 0xDD);
 
         gc.close().unwrap();
     }

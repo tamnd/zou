@@ -121,6 +121,8 @@ pub fn upload(
 /// Skip list for a full capture taken while the server runs. Wal
 /// segments live in the mirrored tail and restore rebuilds them from
 /// it, the rest is per instance noise the server recreates on start.
+/// [`full_capture`] carves out one exception for the segment holding
+/// the redo location.
 pub fn runtime_skip(relpath: &str) -> bool {
     if relpath == "postmaster.pid" || relpath == "postmaster.opts" || relpath == "current_logfiles"
     {
@@ -135,14 +137,45 @@ pub fn runtime_skip(relpath: &str) -> bool {
     relpath.rsplit('/').next() == Some("pgsql_tmp")
 }
 
+/// Whether a wal segment file name covers `lsn`. Names are 24 hex
+/// digits, timeline then the two halves of the segment number, and the
+/// timeline is ignored because a capture only ever sees its own.
+fn wal_segment_holds(name: &str, lsn: u64) -> bool {
+    if name.len() != 24 {
+        return false;
+    }
+    let per_xlogid = 0x1_0000_0000 / crate::restore::WAL_SEGMENT_SIZE;
+    match (
+        u64::from_str_radix(&name[8..16], 16),
+        u64::from_str_radix(&name[16..24], 16),
+    ) {
+        (Ok(hi), Ok(lo)) => hi * per_xlogid + lo == lsn / crate::restore::WAL_SEGMENT_SIZE,
+        _ => false,
+    }
+}
+
 /// Everything a full checkpoint captures from a running data directory.
 /// Relation pages are absent locally under the zou storage manager, so a
 /// full walk collects exactly the filesystem skeleton plus the non
-/// relation state, which is what a node needs to attach.
-pub fn full_capture(pgdata: &Path) -> Result<Capture, String> {
+/// relation state, which is what a node needs to attach. The wal segment
+/// file holding `redo` is captured whole even though wal normally stays
+/// out: the mirrored stream can begin mid segment, restore only rebuilds
+/// segment files from the first mirrored byte onward, and recovery
+/// refuses a segment whose first page header is zeroed. The bytes below
+/// the mirrored coverage never change once written, and the restore
+/// overlay overwrites everything from coverage on, so the captured copy
+/// is always consistent with the stream.
+pub fn full_capture(pgdata: &Path, redo: u64) -> Result<Capture, String> {
+    let skip = |relpath: &str| {
+        if let Some(name) = relpath.strip_prefix("pg_wal/")
+            && wal_segment_holds(name, redo)
+        {
+            return false;
+        }
+        runtime_skip(relpath)
+    };
     let mut out = Capture::default();
-    walk(pgdata, "", &runtime_skip, &mut out)
-        .map_err(|e| format!("walk {}: {e}", pgdata.display()))?;
+    walk(pgdata, "", &skip, &mut out).map_err(|e| format!("walk {}: {e}", pgdata.display()))?;
     out.files.sort();
     out.dirs.sort();
     Ok(out)

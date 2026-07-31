@@ -57,12 +57,19 @@ jobs:
           sleep 5
           grep -q '"kind": "delta"' "$ZOU_TARGET/tenants/local/MANIFEST"
           grep -q "folded a delta checkpoint" /tmp/zou-pg.log
+          FILENODE=$(build/pg/bin/psql -h /tmp -d postgres -Atc "select relfilenode from pg_class where relname='t'")
+          DELTA=$(ls "$ZOU_TARGET/tenants/local/chk/" | grep -v genesis | sort | tail -1)
+          grep -q "^runs " "$ZOU_TARGET/tenants/local/chk/$DELTA/PAGES"
+          grep -q "^p [0-9]* [0-9]* $FILENODE " "$ZOU_TARGET/tenants/local/chk/$DELTA/PAGES"
+          test -s "$ZOU_TARGET/tenants/local/chk/$DELTA/00000000.pages"
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           ZOU_FOLD_DOWN_FACTOR=0 build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
           build/pg/bin/psql -h /tmp -d postgres -c "insert into t select g, 'row ' || g from generate_series(1001,2000) g" -c checkpoint
           sleep 5
           grep -q "folded a full checkpoint" /tmp/zou-pg.log
           test "$(grep -c '"kind": "full"' $ZOU_TARGET/tenants/local/MANIFEST)" -ge 2
+          FULL=$(ls "$ZOU_TARGET/tenants/local/chk/" | grep -v genesis | sort | tail -1)
+          grep -q "^s [0-9]* [0-9]* $FILENODE " "$ZOU_TARGET/tenants/local/chk/$FULL/PAGES"
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           cat /tmp/zou-pg.log
       - name: Restore and attach from the store alone

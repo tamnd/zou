@@ -105,7 +105,7 @@ mod tests {
         let t = TenantLayout::new("t1");
         for key in [
             t.wal_segment(1, Lsn(0)),
-            t.checkpoint_index("chk-1"),
+            t.checkpoint_page_index("chk-1"),
             t.checkpoint_pages("chk-1", 0),
             t.manifest_history(1),
         ] {
