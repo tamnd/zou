@@ -118,6 +118,36 @@ pub fn upload(
     }
 }
 
+/// Skip list for a full capture taken while the server runs. Wal
+/// segments live in the mirrored tail and restore rebuilds them from
+/// it, the rest is per instance noise the server recreates on start.
+pub fn runtime_skip(relpath: &str) -> bool {
+    if relpath == "postmaster.pid" || relpath == "postmaster.opts" || relpath == "current_logfiles"
+    {
+        return true;
+    }
+    if relpath.starts_with("log/") || relpath.starts_with("pg_stat_tmp/") {
+        return true;
+    }
+    if let Some(name) = relpath.strip_prefix("pg_wal/") {
+        return name.len() == 24 && name.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    relpath.rsplit('/').next() == Some("pgsql_tmp")
+}
+
+/// Everything a full checkpoint captures from a running data directory.
+/// Relation pages are absent locally under the zou storage manager, so a
+/// full walk collects exactly the filesystem skeleton plus the non
+/// relation state, which is what a node needs to attach.
+pub fn full_capture(pgdata: &Path) -> Result<Capture, String> {
+    let mut out = Capture::default();
+    walk(pgdata, "", &runtime_skip, &mut out)
+        .map_err(|e| format!("walk {}: {e}", pgdata.display()))?;
+    out.files.sort();
+    out.dirs.sort();
+    Ok(out)
+}
+
 /// The non relation state a delta checkpoint captures. Relation pages
 /// flow through the storage manager and WAL through the pusher, this is
 /// the rest of what recovery reads: the control file, the transaction

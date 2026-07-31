@@ -87,6 +87,9 @@ The cut sits at the segment boundary rather than at redo itself because the xlog
 The pusher only folds while fully caught up, pushed equal to the local flush, which guarantees the checkpoint record named by the captured pg_control is already durable in the store.
 Transaction status captured in the fold can run slightly ahead of the record stream for commits landing in the capture window, which is safe because those commits were never acked.
 Dropped segment objects stay in the bucket until the garbage collection job arrives, so a restore may overlay more WAL files than the manifest references, which recovery ignores because replay starts at the restored redo.
+The fold down policy keeps the chain short: once the deltas since the newest full outweigh it five times, the next fold captures a full instead, a whole data directory walk minus the wal segments the mirrored tail already owns and the per instance noise the server recreates.
+Restore then starts at that full and the superseded chain becomes garbage for the gc job.
+`ZOU_FOLD_DOWN_FACTOR` overrides the factor, which the CI smoke test uses to force a fold down without writing five fulls worth of deltas.
 
 ```sh
 mkdir -p /tmp/zou-pg-store
@@ -105,7 +108,7 @@ All five load and run with `ZOU_TARGET` set, hnsw index builds included, and CI 
 
 ## CI
 
-The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, reads the rows back from the object store, and checkpoints so the manifest carries a folded delta, and one that restores a second data directory from the store with `zou-restore` and reads the same rows after crash recovery, which exercises the delta chain.
+The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, reads the rows back from the object store, checkpoints so the manifest carries a folded delta, and forces a fold down so it also carries a runtime full, and one that restores a second data directory from the store with `zou-restore` and reads the same rows after crash recovery, which exercises restore from a runtime full.
 It triggers on any PR touching `vendor/`, `patches/`, the build scripts, the `zou-pg` or `zou-store` crates, or the Makefile, and on manual dispatch.
 A patch that breaks the build or changes `select version()` output gets caught in the same PR that introduces it.
 

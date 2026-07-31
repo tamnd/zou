@@ -21,6 +21,11 @@
 //! status captured here can run slightly ahead of the record stream for
 //! commits that happened in the capture window; those commits were never
 //! acked, and the docs carry the caveat.
+//!
+//! The fold down policy keeps the chain short: once the deltas since
+//! the newest full outweigh it by a factor, the next fold captures a
+//! full instead, restore starts there and the superseded chain becomes
+//! garbage for the gc job.
 
 use std::path::Path;
 
@@ -31,12 +36,72 @@ use zou_store::{CasStore, GroupCommit, Lsn, Manifest, SegmentReader};
 use crate::capture;
 use crate::restore::{WAL_SEGMENT_SIZE, control_redo};
 
+/// A new full checkpoint replaces the delta chain once the deltas
+/// outweigh the newest full by this factor. Restore cost stays bounded
+/// by the full size, and the superseded chain becomes garbage for the
+/// gc job. `ZOU_FOLD_DOWN_FACTOR` overrides it, which tests use to
+/// force a fold down without writing five fulls worth of deltas.
+const FOLD_DOWN_FACTOR: u64 = 5;
+
+fn fold_down_factor() -> u64 {
+    std::env::var("ZOU_FOLD_DOWN_FACTOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FOLD_DOWN_FACTOR)
+}
+
 #[derive(Debug)]
 pub struct FoldStats {
     pub id: String,
+    pub kind: CheckpointKind,
     pub files: usize,
     pub bytes: u64,
     pub dropped: usize,
+}
+
+/// Total file bytes a checkpoint describes, summed from its INDEX.
+fn index_bytes(store: &dyn CasStore, layout: &TenantLayout, id: &str) -> Result<u64, String> {
+    let (data, _) = store
+        .get(&layout.chk_index(id))
+        .map_err(|e| format!("store: {e}"))?
+        .ok_or_else(|| format!("INDEX for checkpoint {id} is missing"))?;
+    let text = String::from_utf8(data).map_err(|_| format!("INDEX for {id} is not utf8"))?;
+    let mut total = 0u64;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("f ") {
+            let len = rest
+                .rsplit(' ')
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or_else(|| format!("bad INDEX line {line:?} in {id}"))?;
+            total += len;
+        }
+    }
+    Ok(total)
+}
+
+/// The fold down policy: capture a full instead of a delta when the
+/// deltas since the newest full have grown past the factor times its
+/// size. A manifest with no full at all also gets one, nothing to
+/// chain a delta onto.
+fn chain_wants_full(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    manifest: &Manifest,
+) -> Result<bool, String> {
+    let Some(full) = manifest
+        .checkpoints
+        .iter()
+        .rposition(|c| c.kind == CheckpointKind::Full)
+    else {
+        return Ok(true);
+    };
+    let full_bytes = index_bytes(store, layout, &manifest.checkpoints[full].id)?;
+    let mut delta_bytes = 0u64;
+    for c in &manifest.checkpoints[full + 1..] {
+        delta_bytes += index_bytes(store, layout, &c.id)?;
+    }
+    Ok(delta_bytes > fold_down_factor().saturating_mul(full_bytes))
 }
 
 /// First Postgres LSN covered by a stored segment, from the 8 byte
@@ -70,8 +135,9 @@ fn segment_first_pg_lsn(
     ))
 }
 
-/// Capture the delta checkpoint for the completed checkpoint at `redo`
-/// and publish it together with the tail truncation. Idempotent per redo:
+/// Capture the checkpoint at `redo`, a delta normally or a full when
+/// the fold down policy says the chain has outgrown its base, and
+/// publish it together with the tail truncation. Idempotent per redo:
 /// the checkpoint id is derived from it and every step tolerates a
 /// retried run. Errors leave the manifest unchanged, the caller retries.
 pub fn fold(
@@ -81,7 +147,20 @@ pub fn fold(
     pgdata: &Path,
     redo: u64,
 ) -> Result<FoldStats, String> {
-    let paths = capture::delta_capture(pgdata)?;
+    let (data, _) = store
+        .get(&layout.manifest())
+        .map_err(|e| format!("store: {e}"))?
+        .ok_or_else(|| "manifest vanished".to_string())?;
+    let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
+    let kind = if chain_wants_full(store, layout, &manifest)? {
+        CheckpointKind::Full
+    } else {
+        CheckpointKind::Delta
+    };
+    let paths = match kind {
+        CheckpointKind::Full => capture::full_capture(pgdata)?,
+        CheckpointKind::Delta => capture::delta_capture(pgdata)?,
+    };
     let files = capture::read_files(&paths)?;
     let control = files
         .iter()
@@ -114,11 +193,6 @@ pub fn fold(
     // then before the retained window. Unpublished segments are newer
     // than the checkpoint and never candidates.
     let cut = redo & !(WAL_SEGMENT_SIZE - 1);
-    let (data, _) = store
-        .get(&layout.manifest())
-        .map_err(|e| format!("store: {e}"))?
-        .ok_or_else(|| "manifest vanished".to_string())?;
-    let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
     let mut drop = Vec::new();
     if let Some(tail) = &manifest.wal_tail {
         for pair in tail.segments.windows(2) {
@@ -135,13 +209,14 @@ pub fn fold(
             CheckpointRef {
                 id: id.clone(),
                 lsn: Lsn(redo),
-                kind: CheckpointKind::Delta,
+                kind,
             },
             drop,
         )
         .map_err(|e| format!("fold publish: {e}"))?;
     Ok(FoldStats {
         id,
+        kind,
         files: files.len(),
         bytes,
         dropped,
@@ -189,8 +264,19 @@ mod tests {
         std::fs::write(pgdata.join("global/pg_control"), &control).unwrap();
         std::fs::write(pgdata.join("pg_xact/0000"), b"clog").unwrap();
 
+        // A genesis full big enough that the deltas never trigger the
+        // fold down, this test is about the delta path.
+        let mut genesis = Manifest::new("local", 18);
+        genesis.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+        });
         store
-            .put_new(&layout.manifest(), &Manifest::new("local", 18).to_json())
+            .put_new(&layout.chk_index("genesis"), b"f base/big 1000000\n")
+            .unwrap();
+        store
+            .put_new(&layout.manifest(), &genesis.to_json())
             .unwrap();
         let held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
         let gc = GroupCommit::with_lease(
@@ -222,13 +308,14 @@ mod tests {
             stats.dropped, 1,
             "only the first segment's successor starts below the cut"
         );
+        assert_eq!(stats.kind, CheckpointKind::Delta);
         assert_eq!(stats.files, 2);
 
         let m = manifest_of(&*store, &layout);
         let tail = m.wal_tail.unwrap();
         assert_eq!(tail.segments, before.segments[1..].to_vec());
-        assert_eq!(m.checkpoints.len(), 1);
-        let chk = &m.checkpoints[0];
+        assert_eq!(m.checkpoints.len(), 2);
+        let chk = &m.checkpoints[1];
         assert_eq!(chk.lsn, Lsn(redo));
         assert_eq!(chk.kind, CheckpointKind::Delta);
         assert_eq!(chk.id, format!("{redo:016x}"));
@@ -246,13 +333,87 @@ mod tests {
         // Folding the same redo again is a no op on the manifest.
         let again = fold(&*store, &layout, &gc, pgdata, redo).unwrap();
         assert_eq!(again.dropped, 0);
-        assert_eq!(manifest_of(&*store, &layout).checkpoints.len(), 1);
+        assert_eq!(manifest_of(&*store, &layout).checkpoints.len(), 2);
 
         // A capture whose pg_control moved past the fold is refused.
         let newer = synthetic_control(redo + 0x1000);
         std::fs::write(pgdata.join("global/pg_control"), &newer).unwrap();
         let err = fold(&*store, &layout, &gc, pgdata, redo).unwrap_err();
         assert!(err.contains("past the fold"));
+
+        gc.close().unwrap();
+    }
+
+    #[test]
+    fn the_fold_down_policy_promotes_a_full_once_the_deltas_outgrow_it() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let pgdata_dir = tempfile::tempdir().unwrap();
+        let pgdata = pgdata_dir.path();
+        let store = Arc::new(LocalFsStore::new(store_dir.path()));
+        let layout = TenantLayout::new("local");
+
+        let redo = WAL_SEGMENT_SIZE + 0x80;
+        for d in ["global", "pg_xact", "pg_wal", "pg_twophase"] {
+            std::fs::create_dir_all(pgdata.join(d)).unwrap();
+        }
+        std::fs::write(pgdata.join("global/pg_control"), synthetic_control(redo)).unwrap();
+        std::fs::write(pgdata.join("PG_VERSION"), b"18\n").unwrap();
+        std::fs::write(pgdata.join("pg_xact/0000"), b"clog").unwrap();
+        std::fs::write(pgdata.join("pg_wal/000000010000000000000001"), b"wal").unwrap();
+        std::fs::write(pgdata.join("postmaster.pid"), b"123").unwrap();
+
+        // The delta chain weighs 600 bytes against a 100 byte full, past
+        // the factor of five, so the next fold must capture a full.
+        let mut m = Manifest::new("local", 18);
+        m.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+        });
+        m.checkpoints.push(CheckpointRef {
+            id: "d1".into(),
+            lsn: Lsn(0x200),
+            kind: CheckpointKind::Delta,
+        });
+        store
+            .put_new(&layout.chk_index("genesis"), b"f base/small 100\n")
+            .unwrap();
+        store
+            .put_new(&layout.chk_index("d1"), b"f pg_xact/0000 600\n")
+            .unwrap();
+        store.put_new(&layout.manifest(), &m.to_json()).unwrap();
+
+        let held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
+        let gc = GroupCommit::with_lease(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout.clone(),
+            Arc::new(Mutex::new(held)),
+            Lsn(0),
+            GroupCommitConfig::default(),
+            TailConfig::default(),
+        );
+        let mut record = 0x100u64.to_le_bytes().to_vec();
+        record.extend_from_slice(b"payload");
+        gc.append(&record).unwrap().wait().unwrap();
+
+        let stats = fold(&*store, &layout, &gc, pgdata, redo).unwrap();
+        assert_eq!(stats.kind, CheckpointKind::Full);
+
+        let m2 = manifest_of(&*store, &layout);
+        let last = m2.checkpoints.last().unwrap();
+        assert_eq!(last.kind, CheckpointKind::Full);
+        assert_eq!(last.id, format!("{redo:016x}"));
+
+        // The full walk keeps the skeleton, drops wal segments and the
+        // per instance noise, and resets the policy for the next fold.
+        let (index, _) = store.get(&layout.chk_index(&stats.id)).unwrap().unwrap();
+        let index = String::from_utf8(index).unwrap();
+        assert!(index.contains("f PG_VERSION"));
+        assert!(index.contains("f pg_xact/0000"));
+        assert!(!index.contains("000000010000000000000001"));
+        assert!(!index.contains("postmaster.pid"));
+        assert!(index.contains("d pg_wal"));
+        assert!(!chain_wants_full(&*store, &layout, &m2).unwrap());
 
         gc.close().unwrap();
     }
