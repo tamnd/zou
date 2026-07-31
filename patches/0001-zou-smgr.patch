@@ -61,10 +61,10 @@ index 37b99fa..886d99e 100644
  		reln->pincount = 0;
 diff --git a/src/backend/storage/smgr/zou_smgr.c b/src/backend/storage/smgr/zou_smgr.c
 new file mode 100644
-index 0000000..b462b73
+index 0000000..f3595b0
 --- /dev/null
 +++ b/src/backend/storage/smgr/zou_smgr.c
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,314 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_smgr.c
@@ -92,10 +92,12 @@ index 0000000..b462b73
 +#include <fcntl.h>
 +#include <unistd.h>
 +
++#include "access/zou_wal.h"
 +#include "miscadmin.h"
 +#include "port/pg_iovec.h"
 +#include "storage/aio.h"
 +#include "storage/bufmgr.h"
++#include "storage/bufpage.h"
 +#include "storage/zou_smgr.h"
 +
 +/* C ABI of the zou-pg crate (crates/zou-pg). */
@@ -262,7 +264,7 @@ index 0000000..b462b73
 +{
 +	off_t		region;
 +	struct iovec *iov;
-+	int			iovcnt;
++	int			iovcnt PG_USED_FOR_ASSERTS_ONLY;
 +	uint8		page[BLCKSZ];
 +
 +	if (zou_scratch_fd < 0)
@@ -312,10 +314,24 @@ index 0000000..b462b73
 +		  const void **buffers, BlockNumber nblocks, bool skipFsync)
 +{
 +	for (BlockNumber i = 0; i < nblocks; i++)
++	{
++		XLogRecPtr	lsn = PageGetLSN((const PageData *) buffers[i]);
++
++		/*
++		 * A page must never reach the store ahead of the WAL that
++		 * produced it. Store objects survive a crash while local pg_wal
++		 * does not, so an early page would carry effects of records the
++		 * mirrored stream has never heard of, and a node attaching from
++		 * the store could not explain its own pages. Waiting here is the
++		 * same backpressure a committing backend already accepts.
++		 */
++		if (lsn != InvalidXLogRecPtr)
++			ZouWalWaitForLSN(lsn);
 +		zou_check(zou_smgr_write(ZOU_LOCATOR(reln), (uint32) forknum,
 +								 (uint32) (blocknum + i),
 +								 (const uint8 *) buffers[i]),
 +				  "write", reln, forknum);
++	}
 +}
 +
 +void

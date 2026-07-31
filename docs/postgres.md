@@ -72,6 +72,12 @@ ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/pg_ctl -D /tmp/zou-restored -l /tmp/zo
 On restart or reattach the pusher resumes right after the store's last record rather than at the local flush pointer, because the previous session can exit before pushing its final bytes, the shutdown checkpoint record at least, which is written after background workers stop.
 The manifest tail chains segment lists across writer sessions, each entry named `<epoch>/<start-lsn>.wal`, and a session opening the store first reconciles the tail against a full listing of `wal/` so segments sealed by a crashed session are never lost.
 
+Page writes are gated the same way commits are: `zouwritev` waits until the mirrored stream holds the WAL that produced the page, so a store object can never carry effects of records the stream has never heard of.
+Without that gate a kill -9 could leave future pages in the store, and a node attaching from the store could not explain its own data.
+`scripts/zou-crash-loop.sh` proves the whole contract: it runs pgbench plus a ledger client that records an id only after the server acks the COMMIT, kills the postmaster with -9 mid load, reattaches from the store alone with `zou-restore`, and asserts every recorded id is present, in a loop.
+CI runs three cycles on every PR that touches the server.
+One known limit: an in place crash restart replays local WAL the store has not seen yet and can push pages early during recovery, so after a crash a node should reattach with `zou-restore`; the fix, starting the pusher at consistent state, is tracked in the milestone issue.
+
 ```sh
 mkdir -p /tmp/zou-pg-store
 ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync
