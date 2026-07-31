@@ -109,6 +109,9 @@ fn parse(target: &str) -> Result<Parsed<'_>, String> {
 /// object store latency, see [`crate::delay`].
 pub fn open_store(target: &str) -> Result<Box<dyn CasStore>, String> {
     let store: Box<dyn CasStore> = match parse(target)? {
+        Parsed::Local(path) if path.ends_with(".zou") => {
+            Box::new(crate::zoufile::ZouFileStore::open(path)?)
+        }
         Parsed::Local(path) => Box::new(LocalFsStore::new(path)),
         Parsed::Remote {
             scheme,

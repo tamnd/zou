@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use zou_store::{CasError, CasStore, LocalFsStore, PrefixStore};
+use zou_store::{CasError, CasStore, LocalFsStore, PrefixStore, ZouFileStore};
 
 fn run_contract(store: Arc<dyn CasStore>) {
     missing_key_reads_as_none(&*store);
@@ -141,6 +141,14 @@ fn concurrent_swappers_never_lose_an_update(store: Arc<dyn CasStore>) {
 fn local_fs_backend_passes_the_contract() {
     let dir = tempfile::tempdir().unwrap();
     run_contract(Arc::new(LocalFsStore::new(dir.path())));
+}
+
+#[test]
+fn zou_file_backend_passes_the_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    run_contract(Arc::new(
+        ZouFileStore::open(dir.path().join("contract.zou")).unwrap(),
+    ));
 }
 
 /// The wrapper `s3://bucket/prefix` targets go through must preserve the
