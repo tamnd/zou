@@ -12,7 +12,9 @@ authors.workspace = true
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-zou-store = { path = "../zou-store" }
+# The s3 feature so ZOU_TARGET can name an object store URL, which links
+# the S3 client into the postgres backend through the staticlib.
+zou-store = { path = "../zou-store", features = ["s3"] }
 crc32c = { workspace = true }
 
 [dev-dependencies]

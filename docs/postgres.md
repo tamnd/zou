@@ -42,6 +42,8 @@ build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
 Patch `0001-zou-smgr.patch` adds a second entry to the smgr table that routes relation pages to zou-store through the C ABI of the `zou-pg` crate, linked into the backend as a static library.
 Set `ZOU_TARGET` to a store root before running `initdb --set io_method=sync` and every non temp relation lives as one object per block under `tenants/local/pg/<spc>/<db>/<rel>/<fork>/`, with a `SIZE` marker per fork and absent blocks reading as zeros.
 Without `ZOU_TARGET` the binary behaves exactly like stock Postgres on md.
+The target is a local directory or an object store URL: `s3://bucket/prefix` speaks the S3 wire API against AWS, MinIO, or R2, and `gs://bucket/prefix` speaks the same client in the GCS dialect, with the prefix scoping every key so stores can share a bucket.
+URL targets read `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the environment, `ZOU_S3_ENDPOINT` to point at a non AWS endpoint like a local MinIO, and `ZOU_S3_REGION` falling back to `AWS_REGION` then us-east-1, and the same forms work for `zou-bootstrap`, `zou-restore`, and `zou-gc`.
 
 Two constraints in v0.
 Reads arrive through the PG 18 AIO path, which executes on file descriptors, so `zoustartreadv` stages pages into a per process scratch file and points the IO handle at it, which confines the build to `io_method=sync` and zouinit enforces that at startup.
@@ -142,6 +144,7 @@ All five load and run with `ZOU_TARGET` set, hnsw index builds included, and CI 
 ## CI
 
 The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, reads the rows back from the object store, checkpoints so the manifest carries a folded delta, forces a fold down so it also carries a runtime full, and then deletes a `pg/` block object and reads the rows back through the checkpoint runs, then runs `zou-gc` twice with a zero window, asserts the superseded chain is swept and the rows still read back, and one that restores a second data directory from the gc'd store with `zou-restore` and reads the same rows after crash recovery, which exercises restore from a runtime full.
+A further step runs the whole cycle against a MinIO container with `ZOU_TARGET=s3://zou-pg/smoke`: initdb, bootstrap, insert, checkpoint fold, restart, read back, and a `zou-restore` from the bucket, so the URL target path is proven against a real S3 endpoint on every server PR.
 It triggers on any PR touching `vendor/`, `patches/`, the build scripts, the `zou-pg` or `zou-store` crates, or the Makefile, and on manual dispatch.
 A patch that breaks the build or changes `select version()` output gets caught in the same PR that introduces it.
 

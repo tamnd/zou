@@ -23,7 +23,7 @@ use std::sync::Arc;
 use zou_store::commit::{reconcile_tail, segment_epoch, split_records};
 use zou_store::layout::TenantLayout;
 use zou_store::manifest::CheckpointKind;
-use zou_store::{CasStore, LocalFsStore, Manifest, SegmentReader};
+use zou_store::{CasStore, Manifest, SegmentReader, open_store};
 
 /// initdb's default, pinned for v0. The capture records no segment size,
 /// and a cluster built with --wal-segsize would need it here.
@@ -236,7 +236,7 @@ pub fn restore(store_root: &str, pgdata: &Path) -> Result<RestoreStats, String> 
             pgdata.display()
         ));
     }
-    let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(store_root));
+    let store: Arc<dyn CasStore> = Arc::from(open_store(store_root)?);
     let layout = TenantLayout::new("local");
 
     let (data, _) = store
@@ -316,7 +316,7 @@ pub fn restore(store_root: &str, pgdata: &Path) -> Result<RestoreStats, String> 
 mod tests {
     use super::*;
     use zou_store::manifest::CheckpointRef;
-    use zou_store::{GroupCommit, GroupCommitConfig, Lsn};
+    use zou_store::{GroupCommit, GroupCommitConfig, LocalFsStore, Lsn};
 
     #[test]
     fn wal_file_names_match_postgres() {

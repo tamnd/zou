@@ -21,7 +21,7 @@ use zou_pg::capture::{self, Capture};
 use zou_store::layout::TenantLayout;
 use zou_store::lease;
 use zou_store::manifest::{CheckpointKind, CheckpointRef};
-use zou_store::{CasStore, LocalFsStore, Lsn, Manifest};
+use zou_store::{CasStore, Lsn, Manifest, open_store};
 
 const GENESIS_ID: &str = "genesis";
 const LEASE_TTL_SECS: u64 = 15;
@@ -63,7 +63,7 @@ fn run() -> Result<(), String> {
         return Err(format!("{} is not a data directory", pgdata.display()));
     }
 
-    let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(target));
+    let store: Arc<dyn CasStore> = Arc::from(open_store(target)?);
     let layout = TenantLayout::new("local");
 
     let manifest_key = layout.manifest();

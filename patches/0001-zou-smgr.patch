@@ -61,17 +61,18 @@ index 37b99fa..886d99e 100644
  		reln->pincount = 0;
 diff --git a/src/backend/storage/smgr/zou_smgr.c b/src/backend/storage/smgr/zou_smgr.c
 new file mode 100644
-index 0000000..5efc248
+index 0000000..a2da4e3
 --- /dev/null
 +++ b/src/backend/storage/smgr/zou_smgr.c
-@@ -0,0 +1,316 @@
+@@ -0,0 +1,321 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_smgr.c
 + *	  storage manager routing relation pages to zou-store objects.
 + *
 + *	  Activated by the ZOU_TARGET environment variable, which names the
-+ *	  store root. Temp relations stay on md. Pages live as one object per
++ *	  store root: a directory or an object store URL like s3://bucket/
++ *	  prefix. Temp relations stay on md. Pages live as one object per
 + *	  block in the zou-pg Rust crate, linked in as a static library.
 + *
 + *	  Reads arrive through AIO. Since the AIO executor operates on file
@@ -272,8 +273,12 @@ index 0000000..5efc248
 +	{
 +		char		path[MAXPGPATH];
 +
-+		snprintf(path, sizeof(path), "%s/zou-scratch-%d",
-+				 getenv("ZOU_TARGET"), MyProcPid);
++		/*
++		 * The scratch file is local process state, not store data, and
++		 * the target can be an object store URL, so it lives in the data
++		 * directory, which is every backend's working directory.
++		 */
++		snprintf(path, sizeof(path), "zou-scratch-%d", MyProcPid);
 +		zou_scratch_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
 +		if (zou_scratch_fd < 0)
 +			ereport(ERROR,

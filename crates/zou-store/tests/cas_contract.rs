@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use zou_store::{CasError, CasStore, LocalFsStore};
+use zou_store::{CasError, CasStore, LocalFsStore, PrefixStore};
 
 fn run_contract(store: Arc<dyn CasStore>) {
     missing_key_reads_as_none(&*store);
@@ -138,50 +138,15 @@ fn local_fs_backend_passes_the_contract() {
     run_contract(Arc::new(LocalFsStore::new(dir.path())));
 }
 
-/// Prefixes every key with a per-run nonce so the contract's fixed key
-/// names never collide across runs against a long lived bucket.
-#[cfg(feature = "s3")]
-struct PrefixedStore {
-    inner: zou_store::S3Store,
-    prefix: String,
-}
-
-#[cfg(feature = "s3")]
-impl CasStore for PrefixedStore {
-    fn get(&self, key: &str) -> Result<Option<(Vec<u8>, zou_store::Version)>, CasError> {
-        self.inner.get(&format!("{}{key}", self.prefix))
-    }
-
-    fn put_if_match(
-        &self,
-        key: &str,
-        data: &[u8],
-        expected: Option<&zou_store::Version>,
-    ) -> Result<zou_store::Version, CasError> {
-        self.inner
-            .put_if_match(&format!("{}{key}", self.prefix), data, expected)
-    }
-
-    fn put(&self, key: &str, data: &[u8]) -> Result<zou_store::Version, CasError> {
-        self.inner.put(&format!("{}{key}", self.prefix), data)
-    }
-
-    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
-        self.inner
-            .get_range(&format!("{}{key}", self.prefix), offset, len)
-    }
-
-    fn delete(&self, key: &str) -> Result<(), CasError> {
-        self.inner.delete(&format!("{}{key}", self.prefix))
-    }
-
-    fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
-        let keys = self.inner.list(&format!("{}{prefix}", self.prefix))?;
-        Ok(keys
-            .into_iter()
-            .filter_map(|k| k.strip_prefix(&self.prefix).map(str::to_string))
-            .collect())
-    }
+/// The wrapper `s3://bucket/prefix` targets go through must preserve the
+/// contract over any backend, so run it over the local one too.
+#[test]
+fn a_prefixed_store_passes_the_contract() {
+    let dir = tempfile::tempdir().unwrap();
+    run_contract(Arc::new(PrefixStore::new(
+        Box::new(LocalFsStore::new(dir.path())),
+        "nested/store",
+    )));
 }
 
 /// Runs against any S3 compatible endpoint, MinIO in CI. Skips unless
@@ -206,12 +171,14 @@ fn s3_backend_passes_the_contract() {
         secret_key: var("ZOU_S3_TEST_SECRET_KEY"),
         dialect,
     });
+    // A per-run nonce prefix keeps the contract's fixed key names from
+    // colliding across runs against a long lived bucket.
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    run_contract(Arc::new(PrefixedStore {
-        inner: store,
-        prefix: format!("contract-runs/{nonce:x}/"),
-    }));
+    run_contract(Arc::new(PrefixStore::new(
+        Box::new(store),
+        &format!("contract-runs/{nonce:x}"),
+    )));
 }
