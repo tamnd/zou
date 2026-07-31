@@ -73,7 +73,7 @@ The child manifest carries three things. Inherited checkpoint refs are tagged wi
 
 History snapshots make PITR work: every manifest state change writes a copy under `manifests/`, at most one per second. Garbage collection pins everything a snapshot younger than the retention window references, a week by default, so a branch materialized inside the window always finds its objects. Snapshots past retention are collected through the same two phase candidate window as everything else, and a parked branch pins its inherited objects for as long as it lives.
 
-Restoring a branch to a data directory works today through `zou-restore <store-root> <pgdata> <ref>`. Serving a branch from a live server on the chain reader alone still has a gap, blocks that predate the runs live only in the parent's pg/ prefix, so the smgr side attach lands together with time travel reads.
+Restoring a branch to a data directory works through `zou-restore <store-root> <pgdata> <ref>`, and `--at <unix>` restores the newest history snapshot at or before that second instead of the live head, replaying the snapshot's own frozen tail so the result is exactly what an attach at that moment would have seen. A live server serves a branch through the chain reader: inherited page runs answer from their owner's prefix, truncate events in a newer delta mask only the blocks past their cutoff so surviving rows of an inherited table keep serving, and the frozen parent tail is scanned like the tenant's own stream. The first fold on a branch that captures a full merges the inherited chain into the child's own run objects, after which the manifest names nothing of the parent and gc may unpin it.
 
 ## Failure behavior
 

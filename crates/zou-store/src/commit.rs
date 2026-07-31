@@ -746,6 +746,12 @@ fn publish_manifest(
                 {
                     m.checkpoints.drain(..pos);
                 }
+                // Any fold's scan window covers the frozen parent tail,
+                // the assembly errors out before publish if a segment
+                // is unreadable, so once a checkpoint lands the child
+                // no longer needs the parent's WAL and gc can let go
+                // of it.
+                m.parent_tail.clear();
             }
         }) {
             Ok(()) => {

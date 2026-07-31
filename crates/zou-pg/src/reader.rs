@@ -27,11 +27,16 @@
 //! Relation level staleness needs its own barrier: smgr truncate and
 //! create records name a relation with no block references, and after
 //! one of those the older checkpoint copies of the relation are stale
-//! even for blocks no record names again. The fold persists those
-//! events as r lines in the PAGES index, and the chain walk stops for
-//! a relation at the first index naming it. Unlogged relations never
-//! enter the runs at all, the fold skips them, because their writes
-//! bypass the WAL and no barrier can see them.
+//! even for blocks no record names again. The fold persists a file
+//! recreation as an r line in the PAGES index and the chain walk stops
+//! for a relation at the first index naming it, every block of the old
+//! incarnation is dead. A truncate is softer and gets a t line with
+//! the record's surviving block count: main fork blocks below it kept
+//! their bytes and older copies of them still serve, which matters on
+//! a branch where the pg/ fallback holds nothing, only blocks at or
+//! past the cutoff and the vm and fsm forks go stale. Unlogged
+//! relations never enter the runs at all, the fold skips them, because
+//! their writes bypass the WAL and no barrier can see them.
 //!
 //! A branched tenant complicates the walk in two bounded ways. The
 //! inherited checkpoints carry an owner tag, so their PAGES indexes
@@ -76,17 +81,29 @@ const SLAB_BYTES: u64 = 1 << 20;
 
 /// The parsed PAGES index of one checkpoint, remembering which tenant
 /// prefix holds its objects: an inherited checkpoint reads from its
-/// owner, everything else from the attaching tenant.
-struct ChkIndex {
-    id: String,
-    layout: TenantLayout,
-    run_pages: usize,
-    entries: Vec<BlockRef>,
-    rels: BTreeSet<RelTag>,
+/// owner, everything else from the attaching tenant. The fold uses it
+/// too when a branched full merges the chain into its own runs.
+pub(crate) struct ChkIndex {
+    pub(crate) id: String,
+    pub(crate) layout: TenantLayout,
+    pub(crate) run_pages: usize,
+    pub(crate) entries: Vec<BlockRef>,
+    pub(crate) rels: BTreeSet<RelTag>,
+    /// Truncate events the fold recorded as t lines, the smallest main
+    /// fork cutoff per relation in the window. Blocks below it survive
+    /// the walk into older indexes, everything else the event names is
+    /// dead, see the module docs.
+    pub(crate) truncs: BTreeMap<RelTag, u32>,
+    /// Fork sizes the fold recorded as s lines: every fork for a full
+    /// capture, the touched relations for a delta. The chain walk in
+    /// [`ChainReader::fork_size`] answers from the newest index naming
+    /// a fork, which is how a branched tenant with an empty pg/ prefix
+    /// learns the lengths of inherited relations.
+    pub(crate) sizes: BTreeMap<(u32, u32, u32, u32), u32>,
 }
 
 impl ChkIndex {
-    fn parse(id: &str, layout: TenantLayout, text: &str) -> Result<Self, String> {
+    pub(crate) fn parse(id: &str, layout: TenantLayout, text: &str) -> Result<Self, String> {
         let mut lines = text.lines();
         let run_pages = lines
             .next()
@@ -96,6 +113,8 @@ impl ChkIndex {
             .ok_or_else(|| format!("bad PAGES header in {id}"))?;
         let mut entries = Vec::new();
         let mut rels = BTreeSet::new();
+        let mut truncs = BTreeMap::new();
+        let mut sizes = BTreeMap::new();
         for line in lines {
             let num = |rest: &str| -> Result<Vec<u32>, String> {
                 rest.split(' ')
@@ -124,7 +143,26 @@ impl ChkIndex {
                     db: v[1],
                     rel: v[2],
                 });
-            } else if !line.starts_with("s ") {
+            } else if let Some(rest) = line.strip_prefix("t ") {
+                let v = num(rest)?;
+                if v.len() != 4 {
+                    return Err(format!("bad PAGES line in {id}"));
+                }
+                truncs.insert(
+                    RelTag {
+                        spc: v[0],
+                        db: v[1],
+                        rel: v[2],
+                    },
+                    v[3],
+                );
+            } else if let Some(rest) = line.strip_prefix("s ") {
+                let v = num(rest)?;
+                if v.len() != 5 {
+                    return Err(format!("bad PAGES line in {id}"));
+                }
+                sizes.insert((v[0], v[1], v[2], v[3]), v[4]);
+            } else {
                 return Err(format!("unknown PAGES line in {id}"));
             }
         }
@@ -137,11 +175,13 @@ impl ChkIndex {
             run_pages,
             entries,
             rels,
+            truncs,
+            sizes,
         })
     }
 
     /// Which run object holds the block and at what byte offset.
-    fn lookup(&self, r: &BlockRef) -> Option<(u32, u64)> {
+    pub(crate) fn lookup(&self, r: &BlockRef) -> Option<(u32, u64)> {
         let i = self.entries.binary_search(r).ok()?;
         Some((
             (i / self.run_pages) as u32,
@@ -205,6 +245,7 @@ impl TailScan {
         &mut self,
         dirty: &mut BTreeSet<BlockRef>,
         rels: &mut BTreeSet<RelTag>,
+        truncs: &mut BTreeMap<RelTag, u32>,
     ) -> Result<(), String> {
         if !self.started || self.window.buf.is_empty() {
             return Ok(());
@@ -212,6 +253,10 @@ impl TailScan {
         let out = walscan::scan_available(&self.window, self.window.base)?;
         dirty.extend(out.refs);
         rels.extend(out.rels);
+        for (tag, cut) in out.truncs {
+            let e = truncs.entry(tag).or_insert(cut);
+            *e = (*e).min(cut);
+        }
         let consumed = (out.resume - self.window.base) as usize;
         self.window.buf.drain(..consumed);
         self.window.base = out.resume;
@@ -246,6 +291,16 @@ fn scan_segment_into(
     Ok(())
 }
 
+/// Why an attach failed. A fatal failure means the manifest is a
+/// branch: the pg/ prefix of a branch holds only its own divergent
+/// writes, so falling back to it would read zeros where inherited
+/// pages should be, and the caller must refuse to serve instead.
+#[derive(Debug)]
+pub struct AttachError {
+    pub fatal: bool,
+    pub why: String,
+}
+
 pub struct ChainReader {
     /// Newest first, starting no earlier than the newest full capture.
     chain: Vec<ChkIndex>,
@@ -254,6 +309,10 @@ pub struct ChainReader {
     floor: u64,
     dirty: BTreeSet<BlockRef>,
     dirty_rels: BTreeSet<RelTag>,
+    /// Truncates the tail WAL or this process performed, the smallest
+    /// cutoff per relation. Blocks below it still serve from the
+    /// chain, the truncate never touched them.
+    dirty_truncs: BTreeMap<RelTag, u32>,
     tails: BTreeMap<u64, TailScan>,
     seen: BTreeSet<String>,
     /// The published durable LSN the last barrier ran under. A read
@@ -261,6 +320,9 @@ pub struct ChainReader {
     scanned_durable: u64,
     cache: SlabCache,
     poisoned: bool,
+    /// The manifest is a branch, pg/ fallback is not sound for blocks
+    /// this reader declines, see [`AttachError`].
+    branched: bool,
 }
 
 impl ChainReader {
@@ -270,20 +332,45 @@ impl ChainReader {
     /// pg/. An index pattern that cannot be served soundly is an error:
     /// every checkpoint newer than the oldest index bearing one must
     /// have an index too, otherwise a window of dirtied blocks would be
-    /// invisible to the chain walk.
-    pub fn attach(store: &dyn CasStore, layout: &TenantLayout) -> Result<Option<Self>, String> {
+    /// invisible to the chain walk. A branched manifest tightens both
+    /// rules into fatal errors, and demands a run bearing full at the
+    /// bottom of the chain, because a branch has no pg/ fallback for
+    /// inherited state: blocks below an indexless capture exist only
+    /// under the parent's mutable prefix, which moved on after the
+    /// branch and must never serve.
+    pub fn attach(
+        store: &dyn CasStore,
+        layout: &TenantLayout,
+    ) -> Result<Option<Self>, AttachError> {
+        let soft = |why: String| AttachError { fatal: false, why };
         let Some((data, _)) = store
             .get(&layout.manifest())
-            .map_err(|e| format!("store: {e}"))?
+            .map_err(|e| soft(format!("store: {e}")))?
         else {
             return Ok(None);
         };
-        let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
+        let manifest = Manifest::from_json(&data).map_err(|e| soft(format!("manifest: {e}")))?;
+        let branched = manifest.branch_of.is_some()
+            || !manifest.parent_tail.is_empty()
+            || manifest.checkpoints.iter().any(|c| c.owner.is_some());
+        let fail = |why: String| AttachError {
+            fatal: branched,
+            why,
+        };
+        let no_chain = || AttachError {
+            fatal: true,
+            why: "the branch has no run bearing full capture to serve inherited pages from, \
+                  fold one in the source before branching"
+                .into(),
+        };
         let Some(full) = manifest
             .checkpoints
             .iter()
             .rposition(|c| c.kind == CheckpointKind::Full)
         else {
+            if branched {
+                return Err(no_chain());
+            }
             return Ok(None);
         };
         // The index bearing checkpoints must form a contiguous newest
@@ -299,21 +386,24 @@ impl ChainReader {
             let lay = crate::fold::chk_layout(layout, c);
             match store
                 .get(&lay.checkpoint_page_index(&c.id))
-                .map_err(|e| format!("store: {e}"))?
+                .map_err(|e| fail(format!("store: {e}")))?
             {
                 Some((data, _)) => {
                     if gap {
-                        return Err(format!(
+                        return Err(fail(format!(
                             "checkpoint {} has PAGES but a newer one does not",
                             c.id
-                        ));
+                        )));
                     }
                     let text = String::from_utf8(data)
-                        .map_err(|_| format!("PAGES for {} is not utf8", c.id))?;
-                    chain.push(ChkIndex::parse(&c.id, lay, &text)?);
+                        .map_err(|_| fail(format!("PAGES for {} is not utf8", c.id)))?;
+                    chain.push(ChkIndex::parse(&c.id, lay, &text).map_err(fail)?);
                 }
                 None => gap = true,
             }
+        }
+        if branched && (chain.is_empty() || gap) {
+            return Err(no_chain());
         }
         if chain.is_empty() {
             return Ok(None);
@@ -331,6 +421,7 @@ impl ChainReader {
         // this tenant's own.
         let mut dirty = BTreeSet::new();
         let mut dirty_rels = BTreeSet::new();
+        let mut dirty_truncs = BTreeMap::new();
         for pt in &manifest.parent_tail {
             let lay = TenantLayout::new(&pt.tenant_ref);
             let mut scans: BTreeMap<u64, TailScan> = BTreeMap::new();
@@ -338,12 +429,13 @@ impl ChainReader {
                 let key = lay.wal_segment_path(name);
                 let (bytes, _) = store
                     .get(&key)
-                    .map_err(|e| format!("store: {e}"))?
-                    .ok_or_else(|| format!("inherited segment {key} is missing"))?;
-                scan_segment_into(&mut scans, name, &bytes, floor)?;
+                    .map_err(|e| fail(format!("store: {e}")))?
+                    .ok_or_else(|| fail(format!("inherited segment {key} is missing")))?;
+                scan_segment_into(&mut scans, name, &bytes, floor).map_err(fail)?;
             }
             for tail in scans.values_mut() {
-                tail.scan(&mut dirty, &mut dirty_rels)?;
+                tail.scan(&mut dirty, &mut dirty_rels, &mut dirty_truncs)
+                    .map_err(fail)?;
             }
         }
         Ok(Some(Self {
@@ -351,11 +443,13 @@ impl ChainReader {
             floor,
             dirty,
             dirty_rels,
+            dirty_truncs,
             tails: BTreeMap::new(),
             seen: BTreeSet::new(),
             scanned_durable: 0,
             cache: SlabCache::new(CacheConfig::from_env()),
             poisoned: false,
+            branched,
         }))
     }
 
@@ -381,10 +475,65 @@ impl ChainReader {
         self.dirty.insert(r);
     }
 
-    /// A truncate, unlink, or create in this process invalidates every
-    /// run image of the relation.
+    /// An unlink or create in this process invalidates every run image
+    /// of the relation.
     pub fn note_rel(&mut self, t: RelTag) {
         self.dirty_rels.insert(t);
+    }
+
+    /// A truncate in this process: main fork blocks below `nblocks`
+    /// survived and keep serving, everything else the relation held is
+    /// dead. The smallest cutoff wins across repeated truncates.
+    pub fn note_truncate(&mut self, t: RelTag, nblocks: u32) {
+        let e = self.dirty_truncs.entry(t).or_insert(nblocks);
+        *e = (*e).min(nblocks);
+    }
+
+    /// The manifest this reader attached to is a branch, so a block or
+    /// size the chain declines has no sound pg/ fallback for inherited
+    /// state, only the tenant's own divergent writes live there.
+    pub fn branched(&self) -> bool {
+        self.branched
+    }
+
+    /// The fork's block count as the chain knows it: the newest index
+    /// with an s line for the fork answers, an r line in a newer index
+    /// masks older answers the way it masks pages, and a t line
+    /// answers for the main fork directly, the truncate record named
+    /// the exact surviving count. `None` means the chain never heard
+    /// of the fork or an event killed every older answer.
+    ///
+    /// The caller consults its own SIZE object first, an own write of
+    /// extend, truncate, or create always lands there eagerly and is
+    /// newer than any fold. So this only answers for forks untouched
+    /// since the index that names them, where the folded size is still
+    /// current, which is exactly the inherited state a branch cannot
+    /// find under its own prefix. No freshness barrier runs here: a
+    /// size can only move through an smgr call that writes the own
+    /// SIZE first.
+    pub fn fork_size(&self, spc: u32, db: u32, rel: u32, fork: u32) -> Option<u32> {
+        if self.poisoned {
+            return None;
+        }
+        let tag = RelTag { spc, db, rel };
+        for chk in &self.chain {
+            if let Some(n) = chk.sizes.get(&(spc, db, rel, fork)) {
+                return Some(*n);
+            }
+            if let Some(cut) = chk.truncs.get(&tag) {
+                match (fork, *cut) {
+                    // A vm or fsm only truncate, the main fork length
+                    // is whatever an older index says.
+                    (0, u32::MAX) => {}
+                    (0, cut) => return Some(cut),
+                    _ => return None,
+                }
+            }
+            if chk.rels.contains(&tag) {
+                return None;
+            }
+        }
+        None
     }
 
     /// Serve one page from the chain, or `None` when pg/ must answer:
@@ -415,9 +564,17 @@ impl ChainReader {
                 hit = Some((chk.layout.clone(), chk.id.clone(), run, off));
                 break;
             }
+            if let Some(cut) = chk.truncs.get(&tag) {
+                // A truncate in this window: main fork blocks below
+                // the cutoff survived with their bytes and older
+                // copies still serve, everything else is dead.
+                if r.fork != 0 || r.blk >= *cut {
+                    break;
+                }
+            }
             if chk.rels.contains(&tag) {
-                // The relation was truncated or its file recreated in
-                // this window, older copies of it are stale.
+                // The relation's file was recreated in this window,
+                // older copies of it are stale.
                 break;
             }
         }
@@ -430,6 +587,11 @@ impl ChainReader {
             self.scanned_durable = self.scanned_durable.max(durable);
         }
         if self.dirty.contains(&r) || self.dirty_rels.contains(&tag) {
+            return None;
+        }
+        if let Some(cut) = self.dirty_truncs.get(&tag)
+            && (r.fork != 0 || r.blk >= *cut)
+        {
             return None;
         }
         match self.fetch(store, &lay, &id, run, off) {
@@ -463,7 +625,11 @@ impl ChainReader {
             self.seen.insert(key);
         }
         for tail in self.tails.values_mut() {
-            tail.scan(&mut self.dirty, &mut self.dirty_rels)?;
+            tail.scan(
+                &mut self.dirty,
+                &mut self.dirty_rels,
+                &mut self.dirty_truncs,
+            )?;
         }
         Ok(())
     }
@@ -687,6 +853,60 @@ mod tests {
     }
 
     #[test]
+    fn a_truncate_event_in_a_newer_delta_spares_blocks_below_its_cutoff() {
+        let (_d, store, layout) = setup();
+        put_chk(
+            &*store,
+            &layout,
+            "f1",
+            &[
+                (blk(20000, 0), 0xA0),
+                (blk(20000, 1), 0xA1),
+                (blk(20000, 5), 0xA5),
+                (
+                    BlockRef {
+                        spc: 1663,
+                        db: 5,
+                        rel: 20000,
+                        fork: 1,
+                        blk: 0,
+                    },
+                    0xF5,
+                ),
+            ],
+            &[],
+        );
+        let delta = "runs 1024\nt 1663 5 20000 2\n";
+        store
+            .put_new(&layout.checkpoint_page_index("d2"), delta.as_bytes())
+            .unwrap();
+        put_manifest(
+            &*store,
+            &layout,
+            &[
+                ("f1", 0x100, CheckpointKind::Full),
+                ("d2", 0x200, CheckpointKind::Delta),
+            ],
+        );
+
+        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
+        // Blocks below the cutoff survived the truncate byte for byte.
+        let page = rd.read(&*store, &layout, blk(20000, 1), 0).unwrap();
+        assert!(page.iter().all(|b| *b == 0xA1));
+        // The truncated block and the fsm fork are dead.
+        assert!(rd.read(&*store, &layout, blk(20000, 5), 0).is_none());
+        let fsm = BlockRef {
+            spc: 1663,
+            db: 5,
+            rel: 20000,
+            fork: 1,
+            blk: 0,
+        };
+        assert!(rd.read(&*store, &layout, fsm, 0).is_none());
+        assert!(!rd.poisoned());
+    }
+
+    #[test]
     fn tail_wal_dirties_blocks_and_relations() {
         let (_d, store, layout) = setup();
         let floor = WAL_SEGMENT_SIZE;
@@ -698,6 +918,7 @@ mod tests {
                 (blk(16384, 0), 0xAA),
                 (blk(16384, 1), 0xBB),
                 (blk(30000, 0), 0xDD),
+                (blk(30000, 1), 0xDE),
             ],
             &[],
         );
@@ -706,6 +927,8 @@ mod tests {
         let gc = commit(&store, &layout);
         let mut wal = Builder::new(floor);
         wal.record(&[(blk(16384, 0), false)], b"dirty block zero");
+        // A truncate of relation 30000 down to one block: the survivor
+        // keeps serving its chain image, the truncated block must not.
         let mut trunc = Vec::new();
         trunc.extend_from_slice(&1u32.to_le_bytes());
         trunc.extend_from_slice(&1663u32.to_le_bytes());
@@ -718,7 +941,9 @@ mod tests {
 
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
         assert!(rd.read(&*store, &layout, blk(16384, 0), 0).is_none());
-        assert!(rd.read(&*store, &layout, blk(30000, 0), 0).is_none());
+        assert!(rd.read(&*store, &layout, blk(30000, 1), 0).is_none());
+        let survivor = rd.read(&*store, &layout, blk(30000, 0), 0).unwrap();
+        assert!(survivor.iter().all(|b| *b == 0xDD));
         let clean = rd.read(&*store, &layout, blk(16384, 1), 0).unwrap();
         assert!(clean.iter().all(|b| *b == 0xBB));
         assert!(!rd.poisoned());
@@ -790,7 +1015,8 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("attach must refuse the gap"),
         };
-        assert!(err.contains("newer one does not"));
+        assert!(err.why.contains("newer one does not"));
+        assert!(!err.fatal, "pg/ still serves an unbranched tenant");
     }
 
     #[test]
@@ -808,6 +1034,95 @@ mod tests {
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
         let page = rd.read(&*store, &layout, blk(16384, 0), 0).unwrap();
         assert!(page.iter().all(|b| *b == 0xAB));
+    }
+
+    #[test]
+    fn fork_sizes_walk_the_chain_and_rel_events_mask_older_ones() {
+        let (_d, store, layout) = setup();
+        let full = "runs 1024\ns 1663 5 16384 0 4\ns 1663 5 20000 0 7\n";
+        store
+            .put_new(&layout.checkpoint_page_index("f1"), full.as_bytes())
+            .unwrap();
+        let delta = "runs 1024\nr 1663 5 20000\ns 1663 5 16384 0 6\n";
+        store
+            .put_new(&layout.checkpoint_page_index("d2"), delta.as_bytes())
+            .unwrap();
+        put_manifest(
+            &*store,
+            &layout,
+            &[
+                ("f1", 0x100, CheckpointKind::Full),
+                ("d2", 0x200, CheckpointKind::Delta),
+            ],
+        );
+
+        let rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
+        assert!(!rd.branched());
+        assert_eq!(rd.fork_size(1663, 5, 16384, 0), Some(6), "newest s wins");
+        assert_eq!(
+            rd.fork_size(1663, 5, 20000, 0),
+            None,
+            "the rel event in d2 masks the size the full recorded"
+        );
+        assert_eq!(rd.fork_size(1663, 5, 99, 0), None);
+    }
+
+    #[test]
+    fn a_truncate_event_answers_the_main_fork_size_and_masks_the_rest() {
+        let (_d, store, layout) = setup();
+        let full = "runs 1024\ns 1663 5 16384 0 9\ns 1663 5 16384 1 3\ns 1663 5 20000 0 4\n";
+        store
+            .put_new(&layout.checkpoint_page_index("f1"), full.as_bytes())
+            .unwrap();
+        let delta = format!("runs 1024\nt 1663 5 16384 2\nt 1663 5 20000 {}\n", u32::MAX);
+        store
+            .put_new(&layout.checkpoint_page_index("d2"), delta.as_bytes())
+            .unwrap();
+        put_manifest(
+            &*store,
+            &layout,
+            &[
+                ("f1", 0x100, CheckpointKind::Full),
+                ("d2", 0x200, CheckpointKind::Delta),
+            ],
+        );
+
+        let rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
+        assert_eq!(
+            rd.fork_size(1663, 5, 16384, 0),
+            Some(2),
+            "the truncate record names the exact surviving count"
+        );
+        assert_eq!(
+            rd.fork_size(1663, 5, 16384, 1),
+            None,
+            "the fsm fork length from before the truncate is dead"
+        );
+        assert_eq!(
+            rd.fork_size(1663, 5, 20000, 0),
+            Some(4),
+            "a vm only truncate leaves the main fork answer alone"
+        );
+    }
+
+    #[test]
+    fn a_branch_without_a_run_bearing_chain_refuses_fatally() {
+        let (_d, store, layout) = setup();
+        put_manifest(
+            &*store,
+            &layout,
+            &[("genesis", 0x100, CheckpointKind::Full)],
+        );
+        zou_store::branch(&*store, "local", "child", None, 5000).unwrap();
+        let err = match ChainReader::attach(&*store, &TenantLayout::new("child")) {
+            Err(e) => e,
+            Ok(_) => panic!("a branch with nothing to serve inherited pages from must refuse"),
+        };
+        assert!(
+            err.fatal,
+            "pg/ fallback would read zeros for inherited pages"
+        );
+        assert!(err.why.contains("run bearing"));
     }
 
     #[test]
