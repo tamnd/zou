@@ -465,7 +465,7 @@ impl ChainReader {
 
     fn poison(&mut self, why: &str) {
         if !self.poisoned {
-            eprintln!("zou chain reader poisoned, all reads fall back to pg/: {why}");
+            log::error!("zou chain reader poisoned, all reads fall back to pg/: {why}");
         }
         self.poisoned = true;
     }

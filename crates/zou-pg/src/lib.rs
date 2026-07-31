@@ -106,11 +106,11 @@ fn with_reader<R>(
                 }
                 Ok(None) => ReaderSlot::Off,
                 Err(e) if e.fatal => {
-                    eprintln!("zou chain reader cannot serve this branch: {}", e.why);
+                    log::error!("zou chain reader cannot serve this branch: {}", e.why);
                     ReaderSlot::Fatal
                 }
                 Err(e) => {
-                    eprintln!(
+                    log::warn!(
                         "zou chain reader attach failed, reads stay on pg/: {}",
                         e.why
                     );
@@ -164,6 +164,18 @@ fn note_truncate(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u
 
 fn wrap(f: impl FnOnce() -> i32) -> i32 {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(ZOU_ERR_PANIC)
+}
+
+/// Install the env_logger backend once per process. Output goes to
+/// stderr, which the server collects into its own log, so Rust lines
+/// land next to Postgres's. `RUST_LOG` in the server environment
+/// filters them and info is the default.
+fn init_logging() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .try_init();
+    });
 }
 
 fn with_shim(f: impl FnOnce(&'static Shim) -> i32) -> i32 {
@@ -241,6 +253,7 @@ fn block_index(key: &str) -> Option<u32> {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
     wrap(|| {
+        init_logging();
         if target.is_null() {
             return ZOU_ERR_BAD_ARGUMENT;
         }
@@ -250,7 +263,7 @@ pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
         let store = match open_store(target) {
             Ok(store) => store,
             Err(e) => {
-                eprintln!("zou_pg_init: {e}");
+                log::error!("zou_pg_init: {e}");
                 return ZOU_ERR_BAD_ARGUMENT;
             }
         };
@@ -629,10 +642,11 @@ fn resume_point(
 /// Returns the pipe plus the Postgres LSN to resume pushing from, zero
 /// when the store holds no WAL and pushing starts at `flush_lsn`.
 fn open_wal_pipe(target: &str, flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
+    init_logging();
     let store: Arc<dyn CasStore> = match open_store(target) {
         Ok(store) => Arc::from(store),
         Err(e) => {
-            eprintln!("zou_wal_open: {e}");
+            log::error!("zou_wal_open: {e}");
             return Err(ZOU_ERR_BAD_ARGUMENT);
         }
     };
@@ -837,7 +851,7 @@ pub unsafe extern "C" fn zou_wal_fold(redo: u64, out_dropped: *mut u32) -> i32 {
             Err(e) => {
                 // The bgworker's stderr lands in the server log, which is
                 // the only channel this shim has for the error detail.
-                eprintln!("zou_wal_fold: {e}");
+                log::error!("zou_wal_fold: {e}");
                 ZOU_ERR_STORE
             }
         }

@@ -136,7 +136,7 @@ jobs:
             sleep 1
           done
           [ "$OUT" = 100 ]
-          grep -q "zou: restored" /tmp/zou-dev2.log
+          grep -q "restored [0-9]* files" /tmp/zou-dev2.log
           kill -INT "$DEV2"
           wait "$DEV2"
           cat /tmp/zou-dev.log /tmp/zou-dev2.log

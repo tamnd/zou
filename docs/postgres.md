@@ -77,6 +77,10 @@ The `zou dev` command wraps this whole choreography for daily use.
 `zou dev <target>` runs initdb plus the genesis capture when the target holds no checkpoints yet, restores into a throwaway runtime directory otherwise, then supervises the patched postmaster on 127.0.0.1:5432 plus a unix socket in a private directory, restarting it when it dies and shutting it down fast on SIGINT or SIGTERM.
 `--pg-bin` or `ZOU_PG_BIN` points it at the patched install, `build/pg/bin` by default, and `--port` and `--runtime` override the rest.
 
+The Rust side logs through the standard log facade to stderr with level, timestamp, and module target, and `RUST_LOG` filters it with the usual directives, info being the default.
+That holds inside the server too: the shim installs the same backend on init, its lines land in the server log next to Postgres's own, and `RUST_LOG=zou_pg=debug,zou_store=debug` in the server environment turns up the detail.
+The zou binary passes its environment to the postmaster child, so one `RUST_LOG` set in front of `zou dev` reaches both the supervisor and the shim.
+
 On restart or reattach the pusher resumes right after the store's last record rather than at the local flush pointer, because the previous session can exit before pushing its final bytes, the shutdown checkpoint record at least, which is written after background workers stop.
 The manifest tail chains segment lists across writer sessions, each entry named `<epoch>/<start-lsn>.wal`, and a session opening the store first reconciles the tail against a full listing of `wal/` so segments sealed by a crashed session are never lost.
 

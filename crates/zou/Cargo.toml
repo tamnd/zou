@@ -10,6 +10,8 @@ authors.workspace = true
 [dependencies]
 zou-pg = { path = "../zou-pg" }
 zou-store = { path = "../zou-store" }
+env_logger = { workspace = true }
+log = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
