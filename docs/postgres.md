@@ -46,7 +46,11 @@ Without `ZOU_TARGET` the binary behaves exactly like stock Postgres on md.
 Two constraints in v0.
 Reads arrive through the PG 18 AIO path, which executes on file descriptors, so `zoustartreadv` stages pages into a per process scratch file and points the IO handle at it, which confines the build to `io_method=sync` and zouinit enforces that at startup.
 `initdb` switches `CREATE DATABASE` to the `wal_log` strategy when `ZOU_TARGET` is set, because `file_copy` duplicates databases with `copydir()` underneath the storage manager and cannot see pages in the object store.
-Durability still comes from the local WAL at this stage, wiring redo into zou-store checkpoints is the next milestone step.
+Patch `0002-zou-wal.patch` adds the durability side.
+A background worker, the zou wal pusher, owns the zou-store writer lease and tails `pg_wal`: every flushed byte is appended to the group commit pipeline as a chunk prefixed with its Postgres LSN, and the durable LSN is published into shared memory.
+Committing backends block after their local flush until the store holds their commit record, the same contract as a synchronous replication ack, so an acked COMMIT is durable on object storage, not just on the local disk.
+The pusher lives in one process because zou-store has a single writer lease, while `XLogWrite` runs in whichever process holds `WALWriteLock`.
+Recovery from the mirrored stream and the bootstrap checkpoint capture are the next milestone steps.
 
 ```sh
 mkdir -p /tmp/zou-pg-store
