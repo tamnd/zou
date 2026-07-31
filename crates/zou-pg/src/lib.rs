@@ -17,6 +17,7 @@
 pub mod cache;
 pub mod capture;
 pub mod fold;
+pub mod gc;
 pub mod reader;
 pub mod restore;
 pub mod walscan;
