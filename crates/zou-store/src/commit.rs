@@ -21,7 +21,7 @@ use crate::cas::{CasError, CasStore};
 use crate::layout::TenantLayout;
 use crate::lease::{self, HeldLease, LeaseError};
 use crate::lsn::Lsn;
-use crate::manifest::{Manifest, WalTail};
+use crate::manifest::{CheckpointRef, Manifest, WalTail};
 use crate::tier::{PureS3Target, WalTarget};
 use crate::wal::{Frame, MAX_BODY_LEN};
 
@@ -86,6 +86,10 @@ pub enum CommitError {
     LeaseLost,
     #[error("wal tail publish failed: {reason}")]
     TailPublish { reason: String },
+    /// A fold request could not be applied to the live tail. The tail is
+    /// unchanged and the pipeline keeps running, the caller retries later.
+    #[error("wal fold rejected: {reason}")]
+    FoldRejected { reason: String },
 }
 
 struct State {
@@ -101,6 +105,19 @@ struct State {
     durable_lsn: u64,
     failure: Option<CommitError>,
     shutdown: bool,
+    /// A pending checkpoint fold, applied by the flusher between frames.
+    fold: Option<FoldRequest>,
+}
+
+/// A checkpoint fold: drop a prefix of sealed segments and publish the
+/// checkpoint ref atomically with the truncated tail. Serviced on the
+/// flusher thread because it owns the live segment list; a manifest CAS
+/// from outside would be undone by the next publish.
+struct FoldRequest {
+    checkpoint: CheckpointRef,
+    /// Segment names to drop, a prefix of the live list, oldest first.
+    drop: Vec<String>,
+    result: Option<Result<(), CommitError>>,
 }
 
 struct Shared {
@@ -315,6 +332,7 @@ impl GroupCommit {
                 durable_lsn: start_lsn.0,
                 failure: None,
                 shutdown: false,
+                fold: None,
             }),
             work: Condvar::new(),
             progress: Condvar::new(),
@@ -381,6 +399,53 @@ impl GroupCommit {
         })
     }
 
+    /// Fold a checkpoint into the manifest: drop `drop` sealed segments,
+    /// which must be a prefix of the live tail, and publish the truncated
+    /// tail together with the checkpoint ref in one manifest update. The
+    /// caller decides which segments the checkpoint covers, this method
+    /// only guarantees the swap is atomic against concurrent publishes.
+    /// Blocks until the flusher applied it. Only meaningful on lease bound
+    /// pipelines, session pipelines reject it.
+    pub fn fold_tail(
+        &self,
+        checkpoint: CheckpointRef,
+        drop: Vec<String>,
+    ) -> Result<(), CommitError> {
+        let mut state = self.shared.state.lock().unwrap();
+        if let Some(failure) = &state.failure {
+            return Err(failure.clone());
+        }
+        if state.shutdown {
+            return Err(CommitError::Closed);
+        }
+        if state.fold.is_some() {
+            return Err(CommitError::FoldRejected {
+                reason: "another fold is in flight".into(),
+            });
+        }
+        state.fold = Some(FoldRequest {
+            checkpoint,
+            drop,
+            result: None,
+        });
+        self.shared.work.notify_one();
+        loop {
+            if state
+                .fold
+                .as_ref()
+                .is_some_and(|fold| fold.result.is_some())
+            {
+                let fold = state.fold.take().expect("checked above");
+                return fold.result.expect("checked above");
+            }
+            if let Some(failure) = state.failure.clone() {
+                state.fold = None;
+                return Err(failure);
+            }
+            state = self.shared.progress.wait(state).unwrap();
+        }
+    }
+
     /// Flush everything pending and stop the flusher. Returns the pipeline
     /// failure if one happened, in which case the unflushed tail is lost
     /// and its tickets already reported that.
@@ -439,6 +504,71 @@ fn flusher_loop(
     } = params;
     let mut state = shared.state.lock().unwrap();
     loop {
+        // A fold outranks everything else: the segment list must not move
+        // between the caller's snapshot and the publish, and only this
+        // thread appends to it, so applying it here makes it atomic.
+        if state
+            .fold
+            .as_ref()
+            .is_some_and(|fold| fold.result.is_none())
+        {
+            let mut fold = state.fold.take().expect("checked above");
+            let result = match tail.as_mut() {
+                None => Err(CommitError::FoldRejected {
+                    reason: "pipeline is not lease bound".into(),
+                }),
+                Some(tail) if !tail.segments.starts_with(&fold.drop) => {
+                    Err(CommitError::FoldRejected {
+                        reason: "drop list is not a prefix of the live tail".into(),
+                    })
+                }
+                Some(tail) if !fold.drop.is_empty() && fold.drop.len() == tail.segments.len() => {
+                    Err(CommitError::FoldRejected {
+                        reason: "fold would drop the entire tail".into(),
+                    })
+                }
+                Some(tail) => {
+                    let kept: Vec<String> = tail.segments[fold.drop.len()..].to_vec();
+                    let from_lsn = match kept.first() {
+                        Some(first) => segment_start_lsn(first).unwrap_or(tail.from_lsn),
+                        None => tail.from_lsn,
+                    };
+                    let wal_tail = WalTail {
+                        epoch_dir: epoch,
+                        from_lsn,
+                        segments: kept.clone(),
+                    };
+                    drop(state);
+                    let result =
+                        publish_manifest(store, layout, tail, wal_tail, Some(&fold.checkpoint));
+                    state = shared.state.lock().unwrap();
+                    // The in memory tail only truncates once the manifest
+                    // carries the checkpoint, otherwise a later routine
+                    // publish would drop coverage the store still needs.
+                    if result.is_ok() {
+                        tail.segments = kept;
+                        tail.from_lsn = from_lsn;
+                    }
+                    result
+                }
+            };
+            match result {
+                Err(e @ CommitError::LeaseLost) => {
+                    fold.result = Some(Err(e.clone()));
+                    state.fold = Some(fold);
+                    state.failure = Some(e);
+                    shared.progress.notify_all();
+                    return;
+                }
+                result => {
+                    fold.result = Some(result);
+                    state.fold = Some(fold);
+                    shared.progress.notify_all();
+                }
+            }
+            continue;
+        }
+
         if state.pending.is_empty() {
             if state.shutdown {
                 // A clean shutdown leaves an exact tail in the manifest.
@@ -562,18 +692,38 @@ fn publish_tail(
     tail: &mut TailCtx,
     epoch: u64,
 ) -> Result<(), CommitError> {
-    const ATTEMPTS: u32 = 5;
     let wal_tail = WalTail {
         epoch_dir: epoch,
         from_lsn: tail.from_lsn,
         segments: tail.segments.clone(),
     };
+    publish_manifest(store, layout, tail, wal_tail, None)
+}
+
+/// The manifest CAS behind both routine tail publishes and checkpoint
+/// folds. Publishes the given tail, and with it the checkpoint ref when
+/// one rides along, skipping refs the manifest already carries so a
+/// retried fold stays idempotent.
+fn publish_manifest(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    tail: &mut TailCtx,
+    wal_tail: WalTail,
+    checkpoint: Option<&CheckpointRef>,
+) -> Result<(), CommitError> {
+    const ATTEMPTS: u32 = 5;
     let mut last: Option<LeaseError> = None;
     for _ in 0..ATTEMPTS {
         let mut held = tail.held.lock().unwrap();
         let wal_tail = wal_tail.clone();
+        let checkpoint = checkpoint.cloned();
         match lease::update_manifest(store, layout, &mut held, move |m| {
             m.wal_tail = Some(wal_tail);
+            if let Some(checkpoint) = checkpoint
+                && !m.checkpoints.iter().any(|c| c.id == checkpoint.id)
+            {
+                m.checkpoints.push(checkpoint);
+            }
         }) {
             Ok(()) => {
                 tail.bytes_since_publish = 0;
@@ -1154,6 +1304,102 @@ mod tests {
             .wal_tail
             .expect("published on close");
         assert!(!tail.segments.is_empty());
+    }
+
+    #[test]
+    fn a_fold_truncates_the_tail_and_publishes_the_checkpoint_atomically() {
+        use crate::manifest::{CheckpointKind, CheckpointRef};
+
+        let (_d, store, layout) = setup();
+        let held = lease_setup(&store, &layout, 1000);
+        let gc = GroupCommit::with_lease(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout.clone(),
+            held,
+            Lsn(0),
+            GroupCommitConfig::default(),
+            TailConfig {
+                seal_bytes: 1,
+                ..TailConfig::default()
+            },
+        );
+        for i in 0u8..4 {
+            gc.append(&[i; 50]).unwrap().wait().unwrap();
+        }
+        let before = manifest_of(&*store, &layout).wal_tail.unwrap();
+        assert_eq!(before.segments.len(), 4, "one sealed segment per append");
+
+        let checkpoint = CheckpointRef {
+            id: "00000000000000aa".into(),
+            lsn: Lsn(0xAA),
+            kind: CheckpointKind::Delta,
+        };
+        gc.fold_tail(checkpoint.clone(), before.segments[..2].to_vec())
+            .unwrap();
+
+        // One manifest swap carries both the truncation and the ref.
+        let m = manifest_of(&*store, &layout);
+        let tail = m.wal_tail.unwrap();
+        assert_eq!(tail.segments, before.segments[2..].to_vec());
+        assert_eq!(
+            tail.from_lsn,
+            segment_start_lsn(&before.segments[2]).unwrap()
+        );
+        assert_eq!(m.checkpoints, vec![checkpoint.clone()]);
+
+        // A retried fold with the same id publishes no duplicate ref.
+        gc.fold_tail(checkpoint.clone(), Vec::new()).unwrap();
+        assert_eq!(manifest_of(&*store, &layout).checkpoints.len(), 1);
+
+        // A drop list the tail does not start with is rejected, and so is
+        // dropping everything, the tail must keep covering the stream.
+        let bogus = vec!["0000000000000099/00000000DEADBEEF.wal".to_string()];
+        assert!(matches!(
+            gc.fold_tail(checkpoint.clone(), bogus),
+            Err(CommitError::FoldRejected { .. })
+        ));
+        let all = manifest_of(&*store, &layout).wal_tail.unwrap().segments;
+        assert!(matches!(
+            gc.fold_tail(checkpoint.clone(), all),
+            Err(CommitError::FoldRejected { .. })
+        ));
+
+        // Later appends chain onto the truncated tail, the dropped
+        // segments never resurface.
+        gc.append(&[9u8; 50]).unwrap().wait().unwrap();
+        gc.close().unwrap();
+        let final_tail = manifest_of(&*store, &layout).wal_tail.unwrap();
+        assert_eq!(final_tail.segments.len(), 3);
+        assert!(!final_tail.segments.contains(&before.segments[0]));
+        assert_eq!(
+            final_tail.from_lsn,
+            segment_start_lsn(&before.segments[2]).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_session_pipeline_rejects_folds() {
+        use crate::manifest::{CheckpointKind, CheckpointRef};
+
+        let (_d, store, layout) = setup();
+        let gc = GroupCommit::new(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout,
+            1,
+            1,
+            Lsn(0),
+            GroupCommitConfig::default(),
+        );
+        let checkpoint = CheckpointRef {
+            id: "x".into(),
+            lsn: Lsn(0),
+            kind: CheckpointKind::Delta,
+        };
+        assert!(matches!(
+            gc.fold_tail(checkpoint, Vec::new()),
+            Err(CommitError::FoldRejected { .. })
+        ));
+        gc.close().unwrap();
     }
 
     #[test]

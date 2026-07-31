@@ -53,6 +53,10 @@ jobs:
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata restart -l /tmp/zou-pg.log
           build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/reread.txt
           grep -q 500500 /tmp/reread.txt
+          build/pg/bin/psql -h /tmp -d postgres -c checkpoint
+          sleep 5
+          grep -q '"kind": "delta"' "$ZOU_TARGET/tenants/local/MANIFEST"
+          grep -q "folded a delta checkpoint" /tmp/zou-pg.log
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           cat /tmp/zou-pg.log
       - name: Restore and attach from the store alone

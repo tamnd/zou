@@ -1,15 +1,17 @@
 //! Attach a node from the store alone: rebuild a data directory from the
-//! genesis checkpoint capture and overlay the mirrored WAL, so a plain
-//! server start runs crash recovery to the end of the durable stream.
+//! checkpoint captures and overlay the mirrored WAL, so a plain server
+//! start runs crash recovery to the end of the durable stream.
 //!
 //! Three steps.
-//! The filesystem capture under `chk/<id>/fs/` is written back exactly as
-//! the INDEX describes it, files and empty directories both.
-//! The captured pg_control still says the cluster was shut down cleanly,
-//! and a clean shutdown makes Postgres skip WAL replay and start writing
-//! right after the old checkpoint, which would overwrite the restored
-//! WAL. So the state field is flipped to in production, turning the start
-//! into ordinary crash recovery from the genesis checkpoint.
+//! The newest full capture under `chk/<id>/fs/` is written back exactly
+//! as its INDEX describes it, then every delta after it in order, later
+//! files overwriting earlier ones.
+//! pg_control from a genesis capture says the cluster was shut down
+//! cleanly, and a clean shutdown makes Postgres skip WAL replay and start
+//! writing right after the old checkpoint, which would overwrite the
+//! restored WAL. So the state field is flipped to in production, turning
+//! the start into ordinary crash recovery. A delta pg_control comes from
+//! a running server and already says so.
 //! Then every record in the WAL stream, a Postgres LSN header plus raw
 //! bytes, is written into the pg_wal segment file it came from, and
 //! recovery replays to the last durable record.
@@ -31,6 +33,10 @@ pub const WAL_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 /// vendored src/include/catalog/pg_control.h. The state field follows
 /// system_identifier (8 bytes) and two version fields (4 bytes each).
 const CONTROL_STATE_OFFSET: usize = 16;
+/// checkPointCopy.redo: after state comes 4 bytes of alignment padding,
+/// then pg_time_t time (8), XLogRecPtr checkPoint (8), and the CheckPoint
+/// struct whose first field is the redo location.
+const CONTROL_REDO_OFFSET: usize = 40;
 const DB_SHUTDOWNED: u32 = 1;
 const DB_IN_PRODUCTION: u32 = 6;
 
@@ -55,24 +61,15 @@ pub fn wal_file_name(tli: u32, lsn: u64) -> String {
     )
 }
 
-/// Flip pg_control from cleanly shut down to in production, recomputing
-/// the crc. The crc field's offset inside the file depends on the struct
-/// layout, so it is discovered instead of assumed: it is the unique
-/// position whose stored word is the crc32c of everything before it.
-/// Anything unexpected fails loudly, this touches the one file Postgres
-/// trusts blindly.
-pub fn patch_control_state(control: &mut [u8]) -> Result<(), String> {
+/// Locate the pg_control crc field. Its offset inside the file depends on
+/// the struct layout, so it is discovered instead of assumed: it is the
+/// unique position whose stored word is the crc32c of everything before
+/// it. A torn or corrupt file has no such position and errors out, which
+/// doubles as an integrity check for callers reading pg_control from
+/// under a running server.
+pub fn control_crc_offset(control: &[u8]) -> Result<usize, String> {
     if control.len() < 512 {
         return Err(format!("pg_control is {} bytes, too small", control.len()));
-    }
-    let state_bytes: [u8; 4] = control[CONTROL_STATE_OFFSET..CONTROL_STATE_OFFSET + 4]
-        .try_into()
-        .expect("checked length");
-    let state = u32::from_le_bytes(state_bytes);
-    if state != DB_SHUTDOWNED {
-        return Err(format!(
-            "pg_control state is {state}, expected a cleanly shut down cluster"
-        ));
     }
     let mut crc_offset = None;
     for k in (CONTROL_STATE_OFFSET + 4)..control.len().min(1024) - 4 {
@@ -84,9 +81,41 @@ pub fn patch_control_state(control: &mut [u8]) -> Result<(), String> {
             crc_offset = Some(k);
         }
     }
-    let Some(k) = crc_offset else {
-        return Err("pg_control crc not found, file layout not understood".into());
-    };
+    crc_offset.ok_or_else(|| "pg_control crc not found, file layout not understood".into())
+}
+
+/// The redo location of the last completed checkpoint recorded in
+/// pg_control. Validates the crc first, so a torn concurrent read fails
+/// instead of returning garbage.
+pub fn control_redo(control: &[u8]) -> Result<u64, String> {
+    control_crc_offset(control)?;
+    let bytes: [u8; 8] = control[CONTROL_REDO_OFFSET..CONTROL_REDO_OFFSET + 8]
+        .try_into()
+        .expect("length checked by control_crc_offset");
+    Ok(u64::from_le_bytes(bytes))
+}
+
+/// Make pg_control say in production, recomputing the crc. A genesis
+/// capture says cleanly shut down, and a clean shutdown makes Postgres
+/// skip WAL replay and start writing right after the old checkpoint,
+/// which would overwrite the restored WAL, so it is flipped into ordinary
+/// crash recovery. A delta capture comes from a running server and
+/// already says in production, nothing to do. Anything else fails loudly,
+/// this touches the one file Postgres trusts blindly.
+pub fn patch_control_state(control: &mut [u8]) -> Result<(), String> {
+    let k = control_crc_offset(control)?;
+    let state_bytes: [u8; 4] = control[CONTROL_STATE_OFFSET..CONTROL_STATE_OFFSET + 4]
+        .try_into()
+        .expect("checked length");
+    let state = u32::from_le_bytes(state_bytes);
+    if state == DB_IN_PRODUCTION {
+        return Ok(());
+    }
+    if state != DB_SHUTDOWNED {
+        return Err(format!(
+            "pg_control state is {state}, expected shut down or in production"
+        ));
+    }
     control[CONTROL_STATE_OFFSET..CONTROL_STATE_OFFSET + 4]
         .copy_from_slice(&DB_IN_PRODUCTION.to_le_bytes());
     let crc = crc32c::crc32c(&control[..k]);
@@ -215,16 +244,25 @@ pub fn restore(store_root: &str, pgdata: &Path) -> Result<RestoreStats, String> 
         .map_err(|e| format!("store: {e}"))?
         .ok_or_else(|| format!("{store_root} has no manifest, nothing to restore"))?;
     let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
-    let checkpoint = manifest
+    let full = manifest
         .checkpoints
         .iter()
-        .rev()
-        .find(|c| c.kind == CheckpointKind::Full)
+        .rposition(|c| c.kind == CheckpointKind::Full)
         .ok_or_else(|| "manifest has no full checkpoint, run zou-bootstrap first".to_string())?;
+    // The newest full capture plus every delta after it, in order. Deltas
+    // only carry what changed, so later files overwrite earlier ones and
+    // the last pg_control wins.
+    let chain = &manifest.checkpoints[full..];
 
     std::fs::create_dir_all(pgdata).map_err(|e| format!("mkdir {}: {e}", pgdata.display()))?;
     set_mode(pgdata, 0o700)?;
-    let (files, dirs) = restore_fs(&*store, &layout, &checkpoint.id, pgdata)?;
+    let mut files = 0usize;
+    let mut dirs = 0usize;
+    for checkpoint in chain {
+        let (f, d) = restore_fs(&*store, &layout, &checkpoint.id, pgdata)?;
+        files += f;
+        dirs += d;
+    }
 
     let control_path = pgdata.join("global/pg_control");
     let mut control = std::fs::read(&control_path).map_err(|e| format!("read pg_control: {e}"))?;
@@ -233,7 +271,7 @@ pub fn restore(store_root: &str, pgdata: &Path) -> Result<RestoreStats, String> 
 
     let mut wal_records = 0usize;
     let mut wal_bytes = 0u64;
-    let mut wal_end = checkpoint.lsn.0;
+    let mut wal_end = chain.last().expect("chain is nonempty").lsn.0;
     let tli = manifest.pg.timeline;
     let pg_wal = pgdata.join("pg_wal");
     let tail = reconcile_tail(&*store, &layout, &manifest).map_err(|e| format!("store: {e}"))?;
@@ -294,8 +332,9 @@ mod tests {
 
     fn synthetic_control(state: u32) -> Vec<u8> {
         // Shaped like ControlFileData: some header words, the state at
-        // offset 16, junk, then the crc over everything before it at an
-        // arbitrary struct dependent position, then zero padding.
+        // offset 16, the checkpoint redo at 40, junk, then the crc over
+        // everything before it at an arbitrary struct dependent position,
+        // then zero padding.
         let mut control = vec![0u8; 8192];
         control[0..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
         control[8..12].copy_from_slice(&1800u32.to_le_bytes());
@@ -304,6 +343,7 @@ mod tests {
         for (i, b) in control[20..300].iter_mut().enumerate() {
             *b = (i * 7 + 13) as u8;
         }
+        control[40..48].copy_from_slice(&0x0100_0028u64.to_le_bytes());
         let crc = crc32c::crc32c(&control[..300]);
         control[300..304].copy_from_slice(&crc.to_le_bytes());
         control
@@ -320,9 +360,27 @@ mod tests {
     }
 
     #[test]
-    fn the_control_state_patch_refuses_a_crashed_cluster() {
+    fn the_control_state_patch_leaves_a_running_capture_alone() {
         let mut control = synthetic_control(DB_IN_PRODUCTION);
+        let before = control.clone();
+        patch_control_state(&mut control).unwrap();
+        assert_eq!(control, before, "in production is already right");
+    }
+
+    #[test]
+    fn the_control_state_patch_refuses_unknown_states() {
+        // 2 is DB_SHUTDOWNING, a capture mid shutdown is not restorable.
+        let mut control = synthetic_control(2);
         assert!(patch_control_state(&mut control).is_err());
+    }
+
+    #[test]
+    fn control_redo_reads_the_checkpoint_redo_and_rejects_torn_files() {
+        let control = synthetic_control(DB_IN_PRODUCTION);
+        assert_eq!(control_redo(&control).unwrap(), 0x0100_0028);
+        let mut torn = control.clone();
+        torn[100] ^= 0xFF;
+        assert!(control_redo(&torn).is_err(), "crc catches the tear");
     }
 
     #[test]
@@ -357,11 +415,33 @@ mod tests {
         store
             .put_new(&layout.chk_index("genesis"), index.as_bytes())
             .unwrap();
+        // A delta checkpoint after genesis: a newer pg_control already in
+        // production and a clog segment, later files overwrite earlier.
+        let delta_control = synthetic_control(DB_IN_PRODUCTION);
+        store
+            .put_new(&layout.chk_file("d1", "global/pg_control"), &delta_control)
+            .unwrap();
+        store
+            .put_new(&layout.chk_file("d1", "pg_xact/0000"), b"delta clog")
+            .unwrap();
+        let delta_index = format!(
+            "f global/pg_control {}\nf pg_xact/0000 10\n",
+            delta_control.len()
+        );
+        store
+            .put_new(&layout.chk_index("d1"), delta_index.as_bytes())
+            .unwrap();
+
         let mut manifest = Manifest::new("local", 18);
         manifest.checkpoints.push(CheckpointRef {
             id: "genesis".into(),
             lsn: Lsn(0x0100_0028),
             kind: CheckpointKind::Full,
+        });
+        manifest.checkpoints.push(CheckpointRef {
+            id: "d1".into(),
+            lsn: Lsn(0x0100_1000),
+            kind: CheckpointKind::Delta,
         });
         store
             .put_new(&layout.manifest(), &manifest.to_json())
@@ -388,18 +468,24 @@ mod tests {
 
         let pgdata = out_dir.path().join("restored");
         let stats = restore(store_root, &pgdata).unwrap();
-        assert_eq!(stats.files, 3);
+        assert_eq!(stats.files, 5, "three genesis files plus two delta");
         assert_eq!(stats.dirs, 1);
         assert_eq!(stats.wal_records, 2);
         assert_eq!(stats.wal_bytes, 4096 + 300);
         assert_eq!(stats.wal_end, 2 * WAL_SEGMENT_SIZE + 200);
 
-        // The tree came back, including the empty dir.
+        // The tree came back, including the empty dir and the delta's
+        // additions on top of genesis.
         assert_eq!(std::fs::read(pgdata.join("PG_VERSION")).unwrap(), b"18\n");
         assert!(pgdata.join("pg_wal/archive_status").is_dir());
+        assert_eq!(
+            std::fs::read(pgdata.join("pg_xact/0000")).unwrap(),
+            b"delta clog"
+        );
 
-        // pg_control flipped to in production.
+        // The delta pg_control won and stayed in production untouched.
         let restored_control = std::fs::read(pgdata.join("global/pg_control")).unwrap();
+        assert_eq!(restored_control, delta_control);
         let state = u32::from_le_bytes(restored_control[16..20].try_into().unwrap());
         assert_eq!(state, DB_IN_PRODUCTION);
 

@@ -60,8 +60,9 @@ target/release/zou-bootstrap /tmp/zou-pg-store /tmp/zou-pgdata --redo "$REDO"
 ```
 
 The `zou-restore` tool closes the loop: it rebuilds a data directory from the store alone.
-It writes the genesis capture back exactly as the INDEX describes it, flips the pg_control state from shut down to in production so the server runs crash recovery instead of trusting the old clean shutdown, and overlays every mirrored WAL record into the `pg_wal` segment file it came from.
-A plain server start then replays from the genesis checkpoint through the last durable record, and the node attaches with all committed data and no other local state.
+It writes the newest full capture back exactly as its INDEX describes it, applies every delta checkpoint after it in manifest order with later files winning, flips the pg_control state from shut down to in production so the server runs crash recovery instead of trusting an old clean shutdown, and overlays every mirrored WAL record into the `pg_wal` segment file it came from.
+A pg_control taken from a running server is already in production and passes through untouched.
+A plain server start then replays from the last checkpoint's redo through the last durable record, and the node attaches with all committed data and no other local state.
 
 ```sh
 target/release/zou-restore /tmp/zou-pg-store /tmp/zou-restored
@@ -77,6 +78,15 @@ Without that gate a kill -9 could leave future pages in the store, and a node at
 `scripts/zou-crash-loop.sh` proves the whole contract: it runs pgbench plus a ledger client that records an id only after the server acks the COMMIT, kills the postmaster with -9 mid load, reattaches from the store alone with `zou-restore`, and asserts every recorded id is present, in a loop.
 CI runs three cycles on every PR that touches the server.
 One known limit: an in place crash restart replays local WAL the store has not seen yet and can push pages early during recovery, so after a crash a node should reattach with `zou-restore`; the fix, starting the pusher at consistent state, is tracked in the milestone issue.
+
+The mirrored tail would grow without bound, so the pusher folds it at every completed Postgres checkpoint.
+Once a checkpoint completes, every page change before its redo location is on the page store, and the WAL before redo is only needed for the state that does not flow through the storage manager.
+The fold captures exactly that as a delta checkpoint under `chk/<redo>/`: pg_control, the transaction status SLRUs (pg_xact, pg_multixact, pg_commit_ts), two phase state, the relation maps, and the config files.
+It then drops the sealed stream segments that lie entirely below the 16MB pg_wal segment boundary under redo, in the same manifest swap that records the checkpoint, so no failure between the two steps can lose WAL coverage.
+The cut sits at the segment boundary rather than at redo itself because the xlog reader validates the first page header of any segment file it opens, so restore must rebuild retained segment files from their start.
+The pusher only folds while fully caught up, pushed equal to the local flush, which guarantees the checkpoint record named by the captured pg_control is already durable in the store.
+Transaction status captured in the fold can run slightly ahead of the record stream for commits landing in the capture window, which is safe because those commits were never acked.
+Dropped segment objects stay in the bucket until the garbage collection job arrives, so a restore may overlay more WAL files than the manifest references, which recovery ignores because replay starts at the restored redo.
 
 ```sh
 mkdir -p /tmp/zou-pg-store
@@ -95,7 +105,7 @@ All five load and run with `ZOU_TARGET` set, hnsw index builds included, and CI 
 
 ## CI
 
-The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, and reads the rows back from the object store, and one that restores a second data directory from the store with `zou-restore` and reads the same rows after crash recovery.
+The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, reads the rows back from the object store, and checkpoints so the manifest carries a folded delta, and one that restores a second data directory from the store with `zou-restore` and reads the same rows after crash recovery, which exercises the delta chain.
 It triggers on any PR touching `vendor/`, `patches/`, the build scripts, the `zou-pg` or `zou-store` crates, or the Makefile, and on manual dispatch.
 A patch that breaks the build or changes `select version()` output gets caught in the same PR that introduces it.
 
