@@ -13,6 +13,7 @@
 //! - `ZOU_S3_REGION`, falls back to `AWS_REGION`, then `us-east-1`
 
 use crate::cas::{CasError, CasStore, LocalFsStore, Version};
+use crate::delay::{DelayConfig, DelayStore};
 
 /// A store that scopes every key under a fixed prefix, so one bucket can
 /// hold many stores. Callers see their own key space: keys are prefixed
@@ -104,9 +105,11 @@ fn parse(target: &str) -> Result<Parsed<'_>, String> {
 
 /// Open the backend a target string names: a filesystem directory, or an
 /// `s3://bucket/prefix` style URL configured from the environment.
+/// `ZOU_STORE_DELAY` wraps the result in [`DelayStore`] for simulated
+/// object store latency, see [`crate::delay`].
 pub fn open_store(target: &str) -> Result<Box<dyn CasStore>, String> {
-    match parse(target)? {
-        Parsed::Local(path) => Ok(Box::new(LocalFsStore::new(path))),
+    let store: Box<dyn CasStore> = match parse(target)? {
+        Parsed::Local(path) => Box::new(LocalFsStore::new(path)),
         Parsed::Remote {
             scheme,
             bucket,
@@ -114,11 +117,18 @@ pub fn open_store(target: &str) -> Result<Box<dyn CasStore>, String> {
         } => {
             let store = open_remote(scheme, bucket)?;
             if prefix.is_empty() {
-                Ok(store)
+                store
             } else {
-                Ok(Box::new(PrefixStore::new(store, prefix)))
+                Box::new(PrefixStore::new(store, prefix))
             }
         }
+    };
+    match std::env::var("ZOU_STORE_DELAY") {
+        Ok(spec) if !spec.is_empty() => {
+            let config = DelayConfig::parse(&spec).map_err(|e| format!("ZOU_STORE_DELAY: {e}"))?;
+            Ok(Box::new(DelayStore::new(store, config)))
+        }
+        _ => Ok(store),
     }
 }
 

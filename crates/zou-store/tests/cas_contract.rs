@@ -93,6 +93,11 @@ fn list_returns_sorted_keys_under_a_prefix(store: &dyn CasStore) {
         store.list("contract/list/").unwrap(),
         vec!["contract/list/a", "contract/list/b", "contract/list/sub/c"]
     );
+    // A prefix ending mid name filters by bytes, the way S3 does.
+    assert_eq!(
+        store.list("contract/list/su").unwrap(),
+        vec!["contract/list/sub/c"]
+    );
 }
 
 /// The classic CAS counter: N threads each add 1 through a read-modify-swap
