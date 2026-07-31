@@ -35,8 +35,19 @@
 //!
 //! Any parse error, store error, or coverage gap poisons the reader,
 //! which then declines every read and the smgr falls back to pg/.
-//! The per read LIST is the v0 freshness barrier, the shared memory
-//! durable LSN replaces it together with the cache tiers.
+//!
+//! The LIST would be the whole read cost if it ran every time, so the
+//! barrier is gated on the durable LSN the wal pusher publishes into
+//! shared memory. The write gate reads that same value before letting
+//! a page object mutate, so a change to any block always advances the
+//! published LSN before the page can change, and a read that sees an
+//! unchanged value since its last scan can skip the LIST outright. A
+//! zero means no pusher has published, initdb, recovery, or a store
+//! opened readonly, and the reader falls back to listing every time.
+//! Run slabs go through [`crate::cache::SlabCache`], RAM in front of
+//! an optional shared disk tier, keyed by checkpoint id, run, and
+//! offset, which is content addressed because run objects are
+//! immutable.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,6 +56,7 @@ use zou_store::manifest::{CheckpointKind, Manifest};
 use zou_store::{CasStore, SegmentReader};
 
 use crate::ZOU_PAGE_SIZE;
+use crate::cache::{CacheConfig, SlabCache};
 use crate::walscan::{self, BlockRef, RelTag, WalWindow};
 
 /// Readahead unit for run objects. Neighboring pages of a sequential
@@ -193,12 +205,6 @@ impl TailScan {
     }
 }
 
-struct Slab {
-    key: String,
-    offset: u64,
-    data: Vec<u8>,
-}
-
 pub struct ChainReader {
     /// Newest first, starting no earlier than the newest full capture.
     chain: Vec<ChkIndex>,
@@ -209,7 +215,10 @@ pub struct ChainReader {
     dirty_rels: BTreeSet<RelTag>,
     tails: BTreeMap<u64, TailScan>,
     seen: BTreeSet<String>,
-    slab: Option<Slab>,
+    /// The published durable LSN the last barrier ran under. A read
+    /// whose durable LSN has not moved past this skips the LIST.
+    scanned_durable: u64,
+    cache: SlabCache,
     poisoned: bool,
 }
 
@@ -279,9 +288,16 @@ impl ChainReader {
             dirty_rels: BTreeSet::new(),
             tails: BTreeMap::new(),
             seen: BTreeSet::new(),
-            slab: None,
+            scanned_durable: 0,
+            cache: SlabCache::new(CacheConfig::from_env()),
             poisoned: false,
         }))
+    }
+
+    /// Emit the cache hit rate summary, see
+    /// [`SlabCache::log_summary`].
+    pub fn log_cache_summary(&self) {
+        self.cache.log_summary();
     }
 
     pub fn poisoned(&self) -> bool {
@@ -308,12 +324,17 @@ impl ChainReader {
 
     /// Serve one page from the chain, or `None` when pg/ must answer:
     /// the block is not in the chain, something dirtied it, or the
-    /// reader is poisoned.
+    /// reader is poisoned. `durable` is the durable LSN published by
+    /// the wal pusher at the moment the read began, zero when no
+    /// pusher has published one; an unchanged nonzero value since the
+    /// last barrier means the stream cannot hold anything new and the
+    /// LIST is skipped.
     pub fn read(
         &mut self,
         store: &dyn CasStore,
         layout: &TenantLayout,
         r: BlockRef,
+        durable: u64,
     ) -> Option<Vec<u8>> {
         if self.poisoned {
             return None;
@@ -336,9 +357,12 @@ impl ChainReader {
             }
         }
         let (id, run, off) = hit?;
-        if let Err(e) = self.barrier(store, layout) {
-            self.poison(&e);
-            return None;
+        if durable == 0 || durable > self.scanned_durable {
+            if let Err(e) = self.barrier(store, layout) {
+                self.poison(&e);
+                return None;
+            }
+            self.scanned_durable = self.scanned_durable.max(durable);
         }
         if self.dirty.contains(&r) || self.dirty_rels.contains(&tag) {
             return None;
@@ -393,8 +417,8 @@ impl ChainReader {
         Ok(())
     }
 
-    /// Range read the page out of its run object through a one slot
-    /// readahead slab.
+    /// Range read the page out of its run object through the slab
+    /// cache, one aligned readahead slab per range request.
     fn fetch(
         &mut self,
         store: &dyn CasStore,
@@ -403,28 +427,22 @@ impl ChainReader {
         run: u32,
         off: u64,
     ) -> Result<Vec<u8>, String> {
-        let key = layout.checkpoint_pages(id, run);
-        let page = ZOU_PAGE_SIZE as u64;
-        if let Some(s) = &self.slab
-            && s.key == key
-            && off >= s.offset
-            && off + page <= s.offset + s.data.len() as u64
-        {
-            let a = (off - s.offset) as usize;
-            return Ok(s.data[a..a + ZOU_PAGE_SIZE].to_vec());
-        }
         let offset = off / SLAB_BYTES * SLAB_BYTES;
-        let data = store
-            .get_range(&key, offset, SLAB_BYTES)
-            .map_err(|e| format!("store: {e}"))?
-            .ok_or_else(|| format!("run object {key} is missing"))?;
-        if (off - offset) as usize + ZOU_PAGE_SIZE > data.len() {
-            return Err(format!("run object {key} is shorter than its index"));
-        }
+        let cache_key = format!("{id}-{run:08}-{offset:016X}");
+        let slab = self.cache.get_or_load(&cache_key, || {
+            let key = layout.checkpoint_pages(id, run);
+            store
+                .get_range(&key, offset, SLAB_BYTES)
+                .map_err(|e| format!("store: {e}"))?
+                .ok_or_else(|| format!("run object {key} is missing"))
+        })?;
         let a = (off - offset) as usize;
-        let out = data[a..a + ZOU_PAGE_SIZE].to_vec();
-        self.slab = Some(Slab { key, offset, data });
-        Ok(out)
+        if a + ZOU_PAGE_SIZE > slab.len() {
+            return Err(format!(
+                "run object for {id} run {run} is shorter than its index"
+            ));
+        }
+        Ok(slab[a..a + ZOU_PAGE_SIZE].to_vec())
     }
 }
 
@@ -540,11 +558,11 @@ mod tests {
         put_manifest(&*store, &layout, &[("f1", 0x100, CheckpointKind::Full)]);
 
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        let page = rd.read(&*store, &layout, blk(16384, 1)).unwrap();
+        let page = rd.read(&*store, &layout, blk(16384, 1), 0).unwrap();
         assert_eq!(page.len(), ZOU_PAGE_SIZE);
         assert!(page.iter().all(|b| *b == 0xBB));
-        assert!(rd.read(&*store, &layout, blk(16384, 7)).is_none());
-        assert!(rd.read(&*store, &layout, blk(999, 0)).is_none());
+        assert!(rd.read(&*store, &layout, blk(16384, 7), 0).is_none());
+        assert!(rd.read(&*store, &layout, blk(999, 0), 0).is_none());
         assert!(!rd.poisoned());
     }
 
@@ -569,9 +587,9 @@ mod tests {
         );
 
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        let newest = rd.read(&*store, &layout, blk(16384, 0)).unwrap();
+        let newest = rd.read(&*store, &layout, blk(16384, 0), 0).unwrap();
         assert!(newest.iter().all(|b| *b == 0xCC));
-        let older = rd.read(&*store, &layout, blk(16384, 1)).unwrap();
+        let older = rd.read(&*store, &layout, blk(16384, 1), 0).unwrap();
         assert!(older.iter().all(|b| *b == 0xBB));
     }
 
@@ -604,11 +622,11 @@ mod tests {
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
         // The truncated relation's own delta pages still serve, images
         // packed after the event are current.
-        let own = rd.read(&*store, &layout, blk(20000, 1)).unwrap();
+        let own = rd.read(&*store, &layout, blk(20000, 1), 0).unwrap();
         assert!(own.iter().all(|b| *b == 0xC1));
         // Older copies of it are dead, the untouched relation is fine.
-        assert!(rd.read(&*store, &layout, blk(20000, 0)).is_none());
-        assert!(rd.read(&*store, &layout, blk(16384, 0)).is_some());
+        assert!(rd.read(&*store, &layout, blk(20000, 0), 0).is_none());
+        assert!(rd.read(&*store, &layout, blk(16384, 0), 0).is_some());
     }
 
     #[test]
@@ -642,9 +660,9 @@ mod tests {
         push(&gc, lsn, bytes);
 
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        assert!(rd.read(&*store, &layout, blk(16384, 0)).is_none());
-        assert!(rd.read(&*store, &layout, blk(30000, 0)).is_none());
-        let clean = rd.read(&*store, &layout, blk(16384, 1)).unwrap();
+        assert!(rd.read(&*store, &layout, blk(16384, 0), 0).is_none());
+        assert!(rd.read(&*store, &layout, blk(30000, 0), 0).is_none());
+        let clean = rd.read(&*store, &layout, blk(16384, 1), 0).unwrap();
         assert!(clean.iter().all(|b| *b == 0xBB));
         assert!(!rd.poisoned());
         gc.close().unwrap();
@@ -668,14 +686,14 @@ mod tests {
         // its pages cannot be in the store yet, so serving the chain
         // image is still correct and nothing poisons.
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        let page = rd.read(&*store, &layout, blk(16384, 0)).unwrap();
+        let page = rd.read(&*store, &layout, blk(16384, 0), 0).unwrap();
         assert!(page.iter().all(|b| *b == 0xAA));
         assert!(!rd.poisoned());
 
         // Once the rest arrives the record completes and dirties the
         // block, the resumed scan picks up exactly where it stopped.
         push(&gc, lsn + cut as u64, &bytes[cut..]);
-        assert!(rd.read(&*store, &layout, blk(16384, 0)).is_none());
+        assert!(rd.read(&*store, &layout, blk(16384, 0), 0).is_none());
         assert!(!rd.poisoned());
         gc.close().unwrap();
     }
@@ -695,8 +713,8 @@ mod tests {
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
         rd.note_write(blk(16384, 0));
         rd.note_rel(tag(20000));
-        assert!(rd.read(&*store, &layout, blk(16384, 0)).is_none());
-        assert!(rd.read(&*store, &layout, blk(20000, 0)).is_none());
+        assert!(rd.read(&*store, &layout, blk(16384, 0), 0).is_none());
+        assert!(rd.read(&*store, &layout, blk(20000, 0), 0).is_none());
     }
 
     #[test]
@@ -731,7 +749,7 @@ mod tests {
             ],
         );
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        let page = rd.read(&*store, &layout, blk(16384, 0)).unwrap();
+        let page = rd.read(&*store, &layout, blk(16384, 0), 0).unwrap();
         assert!(page.iter().all(|b| *b == 0xAB));
     }
 
@@ -770,8 +788,166 @@ mod tests {
 
         let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
         for (i, fill) in [(0u32, 0x11u8), (1, 0x22), (2, 0x33)] {
-            let page = rd.read(&*store, &layout, blk(16384, i)).unwrap();
+            let page = rd.read(&*store, &layout, blk(16384, i), 0).unwrap();
             assert!(page.iter().all(|b| *b == fill), "block {i}");
         }
+    }
+
+    /// Delegating store that counts LIST and ranged GET calls, so the
+    /// tests can see the barrier skip and the slab cache at work.
+    struct CountingStore {
+        inner: Arc<LocalFsStore>,
+        lists: std::sync::atomic::AtomicU64,
+        ranges: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountingStore {
+        fn new(inner: Arc<LocalFsStore>) -> Self {
+            Self {
+                inner,
+                lists: 0.into(),
+                ranges: 0.into(),
+            }
+        }
+
+        fn lists(&self) -> u64 {
+            self.lists.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn ranges(&self) -> u64 {
+            self.ranges.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl CasStore for CountingStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<(Vec<u8>, zou_store::Version)>, zou_store::CasError> {
+            self.inner.get(key)
+        }
+
+        fn put_if_match(
+            &self,
+            key: &str,
+            data: &[u8],
+            expected: Option<&zou_store::Version>,
+        ) -> Result<zou_store::Version, zou_store::CasError> {
+            self.inner.put_if_match(key, data, expected)
+        }
+
+        fn put(&self, key: &str, data: &[u8]) -> Result<zou_store::Version, zou_store::CasError> {
+            self.inner.put(key, data)
+        }
+
+        fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            len: u64,
+        ) -> Result<Option<Vec<u8>>, zou_store::CasError> {
+            self.ranges
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.get_range(key, offset, len)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), zou_store::CasError> {
+            self.inner.delete(key)
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<String>, zou_store::CasError> {
+            self.lists
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.list(prefix)
+        }
+    }
+
+    #[test]
+    fn a_stable_durable_lsn_skips_the_list_barrier() {
+        let (_d, store, layout) = setup();
+        put_chk(
+            &*store,
+            &layout,
+            "f1",
+            &[(blk(16384, 0), 0xAA), (blk(16384, 1), 0xBB)],
+            &[],
+        );
+        put_manifest(&*store, &layout, &[("f1", 0x100, CheckpointKind::Full)]);
+        let counting = CountingStore::new(Arc::clone(&store));
+
+        let mut rd = ChainReader::attach(&counting, &layout).unwrap().unwrap();
+        // The first read always scans, nothing has been listed yet.
+        rd.read(&counting, &layout, blk(16384, 0), 0x500).unwrap();
+        assert_eq!(counting.lists(), 1);
+        // The published LSN has not moved, no reason to list again.
+        rd.read(&counting, &layout, blk(16384, 1), 0x500).unwrap();
+        rd.read(&counting, &layout, blk(16384, 0), 0x500).unwrap();
+        assert_eq!(counting.lists(), 1);
+        // Zero means nobody publishes, every read must list.
+        rd.read(&counting, &layout, blk(16384, 0), 0).unwrap();
+        assert_eq!(counting.lists(), 2);
+        // An advance means the stream may hold new WAL, list once more.
+        rd.read(&counting, &layout, blk(16384, 0), 0x600).unwrap();
+        assert_eq!(counting.lists(), 3);
+        rd.read(&counting, &layout, blk(16384, 0), 0x600).unwrap();
+        assert_eq!(counting.lists(), 3);
+    }
+
+    #[test]
+    fn an_advanced_durable_lsn_still_sees_new_dirtying_wal() {
+        let (_d, store, layout) = setup();
+        let floor = WAL_SEGMENT_SIZE;
+        put_chk(
+            &*store,
+            &layout,
+            "f1",
+            &[(blk(16384, 0), 0xAA), (blk(16384, 1), 0xBB)],
+            &[],
+        );
+        put_manifest(&*store, &layout, &[("f1", floor, CheckpointKind::Full)]);
+        let counting = CountingStore::new(Arc::clone(&store));
+
+        let mut rd = ChainReader::attach(&counting, &layout).unwrap().unwrap();
+        rd.read(&counting, &layout, blk(16384, 0), floor).unwrap();
+
+        // WAL arrives dirtying block 0 and the pusher publishes past
+        // it, exactly what a concurrent writer looks like.
+        let gc = commit(&store, &layout);
+        let mut wal = Builder::new(floor);
+        wal.record(&[(blk(16384, 0), false)], b"concurrent change");
+        let (lsn, bytes) = wal.stream();
+        push(&gc, lsn, bytes);
+        let advanced = floor + bytes.len() as u64;
+
+        assert!(
+            rd.read(&counting, &layout, blk(16384, 0), advanced)
+                .is_none()
+        );
+        let clean = rd
+            .read(&counting, &layout, blk(16384, 1), advanced)
+            .unwrap();
+        assert!(clean.iter().all(|b| *b == 0xBB));
+        assert!(!rd.poisoned());
+        gc.close().unwrap();
+    }
+
+    #[test]
+    fn neighboring_pages_share_one_ranged_read() {
+        let (_d, store, layout) = setup();
+        put_chk(
+            &*store,
+            &layout,
+            "f1",
+            &[(blk(16384, 0), 0xAA), (blk(16384, 1), 0xBB)],
+            &[],
+        );
+        put_manifest(&*store, &layout, &[("f1", 0x100, CheckpointKind::Full)]);
+        let counting = CountingStore::new(Arc::clone(&store));
+
+        let mut rd = ChainReader::attach(&counting, &layout).unwrap().unwrap();
+        rd.read(&counting, &layout, blk(16384, 0), 0x500).unwrap();
+        rd.read(&counting, &layout, blk(16384, 1), 0x500).unwrap();
+        rd.read(&counting, &layout, blk(16384, 0), 0x500).unwrap();
+        assert_eq!(counting.ranges(), 1, "one slab covers both pages");
     }
 }
