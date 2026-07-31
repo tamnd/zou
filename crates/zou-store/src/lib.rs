@@ -5,6 +5,7 @@
 //! checkpoints. The manifest is the only mutable object and is swapped with
 //! compare-and-swap, which also carries the writer lease.
 
+pub mod branch;
 pub mod cas;
 pub mod commit;
 pub mod delay;
@@ -20,6 +21,7 @@ pub mod s3;
 pub mod tier;
 pub mod wal;
 
+pub use branch::{BranchError, branch, materialize_at};
 pub use cas::{CasError, CasStore, LocalFsStore, Version};
 pub use commit::{CommitError, CommitTicket, GroupCommit, GroupCommitConfig, TailConfig};
 pub use delay::{DelayConfig, DelayStore};

@@ -190,9 +190,12 @@ pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
                 return ZOU_ERR_BAD_ARGUMENT;
             }
         };
+        // A restored branch server writes under its own tenant prefix,
+        // ZOU_TENANT names it and single node setups stay on local.
+        let tenant = std::env::var("ZOU_TENANT").unwrap_or_else(|_| "local".to_string());
         let _ = SHIM.set(Shim {
             store: Arc::from(store),
-            layout: TenantLayout::new("local"),
+            layout: TenantLayout::new(&tenant),
             reader: Mutex::new(ReaderSlot::Unset),
         });
         ZOU_OK

@@ -31,6 +31,10 @@ pub struct HeldLease {
     pub expires_unix: u64,
     manifest: Manifest,
     version: Version,
+    /// Second of the last history snapshot this holder wrote, so a busy
+    /// publisher skips the extra PUT instead of racing put_new against
+    /// its own earlier write within the same second.
+    last_history_unix: u64,
 }
 
 impl HeldLease {
@@ -104,6 +108,7 @@ pub fn acquire(
         expires_unix: now_unix + ttl_secs,
         manifest,
         version,
+        last_history_unix: 0,
     })
 }
 
@@ -147,16 +152,47 @@ pub fn release(
 /// publishes wal_tail and checkpoint updates: every such write doubles as
 /// an ownership check, so a stolen lease surfaces as `Lost` here instead
 /// of silently corrupting the manifest.
+///
+/// A swap that changed anything besides the lease also lands a history
+/// snapshot under `manifests/`, at most one per second, which is the
+/// trail PITR materializes branches from. The snapshot is best effort
+/// and written after the swap: the manifest is already current, so a
+/// failed history PUT costs a snapshot of granularity, never state.
 pub fn update_manifest(
     store: &dyn CasStore,
     layout: &TenantLayout,
     held: &mut HeldLease,
+    now_unix: u64,
     mutate: impl FnOnce(&mut Manifest),
 ) -> Result<(), LeaseError> {
     let key = layout.manifest();
     let (mut manifest, version) = reread_checking_ownership(store, &key, held)?;
+    let before = manifest.clone();
     mutate(&mut manifest);
+    let changed = {
+        let strip = |m: &Manifest| {
+            let mut m = m.clone();
+            m.lease = None;
+            m.published_unix = None;
+            m
+        };
+        strip(&before) != strip(&manifest)
+    };
+    if changed {
+        manifest.published_unix = Some(now_unix);
+    }
     held.version = swap(store, &key, &manifest, &version)?;
+    if changed && held.last_history_unix != now_unix {
+        let mut snapshot = manifest.clone();
+        snapshot.lease = None;
+        let history = layout.manifest_history(manifest.epoch, now_unix);
+        match store.put_new(&history, &snapshot.to_json()) {
+            Ok(_) | Err(CasError::AlreadyExists { .. }) => held.last_history_unix = now_unix,
+            Err(e) => {
+                eprintln!("zou: history snapshot {history} failed, pitr loses this second: {e}")
+            }
+        }
+    }
     held.manifest = manifest;
     Ok(())
 }
@@ -286,6 +322,50 @@ mod tests {
         // The next writer gets in immediately, no TTL wait.
         let b = acquire(&store, &layout, "node-b", 15, 1001).unwrap();
         assert_eq!(b.epoch, 2);
+    }
+
+    #[test]
+    fn state_changes_leave_history_snapshots_and_lease_churn_does_not() {
+        use crate::lsn::Lsn;
+        use crate::manifest::{CheckpointKind, CheckpointRef};
+        let chk = |id: &str| CheckpointRef {
+            id: id.into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+            owner: None,
+        };
+        let (_d, store, layout) = setup();
+        let mut held = acquire(&store, &layout, "node-a", 15, 1000).unwrap();
+
+        // A swap that changes nothing but the lease is not history.
+        update_manifest(&store, &layout, &mut held, 1001, |_| {}).unwrap();
+        assert!(store.list(&layout.manifests_dir()).unwrap().is_empty());
+
+        // A checkpoint publish is, with the lease stripped from the copy.
+        update_manifest(&store, &layout, &mut held, 1002, |m| {
+            m.checkpoints.push(chk("aaa"));
+        })
+        .unwrap();
+        let keys = store.list(&layout.manifests_dir()).unwrap();
+        assert_eq!(keys, vec![layout.manifest_history(1, 1002)]);
+        let (data, _) = store.get(&keys[0]).unwrap().unwrap();
+        let snap = Manifest::from_json(&data).unwrap();
+        assert!(snap.lease.is_none(), "history copies carry no lease");
+        assert_eq!(snap.published_unix, Some(1002));
+        assert_eq!(snap.checkpoints.len(), 1);
+
+        // Publishes within one second collapse into one snapshot, the
+        // next second gets its own.
+        update_manifest(&store, &layout, &mut held, 1002, |m| {
+            m.checkpoints.push(chk("bbb"));
+        })
+        .unwrap();
+        assert_eq!(store.list(&layout.manifests_dir()).unwrap().len(), 1);
+        update_manifest(&store, &layout, &mut held, 1003, |m| {
+            m.checkpoints.push(chk("ccc"));
+        })
+        .unwrap();
+        assert_eq!(store.list(&layout.manifests_dir()).unwrap().len(), 2);
     }
 
     #[test]

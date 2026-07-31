@@ -101,11 +101,12 @@ fn run() -> Result<(), String> {
     let files = capture::read_files(&paths)?;
     let bytes = capture::upload(&*store, &layout, GENESIS_ID, &files, &paths.dirs, false)?;
 
-    lease::update_manifest(&*store, &layout, &mut held, |m| {
+    lease::update_manifest(&*store, &layout, &mut held, now_unix(), |m| {
         m.checkpoints.push(CheckpointRef {
             id: GENESIS_ID.to_string(),
             lsn: Lsn(redo),
             kind: CheckpointKind::Full,
+            owner: None,
         });
     })
     .map_err(|e| format!("manifest: {e}"))?;

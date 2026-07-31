@@ -78,6 +78,15 @@ pub struct FoldStats {
     pub dropped: usize,
 }
 
+/// The layout holding a checkpoint's objects: an inherited ref names
+/// its owner, our own live under the tenant's own prefix.
+pub(crate) fn chk_layout(own: &TenantLayout, c: &CheckpointRef) -> TenantLayout {
+    match &c.owner {
+        Some(owner) => TenantLayout::new(owner),
+        None => own.clone(),
+    }
+}
+
 /// Total file bytes a checkpoint describes, summed from its INDEX.
 fn index_bytes(store: &dyn CasStore, layout: &TenantLayout, id: &str) -> Result<u64, String> {
     let (data, _) = store
@@ -119,10 +128,11 @@ fn chain_wants_full(
     if manifest.checkpoints.len() - full > MAX_DELTA_CHAIN {
         return Ok(true);
     }
-    let full_bytes = index_bytes(store, layout, &manifest.checkpoints[full].id)?;
+    let base = &manifest.checkpoints[full];
+    let full_bytes = index_bytes(store, &chk_layout(layout, base), &base.id)?;
     let mut delta_bytes = 0u64;
     for c in &manifest.checkpoints[full + 1..] {
-        delta_bytes += index_bytes(store, layout, &c.id)?;
+        delta_bytes += index_bytes(store, &chk_layout(layout, c), &c.id)?;
     }
     Ok(delta_bytes > fold_down_factor().saturating_mul(full_bytes))
 }
@@ -441,6 +451,7 @@ pub fn fold(
                 id: id.clone(),
                 lsn: Lsn(redo),
                 kind,
+                owner: None,
             },
             drop,
         )
@@ -551,6 +562,7 @@ mod tests {
             id: "genesis".into(),
             lsn: Lsn(stream_base),
             kind: CheckpointKind::Full,
+            owner: None,
         });
         store
             .put_new(&layout.chk_index("genesis"), b"f base/big 1000000\n")
@@ -713,11 +725,13 @@ mod tests {
             id: "genesis".into(),
             lsn: Lsn(0x100),
             kind: CheckpointKind::Full,
+            owner: None,
         });
         m.checkpoints.push(CheckpointRef {
             id: "d1".into(),
             lsn: Lsn(0x200),
             kind: CheckpointKind::Delta,
+            owner: None,
         });
         store
             .put_new(&layout.chk_index("genesis"), b"f base/small 100\n")
@@ -800,6 +814,7 @@ mod tests {
             id: "genesis".into(),
             lsn: Lsn(0x100),
             kind: CheckpointKind::Full,
+            owner: None,
         });
         store
             .put_new(&layout.chk_index("genesis"), b"f base/huge 1000000\n")
@@ -813,6 +828,7 @@ mod tests {
                 id,
                 lsn: Lsn(0x100 + i * 0x100),
                 kind: CheckpointKind::Delta,
+                owner: None,
             });
             let want_full = chain_wants_full(&store, &layout, &m).unwrap();
             assert_eq!(

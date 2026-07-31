@@ -15,6 +15,12 @@
 //! Then every record in the WAL stream, a Postgres LSN header plus raw
 //! bytes, is written into the pg_wal segment file it came from, and
 //! recovery replays to the last durable record.
+//!
+//! A branched tenant restores the same way with two twists: inherited
+//! checkpoints read their files from the owner's prefix, and the frozen
+//! parent tail entries replay before the tenant's own stream, oldest
+//! ancestor first, because the child's WAL begins where the parent's
+//! tail ended.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -226,10 +232,50 @@ fn overlay_wal_chunk(
     Ok(())
 }
 
-/// Restore a data directory from the store into `pgdata`, which must not
-/// already exist. Returns what was rebuilt; a plain server start on the
-/// result completes the attach.
-pub fn restore(store_root: &str, pgdata: &Path) -> Result<RestoreStats, String> {
+/// Replay one list of mirrored segments into pg_wal. Returns records
+/// written, chunk bytes, and the LSN right after the last byte.
+fn overlay_segments(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    segments: &[String],
+    tli: u32,
+    pg_wal: &Path,
+) -> Result<(usize, u64, u64), String> {
+    let mut records = 0usize;
+    let mut total = 0u64;
+    let mut end = 0u64;
+    for name in segments {
+        let epoch = segment_epoch(name).ok_or_else(|| format!("bad segment name {name:?}"))?;
+        let (bytes, _) = store
+            .get(&layout.wal_segment_path(name))
+            .map_err(|e| format!("store: {e}"))?
+            .ok_or_else(|| format!("segment {name} is missing"))?;
+        for frame in SegmentReader::new(&bytes, epoch) {
+            // Segments upload whole, so a decode failure is real
+            // corruption, never a torn tail.
+            let frame = frame.map_err(|e| format!("segment {name}: {e}"))?;
+            for record in
+                split_records(&frame.payload).ok_or_else(|| format!("bad batch in {name}"))?
+            {
+                if record.len() < 8 {
+                    return Err(format!("short record in {name}"));
+                }
+                let lsn = u64::from_le_bytes(record[..8].try_into().expect("checked"));
+                let chunk = &record[8..];
+                overlay_wal_chunk(pg_wal, tli, lsn, chunk)?;
+                records += 1;
+                total += chunk.len() as u64;
+                end = end.max(lsn + chunk.len() as u64);
+            }
+        }
+    }
+    Ok((records, total, end))
+}
+
+/// Restore a tenant's data directory from the store into `pgdata`, which
+/// must not already exist. Returns what was rebuilt; a plain server start
+/// on the result completes the attach.
+pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreStats, String> {
     if pgdata.exists() {
         return Err(format!(
             "{} already exists, refusing to restore over it",
@@ -237,7 +283,7 @@ pub fn restore(store_root: &str, pgdata: &Path) -> Result<RestoreStats, String> 
         ));
     }
     let store: Arc<dyn CasStore> = Arc::from(open_store(store_root)?);
-    let layout = TenantLayout::new("local");
+    let layout = TenantLayout::new(tenant);
 
     let (data, _) = store
         .get(&layout.manifest())
@@ -259,7 +305,8 @@ pub fn restore(store_root: &str, pgdata: &Path) -> Result<RestoreStats, String> 
     let mut files = 0usize;
     let mut dirs = 0usize;
     for checkpoint in chain {
-        let (f, d) = restore_fs(&*store, &layout, &checkpoint.id, pgdata)?;
+        let lay = crate::fold::chk_layout(&layout, checkpoint);
+        let (f, d) = restore_fs(&*store, &lay, &checkpoint.id, pgdata)?;
         files += f;
         dirs += d;
     }
@@ -274,33 +321,21 @@ pub fn restore(store_root: &str, pgdata: &Path) -> Result<RestoreStats, String> 
     let mut wal_end = chain.last().expect("chain is nonempty").lsn.0;
     let tli = manifest.pg.timeline;
     let pg_wal = pgdata.join("pg_wal");
+    // Inherited parent tails first, oldest ancestor to newest, then the
+    // tenant's own stream on top of them.
+    for pt in &manifest.parent_tail {
+        let lay = TenantLayout::new(&pt.tenant_ref);
+        let (r, b, e) = overlay_segments(&*store, &lay, &pt.segments, tli, &pg_wal)?;
+        wal_records += r;
+        wal_bytes += b;
+        wal_end = wal_end.max(e);
+    }
     let tail = reconcile_tail(&*store, &layout, &manifest).map_err(|e| format!("store: {e}"))?;
     if let Some(tail) = tail {
-        for name in &tail.segments {
-            let epoch = segment_epoch(name).ok_or_else(|| format!("bad segment name {name:?}"))?;
-            let (bytes, _) = store
-                .get(&layout.wal_segment_path(name))
-                .map_err(|e| format!("store: {e}"))?
-                .ok_or_else(|| format!("segment {name} is missing"))?;
-            for frame in SegmentReader::new(&bytes, epoch) {
-                // Segments upload whole, so a decode failure is real
-                // corruption, never a torn tail.
-                let frame = frame.map_err(|e| format!("segment {name}: {e}"))?;
-                for record in
-                    split_records(&frame.payload).ok_or_else(|| format!("bad batch in {name}"))?
-                {
-                    if record.len() < 8 {
-                        return Err(format!("short record in {name}"));
-                    }
-                    let lsn = u64::from_le_bytes(record[..8].try_into().expect("checked"));
-                    let chunk = &record[8..];
-                    overlay_wal_chunk(&pg_wal, tli, lsn, chunk)?;
-                    wal_records += 1;
-                    wal_bytes += chunk.len() as u64;
-                    wal_end = wal_end.max(lsn + chunk.len() as u64);
-                }
-            }
-        }
+        let (r, b, e) = overlay_segments(&*store, &layout, &tail.segments, tli, &pg_wal)?;
+        wal_records += r;
+        wal_bytes += b;
+        wal_end = wal_end.max(e);
     }
 
     Ok(RestoreStats {
@@ -437,11 +472,13 @@ mod tests {
             id: "genesis".into(),
             lsn: Lsn(0x0100_0028),
             kind: CheckpointKind::Full,
+            owner: None,
         });
         manifest.checkpoints.push(CheckpointRef {
             id: "d1".into(),
             lsn: Lsn(0x0100_1000),
             kind: CheckpointKind::Delta,
+            owner: None,
         });
         store
             .put_new(&layout.manifest(), &manifest.to_json())
@@ -467,7 +504,7 @@ mod tests {
         gc.close().unwrap();
 
         let pgdata = out_dir.path().join("restored");
-        let stats = restore(store_root, &pgdata).unwrap();
+        let stats = restore(store_root, "local", &pgdata).unwrap();
         assert_eq!(stats.files, 5, "three genesis files plus two delta");
         assert_eq!(stats.dirs, 1);
         assert_eq!(stats.wal_records, 2);
@@ -514,6 +551,81 @@ mod tests {
         assert!(seg2[200..].iter().all(|b| *b == 0));
 
         // A second restore refuses to clobber the first.
-        assert!(restore(store_root, &pgdata).is_err());
+        assert!(restore(store_root, "local", &pgdata).is_err());
+    }
+
+    #[test]
+    fn a_branch_restores_parent_files_and_replays_the_parent_tail() {
+        use std::sync::Mutex;
+        use zou_store::{TailConfig, lease};
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let store_root = store_dir.path().to_str().unwrap();
+        let store = Arc::new(LocalFsStore::new(store_dir.path()));
+        let layout = TenantLayout::new("local");
+
+        let control = synthetic_control(DB_SHUTDOWNED);
+        let initial_segment = vec![0x11u8; WAL_SEGMENT_SIZE as usize];
+        store
+            .put_new(&layout.chk_file("genesis", "global/pg_control"), &control)
+            .unwrap();
+        store
+            .put_new(&layout.chk_file("genesis", "PG_VERSION"), b"18\n")
+            .unwrap();
+        store
+            .put_new(
+                &layout.chk_file("genesis", "pg_wal/000000010000000000000001"),
+                &initial_segment,
+            )
+            .unwrap();
+        let index = format!(
+            "f PG_VERSION 3\nf global/pg_control {}\nf pg_wal/000000010000000000000001 {}\n",
+            control.len(),
+            initial_segment.len()
+        );
+        store
+            .put_new(&layout.chk_index("genesis"), index.as_bytes())
+            .unwrap();
+        let mut manifest = Manifest::new("local", 18);
+        manifest.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(0x0100_0028),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        store
+            .put_new(&layout.manifest(), &manifest.to_json())
+            .unwrap();
+
+        // A leased session pushes and publishes the tail, which is the
+        // state a branch inherits.
+        let held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
+        let gc = GroupCommit::with_lease(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout.clone(),
+            Arc::new(Mutex::new(held)),
+            Lsn(0x0100_0028),
+            GroupCommitConfig::default(),
+            TailConfig::default(),
+        );
+        let mut record = 0x0100_0028u64.to_le_bytes().to_vec();
+        record.extend(std::iter::repeat_n(0x22u8, 4096));
+        gc.append(&record).unwrap().wait().unwrap();
+        gc.close().unwrap();
+
+        zou_store::branch(&*store, "local", "b1", None, 5000).unwrap();
+
+        let pgdata = out_dir.path().join("child");
+        let stats = restore(store_root, "b1", &pgdata).unwrap();
+        assert_eq!(stats.files, 3, "the tree comes from the parent capture");
+        assert_eq!(stats.wal_records, 1, "the parent tail replays");
+        assert_eq!(stats.wal_bytes, 4096);
+
+        assert_eq!(std::fs::read(pgdata.join("PG_VERSION")).unwrap(), b"18\n");
+        let seg1 = std::fs::read(pgdata.join("pg_wal/000000010000000000000001")).unwrap();
+        let off = (0x0100_0028 % WAL_SEGMENT_SIZE) as usize;
+        assert!(seg1[off..off + 4096].iter().all(|b| *b == 0x22));
+        assert_eq!(seg1[off - 1], 0x11, "capture bytes around it survive");
     }
 }

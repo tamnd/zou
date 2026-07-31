@@ -1,6 +1,6 @@
 //! Delete objects no retained manifest references.
 //!
-//! Usage: `zou-gc <store-root> [window-secs]`
+//! Usage: `zou-gc <store-root> [window-secs] [retention-secs]`
 //!
 //! Deletion is two phase: a run stamps unreferenced keys as candidates
 //! and a later run deletes what stayed unreferenced past the safety
@@ -8,6 +8,10 @@
 //! window defaults to a day and must exceed the longest checkpoint
 //! fold upload and the longest gap between reading a manifest and
 //! publishing a branch from it. Run one job at a time.
+//!
+//! The retention window, a week by default, is how far back PITR
+//! reaches: manifest history snapshots younger than it keep the
+//! objects they reference alive, older ones are collected.
 
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,15 +20,29 @@ use zou_pg::gc;
 use zou_store::open_store;
 
 const DEFAULT_WINDOW_SECS: u64 = 24 * 60 * 60;
+const DEFAULT_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
-    let usage = || eprintln!("usage: {} <store-root> [window-secs]", args[0]);
-    let (store_root, window) = match args.as_slice() {
-        [_, root] => (root, DEFAULT_WINDOW_SECS),
-        [_, root, w] => match w.parse() {
-            Ok(w) => (root, w),
-            Err(_) => {
+    let usage = || {
+        eprintln!(
+            "usage: {} <store-root> [window-secs] [retention-secs]",
+            args[0]
+        )
+    };
+    let parse = |s: &String| s.parse::<u64>().ok();
+    let (store_root, window, retention) = match args.as_slice() {
+        [_, root] => (root, DEFAULT_WINDOW_SECS, DEFAULT_RETENTION_SECS),
+        [_, root, w] => match parse(w) {
+            Some(w) => (root, w, DEFAULT_RETENTION_SECS),
+            None => {
+                usage();
+                return ExitCode::FAILURE;
+            }
+        },
+        [_, root, w, r] => match (parse(w), parse(r)) {
+            (Some(w), Some(r)) => (root, w, r),
+            _ => {
                 usage();
                 return ExitCode::FAILURE;
             }
@@ -45,7 +63,7 @@ fn main() -> ExitCode {
         .duration_since(UNIX_EPOCH)
         .expect("clock before 1970")
         .as_secs();
-    match gc::run(&*store, now, window) {
+    match gc::run(&*store, now, window, retention) {
         Ok(stats) => {
             println!(
                 "gc: {} tenants, {} candidates waiting, {} objects deleted",
