@@ -226,6 +226,32 @@ impl CasStore for S3Store {
         }
     }
 
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
+        if len == 0 {
+            return Ok(self.get(key)?.map(|_| Vec::new()));
+        }
+        let path = self.object_path(key);
+        let range = format!("bytes={}-{}", offset, offset.saturating_add(len) - 1);
+        let (status, _, body) =
+            self.request("GET", &path, "", None, &[("range", range.as_str())], key)?;
+        match status {
+            // 200 means the backend ignored the range and sent it all.
+            206 => Ok(Some(body)),
+            200 => {
+                let start = (offset as usize).min(body.len());
+                let end = (offset.saturating_add(len) as usize).min(body.len());
+                Ok(Some(body[start..end].to_vec()))
+            }
+            404 => Ok(None),
+            // The range starts at or past the object's end.
+            416 => Ok(Some(Vec::new())),
+            s => Err(Self::io(
+                key,
+                format!("ranged GET returned {s}: {}", error_snippet(&body)),
+            )),
+        }
+    }
+
     fn put_if_match(
         &self,
         key: &str,

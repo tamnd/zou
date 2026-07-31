@@ -101,6 +101,21 @@ pub trait CasStore: Send + Sync {
         }
     }
 
+    /// Read `len` bytes of an object starting at `offset`, clamped to
+    /// the object's end, so a range past it comes back short or empty.
+    /// `None` if the object does not exist. Backends with native range
+    /// requests override this, the default fetches the whole object.
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
+        match self.get(key)? {
+            Some((data, _)) => {
+                let start = (offset as usize).min(data.len());
+                let end = (offset.saturating_add(len) as usize).min(data.len());
+                Ok(Some(data[start..end].to_vec()))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Delete an object. Deleting a missing key succeeds, so retries and
     /// concurrent deleters are harmless. When history must be protected
     /// that is the GC safety window's job, not the store's.
@@ -201,6 +216,26 @@ impl CasStore for LocalFsStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(Self::io(key, e)),
         }
+    }
+
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
+        use std::io::{Read, Seek, SeekFrom};
+        let path = self.path_for(key);
+        #[cfg(windows)]
+        let _lock = KeyLock::acquire(&path, key)?;
+        let mut file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Self::io(key, e)),
+        };
+        let size = file.metadata().map_err(|e| Self::io(key, e))?.len();
+        let start = offset.min(size);
+        let end = offset.saturating_add(len).min(size);
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| Self::io(key, e))?;
+        let mut data = vec![0u8; (end - start) as usize];
+        file.read_exact(&mut data).map_err(|e| Self::io(key, e))?;
+        Ok(Some(data))
     }
 
     fn put_if_match(

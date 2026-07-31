@@ -182,16 +182,21 @@ fn scan_segments(
 }
 
 /// The blocks dirtied since the previous checkpoint, scanned out of the
-/// WAL the stream holds over that window. Completeness rests on the
-/// write gate: no page object mutates before its WAL is durable in the
-/// stream, so the stream names every page the fold must carry.
-fn delta_refs(
+/// WAL the stream holds over that window, plus the relations its smgr
+/// create and truncate records name. Completeness rests on the write
+/// gate: no page object mutates before its WAL is durable in the
+/// stream, so the stream names every page the fold must carry. The
+/// relation events ride into the PAGES index as r lines because a
+/// truncate or a file recreation makes older checkpoint copies of the
+/// relation stale without any block reference saying so, and the read
+/// path needs that barrier long after this WAL is dropped.
+fn delta_scan(
     store: &dyn CasStore,
     layout: &TenantLayout,
     manifest: &Manifest,
     epoch: u64,
     redo: u64,
-) -> Result<Vec<BlockRef>, String> {
+) -> Result<walscan::ScanOut, String> {
     let prev = manifest
         .checkpoints
         .last()
@@ -204,12 +209,18 @@ fn delta_refs(
     // are older than the stream's first push, so their page effects are
     // already in the base capture.
     let start = prev.max(window.covered_from);
-    walscan::scan_block_refs(&window, start, redo)
+    walscan::scan_range(&window, start, redo)
 }
+
+/// The init fork number, INIT_FORKNUM. A relation with one is unlogged.
+const INIT_FORK: u32 = 3;
 
 /// Every page and fork size the store holds, from a listing of the pg/
 /// prefix. Sizes ride along in the PAGES index so a reader of a full
-/// checkpoint has fork lengths without another source.
+/// checkpoint has fork lengths without another source. Relations with
+/// an init fork are unlogged, their main fork writes never reach the
+/// WAL, so the read path's freshness barrier cannot see them go stale;
+/// their pages stay out of the runs and always serve from pg/.
 #[allow(clippy::type_complexity)]
 fn all_pages(
     store: &dyn CasStore,
@@ -218,6 +229,7 @@ fn all_pages(
     let prefix = layout.pg_dir();
     let mut refs = Vec::new();
     let mut sizes = Vec::new();
+    let mut unlogged = std::collections::BTreeSet::new();
     for key in store.list(&prefix).map_err(|e| format!("store: {e}"))? {
         let rest = key.strip_prefix(&prefix).unwrap_or(&key);
         let parts: Vec<&str> = rest.split('/').collect();
@@ -232,6 +244,9 @@ fn all_pages(
         ) else {
             continue;
         };
+        if fork == INIT_FORK {
+            unlogged.insert((spc, db, rel));
+        }
         if parts[4] == "SIZE" {
             let Some((data, _)) = store.get(&key).map_err(|e| format!("store: {e}"))? else {
                 continue;
@@ -250,6 +265,7 @@ fn all_pages(
             });
         }
     }
+    refs.retain(|r| !unlogged.contains(&(r.spc, r.db, r.rel)));
     refs.sort();
     Ok((refs, sizes))
 }
@@ -257,6 +273,8 @@ fn all_pages(
 /// Pack the pages into sorted run objects plus the PAGES index. Blocks
 /// the WAL names but the store no longer holds belonged to dropped
 /// relations and are skipped, the WAL that drops them is retained.
+/// Relation events land as r lines after the p lines, the read path
+/// stops its chain walk for a relation at the first index naming it.
 /// Idempotent: an existing PAGES index means an earlier attempt of this
 /// checkpoint finished, and run objects it left behind are kept.
 fn pack_page_runs(
@@ -264,6 +282,7 @@ fn pack_page_runs(
     layout: &TenantLayout,
     id: &str,
     refs: &[BlockRef],
+    rels: &[walscan::RelTag],
     sizes: &[(u32, u32, u32, u32, u32)],
 ) -> Result<(usize, usize), String> {
     if store
@@ -310,6 +329,9 @@ fn pack_page_runs(
         }
     }
     flush(&mut run, &mut runs)?;
+    for r in rels {
+        index.push_str(&format!("r {} {} {}\n", r.spc, r.db, r.rel));
+    }
     for (spc, db, rel, fork, n) in sizes {
         index.push_str(&format!("s {spc} {db} {rel} {fork} {n}\n"));
     }
@@ -378,12 +400,12 @@ pub fn fold(
     // the manifest still names nothing.
     let (pages, runs) = match kind {
         CheckpointKind::Delta => {
-            let refs = delta_refs(store, layout, &manifest, commit.epoch(), redo)?;
-            pack_page_runs(store, layout, &id, &refs, &[])?
+            let out = delta_scan(store, layout, &manifest, commit.epoch(), redo)?;
+            pack_page_runs(store, layout, &id, &out.refs, &out.rels, &[])?
         }
         CheckpointKind::Full => {
             let (refs, sizes) = all_pages(store, layout)?;
-            pack_page_runs(store, layout, &id, &refs, &sizes)?
+            pack_page_runs(store, layout, &id, &refs, &[], &sizes)?
         }
     };
 
@@ -478,6 +500,15 @@ mod tests {
             &[(block(16384, 0), false), (block(16384, 5), true)],
             b"second",
         );
+        // An smgr truncate of relation 30000, which must surface as an
+        // r line so the read path stops trusting older copies of it.
+        let mut trunc = Vec::new();
+        trunc.extend_from_slice(&3u32.to_le_bytes());
+        trunc.extend_from_slice(&1663u32.to_le_bytes());
+        trunc.extend_from_slice(&5u32.to_le_bytes());
+        trunc.extend_from_slice(&30000u32.to_le_bytes());
+        trunc.extend_from_slice(&7u32.to_le_bytes());
+        wal.record_with(&[], &trunc, 0x20, 2);
         let redo = wal.pos();
         wal.record(&[(block(99999, 9), false)], b"after the fold");
 
@@ -584,7 +615,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(pages_index).unwrap(),
-            "runs 1024\np 1663 5 16384 0 0\np 1663 5 16384 0 1\n"
+            "runs 1024\np 1663 5 16384 0 0\np 1663 5 16384 0 1\nr 1663 5 30000\n"
         );
         let (run, _) = store
             .get(&layout.checkpoint_pages(&chk.id, 0))
@@ -649,6 +680,20 @@ mod tests {
             .unwrap();
         store
             .put(&layout.pg_size(1663, 5, 16384, 0), &2u32.to_le_bytes())
+            .unwrap();
+        // Relation 28000 has an init fork, so it is unlogged and its
+        // pages must stay out of the runs, WAL never names its writes.
+        store
+            .put(
+                &layout.pg_block(1663, 5, 28000, 0, 0),
+                &[0xEE; ZOU_PAGE_SIZE],
+            )
+            .unwrap();
+        store
+            .put(
+                &layout.pg_block(1663, 5, 28000, 3, 0),
+                &[0xEF; ZOU_PAGE_SIZE],
+            )
             .unwrap();
 
         // The delta chain weighs 600 bytes against a 100 byte full, past

@@ -98,6 +98,21 @@ One wal segment file is kept in that walk, the segment holding the redo location
 Restore then starts at that full and the superseded chain becomes garbage for the gc job.
 `ZOU_FOLD_DOWN_FACTOR` overrides the factor, which the CI smoke test uses to force a fold down without writing five fulls worth of deltas.
 
+The chain reader is the consumer of those runs: the server serves page reads from checkpoint run objects instead of the mutable `pg/` prefix whenever it can.
+At first read it loads the PAGES index of every checkpoint from the newest full onward, and a read walks that chain newest first with a binary search per index, first hit names the run object and offset, a miss falls back to the `pg/` block as before.
+Serving an immutable image is only correct if nothing changed the block since that checkpoint, and the freshness argument has three legs.
+The write gate guarantees any page change has its WAL durable in the mirrored stream before the page object can change.
+Postgres itself serializes buffer eviction against reads of the same block, so the evicting write finishes before a competing read of that block begins.
+Given those two, a per read listing of `wal/` is a sound barrier: the reader scans every stream segment it has not seen, across all epochs including zombie writers, and marks each referenced block dirty, and dirty blocks fall back to `pg/`.
+That per read LIST is the v0 barrier and it is slow; the follow up publishes the durable LSN in shared memory so reads only scan when the stream actually advanced, and puts a RAM and NVMe cache in front of the range reads.
+Two cases need more than block references.
+A relation truncated or a relfilenode reused before the newest checkpoint leaves stale images in older chain entries with no WAL above the chain to flag them, so delta folds also persist smgr create and truncate events as `r` lines in PAGES and the chain walk stops for a relation at the first index naming it.
+Unlogged relations write their main fork without WAL, so no stream barrier can see those pages change; full folds skip any relation that has an init fork and their pages always come from `pg/`.
+Attach also enforces a shape rule: every fold drops WAL below its redo, so a checkpoint without runs sitting newer than one with runs would hide its window of changes forever, and the reader refuses to attach to that chain rather than serve stale pages.
+On any doubt at runtime, a scan error, a vanished segment, a short run object, the reader poisons itself and every read falls back to `pg/` for the rest of the process, logged once.
+`ZOU_CHAIN_READER=0` disables the reader outright.
+CI proves the path end to end by deleting a `pg/` block object after a clean shutdown and reading the rows back through the runs, which only the chain reader can serve.
+
 ```sh
 mkdir -p /tmp/zou-pg-store
 ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync
@@ -115,7 +130,7 @@ All five load and run with `ZOU_TARGET` set, hnsw index builds included, and CI 
 
 ## CI
 
-The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, reads the rows back from the object store, checkpoints so the manifest carries a folded delta, and forces a fold down so it also carries a runtime full, and one that restores a second data directory from the store with `zou-restore` and reads the same rows after crash recovery, which exercises restore from a runtime full.
+The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, reads the rows back from the object store, checkpoints so the manifest carries a folded delta, forces a fold down so it also carries a runtime full, and then deletes a `pg/` block object and reads the rows back through the checkpoint runs, and one that restores a second data directory from the store with `zou-restore` and reads the same rows after crash recovery, which exercises restore from a runtime full.
 It triggers on any PR touching `vendor/`, `patches/`, the build scripts, the `zou-pg` or `zou-store` crates, or the Makefile, and on manual dispatch.
 A patch that breaks the build or changes `select version()` output gets caught in the same PR that introduces it.
 

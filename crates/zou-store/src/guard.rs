@@ -46,6 +46,10 @@ impl<S: CasStore> CasStore for GuardedStore<S> {
         self.inner.get(key)
     }
 
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
+        self.inner.get_range(key, offset, len)
+    }
+
     fn put_if_match(
         &self,
         key: &str,
