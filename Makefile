@@ -5,7 +5,9 @@ PG_SRC := vendor/postgres
 PG_BUILD := build/pg-build
 PG_PREFIX := $(abspath build/pg)
 
-.PHONY: demo test lint pg-init pg-patch pg-build pg-clean
+ZOU_PG_LIB := $(abspath target/release)
+
+.PHONY: demo test lint pg-init pg-patch pg-build pg-clean zou-pg-lib
 
 # End to end tour of the object layer on a local directory.
 demo:
@@ -25,10 +27,14 @@ pg-init:
 pg-patch: pg-init
 	scripts/pg-apply-patches.sh
 
-# Out of tree build so the submodule stays clean. Stock configuration,
-# see docs/postgres.md before changing options.
-pg-build: pg-patch
-	meson setup $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX) || meson setup --reconfigure $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX)
+# The zou smgr patch calls into this static library.
+zou-pg-lib:
+	cargo build -p zou-pg --release
+
+# Out of tree build so the submodule stays clean. LDFLAGS pulls in the
+# zou-pg staticlib for the smgr patch, see docs/postgres.md.
+pg-build: pg-patch zou-pg-lib
+	meson setup $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX) -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg" || meson setup --reconfigure $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX) -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg"
 	ninja -C $(PG_BUILD)
 	ninja -C $(PG_BUILD) install
 

@@ -12,6 +12,8 @@ on:
       - patches/**
       - scripts/pg-apply-patches.sh
       - Makefile
+      - crates/zou-pg/**
+      - crates/zou-store/**
       - .github/workflows/postgres-build.yml
   workflow_dispatch:
 
@@ -24,14 +26,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config
       - name: Build with the patch series applied
         run: make pg-build
-      - name: Smoke test
+      - name: Smoke test on md
         run: |
-          build/pg/bin/initdb -D /tmp/zou-pgdata
-          build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
+          build/pg/bin/initdb -D /tmp/md-pgdata
+          build/pg/bin/pg_ctl -D /tmp/md-pgdata -l /tmp/md-pg.log start
           build/pg/bin/psql -h /tmp -d postgres -c 'select version()' | tee /tmp/version.txt
           grep -q "PostgreSQL 18.4" /tmp/version.txt
+          build/pg/bin/pg_ctl -D /tmp/md-pgdata stop
+      - name: Smoke test on zou storage
+        run: |
+          export ZOU_TARGET=/tmp/zou-pg-store
+          mkdir -p "$ZOU_TARGET"
+          build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync
+          test "$(find $ZOU_TARGET/tenants/local/pg -type f | wc -l)" -gt 1000
+          build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
+          build/pg/bin/psql -h /tmp -d postgres -c "create table t(id int primary key, v text)" -c "insert into t select g, 'row ' || g from generate_series(1,1000) g"
+          build/pg/bin/pg_ctl -D /tmp/zou-pgdata restart -l /tmp/zou-pg.log
+          build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/reread.txt
+          grep -q 500500 /tmp/reread.txt
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
+          cat /tmp/zou-pg.log

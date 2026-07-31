@@ -338,6 +338,10 @@ mod tests {
             self.inner.put_if_match(key, data, expected)
         }
 
+        fn delete(&self, key: &str) -> Result<(), CasError> {
+            self.inner.delete(key)
+        }
+
         fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
             self.inner.list(prefix)
         }

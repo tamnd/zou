@@ -163,13 +163,23 @@ impl S3Store {
                     .header("x-amz-date", &amz_date)
                     .send(body.unwrap_or_default())
             }
+            "DELETE" => {
+                let mut req = self.agent.delete(&url);
+                for (k, v) in extra_headers {
+                    req = req.header(*k, *v);
+                }
+                req.header("authorization", &auth)
+                    .header("x-amz-content-sha256", &payload_hash)
+                    .header("x-amz-date", &amz_date)
+                    .call()
+            }
             other => unreachable!("unsupported method {other}"),
         };
-        // GET is idempotent, so one retry absorbs a stale pooled
-        // connection that died between requests. PUT is not retried at
-        // this layer: callers own that decision.
+        // GET and DELETE are idempotent, so one retry absorbs a stale
+        // pooled connection that died between requests. PUT is not
+        // retried at this layer: callers own that decision.
         let result = match send() {
-            Err(_) if method == "GET" => send(),
+            Err(_) if method == "GET" || method == "DELETE" => send(),
             other => other,
         };
         let res = result.map_err(|e| Self::io(err_key, format!("transport: {e}")))?;
@@ -249,6 +259,36 @@ impl CasStore for S3Store {
             s => Err(Self::io(
                 key,
                 format!("PUT returned {s}: {}", error_snippet(&body)),
+            )),
+        }
+    }
+
+    fn put(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
+        let path = self.object_path(key);
+        let (status, version, body) = self.request("PUT", &path, "", Some(data), &[], key)?;
+        match status {
+            200 => {
+                let version = version
+                    .ok_or_else(|| Self::io(key, "put response without a version".into()))?;
+                Ok(Version::from_backend(version))
+            }
+            s => Err(Self::io(
+                key,
+                format!("PUT returned {s}: {}", error_snippet(&body)),
+            )),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<(), CasError> {
+        let path = self.object_path(key);
+        let (status, _, body) = self.request("DELETE", &path, "", None, &[], key)?;
+        match status {
+            // 204 on both dialects, and 404 when already gone, which
+            // delete treats as success.
+            204 | 404 => Ok(()),
+            s => Err(Self::io(
+                key,
+                format!("DELETE returned {s}: {}", error_snippet(&body)),
             )),
         }
     }

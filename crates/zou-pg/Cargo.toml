@@ -1,0 +1,21 @@
+[package]
+name = "zou-pg"
+description = "C ABI shim between the Postgres zou storage manager and zou-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+# staticlib links into the postgres backend, rlib keeps cargo test working.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+zou-store = { path = "../zou-store" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

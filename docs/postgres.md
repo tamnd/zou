@@ -37,11 +37,30 @@ build/pg/bin/psql -h /tmp -d postgres -c 'select version()'
 build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
 ```
 
+## The zou storage manager
+
+Patch `0001-zou-smgr.patch` adds a second entry to the smgr table that routes relation pages to zou-store through the C ABI of the `zou-pg` crate, linked into the backend as a static library.
+Set `ZOU_TARGET` to a store root before running `initdb --set io_method=sync` and every non temp relation lives as one object per block under `tenants/local/pg/<spc>/<db>/<rel>/<fork>/`, with a `SIZE` marker per fork and absent blocks reading as zeros.
+Without `ZOU_TARGET` the binary behaves exactly like stock Postgres on md.
+
+Two constraints in v0.
+Reads arrive through the PG 18 AIO path, which executes on file descriptors, so `zoustartreadv` stages pages into a per process scratch file and points the IO handle at it, which confines the build to `io_method=sync` and zouinit enforces that at startup.
+`initdb` switches `CREATE DATABASE` to the `wal_log` strategy when `ZOU_TARGET` is set, because `file_copy` duplicates databases with `copydir()` underneath the storage manager and cannot see pages in the object store.
+Durability still comes from the local WAL at this stage, wiring redo into zou-store checkpoints is the next milestone step.
+
+```sh
+mkdir -p /tmp/zou-pg-store
+ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync
+ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
+build/pg/bin/psql -h /tmp -d postgres -c 'create table t(id int)'
+find /tmp/zou-pg-store/tenants/local/pg -type f | head
+```
+
 ## CI
 
-The `postgres-build` workflow builds the vendored source with the full series applied and runs the initdb plus psql smoke test.
-It triggers on any PR touching `vendor/`, `patches/`, the build scripts, or the Makefile, and on manual dispatch.
-While the series is empty this is the reproducible stock baseline the milestone asks for, so a patch that breaks the build or changes `select version()` output gets caught in the same PR that introduces it.
+The `postgres-build` workflow builds the vendored source with the full series applied and runs two smoke tests, one on stock md storage and one with `ZOU_TARGET` set that creates a table, restarts the server, and reads the rows back from the object store.
+It triggers on any PR touching `vendor/`, `patches/`, the build scripts, the `zou-pg` or `zou-store` crates, or the Makefile, and on manual dispatch.
+A patch that breaks the build or changes `select version()` output gets caught in the same PR that introduces it.
 
 ## Authoring a patch
 

@@ -55,6 +55,24 @@ impl TenantLayout {
         format!("{}/wal/{epoch:016}/", self.prefix)
     }
 
+    /// One relation page. Mutable derived data, the durable truth for
+    /// these bytes is WAL plus checkpoints, so pg/ sits outside the
+    /// immutable prefixes on purpose.
+    pub fn pg_block(&self, spc: u32, db: u32, rel: u32, fork: u32, blk: u32) -> String {
+        format!("{}/{blk:08X}", self.pg_fork_prefix(spc, db, rel, fork))
+    }
+
+    /// Fork size marker. Presence means the fork exists, content is the
+    /// block count. Blocks at or past the size are logically absent even
+    /// if an object lingers, which mirrors file length semantics.
+    pub fn pg_size(&self, spc: u32, db: u32, rel: u32, fork: u32) -> String {
+        format!("{}/SIZE", self.pg_fork_prefix(spc, db, rel, fork))
+    }
+
+    pub fn pg_fork_prefix(&self, spc: u32, db: u32, rel: u32, fork: u32) -> String {
+        format!("{}/pg/{spc}/{db}/{rel}/{fork}", self.prefix)
+    }
+
     pub fn checkpoint_index(&self, chk_id: &str) -> String {
         format!("{}/chk/{chk_id}/index", self.prefix)
     }
