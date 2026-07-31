@@ -481,8 +481,10 @@ impl ChainReader {
         let offset = off / SLAB_BYTES * SLAB_BYTES;
         // The tenant prefix is part of the key: two branches can each
         // hold a checkpoint named like the other's while the objects
-        // differ, only (owner, id) is content addressed.
-        let cache_key = format!("{}/{id}-{run:08}-{offset:016X}", layout.prefix());
+        // differ, only (owner, id) is content addressed. Flattened,
+        // the disk tier uses the key as a file name.
+        let owner = layout.prefix().replace('/', "_");
+        let cache_key = format!("{owner}-{id}-{run:08}-{offset:016X}");
         let slab = self.cache.get_or_load(&cache_key, || {
             let key = layout.checkpoint_pages(id, run);
             store
