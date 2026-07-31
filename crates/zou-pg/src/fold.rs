@@ -222,8 +222,22 @@ fn delta_scan(
         .last()
         .map(|c| c.lsn.0)
         .ok_or_else(|| "delta fold with no prior checkpoint".to_string())?;
-    let segments = scan_segments(store, layout, manifest, epoch)?;
-    let window = walscan::assemble_window(store, layout, &segments, prev, redo)?;
+    // A branched tenant's window begins in the frozen parent tails: its
+    // first fold covers WAL from the inherited checkpoint through the
+    // branch point into its own stream, and the blocks those parent
+    // records dirtied must land in this delta, the fold raises the read
+    // floor past them for good. Parents go first so the tenant's own
+    // bytes win where the streams overlap.
+    let mut sources: Vec<(TenantLayout, Vec<String>)> = manifest
+        .parent_tail
+        .iter()
+        .map(|pt| (TenantLayout::new(&pt.tenant_ref), pt.segments.clone()))
+        .collect();
+    sources.push((
+        layout.clone(),
+        scan_segments(store, layout, manifest, epoch)?,
+    ));
+    let window = walscan::assemble_window_from(store, &sources, prev, redo)?;
     // Coverage can start after the previous checkpoint when that one
     // predates the stream, the genesis capture does. Records in the gap
     // are older than the stream's first push, so their page effects are
@@ -235,17 +249,23 @@ fn delta_scan(
 /// The init fork number, INIT_FORKNUM. A relation with one is unlogged.
 const INIT_FORK: u32 = 3;
 
+/// A fork length destined for an s line: spc, db, rel, fork, nblocks.
+type ForkSize = (u32, u32, u32, u32, u32);
+
+/// A page image source for the pack: the live pg/ prefix on an ordinary
+/// fold, the merged chain view on a branched full.
+type FetchPage<'a> = dyn FnMut(&BlockRef) -> Result<Option<Vec<u8>>, String> + 'a;
+
 /// Every page and fork size the store holds, from a listing of the pg/
 /// prefix. Sizes ride along in the PAGES index so a reader of a full
 /// checkpoint has fork lengths without another source. Relations with
 /// an init fork are unlogged, their main fork writes never reach the
 /// WAL, so the read path's freshness barrier cannot see them go stale;
 /// their pages stay out of the runs and always serve from pg/.
-#[allow(clippy::type_complexity)]
 fn all_pages(
     store: &dyn CasStore,
     layout: &TenantLayout,
-) -> Result<(Vec<BlockRef>, Vec<(u32, u32, u32, u32, u32)>), String> {
+) -> Result<(Vec<BlockRef>, Vec<ForkSize>), String> {
     let prefix = layout.pg_dir();
     let mut refs = Vec::new();
     let mut sizes = Vec::new();
@@ -290,20 +310,67 @@ fn all_pages(
     Ok((refs, sizes))
 }
 
-/// Pack the pages into sorted run objects plus the PAGES index. Blocks
-/// the WAL names but the store no longer holds belonged to dropped
+/// The fork sizes a delta records as s lines: every fork the window's
+/// refs touch plus the forks of relations its truncate and create
+/// events name, read from the tenant's own SIZE objects. A fork with
+/// no own SIZE is skipped, on a branch that means the size never
+/// changed under this prefix and the older chain answer stays current,
+/// on the owner it means the relation was dropped after the window and
+/// the retained WAL carries the drop. Without these lines a branch
+/// child would answer nblocks from the last full and never see rows in
+/// blocks a later delta packed.
+fn touched_sizes(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    out: &walscan::ScanOut,
+) -> Result<Vec<ForkSize>, String> {
+    let mut forks: std::collections::BTreeSet<(u32, u32, u32, u32)> = out
+        .refs
+        .iter()
+        .map(|r| (r.spc, r.db, r.rel, r.fork))
+        .collect();
+    for t in out.rels.iter().chain(out.truncs.iter().map(|(t, _)| t)) {
+        for fork in 0..4 {
+            forks.insert((t.spc, t.db, t.rel, fork));
+        }
+    }
+    let mut sizes = Vec::new();
+    for (spc, db, rel, fork) in forks {
+        let Some((data, _)) = store
+            .get(&layout.pg_size(spc, db, rel, fork))
+            .map_err(|e| format!("store: {e}"))?
+        else {
+            continue;
+        };
+        let n = <[u8; 4]>::try_from(data.as_slice())
+            .map(u32::from_le_bytes)
+            .map_err(|_| format!("bad SIZE object for {spc}/{db}/{rel}/{fork}"))?;
+        sizes.push((spc, db, rel, fork, n));
+    }
+    Ok(sizes)
+}
+
+/// Pack the pages into sorted run objects plus the PAGES index, each
+/// image produced by `fetch`, which reads the live pg/ prefix for an
+/// ordinary fold and the merged chain view for a branched full. Blocks
+/// the WAL names but `fetch` no longer finds belonged to dropped
 /// relations and are skipped, the WAL that drops them is retained.
-/// Relation events land as r lines after the p lines, the read path
-/// stops its chain walk for a relation at the first index naming it.
+/// Relation events land after the p lines, file recreations as r lines
+/// that stop the read path's chain walk outright and truncates as t
+/// lines carrying the main fork cutoff below which older copies still
+/// serve, then the fork sizes as s lines.
 /// Idempotent: an existing PAGES index means an earlier attempt of this
 /// checkpoint finished, and run objects it left behind are kept.
+#[allow(clippy::too_many_arguments)]
 fn pack_page_runs(
     store: &dyn CasStore,
     layout: &TenantLayout,
     id: &str,
     refs: &[BlockRef],
     rels: &[walscan::RelTag],
-    sizes: &[(u32, u32, u32, u32, u32)],
+    truncs: &[(walscan::RelTag, u32)],
+    sizes: &[ForkSize],
+    fetch: &mut FetchPage,
 ) -> Result<(usize, usize), String> {
     if store
         .get(&layout.checkpoint_page_index(id))
@@ -329,10 +396,7 @@ fn pack_page_runs(
         Ok(())
     };
     for r in refs {
-        let Some((data, _)) = store
-            .get(&layout.pg_block(r.spc, r.db, r.rel, r.fork, r.blk))
-            .map_err(|e| format!("store: {e}"))?
-        else {
+        let Some(data) = fetch(r)? else {
             continue;
         };
         if data.len() != ZOU_PAGE_SIZE {
@@ -352,6 +416,9 @@ fn pack_page_runs(
     for r in rels {
         index.push_str(&format!("r {} {} {}\n", r.spc, r.db, r.rel));
     }
+    for (t, cut) in truncs {
+        index.push_str(&format!("t {} {} {} {}\n", t.spc, t.db, t.rel, cut));
+    }
     for (spc, db, rel, fork, n) in sizes {
         index.push_str(&format!("s {spc} {db} {rel} {fork} {n}\n"));
     }
@@ -359,6 +426,168 @@ fn pack_page_runs(
         Ok(_) | Err(CasError::AlreadyExists { .. }) => Ok((pages, runs as usize)),
         Err(e) => Err(format!("put PAGES: {e}")),
     }
+}
+
+/// Whether the manifest still leans on state it does not own: a branch
+/// origin, a frozen parent tail, or checkpoints tagged with another
+/// owner. Once a merged full publishes and prunes those, the tenant
+/// packs like any other.
+fn branched(m: &Manifest) -> bool {
+    m.branch_of.is_some()
+        || !m.parent_tail.is_empty()
+        || m.checkpoints.iter().any(|c| c.owner.is_some())
+}
+
+/// The full capture for a branched manifest. Packing from pg/ alone
+/// would be a disaster here: the prefix holds only the tenant's own
+/// divergent writes, the inherited blocks live in run objects under
+/// their owners, and a full that omits them prunes the chain that
+/// serves them. So the pack takes the union. The own pg/ block wins
+/// where both exist, the write gate flushed every changed block there,
+/// and the chain image serves the rest, with recreation and truncate
+/// events masking dead refs exactly the way the read path masks them.
+/// Effective fork sizes follow the same rule, own SIZE first and the
+/// chain walk otherwise, and chain refs at or past the effective size
+/// are truncation garbage the pack drops. A relation dropped since the
+/// last fold still rides along under its old size, its WAL drop is in
+/// the retained tail and nothing reads a relation the catalog no
+/// longer names. After this full publishes, the chain prunes to it,
+/// the branch is self sufficient, and gc can unpin the parent.
+fn pack_merged_full(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    id: &str,
+    manifest: &Manifest,
+) -> Result<(usize, usize), String> {
+    use crate::reader::ChkIndex;
+    use crate::walscan::RelTag;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let (own_refs, own_sizes) = all_pages(store, layout)?;
+    let full = manifest
+        .checkpoints
+        .iter()
+        .rposition(|c| c.kind == CheckpointKind::Full)
+        .ok_or_else(|| "a branched manifest has no full to merge".to_string())?;
+    let mut chain: Vec<ChkIndex> = Vec::new();
+    for c in manifest.checkpoints[full..].iter().rev() {
+        let lay = chk_layout(layout, c);
+        let (data, _) = store
+            .get(&lay.checkpoint_page_index(&c.id))
+            .map_err(|e| format!("store: {e}"))?
+            .ok_or_else(|| format!("checkpoint {} has no PAGES to merge from", c.id))?;
+        let text =
+            String::from_utf8(data).map_err(|_| format!("PAGES for {} is not utf8", c.id))?;
+        chain.push(ChkIndex::parse(&c.id, lay, &text)?);
+    }
+
+    // Walk newest first with the read path's masking: an r line kills
+    // older refs of the relation, a t line kills main fork refs at or
+    // past the smallest cutoff seen and every other fork, and an
+    // index's own entries are never masked by its own events, a
+    // recreation packs its new blocks beside the r line that kills the
+    // old incarnation. Sizes answer newest first too, an s line before
+    // the same index's events, and a t line with a real cutoff is
+    // itself the main fork answer, the record named the surviving
+    // count.
+    let mut sizes: BTreeMap<(u32, u32, u32, u32), u32> = own_sizes
+        .iter()
+        .map(|&(a, b, c, d, n)| ((a, b, c, d), n))
+        .collect();
+    let mut seen: BTreeSet<BlockRef> = own_refs.iter().copied().collect();
+    let mut masked: BTreeSet<RelTag> = BTreeSet::new();
+    let mut cuts: BTreeMap<RelTag, u32> = BTreeMap::new();
+    let mut picked: Vec<(BlockRef, usize)> = Vec::new();
+    for (i, chk) in chain.iter().enumerate() {
+        for r in &chk.entries {
+            let tag = RelTag {
+                spc: r.spc,
+                db: r.db,
+                rel: r.rel,
+            };
+            if masked.contains(&tag)
+                || cuts
+                    .get(&tag)
+                    .is_some_and(|cut| r.fork != 0 || r.blk >= *cut)
+                || !seen.insert(*r)
+            {
+                continue;
+            }
+            picked.push((*r, i));
+        }
+        for (key, n) in &chk.sizes {
+            let tag = RelTag {
+                spc: key.0,
+                db: key.1,
+                rel: key.2,
+            };
+            if masked.contains(&tag) || (key.3 != 0 && cuts.contains_key(&tag)) {
+                continue;
+            }
+            sizes.entry(*key).or_insert(*n);
+        }
+        for (tag, cut) in &chk.truncs {
+            if *cut != u32::MAX && !masked.contains(tag) {
+                sizes.entry((tag.spc, tag.db, tag.rel, 0)).or_insert(*cut);
+            }
+            let e = cuts.entry(*tag).or_insert(*cut);
+            *e = (*e).min(*cut);
+        }
+        masked.extend(chk.rels.iter().copied());
+    }
+    picked.retain(|(r, _)| {
+        sizes
+            .get(&(r.spc, r.db, r.rel, r.fork))
+            .is_none_or(|n| r.blk < *n)
+    });
+
+    let mut refs = own_refs;
+    refs.extend(picked.iter().map(|(r, _)| *r));
+    refs.sort();
+    let src: BTreeMap<BlockRef, usize> = picked.into_iter().collect();
+    // Whole run objects cache in a small window: the refs are sorted
+    // in (relation, block) order, so pages of one region cluster into
+    // the same run and a handful of slots absorbs the interleaving
+    // between chain indexes.
+    let mut cache: BTreeMap<(usize, u32), Vec<u8>> = BTreeMap::new();
+    let mut fetch = |r: &BlockRef| -> Result<Option<Vec<u8>>, String> {
+        let Some(&i) = src.get(r) else {
+            return store
+                .get(&layout.pg_block(r.spc, r.db, r.rel, r.fork, r.blk))
+                .map(|o| o.map(|(d, _)| d))
+                .map_err(|e| format!("store: {e}"));
+        };
+        let chk = &chain[i];
+        let (run, off) = chk
+            .lookup(r)
+            .ok_or_else(|| format!("merged ref {r:?} vanished from {}", chk.id))?;
+        if !cache.contains_key(&(i, run)) {
+            if cache.len() >= 4 {
+                let oldest = *cache.keys().next().expect("cache is nonempty");
+                cache.remove(&oldest);
+            }
+            let key = chk.layout.checkpoint_pages(&chk.id, run);
+            let (bytes, _) = store
+                .get(&key)
+                .map_err(|e| format!("store: {e}"))?
+                .ok_or_else(|| format!("run object {key} is missing"))?;
+            cache.insert((i, run), bytes);
+        }
+        let bytes = &cache[&(i, run)];
+        let a = off as usize;
+        if a + ZOU_PAGE_SIZE > bytes.len() {
+            return Err(format!(
+                "run object for {} is shorter than its index",
+                chk.id
+            ));
+        }
+        Ok(Some(bytes[a..a + ZOU_PAGE_SIZE].to_vec()))
+    };
+    let sizes: Vec<(u32, u32, u32, u32, u32)> = sizes
+        .into_iter()
+        .map(|((a, b, c, d), n)| (a, b, c, d, n))
+        .collect();
+    pack_page_runs(store, layout, id, &refs, &[], &[], &sizes, &mut fetch)
 }
 
 /// Capture the checkpoint at `redo`, a delta normally or a full when
@@ -416,16 +645,37 @@ pub fn fold(
 
     // The sorted page runs: a delta packs the blocks the WAL dirtied
     // since the previous checkpoint, a full packs every page the store
-    // holds. A failure here leaves fs and run objects behind for gc,
-    // the manifest still names nothing.
+    // holds, and a full on a branched manifest merges the chain in so
+    // the inherited refs it prunes stay served. A failure here leaves
+    // fs and run objects behind for gc, the manifest still names
+    // nothing.
+    let mut own_fetch = |r: &BlockRef| -> Result<Option<Vec<u8>>, String> {
+        store
+            .get(&layout.pg_block(r.spc, r.db, r.rel, r.fork, r.blk))
+            .map(|o| o.map(|(d, _)| d))
+            .map_err(|e| format!("store: {e}"))
+    };
     let (pages, runs) = match kind {
         CheckpointKind::Delta => {
             let out = delta_scan(store, layout, &manifest, commit.epoch(), redo)?;
-            pack_page_runs(store, layout, &id, &out.refs, &out.rels, &[])?
+            let sizes = touched_sizes(store, layout, &out)?;
+            pack_page_runs(
+                store,
+                layout,
+                &id,
+                &out.refs,
+                &out.rels,
+                &out.truncs,
+                &sizes,
+                &mut own_fetch,
+            )?
+        }
+        CheckpointKind::Full if branched(&manifest) => {
+            pack_merged_full(store, layout, &id, &manifest)?
         }
         CheckpointKind::Full => {
             let (refs, sizes) = all_pages(store, layout)?;
-            pack_page_runs(store, layout, &id, &refs, &[], &sizes)?
+            pack_page_runs(store, layout, &id, &refs, &[], &[], &sizes, &mut own_fetch)?
         }
     };
 
@@ -521,8 +771,9 @@ mod tests {
             &[(block(16384, 0), false), (block(16384, 5), true)],
             b"second",
         );
-        // An smgr truncate of relation 30000, which must surface as an
-        // r line so the read path stops trusting older copies of it.
+        // An smgr truncate of relation 30000 down to three blocks,
+        // which must surface as a t line so the read path stops
+        // trusting older copies past the cutoff.
         let mut trunc = Vec::new();
         trunc.extend_from_slice(&3u32.to_le_bytes());
         trunc.extend_from_slice(&1663u32.to_le_bytes());
@@ -540,7 +791,10 @@ mod tests {
         std::fs::write(pgdata.join("pg_xact/0000"), b"clog").unwrap();
 
         // The two dirtied blocks exist in the page store, block 5 does
-        // not, a dropped relation the pack must skip.
+        // not, a dropped relation the pack must skip. The SIZE objects
+        // of the touched relation and the truncated one must ride into
+        // the index as s lines, a branch child answers nblocks from
+        // them long after this WAL is gone.
         store
             .put(
                 &layout.pg_block(1663, 5, 16384, 0, 0),
@@ -552,6 +806,12 @@ mod tests {
                 &layout.pg_block(1663, 5, 16384, 0, 1),
                 &[0xBB; ZOU_PAGE_SIZE],
             )
+            .unwrap();
+        store
+            .put(&layout.pg_size(1663, 5, 16384, 0), &6u32.to_le_bytes())
+            .unwrap();
+        store
+            .put(&layout.pg_size(1663, 5, 30000, 0), &3u32.to_le_bytes())
             .unwrap();
 
         // A genesis full big enough that the deltas never trigger the
@@ -637,7 +897,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             String::from_utf8(pages_index).unwrap(),
-            "runs 1024\np 1663 5 16384 0 0\np 1663 5 16384 0 1\nr 1663 5 30000\n"
+            "runs 1024\np 1663 5 16384 0 0\np 1663 5 16384 0 1\nt 1663 5 30000 3\ns 1663 5 16384 0 6\ns 1663 5 30000 0 3\n"
         );
         let (run, _) = store
             .get(&layout.checkpoint_pages(&chk.id, 0))
@@ -797,6 +1057,146 @@ mod tests {
             .unwrap();
         assert_eq!(run[0], 0xCC);
         assert_eq!(run[ZOU_PAGE_SIZE], 0xDD);
+
+        gc.close().unwrap();
+    }
+
+    #[test]
+    fn a_branched_full_merges_the_inherited_chain_and_lets_the_parent_go() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let pgdata_dir = tempfile::tempdir().unwrap();
+        let pgdata = pgdata_dir.path();
+        let store = Arc::new(LocalFsStore::new(store_dir.path()));
+        let parent = TenantLayout::new("parent");
+        let child = TenantLayout::new("child");
+
+        // The parent chain a child inherits: a full and four deltas,
+        // five refs, so the child's first fold trips the delta cap and
+        // captures a full. The images and events cover every masking
+        // rule the merge honors: a newer delta image shadowing the
+        // full's, a truncate cutoff killing the block past it, and a
+        // recreation killing the older incarnation outright.
+        let page = |b: u8| vec![b; ZOU_PAGE_SIZE];
+        let put_chk = |id: &str, index: &str, run: &[Vec<u8>]| {
+            store
+                .put_new(&parent.checkpoint_page_index(id), index.as_bytes())
+                .unwrap();
+            if !run.is_empty() {
+                let bytes: Vec<u8> = run.iter().flatten().copied().collect();
+                store
+                    .put_new(&parent.checkpoint_pages(id, 0), &bytes)
+                    .unwrap();
+            }
+        };
+        put_chk(
+            "f1",
+            "runs 1024\np 1663 5 16384 0 0\np 1663 5 16384 0 1\np 1663 5 16384 0 2\np 1663 5 20000 0 0\ns 1663 5 16384 0 3\ns 1663 5 20000 0 1\n",
+            &[page(0x11), page(0x22), page(0x44), page(0x55)],
+        );
+        put_chk(
+            "d1",
+            "runs 1024\np 1663 5 16384 0 1\ns 1663 5 16384 0 3\n",
+            &[page(0x33)],
+        );
+        put_chk("d2", "runs 1024\nt 1663 5 16384 2\n", &[]);
+        put_chk(
+            "d3",
+            "runs 1024\np 1663 5 20000 0 0\nr 1663 5 20000\ns 1663 5 20000 0 1\n",
+            &[page(0x66)],
+        );
+        put_chk("d4", "runs 1024\n", &[]);
+
+        let mut pm = Manifest::new("parent", 18);
+        let kinds = [
+            ("f1", CheckpointKind::Full),
+            ("d1", CheckpointKind::Delta),
+            ("d2", CheckpointKind::Delta),
+            ("d3", CheckpointKind::Delta),
+            ("d4", CheckpointKind::Delta),
+        ];
+        for (i, (id, kind)) in kinds.into_iter().enumerate() {
+            pm.checkpoints.push(CheckpointRef {
+                id: id.into(),
+                lsn: Lsn(0x100 * (i as u64 + 1)),
+                kind,
+                owner: None,
+            });
+        }
+        pm.wal_tail = Some(zou_store::manifest::WalTail {
+            epoch_dir: 1,
+            from_lsn: Lsn(0x500),
+            segments: vec!["0000000000000001/0000000000000000.wal".into()],
+        });
+        store.put_new(&parent.manifest(), &pm.to_json()).unwrap();
+
+        zou_store::branch(&*store, "parent", "child", None, 5000).unwrap();
+
+        // The child diverged on one block, its own image of block 0
+        // must win over the inherited copy, and its own SIZE beats the
+        // chain's answers.
+        store
+            .put(&child.pg_block(1663, 5, 16384, 0, 0), &page(0x77))
+            .unwrap();
+        store
+            .put(&child.pg_size(1663, 5, 16384, 0), &2u32.to_le_bytes())
+            .unwrap();
+
+        let redo = WAL_SEGMENT_SIZE + 0x80;
+        for d in ["global", "pg_xact", "pg_wal", "pg_twophase"] {
+            std::fs::create_dir_all(pgdata.join(d)).unwrap();
+        }
+        std::fs::write(pgdata.join("global/pg_control"), synthetic_control(redo)).unwrap();
+        std::fs::write(pgdata.join("PG_VERSION"), b"18\n").unwrap();
+        std::fs::write(pgdata.join("pg_wal/000000010000000000000001"), b"wal").unwrap();
+
+        let held = lease::acquire(&*store, &child, "test", 15, 1000).unwrap();
+        let gc = GroupCommit::with_lease(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            child.clone(),
+            Arc::new(Mutex::new(held)),
+            Lsn(0),
+            GroupCommitConfig::default(),
+            TailConfig::default(),
+        );
+        let mut record = 0x100u64.to_le_bytes().to_vec();
+        record.extend_from_slice(b"payload");
+        gc.append(&record).unwrap().wait().unwrap();
+
+        let stats = fold(&*store, &child, &gc, pgdata, redo).unwrap();
+        assert_eq!(stats.kind, CheckpointKind::Full);
+        assert_eq!(stats.pages, 3);
+        assert_eq!(stats.runs, 1);
+
+        // The union: the child's own block 0, the newest inherited
+        // block 1, the recreated 20000. Block 2 died to the truncate
+        // cutoff, the old 20000 incarnation to the r line, and the
+        // sizes answer own first, chain otherwise.
+        let (pages_index, _) = store
+            .get(&child.checkpoint_page_index(&stats.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(pages_index).unwrap(),
+            "runs 1024\np 1663 5 16384 0 0\np 1663 5 16384 0 1\np 1663 5 20000 0 0\ns 1663 5 16384 0 2\ns 1663 5 20000 0 1\n"
+        );
+        let (run, _) = store
+            .get(&child.checkpoint_pages(&stats.id, 0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.len(), 3 * ZOU_PAGE_SIZE);
+        assert_eq!(run[0], 0x77, "the child's own image wins");
+        assert_eq!(run[ZOU_PAGE_SIZE], 0x33, "the newest chain image serves");
+        assert_eq!(run[2 * ZOU_PAGE_SIZE], 0x66, "the recreated incarnation");
+
+        // Published, the chain prunes to the new full, the frozen
+        // parent tail lets go, and nothing in the manifest names the
+        // parent's objects anymore: the branch is self sufficient and
+        // gc may unpin the parent.
+        let m = manifest_of(&*store, &child);
+        assert_eq!(m.checkpoints.len(), 1);
+        assert_eq!(m.checkpoints[0].kind, CheckpointKind::Full);
+        assert_eq!(m.checkpoints[0].owner, None);
+        assert!(m.parent_tail.is_empty());
 
         gc.close().unwrap();
     }

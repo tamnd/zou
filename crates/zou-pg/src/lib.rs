@@ -48,11 +48,14 @@ pub const ZOU_ERR_LEASE_LOST: i32 = -6;
 /// read, which attaches lazily so init stays cheap and a store with no
 /// checkpoints yet costs nothing. Off means every read goes to pg/,
 /// either by choice, by attach failure, or because there is no chain
-/// to serve. Backends are single threaded, the mutex sees no
-/// contention.
+/// to serve. Fatal means the tenant is a branch whose inherited state
+/// cannot be served, pg/ would answer zeros where the parent's pages
+/// belong, so every read errors instead of lying. Backends are single
+/// threaded, the mutex sees no contention.
 enum ReaderSlot {
     Unset,
     Off,
+    Fatal,
     On(Box<reader::ChainReader>),
 }
 
@@ -79,11 +82,18 @@ extern "C" fn log_cache_summary_at_exit() {
     }
 }
 
-fn chain_read(shim: &Shim, r: walscan::BlockRef, durable: u64) -> Option<Vec<u8>> {
+/// Run `f` against the attached reader. `Ok(None)` means there is no
+/// reader and pg/ answers alone, `Err(())` means the attach failed
+/// fatally, a branch whose inherited pages nothing can serve, and the
+/// caller must error instead of touching pg/.
+fn with_reader<R>(
+    shim: &Shim,
+    f: impl FnOnce(&mut reader::ChainReader) -> R,
+) -> Result<Option<R>, ()> {
     unsafe extern "C" {
         fn atexit(cb: extern "C" fn()) -> i32;
     }
-    let mut slot = shim.reader.lock().ok()?;
+    let mut slot = shim.reader.lock().map_err(|_| ())?;
     if matches!(*slot, ReaderSlot::Unset) {
         *slot = if std::env::var("ZOU_CHAIN_READER").is_ok_and(|v| v == "0") {
             ReaderSlot::Off
@@ -94,17 +104,29 @@ fn chain_read(shim: &Shim, r: walscan::BlockRef, durable: u64) -> Option<Vec<u8>
                     ReaderSlot::On(Box::new(rd))
                 }
                 Ok(None) => ReaderSlot::Off,
+                Err(e) if e.fatal => {
+                    eprintln!("zou chain reader cannot serve this branch: {}", e.why);
+                    ReaderSlot::Fatal
+                }
                 Err(e) => {
-                    eprintln!("zou chain reader attach failed, reads stay on pg/: {e}");
+                    eprintln!(
+                        "zou chain reader attach failed, reads stay on pg/: {}",
+                        e.why
+                    );
                     ReaderSlot::Off
                 }
             }
         };
     }
     match &mut *slot {
-        ReaderSlot::On(rd) => rd.read(&*shim.store, &shim.layout, r, durable),
-        _ => None,
+        ReaderSlot::On(rd) => Ok(Some(f(rd))),
+        ReaderSlot::Fatal => Err(()),
+        _ => Ok(None),
     }
+}
+
+fn chain_read(shim: &Shim, r: walscan::BlockRef, durable: u64) -> Result<Option<Vec<u8>>, ()> {
+    with_reader(shim, |rd| rd.read(&*shim.store, &shim.layout, r, durable)).map(Option::flatten)
 }
 
 /// Tell an attached reader this process wrote a page, see
@@ -123,6 +145,19 @@ fn note_rel(shim: &Shim, spc: u32, db: u32, rel: u32) {
         && let ReaderSlot::On(rd) = &mut *slot
     {
         rd.note_rel(walscan::RelTag { spc, db, rel });
+    }
+}
+
+/// Tell an attached reader this process truncated a fork. A main fork
+/// truncate keeps blocks below the cutoff serving from the chain,
+/// which a branch needs, its pg/ prefix has no copy of inherited
+/// survivors. Truncating any other fork leaves the main fork alone.
+fn note_truncate(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) {
+    if let Ok(mut slot) = shim.reader.lock()
+        && let ReaderSlot::On(rd) = &mut *slot
+    {
+        let cut = if fork == 0 { nblocks } else { u32::MAX };
+        rd.note_truncate(walscan::RelTag { spc, db, rel }, cut);
     }
 }
 
@@ -147,6 +182,34 @@ fn read_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Result<Opti
         Ok(None) => Ok(None),
         Err(_) => Err(()),
     }
+}
+
+/// The fork size for the read side: the tenant's own SIZE object when
+/// one exists, an own extend, truncate, or create always writes it
+/// eagerly, and otherwise the chain's folded sizes, but only on a
+/// branch. A branch inherits forks that have no SIZE under its own
+/// prefix, the s lines of the owner's folds are the only place their
+/// lengths live. An unbranched tenant's own prefix is complete, its
+/// absent SIZE means the fork does not exist and the chain would
+/// resurrect just dropped relations until the next fold names them.
+fn read_size_chained(
+    shim: &Shim,
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+) -> Result<Option<u32>, ()> {
+    if let Some(n) = read_size(shim, spc, db, rel, fork)? {
+        return Ok(Some(n));
+    }
+    with_reader(shim, |rd| {
+        if rd.branched() {
+            rd.fork_size(spc, db, rel, fork)
+        } else {
+            None
+        }
+    })
+    .map(Option::flatten)
 }
 
 fn write_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> Result<(), ()> {
@@ -236,7 +299,7 @@ pub unsafe extern "C" fn zou_smgr_exists(
         if out.is_null() {
             return ZOU_ERR_BAD_ARGUMENT;
         }
-        match read_size(shim, spc, db, rel, fork) {
+        match read_size_chained(shim, spc, db, rel, fork) {
             Ok(size) => {
                 unsafe { *out = size.is_some() as i32 };
                 ZOU_OK
@@ -263,7 +326,7 @@ pub unsafe extern "C" fn zou_smgr_nblocks(
         if out.is_null() {
             return ZOU_ERR_BAD_ARGUMENT;
         }
-        match read_size(shim, spc, db, rel, fork) {
+        match read_size_chained(shim, spc, db, rel, fork) {
             Ok(Some(n)) => {
                 unsafe { *out = n };
                 ZOU_OK
@@ -305,9 +368,13 @@ pub unsafe extern "C" fn zou_smgr_read(
             fork,
             blk,
         };
-        if let Some(page) = chain_read(shim, r, durable_lsn) {
-            out.copy_from_slice(&page);
-            return ZOU_OK;
+        match chain_read(shim, r, durable_lsn) {
+            Ok(Some(page)) => {
+                out.copy_from_slice(&page);
+                return ZOU_OK;
+            }
+            Ok(None) => {}
+            Err(()) => return ZOU_ERR_STORE,
         }
         match shim
             .store
@@ -443,7 +510,7 @@ pub extern "C" fn zou_smgr_zeroextend(
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_smgr_truncate(spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> i32 {
     with_shim(|shim| {
-        note_rel(shim, spc, db, rel);
+        note_truncate(shim, spc, db, rel, fork, nblocks);
         if write_size(shim, spc, db, rel, fork, nblocks).is_err() {
             return ZOU_ERR_STORE;
         }

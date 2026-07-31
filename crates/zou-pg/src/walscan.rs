@@ -44,6 +44,8 @@ const BKPIMAGE_COMPRESSED: u8 = 0x04 | 0x08 | 0x10;
 const RM_SMGR_ID: u8 = 2;
 const XLOG_SMGR_CREATE: u8 = 0x10;
 const XLOG_SMGR_TRUNCATE: u8 = 0x20;
+/// The truncate record's flag for the main fork, SMGR_TRUNCATE_HEAP.
+const SMGR_TRUNCATE_HEAP: u32 = 0x0001;
 
 /// A block a WAL record references. Orders by relation then block,
 /// which is the page run order.
@@ -56,9 +58,9 @@ pub struct BlockRef {
     pub blk: u32,
 }
 
-/// A relation an smgr create or truncate record names. After one of
-/// these, checkpoint copies of any block in the relation may be stale
-/// even though no block reference ever said so.
+/// A relation an smgr create record names. After a file recreation,
+/// checkpoint copies of any block in the relation may be stale even
+/// though no block reference ever said so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RelTag {
     pub spc: u32,
@@ -66,12 +68,20 @@ pub struct RelTag {
     pub rel: u32,
 }
 
-/// What a scan produced: the blocks and relations the records touch,
-/// and where the next scan should resume, the end of the last complete
-/// record.
+/// What a scan produced: the blocks the records touch, the relations
+/// smgr create records recreated, the truncate events with their main
+/// fork cutoff, and where the next scan should resume, the end of the
+/// last complete record. A truncate is softer than a recreation: main
+/// fork blocks below the cutoff keep their bytes and older checkpoint
+/// copies of them stay valid, only blocks at or past it and the vm and
+/// fsm forks go stale. A cutoff of `u32::MAX` means the record did not
+/// truncate the main fork at all, only vm or fsm. Duplicate truncates
+/// of one relation collapse to the smallest cutoff, the only blocks
+/// that survived every event in the window.
 pub struct ScanOut {
     pub refs: Vec<BlockRef>,
     pub rels: Vec<RelTag>,
+    pub truncs: Vec<(RelTag, u32)>,
     pub resume: u64,
 }
 
@@ -94,35 +104,53 @@ pub fn assemble_window(
     from: u64,
     to: u64,
 ) -> Result<WalWindow, String> {
+    let sources = [(layout.clone(), segments.to_vec())];
+    assemble_window_from(store, &sources, from, to)
+}
+
+/// The multi source form: each entry names the tenant prefix its
+/// segments live under. A branched tenant assembles the frozen parent
+/// tails and its own stream into one window, listed parents first so
+/// the tenant's own bytes win where the streams overlap, the region a
+/// parent's incomplete trailing record left behind and the child's
+/// first records overwrote.
+pub fn assemble_window_from(
+    store: &dyn CasStore,
+    sources: &[(TenantLayout, Vec<String>)],
+    from: u64,
+    to: u64,
+) -> Result<WalWindow, String> {
     let mut buf = vec![0u8; (to.saturating_sub(from)) as usize];
     let mut covered_from = to;
-    for name in segments {
-        let epoch = zou_store::commit::segment_epoch(name)
-            .ok_or_else(|| format!("bad segment name {name:?}"))?;
-        let Some((bytes, _)) = store
-            .get(&layout.wal_segment_path(name))
-            .map_err(|e| format!("store: {e}"))?
-        else {
-            continue;
-        };
-        for frame in SegmentReader::new(&bytes, epoch) {
-            let frame = frame.map_err(|e| format!("segment {name}: {e}"))?;
-            let records = zou_store::commit::split_records(&frame.payload)
-                .ok_or_else(|| format!("bad batch in {name}"))?;
-            for record in records {
-                if record.len() < 8 {
-                    return Err(format!("short record in {name}"));
+    for (layout, segments) in sources {
+        for name in segments {
+            let epoch = zou_store::commit::segment_epoch(name)
+                .ok_or_else(|| format!("bad segment name {name:?}"))?;
+            let Some((bytes, _)) = store
+                .get(&layout.wal_segment_path(name))
+                .map_err(|e| format!("store: {e}"))?
+            else {
+                continue;
+            };
+            for frame in SegmentReader::new(&bytes, epoch) {
+                let frame = frame.map_err(|e| format!("segment {name}: {e}"))?;
+                let records = zou_store::commit::split_records(&frame.payload)
+                    .ok_or_else(|| format!("bad batch in {name}"))?;
+                for record in records {
+                    if record.len() < 8 {
+                        return Err(format!("short record in {name}"));
+                    }
+                    let lsn = u64::from_le_bytes(record[..8].try_into().expect("checked length"));
+                    let wal = &record[8..];
+                    let (start, end) = (lsn.max(from), (lsn + wal.len() as u64).min(to));
+                    if start >= end {
+                        continue;
+                    }
+                    covered_from = covered_from.min(start);
+                    let src = (start - lsn) as usize..(end - lsn) as usize;
+                    let dst = (start - from) as usize..(end - from) as usize;
+                    buf[dst].copy_from_slice(&wal[src]);
                 }
-                let lsn = u64::from_le_bytes(record[..8].try_into().expect("checked length"));
-                let wal = &record[8..];
-                let (start, end) = (lsn.max(from), (lsn + wal.len() as u64).min(to));
-                if start >= end {
-                    continue;
-                }
-                covered_from = covered_from.min(start);
-                let src = (start - lsn) as usize..(end - lsn) as usize;
-                let dst = (start - from) as usize..(end - from) as usize;
-                buf[dst].copy_from_slice(&wal[src]);
             }
         }
     }
@@ -226,9 +254,10 @@ impl<'a> Cursor<'a> {
 /// following DecodeXLogRecord: items run from after the fixed header
 /// until the main data header, which is always last. Smgr create and
 /// truncate records carry their relation in main data with no block
-/// references at all, so those surface as whole relation events in
-/// `rels`, which a reader needs to stop trusting checkpoint copies of
-/// a relation that was truncated or its file recreated.
+/// references at all, so those surface as relation events, a hard one
+/// in `rels` for a file recreation and a truncate event with its main
+/// fork cutoff in `truncs`, which a reader needs to know where to stop
+/// trusting checkpoint copies of the relation.
 fn record_block_refs(
     header: &[u8],
     tot_len: u64,
@@ -236,6 +265,7 @@ fn record_block_refs(
     rmid: u8,
     out: &mut Vec<BlockRef>,
     rels: &mut Vec<RelTag>,
+    truncs: &mut Vec<(RelTag, u32)>,
 ) -> Result<(), ScanErr> {
     let mut p = 0usize;
     let mut remaining = tot_len - RECORD_HEADER;
@@ -321,20 +351,38 @@ fn record_block_refs(
         // no block references so datatotal is zero in practice, the add
         // keeps the offset honest anyway.
         let main = p + datatotal as usize;
-        let locator_at = match info & 0xF0 {
-            XLOG_SMGR_CREATE => Some(main),
-            XLOG_SMGR_TRUNCATE => Some(main + 4),
-            _ => None,
+        let field = |at: usize| -> Result<u32, ScanErr> {
+            header
+                .get(at..at + 4)
+                .map(|s| u32::from_le_bytes(s.try_into().expect("checked length")))
+                .ok_or_else(|| ScanErr::Corrupt("smgr record too short".to_string()))
         };
-        if let Some(at) = locator_at {
-            let loc = header
-                .get(at..at + 12)
-                .ok_or_else(|| ScanErr::Corrupt("smgr record too short".to_string()))?;
-            rels.push(RelTag {
-                spc: u32::from_le_bytes(loc[..4].try_into().expect("checked length")),
-                db: u32::from_le_bytes(loc[4..8].try_into().expect("checked length")),
-                rel: u32::from_le_bytes(loc[8..12].try_into().expect("checked length")),
-            });
+        match info & 0xF0 {
+            XLOG_SMGR_CREATE => rels.push(RelTag {
+                spc: field(main)?,
+                db: field(main + 4)?,
+                rel: field(main + 8)?,
+            }),
+            // xl_smgr_truncate: the surviving block count, the locator,
+            // then which forks the truncate hit. Without the heap flag
+            // the main fork was not touched, only vm or fsm, and the
+            // MAX cutoff says every main block survived.
+            XLOG_SMGR_TRUNCATE => {
+                let nblocks = field(main)?;
+                let tag = RelTag {
+                    spc: field(main + 4)?,
+                    db: field(main + 8)?,
+                    rel: field(main + 12)?,
+                };
+                let flags = field(main + 16)?;
+                let cut = if flags & SMGR_TRUNCATE_HEAP != 0 {
+                    nblocks
+                } else {
+                    u32::MAX
+                };
+                truncs.push((tag, cut));
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -351,6 +399,7 @@ fn scan(window: &WalWindow, start: u64, end: Option<u64>) -> Result<ScanOut, Str
     let mut out = ScanOut {
         refs: Vec::new(),
         rels: Vec::new(),
+        truncs: Vec::new(),
         resume: start,
     };
     let mut header = Vec::new();
@@ -387,7 +436,15 @@ fn scan(window: &WalWindow, start: u64, end: Option<u64>) -> Result<ScanOut, Str
             let head = body.min(4096);
             header.clear();
             cursor.read(head, &mut header)?;
-            record_block_refs(&header, tot_len, info, rmid, &mut out.refs, &mut out.rels)?;
+            record_block_refs(
+                &header,
+                tot_len,
+                info,
+                rmid,
+                &mut out.refs,
+                &mut out.rels,
+                &mut out.truncs,
+            )?;
             cursor.skip(body - head)?;
             cursor.pos = (cursor.pos + MAXALIGN - 1) & !(MAXALIGN - 1);
             Ok(())
@@ -405,6 +462,10 @@ fn scan(window: &WalWindow, start: u64, end: Option<u64>) -> Result<ScanOut, Str
     out.refs.dedup();
     out.rels.sort();
     out.rels.dedup();
+    // Ascending sort puts the smallest cutoff first per relation, and
+    // only blocks below every cutoff in the window survived them all.
+    out.truncs.sort();
+    out.truncs.dedup_by(|b, a| b.0 == a.0);
     Ok(out)
 }
 
@@ -638,19 +699,52 @@ mod tests {
         assert_eq!(out.refs, vec![blk(999, 1)]);
         assert_eq!(
             out.rels,
-            vec![
+            vec![RelTag {
+                spc: 1663,
+                db: 5,
+                rel: 24000
+            }],
+            "only the create is a hard relation event"
+        );
+        assert_eq!(
+            out.truncs,
+            vec![(
                 RelTag {
                     spc: 1663,
                     db: 5,
                     rel: 16384
                 },
-                RelTag {
-                    spc: 1663,
-                    db: 5,
-                    rel: 24000
-                },
-            ]
+                3
+            )],
+            "the truncate carries its main fork cutoff"
         );
+    }
+
+    #[test]
+    fn truncate_cutoffs_collapse_to_the_minimum_and_honor_the_heap_flag() {
+        let mut b = Builder::new(WAL_SEGMENT_SIZE);
+        let trunc = |nblocks: u32, rel: u32, flags: u32| {
+            let mut d = Vec::new();
+            d.extend_from_slice(&nblocks.to_le_bytes());
+            d.extend_from_slice(&1663u32.to_le_bytes());
+            d.extend_from_slice(&5u32.to_le_bytes());
+            d.extend_from_slice(&rel.to_le_bytes());
+            d.extend_from_slice(&flags.to_le_bytes());
+            d
+        };
+        b.record_with(&[], &trunc(9, 16384, 7), 0x20, 2);
+        b.record_with(&[], &trunc(4, 16384, 7), 0x20, 2);
+        // A vm only truncate leaves the main fork alone.
+        b.record_with(&[], &trunc(0, 20000, 2), 0x20, 2);
+
+        let out = scan_available(&b.window(), WAL_SEGMENT_SIZE).unwrap();
+        let tag = |rel| RelTag {
+            spc: 1663,
+            db: 5,
+            rel,
+        };
+        assert_eq!(out.truncs, vec![(tag(16384), 4), (tag(20000), u32::MAX)]);
+        assert!(out.rels.is_empty());
     }
 
     #[test]

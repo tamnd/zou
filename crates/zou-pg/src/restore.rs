@@ -21,6 +21,12 @@
 //! parent tail entries replay before the tenant's own stream, oldest
 //! ancestor first, because the child's WAL begins where the parent's
 //! tail ended.
+//!
+//! Time travel is the same machinery pointed at a history snapshot:
+//! [`restore_at`] picks the newest published manifest at or before a
+//! timestamp and replays that manifest's own frozen tail, so the result
+//! is exactly what an attach at that moment would have seen. The store
+//! is never written.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
@@ -46,6 +52,7 @@ const CONTROL_REDO_OFFSET: usize = 40;
 const DB_SHUTDOWNED: u32 = 1;
 const DB_IN_PRODUCTION: u32 = 6;
 
+#[derive(Debug)]
 pub struct RestoreStats {
     pub files: usize,
     pub dirs: usize,
@@ -276,12 +283,6 @@ fn overlay_segments(
 /// must not already exist. Returns what was rebuilt; a plain server start
 /// on the result completes the attach.
 pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreStats, String> {
-    if pgdata.exists() {
-        return Err(format!(
-            "{} already exists, refusing to restore over it",
-            pgdata.display()
-        ));
-    }
     let store: Arc<dyn CasStore> = Arc::from(open_store(store_root)?);
     let layout = TenantLayout::new(tenant);
 
@@ -290,6 +291,46 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
         .map_err(|e| format!("store: {e}"))?
         .ok_or_else(|| format!("{store_root} has no manifest, nothing to restore"))?;
     let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
+    // The live head may hold segments published after the manifest's own
+    // tail was folded, so the tail is reconciled against the wal/ listing.
+    let tail = reconcile_tail(&*store, &layout, &manifest).map_err(|e| format!("store: {e}"))?;
+    restore_manifest(&*store, &layout, &manifest, tail, pgdata)
+}
+
+/// Restore the newest history snapshot of `tenant` at or before
+/// `unix_ts` into `pgdata`. This is time travel as a read only attach:
+/// nothing in the store changes, and the snapshot's own frozen wal_tail
+/// replays verbatim. Listing live epoch dirs here would pull in WAL
+/// written after the snapshot, so reconcile_tail is deliberately not
+/// used.
+pub fn restore_at(
+    store_root: &str,
+    tenant: &str,
+    unix_ts: u64,
+    pgdata: &Path,
+) -> Result<RestoreStats, String> {
+    let store: Arc<dyn CasStore> = Arc::from(open_store(store_root)?);
+    let layout = TenantLayout::new(tenant);
+    let snapshot = zou_store::snapshot_at(&*store, tenant, unix_ts).map_err(|e| e.to_string())?;
+    let tail = snapshot.wal_tail.clone();
+    restore_manifest(&*store, &layout, &snapshot, tail, pgdata)
+}
+
+/// Materialize one manifest, live head or history snapshot, into a fresh
+/// `pgdata` and overlay `tail` on top of any inherited parent tails.
+fn restore_manifest(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    manifest: &Manifest,
+    tail: Option<zou_store::manifest::WalTail>,
+    pgdata: &Path,
+) -> Result<RestoreStats, String> {
+    if pgdata.exists() {
+        return Err(format!(
+            "{} already exists, refusing to restore over it",
+            pgdata.display()
+        ));
+    }
     let full = manifest
         .checkpoints
         .iter()
@@ -305,8 +346,8 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
     let mut files = 0usize;
     let mut dirs = 0usize;
     for checkpoint in chain {
-        let lay = crate::fold::chk_layout(&layout, checkpoint);
-        let (f, d) = restore_fs(&*store, &lay, &checkpoint.id, pgdata)?;
+        let lay = crate::fold::chk_layout(layout, checkpoint);
+        let (f, d) = restore_fs(store, &lay, &checkpoint.id, pgdata)?;
         files += f;
         dirs += d;
     }
@@ -325,14 +366,13 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
     // tenant's own stream on top of them.
     for pt in &manifest.parent_tail {
         let lay = TenantLayout::new(&pt.tenant_ref);
-        let (r, b, e) = overlay_segments(&*store, &lay, &pt.segments, tli, &pg_wal)?;
+        let (r, b, e) = overlay_segments(store, &lay, &pt.segments, tli, &pg_wal)?;
         wal_records += r;
         wal_bytes += b;
         wal_end = wal_end.max(e);
     }
-    let tail = reconcile_tail(&*store, &layout, &manifest).map_err(|e| format!("store: {e}"))?;
     if let Some(tail) = tail {
-        let (r, b, e) = overlay_segments(&*store, &layout, &tail.segments, tli, &pg_wal)?;
+        let (r, b, e) = overlay_segments(store, layout, &tail.segments, tli, &pg_wal)?;
         wal_records += r;
         wal_bytes += b;
         wal_end = wal_end.max(e);
@@ -350,7 +390,7 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zou_store::manifest::CheckpointRef;
+    use zou_store::manifest::{CheckpointRef, WalTail};
     use zou_store::{GroupCommit, GroupCommitConfig, LocalFsStore, Lsn};
 
     #[test]
@@ -552,6 +592,106 @@ mod tests {
 
         // A second restore refuses to clobber the first.
         assert!(restore(store_root, "local", &pgdata).is_err());
+    }
+
+    #[test]
+    fn restore_at_replays_the_snapshot_tail_not_the_live_head() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let store_root = store_dir.path().to_str().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let layout = TenantLayout::new("local");
+
+        let control = synthetic_control(DB_SHUTDOWNED);
+        let initial_segment = vec![0x11u8; WAL_SEGMENT_SIZE as usize];
+        store
+            .put_new(&layout.chk_file("genesis", "global/pg_control"), &control)
+            .unwrap();
+        store
+            .put_new(&layout.chk_file("genesis", "PG_VERSION"), b"18\n")
+            .unwrap();
+        store
+            .put_new(
+                &layout.chk_file("genesis", "pg_wal/000000010000000000000001"),
+                &initial_segment,
+            )
+            .unwrap();
+        let index = format!(
+            "f PG_VERSION 3\nf global/pg_control {}\nf pg_wal/000000010000000000000001 {}\n",
+            control.len(),
+            initial_segment.len()
+        );
+        store
+            .put_new(&layout.chk_index("genesis"), index.as_bytes())
+            .unwrap();
+        let mut manifest = Manifest::new("local", 18);
+        manifest.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(0x0100_0028),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        store
+            .put_new(&layout.manifest(), &manifest.to_json())
+            .unwrap();
+
+        // Two pusher sessions, one sealed segment each, so the store
+        // ends up holding WAL from after the snapshot below.
+        let push = |epoch: u64, pg_lsn: u64, fill: u8, len: usize| {
+            let gc = GroupCommit::new(
+                Arc::new(LocalFsStore::new(store_dir.path())) as Arc<dyn CasStore>,
+                layout.clone(),
+                epoch,
+                epoch,
+                Lsn(epoch * 0x1000),
+                GroupCommitConfig::default(),
+            );
+            let mut record = pg_lsn.to_le_bytes().to_vec();
+            record.extend(std::iter::repeat_n(fill, len));
+            gc.append(&record).unwrap().wait().unwrap();
+            gc.close().unwrap();
+        };
+        push(1, 0x0100_0028, 0x22, 4096);
+        push(2, 0x0100_5000, 0x33, 100);
+        let live = reconcile_tail(&store, &layout, &manifest)
+            .unwrap()
+            .expect("two sessions sealed segments");
+        assert_eq!(live.segments.len(), 2);
+
+        // A history snapshot published between the two sessions: it
+        // froze the tail at the first segment, the second is future to
+        // it even though the live listing holds both.
+        let mut snapshot = manifest.clone();
+        snapshot.wal_tail = Some(WalTail {
+            epoch_dir: 1,
+            from_lsn: Lsn(0x0100_0028),
+            segments: vec![live.segments[0].clone()],
+        });
+        store
+            .put_new(&layout.manifest_history(1, 1000), &snapshot.to_json())
+            .unwrap();
+
+        // Time travel to the snapshot: only the first session's record
+        // replays, the store's newer WAL stays out of the tree.
+        let at_dir = out_dir.path().join("at");
+        let stats = restore_at(store_root, "local", 1500, &at_dir).unwrap();
+        assert_eq!(stats.wal_records, 1);
+        assert_eq!(stats.wal_bytes, 4096);
+        let seg1 = std::fs::read(at_dir.join("pg_wal/000000010000000000000001")).unwrap();
+        let off = (0x0100_0028 % WAL_SEGMENT_SIZE) as usize;
+        assert!(seg1[off..off + 4096].iter().all(|b| *b == 0x22));
+        let later = (0x0100_5000 % WAL_SEGMENT_SIZE) as usize;
+        assert_eq!(seg1[later], 0x11, "the newer record never landed");
+
+        // The live restore of the same store replays both records.
+        let live_dir = out_dir.path().join("live");
+        let stats = restore(store_root, "local", &live_dir).unwrap();
+        assert_eq!(stats.wal_records, 2);
+        assert_eq!(stats.wal_bytes, 4096 + 100);
+
+        // Before the earliest snapshot there is nothing to travel to.
+        let err = restore_at(store_root, "local", 500, &out_dir.path().join("gone")).unwrap_err();
+        assert!(err.contains("no history"), "{err}");
     }
 
     #[test]

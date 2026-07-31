@@ -80,6 +80,20 @@ pub fn materialize_at(
     unix_ts: u64,
     now_unix: u64,
 ) -> Result<Manifest, BranchError> {
+    let snapshot = snapshot_at(store, src_ref, unix_ts)?;
+    let child = child_of(&snapshot, src_ref, dst_ref, None, now_unix)?;
+    publish_child(store, dst_ref, &child)?;
+    Ok(child)
+}
+
+/// The newest history snapshot of `src_ref` at or before `unix_ts`,
+/// exactly what the source had published at that moment. Time travel
+/// restore reads one of these directly, nothing in the store changes.
+pub fn snapshot_at(
+    store: &dyn CasStore,
+    src_ref: &str,
+    unix_ts: u64,
+) -> Result<Manifest, BranchError> {
     let src = TenantLayout::new(src_ref);
     let dir = src.manifests_dir();
     let mut best: Option<(u64, String)> = None;
@@ -95,10 +109,7 @@ pub fn materialize_at(
         return Err(BranchError::NoHistory { unix_ts });
     };
     let (data, _) = store.get(&key)?.ok_or(BranchError::NoHistory { unix_ts })?;
-    let snapshot = Manifest::from_json(&data)?;
-    let child = child_of(&snapshot, src_ref, dst_ref, None, now_unix)?;
-    publish_child(store, dst_ref, &child)?;
-    Ok(child)
+    Ok(Manifest::from_json(&data)?)
 }
 
 /// The unix stamp inside a history key like
