@@ -71,6 +71,13 @@ jobs:
           FULL=$(ls "$ZOU_TARGET/tenants/local/chk/" | grep -v genesis | sort | tail -1)
           grep -q "^s [0-9]* [0-9]* $FILENODE " "$ZOU_TARGET/tenants/local/chk/$FULL/PAGES"
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
+          grep -q "^p 1663 5 $FILENODE 0 0$" "$ZOU_TARGET/tenants/local/chk/$FULL/PAGES"
+          rm "$ZOU_TARGET/tenants/local/pg/1663/5/$FILENODE/0/00000000"
+          build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
+          build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/runread.txt
+          grep -q 2001000 /tmp/runread.txt
+          ! grep -q "chain reader poisoned" /tmp/zou-pg.log
+          build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           cat /tmp/zou-pg.log
       - name: Restore and attach from the store alone
         run: |

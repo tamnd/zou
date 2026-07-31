@@ -39,6 +39,12 @@ const BKPBLOCK_FORK_MASK: u8 = 0x0F;
 const BKPIMAGE_HAS_HOLE: u8 = 0x01;
 const BKPIMAGE_COMPRESSED: u8 = 0x04 | 0x08 | 0x10;
 
+/// Storage rmgr, whose create and truncate records name a relation in
+/// main data instead of a block reference.
+const RM_SMGR_ID: u8 = 2;
+const XLOG_SMGR_CREATE: u8 = 0x10;
+const XLOG_SMGR_TRUNCATE: u8 = 0x20;
+
 /// A block a WAL record references. Orders by relation then block,
 /// which is the page run order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -50,13 +56,32 @@ pub struct BlockRef {
     pub blk: u32,
 }
 
+/// A relation an smgr create or truncate record names. After one of
+/// these, checkpoint copies of any block in the relation may be stale
+/// even though no block reference ever said so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RelTag {
+    pub spc: u32,
+    pub db: u32,
+    pub rel: u32,
+}
+
+/// What a scan produced: the blocks and relations the records touch,
+/// and where the next scan should resume, the end of the last complete
+/// record.
+pub struct ScanOut {
+    pub refs: Vec<BlockRef>,
+    pub rels: Vec<RelTag>,
+    pub resume: u64,
+}
+
 /// Mirrored stream bytes reassembled over `[base, base + buf.len())` in
 /// Postgres LSN space. `covered_from` is where coverage actually starts,
 /// the stream may begin after the requested base when older bytes were
 /// never pushed, the genesis case.
 pub struct WalWindow {
-    base: u64,
-    buf: Vec<u8>,
+    pub(crate) base: u64,
+    pub(crate) buf: Vec<u8>,
     pub covered_from: u64,
 }
 
@@ -108,6 +133,14 @@ pub fn assemble_window(
     })
 }
 
+/// Why a scan step could not proceed. Truncation means the window ends
+/// inside the current record, which a tolerant caller treats as a clean
+/// stop at the record's start. Corruption always propagates.
+enum ScanErr {
+    Truncated,
+    Corrupt(String),
+}
+
 /// Byte cursor over a window in absolute LSN space. Skips the page
 /// header at every 8KB boundary, the long form at segment starts, and
 /// validates the page magic on the way through.
@@ -121,33 +154,36 @@ impl<'a> Cursor<'a> {
         self.window.base + self.window.buf.len() as u64
     }
 
-    fn at(&self, pos: u64, len: usize) -> Result<&'a [u8], String> {
+    fn at(&self, pos: u64, len: usize) -> Result<&'a [u8], ScanErr> {
         let off = (pos - self.window.base) as usize;
         self.window
             .buf
             .get(off..off + len)
-            .ok_or_else(|| format!("wal window ends inside data at {pos:#X}"))
+            .ok_or(ScanErr::Truncated)
     }
 
     /// Skip the page header if the cursor sits on a page boundary.
-    fn skip_page_header(&mut self) -> Result<(), String> {
+    fn skip_page_header(&mut self) -> Result<(), ScanErr> {
         if !self.pos.is_multiple_of(XLOG_BLCKSZ) {
             return Ok(());
         }
         let header = self.at(self.pos, 4)?;
         let magic = u16::from_le_bytes(header[..2].try_into().expect("checked length"));
         if magic != XLOG_PAGE_MAGIC {
-            return Err(format!(
+            return Err(ScanErr::Corrupt(format!(
                 "bad wal page magic {magic:#06X} at {:#X}",
                 self.pos
-            ));
+            )));
         }
         let info = u16::from_le_bytes(header[2..4].try_into().expect("checked length"));
         if info & 0x0008 != 0 {
             // XLP_FIRST_IS_OVERWRITE_CONTRECORD only appears when local
             // WAL diverged from the stream, which reattach via restore
             // prevents. Refusing beats misparsing.
-            return Err(format!("overwrite contrecord at {:#X}", self.pos));
+            return Err(ScanErr::Corrupt(format!(
+                "overwrite contrecord at {:#X}",
+                self.pos
+            )));
         }
         self.pos += if self.pos.is_multiple_of(WAL_SEGMENT_SIZE) {
             LONG_PHD
@@ -158,7 +194,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// Read `len` record bytes into `out`, hopping page headers.
-    fn read(&mut self, len: u64, out: &mut Vec<u8>) -> Result<(), String> {
+    fn read(&mut self, len: u64, out: &mut Vec<u8>) -> Result<(), ScanErr> {
         let mut remaining = len;
         while remaining > 0 {
             self.skip_page_header()?;
@@ -171,13 +207,13 @@ impl<'a> Cursor<'a> {
     }
 
     /// Advance past `len` record bytes without copying.
-    fn skip(&mut self, len: u64) -> Result<(), String> {
+    fn skip(&mut self, len: u64) -> Result<(), ScanErr> {
         let mut remaining = len;
         while remaining > 0 {
             self.skip_page_header()?;
             let run = (XLOG_BLCKSZ - self.pos % XLOG_BLCKSZ).min(remaining);
             if self.pos + run > self.end() {
-                return Err(format!("wal window ends inside record at {:#X}", self.pos));
+                return Err(ScanErr::Truncated);
             }
             self.pos += run;
             remaining -= run;
@@ -188,16 +224,27 @@ impl<'a> Cursor<'a> {
 
 /// Parse the block references out of one record's header bytes,
 /// following DecodeXLogRecord: items run from after the fixed header
-/// until the main data header, which is always last.
-fn record_block_refs(header: &[u8], tot_len: u64, out: &mut Vec<BlockRef>) -> Result<(), String> {
+/// until the main data header, which is always last. Smgr create and
+/// truncate records carry their relation in main data with no block
+/// references at all, so those surface as whole relation events in
+/// `rels`, which a reader needs to stop trusting checkpoint copies of
+/// a relation that was truncated or its file recreated.
+fn record_block_refs(
+    header: &[u8],
+    tot_len: u64,
+    info: u8,
+    rmid: u8,
+    out: &mut Vec<BlockRef>,
+    rels: &mut Vec<RelTag>,
+) -> Result<(), ScanErr> {
     let mut p = 0usize;
     let mut remaining = tot_len - RECORD_HEADER;
     let mut datatotal = 0u64;
     let mut rel: Option<(u32, u32, u32)> = None;
-    let take = |p: &mut usize, n: usize| -> Result<&[u8], String> {
+    let take = |p: &mut usize, n: usize| -> Result<&[u8], ScanErr> {
         let s = header
             .get(*p..*p + n)
-            .ok_or_else(|| "record header truncated".to_string())?;
+            .ok_or_else(|| ScanErr::Corrupt("record header items overrun".to_string()))?;
         *p += n;
         Ok(s)
     };
@@ -249,8 +296,9 @@ fn record_block_refs(header: &[u8], tot_len: u64, out: &mut Vec<BlockRef>) -> Re
                     ));
                     remaining = remaining.saturating_sub(12);
                 }
-                let (spc, db, relnum) =
-                    rel.ok_or_else(|| "same rel flag with no prior relation".to_string())?;
+                let (spc, db, relnum) = rel.ok_or_else(|| {
+                    ScanErr::Corrupt("same rel flag with no prior relation".to_string())
+                })?;
                 let blk = u32::from_le_bytes(take(&mut p, 4)?.try_into().expect("checked length"));
                 remaining = remaining.saturating_sub(4);
                 out.push(BlockRef {
@@ -261,53 +309,127 @@ fn record_block_refs(header: &[u8], tot_len: u64, out: &mut Vec<BlockRef>) -> Re
                     blk,
                 });
             }
-            _ => return Err(format!("unknown block id {id} in record header")),
+            _ => {
+                return Err(ScanErr::Corrupt(format!(
+                    "unknown block id {id} in record header"
+                )));
+            }
+        }
+    }
+    if rmid == RM_SMGR_ID {
+        // Main data sits after the block data region. Smgr records have
+        // no block references so datatotal is zero in practice, the add
+        // keeps the offset honest anyway.
+        let main = p + datatotal as usize;
+        let locator_at = match info & 0xF0 {
+            XLOG_SMGR_CREATE => Some(main),
+            XLOG_SMGR_TRUNCATE => Some(main + 4),
+            _ => None,
+        };
+        if let Some(at) = locator_at {
+            let loc = header
+                .get(at..at + 12)
+                .ok_or_else(|| ScanErr::Corrupt("smgr record too short".to_string()))?;
+            rels.push(RelTag {
+                spc: u32::from_le_bytes(loc[..4].try_into().expect("checked length")),
+                db: u32::from_le_bytes(loc[4..8].try_into().expect("checked length")),
+                rel: u32::from_le_bytes(loc[8..12].try_into().expect("checked length")),
+            });
         }
     }
     Ok(())
+}
+
+/// The scan loop shared by the strict and tolerant entry points. With
+/// `end` set, running out of window before it is an error. Without it,
+/// the scan consumes complete records until the window ends inside one
+/// and reports where it stopped, which is how a reader tails a stream
+/// whose last frame can end mid record.
+fn scan(window: &WalWindow, start: u64, end: Option<u64>) -> Result<ScanOut, String> {
+    let mut cursor = Cursor { window, pos: start };
+    let limit = end.unwrap_or_else(|| cursor.end());
+    let mut out = ScanOut {
+        refs: Vec::new(),
+        rels: Vec::new(),
+        resume: start,
+    };
+    let mut header = Vec::new();
+    while cursor.pos < limit {
+        let rec_start = cursor.pos;
+        let step = (|cursor: &mut Cursor| -> Result<(), ScanErr> {
+            // Zero bytes where a record should begin are xlog switch
+            // padding, the rest of the segment is unused and the stream
+            // resumes behind the next 16MB boundary's long header.
+            if cursor.at(rec_start, 4)? == [0, 0, 0, 0] {
+                cursor.pos = rec_start / WAL_SEGMENT_SIZE * WAL_SEGMENT_SIZE + WAL_SEGMENT_SIZE;
+                return Ok(());
+            }
+            cursor.skip_page_header()?;
+            if cursor.pos >= limit {
+                return Ok(());
+            }
+            header.clear();
+            cursor.read(RECORD_HEADER, &mut header)?;
+            let tot_len = u64::from(u32::from_le_bytes(
+                header[..4].try_into().expect("checked length"),
+            ));
+            if tot_len < RECORD_HEADER {
+                return Err(ScanErr::Corrupt(format!(
+                    "bad record length {tot_len} at {rec_start:#X}"
+                )));
+            }
+            let info = header[16];
+            let rmid = header[17];
+            // Only the header items matter, capped well above the
+            // biggest possible header region, 33 block references at 46
+            // bytes each.
+            let body = tot_len - RECORD_HEADER;
+            let head = body.min(4096);
+            header.clear();
+            cursor.read(head, &mut header)?;
+            record_block_refs(&header, tot_len, info, rmid, &mut out.refs, &mut out.rels)?;
+            cursor.skip(body - head)?;
+            cursor.pos = (cursor.pos + MAXALIGN - 1) & !(MAXALIGN - 1);
+            Ok(())
+        })(&mut cursor);
+        match step {
+            Ok(()) => out.resume = cursor.pos,
+            Err(ScanErr::Truncated) if end.is_none() => break,
+            Err(ScanErr::Truncated) => {
+                return Err(format!("wal window ends inside record at {rec_start:#X}"));
+            }
+            Err(ScanErr::Corrupt(msg)) => return Err(msg),
+        }
+    }
+    out.refs.sort();
+    out.refs.dedup();
+    out.rels.sort();
+    out.rels.dedup();
+    Ok(out)
 }
 
 /// Walk the records in `[start, end)` and collect every block they
 /// reference, sorted and deduplicated. `start` and `end` must both be
 /// record boundaries, which checkpoint redo locations are.
 pub fn scan_block_refs(window: &WalWindow, start: u64, end: u64) -> Result<Vec<BlockRef>, String> {
-    let mut cursor = Cursor { window, pos: start };
-    let mut refs = Vec::new();
-    let mut header = Vec::new();
-    while cursor.pos < end {
-        let rec_start = cursor.pos;
-        // Zero bytes where a record should begin are xlog switch
-        // padding, the rest of the segment is unused and the stream
-        // resumes behind the next 16MB boundary's long header.
-        if cursor.at(rec_start, 4)? == [0, 0, 0, 0] {
-            cursor.pos = rec_start / WAL_SEGMENT_SIZE * WAL_SEGMENT_SIZE + WAL_SEGMENT_SIZE;
-            continue;
-        }
-        cursor.skip_page_header()?;
-        if cursor.pos >= end {
-            break;
-        }
-        header.clear();
-        cursor.read(RECORD_HEADER, &mut header)?;
-        let tot_len = u64::from(u32::from_le_bytes(
-            header[..4].try_into().expect("checked length"),
-        ));
-        if tot_len < RECORD_HEADER {
-            return Err(format!("bad record length {tot_len} at {rec_start:#X}"));
-        }
-        // Only the header items matter, capped well above the biggest
-        // possible header region, 33 block references at 46 bytes each.
-        let body = tot_len - RECORD_HEADER;
-        let head = body.min(4096);
-        header.clear();
-        cursor.read(head, &mut header)?;
-        record_block_refs(&header, tot_len, &mut refs)?;
-        cursor.skip(body - head)?;
-        cursor.pos = (cursor.pos + MAXALIGN - 1) & !(MAXALIGN - 1);
-    }
-    refs.sort();
-    refs.dedup();
-    Ok(refs)
+    scan_range(window, start, end).map(|out| out.refs)
+}
+
+/// Like [`scan_block_refs`] but with the relation events too, which the
+/// fold persists so the read path knows where a truncate or a file
+/// recreation invalidated older checkpoint copies of a relation.
+pub fn scan_range(window: &WalWindow, start: u64, end: u64) -> Result<ScanOut, String> {
+    scan(window, start, Some(end))
+}
+
+/// Walk complete records from `start` to wherever the window stops
+/// covering them, and report the resume point along with everything the
+/// records touch. A record the window ends inside is left for the next
+/// call, which is safe for dirty tracking: the write gate holds page
+/// writes until their record is fully durable, so a partially mirrored
+/// record cannot have pages in the store yet.
+pub fn scan_available(window: &WalWindow, start: u64) -> Result<ScanOut, String> {
+    scan(window, start, None)
 }
 
 /// Synthetic WAL for tests, shared with the fold tests: real page
@@ -354,6 +476,16 @@ pub(crate) mod testwal {
         }
 
         pub(crate) fn record(&mut self, refs: &[(BlockRef, bool)], main_data: &[u8]) {
+            self.record_with(refs, main_data, 0, 0);
+        }
+
+        pub(crate) fn record_with(
+            &mut self,
+            refs: &[(BlockRef, bool)],
+            main_data: &[u8],
+            info: u8,
+            rmid: u8,
+        ) {
             let mut items = Vec::new();
             let mut datatotal = 0u64;
             for (i, (r, same_rel)) in refs.iter().enumerate() {
@@ -376,12 +508,13 @@ pub(crate) mod testwal {
             record.extend_from_slice(&(tot_len as u32).to_le_bytes());
             record.extend_from_slice(&7u32.to_le_bytes());
             record.extend_from_slice(&0u64.to_le_bytes());
-            record.push(0);
-            record.push(0);
+            record.push(info);
+            record.push(rmid);
             record.extend_from_slice(&[0, 0]);
             record.extend_from_slice(&0u32.to_le_bytes());
             record.extend_from_slice(&items);
-            record.resize(tot_len as usize, 0x5A);
+            record.resize(tot_len as usize - main_data.len(), 0x5A);
+            record.extend_from_slice(main_data);
             self.write(&record);
             while !self.pos().is_multiple_of(MAXALIGN) {
                 self.bytes.push(0);
@@ -452,6 +585,72 @@ mod tests {
         assert_eq!(refs.len(), 6);
         assert_eq!(refs[0], blk(20000, 0));
         assert_eq!(refs[5], blk(20005, 5));
+    }
+
+    #[test]
+    fn the_tolerant_scan_stops_before_an_incomplete_record_and_resumes() {
+        let mut b = Builder::new(WAL_SEGMENT_SIZE);
+        b.record(&[(blk(16384, 7), false)], b"whole");
+        let boundary = b.pos();
+        b.record(&[(blk(16384, 8), false)], b"cut off");
+        let full_end = b.pos();
+        let mut window = b.window();
+        // Chop the second record in half: only the first one is complete.
+        window
+            .buf
+            .truncate((boundary - WAL_SEGMENT_SIZE + 10) as usize);
+
+        let out = scan_available(&window, WAL_SEGMENT_SIZE).unwrap();
+        assert_eq!(out.refs, vec![blk(16384, 7)]);
+        assert_eq!(out.resume, boundary);
+
+        // With the rest of the bytes present, resuming picks up the
+        // record that was cut off, and nothing is double counted.
+        let mut b2 = Builder::new(WAL_SEGMENT_SIZE);
+        b2.record(&[(blk(16384, 7), false)], b"whole");
+        b2.record(&[(blk(16384, 8), false)], b"cut off");
+        let out2 = scan_available(&b2.window(), out.resume).unwrap();
+        assert_eq!(out2.refs, vec![blk(16384, 8)]);
+        assert_eq!(out2.resume, full_end);
+    }
+
+    #[test]
+    fn smgr_create_and_truncate_surface_as_relation_events() {
+        let mut b = Builder::new(WAL_SEGMENT_SIZE);
+        // xl_smgr_create: locator then fork number.
+        let mut create = Vec::new();
+        create.extend_from_slice(&1663u32.to_le_bytes());
+        create.extend_from_slice(&5u32.to_le_bytes());
+        create.extend_from_slice(&24000u32.to_le_bytes());
+        create.extend_from_slice(&0u32.to_le_bytes());
+        b.record_with(&[], &create, 0x10, 2);
+        // xl_smgr_truncate: block count first, then the locator.
+        let mut trunc = Vec::new();
+        trunc.extend_from_slice(&3u32.to_le_bytes());
+        trunc.extend_from_slice(&1663u32.to_le_bytes());
+        trunc.extend_from_slice(&5u32.to_le_bytes());
+        trunc.extend_from_slice(&16384u32.to_le_bytes());
+        trunc.extend_from_slice(&7u32.to_le_bytes());
+        b.record_with(&[], &trunc, 0x20, 2);
+        b.record(&[(blk(999, 1), false)], b"plain");
+
+        let out = scan_available(&b.window(), WAL_SEGMENT_SIZE).unwrap();
+        assert_eq!(out.refs, vec![blk(999, 1)]);
+        assert_eq!(
+            out.rels,
+            vec![
+                RelTag {
+                    spc: 1663,
+                    db: 5,
+                    rel: 16384
+                },
+                RelTag {
+                    spc: 1663,
+                    db: 5,
+                    rel: 24000
+                },
+            ]
+        );
     }
 
     #[test]

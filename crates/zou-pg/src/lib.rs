@@ -16,6 +16,7 @@
 
 pub mod capture;
 pub mod fold;
+pub mod reader;
 pub mod restore;
 pub mod walscan;
 
@@ -43,12 +44,69 @@ pub const ZOU_ERR_BAD_ARGUMENT: i32 = -4;
 pub const ZOU_ERR_LEASE_HELD: i32 = -5;
 pub const ZOU_ERR_LEASE_LOST: i32 = -6;
 
+/// The chain reader behind the smgr read path. Unset until the first
+/// read, which attaches lazily so init stays cheap and a store with no
+/// checkpoints yet costs nothing. Off means every read goes to pg/,
+/// either by choice, by attach failure, or because there is no chain
+/// to serve. Backends are single threaded, the mutex sees no
+/// contention.
+enum ReaderSlot {
+    Unset,
+    Off,
+    On(Box<reader::ChainReader>),
+}
+
 struct Shim {
     store: LocalFsStore,
     layout: TenantLayout,
+    reader: Mutex<ReaderSlot>,
 }
 
 static SHIM: OnceLock<Shim> = OnceLock::new();
+
+/// Serve one page from the checkpoint chain, `None` when pg/ must
+/// answer. `ZOU_CHAIN_READER=0` is the escape hatch that pins every
+/// read to pg/.
+fn chain_read(shim: &Shim, r: walscan::BlockRef) -> Option<Vec<u8>> {
+    let mut slot = shim.reader.lock().ok()?;
+    if matches!(*slot, ReaderSlot::Unset) {
+        *slot = if std::env::var("ZOU_CHAIN_READER").is_ok_and(|v| v == "0") {
+            ReaderSlot::Off
+        } else {
+            match reader::ChainReader::attach(&shim.store, &shim.layout) {
+                Ok(Some(rd)) => ReaderSlot::On(Box::new(rd)),
+                Ok(None) => ReaderSlot::Off,
+                Err(e) => {
+                    eprintln!("zou chain reader attach failed, reads stay on pg/: {e}");
+                    ReaderSlot::Off
+                }
+            }
+        };
+    }
+    match &mut *slot {
+        ReaderSlot::On(rd) => rd.read(&shim.store, &shim.layout, r),
+        _ => None,
+    }
+}
+
+/// Tell an attached reader this process wrote a page, see
+/// [`reader::ChainReader::note_write`].
+fn note_write(shim: &Shim, r: walscan::BlockRef) {
+    if let Ok(mut slot) = shim.reader.lock()
+        && let ReaderSlot::On(rd) = &mut *slot
+    {
+        rd.note_write(r);
+    }
+}
+
+/// Tell an attached reader a whole relation changed shape locally.
+fn note_rel(shim: &Shim, spc: u32, db: u32, rel: u32) {
+    if let Ok(mut slot) = shim.reader.lock()
+        && let ReaderSlot::On(rd) = &mut *slot
+    {
+        rd.note_rel(walscan::RelTag { spc, db, rel });
+    }
+}
 
 fn wrap(f: impl FnOnce() -> i32) -> i32 {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(ZOU_ERR_PANIC)
@@ -114,6 +172,7 @@ pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
         let _ = SHIM.set(Shim {
             store: LocalFsStore::new(target),
             layout: TenantLayout::new("local"),
+            reader: Mutex::new(ReaderSlot::Unset),
         });
         ZOU_OK
     })
@@ -122,13 +181,18 @@ pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
 /// Create a fork: write SIZE=0 unless it already exists.
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_smgr_create(spc: u32, db: u32, rel: u32, fork: u32) -> i32 {
-    with_shim(|shim| match read_size(shim, spc, db, rel, fork) {
-        Ok(Some(_)) => ZOU_OK,
-        Ok(None) => match write_size(shim, spc, db, rel, fork, 0) {
-            Ok(()) => ZOU_OK,
+    with_shim(|shim| {
+        // A create can reuse a relfilenode a dropped relation once
+        // held, run images of the old incarnation must not serve.
+        note_rel(shim, spc, db, rel);
+        match read_size(shim, spc, db, rel, fork) {
+            Ok(Some(_)) => ZOU_OK,
+            Ok(None) => match write_size(shim, spc, db, rel, fork, 0) {
+                Ok(()) => ZOU_OK,
+                Err(()) => ZOU_ERR_STORE,
+            },
             Err(()) => ZOU_ERR_STORE,
-        },
-        Err(()) => ZOU_ERR_STORE,
+        }
     })
 }
 
@@ -206,6 +270,17 @@ pub unsafe extern "C" fn zou_smgr_read(
             return ZOU_ERR_BAD_ARGUMENT;
         }
         let out = unsafe { std::slice::from_raw_parts_mut(buf, ZOU_PAGE_SIZE) };
+        let r = walscan::BlockRef {
+            spc,
+            db,
+            rel,
+            fork,
+            blk,
+        };
+        if let Some(page) = chain_read(shim, r) {
+            out.copy_from_slice(&page);
+            return ZOU_OK;
+        }
         match shim
             .store
             .get(&shim.layout.pg_block(spc, db, rel, fork, blk))
@@ -247,7 +322,19 @@ pub unsafe extern "C" fn zou_smgr_write(
             .store
             .put(&shim.layout.pg_block(spc, db, rel, fork, blk), data)
         {
-            Ok(_) => ZOU_OK,
+            Ok(_) => {
+                note_write(
+                    shim,
+                    walscan::BlockRef {
+                        spc,
+                        db,
+                        rel,
+                        fork,
+                        blk,
+                    },
+                );
+                ZOU_OK
+            }
             Err(_) => ZOU_ERR_STORE,
         }
     })
@@ -300,7 +387,24 @@ pub extern "C" fn zou_smgr_zeroextend(
             return ZOU_ERR_BAD_ARGUMENT;
         };
         match write_size(shim, spc, db, rel, fork, new_size) {
-            Ok(()) => ZOU_OK,
+            Ok(()) => {
+                // The new blocks are zeros with no pg/ objects and, for
+                // unWALed cases, no records either, so run images of a
+                // previous incarnation must never answer for them.
+                for b in blk..new_size {
+                    note_write(
+                        shim,
+                        walscan::BlockRef {
+                            spc,
+                            db,
+                            rel,
+                            fork,
+                            blk: b,
+                        },
+                    );
+                }
+                ZOU_OK
+            }
             Err(()) => ZOU_ERR_STORE,
         }
     })
@@ -311,6 +415,7 @@ pub extern "C" fn zou_smgr_zeroextend(
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_smgr_truncate(spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> i32 {
     with_shim(|shim| {
+        note_rel(shim, spc, db, rel);
         if write_size(shim, spc, db, rel, fork, nblocks).is_err() {
             return ZOU_ERR_STORE;
         }
@@ -334,6 +439,7 @@ pub extern "C" fn zou_smgr_truncate(spc: u32, db: u32, rel: u32, fork: u32, nblo
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_smgr_unlink(spc: u32, db: u32, rel: u32, fork: u32) -> i32 {
     with_shim(|shim| {
+        note_rel(shim, spc, db, rel);
         // SIZE goes first so the fork stops existing even if a block
         // delete fails midway, leaving only unreachable garbage.
         if shim

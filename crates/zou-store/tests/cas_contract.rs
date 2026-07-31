@@ -12,7 +12,24 @@ fn run_contract(store: Arc<dyn CasStore>) {
     immutable_objects_cannot_be_overwritten(&*store);
     unconditional_put_overwrites_and_delete_removes(&*store);
     list_returns_sorted_keys_under_a_prefix(&*store);
+    ranged_reads_clamp_to_the_object(&*store);
     concurrent_swappers_never_lose_an_update(store);
+}
+
+fn ranged_reads_clamp_to_the_object(store: &dyn CasStore) {
+    let key = "contract/range/obj";
+    store.put(key, b"0123456789").unwrap();
+    assert_eq!(store.get_range(key, 0, 4).unwrap().unwrap(), b"0123");
+    assert_eq!(store.get_range(key, 4, 4).unwrap().unwrap(), b"4567");
+    // Ranges past the end come back short or empty, never an error.
+    assert_eq!(store.get_range(key, 8, 100).unwrap().unwrap(), b"89");
+    assert_eq!(store.get_range(key, 100, 4).unwrap().unwrap(), b"");
+    assert!(
+        store
+            .get_range("contract/range/missing", 0, 4)
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn unconditional_put_overwrites_and_delete_removes(store: &dyn CasStore) {
@@ -147,6 +164,11 @@ impl CasStore for PrefixedStore {
 
     fn put(&self, key: &str, data: &[u8]) -> Result<zou_store::Version, CasError> {
         self.inner.put(&format!("{}{key}", self.prefix), data)
+    }
+
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
+        self.inner
+            .get_range(&format!("{}{key}", self.prefix), offset, len)
     }
 
     fn delete(&self, key: &str) -> Result<(), CasError> {
