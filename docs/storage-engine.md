@@ -18,6 +18,8 @@ s3://<bucket>/tenants/<ref>/
 
 Everything under wal/ and chk/ is immutable once written. Only MANIFEST is mutated, and only through conditional PUT (If-Match on S3 and R2, preconditions on GCS, atomic rename plus lock on the local backend). That gives atomicity without any external coordination service.
 
+The same layout lives on any backend that passes the CAS contract. A plain path is a directory tree of one file per object, and a path ending in `.zou` is the single file backend: append only frames holding keys, fixed width metadata, and lz4 compressed payloads column wise, a crc guarded scan that truncates torn tails at open, versions as never reused sequence numbers, and compaction that rewrites live entries and swaps the file in atomically. One process owns a `.zou` file at a time through an OS level lock, which fits every sequential tool today, initdb over the shim, zou-bootstrap, zou info, and zou branch, while attaching the multi process postmaster to one waits on the in process engine. A bootstrapped store that spreads over a few thousand files in a directory lands in one file about a quarter the size.
+
 ## Manifest
 
 A small JSON document, the root of truth for one database. It names the Postgres version (18), the current checkpoint set, the WAL tail, the lease, and the branch provenance:

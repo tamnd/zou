@@ -20,6 +20,7 @@ pub mod open;
 pub mod s3;
 pub mod tier;
 pub mod wal;
+pub mod zoufile;
 
 pub use branch::{BranchError, branch, materialize_at, snapshot_at};
 pub use cas::{CasError, CasStore, LocalFsStore, Version};
@@ -35,3 +36,4 @@ pub use open::{PrefixStore, open_store};
 pub use s3::{Dialect, S3Config, S3Store};
 pub use tier::{BufferedTarget, ExpressTarget, LatencyTier, PureS3Target, WalTarget};
 pub use wal::{Frame, SegmentReader, WAL_VERSION, WalDecodeError};
+pub use zoufile::ZouFileStore;
