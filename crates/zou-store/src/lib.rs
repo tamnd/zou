@@ -26,6 +26,6 @@ pub use lease::{DEFAULT_TTL_SECS, HeldLease, LeaseError};
 pub use lsn::Lsn;
 pub use manifest::{MANIFEST_FORMAT, Manifest};
 #[cfg(feature = "s3")]
-pub use s3::{S3Config, S3Store};
+pub use s3::{Dialect, S3Config, S3Store};
 pub use tier::{BufferedTarget, ExpressTarget, LatencyTier, PureS3Target, WalTarget};
 pub use wal::{Frame, SegmentReader, WAL_VERSION, WalDecodeError};

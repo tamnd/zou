@@ -152,12 +152,17 @@ fn s3_backend_passes_the_contract() {
         return;
     };
     let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"));
+    let dialect = match std::env::var("ZOU_S3_TEST_DIALECT").as_deref() {
+        Ok("gcs") => zou_store::Dialect::Gcs,
+        _ => zou_store::Dialect::S3,
+    };
     let store = zou_store::S3Store::new(zou_store::S3Config {
         endpoint,
         region: std::env::var("ZOU_S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".into()),
         bucket: var("ZOU_S3_TEST_BUCKET"),
         access_key: var("ZOU_S3_TEST_ACCESS_KEY"),
         secret_key: var("ZOU_S3_TEST_SECRET_KEY"),
+        dialect,
     });
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
