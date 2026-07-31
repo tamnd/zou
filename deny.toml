@@ -10,6 +10,8 @@ allow = [
   "MIT",
   "BSD-2-Clause",
   "BSD-3-Clause",
+  # webpki-roots ships the Mozilla CA bundle under CDLA-Permissive-2.0.
+  "CDLA-Permissive-2.0",
   "ISC",
   "Unicode-3.0",
   "Zlib",

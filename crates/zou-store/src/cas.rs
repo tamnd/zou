@@ -3,8 +3,9 @@
 //! This is the only coordination primitive zou needs. S3 gives it to us as
 //! conditional PUT with If-Match, GCS as generation preconditions, and the
 //! local filesystem backend emulates it with a per-key lock plus atomic
-//! rename. Versions are content hashes, so they are stable across backends
-//! and shareable between branches and replicas.
+//! rename. Versions are opaque: the local backend uses content hashes,
+//! remote backends use whatever token their API returns, and callers may
+//! only ever compare them for equality.
 
 use std::fs;
 use std::io::Write;
@@ -27,6 +28,13 @@ impl Version {
             hex.push_str(&format!("{b:02x}"));
         }
         Version(hex)
+    }
+
+    /// Wrap a backend supplied version token, an ETag or a generation
+    /// number, verbatim.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    pub(crate) fn from_backend(token: impl Into<String>) -> Self {
+        Version(token.into())
     }
 
     pub fn as_str(&self) -> &str {

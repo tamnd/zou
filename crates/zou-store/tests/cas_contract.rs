@@ -108,3 +108,63 @@ fn local_fs_backend_passes_the_contract() {
     let dir = tempfile::tempdir().unwrap();
     run_contract(Arc::new(LocalFsStore::new(dir.path())));
 }
+
+/// Prefixes every key with a per-run nonce so the contract's fixed key
+/// names never collide across runs against a long lived bucket.
+#[cfg(feature = "s3")]
+struct PrefixedStore {
+    inner: zou_store::S3Store,
+    prefix: String,
+}
+
+#[cfg(feature = "s3")]
+impl CasStore for PrefixedStore {
+    fn get(&self, key: &str) -> Result<Option<(Vec<u8>, zou_store::Version)>, CasError> {
+        self.inner.get(&format!("{}{key}", self.prefix))
+    }
+
+    fn put_if_match(
+        &self,
+        key: &str,
+        data: &[u8],
+        expected: Option<&zou_store::Version>,
+    ) -> Result<zou_store::Version, CasError> {
+        self.inner
+            .put_if_match(&format!("{}{key}", self.prefix), data, expected)
+    }
+
+    fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+        let keys = self.inner.list(&format!("{}{prefix}", self.prefix))?;
+        Ok(keys
+            .into_iter()
+            .filter_map(|k| k.strip_prefix(&self.prefix).map(str::to_string))
+            .collect())
+    }
+}
+
+/// Runs against any S3 compatible endpoint, MinIO in CI. Skips unless
+/// ZOU_S3_TEST_ENDPOINT is set so plain `cargo test` stays offline.
+#[cfg(feature = "s3")]
+#[test]
+fn s3_backend_passes_the_contract() {
+    let Ok(endpoint) = std::env::var("ZOU_S3_TEST_ENDPOINT") else {
+        eprintln!("skipping: ZOU_S3_TEST_ENDPOINT not set");
+        return;
+    };
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"));
+    let store = zou_store::S3Store::new(zou_store::S3Config {
+        endpoint,
+        region: std::env::var("ZOU_S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".into()),
+        bucket: var("ZOU_S3_TEST_BUCKET"),
+        access_key: var("ZOU_S3_TEST_ACCESS_KEY"),
+        secret_key: var("ZOU_S3_TEST_SECRET_KEY"),
+    });
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    run_contract(Arc::new(PrefixedStore {
+        inner: store,
+        prefix: format!("contract-runs/{nonce:x}/"),
+    }));
+}

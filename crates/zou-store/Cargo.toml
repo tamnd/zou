@@ -9,11 +9,16 @@ authors.workspace = true
 
 [dependencies]
 crc32c = { workspace = true }
+hmac = { workspace = true, optional = true }
 lz4_flex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"
 thiserror = { workspace = true }
+ureq = { workspace = true, optional = true }
+
+[features]
+s3 = ["dep:hmac", "dep:ureq"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
