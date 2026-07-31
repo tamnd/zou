@@ -7,7 +7,7 @@
 //! With that in place a node can attach to the store with no local state,
 //! which is what the recovery path builds on.
 //!
-//! Usage: zou-bootstrap <store-root> <pgdata> --redo <X/Y>
+//! Usage: `zou-bootstrap <store-root> <pgdata> --redo <X/Y>`
 //!
 //! The redo location comes from pg_controldata, the caller passes it in
 //! so this tool does not have to parse the binary control file.
