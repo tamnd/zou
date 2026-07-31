@@ -2,3 +2,7 @@
 	path = vendor/postgres
 	url = https://github.com/postgres/postgres.git
 	shallow = true
+[submodule "vendor/pgvector"]
+	path = vendor/pgvector
+	url = https://github.com/pgvector/pgvector
+	shallow = true
