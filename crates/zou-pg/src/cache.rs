@@ -259,7 +259,7 @@ impl SlabCache {
 
     fn log_maybe(&self) {
         if self.metrics.lookups().is_multiple_of(LOG_EVERY) {
-            eprintln!("{}", self.metrics.line());
+            log::info!("{}", self.metrics.line());
         }
     }
 
@@ -268,7 +268,7 @@ impl SlabCache {
     /// a backend exits through C's exit().
     pub fn log_summary(&self) {
         if self.metrics.lookups() > 0 {
-            eprintln!("{}", self.metrics.line());
+            log::info!("{}", self.metrics.line());
         }
     }
 }

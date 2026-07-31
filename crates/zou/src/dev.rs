@@ -97,7 +97,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     fs::create_dir_all(&sock).map_err(|e| format!("create {}: {e}", sock.display()))?;
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("chmod {}: {e}", sock.display()))?;
-    eprintln!("zou: runtime directory {}", args.runtime.display());
+    log::info!("runtime directory {}", args.runtime.display());
 
     let store: Arc<dyn CasStore> = Arc::from(open_store(&args.target)?);
     let layout = TenantLayout::new("local");
@@ -112,7 +112,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             .is_empty(),
     };
     if fresh {
-        eprintln!("zou: {} is empty, running initdb", args.target);
+        log::info!("{} is empty, running initdb", args.target);
         let out = Command::new(args.pg_bin.join("initdb"))
             .arg("-D")
             .arg(&pgdata)
@@ -130,15 +130,18 @@ pub fn run(args: &Args) -> Result<(), String> {
             .map_err(|e| format!("read pg_control: {e}"))?;
         let redo = restore::control_redo(&control)?;
         let stats = bootstrap::capture_genesis(&*store, &layout, &pgdata, redo)?;
-        eprintln!(
-            "zou: captured genesis, {} files, {} bytes, redo {redo:#X}",
-            stats.files, stats.bytes
+        log::info!(
+            "captured genesis, {} files, {} bytes, redo {redo:#X}",
+            stats.files,
+            stats.bytes
         );
     } else {
         let stats = restore::restore(&args.target, "local", &pgdata)?;
-        eprintln!(
-            "zou: restored {} files and replayed {} wal records from {}",
-            stats.files, stats.wal_records, args.target
+        log::info!(
+            "restored {} files and replayed {} wal records from {}",
+            stats.files,
+            stats.wal_records,
+            args.target
         );
     }
 
@@ -179,11 +182,11 @@ pub fn run(args: &Args) -> Result<(), String> {
                     if line.contains("ready to accept connections")
                         && !ready.swap(true, Ordering::SeqCst)
                     {
-                        eprintln!(
-                            "zou: postgres ready on 127.0.0.1:{port} and socket {}",
+                        log::info!(
+                            "postgres ready on 127.0.0.1:{port} and socket {}",
                             sock.display()
                         );
-                        eprintln!("zou: try psql -h 127.0.0.1 -p {port} -d postgres");
+                        log::info!("try psql -h 127.0.0.1 -p {port} -d postgres");
                     }
                 }
             })
@@ -208,11 +211,11 @@ pub fn run(args: &Args) -> Result<(), String> {
         let _ = echo.join();
 
         if SHUTDOWN.load(Ordering::SeqCst) {
-            eprintln!("zou: postmaster stopped, store is at {}", args.target);
+            log::info!("postmaster stopped, store is at {}", args.target);
             return Ok(());
         }
         if status.success() {
-            eprintln!("zou: postmaster exited cleanly on its own");
+            log::info!("postmaster exited cleanly on its own");
             return Ok(());
         }
         if ready.load(Ordering::SeqCst) {
@@ -225,7 +228,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                 ));
             }
         }
-        eprintln!("zou: postmaster died ({status}), restarting");
+        log::warn!("postmaster died ({status}), restarting");
         std::thread::sleep(Duration::from_secs(1));
     }
 }

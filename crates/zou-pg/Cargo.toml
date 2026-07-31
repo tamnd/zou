@@ -16,6 +16,8 @@ crate-type = ["staticlib", "rlib"]
 # the S3 client into the postgres backend through the staticlib.
 zou-store = { path = "../zou-store", features = ["s3"] }
 crc32c = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -189,7 +189,7 @@ pub fn update_manifest(
         match store.put_new(&history, &snapshot.to_json()) {
             Ok(_) | Err(CasError::AlreadyExists { .. }) => held.last_history_unix = now_unix,
             Err(e) => {
-                eprintln!("zou: history snapshot {history} failed, pitr loses this second: {e}")
+                log::warn!("history snapshot {history} failed, pitr loses this second: {e}")
             }
         }
     }

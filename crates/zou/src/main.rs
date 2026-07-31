@@ -30,6 +30,9 @@ fn simple(result: Result<(), String>) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Structured logs on stderr, RUST_LOG filters them, info by default.
+    // Results meant for scripts stay on stdout untouched.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
