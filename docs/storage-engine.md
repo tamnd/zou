@@ -9,7 +9,7 @@ One prefix per logical database:
 ```
 s3://<bucket>/tenants/<ref>/
   MANIFEST                      current manifest, swapped with CAS
-  manifests/<epoch>.json        manifest history, enables PITR and branching
+  manifests/<epoch>-<unix>.json manifest history, enables PITR and branching
   wal/<epoch>/<start-lsn>.wal   sealed WAL segments, immutable
   chk/<chk-id>/index            page location index for one checkpoint
   chk/<chk-id>/<n>.pages        sorted page images, 64 to 256 MB objects
@@ -67,7 +67,13 @@ A background checkpointer replays sealed WAL into delta checkpoints, sorted page
 
 ## Branching and PITR
 
-A branch is a new prefix containing only a manifest that points into the parent's immutable objects. It costs one small object and completes in well under a second. Writes to the branch diverge into its own epoch directories. Point in time recovery picks the manifest at or before the target time and replays parent WAL to the target LSN, materialized as a branch. Retention defaults to 7 days.
+A branch is a new prefix containing only a manifest that points into the parent's immutable objects. It costs one small object and completes in well under a second. `zou-branch <store-root> <src> <dst>` takes it at the parent's last published state, `--at <lsn>` pins it to a checkpoint redo or a point in the unfolded tail, and `--ts <unix>` materializes the newest history snapshot at or before that second.
+
+The child manifest carries three things. Inherited checkpoint refs are tagged with their owner, so reads and restores fetch those objects from the owner's prefix no matter how many hops down the branch chain sits. The frozen parent tail lists the parent WAL segments the fold had not consumed at branch time, replayed before the child's own stream. And `branch_of` records provenance. Writes to the branch diverge into its own epoch directories under its own prefix, the parent's objects are never touched.
+
+History snapshots make PITR work: every manifest state change writes a copy under `manifests/`, at most one per second. Garbage collection pins everything a snapshot younger than the retention window references, a week by default, so a branch materialized inside the window always finds its objects. Snapshots past retention are collected through the same two phase candidate window as everything else, and a parked branch pins its inherited objects for as long as it lives.
+
+Restoring a branch to a data directory works today through `zou-restore <store-root> <pgdata> <ref>`. Serving a branch from a live server on the chain reader alone still has a gap, blocks that predate the runs live only in the parent's pg/ prefix, so the smgr side attach lands together with time travel reads.
 
 ## Failure behavior
 

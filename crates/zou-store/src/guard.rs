@@ -111,7 +111,7 @@ mod tests {
             t.wal_segment(1, Lsn(0)),
             t.checkpoint_page_index("chk-1"),
             t.checkpoint_pages("chk-1", 0),
-            t.manifest_history(1),
+            t.manifest_history(1, 1000),
         ] {
             let v = store.put_new(&key, b"original").unwrap();
             let err = store.put_if_match(&key, b"rewrite", Some(&v)).unwrap_err();
@@ -145,7 +145,7 @@ mod tests {
             .unwrap();
         let mut held = lease::acquire(&store, &layout, "node-a", 15, 1000).unwrap();
         lease::renew(&store, &layout, &mut held, 15, 1005).unwrap();
-        lease::update_manifest(&store, &layout, &mut held, |_| {}).unwrap();
+        lease::update_manifest(&store, &layout, &mut held, 1010, |_| {}).unwrap();
         lease::release(&store, &layout, held).unwrap();
     }
 

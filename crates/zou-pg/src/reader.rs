@@ -33,6 +33,17 @@
 //! enter the runs at all, the fold skips them, because their writes
 //! bypass the WAL and no barrier can see them.
 //!
+//! A branched tenant complicates the walk in two bounded ways. The
+//! inherited checkpoints carry an owner tag, so their PAGES indexes
+//! and run objects are fetched under the owner's prefix, and the
+//! manifest's parent tail names the parent WAL segments the fold had
+//! not consumed at branch time. That segment list is frozen, the
+//! parent moved on in its own prefix, so one static scan at attach
+//! folds its dirtying into the same sets the live barrier feeds. An
+//! incomplete trailing parent record can never complete and is
+//! dropped, which is correct: the write gate never let its pages
+//! reach any store state the child inherited.
+//!
 //! Any parse error, store error, or coverage gap poisons the reader,
 //! which then declines every read and the smgr falls back to pg/.
 //!
@@ -63,16 +74,19 @@ use crate::walscan::{self, BlockRef, RelTag, WalWindow};
 /// scan land in the same slab, one range request instead of 128.
 const SLAB_BYTES: u64 = 1 << 20;
 
-/// The parsed PAGES index of one checkpoint.
+/// The parsed PAGES index of one checkpoint, remembering which tenant
+/// prefix holds its objects: an inherited checkpoint reads from its
+/// owner, everything else from the attaching tenant.
 struct ChkIndex {
     id: String,
+    layout: TenantLayout,
     run_pages: usize,
     entries: Vec<BlockRef>,
     rels: BTreeSet<RelTag>,
 }
 
 impl ChkIndex {
-    fn parse(id: &str, text: &str) -> Result<Self, String> {
+    fn parse(id: &str, layout: TenantLayout, text: &str) -> Result<Self, String> {
         let mut lines = text.lines();
         let run_pages = lines
             .next()
@@ -119,6 +133,7 @@ impl ChkIndex {
         }
         Ok(Self {
             id: id.to_string(),
+            layout,
             run_pages,
             entries,
             rels,
@@ -205,6 +220,32 @@ impl TailScan {
     }
 }
 
+/// Feed one segment's frames into the per epoch tail scans. Shared by
+/// the live barrier and the static parent tail pass at attach.
+fn scan_segment_into(
+    scans: &mut BTreeMap<u64, TailScan>,
+    name: &str,
+    bytes: &[u8],
+    floor: u64,
+) -> Result<(), String> {
+    let epoch = zou_store::commit::segment_epoch(name)
+        .ok_or_else(|| format!("bad segment name {name:?}"))?;
+    let tail = scans.entry(epoch).or_insert_with(TailScan::new);
+    for frame in SegmentReader::new(bytes, epoch) {
+        let frame = frame.map_err(|e| format!("segment {name}: {e}"))?;
+        let records = zou_store::commit::split_records(&frame.payload)
+            .ok_or_else(|| format!("bad batch in {name}"))?;
+        for record in records {
+            if record.len() < 8 {
+                return Err(format!("short record in {name}"));
+            }
+            let lsn = u64::from_le_bytes(record[..8].try_into().expect("checked length"));
+            tail.append(lsn, &record[8..], floor)?;
+        }
+    }
+    Ok(())
+}
+
 pub struct ChainReader {
     /// Newest first, starting no earlier than the newest full capture.
     chain: Vec<ChkIndex>,
@@ -255,8 +296,9 @@ impl ChainReader {
         let mut chain = Vec::new();
         let mut gap = false;
         for c in manifest.checkpoints[full..].iter().rev() {
+            let lay = crate::fold::chk_layout(layout, c);
             match store
-                .get(&layout.checkpoint_page_index(&c.id))
+                .get(&lay.checkpoint_page_index(&c.id))
                 .map_err(|e| format!("store: {e}"))?
             {
                 Some((data, _)) => {
@@ -268,7 +310,7 @@ impl ChainReader {
                     }
                     let text = String::from_utf8(data)
                         .map_err(|_| format!("PAGES for {} is not utf8", c.id))?;
-                    chain.push(ChkIndex::parse(&c.id, &text)?);
+                    chain.push(ChkIndex::parse(&c.id, lay, &text)?);
                 }
                 None => gap = true,
             }
@@ -281,11 +323,34 @@ impl ChainReader {
         // The stream holds everything from here on, folds only drop
         // WAL below it.
         let floor = manifest.checkpoints.last().expect("full exists").lsn.0;
+        // The inherited parent tail is a frozen segment list, scan it
+        // once here. The floor is a fold redo, so a record boundary,
+        // which makes the clip in TailScan::append sound for parent
+        // bytes too. Per entry local scans keep parent epochs out of
+        // the live tails map, a parent epoch number could collide with
+        // this tenant's own.
+        let mut dirty = BTreeSet::new();
+        let mut dirty_rels = BTreeSet::new();
+        for pt in &manifest.parent_tail {
+            let lay = TenantLayout::new(&pt.tenant_ref);
+            let mut scans: BTreeMap<u64, TailScan> = BTreeMap::new();
+            for name in &pt.segments {
+                let key = lay.wal_segment_path(name);
+                let (bytes, _) = store
+                    .get(&key)
+                    .map_err(|e| format!("store: {e}"))?
+                    .ok_or_else(|| format!("inherited segment {key} is missing"))?;
+                scan_segment_into(&mut scans, name, &bytes, floor)?;
+            }
+            for tail in scans.values_mut() {
+                tail.scan(&mut dirty, &mut dirty_rels)?;
+            }
+        }
         Ok(Some(Self {
             chain,
             floor,
-            dirty: BTreeSet::new(),
-            dirty_rels: BTreeSet::new(),
+            dirty,
+            dirty_rels,
             tails: BTreeMap::new(),
             seen: BTreeSet::new(),
             scanned_durable: 0,
@@ -347,7 +412,7 @@ impl ChainReader {
         let mut hit = None;
         for chk in &self.chain {
             if let Some((run, off)) = chk.lookup(&r) {
-                hit = Some((chk.id.clone(), run, off));
+                hit = Some((chk.layout.clone(), chk.id.clone(), run, off));
                 break;
             }
             if chk.rels.contains(&tag) {
@@ -356,7 +421,7 @@ impl ChainReader {
                 break;
             }
         }
-        let (id, run, off) = hit?;
+        let (lay, id, run, off) = hit?;
         if durable == 0 || durable > self.scanned_durable {
             if let Err(e) = self.barrier(store, layout) {
                 self.poison(&e);
@@ -367,7 +432,7 @@ impl ChainReader {
         if self.dirty.contains(&r) || self.dirty_rels.contains(&tag) {
             return None;
         }
-        match self.fetch(store, layout, &id, run, off) {
+        match self.fetch(store, &lay, &id, run, off) {
             Ok(page) => Some(page),
             Err(e) => {
                 self.poison(&e);
@@ -390,25 +455,11 @@ impl ChainReader {
             let name = key
                 .strip_prefix(&dir)
                 .ok_or_else(|| format!("unexpected key {key} under the wal prefix"))?;
-            let epoch = zou_store::commit::segment_epoch(name)
-                .ok_or_else(|| format!("bad segment name {name:?}"))?;
             let (bytes, _) = store
                 .get(&key)
                 .map_err(|e| format!("store: {e}"))?
                 .ok_or_else(|| format!("listed segment {key} vanished"))?;
-            let tail = self.tails.entry(epoch).or_insert_with(TailScan::new);
-            for frame in SegmentReader::new(&bytes, epoch) {
-                let frame = frame.map_err(|e| format!("segment {name}: {e}"))?;
-                let records = zou_store::commit::split_records(&frame.payload)
-                    .ok_or_else(|| format!("bad batch in {name}"))?;
-                for record in records {
-                    if record.len() < 8 {
-                        return Err(format!("short record in {name}"));
-                    }
-                    let lsn = u64::from_le_bytes(record[..8].try_into().expect("checked length"));
-                    tail.append(lsn, &record[8..], self.floor)?;
-                }
-            }
+            scan_segment_into(&mut self.tails, name, &bytes, self.floor)?;
             self.seen.insert(key);
         }
         for tail in self.tails.values_mut() {
@@ -428,7 +479,12 @@ impl ChainReader {
         off: u64,
     ) -> Result<Vec<u8>, String> {
         let offset = off / SLAB_BYTES * SLAB_BYTES;
-        let cache_key = format!("{id}-{run:08}-{offset:016X}");
+        // The tenant prefix is part of the key: two branches can each
+        // hold a checkpoint named like the other's while the objects
+        // differ, only (owner, id) is content addressed. Flattened,
+        // the disk tier uses the key as a file name.
+        let owner = layout.prefix().replace('/', "_");
+        let cache_key = format!("{owner}-{id}-{run:08}-{offset:016X}");
         let slab = self.cache.get_or_load(&cache_key, || {
             let key = layout.checkpoint_pages(id, run);
             store
@@ -515,6 +571,7 @@ mod tests {
                 id: (*id).to_string(),
                 lsn: Lsn(*lsn),
                 kind: *kind,
+                owner: None,
             });
         }
         store.put_new(&layout.manifest(), &m.to_json()).unwrap();
@@ -791,6 +848,41 @@ mod tests {
             let page = rd.read(&*store, &layout, blk(16384, i), 0).unwrap();
             assert!(page.iter().all(|b| *b == fill), "block {i}");
         }
+    }
+
+    #[test]
+    fn a_branch_child_serves_inherited_runs_and_scans_the_parent_tail() {
+        let (_d, store, layout) = setup();
+        let floor = WAL_SEGMENT_SIZE;
+        put_chk(
+            &*store,
+            &layout,
+            "f1",
+            &[(blk(16384, 0), 0xAA), (blk(16384, 1), 0xBB)],
+            &[],
+        );
+        put_manifest(&*store, &layout, &[("f1", floor, CheckpointKind::Full)]);
+
+        // The parent pushes tail WAL dirtying block 0, publishes it,
+        // and only then is the branch taken at head.
+        let gc = commit(&store, &layout);
+        let mut wal = Builder::new(floor);
+        wal.record(&[(blk(16384, 0), false)], b"parent change before branch");
+        let (lsn, bytes) = wal.stream();
+        push(&gc, lsn, bytes);
+        gc.close().unwrap();
+        zou_store::branch(&*store, "local", "child", None, 5000).unwrap();
+
+        let child = TenantLayout::new("child");
+        let mut rd = ChainReader::attach(&*store, &child).unwrap().unwrap();
+        // The untouched block serves out of the parent's run object,
+        // the child prefix holds no chk/ at all.
+        let page = rd.read(&*store, &child, blk(16384, 1), 0).unwrap();
+        assert!(page.iter().all(|b| *b == 0xBB));
+        // The parent tail dirtied block 0 before the branch, pg/ must
+        // answer even though the child's own stream is empty.
+        assert!(rd.read(&*store, &child, blk(16384, 0), 0).is_none());
+        assert!(!rd.poisoned());
     }
 
     /// Delegating store that counts GET, LIST, and ranged GET calls,

@@ -3,7 +3,7 @@
 //! ```text
 //! tenants/<ref>/
 //!   MANIFEST                      current manifest, swapped with CAS
-//!   manifests/<epoch>.json        manifest history
+//!   manifests/<epoch>-<unix>.json manifest history
 //!   wal/<epoch>/<start-lsn>.wal   sealed WAL segments, immutable
 //!   chk/<chk-id>/INDEX            fs capture index for one checkpoint
 //!   chk/<chk-id>/fs/<path>        captured files
@@ -41,9 +41,18 @@ impl TenantLayout {
         format!("{}/MANIFEST", self.prefix)
     }
 
-    /// Historical manifest snapshot, written before every swap.
-    pub fn manifest_history(&self, epoch: u64) -> String {
-        format!("{}/manifests/{epoch:016}.json", self.prefix)
+    /// Historical manifest snapshot, one per state changing publish,
+    /// at most one per second. The epoch leads so the listing sorts in
+    /// write order, the unix stamp disambiguates the many publishes one
+    /// epoch makes and is what PITR picks a snapshot by.
+    pub fn manifest_history(&self, epoch: u64, unix: u64) -> String {
+        format!("{}/manifests/{epoch:016}-{unix:016}.json", self.prefix)
+    }
+
+    /// The whole history prefix, listed by PITR and swept by gc past
+    /// the retention window.
+    pub fn manifests_dir(&self) -> String {
+        format!("{}/manifests/", self.prefix)
     }
 
     /// A sealed WAL segment. Segments live under the epoch that wrote them,
@@ -137,9 +146,10 @@ mod tests {
         let t = TenantLayout::new("acme-prod");
         assert_eq!(t.manifest(), "tenants/acme-prod/MANIFEST");
         assert_eq!(
-            t.manifest_history(42),
-            "tenants/acme-prod/manifests/0000000000000042.json"
+            t.manifest_history(42, 1_767_100_000),
+            "tenants/acme-prod/manifests/0000000000000042-0000001767100000.json"
         );
+        assert_eq!(t.manifests_dir(), "tenants/acme-prod/manifests/");
         assert_eq!(
             t.wal_segment(42, Lsn(0x8B00_0000)),
             "tenants/acme-prod/wal/0000000000000042/000000008B000000.wal"
@@ -173,7 +183,7 @@ mod tests {
         assert!(!t.is_immutable(&t.manifest()));
         assert!(t.is_immutable(&t.wal_segment(1, Lsn(0))));
         assert!(t.is_immutable(&t.checkpoint_page_index("chk-1")));
-        assert!(t.is_immutable(&t.manifest_history(1)));
+        assert!(t.is_immutable(&t.manifest_history(1, 1000)));
         assert!(!t.is_immutable("tenants/other/MANIFEST"));
     }
 }

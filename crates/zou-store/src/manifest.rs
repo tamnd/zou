@@ -41,6 +41,16 @@ pub struct Manifest {
     pub wal_tail: Option<WalTail>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_of: Option<BranchOf>,
+    /// WAL inherited from ancestors at branch time, replayed before the
+    /// own tail. Static: the referenced segments are sealed and the list
+    /// never grows, it only goes away wholesale once a fold learns to
+    /// repack the window it covers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parent_tail: Vec<ParentTail>,
+    /// Unix seconds of the last state changing publish. Rides into the
+    /// manifest history copy, which is what PITR picks a snapshot by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +83,12 @@ pub struct CheckpointRef {
     pub id: String,
     pub lsn: Lsn,
     pub kind: CheckpointKind,
+    /// Tenant whose prefix holds the objects, absent for our own. A
+    /// branch copies its parent's refs and tags them, so a chain can
+    /// reference captures across any number of ancestors without
+    /// copying a byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +112,18 @@ pub struct BranchOf {
     pub at_lsn: Lsn,
 }
 
+/// One ancestor's WAL tail as inherited at branch time. Segment names
+/// are the usual `<epoch>/<start-lsn>.wal`, resolved under the named
+/// tenant's prefix, not ours.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParentTail {
+    #[serde(rename = "ref")]
+    pub tenant_ref: String,
+    pub from_lsn: Lsn,
+    #[serde(default)]
+    pub segments: Vec<String>,
+}
+
 impl Manifest {
     /// A fresh manifest for a brand new database.
     pub fn new(tenant_ref: &str, pg_version: u32) -> Self {
@@ -111,6 +139,8 @@ impl Manifest {
             checkpoints: Vec::new(),
             wal_tail: None,
             branch_of: None,
+            parent_tail: Vec::new(),
+            published_unix: None,
         }
     }
 
@@ -158,11 +188,13 @@ mod tests {
                     id: "chk-000121".into(),
                     lsn: "0/8A211000".parse().unwrap(),
                     kind: CheckpointKind::Full,
+                    owner: None,
                 },
                 CheckpointRef {
                     id: "chk-000122".into(),
                     lsn: "0/8B000000".parse().unwrap(),
                     kind: CheckpointKind::Delta,
+                    owner: None,
                 },
             ],
             wal_tail: Some(WalTail {
@@ -171,6 +203,8 @@ mod tests {
                 segments: vec!["000000008B000000.wal".into()],
             }),
             branch_of: None,
+            parent_tail: Vec::new(),
+            published_unix: None,
         }
     }
 
@@ -199,6 +233,29 @@ mod tests {
             matches!(err, ManifestError::FormatTooNew { found } if found == MANIFEST_FORMAT + 1)
         );
         assert!(err.to_string().contains("upgrade zou"));
+    }
+
+    #[test]
+    fn branch_fields_round_trip_and_stay_off_the_wire_when_absent() {
+        let mut m = sample();
+        m.branch_of = Some(BranchOf {
+            tenant_ref: "acme-prod".into(),
+            at_lsn: "0/8B000000".parse().unwrap(),
+        });
+        m.checkpoints[0].owner = Some("acme-prod".into());
+        m.parent_tail.push(ParentTail {
+            tenant_ref: "acme-prod".into(),
+            from_lsn: "0/8B000000".parse().unwrap(),
+            segments: vec!["0000000000000042/000000008B000000.wal".into()],
+        });
+        m.published_unix = Some(1_767_100_123);
+        assert_eq!(Manifest::from_json(&m.to_json()).unwrap(), m);
+        // The plain sample serializes without any of the new keys, which
+        // is what keeps the golden file byte for byte stable.
+        let text = String::from_utf8(sample().to_json()).unwrap();
+        for key in ["owner", "parent_tail", "published_unix"] {
+            assert!(!text.contains(key), "{key} leaked into a plain manifest");
+        }
     }
 
     #[test]

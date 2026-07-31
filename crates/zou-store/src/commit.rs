@@ -727,11 +727,15 @@ fn publish_manifest(
 ) -> Result<(), CommitError> {
     const ATTEMPTS: u32 = 5;
     let mut last: Option<LeaseError> = None;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     for _ in 0..ATTEMPTS {
         let mut held = tail.held.lock().unwrap();
         let wal_tail = wal_tail.clone();
         let checkpoint = checkpoint.cloned();
-        match lease::update_manifest(store, layout, &mut held, move |m| {
+        match lease::update_manifest(store, layout, &mut held, now_unix, move |m| {
             m.wal_tail = Some(wal_tail);
             if let Some(checkpoint) = checkpoint {
                 if !m.checkpoints.iter().any(|c| c.id == checkpoint.id) {
@@ -1352,6 +1356,7 @@ mod tests {
             id: "00000000000000aa".into(),
             lsn: Lsn(0xAA),
             kind: CheckpointKind::Delta,
+            owner: None,
         };
         gc.fold_tail(checkpoint.clone(), before.segments[..2].to_vec())
             .unwrap();
@@ -1389,6 +1394,7 @@ mod tests {
             id: "00000000000000bb".into(),
             lsn: Lsn(0xBB),
             kind: CheckpointKind::Full,
+            owner: None,
         };
         gc.fold_tail(full.clone(), Vec::new()).unwrap();
         assert_eq!(manifest_of(&*store, &layout).checkpoints, vec![full]);
@@ -1423,6 +1429,7 @@ mod tests {
             id: "x".into(),
             lsn: Lsn(0),
             kind: CheckpointKind::Delta,
+            owner: None,
         };
         assert!(matches!(
             gc.fold_tail(checkpoint, Vec::new()),

@@ -11,7 +11,19 @@
 //! objects that live under its parent's prefix, so its checkpoint ids
 //! and tail segments pin keys under both prefixes, and a tenant whose
 //! manifest is missing or unreadable contributes nothing and loses
-//! nothing.
+//! nothing. A checkpoint ref carrying an owner tag is sharper, it pins
+//! under exactly that owner, which is what keeps a grandparent's
+//! capture alive when `branch_of` only names the direct parent. The
+//! frozen parent tail segment lists pin by name under the tenant each
+//! entry names.
+//!
+//! PITR retention rides the same pins. Every state change leaves a
+//! snapshot under `manifests/`, and a snapshot younger than the
+//! retention window pins its references exactly like a live manifest,
+//! except it never moves the WAL cut, its own tail segments are pinned
+//! by name and need no successor rule. A snapshot past retention is
+//! ordinary two phase garbage, and whatever only it referenced follows
+//! it out through the same window.
 //!
 //! WAL is never judged by reference alone. Recovery reconciles the
 //! tail from a LIST of the whole wal prefix, so a segment absent from
@@ -57,10 +69,24 @@ pub struct GcStats {
     pub deleted: usize,
 }
 
+/// The stamp encoded in a history key, `<epoch>-<unix>.json`.
+fn history_stamp(key: &str) -> Option<u64> {
+    let name = key.rsplit('/').next()?;
+    let (_, unix) = name.strip_suffix(".json")?.split_once('-')?;
+    unix.parse().ok()
+}
+
 /// One gc pass over the whole store. `now_unix` is the caller's clock
 /// and `window_secs` the safety window, so a run never deletes a key
 /// it stamped itself and a window of zero still takes two runs.
-pub fn run(store: &dyn CasStore, now_unix: u64, window_secs: u64) -> Result<GcStats, String> {
+/// `retention_secs` is how far back PITR reaches, history snapshots
+/// younger than it pin their references.
+pub fn run(
+    store: &dyn CasStore,
+    now_unix: u64,
+    window_secs: u64,
+    retention_secs: u64,
+) -> Result<GcStats, String> {
     let keys = store.list("tenants/").map_err(|e| format!("store: {e}"))?;
 
     let mut refs = BTreeSet::new();
@@ -83,14 +109,39 @@ pub fn run(store: &dyn CasStore, now_unix: u64, window_secs: u64) -> Result<GcSt
         }
     }
 
+    // History snapshots: within retention they pin like live
+    // manifests, past it they are garbage. Only tenants with a live
+    // manifest are processed, a ghost prefix stays untouched.
+    let mut history: Vec<(String, Manifest)> = Vec::new();
+    let mut expired_history: Vec<String> = Vec::new();
+    for r in manifests.keys() {
+        let prefix = format!("tenants/{r}/manifests/");
+        for key in &keys {
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let Some(stamp) = history_stamp(key) else {
+                continue;
+            };
+            if now_unix.saturating_sub(stamp) >= retention_secs {
+                expired_history.push(key.clone());
+            } else if let Some((data, _)) = store.get(key).map_err(|e| format!("store: {e}"))? {
+                let m = Manifest::from_json(&data).map_err(|e| format!("history {key}: {e}"))?;
+                history.push((r.clone(), m));
+            }
+        }
+    }
+
     // The pins: checkpoint ids and tail segments under every prefix
     // the manifest can reference, and the WAL cut per tenant, the
-    // minimum over every manifest that reaches it.
+    // minimum over every live manifest that reaches it. An owner
+    // tagged checkpoint ref pins under exactly its owner, an untagged
+    // one predates the tags and pins under everything reachable.
     let mut pinned_chk: BTreeSet<(String, String)> = BTreeSet::new();
     let mut pinned_wal: BTreeSet<String> = BTreeSet::new();
     let mut cuts: BTreeMap<String, u64> = BTreeMap::new();
-    for (r, m) in &manifests {
-        let mut owners = vec![r.clone()];
+    let mut pin = |r: &str, m: &Manifest, live: bool| {
+        let mut owners = vec![r.to_string()];
         if let Some(b) = &m.branch_of {
             owners.push(b.tenant_ref.clone());
         }
@@ -98,22 +149,48 @@ pub fn run(store: &dyn CasStore, now_unix: u64, window_secs: u64) -> Result<GcSt
             .checkpoints
             .last()
             .map_or(0, |c| c.lsn.0 & !(WAL_SEGMENT_SIZE - 1));
+        for c in &m.checkpoints {
+            match &c.owner {
+                Some(o) => {
+                    pinned_chk.insert((o.clone(), c.id.clone()));
+                }
+                None => {
+                    for owner in &owners {
+                        pinned_chk.insert((owner.clone(), c.id.clone()));
+                    }
+                }
+            }
+        }
         for owner in &owners {
             let layout = TenantLayout::new(owner);
-            for c in &m.checkpoints {
-                pinned_chk.insert((owner.clone(), c.id.clone()));
-            }
             if let Some(tail) = &m.wal_tail {
                 for s in &tail.segments {
                     pinned_wal.insert(layout.wal_segment_path(s));
                 }
             }
-            let entry = cuts.entry(owner.clone()).or_insert(u64::MAX);
-            *entry = (*entry).min(cut);
+            // A history snapshot must not drag the cut down forever,
+            // its tail is pinned by name and needs no successor rule.
+            if live {
+                let entry = cuts.entry(owner.clone()).or_insert(u64::MAX);
+                *entry = (*entry).min(cut);
+            }
         }
+        for pt in &m.parent_tail {
+            let layout = TenantLayout::new(&pt.tenant_ref);
+            for s in &pt.segments {
+                pinned_wal.insert(layout.wal_segment_path(s));
+            }
+        }
+    };
+    for (r, m) in &manifests {
+        pin(r, m, true);
+    }
+    for (r, m) in &history {
+        pin(r, m, false);
     }
 
     let mut garbage: BTreeSet<String> = BTreeSet::new();
+    garbage.extend(expired_history);
     for r in manifests.keys() {
         let chk_prefix = format!("tenants/{r}/chk/");
         let wal_prefix = format!("tenants/{r}/wal/");
@@ -206,7 +283,7 @@ pub fn run(store: &dyn CasStore, now_unix: u64, window_secs: u64) -> Result<GcSt
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
-    use zou_store::manifest::{BranchOf, CheckpointKind, CheckpointRef, WalTail};
+    use zou_store::manifest::{BranchOf, CheckpointKind, CheckpointRef, ParentTail, WalTail};
     use zou_store::{GroupCommit, GroupCommitConfig, LocalFsStore, Lsn, TailConfig, lease};
 
     fn put_chk(store: &dyn CasStore, r: &str, id: &str) {
@@ -227,6 +304,16 @@ mod tests {
         store.get(&layout.chk_index(id)).unwrap().is_some()
     }
 
+    /// Drop the history snapshots a leased session leaves behind. They
+    /// carry real wall clock stamps, which would pin everything under
+    /// the synthetic clocks these tests run gc with; retention has its
+    /// own test.
+    fn purge_history(store: &dyn CasStore, r: &str) {
+        for key in store.list(&format!("tenants/{r}/manifests/")).unwrap() {
+            store.delete(&key).unwrap();
+        }
+    }
+
     fn write_manifest(
         store: &dyn CasStore,
         r: &str,
@@ -240,6 +327,7 @@ mod tests {
                 id: (*id).to_string(),
                 lsn: Lsn(*lsn),
                 kind: *kind,
+                owner: None,
             });
         }
         m.wal_tail = wal_tail;
@@ -266,7 +354,7 @@ mod tests {
             None,
         );
 
-        let first = run(&store, 1000, 100).unwrap();
+        let first = run(&store, 1000, 100, 100_000).unwrap();
         assert_eq!(
             first,
             GcStats {
@@ -278,11 +366,11 @@ mod tests {
         );
         assert!(chk_present(&store, "p", "aaa"));
 
-        let early = run(&store, 1050, 100).unwrap();
+        let early = run(&store, 1050, 100, 100_000).unwrap();
         assert_eq!(early.deleted, 0, "the window has not passed");
         assert!(chk_present(&store, "p", "aaa"));
 
-        let due = run(&store, 1100, 100).unwrap();
+        let due = run(&store, 1100, 100, 100_000).unwrap();
         assert_eq!(due.deleted, 3);
         assert_eq!(due.candidates, 0);
         assert!(!chk_present(&store, "p", "aaa"));
@@ -302,7 +390,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(run(&store, 1000, 100).unwrap().candidates, 3);
+        assert_eq!(run(&store, 1000, 100, 100_000).unwrap().candidates, 3);
 
         // The branch lands after the stamping run and before the
         // deleting one, referencing the parent's superseded full, the
@@ -314,7 +402,7 @@ mod tests {
             None,
             Some(("p", 0x100)),
         );
-        let pinned = run(&store, 2000, 100).unwrap();
+        let pinned = run(&store, 2000, 100, 100_000).unwrap();
         assert_eq!(pinned.tenants, 2);
         assert_eq!(pinned.deleted, 0);
         assert_eq!(pinned.candidates, 0, "the branch pin drops the candidate");
@@ -325,9 +413,9 @@ mod tests {
         store
             .delete(&TenantLayout::new("child").manifest())
             .unwrap();
-        assert_eq!(run(&store, 2000, 100).unwrap().candidates, 3);
-        assert_eq!(run(&store, 2099, 100).unwrap().deleted, 0);
-        assert_eq!(run(&store, 2100, 100).unwrap().deleted, 3);
+        assert_eq!(run(&store, 2000, 100, 100_000).unwrap().candidates, 3);
+        assert_eq!(run(&store, 2099, 100, 100_000).unwrap().deleted, 0);
+        assert_eq!(run(&store, 2100, 100, 100_000).unwrap().deleted, 3);
         assert!(!chk_present(&store, "p", "aaa"));
         assert!(chk_present(&store, "p", "bbb"));
     }
@@ -368,6 +456,7 @@ mod tests {
         };
         assert_eq!(segments.len(), 3);
         gc.close().unwrap();
+        purge_history(&*store, "p");
         let seg_key = |i: usize| layout.wal_segment_path(&segments[i]);
 
         // The fold kept the tail from the second segment on, redo just
@@ -393,7 +482,7 @@ mod tests {
         );
         put_chk(&*store, "p", "ff");
         put_chk(&*store, "p", "aa");
-        assert_eq!(run(&*store, 1000, 0).unwrap().candidates, 0);
+        assert_eq!(run(&*store, 1000, 0, 100_000).unwrap().candidates, 0);
         assert!(store.get(&seg_key(0)).unwrap().is_some());
 
         // Without the branch the cut is past the first two segments,
@@ -402,9 +491,9 @@ mod tests {
         store
             .delete(&TenantLayout::new("child").manifest())
             .unwrap();
-        let stamped = run(&*store, 2000, 0).unwrap();
+        let stamped = run(&*store, 2000, 0, 100_000).unwrap();
         assert_eq!(stamped.deleted, 0, "a window of zero still takes two runs");
-        let swept = run(&*store, 2001, 0).unwrap();
+        let swept = run(&*store, 2001, 0, 100_000).unwrap();
         assert!(store.get(&seg_key(0)).unwrap().is_none());
         assert!(store.get(&seg_key(1)).unwrap().is_some());
         assert!(store.get(&seg_key(2)).unwrap().is_some());
@@ -416,13 +505,179 @@ mod tests {
     }
 
     #[test]
+    fn history_snapshots_pin_within_retention_and_expire_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        put_chk(&store, "p", "aaa");
+        put_chk(&store, "p", "bbb");
+        write_manifest(
+            &store,
+            "p",
+            &[("bbb", 0x200, CheckpointKind::Full)],
+            None,
+            None,
+        );
+        // A snapshot from when aaa was still the head, stamped 1000.
+        let mut old = Manifest::new("p", 18);
+        old.checkpoints.push(CheckpointRef {
+            id: "aaa".into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        let hkey = TenantLayout::new("p").manifest_history(1, 1000);
+        store.put_new(&hkey, &old.to_json()).unwrap();
+
+        // Within retention the snapshot pins its checkpoint, a PITR
+        // materialize at that second must still find everything.
+        assert_eq!(run(&store, 1500, 0, 1000).unwrap().candidates, 0);
+        assert!(chk_present(&store, "p", "aaa"));
+
+        // Past retention the snapshot and the capture only it named
+        // go out through the ordinary two phase window.
+        let stamped = run(&store, 2100, 0, 1000).unwrap();
+        assert_eq!(stamped.deleted, 0);
+        assert_eq!(
+            stamped.candidates, 4,
+            "the snapshot plus the three aaa objects"
+        );
+        let swept = run(&store, 2101, 0, 1000).unwrap();
+        assert_eq!(swept.deleted, 4);
+        assert!(store.get(&hkey).unwrap().is_none());
+        assert!(!chk_present(&store, "p", "aaa"));
+        assert!(chk_present(&store, "p", "bbb"));
+    }
+
+    #[test]
+    fn an_owner_tag_pins_under_the_owner_even_two_hops_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        put_chk(&store, "p", "aaa");
+        put_chk(&store, "p", "bbb");
+        write_manifest(
+            &store,
+            "p",
+            &[("bbb", 0x200, CheckpointKind::Full)],
+            None,
+            None,
+        );
+        // A grandchild two hops from p: branch_of names its direct
+        // parent c, only the owner tag on the inherited ref reaches p.
+        let mut g = Manifest::new("g", 18);
+        g.checkpoints.push(CheckpointRef {
+            id: "aaa".into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+            owner: Some("p".into()),
+        });
+        g.branch_of = Some(BranchOf {
+            tenant_ref: "c".into(),
+            at_lsn: Lsn(0x100),
+        });
+        store
+            .put(&TenantLayout::new("g").manifest(), &g.to_json())
+            .unwrap();
+
+        assert_eq!(run(&store, 1000, 0, 100_000).unwrap().candidates, 0);
+        assert!(chk_present(&store, "p", "aaa"));
+
+        store.delete(&TenantLayout::new("g").manifest()).unwrap();
+        assert_eq!(run(&store, 2000, 0, 100_000).unwrap().candidates, 3);
+        assert_eq!(run(&store, 2001, 0, 100_000).unwrap().deleted, 3);
+        assert!(!chk_present(&store, "p", "aaa"));
+        assert!(chk_present(&store, "p", "bbb"));
+    }
+
+    #[test]
+    fn a_parent_tail_entry_pins_segments_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFsStore::new(dir.path()));
+        let layout = TenantLayout::new("p");
+        write_manifest(&*store, "p", &[], None, None);
+
+        let held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
+        let gc = GroupCommit::with_lease(
+            Arc::clone(&store) as Arc<dyn CasStore>,
+            layout.clone(),
+            Arc::new(Mutex::new(held)),
+            Lsn(0),
+            GroupCommitConfig::default(),
+            TailConfig {
+                seal_bytes: 1,
+                ..TailConfig::default()
+            },
+        );
+        for pg_lsn in [0x100u64, 0x200, WAL_SEGMENT_SIZE] {
+            let mut record = pg_lsn.to_le_bytes().to_vec();
+            record.extend_from_slice(b"payload");
+            gc.append(&record).unwrap().wait().unwrap();
+        }
+        let segments = {
+            let (data, _) = store.get(&layout.manifest()).unwrap().unwrap();
+            Manifest::from_json(&data)
+                .unwrap()
+                .wal_tail
+                .unwrap()
+                .segments
+        };
+        gc.close().unwrap();
+        purge_history(&*store, "p");
+        let seg0 = layout.wal_segment_path(&segments[0]);
+
+        // The parent folded past the first segment and dropped it from
+        // its tail, so nothing of p's own holds it anymore.
+        put_chk(&*store, "p", "ff");
+        write_manifest(
+            &*store,
+            "p",
+            &[("ff", WAL_SEGMENT_SIZE + 0x80, CheckpointKind::Full)],
+            Some(WalTail {
+                epoch_dir: 1,
+                from_lsn: Lsn(0x200),
+                segments: segments[1..].to_vec(),
+            }),
+            None,
+        );
+        // A child whose checkpoints sit past the cut: the only hold on
+        // the first segment is its frozen parent tail list.
+        let mut c = Manifest::new("c", 18);
+        c.checkpoints.push(CheckpointRef {
+            id: "ff".into(),
+            lsn: Lsn(WAL_SEGMENT_SIZE + 0x80),
+            kind: CheckpointKind::Full,
+            owner: Some("p".into()),
+        });
+        c.branch_of = Some(BranchOf {
+            tenant_ref: "p".into(),
+            at_lsn: Lsn(WAL_SEGMENT_SIZE + 0x80),
+        });
+        c.parent_tail.push(ParentTail {
+            tenant_ref: "p".into(),
+            from_lsn: Lsn(0x100),
+            segments: vec![segments[0].clone()],
+        });
+        store
+            .put(&TenantLayout::new("c").manifest(), &c.to_json())
+            .unwrap();
+
+        assert_eq!(run(&*store, 1000, 0, 100_000).unwrap().candidates, 0);
+        assert!(store.get(&seg0).unwrap().is_some());
+
+        // Dropping the child frees the segment through the window.
+        store.delete(&TenantLayout::new("c").manifest()).unwrap();
+        assert_eq!(run(&*store, 2000, 0, 100_000).unwrap().candidates, 1);
+        assert_eq!(run(&*store, 2001, 0, 100_000).unwrap().deleted, 1);
+        assert!(store.get(&seg0).unwrap().is_none());
+    }
+
+    #[test]
     fn a_tenant_without_a_manifest_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         put_chk(&store, "ghost", "aaa");
 
-        assert_eq!(run(&store, 1000, 0).unwrap(), GcStats::default());
-        assert_eq!(run(&store, 2000, 0).unwrap(), GcStats::default());
+        assert_eq!(run(&store, 1000, 0, 100_000).unwrap(), GcStats::default());
+        assert_eq!(run(&store, 2000, 0, 100_000).unwrap(), GcStats::default());
         assert!(chk_present(&store, "ghost", "aaa"));
     }
 }
