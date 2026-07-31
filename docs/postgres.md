@@ -73,6 +73,10 @@ build/pg/bin/pg_controldata -D /tmp/zou-restored | grep "cluster state"
 ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/pg_ctl -D /tmp/zou-restored -l /tmp/zou-restored.log start
 ```
 
+The `zou dev` command wraps this whole choreography for daily use.
+`zou dev <target>` runs initdb plus the genesis capture when the target holds no checkpoints yet, restores into a throwaway runtime directory otherwise, then supervises the patched postmaster on 127.0.0.1:5432 plus a unix socket in a private directory, restarting it when it dies and shutting it down fast on SIGINT or SIGTERM.
+`--pg-bin` or `ZOU_PG_BIN` points it at the patched install, `build/pg/bin` by default, and `--port` and `--runtime` override the rest.
+
 On restart or reattach the pusher resumes right after the store's last record rather than at the local flush pointer, because the previous session can exit before pushing its final bytes, the shutdown checkpoint record at least, which is written after background workers stop.
 The manifest tail chains segment lists across writer sessions, each entry named `<epoch>/<start-lsn>.wal`, and a session opening the store first reconciles the tail against a full listing of `wal/` so segments sealed by a crashed session are never lost.
 
@@ -146,7 +150,8 @@ All five load and run with `ZOU_TARGET` set, hnsw index builds included, and CI 
 
 The `postgres-build` workflow builds the vendored source with the full series applied and runs three smoke tests: one on stock md storage, one with `ZOU_TARGET` set that creates a table, restarts the server, reads the rows back from the object store, checkpoints so the manifest carries a folded delta, forces a fold down so it also carries a runtime full, and then deletes a `pg/` block object and reads the rows back through the checkpoint runs, then runs `zou-gc` twice with a zero window, asserts the superseded chain is swept and the rows still read back, and one that restores a second data directory from the gc'd store with `zou-restore` and reads the same rows after crash recovery, which exercises restore from a runtime full.
 A further step runs the whole cycle against a MinIO container with `ZOU_TARGET=s3://zou-pg/smoke`: initdb, bootstrap, insert, checkpoint fold, restart, read back, and a `zou-restore` from the bucket, so the URL target path is proven against a real S3 endpoint on every server PR.
-It triggers on any PR touching `vendor/`, `patches/`, the build scripts, the `zou-pg` or `zou-store` crates, or the Makefile, and on manual dispatch.
+A `zou dev` step boots the supervisor against a fresh store, writes rows, kill -9s the postmaster underneath it and waits for the automatic restart to serve them again, stops it with SIGINT, and reattaches from the store alone with a second run in a new runtime directory.
+It triggers on any PR touching `vendor/`, `patches/`, the build scripts, the `zou`, `zou-pg`, or `zou-store` crates, or the Makefile, and on manual dispatch.
 A patch that breaks the build or changes `select version()` output gets caught in the same PR that introduces it.
 
 ## Authoring a patch

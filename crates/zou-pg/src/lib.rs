@@ -14,6 +14,7 @@
 //! Every function returns 0 for success or a negative ZOU_ERR code, and
 //! never unwinds into C. Postgres turns nonzero into ereport(ERROR).
 
+pub mod bootstrap;
 pub mod cache;
 pub mod capture;
 pub mod fold;

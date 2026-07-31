@@ -22,7 +22,7 @@ Because the durable state is a prefix of immutable objects, some things fall out
 
 ## Status
 
-Early development. Nothing here is usable yet.
+Early development. The first runnable piece is `zou dev <target>`: it bootstraps or attaches a store at a local directory or an S3 prefix and serves it through a supervised Postgres 18 on 127.0.0.1:5432. It needs the patched Postgres built first, see [docs/postgres.md](docs/postgres.md). Everything above the storage engine does not exist yet.
 
 The full design lives in the [architecture docs](docs/), and the implementation plan is tracked in the milestone issues:
 

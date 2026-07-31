@@ -36,6 +36,11 @@ impl TenantLayout {
         &self.prefix
     }
 
+    /// The tenant ref the layout was built from.
+    pub fn tenant_ref(&self) -> &str {
+        self.prefix.strip_prefix("tenants/").unwrap_or(&self.prefix)
+    }
+
     /// The single mutable object, the root of truth.
     pub fn manifest(&self) -> String {
         format!("{}/MANIFEST", self.prefix)

@@ -12,6 +12,7 @@ on:
       - patches/**
       - scripts/pg-apply-patches.sh
       - Makefile
+      - crates/zou/**
       - crates/zou-pg/**
       - crates/zou-store/**
       - .github/workflows/postgres-build.yml
@@ -106,6 +107,39 @@ jobs:
           cat /tmp/zou-restored.log
       - name: kill -9 loop under pgbench load
         run: scripts/zou-crash-loop.sh 3
+      - name: zou dev end to end
+        run: |
+          cargo build -p zou --release
+          mkdir -p /tmp/zou-dev-store
+          target/release/zou dev /tmp/zou-dev-store --pg-bin build/pg/bin --port 5614 --runtime /tmp/zou-dev-run >/tmp/zou-dev.log 2>&1 &
+          DEV=$!
+          for i in $(seq 1 120); do
+            build/pg/bin/psql -h 127.0.0.1 -p 5614 -d postgres -Atc 'select 1' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          build/pg/bin/psql -h 127.0.0.1 -p 5614 -d postgres -c "create table devt(id int)" -c "insert into devt select g from generate_series(1,100) g"
+          kill -9 "$(head -1 /tmp/zou-dev-run/pgdata/postmaster.pid)"
+          OUT=""
+          for i in $(seq 1 120); do
+            OUT=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -d postgres -Atc 'select count(*) from devt' 2>/dev/null) && [ "$OUT" = 100 ] && break
+            sleep 1
+          done
+          [ "$OUT" = 100 ]
+          grep -q "restarting" /tmp/zou-dev.log
+          kill -INT "$DEV"
+          wait "$DEV"
+          target/release/zou dev /tmp/zou-dev-store --pg-bin build/pg/bin --port 5614 --runtime /tmp/zou-dev-run2 >/tmp/zou-dev2.log 2>&1 &
+          DEV2=$!
+          OUT=""
+          for i in $(seq 1 120); do
+            OUT=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -d postgres -Atc 'select count(*) from devt' 2>/dev/null) && [ "$OUT" = 100 ] && break
+            sleep 1
+          done
+          [ "$OUT" = 100 ]
+          grep -q "zou: restored" /tmp/zou-dev2.log
+          kill -INT "$DEV2"
+          wait "$DEV2"
+          cat /tmp/zou-dev.log /tmp/zou-dev2.log
       - name: Smoke test on MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
