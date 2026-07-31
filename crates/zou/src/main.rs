@@ -1,13 +1,49 @@
-fn main() {
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
+#[cfg(unix)]
+mod dev;
+
+use std::process::ExitCode;
+
+/// The postmaster child, unix sockets, and signal forwarding are all
+/// unix machinery, so the dev subcommand only exists there.
+pub const DEV_USAGE: &str =
+    "usage: zou dev <target> [--pg-bin <dir>] [--port <n>] [--runtime <dir>]";
+
+fn usage() -> ExitCode {
+    eprintln!("zou {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("{DEV_USAGE}");
+    eprintln!("       zou --version");
+    ExitCode::from(2)
+}
+
+fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match argv.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
             println!("zou {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
         }
-        _ => {
-            eprintln!("zou {}", env!("CARGO_PKG_VERSION"));
-            eprintln!("nothing to run yet, see https://github.com/tamnd/zou");
-            std::process::exit(2);
+        #[cfg(unix)]
+        Some("dev") => {
+            let args = match dev::parse(&argv[1..]) {
+                Ok(args) => args,
+                Err(e) => {
+                    eprintln!("zou: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            match dev::run(&args) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("zou: {e}");
+                    ExitCode::FAILURE
+                }
+            }
         }
+        #[cfg(not(unix))]
+        Some("dev") => {
+            eprintln!("zou: dev needs a unix platform");
+            ExitCode::FAILURE
+        }
+        _ => usage(),
     }
 }

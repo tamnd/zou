@@ -15,6 +15,7 @@ authors = ["Tam Nguyen <tamnd87@gmail.com>"]
 anyhow = "1"
 crc32c = "0.6"
 hmac = "0.13"
+libc = "0.2"
 lz4_flex = "0.14"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
