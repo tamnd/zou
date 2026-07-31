@@ -304,8 +304,14 @@ impl CasStore for LocalFsStore {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+        // Walk only the subtree the prefix can reach. The root can hold
+        // hundreds of thousands of page objects, and a LIST of the wal
+        // tail must not pay a full walk over all of them, S3 does not.
+        // The prefix may end mid name, so descend to its directory part
+        // and let the string filter below handle the rest.
+        let dir = prefix.rsplit_once('/').map_or("", |(d, _)| d);
         let mut out = Vec::new();
-        let mut stack = vec![self.root.clone()];
+        let mut stack = vec![self.root.join(dir)];
         while let Some(dir) = stack.pop() {
             let entries = match fs::read_dir(&dir) {
                 Ok(e) => e,

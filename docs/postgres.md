@@ -44,6 +44,7 @@ Set `ZOU_TARGET` to a store root before running `initdb --set io_method=sync` an
 Without `ZOU_TARGET` the binary behaves exactly like stock Postgres on md.
 The target is a local directory or an object store URL: `s3://bucket/prefix` speaks the S3 wire API against AWS, MinIO, or R2, and `gs://bucket/prefix` speaks the same client in the GCS dialect, with the prefix scoping every key so stores can share a bucket.
 URL targets read `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the environment, `ZOU_S3_ENDPOINT` to point at a non AWS endpoint like a local MinIO, and `ZOU_S3_REGION` falling back to `AWS_REGION` then us-east-1, and the same forms work for `zou-bootstrap`, `zou-restore`, and `zou-gc`.
+`ZOU_STORE_DELAY=get=15,put=25,list=40` sleeps that many milliseconds inside every store call of the named kind, which turns a fast local store into a stand in for a distant one when benchmarking, see docs/perf.md.
 
 Two constraints in v0.
 Reads arrive through the PG 18 AIO path, which executes on file descriptors, so `zoustartreadv` stages pages into a per process scratch file and points the IO handle at it, which confines the build to `io_method=sync` and zouinit enforces that at startup.

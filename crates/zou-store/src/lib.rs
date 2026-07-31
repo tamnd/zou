@@ -7,6 +7,7 @@
 
 pub mod cas;
 pub mod commit;
+pub mod delay;
 pub mod guard;
 pub mod heartbeat;
 pub mod layout;
@@ -21,6 +22,7 @@ pub mod wal;
 
 pub use cas::{CasError, CasStore, LocalFsStore, Version};
 pub use commit::{CommitError, CommitTicket, GroupCommit, GroupCommitConfig, TailConfig};
+pub use delay::{DelayConfig, DelayStore};
 pub use guard::GuardedStore;
 pub use heartbeat::Heartbeat;
 pub use lease::{DEFAULT_TTL_SECS, HeldLease, LeaseError};
