@@ -21,7 +21,7 @@ use crate::cas::{CasError, CasStore};
 use crate::layout::TenantLayout;
 use crate::lease::{self, HeldLease, LeaseError};
 use crate::lsn::Lsn;
-use crate::manifest::{CheckpointRef, Manifest, WalTail};
+use crate::manifest::{CheckpointKind, CheckpointRef, Manifest, WalTail};
 use crate::tier::{PureS3Target, WalTarget};
 use crate::wal::{Frame, MAX_BODY_LEN};
 
@@ -714,7 +714,10 @@ fn publish_tail(
 /// The manifest CAS behind both routine tail publishes and checkpoint
 /// folds. Publishes the given tail, and with it the checkpoint ref when
 /// one rides along, skipping refs the manifest already carries so a
-/// retried fold stays idempotent.
+/// retried fold stays idempotent. A full ref prunes everything before
+/// it: restore and the chain walk start at the newest full and never
+/// look behind it, so the superseded chain becomes garbage for the gc
+/// job the moment the full publishes.
 fn publish_manifest(
     store: &dyn CasStore,
     layout: &TenantLayout,
@@ -730,10 +733,15 @@ fn publish_manifest(
         let checkpoint = checkpoint.cloned();
         match lease::update_manifest(store, layout, &mut held, move |m| {
             m.wal_tail = Some(wal_tail);
-            if let Some(checkpoint) = checkpoint
-                && !m.checkpoints.iter().any(|c| c.id == checkpoint.id)
-            {
-                m.checkpoints.push(checkpoint);
+            if let Some(checkpoint) = checkpoint {
+                if !m.checkpoints.iter().any(|c| c.id == checkpoint.id) {
+                    m.checkpoints.push(checkpoint.clone());
+                }
+                if checkpoint.kind == CheckpointKind::Full
+                    && let Some(pos) = m.checkpoints.iter().rposition(|c| c.id == checkpoint.id)
+                {
+                    m.checkpoints.drain(..pos);
+                }
             }
         }) {
             Ok(()) => {
@@ -1374,6 +1382,16 @@ mod tests {
             gc.fold_tail(checkpoint.clone(), all),
             Err(CommitError::FoldRejected { .. })
         ));
+
+        // A full ref prunes everything before it, the superseded chain
+        // becomes garbage for the gc job.
+        let full = CheckpointRef {
+            id: "00000000000000bb".into(),
+            lsn: Lsn(0xBB),
+            kind: CheckpointKind::Full,
+        };
+        gc.fold_tail(full.clone(), Vec::new()).unwrap();
+        assert_eq!(manifest_of(&*store, &layout).checkpoints, vec![full]);
 
         // Later appends chain onto the truncated tail, the dropped
         // segments never resurface.

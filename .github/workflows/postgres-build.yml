@@ -67,7 +67,8 @@ jobs:
           build/pg/bin/psql -h /tmp -d postgres -c "insert into t select g, 'row ' || g from generate_series(1001,2000) g" -c checkpoint
           sleep 5
           grep -q "folded a full checkpoint" /tmp/zou-pg.log
-          test "$(grep -c '"kind": "full"' $ZOU_TARGET/tenants/local/MANIFEST)" -ge 2
+          test "$(grep -c '"kind": "full"' $ZOU_TARGET/tenants/local/MANIFEST)" -eq 1
+          ! grep -q '"kind": "delta"' "$ZOU_TARGET/tenants/local/MANIFEST"
           FULL=$(ls "$ZOU_TARGET/tenants/local/chk/" | grep -v genesis | sort | tail -1)
           grep -q "^s [0-9]* [0-9]* $FILENODE " "$ZOU_TARGET/tenants/local/chk/$FULL/PAGES"
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
@@ -81,6 +82,17 @@ jobs:
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           test "$(ls $ZOU_READ_CACHE_DIR | wc -l)" -ge 1
           grep -q "zou read cache:" /tmp/zou-pg.log
+          target/release/zou-gc "$ZOU_TARGET" 0 | tee /tmp/gc1.txt
+          grep -q " 0 objects deleted" /tmp/gc1.txt
+          target/release/zou-gc "$ZOU_TARGET" 0 | tee /tmp/gc2.txt
+          ! grep -q " 0 objects deleted" /tmp/gc2.txt
+          test ! -e "$ZOU_TARGET/tenants/local/chk/$DELTA/INDEX"
+          test ! -e "$ZOU_TARGET/tenants/local/chk/genesis/INDEX"
+          build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
+          build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/gcread.txt
+          grep -q 2001000 /tmp/gcread.txt
+          ! grep -q "chain reader poisoned" /tmp/zou-pg.log
+          build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           cat /tmp/zou-pg.log
       - name: Restore and attach from the store alone
         run: |

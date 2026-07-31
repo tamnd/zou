@@ -130,7 +130,7 @@ fn chain_wants_full(
 /// First Postgres LSN covered by a stored segment, from the 8 byte
 /// header of its first record. Stream order is push order is pg order,
 /// so this bounds everything in earlier segments from above.
-fn segment_first_pg_lsn(
+pub(crate) fn segment_first_pg_lsn(
     store: &dyn CasStore,
     layout: &TenantLayout,
     name: &str,
@@ -746,6 +746,11 @@ mod tests {
         assert_eq!(stats.runs, 1);
 
         let m2 = manifest_of(&*store, &layout);
+        assert_eq!(
+            m2.checkpoints.len(),
+            1,
+            "the full pruned the superseded chain from the manifest"
+        );
         let last = m2.checkpoints.last().unwrap();
         assert_eq!(last.kind, CheckpointKind::Full);
         assert_eq!(last.id, format!("{redo:016x}"));
