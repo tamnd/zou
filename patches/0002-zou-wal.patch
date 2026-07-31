@@ -38,10 +38,10 @@ index b885513..24c245d 100644
  		 */
 diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
 new file mode 100644
-index 0000000..ba6a929
+index 0000000..7ab25df
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,325 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -300,6 +300,23 @@ index 0000000..ba6a929
 +		else if (ShutdownRequestPending)
 +		{
 +			/*
++			 * The flush pointer is drained, but WAL can still sit in
++			 * the buffers, hint bit FPIs from read only queries at
++			 * least. The shutdown checkpoint that runs after this
++			 * worker exits will flush pages whose LSNs point at those
++			 * records, and the write gate would wait for them forever.
++			 * Force the rest out and keep pushing until insert, flush,
++			 * and pushed all agree.
++			 */
++			XLogRecPtr	insert = GetXLogInsertRecPtr();
++
++			if (insert > pushed)
++			{
++				XLogFlush(insert);
++				continue;
++			}
++
++			/*
 +			 * Fully drained and asked to stop. proc_exit runs
 +			 * zou_wal_on_exit, which seals the tail and releases the
 +			 * lease cleanly.
@@ -327,6 +344,19 @@ index 0000000..ba6a929
 +ZouWalWaitForLSN(XLogRecPtr lsn)
 +{
 +	if (!IsUnderPostmaster || ZouWalShmem == NULL || !ZouWalActive())
++		return;
++
++	/*
++	 * Recovery cannot wait: the pusher only starts once recovery
++	 * finishes, so waiting here would deadlock the startup process
++	 * against a worker that cannot run yet. A node attached with
++	 * zou-restore only replays WAL the store already holds, which makes
++	 * the skip safe. An in place crash restart replaying local WAL the
++	 * store has not seen yet can push pages early during recovery; the
++	 * fix is starting the pusher at consistent state, noted in the
++	 * milestone issue.
++	 */
++	if (RecoveryInProgress())
 +		return;
 +
 +	if ((XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn) >= lsn)

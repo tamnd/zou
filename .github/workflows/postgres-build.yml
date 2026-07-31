@@ -65,3 +65,5 @@ jobs:
           grep -q 500500 /tmp/restored.txt
           build/pg/bin/pg_ctl -D /tmp/zou-restored stop
           cat /tmp/zou-restored.log
+      - name: kill -9 loop under pgbench load
+        run: scripts/zou-crash-loop.sh 3
