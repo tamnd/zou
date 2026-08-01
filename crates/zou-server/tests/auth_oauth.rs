@@ -1152,11 +1152,24 @@ async fn an_address_the_person_has_moved_away_from_still_finds_them() {
     assert_eq!(moved, new, "the account is at the new address now");
     let held: String = scalar(
         &pool,
-        "select email from auth.identities where user_id = $1::text::uuid",
+        "select email from auth.identities
+          where user_id = $1::text::uuid and provider = 'google'",
         &[&signed_in],
     )
     .await;
-    assert_eq!(held, old, "and the identity still holds the old one");
+    assert_eq!(held, old, "and the google identity still holds the old one");
+    // Proving an address gives the account an email identity if it had
+    // none, which is what upstream does on this branch: the account can
+    // be signed in to with a password now, so something has to say the
+    // email provider owns it.
+    let proved: String = scalar(
+        &pool,
+        "select identity_data->>'email' from auth.identities
+          where user_id = $1::text::uuid and provider = 'email'",
+        &[&signed_in],
+    )
+    .await;
+    assert_eq!(proved, new);
 
     // Github now turns up vouching for the old address, which no
     // account carries any more. The identity does, and that is enough.
@@ -1175,7 +1188,7 @@ async fn an_address_the_person_has_moved_away_from_still_finds_them() {
         &[&signed_in],
     )
     .await;
-    assert_eq!(accounts, 2, "two ways in, one account");
+    assert_eq!(accounts, 3, "google, github and email, one account");
 }
 
 #[tokio::test]

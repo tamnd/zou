@@ -169,6 +169,10 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
         std::env::var("ZOU_SECURITY_MANUAL_LINKING_ENABLED").as_deref(),
         Ok("true") | Ok("1")
     );
+    let anonymous_users = matches!(
+        std::env::var("ZOU_EXTERNAL_ANONYMOUS_USERS_ENABLED").as_deref(),
+        Ok("true") | Ok("1")
+    );
     // initdb ran without -U, so the cluster superuser is the OS user
     // and local connections are trust, the stock dev loop layout.
     let user = std::env::var("USER")
@@ -204,6 +208,12 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // person can attach a second provider to the account they
             // already have, and detach one again.
             manual_linking,
+            // Off by default too. Set
+            // ZOU_EXTERNAL_ANONYMOUS_USERS_ENABLED=true and a signup
+            // with no address at all gets an account and a session,
+            // which the client turns into a real account later by
+            // setting an address on it.
+            anonymous_users,
             // Everything else is GoTrue's default, including the
             // unlimited rate the dev loop wants: the real per endpoint
             // budgets arrive with the rest of the auth surface.

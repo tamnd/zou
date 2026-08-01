@@ -34,7 +34,7 @@ use axum::http::{Request, StatusCode};
 use axum::response::Response;
 
 use crate::sql::{self, Pool};
-use crate::{App, json_body, not_yet};
+use crate::{App, json_body, no_content, not_yet};
 
 /// GoTrue's JWT_EXP default, the lifetime of an access token.
 const ACCESS_TTL: i64 = 3600;
@@ -1069,6 +1069,60 @@ pub async fn sign_up(
     }
 }
 
+/// POST /auth/v1/signup carrying neither an address nor a number,
+/// which is how a supabase client asks for an anonymous account.
+///
+/// There is nothing to prove, so there is nothing to mail and no state
+/// to wait in: the answer is a session. What makes the account
+/// anonymous is what it does not have. No address, no identity row, and
+/// an empty app_metadata, because every other signup writes down the
+/// provider that owns the account and this one has no provider. Nobody
+/// asserted anything here, which is the whole of what the flag says.
+pub async fn sign_up_anonymously(
+    pool: &Pool,
+    data: &serde_json::Value,
+    signer: &crate::jwt::Signer<'_>,
+    issuer: &str,
+) -> Result<Issued, Error> {
+    let sess = pool.admin().await?;
+    let out = anonymously(&sess, data, signer, issuer).await;
+    match out {
+        Ok(issued) => {
+            sess.commit().await?;
+            Ok(issued)
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+async fn anonymously(
+    sess: &sql::Session,
+    data: &serde_json::Value,
+    signer: &crate::jwt::Signer<'_>,
+    issuer: &str,
+) -> Result<Issued, Error> {
+    let rows = sess
+        .query(
+            "insert into auth.users
+                 (instance_id, id, aud, role, encrypted_password,
+                  raw_app_meta_data, raw_user_meta_data,
+                  confirmation_token, recovery_token,
+                  email_change_token_new, email_change,
+                  created_at, updated_at, is_anonymous, is_sso_user)
+             values ('00000000-0000-0000-0000-000000000000', gen_random_uuid(),
+                     $1, 'authenticated', '',
+                     '{}'::jsonb, $2::jsonb, '', '', '', '', now(), now(), true, false)
+             returning id::text",
+            &[&AUD, &data],
+        )
+        .await?;
+    let user_id: String = rows[0].get(0);
+    start(sess, &user_id, "anonymous", signer, issuer).await
+}
+
 async fn hash_off_thread(password: &str) -> String {
     let password = password.to_string();
     tokio::task::spawn_blocking(move || crate::password::hash(&password))
@@ -1542,7 +1596,7 @@ async fn consume(
             forget_tokens(sess, &holder.user_id).await?;
         }
         "email_change" => {
-            return change_address(sess, holder, hash, secure_change, autoconfirm).await;
+            return change_address(sess, &holder.user_id, hash, secure_change, autoconfirm).await;
         }
         _ => return denied("validation_failed", "Unsupported verification type"),
     }
@@ -1555,7 +1609,7 @@ async fn consume(
 /// holding one of the two links moves nobody's account.
 async fn change_address(
     sess: &sql::Session,
-    holder: &Holder,
+    user_id: &str,
     hash: &str,
     secure_change: bool,
     autoconfirm: bool,
@@ -1567,7 +1621,7 @@ async fn change_address(
                     coalesce(email_change_token_current, ''),
                     coalesce(email_change_token_new, '')
                from auth.users where id = $1::text::uuid",
-            &[&holder.user_id],
+            &[&user_id],
         )
         .await?;
     let row = &rows[0];
@@ -1594,19 +1648,38 @@ async fn change_address(
                         set {spent} = '', email_change_confirm_status = 1, updated_at = now()
                       where id = $1::text::uuid"
                 ),
-                &[&holder.user_id],
+                &[&user_id],
             )
             .await?;
             sess.execute(
                 "delete from auth.one_time_tokens
                   where user_id = $1::text::uuid and token_type::text = $2",
-                &[&holder.user_id, &spent],
+                &[&user_id, &spent],
             )
             .await?;
         }
         return Ok(false);
     }
 
+    // Upstream's createNewIdentity on this path. An account that has
+    // never held an address has no email identity either, and the
+    // address it is about to hold needs one that says who asserted it.
+    // This is the anonymous account being turned into a real one.
+    sess.execute(
+        "insert into auth.identities
+             (provider_id, user_id, identity_data, provider,
+              last_sign_in_at, created_at, updated_at)
+         select u.id::text, u.id,
+                jsonb_build_object('sub', u.id::text, 'email', u.email_change,
+                                   'email_verified', true, 'phone_verified', false),
+                'email', now(), now(), now()
+           from auth.users u
+          where u.id = $1::text::uuid
+            and not exists (select 1 from auth.identities i
+                             where i.user_id = u.id and i.provider = 'email')",
+        &[&user_id],
+    )
+    .await?;
     sess.execute(
         "update auth.identities i
             set identity_data = i.identity_data
@@ -1615,7 +1688,7 @@ async fn change_address(
                 updated_at = now()
            from auth.users u
           where i.user_id = u.id and u.id = $1::text::uuid and i.provider = 'email'",
-        &[&holder.user_id],
+        &[&user_id],
     )
     .await?;
     sess.execute(
@@ -1627,11 +1700,20 @@ async fn change_address(
                 email_change_confirm_status = 0,
                 updated_at = now()
           where id = $1::text::uuid",
-        &[&holder.user_id],
+        &[&user_id],
     )
     .await?;
-    confirm_address(sess, &holder.user_id, true).await?;
-    forget_tokens(sess, &holder.user_id).await?;
+    // An account that has proved an address is not anonymous any more,
+    // whichever way it got here: the address was taken on the spot
+    // because the project confirms its own, or a link was followed.
+    sess.execute(
+        "update auth.users set is_anonymous = false, updated_at = now()
+          where id = $1::text::uuid and is_anonymous",
+        &[&user_id],
+    )
+    .await?;
+    confirm_address(sess, user_id, true).await?;
+    forget_tokens(sess, user_id).await?;
     Ok(true)
 }
 
@@ -2177,23 +2259,30 @@ async fn update_user(
         ));
     }
 
+    still_there(sess, caller).await?;
     let rows = sess
         .query(
-            "select coalesce(email, ''), coalesce(encrypted_password, ''), is_sso_user
+            "select coalesce(email, ''), coalesce(encrypted_password, ''),
+                    is_sso_user, is_anonymous
                from auth.users where id = $1::text::uuid and deleted_at is null",
             &[&caller.user_id],
         )
         .await?;
-    let Some(row) = rows.first() else {
-        return Err(refused(
-            StatusCode::FORBIDDEN,
-            "user_not_found",
-            "User from sub claim in JWT does not exist",
-        ));
-    };
+    let row = &rows[0];
     let current: String = row.get(0);
     let stored: String = row.get(1);
     let sso: bool = row.get(2);
+    let anonymous: bool = row.get(3);
+    // An anonymous account with a password and no address is an account
+    // nobody could ever sign in to again, because there is nothing to
+    // present the password with.
+    if anonymous && password.is_some_and(|p| !p.is_empty()) && email.is_none() {
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "Updating password of an anonymous user without an email or phone is not allowed",
+        ));
+    }
     if sso && (email.is_some() || password.is_some()) {
         return Err(refused(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2243,7 +2332,22 @@ async fn update_user(
     if let Some(wanted) = &email
         && wanted != &current
     {
-        stage_change(sess, &caller.user_id, &current, wanted, secure_change, post).await?;
+        // An anonymous account has no address to be asked from, so a
+        // project that confirms its own signups takes this one the same
+        // way it takes a signup's, on the spot. Every other account
+        // proves the new address first, and so does this one when the
+        // project mails its confirmations.
+        if anonymous && post.autoconfirm {
+            sess.execute(
+                "update auth.users set email_change = $2, updated_at = now()
+                  where id = $1::text::uuid",
+                &[&caller.user_id, wanted],
+            )
+            .await?;
+            change_address(sess, &caller.user_id, "", false, true).await?;
+        } else {
+            stage_change(sess, &caller.user_id, &current, wanted, secure_change, post).await?;
+        }
     }
 
     Ok(user_json(sess, &caller.user_id).await?)
@@ -2306,6 +2410,10 @@ pub struct Caller {
     pub user_id: String,
     pub session_id: Option<String>,
     pub role: String,
+    /// The `aud` claim as the token carries it, which is the only
+    /// endpoint input that decides whether this token was minted for
+    /// the audience the request is being made against.
+    pub aud: String,
 }
 
 /// GoTrue's requireAuthentication, in its wording. The gate has already
@@ -2353,7 +2461,70 @@ fn caller(req: &Request<Body>) -> Result<Caller, Box<Response>> {
         user_id: sub.to_string(),
         session_id,
         role: ctx.role.clone(),
+        aud: field(&ctx.claims, "aud").to_string(),
     })
+}
+
+/// The half of GoTrue's requireAuthentication that needs the database:
+/// the account the token names is still there, and so is the session it
+/// names.
+///
+/// The session half is what makes logging out mean anything. Nothing
+/// revokes an access token, it stays signed and stays inside its hour,
+/// so a token whose session has been deleted is refused here or it is
+/// not refused at all.
+async fn still_there(sess: &sql::Session, caller: &Caller) -> Result<(), Error> {
+    let rows = sess
+        .query(
+            "select 1 from auth.users
+              where id = $1::text::uuid and deleted_at is null",
+            &[&caller.user_id],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Err(refused(
+            StatusCode::FORBIDDEN,
+            "user_not_found",
+            "User from sub claim in JWT does not exist",
+        ));
+    }
+    let Some(session_id) = &caller.session_id else {
+        return Ok(());
+    };
+    let rows = sess
+        .query(
+            "select 1 from auth.sessions where id = $1::text::uuid",
+            &[session_id],
+        )
+        .await?;
+    if rows.is_empty() {
+        return Err(refused(
+            StatusCode::FORBIDDEN,
+            "session_not_found",
+            "Session from session_id claim in JWT does not exist",
+        ));
+    }
+    Ok(())
+}
+
+/// GoTrue's requestAud, which decides what audience this request is
+/// being made against: the header if one was sent, then the token's own
+/// claim unless the caller holds an admin role, because those tokens
+/// never had an aud claim to begin with, and the project's default
+/// otherwise.
+fn requested_aud(req: &Request<Body>, caller: &Caller) -> String {
+    if let Some(header) = req
+        .headers()
+        .get("x-jwt-aud")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+    {
+        return header.to_string();
+    }
+    if caller.role != "service_role" && caller.role != "supabase_admin" && !caller.aud.is_empty() {
+        return caller.aud.clone();
+    }
+    AUD.to_string()
 }
 
 /// A cheap shape check, so a claim that was never a uuid is a refusal
@@ -2475,6 +2646,24 @@ pub async fn signup(
         field(&body, "phone"),
         field(&body, "password"),
     );
+    // Upstream splits this off in the route rather than in the handler,
+    // so it happens before anything else is judged: a body with neither
+    // an address nor a number is an anonymous sign in whatever else it
+    // carried, and the password on it is not read at all.
+    if email.is_empty() && phone.is_empty() {
+        if !app.cfg.anonymous_users {
+            return error_body(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "anonymous_provider_disabled",
+                "Anonymous sign-ins are disabled",
+            );
+        }
+        let data = metadata(&body);
+        return match sign_up_anonymously(pool, &data, &app.signer(), &app.issuer()).await {
+            Ok(issued) => json_body(StatusCode::OK, issued.json()),
+            Err(e) => refusal(e, "anonymous signup"),
+        };
+    }
     // Upstream's order: the password is judged before anyone asks what
     // is being signed up, so a weak password is called weak whether or
     // not the address was going to be accepted.
@@ -2490,13 +2679,6 @@ pub async fn signup(
     }
     if !phone.is_empty() {
         return not_yet("phone signup");
-    }
-    if email.is_empty() {
-        return error_body(
-            StatusCode::BAD_REQUEST,
-            "validation_failed",
-            "Sign up only available with email or phone provider",
-        );
     }
 
     let data = metadata(&body);
@@ -4294,6 +4476,314 @@ async fn magic(app: &App, pool: &Pool, body: &serde_json::Value, post: &Post<'_>
         Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
         Err(e) => refusal(e, "magic link"),
     }
+}
+
+/// POST /auth/v1/resend, which sends the last code again.
+///
+/// It is not a way to start anything. The account has to exist and it
+/// has to be waiting for exactly the thing being asked for, and when it
+/// is not, the answer is an empty 200 rather than a refusal, because
+/// otherwise this endpoint answers the question of who has an account
+/// here and what they are in the middle of.
+pub async fn resend(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let (wanted, from) = link_target(&req);
+    let body = match read_json(req.into_body()).await {
+        Ok(v) => v,
+        Err(res) => return res,
+    };
+    match again(
+        pool,
+        &body,
+        app.cfg.secure_email_change,
+        &posting(&app, &wanted, &from),
+    )
+    .await
+    {
+        Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
+        Err(e) => refusal(e, "resend"),
+    }
+}
+
+/// Upstream's ResendConfirmationParams.Validate, in its order, and then
+/// the send itself.
+async fn again(
+    pool: &Pool,
+    body: &serde_json::Value,
+    secure_change: bool,
+    post: &Post<'_>,
+) -> Result<(), Error> {
+    let kind = field(body, "type");
+    match kind {
+        "signup" | "email_change" => validate_pkce(
+            field(body, "code_challenge_method"),
+            field(body, "code_challenge"),
+        )?,
+        "sms" | "phone_change" => {}
+        _ => {
+            return denied(
+                "validation_failed",
+                "Missing one of these types: signup, email_change, sms, phone_change",
+            );
+        }
+    }
+    let (email, phone) = (field(body, "email"), field(body, "phone"));
+    if email.is_empty() && kind == "signup" {
+        return denied(
+            "validation_failed",
+            "Type provided requires an email address",
+        );
+    }
+    if phone.is_empty() && kind == "sms" {
+        return denied("validation_failed", "Type provided requires a phone number");
+    }
+    if !email.is_empty() && !phone.is_empty() {
+        return denied(
+            "validation_failed",
+            "Only an email address or phone number should be provided.",
+        );
+    }
+    let email = if !email.is_empty() {
+        validate_email(email)?
+    } else if !phone.is_empty() {
+        // The same refusal a project with no SMS provider gets from
+        // upstream, because that is what this project is.
+        return denied("phone_provider_disabled", "Phone logins are disabled");
+    } else {
+        return denied("validation_failed", "Missing email address or phone number");
+    };
+
+    let sess = pool.admin().await?;
+    let out = resent(&sess, kind, &email, secure_change, post).await;
+    match out {
+        Ok(()) => {
+            sess.commit().await?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+async fn resent(
+    sess: &sql::Session,
+    kind: &str,
+    email: &str,
+    secure_change: bool,
+    post: &Post<'_>,
+) -> Result<(), Error> {
+    let rows = sess
+        .query(
+            "select id::text, email_confirmed_at is not null, coalesce(email_change, '')
+               from auth.users
+              where email = $1 and aud = $2 and is_sso_user = false and deleted_at is null
+              limit 1",
+            &[&email, &AUD],
+        )
+        .await?;
+    // Nobody holds the address. Upstream answers the same empty object
+    // it answers a confirmed account with, and so does this.
+    let Some(row) = rows.first() else {
+        return Ok(());
+    };
+    let user_id: String = row.get(0);
+    let confirmed: bool = row.get(1);
+    let pending: String = row.get(2);
+
+    match kind {
+        "signup" => {
+            if confirmed {
+                return Ok(());
+            }
+            within_limit(
+                sess,
+                &user_id,
+                "confirmation_sent_at",
+                post.settings.max_frequency,
+            )
+            .await?;
+            let code = mint_code(sess, &user_id, email, "confirmation_token").await?;
+            send_code(
+                sess,
+                post,
+                &user_id,
+                Outgoing {
+                    template: crate::mail::CONFIRMATION,
+                    kind: "signup",
+                    to: email,
+                    code: &code,
+                    new_email: "",
+                },
+            )
+            .await
+        }
+        "email_change" => {
+            if pending.is_empty() {
+                return Ok(());
+            }
+            // Both codes are drawn again, which is what upstream's
+            // sendEmailChange does when it is called a second time: the
+            // pair that was mailed is replaced rather than repeated, so
+            // whoever half finished the change starts it over.
+            stage_change(sess, &user_id, email, &pending, secure_change, post).await
+        }
+        // A phone change on an account that has no number to change is
+        // upstream's silent 200, and every account here is that.
+        _ => Ok(()),
+    }
+}
+
+/// GET /auth/v1/user, the account as it stands.
+pub async fn user_get(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let caller = match caller(&req) {
+        Ok(v) => v,
+        Err(res) => return *res,
+    };
+    let asked = requested_aud(&req, &caller);
+    let sess = match pool.admin().await {
+        Ok(v) => v,
+        Err(e) => return refusal(Error::Db(e), "user get"),
+    };
+    let out = read_user(&sess, &caller, &asked).await;
+    match out {
+        Ok(user) => match sess.commit().await {
+            Ok(()) => json_body(StatusCode::OK, user),
+            Err(e) => refusal(Error::Db(e), "user get"),
+        },
+        Err(e) => {
+            let _ = sess.rollback().await;
+            refusal(e, "user get")
+        }
+    }
+}
+
+async fn read_user(
+    sess: &sql::Session,
+    caller: &Caller,
+    asked: &str,
+) -> Result<serde_json::Value, Error> {
+    still_there(sess, caller).await?;
+    // A token minted for one audience does not describe an account in
+    // another, and a token with no audience at all describes nobody.
+    // That is what refuses a service_role key here: it was never minted
+    // for a person.
+    if caller.aud.is_empty() || asked != caller.aud {
+        return denied(
+            "validation_failed",
+            "Token audience doesn't match request audience",
+        );
+    }
+    Ok(user_json(sess, &caller.user_id).await?)
+}
+
+/// Which sessions a logout is about.
+#[derive(Clone, Copy)]
+enum Scope {
+    Global,
+    Local,
+    Others,
+}
+
+/// POST /auth/v1/logout, which deletes sessions rather than tokens.
+///
+/// Nothing here can revoke the access token that was presented: it is
+/// signed, it says what it says, and it stays inside its hour. What
+/// this does is take away the session it names, which every endpoint
+/// that requires a session then refuses to find, and the refresh tokens
+/// that hang off it, which is what stops the client renewing. The
+/// answer is 204 and carries nothing, including when there was nothing
+/// left to delete.
+pub async fn logout(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let caller = match caller(&req) {
+        Ok(v) => v,
+        Err(res) => return *res,
+    };
+    let asked = field(
+        &query_object(req.uri().query().unwrap_or_default()),
+        "scope",
+    )
+    .to_string();
+    let scope = match asked.as_str() {
+        "" | "global" => Scope::Global,
+        "local" => Scope::Local,
+        "others" => Scope::Others,
+        // Go's %q and Rust's {:?} quote a plain string the same way,
+        // which is what this message is made of.
+        other => {
+            return error_body(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                &format!("Unsupported logout scope {other:?}"),
+            );
+        }
+    };
+    let sess = match pool.admin().await {
+        Ok(v) => v,
+        Err(e) => return refusal(Error::Db(e), "logout"),
+    };
+    let out = log_out(&sess, &caller, scope).await;
+    match out {
+        Ok(()) => match sess.commit().await {
+            Ok(()) => no_content(),
+            Err(e) => refusal(Error::Db(e), "logout"),
+        },
+        Err(e) => {
+            let _ = sess.rollback().await;
+            refusal(e, "logout")
+        }
+    }
+}
+
+async fn log_out(sess: &sql::Session, caller: &Caller, scope: Scope) -> Result<(), Error> {
+    still_there(sess, caller).await?;
+    // A token that names no session cannot say which one to keep or
+    // which one to drop, so both of the narrow scopes fall back to the
+    // wide one, which is upstream's behaviour and the safe direction to
+    // be wrong in.
+    match (scope, caller.session_id.as_deref()) {
+        (Scope::Local, Some(id)) => {
+            sess.execute(
+                "delete from auth.sessions where id = $1::text::uuid",
+                &[&id],
+            )
+            .await?;
+        }
+        (Scope::Others, Some(id)) => {
+            sess.execute(
+                "delete from auth.sessions
+                  where user_id = $1::text::uuid and id <> $2::text::uuid",
+                &[&caller.user_id, &id],
+            )
+            .await?;
+        }
+        _ => {
+            sess.execute(
+                "delete from auth.sessions where user_id = $1::text::uuid",
+                &[&caller.user_id],
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// POST /auth/v1/reauthenticate, which mails a code that proves the

@@ -121,6 +121,30 @@ These are the only two places where what a provider says about an address does n
 
 The last identity cannot be unlinked, because an account with none is one nobody can sign in to again.
 
+## Signing in as nobody
+
+Off by default, the same as GoTrue. Set `ZOU_EXTERNAL_ANONYMOUS_USERS_ENABLED=true` and a signup carrying neither an address nor a number gets a real account with a real session, and no way to sign in to it a second time.
+
+```js
+await supabase.auth.signInAnonymously()
+```
+
+The account has no address, no identity, and an empty `app_metadata`, and its token carries `is_anonymous`. Row level security policies can read that claim, which is the point: an anonymous visitor gets to write a cart or a draft without being asked who they are first.
+
+The account becomes a permanent one by taking an address, either through `updateUser({ email })` or by linking a provider to it. The id does not change, so everything already written against it stays where it is. With `ZOU_MAILER_AUTOCONFIRM=true` the address is taken on the spot and the account stops being anonymous immediately; otherwise the ordinary email change mail goes out and the account stops being anonymous when the link is followed. Setting a password on an account that still has no address or number is refused, because there would be nothing to sign in with.
+
+## Reading and throwing away a session
+
+`GET /auth/v1/user` describes the account the token names, and refuses with `user_not_found` or `session_not_found` when the account or the session behind the token is gone. That is what makes a logout mean something: the token stays signed and inside its hour, but what it names is no longer there.
+
+```js
+await supabase.auth.signOut()                    // this session
+await supabase.auth.signOut({ scope: 'global' }) // every session on the account
+await supabase.auth.signOut({ scope: 'others' }) // every session except this one
+```
+
+`POST /auth/v1/logout` takes `global`, `local`, and `others`, defaults to `global` when the scope is missing, and answers 204 with no body. Any other scope is a 400 that names back what it was given. `POST /auth/v1/resend` sends a signup confirmation or an email change pair again, draws fresh codes rather than repeating the ones already mailed, waits out the same minute the first send started, and answers with an empty object whether or not there was anything to send, so it says nothing about who has an account here.
+
 ## Where to go next
 
 - docs/architecture.md for the shape of the whole system
