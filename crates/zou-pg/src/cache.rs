@@ -2,7 +2,7 @@
 //!
 //! Keys are content addressed: a slab is named by its checkpoint id,
 //! run number, and byte offset, and run objects are immutable once
-//! written, put_new refuses overwrites and a fold never rewrites an
+//! written, put_if_absent refuses overwrites and a fold never rewrites an
 //! existing run. A cached slab can therefore never go stale and there
 //! is no invalidation path at all, eviction is purely about space.
 //!

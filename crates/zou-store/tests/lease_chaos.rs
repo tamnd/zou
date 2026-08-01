@@ -164,7 +164,7 @@ fn contender(h: &Arc<Harness>, node: usize, generations: usize) {
             let key = h
                 .layout
                 .wal_segment(held.epoch, Lsn(generation as u64 * 10 + stint + 1));
-            if h.store.put_new(&key, holder.as_bytes()).is_ok() {
+            if h.store.put_if_absent(&key, holder.as_bytes()).is_ok() {
                 h.segments.lock().unwrap().insert(key, held.epoch);
             }
             let now = h.clock.load(Ordering::Relaxed);

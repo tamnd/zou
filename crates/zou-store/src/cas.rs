@@ -77,9 +77,13 @@ pub trait CasStore: Send + Sync {
         expected: Option<&Version>,
     ) -> Result<Version, CasError>;
 
-    /// Write an immutable object. Fails if the key exists, because nothing
-    /// under wal/ or chk/ is ever overwritten.
-    fn put_new(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
+    /// Write an immutable object, failing if the key exists. This is the
+    /// fencing primitive of the v2 design: exactly one writer wins the
+    /// creation race for a landing segment or a chain link, everyone else
+    /// gets [`CasError::AlreadyExists`] and reads the winner's bytes. On
+    /// S3 dialects it maps to a PUT with If-None-Match, everywhere else
+    /// to the create arm of [`CasStore::put_if_match`].
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
         match self.put_if_match(key, data, None) {
             Err(CasError::Conflict { key }) => Err(CasError::AlreadyExists { key }),
             other => other,
@@ -163,11 +167,27 @@ impl KeyLock {
         if let Some(parent) = dir.parent() {
             fs::create_dir_all(parent).map_err(|e| LocalFsStore::io(key, e))?;
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let stale = stale_lock_age();
+        let deadline = Instant::now() + stale + Duration::from_secs(10);
         loop {
             match fs::create_dir(&dir) {
                 Ok(()) => return Ok(Self { dir }),
                 Err(e) if lock_busy(&e) => {
+                    // A crash between mkdir and Drop leaves the lock dir
+                    // behind forever, and without this check the key would
+                    // be wedged for good. A live holder keeps a lock for
+                    // the duration of one small file write, so a lock dir
+                    // whose mtime is minutes old belongs to a dead process
+                    // and gets broken. The mtime of a dir is set at mkdir
+                    // and a crashed owner never touches it again.
+                    if let Ok(meta) = fs::metadata(&dir)
+                        && let Ok(modified) = meta.modified()
+                        && let Ok(age) = modified.elapsed()
+                        && age > stale
+                    {
+                        let _ = fs::remove_dir_all(&dir);
+                        continue;
+                    }
                     if Instant::now() > deadline {
                         return Err(LocalFsStore::io(
                             key,
@@ -183,6 +203,19 @@ impl KeyLock {
             }
         }
     }
+}
+
+/// How old a lock dir must be before a waiter breaks it. The default is
+/// far above any legitimate hold time, and the env override exists so
+/// the crash fuzz can exercise the recovery path without waiting a
+/// minute per case. Read on the contended path only, which is already
+/// sleeping.
+fn stale_lock_age() -> Duration {
+    let ms = std::env::var("ZOU_LOCALFS_LOCK_STALE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60_000);
+    Duration::from_millis(ms)
 }
 
 /// Whether a failed lock mkdir means "held by someone else, wait". Windows

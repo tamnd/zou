@@ -237,7 +237,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         store
-            .put_new(
+            .put_if_absent(
                 &TenantLayout::new("p").manifest(),
                 &parent_manifest().to_json(),
             )
@@ -365,7 +365,7 @@ mod tests {
             BranchError::NoSource { .. }
         ));
         store
-            .put_new(
+            .put_if_absent(
                 &TenantLayout::new("empty").manifest(),
                 &Manifest::new("empty", 18).to_json(),
             )
@@ -387,18 +387,18 @@ mod tests {
         early.wal_tail = None;
         early.published_unix = Some(1000);
         store
-            .put_new(&p.manifest_history(3, 1000), &early.to_json())
+            .put_if_absent(&p.manifest_history(3, 1000), &early.to_json())
             .unwrap();
         let mut middle = parent_manifest();
         middle.wal_tail.as_mut().unwrap().segments.truncate(1);
         middle.published_unix = Some(2000);
         store
-            .put_new(&p.manifest_history(3, 2000), &middle.to_json())
+            .put_if_absent(&p.manifest_history(3, 2000), &middle.to_json())
             .unwrap();
         let mut late = parent_manifest();
         late.published_unix = Some(3000);
         store
-            .put_new(&p.manifest_history(3, 3000), &late.to_json())
+            .put_if_absent(&p.manifest_history(3, 3000), &late.to_json())
             .unwrap();
 
         let child = materialize_at(&store, "p", "c", 2500, 5000).unwrap();

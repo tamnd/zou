@@ -67,7 +67,7 @@ impl<S: CasStore> CasStore for GuardedStore<S> {
     fn put(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
         // An unconditional write can overwrite, so immutable prefixes are
         // off limits entirely. WAL and checkpoint objects go through
-        // put_new, which proves absence.
+        // put_if_absent, which proves absence.
         if overwrite_forbidden(key) {
             return Err(CasError::ImmutableOverwrite {
                 key: key.to_string(),
@@ -113,7 +113,7 @@ mod tests {
             t.checkpoint_pages("chk-1", 0),
             t.manifest_history(1, 1000),
         ] {
-            let v = store.put_new(&key, b"original").unwrap();
+            let v = store.put_if_absent(&key, b"original").unwrap();
             let err = store.put_if_match(&key, b"rewrite", Some(&v)).unwrap_err();
             assert!(
                 matches!(err, CasError::ImmutableOverwrite { .. }),
@@ -129,9 +129,9 @@ mod tests {
         let (_d, store) = guarded();
         let t = TenantLayout::new("t1");
         let key = t.wal_segment(1, Lsn(0));
-        store.put_new(&key, b"frame").unwrap();
+        store.put_if_absent(&key, b"frame").unwrap();
         assert!(matches!(
-            store.put_new(&key, b"other").unwrap_err(),
+            store.put_if_absent(&key, b"other").unwrap_err(),
             CasError::AlreadyExists { .. }
         ));
     }
@@ -141,7 +141,7 @@ mod tests {
         let (_d, store) = guarded();
         let layout = TenantLayout::new("t1");
         store
-            .put_new(&layout.manifest(), &Manifest::new("t1", 18).to_json())
+            .put_if_absent(&layout.manifest(), &Manifest::new("t1", 18).to_json())
             .unwrap();
         let mut held = lease::acquire(&store, &layout, "node-a", 15, 1000).unwrap();
         lease::renew(&store, &layout, &mut held, 15, 1005).unwrap();
@@ -157,7 +157,7 @@ mod tests {
             "scratch/anything",
             "tenants/t1/MANIFEST-backup",
         ] {
-            let v = store.put_new(key, b"v1").unwrap();
+            let v = store.put_if_absent(key, b"v1").unwrap();
             store.put_if_match(key, b"v2", Some(&v)).unwrap();
         }
     }

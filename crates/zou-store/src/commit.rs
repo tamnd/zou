@@ -1146,7 +1146,7 @@ mod tests {
         now: u64,
     ) -> Arc<Mutex<HeldLease>> {
         store
-            .put_new(
+            .put_if_absent(
                 &layout.manifest(),
                 &crate::manifest::Manifest::new("t1", 18).to_json(),
             )
@@ -1264,7 +1264,7 @@ mod tests {
     fn reconcile_finds_segments_the_manifest_never_learned_about() {
         let (_d, store, layout) = setup();
         store
-            .put_new(
+            .put_if_absent(
                 &layout.manifest(),
                 &crate::manifest::Manifest::new("t1", 18).to_json(),
             )
@@ -1298,7 +1298,7 @@ mod tests {
     fn reconcile_of_an_empty_store_is_none() {
         let (_d, store, layout) = setup();
         store
-            .put_new(
+            .put_if_absent(
                 &layout.manifest(),
                 &crate::manifest::Manifest::new("t1", 18).to_json(),
             )

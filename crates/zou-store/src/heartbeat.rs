@@ -230,7 +230,7 @@ mod tests {
         let store = Arc::new(LocalFsStore::new(dir.path()));
         let layout = TenantLayout::new("t1");
         store
-            .put_new(&layout.manifest(), &Manifest::new("t1", 18).to_json())
+            .put_if_absent(&layout.manifest(), &Manifest::new("t1", 18).to_json())
             .unwrap();
         (dir, store, layout)
     }

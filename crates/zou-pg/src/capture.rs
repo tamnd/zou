@@ -91,7 +91,7 @@ pub fn upload(
     let mut bytes = 0u64;
     for (relpath, data) in files {
         let key = layout.chk_file(id, relpath);
-        let len = match store.put_new(&key, data) {
+        let len = match store.put_if_absent(&key, data) {
             Ok(_) => data.len() as u64,
             Err(CasError::AlreadyExists { .. }) if keep_existing => {
                 let (existing, _) = store
@@ -111,7 +111,7 @@ pub fn upload(
     for dir in dirs {
         index.push_str(&format!("d {dir}\n"));
     }
-    match store.put_new(&layout.chk_index(id), index.as_bytes()) {
+    match store.put_if_absent(&layout.chk_index(id), index.as_bytes()) {
         Ok(_) => Ok(bytes),
         Err(CasError::AlreadyExists { .. }) if keep_existing => Ok(bytes),
         Err(e) => Err(format!("put index: {e}")),
@@ -279,7 +279,7 @@ mod tests {
         let store = LocalFsStore::new(dir.path());
         let layout = TenantLayout::new("local");
         store
-            .put_new(&layout.chk_file("d1", "pg_xact/0000"), b"older bytes")
+            .put_if_absent(&layout.chk_file("d1", "pg_xact/0000"), b"older bytes")
             .unwrap();
 
         let files = vec![("pg_xact/0000".to_string(), b"newer".to_vec())];

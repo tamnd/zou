@@ -471,13 +471,13 @@ mod tests {
         let control = synthetic_control(DB_SHUTDOWNED);
         let initial_segment = vec![0x11u8; WAL_SEGMENT_SIZE as usize];
         store
-            .put_new(&layout.chk_file("genesis", "global/pg_control"), &control)
+            .put_if_absent(&layout.chk_file("genesis", "global/pg_control"), &control)
             .unwrap();
         store
-            .put_new(&layout.chk_file("genesis", "PG_VERSION"), b"18\n")
+            .put_if_absent(&layout.chk_file("genesis", "PG_VERSION"), b"18\n")
             .unwrap();
         store
-            .put_new(
+            .put_if_absent(
                 &layout.chk_file("genesis", "pg_wal/000000010000000000000001"),
                 &initial_segment,
             )
@@ -488,23 +488,23 @@ mod tests {
             initial_segment.len()
         );
         store
-            .put_new(&layout.chk_index("genesis"), index.as_bytes())
+            .put_if_absent(&layout.chk_index("genesis"), index.as_bytes())
             .unwrap();
         // A delta checkpoint after genesis: a newer pg_control already in
         // production and a clog segment, later files overwrite earlier.
         let delta_control = synthetic_control(DB_IN_PRODUCTION);
         store
-            .put_new(&layout.chk_file("d1", "global/pg_control"), &delta_control)
+            .put_if_absent(&layout.chk_file("d1", "global/pg_control"), &delta_control)
             .unwrap();
         store
-            .put_new(&layout.chk_file("d1", "pg_xact/0000"), b"delta clog")
+            .put_if_absent(&layout.chk_file("d1", "pg_xact/0000"), b"delta clog")
             .unwrap();
         let delta_index = format!(
             "f global/pg_control {}\nf pg_xact/0000 10\n",
             delta_control.len()
         );
         store
-            .put_new(&layout.chk_index("d1"), delta_index.as_bytes())
+            .put_if_absent(&layout.chk_index("d1"), delta_index.as_bytes())
             .unwrap();
 
         let mut manifest = Manifest::new("local", 18);
@@ -521,7 +521,7 @@ mod tests {
             owner: None,
         });
         store
-            .put_new(&layout.manifest(), &manifest.to_json())
+            .put_if_absent(&layout.manifest(), &manifest.to_json())
             .unwrap();
 
         // A pusher session: two chunks, the second crossing into the next
@@ -605,13 +605,13 @@ mod tests {
         let control = synthetic_control(DB_SHUTDOWNED);
         let initial_segment = vec![0x11u8; WAL_SEGMENT_SIZE as usize];
         store
-            .put_new(&layout.chk_file("genesis", "global/pg_control"), &control)
+            .put_if_absent(&layout.chk_file("genesis", "global/pg_control"), &control)
             .unwrap();
         store
-            .put_new(&layout.chk_file("genesis", "PG_VERSION"), b"18\n")
+            .put_if_absent(&layout.chk_file("genesis", "PG_VERSION"), b"18\n")
             .unwrap();
         store
-            .put_new(
+            .put_if_absent(
                 &layout.chk_file("genesis", "pg_wal/000000010000000000000001"),
                 &initial_segment,
             )
@@ -622,7 +622,7 @@ mod tests {
             initial_segment.len()
         );
         store
-            .put_new(&layout.chk_index("genesis"), index.as_bytes())
+            .put_if_absent(&layout.chk_index("genesis"), index.as_bytes())
             .unwrap();
         let mut manifest = Manifest::new("local", 18);
         manifest.checkpoints.push(CheckpointRef {
@@ -632,7 +632,7 @@ mod tests {
             owner: None,
         });
         store
-            .put_new(&layout.manifest(), &manifest.to_json())
+            .put_if_absent(&layout.manifest(), &manifest.to_json())
             .unwrap();
 
         // Two pusher sessions, one sealed segment each, so the store
@@ -668,7 +668,7 @@ mod tests {
             segments: vec![live.segments[0].clone()],
         });
         store
-            .put_new(&layout.manifest_history(1, 1000), &snapshot.to_json())
+            .put_if_absent(&layout.manifest_history(1, 1000), &snapshot.to_json())
             .unwrap();
 
         // Time travel to the snapshot: only the first session's record
@@ -708,13 +708,13 @@ mod tests {
         let control = synthetic_control(DB_SHUTDOWNED);
         let initial_segment = vec![0x11u8; WAL_SEGMENT_SIZE as usize];
         store
-            .put_new(&layout.chk_file("genesis", "global/pg_control"), &control)
+            .put_if_absent(&layout.chk_file("genesis", "global/pg_control"), &control)
             .unwrap();
         store
-            .put_new(&layout.chk_file("genesis", "PG_VERSION"), b"18\n")
+            .put_if_absent(&layout.chk_file("genesis", "PG_VERSION"), b"18\n")
             .unwrap();
         store
-            .put_new(
+            .put_if_absent(
                 &layout.chk_file("genesis", "pg_wal/000000010000000000000001"),
                 &initial_segment,
             )
@@ -725,7 +725,7 @@ mod tests {
             initial_segment.len()
         );
         store
-            .put_new(&layout.chk_index("genesis"), index.as_bytes())
+            .put_if_absent(&layout.chk_index("genesis"), index.as_bytes())
             .unwrap();
         let mut manifest = Manifest::new("local", 18);
         manifest.checkpoints.push(CheckpointRef {
@@ -735,7 +735,7 @@ mod tests {
             owner: None,
         });
         store
-            .put_new(&layout.manifest(), &manifest.to_json())
+            .put_if_absent(&layout.manifest(), &manifest.to_json())
             .unwrap();
 
         // A leased session pushes and publishes the tail, which is the
