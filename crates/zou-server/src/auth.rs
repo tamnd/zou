@@ -113,6 +113,187 @@ fn refused(status: StatusCode, code: &'static str, msg: &str) -> Error {
     }
 }
 
+/// GoTrue's send frequency limit: one account, one code, then a wait.
+/// The wording and the arithmetic are upstream's, seconds truncated
+/// rather than rounded, because a client shows this string to a person
+/// staring at a form.
+fn too_soon(seconds: i64) -> Error {
+    Error::Denied {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        code: "over_email_send_rate_limit",
+        msg: format!("For security purposes, you can only request this after {seconds} seconds."),
+    }
+}
+
+/// Everything a flow needs to get a code to the person it belongs to:
+/// what to send it with, and where the link in it should point.
+pub struct Post<'a> {
+    pub sender: &'a Arc<dyn crate::mail::Sender>,
+    pub settings: &'a crate::mail::Settings,
+    /// The base every link is built on, this server's external url.
+    pub external: String,
+    pub site: String,
+    /// Where a followed link should land, already checked against the
+    /// site url, which is what upstream's getReferrer hands the mailer.
+    pub referrer: String,
+    /// Whether the project confirms its own signups, which decides
+    /// whether a confirmation is posted at all.
+    pub autoconfirm: bool,
+}
+
+/// Build one from the app and from where this request asked a followed
+/// link to land. The wanted target is honoured on the same terms the
+/// followed link itself is: same scheme and host as the site url, or
+/// the site url instead.
+pub fn posting<'a>(app: &'a App, wanted: &str, referer: &str) -> Post<'a> {
+    Post {
+        sender: &app.mailer,
+        settings: &app.cfg.mail,
+        external: app
+            .cfg
+            .external_url
+            .clone()
+            .unwrap_or_else(|| "http://localhost:9999".to_string()),
+        site: app.site_url(),
+        referrer: landing(app, wanted, referer),
+        autoconfirm: app.cfg.mailer_autoconfirm,
+    }
+}
+
+/// The Referer of a request, which is the second place a link target
+/// is looked for and has to be read before the body is consumed.
+fn referer(req: &Request<Body>) -> String {
+    req.headers()
+        .get("referer")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Where this request asked a followed link to land, and where it came
+/// from, both read before the body is consumed. Upstream takes the
+/// redirect from the query string on these endpoints rather than from
+/// the body, and falls back to the Referer.
+fn link_target(req: &Request<Body>) -> (String, String) {
+    let query = query_object(req.uri().query().unwrap_or_default());
+    (field(&query, "redirect_to").to_string(), referer(req))
+}
+
+/// One code, as it is held: the digits that go in the email and the
+/// hash of them that goes in the database.
+struct Code {
+    code: String,
+    hash: String,
+}
+
+/// What one outgoing code is about.
+struct Outgoing<'a> {
+    /// Which template renders it.
+    template: &'a str,
+    /// The type the link carries, which is what verify branches on and
+    /// is not always the template's own name.
+    kind: &'a str,
+    /// Where it goes, which for a change of address is not the address
+    /// on the account.
+    to: &'a str,
+    code: &'a Code,
+    /// The address being moved to, for the change of address templates.
+    new_email: &'a str,
+}
+
+/// Render one code into its email and hand it to the sender.
+///
+/// This runs inside the flow's transaction on purpose. A send that
+/// fails takes the token it was carrying with it, so the account is
+/// never left holding a code that nobody was told, and the next
+/// attempt draws a fresh one.
+async fn send_code(
+    sess: &sql::Session,
+    post: &Post<'_>,
+    user_id: &str,
+    out: Outgoing<'_>,
+) -> Result<(), Error> {
+    let rows = sess
+        .query(
+            "select coalesce(email, ''), coalesce(raw_user_meta_data, '{}'::jsonb)
+               from auth.users where id = $1::text::uuid",
+            &[&user_id],
+        )
+        .await?;
+    let (email, data): (String, serde_json::Value) = match rows.first() {
+        Some(row) => (row.get(0), row.get(1)),
+        None => (String::new(), serde_json::json!({})),
+    };
+    let vars = crate::mail::Vars {
+        site_url: post.site.clone(),
+        confirmation_url: crate::mail::action_link(
+            &post.external,
+            post.settings.path(out.template),
+            out.kind,
+            &out.code.hash,
+            &post.referrer,
+        ),
+        email,
+        new_email: out.new_email.to_string(),
+        sending_to: out.to.to_string(),
+        token: out.code.code.clone(),
+        token_hash: out.code.hash.clone(),
+        redirect_to: post.referrer.clone(),
+        data,
+    };
+    let mail = crate::mail::compose(post.settings, out.template, out.to, &vars);
+    match crate::mail::post(post.sender, mail).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            log::error!("sending the {} email failed: {e}", out.template);
+            Err(refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected_failure",
+                sending_failed(out.template),
+            ))
+        }
+    }
+}
+
+/// Upstream's message for a send that did not happen, per template.
+fn sending_failed(template: &str) -> &'static str {
+    match template {
+        crate::mail::RECOVERY => "Error sending recovery email",
+        crate::mail::MAGIC_LINK => "Error sending magic link email",
+        crate::mail::EMAIL_CHANGE => "Error sending email change email",
+        crate::mail::REAUTHENTICATION => "Error sending reauthentication email",
+        crate::mail::INVITE => "Error sending invite email",
+        _ => "Error sending confirmation email",
+    }
+}
+
+/// How long this account still has to wait before another code may go
+/// out on this column, refused when that is any time at all.
+async fn within_limit(
+    sess: &sql::Session,
+    user_id: &str,
+    column: &str,
+    max_frequency: u64,
+) -> Result<(), Error> {
+    if max_frequency == 0 {
+        return Ok(());
+    }
+    let rows = sess
+        .query(
+            &format!(
+                "select trunc(extract(epoch from
+                          ({column} + make_interval(secs => $2::int) - now())))::int
+                   from auth.users where id = $1::text::uuid and {column} is not null"
+            ),
+            &[&user_id, &(max_frequency as i32)],
+        )
+        .await?;
+    match rows.first().map(|r| r.get::<_, i32>(0)) {
+        Some(left) if left > 0 => Err(too_soon(left as i64)),
+        _ => Ok(()),
+    }
+}
+
 /// Seconds since the epoch.
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -696,10 +877,11 @@ async fn register(
     email: &str,
     hash: &str,
     data: &serde_json::Value,
-    autoconfirm: bool,
     signer: &crate::jwt::Signer<'_>,
     issuer: &str,
+    post: &Post<'_>,
 ) -> Result<SignedUp, Error> {
+    let autoconfirm = post.autoconfirm;
     let rows = sess
         .query(
             "select id::text, email_confirmed_at is not null
@@ -780,7 +962,27 @@ async fn register(
         // confirmation per user, which is upstream's rule: a second
         // signup on the same unconfirmed address replaces the first
         // code rather than leaving two that both work.
-        mint_code(sess, &user_id, email, "confirmation_token").await?;
+        within_limit(
+            sess,
+            &user_id,
+            "confirmation_sent_at",
+            post.settings.max_frequency,
+        )
+        .await?;
+        let code = mint_code(sess, &user_id, email, "confirmation_token").await?;
+        send_code(
+            sess,
+            post,
+            &user_id,
+            Outgoing {
+                template: crate::mail::CONFIRMATION,
+                kind: "signup",
+                to: email,
+                code: &code,
+                new_email: "",
+            },
+        )
+        .await?;
         return Ok(SignedUp::Pending(user_json(sess, &user_id).await?));
     }
 
@@ -844,9 +1046,9 @@ pub async fn sign_up(
     email: &str,
     password: &str,
     data: &serde_json::Value,
-    autoconfirm: bool,
     signer: &crate::jwt::Signer<'_>,
     issuer: &str,
+    post: &Post<'_>,
 ) -> Result<SignedUp, Error> {
     let email = validate_email(email)?;
     validate_password(password)?;
@@ -854,7 +1056,7 @@ pub async fn sign_up(
     // before the connection is taken so a slow hash never holds one.
     let hash = hash_off_thread(password).await;
     let sess = pool.admin().await?;
-    let out = register(&sess, &email, &hash, data, autoconfirm, signer, issuer).await;
+    let out = register(&sess, &email, &hash, data, signer, issuer, post).await;
     match out {
         Ok(done) => {
             sess.commit().await?;
@@ -1017,7 +1219,7 @@ async fn mint_code(
     user_id: &str,
     email: &str,
     token_type: &str,
-) -> Result<String, sql::Error> {
+) -> Result<Code, sql::Error> {
     let (column, sent) = match token_type {
         "recovery_token" => ("recovery_token", "recovery_sent_at"),
         "reauthentication_token" => ("reauthentication_token", "reauthentication_sent_at"),
@@ -1035,7 +1237,7 @@ async fn mint_code(
     )
     .await?;
     keep_token(sess, user_id, token_type, &hashed, email).await?;
-    Ok(code)
+    Ok(Code { code, hash: hashed })
 }
 
 /// A verify request, GoTrue's VerifyParams. The code arrives either as
@@ -1485,7 +1687,7 @@ async fn confirm(
 /// did, because on this endpoint the answer is the whole information:
 /// anything else turns a password reset form into a list of who has an
 /// account here.
-async fn recovery_for(sess: &sql::Session, email: &str) -> Result<(), Error> {
+async fn recovery_for(sess: &sql::Session, email: &str, post: &Post<'_>) -> Result<(), Error> {
     let rows = sess
         .query(
             "select id::text from auth.users
@@ -1497,15 +1699,35 @@ async fn recovery_for(sess: &sql::Session, email: &str) -> Result<(), Error> {
         return Ok(());
     };
     let user_id: String = row.get(0);
-    mint_code(sess, &user_id, email, "recovery_token").await?;
+    within_limit(
+        sess,
+        &user_id,
+        "recovery_sent_at",
+        post.settings.max_frequency,
+    )
+    .await?;
+    let code = mint_code(sess, &user_id, email, "recovery_token").await?;
+    send_code(
+        sess,
+        post,
+        &user_id,
+        Outgoing {
+            template: crate::mail::RECOVERY,
+            kind: "recovery",
+            to: email,
+            code: &code,
+            new_email: "",
+        },
+    )
+    .await?;
     Ok(())
 }
 
 /// POST /auth/v1/recover, the start of a password reset.
-pub async fn send_recovery(pool: &Pool, email: &str) -> Result<(), Error> {
+pub async fn send_recovery(pool: &Pool, email: &str, post: &Post<'_>) -> Result<(), Error> {
     let email = validate_email(email)?;
     let sess = pool.admin().await?;
-    let out = recovery_for(&sess, &email).await;
+    let out = recovery_for(&sess, &email, post).await;
     match out {
         Ok(()) => {
             sess.commit().await?;
@@ -1544,9 +1766,9 @@ async fn magic_for(
     sess: &sql::Session,
     email: &str,
     data: &serde_json::Value,
-    autoconfirm: bool,
     signer: &crate::jwt::Signer<'_>,
     issuer: &str,
+    post: &Post<'_>,
 ) -> Result<(), Error> {
     let rows = sess
         .query(
@@ -1561,8 +1783,8 @@ async fn magic_for(
         // it, and both are a signup as far as this endpoint is
         // concerned. The password is drawn and thrown away.
         let hash = hash_off_thread(&unguessable_password()).await;
-        register(sess, email, &hash, data, autoconfirm, signer, issuer).await?;
-        if !autoconfirm {
+        register(sess, email, &hash, data, signer, issuer, post).await?;
+        if !post.autoconfirm {
             // The confirmation this just wrote is the link, so there is
             // nothing else to send.
             return Ok(());
@@ -1576,7 +1798,27 @@ async fn magic_for(
         )
         .await?;
     let user_id: String = rows[0].get(0);
-    mint_code(sess, &user_id, email, "recovery_token").await?;
+    within_limit(
+        sess,
+        &user_id,
+        "recovery_sent_at",
+        post.settings.max_frequency,
+    )
+    .await?;
+    let code = mint_code(sess, &user_id, email, "recovery_token").await?;
+    send_code(
+        sess,
+        post,
+        &user_id,
+        Outgoing {
+            template: crate::mail::MAGIC_LINK,
+            kind: "magiclink",
+            to: email,
+            code: &code,
+            new_email: "",
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -1585,13 +1827,13 @@ pub async fn send_magic_link(
     pool: &Pool,
     email: &str,
     data: &serde_json::Value,
-    autoconfirm: bool,
     signer: &crate::jwt::Signer<'_>,
     issuer: &str,
+    post: &Post<'_>,
 ) -> Result<(), Error> {
     let email = validate_email(email)?;
     let sess = pool.admin().await?;
-    let out = magic_for(&sess, &email, data, autoconfirm, signer, issuer).await;
+    let out = magic_for(&sess, &email, data, signer, issuer, post).await;
     match out {
         Ok(()) => {
             sess.commit().await?;
@@ -1629,7 +1871,7 @@ async fn is_registered(pool: &Pool, email: &str) -> Result<bool, Error> {
 /// Write down a code that proves the person holding this session is
 /// still the person who owns the address, which is what a password
 /// change asks for when the session is old.
-async fn reauth_for(sess: &sql::Session, user_id: &str) -> Result<(), Error> {
+async fn reauth_for(sess: &sql::Session, user_id: &str, post: &Post<'_>) -> Result<(), Error> {
     let rows = sess
         .query(
             "select coalesce(email, ''), email_confirmed_at is not null
@@ -1659,14 +1901,40 @@ async fn reauth_for(sess: &sql::Session, user_id: &str) -> Result<(), Error> {
             "Please verify your email first.",
         ));
     }
-    mint_code(sess, user_id, &email, "reauthentication_token").await?;
+    within_limit(
+        sess,
+        user_id,
+        "reauthentication_sent_at",
+        post.settings.max_frequency,
+    )
+    .await?;
+    let code = mint_code(sess, user_id, &email, "reauthentication_token").await?;
+    send_code(
+        sess,
+        post,
+        user_id,
+        Outgoing {
+            template: crate::mail::REAUTHENTICATION,
+            // There is no link in this one at all, only the code, so
+            // the type is the one the client posts back with it.
+            kind: "reauthentication",
+            to: &email,
+            code: &code,
+            new_email: "",
+        },
+    )
+    .await?;
     Ok(())
 }
 
 /// POST /auth/v1/reauthenticate.
-pub async fn send_reauthentication(pool: &Pool, user_id: &str) -> Result<(), Error> {
+pub async fn send_reauthentication(
+    pool: &Pool,
+    user_id: &str,
+    post: &Post<'_>,
+) -> Result<(), Error> {
     let sess = pool.admin().await?;
-    let out = reauth_for(&sess, user_id).await;
+    let out = reauth_for(&sess, user_id, post).await;
     match out {
         Ok(()) => {
             sess.commit().await?;
@@ -1689,12 +1957,36 @@ async fn stage_change(
     current: &str,
     new: &str,
     secure_change: bool,
-) -> Result<(), sql::Error> {
-    let to_new = token_hash(new, &six_digits());
-    let to_current = if secure_change && !current.is_empty() {
-        token_hash(current, &six_digits())
-    } else {
-        String::new()
+    post: &Post<'_>,
+) -> Result<(), Error> {
+    within_limit(
+        sess,
+        user_id,
+        "email_change_sent_at",
+        post.settings.max_frequency,
+    )
+    .await?;
+    let for_new = {
+        let code = six_digits();
+        Code {
+            hash: token_hash(new, &code),
+            code,
+        }
+    };
+    let for_current = match secure_change && !current.is_empty() {
+        true => {
+            let code = six_digits();
+            Some(Code {
+                hash: token_hash(current, &code),
+                code,
+            })
+        }
+        false => None,
+    };
+    let to_new = for_new.hash.clone();
+    let to_current = match &for_current {
+        Some(code) => code.hash.clone(),
+        None => String::new(),
     };
     sess.execute(
         "update auth.users
@@ -1716,6 +2008,38 @@ async fn stage_change(
             "email_change_token_current",
             &to_current,
             current,
+        )
+        .await?;
+    }
+    // The new address always hears about it. The old one hears too when
+    // the project confirms both ends, and it is a different code in a
+    // different email, because the whole point is that whoever asked
+    // has to be able to read both mailboxes.
+    send_code(
+        sess,
+        post,
+        user_id,
+        Outgoing {
+            template: crate::mail::EMAIL_CHANGE,
+            kind: "email_change",
+            to: new,
+            code: &for_new,
+            new_email: new,
+        },
+    )
+    .await?;
+    if let Some(code) = &for_current {
+        send_code(
+            sess,
+            post,
+            user_id,
+            Outgoing {
+                template: crate::mail::EMAIL_CHANGE,
+                kind: "email_change",
+                to: current,
+                code,
+                new_email: new,
+            },
         )
         .await?;
     }
@@ -1831,6 +2155,7 @@ async fn update_user(
     body: &serde_json::Value,
     reauth_required: bool,
     secure_change: bool,
+    post: &Post<'_>,
 ) -> Result<serde_json::Value, Error> {
     let email = match field(body, "email") {
         "" => None,
@@ -1918,7 +2243,7 @@ async fn update_user(
     if let Some(wanted) = &email
         && wanted != &current
     {
-        stage_change(sess, &caller.user_id, &current, wanted, secure_change).await?;
+        stage_change(sess, &caller.user_id, &current, wanted, secure_change, post).await?;
     }
 
     Ok(user_json(sess, &caller.user_id).await?)
@@ -2140,6 +2465,7 @@ pub async fn signup(
     let Some(pool) = &app.pool else {
         return no_database();
     };
+    let (wanted, from) = link_target(&req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -2174,15 +2500,14 @@ pub async fn signup(
     }
 
     let data = metadata(&body);
-    let autoconfirm = app.cfg.mailer_autoconfirm;
     match sign_up(
         pool,
         email,
         password,
         &data,
-        autoconfirm,
         &app.signer(),
         &app.issuer(),
+        &posting(&app, &wanted, &from),
     )
     .await
     {
@@ -2393,7 +2718,7 @@ fn redirect(target: &str, pairs: &Vec<(&str, String)>) -> Response {
 
 /// Go's url.QueryEscape: unreserved characters through, a space as a
 /// plus, everything else percent encoded.
-fn query_escape(s: &str) -> String {
+pub(crate) fn query_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -2431,6 +2756,7 @@ pub async fn recover(
     let Some(pool) = &app.pool else {
         return no_database();
     };
+    let (wanted, from) = link_target(&req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -2443,7 +2769,7 @@ pub async fn recover(
             "Password recovery requires an email",
         );
     }
-    match send_recovery(pool, email).await {
+    match send_recovery(pool, email, &posting(&app, &wanted, &from)).await {
         Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
         Err(e) => refusal(e, "recover"),
     }
@@ -2458,11 +2784,12 @@ pub async fn magiclink(
     let Some(pool) = &app.pool else {
         return no_database();
     };
+    let (wanted, from) = link_target(&req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
     };
-    magic(&app, pool, &body).await
+    magic(&app, pool, &body, &posting(&app, &wanted, &from)).await
 }
 
 /// POST /auth/v1/otp, which is the magic link endpoint with a phone
@@ -2475,6 +2802,7 @@ pub async fn otp(
     let Some(pool) = &app.pool else {
         return no_database();
     };
+    let (wanted, from) = link_target(&req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -2528,13 +2856,13 @@ pub async fn otp(
             "One of email or phone must be set",
         );
     }
-    magic(&app, pool, &body).await
+    magic(&app, pool, &body, &posting(&app, &wanted, &from)).await
 }
 
 /// The body both of them share. The answer is empty and the same
 /// whether the address was known, which is what keeps either endpoint
 /// from being asked who has an account here.
-async fn magic(app: &App, pool: &Pool, body: &serde_json::Value) -> Response {
+async fn magic(app: &App, pool: &Pool, body: &serde_json::Value, post: &Post<'_>) -> Response {
     let email = field(body, "email");
     if email.is_empty() {
         // Upstream's wording, copied from recover, and its status,
@@ -2547,16 +2875,7 @@ async fn magic(app: &App, pool: &Pool, body: &serde_json::Value) -> Response {
         );
     }
     let data = metadata(body);
-    match send_magic_link(
-        pool,
-        email,
-        &data,
-        app.cfg.mailer_autoconfirm,
-        &app.signer(),
-        &app.issuer(),
-    )
-    .await
-    {
+    match send_magic_link(pool, email, &data, &app.signer(), &app.issuer(), post).await {
         Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
         Err(e) => refusal(e, "magic link"),
     }
@@ -2575,7 +2894,8 @@ pub async fn reauthenticate(
         Ok(v) => v,
         Err(res) => return *res,
     };
-    match send_reauthentication(pool, &caller.user_id).await {
+    let (wanted, from) = link_target(&req);
+    match send_reauthentication(pool, &caller.user_id, &posting(&app, &wanted, &from)).await {
         Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
         Err(e) => refusal(e, "reauthenticate"),
     }
@@ -2594,6 +2914,7 @@ pub async fn user_update(
         Ok(v) => v,
         Err(res) => return *res,
     };
+    let (wanted, from) = link_target(&req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -2608,6 +2929,7 @@ pub async fn user_update(
         &body,
         app.cfg.reauthentication_required,
         app.cfg.secure_email_change,
+        &posting(&app, &wanted, &from),
     )
     .await;
     match out {

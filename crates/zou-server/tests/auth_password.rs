@@ -21,7 +21,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use zou_server::sql::{Pool, Session};
-use zou_server::{Config, jwt, password, router};
+use zou_server::{Config, jwt, mail, password, router};
 
 const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long";
 const ISSUER: &str = "https://zou.test/auth/v1";
@@ -38,12 +38,19 @@ fn dsn() -> Option<String> {
 
 /// The whole front door, with the one knob these tests care about:
 /// whether the project confirms its own signups or mails for it.
+/// The send frequency limit is off, the way it is in the other suites
+/// that are not about it: it belongs to `auth_mail`, and here it would
+/// only refuse the second signup this suite exists to make.
 fn app(dsn: &str, autoconfirm: bool) -> axum::Router {
     router(Config {
         jwt_secret: SECRET.to_vec(),
         pg: Some(dsn.to_string()),
         external_url: Some("https://zou.test".to_string()),
         mailer_autoconfirm: autoconfirm,
+        mail: mail::Settings {
+            max_frequency: 0,
+            ..mail::Settings::default()
+        },
         ..Config::default()
     })
     .expect("router builds")

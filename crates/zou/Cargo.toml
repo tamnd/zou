@@ -16,6 +16,7 @@ log = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 getrandom = { workspace = true }
 libc = { workspace = true }
+serde_json = { workspace = true }
 zou-server = { path = "../zou-server" }
 
 [lints]

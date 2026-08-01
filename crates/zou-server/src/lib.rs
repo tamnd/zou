@@ -30,6 +30,7 @@ use zou_rest::catalog::Catalog;
 pub mod auth;
 pub mod edge;
 pub mod jwt;
+pub mod mail;
 pub mod openapi;
 pub mod password;
 pub mod rest;
@@ -90,6 +91,16 @@ pub struct Config {
     /// needs a code mailed to the address first unless the session was
     /// started in the last day.
     pub reauthentication_required: bool,
+    /// Templates, link paths, and how often one account may be mailed.
+    /// Everything here has a GoTrue default and takes it.
+    pub mail: mail::Settings,
+    /// Who carries the mail. None is the dev inbox, which is what an
+    /// unconfigured project gets. This is not an environment variable
+    /// and never will be: it is here because something embedding this
+    /// server already has a way to send mail and should be able to
+    /// hand it over rather than configure a second one, and because a
+    /// test needs to be able to watch a send fail.
+    pub sender: Option<Arc<dyn mail::Sender>>,
 }
 
 impl Default for Config {
@@ -108,6 +119,8 @@ impl Default for Config {
             site_url: None,
             secure_email_change: true,
             reauthentication_required: false,
+            mail: mail::Settings::default(),
+            sender: None,
         }
     }
 }
@@ -125,6 +138,11 @@ pub struct App {
     pub jwks: Option<jwt::Jwks>,
     /// The private keys this server signs with, when it has any.
     pub keys: Option<jwt::KeySet>,
+    /// Where the email flows post their codes. With nothing configured
+    /// that is the dev inbox, which keeps them in memory and logs the
+    /// link rather than dropping them the way an unconfigured GoTrue
+    /// does.
+    pub mailer: Arc<dyn mail::Sender>,
     /// The fk catalog per exposed schema, each tagged with the epoch
     /// it was introspected under. A request reuses it while the epoch
     /// holds and reintrospects when the DDL watch moves it.
@@ -195,12 +213,17 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         (Some(a), Some(b)) => Some(a.and(b)),
         (a, b) => a.or(b),
     };
+    let mailer: Arc<dyn mail::Sender> = match cfg.sender.take() {
+        Some(sender) => sender,
+        None => Arc::new(mail::Inbox::default()),
+    };
     Ok(Arc::new(App {
         cfg,
         pool,
         limiter,
         jwks,
         keys,
+        mailer,
         catalog: tokio::sync::RwLock::new(HashMap::new()),
         epoch: Arc::new(AtomicU64::new(0)),
         watching: tokio::sync::OnceCell::new(),
@@ -332,6 +355,55 @@ async fn auth_health() -> Response {
     )
 }
 
+/// Whether this request may read the mail, and whether there is any to
+/// read. Both answers are the same 404, because a route that exists
+/// only for the right caller should not be discoverable by the wrong
+/// one.
+///
+/// The service role is the bar, and it is the right bar: a caller
+/// holding that key can already mint a session for anybody, so being
+/// able to read a recovery code tells it nothing it could not have
+/// helped itself to. The anon key is public, so it is not a bar at
+/// all.
+fn readable_inbox<'a>(app: &'a App, ctx: &AuthContext) -> Option<&'a mail::Inbox> {
+    match ctx.role.as_str() {
+        "service_role" => app.mailer.inbox(),
+        _ => None,
+    }
+}
+
+/// GET /dev/inbox, everything the dev inbox is holding, oldest first.
+///
+/// This is the local loop's mailbox. Nobody is carrying these
+/// anywhere, so reading them here is the only way to follow a
+/// confirmation link on a laptop, and `zou inbox` is this endpoint
+/// with a terminal in front of it. It exists only while there is no
+/// transport configured, because with one it would be a way to read
+/// somebody else's codes.
+async fn dev_inbox(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+) -> Response {
+    let Some(inbox) = readable_inbox(&app, &ctx) else {
+        return no_route().await;
+    };
+    let messages: Vec<serde_json::Value> = inbox.kept().iter().map(mail::Mail::as_json).collect();
+    json_body(StatusCode::OK, serde_json::json!({"messages": messages}))
+}
+
+/// DELETE /dev/inbox, throw the kept mail away, which is what a test
+/// or a person starting a fresh flow wants.
+async fn dev_inbox_clear(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::Extension(ctx): axum::Extension<AuthContext>,
+) -> Response {
+    let Some(inbox) = readable_inbox(&app, &ctx) else {
+        return no_route().await;
+    };
+    inbox.clear();
+    json_body(StatusCode::OK, serde_json::json!({"messages": []}))
+}
+
 /// GET /auth/v1/.well-known/jwks.json, the public half of the
 /// project's signing keys.
 ///
@@ -410,6 +482,12 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/rest/v1/{table}", any(rest::table))
         .route("/storage/v1/{*rest}", any(storage_stub))
         .route("/realtime/v1/{*rest}", any(realtime_stub))
+        // The local loop's mailbox. It answers only while nothing is
+        // carrying the mail anywhere and only to the service role,
+        // and 404s otherwise, so a project that configures a
+        // transport loses it and a project that does not has not
+        // opened its codes to the internet.
+        .route("/dev/inbox", get(dev_inbox).delete(dev_inbox_clear))
         .layer(middleware::from_fn_with_state(Arc::clone(&app), gate))
         .layer(middleware::from_fn_with_state(Arc::clone(&app), rate_limit))
         .with_state(Arc::clone(&app));
@@ -421,7 +499,7 @@ pub fn router(cfg: Config) -> Result<Router, String> {
     let open = Router::new()
         .route("/auth/v1/.well-known/jwks.json", get(well_known_jwks))
         .route("/auth/v1/verify", get(auth::verify_get).post(auth::verify))
-        .with_state(app);
+        .with_state(Arc::clone(&app));
     Ok(Router::new()
         .merge(open)
         .merge(gated)
