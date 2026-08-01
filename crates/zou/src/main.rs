@@ -2,6 +2,7 @@ mod branch;
 #[cfg(unix)]
 mod dev;
 mod info;
+mod stats;
 
 use std::process::ExitCode;
 
@@ -15,6 +16,7 @@ fn usage() -> ExitCode {
     eprintln!("{DEV_USAGE}");
     eprintln!("       {}", branch::USAGE);
     eprintln!("       {}", info::USAGE);
+    eprintln!("       {}", stats::USAGE);
     eprintln!("       zou --version");
     ExitCode::from(2)
 }
@@ -63,6 +65,7 @@ fn main() -> ExitCode {
         }
         Some("branch") => simple(branch::run(&argv[1..])),
         Some("info") => simple(info::run(&argv[1..])),
+        Some("stats") => simple(stats::run(&argv[1..])),
         _ => usage(),
     }
 }

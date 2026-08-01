@@ -11,6 +11,10 @@
 //! - `ZOU_S3_ENDPOINT`, defaults to `https://s3.<region>.amazonaws.com`
 //!   for s3 and `https://storage.googleapis.com` for gs
 //! - `ZOU_S3_REGION`, falls back to `AWS_REGION`, then `us-east-1`
+//!
+//! Two wrappers apply to every backend: `ZOU_STORE_DELAY` simulates
+//! object store latency, `ZOU_STORE_STATS` counts ops into a shared
+//! counter file, see [`crate::stats`].
 
 use crate::cas::{CasError, CasStore, LocalFsStore, Version};
 use crate::delay::{DelayConfig, DelayStore};
@@ -139,10 +143,20 @@ pub fn open_store(target: &str) -> Result<Box<dyn CasStore>, String> {
             }
         }
     };
-    match std::env::var("ZOU_STORE_DELAY") {
+    let store: Box<dyn CasStore> = match std::env::var("ZOU_STORE_DELAY") {
         Ok(spec) if !spec.is_empty() => {
             let config = DelayConfig::parse(&spec).map_err(|e| format!("ZOU_STORE_DELAY: {e}"))?;
-            Ok(Box::new(DelayStore::new(store, config)))
+            Box::new(DelayStore::new(store, config))
+        }
+        _ => store,
+    };
+    // Counters wrap outermost, after any simulated delay, so the
+    // latency they record is the latency callers actually paid.
+    match std::env::var("ZOU_STORE_STATS") {
+        Ok(path) if !path.is_empty() => {
+            let stats = crate::stats::StatsStore::new(store, std::path::Path::new(&path))
+                .map_err(|e| format!("ZOU_STORE_STATS {path}: {e}"))?;
+            Ok(Box::new(stats))
         }
         _ => Ok(store),
     }

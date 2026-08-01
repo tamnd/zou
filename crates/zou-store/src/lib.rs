@@ -20,6 +20,7 @@ pub mod open;
 pub mod s3;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod stats;
 pub mod tier;
 pub mod wal;
 pub mod zoufile;
@@ -38,6 +39,7 @@ pub use open::{PrefixStore, open_store};
 pub use s3::{Dialect, S3Config, S3Store};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
+pub use stats::{Snapshot, StatsStore};
 pub use tier::{BufferedTarget, ExpressTarget, LatencyTier, PureS3Target, WalTarget};
 pub use wal::{Frame, SegmentReader, WAL_VERSION, WalDecodeError};
 pub use zoufile::ZouFileStore;
