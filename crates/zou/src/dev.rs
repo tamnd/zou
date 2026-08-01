@@ -157,6 +157,7 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // arrive with the auth surface.
             rate: None,
             jwks: None,
+            schemas: vec![],
         };
         if let Err(e) = zou_server::serve_blocking(listener, cfg) {
             log::error!("http server: {e}");

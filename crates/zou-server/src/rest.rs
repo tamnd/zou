@@ -55,9 +55,48 @@ use zou_rest::{order, page, rpc, select};
 use crate::sql::{RequestContext, Session};
 use crate::{App, AuthContext, json_body};
 
-/// The one schema the REST surface serves until Accept-Profile
-/// lands, the same default a fresh Supabase project exposes.
-const SCHEMA: &str = "public";
+/// PostgREST's getSchema: writes pick their schema through
+/// Content-Profile, everything else through Accept-Profile, a header
+/// naming an unexposed schema is the PGRST106 406, and no header
+/// means the first exposed schema. The bool says whether the
+/// response echoes Content-Profile back, which happens when a header
+/// chose and also headerless when more than one schema is exposed,
+/// because the default then counts as negotiated.
+fn profile<'a>(
+    schemas: &'a [String],
+    method: &Method,
+    headers: &HeaderMap,
+) -> Result<(&'a str, bool), RestError> {
+    let name = match *method {
+        Method::POST | Method::PATCH | Method::PUT | Method::DELETE => "content-profile",
+        _ => "accept-profile",
+    };
+    match headers.get(name).and_then(|v| v.to_str().ok()) {
+        Some(p) => match schemas.iter().find(|s| s.as_str() == p) {
+            Some(s) => Ok((s.as_str(), true)),
+            None => Err(RestError {
+                status: StatusCode::NOT_ACCEPTABLE,
+                code: "PGRST106".to_string(),
+                message: format!("Invalid schema: {p}"),
+                details: None,
+                hint: Some(format!(
+                    "Only the following schemas are exposed: {}",
+                    schemas.join(", ")
+                )),
+            }),
+        },
+        None => Ok((schemas[0].as_str(), schemas.len() != 1)),
+    }
+}
+
+/// The Content-Profile response header rides wherever a Content-Type
+/// does once a profile negotiated the schema, upstream's
+/// profileHeader inside contentTypeHeaders.
+fn profile_header(res: &mut Response, schema: &str, negotiated: bool) {
+    if negotiated && let Ok(v) = schema.parse() {
+        res.headers_mut().insert("content-profile", v);
+    }
+}
 
 /// The most body a write accepts, 16 MiB like a generous PostgREST
 /// deployment; past it the response is 413.
@@ -699,10 +738,11 @@ fn plan_error(e: PlanError) -> RestError {
     }
 }
 
-/// The request identity and shape as the six settings the session
-/// pool injects, which is the whole per request contract RLS
-/// policies read.
-fn request_context(auth: &AuthContext, req: &Parts) -> RequestContext {
+/// The request identity and shape as the settings the session pool
+/// injects, which is the whole per request contract RLS policies
+/// read, plus the search_path scoping the transaction to the
+/// negotiated schema.
+fn request_context(auth: &AuthContext, req: &Parts, schema: &str) -> RequestContext {
     let mut headers = serde_json::Map::new();
     for (name, value) in &req.headers {
         if let Ok(v) = value.to_str() {
@@ -728,6 +768,7 @@ fn request_context(auth: &AuthContext, req: &Parts) -> RequestContext {
         path: req.uri.path().to_string(),
         headers: serde_json::Value::Object(headers).to_string(),
         cookies: serde_json::Value::Object(cookies).to_string(),
+        search_path: format!("\"{}\"", schema.replace('"', "\"\"")),
     }
 }
 
@@ -773,9 +814,9 @@ fn out_of_bounds(offset: u64, total: i64) -> serde_json::Value {
 
 /// The fk graph on the request's own transaction, one pg_constraint
 /// query; caching belongs to the catalog epoch work.
-async fn load_catalog(sess: &Session, authed: bool) -> Result<Catalog, RestError> {
+async fn load_catalog(sess: &Session, authed: bool, schema: &str) -> Result<Catalog, RestError> {
     let rows = sess
-        .query(INTROSPECT_SQL, &[&SCHEMA])
+        .query(INTROSPECT_SQL, &[&schema])
         .await
         .map_err(|e| pg_error(&e, authed))?;
     Ok(Catalog::new(
@@ -821,9 +862,10 @@ async fn read(
     apply_range(&mut q, &req.headers);
     let prefer = parse_prefer(&req.headers);
 
+    let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != "anon";
-    let ctx = request_context(auth, req);
+    let ctx = request_context(auth, req, schema);
     let sess = pool
         .session(&ctx, true)
         .await
@@ -832,7 +874,7 @@ async fn read(
     // An early return past this point drops the session, which
     // forfeits the connection instead of pooling a dirty one, the
     // containment the pool promises.
-    let catalog = load_catalog(&sess, authed).await?;
+    let catalog = load_catalog(&sess, authed, schema).await?;
 
     let sql = plan::plan(&catalog, &q).map_err(plan_error)?;
     let media = negotiate(&req.headers)?;
@@ -940,6 +982,9 @@ async fn read(
     if let Ok(v) = content_range(offset, returned, total).parse() {
         res.headers_mut().insert(header::CONTENT_RANGE, v);
     }
+    // Upstream builds the read headers once, so even the 416 keeps
+    // its Content-Profile.
+    profile_header(&mut res, schema, negotiated);
     let applied = match prefer.count {
         Some(Count::Exact) => Some("count=exact"),
         Some(Count::Planned) => Some("count=planned"),
@@ -974,6 +1019,9 @@ async fn write(
 ) -> Result<Response, RestError> {
     let method = &req.method;
     let prefer = parse_prefer(&req.headers);
+    // The schema check runs before the payload parse, upstream's
+    // getSchema order, so PGRST106 beats a bad body.
+    let (schema, negotiated) = profile(&app.cfg.schemas, method, &req.headers)?;
     let (mut q, extras) = parse_query(table, req.uri.query())?;
 
     // Root filters belong to the mutation's WHERE. A condition whose
@@ -1006,12 +1054,14 @@ async fn write(
         }
         let mut res = if prefer.ret == Ret::Representation {
             let body = if media == Media::Csv { "\n" } else { "[]" };
-            (
+            let mut res = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, media.content_type())],
                 body,
             )
-                .into_response()
+                .into_response();
+            profile_header(&mut res, schema, negotiated);
+            res
         } else {
             StatusCode::NO_CONTENT.into_response()
         };
@@ -1021,7 +1071,7 @@ async fn write(
 
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != "anon";
-    let ctx = request_context(auth, req);
+    let ctx = request_context(auth, req, schema);
     let sess = pool
         .session(&ctx, false)
         .await
@@ -1033,7 +1083,7 @@ async fn write(
     let needs_pk = wants_location
         || (*method == Method::POST && prefer.merge.is_some() && extras.on_conflict.is_none());
     let pk: Vec<String> = if needs_pk {
-        sess.query(PK_SQL, &[&SCHEMA, &table])
+        sess.query(PK_SQL, &[&schema, &table])
             .await
             .map_err(|e| pg_error(&e, authed))?
             .iter()
@@ -1089,7 +1139,7 @@ async fn write(
     let affected: u64;
     let mut res = match prefer.ret {
         Ret::Representation => {
-            let catalog = load_catalog(&sess, authed).await?;
+            let catalog = load_catalog(&sess, authed, schema).await?;
             let r = mutate::representation(&catalog, m, &mut q).map_err(plan_error)?;
             let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
             let status = if created {
@@ -1206,6 +1256,11 @@ async fn write(
     if let Ok(v) = window.parse() {
         res.headers_mut().insert(header::CONTENT_RANGE, v);
     }
+    // Content-Profile rides with Content-Type, so only the
+    // representation arm carries it, never a 204 or the bare 201.
+    if prefer.ret == Ret::Representation {
+        profile_header(&mut res, schema, negotiated);
+    }
     write_headers(&prefer, &mut res);
     Ok(res)
 }
@@ -1266,9 +1321,10 @@ async fn invoke(
     body: Option<&[u8]>,
 ) -> Result<Response, RestError> {
     let is_post = body.is_some();
+    let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != "anon";
-    let ctx = request_context(auth, req);
+    let ctx = request_context(auth, req, schema);
     // GET and HEAD run read only, so a volatile function fails with
     // pg's 25006, which the status table maps to PostgREST's 405.
     let sess = pool
@@ -1277,7 +1333,7 @@ async fn invoke(
         .map_err(|e| pg_error(&e, authed))?;
 
     let rows = sess
-        .query(rpc::INTROSPECT_SQL, &[&SCHEMA, &func])
+        .query(rpc::INTROSPECT_SQL, &[&schema, &func])
         .await
         .map_err(|e| pg_error(&e, authed))?;
     let overloads: Vec<rpc::Routine> = rows
@@ -1352,12 +1408,12 @@ async fn invoke(
         None => None,
     };
 
-    let choice = rpc::choose(SCHEMA, func, &overloads, &supplied, is_post).map_err(rpc_error)?;
+    let choice = rpc::choose(schema, func, &overloads, &supplied, is_post).map_err(rpc_error)?;
     let kind = choice.routine.kind.clone();
     let returns_set = choice.routine.returns_set;
     let m = match payload {
-        Some(text) => rpc::call_json(SCHEMA, func, &choice, &supplied, text),
-        None => rpc::call_get(SCHEMA, func, choice.routine, &get_args),
+        Some(text) => rpc::call_json(schema, func, &choice, &supplied, text),
+        None => rpc::call_get(schema, func, choice.routine, &get_args),
     };
 
     match kind {
@@ -1381,12 +1437,14 @@ async fn invoke(
                 .first()
                 .and_then(|r| r.get::<_, Option<String>>(0))
                 .unwrap_or_else(|| if returns_set { "[]" } else { "null" }.to_string());
-            Ok((
+            let mut res = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
                 out,
             )
-                .into_response())
+                .into_response();
+            profile_header(&mut res, schema, negotiated);
+            Ok(res)
         }
         rpc::RetKind::Composite { table } => {
             // Rows go through the planner over the call's CTE, so
@@ -1403,7 +1461,7 @@ async fn invoke(
                 },
             )?;
             apply_range(&mut q, &req.headers);
-            let catalog = load_catalog(&sess, authed).await?;
+            let catalog = load_catalog(&sess, authed, schema).await?;
             let r = rpc::representation(&catalog, m, &mut q).map_err(plan_error)?;
             let text = format!(
                 "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
@@ -1422,7 +1480,7 @@ async fn invoke(
                     .find(|(route, _)| route.is_empty())
                     .map(|(_, n)| *n)
                     .unwrap_or(0);
-                Ok((
+                let mut res = (
                     StatusCode::OK,
                     [
                         (header::CONTENT_TYPE, "application/json; charset=utf-8"),
@@ -1433,7 +1491,9 @@ async fn invoke(
                     ],
                     json_array(&rows),
                 )
-                    .into_response())
+                    .into_response();
+                profile_header(&mut res, schema, negotiated);
+                Ok(res)
             } else {
                 // A non set function is one row, and PostgREST hands
                 // it back as a bare object, not a one element array.
@@ -1441,12 +1501,14 @@ async fn invoke(
                     .first()
                     .map(|r| r.get::<_, String>(0))
                     .unwrap_or_else(|| "null".to_string());
-                Ok((
+                let mut res = (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
                     out,
                 )
-                    .into_response())
+                    .into_response();
+                profile_header(&mut res, schema, negotiated);
+                Ok(res)
             }
         }
     }
@@ -1746,6 +1808,79 @@ mod tests {
             "Cannot coerce the result to a single JSON object"
         );
         assert_eq!(e.details.as_deref(), Some("The result contains 2 rows"));
+    }
+
+    #[test]
+    fn schema_profiles_pick_the_header_by_method() {
+        let exposed = vec!["public".to_string(), "other".to_string()];
+        let p = |method: Method, name: &'static str, value: &str| {
+            let mut h = HeaderMap::new();
+            if !name.is_empty() {
+                h.insert(name, value.parse().unwrap());
+            }
+            profile(&exposed, &method, &h)
+        };
+
+        assert_eq!(
+            p(Method::GET, "accept-profile", "other").unwrap(),
+            ("other", true)
+        );
+        assert_eq!(
+            p(Method::GET, "content-profile", "other").unwrap(),
+            ("public", true),
+            "a read ignores Content-Profile, and two schemas make the default negotiated"
+        );
+        assert_eq!(
+            p(Method::POST, "content-profile", "other").unwrap(),
+            ("other", true)
+        );
+        assert_eq!(
+            p(Method::POST, "accept-profile", "other").unwrap(),
+            ("public", true),
+            "a write ignores Accept-Profile"
+        );
+        for m in [Method::PATCH, Method::PUT, Method::DELETE] {
+            assert_eq!(p(m, "content-profile", "other").unwrap(), ("other", true));
+        }
+        assert_eq!(p(Method::GET, "", "").unwrap(), ("public", true));
+        assert_eq!(
+            profile(&["public".to_string()], &Method::GET, &HeaderMap::new()).unwrap(),
+            ("public", false),
+            "one exposed schema means nothing was negotiated"
+        );
+
+        let e = p(Method::GET, "accept-profile", "secret").unwrap_err();
+        assert_eq!(e.status, StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(e.code, "PGRST106");
+        assert_eq!(e.message, "Invalid schema: secret");
+        assert_eq!(e.details, None);
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("Only the following schemas are exposed: public, other")
+        );
+    }
+
+    #[test]
+    fn the_search_path_is_a_quoted_ident() {
+        let parts = Request::builder()
+            .uri("/rest/v1/t")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let auth = AuthContext {
+            role: "anon".to_string(),
+            claims: Arc::new(serde_json::json!({})),
+        };
+        assert_eq!(
+            request_context(&auth, &parts, "public").search_path,
+            "\"public\""
+        );
+        assert_eq!(
+            request_context(&auth, &parts, "we\"ird").search_path,
+            "\"we\"\"ird\"",
+            "a quote in the name doubles instead of escaping the list"
+        );
     }
 
     #[test]

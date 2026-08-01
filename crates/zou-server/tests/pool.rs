@@ -44,6 +44,7 @@ async fn the_context_exists_inside_the_transaction() {
         path: "/todos".to_string(),
         headers: r#"{"x-forwarded-for":"10.0.0.1"}"#.to_string(),
         cookies: "{}".to_string(),
+        search_path: "\"public\"".to_string(),
     };
     let sess = pool.session(&ctx, false).await.expect("session");
     assert_eq!(

@@ -44,6 +44,10 @@ pub struct RequestContext {
     pub path: String,
     pub headers: String,
     pub cookies: String,
+    /// The transaction's search_path, already quoted as an ident
+    /// list, which is how PostgREST scopes a request to its
+    /// negotiated schema.
+    pub search_path: String,
 }
 
 impl RequestContext {
@@ -58,6 +62,7 @@ impl RequestContext {
             path: String::new(),
             headers: "{}".to_string(),
             cookies: "{}".to_string(),
+            search_path: "\"public\"".to_string(),
         }
     }
 }
@@ -228,7 +233,8 @@ impl Pool {
                             set_config('request.method', $3, true),
                             set_config('request.path', $4, true),
                             set_config('request.headers', $5, true),
-                            set_config('request.cookies', $6, true)",
+                            set_config('request.cookies', $6, true),
+                            set_config('search_path', $7, true)",
                     &[
                         &ctx.role,
                         &ctx.claims,
@@ -236,6 +242,7 @@ impl Pool {
                         &ctx.path,
                         &ctx.headers,
                         &ctx.cookies,
+                        &ctx.search_path,
                     ],
                 )
                 .await?;
