@@ -24,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Router, middleware};
 
+pub mod edge;
 pub mod jwt;
 pub mod sql;
 
@@ -31,10 +32,13 @@ pub mod sql;
 /// must verify against, and where postgres lives when there is one to
 /// talk to. `pg` is a dsn like "host=127.0.0.1 port=5432 user=x
 /// dbname=postgres", None runs the router without a pool, which is
-/// what the pure routing tests use.
+/// what the pure routing tests use. `rate` of None means unlimited,
+/// which is what zou dev wants, the real per endpoint budgets arrive
+/// with the auth surface.
 pub struct Config {
     pub jwt_secret: Vec<u8>,
     pub pg: Option<String>,
+    pub rate: Option<edge::Rate>,
 }
 
 /// Everything the handlers share: the config and, when postgres is
@@ -43,6 +47,7 @@ pub struct Config {
 pub struct App {
     pub cfg: Config,
     pub pool: Option<sql::Pool>,
+    pub limiter: Option<edge::RateLimit>,
 }
 
 /// PostgREST's default db-pool size, a sane dev loop default here too.
@@ -53,7 +58,8 @@ fn app_state(cfg: Config) -> Result<Arc<App>, String> {
         Some(dsn) => Some(sql::Pool::new(dsn, POOL_SIZE).map_err(|e| format!("pg dsn: {e}"))?),
         None => None,
     };
-    Ok(Arc::new(App { cfg, pool }))
+    let limiter = cfg.rate.map(edge::RateLimit::new);
+    Ok(Arc::new(App { cfg, pool, limiter }))
 }
 
 /// The verified identity of a request, deposited in request extensions
@@ -141,6 +147,33 @@ async fn gate(
     next.run(req).await
 }
 
+/// The rate limit, sitting outside the gate so a hammering client is
+/// refused before its keys are even verified. Keyed on the apikey
+/// when one was sent, otherwise everything unkeyed shares a bucket,
+/// good enough for the skeleton until per endpoint budgets land with
+/// the auth surface. The 429 body is the message the hosted edge
+/// sends.
+async fn rate_limit(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Some(limiter) = &app.limiter {
+        let key = apikey_of(&req).unwrap_or_else(|| "unkeyed".to_string());
+        if !limiter.allow(&key) {
+            let mut res = json_body(
+                StatusCode::TOO_MANY_REQUESTS,
+                serde_json::json!({"message": "API rate limit exceeded"}),
+            );
+            if let Ok(v) = header::HeaderValue::from_str(&limiter.retry_after().to_string()) {
+                res.headers_mut().insert(header::RETRY_AFTER, v);
+            }
+            return res;
+        }
+    }
+    next.run(req).await
+}
+
 /// GoTrue's health shape, served locally: the auth surface is going to
 /// be a reimplementation, and health is its first endpoint.
 async fn auth_health() -> Response {
@@ -187,7 +220,10 @@ async fn no_route() -> Response {
     )
 }
 
-/// The whole front door as one axum router.
+/// The whole front door as one axum router. Layer order matters:
+/// request id outermost so even a 404 or a 429 carries one, CORS next
+/// so preflights never reach the gate and every response with an
+/// Origin gets its mirror, then the rate limit, then the apikey gate.
 pub fn router(cfg: Config) -> Result<Router, String> {
     let app = app_state(cfg)?;
     let gated = Router::new()
@@ -198,8 +234,13 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/storage/v1/{*rest}", any(storage_stub))
         .route("/realtime/v1/{*rest}", any(realtime_stub))
         .layer(middleware::from_fn_with_state(Arc::clone(&app), gate))
+        .layer(middleware::from_fn_with_state(Arc::clone(&app), rate_limit))
         .with_state(app);
-    Ok(Router::new().merge(gated).fallback(no_route))
+    Ok(Router::new()
+        .merge(gated)
+        .fallback(no_route)
+        .layer(middleware::from_fn(edge::cors))
+        .layer(middleware::from_fn(edge::request_id)))
 }
 
 /// Serve `router(cfg)` on `listener` forever. Builds a private tokio
@@ -236,6 +277,7 @@ mod tests {
         router(Config {
             jwt_secret: SECRET.to_vec(),
             pg: None,
+            rate: None,
         })
         .unwrap()
     }
@@ -340,6 +382,7 @@ mod tests {
         let app = app_state(Config {
             jwt_secret: SECRET.to_vec(),
             pg: None,
+            rate: None,
         })
         .unwrap();
         Router::new()
@@ -362,6 +405,121 @@ mod tests {
         let res = echo_app().oneshot(req).await.unwrap();
         let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
         assert_eq!(&bytes[..], b"service_role");
+    }
+
+    #[tokio::test]
+    async fn a_preflight_needs_no_apikey() {
+        let req = Request::builder()
+            .method("OPTIONS")
+            .uri("/rest/v1/todos")
+            .header("origin", "http://localhost:3000")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "authorization, apikey")
+            .body(Body::empty())
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let h = res.headers();
+        assert_eq!(
+            h["access-control-allow-origin"], "http://localhost:3000",
+            "the origin is mirrored, not *"
+        );
+        assert_eq!(h["access-control-allow-credentials"], "true");
+        assert_eq!(
+            h["access-control-allow-methods"],
+            "GET, POST, PATCH, PUT, DELETE, OPTIONS, HEAD"
+        );
+        assert_eq!(h["access-control-allow-headers"], "authorization, apikey");
+        assert_eq!(h["access-control-max-age"], "86400");
+    }
+
+    #[tokio::test]
+    async fn responses_with_an_origin_get_the_mirror_and_exposed_headers() {
+        let req = Request::builder()
+            .uri("/auth/v1/health")
+            .header("apikey", anon_key())
+            .header("origin", "https://app.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let h = res.headers();
+        assert_eq!(h["access-control-allow-origin"], "https://app.example.com");
+        assert_eq!(h["access-control-allow-credentials"], "true");
+        assert!(
+            h["access-control-expose-headers"]
+                .to_str()
+                .unwrap()
+                .contains("Content-Range"),
+            "supabase-js reads Content-Range for counts"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_origin_means_no_cors_headers() {
+        let req = Request::builder()
+            .uri("/auth/v1/health")
+            .header("apikey", anon_key())
+            .body(Body::empty())
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert!(!res.headers().contains_key("access-control-allow-origin"));
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_a_request_id_even_a_404() {
+        let res = app().oneshot(get_req("/nope")).await.unwrap();
+        let id = res.headers()["x-request-id"].to_str().unwrap().to_string();
+        assert_eq!(id.len(), 36, "a minted id is a uuid: {id}");
+    }
+
+    #[tokio::test]
+    async fn a_client_supplied_request_id_is_echoed() {
+        let req = Request::builder()
+            .uri("/auth/v1/health")
+            .header("apikey", anon_key())
+            .header("x-request-id", "trace-me-7")
+            .body(Body::empty())
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert_eq!(res.headers()["x-request-id"], "trace-me-7");
+    }
+
+    #[tokio::test]
+    async fn past_the_budget_is_the_edge_429() {
+        let app = router(Config {
+            jwt_secret: SECRET.to_vec(),
+            pg: None,
+            rate: Some(edge::Rate {
+                burst: 2,
+                per_second: 0.5,
+            }),
+        })
+        .unwrap();
+        let key = anon_key();
+        for _ in 0..2 {
+            let req = Request::builder()
+                .uri("/auth/v1/health")
+                .header("apikey", &key)
+                .body(Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        let req = Request::builder()
+            .uri("/auth/v1/health")
+            .header("apikey", &key)
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(res.headers()[header::RETRY_AFTER], "2");
+        assert!(
+            res.headers().contains_key("x-request-id"),
+            "even a 429 is traceable"
+        );
+        let body = body_json(res).await;
+        assert_eq!(body["message"], "API rate limit exceeded");
     }
 
     #[tokio::test]
