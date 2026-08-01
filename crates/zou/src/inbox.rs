@@ -82,18 +82,35 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     let messages = parsed["messages"]
         .as_array()
         .ok_or_else(|| format!("the inbox answered with {body}"))?;
+    let empty = Vec::new();
+    let texts = parsed["texts"].as_array().unwrap_or(&empty);
     if args.clear {
         println!("inbox cleared");
         return Ok(());
     }
-    if messages.is_empty() {
+    if messages.is_empty() && texts.is_empty() {
         println!("no mail");
         return Ok(());
     }
+    let now = now();
     for message in messages {
-        print!("{}", render(message, now()));
+        print!("{}", render(message, now));
+    }
+    for text in texts {
+        print!("{}", texted(text, now));
     }
     Ok(())
+}
+
+/// One text the way a person reads it. There is no link and no subject,
+/// only the number and the code, so the code is the line.
+fn texted(text: &serde_json::Value, now: i64) -> String {
+    format!(
+        "{} to {}\n  {}\n",
+        age(now - text["at"].as_i64().unwrap_or(now)),
+        text["to"].as_str().unwrap_or(""),
+        text["body"].as_str().unwrap_or(""),
+    )
 }
 
 /// One message the way a person reads it: who it went to and when, the
@@ -255,6 +272,21 @@ mod tests {
         assert_eq!(
             render(&message, 1_005),
             "5s ago to someone@zou.test\n  123456 is your verification code\n"
+        );
+    }
+
+    #[test]
+    fn a_text_prints_its_number_and_the_code_that_went_to_it() {
+        let text = serde_json::json!({
+            "to": "15551234567",
+            "body": "Your code is 123456",
+            "code": "123456",
+            "channel": "sms",
+            "at": 1_000,
+        });
+        assert_eq!(
+            texted(&text, 1_030),
+            "30s ago to 15551234567\n  Your code is 123456\n"
         );
     }
 

@@ -1356,15 +1356,18 @@ async fn the_otp_endpoint_is_the_magic_link_with_one_more_rule() {
         assert_eq!(answer.refusal(), expected, "for {body}");
     }
 
-    // A phone is a real branch upstream and not here yet, so it says so
-    // rather than pretending to have sent anything.
+    // The phone branch is served, and this app has phone sign in off,
+    // which is the refusal upstream gives for the same config.
     let phone = post(
         &app,
         "/auth/v1/otp",
         serde_json::json!({"phone": "+15551234567"}),
     )
     .await;
-    assert_eq!(phone.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        phone.refusal(),
+        (400, "phone_provider_disabled", "Unsupported phone provider")
+    );
 
     // create_user false turns it into a sign in, so an address nobody
     // holds is refused instead of registered.

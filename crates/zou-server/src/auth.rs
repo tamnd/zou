@@ -117,19 +117,30 @@ pub(crate) fn refused(status: StatusCode, code: &'static str, msg: &str) -> Erro
 /// The wording and the arithmetic are upstream's, seconds truncated
 /// rather than rounded, because a client shows this string to a person
 /// staring at a form.
-fn too_soon(seconds: i64) -> Error {
+fn too_soon(code: &'static str, seconds: i64) -> Error {
     Error::Denied {
         status: StatusCode::TOO_MANY_REQUESTS,
-        code: "over_email_send_rate_limit",
+        code,
         msg: format!("For security purposes, you can only request this after {seconds} seconds."),
     }
 }
+
+/// The two codes the frequency limit is refused under. The words are
+/// the same either way, the code is what a client branches on.
+const TOO_SOON_MAIL: &str = "over_email_send_rate_limit";
+const TOO_SOON_SMS: &str = "over_sms_send_rate_limit";
 
 /// Everything a flow needs to get a code to the person it belongs to:
 /// what to send it with, and where the link in it should point.
 pub struct Post<'a> {
     pub sender: &'a Arc<dyn crate::mail::Sender>,
     pub settings: &'a crate::mail::Settings,
+    /// The same pair for text messages. They travel together because
+    /// half of these flows can be reached with either an address or a
+    /// number and the flow itself should not have to ask the app which
+    /// it is holding.
+    pub texter: &'a Arc<dyn crate::sms::Sender>,
+    pub sms: &'a crate::sms::Settings,
     /// The base every link is built on, this server's external url.
     pub external: String,
     pub site: String,
@@ -149,6 +160,8 @@ pub fn posting<'a>(app: &'a App, wanted: &str, referer: &str) -> Post<'a> {
     Post {
         sender: &app.mailer,
         settings: &app.cfg.mail,
+        texter: &app.texter,
+        sms: &app.cfg.sms,
         external: app
             .cfg
             .external_url
@@ -274,6 +287,7 @@ async fn within_limit(
     user_id: &str,
     column: &str,
     max_frequency: u64,
+    code: &'static str,
 ) -> Result<(), Error> {
     if max_frequency == 0 {
         return Ok(());
@@ -289,8 +303,106 @@ async fn within_limit(
         )
         .await?;
     match rows.first().map(|r| r.get::<_, i32>(0)) {
-        Some(left) if left > 0 => Err(too_soon(left as i64)),
+        Some(left) if left > 0 => Err(too_soon(code, left as i64)),
         _ => Ok(()),
+    }
+}
+
+/// GoTrue's validatePhone: the plus and the spaces come off, and what
+/// is left has to be E.164. The column holds the stripped form, so two
+/// people who typed the same number two ways are one account.
+pub(crate) fn validate_phone(phone: &str) -> Result<String, Error> {
+    let phone = crate::sms::strip(phone);
+    if !crate::sms::e164(&phone) {
+        return denied(
+            "validation_failed",
+            "Invalid phone number format (E.164 required)",
+        );
+    }
+    Ok(phone)
+}
+
+/// Upstream's InvalidChannelError, word for word, including the two
+/// provider names, because it is what a client shows a person.
+const INVALID_CHANNEL: &str = "Invalid channel, supported values are 'sms' or 'whatsapp'. 'whatsapp' is only supported if Twilio or Twilio Verify is used as the provider.";
+
+/// Which channel a phone request asked for. Unset is sms, which is
+/// upstream's backwards compatible default, and whatever is asked for
+/// has to be something the configured provider actually carries.
+fn channel_of(body: &serde_json::Value, post: &Post<'_>) -> Result<String, Error> {
+    let channel = match field(body, "channel") {
+        "" => crate::sms::SMS,
+        other => other,
+    };
+    if !post.texter.carries(channel) {
+        return denied("validation_failed", INVALID_CHANNEL);
+    }
+    Ok(channel.to_string())
+}
+
+/// What one outgoing text is about. The otp type is upstream's own
+/// name for it and it decides three things at once: which column holds
+/// the code, which sent_at the frequency limit reads, and which words
+/// a failed send is refused with.
+pub(crate) struct Texting<'a> {
+    pub(crate) otp_type: &'a str,
+    pub(crate) to: &'a str,
+    pub(crate) channel: &'a str,
+}
+
+/// The phone otp types, upstream's strings.
+pub(crate) const PHONE_CONFIRMATION: &str = "confirmation";
+pub(crate) const PHONE_CHANGE: &str = "phone_change";
+pub(crate) const PHONE_REAUTHENTICATION: &str = "reauthentication";
+
+/// Draw a code, write it down, and text it. The answer is the
+/// provider's id for the message, which the otp endpoint hands back and
+/// which is empty for the dev sink.
+///
+/// Like the mail side this runs inside the flow's transaction, so a
+/// send that fails takes its token with it and the next attempt draws a
+/// fresh one.
+pub(crate) async fn send_phone_code(
+    sess: &sql::Session,
+    post: &Post<'_>,
+    user_id: &str,
+    out: Texting<'_>,
+) -> Result<String, Error> {
+    let (token_type, sent) = match out.otp_type {
+        PHONE_CHANGE => ("phone_change_token", "phone_change_sent_at"),
+        PHONE_REAUTHENTICATION => ("reauthentication_token", "reauthentication_sent_at"),
+        _ => ("confirmation_token", "confirmation_sent_at"),
+    };
+    within_limit(sess, user_id, sent, post.sms.max_frequency, TOO_SOON_SMS).await?;
+    if out.otp_type == PHONE_CHANGE {
+        // The number being moved to is staged before the code that
+        // proves it, because the code is hashed against it and verify
+        // finds the account by it.
+        sess.execute(
+            "update auth.users set phone_change = $2, updated_at = now()
+              where id = $1::text::uuid",
+            &[&user_id, &out.to],
+        )
+        .await?;
+    }
+    let code = mint_digits(sess, user_id, out.to, token_type, post.sms.digits()).await?;
+    let text = crate::sms::Text {
+        to: out.to.to_string(),
+        body: post.sms.body(&code.code),
+        code: code.code.clone(),
+        channel: out.channel.to_string(),
+        at: now(),
+    };
+    match crate::sms::post(post.texter, text).await {
+        Ok(id) => Ok(id),
+        Err(e) => {
+            log::error!("sending the {} sms failed: {e}", out.otp_type);
+            Err(refused(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "sms_send_failed",
+                &format!("Error sending {} OTP to provider: {e}", out.otp_type),
+            ))
+        }
     }
 }
 
@@ -786,16 +898,30 @@ async fn swap(sess: &sql::Session, found: &Presented) -> Result<String, Error> {
 /// what the confirmation email carries, and it is drawn uniformly
 /// rather than from the low bits of a timestamp.
 pub(crate) fn six_digits() -> String {
-    let mut raw = [0u8; 4];
-    getrandom::fill(&mut raw).expect("the os rng never fails");
-    // A million does not divide 2^32, so the top of the range is
-    // redrawn rather than folded, which would favour the low codes.
-    let mut value = u32::from_be_bytes(raw);
-    while value >= 4_294_000_000 {
-        getrandom::fill(&mut raw).expect("the os rng never fails");
-        value = u32::from_be_bytes(raw);
+    code_of(6)
+}
+
+/// The same for a code of any length, which is what the SMS side needs:
+/// GOTRUE_SMS_OTP_LENGTH is six by default and an operator may take it
+/// up to ten.
+///
+/// Each digit is drawn on its own rather than one number being taken
+/// modulo a power of ten, because ten does not divide 256 either and
+/// the fold would favour the low digits. A byte in the top of the
+/// range is thrown away instead.
+pub(crate) fn code_of(digits: usize) -> String {
+    let mut out = String::with_capacity(digits);
+    let mut raw = [0u8; 1];
+    for _ in 0..digits {
+        loop {
+            getrandom::fill(&mut raw).expect("the os rng never fails");
+            if raw[0] < 250 {
+                break;
+            }
+        }
+        out.push(char::from(b'0' + raw[0] % 10));
     }
-    format!("{:06}", value % 1_000_000)
+    out
 }
 
 /// What is stored for a one time code: the hex of sha224 over the
@@ -904,14 +1030,16 @@ async fn register(
         // belongs to nobody. A project that confirms its own signups
         // has no such secret to keep and says it plainly.
         Some((_, true)) => {
-            if autoconfirm {
+            if autoconfirm || post.sms.autoconfirm {
                 return Err(refused(
                     StatusCode::UNPROCESSABLE_ENTITY,
                     "user_already_exists",
                     "User already registered",
                 ));
             }
-            return Ok(SignedUp::Pending(sanitized(sess, email, data).await?));
+            return Ok(SignedUp::Pending(
+                sanitized(sess, "email", email, data).await?,
+            ));
         }
         // The address is claimed but unproven, so the row is reused as
         // it stands. The password is deliberately left alone: whoever
@@ -970,6 +1098,7 @@ async fn register(
             &user_id,
             "confirmation_sent_at",
             post.settings.max_frequency,
+            TOO_SOON_MAIL,
         )
         .await?;
         let code = mint_code(sess, &user_id, email, "confirmation_token").await?;
@@ -1010,13 +1139,15 @@ async fn register(
     )))
 }
 
-/// The answer a project that mails confirmations gives when the address
-/// is already taken: a user object that belongs to nobody. The id is
-/// fresh, there are no identities, and the timestamps are all now, so
-/// nothing in it distinguishes a taken address from a free one.
+/// The answer a project that sends its confirmations gives when the
+/// address or the number is already taken: a user object that belongs to
+/// nobody. The id is fresh, there are no identities, and the timestamps
+/// are all now, so nothing in it distinguishes a taken address from a
+/// free one.
 async fn sanitized(
     sess: &sql::Session,
-    email: &str,
+    provider: &str,
+    to: &str,
     data: &serde_json::Value,
 ) -> Result<serde_json::Value, sql::Error> {
     let sql = format!(
@@ -1024,11 +1155,11 @@ async fn sanitized(
                     'id', gen_random_uuid()::text,
                     'aud', $2::text,
                     'role', '',
-                    'email', $1::text,
-                    'phone', '',
+                    'email', case when $4::text = 'email' then $1::text else '' end,
+                    'phone', case when $4::text = 'phone' then $1::text else '' end,
                     'app_metadata', jsonb_build_object(
-                        'provider', 'email',
-                        'providers', jsonb_build_array('email')),
+                        'provider', $4::text,
+                        'providers', jsonb_build_array($4::text)),
                     'user_metadata', $3::jsonb,
                     'identities', '[]'::jsonb,
                     'created_at', {now},
@@ -1038,9 +1169,147 @@ async fn sanitized(
                 )::text",
         now = ts("now()"),
     );
-    let rows = sess.query(&sql, &[&email, &AUD, &data]).await?;
+    let rows = sess.query(&sql, &[&to, &AUD, &data, &provider]).await?;
     Ok(serde_json::from_str(rows[0].get::<_, &str>(0))
         .expect("jsonb_build_object always produces json"))
+}
+
+/// The phone half of a signup, which is the email half with the columns
+/// swapped and the code going out by text. The account is unusable until
+/// the number answers, exactly as an unconfirmed address is.
+///
+/// One argument longer than `register` because a text has a channel and
+/// a mail does not.
+#[allow(clippy::too_many_arguments)]
+async fn register_phone(
+    sess: &sql::Session,
+    phone: &str,
+    hash: &str,
+    channel: &str,
+    data: &serde_json::Value,
+    signer: &crate::jwt::Signer<'_>,
+    issuer: &str,
+    post: &Post<'_>,
+) -> Result<SignedUp, Error> {
+    let rows = sess
+        .query(
+            "select id::text, phone_confirmed_at is not null
+             from auth.users
+             where phone = $1 and aud = $2 and is_sso_user = false and deleted_at is null
+             limit 1",
+            &[&phone, &AUD],
+        )
+        .await?;
+    let existing: Option<(String, bool)> = rows.first().map(|r| (r.get(0), r.get(1)));
+
+    let user_id = match existing {
+        Some((_, true)) => {
+            if post.autoconfirm || post.sms.autoconfirm {
+                return Err(refused(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "user_already_exists",
+                    "User already registered",
+                ));
+            }
+            return Ok(SignedUp::Pending(
+                sanitized(sess, "phone", phone, data).await?,
+            ));
+        }
+        Some((id, false)) => id,
+        None => {
+            let rows = sess
+                .query(
+                    "insert into auth.users
+                         (instance_id, id, aud, role, phone, encrypted_password,
+                          raw_app_meta_data, raw_user_meta_data,
+                          confirmation_token, recovery_token,
+                          email_change_token_new, email_change,
+                          phone_change, phone_change_token,
+                          created_at, updated_at, is_anonymous, is_sso_user)
+                     values ('00000000-0000-0000-0000-000000000000', gen_random_uuid(),
+                             $2, 'authenticated', $1, $3,
+                             jsonb_build_object('provider', 'phone',
+                                                'providers', jsonb_build_array('phone')),
+                             $4::jsonb, '', '', '', '', '', '',
+                             now(), now(), false, false)
+                     returning id::text",
+                    &[&phone, &AUD, &hash, &data],
+                )
+                .await?;
+            rows[0].get(0)
+        }
+    };
+
+    // Upstream leaves the number off this identity entirely, because its
+    // claims struct drops empty fields and nothing fills the phone one
+    // on a signup. zou writes it, the same way the email identity
+    // carries the address, so an identity always says what it is for.
+    sess.execute(
+        "insert into auth.identities
+             (provider_id, user_id, identity_data, provider,
+              last_sign_in_at, created_at, updated_at)
+         select $1::text::uuid::text, $1::text::uuid,
+                $3::jsonb || jsonb_build_object(
+                    'sub', $1::text, 'phone', $2::text, 'phone_verified', false),
+                'phone', now(), now(), now()
+         where not exists (
+             select 1 from auth.identities
+             where user_id = $1::text::uuid and provider = 'phone'
+         )",
+        &[&user_id, &phone, &data],
+    )
+    .await?;
+
+    if !post.sms.autoconfirm {
+        send_phone_code(
+            sess,
+            post,
+            &user_id,
+            Texting {
+                otp_type: PHONE_CONFIRMATION,
+                to: phone,
+                channel,
+            },
+        )
+        .await?;
+        return Ok(SignedUp::Pending(user_json(sess, &user_id).await?));
+    }
+
+    confirm_phone(sess, &user_id).await?;
+    forget_tokens(sess, &user_id).await?;
+    Ok(SignedUp::Session(Box::new(
+        start(sess, &user_id, "password", signer, issuer).await?,
+    )))
+}
+
+/// POST /auth/v1/signup with a number and a password. One argument
+/// longer than `sign_up` for the same reason `register_phone` is.
+#[allow(clippy::too_many_arguments)]
+pub async fn sign_up_by_phone(
+    pool: &Pool,
+    phone: &str,
+    password: &str,
+    channel: &str,
+    data: &serde_json::Value,
+    signer: &crate::jwt::Signer<'_>,
+    issuer: &str,
+    post: &Post<'_>,
+) -> Result<SignedUp, Error> {
+    let phone = validate_phone(phone)?;
+    validate_password(password)?;
+    let hash = hash_off_thread(password).await;
+    let sess = pool.admin().await?;
+    let out = register_phone(&sess, &phone, &hash, channel, data, signer, issuer, post).await;
+    match out {
+        Ok(done) => {
+            sess.commit().await?;
+            Ok(done)
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            Err(e)
+        }
+    }
 }
 
 /// POST /auth/v1/signup with an email and a password.
@@ -1147,13 +1416,14 @@ async fn matches_off_thread(password: &str, hash: &str) -> bool {
 /// to ask.
 pub async fn password_grant(
     pool: &Pool,
-    email: &str,
+    column: &str,
+    held: &str,
     password: &str,
     signer: &crate::jwt::Signer<'_>,
     issuer: &str,
 ) -> Result<Issued, Error> {
     let sess = pool.admin().await?;
-    let out = sign_in(&sess, email, password, signer, issuer).await;
+    let out = sign_in(&sess, column, held, password, signer, issuer).await;
     match out {
         Ok(issued) => {
             sess.commit().await?;
@@ -1168,22 +1438,33 @@ pub async fn password_grant(
 
 async fn sign_in(
     sess: &sql::Session,
-    email: &str,
+    column: &str,
+    held: &str,
     password: &str,
     signer: &crate::jwt::Signer<'_>,
     issuer: &str,
 ) -> Result<Issued, Error> {
-    let email = email.to_lowercase();
+    // A number is already in its stored form by the time it gets here.
+    // An address is not, because people type them in whatever case they
+    // like and there is only one account behind all of them.
+    let held = if column == "email" {
+        held.to_lowercase()
+    } else {
+        held.to_string()
+    };
     let rows = sess
         .query(
-            "select id::text,
-                    coalesce(encrypted_password, ''),
-                    coalesce(banned_until > now(), false),
-                    email_confirmed_at is not null
-             from auth.users
-             where email = $1 and aud = $2 and is_sso_user = false and deleted_at is null
-             limit 1",
-            &[&email, &AUD],
+            &format!(
+                "select id::text,
+                        coalesce(encrypted_password, ''),
+                        coalesce(banned_until > now(), false),
+                        {column}_confirmed_at is not null
+                 from auth.users
+                 where {column} = $1 and aud = $2 and is_sso_user = false
+                   and deleted_at is null
+                 limit 1"
+            ),
+            &[&held, &AUD],
         )
         .await?;
     let Some(row) = rows.first() else {
@@ -1208,7 +1489,10 @@ async fn sign_in(
     // Last, so an unconfirmed address is only ever revealed to whoever
     // proved they hold the password for it.
     if !confirmed {
-        return denied("email_not_confirmed", "Email not confirmed");
+        return match column {
+            "phone" => denied("phone_not_confirmed", "Phone not confirmed"),
+            _ => denied("email_not_confirmed", "Email not confirmed"),
+        };
     }
     start(sess, &user_id, "password", signer, issuer).await
 }
@@ -1277,13 +1561,27 @@ async fn mint_code(
     email: &str,
     token_type: &str,
 ) -> Result<Code, sql::Error> {
+    mint_digits(sess, user_id, email, token_type, 6).await
+}
+
+/// The same over a code of a given length, which is what the phone
+/// flows draw. `to` is the address or the number the code is hashed
+/// against, and therefore the only place it is worth anything.
+async fn mint_digits(
+    sess: &sql::Session,
+    user_id: &str,
+    to: &str,
+    token_type: &str,
+    digits: usize,
+) -> Result<Code, sql::Error> {
     let (column, sent) = match token_type {
         "recovery_token" => ("recovery_token", "recovery_sent_at"),
         "reauthentication_token" => ("reauthentication_token", "reauthentication_sent_at"),
+        "phone_change_token" => ("phone_change_token", "phone_change_sent_at"),
         _ => ("confirmation_token", "confirmation_sent_at"),
     };
-    let code = six_digits();
-    let hashed = token_hash(email, &code);
+    let code = code_of(digits);
+    let hashed = token_hash(to, &code);
     sess.execute(
         &format!(
             "update auth.users
@@ -1293,18 +1591,21 @@ async fn mint_code(
         &[&user_id, &hashed],
     )
     .await?;
-    keep_token(sess, user_id, token_type, &hashed, email).await?;
+    keep_token(sess, user_id, token_type, &hashed, to).await?;
     Ok(Code { code, hash: hashed })
 }
 
 /// A verify request, GoTrue's VerifyParams. The code arrives either as
-/// the digits that were mailed, together with the address they went to,
-/// or as its hash, which is what the link in the email carries.
+/// the digits that were sent, together with the address or the number
+/// they went to, or as its hash, which is what the link in the email
+/// carries. A link is only ever an email thing, so a hash on its own is
+/// never a phone verification.
 struct Asked {
     kind: String,
     token: String,
     hash: String,
     email: String,
+    phone: String,
 }
 
 /// Upstream's validation of a verify request, in its order and its
@@ -1336,6 +1637,7 @@ fn asked(body: &serde_json::Value, followed: bool) -> Result<Asked, Error> {
             token: String::new(),
             hash: carried,
             email: String::new(),
+            phone: String::new(),
         });
     }
     if token.is_empty() == hash.is_empty() {
@@ -1344,11 +1646,11 @@ fn asked(body: &serde_json::Value, followed: bool) -> Result<Asked, Error> {
             "Verify requires either a token or a token hash",
         );
     }
-    if kind == "sms" || kind == "phone_change" || !phone.is_empty() {
-        return Err(Error::NotYet("verifying a phone number"));
-    }
     if token.is_empty() {
-        if !field(body, "email").is_empty() || !field(body, "redirect_to").is_empty() {
+        if !field(body, "email").is_empty()
+            || !phone.is_empty()
+            || !field(body, "redirect_to").is_empty()
+        {
             return denied(
                 "validation_failed",
                 "Only the token_hash and type should be provided",
@@ -1359,10 +1661,27 @@ fn asked(body: &serde_json::Value, followed: bool) -> Result<Asked, Error> {
             token,
             hash,
             email: String::new(),
+            phone: String::new(),
         });
     }
     let email = field(body, "email");
-    if email.is_empty() {
+    // Which of the two it is comes from the request and not from the
+    // type, so a number sent with type `signup` is a phone signup being
+    // verified, which is exactly what the phone signup flow sends.
+    if !phone.is_empty() && email.is_empty() {
+        let phone = validate_phone(&phone)?;
+        let hash = token_hash(&phone, &token);
+        return Ok(Asked {
+            kind,
+            token,
+            hash,
+            email: String::new(),
+            phone,
+        });
+    }
+    // One or the other, never both and never neither: with both there is
+    // no saying which one the code was hashed against.
+    if email.is_empty() || !phone.is_empty() {
         return denied(
             "validation_failed",
             "Only an email address or phone number should be provided on verify",
@@ -1384,6 +1703,7 @@ fn asked(body: &serde_json::Value, followed: bool) -> Result<Asked, Error> {
         token,
         hash,
         email,
+        phone: String::new(),
     })
 }
 
@@ -1506,6 +1826,53 @@ async fn by_email(
     })
 }
 
+/// Find the user from the number, which is the only way a phone code is
+/// ever verified: there is no link to follow, so there is no hash on its
+/// own. A phone change is found by the number being moved to rather
+/// than the one held, because the account keeps the old one until this
+/// code is spent.
+async fn by_phone(
+    sess: &sql::Session,
+    kind: &str,
+    phone: &str,
+    hash: &str,
+    sms_exp: i64,
+) -> Result<Holder, Error> {
+    let (held, token, sent) = match kind {
+        "sms" => ("phone", "confirmation_token", "confirmation_sent_at"),
+        "phone_change" => ("phone_change", "phone_change_token", "phone_change_sent_at"),
+        // Any other type sent with a number verifies nothing, because
+        // no flow ever wrote a code against it.
+        _ => return expired(TOKEN_EXPIRED),
+    };
+    let sql = format!(
+        "select u.id::text,
+                coalesce(u.banned_until > now(), false),
+                coalesce(u.{token} = $2
+                         and u.{sent} > now() - make_interval(secs => $4::int), false)
+           from auth.users u
+          where u.{held} = $1 and u.aud = $3 and u.deleted_at is null
+          limit 1"
+    );
+    let rows = sess
+        .query(&sql, &[&phone, &hash, &AUD, &(sms_exp as i32)])
+        .await?;
+    let Some(row) = rows.first() else {
+        return expired(TOKEN_EXPIRED);
+    };
+    let user_id: String = row.get(0);
+    if row.get::<_, bool>(1) {
+        return banned();
+    }
+    if !row.get::<_, bool>(2) {
+        return expired(TOKEN_EXPIRED);
+    }
+    Ok(Holder {
+        user_id,
+        kind: kind.to_string(),
+    })
+}
+
 /// What a verification of type `email` turned out to be, which is
 /// whichever code matched: the one a signup left behind, or the one a
 /// recovery or a magic link did.
@@ -1563,6 +1930,90 @@ pub(crate) async fn confirm_address(
     Ok(())
 }
 
+/// Confirm the number. Upstream writes the two columns and stops, which
+/// leaves the phone identity saying the number is unverified for ever.
+/// That is the same gap zou closed on the email side, so the identity is
+/// marked here too.
+pub(crate) async fn confirm_phone(sess: &sql::Session, user_id: &str) -> Result<(), sql::Error> {
+    sess.execute(
+        "update auth.users
+            set confirmation_token = '', phone_confirmed_at = now(), updated_at = now()
+          where id = $1::text::uuid",
+        &[&user_id],
+    )
+    .await?;
+    sess.execute(
+        "update auth.identities i
+            set identity_data = i.identity_data
+                                || jsonb_build_object('phone_verified', true),
+                updated_at = now()
+           from auth.users u
+          where i.user_id = u.id and u.id = $1::text::uuid
+            and i.provider = 'phone' and i.identity_data->>'phone' = u.phone",
+        &[&user_id],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Move the number. The staged one becomes the held one, the identity
+/// follows it, and both of the change columns are emptied so the code
+/// that did this cannot do it twice.
+async fn change_number(sess: &sql::Session, user_id: &str) -> Result<(), sql::Error> {
+    // The identity is written before the move, while phone_change still
+    // holds the number being taken.
+    sess.execute(
+        "insert into auth.identities
+             (provider_id, user_id, identity_data, provider,
+              last_sign_in_at, created_at, updated_at)
+         select u.id::text, u.id,
+                jsonb_build_object('sub', u.id::text, 'phone', u.phone_change,
+                                   'phone_verified', true),
+                'phone', now(), now(), now()
+           from auth.users u
+          where u.id = $1::text::uuid
+            and not exists (select 1 from auth.identities i
+                             where i.user_id = u.id and i.provider = 'phone')",
+        &[&user_id],
+    )
+    .await?;
+    sess.execute(
+        "update auth.identities i
+            set identity_data = i.identity_data
+                                || jsonb_build_object('phone', u.phone_change,
+                                                      'phone_verified', true),
+                updated_at = now()
+           from auth.users u
+          where i.user_id = u.id and u.id = $1::text::uuid and i.provider = 'phone'",
+        &[&user_id],
+    )
+    .await?;
+    sess.execute(
+        "update auth.users
+            set phone = phone_change,
+                phone_change = '',
+                phone_change_token = '',
+                phone_confirmed_at = now(),
+                updated_at = now()
+          where id = $1::text::uuid",
+        &[&user_id],
+    )
+    .await?;
+    Ok(())
+}
+
+/// An account that has proved an address or a number is not anonymous
+/// any more, which is how a temporary account becomes a real one.
+async fn not_anonymous(sess: &sql::Session, user_id: &str) -> Result<(), sql::Error> {
+    sess.execute(
+        "update auth.users set is_anonymous = false, updated_at = now()
+          where id = $1::text::uuid and is_anonymous",
+        &[&user_id],
+    )
+    .await?;
+    Ok(())
+}
+
 async fn forget_tokens(sess: &sql::Session, user_id: &str) -> Result<(), sql::Error> {
     sess.execute(
         "delete from auth.one_time_tokens where user_id = $1::text::uuid",
@@ -1572,6 +2023,24 @@ async fn forget_tokens(sess: &sql::Session, user_id: &str) -> Result<(), sql::Er
     Ok(())
 }
 
+/// What a verify has to consult about the project. They travel together
+/// because four call levels of bare bools in a row is where the wrong
+/// one gets passed and nothing looks wrong.
+pub(crate) struct Rules {
+    pub(crate) secure_change: bool,
+    pub(crate) autoconfirm: bool,
+    pub(crate) sms_exp: i64,
+}
+
+/// The project's settings as a verify reads them.
+fn rules(app: &App) -> Rules {
+    Rules {
+        secure_change: app.cfg.secure_email_change,
+        autoconfirm: app.cfg.mailer_autoconfirm,
+        sms_exp: app.cfg.sms.otp_exp,
+    }
+}
+
 /// Spend the code. The answer is whether the flow finished: an email
 /// change under double confirmation says no the first time, because one
 /// of the two addresses has answered and the other has not.
@@ -1579,8 +2048,7 @@ async fn consume(
     sess: &sql::Session,
     holder: &Holder,
     hash: &str,
-    secure_change: bool,
-    autoconfirm: bool,
+    rules: &Rules,
 ) -> Result<bool, Error> {
     match holder.kind.as_str() {
         "signup" | "invite" => {
@@ -1599,7 +2067,17 @@ async fn consume(
             forget_tokens(sess, &holder.user_id).await?;
         }
         "email_change" => {
-            return change_address(sess, &holder.user_id, hash, secure_change, autoconfirm).await;
+            return change_address(sess, &holder.user_id, hash, rules).await;
+        }
+        "sms" => {
+            confirm_phone(sess, &holder.user_id).await?;
+            not_anonymous(sess, &holder.user_id).await?;
+            forget_tokens(sess, &holder.user_id).await?;
+        }
+        "phone_change" => {
+            change_number(sess, &holder.user_id).await?;
+            not_anonymous(sess, &holder.user_id).await?;
+            forget_tokens(sess, &holder.user_id).await?;
         }
         _ => return denied("validation_failed", "Unsupported verification type"),
     }
@@ -1614,8 +2092,7 @@ async fn change_address(
     sess: &sql::Session,
     user_id: &str,
     hash: &str,
-    secure_change: bool,
-    autoconfirm: bool,
+    rules: &Rules,
 ) -> Result<bool, Error> {
     let rows = sess
         .query(
@@ -1633,7 +2110,7 @@ async fn change_address(
     let token_current: String = row.get(2);
     let token_new: String = row.get(3);
 
-    if !autoconfirm && secure_change && status == 0 && !current.is_empty() {
+    if !rules.autoconfirm && rules.secure_change && status == 0 && !current.is_empty() {
         let spent = if hash == token_current {
             "email_change_token_current"
         } else if hash == token_new {
@@ -1706,15 +2183,9 @@ async fn change_address(
         &[&user_id],
     )
     .await?;
-    // An account that has proved an address is not anonymous any more,
-    // whichever way it got here: the address was taken on the spot
+    // Whichever way it got here: the address was taken on the spot
     // because the project confirms its own, or a link was followed.
-    sess.execute(
-        "update auth.users set is_anonymous = false, updated_at = now()
-          where id = $1::text::uuid and is_anonymous",
-        &[&user_id],
-    )
-    .await?;
+    not_anonymous(sess, user_id).await?;
     confirm_address(sess, user_id, true).await?;
     forget_tokens(sess, user_id).await?;
     Ok(true)
@@ -1727,17 +2198,18 @@ async fn change_address(
 async fn verified(
     sess: &sql::Session,
     asked: &Asked,
-    secure_change: bool,
-    autoconfirm: bool,
+    rules: &Rules,
     signer: &crate::jwt::Signer<'_>,
     issuer: &str,
 ) -> Result<Option<Issued>, Error> {
     let holder = if asked.token.is_empty() {
         by_hash(sess, &asked.kind, &asked.hash, LINK_EXPIRED).await?
+    } else if !asked.phone.is_empty() {
+        by_phone(sess, &asked.kind, &asked.phone, &asked.hash, rules.sms_exp).await?
     } else {
         by_email(sess, &asked.kind, &asked.email, &asked.hash).await?
     };
-    if !consume(sess, &holder, &asked.hash, secure_change, autoconfirm).await? {
+    if !consume(sess, &holder, &asked.hash, rules).await? {
         return Ok(None);
     }
     Ok(Some(
@@ -1748,13 +2220,12 @@ async fn verified(
 async fn confirm(
     pool: &Pool,
     asked: &Asked,
-    secure_change: bool,
-    autoconfirm: bool,
+    rules: &Rules,
     signer: &crate::jwt::Signer<'_>,
     issuer: &str,
 ) -> Result<Option<Issued>, Error> {
     let sess = pool.admin().await?;
-    let out = verified(&sess, asked, secure_change, autoconfirm, signer, issuer).await;
+    let out = verified(&sess, asked, rules, signer, issuer).await;
     match out {
         Ok(done) => {
             sess.commit().await?;
@@ -1789,6 +2260,7 @@ async fn recovery_for(sess: &sql::Session, email: &str, post: &Post<'_>) -> Resu
         &user_id,
         "recovery_sent_at",
         post.settings.max_frequency,
+        TOO_SOON_MAIL,
     )
     .await?;
     let code = mint_code(sess, &user_id, email, "recovery_token").await?;
@@ -1829,8 +2301,15 @@ pub async fn send_recovery(pool: &Pool, email: &str, post: &Post<'_>) -> Result<
 /// creates. GoTrue draws 33 characters, and the point of it is that the
 /// row has a password column that no password grant can ever satisfy.
 pub(crate) fn unguessable_password() -> String {
+    unguessable(33)
+}
+
+/// The same for the phone otp, which draws 64 because that is what
+/// upstream draws there. The two lengths are upstream's and there is no
+/// reason behind either beyond being far past guessing.
+pub(crate) fn unguessable(len: usize) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut raw = [0u8; 33];
+    let mut raw = vec![0u8; len];
     getrandom::fill(&mut raw).expect("the os rng never fails");
     raw.iter()
         .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
@@ -1888,6 +2367,7 @@ async fn magic_for(
         &user_id,
         "recovery_sent_at",
         post.settings.max_frequency,
+        TOO_SOON_MAIL,
     )
     .await?;
     let code = mint_code(sess, &user_id, email, "recovery_token").await?;
@@ -1931,15 +2411,17 @@ pub async fn send_magic_link(
     }
 }
 
-/// Whether anyone holds this address, which is the one question the otp
-/// endpoint asks before it refuses to create somebody.
-async fn is_registered(pool: &Pool, email: &str) -> Result<bool, Error> {
+/// Whether anyone holds this address or this number, which is the one
+/// question the otp endpoint asks before it refuses to create somebody.
+async fn is_registered(pool: &Pool, column: &str, held: &str) -> Result<bool, Error> {
     let sess = pool.admin().await?;
     let rows = sess
         .query(
-            "select 1 from auth.users
-              where email = $1 and aud = $2 and deleted_at is null limit 1",
-            &[&email, &AUD],
+            &format!(
+                "select 1 from auth.users
+                  where {column} = $1 and aud = $2 and deleted_at is null limit 1"
+            ),
+            &[&held, &AUD],
         )
         .await;
     let found = match rows {
@@ -1956,10 +2438,11 @@ async fn is_registered(pool: &Pool, email: &str) -> Result<bool, Error> {
 /// Write down a code that proves the person holding this session is
 /// still the person who owns the address, which is what a password
 /// change asks for when the session is old.
-async fn reauth_for(sess: &sql::Session, user_id: &str, post: &Post<'_>) -> Result<(), Error> {
+async fn reauth_for(sess: &sql::Session, user_id: &str, post: &Post<'_>) -> Result<String, Error> {
     let rows = sess
         .query(
-            "select coalesce(email, ''), email_confirmed_at is not null
+            "select coalesce(email, ''), email_confirmed_at is not null,
+                    coalesce(phone, ''), phone_confirmed_at is not null
                from auth.users where id = $1::text::uuid and deleted_at is null",
             &[&user_id],
         )
@@ -1973,11 +2456,35 @@ async fn reauth_for(sess: &sql::Session, user_id: &str, post: &Post<'_>) -> Resu
     };
     let email: String = row.get(0);
     let confirmed: bool = row.get(1);
-    if email.is_empty() {
+    let phone: String = row.get(2);
+    let phone_confirmed: bool = row.get(3);
+    if email.is_empty() && phone.is_empty() {
         return denied(
             "validation_failed",
             "Reauthentication requires the user to have an email or a phone number",
         );
+    }
+    // The address wins when there is one, which is upstream's order and
+    // not a preference: an account with both is asked at the address.
+    if email.is_empty() {
+        if !phone_confirmed {
+            return Err(refused(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "phone_not_confirmed",
+                "Please verify your phone first.",
+            ));
+        }
+        return send_phone_code(
+            sess,
+            post,
+            user_id,
+            Texting {
+                otp_type: PHONE_REAUTHENTICATION,
+                to: &phone,
+                channel: crate::sms::SMS,
+            },
+        )
+        .await;
     }
     if !confirmed {
         return Err(refused(
@@ -1991,6 +2498,7 @@ async fn reauth_for(sess: &sql::Session, user_id: &str, post: &Post<'_>) -> Resu
         user_id,
         "reauthentication_sent_at",
         post.settings.max_frequency,
+        TOO_SOON_MAIL,
     )
     .await?;
     let code = mint_code(sess, user_id, &email, "reauthentication_token").await?;
@@ -2009,7 +2517,7 @@ async fn reauth_for(sess: &sql::Session, user_id: &str, post: &Post<'_>) -> Resu
         },
     )
     .await?;
-    Ok(())
+    Ok(String::new())
 }
 
 /// POST /auth/v1/reauthenticate.
@@ -2017,13 +2525,13 @@ pub async fn send_reauthentication(
     pool: &Pool,
     user_id: &str,
     post: &Post<'_>,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let sess = pool.admin().await?;
     let out = reauth_for(&sess, user_id, post).await;
     match out {
-        Ok(()) => {
+        Ok(id) => {
             sess.commit().await?;
-            Ok(())
+            Ok(id)
         }
         Err(e) => {
             let _ = sess.rollback().await;
@@ -2049,6 +2557,7 @@ async fn stage_change(
         user_id,
         "email_change_sent_at",
         post.settings.max_frequency,
+        TOO_SOON_MAIL,
     )
     .await?;
     let for_new = {
@@ -2150,7 +2659,12 @@ fn validate_new_password(password: &str) -> Result<(), Error> {
 
 /// Check the code from a reauthenticate against the one written down,
 /// and spend it. The window is the same day a mailed code lives for.
-async fn check_nonce(sess: &sql::Session, user_id: &str, nonce: &str) -> Result<(), Error> {
+async fn check_nonce(
+    sess: &sql::Session,
+    user_id: &str,
+    nonce: &str,
+    sms_exp: i64,
+) -> Result<(), Error> {
     let invalid = || {
         Err(refused(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2161,18 +2675,44 @@ async fn check_nonce(sess: &sql::Session, user_id: &str, nonce: &str) -> Result<
     if nonce.is_empty() {
         return invalid();
     }
+    // The code that went out by text lives a minute by default and the
+    // one that went out by mail lives a day, so which window applies
+    // depends on which one was sent, which is what the account holds.
     let sql = format!(
         "select coalesce(reauthentication_token, ''),
                 coalesce(reauthentication_sent_at > now() - interval '{OTP_EXP} seconds', false),
-                coalesce(email, '')
+                coalesce(email, ''),
+                coalesce(phone, ''),
+                coalesce(reauthentication_sent_at
+                         > now() - make_interval(secs => $2::int), false)
            from auth.users where id = $1::text::uuid"
     );
-    let rows = sess.query(&sql, &[&user_id]).await?;
+    let rows = sess.query(&sql, &[&user_id, &(sms_exp as i32)]).await?;
     let row = &rows[0];
     let token: String = row.get(0);
     let fresh: bool = row.get(1);
     let email: String = row.get(2);
-    if token.is_empty() || !fresh || token_hash(&email, nonce) != token {
+    let phone: String = row.get(3);
+    let fresh_text: bool = row.get(4);
+    // An account holding no code at all is asked before it is asked
+    // what the code would have been hashed against, which is upstream's
+    // order and the one a client branches on.
+    if token.is_empty() {
+        return invalid();
+    }
+    let (against, fresh) = if email.is_empty() {
+        (phone, fresh_text)
+    } else {
+        (email, fresh)
+    };
+    if against.is_empty() {
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reauthentication_not_valid",
+            "Reauthentication requires an email or a phone number",
+        ));
+    }
+    if token.is_empty() || !fresh || token_hash(&against, nonce) != token {
         return invalid();
     }
     sess.execute(
@@ -2246,9 +2786,14 @@ async fn update_user(
         "" => None,
         given => Some(validate_email(given)?),
     };
-    if !field(body, "phone").is_empty() {
-        return Err(Error::NotYet("changing a phone number"));
-    }
+    let phone = match field(body, "phone") {
+        "" => None,
+        given => Some(validate_phone(given)?),
+    };
+    let channel = match &phone {
+        Some(_) => channel_of(body, post)?,
+        None => String::new(),
+    };
     let password = body.get("password").and_then(|v| v.as_str());
     if let Some(password) = password {
         validate_new_password(password)?;
@@ -2266,7 +2811,7 @@ async fn update_user(
     let rows = sess
         .query(
             "select coalesce(email, ''), coalesce(encrypted_password, ''),
-                    is_sso_user, is_anonymous
+                    is_sso_user, is_anonymous, coalesce(phone, '')
                from auth.users where id = $1::text::uuid and deleted_at is null",
             &[&caller.user_id],
         )
@@ -2276,17 +2821,19 @@ async fn update_user(
     let stored: String = row.get(1);
     let sso: bool = row.get(2);
     let anonymous: bool = row.get(3);
+    let held: String = row.get(4);
     // An anonymous account with a password and no address is an account
     // nobody could ever sign in to again, because there is nothing to
     // present the password with.
-    if anonymous && password.is_some_and(|p| !p.is_empty()) && email.is_none() {
+    if anonymous && password.is_some_and(|p| !p.is_empty()) && email.is_none() && phone.is_none() {
         return Err(refused(
             StatusCode::UNPROCESSABLE_ENTITY,
             "validation_failed",
             "Updating password of an anonymous user without an email or phone is not allowed",
         ));
     }
-    if sso && (email.is_some() || password.is_some()) {
+    if sso && (email.is_some() || password.is_some() || phone.as_deref().is_some_and(|p| p != held))
+    {
         return Err(refused(
             StatusCode::UNPROCESSABLE_ENTITY,
             "user_sso_managed",
@@ -2302,6 +2849,16 @@ async fn update_user(
             "A user with this email address has already been registered",
         ));
     }
+    if let Some(wanted) = &phone
+        && wanted != &held
+        && held_by_another(sess, wanted, &caller.user_id).await?
+    {
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "phone_exists",
+            DUPLICATE_PHONE,
+        ));
+    }
 
     if let Some(password) = password {
         if reauth_required && !recent(sess, caller.session_id.as_deref()).await? {
@@ -2312,7 +2869,7 @@ async fn update_user(
                     "Password update requires reauthentication",
                 );
             }
-            check_nonce(sess, &caller.user_id, nonce).await?;
+            check_nonce(sess, &caller.user_id, nonce, post.sms.otp_exp).await?;
         }
         if !stored.is_empty() && matches_off_thread(password, &stored).await {
             return Err(refused(
@@ -2347,13 +2904,74 @@ async fn update_user(
                 &[&caller.user_id, wanted],
             )
             .await?;
-            change_address(sess, &caller.user_id, "", false, true).await?;
+            change_address(
+                sess,
+                &caller.user_id,
+                "",
+                &Rules {
+                    secure_change: false,
+                    autoconfirm: true,
+                    sms_exp: 0,
+                },
+            )
+            .await?;
         } else {
             stage_change(sess, &caller.user_id, &current, wanted, secure_change, post).await?;
         }
     }
 
+    if let Some(wanted) = &phone
+        && wanted != &held
+    {
+        if post.sms.autoconfirm {
+            // The project asked for no proof, so the number moves on the
+            // spot through the same code path a verified one takes.
+            sess.execute(
+                "update auth.users set phone_change = $2, updated_at = now()
+                  where id = $1::text::uuid",
+                &[&caller.user_id, wanted],
+            )
+            .await?;
+            change_number(sess, &caller.user_id).await?;
+            not_anonymous(sess, &caller.user_id).await?;
+            forget_tokens(sess, &caller.user_id).await?;
+        } else {
+            send_phone_code(
+                sess,
+                post,
+                &caller.user_id,
+                Texting {
+                    otp_type: PHONE_CHANGE,
+                    to: wanted,
+                    channel: &channel,
+                },
+            )
+            .await?;
+        }
+    }
+
     Ok(user_json(sess, &caller.user_id).await?)
+}
+
+/// Upstream's DuplicatePhoneMsg.
+pub(crate) const DUPLICATE_PHONE: &str =
+    "A user with this phone number has already been registered";
+
+/// Whether the number belongs to somebody else already.
+pub(crate) async fn held_by_another(
+    sess: &sql::Session,
+    phone: &str,
+    user_id: &str,
+) -> Result<bool, sql::Error> {
+    let rows = sess
+        .query(
+            "select 1 from auth.users
+              where phone = $1 and aud = $2 and id <> $3::text::uuid
+                and deleted_at is null limit 1",
+            &[&phone, &AUD, &user_id],
+        )
+        .await?;
+    Ok(!rows.is_empty())
 }
 
 /// Whether the address belongs to somebody else already.
@@ -2684,11 +3302,41 @@ pub async fn signup(
             "Only an email address or phone number should be provided on signup.",
         );
     }
+    let data = metadata(&body);
     if !phone.is_empty() {
-        return not_yet("phone signup");
+        // The channel is judged before the provider is, which is
+        // upstream's order: a request naming a channel nobody carries is
+        // malformed whether or not phone signups are on at all.
+        let post = posting(&app, &wanted, &from);
+        let channel = match channel_of(&body, &post) {
+            Ok(v) => v,
+            Err(e) => return refusal(e, "signup"),
+        };
+        if !app.cfg.phone_enabled {
+            return error_body(
+                StatusCode::BAD_REQUEST,
+                "phone_provider_disabled",
+                "Phone signups are disabled",
+            );
+        }
+        return match sign_up_by_phone(
+            pool,
+            phone,
+            password,
+            &channel,
+            &data,
+            &app.signer(),
+            &app.issuer(),
+            &post,
+        )
+        .await
+        {
+            Ok(SignedUp::Session(issued)) => json_body(StatusCode::OK, issued.json()),
+            Ok(SignedUp::Pending(user)) => json_body(StatusCode::OK, user),
+            Err(e) => refusal(e, "signup"),
+        };
     }
 
-    let data = metadata(&body);
     match sign_up(
         pool,
         email,
@@ -2723,16 +3371,7 @@ pub async fn verify(
         Ok(v) => v,
         Err(e) => return refusal(e, "verify"),
     };
-    match confirm(
-        pool,
-        &asked,
-        app.cfg.secure_email_change,
-        app.cfg.mailer_autoconfirm,
-        &app.signer(),
-        &app.issuer(),
-    )
-    .await
-    {
+    match confirm(pool, &asked, &rules(&app), &app.signer(), &app.issuer()).await {
         Ok(Some(issued)) => json_body(StatusCode::OK, issued.json()),
         // One of the two addresses has answered. The other one still
         // has to, so there is no session to hand out yet.
@@ -2773,16 +3412,7 @@ pub async fn verify_get(
         .unwrap_or_default();
     let target = landing(&app, field(&query, "redirect_to"), referrer);
 
-    match confirm(
-        pool,
-        &asked,
-        app.cfg.secure_email_change,
-        app.cfg.mailer_autoconfirm,
-        &app.signer(),
-        &app.issuer(),
-    )
-    .await
-    {
+    match confirm(pool, &asked, &rules(&app), &app.signer(), &app.issuer()).await {
         Ok(Some(issued)) => {
             let fragment = vec![
                 ("access_token", issued.access_token.clone()),
@@ -3831,6 +4461,7 @@ async fn attach(
         &user_id,
         "confirmation_sent_at",
         post.settings.max_frequency,
+        TOO_SOON_MAIL,
     )
     .await?;
     let code = mint_code(sess, &user_id, &address, "confirmation_token").await?;
@@ -3912,6 +4543,7 @@ async fn link_to(
                 target,
                 "confirmation_sent_at",
                 post.settings.max_frequency,
+                TOO_SOON_MAIL,
             )
             .await?;
             let code = mint_code(sess, target, &address, "confirmation_token").await?;
@@ -4433,12 +5065,19 @@ pub async fn otp(
         .get("create_user")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    if !create && !email.is_empty() {
-        let address = match validate_email(email) {
-            Ok(v) => v,
-            Err(e) => return refusal(e, "otp"),
+    if !create && !(email.is_empty() && phone.is_empty()) {
+        let (column, held) = if email.is_empty() {
+            match validate_phone(phone) {
+                Ok(v) => ("phone", v),
+                Err(e) => return refusal(e, "otp"),
+            }
+        } else {
+            match validate_email(email) {
+                Ok(v) => ("email", v),
+                Err(e) => return refusal(e, "otp"),
+            }
         };
-        match is_registered(pool, &address).await {
+        match is_registered(pool, column, &held).await {
             Ok(false) => {
                 return error_body(
                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -4451,7 +5090,7 @@ pub async fn otp(
         }
     }
     if !phone.is_empty() {
-        return not_yet("the phone otp");
+        return sms_otp(&app, pool, &body, &posting(&app, &wanted, &from)).await;
     }
     if email.is_empty() {
         return error_body(
@@ -4485,6 +5124,131 @@ async fn magic(app: &App, pool: &Pool, body: &serde_json::Value, post: &Post<'_>
     }
 }
 
+/// The phone half of the otp endpoint, GoTrue's SmsOtp.
+///
+/// A number nobody has signed up with is signed up here, with a password
+/// nobody will ever hold, which is how a project with no passwords at
+/// all registers people. Whether that signup sends the code or this does
+/// depends on autoconfirm, and so does whether the answer carries the
+/// provider's message id.
+async fn sms_otp(app: &App, pool: &Pool, body: &serde_json::Value, post: &Post<'_>) -> Response {
+    if !app.cfg.phone_enabled {
+        return error_body(
+            StatusCode::BAD_REQUEST,
+            "phone_provider_disabled",
+            "Unsupported phone provider",
+        );
+    }
+    let phone = match validate_phone(field(body, "phone")) {
+        Ok(v) => v,
+        Err(e) => return refusal(e, "otp"),
+    };
+    let channel = match channel_of(body, post) {
+        Ok(v) => v,
+        Err(e) => return refusal(e, "otp"),
+    };
+    let data = metadata(body);
+
+    // A number that has never answered is not being signed in, it is
+    // being signed up, and an account halfway through a signup is in
+    // the same position as one that does not exist yet.
+    let confirmed = match phone_confirmed(pool, &phone).await {
+        Ok(v) => v,
+        Err(e) => return refusal(e, "otp"),
+    };
+    if !confirmed {
+        let signed = sign_up_by_phone(
+            pool,
+            &phone,
+            &unguessable(64),
+            &channel,
+            &data,
+            &app.signer(),
+            &app.issuer(),
+            post,
+        )
+        .await;
+        if let Err(e) = signed {
+            return refusal(e, "otp");
+        }
+        // Without autoconfirm the signup itself has just texted the
+        // code, so there is nothing left to send and nothing to say.
+        if !post.sms.autoconfirm {
+            return json_body(StatusCode::OK, serde_json::json!({}));
+        }
+        // With it the account is confirmed and holds no code at all, so
+        // the code this endpoint was asked for still has to go out.
+    }
+    match texted(pool, &phone, &channel, post).await {
+        Ok(id) if id.is_empty() => json_body(StatusCode::OK, serde_json::json!({})),
+        Ok(id) => json_body(StatusCode::OK, serde_json::json!({"message_id": id})),
+        Err(e) => refusal(e, "otp"),
+    }
+}
+
+/// Whether this number has ever answered a code.
+async fn phone_confirmed(pool: &Pool, phone: &str) -> Result<bool, Error> {
+    let sess = pool.admin().await?;
+    let rows = sess
+        .query(
+            "select phone_confirmed_at is not null from auth.users
+              where phone = $1 and aud = $2 and deleted_at is null limit 1",
+            &[&phone, &AUD],
+        )
+        .await;
+    let confirmed = match rows {
+        Ok(rows) => rows.first().is_some_and(|r| r.get::<_, bool>(0)),
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return Err(Error::Db(e));
+        }
+    };
+    sess.commit().await?;
+    Ok(confirmed)
+}
+
+/// Text a fresh sign in code to a number that already answered once.
+async fn texted(pool: &Pool, phone: &str, channel: &str, post: &Post<'_>) -> Result<String, Error> {
+    let sess = pool.admin().await?;
+    let out = async {
+        let rows = sess
+            .query(
+                "select id::text from auth.users
+                  where phone = $1 and aud = $2 and deleted_at is null limit 1",
+                &[&phone, &AUD],
+            )
+            .await?;
+        let Some(row) = rows.first() else {
+            // The account was there a moment ago. Nothing to send to
+            // and nothing to say about it.
+            return Ok(String::new());
+        };
+        let user_id: String = row.get(0);
+        send_phone_code(
+            &sess,
+            post,
+            &user_id,
+            Texting {
+                otp_type: PHONE_CONFIRMATION,
+                to: phone,
+                channel,
+            },
+        )
+        .await
+    }
+    .await;
+    match out {
+        Ok(id) => {
+            sess.commit().await?;
+            Ok(id)
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            Err(e)
+        }
+    }
+}
+
 /// POST /auth/v1/resend, which sends the last code again.
 ///
 /// It is not a way to start anything. The account has to exist and it
@@ -4508,11 +5272,13 @@ pub async fn resend(
         pool,
         &body,
         app.cfg.secure_email_change,
+        app.cfg.phone_enabled,
         &posting(&app, &wanted, &from),
     )
     .await
     {
-        Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
+        Ok(id) if id.is_empty() => json_body(StatusCode::OK, serde_json::json!({})),
+        Ok(id) => json_body(StatusCode::OK, serde_json::json!({"message_id": id})),
         Err(e) => refusal(e, "resend"),
     }
 }
@@ -4523,8 +5289,9 @@ async fn again(
     pool: &Pool,
     body: &serde_json::Value,
     secure_change: bool,
+    phone_enabled: bool,
     post: &Post<'_>,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let kind = field(body, "type");
     match kind {
         "signup" | "email_change" => validate_pkce(
@@ -4555,22 +5322,23 @@ async fn again(
             "Only an email address or phone number should be provided.",
         );
     }
-    let email = if !email.is_empty() {
-        validate_email(email)?
+    let (column, held) = if !email.is_empty() {
+        ("email", validate_email(email)?)
     } else if !phone.is_empty() {
-        // The same refusal a project with no SMS provider gets from
-        // upstream, because that is what this project is.
-        return denied("phone_provider_disabled", "Phone logins are disabled");
+        if !phone_enabled {
+            return denied("phone_provider_disabled", "Phone logins are disabled");
+        }
+        ("phone", validate_phone(phone)?)
     } else {
         return denied("validation_failed", "Missing email address or phone number");
     };
 
     let sess = pool.admin().await?;
-    let out = resent(&sess, kind, &email, secure_change, post).await;
+    let out = resent(&sess, kind, column, &held, secure_change, post).await;
     match out {
-        Ok(()) => {
+        Ok(id) => {
             sess.commit().await?;
-            Ok(())
+            Ok(id)
         }
         Err(e) => {
             let _ = sess.rollback().await;
@@ -4579,41 +5347,92 @@ async fn again(
     }
 }
 
+/// The answer is the provider's message id when a text went out, which
+/// is the only thing this endpoint ever says about what it did.
 async fn resent(
     sess: &sql::Session,
     kind: &str,
-    email: &str,
+    column: &str,
+    held: &str,
     secure_change: bool,
     post: &Post<'_>,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let rows = sess
         .query(
-            "select id::text, email_confirmed_at is not null, coalesce(email_change, '')
-               from auth.users
-              where email = $1 and aud = $2 and is_sso_user = false and deleted_at is null
-              limit 1",
-            &[&email, &AUD],
+            &format!(
+                "select id::text, email_confirmed_at is not null, coalesce(email_change, ''),
+                        phone_confirmed_at is not null, coalesce(phone_change, ''),
+                        coalesce(email, '')
+                   from auth.users
+                  where {column} = $1 and aud = $2 and is_sso_user = false
+                    and deleted_at is null
+                  limit 1"
+            ),
+            &[&held, &AUD],
         )
         .await?;
-    // Nobody holds the address. Upstream answers the same empty object
-    // it answers a confirmed account with, and so does this.
+    // Nobody holds the address or the number. Upstream answers the same
+    // empty object it answers a confirmed account with, and so does this.
     let Some(row) = rows.first() else {
-        return Ok(());
+        return Ok(String::new());
     };
     let user_id: String = row.get(0);
     let confirmed: bool = row.get(1);
     let pending: String = row.get(2);
+    let phone_confirmed: bool = row.get(3);
+    let staged_phone: String = row.get(4);
+    let email: String = row.get(5);
+
+    match kind {
+        "sms" => {
+            if phone_confirmed {
+                return Ok(String::new());
+            }
+            // Resend has no channel of its own, so it goes out the way
+            // upstream sends it, which is always plain sms.
+            return send_phone_code(
+                sess,
+                post,
+                &user_id,
+                Texting {
+                    otp_type: PHONE_CONFIRMATION,
+                    to: held,
+                    channel: crate::sms::SMS,
+                },
+            )
+            .await;
+        }
+        "phone_change" => {
+            if staged_phone.is_empty() {
+                return Ok(String::new());
+            }
+            return send_phone_code(
+                sess,
+                post,
+                &user_id,
+                Texting {
+                    otp_type: PHONE_CHANGE,
+                    to: &staged_phone,
+                    channel: crate::sms::SMS,
+                },
+            )
+            .await;
+        }
+        _ => {}
+    }
+    let email = email.as_str();
 
     match kind {
         "signup" => {
             if confirmed {
-                return Ok(());
+                return Ok(String::new());
             }
             within_limit(
                 sess,
                 &user_id,
                 "confirmation_sent_at",
                 post.settings.max_frequency,
+                TOO_SOON_MAIL,
             )
             .await?;
             let code = mint_code(sess, &user_id, email, "confirmation_token").await?;
@@ -4629,22 +5448,21 @@ async fn resent(
                     new_email: "",
                 },
             )
-            .await
+            .await?;
         }
         "email_change" => {
             if pending.is_empty() {
-                return Ok(());
+                return Ok(String::new());
             }
             // Both codes are drawn again, which is what upstream's
             // sendEmailChange does when it is called a second time: the
             // pair that was mailed is replaced rather than repeated, so
             // whoever half finished the change starts it over.
-            stage_change(sess, &user_id, email, &pending, secure_change, post).await
+            stage_change(sess, &user_id, email, &pending, secure_change, post).await?;
         }
-        // A phone change on an account that has no number to change is
-        // upstream's silent 200, and every account here is that.
-        _ => Ok(()),
+        _ => {}
     }
+    Ok(String::new())
 }
 
 /// GET /auth/v1/user, the account as it stands.
@@ -4808,7 +5626,8 @@ pub async fn reauthenticate(
     };
     let (wanted, from) = link_target(&req);
     match send_reauthentication(pool, &caller.user_id, &posting(&app, &wanted, &from)).await {
-        Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
+        Ok(id) if id.is_empty() => json_body(StatusCode::OK, serde_json::json!({})),
+        Ok(id) => json_body(StatusCode::OK, serde_json::json!({"message_id": id})),
         Err(e) => refusal(e, "reauthenticate"),
     }
 }
@@ -4948,21 +5767,32 @@ pub async fn token(
                 "Only an email address or phone number should be provided on login.",
             );
         }
-        if email.is_empty() {
-            // The phone grant is the same query against a different
-            // column, and it waits for the SMS side of the surface.
-            if !phone.is_empty() {
-                return not_yet("the phone password grant");
+        // The phone grant is the same query against a different column.
+        // The number is only stripped, not judged: a malformed one is
+        // simply a number nobody holds, which is what upstream does here
+        // and the right answer for a sign in either way.
+        let (column, held) = if !email.is_empty() {
+            ("email", email.to_string())
+        } else if !phone.is_empty() {
+            if !app.cfg.phone_enabled {
+                return error_body(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "phone_provider_disabled",
+                    "Phone logins are disabled",
+                );
             }
+            ("phone", crate::sms::strip(phone))
+        } else {
             return error_body(
                 StatusCode::BAD_REQUEST,
                 "validation_failed",
                 "missing email or phone",
             );
-        }
+        };
         password_grant(
             pool,
-            email,
+            column,
+            &held,
             field(&body, "password"),
             &app.signer(),
             &app.issuer(),

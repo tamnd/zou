@@ -75,7 +75,35 @@ Port 465 is TLS from the first byte and everything else is plain TCP upgraded wi
 
 Two rules here are stricter than GoTrue's. A server that offers no STARTTLS is refused rather than talked to in the clear, and the password is never sent unencrypted unless the server is on the loopback address. There is no knob for skipping certificate verification, because a transport that can be told not to check is one that ends up not checking.
 
-Once something is carrying the mail there is nothing left in the process, so `zou inbox` has nothing to print and `/dev/inbox` is not there at all.
+Once something is carrying the mail there is nothing left in the process, so `zou inbox` has no messages to print. It still prints the texted codes when there is no SMS provider, and `/dev/inbox` is only gone once both media have somewhere to go.
+
+## Signing in with a phone number
+
+Phone sign in is off by default, the same as GoTrue, because a project that has not asked for it should refuse it by name rather than half serve it. Turn it on and the codes behave exactly like the mail does on a laptop: nothing carries them anywhere, they are kept in the process, and `zou inbox` prints them next to the number they went to.
+
+```bash
+ZOU_JWT_SECRET=$(openssl rand -hex 32) \
+ZOU_EXTERNAL_PHONE_ENABLED=true \
+  zou dev /tmp/mydb --http 54321
+zou inbox                              # the number, and the six digits that went to it
+```
+
+That is enough for `supabase.auth.signInWithOtp({ phone })` and `supabase.auth.verifyOtp({ phone, token, type: 'sms' })` to work end to end with no account anywhere. A number nobody has signed up with is signed up by the first code that goes to it, which is how a project with no passwords at all registers people. `POST /auth/v1/otp` with `create_user: false` refuses a number nobody holds instead.
+
+Set `ZOU_SMS_PROVIDER` and the codes go out for real. The credentials are GoTrue's names with `GOTRUE_` swapped for `ZOU_`, and half a set is refused at startup rather than at the first send.
+
+```bash
+ZOU_EXTERNAL_PHONE_ENABLED=true \
+ZOU_SMS_PROVIDER=twilio \
+ZOU_SMS_TWILIO_ACCOUNT_SID=AC... \
+ZOU_SMS_TWILIO_AUTH_TOKEN=... \
+ZOU_SMS_TWILIO_MESSAGE_SERVICE_SID=MG... \
+  zou dev /tmp/mydb --http 54321
+```
+
+`messagebird` is the other one, on `ZOU_SMS_MESSAGEBIRD_ACCESS_KEY` and `ZOU_SMS_MESSAGEBIRD_ORIGINATOR`. WhatsApp is Twilio's alone, through `ZOU_SMS_TWILIO_CONTENT_SID`, and asking any other provider for the `whatsapp` channel is refused by name. `ZOU_SMS_AUTOCONFIRM=true` takes a number at its word the way `ZOU_MAILER_AUTOCONFIRM` takes an address, which is what a project wants while it is still being written.
+
+A number is held in E.164 with the plus taken off, so somebody who typed `+1 555 010 0000` and somebody who typed `15550100000` are one account. Changing a number through `updateUser({ phone })` stages it and texts the new one, and the account keeps the old number until that code comes back with `type: 'phone_change'`.
 
 ## Signing in with Google, Github, or Apple
 
