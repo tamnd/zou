@@ -40,6 +40,7 @@ fn app(dsn: &str) -> axum::Router {
         schemas: vec![],
         external_url: Some("https://zou.test".to_string()),
         jwt_keys: None,
+        mailer_autoconfirm: false,
     })
     .expect("router builds")
 }
@@ -570,9 +571,9 @@ async fn the_grant_refuses_what_it_cannot_serve() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/auth/v1/token?grant_type=password")
+        .uri("/auth/v1/token?grant_type=id_token")
         .header("apikey", anon_key())
-        .body(Body::from(r#"{"email":"a@b.c","password":"x"}"#))
+        .body(Body::from(r#"{"provider":"google","id_token":"x"}"#))
         .unwrap();
     let res = app.clone().oneshot(req).await.expect("router answers");
     assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);

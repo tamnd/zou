@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 axum = { workspace = true }
 base64ct = { workspace = true }
+bcrypt = { version = "0.19", default-features = false, features = ["std", "zeroize"] }
 bytes = "1"
 getrandom = { workspace = true }
 hmac = { workspace = true }

@@ -163,6 +163,10 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // nothing here listens on.
             external_url: Some(format!("http://127.0.0.1:{port}")),
             jwt_keys: None,
+            // There is no inbox to read a confirmation link out of in a
+            // dev loop, so a signup is confirmed on the spot. The
+            // Supabase CLI does the same thing locally.
+            mailer_autoconfirm: true,
         };
         if let Err(e) = zou_server::serve_blocking(listener, cfg) {
             log::error!("http server: {e}");
