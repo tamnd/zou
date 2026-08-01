@@ -16,6 +16,7 @@ pub mod layout;
 pub mod lease;
 pub mod lsn;
 pub mod manifest;
+pub mod mem;
 pub mod open;
 #[cfg(feature = "s3")]
 pub mod s3;
@@ -37,6 +38,7 @@ pub use heartbeat::Heartbeat;
 pub use lease::{DEFAULT_TTL_SECS, HeldLease, LeaseError};
 pub use lsn::Lsn;
 pub use manifest::{MANIFEST_FORMAT, Manifest};
+pub use mem::MemStore;
 pub use open::{PrefixStore, open_store};
 #[cfg(feature = "s3")]
 pub use s3::{Dialect, S3Config, S3Store};
