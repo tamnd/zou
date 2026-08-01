@@ -8,3 +8,5 @@
 //! compiler and the embedding planner on top.
 
 pub mod filter;
+mod scan;
+pub mod select;

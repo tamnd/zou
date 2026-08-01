@@ -23,6 +23,9 @@
 
 use std::fmt;
 
+use crate::scan::{Cur, fmt_path, parse_json_path, scan_name, scan_quoted, write_escaped};
+pub use crate::scan::{Error, JsonKey, JsonStep};
+
 /// A filter operator, the token between the two dots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -162,21 +165,6 @@ impl LogicOp {
     }
 }
 
-/// One json arrow step hung off a column, `->key`, `->>key`, or an
-/// array index in either flavor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JsonStep {
-    /// True for `->>`, the text extraction arrow.
-    pub text: bool,
-    pub key: JsonKey,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JsonKey {
-    Name(String),
-    Index(i64),
-}
-
 /// Where a condition points: zero or more embedded resource names,
 /// the column, and an optional json path into it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,22 +224,6 @@ pub enum Parsed {
         kids: Vec<Node>,
     },
 }
-
-/// Where and why a parse failed. `at` is a zero based byte offset
-/// into whichever of the two strings was being read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Error {
-    pub message: String,
-    pub at: usize,
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at offset {}", self.message, self.at)
-    }
-}
-
-impl std::error::Error for Error {}
 
 /// Parse one query pair. The caller has already url decoded both
 /// sides and decided the key is not one of the reserved words like
@@ -336,115 +308,9 @@ fn embed_names(kc: &Cur, segs: Vec<Seg>) -> Result<Vec<String>, Error> {
     Ok(out)
 }
 
-struct Cur<'a> {
-    s: &'a str,
-    pos: usize,
-}
-
-impl<'a> Cur<'a> {
-    fn new(s: &'a str) -> Self {
-        Cur { s, pos: 0 }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.s.as_bytes().get(self.pos).copied()
-    }
-
-    fn bump(&mut self) {
-        self.pos += 1;
-    }
-
-    fn done(&self) -> bool {
-        self.pos >= self.s.len()
-    }
-
-    fn eat(&mut self, b: u8) -> bool {
-        if self.peek() == Some(b) {
-            self.bump();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn eat_str(&mut self, w: &str) -> bool {
-        if self.s.as_bytes()[self.pos..].starts_with(w.as_bytes()) {
-            self.pos += w.len();
-            true
-        } else {
-            false
-        }
-    }
-
-    fn starts(&self, w: &str) -> bool {
-        self.s.as_bytes()[self.pos..].starts_with(w.as_bytes())
-    }
-
-    fn err<T>(&self, message: impl Into<String>) -> Result<T, Error> {
-        Err(Error {
-            message: message.into(),
-            at: self.pos,
-        })
-    }
-
-    fn expect(&mut self, b: u8, what: &str) -> Result<(), Error> {
-        if self.eat(b) { Ok(()) } else { self.err(what) }
-    }
-
-    fn take_rest(&mut self) -> String {
-        let out = self.s[self.pos..].to_string();
-        self.pos = self.s.len();
-        out
-    }
-}
-
-/// Bytes that end a bare name: the field and value delimiters. The
-/// scan also stops at `->`, handled separately so a lone dash stays
-/// part of the name.
+/// Bytes that end a bare name: the field and value delimiters.
 fn name_break(b: u8) -> bool {
     matches!(b, b'.' | b',' | b'(' | b')' | b'"' | b'{' | b'}')
-}
-
-fn scan_name(cur: &mut Cur) -> String {
-    let start = cur.pos;
-    while let Some(b) = cur.peek() {
-        if name_break(b) || (b == b'-' && cur.starts("->")) {
-            break;
-        }
-        cur.bump();
-    }
-    cur.s[start..cur.pos].to_string()
-}
-
-fn scan_quoted(cur: &mut Cur) -> Result<String, Error> {
-    cur.expect(b'"', "expected an opening quote")?;
-    let mut out = Vec::new();
-    loop {
-        match cur.peek() {
-            None => return cur.err("unterminated quoted string"),
-            Some(b'"') => {
-                cur.bump();
-                break;
-            }
-            Some(b'\\') => {
-                cur.bump();
-                match cur.peek() {
-                    None => return cur.err("unterminated quoted string"),
-                    Some(b) => {
-                        out.push(b);
-                        cur.bump();
-                    }
-                }
-            }
-            Some(b) => {
-                out.push(b);
-                cur.bump();
-            }
-        }
-    }
-    // Only ascii delimiters split the input, so the bytes between
-    // them are still the valid utf8 they arrived as.
-    Ok(String::from_utf8(out).expect("splits happen at ascii bytes"))
 }
 
 fn parse_segment(cur: &mut Cur) -> Result<Seg, Error> {
@@ -452,42 +318,13 @@ fn parse_segment(cur: &mut Cur) -> Result<Seg, Error> {
     let name = if quoted {
         scan_quoted(cur)?
     } else {
-        scan_name(cur)
+        scan_name(cur, name_break)
     };
     if name.is_empty() {
         return cur.err("expected a field name");
     }
-    let mut path = Vec::new();
-    while cur.eat_str("->") {
-        let text = cur.eat(b'>');
-        let key = parse_json_key(cur)?;
-        path.push(JsonStep { text, key });
-    }
+    let path = parse_json_path(cur, name_break)?;
     Ok(Seg { name, path, quoted })
-}
-
-fn parse_json_key(cur: &mut Cur) -> Result<JsonKey, Error> {
-    let bytes = cur.s.as_bytes();
-    let digit_at = |i: usize| bytes.get(i).is_some_and(|b| b.is_ascii_digit());
-    let index = digit_at(cur.pos) || (cur.peek() == Some(b'-') && digit_at(cur.pos + 1));
-    if index {
-        let start = cur.pos;
-        if cur.peek() == Some(b'-') {
-            cur.bump();
-        }
-        while cur.peek().is_some_and(|b| b.is_ascii_digit()) {
-            cur.bump();
-        }
-        return match cur.s[start..cur.pos].parse::<i64>() {
-            Ok(n) => Ok(JsonKey::Index(n)),
-            Err(_) => cur.err("json index out of range"),
-        };
-    }
-    let name = scan_name(cur);
-    if name.is_empty() {
-        return cur.err("expected a json path key");
-    }
-    Ok(JsonKey::Name(name))
 }
 
 /// Parse `[not.]op[(modifier)].value` at the cursor. In a tree the
@@ -496,7 +333,7 @@ fn parse_json_key(cur: &mut Cur) -> Result<JsonKey, Error> {
 fn parse_cond_rhs(cur: &mut Cur, field: Field, in_tree: bool) -> Result<Cond, Error> {
     let negated = cur.eat_str("not.");
     let at = cur.pos;
-    let opname = scan_name(cur);
+    let opname = scan_name(cur, name_break);
     if opname.is_empty() {
         return cur.err("expected an operator");
     }
@@ -509,7 +346,7 @@ fn parse_cond_rhs(cur: &mut Cur, field: Field, in_tree: bool) -> Result<Cond, Er
     let mut quant = None;
     let mut config = None;
     if cur.eat(b'(') {
-        let m = scan_name(cur);
+        let m = scan_name(cur, name_break);
         if op.is_fts() {
             config = Some(m);
         } else if m == "any" && op.quantifiable() {
@@ -655,17 +492,6 @@ fn element_needs_quotes(s: &str) -> bool {
             .any(|b| matches!(b, b',' | b'(' | b')' | b'"' | b'{' | b'}' | b'\\'))
 }
 
-fn write_escaped(f: &mut fmt::Formatter<'_>, s: &str) -> fmt::Result {
-    write!(f, "\"")?;
-    for c in s.chars() {
-        if c == '"' || c == '\\' {
-            write!(f, "\\")?;
-        }
-        write!(f, "{c}")?;
-    }
-    write!(f, "\"")
-}
-
 struct Name<'a>(&'a str);
 
 impl fmt::Display for Name<'_> {
@@ -696,14 +522,7 @@ impl fmt::Display for Field {
             write!(f, "{}.", Name(e))?;
         }
         write!(f, "{}", Name(&self.column))?;
-        for step in &self.path {
-            write!(f, "->{}", if step.text { ">" } else { "" })?;
-            match &step.key {
-                JsonKey::Name(n) => write!(f, "{n}")?,
-                JsonKey::Index(i) => write!(f, "{i}")?,
-            }
-        }
-        Ok(())
+        fmt_path(f, &self.path)
     }
 }
 
