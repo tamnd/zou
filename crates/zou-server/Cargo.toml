@@ -1,0 +1,24 @@
+[package]
+name = "zou-server"
+description = "HTTP front door: Supabase compatible routing, keys, and JWT context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+base64ct = { workspace = true }
+hmac = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }
+tower = { workspace = true, features = ["util"] }
+
+[lints]
+workspace = true

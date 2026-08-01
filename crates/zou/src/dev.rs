@@ -38,6 +38,7 @@ pub struct Args {
     pub target: String,
     pub pg_bin: PathBuf,
     pub port: u16,
+    pub http: Option<u16>,
     pub runtime: PathBuf,
 }
 
@@ -47,6 +48,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut target = None;
     let mut pg_bin = None;
     let mut port = 5432u16;
+    let mut http = None;
     let mut runtime = None;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
@@ -55,6 +57,10 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--port" => {
                 let raw = need(&mut it, "--port")?;
                 port = raw.parse().map_err(|_| format!("bad port {raw:?}"))?;
+            }
+            "--http" => {
+                let raw = need(&mut it, "--http")?;
+                http = Some(raw.parse().map_err(|_| format!("bad http port {raw:?}"))?);
             }
             "--runtime" => runtime = Some(PathBuf::from(need(&mut it, "--runtime")?)),
             other if target.is_none() && !other.starts_with('-') => {
@@ -73,6 +79,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         target,
         pg_bin,
         port,
+        http,
         runtime,
     })
 }
@@ -105,6 +112,44 @@ fn shared_buffers() -> String {
     };
     let mb = ((bytes / 4) >> 20).max(128);
     format!("{mb}MB")
+}
+
+/// Start the HTTP front door on 127.0.0.1:port in its own thread. The
+/// secret comes from ZOU_JWT_SECRET when the caller pins one, so the
+/// keys stay stable across restarts, otherwise a fresh secret is
+/// generated and logged together with the keys it signs, which is
+/// enough for a dev loop. The keys are printed the way supabase start
+/// prints its own, copy them into the client and go.
+fn start_http(port: u16) -> Result<(), String> {
+    let secret = match std::env::var("ZOU_JWT_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            let mut raw = [0u8; 32];
+            getrandom::fill(&mut raw).map_err(|e| format!("random secret: {e}"))?;
+            let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+            log::info!("generated a jwt secret, pin ZOU_JWT_SECRET={hex} to keep keys stable");
+            hex
+        }
+    };
+    let anon = zou_server::jwt::mint(&zou_server::jwt::key_claims("anon"), secret.as_bytes());
+    let service = zou_server::jwt::mint(
+        &zou_server::jwt::key_claims("service_role"),
+        secret.as_bytes(),
+    );
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("bind http on 127.0.0.1:{port}: {e}"))?;
+    log::info!("http api on http://127.0.0.1:{port}");
+    log::info!("anon key {anon}");
+    log::info!("service_role key {service}");
+    std::thread::spawn(move || {
+        let cfg = zou_server::Config {
+            jwt_secret: secret.into_bytes(),
+        };
+        if let Err(e) = zou_server::serve_blocking(listener, cfg) {
+            log::error!("http server: {e}");
+        }
+    });
+    Ok(())
 }
 
 pub fn run(args: &Args) -> Result<(), String> {
@@ -199,6 +244,10 @@ pub fn run(args: &Args) -> Result<(), String> {
         let handler = on_signal as extern "C" fn(libc::c_int) as usize;
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
+    }
+
+    if let Some(http_port) = args.http {
+        start_http(http_port)?;
     }
 
     let mut failed_starts = 0u32;
@@ -298,6 +347,7 @@ mod tests {
         let args = parse(&argv(&["./data"])).unwrap();
         assert_eq!(args.target, "./data");
         assert_eq!(args.port, 5432);
+        assert_eq!(args.http, None);
         assert_eq!(args.pg_bin, PathBuf::from("build/pg/bin"));
     }
 
@@ -309,6 +359,8 @@ mod tests {
             "/opt/pg/bin",
             "--port",
             "5614",
+            "--http",
+            "54321",
             "--runtime",
             "/tmp/run",
         ]))
@@ -316,6 +368,7 @@ mod tests {
         assert_eq!(args.target, "s3://bucket/x");
         assert_eq!(args.pg_bin, PathBuf::from("/opt/pg/bin"));
         assert_eq!(args.port, 5614);
+        assert_eq!(args.http, Some(54321));
         assert_eq!(args.runtime, PathBuf::from("/tmp/run"));
     }
 
@@ -324,6 +377,7 @@ mod tests {
         assert!(parse(&argv(&[])).is_err());
         assert!(parse(&argv(&["./data", "--port"])).is_err());
         assert!(parse(&argv(&["./data", "--port", "hot"])).is_err());
+        assert!(parse(&argv(&["./data", "--http", "cold"])).is_err());
         assert!(parse(&argv(&["./data", "extra"])).is_err());
         assert!(parse(&argv(&["--bogus", "./data"])).is_err());
     }
