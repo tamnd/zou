@@ -1177,3 +1177,243 @@ async fn metadata_merges_and_a_null_removes_a_key() {
         )
     );
 }
+
+#[tokio::test]
+async fn a_magic_link_is_a_recovery_code_under_another_name() {
+    let Some(dsn) = dsn() else { return };
+    let pool = Pool::new(&dsn, 4).expect("dsn parses");
+    let email = address("magic-known");
+    wipe(&pool, &email).await;
+    let app = app_autoconfirm(&dsn);
+    confirmed(&app, &email).await;
+    let id = user_id(&pool, &email).await;
+
+    let asked = post(
+        &app,
+        "/auth/v1/magiclink",
+        serde_json::json!({"email": &email}),
+    )
+    .await;
+    assert_eq!(asked.status, StatusCode::OK, "{}", asked.body);
+    assert_eq!(asked.body, serde_json::json!({}), "it says nothing at all");
+
+    let staged: bool = scalar(
+        &pool,
+        "select recovery_token <> '' and recovery_sent_at is not null
+           from auth.users where id = $1::text::uuid",
+        &[&id],
+    )
+    .await;
+    assert!(staged, "the same column a recovery uses");
+
+    // And the same verify, under the type a client sends for a link it
+    // did not ask a password question about.
+    plant(&pool, &id, "recovery_token", &email, "123456").await;
+    let answer = post(
+        &app,
+        "/auth/v1/verify",
+        serde_json::json!({"type": "magiclink", "token": "123456", "email": &email}),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body["user"]["id"], id.as_str());
+    let claims = claims_of(answer.body["access_token"].as_str().expect("a session"));
+    assert_eq!(claims["amr"][0]["method"], "otp");
+}
+
+#[tokio::test]
+async fn a_magic_link_signs_up_an_address_nobody_holds() {
+    let Some(dsn) = dsn() else { return };
+    let pool = Pool::new(&dsn, 4).expect("dsn parses");
+
+    // Confirming locally: the account is made, confirmed, and the code
+    // that signs them in goes out on the spot.
+    let quick = address("magic-new-quick");
+    wipe(&pool, &quick).await;
+    let local = app_autoconfirm(&dsn);
+    let asked = post(
+        &local,
+        "/auth/v1/magiclink",
+        serde_json::json!({"email": &quick, "data": {"nickname": "tester"}}),
+    )
+    .await;
+    assert_eq!(asked.status, StatusCode::OK);
+    assert_eq!(asked.body, serde_json::json!({}));
+    let ready: bool = scalar(
+        &pool,
+        "select email_confirmed_at is not null and recovery_token <> ''
+                and raw_user_meta_data->>'nickname' = 'tester'
+           from auth.users where email = $1",
+        &[&quick],
+    )
+    .await;
+    assert!(ready, "signed up, confirmed, and a code is waiting");
+
+    // Mailing confirmations: the confirmation is the link, so there is
+    // no second code to send.
+    let slow = address("magic-new-slow");
+    wipe(&pool, &slow).await;
+    let mailing = app(&dsn);
+    let asked = post(
+        &mailing,
+        "/auth/v1/magiclink",
+        serde_json::json!({"email": &slow}),
+    )
+    .await;
+    assert_eq!(asked.status, StatusCode::OK);
+    let waiting: bool = scalar(
+        &pool,
+        "select email_confirmed_at is null and confirmation_token <> '' and recovery_token = ''
+           from auth.users where email = $1",
+        &[&slow],
+    )
+    .await;
+    assert!(waiting, "one code, and it is the confirmation");
+
+    // An address that is known but never proved is the same situation,
+    // so it takes the same path rather than being told to confirm the
+    // first link it already lost.
+    let asked = post(
+        &mailing,
+        "/auth/v1/magiclink",
+        serde_json::json!({"email": &slow}),
+    )
+    .await;
+    assert_eq!(asked.status, StatusCode::OK);
+    let one: i64 = scalar(
+        &pool,
+        "select count(*) from auth.users where email = $1",
+        &[&slow],
+    )
+    .await;
+    assert_eq!(one, 1, "and it did not sign anybody up twice");
+    let still: bool = scalar(
+        &pool,
+        "select confirmation_token <> '' and recovery_token = ''
+           from auth.users where email = $1",
+        &[&slow],
+    )
+    .await;
+    assert!(
+        still,
+        "and it did not send a sign in code to an address nobody has proved"
+    );
+
+    let empty = post(&mailing, "/auth/v1/magiclink", serde_json::json!({})).await;
+    assert_eq!(
+        empty.refusal(),
+        (
+            422,
+            "validation_failed",
+            "Password recovery requires an email"
+        ),
+        "upstream's wording, and its status, which is not recover's"
+    );
+}
+
+#[tokio::test]
+async fn the_otp_endpoint_is_the_magic_link_with_one_more_rule() {
+    let Some(dsn) = dsn() else { return };
+    let pool = Pool::new(&dsn, 4).expect("dsn parses");
+    let app = app_autoconfirm(&dsn);
+
+    for (body, expected) in [
+        (
+            serde_json::json!({"email": "a@zou.test", "phone": "+15551234567"}),
+            (
+                400,
+                "validation_failed",
+                "Only an email address or phone number should be provided",
+            ),
+        ),
+        (
+            serde_json::json!({"email": "a@zou.test", "channel": "sms"}),
+            (
+                400,
+                "validation_failed",
+                "Channel should only be specified with Phone OTP",
+            ),
+        ),
+        (
+            serde_json::json!({}),
+            (
+                400,
+                "validation_failed",
+                "One of email or phone must be set",
+            ),
+        ),
+    ] {
+        let answer = post(&app, "/auth/v1/otp", body.clone()).await;
+        assert_eq!(answer.refusal(), expected, "for {body}");
+    }
+
+    // A phone is a real branch upstream and not here yet, so it says so
+    // rather than pretending to have sent anything.
+    let phone = post(
+        &app,
+        "/auth/v1/otp",
+        serde_json::json!({"phone": "+15551234567"}),
+    )
+    .await;
+    assert_eq!(phone.status, StatusCode::NOT_IMPLEMENTED);
+
+    // create_user false turns it into a sign in, so an address nobody
+    // holds is refused instead of registered.
+    let stranger = address("otp-stranger");
+    wipe(&pool, &stranger).await;
+    let refused = post(
+        &app,
+        "/auth/v1/otp",
+        serde_json::json!({"email": &stranger, "create_user": false}),
+    )
+    .await;
+    assert_eq!(
+        refused.refusal(),
+        (422, "otp_disabled", "Signups not allowed for otp")
+    );
+    let none: i64 = scalar(
+        &pool,
+        "select count(*) from auth.users where email = $1",
+        &[&stranger],
+    )
+    .await;
+    assert_eq!(none, 0, "and nobody was created");
+
+    // Without the flag it is a magic link, so the same address is
+    // registered instead: upstream defaults create_user to true.
+    let asked = post(
+        &app,
+        "/auth/v1/otp",
+        serde_json::json!({"email": &stranger}),
+    )
+    .await;
+    assert_eq!(asked.status, StatusCode::OK, "{}", asked.body);
+    let made: i64 = scalar(
+        &pool,
+        "select count(*) from auth.users where email = $1 and recovery_token <> ''",
+        &[&stranger],
+    )
+    .await;
+    assert_eq!(made, 1, "and this time it did sign them up");
+
+    // The same request for somebody who does have an account sends the
+    // code, which is the whole point of the flag.
+    let known = address("otp-known");
+    wipe(&pool, &known).await;
+    confirmed(&app, &known).await;
+    let answer = post(
+        &app,
+        "/auth/v1/otp",
+        serde_json::json!({"email": &known, "create_user": false}),
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.body);
+    assert_eq!(answer.body, serde_json::json!({}));
+    let staged: bool = scalar(
+        &pool,
+        "select recovery_token <> '' from auth.users where email = $1",
+        &[&known],
+    )
+    .await;
+    assert!(staged);
+}

@@ -397,6 +397,8 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/auth/v1/token", post(auth::token))
         .route("/auth/v1/signup", post(auth::signup))
         .route("/auth/v1/recover", post(auth::recover))
+        .route("/auth/v1/magiclink", post(auth::magiclink))
+        .route("/auth/v1/otp", post(auth::otp))
         .route("/auth/v1/reauthenticate", post(auth::reauthenticate))
         // Reading the user back is the other half of this endpoint and
         // it lands with the rest of the session surface, so it keeps
