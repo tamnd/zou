@@ -174,31 +174,31 @@ fn referer(req: &Request<Body>) -> String {
 /// from, both read before the body is consumed. Upstream takes the
 /// redirect from the query string on these endpoints rather than from
 /// the body, and falls back to the Referer.
-fn link_target(req: &Request<Body>) -> (String, String) {
+pub(crate) fn link_target(req: &Request<Body>) -> (String, String) {
     let query = query_object(req.uri().query().unwrap_or_default());
     (field(&query, "redirect_to").to_string(), referer(req))
 }
 
 /// One code, as it is held: the digits that go in the email and the
 /// hash of them that goes in the database.
-struct Code {
-    code: String,
-    hash: String,
+pub(crate) struct Code {
+    pub(crate) code: String,
+    pub(crate) hash: String,
 }
 
 /// What one outgoing code is about.
-struct Outgoing<'a> {
+pub(crate) struct Outgoing<'a> {
     /// Which template renders it.
-    template: &'a str,
+    pub(crate) template: &'a str,
     /// The type the link carries, which is what verify branches on and
     /// is not always the template's own name.
-    kind: &'a str,
+    pub(crate) kind: &'a str,
     /// Where it goes, which for a change of address is not the address
     /// on the account.
-    to: &'a str,
-    code: &'a Code,
+    pub(crate) to: &'a str,
+    pub(crate) code: &'a Code,
     /// The address being moved to, for the change of address templates.
-    new_email: &'a str,
+    pub(crate) new_email: &'a str,
 }
 
 /// Render one code into its email and hand it to the sender.
@@ -207,7 +207,7 @@ struct Outgoing<'a> {
 /// fails takes the token it was carrying with it, so the account is
 /// never left holding a code that nobody was told, and the next
 /// attempt draws a fresh one.
-async fn send_code(
+pub(crate) async fn send_code(
     sess: &sql::Session,
     post: &Post<'_>,
     user_id: &str,
@@ -785,7 +785,7 @@ async fn swap(sess: &sql::Session, found: &Presented) -> Result<String, Error> {
 /// A six digit one time code, GoTrue's MAILER_OTP_LENGTH default. It is
 /// what the confirmation email carries, and it is drawn uniformly
 /// rather than from the low bits of a timestamp.
-fn six_digits() -> String {
+pub(crate) fn six_digits() -> String {
     let mut raw = [0u8; 4];
     getrandom::fill(&mut raw).expect("the os rng never fails");
     // A million does not divide 2^32, so the top of the range is
@@ -802,7 +802,7 @@ fn six_digits() -> String {
 /// address and the code together, which is GoTrue's GenerateTokenHash.
 /// The code itself is never written down, so a database that leaks does
 /// not hand out working confirmation links.
-fn token_hash(email: &str, otp: &str) -> String {
+pub(crate) fn token_hash(email: &str, otp: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha224::digest(format!("{email}{otp}").as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()
@@ -1241,7 +1241,7 @@ const TOKEN_EXPIRED: &str = "Token has expired or is invalid";
 /// new code replaces the one before it rather than leaving two that
 /// both work. `relates_to` is the address the code was sent to, which
 /// is what stops a code from being worth anything anywhere else.
-async fn keep_token(
+pub(crate) async fn keep_token(
     sess: &sql::Session,
     user_id: &str,
     token_type: &str,
@@ -2848,7 +2848,7 @@ fn oauth_error(status: StatusCode) -> &'static str {
 /// on the same terms, otherwise the site url. An open redirect here
 /// would turn every confirmation email into a phishing hop, so an
 /// address that is not ours is dropped rather than refused.
-fn landing(app: &App, wanted: &str, referrer: &str) -> String {
+pub(crate) fn landing(app: &App, wanted: &str, referrer: &str) -> String {
     let site = app.site_url();
     for candidate in [wanted, referrer] {
         if !candidate.is_empty() && same_site(&site, candidate) {
@@ -5037,6 +5037,24 @@ mod tests {
             "200 draws collided {} times",
             200 - seen.len()
         );
+    }
+
+    #[test]
+    fn the_password_nobody_types_is_a_different_one_every_time() {
+        // The account a magic link or an admin create leaves behind has
+        // a password column nobody can satisfy, and the only thing that
+        // makes that true is that the value is long and drawn fresh.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let drawn = unguessable_password();
+            assert_eq!(drawn.len(), 33, "GoTrue draws 33: {drawn}");
+            assert!(
+                drawn.chars().all(|c| c.is_ascii_alphanumeric()),
+                "not from the alphabet: {drawn}"
+            );
+            seen.insert(drawn);
+        }
+        assert_eq!(seen.len(), 100, "the same password came up twice");
     }
 
     #[test]

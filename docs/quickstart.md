@@ -164,6 +164,29 @@ An account created this way needs no confirmation mail: `email_confirm` is the a
 
 The second argument to `deleteUser` is a soft delete. The row stays, so an application's own rows pointing at `auth.users` still resolve, and the address, the number, the password, the metadata and every identity are replaced with a one way hash of themselves. Sessions and factors go for good either way.
 
+## Sending the mail yourself
+
+A project with its own templates and its own mail provider does not want zou posting anything. `generateLink` writes down everything the flow would have written down and hands the link back instead of sending it.
+
+```js
+const { data } = await admin.generateLink({
+  type: 'magiclink',                       // signup, invite, recovery, email_change_current, email_change_new
+  email: 'ada@example.com',
+  options: { redirectTo: 'https://app.example.com/welcome' },
+})
+// data.properties.action_link, .email_otp, .hashed_token, .verification_type
+```
+
+Nothing goes out, so the dev inbox stays empty and a real SMTP server is never touched. The six digit code comes back next to the link, so a project that verifies codes rather than links has both. A `magiclink` for an address nobody has signed up with turns into a signup with a password nobody knows, which is upstream's way of inviting somebody without saying so, and the answer says `signup` back. A `recovery` or an email change for an address with no account is a 404 rather than a silence, because the caller here is the project itself and not a stranger. `redirectTo` is dropped unless it is somewhere this project owns, the same rule the rest of the mail follows.
+
+`admin.inviteUserByEmail(email)` is the other half: it makes the account and does post the mail.
+
+```js
+await admin.inviteUserByEmail('ada@example.com', { data: { team: 'core' } })
+```
+
+The account it leaves has no password at all, so the invitation is the only way in until whoever takes it sets one, and it is marked `invited_at` so an application can tell an invited account from one that signed itself up. An address somebody has already confirmed is refused with `email_exists`; an account that never confirmed is invited where it stands, and the code it was holding stops working.
+
 ## Where to go next
 
 - docs/architecture.md for the shape of the whole system
