@@ -18,7 +18,7 @@
 //! expect them to equal the content hashes the local backend produces.
 
 use std::io::Read;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
@@ -59,10 +59,20 @@ pub struct S3Config {
     pub dialect: Dialect,
 }
 
+/// Total attempts per request, so up to three retries after the first.
+const MAX_ATTEMPTS: u32 = 4;
+
+/// Statuses worth retrying: throttling and transient server trouble.
+/// Everything else means what it says and goes straight to the caller.
+fn retryable(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
 pub struct S3Store {
     agent: ureq::Agent,
     cfg: S3Config,
     host: String,
+    retry_base: Duration,
 }
 
 impl S3Store {
@@ -79,7 +89,19 @@ impl S3Store {
             .http_status_as_error(false)
             .build()
             .into();
-        Self { agent, cfg, host }
+        // First backoff step, doubling per retry. The env knob exists so
+        // fault injection tests can run a fast schedule.
+        let retry_base = std::env::var("ZOU_S3_RETRY_BASE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_millis(100));
+        Self {
+            agent,
+            cfg,
+            host,
+            retry_base,
+        }
     }
 
     fn io(key: &str, msg: String) -> CasError {
@@ -108,12 +130,84 @@ impl S3Store {
         err_key: &str,
     ) -> Result<(u16, Option<String>, Vec<u8>), CasError> {
         let payload_hash = body.map_or_else(|| EMPTY_SHA256.to_string(), sha256_hex);
+        let url = if query.is_empty() {
+            format!("{}{path}", self.cfg.endpoint.trim_end_matches('/'))
+        } else {
+            format!("{}{path}?{query}", self.cfg.endpoint.trim_end_matches('/'))
+        };
+        // GET and DELETE are idempotent, so transport errors retry, which
+        // also absorbs a stale pooled connection that died between
+        // requests. A PUT that dies on the wire is not retried at this
+        // layer: the outcome is ambiguous and callers own that decision.
+        // Throttling and 5xx answers retry for every method with
+        // exponential backoff, bounded so commits stall visibly rather
+        // than hang. Signing happens per attempt to keep the timestamp
+        // fresh.
+        let idempotent = method == "GET" || method == "DELETE";
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let retry = |what: &str| {
+                if attempt >= MAX_ATTEMPTS {
+                    return None;
+                }
+                let wait = self.retry_base * 2u32.pow(attempt - 1);
+                log::warn!("s3 {method} {err_key}: {what}, retrying in {wait:?}");
+                Some(wait)
+            };
+            let (status, version, data) = match self.attempt(
+                method,
+                path,
+                query,
+                &url,
+                body,
+                extra_headers,
+                &payload_hash,
+            ) {
+                Ok(answer) => answer,
+                Err(e) if idempotent => match retry(&format!("transport: {e}")) {
+                    // The first transport retry goes immediately, a dead
+                    // pooled connection needs no backoff.
+                    Some(wait) => {
+                        if attempt > 1 {
+                            std::thread::sleep(wait);
+                        }
+                        continue;
+                    }
+                    None => return Err(Self::io(err_key, format!("transport: {e}"))),
+                },
+                Err(e) => return Err(Self::io(err_key, format!("transport: {e}"))),
+            };
+            if retryable(status)
+                && let Some(wait) = retry(&format!("status {status}"))
+            {
+                std::thread::sleep(wait);
+                continue;
+            }
+            return Ok((status, version, data));
+        }
+    }
+
+    /// One signed attempt: build the signature, send, read the body.
+    /// Transport and body read failures come back as one error kind so
+    /// the retry loop above can treat them alike.
+    #[allow(clippy::too_many_arguments)]
+    fn attempt(
+        &self,
+        method: &str,
+        path: &str,
+        query: &str,
+        url: &str,
+        body: Option<&[u8]>,
+        extra_headers: &[(&str, &str)],
+        payload_hash: &str,
+    ) -> Result<(u16, Option<String>, Vec<u8>), String> {
         let (amz_date, datestamp) = amz_timestamp(SystemTime::now());
         // The condition headers are signed too. SigV4 allows signing any
         // header, and GCS requires its x-goog-* headers in the signature.
         let mut signed_headers = vec![
             ("host".to_string(), self.host.clone()),
-            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
+            ("x-amz-content-sha256".to_string(), payload_hash.to_string()),
             ("x-amz-date".to_string(), amz_date.clone()),
         ];
         for (k, v) in extra_headers {
@@ -126,29 +220,23 @@ impl S3Store {
             path,
             query,
             &signed_headers,
-            &payload_hash,
+            payload_hash,
             &amz_date,
             &datestamp,
         );
-
-        let url = if query.is_empty() {
-            format!("{}{path}", self.cfg.endpoint.trim_end_matches('/'))
-        } else {
-            format!("{}{path}?{query}", self.cfg.endpoint.trim_end_matches('/'))
-        };
-        let send = || match method {
+        let result = match method {
             "GET" => {
-                let mut req = self.agent.get(&url);
+                let mut req = self.agent.get(url);
                 for (k, v) in extra_headers {
                     req = req.header(*k, *v);
                 }
                 req.header("authorization", &auth)
-                    .header("x-amz-content-sha256", &payload_hash)
+                    .header("x-amz-content-sha256", payload_hash)
                     .header("x-amz-date", &amz_date)
                     .call()
             }
             "PUT" => {
-                let mut req = self.agent.put(&url);
+                let mut req = self.agent.put(url);
                 for (k, v) in extra_headers {
                     req = req.header(*k, *v);
                 }
@@ -159,30 +247,23 @@ impl S3Store {
                 // poisoning the pool.
                 req.header("connection", "close")
                     .header("authorization", &auth)
-                    .header("x-amz-content-sha256", &payload_hash)
+                    .header("x-amz-content-sha256", payload_hash)
                     .header("x-amz-date", &amz_date)
                     .send(body.unwrap_or_default())
             }
             "DELETE" => {
-                let mut req = self.agent.delete(&url);
+                let mut req = self.agent.delete(url);
                 for (k, v) in extra_headers {
                     req = req.header(*k, *v);
                 }
                 req.header("authorization", &auth)
-                    .header("x-amz-content-sha256", &payload_hash)
+                    .header("x-amz-content-sha256", payload_hash)
                     .header("x-amz-date", &amz_date)
                     .call()
             }
             other => unreachable!("unsupported method {other}"),
         };
-        // GET and DELETE are idempotent, so one retry absorbs a stale
-        // pooled connection that died between requests. PUT is not
-        // retried at this layer: callers own that decision.
-        let result = match send() {
-            Err(_) if method == "GET" || method == "DELETE" => send(),
-            other => other,
-        };
-        let res = result.map_err(|e| Self::io(err_key, format!("transport: {e}")))?;
+        let res = result.map_err(|e| e.to_string())?;
 
         let status = res.status().as_u16();
         let version_header = match self.cfg.dialect {
@@ -198,7 +279,7 @@ impl S3Store {
         res.into_body()
             .into_reader()
             .read_to_end(&mut data)
-            .map_err(|e| Self::io(err_key, format!("reading body: {e}")))?;
+            .map_err(|e| format!("reading body: {e}"))?;
         Ok((status, version, data))
     }
 }
@@ -591,6 +672,17 @@ mod tests {
             amz_timestamp(at(1_769_903_999)),
             ("20260131T235959Z".to_string(), "20260131".to_string())
         );
+    }
+
+    #[test]
+    fn only_throttling_and_transient_server_errors_retry() {
+        for s in [429, 500, 502, 503, 504] {
+            assert!(retryable(s), "{s} should retry");
+        }
+        // CAS statuses and client errors carry meaning, never retry them.
+        for s in [200, 204, 206, 304, 400, 403, 404, 409, 412, 416, 501] {
+            assert!(!retryable(s), "{s} must not retry");
+        }
     }
 
     #[test]
