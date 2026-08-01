@@ -81,6 +81,32 @@ fn need<'a>(it: &mut std::slice::Iter<'a, String>, flag: &str) -> Result<&'a Str
     it.next().ok_or_else(|| format!("{flag} needs a value"))
 }
 
+/// shared_buffers for this machine: a quarter of physical RAM, the
+/// stock initdb 128M starves any working set bigger than toy scale and
+/// turns every eviction into a store round trip. Passed on the
+/// postgres command line rather than baked into postgresql.conf at
+/// initdb time, so a store initialized on a laptop still sizes to the
+/// server that later attaches it. ZOU_SHARED_BUFFERS overrides, any
+/// value postgres accepts.
+fn shared_buffers() -> String {
+    if let Ok(v) = std::env::var("ZOU_SHARED_BUFFERS")
+        && !v.is_empty()
+    {
+        return v;
+    }
+    let bytes = unsafe {
+        let pages = libc::sysconf(libc::_SC_PHYS_PAGES);
+        let size = libc::sysconf(libc::_SC_PAGE_SIZE);
+        if pages > 0 && size > 0 {
+            pages as u64 * size as u64
+        } else {
+            0
+        }
+    };
+    let mb = ((bytes / 4) >> 20).max(128);
+    format!("{mb}MB")
+}
+
 pub fn run(args: &Args) -> Result<(), String> {
     let postgres = args.pg_bin.join("postgres");
     if !postgres.is_file() {
@@ -169,6 +195,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             .arg("-k")
             .arg(&sock)
             .args(["-c", "listen_addresses=127.0.0.1"])
+            .args(["-c", &format!("shared_buffers={}", shared_buffers())])
             .env("ZOU_TARGET", &args.target)
             .env("ZOU_PAGE_CACHE", &pagecache)
             .stdout(Stdio::null())
