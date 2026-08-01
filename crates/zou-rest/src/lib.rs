@@ -13,6 +13,7 @@ pub mod mutate;
 pub mod order;
 pub mod page;
 pub mod plan;
+pub mod rpc;
 mod scan;
 pub mod select;
 pub mod sql;
