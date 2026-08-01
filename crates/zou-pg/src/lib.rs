@@ -11,10 +11,13 @@
 //! WAL plus checkpoints as the milestone progresses, at which point reads
 //! route through checkpoint objects instead. The FFI surface stays.
 //!
-//! Two things keep the round trips off the query path: skipFsync pages
-//! buffer in this process and drain in parallel when durability comes
-//! due (see the pending module), and the vectored entry points fan
-//! independent gets, puts, and deletes across a small thread pool.
+//! Three things keep the round trips off the query path: skipFsync
+//! pages buffer in this process and drain in parallel when durability
+//! comes due (see the pending module), the vectored entry points fan
+//! independent gets, puts, and deletes across a small thread pool, and
+//! every page written to or read from the store also lands in a local
+//! write-through cache that answers reads first (see the pagecache
+//! module), so a warm working set never leaves the machine.
 //!
 //! Every function returns 0 for success or a negative ZOU_ERR code, and
 //! never unwinds into C. Postgres turns nonzero into ereport(ERROR).
@@ -24,6 +27,7 @@ pub mod cache;
 pub mod capture;
 pub mod fold;
 pub mod gc;
+pub mod pagecache;
 pub mod pending;
 pub mod reader;
 pub mod restore;
@@ -74,6 +78,10 @@ struct Shim {
     /// Locked after neither of the other locks, drains release it
     /// before touching the store.
     pending: Mutex<pending::Pending>,
+    /// Write-through local page cache, `None` when ZOU_PAGE_CACHE is
+    /// unset. Plain files, no lock, cross process safety comes from
+    /// bufmgr never running IO on one block from two processes.
+    cache: Option<pagecache::PageCache>,
 }
 
 static SHIM: OnceLock<Shim> = OnceLock::new();
@@ -326,6 +334,7 @@ pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
             layout: TenantLayout::new(&tenant),
             reader: Mutex::new(ReaderSlot::Unset),
             pending: Mutex::new(pending::Pending::default()),
+            cache: pagecache::PageCache::from_env(),
         });
         ZOU_OK
     })
@@ -431,6 +440,12 @@ pub unsafe extern "C" fn zou_smgr_read(
             out.copy_from_slice(&page);
             return ZOU_OK;
         }
+        if let Some(cache) = &shim.cache
+            && let Some(page) = cache.load((spc, db, rel, fork), blk)
+        {
+            out.copy_from_slice(&page);
+            return ZOU_OK;
+        }
         let r = walscan::BlockRef {
             spc,
             db,
@@ -441,6 +456,9 @@ pub unsafe extern "C" fn zou_smgr_read(
         match chain_read(shim, r, durable_lsn) {
             Ok(Some(page)) => {
                 out.copy_from_slice(&page);
+                if let Some(cache) = &shim.cache {
+                    cache.save((spc, db, rel, fork), blk, &page);
+                }
                 return ZOU_OK;
             }
             Ok(None) => {}
@@ -452,10 +470,17 @@ pub unsafe extern "C" fn zou_smgr_read(
         {
             Ok(Some((data, _))) if data.len() == ZOU_PAGE_SIZE => {
                 out.copy_from_slice(&data);
+                if let Some(cache) = &shim.cache {
+                    cache.save((spc, db, rel, fork), blk, &data);
+                }
                 ZOU_OK
             }
             Ok(Some(_)) => ZOU_ERR_STORE,
             Ok(None) => {
+                // Absent blocks read as zeros and stay out of the
+                // cache, absence is already a local answer once SIZE
+                // is known and zeros cached across a truncate and
+                // re-extend would need their own invalidation.
                 out.fill(0);
                 ZOU_OK
             }
@@ -499,6 +524,12 @@ pub unsafe extern "C" fn zou_smgr_readv(
                 out.copy_from_slice(&page);
                 continue;
             }
+            if let Some(cache) = &shim.cache
+                && let Some(page) = cache.load((spc, db, rel, fork), b)
+            {
+                out.copy_from_slice(&page);
+                continue;
+            }
             let r = walscan::BlockRef {
                 spc,
                 db,
@@ -507,7 +538,12 @@ pub unsafe extern "C" fn zou_smgr_readv(
                 blk: b,
             };
             match chain_read(shim, r, durable_lsn) {
-                Ok(Some(page)) => out.copy_from_slice(&page),
+                Ok(Some(page)) => {
+                    out.copy_from_slice(&page);
+                    if let Some(cache) = &shim.cache {
+                        cache.save((spc, db, rel, fork), b, &page);
+                    }
+                }
                 Ok(None) => misses.push((i, b)),
                 Err(()) => return ZOU_ERR_STORE,
             }
@@ -528,6 +564,9 @@ pub unsafe extern "C" fn zou_smgr_readv(
             {
                 Ok(Some((data, _))) if data.len() == ZOU_PAGE_SIZE => {
                     out.copy_from_slice(&data);
+                    if let Some(cache) = &shim.cache {
+                        cache.save((spc, db, rel, fork), *b, &data);
+                    }
                     true
                 }
                 Ok(Some(_)) | Err(_) => false,
@@ -568,6 +607,9 @@ pub unsafe extern "C" fn zou_smgr_write(
                 if let Ok(mut slot) = shim.pending.lock() {
                     slot.refresh((spc, db, rel, fork), blk, data);
                 }
+                if let Some(cache) = &shim.cache {
+                    cache.save((spc, db, rel, fork), blk, data);
+                }
                 note_write(
                     shim,
                     walscan::BlockRef {
@@ -604,6 +646,11 @@ fn buffer_page(
         }
         slot.push(fork, blk, page, grow.then_some(blk + 1))
     };
+    // The cache copy lands now rather than at drain time, so a page
+    // that outlives its pending stay reads locally either way.
+    if let Some(cache) = &shim.cache {
+        cache.save(fork, blk, page);
+    }
     let (spc, db, rel, fk) = fork;
     note_write(
         shim,
@@ -740,6 +787,9 @@ pub unsafe extern "C" fn zou_smgr_writev(
             if let Ok(mut slot) = shim.pending.lock() {
                 slot.refresh((spc, db, rel, fork), blk + i as u32, page);
             }
+            if let Some(cache) = &shim.cache {
+                cache.save((spc, db, rel, fork), blk + i as u32, page);
+            }
             note_write(
                 shim,
                 walscan::BlockRef {
@@ -813,6 +863,9 @@ pub extern "C" fn zou_smgr_truncate(spc: u32, db: u32, rel: u32, fork: u32, nblo
         } else {
             return ZOU_ERR_STORE;
         }
+        if let Some(cache) = &shim.cache {
+            cache.truncate((spc, db, rel, fork), nblocks);
+        }
         note_truncate(shim, spc, db, rel, fork, nblocks);
         if write_size(shim, spc, db, rel, fork, nblocks).is_err() {
             return ZOU_ERR_STORE;
@@ -841,6 +894,9 @@ pub extern "C" fn zou_smgr_unlink(spc: u32, db: u32, rel: u32, fork: u32) -> i32
             slot.forget((spc, db, rel, fork));
         } else {
             return ZOU_ERR_STORE;
+        }
+        if let Some(cache) = &shim.cache {
+            cache.forget((spc, db, rel, fork));
         }
         note_rel(shim, spc, db, rel);
         // SIZE goes first so the fork stops existing even if a block
@@ -1176,8 +1232,11 @@ mod tests {
     #[test]
     fn the_c_abi_lifecycle_works_end_to_end() {
         let dir = tempfile::tempdir().unwrap();
+        let cache_dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("ZOU_PAGE_CACHE", cache_dir.path()) };
         let target = CString::new(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(unsafe { zou_pg_init(target.as_ptr()) }, ZOU_OK);
+        unsafe { std::env::remove_var("ZOU_PAGE_CACHE") };
         // Idempotent: a second init from the same process is fine.
         assert_eq!(unsafe { zou_pg_init(target.as_ptr()) }, ZOU_OK);
 
@@ -1342,7 +1401,30 @@ mod tests {
             );
             assert!(buf.iter().all(|b| *b == expect), "block {blk}");
         }
+
+        // The write-through cache answers reads on its own: delete a
+        // block object behind the shim's back and the page still comes
+        // back, no store get involved.
+        shim.store
+            .delete(&shim.layout.pg_block(spc, db, rel2, fork, 2))
+            .unwrap();
+        assert_eq!(
+            unsafe { zou_smgr_read(spc, db, rel2, fork, 2, buf.as_mut_ptr(), 0) },
+            ZOU_OK
+        );
+        assert!(
+            buf.iter().all(|b| *b == 0x50),
+            "cache serves the deleted block"
+        );
+
         assert_eq!(zou_smgr_unlink(spc, db, rel2, fork), ZOU_OK);
+        // Unlink dropped the cached fork too, the read now zero fills
+        // instead of resurrecting cached pages.
+        assert_eq!(
+            unsafe { zou_smgr_read(spc, db, rel2, fork, 2, buf.as_mut_ptr(), 0) },
+            ZOU_OK
+        );
+        assert!(buf.iter().all(|b| *b == 0), "no cache after unlink");
     }
 
     /// One test for the WAL side too, the pipe is its own process global.
