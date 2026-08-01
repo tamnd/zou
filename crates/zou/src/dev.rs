@@ -153,6 +153,9 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
         let cfg = zou_server::Config {
             jwt_secret: secret.into_bytes(),
             pg: Some(dsn),
+            // Unlimited in the dev loop, GoTrue's per endpoint budgets
+            // arrive with the auth surface.
+            rate: None,
         };
         if let Err(e) = zou_server::serve_blocking(listener, cfg) {
             log::error!("http server: {e}");
