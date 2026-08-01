@@ -685,6 +685,176 @@ async fn an_rls_write_denial_comes_back_as_401() {
 }
 
 #[tokio::test]
+async fn the_count_preferences_speak_postgrest() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_cnt_items, zou_cnt_owners cascade",
+            "create table zou_cnt_owners (id int primary key, name text)",
+            "create table zou_cnt_items (id int primary key, \
+             owner_id int references zou_cnt_owners(id), name text)",
+            "insert into zou_cnt_owners values (1, 'ann'), (2, 'bob')",
+            "insert into zou_cnt_items values \
+             (1, 1, 'a'), (2, 1, 'b'), (3, 1, 'c'), (4, 1, 'd'), \
+             (5, 2, 'e'), (6, 2, 'f'), (7, 2, 'g')",
+            "analyze zou_cnt_items",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // A paged exact count: the total lands in Content-Range, the
+    // partial window is a 206, and the preference echoes back.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_cnt_items?select=id&order=id&limit=2",
+            "",
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.headers()["content-range"], "0-1/7");
+    assert_eq!(res.headers()["preference-applied"], "count=exact");
+    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 2}]"#);
+
+    // Unpaged with the whole table served is a 200 over the full
+    // window.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_cnt_items?select=id",
+            "",
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-range"], "0-6/7");
+
+    // The count query sees the filters and an inner embed's
+    // narrowing, not just the raw table.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_cnt_items?select=id,zou_cnt_owners!inner(name)&zou_cnt_owners.name=eq.ann&id=lte.5&order=id&limit=1",
+            "",
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.headers()["content-range"], "0-0/4");
+
+    // A window past the end is PostgREST's 416 with the PGRST103
+    // body, the total still in the header.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_cnt_items?select=id&offset=10&limit=2",
+            "",
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(res.headers()["content-range"], "*/7");
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST103");
+    assert_eq!(body["message"], "Requested range not satisfiable");
+    assert_eq!(
+        body["details"],
+        "An offset of 10 was requested, but there are only 7 rows."
+    );
+
+    // An empty filtered read with a count is 200 over */0.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_cnt_items?select=id&id=gt.100",
+            "",
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-range"], "*/0");
+
+    // Planned reads the analyzed estimate, estimated agrees with
+    // exact on a small table; both still page as 206.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_cnt_items?select=id&order=id&limit=1",
+            "",
+            &["count=planned"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.headers()["content-range"], "0-0/7");
+    assert_eq!(res.headers()["preference-applied"], "count=planned");
+
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_cnt_items?select=id&order=id&limit=2",
+            "",
+            &["count=estimated"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.headers()["content-range"], "0-1/7");
+
+    // Writes carry Content-Range too: inserts and deletes collapse
+    // the window, an update shows the rows it touched, and the total
+    // only lands when count= asked for it.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_cnt_items",
+            r#"{"id": 8, "owner_id": 2, "name": "h"}"#,
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(res.headers()["content-range"], "*/1");
+
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_cnt_items?owner_id=eq.2",
+            r#"{"name": "z"}"#,
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(res.headers()["content-range"], "0-3/4");
+
+    let res = app
+        .clone()
+        .oneshot(req("DELETE", "/rest/v1/zou_cnt_items?id=eq.8", "", &[]))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(res.headers()["content-range"], "*/*");
+}
+
+#[tokio::test]
 async fn the_context_and_rls_hold_through_the_whole_door() {
     let Some(dsn) = dsn() else { return };
     seed(

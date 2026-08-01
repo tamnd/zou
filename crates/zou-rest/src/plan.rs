@@ -135,6 +135,31 @@ pub fn plan_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sq
     })
 }
 
+/// The count query a `Prefer: count=` total runs beside a read:
+/// `select 1` over the root with its filters, and each `!inner`
+/// embed folded into an EXISTS carrying its own filters and its own
+/// inner children, since those are the only parts of the select tree
+/// that change how many rows the root keeps. Left joined embeds,
+/// output columns, order, and paging all drop out, which is exactly
+/// PostgREST's readPlanToCountQuery.
+pub fn count(catalog: &Catalog, q: &Query) -> Result<Sql, PlanError> {
+    let routes = collect_routes(&q.select);
+    let filters = route_filters(q, &routes)?;
+    let mut p = Planner {
+        catalog,
+        q,
+        filters,
+        params: Vec::new(),
+        next: 0,
+    };
+    let root = p.next_alias();
+    let text = p.count_level(&q.table, &root, &q.select, &[], None)?;
+    Ok(Sql {
+        text,
+        params: p.params,
+    })
+}
+
 /// The key an embed answers to in routes and in the response.
 fn key_of(e: &Embed) -> &str {
     e.alias.as_deref().unwrap_or(&e.relation)
@@ -340,6 +365,66 @@ impl Planner<'_> {
         }
         if let Some((_, n)) = self.q.offset.iter().find(|(r, _)| r == path) {
             sql.push_str(&format!(" offset {n}"));
+        }
+        Ok(sql)
+    }
+
+    /// One level of the count query: `select 1` from this table with
+    /// the filters routed here, inner embeds recursing as EXISTS.
+    fn count_level(
+        &mut self,
+        table: &str,
+        alias: &str,
+        items: &[Item],
+        path: &[String],
+        link: Option<String>,
+    ) -> Result<String, PlanError> {
+        let from = match &self.q.source {
+            Some(s) if path.is_empty() => s.as_str(),
+            _ => table,
+        };
+        let mut sql = format!(
+            "select 1 from {} as {}",
+            quote_ident(from),
+            quote_ident(alias)
+        );
+
+        let mut conjuncts: Vec<String> = Vec::new();
+        if let Some(link) = link {
+            conjuncts.push(link);
+        }
+        let mine: Vec<Node> = self
+            .filters
+            .iter()
+            .filter(|(r, _)| r == path)
+            .map(|(_, n)| n.clone())
+            .collect();
+        if !mine.is_empty() {
+            let compiled = where_clause_from(&mine, Some(alias), std::mem::take(&mut self.params))?;
+            self.params = compiled.params;
+            conjuncts.push(compiled.text);
+        }
+        for item in items {
+            let (Item::Embed(e) | Item::Spread(e)) = item else {
+                continue;
+            };
+            if e.join != Some(Join::Inner) {
+                continue;
+            }
+            let rel = self
+                .catalog
+                .resolve(table, &e.relation, e.hint.as_deref())?;
+            let child = self.next_alias();
+            let junction = rel.via.as_ref().map(|_| self.next_alias());
+            let mut child_path = path.to_vec();
+            child_path.push(key_of(e).to_string());
+            let link = link_sql(&rel, alias, &child, junction.as_deref());
+            let sub = self.count_level(&e.relation, &child, &e.items, &child_path, Some(link))?;
+            conjuncts.push(format!("exists ({sub})"));
+        }
+        if !conjuncts.is_empty() {
+            sql.push_str(" where ");
+            sql.push_str(&conjuncts.join(" AND "));
         }
         Ok(sql)
     }
@@ -764,6 +849,36 @@ mod tests {
         assert!(t.starts_with(r#"select "z0"."id" as "id" from"#), "{t}");
         assert!(t.contains(r#"select 1 from "orders""#), "{t}");
         assert!(t.contains(r#"is not null"#), "{t}");
+    }
+
+    #[test]
+    fn the_count_query_keeps_only_what_changes_the_count() {
+        // A left joined embed and the output shape drop out entirely.
+        let mut q = query("users", "id,orders(id)");
+        filt(&mut q, "id", "gte.5");
+        let sql = count(&shop(), &q).unwrap();
+        assert_eq!(
+            sql.text,
+            r#"select 1 from "users" as "z0" where "z0"."id" >= $1"#
+        );
+        assert_eq!(sql.params, vec!["5"]);
+
+        // An inner embed folds to EXISTS and carries its filter.
+        let mut q = query("users", "id,orders!inner(id)");
+        filt(&mut q, "orders.total", "gte.100");
+        let sql = count(&shop(), &q).unwrap();
+        assert_eq!(
+            sql.text,
+            r#"select 1 from "users" as "z0" where exists (select 1 from "orders" as "z1" where "z1"."user_id" = "z0"."id" AND "z1"."total" >= $1)"#
+        );
+        assert_eq!(sql.params, vec!["100"]);
+
+        // A filter on the left joined embed stays out of the count.
+        let mut q = query("users", "id,orders(id)");
+        filt(&mut q, "orders.total", "gte.100");
+        let sql = count(&shop(), &q).unwrap();
+        assert_eq!(sql.text, r#"select 1 from "users" as "z0""#);
+        assert!(sql.params.is_empty());
     }
 
     #[test]
