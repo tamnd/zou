@@ -792,3 +792,131 @@ async fn the_link_carries_the_redirect_the_request_asked_for() {
     let mail = only_message(&app).await;
     assert_eq!(mail.field("redirect_to"), SITE);
 }
+
+/// A mail server that takes one message and writes it down. Plaintext
+/// on the loopback address, which is what a local catcher is. The wire
+/// format and the encrypted paths are pinned in `tests/smtp.rs`, this
+/// only has to be enough to receive.
+fn catcher() -> (u16, std::thread::JoinHandle<String>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("bound").port();
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("one connection");
+        let mut out = stream.try_clone().expect("a writer");
+        let mut lines = BufReader::new(stream).lines();
+        let mut say = |line: &str| {
+            out.write_all(format!("{line}\r\n").as_bytes())
+                .expect("write");
+        };
+        say("220 catcher ESMTP");
+        let mut message = String::new();
+        while let Some(Ok(line)) = lines.next() {
+            match line
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_uppercase()
+                .as_str()
+            {
+                "EHLO" => say("250 catcher"),
+                "MAIL" | "RCPT" => say("250 ok"),
+                "DATA" => {
+                    say("354 go on");
+                    for line in lines.by_ref().map_while(Result::ok) {
+                        if line == "." {
+                            break;
+                        }
+                        message.push_str(&line);
+                    }
+                    say("250 queued");
+                }
+                "QUIT" => {
+                    say("221 bye");
+                    break;
+                }
+                _ => say("500 what"),
+            }
+        }
+        message
+    });
+    (port, handle)
+}
+
+#[tokio::test]
+async fn with_a_mail_server_configured_the_link_goes_out_on_a_socket() {
+    // The whole chain in one test: a signup mints a code, the template
+    // is rendered, the transport puts it on a socket, and the link a
+    // mail server received is the link that confirms the account.
+    // Everything else in this suite reads the message out of memory.
+    let Some(dsn) = dsn() else { return };
+    let pool = Pool::new(&dsn, 4).expect("dsn parses");
+    let email = address("mail-smtp");
+    wipe(&pool, &email).await;
+    let (port, server) = catcher();
+
+    let mut smtp = zou_server::smtp::Smtp::new("127.0.0.1", port);
+    smtp.security = zou_server::smtp::Security::None;
+    smtp.admin_email = "noreply@zou.test".to_string();
+    smtp.sender_name = "Zou".to_string();
+    let app = router(Config {
+        sender: Some(Arc::new(smtp)),
+        ..base(&dsn)
+    })
+    .expect("router builds");
+
+    let signup = post(
+        &app,
+        "/auth/v1/signup",
+        serde_json::json!({"email": &email, "password": "correct horse"}),
+    )
+    .await;
+    assert_eq!(signup.status, StatusCode::OK, "{}", signup.body);
+
+    let received = server.join().expect("the mail server finished");
+    assert!(
+        received.contains(&format!("To: <{email}>")),
+        "the envelope reached it: {received}"
+    );
+    let body = received
+        .split_once("Content-Transfer-Encoding: base64")
+        .expect("an encoded body")
+        .1;
+    use base64ct::Encoding;
+    let html =
+        String::from_utf8(base64ct::Base64::decode_vec(body.trim()).expect("the body is base64"))
+            .expect("utf8");
+    let link = html
+        .split_once("href=\"")
+        .expect("a link in the mail")
+        .1
+        .split('"')
+        .next()
+        .expect("a quoted link")
+        .replace("&amp;", "&");
+
+    // Nothing was kept in the process, because something else is
+    // carrying it now.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/dev/inbox")
+        .header("apikey", service_key())
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.expect("router answers");
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "there is no mailbox to read once a mail server has the mail"
+    );
+
+    let landing = follow(&app, &link).await;
+    assert_eq!(landing.status(), StatusCode::SEE_OTHER, "{link}");
+    let confirmed: bool = scalar(
+        &pool,
+        "select email_confirmed_at is not null from auth.users where email = $1",
+        &[&email],
+    )
+    .await;
+    assert!(confirmed, "the link that went out on the wire works");
+}
