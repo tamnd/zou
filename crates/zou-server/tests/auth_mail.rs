@@ -896,7 +896,9 @@ async fn with_a_mail_server_configured_the_link_goes_out_on_a_socket() {
         .replace("&amp;", "&");
 
     // Nothing was kept in the process, because something else is
-    // carrying it now.
+    // carrying it now. The endpoint is still served because this
+    // project has no SMS provider and the texted codes are still kept
+    // here, but the mail half of it is empty.
     let req = Request::builder()
         .method("GET")
         .uri("/dev/inbox")
@@ -904,9 +906,12 @@ async fn with_a_mail_server_configured_the_link_goes_out_on_a_socket() {
         .body(Body::empty())
         .unwrap();
     let res = app.clone().oneshot(req).await.expect("router answers");
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let kept: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(
-        res.status(),
-        StatusCode::NOT_FOUND,
+        kept["messages"],
+        serde_json::json!([]),
         "there is no mailbox to read once a mail server has the mail"
     );
 

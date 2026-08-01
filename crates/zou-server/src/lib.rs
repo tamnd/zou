@@ -36,6 +36,7 @@ pub mod oauth;
 pub mod openapi;
 pub mod password;
 pub mod rest;
+pub mod sms;
 pub mod smtp;
 pub mod sql;
 
@@ -116,6 +117,16 @@ pub struct Config {
     /// hand it over rather than configure a second one, and because a
     /// test needs to be able to watch a send fail.
     pub sender: Option<Arc<dyn mail::Sender>>,
+    /// GoTrue's GOTRUE_EXTERNAL_PHONE_ENABLED, off by default there and
+    /// here. Off, and every phone endpoint refuses in upstream's words,
+    /// which is what a project with no numbers to text wants.
+    pub phone_enabled: bool,
+    /// The template, the code length, and how often one account may be
+    /// texted. GoTrue's defaults, which are not the mail ones.
+    pub sms: sms::Settings,
+    /// Who carries the text messages. None is the dev sink, here for
+    /// the same reasons `sender` is.
+    pub texter: Option<Arc<dyn sms::Sender>>,
     /// The external identity providers, GoTrue's GOTRUE_EXTERNAL_*.
     /// Empty is a project with no social login, which is what
     /// /authorize then says about every provider it is asked for.
@@ -147,6 +158,9 @@ impl Default for Config {
             anonymous_users: false,
             mail: mail::Settings::default(),
             sender: None,
+            phone_enabled: false,
+            sms: sms::Settings::default(),
+            texter: None,
             oauth: oauth::Providers::default(),
             http: None,
         }
@@ -171,6 +185,10 @@ pub struct App {
     /// link rather than dropping them the way an unconfigured GoTrue
     /// does.
     pub mailer: Arc<dyn mail::Sender>,
+    /// Where the phone flows post their codes. With nothing configured
+    /// that is the dev sink, which is the whole reason a phone sign in
+    /// can be written on a laptop that has no Twilio account.
+    pub texter: Arc<dyn sms::Sender>,
     /// What the external providers are called with.
     pub web: Arc<dyn oauth::Http>,
     /// The fk catalog per exposed schema, each tagged with the epoch
@@ -247,6 +265,10 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         Some(sender) => sender,
         None => Arc::new(mail::Inbox::default()),
     };
+    let texter: Arc<dyn sms::Sender> = match cfg.texter.take() {
+        Some(texter) => texter,
+        None => Arc::new(sms::Sink::default()),
+    };
     let web: Arc<dyn oauth::Http> = match cfg.http.take() {
         Some(http) => http,
         None => Arc::new(oauth::Web::default()),
@@ -258,6 +280,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         jwks,
         keys,
         mailer,
+        texter,
         web,
         catalog: tokio::sync::RwLock::new(HashMap::new()),
         epoch: Arc::new(AtomicU64::new(0)),
@@ -413,36 +436,67 @@ fn readable_inbox<'a>(app: &'a App, ctx: &AuthContext) -> Option<&'a mail::Inbox
     }
 }
 
+/// The same question for text messages, and the same answer. The two
+/// media are asked separately because a project may well have a mail
+/// server and no SMS provider, and the codes that are still being kept
+/// in the process are still the ones a person on a laptop needs.
+fn readable_sink<'a>(app: &'a App, ctx: &AuthContext) -> Option<&'a sms::Sink> {
+    match ctx.role.as_str() {
+        "service_role" => app.texter.sink(),
+        _ => None,
+    }
+}
+
 /// GET /dev/inbox, everything the dev inbox is holding, oldest first.
 ///
 /// This is the local loop's mailbox. Nobody is carrying these
 /// anywhere, so reading them here is the only way to follow a
-/// confirmation link on a laptop, and `zou inbox` is this endpoint
-/// with a terminal in front of it. It exists only while there is no
-/// transport configured, because with one it would be a way to read
-/// somebody else's codes.
+/// confirmation link or read a texted code on a laptop, and `zou inbox`
+/// is this endpoint with a terminal in front of it. It exists only
+/// while there is no transport configured, because with one it would be
+/// a way to read somebody else's codes.
 async fn dev_inbox(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     axum::Extension(ctx): axum::Extension<AuthContext>,
 ) -> Response {
-    let Some(inbox) = readable_inbox(&app, &ctx) else {
+    let (inbox, sink) = (readable_inbox(&app, &ctx), readable_sink(&app, &ctx));
+    if inbox.is_none() && sink.is_none() {
         return no_route().await;
+    }
+    let messages: Vec<serde_json::Value> = match inbox {
+        Some(inbox) => inbox.kept().iter().map(mail::Mail::as_json).collect(),
+        None => Vec::new(),
     };
-    let messages: Vec<serde_json::Value> = inbox.kept().iter().map(mail::Mail::as_json).collect();
-    json_body(StatusCode::OK, serde_json::json!({"messages": messages}))
+    let texts: Vec<serde_json::Value> = match sink {
+        Some(sink) => sink.kept().iter().map(sms::Text::as_json).collect(),
+        None => Vec::new(),
+    };
+    json_body(
+        StatusCode::OK,
+        serde_json::json!({"messages": messages, "texts": texts}),
+    )
 }
 
-/// DELETE /dev/inbox, throw the kept mail away, which is what a test
-/// or a person starting a fresh flow wants.
+/// DELETE /dev/inbox, throw the kept messages away, which is what a
+/// test or a person starting a fresh flow wants.
 async fn dev_inbox_clear(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     axum::Extension(ctx): axum::Extension<AuthContext>,
 ) -> Response {
-    let Some(inbox) = readable_inbox(&app, &ctx) else {
+    let (inbox, sink) = (readable_inbox(&app, &ctx), readable_sink(&app, &ctx));
+    if inbox.is_none() && sink.is_none() {
         return no_route().await;
-    };
-    inbox.clear();
-    json_body(StatusCode::OK, serde_json::json!({"messages": []}))
+    }
+    if let Some(inbox) = inbox {
+        inbox.clear();
+    }
+    if let Some(sink) = sink {
+        sink.clear();
+    }
+    json_body(
+        StatusCode::OK,
+        serde_json::json!({"messages": [], "texts": []}),
+    )
 }
 
 /// GET /auth/v1/.well-known/jwks.json, the public half of the
@@ -1158,12 +1212,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_configured_mail_server_takes_the_dev_inbox_away_with_it() {
+    async fn a_configured_transport_takes_the_dev_inbox_away_with_it() {
         // Nothing is kept in the process once something is carrying
-        // the mail, so the mailbox is not there to be read. This is
+        // the messages, so the mailbox is not there to be read. This is
         // the deployment case: the route exists in the router either
         // way, and the only thing standing between a stranger and a
-        // recovery code is that there is no mail to hand out.
+        // recovery code is that there is nothing to hand out.
         let service = jwt::mint(&jwt::key_claims("service_role"), SECRET);
         let ask = |app: Router, key: String| async move {
             let req = Request::builder()
@@ -1181,9 +1235,20 @@ mod tests {
         .unwrap();
         assert_eq!(ask(local, service.clone()).await, StatusCode::OK);
 
+        // A mail server and no SMS provider still keeps the texted
+        // codes in the process, and those are still worth reading.
+        let mailing = router(Config {
+            jwt_secret: SECRET.to_vec(),
+            sender: Some(Arc::new(smtp::Smtp::new("mail.zou.test", 587))),
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(ask(mailing, service.clone()).await, StatusCode::OK);
+
         let sending = router(Config {
             jwt_secret: SECRET.to_vec(),
             sender: Some(Arc::new(smtp::Smtp::new("mail.zou.test", 587))),
+            texter: Some(Arc::new(sms::Twilio::new("AC1", "secret", "MG9"))),
             ..Config::default()
         })
         .unwrap();

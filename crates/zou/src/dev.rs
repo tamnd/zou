@@ -161,6 +161,28 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
     if !autoconfirm && sender.is_none() {
         log::info!("signups need a confirmation link, read it with zou inbox --http {port}");
     }
+    // Phone is off by default, the same as GoTrue, because a project
+    // that has not said it wants phone sign in should refuse it by name
+    // rather than half serve it.
+    let phone_enabled = matches!(
+        std::env::var("ZOU_EXTERNAL_PHONE_ENABLED").as_deref(),
+        Ok("true") | Ok("1")
+    );
+    let texter: Option<std::sync::Arc<dyn zou_server::sms::Sender>> =
+        match zou_server::sms::from_env()? {
+            Some(texter) => {
+                log::info!("texts go through {}", texter.describe());
+                Some(texter)
+            }
+            None => None,
+        };
+    if phone_enabled && texter.is_none() {
+        log::info!("phone codes stay in this process, read them with zou inbox --http {port}");
+    }
+    let sms_autoconfirm = matches!(
+        std::env::var("ZOU_SMS_AUTOCONFIRM").as_deref(),
+        Ok("true") | Ok("1")
+    );
     let oauth = zou_server::oauth::from_env()?;
     if !oauth.is_empty() {
         log::info!("social sign in with {}", oauth.names().join(", "));
@@ -214,6 +236,18 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // which the client turns into a real account later by
             // setting an address on it.
             anonymous_users,
+            // Off unless ZOU_EXTERNAL_PHONE_ENABLED=true, and then set
+            // ZOU_SMS_PROVIDER=twilio or messagebird with its
+            // credentials to send for real. With no provider the codes
+            // stay in the process and `zou inbox` prints them, which is
+            // how a phone sign in screen gets written on a laptop with
+            // no Twilio account.
+            phone_enabled,
+            texter,
+            sms: zou_server::sms::Settings {
+                autoconfirm: sms_autoconfirm,
+                ..Default::default()
+            },
             // Everything else is GoTrue's default, including the
             // unlimited rate the dev loop wants: the real per endpoint
             // budgets arrive with the rest of the auth surface.
