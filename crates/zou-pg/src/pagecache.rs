@@ -26,11 +26,58 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use crate::ZOU_PAGE_SIZE;
 use crate::pending::ForkId;
+
+/// Positional reads and writes without touching the shared cursor,
+/// pread and pwrite on unix, seek_read and seek_write on windows.
+/// Sharing one File between threads stays safe either way because no
+/// call here depends on the file position.
+#[cfg(unix)]
+fn read_exact_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(f, buf, off)
+}
+
+#[cfg(unix)]
+fn write_all_at(f: &File, buf: &[u8], off: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(f, buf, off)
+}
+
+#[cfg(windows)]
+fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match f.seek_read(buf, off) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => {
+                buf = &mut buf[n..];
+                off += n as u64;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_all_at(f: &File, mut buf: &[u8], mut off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match f.seek_write(buf, off) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                buf = &buf[n..];
+                off += n as u64;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
 
 pub struct PageCache {
     dir: PathBuf,
@@ -93,14 +140,13 @@ impl PageCache {
     pub fn load(&self, fork: ForkId, blk: u32) -> Option<Vec<u8>> {
         let map = File::open(self.map_path(fork)).ok()?;
         let mut flag = [0u8];
-        map.read_exact_at(&mut flag, blk as u64).ok()?;
+        read_exact_at(&map, &mut flag, blk as u64).ok()?;
         if flag[0] != 1 {
             return None;
         }
         let data = File::open(self.data_path(fork)).ok()?;
         let mut page = vec![0u8; ZOU_PAGE_SIZE];
-        data.read_exact_at(&mut page, blk as u64 * ZOU_PAGE_SIZE as u64)
-            .ok()?;
+        read_exact_at(&data, &mut page, blk as u64 * ZOU_PAGE_SIZE as u64).ok()?;
         Some(page)
     }
 
@@ -111,14 +157,11 @@ impl PageCache {
         let Some(data) = self.open_rw(&self.data_path(fork)) else {
             return;
         };
-        if data
-            .write_all_at(page, blk as u64 * ZOU_PAGE_SIZE as u64)
-            .is_err()
-        {
+        if write_all_at(&data, page, blk as u64 * ZOU_PAGE_SIZE as u64).is_err() {
             return;
         }
         if let Some(map) = self.open_rw(&self.map_path(fork)) {
-            let _ = map.write_all_at(&[1], blk as u64);
+            let _ = write_all_at(&map, &[1], blk as u64);
         }
     }
 
