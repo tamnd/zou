@@ -1,6 +1,8 @@
 mod branch;
 #[cfg(unix)]
 mod dev;
+#[cfg(unix)]
+mod inbox;
 mod info;
 mod stats;
 
@@ -16,6 +18,8 @@ fn usage() -> ExitCode {
     eprintln!("{DEV_USAGE}");
     eprintln!("       {}", branch::USAGE);
     eprintln!("       {}", info::USAGE);
+    #[cfg(unix)]
+    eprintln!("       {}", inbox::USAGE);
     eprintln!("       {}", stats::USAGE);
     eprintln!("       zou --version");
     ExitCode::from(2)
@@ -64,6 +68,8 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Some("branch") => simple(branch::run(&argv[1..])),
+        #[cfg(unix)]
+        Some("inbox") => simple(inbox::run(&argv[1..])),
         Some("info") => simple(info::run(&argv[1..])),
         Some("stats") => simple(stats::run(&argv[1..])),
         _ => usage(),

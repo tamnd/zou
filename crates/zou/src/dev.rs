@@ -143,6 +143,13 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
     log::info!("http api on http://127.0.0.1:{port}");
     log::info!("anon key {anon}");
     log::info!("service_role key {service}");
+    let autoconfirm = !matches!(
+        std::env::var("ZOU_MAILER_AUTOCONFIRM").as_deref(),
+        Ok("false") | Ok("0")
+    );
+    if !autoconfirm {
+        log::info!("signups need a confirmation link, read it with zou inbox --http {port}");
+    }
     // initdb ran without -U, so the cluster superuser is the OS user
     // and local connections are trust, the stock dev loop layout.
     let user = std::env::var("USER")
@@ -157,10 +164,13 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // say so rather than naming GoTrue's default port, which
             // nothing here listens on.
             external_url: Some(format!("http://127.0.0.1:{port}")),
-            // There is no inbox to read a confirmation link out of in a
-            // dev loop, so a signup is confirmed on the spot. The
-            // Supabase CLI does the same thing locally.
-            mailer_autoconfirm: true,
+            // A signup is confirmed on the spot, which is what the
+            // Supabase CLI does locally too. Set
+            // ZOU_MAILER_AUTOCONFIRM=false to make the dev loop mail
+            // its confirmations instead: nothing carries them
+            // anywhere, they are kept in memory, and `zou inbox`
+            // prints the link.
+            mailer_autoconfirm: autoconfirm,
             // Everything else is GoTrue's default, including the
             // unlimited rate the dev loop wants: the real per endpoint
             // budgets arrive with the rest of the auth surface.

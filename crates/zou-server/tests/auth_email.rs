@@ -24,7 +24,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use zou_server::sql::Pool;
-use zou_server::{Config, jwt, router};
+use zou_server::{Config, jwt, mail, router};
 
 const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long";
 
@@ -43,12 +43,21 @@ fn dsn() -> Option<String> {
 
 /// A project that mails its confirmations, which is the default and the
 /// only interesting setting for this suite.
+///
+/// The send frequency limit is off here. It is a real part of these
+/// flows and it is pinned in `auth_mail`, but with it on a suite that
+/// asks the same account twice in a second would be testing the clock
+/// instead of the flow.
 fn base(dsn: &str) -> Config {
     Config {
         jwt_secret: SECRET.to_vec(),
         pg: Some(dsn.to_string()),
         external_url: Some("https://zou.test".to_string()),
         site_url: Some(SITE.to_string()),
+        mail: mail::Settings {
+            max_frequency: 0,
+            ..mail::Settings::default()
+        },
         ..Config::default()
     }
 }
