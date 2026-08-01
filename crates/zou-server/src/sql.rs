@@ -25,10 +25,12 @@
 //! grants that make row level security the actual guard, exactly the
 //! stance a Supabase project ships with.
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{AsyncMessage, Client, NoTls};
 
 /// One error type end to end: dsn parse, connect, and query failures
 /// are all tokio_postgres errors already.
@@ -173,7 +175,43 @@ begin
     end if;
 end
 $$;
+
+-- The DDL watch behind catalog invalidation. Event triggers are
+-- superuser only, so a deployment that connects as a lesser role
+-- keeps working and falls back to the timed refresh instead.
+do $$
+begin
+    create schema if not exists zou;
+    execute $fn$
+        create or replace function zou.notify_catalog() returns event_trigger
+        language plpgsql as $body$
+        begin
+            perform pg_notify('zou_catalog', '');
+        end
+        $body$
+    $fn$;
+    if not exists (select 1 from pg_event_trigger where evtname = 'zou_catalog_watch') then
+        create event trigger zou_catalog_watch on ddl_command_end
+            execute function zou.notify_catalog();
+    end if;
+    if not exists (select 1 from pg_event_trigger where evtname = 'zou_catalog_drop') then
+        create event trigger zou_catalog_drop on sql_drop
+            execute function zou.notify_catalog();
+    end if;
+exception when insufficient_privilege then
+    null;
+end
+$$;
 ";
+
+/// How long a watch waits before dialing again after its connection
+/// died.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often a database with no event trigger installed is assumed to
+/// have changed. Nothing will notify there, so this is the only thing
+/// keeping the catalog from going stale forever.
+const REFRESH: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl Pool {
     /// Parse the dsn now, dial nothing. `max` caps the number of live
@@ -212,6 +250,79 @@ impl Pool {
             .get_or_try_init(|| client.batch_execute(BOOTSTRAP))
             .await?;
         Ok((permit, client))
+    }
+
+    /// The DDL watch that drives catalog invalidation. A connection of
+    /// its own, outside the pool's permits so a busy server cannot
+    /// starve it, listening for the event trigger's notification and
+    /// bumping `epoch` on every one. A bump is a hint that the schema
+    /// may have changed, never a promise that it did, so the cost of a
+    /// spurious one is a single reintrospection.
+    ///
+    /// Two things get the same treatment as a real notification. A lost
+    /// connection, because whatever happened while it was down was
+    /// missed, and a database with no event trigger installed, because
+    /// then nothing will ever notify and the cache would go stale
+    /// forever; that deployment gets the timed refresh instead, which is the
+    /// honest fallback rather than a silent one.
+    pub fn watch(&self, epoch: Arc<AtomicU64>) {
+        let pool = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = pool.watch_once(&epoch).await {
+                    log::warn!("catalog watch: {e}");
+                }
+                // Whatever was missed while the connection was down is
+                // missed, so assume the worst and reintrospect.
+                epoch.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(RETRY).await;
+            }
+        });
+    }
+
+    /// One connection's worth of watching, until it dies.
+    async fn watch_once(&self, epoch: &AtomicU64) -> Result<(), Error> {
+        let (client, mut conn) = self.0.pg.connect(NoTls).await?;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Polling for messages is also what drives the queries below,
+        // so the pump owns the connection and the client speaks
+        // through it.
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) =
+                std::future::poll_fn(|cx| Pin::new(&mut conn).poll_message(cx)).await
+            {
+                if matches!(msg, AsyncMessage::Notification(_)) && tx.send(()).is_err() {
+                    return;
+                }
+            }
+        });
+        client.batch_execute("listen zou_catalog").await?;
+        // Nothing cached before this point was under watch, so it
+        // cannot be trusted: one bump on arrival closes the startup
+        // race for the price of one reintrospection.
+        epoch.fetch_add(1, Ordering::Relaxed);
+        let watched: bool = client
+            .query_one(
+                "select exists (select 1 from pg_event_trigger \
+                 where evtname = 'zou_catalog_watch')",
+                &[],
+            )
+            .await?
+            .get(0);
+        loop {
+            let alive = if watched {
+                rx.recv().await.is_some()
+            } else {
+                tokio::select! {
+                    m = rx.recv() => m.is_some(),
+                    _ = tokio::time::sleep(REFRESH) => true,
+                }
+            };
+            if !alive {
+                return Ok(());
+            }
+            epoch.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// A transaction with the request context injected, the unit every

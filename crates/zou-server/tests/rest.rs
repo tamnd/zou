@@ -1537,8 +1537,11 @@ async fn the_openapi_document_speaks_postgrest() {
             "comment on function zou_oa_add(integer, integer) is 'adds\n\ntwo numbers'",
             "create function zou_oa_touch(note text) returns void language sql volatile \
              as 'select null::void'",
-            "grant all on all tables in schema public to anon, authenticated, service_role",
-            "grant usage, select on all sequences in schema public \
+            // Narrow grants on purpose: two tests rewriting every acl
+            // in public at once race each other in the catalog.
+            "grant all on zou_oa_parents, zou_oa_children, zou_oa_view, zou_oa_agg \
+             to anon, authenticated, service_role",
+            "grant usage, select on sequence zou_oa_children_id_seq \
              to anon, authenticated, service_role",
         ],
     )
@@ -1784,4 +1787,57 @@ async fn the_openapi_document_follows_the_profile() {
     assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
     let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
     assert_eq!(e["code"], "PGRST106");
+}
+
+#[tokio::test]
+async fn the_catalog_follows_the_ddl_epoch() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_ep_children, zou_ep_parents cascade",
+            "create table zou_ep_parents (id int primary key, name text)",
+            // No foreign key yet, so the embed cannot resolve.
+            "create table zou_ep_children (id int primary key, parent_id int)",
+            "insert into zou_ep_parents values (1, 'ann')",
+            "insert into zou_ep_children values (10, 1)",
+            "grant all on zou_ep_parents, zou_ep_children to anon, authenticated, service_role",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+    let embed = "/rest/v1/zou_ep_children?select=id,zou_ep_parents(name)";
+
+    let res = app.clone().oneshot(get(embed)).await.unwrap();
+    assert_ne!(
+        res.status(),
+        StatusCode::OK,
+        "no foreign key means no embed, and this is what caches the catalog"
+    );
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["code"], "PGRST200");
+
+    seed(
+        &dsn,
+        &["alter table zou_ep_children add constraint zou_ep_fk \
+           foreign key (parent_id) references zou_ep_parents(id)"],
+    )
+    .await;
+
+    // The DDL notification travels over the watch connection, so the
+    // epoch moves a moment after the alter commits rather than during
+    // it. Poll rather than sleep a fixed amount.
+    let mut body = String::new();
+    for _ in 0..100 {
+        let res = app.clone().oneshot(get(embed)).await.unwrap();
+        if res.status() == StatusCode::OK {
+            body = body_text(res).await;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        body, r#"[{"id": 10, "zou_ep_parents": {"name": "ann"}}]"#,
+        "the new foreign key reached the cached catalog"
+    );
 }
