@@ -166,8 +166,13 @@ impl CasStore for StatsStore {
             Ok(Some(data)) => data.len() as u64,
             _ => 0,
         };
-        self.counters
-            .op(Op::GetRange, key, bytes, start.elapsed(), out.as_ref().err());
+        self.counters.op(
+            Op::GetRange,
+            key,
+            bytes,
+            start.elapsed(),
+            out.as_ref().err(),
+        );
         out
     }
 
@@ -267,8 +272,7 @@ fn percentile(buckets: &[u64], total: u64, q: f64) -> u64 {
 
 impl Snapshot {
     pub fn read(path: &Path) -> Result<Self, String> {
-        let data =
-            fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let data = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
         if data.len() < SLOTS * 8 {
             return Err(format!("{} is not a counter file", path.display()));
         }
@@ -284,7 +288,10 @@ impl Snapshot {
             let mut by_class = Vec::new();
             let (mut count, mut bytes) = (0u64, 0u64);
             for (class, name) in CLASS_NAMES.iter().copied().enumerate() {
-                let (c, b) = (slot(count_slot(kind, class)), slot(count_slot(kind, class) + 1));
+                let (c, b) = (
+                    slot(count_slot(kind, class)),
+                    slot(count_slot(kind, class) + 1),
+                );
                 count += c;
                 bytes += b;
                 if c > 0 {
@@ -350,11 +357,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let counters = dir.path().join("stats");
         let store = wrap(dir.path(), &counters);
-        store.put("tenants/a/pg/1/2/3/0/00000000", &[7u8; 100]).unwrap();
-        store.put("tenants/a/pg/1/2/3/0/00000001", &[7u8; 100]).unwrap();
+        store
+            .put("tenants/a/pg/1/2/3/0/00000000", &[7u8; 100])
+            .unwrap();
+        store
+            .put("tenants/a/pg/1/2/3/0/00000001", &[7u8; 100])
+            .unwrap();
         store.get("tenants/a/pg/1/2/3/0/00000000").unwrap();
         store.get("tenants/a/pg/1/2/3/0/missing").unwrap();
-        store.put_new("tenants/a/wal/0000000000000001/00.wal", b"frame").unwrap();
+        store
+            .put_new("tenants/a/wal/0000000000000001/00.wal", b"frame")
+            .unwrap();
         store.list("tenants/a/wal/").unwrap();
         store.delete("tenants/a/pg/1/2/3/0/00000001").unwrap();
 
@@ -380,7 +393,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let counters = dir.path().join("stats");
         let store = wrap(dir.path(), &counters);
-        store.put_if_match("tenants/a/MANIFEST", b"v1", None).unwrap();
+        store
+            .put_if_match("tenants/a/MANIFEST", b"v1", None)
+            .unwrap();
         let err = store.put_if_match("tenants/a/MANIFEST", b"v2", None);
         assert!(matches!(err, Err(CasError::Conflict { .. })));
         let snap = Snapshot::read(&counters).unwrap();
