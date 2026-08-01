@@ -25,11 +25,35 @@ use axum::routing::{any, get};
 use axum::{Router, middleware};
 
 pub mod jwt;
+pub mod sql;
 
 /// What the front door needs to know: the secret every key and token
-/// must verify against.
+/// must verify against, and where postgres lives when there is one to
+/// talk to. `pg` is a dsn like "host=127.0.0.1 port=5432 user=x
+/// dbname=postgres", None runs the router without a pool, which is
+/// what the pure routing tests use.
 pub struct Config {
     pub jwt_secret: Vec<u8>,
+    pub pg: Option<String>,
+}
+
+/// Everything the handlers share: the config and, when postgres is
+/// reachable, the session pool. The pool dials lazily, so building
+/// this never blocks on the database.
+pub struct App {
+    pub cfg: Config,
+    pub pool: Option<sql::Pool>,
+}
+
+/// PostgREST's default db-pool size, a sane dev loop default here too.
+const POOL_SIZE: usize = 10;
+
+fn app_state(cfg: Config) -> Result<Arc<App>, String> {
+    let pool = match &cfg.pg {
+        Some(dsn) => Some(sql::Pool::new(dsn, POOL_SIZE).map_err(|e| format!("pg dsn: {e}"))?),
+        None => None,
+    };
+    Ok(Arc::new(App { cfg, pool }))
 }
 
 /// The verified identity of a request, deposited in request extensions
@@ -68,7 +92,7 @@ fn apikey_of(req: &Request<Body>) -> Option<String> {
 /// misconfigured client sees the exact message it would see against
 /// Supabase.
 async fn gate(
-    axum::extract::State(cfg): axum::extract::State<Arc<Config>>,
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -81,7 +105,7 @@ async fn gate(
             }),
         );
     };
-    let key = match jwt::verify(&apikey, &cfg.jwt_secret) {
+    let key = match jwt::verify(&apikey, &app.cfg.jwt_secret) {
         Ok(v) => v,
         Err(_) => {
             return json_body(
@@ -98,7 +122,7 @@ async fn gate(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string);
     let identity = match bearer {
-        Some(token) => match jwt::verify(&token, &cfg.jwt_secret) {
+        Some(token) => match jwt::verify(&token, &app.cfg.jwt_secret) {
             Ok(v) => v,
             Err(why) => {
                 return json_body(
@@ -164,7 +188,8 @@ async fn no_route() -> Response {
 }
 
 /// The whole front door as one axum router.
-pub fn router(cfg: Arc<Config>) -> Router {
+pub fn router(cfg: Config) -> Result<Router, String> {
+    let app = app_state(cfg)?;
     let gated = Router::new()
         .route("/auth/v1/health", get(auth_health))
         .route("/auth/v1/{*rest}", any(auth_stub))
@@ -172,9 +197,9 @@ pub fn router(cfg: Arc<Config>) -> Router {
         .route("/rest/v1/{*rest}", any(rest_stub))
         .route("/storage/v1/{*rest}", any(storage_stub))
         .route("/realtime/v1/{*rest}", any(realtime_stub))
-        .layer(middleware::from_fn_with_state(Arc::clone(&cfg), gate))
-        .with_state(cfg);
-    Router::new().merge(gated).fallback(no_route)
+        .layer(middleware::from_fn_with_state(Arc::clone(&app), gate))
+        .with_state(app);
+    Ok(Router::new().merge(gated).fallback(no_route))
 }
 
 /// Serve `router(cfg)` on `listener` forever. Builds a private tokio
@@ -193,7 +218,7 @@ pub fn serve_blocking(listener: std::net::TcpListener, cfg: Config) -> Result<()
             .map_err(|e| format!("nonblocking: {e}"))?;
         let listener =
             tokio::net::TcpListener::from_std(listener).map_err(|e| format!("listener: {e}"))?;
-        axum::serve(listener, router(Arc::new(cfg)))
+        axum::serve(listener, router(cfg)?)
             .await
             .map_err(|e| format!("serve: {e}"))
     })
@@ -208,9 +233,11 @@ mod tests {
     const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long";
 
     fn app() -> Router {
-        router(Arc::new(Config {
+        router(Config {
             jwt_secret: SECRET.to_vec(),
-        }))
+            pg: None,
+        })
+        .unwrap()
     }
 
     fn anon_key() -> String {
@@ -310,16 +337,18 @@ mod tests {
     /// A router with the real gate in front of a handler that echoes
     /// the deposited role, so precedence is observed, not inferred.
     fn echo_app() -> Router {
-        let cfg = Arc::new(Config {
+        let app = app_state(Config {
             jwt_secret: SECRET.to_vec(),
-        });
+            pg: None,
+        })
+        .unwrap();
         Router::new()
             .route(
                 "/echo",
                 get(|axum::Extension(ctx): axum::Extension<AuthContext>| async move { ctx.role }),
             )
-            .layer(middleware::from_fn_with_state(Arc::clone(&cfg), gate))
-            .with_state(cfg)
+            .layer(middleware::from_fn_with_state(Arc::clone(&app), gate))
+            .with_state(app)
     }
 
     #[tokio::test]

@@ -119,8 +119,10 @@ fn shared_buffers() -> String {
 /// keys stay stable across restarts, otherwise a fresh secret is
 /// generated and logged together with the keys it signs, which is
 /// enough for a dev loop. The keys are printed the way supabase start
-/// prints its own, copy them into the client and go.
-fn start_http(port: u16) -> Result<(), String> {
+/// prints its own, copy them into the client and go. The SQL pool
+/// dials the postmaster this process supervises, lazily, so the order
+/// the two come up in does not matter.
+fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
     let secret = match std::env::var("ZOU_JWT_SECRET") {
         Ok(s) if !s.is_empty() => s,
         _ => {
@@ -141,9 +143,16 @@ fn start_http(port: u16) -> Result<(), String> {
     log::info!("http api on http://127.0.0.1:{port}");
     log::info!("anon key {anon}");
     log::info!("service_role key {service}");
+    // initdb ran without -U, so the cluster superuser is the OS user
+    // and local connections are trust, the stock dev loop layout.
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "postgres".to_string());
+    let dsn = format!("host=127.0.0.1 port={pg_port} user={user} dbname=postgres");
     std::thread::spawn(move || {
         let cfg = zou_server::Config {
             jwt_secret: secret.into_bytes(),
+            pg: Some(dsn),
         };
         if let Err(e) = zou_server::serve_blocking(listener, cfg) {
             log::error!("http server: {e}");
@@ -247,7 +256,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     if let Some(http_port) = args.http {
-        start_http(http_port)?;
+        start_http(http_port, args.port)?;
     }
 
     let mut failed_starts = 0u32;
