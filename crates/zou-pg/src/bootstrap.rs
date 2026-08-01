@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::SystemTime;
 
 use zou_store::CasStore;
+use zou_store::cas::CasError;
 use zou_store::layout::TenantLayout;
 use zou_store::lease;
 use zou_store::manifest::{CheckpointKind, CheckpointRef};
@@ -61,7 +62,19 @@ pub fn capture_genesis(
         Ok(Some(_)) => {}
         Ok(None) => {
             let genesis = Manifest::new(layout.tenant_ref(), 18);
-            let _ = store.put_if_match(&manifest_key, &genesis.to_json(), None);
+            match store.put_if_match(&manifest_key, &genesis.to_json(), None) {
+                Ok(_) => {}
+                // A concurrent bootstrap won the create, the acquire
+                // below re-reads and the genesis checkpoint guard
+                // handles the rest.
+                Err(CasError::Conflict { .. }) => {}
+                // Swallowing this used to turn a backend that cannot
+                // do conditional creates into a baffling "no manifest"
+                // from the lease acquire. MinIO RELEASE.2025-09-06
+                // answers If-None-Match: * on a missing key with 404
+                // NoSuchKey, which is how we learned.
+                Err(e) => return Err(format!("create manifest: {e}")),
+            }
         }
         Err(e) => return Err(format!("store: {e}")),
     }
@@ -101,4 +114,61 @@ pub fn capture_genesis(
         dirs: paths.dirs.len(),
         bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zou_store::cas::Version;
+
+    /// A backend whose conditional create always fails, the shape of
+    /// MinIO RELEASE.2025-09-06 answering If-None-Match: * on a
+    /// missing key with 404 NoSuchKey.
+    struct BrokenCreate;
+
+    impl CasStore for BrokenCreate {
+        fn get(&self, _key: &str) -> Result<Option<(Vec<u8>, Version)>, CasError> {
+            Ok(None)
+        }
+
+        fn put_if_match(
+            &self,
+            key: &str,
+            _data: &[u8],
+            _expected: Option<&Version>,
+        ) -> Result<Version, CasError> {
+            Err(CasError::Io {
+                key: key.to_string(),
+                source: std::io::Error::other("PUT returned 404: NoSuchKey"),
+            })
+        }
+
+        fn delete(&self, _key: &str) -> Result<(), CasError> {
+            unreachable!("capture_genesis must fail before deleting anything")
+        }
+
+        fn list(&self, _prefix: &str) -> Result<Vec<String>, CasError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn a_failed_manifest_create_is_reported_not_swallowed() {
+        let dir = std::env::temp_dir().join(format!("zou-bootstrap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("PG_VERSION"), "18\n").unwrap();
+
+        let layout = TenantLayout::new("local");
+        let err = capture_genesis(&BrokenCreate, &layout, &dir, 0).unwrap_err();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(
+            err.starts_with("create manifest:"),
+            "the create failure must surface directly, got: {err}"
+        );
+        assert!(
+            err.contains("NoSuchKey"),
+            "the backend error must survive: {err}"
+        );
+    }
 }
