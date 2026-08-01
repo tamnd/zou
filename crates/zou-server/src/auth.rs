@@ -101,11 +101,11 @@ impl From<sql::Error> for Error {
 }
 
 /// A refusal on GoTrue's usual status for a bad request.
-fn denied<T>(code: &'static str, msg: &str) -> Result<T, Error> {
+pub(crate) fn denied<T>(code: &'static str, msg: &str) -> Result<T, Error> {
     Err(refused(StatusCode::BAD_REQUEST, code, msg))
 }
 
-fn refused(status: StatusCode, code: &'static str, msg: &str) -> Error {
+pub(crate) fn refused(status: StatusCode, code: &'static str, msg: &str) -> Error {
     Error::Denied {
         status,
         code,
@@ -358,7 +358,7 @@ fn opt_text(key: &str, col: &str) -> String {
 /// is not a null key, it is no key at all. new_email and new_phone are
 /// the same story for the two string columns that carry a pending
 /// change, which are empty rather than null when there is none.
-fn user_object() -> String {
+pub(crate) fn user_object() -> String {
     format!(
         "(jsonb_build_object(
               'id', u.id::text,
@@ -397,7 +397,7 @@ fn user_object() -> String {
 }
 
 /// The identity list, joined the way both user queries need it.
-fn identities_join() -> String {
+pub(crate) fn identities_join() -> String {
     format!(
         "left join lateral (
              select jsonb_agg(jsonb_build_object(
@@ -419,7 +419,10 @@ fn identities_join() -> String {
 /// The user as a client sees it, for the answers that carry a user
 /// without a session: a signup that still needs confirming, and the
 /// user endpoints when they land.
-async fn user_json(sess: &sql::Session, user_id: &str) -> Result<serde_json::Value, sql::Error> {
+pub(crate) async fn user_json(
+    sess: &sql::Session,
+    user_id: &str,
+) -> Result<serde_json::Value, sql::Error> {
     let sql = format!(
         "select {user}::text from auth.users u {ids} where u.id = $1::text::uuid",
         user = user_object(),
@@ -821,7 +824,7 @@ pub enum SignedUp {
 /// regex itself: exactly one @, something either side of it, no
 /// whitespace anywhere, and a domain that is dotted, which is what
 /// keeps user@localhost out.
-fn validate_email(email: &str) -> Result<String, Error> {
+pub(crate) fn validate_email(email: &str) -> Result<String, Error> {
     if email.is_empty() {
         return denied("validation_failed", "An email address is required");
     }
@@ -849,7 +852,7 @@ fn validate_email(email: &str) -> Result<String, Error> {
 
 /// GoTrue's password rules, in its order: the bcrypt ceiling first
 /// because a password over it is not weak but unusable, then strength.
-fn validate_password(password: &str) -> Result<(), Error> {
+pub(crate) fn validate_password(password: &str) -> Result<(), Error> {
     if password.is_empty() {
         return denied("validation_failed", "Signup requires a valid password");
     }
@@ -1123,7 +1126,7 @@ async fn anonymously(
     start(sess, &user_id, "anonymous", signer, issuer).await
 }
 
-async fn hash_off_thread(password: &str) -> String {
+pub(crate) async fn hash_off_thread(password: &str) -> String {
     let password = password.to_string();
     tokio::task::spawn_blocking(move || crate::password::hash(&password))
         .await
@@ -1520,7 +1523,7 @@ fn resolved(kind: &str, matched: &str) -> String {
 /// wants: following a recovery link proves the address as surely as
 /// following a confirmation link does, but an account that was already
 /// confirmed does not have its confirmation moved to today.
-async fn confirm_address(
+pub(crate) async fn confirm_address(
     sess: &sql::Session,
     user_id: &str,
     only_unconfirmed: bool,
@@ -1825,7 +1828,7 @@ pub async fn send_recovery(pool: &Pool, email: &str, post: &Post<'_>) -> Result<
 /// A password nobody will ever type, for the account a magic link
 /// creates. GoTrue draws 33 characters, and the point of it is that the
 /// row has a password column that no password grant can ever satisfy.
-fn unguessable_password() -> String {
+pub(crate) fn unguessable_password() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut raw = [0u8; 33];
     getrandom::fill(&mut raw).expect("the os rng never fails");
@@ -2354,7 +2357,11 @@ async fn update_user(
 }
 
 /// Whether the address belongs to somebody else already.
-async fn taken(sess: &sql::Session, email: &str, user_id: &str) -> Result<bool, sql::Error> {
+pub(crate) async fn taken(
+    sess: &sql::Session,
+    email: &str,
+    user_id: &str,
+) -> Result<bool, sql::Error> {
     let rows = sess
         .query(
             "select 1 from auth.users
@@ -2383,7 +2390,7 @@ async fn recent(sess: &sql::Session, session_id: Option<&str>) -> Result<bool, s
 /// Merge an object into one of the metadata columns. A key sent as null
 /// is a deletion rather than a null value, which is GoTrue's rule and
 /// the only way its clients have of removing a key at all.
-async fn merge_metadata(
+pub(crate) async fn merge_metadata(
     sess: &sql::Session,
     user_id: &str,
     column: &str,
@@ -2419,7 +2426,7 @@ pub struct Caller {
 /// GoTrue's requireAuthentication, in its wording. The gate has already
 /// refused a token this server cannot verify, so what is left to check
 /// is that a token was sent at all and that it says who it is for.
-fn caller(req: &Request<Body>) -> Result<Caller, Box<Response>> {
+pub(crate) fn caller(req: &Request<Body>) -> Result<Caller, Box<Response>> {
     let bad = |status: StatusCode, msg: &str| Box::new(error_body(status, "bad_jwt", msg));
     if !req
         .headers()
@@ -2473,7 +2480,7 @@ fn caller(req: &Request<Body>) -> Result<Caller, Box<Response>> {
 /// revokes an access token, it stays signed and stays inside its hour,
 /// so a token whose session has been deleted is refused here or it is
 /// not refused at all.
-async fn still_there(sess: &sql::Session, caller: &Caller) -> Result<(), Error> {
+pub(crate) async fn still_there(sess: &sql::Session, caller: &Caller) -> Result<(), Error> {
     let rows = sess
         .query(
             "select 1 from auth.users
@@ -2512,7 +2519,7 @@ async fn still_there(sess: &sql::Session, caller: &Caller) -> Result<(), Error> 
 /// claim unless the caller holds an admin role, because those tokens
 /// never had an aud claim to begin with, and the project's default
 /// otherwise.
-fn requested_aud(req: &Request<Body>, caller: &Caller) -> String {
+pub(crate) fn requested_aud(req: &Request<Body>, role: &str, claim: &str) -> String {
     if let Some(header) = req
         .headers()
         .get("x-jwt-aud")
@@ -2521,15 +2528,15 @@ fn requested_aud(req: &Request<Body>, caller: &Caller) -> String {
     {
         return header.to_string();
     }
-    if caller.role != "service_role" && caller.role != "supabase_admin" && !caller.aud.is_empty() {
-        return caller.aud.clone();
+    if role != "service_role" && role != "supabase_admin" && !claim.is_empty() {
+        return claim.to_string();
     }
     AUD.to_string()
 }
 
 /// A cheap shape check, so a claim that was never a uuid is a refusal
 /// rather than a database error further in.
-fn is_uuid(s: &str) -> bool {
+pub(crate) fn is_uuid(s: &str) -> bool {
     s.len() == 36
         && s.chars().enumerate().all(|(i, c)| match i {
             8 | 13 | 18 | 23 => c == '-',
@@ -2542,7 +2549,7 @@ fn is_uuid(s: &str) -> bool {
 /// and the human message under msg. The same code rides in a response
 /// header, which is where the newer clients read it from without
 /// parsing the body at all.
-fn error_body(status: StatusCode, code: &str, msg: &str) -> Response {
+pub(crate) fn error_body(status: StatusCode, code: &str, msg: &str) -> Response {
     body_with(
         status,
         serde_json::json!({
@@ -2566,7 +2573,7 @@ fn body_with(status: StatusCode, body: serde_json::Value, code: &str) -> Respons
 /// password is the one refusal with more to say than a message: the
 /// reasons ride alongside so a client can point at the rule that was
 /// broken rather than re-deriving it from english.
-fn refusal(e: Error, doing: &str) -> Response {
+pub(crate) fn refusal(e: Error, doing: &str) -> Response {
     match e {
         Error::Denied { status, code, msg } => error_body(status, code, &msg),
         Error::Weak(weak) => body_with(
@@ -2593,7 +2600,7 @@ fn refusal(e: Error, doing: &str) -> Response {
 
 /// The json body of a request, or the response that says why it could
 /// not be read. Both failures are GoTrue's own.
-async fn read_json(body: Body) -> Result<serde_json::Value, Response> {
+pub(crate) async fn read_json(body: Body) -> Result<serde_json::Value, Response> {
     let bytes = to_bytes(body, MAX_BODY).await.map_err(|_| {
         error_body(
             StatusCode::BAD_REQUEST,
@@ -2610,7 +2617,7 @@ async fn read_json(body: Body) -> Result<serde_json::Value, Response> {
     })
 }
 
-fn field<'a>(body: &'a serde_json::Value, key: &str) -> &'a str {
+pub(crate) fn field<'a>(body: &'a serde_json::Value, key: &str) -> &'a str {
     body.get(key).and_then(|v| v.as_str()).unwrap_or_default()
 }
 
@@ -2928,7 +2935,7 @@ pub(crate) fn query_escape(s: &str) -> String {
 
 /// A query string as the same object shape a posted body has, so both
 /// halves of verify read their parameters through one path.
-fn query_object(query: &str) -> serde_json::Value {
+pub(crate) fn query_object(query: &str) -> serde_json::Value {
     let mut out = serde_json::Map::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
@@ -4652,7 +4659,7 @@ pub async fn user_get(
         Ok(v) => v,
         Err(res) => return *res,
     };
-    let asked = requested_aud(&req, &caller);
+    let asked = requested_aud(&req, &caller.role, &caller.aud);
     let sess = match pool.admin().await {
         Ok(v) => v,
         Err(e) => return refusal(Error::Db(e), "user get"),
@@ -4849,7 +4856,7 @@ pub async fn user_update(
     }
 }
 
-fn no_database() -> Response {
+pub(crate) fn no_database() -> Response {
     error_body(
         StatusCode::INTERNAL_SERVER_ERROR,
         "unexpected_failure",
