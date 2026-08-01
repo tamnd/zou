@@ -53,7 +53,7 @@ use zou_rest::plan::{self, PlanError, Query};
 use zou_rest::{order, page, rpc, select};
 
 use crate::sql::{RequestContext, Session};
-use crate::{App, AuthContext, json_body};
+use crate::{App, AuthContext, json_body, openapi};
 
 /// PostgREST's getSchema: writes pick their schema through
 /// Content-Profile, everything else through Accept-Profile, a header
@@ -486,15 +486,12 @@ fn decode_media(item: &str) -> Result<Media, String> {
     }
 }
 
-/// Content negotiation the way PostgREST does it through wai: every
-/// space stripped, each item cut at ";q=" keeping the parameters
-/// before it, sorted by quality then by semicolons minus stars, and
-/// the first item with a handler wins. Nothing usable is the
-/// PGRST107 406, which lists the items in that same order.
-fn negotiate(headers: &HeaderMap) -> Result<Media, RestError> {
-    let Some(raw) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) else {
-        return Ok(Media::Json { stripped: false });
-    };
+/// The Accept header the way wai reads it: every space stripped,
+/// each item cut at ";q=" keeping the parameters before it, sorted by
+/// quality then by semicolons minus stars. None means no Accept at
+/// all, which every handler treats as its own default.
+fn accept_items(headers: &HeaderMap) -> Option<Vec<String>> {
+    let raw = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok())?;
     let mut items: Vec<(String, f64)> = Vec::new();
     for part in raw.split(',') {
         let s: String = part.chars().filter(|c| *c != ' ').collect();
@@ -514,14 +511,13 @@ fn negotiate(headers: &HeaderMap) -> Result<Media, RestError> {
             .partial_cmp(&(a.1, spec(&a.0)))
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let mut offered: Vec<String> = Vec::new();
-    for (mime, _) in &items {
-        match decode_media(mime) {
-            Ok(m) => return Ok(m),
-            Err(name) => offered.push(name),
-        }
-    }
-    Err(RestError {
+    Some(items.into_iter().map(|(mime, _)| mime).collect())
+}
+
+/// The PGRST107 406, which lists the items in the order they were
+/// weighed.
+fn unacceptable(offered: Vec<String>) -> RestError {
+    RestError {
         status: StatusCode::NOT_ACCEPTABLE,
         code: "PGRST107".to_string(),
         message: format!(
@@ -530,7 +526,45 @@ fn negotiate(headers: &HeaderMap) -> Result<Media, RestError> {
         ),
         details: None,
         hint: None,
-    })
+    }
+}
+
+/// Content negotiation for a table or an rpc: the first weighed item
+/// with a handler wins.
+fn negotiate(headers: &HeaderMap) -> Result<Media, RestError> {
+    let Some(items) = accept_items(headers) else {
+        return Ok(Media::Json { stripped: false });
+    };
+    let mut offered: Vec<String> = Vec::new();
+    for mime in &items {
+        match decode_media(mime) {
+            Ok(m) => return Ok(m),
+            Err(name) => offered.push(name),
+        }
+    }
+    Err(unacceptable(offered))
+}
+
+/// Content negotiation for the root, whose producible list is the
+/// openapi type, plain json and the star. Anything else is the same
+/// PGRST107 a table raises, which is why `/items` cannot ask for
+/// openapi+json and the root cannot ask for csv.
+fn negotiate_openapi(headers: &HeaderMap) -> Result<(), RestError> {
+    let Some(items) = accept_items(headers) else {
+        return Ok(());
+    };
+    let mut offered: Vec<String> = Vec::new();
+    for mime in &items {
+        let name = mime.split(';').next().unwrap_or("").to_ascii_lowercase();
+        match name.as_str() {
+            "application/openapi+json" | "application/json" | "*/*" => return Ok(()),
+            _ => offered.push(match decode_media(mime) {
+                Ok(_) => name,
+                Err(verbatim) => verbatim,
+            }),
+        }
+    }
+    Err(unacceptable(offered))
 }
 
 /// The PGRST116 refusal for a singular request that did not land on
@@ -1296,6 +1330,152 @@ pub async fn table(
     match result {
         Ok(res) => res,
         Err(e) => e.into_response(),
+    }
+}
+
+/// The introspection behind the document, all of it on the request's
+/// own transaction under the request's own role, which is what makes
+/// the document show a caller only what that caller may reach.
+async fn describe(app: &App, auth: &AuthContext, req: &Parts) -> Result<Response, RestError> {
+    // getSchema runs before the plan upstream, so an unexposed
+    // profile is the 406 even when the Accept is hopeless too.
+    let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
+    negotiate_openapi(&req.headers)?;
+
+    let pool = app.pool.as_ref().ok_or_else(no_database)?;
+    let authed = auth.role != "anon";
+    let ctx = request_context(auth, req, schema);
+    let sess = pool
+        .session(&ctx, true)
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+
+    let catalog = load_catalog(&sess, authed, schema).await?;
+    let table_rows = sess
+        .query(openapi::TABLES_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let column_rows = sess
+        .query(openapi::COLUMNS_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let func_rows = sess
+        .query(openapi::FUNCS_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let comment: Option<String> = sess
+        .query(openapi::SCHEMA_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?
+        .first()
+        .and_then(|r| r.get(0));
+    sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+
+    let mut tables: Vec<openapi::Table> = table_rows
+        .iter()
+        .map(|r| openapi::Table {
+            name: r.get(0),
+            description: r.get(1),
+            insertable: r.get(2),
+            updatable: r.get(3),
+            deletable: r.get(4),
+            pk: r.get(5),
+            columns: Vec::new(),
+        })
+        .collect();
+    // Both queries order by relation name, so one walk fills every
+    // column list without a map in between.
+    for row in &column_rows {
+        let table: String = row.get(0);
+        if let Some(t) = tables.iter_mut().find(|t| t.name == table) {
+            t.columns.push(openapi::Column {
+                name: row.get(1),
+                description: row.get(2),
+                nullable: row.get(3),
+                data_type: row.get(4),
+                max_len: row.get(5),
+                default: row.get(6),
+                enum_labels: row.get(7),
+            });
+        }
+    }
+    let funcs: Vec<openapi::Func> = func_rows
+        .iter()
+        .map(|r| {
+            let names: Vec<String> = r.get(3);
+            let types: Vec<String> = r.get(4);
+            let required: Vec<bool> = r.get(5);
+            let variadic: Vec<bool> = r.get(6);
+            openapi::Func {
+                name: r.get(0),
+                description: r.get(1),
+                volatile: r.get(2),
+                params: names
+                    .into_iter()
+                    .zip(types)
+                    .zip(required)
+                    .zip(variadic)
+                    .map(|(((name, type_name), required), variadic)| openapi::Param {
+                        name,
+                        type_name,
+                        required,
+                        variadic,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+
+    // Upstream takes the host and the base path from its own config
+    // and serves the document at the server root. Zou is mounted
+    // under the Supabase prefix and has no such config, so the site
+    // is read off the request instead: whatever name the client used
+    // to get here is a name that works.
+    let site = openapi::Site {
+        scheme: req
+            .headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("http")
+            .to_string(),
+        host: req
+            .headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost")
+            .to_string(),
+        base_path: "/rest/v1/".to_string(),
+        version: openapi::version(),
+    };
+    let doc = openapi::document(&site, comment.as_ref(), &tables, &funcs, &catalog);
+
+    let mut res = (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/openapi+json; charset=utf-8",
+        )],
+        doc.to_string(),
+    )
+        .into_response();
+    profile_header(&mut res, schema, negotiated);
+    Ok(res)
+}
+
+/// The /rest/v1/ handler, which is the OpenAPI document and nothing
+/// else.
+pub async fn root(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::Extension(auth): axum::Extension<AuthContext>,
+    req: Request<Body>,
+) -> Response {
+    let (parts, _body) = req.into_parts();
+    match parts.method {
+        Method::GET | Method::HEAD => match describe(&app, &auth, &parts).await {
+            Ok(res) => res,
+            Err(e) => e.into_response(),
+        },
+        _ => crate::not_yet("this REST method"),
     }
 }
 
