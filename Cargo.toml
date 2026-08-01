@@ -30,6 +30,7 @@ serde_json = "1"
 sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+tokio-postgres = "0.7"
 tower = "0.5"
 ureq = "3.3"
 

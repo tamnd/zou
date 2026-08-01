@@ -1,0 +1,283 @@
+//! Leak tests for the SQL session pool against a live postgres.
+//!
+//! Gated on ZOU_PG_TEST_DSN, unset means every test skips, same
+//! pattern as the s3 contract suite. CI runs these against a stock
+//! postgres service container, locally point the var at any cluster
+//! you can throw roles at:
+//!
+//!   ZOU_PG_TEST_DSN="host=127.0.0.1 port=5432 user=postgres dbname=postgres" \
+//!     cargo test -p zou-server --test pool
+//!
+//! Every test builds a pool capped at one connection, so reuse versus
+//! replacement is observable through pg_backend_pid.
+
+use zou_server::sql::{Pool, RequestContext};
+
+fn dsn() -> Option<String> {
+    match std::env::var("ZOU_PG_TEST_DSN") {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => {
+            eprintln!("skipping: ZOU_PG_TEST_DSN not set");
+            None
+        }
+    }
+}
+
+fn pool_of(n: usize) -> Option<Pool> {
+    dsn().map(|d| Pool::new(&d, n).expect("dsn parses"))
+}
+
+const CLAIMS: &str = r#"{"sub":"user-1","role":"authenticated"}"#;
+
+async fn text(sess: &zou_server::sql::Session, sql: &str) -> String {
+    let rows = sess.query(sql, &[]).await.expect("query");
+    rows[0].get::<_, String>(0)
+}
+
+#[tokio::test]
+async fn the_context_exists_inside_the_transaction() {
+    let Some(pool) = pool_of(1) else { return };
+    let ctx = RequestContext {
+        role: "authenticated".to_string(),
+        claims: CLAIMS.to_string(),
+        method: "GET".to_string(),
+        path: "/todos".to_string(),
+        headers: r#"{"x-forwarded-for":"10.0.0.1"}"#.to_string(),
+        cookies: "{}".to_string(),
+    };
+    let sess = pool.session(&ctx, false).await.expect("session");
+    assert_eq!(
+        text(&sess, "select current_user::text").await,
+        "authenticated"
+    );
+    assert_eq!(
+        text(&sess, "select current_setting('request.jwt.claims')").await,
+        CLAIMS
+    );
+    assert_eq!(
+        text(&sess, "select current_setting('request.method')").await,
+        "GET"
+    );
+    assert_eq!(
+        text(&sess, "select current_setting('request.path')").await,
+        "/todos"
+    );
+    assert_eq!(
+        text(
+            &sess,
+            "select current_setting('request.headers')::json ->> 'x-forwarded-for'"
+        )
+        .await,
+        "10.0.0.1"
+    );
+    sess.commit().await.expect("commit");
+}
+
+#[tokio::test]
+async fn nothing_leaks_into_the_next_checkout_after_commit() {
+    let Some(pool) = pool_of(1) else { return };
+    let ctx = RequestContext::bare("anon", "{}");
+    let sess = pool.session(&ctx, false).await.expect("session");
+    let pid = sess.backend_pid().await.expect("pid");
+    sess.commit().await.expect("commit");
+
+    let clean = pool.unscoped().await.expect("unscoped");
+    assert_eq!(
+        clean.backend_pid().await.expect("pid"),
+        pid,
+        "same connection reused"
+    );
+    assert_ne!(text(&clean, "select current_user::text").await, "anon");
+    assert_eq!(
+        text(
+            &clean,
+            "select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '<unset>')"
+        )
+        .await,
+        "<unset>"
+    );
+    clean.commit().await.expect("finish");
+}
+
+#[tokio::test]
+async fn a_session_level_set_config_is_scrubbed_on_return() {
+    let Some(pool) = pool_of(1) else { return };
+    let ctx = RequestContext::bare("anon", "{}");
+    let sess = pool.session(&ctx, false).await.expect("session");
+    // is_local false survives commit, exactly the smuggling the pool
+    // must scrub before the connection serves anyone else.
+    sess.query("select set_config('app.sticky', 'leaked', false)", &[])
+        .await
+        .expect("session level set");
+    sess.query("select set_config('role', 'service_role', false)", &[])
+        .await
+        .expect("session level role");
+    let pid = sess.backend_pid().await.expect("pid");
+    sess.commit().await.expect("commit");
+
+    let clean = pool.unscoped().await.expect("unscoped");
+    assert_eq!(
+        clean.backend_pid().await.expect("pid"),
+        pid,
+        "same connection reused"
+    );
+    assert_ne!(
+        text(&clean, "select current_user::text").await,
+        "service_role"
+    );
+    assert_eq!(
+        text(
+            &clean,
+            "select coalesce(nullif(current_setting('app.sticky', true), ''), '<unset>')"
+        )
+        .await,
+        "<unset>"
+    );
+    clean.commit().await.expect("finish");
+}
+
+#[tokio::test]
+async fn an_abandoned_session_forfeits_its_connection() {
+    let Some(pool) = pool_of(1) else { return };
+    let ctx = RequestContext::bare("anon", "{}");
+    let sess = pool.session(&ctx, false).await.expect("session");
+    sess.query("select set_config('app.sticky', 'leaked', false)", &[])
+        .await
+        .expect("session level set");
+    let pid = sess.backend_pid().await.expect("pid");
+    drop(sess);
+
+    let clean = pool.unscoped().await.expect("unscoped");
+    assert_ne!(
+        clean.backend_pid().await.expect("pid"),
+        pid,
+        "fresh connection dialed"
+    );
+    assert_eq!(
+        text(
+            &clean,
+            "select coalesce(nullif(current_setting('app.sticky', true), ''), '<unset>')"
+        )
+        .await,
+        "<unset>"
+    );
+    clean.commit().await.expect("finish");
+}
+
+#[tokio::test]
+async fn rollback_returns_a_clean_connection() {
+    let Some(pool) = pool_of(1) else { return };
+    let ctx = RequestContext::bare("anon", "{}");
+    let sess = pool.session(&ctx, false).await.expect("session");
+    let pid = sess.backend_pid().await.expect("pid");
+    assert!(
+        sess.query("select no_such_column from nowhere", &[])
+            .await
+            .is_err()
+    );
+    sess.rollback().await.expect("rollback");
+
+    let clean = pool.unscoped().await.expect("unscoped");
+    assert_eq!(
+        clean.backend_pid().await.expect("pid"),
+        pid,
+        "same connection reused"
+    );
+    assert_eq!(
+        text(
+            &clean,
+            "select coalesce(nullif(current_setting('request.jwt.claims', true), ''), '<unset>')"
+        )
+        .await,
+        "<unset>"
+    );
+    clean.commit().await.expect("finish");
+}
+
+#[tokio::test]
+async fn read_only_sessions_reject_writes() {
+    let Some(pool) = pool_of(1) else { return };
+    let ctx = RequestContext::bare("anon", "{}");
+    let sess = pool.session(&ctx, true).await.expect("session");
+    let err = sess
+        .execute("create table zou_pool_never (x int)", &[])
+        .await
+        .expect_err("write in a read only transaction");
+    let msg = err.as_db_error().expect("a db error").message();
+    assert!(msg.contains("read-only"), "unexpected error: {msg}");
+    sess.rollback().await.expect("rollback");
+}
+
+#[tokio::test]
+async fn bootstrap_created_the_three_roles() {
+    let Some(pool) = pool_of(1) else { return };
+    let sess = pool.unscoped().await.expect("unscoped");
+    assert_eq!(
+        text(
+            &sess,
+            "select count(*)::text from pg_roles where rolname in ('anon','authenticated','service_role')"
+        )
+        .await,
+        "3"
+    );
+    assert_eq!(
+        text(
+            &sess,
+            "select rolbypassrls::text from pg_roles where rolname = 'service_role'"
+        )
+        .await,
+        "true"
+    );
+    sess.commit().await.expect("finish");
+}
+
+#[tokio::test]
+async fn the_injected_role_carries_real_privileges() {
+    let Some(pool) = pool_of(1) else { return };
+    let admin = pool.unscoped().await.expect("unscoped");
+    admin
+        .execute("create table if not exists zou_pool_private (x int)", &[])
+        .await
+        .expect("create");
+    admin
+        .execute("revoke all on zou_pool_private from anon", &[])
+        .await
+        .expect("revoke");
+    admin.commit().await.expect("finish");
+
+    let ctx = RequestContext::bare("anon", "{}");
+    let sess = pool.session(&ctx, false).await.expect("session");
+    let err = sess
+        .query("select * from zou_pool_private", &[])
+        .await
+        .expect_err("anon reading an unGRANTed table");
+    let msg = err.as_db_error().expect("a db error").message();
+    assert!(msg.contains("permission denied"), "unexpected error: {msg}");
+    sess.rollback().await.expect("rollback");
+
+    let admin = pool.unscoped().await.expect("unscoped");
+    admin
+        .execute("drop table zou_pool_private", &[])
+        .await
+        .expect("drop");
+    admin.commit().await.expect("finish");
+}
+
+#[tokio::test]
+async fn checkouts_past_the_cap_wait_instead_of_failing() {
+    let Some(pool) = pool_of(2) else { return };
+    let mut tasks = Vec::new();
+    for i in 0..6 {
+        let pool = pool.clone();
+        tasks.push(tokio::spawn(async move {
+            let ctx = RequestContext::bare("anon", "{}");
+            let sess = pool.session(&ctx, false).await.expect("session");
+            let n: String = text(&sess, &format!("select {i}::text")).await;
+            sess.commit().await.expect("commit");
+            n
+        }));
+    }
+    for (i, t) in tasks.into_iter().enumerate() {
+        assert_eq!(t.await.expect("join"), i.to_string());
+    }
+}

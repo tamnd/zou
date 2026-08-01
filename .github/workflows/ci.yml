@@ -52,6 +52,30 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo build --workspace
 
+  pg-pool:
+    name: sql session pool (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-pool-tests
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the pool leak tests
+        env:
+          ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
+        run: cargo test -p zou-server --test pool -- --nocapture
+
   s3-contract:
     name: s3 contract (minio)
     runs-on: ubuntu-latest
