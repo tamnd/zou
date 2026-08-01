@@ -252,3 +252,163 @@ async fn the_introspection_query_reads_the_fk_graph() {
         .await
         .expect("cleanup");
 }
+
+/// The planner's output executed for real: every lateral shape runs
+/// and the rows come back as the json a PostgREST client expects.
+/// Its own schema name, the introspection test drops zou_embed while
+/// this one runs.
+#[tokio::test]
+async fn planned_queries_return_postgrest_shaped_rows() {
+    use zou_rest::filter::{Node, Parsed, parse_pair};
+    use zou_rest::{order, plan, select};
+
+    let Some(c) = client().await else { return };
+
+    c.batch_execute(
+        "drop schema if exists zou_plan cascade;
+         create schema zou_plan;
+         set search_path to zou_plan;
+         create table users (id int primary key, name text);
+         create table profiles (
+             id int primary key,
+             user_id int not null unique references users,
+             bio text
+         );
+         create table orders (
+             id int primary key,
+             user_id int references users,
+             total int
+         );
+         create table products (id int primary key);
+         create table order_items (
+             order_id int references orders,
+             product_id int references products,
+             primary key (order_id, product_id)
+         );
+         insert into users values (1, 'ann'), (2, 'bob');
+         insert into profiles values (1, 1, 'ann bio');
+         insert into orders values (10, 1, 100), (11, 1, 50), (12, 2, 75);
+         insert into products values (1), (2);
+         insert into order_items values (10, 1), (10, 2), (11, 1);",
+    )
+    .await
+    .expect("plan schema");
+
+    let rows = c
+        .query(zou_rest::catalog::INTROSPECT_SQL, &[&"zou_plan"])
+        .await
+        .expect("introspect");
+    let catalog = Catalog::new(
+        rows.iter()
+            .map(|r| FkRow {
+                constraint: r.get(0),
+                table: r.get(1),
+                columns: r.get(2),
+                ref_table: r.get(3),
+                ref_columns: r.get(4),
+                unique: r.get(5),
+                in_pk: r.get(6),
+            })
+            .collect(),
+    );
+
+    let run = async |q: &plan::Query, expect: &[&str]| {
+        let sql = plan::plan(&catalog, q).unwrap_or_else(|e| panic!("{e}"));
+        let text = format!("select to_jsonb(t)::text from ({}) as t", sql.text);
+        let params: Vec<Text> = sql.params.into_iter().map(Text).collect();
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        let rows = c
+            .query(&text, &refs)
+            .await
+            .unwrap_or_else(|e| panic!("{text}: {e}"));
+        let got: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+        assert_eq!(got, expect, "for {text}");
+    };
+
+    let query = |table: &str, sel: &str| plan::Query {
+        table: table.into(),
+        select: select::parse(sel).unwrap(),
+        ..plan::Query::default()
+    };
+    let filt = |q: &mut plan::Query, key: &str, value: &str| match parse_pair(key, value).unwrap() {
+        Parsed::Filter(cond) => q.filters.push((Vec::new(), Node::Cond(cond))),
+        Parsed::Logic {
+            embed,
+            op,
+            negated,
+            kids,
+        } => q.filters.push((embed, Node::Group { op, negated, kids })),
+    };
+    let root_order = |q: &mut plan::Query, terms: &str| {
+        q.order.push((Vec::new(), order::parse(terms).unwrap()));
+    };
+
+    // To many with nested order and limit.
+    let mut q = query("users", "id,orders(total)");
+    root_order(&mut q, "id");
+    q.order
+        .push((vec!["orders".into()], order::parse("total.desc").unwrap()));
+    q.limit.push((vec!["orders".into()], 1));
+    run(
+        &q,
+        &[
+            r#"{"id": 1, "orders": [{"total": 100}]}"#,
+            r#"{"id": 2, "orders": [{"total": 75}]}"#,
+        ],
+    )
+    .await;
+
+    // To one, and the empty side of it.
+    let mut q = query("users", "id,profiles(bio)");
+    root_order(&mut q, "id");
+    run(
+        &q,
+        &[
+            r#"{"id": 1, "profiles": {"bio": "ann bio"}}"#,
+            r#"{"id": 2, "profiles": null}"#,
+        ],
+    )
+    .await;
+
+    // An inner empty embed with a routed filter is pure existence.
+    let mut q = query("users", "id,orders!inner()");
+    filt(&mut q, "orders.total", "gte.100");
+    run(&q, &[r#"{"id": 1}"#]).await;
+
+    // Many to many through the junction, and the empty array.
+    let mut q = query("orders", "id,products(id)");
+    root_order(&mut q, "id");
+    q.order
+        .push((vec!["products".into()], order::parse("id").unwrap()));
+    run(
+        &q,
+        &[
+            r#"{"id": 10, "products": [{"id": 1}, {"id": 2}]}"#,
+            r#"{"id": 11, "products": [{"id": 1}]}"#,
+            r#"{"id": 12, "products": []}"#,
+        ],
+    )
+    .await;
+
+    // A spread folds the to one columns into the parent.
+    let mut q = query("orders", "id,...users(name)");
+    filt(&mut q, "id", "eq.12");
+    run(&q, &[r#"{"id": 12, "name": "bob"}"#]).await;
+
+    // Aggregates group by the plain columns.
+    let mut q = query("orders", "user_id,total.sum()");
+    root_order(&mut q, "user_id");
+    run(
+        &q,
+        &[
+            r#"{"sum": 150, "user_id": 1}"#,
+            r#"{"sum": 75, "user_id": 2}"#,
+        ],
+    )
+    .await;
+
+    c.batch_execute("drop schema zou_plan cascade")
+        .await
+        .expect("cleanup");
+}

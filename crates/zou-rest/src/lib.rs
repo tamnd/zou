@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod filter;
 pub mod order;
 pub mod page;
+pub mod plan;
 mod scan;
 pub mod select;
 pub mod sql;

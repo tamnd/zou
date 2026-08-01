@@ -69,5 +69,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "rest_plan"
+path = "fuzz_targets/rest_plan.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
