@@ -26,6 +26,7 @@ use axum::{Router, middleware};
 
 pub mod edge;
 pub mod jwt;
+pub mod rest;
 pub mod sql;
 
 /// What the front door needs to know: the secret every key and token
@@ -85,7 +86,7 @@ pub struct AuthContext {
     pub claims: Arc<serde_json::Value>,
 }
 
-fn json_body(status: StatusCode, body: serde_json::Value) -> Response {
+pub(crate) fn json_body(status: StatusCode, body: serde_json::Value) -> Response {
     (
         status,
         [(header::CONTENT_TYPE, "application/json")],
@@ -202,7 +203,7 @@ async fn auth_health() -> Response {
 
 /// An honest placeholder for surfaces that exist in the router but not
 /// yet in the code, with the milestone that will fill them in.
-fn not_yet(surface: &str) -> Response {
+pub(crate) fn not_yet(surface: &str) -> Response {
     json_body(
         StatusCode::NOT_IMPLEMENTED,
         serde_json::json!({
@@ -212,7 +213,7 @@ fn not_yet(surface: &str) -> Response {
 }
 
 async fn rest_stub() -> Response {
-    not_yet("the REST surface")
+    not_yet("this REST endpoint")
 }
 async fn auth_stub() -> Response {
     not_yet("this auth endpoint")
@@ -243,7 +244,8 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/auth/v1/health", get(auth_health))
         .route("/auth/v1/{*rest}", any(auth_stub))
         .route("/rest/v1/", any(rest_stub))
-        .route("/rest/v1/{*rest}", any(rest_stub))
+        .route("/rest/v1/rpc/{func}", any(rest_stub))
+        .route("/rest/v1/{table}", any(rest::table))
         .route("/storage/v1/{*rest}", any(storage_stub))
         .route("/realtime/v1/{*rest}", any(realtime_stub))
         .layer(middleware::from_fn_with_state(Arc::clone(&app), gate))
@@ -355,9 +357,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_is_a_501_stub_for_now() {
+    async fn a_rest_read_without_a_database_is_the_503_shape() {
         let req = Request::builder()
             .uri("/rest/v1/todos?select=*")
+            .header("apikey", anon_key())
+            .body(Body::empty())
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = body_json(res).await;
+        assert_eq!(body["code"], "PGRST000");
+        assert_eq!(
+            body["message"],
+            "Database connection error. Retrying the connection."
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_mutations_are_still_the_honest_501() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rest/v1/todos")
+            .header("apikey", anon_key())
+            .body(Body::empty())
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn rpc_is_still_stubbed() {
+        let req = Request::builder()
+            .uri("/rest/v1/rpc/do_thing")
             .header("apikey", anon_key())
             .body(Body::empty())
             .unwrap();
