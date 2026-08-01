@@ -1,0 +1,202 @@
+Batch the smgr shim's store round trips.
+
+zoureadv and zoustartreadv hand the whole block run to the Rust side
+in one call so misses fan out across its thread pool, zouwritev pays
+the WAL mirror barrier once on the newest LSN in the run instead of
+once per page and passes skipFsync through so bulk fill pages buffer
+in process, and registersync/immedsync settle those buffers through
+zou_smgr_sync. Buffering only happens under a postmaster, bootstrap
+and single user backends settle durability outside the smgr (initdb
+fsyncs the data directory itself, which never holds relation pages
+under zou), so they write eagerly. See crates/zou-pg/src/pending.rs
+for the buffer's correctness argument.
+
+--- a/src/backend/storage/smgr/zou_smgr.c
++++ b/src/backend/storage/smgr/zou_smgr.c
+@@ -43,10 +43,17 @@
+ 							 uint32 *out);
+ extern int	zou_smgr_read(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+ 						  uint32 blk, uint8 *buf, uint64 durable_lsn);
++extern int	zou_smgr_readv(uint32 spc, uint32 db, uint32 rel, uint32 fork,
++						   uint32 blk, uint8 **bufs, uint32 nblocks,
++						   uint64 durable_lsn);
+ extern int	zou_smgr_write(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+ 						   uint32 blk, const uint8 *buf);
++extern int	zou_smgr_writev(uint32 spc, uint32 db, uint32 rel, uint32 fork,
++							uint32 blk, const uint8 *const *bufs,
++							uint32 nblocks, int32 skip_fsync);
+ extern int	zou_smgr_extend(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+-							uint32 blk, const uint8 *buf);
++							uint32 blk, const uint8 *buf, int32 skip_fsync);
++extern int	zou_smgr_sync(uint32 spc, uint32 db, uint32 rel, uint32 fork);
+ extern int	zou_smgr_zeroextend(uint32 spc, uint32 db, uint32 rel,
+ 								uint32 fork, uint32 blk, uint32 count);
+ extern int	zou_smgr_truncate(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+@@ -143,12 +150,27 @@
+ 	/* like mdunlink, unlink failures are not worth erroring over */
+ }
+ 
++/*
++ * A skipFsync page may buffer in process on the Rust side because its
++ * durability comes due at smgrregistersync or smgrimmedsync. Bootstrap
++ * and single user backends break that contract, initdb settles
++ * durability by fsyncing the data directory itself and relation pages
++ * never live there under zou, so outside a postmaster every write goes
++ * to the store eagerly.
++ */
++static inline int
++zou_skip_fsync(bool skipFsync)
++{
++	return (skipFsync && IsUnderPostmaster) ? 1 : 0;
++}
++
+ void
+ zouextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 		  const void *buffer, bool skipFsync)
+ {
+ 	zou_check(zou_smgr_extend(ZOU_LOCATOR(reln), (uint32) forknum,
+-							  (uint32) blocknum, (const uint8 *) buffer),
++							  (uint32) blocknum, (const uint8 *) buffer,
++							  zou_skip_fsync(skipFsync)),
+ 			  "extend", reln, forknum);
+ }
+ 
+@@ -179,12 +201,11 @@
+ zoureadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 		 void **buffers, BlockNumber nblocks)
+ {
+-	for (BlockNumber i = 0; i < nblocks; i++)
+-		zou_check(zou_smgr_read(ZOU_LOCATOR(reln), (uint32) forknum,
+-								(uint32) (blocknum + i),
+-								(uint8 *) buffers[i],
+-								(uint64) ZouWalDurableLSN()),
+-				  "read", reln, forknum);
++	zou_check(zou_smgr_readv(ZOU_LOCATOR(reln), (uint32) forknum,
++							 (uint32) blocknum, (uint8 **) buffers,
++							 (uint32) nblocks,
++							 (uint64) ZouWalDurableLSN()),
++			  "readv", reln, forknum);
+ }
+ 
+ /*
+@@ -200,7 +221,8 @@
+ 	off_t		region;
+ 	struct iovec *iov;
+ 	int			iovcnt PG_USED_FOR_ASSERTS_ONLY;
+-	uint8		page[BLCKSZ];
++	uint8	   *staged;
++	uint8	  **pages;
+ 
+ 	if (zou_scratch_fd < 0)
+ 	{
+@@ -223,17 +245,21 @@
+ 	}
+ 
+ 	region = (off_t) pgaio_io_get_id(ioh) * PG_IOV_MAX * BLCKSZ;
++	staged = palloc((Size) nblocks * BLCKSZ);
++	pages = palloc(nblocks * sizeof(uint8 *));
+ 	for (BlockNumber i = 0; i < nblocks; i++)
+-	{
+-		zou_check(zou_smgr_read(ZOU_LOCATOR(reln), (uint32) forknum,
+-								(uint32) (blocknum + i), page,
+-								(uint64) ZouWalDurableLSN()),
+-				  "read", reln, forknum);
+-		if (pwrite(zou_scratch_fd, page, BLCKSZ, region + (off_t) i * BLCKSZ) != BLCKSZ)
+-			ereport(ERROR,
+-					(errcode_for_file_access(),
+-					 errmsg("zou smgr could not stage page: %m")));
+-	}
++		pages[i] = staged + (Size) i * BLCKSZ;
++	zou_check(zou_smgr_readv(ZOU_LOCATOR(reln), (uint32) forknum,
++							 (uint32) blocknum, pages, (uint32) nblocks,
++							 (uint64) ZouWalDurableLSN()),
++			  "readv", reln, forknum);
++	if (pwrite(zou_scratch_fd, staged, (size_t) nblocks * BLCKSZ, region) !=
++		(ssize_t) ((size_t) nblocks * BLCKSZ))
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("zou smgr could not stage pages: %m")));
++	pfree(pages);
++	pfree(staged);
+ 
+ 	iovcnt = pgaio_io_get_iovec(ioh, &iov);
+ 	Assert((int) nblocks <= iovcnt);
+@@ -253,25 +279,42 @@
+ zouwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 		  const void **buffers, BlockNumber nblocks, bool skipFsync)
+ {
+-	for (BlockNumber i = 0; i < nblocks; i++)
++	int			skip = zou_skip_fsync(skipFsync);
++
++	if (!skip)
+ 	{
+-		XLogRecPtr	lsn = PageGetLSN((const PageData *) buffers[i]);
++		XLogRecPtr	barrier = InvalidXLogRecPtr;
+ 
+ 		/*
+ 		 * A page must never reach the store ahead of the WAL that
+ 		 * produced it. Store objects survive a crash while local pg_wal
+ 		 * does not, so an early page would carry effects of records the
+ 		 * mirrored stream has never heard of, and a node attaching from
+-		 * the store could not explain its own pages. Waiting here is the
+-		 * same backpressure a committing backend already accepts.
++		 * the store could not explain its own pages. One wait on the
++		 * newest LSN in the run fences every page in it, the same
++		 * backpressure a committing backend already accepts, paid once
++		 * per run instead of once per page.
++		 *
++		 * skipFsync runs skip the barrier: they fill relfilenodes
++		 * nothing references until a commit record whose own mirror
++		 * wait fences everything before it, and they buffer in process
++		 * on the Rust side rather than hitting the store here.
+ 		 */
+-		if (lsn != InvalidXLogRecPtr)
+-			ZouWalWaitForLSN(lsn);
+-		zou_check(zou_smgr_write(ZOU_LOCATOR(reln), (uint32) forknum,
+-								 (uint32) (blocknum + i),
+-								 (const uint8 *) buffers[i]),
+-				  "write", reln, forknum);
++		for (BlockNumber i = 0; i < nblocks; i++)
++		{
++			XLogRecPtr	lsn = PageGetLSN((const PageData *) buffers[i]);
++
++			if (lsn > barrier)
++				barrier = lsn;
++		}
++		if (barrier != InvalidXLogRecPtr)
++			ZouWalWaitForLSN(barrier);
+ 	}
++	zou_check(zou_smgr_writev(ZOU_LOCATOR(reln), (uint32) forknum,
++							  (uint32) blocknum,
++							  (const uint8 *const *) buffers,
++							  (uint32) nblocks, skip),
++			  "writev", reln, forknum);
+ }
+ 
+ void
+@@ -302,12 +345,24 @@
+ void
+ zouimmedsync(SMgrRelation reln, ForkNumber forknum)
+ {
+-	/* every put is durable before it returns, nothing to sync */
++	/*
++	 * Eager puts are durable before they return, this settles the
++	 * skipFsync pages still buffered on the Rust side.
++	 */
++	zou_check(zou_smgr_sync(ZOU_LOCATOR(reln), (uint32) forknum),
++			  "sync", reln, forknum);
+ }
+ 
+ void
+ zouregistersync(SMgrRelation reln, ForkNumber forknum)
+ {
++	/*
++	 * md defers this to the next checkpoint. The store has no fsync to
++	 * defer to, so durability settles here, which still amortizes the
++	 * whole bulk fill into one parallel drain.
++	 */
++	zou_check(zou_smgr_sync(ZOU_LOCATOR(reln), (uint32) forknum),
++			  "sync", reln, forknum);
+ }
+ 
+ int
