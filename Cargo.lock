@@ -1915,6 +1915,17 @@ name = "zou-chaos"
 version = "0.0.1"
 
 [[package]]
+name = "zou-log"
+version = "0.0.1"
+dependencies = [
+ "crc32c",
+ "log",
+ "tempfile",
+ "thiserror",
+ "zou-store",
+]
+
+[[package]]
 name = "zou-pg"
 version = "0.0.1"
 dependencies = [
