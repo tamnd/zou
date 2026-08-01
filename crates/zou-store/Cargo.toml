@@ -25,6 +25,7 @@ sqlite = ["dep:rusqlite"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+zou-chaos = { path = "../zou-chaos" }
 
 [lints]
 workspace = true
