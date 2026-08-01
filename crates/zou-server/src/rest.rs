@@ -375,6 +375,155 @@ fn parse_prefer(headers: &HeaderMap) -> Prefer {
     p
 }
 
+/// The response shape the Accept header negotiated. Plain json
+/// covers application/json, */*, and the vendored array+json name,
+/// which PostgREST folds into plain json unless nulls=stripped
+/// rides along.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Media {
+    Json { stripped: bool },
+    Single { stripped: bool },
+    Csv,
+}
+
+impl Media {
+    fn content_type(self) -> &'static str {
+        match self {
+            Media::Json { stripped: false } => "application/json; charset=utf-8",
+            Media::Json { stripped: true } => {
+                "application/vnd.pgrst.array+json;nulls=stripped; charset=utf-8"
+            }
+            Media::Single { stripped: false } => "application/vnd.pgrst.object+json; charset=utf-8",
+            Media::Single { stripped: true } => {
+                "application/vnd.pgrst.object+json;nulls=stripped; charset=utf-8"
+            }
+            Media::Csv => "text/csv; charset=utf-8",
+        }
+    }
+
+    fn is_single(self) -> bool {
+        matches!(self, Media::Single { .. })
+    }
+
+    fn stripped(self) -> bool {
+        matches!(
+            self,
+            Media::Json { stripped: true } | Media::Single { stripped: true }
+        )
+    }
+}
+
+/// One Accept item into its handler, or into the name the 406
+/// message echoes: canonical for media types PostgREST knows but
+/// cannot produce from a table, verbatim for everything else.
+fn decode_media(item: &str) -> Result<Media, String> {
+    let mut parts = item.split(';');
+    let mime = parts.next().unwrap_or("").to_ascii_lowercase();
+    let mut stripped = false;
+    for param in parts {
+        if let Some((k, v)) = param.split_once('=')
+            && k.eq_ignore_ascii_case("nulls")
+            && v.trim_matches('"') == "stripped"
+        {
+            stripped = true;
+        }
+    }
+    match mime.as_str() {
+        "*/*" | "application/json" => Ok(Media::Json { stripped: false }),
+        "application/vnd.pgrst.array+json" | "application/vnd.pgrst.array" => {
+            Ok(Media::Json { stripped })
+        }
+        "application/vnd.pgrst.object+json" | "application/vnd.pgrst.object" => {
+            Ok(Media::Single { stripped })
+        }
+        "text/csv" => Ok(Media::Csv),
+        "text/plain"
+        | "text/xml"
+        | "application/geo+json"
+        | "application/openapi+json"
+        | "application/x-www-form-urlencoded"
+        | "application/octet-stream" => Err(mime),
+        _ => Err(item.to_string()),
+    }
+}
+
+/// Content negotiation the way PostgREST does it through wai: every
+/// space stripped, each item cut at ";q=" keeping the parameters
+/// before it, sorted by quality then by semicolons minus stars, and
+/// the first item with a handler wins. Nothing usable is the
+/// PGRST107 406, which lists the items in that same order.
+fn negotiate(headers: &HeaderMap) -> Result<Media, RestError> {
+    let Some(raw) = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) else {
+        return Ok(Media::Json { stripped: false });
+    };
+    let mut items: Vec<(String, f64)> = Vec::new();
+    for part in raw.split(',') {
+        let s: String = part.chars().filter(|c| *c != ' ').collect();
+        let (mime, q) = match s.find(";q=") {
+            Some(i) => {
+                let tail = &s[i + 3..];
+                let digits = &tail[..tail.find(';').unwrap_or(tail.len())];
+                (s[..i].to_string(), digits.parse().unwrap_or(1.0))
+            }
+            None => (s, 1.0),
+        };
+        items.push((mime, q));
+    }
+    let spec = |m: &str| m.matches(';').count() as i64 - m.matches('*').count() as i64;
+    items.sort_by(|a, b| {
+        (b.1, spec(&b.0))
+            .partial_cmp(&(a.1, spec(&a.0)))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut offered: Vec<String> = Vec::new();
+    for (mime, _) in &items {
+        match decode_media(mime) {
+            Ok(m) => return Ok(m),
+            Err(name) => offered.push(name),
+        }
+    }
+    Err(RestError {
+        status: StatusCode::NOT_ACCEPTABLE,
+        code: "PGRST107".to_string(),
+        message: format!(
+            "None of these media types are available: {}",
+            offered.join(", ")
+        ),
+        details: None,
+        hint: None,
+    })
+}
+
+/// The PGRST116 refusal for a singular request that did not land on
+/// exactly one row. Writes raise it before commit, so the mutation
+/// rolls back the way PostgREST condemns the transaction.
+fn not_single(rows: usize) -> RestError {
+    RestError {
+        status: StatusCode::NOT_ACCEPTABLE,
+        code: "PGRST116".to_string(),
+        message: "Cannot coerce the result to a single JSON object".to_string(),
+        details: Some(format!("The result contains {rows} rows")),
+        hint: None,
+    }
+}
+
+/// The per-row json expression, stripping nulls when the vendored
+/// nulls=stripped parameter asked for it.
+fn row_json(media: Media) -> &'static str {
+    if media.stripped() {
+        "jsonb_strip_nulls(to_jsonb(\"_zou_row\"))"
+    } else {
+        "to_jsonb(\"_zou_row\")"
+    }
+}
+
+/// PostgREST's csv shaping, transcribed from asCsvF: the header is
+/// the first row's json keys, each line is the row's record text
+/// with the parens shaved off, and the row count rides in a second
+/// column. An empty result comes out as a lone newline, same as
+/// upstream. Callers prepend `with ... "_zou_source" as (...)`.
+const CSV_AGG: &str = "select (select coalesce(string_agg(a.k, ','), '') from (select json_object_keys(r)::text as k from (select row_to_json(hh) as r from \"_zou_source\" as hh limit 1) s) a) || E'\\n' || coalesce(string_agg(substring(\"_zou_t\"::text, 2, length(\"_zou_t\"::text) - 2), E'\\n'), ''), count(*) from (select * from \"_zou_source\") as \"_zou_t\"";
+
 /// An insert body into its column list and normalized payload: one
 /// object wraps into a single element array, the columns are the
 /// union of every element's keys so a key absent from one row
@@ -686,15 +835,38 @@ async fn read(
     let catalog = load_catalog(&sess, authed).await?;
 
     let sql = plan::plan(&catalog, &q).map_err(plan_error)?;
-    let wrapped = format!(
-        "select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
-        sql.text
-    );
+    let media = negotiate(&req.headers)?;
     let params: Vec<Text> = sql.params.into_iter().map(Text).collect();
-    let rows = sess
-        .query(&wrapped, &param_refs(&params))
-        .await
-        .map_err(|e| pg_error(&e, authed))?;
+    let (body, returned) = if media == Media::Csv {
+        let text = format!("with \"_zou_source\" as ({}) {}", sql.text, CSV_AGG);
+        let rows = sess
+            .query(&text, &param_refs(&params))
+            .await
+            .map_err(|e| pg_error(&e, authed))?;
+        (
+            rows[0].get::<_, String>(0),
+            rows[0].get::<_, i64>(1) as usize,
+        )
+    } else {
+        let wrapped = format!(
+            "select {}::text from ({}) as \"_zou_row\"",
+            row_json(media),
+            sql.text
+        );
+        let rows = sess
+            .query(&wrapped, &param_refs(&params))
+            .await
+            .map_err(|e| pg_error(&e, authed))?;
+        if media.is_single() && rows.len() != 1 {
+            return Err(not_single(rows.len()));
+        }
+        let body = if media.is_single() {
+            rows[0].get::<_, String>(0)
+        } else {
+            json_array(&rows)
+        };
+        (body, rows.len())
+    };
 
     // The total, when count= asked for one, on the same transaction
     // so it sees the same snapshot. An unpaged exact total is just
@@ -725,7 +897,7 @@ async fn read(
                 .map_err(|e| pg_error(&e, authed))?;
             Some(crows[0].get(0))
         } else {
-            Some(rows.len() as i64)
+            Some(returned as i64)
         }
     } else {
         None
@@ -759,18 +931,13 @@ async fn read(
         .find(|(r, _)| r.is_empty())
         .map(|(_, n)| *n)
         .unwrap_or(0);
-    let status = range_status(offset, rows.len(), total);
+    let status = range_status(offset, returned, total);
     let mut res = if status == StatusCode::RANGE_NOT_SATISFIABLE {
         json_body(status, out_of_bounds(offset, total.unwrap_or(0)))
     } else {
-        (
-            status,
-            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-            json_array(&rows),
-        )
-            .into_response()
+        (status, [(header::CONTENT_TYPE, media.content_type())], body).into_response()
     };
-    if let Ok(v) = content_range(offset, rows.len(), total).parse() {
+    if let Ok(v) = content_range(offset, returned, total).parse() {
         res.headers_mut().insert(header::CONTENT_RANGE, v);
     }
     let applied = match prefer.count {
@@ -829,14 +996,20 @@ async fn write(
         _ => None,
     };
 
+    let media = negotiate(&req.headers)?;
+
     // A PATCH that carries no keys touches nothing: PostgREST's
     // no-op answer, no database round trip.
     if *method == Method::PATCH && payload.as_ref().is_some_and(|(c, _)| c.is_empty()) {
+        if media.is_single() {
+            return Err(not_single(0));
+        }
         let mut res = if prefer.ret == Ret::Representation {
+            let body = if media == Media::Csv { "\n" } else { "[]" };
             (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-                "[]",
+                [(header::CONTENT_TYPE, media.content_type())],
+                body,
             )
                 .into_response()
         } else {
@@ -918,27 +1091,52 @@ async fn write(
         Ret::Representation => {
             let catalog = load_catalog(&sess, authed).await?;
             let r = mutate::representation(&catalog, m, &mut q).map_err(plan_error)?;
-            let text = format!(
-                "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
-                r.cte, r.select.text
-            );
             let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
-            let rows = sess
-                .query(&text, &param_refs(&params))
-                .await
-                .map_err(|e| pg_error(&e, authed))?;
-            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
-            affected = rows.len() as u64;
-            (
-                if created {
-                    StatusCode::CREATED
+            let status = if created {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            if media == Media::Csv {
+                let text = format!(
+                    "with {}, \"_zou_source\" as ({}) {}",
+                    r.cte, r.select.text, CSV_AGG
+                );
+                let rows = sess
+                    .query(&text, &param_refs(&params))
+                    .await
+                    .map_err(|e| pg_error(&e, authed))?;
+                affected = rows[0].get::<_, i64>(1) as u64;
+                sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+                (
+                    status,
+                    [(header::CONTENT_TYPE, media.content_type())],
+                    rows[0].get::<_, String>(0),
+                )
+                    .into_response()
+            } else {
+                let text = format!(
+                    "with {} select {}::text from ({}) as \"_zou_row\"",
+                    r.cte,
+                    row_json(media),
+                    r.select.text
+                );
+                let rows = sess
+                    .query(&text, &param_refs(&params))
+                    .await
+                    .map_err(|e| pg_error(&e, authed))?;
+                if media.is_single() && rows.len() != 1 {
+                    return Err(not_single(rows.len()));
+                }
+                sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+                affected = rows.len() as u64;
+                let body = if media.is_single() {
+                    rows[0].get::<_, String>(0)
                 } else {
-                    StatusCode::OK
-                },
-                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-                json_array(&rows),
-            )
-                .into_response()
+                    json_array(&rows)
+                };
+                (status, [(header::CONTENT_TYPE, media.content_type())], body).into_response()
+            }
         }
         Ret::HeadersOnly if wants_location && !pk.is_empty() => {
             // The returned key rides out through a CTE as jsonb text,
@@ -953,6 +1151,9 @@ async fn write(
                 .query(&text, &param_refs(&params))
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
+            if media.is_single() && rows.len() != 1 {
+                return Err(not_single(rows.len()));
+            }
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
             affected = rows.len() as u64;
             let mut res = StatusCode::CREATED.into_response();
@@ -981,6 +1182,9 @@ async fn write(
                 .execute(&m.text, &param_refs(&params))
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
+            if media.is_single() && affected != 1 {
+                return Err(not_single(affected as usize));
+            }
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
             if created {
                 StatusCode::CREATED.into_response()
@@ -1464,6 +1668,84 @@ mod tests {
         assert_eq!(p.ret, Ret::Minimal);
         assert_eq!(p.merge, None);
         assert!(p.applied.is_empty());
+    }
+
+    #[test]
+    fn accept_negotiation_speaks_postgrest() {
+        let m = |accept: Option<&str>| {
+            let mut h = HeaderMap::new();
+            if let Some(a) = accept {
+                h.insert("accept", a.parse().unwrap());
+            }
+            negotiate(&h)
+        };
+        assert_eq!(m(None).unwrap(), Media::Json { stripped: false });
+        assert_eq!(m(Some("*/*")).unwrap(), Media::Json { stripped: false });
+        assert_eq!(
+            m(Some("Application/JSON")).unwrap(),
+            Media::Json { stripped: false }
+        );
+        assert_eq!(m(Some("text/csv")).unwrap(), Media::Csv);
+        assert_eq!(
+            m(Some("application/vnd.pgrst.object+json")).unwrap(),
+            Media::Single { stripped: false }
+        );
+        assert_eq!(
+            m(Some("application/vnd.pgrst.object+json;nulls=stripped")).unwrap(),
+            Media::Single { stripped: true }
+        );
+        assert_eq!(
+            m(Some("application/vnd.pgrst.array+json")).unwrap(),
+            Media::Json { stripped: false },
+            "the plain array vendored name folds into plain json"
+        );
+        assert_eq!(
+            m(Some("application/vnd.pgrst.array+json;nulls=stripped")).unwrap(),
+            Media::Json { stripped: true }
+        );
+        assert_eq!(
+            m(Some("text/html, text/csv")).unwrap(),
+            Media::Csv,
+            "an unhandled type is skipped, not fatal"
+        );
+        assert_eq!(
+            m(Some("text/csv;q=0.1, application/json;q=0.9")).unwrap(),
+            Media::Json { stripped: false },
+            "quality reorders"
+        );
+        assert_eq!(
+            m(Some("*/*, text/csv")).unwrap(),
+            Media::Csv,
+            "the stars lose the specificity tiebreak"
+        );
+
+        let e = m(Some("text/html;level=1, image/png")).unwrap_err();
+        assert_eq!(e.status, StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(e.code, "PGRST107");
+        assert_eq!(
+            e.message,
+            "None of these media types are available: text/html;level=1, image/png"
+        );
+        let e = m(Some("TEXT/Plain;foo=1")).unwrap_err();
+        assert_eq!(
+            e.message, "None of these media types are available: text/plain",
+            "a known but unproducible type echoes canonically"
+        );
+
+        assert_eq!(Media::Csv.content_type(), "text/csv; charset=utf-8");
+        assert_eq!(
+            Media::Single { stripped: true }.content_type(),
+            "application/vnd.pgrst.object+json;nulls=stripped; charset=utf-8"
+        );
+
+        let e = not_single(2);
+        assert_eq!(e.status, StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(e.code, "PGRST116");
+        assert_eq!(
+            e.message,
+            "Cannot coerce the result to a single JSON object"
+        );
+        assert_eq!(e.details.as_deref(), Some("The result contains 2 rows"));
     }
 
     #[test]
