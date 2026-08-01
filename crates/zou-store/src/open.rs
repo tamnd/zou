@@ -12,12 +12,16 @@
 //!   for s3 and `https://storage.googleapis.com` for gs
 //! - `ZOU_S3_REGION`, falls back to `AWS_REGION`, then `us-east-1`
 //!
-//! Two wrappers apply to every backend: `ZOU_STORE_DELAY` simulates
-//! object store latency, `ZOU_STORE_STATS` counts ops into a shared
-//! counter file, see [`crate::stats`].
+//! Three wrappers apply to every backend: `ZOU_STORE_SIM` simulates a
+//! provider's latency curve, transfer time, and SlowDown behavior, see
+//! [`crate::sim`], `ZOU_STORE_DELAY` injects fixed per op delays, see
+//! [`crate::delay`], and `ZOU_STORE_STATS` counts ops into a shared
+//! counter file, see [`crate::stats`]. SIM and DELAY answer the same
+//! question two ways, so setting both is an error.
 
 use crate::cas::{CasError, CasStore, LocalFsStore, Version};
 use crate::delay::{DelayConfig, DelayStore};
+use crate::sim::{SimConfig, SimStore};
 
 /// A store that scopes every key under a fixed prefix, so one bucket can
 /// hold many stores. Callers see their own key space: keys are prefixed
@@ -116,8 +120,9 @@ fn parse(target: &str) -> Result<Parsed<'_>, String> {
 
 /// Open the backend a target string names: a filesystem directory, or an
 /// `s3://bucket/prefix` style URL configured from the environment.
-/// `ZOU_STORE_DELAY` wraps the result in [`DelayStore`] for simulated
-/// object store latency, see [`crate::delay`].
+/// `ZOU_STORE_SIM` wraps the result in [`SimStore`] for a full provider
+/// latency profile, `ZOU_STORE_DELAY` in [`DelayStore`] for fixed per op
+/// delays, see [`crate::sim`] and [`crate::delay`].
 pub fn open_store(target: &str) -> Result<Box<dyn CasStore>, String> {
     let store: Box<dyn CasStore> = match parse(target)? {
         Parsed::Local(path) if path.ends_with(".zou") => {
@@ -143,12 +148,23 @@ pub fn open_store(target: &str) -> Result<Box<dyn CasStore>, String> {
             }
         }
     };
-    let store: Box<dyn CasStore> = match std::env::var("ZOU_STORE_DELAY") {
-        Ok(spec) if !spec.is_empty() => {
-            let config = DelayConfig::parse(&spec).map_err(|e| format!("ZOU_STORE_DELAY: {e}"))?;
-            Box::new(DelayStore::new(store, config))
-        }
-        _ => store,
+    let sim_spec = std::env::var("ZOU_STORE_SIM")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let delay_spec = std::env::var("ZOU_STORE_DELAY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if sim_spec.is_some() && delay_spec.is_some() {
+        return Err("ZOU_STORE_SIM and ZOU_STORE_DELAY are both set, pick one simulation".into());
+    }
+    let store: Box<dyn CasStore> = if let Some(spec) = sim_spec {
+        let config = SimConfig::parse(&spec).map_err(|e| format!("ZOU_STORE_SIM: {e}"))?;
+        Box::new(SimStore::new(store, config))
+    } else if let Some(spec) = delay_spec {
+        let config = DelayConfig::parse(&spec).map_err(|e| format!("ZOU_STORE_DELAY: {e}"))?;
+        Box::new(DelayStore::new(store, config))
+    } else {
+        store
     };
     // Counters wrap outermost, after any simulated delay, so the
     // latency they record is the latency callers actually paid.

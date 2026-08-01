@@ -10,6 +10,7 @@ Run any leg yourself with `scripts/zou-bench.sh <target> [scale] [seconds]`, whi
 - 8 clients, 8 threads, 60 seconds per workload.
 - Every commit is durable on the object store before pgbench sees it acknowledged, there is no local WAL fallback to hide behind.
 - The simulated S3 leg is MinIO plus `ZOU_STORE_DELAY=get=15,put=25,list=40`, which sleeps that many milliseconds inside every store call, matching typical S3 Standard service times. It stands in for real S3 until a real bucket run replaces it, and its numbers are labeled simulated.
+- `ZOU_STORE_SIM=s3-standard` is the successor to the fixed delay: per provider profiles (s3-standard, s3-express, r2, gcs, b2, wasabi) sample each call from a p50/p95/p99/max curve, charge transfer time on the bytes moved, and emulate 503 SlowDown rounds with the real backend's backoff schedule. A calibration file measured by the zou-bench probe replaces the built in numbers, and everything produced under it stays labeled simulated.
 - The simulated leg loads its data with the delay off and restarts the server with the delay on for the timed runs, because the load phase serializes hundreds of thousands of extends and would spend hours measuring nothing but the injected sleep. Its init cell is marked accordingly, and its timed runs start from a cold cache where the other columns run warm from the load.
 
 ## Hardware

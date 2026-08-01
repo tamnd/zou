@@ -18,6 +18,7 @@ pub mod manifest;
 pub mod open;
 #[cfg(feature = "s3")]
 pub mod s3;
+pub mod sim;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod stats;
@@ -37,6 +38,7 @@ pub use manifest::{MANIFEST_FORMAT, Manifest};
 pub use open::{PrefixStore, open_store};
 #[cfg(feature = "s3")]
 pub use s3::{Dialect, S3Config, S3Store};
+pub use sim::{BUILTIN_PROFILES, OpDist, SimConfig, SimProfile, SimStore};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
 pub use stats::{Snapshot, StatsStore};
