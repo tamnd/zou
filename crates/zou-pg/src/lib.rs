@@ -11,6 +11,11 @@
 //! WAL plus checkpoints as the milestone progresses, at which point reads
 //! route through checkpoint objects instead. The FFI surface stays.
 //!
+//! Two things keep the round trips off the query path: skipFsync pages
+//! buffer in this process and drain in parallel when durability comes
+//! due (see the pending module), and the vectored entry points fan
+//! independent gets, puts, and deletes across a small thread pool.
+//!
 //! Every function returns 0 for success or a negative ZOU_ERR code, and
 //! never unwinds into C. Postgres turns nonzero into ereport(ERROR).
 
@@ -19,6 +24,7 @@ pub mod cache;
 pub mod capture;
 pub mod fold;
 pub mod gc;
+pub mod pending;
 pub mod reader;
 pub mod restore;
 pub mod walscan;
@@ -64,6 +70,10 @@ struct Shim {
     store: Arc<dyn CasStore>,
     layout: TenantLayout,
     reader: Mutex<ReaderSlot>,
+    /// skipFsync pages waiting for their drain, see the pending module.
+    /// Locked after neither of the other locks, drains release it
+    /// before touching the store.
+    pending: Mutex<pending::Pending>,
 }
 
 static SHIM: OnceLock<Shim> = OnceLock::new();
@@ -166,6 +176,38 @@ fn wrap(f: impl FnOnce() -> i32) -> i32 {
     catch_unwind(AssertUnwindSafe(f)).unwrap_or(ZOU_ERR_PANIC)
 }
 
+/// A copy of the page this process buffered for the block, if any.
+fn pending_page(shim: &Shim, fork: pending::ForkId, blk: u32) -> Option<Vec<u8>> {
+    let slot = shim.pending.lock().ok()?;
+    slot.page(fork, blk).map(<[u8]>::to_vec)
+}
+
+/// Drain one fork's buffered pages to the store, or every fork when
+/// `fork` is None. The buffer empties under the lock, the store work
+/// happens outside it. A failed flush surfaces as ZOU_ERR_STORE and
+/// aborts the transaction, which drops the relation the pages were
+/// building.
+fn drain_pending(shim: &Shim, fork: Option<pending::ForkId>) -> i32 {
+    let drained = {
+        let Ok(mut slot) = shim.pending.lock() else {
+            return ZOU_ERR_STORE;
+        };
+        match fork {
+            Some(id) => slot
+                .take_fork(id)
+                .map(|(pages, size)| vec![(id, pages, size)])
+                .unwrap_or_default(),
+            None => slot.take_all(),
+        }
+    };
+    for (id, pages, size) in drained {
+        if pending::flush_fork(&shim.store, &shim.layout, id, &pages, size).is_err() {
+            return ZOU_ERR_STORE;
+        }
+    }
+    ZOU_OK
+}
+
 /// Install the env_logger backend once per process. Output goes to
 /// stderr, which the server collects into its own log, so Rust lines
 /// land next to Postgres's. `RUST_LOG` in the server environment
@@ -212,17 +254,26 @@ fn read_size_chained(
     rel: u32,
     fork: u32,
 ) -> Result<Option<u32>, ()> {
+    let pending = shim
+        .pending
+        .lock()
+        .map_err(|_| ())?
+        .size((spc, db, rel, fork));
     if let Some(n) = read_size(shim, spc, db, rel, fork)? {
-        return Ok(Some(n));
+        return Ok(Some(pending.map_or(n, |p| p.max(n))));
     }
-    with_reader(shim, |rd| {
+    let chained = with_reader(shim, |rd| {
         if rd.branched() {
             rd.fork_size(spc, db, rel, fork)
         } else {
             None
         }
     })
-    .map(Option::flatten)
+    .map(Option::flatten)?;
+    Ok(match (chained, pending) {
+        (Some(n), Some(p)) => Some(n.max(p)),
+        (n, p) => n.or(p),
+    })
 }
 
 fn write_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> Result<(), ()> {
@@ -274,6 +325,7 @@ pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
             store: Arc::from(store),
             layout: TenantLayout::new(&tenant),
             reader: Mutex::new(ReaderSlot::Unset),
+            pending: Mutex::new(pending::Pending::default()),
         });
         ZOU_OK
     })
@@ -375,6 +427,10 @@ pub unsafe extern "C" fn zou_smgr_read(
             return ZOU_ERR_BAD_ARGUMENT;
         }
         let out = unsafe { std::slice::from_raw_parts_mut(buf, ZOU_PAGE_SIZE) };
+        if let Some(page) = pending_page(shim, (spc, db, rel, fork), blk) {
+            out.copy_from_slice(&page);
+            return ZOU_OK;
+        }
         let r = walscan::BlockRef {
             spc,
             db,
@@ -408,6 +464,83 @@ pub unsafe extern "C" fn zou_smgr_read(
     })
 }
 
+/// Read a run of `nblocks` pages starting at `blk` into `bufs`. Each
+/// page resolves like zou_smgr_read, buffered pages and the chain
+/// answer first, and whatever is left goes to pg/ as one batch of
+/// parallel gets.
+///
+/// # Safety
+/// `bufs` must point to `nblocks` valid pointers, each to
+/// ZOU_PAGE_SIZE writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zou_smgr_readv(
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+    blk: u32,
+    bufs: *const *mut u8,
+    nblocks: u32,
+    durable_lsn: u64,
+) -> i32 {
+    with_shim(|shim| {
+        if bufs.is_null() || nblocks == 0 {
+            return ZOU_ERR_BAD_ARGUMENT;
+        }
+        let ptrs = unsafe { std::slice::from_raw_parts(bufs, nblocks as usize) };
+        if ptrs.iter().any(|p| p.is_null()) {
+            return ZOU_ERR_BAD_ARGUMENT;
+        }
+        let mut misses: Vec<(usize, u32)> = Vec::new();
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let out = unsafe { std::slice::from_raw_parts_mut(*ptr, ZOU_PAGE_SIZE) };
+            let b = blk + i as u32;
+            if let Some(page) = pending_page(shim, (spc, db, rel, fork), b) {
+                out.copy_from_slice(&page);
+                continue;
+            }
+            let r = walscan::BlockRef {
+                spc,
+                db,
+                rel,
+                fork,
+                blk: b,
+            };
+            match chain_read(shim, r, durable_lsn) {
+                Ok(Some(page)) => out.copy_from_slice(&page),
+                Ok(None) => misses.push((i, b)),
+                Err(()) => return ZOU_ERR_STORE,
+            }
+        }
+        // The remaining blocks all live under pg/ and their gets are
+        // independent, so they fan out across the shim thread pool.
+        // Each job owns a distinct output buffer, so worker threads
+        // never write the same bytes.
+        struct Job(u32, *mut u8);
+        unsafe impl Send for Job {}
+        unsafe impl Sync for Job {}
+        let jobs: Vec<Job> = misses.iter().map(|(i, b)| Job(*b, ptrs[*i])).collect();
+        let ok = pending::for_each_parallel(&jobs, |Job(b, ptr)| {
+            let out = unsafe { std::slice::from_raw_parts_mut(*ptr, ZOU_PAGE_SIZE) };
+            match shim
+                .store
+                .get(&shim.layout.pg_block(spc, db, rel, fork, *b))
+            {
+                Ok(Some((data, _))) if data.len() == ZOU_PAGE_SIZE => {
+                    out.copy_from_slice(&data);
+                    true
+                }
+                Ok(Some(_)) | Err(_) => false,
+                Ok(None) => {
+                    out.fill(0);
+                    true
+                }
+            }
+        });
+        if ok { ZOU_OK } else { ZOU_ERR_STORE }
+    })
+}
+
 /// Write one page. The block must already be within the fork size,
 /// Postgres extends before it writes.
 ///
@@ -432,6 +565,9 @@ pub unsafe extern "C" fn zou_smgr_write(
             .put(&shim.layout.pg_block(spc, db, rel, fork, blk), data)
         {
             Ok(_) => {
+                if let Ok(mut slot) = shim.pending.lock() {
+                    slot.refresh((spc, db, rel, fork), blk, data);
+                }
                 note_write(
                     shim,
                     walscan::BlockRef {
@@ -449,9 +585,54 @@ pub unsafe extern "C" fn zou_smgr_write(
     })
 }
 
+/// Buffer one skipFsync page and drain everything when the buffer
+/// tips over its cap. Zero when buffering is disabled and the caller
+/// must go to the store eagerly.
+fn buffer_page(
+    shim: &Shim,
+    fork: pending::ForkId,
+    blk: u32,
+    page: &[u8],
+    grow: bool,
+) -> Option<i32> {
+    let full = {
+        let Ok(mut slot) = shim.pending.lock() else {
+            return Some(ZOU_ERR_STORE);
+        };
+        if !slot.enabled() {
+            return None;
+        }
+        slot.push(fork, blk, page, grow.then_some(blk + 1))
+    };
+    let (spc, db, rel, fk) = fork;
+    note_write(
+        shim,
+        walscan::BlockRef {
+            spc,
+            db,
+            rel,
+            fork: fk,
+            blk,
+        },
+    );
+    if full {
+        return Some(drain_pending(shim, None));
+    }
+    Some(ZOU_OK)
+}
+
 /// Write a page at `blk` and grow the fork size to cover it. Postgres
 /// serializes extension per relation, so the read-modify-write on SIZE
 /// has a single writer.
+///
+/// With `skip_fsync` set the caller owns durability and settles it
+/// later through zou_smgr_sync, so the page only lands in the pending
+/// buffer. Postgres uses this for bulk fills of relfilenodes no other
+/// backend can see yet, which is what makes a process local buffer
+/// coherent. Such a page can reach the store after WAL that mentions
+/// it, or never, and both are fine: nothing references the relation
+/// until a commit record whose own mirror wait fences everything
+/// before it.
 ///
 /// # Safety
 /// `buf` must be a valid pointer to ZOU_PAGE_SIZE readable bytes.
@@ -463,7 +644,19 @@ pub unsafe extern "C" fn zou_smgr_extend(
     fork: u32,
     blk: u32,
     buf: *const u8,
+    skip_fsync: i32,
 ) -> i32 {
+    if skip_fsync != 0 {
+        let rc = with_shim(|shim| {
+            let page = unsafe { std::slice::from_raw_parts(buf, ZOU_PAGE_SIZE) };
+            buffer_page(shim, (spc, db, rel, fork), blk, page, true)
+                .unwrap_or(ZOU_ERR_NOT_INITIALIZED)
+        });
+        if rc != ZOU_ERR_NOT_INITIALIZED {
+            return rc;
+        }
+        // Buffering is disabled, fall through to the eager path.
+    }
     let rc = unsafe { zou_smgr_write(spc, db, rel, fork, blk, buf) };
     if rc != ZOU_OK {
         return rc;
@@ -478,6 +671,97 @@ pub unsafe extern "C" fn zou_smgr_extend(
         }
         Err(()) => ZOU_ERR_STORE,
     })
+}
+
+/// Write a run of `nblocks` pages starting at `blk`. skipFsync runs go
+/// to the pending buffer like zou_smgr_extend, everything else is one
+/// batch of parallel durable puts. The C shim settles the WAL mirror
+/// barrier for the whole run before calling, so per page waits are
+/// gone by the time the pages get here.
+///
+/// # Safety
+/// `bufs` must point to `nblocks` valid pointers, each to
+/// ZOU_PAGE_SIZE readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zou_smgr_writev(
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+    blk: u32,
+    bufs: *const *const u8,
+    nblocks: u32,
+    skip_fsync: i32,
+) -> i32 {
+    with_shim(|shim| {
+        if bufs.is_null() || nblocks == 0 {
+            return ZOU_ERR_BAD_ARGUMENT;
+        }
+        let ptrs = unsafe { std::slice::from_raw_parts(bufs, nblocks as usize) };
+        if ptrs.iter().any(|p| p.is_null()) {
+            return ZOU_ERR_BAD_ARGUMENT;
+        }
+        if skip_fsync != 0 {
+            let mut buffered = true;
+            for (i, ptr) in ptrs.iter().enumerate() {
+                let page = unsafe { std::slice::from_raw_parts(*ptr, ZOU_PAGE_SIZE) };
+                match buffer_page(shim, (spc, db, rel, fork), blk + i as u32, page, false) {
+                    Some(ZOU_OK) => {}
+                    Some(rc) => return rc,
+                    None => {
+                        buffered = false;
+                        break;
+                    }
+                }
+            }
+            if buffered {
+                return ZOU_OK;
+            }
+        }
+        struct Job(u32, *const u8);
+        unsafe impl Send for Job {}
+        unsafe impl Sync for Job {}
+        let jobs: Vec<Job> = ptrs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| Job(blk + i as u32, *p))
+            .collect();
+        let ok = pending::for_each_parallel(&jobs, |Job(b, ptr)| {
+            let page = unsafe { std::slice::from_raw_parts(*ptr, ZOU_PAGE_SIZE) };
+            shim.store
+                .put(&shim.layout.pg_block(spc, db, rel, fork, *b), page)
+                .is_ok()
+        });
+        if !ok {
+            return ZOU_ERR_STORE;
+        }
+        for (i, ptr) in ptrs.iter().enumerate() {
+            let page = unsafe { std::slice::from_raw_parts(*ptr, ZOU_PAGE_SIZE) };
+            if let Ok(mut slot) = shim.pending.lock() {
+                slot.refresh((spc, db, rel, fork), blk + i as u32, page);
+            }
+            note_write(
+                shim,
+                walscan::BlockRef {
+                    spc,
+                    db,
+                    rel,
+                    fork,
+                    blk: blk + i as u32,
+                },
+            );
+        }
+        ZOU_OK
+    })
+}
+
+/// Settle durability for a fork: drain its buffered pages to the
+/// store. The C shim calls this from smgrregistersync and
+/// smgrimmedsync, the two points where a skipFsync caller hands
+/// durability back.
+#[unsafe(no_mangle)]
+pub extern "C" fn zou_smgr_sync(spc: u32, db: u32, rel: u32, fork: u32) -> i32 {
+    with_shim(|shim| drain_pending(shim, Some((spc, db, rel, fork))))
 }
 
 /// Grow the fork by `count` zero pages starting at `blk`. Zero pages are
@@ -524,6 +808,11 @@ pub extern "C" fn zou_smgr_zeroextend(
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_smgr_truncate(spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> i32 {
     with_shim(|shim| {
+        if let Ok(mut slot) = shim.pending.lock() {
+            slot.truncate((spc, db, rel, fork), nblocks);
+        } else {
+            return ZOU_ERR_STORE;
+        }
         note_truncate(shim, spc, db, rel, fork, nblocks);
         if write_size(shim, spc, db, rel, fork, nblocks).is_err() {
             return ZOU_ERR_STORE;
@@ -532,15 +821,15 @@ pub extern "C" fn zou_smgr_truncate(spc: u32, db: u32, rel: u32, fork: u32, nblo
         let Ok(keys) = shim.store.list(&prefix) else {
             return ZOU_ERR_STORE;
         };
-        for key in keys {
-            if let Some(idx) = block_index(&key)
-                && idx >= nblocks
-                && shim.store.delete(&key).is_err()
-            {
-                return ZOU_ERR_STORE;
-            }
+        let doomed: Vec<String> = keys
+            .into_iter()
+            .filter(|key| block_index(key).is_some_and(|idx| idx >= nblocks))
+            .collect();
+        if pending::for_each_parallel(&doomed, |key| shim.store.delete(key).is_ok()) {
+            ZOU_OK
+        } else {
+            ZOU_ERR_STORE
         }
-        ZOU_OK
     })
 }
 
@@ -548,6 +837,11 @@ pub extern "C" fn zou_smgr_truncate(spc: u32, db: u32, rel: u32, fork: u32, nblo
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_smgr_unlink(spc: u32, db: u32, rel: u32, fork: u32) -> i32 {
     with_shim(|shim| {
+        if let Ok(mut slot) = shim.pending.lock() {
+            slot.forget((spc, db, rel, fork));
+        } else {
+            return ZOU_ERR_STORE;
+        }
         note_rel(shim, spc, db, rel);
         // SIZE goes first so the fork stops existing even if a block
         // delete fails midway, leaving only unreachable garbage.
@@ -562,12 +856,11 @@ pub extern "C" fn zou_smgr_unlink(spc: u32, db: u32, rel: u32, fork: u32) -> i32
         let Ok(keys) = shim.store.list(&prefix) else {
             return ZOU_ERR_STORE;
         };
-        for key in keys {
-            if shim.store.delete(&key).is_err() {
-                return ZOU_ERR_STORE;
-            }
+        if pending::for_each_parallel(&keys, |key| shim.store.delete(key).is_ok()) {
+            ZOU_OK
+        } else {
+            ZOU_ERR_STORE
         }
-        ZOU_OK
     })
 }
 
@@ -907,7 +1200,7 @@ mod tests {
         for blk in 0u32..3 {
             let page = [blk as u8 + 1; ZOU_PAGE_SIZE];
             assert_eq!(
-                unsafe { zou_smgr_extend(spc, db, rel, fork, blk, page.as_ptr()) },
+                unsafe { zou_smgr_extend(spc, db, rel, fork, blk, page.as_ptr(), 0) },
                 ZOU_OK
             );
         }
@@ -966,6 +1259,90 @@ mod tests {
             ZOU_OK
         );
         assert_eq!(flag, 0);
+
+        // The skipFsync path on a second fork: extends buffer in
+        // process, reads and nblocks see them before any block object
+        // exists, and zou_smgr_sync drains everything.
+        let (rel2, shim) = (16400, SHIM.get().unwrap());
+        assert_eq!(zou_smgr_create(spc, db, rel2, fork), ZOU_OK);
+        for blk in 0u32..4 {
+            let page = [0x40 + blk as u8; ZOU_PAGE_SIZE];
+            assert_eq!(
+                unsafe { zou_smgr_extend(spc, db, rel2, fork, blk, page.as_ptr(), 1) },
+                ZOU_OK
+            );
+        }
+        assert_eq!(
+            unsafe { zou_smgr_nblocks(spc, db, rel2, fork, &mut n) },
+            ZOU_OK
+        );
+        assert_eq!(n, 4);
+        assert_eq!(
+            unsafe { zou_smgr_read(spc, db, rel2, fork, 2, buf.as_mut_ptr(), 0) },
+            ZOU_OK
+        );
+        assert!(buf.iter().all(|b| *b == 0x42));
+        let prefix = format!("{}/", shim.layout.pg_fork_prefix(spc, db, rel2, fork));
+        let before = shim.store.list(&prefix).unwrap();
+        assert!(
+            before.iter().all(|k| k.ends_with("/SIZE")),
+            "no block objects before the drain: {before:?}"
+        );
+
+        // An eager write to a buffered block must not be shadowed by
+        // the older buffered copy afterwards.
+        let page = [0xEE; ZOU_PAGE_SIZE];
+        assert_eq!(
+            unsafe { zou_smgr_write(spc, db, rel2, fork, 1, page.as_ptr()) },
+            ZOU_OK
+        );
+        assert_eq!(
+            unsafe { zou_smgr_read(spc, db, rel2, fork, 1, buf.as_mut_ptr(), 0) },
+            ZOU_OK
+        );
+        assert!(buf.iter().all(|b| *b == 0xEE));
+
+        assert_eq!(zou_smgr_sync(spc, db, rel2, fork), ZOU_OK);
+        let after = shim.store.list(&prefix).unwrap();
+        assert_eq!(after.len(), 5, "four blocks plus SIZE: {after:?}");
+        assert_eq!(
+            unsafe { zou_smgr_nblocks(spc, db, rel2, fork, &mut n) },
+            ZOU_OK
+        );
+        assert_eq!(n, 4);
+        for (blk, expect) in [(0u32, 0x40u8), (1, 0xEE), (2, 0x42), (3, 0x43)] {
+            assert_eq!(
+                unsafe { zou_smgr_read(spc, db, rel2, fork, blk, buf.as_mut_ptr(), 0) },
+                ZOU_OK
+            );
+            assert!(buf.iter().all(|b| *b == expect), "block {blk}");
+        }
+
+        // The vectored entry points agree with the scalar ones.
+        let mut out = [[0u8; ZOU_PAGE_SIZE]; 4];
+        let mut outp: Vec<*mut u8> = out.iter_mut().map(|p| p.as_mut_ptr()).collect();
+        assert_eq!(
+            unsafe { zou_smgr_readv(spc, db, rel2, fork, 0, outp.as_mut_ptr(), 4, 0) },
+            ZOU_OK
+        );
+        for (blk, expect) in [(0usize, 0x40u8), (1, 0xEE), (2, 0x42), (3, 0x43)] {
+            assert!(out[blk].iter().all(|b| *b == expect), "readv block {blk}");
+        }
+        let w0 = [0x50; ZOU_PAGE_SIZE];
+        let w1 = [0x51; ZOU_PAGE_SIZE];
+        let inp: Vec<*const u8> = vec![w0.as_ptr(), w1.as_ptr()];
+        assert_eq!(
+            unsafe { zou_smgr_writev(spc, db, rel2, fork, 2, inp.as_ptr(), 2, 0) },
+            ZOU_OK
+        );
+        for (blk, expect) in [(2u32, 0x50u8), (3, 0x51)] {
+            assert_eq!(
+                unsafe { zou_smgr_read(spc, db, rel2, fork, blk, buf.as_mut_ptr(), 0) },
+                ZOU_OK
+            );
+            assert!(buf.iter().all(|b| *b == expect), "block {blk}");
+        }
+        assert_eq!(zou_smgr_unlink(spc, db, rel2, fork), ZOU_OK);
     }
 
     /// One test for the WAL side too, the pipe is its own process global.
