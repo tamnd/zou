@@ -15,7 +15,9 @@
 //! The server runs on its own tokio runtime behind [`serve_blocking`],
 //! so the sync callers in zou dev just park a thread on it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -23,6 +25,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get};
 use axum::{Router, middleware};
+use zou_rest::catalog::Catalog;
 
 pub mod edge;
 pub mod jwt;
@@ -58,6 +61,15 @@ pub struct App {
     pub pool: Option<sql::Pool>,
     pub limiter: Option<edge::RateLimit>,
     pub jwks: Option<jwt::Jwks>,
+    /// The fk catalog per exposed schema, each tagged with the epoch
+    /// it was introspected under. A request reuses it while the epoch
+    /// holds and reintrospects when the DDL watch moves it.
+    pub catalog: tokio::sync::RwLock<HashMap<String, (u64, Arc<Catalog>)>>,
+    /// Bumped by the DDL watch whenever the schema may have changed.
+    pub epoch: Arc<AtomicU64>,
+    /// The watch starts on the first request that needs a catalog,
+    /// because a router can be built outside a runtime.
+    pub watching: tokio::sync::OnceCell<()>,
 }
 
 /// PostgREST's default db-pool size, a sane dev loop default here too.
@@ -81,6 +93,9 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         pool,
         limiter,
         jwks,
+        catalog: tokio::sync::RwLock::new(HashMap::new()),
+        epoch: Arc::new(AtomicU64::new(0)),
+        watching: tokio::sync::OnceCell::new(),
     }))
 }
 

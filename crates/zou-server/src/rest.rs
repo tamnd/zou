@@ -40,6 +40,7 @@
 //! the code it expects.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::body::Body;
 use axum::http::request::Parts;
@@ -847,8 +848,8 @@ fn out_of_bounds(offset: u64, total: i64) -> serde_json::Value {
 }
 
 /// The fk graph on the request's own transaction, one pg_constraint
-/// query; caching belongs to the catalog epoch work.
-async fn load_catalog(sess: &Session, authed: bool, schema: &str) -> Result<Catalog, RestError> {
+/// query.
+async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalog, RestError> {
     let rows = sess
         .query(INTROSPECT_SQL, &[&schema])
         .await
@@ -866,6 +867,45 @@ async fn load_catalog(sess: &Session, authed: bool, schema: &str) -> Result<Cata
             })
             .collect(),
     ))
+}
+
+/// The catalog for the profiled schema, introspected once per epoch
+/// instead of once per request. PostgREST holds the same graph in its
+/// schema cache and rebuilds it when told the schema changed; here the
+/// telling is the DDL watch, and the epoch it moves is what a cached
+/// entry is checked against.
+///
+/// Two requests racing a cold cache both introspect and both write,
+/// which is a wasted query and never a wrong answer, so the lock is
+/// never held across the query.
+async fn load_catalog(
+    app: &App,
+    sess: &Session,
+    authed: bool,
+    schema: &str,
+) -> Result<Arc<Catalog>, RestError> {
+    // A router can be built outside a runtime, so the watch starts on
+    // the first request that needs a catalog rather than at boot.
+    app.watching
+        .get_or_init(|| async {
+            if let Some(pool) = &app.pool {
+                pool.watch(Arc::clone(&app.epoch));
+            }
+        })
+        .await;
+
+    let epoch = app.epoch.load(Ordering::Relaxed);
+    if let Some((at, cat)) = app.catalog.read().await.get(schema)
+        && *at == epoch
+    {
+        return Ok(Arc::clone(cat));
+    }
+    let fresh = Arc::new(introspect(sess, authed, schema).await?);
+    app.catalog
+        .write()
+        .await
+        .insert(schema.to_string(), (epoch, Arc::clone(&fresh)));
+    Ok(fresh)
 }
 
 /// Rows of jsonb text joined into the response array by hand, which
@@ -908,7 +948,7 @@ async fn read(
     // An early return past this point drops the session, which
     // forfeits the connection instead of pooling a dirty one, the
     // containment the pool promises.
-    let catalog = load_catalog(&sess, authed, schema).await?;
+    let catalog = load_catalog(app, &sess, authed, schema).await?;
 
     let sql = plan::plan(&catalog, &q).map_err(plan_error)?;
     let media = negotiate(&req.headers)?;
@@ -1173,7 +1213,7 @@ async fn write(
     let affected: u64;
     let mut res = match prefer.ret {
         Ret::Representation => {
-            let catalog = load_catalog(&sess, authed, schema).await?;
+            let catalog = load_catalog(app, &sess, authed, schema).await?;
             let r = mutate::representation(&catalog, m, &mut q).map_err(plan_error)?;
             let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
             let status = if created {
@@ -1350,7 +1390,7 @@ async fn describe(app: &App, auth: &AuthContext, req: &Parts) -> Result<Response
         .await
         .map_err(|e| pg_error(&e, authed))?;
 
-    let catalog = load_catalog(&sess, authed, schema).await?;
+    let catalog = load_catalog(app, &sess, authed, schema).await?;
     let table_rows = sess
         .query(openapi::TABLES_SQL, &[&schema])
         .await
@@ -1641,7 +1681,7 @@ async fn invoke(
                 },
             )?;
             apply_range(&mut q, &req.headers);
-            let catalog = load_catalog(&sess, authed, schema).await?;
+            let catalog = load_catalog(app, &sess, authed, schema).await?;
             let r = rpc::representation(&catalog, m, &mut q).map_err(plan_error)?;
             let text = format!(
                 "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
