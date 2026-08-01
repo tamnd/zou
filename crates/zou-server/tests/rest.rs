@@ -38,6 +38,7 @@ fn app(dsn: &str) -> axum::Router {
         jwks: None,
         schemas: vec![],
         external_url: None,
+        jwt_keys: None,
     })
     .expect("router builds")
 }
@@ -50,6 +51,7 @@ fn app_with_schemas(dsn: &str, schemas: &[&str]) -> axum::Router {
         jwks: None,
         schemas: schemas.iter().map(|s| s.to_string()).collect(),
         external_url: None,
+        jwt_keys: None,
     })
     .expect("router builds")
 }

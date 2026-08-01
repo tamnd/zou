@@ -236,14 +236,14 @@ async fn mint_for(
     sess: &sql::Session,
     session_id: &str,
     refresh_token: String,
-    secret: &[u8],
+    signer: &crate::jwt::Signer<'_>,
     issuer: &str,
 ) -> Result<Issued, Error> {
     let iat = now();
     let exp = iat + ACCESS_TTL;
     let (claims, user) = describe(sess, session_id, iat, exp, issuer).await?;
     Ok(Issued {
-        access_token: crate::jwt::mint(&claims, secret),
+        access_token: signer.sign(&claims),
         refresh_token,
         expires_in: ACCESS_TTL,
         expires_at: exp,
@@ -262,11 +262,11 @@ pub async fn issue(
     pool: &Pool,
     user_id: &str,
     method: &str,
-    secret: &[u8],
+    signer: &crate::jwt::Signer<'_>,
     issuer: &str,
 ) -> Result<Issued, Error> {
     let sess = pool.admin().await?;
-    let issued = start(&sess, user_id, method, secret, issuer).await;
+    let issued = start(&sess, user_id, method, signer, issuer).await;
     match issued {
         Ok(issued) => {
             sess.commit().await?;
@@ -283,7 +283,7 @@ async fn start(
     sess: &sql::Session,
     user_id: &str,
     method: &str,
-    secret: &[u8],
+    signer: &crate::jwt::Signer<'_>,
     issuer: &str,
 ) -> Result<Issued, Error> {
     let rows = sess
@@ -315,7 +315,7 @@ async fn start(
         &[&user_id],
     )
     .await?;
-    mint_for(sess, &session_id, token, secret, issuer).await
+    mint_for(sess, &session_id, token, signer, issuer).await
 }
 
 /// What the presented refresh token turned out to be.
@@ -337,11 +337,11 @@ struct Presented {
 pub async fn refresh(
     pool: &Pool,
     token: &str,
-    secret: &[u8],
+    signer: &crate::jwt::Signer<'_>,
     issuer: &str,
 ) -> Result<Issued, Error> {
     let sess = pool.admin().await?;
-    let out = rotate(&sess, token, secret, issuer).await;
+    let out = rotate(&sess, token, signer, issuer).await;
     // A refusal can still have written: an orphaned token is deleted
     // and a stolen one takes its whole family down with it. Both have
     // to survive the response, so the transaction commits either way
@@ -361,7 +361,7 @@ pub async fn refresh(
 async fn rotate(
     sess: &sql::Session,
     token: &str,
-    secret: &[u8],
+    signer: &crate::jwt::Signer<'_>,
     issuer: &str,
 ) -> Result<Issued, Error> {
     if token.is_empty() {
@@ -456,7 +456,7 @@ async fn rotate(
         &[&session_id],
     )
     .await?;
-    mint_for(sess, &session_id, issued, secret, issuer).await
+    mint_for(sess, &session_id, issued, signer, issuer).await
 }
 
 /// A revoked token was presented. Either it is the parent of the
@@ -605,7 +605,7 @@ pub async fn token(
         .and_then(|v| v.as_str())
         .unwrap_or_default();
 
-    match refresh(pool, presented, &app.cfg.jwt_secret, &app.issuer()).await {
+    match refresh(pool, presented, &app.signer(), &app.issuer()).await {
         Ok(issued) => json_body(StatusCode::OK, issued.json()),
         Err(Error::Denied { code, msg }) => error_body(StatusCode::BAD_REQUEST, code, msg),
         Err(Error::Db(e)) => {
