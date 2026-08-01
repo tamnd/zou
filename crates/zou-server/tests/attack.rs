@@ -38,12 +38,7 @@ fn app(dsn: &str) -> axum::Router {
     router(Config {
         jwt_secret: SECRET.to_vec(),
         pg: Some(dsn.to_string()),
-        rate: None,
-        jwks: None,
-        schemas: vec![],
-        external_url: None,
-        jwt_keys: None,
-        mailer_autoconfirm: false,
+        ..Config::default()
     })
     .expect("router builds")
 }

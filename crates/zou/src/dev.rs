@@ -153,20 +153,18 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
         let cfg = zou_server::Config {
             jwt_secret: secret.into_bytes(),
             pg: Some(dsn),
-            // Unlimited in the dev loop, GoTrue's per endpoint budgets
-            // arrive with the auth surface.
-            rate: None,
-            jwks: None,
-            schemas: vec![],
             // The dev loop knows where it answers, so its access tokens
             // say so rather than naming GoTrue's default port, which
             // nothing here listens on.
             external_url: Some(format!("http://127.0.0.1:{port}")),
-            jwt_keys: None,
             // There is no inbox to read a confirmation link out of in a
             // dev loop, so a signup is confirmed on the spot. The
             // Supabase CLI does the same thing locally.
             mailer_autoconfirm: true,
+            // Everything else is GoTrue's default, including the
+            // unlimited rate the dev loop wants: the real per endpoint
+            // budgets arrive with the rest of the auth surface.
+            ..Default::default()
         };
         if let Err(e) = zou_server::serve_blocking(listener, cfg) {
             log::error!("http server: {e}");
