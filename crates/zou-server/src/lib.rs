@@ -23,10 +23,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use axum::{Router, middleware};
 use zou_rest::catalog::Catalog;
 
+pub mod auth;
 pub mod edge;
 pub mod jwt;
 pub mod openapi;
@@ -51,6 +52,12 @@ pub struct Config {
     /// The first is the default when no profile header picks one;
     /// empty means just public, the fresh Supabase project shape.
     pub schemas: Vec<String>,
+    /// Where this server answers from the outside, GoTrue's
+    /// API_EXTERNAL_URL. It is the `iss` claim of every access token,
+    /// with /auth/v1 appended, which is the one place a client can
+    /// check that a token came from the project it thinks it did.
+    /// None takes GoTrue's own default rather than inventing one.
+    pub external_url: Option<String>,
 }
 
 /// Everything the handlers share: the config and, when postgres is
@@ -70,6 +77,20 @@ pub struct App {
     /// The watch starts on the first request that needs a catalog,
     /// because a router can be built outside a runtime.
     pub watching: tokio::sync::OnceCell<()>,
+}
+
+impl App {
+    /// The `iss` claim of the access tokens this server signs.
+    /// GoTrue's default API_EXTERNAL_URL is http://localhost:9999, so
+    /// an unconfigured zou issues what an unconfigured GoTrue does.
+    pub fn issuer(&self) -> String {
+        let base = self
+            .cfg
+            .external_url
+            .as_deref()
+            .unwrap_or("http://localhost:9999");
+        format!("{}/auth/v1", base.trim_end_matches('/'))
+    }
 }
 
 /// PostgREST's default db-pool size, a sane dev loop default here too.
@@ -262,6 +283,7 @@ pub fn router(cfg: Config) -> Result<Router, String> {
     let app = app_state(cfg)?;
     let gated = Router::new()
         .route("/auth/v1/health", get(auth_health))
+        .route("/auth/v1/token", post(auth::token))
         .route("/auth/v1/{*rest}", any(auth_stub))
         .route("/rest/v1/", any(rest::root))
         .route("/rest/v1/rpc/{func}", any(rest::rpc))
@@ -315,6 +337,7 @@ mod tests {
             rate: None,
             jwks: None,
             schemas: vec![],
+            external_url: None,
         })
         .unwrap()
     }
@@ -497,6 +520,7 @@ mod tests {
             rate: None,
             jwks,
             schemas: vec![],
+            external_url: None,
         })
         .unwrap();
         Router::new()
@@ -610,6 +634,7 @@ mod tests {
             }),
             jwks: None,
             schemas: vec![],
+            external_url: None,
         })
         .unwrap();
         let key = anon_key();

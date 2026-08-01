@@ -71,10 +71,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run the pool leak, rls contract, rls attack, and auth schema tests
+      - name: Run the pool leak, rls contract, rls attack, and auth tests
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
-        run: cargo test -p zou-server --test pool --test rls --test rest --test attack --test auth_schema -- --nocapture
+        run: cargo test -p zou-server --test pool --test rls --test rest --test attack --test auth_schema --test auth_token -- --nocapture
       - name: Run the compiled WHERE clauses against postgres
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
