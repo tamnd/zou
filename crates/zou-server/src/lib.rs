@@ -99,6 +99,12 @@ pub struct Config {
     /// needs a code mailed to the address first unless the session was
     /// started in the last day.
     pub reauthentication_required: bool,
+    /// GoTrue's GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED, off by default
+    /// there and here. On, and a signup carrying neither an address nor
+    /// a number gets an account with no identity and a session, which
+    /// a client later turns into a real account by setting an address
+    /// on it. Off, and that signup is refused.
+    pub anonymous_users: bool,
     /// Templates, link paths, and how often one account may be mailed.
     /// Everything here has a GoTrue default and takes it.
     pub mail: mail::Settings,
@@ -137,6 +143,7 @@ impl Default for Config {
             secure_email_change: true,
             manual_linking: false,
             reauthentication_required: false,
+            anonymous_users: false,
             mail: mail::Settings::default(),
             sender: None,
             oauth: oauth::Providers::default(),
@@ -274,6 +281,12 @@ pub(crate) fn json_body(status: StatusCode, body: serde_json::Value) -> Response
         body.to_string(),
     )
         .into_response()
+}
+
+/// An answer with nothing in it, which is what a logout is: there is
+/// no body to send and no content type to claim for it.
+pub(crate) fn no_content() -> Response {
+    (StatusCode::NO_CONTENT, ()).into_response()
 }
 
 /// The apikey from the header or, failing that, the url query string.
@@ -499,10 +512,11 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/auth/v1/magiclink", post(auth::magiclink))
         .route("/auth/v1/otp", post(auth::otp))
         .route("/auth/v1/reauthenticate", post(auth::reauthenticate))
-        // Reading the user back is the other half of this endpoint and
-        // it lands with the rest of the session surface, so it keeps
-        // saying so rather than becoming a method that does not exist.
-        .route("/auth/v1/user", put(auth::user_update).get(auth_stub))
+        .route("/auth/v1/resend", post(auth::resend))
+        // Throwing a session away is a fetch carrying the token being
+        // thrown away, so it lives inside the gate with the rest.
+        .route("/auth/v1/logout", post(auth::logout))
+        .route("/auth/v1/user", put(auth::user_update).get(auth::user_get))
         // Manual identity linking. Both of these are fetches carrying a
         // bearer token rather than navigations, which is why they are
         // inside the gate while /authorize is not, and both answer 404

@@ -851,14 +851,15 @@ async fn an_address_that_is_not_one_is_refused_in_gotrues_words() {
         (400, "validation_failed", "An email address is too long")
     );
 
-    // Neither an address nor a phone number is not a signup at all.
+    // Neither an address nor a phone number is not this signup at all,
+    // it is the anonymous one, and this project has not turned it on.
     let neither = signup(&app, serde_json::json!({"password": "correct horse"})).await;
     assert_eq!(
         neither.refusal(),
         (
-            400,
-            "validation_failed",
-            "Sign up only available with email or phone provider"
+            422,
+            "anonymous_provider_disabled",
+            "Anonymous sign-ins are disabled"
         )
     );
     let both = signup(
