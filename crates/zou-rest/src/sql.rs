@@ -16,7 +16,7 @@
 
 use std::fmt;
 
-use crate::filter::{Cond, Field, LogicOp, Node, Op, Quant, Value};
+use crate::filter::{Cond, LogicOp, Node, Op, Quant, Value};
 use crate::scan::{JsonKey, JsonStep};
 
 /// Why a tree cannot compile. No offsets here, the input already
@@ -51,10 +51,25 @@ pub struct Sql {
 /// Compile the conjunction of these trees into one WHERE fragment.
 /// Every query pair on a request is one node, PostgREST ands them.
 pub fn where_clause(nodes: &[Node]) -> Result<Sql, CompileError> {
+    where_clause_from(nodes, None, Vec::new())
+}
+
+/// The planner's entry: columns qualify with `qualifier` when given,
+/// and placeholder numbering continues from wherever `params` already
+/// stands, so fragments from different subqueries share one dense
+/// parameter list.
+pub fn where_clause_from(
+    nodes: &[Node],
+    qualifier: Option<&str>,
+    params: Vec<String>,
+) -> Result<Sql, CompileError> {
     if nodes.is_empty() {
         return err("nothing to compile");
     }
-    let mut c = Compiler { params: Vec::new() };
+    let mut c = Compiler {
+        params,
+        qualifier: qualifier.map(str::to_string),
+    };
     let mut parts = Vec::with_capacity(nodes.len());
     for node in nodes {
         parts.push(c.node(node)?);
@@ -67,6 +82,7 @@ pub fn where_clause(nodes: &[Node]) -> Result<Sql, CompileError> {
 
 struct Compiler {
     params: Vec<String>,
+    qualifier: Option<String>,
 }
 
 impl Compiler {
@@ -107,7 +123,7 @@ impl Compiler {
                 c.field.embed.join(".")
             ));
         }
-        let lhs = field_sql(&c.field);
+        let lhs = field_expr(self.qualifier.as_deref(), &c.field.column, &c.field.path);
 
         let expr = if let Some(quant) = c.quant {
             let Value::Array(elems) = &c.value else {
@@ -245,11 +261,18 @@ fn array_literal(elems: &[String], patterns: bool) -> String {
     out
 }
 
-/// The left hand side: a quoted identifier and its json path, name
-/// keys as single quoted strings, index keys as bare integers.
-fn field_sql(field: &Field) -> String {
-    let mut out = quote_ident(&field.column);
-    for JsonStep { text, key } in &field.path {
+/// A column reference and its json path, name keys as single quoted
+/// strings, index keys as bare integers, qualified when the caller
+/// works across more than one table in scope. The planner leans on
+/// this for select items and order terms too.
+pub(crate) fn field_expr(qualifier: Option<&str>, column: &str, path: &[JsonStep]) -> String {
+    let mut out = String::new();
+    if let Some(q) = qualifier {
+        out.push_str(&quote_ident(q));
+        out.push('.');
+    }
+    out.push_str(&quote_ident(column));
+    for JsonStep { text, key } in path {
         out.push_str(if *text { "->>" } else { "->" });
         match key {
             JsonKey::Name(n) => {
@@ -268,7 +291,7 @@ fn field_sql(field: &Field) -> String {
     out
 }
 
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 2);
     out.push('"');
     for ch in name.chars() {
