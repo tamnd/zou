@@ -211,7 +211,7 @@ fn hex_val(b: u8) -> Option<u8> {
 /// Percent decoding plus the form flavor's plus-for-space, applied
 /// to each side of a pair after splitting on & and =, so encoded
 /// separators land inside values instead of splitting them.
-fn decode(s: &str) -> String {
+pub(crate) fn decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

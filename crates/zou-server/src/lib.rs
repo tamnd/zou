@@ -23,7 +23,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, get, post, put};
 use axum::{Router, middleware};
 use zou_rest::catalog::Catalog;
 
@@ -72,6 +72,44 @@ pub struct Config {
     /// False and the signup answers with a user and waits for the
     /// address to be proved, which is the hosted default.
     pub mailer_autoconfirm: bool,
+    /// GoTrue's GOTRUE_SITE_URL, where a confirmation link lands once
+    /// it has been followed. It is also the only redirect target that
+    /// is trusted by default: a redirect_to on the link is honoured
+    /// when it shares this url's scheme and host, and dropped
+    /// otherwise, because a link in an email that will bounce anywhere
+    /// is a phishing tool.
+    pub site_url: Option<String>,
+    /// GoTrue's GOTRUE_MAILER_SECURE_EMAIL_CHANGE_ENABLED, on by
+    /// default there and here. A change of address is confirmed twice,
+    /// once from the old address and once from the new, so someone who
+    /// walks up to an unlocked session cannot quietly move the account
+    /// somewhere the owner cannot reach.
+    pub secure_email_change: bool,
+    /// GoTrue's GOTRUE_SECURITY_UPDATE_PASSWORD_REQUIRE_REAUTHENTICATION,
+    /// off by default there and here. On, and setting a new password
+    /// needs a code mailed to the address first unless the session was
+    /// started in the last day.
+    pub reauthentication_required: bool,
+}
+
+impl Default for Config {
+    /// What a project that configures nothing gets, which is GoTrue's
+    /// own defaults wherever it has one.
+    fn default() -> Config {
+        Config {
+            jwt_secret: Vec::new(),
+            pg: None,
+            rate: None,
+            jwks: None,
+            schemas: Vec::new(),
+            external_url: None,
+            jwt_keys: None,
+            mailer_autoconfirm: false,
+            site_url: None,
+            secure_email_change: true,
+            reauthentication_required: false,
+        }
+    }
 }
 
 /// Everything the handlers share: the config and, when postgres is
@@ -109,6 +147,16 @@ impl App {
             .as_deref()
             .unwrap_or("http://localhost:9999");
         format!("{}/auth/v1", base.trim_end_matches('/'))
+    }
+
+    /// Where a followed confirmation link lands. GoTrue requires
+    /// SITE_URL to be set and the Supabase CLI puts localhost:3000
+    /// there, which is the framework dev server every quickstart runs.
+    pub fn site_url(&self) -> String {
+        self.cfg
+            .site_url
+            .clone()
+            .unwrap_or_else(|| "http://localhost:3000".to_string())
     }
 
     /// What signs an access token: the project's signing key when one
@@ -348,6 +396,12 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/auth/v1/health", get(auth_health))
         .route("/auth/v1/token", post(auth::token))
         .route("/auth/v1/signup", post(auth::signup))
+        .route("/auth/v1/recover", post(auth::recover))
+        .route("/auth/v1/reauthenticate", post(auth::reauthenticate))
+        // Reading the user back is the other half of this endpoint and
+        // it lands with the rest of the session surface, so it keeps
+        // saying so rather than becoming a method that does not exist.
+        .route("/auth/v1/user", put(auth::user_update).get(auth_stub))
         .route("/auth/v1/{*rest}", any(auth_stub))
         .route("/rest/v1/", any(rest::root))
         .route("/rest/v1/rpc/{func}", any(rest::rpc))
@@ -358,9 +412,13 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .layer(middleware::from_fn_with_state(Arc::clone(&app), rate_limit))
         .with_state(Arc::clone(&app));
     // Outside the gate, deliberately. A verifier fetching the public
-    // keys has no apikey and no reason to have one.
+    // keys has no apikey and no reason to have one, and neither does
+    // the link in a confirmation email: it is clicked in a mail client
+    // that knows nothing about the project, which is why the hosted
+    // gateway leaves /auth/v1/verify open too.
     let open = Router::new()
         .route("/auth/v1/.well-known/jwks.json", get(well_known_jwks))
+        .route("/auth/v1/verify", get(auth::verify_get).post(auth::verify))
         .with_state(app);
     Ok(Router::new()
         .merge(open)
@@ -403,13 +461,7 @@ mod tests {
     fn app() -> Router {
         router(Config {
             jwt_secret: SECRET.to_vec(),
-            pg: None,
-            rate: None,
-            jwks: None,
-            schemas: vec![],
-            external_url: None,
-            jwt_keys: None,
-            mailer_autoconfirm: false,
+            ..Config::default()
         })
         .unwrap()
     }
@@ -441,13 +493,8 @@ mod tests {
     fn config_with_keys() -> Config {
         Config {
             jwt_secret: SECRET.to_vec(),
-            pg: None,
-            rate: None,
-            jwks: None,
-            schemas: vec![],
-            external_url: None,
             jwt_keys: Some(keys_json()),
-            mailer_autoconfirm: false,
+            ..Config::default()
         }
     }
 
@@ -728,13 +775,8 @@ mod tests {
     fn echo_app_with_jwks(jwks: Option<String>) -> Router {
         let app = app_state(Config {
             jwt_secret: SECRET.to_vec(),
-            pg: None,
-            rate: None,
             jwks,
-            schemas: vec![],
-            external_url: None,
-            jwt_keys: None,
-            mailer_autoconfirm: false,
+            ..Config::default()
         })
         .unwrap();
         Router::new()
@@ -841,16 +883,11 @@ mod tests {
     async fn past_the_budget_is_the_edge_429() {
         let app = router(Config {
             jwt_secret: SECRET.to_vec(),
-            pg: None,
             rate: Some(edge::Rate {
                 burst: 2,
                 per_second: 0.5,
             }),
-            jwks: None,
-            schemas: vec![],
-            external_url: None,
-            jwt_keys: None,
-            mailer_autoconfirm: false,
+            ..Config::default()
         })
         .unwrap();
         let key = anon_key();
