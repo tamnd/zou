@@ -161,6 +161,10 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
     if !autoconfirm && sender.is_none() {
         log::info!("signups need a confirmation link, read it with zou inbox --http {port}");
     }
+    let oauth = zou_server::oauth::from_env()?;
+    if !oauth.is_empty() {
+        log::info!("social sign in with {}", oauth.names().join(", "));
+    }
     // initdb ran without -U, so the cluster superuser is the OS user
     // and local connections are trust, the stock dev loop layout.
     let user = std::env::var("USER")
@@ -186,6 +190,11 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // nothing set this is None and the messages stay in the
             // process, which is what a laptop wants.
             sender,
+            // Set ZOU_EXTERNAL_GOOGLE_CLIENT_ID and its secret, or the
+            // same pair for github, and /authorize starts offering
+            // them. With nothing set this is empty and every provider
+            // is refused by name.
+            oauth,
             // Everything else is GoTrue's default, including the
             // unlimited rate the dev loop wants: the real per endpoint
             // budgets arrive with the rest of the auth surface.

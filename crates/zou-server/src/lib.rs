@@ -31,6 +31,7 @@ pub mod auth;
 pub mod edge;
 pub mod jwt;
 pub mod mail;
+pub mod oauth;
 pub mod openapi;
 pub mod password;
 pub mod rest;
@@ -102,6 +103,15 @@ pub struct Config {
     /// hand it over rather than configure a second one, and because a
     /// test needs to be able to watch a send fail.
     pub sender: Option<Arc<dyn mail::Sender>>,
+    /// The external identity providers, GoTrue's GOTRUE_EXTERNAL_*.
+    /// Empty is a project with no social login, which is what
+    /// /authorize then says about every provider it is asked for.
+    pub oauth: oauth::Providers,
+    /// What calls the providers. None is a real HTTP client, and this
+    /// is here for the same reason `sender` is: a test that cannot
+    /// answer as Google can only assert what the code passes to
+    /// itself.
+    pub http: Option<Arc<dyn oauth::Http>>,
 }
 
 impl Default for Config {
@@ -122,6 +132,8 @@ impl Default for Config {
             reauthentication_required: false,
             mail: mail::Settings::default(),
             sender: None,
+            oauth: oauth::Providers::default(),
+            http: None,
         }
     }
 }
@@ -144,6 +156,8 @@ pub struct App {
     /// link rather than dropping them the way an unconfigured GoTrue
     /// does.
     pub mailer: Arc<dyn mail::Sender>,
+    /// What the external providers are called with.
+    pub web: Arc<dyn oauth::Http>,
     /// The fk catalog per exposed schema, each tagged with the epoch
     /// it was introspected under. A request reuses it while the epoch
     /// holds and reintrospects when the DDL watch moves it.
@@ -218,6 +232,10 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         Some(sender) => sender,
         None => Arc::new(mail::Inbox::default()),
     };
+    let web: Arc<dyn oauth::Http> = match cfg.http.take() {
+        Some(http) => http,
+        None => Arc::new(oauth::Web::default()),
+    };
     Ok(Arc::new(App {
         cfg,
         pool,
@@ -225,6 +243,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         jwks,
         keys,
         mailer,
+        web,
         catalog: tokio::sync::RwLock::new(HashMap::new()),
         epoch: Arc::new(AtomicU64::new(0)),
         watching: tokio::sync::OnceCell::new(),
@@ -500,6 +519,13 @@ pub fn router(cfg: Config) -> Result<Router, String> {
     let open = Router::new()
         .route("/auth/v1/.well-known/jwks.json", get(well_known_jwks))
         .route("/auth/v1/verify", get(auth::verify_get).post(auth::verify))
+        // Both halves of a social sign in are navigations rather than
+        // fetches: the first is a link or a form post the app hands to
+        // the browser, the second is the provider redirecting back.
+        // Neither carries an apikey and neither can be made to, which
+        // is why the hosted gateway leaves them open too.
+        .route("/auth/v1/authorize", get(auth::authorize))
+        .route("/auth/v1/callback", get(auth::callback))
         .with_state(Arc::clone(&app));
     Ok(Router::new()
         .merge(open)

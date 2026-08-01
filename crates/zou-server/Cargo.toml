@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
+ureq = { workspace = true }
 webpki-roots = { workspace = true }
 zou-rest = { path = "../zou-rest" }
 
