@@ -204,6 +204,55 @@ end
 $$;
 ";
 
+/// The canonical auth schema, the shape GoTrue's own migrations leave
+/// behind. Generated rather than transcribed, see
+/// scripts/auth-schema-refresh.sh for how and why.
+const AUTH_SCHEMA: &str = include_str!("auth-schema.sql");
+
+/// Create the auth schema when the database has none, and leave it
+/// completely alone when it has one.
+///
+/// The check is `auth.users`, not the schema, because zou's own
+/// bootstrap creates the schema for the auth.uid() helpers before this
+/// ever runs. An existing auth.users means somebody else's schema,
+/// most likely a real GoTrue's, possibly several versions behind this
+/// one. Half applying today's ddl over that would leave a shape that
+/// is neither version, so the only safe move is to do nothing.
+/// Migrating an older schema forward is GoTrue's own job.
+///
+/// Its own transaction, so that two servers starting against a fresh
+/// database do not both decide it is empty and both start creating.
+///
+/// The same advisory lock the bootstrap takes, not one of its own. The
+/// two overlap: the four auth helper functions are defined by both, and
+/// under two locks one connection can be replacing auth.uid inside the
+/// bootstrap while another replaces it here, which postgres reports as
+/// a deadlock on pg_proc or as tuple concurrently updated. One lock over
+/// everything that writes the auth schema is the whole fix.
+async fn ensure_auth_schema(client: &Client) -> Result<(), tokio_postgres::Error> {
+    client
+        .batch_execute("begin; select pg_advisory_xact_lock(730501)")
+        .await?;
+    let fresh: bool = client
+        .query_one("select to_regclass('auth.users') is null", &[])
+        .await?
+        .get(0);
+    let applied = if fresh {
+        client.batch_execute(AUTH_SCHEMA).await
+    } else {
+        Ok(())
+    };
+    match applied {
+        Ok(()) => client.batch_execute("commit").await,
+        Err(e) => {
+            // The rollback is best effort: the connection may be the
+            // reason the batch failed in the first place.
+            let _ = client.batch_execute("rollback").await;
+            Err(e)
+        }
+    }
+}
+
 /// How long a watch waits before dialing again after its connection
 /// died.
 const RETRY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -247,7 +296,10 @@ impl Pool {
         });
         self.0
             .bootstrapped
-            .get_or_try_init(|| client.batch_execute(BOOTSTRAP))
+            .get_or_try_init(|| async {
+                client.batch_execute(BOOTSTRAP).await?;
+                ensure_auth_schema(&client).await
+            })
             .await?;
         Ok((permit, client))
     }
