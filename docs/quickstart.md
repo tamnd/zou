@@ -57,7 +57,25 @@ zou inbox --clear                      # start the next flow with an empty mailb
 
 `zou inbox` mints the service_role key from `ZOU_JWT_SECRET`, the same variable `zou dev` asks to be pinned, or takes `ZOU_SERVICE_KEY` when there is one to hand. It talks to 127.0.0.1 and nowhere else. Recovery, magic link, reauthentication and email change codes all arrive in the same place, so the whole of the email surface can be walked through without a mail catcher container or a second port.
 
-There is no SMTP transport yet, so a project that configures a real mail server has nowhere to send. That is the next piece of milestone 2.
+## Mail that leaves the machine
+
+Set `ZOU_SMTP_HOST` and the mail goes to a real server instead. The names are GoTrue's with `GOTRUE_` swapped for `ZOU_`, so a project migrating across brings its own values.
+
+```bash
+ZOU_SMTP_HOST=smtp.example.com \
+ZOU_SMTP_PORT=587 \
+ZOU_SMTP_USER=postmaster@example.com \
+ZOU_SMTP_PASS=... \
+ZOU_SMTP_ADMIN_EMAIL=noreply@example.com \
+ZOU_SMTP_SENDER_NAME="My Project" \
+  zou dev /tmp/mydb --http 54321
+```
+
+Port 465 is TLS from the first byte and everything else is plain TCP upgraded with STARTTLS, which is what the ports mean everywhere else. `ZOU_SMTP_SECURITY=starttls|tls|none` says so explicitly when a server disagrees with its port, and `none` is what a mail catcher on 127.0.0.1 needs.
+
+Two rules here are stricter than GoTrue's. A server that offers no STARTTLS is refused rather than talked to in the clear, and the password is never sent unencrypted unless the server is on the loopback address. There is no knob for skipping certificate verification, because a transport that can be told not to check is one that ends up not checking.
+
+Once something is carrying the mail there is nothing left in the process, so `zou inbox` has nothing to print and `/dev/inbox` is not there at all.
 
 ## Where to go next
 

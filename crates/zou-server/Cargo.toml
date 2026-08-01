@@ -16,10 +16,12 @@ getrandom = { workspace = true }
 hmac = { workspace = true }
 log = { workspace = true }
 p256 = { workspace = true }
+rustls = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
+webpki-roots = { workspace = true }
 zou-rest = { path = "../zou-rest" }
 
 [dev-dependencies]

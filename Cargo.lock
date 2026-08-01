@@ -2010,11 +2010,13 @@ dependencies = [
  "hmac",
  "log",
  "p256",
+ "rustls",
  "serde_json",
  "sha2",
  "tokio",
  "tokio-postgres",
  "tower",
+ "webpki-roots",
  "zou-rest",
 ]
 

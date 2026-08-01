@@ -147,7 +147,18 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
         std::env::var("ZOU_MAILER_AUTOCONFIRM").as_deref(),
         Ok("false") | Ok("0")
     );
-    if !autoconfirm {
+    // A configured mail server carries the mail, and then there is
+    // nothing left in memory for `zou inbox` to print, which is why it
+    // says which of the two is happening.
+    let sender: Option<std::sync::Arc<dyn zou_server::mail::Sender>> =
+        match zou_server::smtp::from_env()? {
+            Some(smtp) => {
+                log::info!("mail goes to {}:{}", smtp.host, smtp.port);
+                Some(std::sync::Arc::new(smtp))
+            }
+            None => None,
+        };
+    if !autoconfirm && sender.is_none() {
         log::info!("signups need a confirmation link, read it with zou inbox --http {port}");
     }
     // initdb ran without -U, so the cluster superuser is the OS user
@@ -171,6 +182,10 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // anywhere, they are kept in memory, and `zou inbox`
             // prints the link.
             mailer_autoconfirm: autoconfirm,
+            // Set ZOU_SMTP_HOST and the mail goes out for real. With
+            // nothing set this is None and the messages stay in the
+            // process, which is what a laptop wants.
+            sender,
             // Everything else is GoTrue's default, including the
             // unlimited rate the dev loop wants: the real per endpoint
             // budgets arrive with the rest of the auth surface.

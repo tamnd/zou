@@ -34,6 +34,7 @@ pub mod mail;
 pub mod openapi;
 pub mod password;
 pub mod rest;
+pub mod smtp;
 pub mod sql;
 
 /// What the front door needs to know: the secret every key and token
@@ -1072,5 +1073,38 @@ mod tests {
             .unwrap();
         let res = echo_app().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_configured_mail_server_takes_the_dev_inbox_away_with_it() {
+        // Nothing is kept in the process once something is carrying
+        // the mail, so the mailbox is not there to be read. This is
+        // the deployment case: the route exists in the router either
+        // way, and the only thing standing between a stranger and a
+        // recovery code is that there is no mail to hand out.
+        let service = jwt::mint(&jwt::key_claims("service_role"), SECRET);
+        let ask = |app: Router, key: String| async move {
+            let req = Request::builder()
+                .uri("/dev/inbox")
+                .header("apikey", key)
+                .body(Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        };
+
+        let local = router(Config {
+            jwt_secret: SECRET.to_vec(),
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(ask(local, service.clone()).await, StatusCode::OK);
+
+        let sending = router(Config {
+            jwt_secret: SECRET.to_vec(),
+            sender: Some(Arc::new(smtp::Smtp::new("mail.zou.test", 587))),
+            ..Config::default()
+        })
+        .unwrap();
+        assert_eq!(ask(sending, service).await, StatusCode::NOT_FOUND);
     }
 }
