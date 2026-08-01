@@ -45,19 +45,20 @@ Vanilla is Postgres 18.4 with stock settings, Neon is its docker compose stack s
 | postgres 18, local NVMe | 506.4 | 15.8 ms | 4259.3 | 1.9 ms | 50.2 s |
 | neon, self hosted compose | 109.9 | 72.8 ms | 562.4 | 14.2 ms | 208.7 s |
 | zou v1, localfs store | 356.1 | 22.5 ms | 12773.7 | 0.63 ms | 1330.7 s |
-| zou v1, minio store | 6.5 * | 1238 ms * | 311.7 | 25.7 ms | 3485.6 s |
+| zou v1, minio store | 0.87 * | 9204 ms * | 37.8 * | 211.4 ms * | 4455.7 s |
 
 Reading the table: zou select-only on localfs is 3x vanilla and 22.7x Neon on identical hardware, because the page cache serves every read locally while the store only sees the write stream.
 tpcb on localfs is 3.2x Neon and 0.7x vanilla, the remaining gap to vanilla is commit ack latency.
 
-The starred MinIO tpcb row is published deliberately.
-Steady state ran 90 to 110 tps at 67 ms p50 and 199 ms p99, then the wal pusher began a full checkpoint fold, and in the v1 pusher folding and segment pushing share one loop, so the final 8 transactions waited 790 s for commit acks and were released the second the fold completed, dragging the 60 s run average to 6.5 tps.
-The MinIO select-only row shows a second problem: 25.7 ms per point read means the store is on the read path where the localfs leg answers from the local cache at 0.63 ms.
-Both issues are tracked for perf spec 006 and the MinIO group reruns after the fixes, replacing this row.
+The starred MinIO row is the rerun after the concurrent fold change from perf spec 006, and it came back worse than the run it replaced, which is exactly why it is published.
+The fold no longer blocks the pusher loop, but it now runs during the benchmark window and its GET traffic saturates the same localhost MinIO the foreground needs: the 60 s select-only run alone saw 2.2 GB of checkpoint range reads and 1.2 GB of wal reads from background fold and replay, plus 7019 page reads that should have been cache hits.
+The 30 s buckets show the shape: tpcb did 53 transactions in its first half then 6 in its second at 67 s p50, and select-only was fully blocked for its first 30 s (1 transaction), ran the middle window at 76.5 tps, then stalled again at the tail.
+Moving the fold off the commit path moved the stall, it did not remove it, because in the v1 store the fold has to read the entire wal and checkpoint history back through the object store to produce pages.
+That cost is a property of the v1 layout, so this row stays as the honest v1 number and the fix is the storage v2 redesign rather than another pusher patch.
 
 ## Pending
 
 - Real S3 and S3 Express One Zone runs from an in region box, plus GCS and R2.
 - Concurrent producer runs to show batching amortization.
-- MinIO rerun after the concurrent fold and page cache fixes from perf spec 006.
+- MinIO rerun on the storage v2 layout once it exists, the v1 rerun above showed the fold cost is structural.
 - pgbench scale 1000 and the TPCC shape from the M1b checklist.
