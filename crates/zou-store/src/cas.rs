@@ -180,12 +180,8 @@ impl KeyLock {
                     // whose mtime is minutes old belongs to a dead process
                     // and gets broken. The mtime of a dir is set at mkdir
                     // and a crashed owner never touches it again.
-                    if let Ok(meta) = fs::metadata(&dir)
-                        && let Ok(modified) = meta.modified()
-                        && let Ok(age) = modified.elapsed()
-                        && age > stale
-                    {
-                        let _ = fs::remove_dir_all(&dir);
+                    if lock_is_stale(&dir, stale) {
+                        break_stale_lock(&dir, stale);
                         continue;
                     }
                     if Instant::now() > deadline {
@@ -216,6 +212,56 @@ fn stale_lock_age() -> Duration {
         .and_then(|v| v.parse().ok())
         .unwrap_or(60_000);
     Duration::from_millis(ms)
+}
+
+fn lock_is_stale(dir: &Path, stale: Duration) -> bool {
+    if let Ok(meta) = fs::metadata(dir)
+        && let Ok(modified) = meta.modified()
+        && let Ok(age) = modified.elapsed()
+    {
+        return age > stale;
+    }
+    false
+}
+
+/// Remove a stale lock so exactly one waiter does the breaking. A naive
+/// stat then remove races: between one waiter's staleness check and its
+/// remove, another waiter can break the stale lock, win the mkdir, and
+/// have its fresh lock deleted out from under it, which lets two writers
+/// into the critical section. The breaker lock serializes candidates and
+/// the second staleness check inside it sees any lock that was rebuilt
+/// fresh in the meantime and leaves it alone.
+fn break_stale_lock(dir: &Path, stale: Duration) {
+    let breaker = dir.with_extension("lock-break");
+    match fs::create_dir(&breaker) {
+        Ok(()) => {
+            if lock_is_stale(dir, stale) {
+                let _ = fs::remove_dir_all(dir);
+            }
+            let _ = fs::remove_dir(&breaker);
+        }
+        Err(_) => {
+            // Another waiter is breaking right now, or a breaker crashed
+            // and left this behind. A live breaker holds it for two stat
+            // calls and a remove, so an old one is a crash leftover and
+            // gets removed the plain way; the recheck above bounds what
+            // the residual race here can do.
+            if lock_is_stale(&breaker, stale) {
+                let _ = fs::remove_dir_all(&breaker);
+            }
+        }
+    }
+}
+
+/// A tmp path no other writer of the same key can collide with, so even
+/// a lock protocol failure that lets two writers in cannot make one
+/// rename the other's half written bytes or fail on a vanished tmp. The
+/// name keeps the .tmp suffix so list keeps hiding it.
+fn unique_tmp(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("{}-{n}.tmp", std::process::id()))
 }
 
 /// Whether a failed lock mkdir means "held by someone else, wait". Windows
@@ -291,7 +337,7 @@ impl CasStore for LocalFsStore {
             });
         }
 
-        let tmp = path.with_extension("tmp");
+        let tmp = unique_tmp(&path);
         let mut f = fs::File::create(&tmp).map_err(|e| Self::io(key, e))?;
         f.write_all(data).map_err(|e| Self::io(key, e))?;
         f.sync_all().map_err(|e| Self::io(key, e))?;
@@ -313,7 +359,7 @@ impl CasStore for LocalFsStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| Self::io(key, e))?;
         }
-        let tmp = path.with_extension("tmp");
+        let tmp = unique_tmp(&path);
         let mut f = fs::File::create(&tmp).map_err(|e| Self::io(key, e))?;
         f.write_all(data).map_err(|e| Self::io(key, e))?;
         f.sync_all().map_err(|e| Self::io(key, e))?;
@@ -356,7 +402,10 @@ impl CasStore for LocalFsStore {
                 let path = entry.path();
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if name.ends_with(".lock") || name.ends_with(".tmp") {
+                if name.ends_with(".lock")
+                    || name.ends_with(".lock-break")
+                    || name.ends_with(".tmp")
+                {
                     continue;
                 }
                 if path.is_dir() {

@@ -33,64 +33,72 @@ fn localfs_recovers_from_every_crash_state() {
     set_fast_lock_recovery();
     let key = "wal/000000000001";
     for lock_left in [false, true] {
-        for tmp_left in [None, Some(&b"torn garbage"[..]), Some(&b""[..])] {
-            for dest_committed in [false, true] {
-                let dir = tempfile::tempdir().unwrap();
-                let store = LocalFsStore::new(dir.path());
-                if dest_committed {
-                    store.put_if_absent(key, b"committed").unwrap();
-                }
-                let path = dir.path().join(key);
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                if lock_left {
-                    fs::create_dir(path.with_extension("lock")).unwrap();
-                }
-                if let Some(tmp) = tmp_left {
-                    fs::write(path.with_extension("tmp"), tmp).unwrap();
-                }
-                // Let the leftover lock age past the staleness bound.
-                if lock_left {
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-                let case = format!(
-                    "lock_left={lock_left} tmp_left={:?} dest_committed={dest_committed}",
-                    tmp_left.map(|t| t.len())
-                );
-
-                // A read never sees tmp garbage, only the committed
-                // value or absence.
-                match store.get(key).unwrap() {
-                    Some((data, _)) => {
-                        assert!(dest_committed, "{case}: read invented an object");
-                        assert_eq!(data, b"committed", "{case}: torn read");
+        for break_left in [false, true] {
+            for tmp_left in [None, Some(&b"torn garbage"[..]), Some(&b""[..])] {
+                for dest_committed in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let store = LocalFsStore::new(dir.path());
+                    if dest_committed {
+                        store.put_if_absent(key, b"committed").unwrap();
                     }
-                    None => assert!(!dest_committed, "{case}: committed object lost"),
-                }
-
-                // Listing shows objects, never .lock or .tmp leftovers.
-                let listed = store.list("wal/").unwrap();
-                if dest_committed {
-                    assert_eq!(listed, vec![key.to_string()], "{case}");
-                } else {
-                    assert!(listed.is_empty(), "{case}: {listed:?}");
-                }
-
-                // The key is not wedged: the exact write the crash
-                // interrupted retries through the stale lock and lands,
-                // and absence semantics hold either way.
-                match store.put_if_absent(key, b"retry") {
-                    Ok(_) => {
-                        assert!(
-                            !dest_committed,
-                            "{case}: create overwrote a committed object"
-                        );
-                        assert_eq!(store.get(key).unwrap().unwrap().0, b"retry", "{case}");
+                    let path = dir.path().join(key);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    if lock_left {
+                        fs::create_dir(path.with_extension("lock")).unwrap();
                     }
-                    Err(CasError::AlreadyExists { .. }) => {
-                        assert!(dest_committed, "{case}: spurious AlreadyExists");
-                        assert_eq!(store.get(key).unwrap().unwrap().0, b"committed", "{case}");
+                    if break_left {
+                        // A breaker that died between its mkdir and its
+                        // cleanup leaves this behind too.
+                        fs::create_dir(path.with_extension("lock-break")).unwrap();
                     }
-                    Err(e) => panic!("{case}: key wedged after crash: {e}"),
+                    if let Some(tmp) = tmp_left {
+                        fs::write(path.with_extension("tmp"), tmp).unwrap();
+                    }
+                    // Let the leftovers age past the staleness bound.
+                    if lock_left || break_left {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                    let case = format!(
+                        "lock_left={lock_left} break_left={break_left} tmp_left={:?} dest_committed={dest_committed}",
+                        tmp_left.map(|t| t.len())
+                    );
+
+                    // A read never sees tmp garbage, only the committed
+                    // value or absence.
+                    match store.get(key).unwrap() {
+                        Some((data, _)) => {
+                            assert!(dest_committed, "{case}: read invented an object");
+                            assert_eq!(data, b"committed", "{case}: torn read");
+                        }
+                        None => assert!(!dest_committed, "{case}: committed object lost"),
+                    }
+
+                    // Listing shows objects, never lock, breaker or tmp
+                    // leftovers.
+                    let listed = store.list("wal/").unwrap();
+                    if dest_committed {
+                        assert_eq!(listed, vec![key.to_string()], "{case}");
+                    } else {
+                        assert!(listed.is_empty(), "{case}: {listed:?}");
+                    }
+
+                    // The key is not wedged: the exact write the crash
+                    // interrupted retries through the stale lock and lands,
+                    // and absence semantics hold either way.
+                    match store.put_if_absent(key, b"retry") {
+                        Ok(_) => {
+                            assert!(
+                                !dest_committed,
+                                "{case}: create overwrote a committed object"
+                            );
+                            assert_eq!(store.get(key).unwrap().unwrap().0, b"retry", "{case}");
+                        }
+                        Err(CasError::AlreadyExists { .. }) => {
+                            assert!(dest_committed, "{case}: spurious AlreadyExists");
+                            assert_eq!(store.get(key).unwrap().unwrap().0, b"committed", "{case}");
+                        }
+                        Err(e) => panic!("{case}: key wedged after crash: {e}"),
+                    }
                 }
             }
         }
