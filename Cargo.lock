@@ -1953,6 +1953,7 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "base64ct",
+ "bytes",
  "getrandom 0.3.4",
  "hmac",
  "log",
@@ -1962,6 +1963,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tower",
+ "zou-rest",
 ]
 
 [[package]]

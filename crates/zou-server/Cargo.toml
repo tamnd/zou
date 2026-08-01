@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 axum = { workspace = true }
 base64ct = { workspace = true }
+bytes = "1"
 getrandom = { workspace = true }
 hmac = { workspace = true }
 log = { workspace = true }
@@ -18,6 +19,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
+zou-rest = { path = "../zou-rest" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }
