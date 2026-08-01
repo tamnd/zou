@@ -165,6 +165,10 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
     if !oauth.is_empty() {
         log::info!("social sign in with {}", oauth.names().join(", "));
     }
+    let manual_linking = matches!(
+        std::env::var("ZOU_SECURITY_MANUAL_LINKING_ENABLED").as_deref(),
+        Ok("true") | Ok("1")
+    );
     // initdb ran without -U, so the cluster superuser is the OS user
     // and local connections are trust, the stock dev loop layout.
     let user = std::env::var("USER")
@@ -195,6 +199,11 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // them. With nothing set this is empty and every provider
             // is refused by name.
             oauth,
+            // Off by default, the same as GoTrue. Set
+            // ZOU_SECURITY_MANUAL_LINKING_ENABLED=true and a signed in
+            // person can attach a second provider to the account they
+            // already have, and detach one again.
+            manual_linking,
             // Everything else is GoTrue's default, including the
             // unlimited rate the dev loop wants: the real per endpoint
             // budgets arrive with the rest of the auth surface.

@@ -23,7 +23,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use axum::{Router, middleware};
 use zou_rest::catalog::Catalog;
 
@@ -88,6 +88,12 @@ pub struct Config {
     /// walks up to an unlocked session cannot quietly move the account
     /// somewhere the owner cannot reach.
     pub secure_email_change: bool,
+    /// GoTrue's GOTRUE_SECURITY_MANUAL_LINKING_ENABLED, off by default
+    /// there and here. On, and a signed in person can start a second
+    /// social sign in that attaches its identity to the account they
+    /// already have, and can detach one again. Off, and both endpoints
+    /// are not there at all.
+    pub manual_linking: bool,
     /// GoTrue's GOTRUE_SECURITY_UPDATE_PASSWORD_REQUIRE_REAUTHENTICATION,
     /// off by default there and here. On, and setting a new password
     /// needs a code mailed to the address first unless the session was
@@ -129,6 +135,7 @@ impl Default for Config {
             mailer_autoconfirm: false,
             site_url: None,
             secure_email_change: true,
+            manual_linking: false,
             reauthentication_required: false,
             mail: mail::Settings::default(),
             sender: None,
@@ -496,6 +503,18 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         // it lands with the rest of the session surface, so it keeps
         // saying so rather than becoming a method that does not exist.
         .route("/auth/v1/user", put(auth::user_update).get(auth_stub))
+        // Manual identity linking. Both of these are fetches carrying a
+        // bearer token rather than navigations, which is why they are
+        // inside the gate while /authorize is not, and both answer 404
+        // until a project turns linking on.
+        .route(
+            "/auth/v1/user/identities/authorize",
+            get(auth::link_identity),
+        )
+        .route(
+            "/auth/v1/user/identities/{identity_id}",
+            delete(auth::unlink_identity),
+        )
         .route("/auth/v1/{*rest}", any(auth_stub))
         .route("/rest/v1/", any(rest::root))
         .route("/rest/v1/rpc/{func}", any(rest::rpc))
@@ -525,7 +544,10 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         // Neither carries an apikey and neither can be made to, which
         // is why the hosted gateway leaves them open too.
         .route("/auth/v1/authorize", get(auth::authorize))
-        .route("/auth/v1/callback", get(auth::callback))
+        .route(
+            "/auth/v1/callback",
+            get(auth::callback).post(auth::callback_form),
+        )
         .with_state(Arc::clone(&app));
     Ok(Router::new()
         .merge(open)
