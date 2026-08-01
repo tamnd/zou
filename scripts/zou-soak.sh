@@ -44,8 +44,9 @@ q() { "$PG_BIN/psql" -h 127.0.0.1 -p "$PORT" -d postgres -Atqc "$1"; }
 
 start_dev() {
 	RT="$WORK/rt-$iter"
+	DEVLOG="$WORK/dev-$iter.log"
 	"$ZOU_BIN/zou" dev "$TARGET" --pg-bin "$PG_BIN" --port "$PORT" \
-		--runtime "$RT" >>"$WORK/dev-$iter.log" 2>&1 &
+		--runtime "$RT" >>"$DEVLOG" 2>&1 &
 	DEVPID=$!
 }
 
@@ -80,20 +81,34 @@ reap_shm() {
 # cap. Our own probes append not-yet-accepting FATALs to the dev log
 # every second, so those lines are filtered out of the progress count
 # or the log would always look alive.
+#
+# The log watched is $DEVLOG from start_dev, not dev-$iter.log: a
+# postmaster kill restarts under the zou dev from an earlier
+# iteration, whose log keeps the old number. Run3 failed its tenth
+# iteration exactly here, grepping a file that never existed while
+# recovery was fine. And the end-of-recovery checkpoint writes every
+# recovered page to the store without logging a line, minutes of
+# honest silence on MinIO, so while the newest checkpoint event in
+# the log is such a start with no matching complete, silence does not
+# count as stall.
 wait_writable() {
-	local devlog="$WORK/dev-$iter.log"
-	local stall=0 last=-1 lines
+	local stall=0 last=-1 lines phase
 	for _ in $(seq 1 3600); do
 		if q "insert into probe values(1)" >/dev/null 2>&1; then
 			return 0
 		fi
 		lines=$(grep -cv "accepting connections\|Consistent recovery state" \
-			"$devlog" 2>/dev/null || echo 0)
+			"$DEVLOG" 2>/dev/null || echo 0)
 		if [ "$lines" != "$last" ]; then
 			last=$lines
 			stall=0
 		else
-			stall=$((stall + 1))
+			phase=$(grep -E "checkpoint (starting: end-of-recovery|complete)" \
+				"$DEVLOG" 2>/dev/null | tail -1)
+			case $phase in
+			*end-of-recovery*) stall=0 ;;
+			*) stall=$((stall + 1)) ;;
+			esac
 		fi
 		if [ "$stall" -ge 240 ]; then
 			break
