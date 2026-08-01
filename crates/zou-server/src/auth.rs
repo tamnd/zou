@@ -601,7 +601,7 @@ async fn swap(sess: &sql::Session, found: &Presented) -> Result<String, Error> {
 /// A six digit one time code, GoTrue's MAILER_OTP_LENGTH default. It is
 /// what the confirmation email carries, and it is drawn uniformly
 /// rather than from the low bits of a timestamp.
-fn otp() -> String {
+fn six_digits() -> String {
     let mut raw = [0u8; 4];
     getrandom::fill(&mut raw).expect("the os rng never fails");
     // A million does not divide 2^32, so the top of the range is
@@ -1023,7 +1023,7 @@ async fn mint_code(
         "reauthentication_token" => ("reauthentication_token", "reauthentication_sent_at"),
         _ => ("confirmation_token", "confirmation_sent_at"),
     };
-    let code = otp();
+    let code = six_digits();
     let hashed = token_hash(email, &code);
     sess.execute(
         &format!(
@@ -1518,6 +1518,114 @@ pub async fn send_recovery(pool: &Pool, email: &str) -> Result<(), Error> {
     }
 }
 
+/// A password nobody will ever type, for the account a magic link
+/// creates. GoTrue draws 33 characters, and the point of it is that the
+/// row has a password column that no password grant can ever satisfy.
+fn unguessable_password() -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut raw = [0u8; 33];
+    getrandom::fill(&mut raw).expect("the os rng never fails");
+    raw.iter()
+        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+        .collect()
+}
+
+/// A magic link, which is a recovery code under a different name and a
+/// different email template. It is the same column, the same token type
+/// and the same verify, which is upstream's own arrangement: a link
+/// that signs someone in and a link that lets them set a new password
+/// are the same thing wearing different words.
+///
+/// An address nobody has signed up with is signed up here, because a
+/// magic link is how a project without passwords registers people at
+/// all. That is also why this endpoint says nothing about whether the
+/// address was already known.
+async fn magic_for(
+    sess: &sql::Session,
+    email: &str,
+    data: &serde_json::Value,
+    autoconfirm: bool,
+    signer: &crate::jwt::Signer<'_>,
+    issuer: &str,
+) -> Result<(), Error> {
+    let rows = sess
+        .query(
+            "select email_confirmed_at is not null from auth.users
+              where email = $1 and aud = $2 and deleted_at is null limit 1",
+            &[&email, &AUD],
+        )
+        .await?;
+    let known = rows.first().map(|r| r.get::<_, bool>(0)).unwrap_or(false);
+    if !known {
+        // Either nobody has this address or whoever has it never proved
+        // it, and both are a signup as far as this endpoint is
+        // concerned. The password is drawn and thrown away.
+        let hash = hash_off_thread(&unguessable_password()).await;
+        register(sess, email, &hash, data, autoconfirm, signer, issuer).await?;
+        if !autoconfirm {
+            // The confirmation this just wrote is the link, so there is
+            // nothing else to send.
+            return Ok(());
+        }
+    }
+    let rows = sess
+        .query(
+            "select id::text from auth.users
+              where email = $1 and aud = $2 and deleted_at is null limit 1",
+            &[&email, &AUD],
+        )
+        .await?;
+    let user_id: String = rows[0].get(0);
+    mint_code(sess, &user_id, email, "recovery_token").await?;
+    Ok(())
+}
+
+/// POST /auth/v1/magiclink, and the email half of POST /auth/v1/otp.
+pub async fn send_magic_link(
+    pool: &Pool,
+    email: &str,
+    data: &serde_json::Value,
+    autoconfirm: bool,
+    signer: &crate::jwt::Signer<'_>,
+    issuer: &str,
+) -> Result<(), Error> {
+    let email = validate_email(email)?;
+    let sess = pool.admin().await?;
+    let out = magic_for(&sess, &email, data, autoconfirm, signer, issuer).await;
+    match out {
+        Ok(()) => {
+            sess.commit().await?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+/// Whether anyone holds this address, which is the one question the otp
+/// endpoint asks before it refuses to create somebody.
+async fn is_registered(pool: &Pool, email: &str) -> Result<bool, Error> {
+    let sess = pool.admin().await?;
+    let rows = sess
+        .query(
+            "select 1 from auth.users
+              where email = $1 and aud = $2 and deleted_at is null limit 1",
+            &[&email, &AUD],
+        )
+        .await;
+    let found = match rows {
+        Ok(rows) => !rows.is_empty(),
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return Err(Error::Db(e));
+        }
+    };
+    sess.commit().await?;
+    Ok(found)
+}
+
 /// Write down a code that proves the person holding this session is
 /// still the person who owns the address, which is what a password
 /// change asks for when the session is old.
@@ -1582,9 +1690,9 @@ async fn stage_change(
     new: &str,
     secure_change: bool,
 ) -> Result<(), sql::Error> {
-    let to_new = token_hash(new, &otp());
+    let to_new = token_hash(new, &six_digits());
     let to_current = if secure_change && !current.is_empty() {
-        token_hash(current, &otp())
+        token_hash(current, &six_digits())
     } else {
         String::new()
     };
@@ -2341,6 +2449,119 @@ pub async fn recover(
     }
 }
 
+/// POST /auth/v1/magiclink, a link that signs someone in without a
+/// password, and signs them up first if nobody holds the address.
+pub async fn magiclink(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let body = match read_json(req.into_body()).await {
+        Ok(v) => v,
+        Err(res) => return res,
+    };
+    magic(&app, pool, &body).await
+}
+
+/// POST /auth/v1/otp, which is the magic link endpoint with a phone
+/// branch and one extra rule: `create_user: false` turns it into a sign
+/// in for people who already have an account.
+pub async fn otp(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let body = match read_json(req.into_body()).await {
+        Ok(v) => v,
+        Err(res) => return res,
+    };
+    let (email, phone) = (field(&body, "email"), field(&body, "phone"));
+    if !email.is_empty() && !phone.is_empty() {
+        return error_body(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "Only an email address or phone number should be provided",
+        );
+    }
+    if !email.is_empty() && !field(&body, "channel").is_empty() {
+        return error_body(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "Channel should only be specified with Phone OTP",
+        );
+    }
+    // Upstream asks this before it looks at which of the two was sent,
+    // so an address that is refused here is refused whatever else the
+    // request said.
+    let create = body
+        .get("create_user")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if !create && !email.is_empty() {
+        let address = match validate_email(email) {
+            Ok(v) => v,
+            Err(e) => return refusal(e, "otp"),
+        };
+        match is_registered(pool, &address).await {
+            Ok(false) => {
+                return error_body(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "otp_disabled",
+                    "Signups not allowed for otp",
+                );
+            }
+            Ok(true) => {}
+            Err(e) => return refusal(e, "otp"),
+        }
+    }
+    if !phone.is_empty() {
+        return not_yet("the phone otp");
+    }
+    if email.is_empty() {
+        return error_body(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "One of email or phone must be set",
+        );
+    }
+    magic(&app, pool, &body).await
+}
+
+/// The body both of them share. The answer is empty and the same
+/// whether the address was known, which is what keeps either endpoint
+/// from being asked who has an account here.
+async fn magic(app: &App, pool: &Pool, body: &serde_json::Value) -> Response {
+    let email = field(body, "email");
+    if email.is_empty() {
+        // Upstream's wording, copied from recover, and its status,
+        // which is not recover's. Both are kept because a client
+        // branches on both.
+        return error_body(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "validation_failed",
+            "Password recovery requires an email",
+        );
+    }
+    let data = metadata(body);
+    match send_magic_link(
+        pool,
+        email,
+        &data,
+        app.cfg.mailer_autoconfirm,
+        &app.signer(),
+        &app.issuer(),
+    )
+    .await
+    {
+        Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
+        Err(e) => refusal(e, "magic link"),
+    }
+}
+
 /// POST /auth/v1/reauthenticate, which mails a code that proves the
 /// person holding this session still reads the address on it.
 pub async fn reauthenticate(
@@ -2542,7 +2763,7 @@ mod tests {
     fn a_one_time_code_is_six_digits_and_not_always_the_same_one() {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..200 {
-            let code = otp();
+            let code = six_digits();
             assert_eq!(code.len(), 6, "MAILER_OTP_LENGTH is 6: {code}");
             assert!(
                 code.chars().all(|c| c.is_ascii_digit()),
