@@ -412,3 +412,165 @@ async fn planned_queries_return_postgrest_shaped_rows() {
         .await
         .expect("cleanup");
 }
+
+/// Every mutation shape executed for real: the payload binds as one
+/// json parameter, the conflict clauses resolve, RETURNING hands
+/// rows back, and the representation CTE feeds the planner with an
+/// embed resolving against the real table.
+#[tokio::test]
+async fn mutations_execute_and_read_back_through_the_planner() {
+    use zou_rest::mutate::{self, Conflict, Returning};
+    use zou_rest::{plan, select};
+
+    let Some(c) = client().await else { return };
+
+    c.batch_execute(
+        "drop schema if exists zou_mut cascade;
+         create schema zou_mut;
+         set search_path to zou_mut;
+         create table authors (id int primary key, name text);
+         create table books (
+             id int primary key,
+             author_id int references authors,
+             title text,
+             price int default 7
+         );
+         insert into authors values (1, 'ann'), (2, 'bob');",
+    )
+    .await
+    .expect("mut schema");
+
+    let cols = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    let run = async |sql: &zou_rest::sql::Sql| -> Vec<tokio_postgres::Row> {
+        let params: Vec<Text> = sql.params.iter().cloned().map(Text).collect();
+        let refs: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        c.query(&sql.text, &refs)
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", sql.text))
+    };
+
+    // Insert unpacks the array against the row type and the default
+    // fills the absent price.
+    let s = mutate::insert(
+        "books",
+        &cols(&["id", "author_id", "title"]),
+        r#"[{"id":1,"author_id":1,"title":"a1"},{"id":2,"author_id":2,"title":"b1"}]"#.into(),
+        None,
+        &Returning::Cols(cols(&["id", "price"])),
+    )
+    .unwrap();
+    let rows = run(&s).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>("price"), 7, "the default filled in");
+
+    // merge-duplicates overwrites the clashing row in place and
+    // still inserts the fresh one.
+    let s = mutate::insert(
+        "books",
+        &cols(&["id", "author_id", "title"]),
+        r#"[{"id":2,"author_id":2,"title":"b2"},{"id":3,"author_id":1,"title":"a2"}]"#.into(),
+        Some(&Conflict::Merge {
+            target: cols(&["id"]),
+            set: cols(&["author_id", "title"]),
+        }),
+        &Returning::Cols(cols(&["id", "title"])),
+    )
+    .unwrap();
+    let rows = run(&s).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, String>("title"), "b2");
+
+    // ignore-duplicates drops the clash instead.
+    let s = mutate::insert(
+        "books",
+        &cols(&["id", "author_id", "title"]),
+        r#"[{"id":3,"author_id":2,"title":"zzz"},{"id":4,"author_id":2,"title":"b3"}]"#.into(),
+        Some(&Conflict::Ignore {
+            target: cols(&["id"]),
+        }),
+        &Returning::Cols(cols(&["id"])),
+    )
+    .unwrap();
+    let rows = run(&s).await;
+    assert_eq!(rows.len(), 1, "only the fresh row landed");
+    assert_eq!(rows[0].get::<_, i32>("id"), 4);
+
+    // An update binds the payload as $1 and the filter after it,
+    // and the qualified RETURNING dodges the payload columns.
+    let s = mutate::update(
+        "books",
+        &cols(&["price"]),
+        r#"{"price":30}"#.into(),
+        &nodes(&[("id", "gte.3")]),
+        &Returning::Star,
+    )
+    .unwrap();
+    let rows = run(&s).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>("price"), 30);
+
+    // Delete hands back what it removed.
+    let s = mutate::delete(
+        "books",
+        &nodes(&[("id", "eq.4")]),
+        &Returning::Cols(cols(&["id"])),
+    )
+    .unwrap();
+    let rows = run(&s).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>("id"), 4);
+
+    // The representation: an insert mounts as the CTE, the planner
+    // reads the returned rows at the root, and the embed still
+    // resolves and joins against the real authors table.
+    let fk_rows = c
+        .query(INTROSPECT_SQL, &[&"zou_mut"])
+        .await
+        .expect("introspect");
+    let catalog = Catalog::new(
+        fk_rows
+            .iter()
+            .map(|r| FkRow {
+                constraint: r.get(0),
+                table: r.get(1),
+                columns: r.get(2),
+                ref_table: r.get(3),
+                ref_columns: r.get(4),
+                unique: r.get(5),
+                in_pk: r.get(6),
+            })
+            .collect(),
+    );
+    let m = mutate::insert(
+        "books",
+        &cols(&["id", "author_id", "title"]),
+        r#"[{"id":9,"author_id":1,"title":"a9"}]"#.into(),
+        None,
+        &Returning::Star,
+    )
+    .unwrap();
+    let mut q = plan::Query {
+        table: "books".into(),
+        select: select::parse("id,title,authors(name)").unwrap(),
+        ..plan::Query::default()
+    };
+    let r = mutate::representation(&catalog, m, &mut q).unwrap();
+    let s = zou_rest::sql::Sql {
+        text: format!(
+            "with {} select to_jsonb(t)::text from ({}) as t",
+            r.cte, r.select.text
+        ),
+        params: r.select.params,
+    };
+    let rows = run(&s).await;
+    let got: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(
+        got,
+        vec![r#"{"id": 9, "title": "a9", "authors": {"name": "ann"}}"#.to_string()]
+    );
+
+    c.batch_execute("drop schema zou_mut cascade")
+        .await
+        .expect("cleanup");
+}

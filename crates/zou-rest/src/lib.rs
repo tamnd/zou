@@ -9,6 +9,7 @@
 
 pub mod catalog;
 pub mod filter;
+pub mod mutate;
 pub mod order;
 pub mod page;
 pub mod plan;

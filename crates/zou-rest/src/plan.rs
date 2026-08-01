@@ -89,12 +89,25 @@ pub struct Query {
     pub order: Vec<(Vec<String>, Vec<Term>)>,
     pub limit: Vec<(Vec<String>, u64)>,
     pub offset: Vec<(Vec<String>, u64)>,
+    /// When set, the root level reads FROM this relation while
+    /// relationships still resolve against `table`: the
+    /// representation select over a mutation CTE.
+    pub source: Option<String>,
 }
 
 /// Plan the whole request into one statement whose rows are the
 /// response records, embed columns already folded to jsonb. The
 /// caller wraps rows into the response body.
 pub fn plan(catalog: &Catalog, q: &Query) -> Result<Sql, PlanError> {
+    plan_from(catalog, q, Vec::new())
+}
+
+/// The same, with placeholder numbering continuing from wherever
+/// `params` already stands, the way where_clause_from does it. A
+/// mutation binds its payload first and the representation select's
+/// own filters follow, one dense parameter list across the whole
+/// statement.
+pub fn plan_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sql, PlanError> {
     let routes = collect_routes(&q.select);
     let filters = route_filters(q, &routes)?;
     for (route, _) in q.order.iter().filter(|(r, _)| !r.is_empty()) {
@@ -111,7 +124,7 @@ pub fn plan(catalog: &Catalog, q: &Query) -> Result<Sql, PlanError> {
         catalog,
         q,
         filters,
-        params: Vec::new(),
+        params,
         next: 0,
     };
     let root = p.next_alias();
@@ -269,9 +282,16 @@ impl Planner<'_> {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
+        // The root reads from the source relation when the query is
+        // a representation over a mutation CTE, embeds keep reading
+        // their real tables.
+        let from = match &self.q.source {
+            Some(s) if path.is_empty() => s.as_str(),
+            _ => table,
+        };
         sql.push_str(&format!(
             " from {} as {}",
-            quote_ident(table),
+            quote_ident(from),
             quote_ident(alias)
         ));
         for l in &laterals {
