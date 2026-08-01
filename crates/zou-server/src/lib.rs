@@ -34,11 +34,14 @@ pub mod sql;
 /// dbname=postgres", None runs the router without a pool, which is
 /// what the pure routing tests use. `rate` of None means unlimited,
 /// which is what zou dev wants, the real per endpoint budgets arrive
-/// with the auth surface.
+/// with the auth surface. `jwks` is the project's published public
+/// keys as JWKS JSON for projects on asymmetric signing keys, None
+/// keeps bearer verification HS256 only.
 pub struct Config {
     pub jwt_secret: Vec<u8>,
     pub pg: Option<String>,
     pub rate: Option<edge::Rate>,
+    pub jwks: Option<String>,
 }
 
 /// Everything the handlers share: the config and, when postgres is
@@ -48,6 +51,7 @@ pub struct App {
     pub cfg: Config,
     pub pool: Option<sql::Pool>,
     pub limiter: Option<edge::RateLimit>,
+    pub jwks: Option<jwt::Jwks>,
 }
 
 /// PostgREST's default db-pool size, a sane dev loop default here too.
@@ -59,7 +63,16 @@ fn app_state(cfg: Config) -> Result<Arc<App>, String> {
         None => None,
     };
     let limiter = cfg.rate.map(edge::RateLimit::new);
-    Ok(Arc::new(App { cfg, pool, limiter }))
+    let jwks = match &cfg.jwks {
+        Some(json) => Some(jwt::Jwks::parse(json).map_err(|e| format!("jwks: {e}"))?),
+        None => None,
+    };
+    Ok(Arc::new(App {
+        cfg,
+        pool,
+        limiter,
+        jwks,
+    }))
 }
 
 /// The verified identity of a request, deposited in request extensions
@@ -128,7 +141,7 @@ async fn gate(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string);
     let identity = match bearer {
-        Some(token) => match jwt::verify(&token, &app.cfg.jwt_secret) {
+        Some(token) => match jwt::verify_any(&token, &app.cfg.jwt_secret, app.jwks.as_ref()) {
             Ok(v) => v,
             Err(why) => {
                 return json_body(
@@ -278,6 +291,7 @@ mod tests {
             jwt_secret: SECRET.to_vec(),
             pg: None,
             rate: None,
+            jwks: None,
         })
         .unwrap()
     }
@@ -379,10 +393,15 @@ mod tests {
     /// A router with the real gate in front of a handler that echoes
     /// the deposited role, so precedence is observed, not inferred.
     fn echo_app() -> Router {
+        echo_app_with_jwks(None)
+    }
+
+    fn echo_app_with_jwks(jwks: Option<String>) -> Router {
         let app = app_state(Config {
             jwt_secret: SECRET.to_vec(),
             pg: None,
             rate: None,
+            jwks,
         })
         .unwrap();
         Router::new()
@@ -494,6 +513,7 @@ mod tests {
                 burst: 2,
                 per_second: 0.5,
             }),
+            jwks: None,
         })
         .unwrap();
         let key = anon_key();
@@ -537,5 +557,66 @@ mod tests {
         let res = echo_app().oneshot(req).await.unwrap();
         let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
         assert_eq!(&bytes[..], b"authenticated");
+    }
+
+    #[tokio::test]
+    async fn an_es256_bearer_passes_the_gate_through_the_jwks() {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        use p256::ecdsa::signature::Signer as _;
+        use p256::ecdsa::{Signature, SigningKey};
+
+        let sk = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let point = sk.verifying_key().to_sec1_point(false);
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "EC",
+                "crv": "P-256",
+                "kid": "k1",
+                "x": Base64UrlUnpadded::encode_string(point.x().unwrap()),
+                "y": Base64UrlUnpadded::encode_string(point.y().unwrap()),
+            }]
+        });
+
+        let header = Base64UrlUnpadded::encode_string(
+            serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": "k1"})
+                .to_string()
+                .as_bytes(),
+        );
+        let payload = Base64UrlUnpadded::encode_string(
+            serde_json::json!({"role": "authenticated", "sub": "user-2"})
+                .to_string()
+                .as_bytes(),
+        );
+        let signed = format!("{header}.{payload}");
+        let sig: Signature = sk.sign(signed.as_bytes());
+        let bearer = format!(
+            "{signed}.{}",
+            Base64UrlUnpadded::encode_string(&sig.to_bytes())
+        );
+
+        // The apikey stays the HS256 anon key, only the bearer rides
+        // the new signing keys, which is what a migrated project does.
+        let req = Request::builder()
+            .uri("/echo")
+            .header("apikey", anon_key())
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = echo_app_with_jwks(Some(jwks.to_string()))
+            .oneshot(req)
+            .await
+            .unwrap();
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&bytes[..], b"authenticated");
+
+        // Without the JWKS configured the same token is refused.
+        let req = Request::builder()
+            .uri("/echo")
+            .header("apikey", anon_key())
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = echo_app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     }
 }

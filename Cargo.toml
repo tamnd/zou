@@ -21,6 +21,7 @@ getrandom = "0.3"
 hmac = "0.13"
 libc = "0.2"
 log = "0.4"
+p256 = "0.14"
 lz4_flex = "0.14"
 memmap2 = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
