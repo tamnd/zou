@@ -72,6 +72,8 @@ cargo build
 cargo test
 ```
 
+`make demo` tours the object layer in seconds, and after a one time `make pg-build` it continues into the real Postgres on a store, rows, a branch, and a restart from nothing but the objects. The walkthrough is in [docs/quickstart.md](docs/quickstart.md).
+
 ## Contributing
 
 The project is being built top to bottom against the milestone checklists, one PR per feature. Issues and PRs are welcome, but expect churn while M1 is in progress.

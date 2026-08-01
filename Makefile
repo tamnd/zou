@@ -9,9 +9,11 @@ ZOU_PG_LIB := $(abspath target/release)
 
 .PHONY: demo test lint pg-init pg-patch pg-build pg-vector pg-clean zou-pg-lib
 
-# End to end tour of the object layer on a local directory.
+# The demo in two acts: the object layer on a local directory, then
+# the real Postgres on a store when pg-build has run, see
+# docs/quickstart.md.
 demo:
-	cargo run -p zou-store --example demo
+	scripts/demo.sh
 
 test:
 	cargo test --workspace --all-features
