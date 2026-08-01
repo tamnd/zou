@@ -2777,7 +2777,76 @@ pub async fn authorize(
         return no_database();
     };
     let query = query_object(req.uri().query().unwrap_or_default());
-    let name = field(&query, "provider");
+    let referrer = landing(&app, field(&query, "redirect_to"), &referer(&req));
+    match sending_off(&app, pool, &query, &referrer, "").await {
+        // 302 rather than the 303 a followed confirmation link gets,
+        // because that is what upstream sends and what every provider's
+        // registered redirect was tested against.
+        Ok(url) => to(StatusCode::FOUND, &url),
+        Err(e) => refusal(e, "authorize"),
+    }
+}
+
+/// GET /auth/v1/user/identities/authorize, the same start with a
+/// signed in person behind it. Upstream is one function taking an
+/// optional user, and the only thing that user changes is the
+/// linking_target_id on the row, so this is that function with the
+/// target filled in.
+///
+/// The answer is a redirect like /authorize's, unless the caller asks
+/// for the url instead: a client that is not navigating the top level
+/// window cannot follow a redirect to a provider and needs the address
+/// to open itself.
+pub async fn link_identity(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    if let Some(off) = linking_off(&app) {
+        return off;
+    }
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let caller = match caller(&req) {
+        Ok(v) => v,
+        Err(res) => return *res,
+    };
+    let query = query_object(req.uri().query().unwrap_or_default());
+    let referrer = landing(&app, field(&query, "redirect_to"), &referer(&req));
+    let url = match sending_off(&app, pool, &query, &referrer, &caller.user_id).await {
+        Ok(url) => url,
+        Err(e) => return refusal(e, "link identity"),
+    };
+    match field(&query, "skip_http_redirect") == "true" {
+        true => json_body(StatusCode::OK, serde_json::json!({ "url": url })),
+        false => to(StatusCode::FOUND, &url),
+    }
+}
+
+/// Upstream's requireManualLinkingEnabled. A project that has not
+/// turned linking on does not have these endpoints, which is a 404
+/// rather than a 403 because the shape of the surface is the answer.
+fn linking_off(app: &App) -> Option<Response> {
+    match app.cfg.manual_linking {
+        true => None,
+        false => Some(error_body(
+            StatusCode::NOT_FOUND,
+            "manual_linking_disabled",
+            "Manual linking is disabled",
+        )),
+    }
+}
+
+/// Write the flow down and work out where the provider should be asked
+/// to send the person, which is all both /authorize endpoints do.
+async fn sending_off(
+    app: &App,
+    pool: &Pool,
+    query: &serde_json::Value,
+    referrer: &str,
+    target: &str,
+) -> Result<String, Error> {
+    let name = field(query, "provider");
     let Some(provider) = app.cfg.oauth.get(name) else {
         // Upstream prints the underlying error into this message, and
         // the two it can be say different things: one means the name is
@@ -2787,33 +2856,13 @@ pub async fn authorize(
             Some(_) => "provider is not enabled".to_string(),
             None => format!("Provider {name} could not be found"),
         };
-        return error_body(
-            StatusCode::BAD_REQUEST,
-            "validation_failed",
-            &format!("Unsupported provider: {why}"),
-        );
+        return denied("validation_failed", &format!("Unsupported provider: {why}"));
     };
-    let challenge = field(&query, "code_challenge");
-    let method = field(&query, "code_challenge_method");
-    if let Err(e) = validate_pkce(method, challenge) {
-        return refusal(e, "authorize");
-    }
-    let referrer = landing(&app, field(&query, "redirect_to"), &referer(&req));
-    let state = match new_flow(pool, &provider.name, challenge, method, &referrer).await {
-        Ok(state) => state,
-        Err(e) => return refusal(e, "authorize"),
-    };
-    // 302 rather than the 303 a followed confirmation link gets,
-    // because that is what upstream sends and what every provider's
-    // registered redirect was tested against.
-    to(
-        StatusCode::FOUND,
-        &provider.authorize_url(
-            &callback_url(&app, provider),
-            &state,
-            field(&query, "scopes"),
-        ),
-    )
+    let challenge = field(query, "code_challenge");
+    let method = field(query, "code_challenge_method");
+    validate_pkce(method, challenge)?;
+    let state = new_flow(pool, &provider.name, challenge, method, referrer, target).await?;
+    Ok(provider.authorize_url(&callback_url(app, provider), &state, field(query, "scopes")))
 }
 
 /// Where the provider sends the person back: whatever this provider was
@@ -2872,6 +2921,7 @@ async fn new_flow(
     challenge: &str,
     method: &str,
     referrer: &str,
+    target: &str,
 ) -> Result<String, Error> {
     let method = method.to_ascii_lowercase();
     let sess = pool.admin().await?;
@@ -2880,16 +2930,17 @@ async fn new_flow(
             "insert into auth.flow_state
                  (id, auth_code, code_challenge, code_challenge_method,
                   provider_type, authentication_method, referrer,
-                  created_at, updated_at)
+                  linking_target_id, created_at, updated_at)
              select gen_random_uuid(),
                     case when $1::text = '' then null
                          else gen_random_uuid()::text end,
                     nullif($1::text, ''),
                     case when $1::text = '' then null
                          else $2::text::auth.code_challenge_method end,
-                    $3::text, 'oauth', $4::text, now(), now()
+                    $3::text, 'oauth', $4::text,
+                    nullif($5::text, '')::uuid, now(), now()
              returning id::text",
-            &[&challenge, &method, &provider, &referrer],
+            &[&challenge, &method, &provider, &referrer, &target],
         )
         .await;
     let rows = match found {
@@ -2913,6 +2964,11 @@ struct Flow {
     /// the implicit flow, which gets its session on the redirect.
     challenge: Option<(String, String)>,
     auth_code: String,
+    /// The account this identity is being attached to, when the flow
+    /// was started by somebody who is already signed in. Empty is an
+    /// ordinary sign in, where the account is whatever the identity
+    /// turns out to belong to.
+    target: String,
 }
 
 /// GET /auth/v1/callback, where the provider sends the person back.
@@ -2924,10 +2980,53 @@ pub async fn callback(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     req: Request<Body>,
 ) -> Response {
+    let query = query_object(req.uri().query().unwrap_or_default());
+    came_back(app, query).await
+}
+
+/// POST /auth/v1/callback, which is the same thing arriving as a form.
+///
+/// Apple is asked for a name and an address, and asking for either of
+/// those makes it answer with response_mode=form_post rather than with
+/// a redirect, so the browser posts a form here instead of following a
+/// location. The fields are the same fields.
+pub async fn callback_form(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let query = query_object(req.uri().query().unwrap_or_default());
+    let bytes = match to_bytes(req.into_body(), MAX_BODY).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return oauth_refusal(
+                &app.site_url(),
+                refused(
+                    StatusCode::BAD_REQUEST,
+                    "bad_oauth_callback",
+                    "Could not read the request body",
+                ),
+            );
+        }
+    };
+    let posted = query_object(&String::from_utf8_lossy(&bytes));
+    // The body wins, because that is where the provider put them. The
+    // query is still read so that a redirect uri carrying its own
+    // parameters keeps working.
+    let mut fields = query.as_object().cloned().unwrap_or_default();
+    if let Some(posted) = posted.as_object() {
+        for (key, value) in posted {
+            fields.insert(key.clone(), value.clone());
+        }
+    }
+    came_back(app, serde_json::Value::Object(fields)).await
+}
+
+/// The callback itself, once its parameters have been found wherever
+/// the provider chose to put them.
+async fn came_back(app: Arc<App>, query: serde_json::Value) -> Response {
     let Some(pool) = &app.pool else {
         return no_database();
     };
-    let query = query_object(req.uri().query().unwrap_or_default());
     let site = app.site_url();
 
     // The flow is loaded first because everything after it, including
@@ -2975,10 +3074,13 @@ pub async fn callback(
         );
     };
 
-    let (person, tokens) = match ask_provider(&app, provider, code).await {
+    let (mut person, tokens) = match ask_provider(&app, provider, code).await {
         Ok(pair) => pair,
         Err(e) => return oauth_refusal(&target, e),
     };
+    // Apple sends the name in a form field, on the first sign in and
+    // never again, so it is taken whenever it turns up.
+    named(&mut person, field(&query, "user"));
     if person.email.is_empty() {
         return oauth_refusal(
             &target,
@@ -2997,6 +3099,30 @@ pub async fn callback(
     }
 }
 
+/// The `user` field Apple posts alongside the code: the only time it
+/// will ever say what somebody is called. Anything that is not the
+/// shape it documents is ignored rather than refused, because a name
+/// is not worth failing a sign in over.
+fn named(person: &mut crate::oauth::Person, posted: &str) {
+    if posted.is_empty() {
+        return;
+    }
+    let Ok(user) = serde_json::from_str::<serde_json::Value>(posted) else {
+        return;
+    };
+    let first = field(&user["name"], "firstName");
+    let last = field(&user["name"], "lastName");
+    let full = format!("{first} {last}");
+    let full = full.trim();
+    if full.is_empty() {
+        return;
+    }
+    if let Some(claims) = person.claims.as_object_mut() {
+        claims.insert("name".to_string(), full.into());
+        claims.insert("full_name".to_string(), full.into());
+    }
+}
+
 /// Trade the code for a token and read the profile it opens, both on a
 /// blocking thread because the client underneath is a blocking one and
 /// a provider on the far side of the internet is not quick.
@@ -3011,7 +3137,7 @@ async fn ask_provider(
     let code = code.to_string();
     let out = tokio::task::spawn_blocking(move || {
         let tokens = crate::oauth::exchange(&provider, http.as_ref(), &code, &redirect)?;
-        let person = crate::oauth::person(&provider, http.as_ref(), &tokens.access_token)?;
+        let person = crate::oauth::person(&provider, http.as_ref(), &tokens)?;
         Ok::<_, String>((person, tokens))
     })
     .await;
@@ -3063,8 +3189,12 @@ async fn load_flow(pool: &Pool, state: &str) -> Result<Flow, Error> {
                     coalesce(code_challenge_method::text, ''),
                     coalesce(auth_code, ''),
                     created_at < now() - make_interval(secs => $2::double precision),
-                    user_id is not null
-               from auth.flow_state where id = $1::text::uuid",
+                    user_id is not null,
+                    coalesce(linking_target_id::text, ''),
+                    exists (select 1 from auth.users u
+                             where u.id = f.linking_target_id
+                               and u.deleted_at is null)
+               from auth.flow_state f where id = $1::text::uuid",
             &[&state, &FLOW_TTL],
         )
         .await;
@@ -3105,6 +3235,7 @@ fn read_flow(row: Option<&tokio_postgres::Row>) -> Result<Flow, Error> {
             false => Some((challenge, row.get(4))),
         },
         auth_code: row.get(5),
+        target: row.get(8),
     };
     // A spent PKCE flow is one whose callback already ran, with the
     // code waiting to be traded. Running it again would issue a second
@@ -3115,6 +3246,17 @@ fn read_flow(row: Option<&tokio_postgres::Row>) -> Result<Flow, Error> {
             StatusCode::BAD_REQUEST,
             "flow_state_already_used",
             "State has already been used",
+        ));
+    }
+    // The account this was going to be attached to has been deleted
+    // since the flow started, which is asked here rather than at the
+    // end so that nothing is traded with a provider for an identity
+    // that has nowhere to go.
+    if !flow.target.is_empty() && !row.get::<_, bool>(9) {
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "user_not_found",
+            "Linking target user not found",
         ));
     }
     Ok(flow)
@@ -3144,9 +3286,9 @@ async fn land(
             sess.commit().await?;
             match landed {
                 Landed::Answer(response) => Ok(*response),
-                Landed::Unverified(provider) => Err(refused(
+                Landed::Unverified(code, provider) => Err(refused(
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    "provider_email_needs_verification",
+                    code,
                     &format!(
                         "Unverified email with {provider}. A confirmation email has been sent to your {provider} email"
                     ),
@@ -3162,7 +3304,11 @@ async fn land(
 
 enum Landed {
     Answer(Box<Response>),
-    Unverified(String),
+    /// The error code and the provider it names. Upstream calls this
+    /// provider_email_needs_verification when the account is being made
+    /// and email_not_confirmed when the identity is joining one that
+    /// exists, and the sentence is the same both times.
+    Unverified(&'static str, String),
 }
 
 async fn settle(
@@ -3174,9 +3320,18 @@ async fn settle(
     tokens: &crate::oauth::Tokens,
     post: &Post<'_>,
 ) -> Result<Landed, Error> {
-    let user_id = match attach(sess, &provider.name, person, post).await? {
+    // A flow that names a target is a manual link: the account is
+    // already known and the question is only whether this identity may
+    // join it. Everything after this point is the same either way.
+    let attached = match flow.target.is_empty() {
+        true => attach(sess, &provider.name, person, post).await?,
+        false => link_to(sess, &flow.target, &provider.name, person, post).await?,
+    };
+    let user_id = match attached {
         Attached::User(id) => id,
-        Attached::Unverified => return Ok(Landed::Unverified(provider.name.clone())),
+        Attached::Unverified(code) => {
+            return Ok(Landed::Unverified(code, provider.name.clone()));
+        }
     };
     let target = match flow.referrer.is_empty() {
         true => app.site_url(),
@@ -3265,8 +3420,9 @@ enum Attached {
     User(String),
     /// The provider will not say the address is verified and this
     /// project will not take its word for it, so a confirmation has
-    /// gone out instead and there is no session.
-    Unverified,
+    /// gone out instead and there is no session. The string is the
+    /// error code that says which of the two paths asked for it.
+    Unverified(&'static str),
 }
 
 /// Which account an external identity belongs to, upstream's
@@ -3502,7 +3658,269 @@ async fn attach(
         },
     )
     .await?;
-    Ok(Attached::Unverified)
+    Ok(Attached::Unverified("provider_email_needs_verification"))
+}
+
+/// Attach this identity to an account that already exists and whose
+/// owner asked for it, upstream's linkIdentityToUser.
+///
+/// None of the linking rules apply here and that is the point: the
+/// person is signed in to the target account, so what the provider
+/// says about an address is not what decides where the identity goes.
+/// What is still asked is whether this identity is spoken for.
+async fn link_to(
+    sess: &sql::Session,
+    target: &str,
+    provider: &str,
+    person: &crate::oauth::Person,
+    post: &Post<'_>,
+) -> Result<Attached, Error> {
+    let rows = sess
+        .query(
+            "select user_id::text from auth.identities
+              where provider_id = $1 and provider = $2",
+            &[&person.sub, &provider],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        let owner: String = row.get(0);
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "identity_already_exists",
+            match owner == target {
+                true => "Identity is already linked",
+                false => "Identity is already linked to another user",
+            },
+        ));
+    }
+    new_identity(sess, target, provider, person).await?;
+
+    // An account that holds an address keeps it. The provider has
+    // vouched for nothing that would justify moving somebody's account
+    // to a different address behind a link button.
+    let address: String = sess
+        .query(
+            "select coalesce(email, '') from auth.users where id = $1::text::uuid",
+            &[&target],
+        )
+        .await?[0]
+        .get(0);
+    if address.is_empty() {
+        let Some(address) = email_from_identities(sess, target).await? else {
+            return Err(refused(
+                StatusCode::BAD_REQUEST,
+                "email_exists",
+                "A user with this email address has already been registered",
+            ));
+        };
+        if !person.email_verified {
+            // Upstream does not consult autoconfirm here the way the
+            // signup path does, and this follows it: the account
+            // exists and is being given an address, so the address is
+            // proved rather than assumed.
+            within_limit(
+                sess,
+                target,
+                "confirmation_sent_at",
+                post.settings.max_frequency,
+            )
+            .await?;
+            let code = mint_code(sess, target, &address, "confirmation_token").await?;
+            send_code(
+                sess,
+                post,
+                target,
+                Outgoing {
+                    template: crate::mail::CONFIRMATION,
+                    kind: "signup",
+                    to: &address,
+                    code: &code,
+                    new_email: "",
+                },
+            )
+            .await?;
+            providers_of(sess, target).await?;
+            return Ok(Attached::Unverified("email_not_confirmed"));
+        }
+        sess.execute(
+            "update auth.users
+                set email_confirmed_at = coalesce(email_confirmed_at, now()),
+                    confirmation_token = '', is_anonymous = false,
+                    updated_at = now()
+              where id = $1::text::uuid",
+            &[&target],
+        )
+        .await?;
+    }
+    providers_of(sess, target).await?;
+    Ok(Attached::User(target.to_string()))
+}
+
+/// Upstream's UpdateUserEmailFromIdentities: an account with no
+/// address of its own takes one from an identity, and an account whose
+/// address one of its identities already carries keeps it.
+///
+/// None is the conflict: every address on offer belongs to somebody
+/// else. That is not a state to pick a way out of, because either
+/// answer would hand one person's address to another.
+async fn email_from_identities(
+    sess: &sql::Session,
+    user_id: &str,
+) -> Result<Option<String>, sql::Error> {
+    let held: bool = sess
+        .query(
+            "select exists (
+                 select 1 from auth.identities i, auth.users u
+                  where i.user_id = $1::text::uuid and u.id = $1::text::uuid
+                    and coalesce(i.email, '') = coalesce(u.email, ''))",
+            &[&user_id],
+        )
+        .await?[0]
+        .get(0);
+    if held {
+        let address: String = sess
+            .query(
+                "select coalesce(email, '') from auth.users where id = $1::text::uuid",
+                &[&user_id],
+            )
+            .await?[0]
+            .get(0);
+        return Ok(Some(address));
+    }
+    // The oldest identity whose address nobody else holds. Ordering by
+    // when the identity arrived is what makes this answer the same
+    // twice rather than whatever the planner felt like.
+    let rows = sess
+        .query(
+            "select coalesce(i.email, '') from auth.identities i
+              where i.user_id = $1::text::uuid
+                and not exists (
+                    select 1 from auth.users u
+                     where u.email = i.email and u.id <> i.user_id
+                       and u.is_sso_user = false and u.deleted_at is null)
+              order by i.created_at, i.id
+              limit 1",
+            &[&user_id],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let address: String = row.get(0);
+    // An identity with no address of its own leaves the account with
+    // none, and an account with no address has nothing confirmed.
+    sess.execute(
+        "update auth.users
+            set email = nullif($2::text, ''),
+                email_confirmed_at = case when $2::text = ''
+                                          then null else email_confirmed_at end,
+                updated_at = now()
+          where id = $1::text::uuid",
+        &[&user_id, &address],
+    )
+    .await?;
+    Ok(Some(address))
+}
+
+/// DELETE /auth/v1/user/identities/{identity_id}, upstream's
+/// DeleteIdentity. The last identity cannot go, because an account
+/// with none is one nobody can sign in to again.
+pub async fn unlink_identity(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::extract::Path(identity_id): axum::extract::Path<String>,
+    req: Request<Body>,
+) -> Response {
+    if let Some(off) = linking_off(&app) {
+        return off;
+    }
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let caller = match caller(&req) {
+        Ok(v) => v,
+        Err(res) => return *res,
+    };
+    let sess = match pool.admin().await {
+        Ok(v) => v,
+        Err(e) => return refusal(Error::Db(e), "unlink identity"),
+    };
+    let out = unlink(&sess, &caller.user_id, &identity_id).await;
+    match out {
+        Ok(()) => match sess.commit().await {
+            Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
+            Err(e) => refusal(Error::Db(e), "unlink identity"),
+        },
+        Err(e) => {
+            let _ = sess.rollback().await;
+            refusal(e, "unlink identity")
+        }
+    }
+}
+
+async fn unlink(sess: &sql::Session, user_id: &str, identity_id: &str) -> Result<(), Error> {
+    // A 404 for a malformed id rather than a 400, which reads oddly
+    // and is what upstream answers.
+    if !is_uuid(identity_id) {
+        return Err(refused(
+            StatusCode::NOT_FOUND,
+            "validation_failed",
+            "identity_id must be an UUID",
+        ));
+    }
+    let rows = sess
+        .query(
+            "select id::text, provider from auth.identities
+              where user_id = $1::text::uuid for update",
+            &[&user_id],
+        )
+        .await?;
+    if rows.len() <= 1 {
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "single_identity_not_deletable",
+            "User must have at least 1 identity after unlinking",
+        ));
+    }
+    let Some(row) = rows
+        .iter()
+        .find(|row| row.get::<_, String>(0) == identity_id)
+    else {
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "identity_not_found",
+            "Identity doesn't exist",
+        ));
+    };
+    let provider: String = row.get(1);
+    sess.execute(
+        "delete from auth.identities where id = $1::text::uuid",
+        &[&identity_id],
+    )
+    .await?;
+    match provider.as_str() {
+        // The phone identity is the number, so unlinking it is what
+        // gives the number up.
+        "phone" => {
+            sess.execute(
+                "update auth.users
+                    set phone = null, phone_confirmed_at = null, updated_at = now()
+                  where id = $1::text::uuid",
+                &[&user_id],
+            )
+            .await?;
+        }
+        _ => {
+            if email_from_identities(sess, user_id).await?.is_none() {
+                return Err(refused(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "email_conflict_identity_not_deletable",
+                    "Unable to unlink identity due to email conflict",
+                ));
+            }
+        }
+    }
+    providers_of(sess, user_id).await?;
+    Ok(())
 }
 
 async fn new_identity(

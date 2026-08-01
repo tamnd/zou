@@ -77,7 +77,7 @@ Two rules here are stricter than GoTrue's. A server that offers no STARTTLS is r
 
 Once something is carrying the mail there is nothing left in the process, so `zou inbox` has nothing to print and `/dev/inbox` is not there at all.
 
-## Signing in with Google or Github
+## Signing in with Google, Github, or Apple
 
 Give a provider a client id and a secret and it turns up in the flow. The names are GoTrue's again with `GOTRUE_EXTERNAL_` swapped for `ZOU_EXTERNAL_`, so the values a project already has keep working.
 
@@ -95,6 +95,31 @@ Half a credential is refused at startup rather than at the first sign in, becaus
 The client library needs nothing new. `supabase.auth.signInWithOAuth({ provider: 'google' })` sends the browser to `/auth/v1/authorize`, the provider sends it back to `/auth/v1/callback`, and the session arrives either in the fragment or, when the client sent a PKCE challenge, as a code that `POST /auth/v1/token?grant_type=pkce` trades for one. Both of those endpoints are outside the apikey gate, because a browser following a redirect has no way to carry a header.
 
 An address a provider will not vouch for never links to an account that already holds it. Signing in at a provider with somebody else's address gets a new account with no address at all, which is what GoTrue does and the reason it does it.
+
+Apple is the same three variables and one extra way to configure it. Its client secret is a JWT with a five minute life rather than a string, so a project can either mint one itself and put it in `ZOU_EXTERNAL_APPLE_SECRET` the way GoTrue takes it, or hand over the key and let zou mint one per exchange:
+
+```bash
+ZOU_EXTERNAL_APPLE_CLIENT_ID=com.example.service \
+ZOU_EXTERNAL_APPLE_TEAM_ID=A1B2C3D4E5 \
+ZOU_EXTERNAL_APPLE_KEY_ID=F6G7H8I9J0 \
+ZOU_EXTERNAL_APPLE_PRIVATE_KEY="$(cat AuthKey_F6G7H8I9J0.p8)" \
+  zou dev /tmp/mydb --http 54321
+```
+
+The three key variables go together or not at all, and the key is signed once at startup so a bad one is a refusal to start rather than a sign in that fails later. Apple also posts the callback as a form instead of redirecting to it, because zou asks for a name and an address, so `/auth/v1/callback` answers POST as well as GET. The name arrives once, on the very first sign in, and is kept.
+
+## Linking a second provider to an account
+
+Off by default, the same as GoTrue. Set `ZOU_SECURITY_MANUAL_LINKING_ENABLED=true` and somebody who is signed in can attach another provider to the account they already have, and detach one again.
+
+```js
+await supabase.auth.linkIdentity({ provider: 'github' })
+await supabase.auth.unlinkIdentity(identity)
+```
+
+These are the only two places where what a provider says about an address does not decide anything. The person is already signed in to the account, so the identity joins it whatever address it names, and the account keeps the address it has. An account that has no address of its own, which is what an anonymous sign in leaves, takes one from the identity that joins it and then has to prove it like any other.
+
+The last identity cannot be unlinked, because an account with none is one nobody can sign in to again.
 
 ## Where to go next
 

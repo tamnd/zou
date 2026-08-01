@@ -16,7 +16,7 @@ use std::io::Read;
 
 /// One provider: where it lives and who we are to it. The environment
 /// variable names are GoTrue's with GOTRUE_ swapped for ZOU_.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Provider {
     pub name: String,
     pub client_id: String,
@@ -26,9 +26,40 @@ pub struct Provider {
     pub redirect_uri: String,
     pub authorize_url: String,
     pub token_url: String,
-    /// The profile document, or for github the first of two calls.
+    /// The profile document, or for github the first of two calls, or
+    /// empty for a provider that answers with an id token instead.
     pub user_url: String,
     pub scopes: Vec<String>,
+    /// The key Apple signs its client secret with, when the operator
+    /// would rather zou minted one than pasted one in. See [`Apple`].
+    pub apple: Option<Apple>,
+}
+
+/// A secret is a secret whichever field it is in, and a struct that
+/// prints itself ends up in a log line eventually.
+impl std::fmt::Debug for Provider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Provider")
+            .field("name", &self.name)
+            .field("client_id", &self.client_id)
+            .field("secret", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What Apple wants instead of a client secret: a JWT signed with the
+/// key from the developer portal, which expires and has to be minted
+/// again. GoTrue takes the minted token in the secret field and leaves
+/// the minting to whoever runs it, which works until the six months
+/// are up. Given both, zou signs one per exchange.
+#[derive(Clone)]
+pub struct Apple {
+    pub team_id: String,
+    pub key_id: String,
+    /// The contents of the .p8 file from the developer portal, PKCS#8
+    /// PEM, kept as text because that is how it arrives.
+    pub pem: String,
 }
 
 impl Provider {
@@ -48,6 +79,15 @@ impl Provider {
                 "https://api.github.com/user",
                 vec!["user:email"],
             ),
+            // Apple has no profile endpoint at all. Everything it will
+            // say about somebody is in the id token that comes back
+            // with the exchange.
+            "apple" => (
+                "https://appleid.apple.com/auth/authorize",
+                "https://appleid.apple.com/auth/token",
+                "",
+                vec!["email", "name"],
+            ),
             _ => return None,
         };
         Some(Provider {
@@ -59,7 +99,17 @@ impl Provider {
             token_url: token_url.to_string(),
             user_url: user_url.to_string(),
             scopes: scopes.into_iter().map(str::to_string).collect(),
+            apple: None,
         })
+    }
+
+    /// What goes in the client_secret field of the exchange. Everybody
+    /// but Apple hands one over once and it stays the same.
+    pub fn client_secret(&self) -> Result<String, String> {
+        match &self.apple {
+            Some(key) => key.secret(&self.client_id),
+            None => Ok(self.secret.clone()),
+        }
     }
 
     /// Where to send the person, with our state along for the ride.
@@ -89,7 +139,49 @@ impl Provider {
             // provider_refresh_token a client is promised is empty.
             url.push_str("&access_type=offline");
         }
+        if self.name == "apple" {
+            // Asking Apple for a name or an address makes the callback
+            // a form post rather than a redirect, which is why there is
+            // a POST /callback at all.
+            url.push_str("&response_mode=form_post");
+        }
         url
+    }
+}
+
+impl Apple {
+    /// A client secret, good for five minutes. Apple allows six
+    /// months, and a token that lives five minutes and is made when it
+    /// is needed cannot be the thing that expired at the weekend.
+    fn secret(&self, client_id: &str) -> Result<String, String> {
+        use base64ct::Encoding;
+        use p256::ecdsa::signature::Signer as _;
+        use p256::pkcs8::DecodePrivateKey as _;
+
+        let key = p256::ecdsa::SigningKey::from_pkcs8_pem(self.pem.trim())
+            .map_err(|e| format!("the apple key is not a pkcs8 pem private key: {e}"))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "the clock is before 1970".to_string())?
+            .as_secs();
+        let header = serde_json::json!({"alg": "ES256", "kid": self.key_id, "typ": "JWT"});
+        let claims = serde_json::json!({
+            "iss": self.team_id,
+            "iat": now,
+            "exp": now + 300,
+            "aud": "https://appleid.apple.com",
+            "sub": client_id,
+        });
+        let signed = format!(
+            "{}.{}",
+            base64ct::Base64UrlUnpadded::encode_string(header.to_string().as_bytes()),
+            base64ct::Base64UrlUnpadded::encode_string(claims.to_string().as_bytes())
+        );
+        let sig: p256::ecdsa::Signature = key.sign(signed.as_bytes());
+        Ok(format!(
+            "{signed}.{}",
+            base64ct::Base64UrlUnpadded::encode_string(&sig.to_bytes())
+        ))
     }
 }
 
@@ -128,13 +220,17 @@ pub fn from_env() -> Result<Providers, String> {
 
 pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Providers, String> {
     let mut out = Providers::default();
-    for name in ["google", "github"] {
+    for name in ["google", "github", "apple"] {
         let upper = name.to_ascii_uppercase();
         let id = var(&format!("ZOU_EXTERNAL_{upper}_CLIENT_ID"));
         let secret = var(&format!("ZOU_EXTERNAL_{upper}_SECRET"));
-        let (id, secret) = match (id, secret) {
-            (Some(id), Some(secret)) => (id, secret),
-            (None, None) => continue,
+        let apple = apple_key(name, &var)?;
+        let (id, secret) = match (id, secret, &apple) {
+            (Some(id), Some(secret), _) => (id, secret),
+            // Apple signs its own, so the secret field is allowed to be
+            // empty when there is a key to sign with.
+            (Some(id), None, Some(_)) => (id, String::new()),
+            (None, None, None) => continue,
             // Half a credential is a typo, and a provider that is
             // offered and then fails at the token exchange is a worse
             // way to find out than a refusal at startup.
@@ -147,12 +243,46 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Providers, Stri
         let mut provider = Provider::named(name).expect("a provider this file knows");
         provider.client_id = id;
         provider.secret = secret;
+        provider.apple = apple;
         if let Some(uri) = var(&format!("ZOU_EXTERNAL_{upper}_REDIRECT_URI")) {
             provider.redirect_uri = uri;
         }
         out.insert(provider);
     }
     Ok(out)
+}
+
+/// The signing key for Apple, when there is one. All three parts have
+/// to be there or none of them: two out of three is a half configured
+/// provider, which is the thing this whole function refuses.
+fn apple_key(name: &str, var: &impl Fn(&str) -> Option<String>) -> Result<Option<Apple>, String> {
+    if name != "apple" {
+        return Ok(None);
+    }
+    let team_id = var("ZOU_EXTERNAL_APPLE_TEAM_ID");
+    let key_id = var("ZOU_EXTERNAL_APPLE_KEY_ID");
+    let pem = var("ZOU_EXTERNAL_APPLE_PRIVATE_KEY");
+    match (team_id, key_id, pem) {
+        (Some(team_id), Some(key_id), Some(pem)) => {
+            let key = Apple {
+                team_id,
+                key_id,
+                // A .p8 in an environment variable loses its newlines
+                // often enough that it is worth putting them back
+                // rather than failing at the first sign in.
+                pem: pem.replace("\\n", "\n"),
+            };
+            // Sign one now, so a key that cannot sign is a startup
+            // error like every other piece of provider configuration.
+            key.secret("startup")?;
+            Ok(Some(key))
+        }
+        (None, None, None) => Ok(None),
+        _ => Err(
+            "apple needs all of ZOU_EXTERNAL_APPLE_TEAM_ID, ZOU_EXTERNAL_APPLE_KEY_ID and ZOU_EXTERNAL_APPLE_PRIVATE_KEY, or none of them and a minted ZOU_EXTERNAL_APPLE_SECRET"
+                .to_string(),
+        ),
+    }
 }
 
 /// One request to a provider. A form makes it a POST, and everything
@@ -237,6 +367,8 @@ impl Http for Web {
 pub struct Tokens {
     pub access_token: String,
     pub refresh_token: String,
+    /// Apple says who this is here and nowhere else.
+    pub id_token: String,
 }
 
 /// The code exchange. The credentials go in the form rather than in a
@@ -254,7 +386,7 @@ pub fn exchange(
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
             ("client_id".to_string(), provider.client_id.clone()),
-            ("client_secret".to_string(), provider.secret.clone()),
+            ("client_secret".to_string(), provider.client_secret()?),
             ("redirect_uri".to_string(), redirect_uri.to_string()),
         ],
         bearer: String::new(),
@@ -278,6 +410,7 @@ pub fn exchange(
         Some(access_token) => Ok(Tokens {
             access_token: access_token.to_string(),
             refresh_token: body["refresh_token"].as_str().unwrap_or("").to_string(),
+            id_token: body["id_token"].as_str().unwrap_or("").to_string(),
         }),
         None => Err(format!(
             "{} answered {} with no access token",
@@ -302,7 +435,13 @@ pub struct Person {
 /// Read a profile. Github needs two calls because its user document
 /// only carries a public email, which is usually null, so the address
 /// comes from the emails endpoint where the verified flag lives too.
-pub fn person(provider: &Provider, http: &dyn Http, token: &str) -> Result<Person, String> {
+/// Apple needs none, because it already said everything it is going to
+/// say in the id token.
+pub fn person(provider: &Provider, http: &dyn Http, tokens: &Tokens) -> Result<Person, String> {
+    if provider.name == "apple" {
+        return from_id_token(&tokens.id_token);
+    }
+    let token = &tokens.access_token;
     let profile = fetch(http, &provider.user_url, token, &provider.name)?;
     match provider.name.as_str() {
         "github" => {
@@ -316,6 +455,58 @@ pub fn person(provider: &Provider, http: &dyn Http, token: &str) -> Result<Perso
         }
         _ => Ok(from_openid(provider, &profile)),
     }
+}
+
+/// The claims of an id token, read without checking the signature.
+///
+/// This is not the shortcut it looks like. The token was handed over
+/// on a TLS connection this process opened to the provider's own token
+/// endpoint, with the client id and client secret sent up it, and
+/// nothing else was on the wire. That is the case OpenID Connect
+/// 3.1.3.7 exempts from signature verification, and it is the only
+/// place zou reads one: an id token that arrives from a browser is
+/// never trusted, because there the channel proves nothing.
+fn from_id_token(token: &str) -> Result<Person, String> {
+    use base64ct::Encoding;
+    let payload = token
+        .split('.')
+        .nth(1)
+        .ok_or("the id token is not a jwt".to_string())?;
+    let bytes = base64ct::Base64UrlUnpadded::decode_vec(payload)
+        .map_err(|e| format!("the id token payload is not base64url: {e}"))?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("the id token payload is not json: {e}"))?;
+    let sub = text(&claims, "sub");
+    if sub.is_empty() {
+        return Err("the id token has no subject".to_string());
+    }
+    let email = text(&claims, "email");
+    // Apple sends this as the string "true" about as often as it sends
+    // the boolean, and both mean the same thing.
+    let verified = match &claims["email_verified"] {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => s == "true",
+        _ => false,
+    };
+    let private = match &claims["is_private_email"] {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => s == "true",
+        _ => false,
+    };
+    Ok(Person {
+        claims: serde_json::json!({
+            "iss": text(&claims, "iss"),
+            "sub": sub,
+            "email": email,
+            "provider_id": sub,
+            "email_verified": verified,
+            "phone_verified": false,
+            "is_private_email": private,
+        }),
+        sub,
+        email,
+        email_verified: verified,
+    })
 }
 
 fn fetch(
@@ -503,6 +694,28 @@ mod tests {
         p
     }
 
+    /// What a provider that hands out an access token handed out.
+    fn bearing(access_token: &str) -> Tokens {
+        Tokens {
+            access_token: access_token.to_string(),
+            ..Tokens::default()
+        }
+    }
+
+    /// An unsigned jwt carrying these claims, which is all
+    /// [`from_id_token`] reads.
+    fn id_token(claims: serde_json::Value) -> String {
+        use base64ct::Encoding;
+        format!(
+            "e30.{}.nosignature",
+            base64ct::Base64UrlUnpadded::encode_string(claims.to_string().as_bytes())
+        )
+    }
+
+    /// A throwaway P-256 key in the shape the developer portal hands
+    /// one over in, generated once and pasted here.
+    const APPLE_P8: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgevZzL1gdAFr88hb2\nOF/2NxApJCzGCEDdfSp6VQO30hyhRANCAAQRWz+jn65BtOMvdyHKcvjBeBSDZH2r\n1RTwjmYSi9R/zpBnuQ4EiMnCqfMPWiZqB4QdbAd0E7oH50VpuZ1P087G\n-----END PRIVATE KEY-----";
+
     #[test]
     fn the_authorize_url_carries_the_state_and_the_scopes() {
         let url = google().authorize_url("https://zou.test/auth/v1/callback", "state-1", "");
@@ -602,7 +815,7 @@ mod tests {
             r#"{"sub":"106","email":"someone@gmail.com","email_verified":true,
                 "name":"Some One","picture":"https://lh3.example/photo"}"#,
         )]);
-        let person = person(&google(), &http, "at-1").expect("a profile");
+        let person = person(&google(), &http, &bearing("at-1")).expect("a profile");
         assert_eq!(person.sub, "106");
         assert_eq!(person.email, "someone@gmail.com");
         assert!(person.email_verified);
@@ -630,7 +843,7 @@ mod tests {
                     {"email":"mona@zou.test","primary":true,"verified":true}]"#,
             ),
         ]);
-        let person = person(&github(), &http, "at-1").expect("a profile");
+        let person = person(&github(), &http, &bearing("at-1")).expect("a profile");
         assert_eq!(
             person.sub, "42",
             "a number, as a string, the way GoTrue stores it"
@@ -658,7 +871,7 @@ mod tests {
                 r#"[{"email":"mona@zou.test","primary":true,"verified":false}]"#,
             ),
         ]);
-        let person = person(&github(), &http, "at-1").expect("a profile");
+        let person = person(&github(), &http, &bearing("at-1")).expect("a profile");
         assert_eq!(person.email, "mona@zou.test");
         assert!(
             !person.email_verified,
@@ -670,5 +883,163 @@ mod tests {
     fn a_provider_nobody_configured_is_not_a_provider() {
         assert!(Provider::named("myspace").is_none());
         assert!(Providers::default().get("google").is_none());
+    }
+
+    #[test]
+    fn apple_asks_for_a_form_post_because_it_asks_for_a_name() {
+        let mut apple = Provider::named("apple").expect("apple is known");
+        apple.client_id = "test.zou.service".to_string();
+        let url = apple.authorize_url("https://zou.test/auth/v1/callback", "state-1", "");
+        assert!(
+            url.starts_with("https://appleid.apple.com/auth/authorize?"),
+            "{url}"
+        );
+        assert!(url.contains("&scope=email+name"), "{url}");
+        assert!(
+            url.contains("&response_mode=form_post"),
+            "without it the name never arrives and the callback is a get: {url}"
+        );
+    }
+
+    #[test]
+    fn apple_says_who_somebody_is_in_the_id_token() {
+        let token = id_token(serde_json::json!({
+            "iss": "https://appleid.apple.com",
+            "sub": "001234.abcdef.0000",
+            "email": "someone@privaterelay.appleid.com",
+            "email_verified": "true",
+            "is_private_email": "true",
+        }));
+        let http = Fake::new(&[]);
+        let apple = Provider::named("apple").expect("apple is known");
+        let read = person(
+            &apple,
+            &http,
+            &Tokens {
+                access_token: "at-1".to_string(),
+                id_token: token,
+                ..Tokens::default()
+            },
+        )
+        .expect("a profile");
+        assert!(
+            http.asked.lock().unwrap().is_empty(),
+            "apple has no profile endpoint, so nothing is fetched"
+        );
+        assert_eq!(read.sub, "001234.abcdef.0000");
+        assert_eq!(read.email, "someone@privaterelay.appleid.com");
+        assert!(
+            read.email_verified,
+            "apple writes the flag as a string as often as as a boolean"
+        );
+        assert_eq!(read.claims["is_private_email"], true);
+        assert_eq!(read.claims["iss"], "https://appleid.apple.com");
+
+        // A token with no subject is not a person, and saying so here
+        // is better than an identity keyed by the empty string.
+        let empty = Tokens {
+            id_token: id_token(serde_json::json!({"email": "nobody@zou.test"})),
+            ..Tokens::default()
+        };
+        assert!(person(&apple, &http, &empty).is_err());
+    }
+
+    #[test]
+    fn apple_signs_its_own_client_secret() {
+        use base64ct::Encoding;
+        use p256::ecdsa::signature::Verifier as _;
+        use p256::pkcs8::DecodePrivateKey as _;
+
+        let providers = from_vars(|name| match name {
+            "ZOU_EXTERNAL_APPLE_CLIENT_ID" => Some("test.zou.service".to_string()),
+            "ZOU_EXTERNAL_APPLE_TEAM_ID" => Some("TEAM123456".to_string()),
+            "ZOU_EXTERNAL_APPLE_KEY_ID" => Some("KEY7890123".to_string()),
+            "ZOU_EXTERNAL_APPLE_PRIVATE_KEY" => Some(APPLE_P8.to_string()),
+            _ => None,
+        })
+        .expect("a complete apple");
+        let apple = providers.get("apple").expect("apple is configured");
+        let secret = apple.client_secret().expect("a secret is minted");
+
+        let parts: Vec<&str> = secret.split('.').collect();
+        assert_eq!(parts.len(), 3, "a jwt: {secret}");
+        let header: serde_json::Value = serde_json::from_slice(
+            &base64ct::Base64UrlUnpadded::decode_vec(parts[0]).expect("base64url"),
+        )
+        .expect("json");
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(
+            header["kid"], "KEY7890123",
+            "apple picks the key to check with out of the header"
+        );
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64ct::Base64UrlUnpadded::decode_vec(parts[1]).expect("base64url"),
+        )
+        .expect("json");
+        assert_eq!(claims["iss"], "TEAM123456");
+        assert_eq!(
+            claims["sub"], "test.zou.service",
+            "the services id, not the team"
+        );
+        assert_eq!(claims["aud"], "https://appleid.apple.com");
+        assert!(
+            claims["exp"].as_u64().expect("an exp") > claims["iat"].as_u64().expect("an iat"),
+            "a secret that has already expired is not a secret"
+        );
+
+        // And it really is signed with the key, which is the only part
+        // apple checks.
+        let key = p256::ecdsa::SigningKey::from_pkcs8_pem(APPLE_P8).expect("a key");
+        let signed = format!("{}.{}", parts[0], parts[1]);
+        let sig = p256::ecdsa::Signature::from_slice(
+            &base64ct::Base64UrlUnpadded::decode_vec(parts[2]).expect("base64url"),
+        )
+        .expect("a signature");
+        assert!(key.verifying_key().verify(signed.as_bytes(), &sig).is_ok());
+
+        // Two in a row differ in nothing but the timestamps, so a
+        // provider handed the same one twice is a bug and not a design.
+        let again = apple.client_secret().expect("another");
+        assert_eq!(
+            again.split('.').next(),
+            secret.split('.').next(),
+            "the same key and the same algorithm"
+        );
+    }
+
+    #[test]
+    fn apple_takes_a_secret_somebody_else_minted() {
+        // GoTrue's way: the operator pastes in a jwt they made
+        // themselves, and it is used exactly as it arrives.
+        let providers = from_vars(|name| match name {
+            "ZOU_EXTERNAL_APPLE_CLIENT_ID" => Some("test.zou.service".to_string()),
+            "ZOU_EXTERNAL_APPLE_SECRET" => Some("already.minted.jwt".to_string()),
+            _ => None,
+        })
+        .expect("apple with a secret");
+        let apple = providers.get("apple").expect("apple is configured");
+        assert_eq!(
+            apple.client_secret().expect("a secret"),
+            "already.minted.jwt"
+        );
+
+        // Two thirds of a key is a typo, and it is refused at startup
+        // rather than at the first sign in.
+        let half = from_vars(|name| match name {
+            "ZOU_EXTERNAL_APPLE_CLIENT_ID" => Some("test.zou.service".to_string()),
+            "ZOU_EXTERNAL_APPLE_TEAM_ID" => Some("TEAM123456".to_string()),
+            _ => None,
+        });
+        assert!(half.is_err(), "{half:?}");
+
+        // As is a key that is not a key.
+        let bad = from_vars(|name| match name {
+            "ZOU_EXTERNAL_APPLE_CLIENT_ID" => Some("test.zou.service".to_string()),
+            "ZOU_EXTERNAL_APPLE_TEAM_ID" => Some("TEAM123456".to_string()),
+            "ZOU_EXTERNAL_APPLE_KEY_ID" => Some("KEY7890123".to_string()),
+            "ZOU_EXTERNAL_APPLE_PRIVATE_KEY" => Some("not a pem at all".to_string()),
+            _ => None,
+        });
+        assert!(bad.is_err(), "{bad:?}");
     }
 }
