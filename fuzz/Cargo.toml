@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 zou-store = { path = "../crates/zou-store" }
+zou-log = { path = "../crates/zou-log" }
 zou-rest = { path = "../crates/zou-rest" }
 
 [[bin]]
@@ -22,6 +23,13 @@ bench = false
 [[bin]]
 name = "frame_v2"
 path = "fuzz_targets/frame_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "landing_segment"
+path = "fuzz_targets/landing_segment.rs"
 test = false
 doc = false
 bench = false
