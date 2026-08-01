@@ -41,6 +41,7 @@ fn app(dsn: &str) -> axum::Router {
         rate: None,
         jwks: None,
         schemas: vec![],
+        external_url: None,
     })
     .expect("router builds")
 }

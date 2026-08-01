@@ -423,6 +423,26 @@ impl Pool {
         }
     }
 
+    /// A transaction with no injected identity, which is what the auth
+    /// surface runs in. It writes auth.users, auth.sessions and
+    /// auth.refresh_tokens as the connecting role, which owns them and
+    /// therefore passes their rls, and it needs a transaction because
+    /// rotating a refresh token is several statements that have to
+    /// land together or not at all.
+    pub async fn admin(&self) -> Result<Session, Error> {
+        let (permit, client) = self.checkout().await?;
+        match client.batch_execute("begin").await {
+            // The client is dropped on failure, never pooled mid begin.
+            Err(e) => Err(e),
+            Ok(()) => Ok(Session {
+                pool: self.clone(),
+                client: Some(client),
+                _permit: permit,
+                in_txn: true,
+            }),
+        }
+    }
+
     /// A connection with no transaction and no injected identity, for
     /// bootstrap work and tests. finish() returns it to the pool.
     pub async fn unscoped(&self) -> Result<Session, Error> {
