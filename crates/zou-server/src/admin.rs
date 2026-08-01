@@ -1,4 +1,5 @@
-//! The admin surface, GoTrue's `/auth/v1/admin/users`.
+//! The admin surface, GoTrue's `/auth/v1/admin/users`, `/generate_link`
+//! and `/invite`.
 //!
 //! Everything here is the service role acting on somebody else's
 //! account, which is a different shape of endpoint from the rest of the
@@ -20,9 +21,10 @@ use axum::http::{Request, StatusCode};
 use axum::response::Response;
 
 use crate::auth::{
-    Caller, Error, caller, confirm_address, denied, error_body, field, hash_off_thread,
-    identities_join, is_uuid, merge_metadata, no_database, query_escape, query_object, read_json,
-    refusal, refused, requested_aud, still_there, taken, unguessable_password, user_json,
+    Caller, Code, Error, Outgoing, Post, caller, confirm_address, denied, error_body, field,
+    hash_off_thread, identities_join, is_uuid, keep_token, landing, link_target, merge_metadata,
+    no_database, posting, query_escape, query_object, read_json, refusal, refused, requested_aud,
+    send_code, six_digits, still_there, taken, token_hash, unguessable_password, user_json,
     user_object, validate_email, validate_password,
 };
 use crate::json_body;
@@ -497,6 +499,51 @@ async fn create(
         serde_json::Value::Null => serde_json::json!({}),
         data => data,
     };
+    let user_id = insert_account(
+        sess,
+        &NewAccount {
+            email: &email,
+            aud,
+            hash: &hash,
+            data: &user_data,
+            role,
+            id,
+        },
+    )
+    .await?;
+    // The identity is what says the account belongs to the email
+    // provider. It goes in unverified whatever the request said, and
+    // email_confirm below is what verifies it, which is the order
+    // upstream writes them in too.
+    insert_identity(sess, &user_id, &email).await?;
+    let app_data = object(body, "app_metadata");
+    if !app_data.is_null() {
+        merge_metadata(sess, &user_id, "raw_app_meta_data", &app_data).await?;
+    }
+    if confirm {
+        confirm_address(sess, &user_id, false).await?;
+    }
+    ban_account(sess, &user_id, ban).await?;
+    Ok(user_json(sess, &user_id).await?)
+}
+
+/// An account about to be written, which three of these endpoints make:
+/// the create, the invite, and the link generated for an address nobody
+/// has signed up with yet.
+struct NewAccount<'a> {
+    email: &'a str,
+    aud: &'a str,
+    /// The stored password, which for an invited account is empty,
+    /// because there is nothing to sign in with until the invitation is
+    /// followed.
+    hash: &'a str,
+    data: &'a serde_json::Value,
+    role: &'a str,
+    /// The id the request asked for, when it asked for one.
+    id: Option<String>,
+}
+
+async fn insert_account(sess: &sql::Session, new: &NewAccount<'_>) -> Result<String, sql::Error> {
     let rows = sess
         .query(
             "insert into auth.users
@@ -513,34 +560,34 @@ async fn create(
                                                         jsonb_build_array('email')),
                      $4::jsonb, '', '', '', '', '', '', '', '', now(), now(), false, false)
              returning id::text",
-            &[&email, &aud, &hash, &user_data, &role, &id, &NOBODY],
+            &[
+                &new.email, &new.aud, &new.hash, &new.data, &new.role, &new.id, &NOBODY,
+            ],
         )
         .await?;
-    let user_id: String = rows[0].get(0);
-    // The identity is what says the account belongs to the email
-    // provider. It goes in unverified whatever the request said, and
-    // email_confirm below is what verifies it, which is the order
-    // upstream writes them in too.
+    Ok(rows[0].get(0))
+}
+
+/// The email identity, unverified, and only when the account has none.
+async fn insert_identity(
+    sess: &sql::Session,
+    user_id: &str,
+    email: &str,
+) -> Result<(), sql::Error> {
     sess.execute(
         "insert into auth.identities
              (provider_id, user_id, identity_data, provider,
               last_sign_in_at, created_at, updated_at)
-         values ($1::text::uuid::text, $1::text::uuid,
-                 jsonb_build_object('sub', $1::text, 'email', $2::text,
-                                    'email_verified', false, 'phone_verified', false),
-                 'email', now(), now(), now())",
+         select $1::text::uuid::text, $1::text::uuid,
+                jsonb_build_object('sub', $1::text, 'email', $2::text,
+                                   'email_verified', false, 'phone_verified', false),
+                'email', now(), now(), now()
+          where not exists (select 1 from auth.identities
+                             where user_id = $1::text::uuid and provider = 'email')",
         &[&user_id, &email],
     )
     .await?;
-    let app_data = object(body, "app_metadata");
-    if !app_data.is_null() {
-        merge_metadata(sess, &user_id, "raw_app_meta_data", &app_data).await?;
-    }
-    if confirm {
-        confirm_address(sess, &user_id, false).await?;
-    }
-    ban_account(sess, &user_id, ban).await?;
-    Ok(user_json(sess, &user_id).await?)
+    Ok(())
 }
 
 /// PUT /auth/v1/admin/users/{user_id}.
@@ -927,6 +974,455 @@ fn obfuscated(user_id: &str, value: &str) -> String {
     ))
 }
 
+/// An account found by its address, for the two endpoints that are given
+/// one rather than an id.
+struct Account {
+    id: String,
+    confirmed: bool,
+}
+
+async fn by_address(
+    sess: &sql::Session,
+    email: &str,
+    aud: &str,
+) -> Result<Option<Account>, sql::Error> {
+    let rows = sess
+        .query(
+            "select id::text, email_confirmed_at is not null
+               from auth.users
+              where email = $1 and aud = $2 and is_sso_user = false and deleted_at is null
+              limit 1",
+            &[&email, &aud],
+        )
+        .await?;
+    Ok(rows.first().map(|row| Account {
+        id: row.get(0),
+        confirmed: row.get(1),
+    }))
+}
+
+fn already_registered() -> Error {
+    refused(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "email_exists",
+        DUPLICATE_EMAIL,
+    )
+}
+
+/// POST /auth/v1/admin/generate_link.
+///
+/// The whole of an email flow except the email. Everything the ordinary
+/// flow writes down gets written down, and then the link that would have
+/// been mailed is handed back instead, along with the code inside it. It
+/// is what a project uses when it sends its own mail, and what a test
+/// suite uses to follow a flow without a mailbox.
+///
+/// Nothing goes out from here, so none of the send frequency rules apply
+/// and none of them are checked, which is upstream's behaviour too: this
+/// endpoint is already behind the service role.
+pub async fn generate_link(
+    axum::extract::State(app): axum::extract::State<Arc<crate::App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let admin = match admin(&req) {
+        Ok(admin) => admin,
+        Err(res) => return *res,
+    };
+    let asked = requested_aud(&req, &admin.role, &admin.aud);
+    let (wanted, from) = link_target(&req);
+    let body = match read_json(req.into_body()).await {
+        Ok(body) => body,
+        Err(res) => return res,
+    };
+    let mut post = posting(&app, &wanted, &from);
+    // Upstream reads the redirect from the body here as well as from the
+    // query, and the body wins when it names somewhere this project owns.
+    post.referrer = landing(&app, field(&body, "redirect_to"), &post.referrer);
+    let sess = match pool.admin().await {
+        Ok(sess) => sess,
+        Err(e) => return refusal(Error::Db(e), "admin generate link"),
+    };
+    let out = link_for(
+        &sess,
+        &admin,
+        &body,
+        &asked,
+        &post,
+        app.cfg.secure_email_change,
+    )
+    .await;
+    finish(sess, out, "admin generate link").await
+}
+
+async fn link_for(
+    sess: &sql::Session,
+    admin: &Admin,
+    body: &serde_json::Value,
+    aud: &str,
+    post: &Post<'_>,
+    secure_change: bool,
+) -> Result<serde_json::Value, Error> {
+    holder_still_there(sess, admin).await?;
+    let email = validate_email(field(body, "email"))?;
+    let found = by_address(sess, &email, aud).await?;
+    let mut kind = field(body, "type").to_string();
+    let mut password = field(body, "password").to_string();
+    if found.is_none() {
+        match kind.as_str() {
+            // A magic link for an address nobody has signed up with is a
+            // signup, which is how a project invites somebody without
+            // saying so. The password is one nobody will ever know, so
+            // the account exists and only the link gets into it.
+            "magiclink" => {
+                kind = "signup".to_string();
+                password = unguessable_password();
+            }
+            "recovery" | "email_change_current" | "email_change_new" => {
+                return Err(refused(
+                    StatusCode::NOT_FOUND,
+                    "user_not_found",
+                    "User with this email not found",
+                ));
+            }
+            _ => {}
+        }
+    }
+    let otp = six_digits();
+    let hashed = token_hash(&email, &otp);
+    let (user_id, carried) = match kind.as_str() {
+        "magiclink" | "recovery" => {
+            let account = found.ok_or_else(|| {
+                refused(
+                    StatusCode::NOT_FOUND,
+                    "user_not_found",
+                    "User with this email not found",
+                )
+            })?;
+            sess.execute(
+                "update auth.users
+                    set recovery_token = $2, recovery_sent_at = now(), updated_at = now()
+                  where id = $1::text::uuid",
+                &[&account.id, &hashed],
+            )
+            .await?;
+            keep_token(sess, &account.id, "recovery_token", &hashed, &email).await?;
+            (account.id, hashed.clone())
+        }
+        "invite" => {
+            let user_id = match found {
+                Some(account) if account.confirmed => return Err(already_registered()),
+                Some(account) => account.id,
+                None => new_account(sess, &email, aud, "", &object_or_empty(body, "data")).await?,
+            };
+            invited(sess, &user_id, &email, &hashed).await?;
+            (user_id, hashed.clone())
+        }
+        "signup" => {
+            let user_id = match found {
+                Some(account) if account.confirmed => return Err(already_registered()),
+                Some(account) => {
+                    let data = object(body, "data");
+                    if !data.is_null() {
+                        merge_metadata(sess, &account.id, "raw_user_meta_data", &data).await?;
+                    }
+                    account.id
+                }
+                None => {
+                    validate_password(&password)?;
+                    let hash = hash_off_thread(&password).await;
+                    new_account(sess, &email, aud, &hash, &object_or_empty(body, "data")).await?
+                }
+            };
+            awaiting_confirmation(sess, &user_id, &email, &hashed).await?;
+            (user_id, hashed.clone())
+        }
+        "email_change_current" | "email_change_new" => {
+            let account = found.ok_or_else(|| {
+                refused(
+                    StatusCode::NOT_FOUND,
+                    "user_not_found",
+                    "User with this email not found",
+                )
+            })?;
+            if !secure_change && kind == "email_change_current" {
+                return denied(
+                    "validation_failed",
+                    "Enable secure email change to generate link for current email",
+                );
+            }
+            let new = validate_email(field(body, "new_email"))?;
+            if taken(sess, &new, &account.id).await? {
+                return Err(already_registered());
+            }
+            // The code the new address is sent is hashed against the new
+            // address, because that is where it will be typed in.
+            let for_new = token_hash(&new, &otp);
+            staged_change(sess, &account.id, &kind, &new, &hashed, &for_new).await?;
+            let carried = match kind.as_str() {
+                "email_change_new" => for_new,
+                _ => hashed.clone(),
+            };
+            (account.id, carried)
+        }
+        other => {
+            return denied(
+                "validation_failed",
+                &format!("Invalid email action link type requested: {other}"),
+            );
+        }
+    };
+    let mut out = user_json(sess, &user_id).await?;
+    let link = crate::mail::action_link(
+        &post.external,
+        post.settings.path(template_of(&kind)),
+        carried_type(&kind),
+        &carried,
+        &post.referrer,
+    );
+    if let Some(out) = out.as_object_mut() {
+        out.insert("action_link".to_string(), link.into());
+        out.insert("email_otp".to_string(), otp.into());
+        // The hash of the code against the address the request named,
+        // which for a change to a new address is not the hash the link
+        // carries. That is upstream's, and a client that wants to verify
+        // the code itself uses the address it sent with it.
+        out.insert("hashed_token".to_string(), hashed.into());
+        out.insert("verification_type".to_string(), kind.into());
+        out.insert("redirect_to".to_string(), post.referrer.clone().into());
+    }
+    Ok(out)
+}
+
+/// Which template's configured path the link points at, which is not
+/// always the template that would have carried it: a magic link is sent
+/// under the recovery path, the way upstream sends it.
+fn template_of(kind: &str) -> &'static str {
+    match kind {
+        "invite" => crate::mail::INVITE,
+        "recovery" => crate::mail::RECOVERY,
+        "magiclink" => crate::mail::MAGIC_LINK,
+        "email_change_current" | "email_change_new" => crate::mail::EMAIL_CHANGE,
+        _ => crate::mail::CONFIRMATION,
+    }
+}
+
+/// The type the link carries, which verify branches on. Both halves of a
+/// change of address are one type there, because verify tells them apart
+/// by which column the code is in.
+fn carried_type(kind: &str) -> &str {
+    match kind {
+        "email_change_current" | "email_change_new" => "email_change",
+        other => other,
+    }
+}
+
+/// An account with no session and nothing signed in to it, which is what
+/// an invitation and a generated signup link both leave behind.
+async fn new_account(
+    sess: &sql::Session,
+    email: &str,
+    aud: &str,
+    hash: &str,
+    data: &serde_json::Value,
+) -> Result<String, Error> {
+    let user_id = insert_account(
+        sess,
+        &NewAccount {
+            email,
+            aud,
+            hash,
+            data,
+            role: DEFAULT_ROLE,
+            id: None,
+        },
+    )
+    .await?;
+    insert_identity(sess, &user_id, email).await?;
+    Ok(user_id)
+}
+
+/// Write down the code an invitation is followed with, and the fact that
+/// the account was invited rather than signed up for.
+async fn invited(
+    sess: &sql::Session,
+    user_id: &str,
+    email: &str,
+    hashed: &str,
+) -> Result<(), Error> {
+    sess.execute(
+        "update auth.users
+            set confirmation_token = $2, confirmation_sent_at = now(),
+                invited_at = now(), updated_at = now()
+          where id = $1::text::uuid",
+        &[&user_id, &hashed],
+    )
+    .await?;
+    keep_token(sess, user_id, "confirmation_token", hashed, email).await?;
+    Ok(())
+}
+
+/// The same, for a signup that is waiting on its confirmation.
+async fn awaiting_confirmation(
+    sess: &sql::Session,
+    user_id: &str,
+    email: &str,
+    hashed: &str,
+) -> Result<(), Error> {
+    sess.execute(
+        "update auth.users
+            set confirmation_token = $2, confirmation_sent_at = now(), updated_at = now()
+          where id = $1::text::uuid",
+        &[&user_id, &hashed],
+    )
+    .await?;
+    keep_token(sess, user_id, "confirmation_token", hashed, email).await?;
+    Ok(())
+}
+
+/// Put a change of address in flight with only the half of it this link
+/// is for. The other column is left as it stands, so a project that
+/// generates both links one after the other ends up with both codes
+/// live, which is what a secure change of address needs.
+async fn staged_change(
+    sess: &sql::Session,
+    user_id: &str,
+    kind: &str,
+    new: &str,
+    for_current: &str,
+    for_new: &str,
+) -> Result<(), Error> {
+    let column = match kind {
+        "email_change_new" => "email_change_token_new",
+        _ => "email_change_token_current",
+    };
+    let hashed = match kind {
+        "email_change_new" => for_new,
+        _ => for_current,
+    };
+    sess.execute(
+        &format!(
+            "update auth.users
+                set {column} = $2,
+                    email_change = $3,
+                    email_change_confirm_status = 0,
+                    email_change_sent_at = now(),
+                    updated_at = now()
+              where id = $1::text::uuid"
+        ),
+        &[&user_id, &hashed, &new],
+    )
+    .await?;
+    // Both live codes are indexed, not just the one this call wrote,
+    // because the column the other one is in was left alone and the
+    // index is what verify looks in.
+    let rows = sess
+        .query(
+            "select email_change_token_current, email_change_token_new, coalesce(email, '')
+               from auth.users where id = $1::text::uuid",
+            &[&user_id],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(());
+    };
+    let (current, fresh, address): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+    if !current.is_empty() {
+        keep_token(
+            sess,
+            user_id,
+            "email_change_token_current",
+            &current,
+            &address,
+        )
+        .await?;
+    }
+    if !fresh.is_empty() {
+        keep_token(sess, user_id, "email_change_token_new", &fresh, new).await?;
+    }
+    Ok(())
+}
+
+/// POST /auth/v1/invite.
+///
+/// An account made for somebody who has not asked for one, with a link
+/// in the post inviting them to take it. It is not under `/admin` in
+/// upstream's routing and it is not here either, but it is behind the
+/// same service role, because inviting somebody is making an account in
+/// their name.
+pub async fn invite(
+    axum::extract::State(app): axum::extract::State<Arc<crate::App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let admin = match admin(&req) {
+        Ok(admin) => admin,
+        Err(res) => return *res,
+    };
+    let asked = requested_aud(&req, &admin.role, &admin.aud);
+    let (wanted, from) = link_target(&req);
+    let body = match read_json(req.into_body()).await {
+        Ok(body) => body,
+        Err(res) => return res,
+    };
+    let post = posting(&app, &wanted, &from);
+    let sess = match pool.admin().await {
+        Ok(sess) => sess,
+        Err(e) => return refusal(Error::Db(e), "invite"),
+    };
+    let out = inviting(&sess, &admin, &body, &asked, &post).await;
+    finish(sess, out, "invite").await
+}
+
+async fn inviting(
+    sess: &sql::Session,
+    admin: &Admin,
+    body: &serde_json::Value,
+    aud: &str,
+    post: &Post<'_>,
+) -> Result<serde_json::Value, Error> {
+    holder_still_there(sess, admin).await?;
+    let email = validate_email(field(body, "email"))?;
+    let user_id = match by_address(sess, &email, aud).await? {
+        // Somebody who has already proved they hold the address cannot
+        // be invited to it, and the refusal is the one a signup on a
+        // taken address gets.
+        Some(account) if account.confirmed => return Err(already_registered()),
+        // An account that never confirmed is invited as it stands, so
+        // the invitation replaces whatever code it was holding rather
+        // than making a second account on the same address.
+        Some(account) => account.id,
+        // No password at all, which is what upstream writes: until the
+        // invitation is followed and a password set, there is nothing to
+        // sign in with.
+        None => new_account(sess, &email, aud, "", &object_or_empty(body, "data")).await?,
+    };
+    let otp = six_digits();
+    let code = Code {
+        hash: token_hash(&email, &otp),
+        code: otp,
+    };
+    invited(sess, &user_id, &email, &code.hash).await?;
+    send_code(
+        sess,
+        post,
+        &user_id,
+        Outgoing {
+            template: crate::mail::INVITE,
+            kind: "invite",
+            to: &email,
+            code: &code,
+            new_email: "",
+        },
+    )
+    .await?;
+    Ok(user_json(sess, &user_id).await?)
+}
+
 /// One of the two metadata objects on a request, or null when it was not
 /// sent at all, which is the difference between leaving the column alone
 /// and merging an empty object into it.
@@ -934,6 +1430,15 @@ fn object(body: &serde_json::Value, key: &str) -> serde_json::Value {
     match body.get(key) {
         Some(value) if value.is_object() => value.clone(),
         _ => serde_json::Value::Null,
+    }
+}
+
+/// The same, for the endpoints that write the metadata out rather than
+/// merging it, where nothing sent is an empty object.
+fn object_or_empty(body: &serde_json::Value, key: &str) -> serde_json::Value {
+    match object(body, key) {
+        serde_json::Value::Null => serde_json::json!({}),
+        data => data,
     }
 }
 

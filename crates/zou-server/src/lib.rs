@@ -545,6 +545,10 @@ pub fn router(cfg: Config) -> Result<Router, String> {
                 .put(admin::user_update)
                 .delete(admin::user_delete),
         )
+        .route("/auth/v1/admin/generate_link", post(admin::generate_link))
+        // Upstream keeps the invitation outside the admin box and behind
+        // the same role, so this is where it is.
+        .route("/auth/v1/invite", post(admin::invite))
         .route("/auth/v1/{*rest}", any(auth_stub))
         .route("/rest/v1/", any(rest::root))
         .route("/rest/v1/rpc/{func}", any(rest::rpc))
