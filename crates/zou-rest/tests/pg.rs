@@ -11,6 +11,7 @@
 
 use tokio_postgres::NoTls;
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
+use zou_rest::catalog::{Catalog, FkRow, INTROSPECT_SQL, Kind};
 use zou_rest::filter::{Node, Parsed, parse_pair};
 use zou_rest::sql::where_clause;
 
@@ -165,4 +166,89 @@ async fn the_server_infers_every_parameter_type() {
         ids(&c, &[("age", "gte.30"), ("name", "like.J*")]).await,
         vec![2]
     );
+}
+
+/// The introspection query against real constraints: temp tables
+/// live in pg_temp, so this one builds a throwaway schema, loads the
+/// catalog from it, and checks the resolutions the unit tests pin
+/// with hand written rows.
+#[tokio::test]
+async fn the_introspection_query_reads_the_fk_graph() {
+    let Some(c) = client().await else { return };
+
+    c.batch_execute(
+        "drop schema if exists zou_embed cascade;
+         create schema zou_embed;
+         set search_path to zou_embed;
+         create table users (id int primary key);
+         create table profiles (
+             id int primary key,
+             user_id int not null unique references users
+         );
+         create table addresses (id int primary key);
+         create table orders (
+             id int primary key,
+             user_id int references users,
+             billing_address_id int references addresses,
+             shipping_address_id int references addresses
+         );
+         create table products (id int primary key);
+         create table order_items (
+             order_id int references orders,
+             product_id int references products,
+             primary key (order_id, product_id)
+         );",
+    )
+    .await
+    .expect("embed schema");
+
+    let rows = c
+        .query(INTROSPECT_SQL, &[&"zou_embed"])
+        .await
+        .expect("introspect");
+    let fks: Vec<FkRow> = rows
+        .iter()
+        .map(|r| FkRow {
+            constraint: r.get(0),
+            table: r.get(1),
+            columns: r.get(2),
+            ref_table: r.get(3),
+            ref_columns: r.get(4),
+            unique: r.get(5),
+            in_pk: r.get(6),
+        })
+        .collect();
+    assert_eq!(fks.len(), 6, "six fks in the schema: {fks:?}");
+    let catalog = Catalog::new(fks);
+
+    let r = catalog.resolve("users", "orders", None).expect("to many");
+    assert_eq!(r.kind, Kind::ToMany);
+    assert_eq!(r.join, vec![("id".into(), "user_id".into())]);
+
+    let r = catalog
+        .resolve("users", "profiles", None)
+        .expect("one to one");
+    assert_eq!(r.kind, Kind::ToOne, "the unique fk flag came through");
+
+    let r = catalog
+        .resolve("orders", "products", None)
+        .expect("many to many");
+    assert_eq!(r.kind, Kind::ToMany);
+    assert_eq!(
+        r.via.expect("a junction").table,
+        "order_items",
+        "the in_pk flags marked the junction"
+    );
+
+    let e = catalog.resolve("orders", "addresses", None).unwrap_err();
+    assert_eq!(e.code, "PGRST201");
+
+    let r = catalog
+        .resolve("orders", "addresses", Some("billing_address_id"))
+        .expect("the column hint");
+    assert_eq!(r.join, vec![("billing_address_id".into(), "id".into())]);
+
+    c.batch_execute("drop schema zou_embed cascade")
+        .await
+        .expect("cleanup");
 }
