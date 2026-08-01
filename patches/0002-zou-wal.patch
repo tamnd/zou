@@ -41,7 +41,7 @@ new file mode 100644
 index 0000000..64e2897
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,431 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -88,10 +88,17 @@ index 0000000..64e2897
 +						 uint64 *out_resume);
 +extern int	zou_wal_append(const uint8 *data, size_t len, uint64 pg_lsn,
 +						   uint64 *out_durable);
-+extern int	zou_wal_fold(uint64 redo, uint32 *out_dropped);
++extern int	zou_wal_fold_start(uint64 redo);
++extern int	zou_wal_fold_poll(uint64 *out_redo, uint32 *out_dropped);
 +extern int	zou_wal_close(void);
 +
 +#define ZOU_ERR_LEASE_HELD (-5)
++
++/* zou_wal_fold_poll answers, mirroring the ZOU_FOLD_* consts in the crate. */
++#define ZOU_FOLD_IDLE 0
++#define ZOU_FOLD_RUNNING 1
++#define ZOU_FOLD_DONE_DELTA 2
++#define ZOU_FOLD_DONE_FULL 3
 +
 +/* One chunk per append, small enough to stay under the frame body cap. */
 +#define ZOU_WAL_CHUNK (1024 * 1024)
@@ -211,6 +218,7 @@ index 0000000..64e2897
 +	XLogRecPtr	pushed;
 +	XLogRecPtr	folded;
 +	TimeLineID	foldtli;
++	bool		fold_running = false;
 +	int			fold_backoff = 0;
 +	uint64		resume = 0;
 +	char	   *buf;
@@ -294,6 +302,75 @@ index 0000000..64e2897
 +	{
 +		XLogRecPtr	flush = GetFlushRecPtr(&tli);
 +
++		/*
++		 * The fold runs on a thread inside the shim, so pushing and
++		 * folding overlap and commit acks never wait out a capture.
++		 * Poll every iteration, a finished fold publishes its
++		 * checkpoint from here between appends, and a fold that ends
++		 * during the shutdown drain still gets published before exit.
++		 */
++		if (fold_running)
++		{
++			uint64		fredo = 0;
++			uint32		dropped = 0;
++			int			rc = zou_wal_fold_poll(&fredo, &dropped);
++
++			if (rc == ZOU_FOLD_DONE_DELTA || rc == ZOU_FOLD_DONE_FULL)
++			{
++				fold_running = false;
++				folded = (XLogRecPtr) fredo;
++				ereport(LOG,
++						(errmsg("zou wal pusher folded a %s checkpoint at %X/%X, dropped %u sealed segments",
++								rc == ZOU_FOLD_DONE_FULL ? "full" : "delta",
++								LSN_FORMAT_ARGS(folded), dropped)));
++			}
++			else if (rc != ZOU_FOLD_RUNNING)
++			{
++				/*
++				 * A thousand iterations before the retry, five seconds
++				 * when idle, less while pushing. The fold is idempotent
++				 * per redo, the retry picks up where this one failed.
++				 */
++				fold_running = false;
++				fold_backoff = 1000;
++				ereport(WARNING,
++						(errmsg("zou wal fold at %X/%X failed: %d, will retry",
++								LSN_FORMAT_ARGS((XLogRecPtr) fredo), rc)));
++			}
++		}
++		else if (!ShutdownRequestPending)
++		{
++			XLogRecPtr	redo;
++
++			/*
++			 * A fold at redo may start once pushed covers it: everything
++			 * the completed checkpoint references, its own record
++			 * included, is then durable in the store, and the pusher
++			 * keeps pushing while the capture runs on its thread.
++			 * GetOldestRestartPoint reads the control file, so redo only
++			 * moves once a checkpoint has fully completed and flushed
++			 * its pages. Nothing new starts once shutdown is requested,
++			 * a capture the exit would abandon is wasted work.
++			 */
++			GetOldestRestartPoint(&redo, &foldtli);
++			if (redo > folded && pushed >= redo && fold_backoff == 0)
++			{
++				int			rc = zou_wal_fold_start((uint64) redo);
++
++				if (rc == 0)
++					fold_running = true;
++				else
++				{
++					fold_backoff = 1000;
++					ereport(WARNING,
++							(errmsg("zou wal fold start at %X/%X failed: %d, will retry",
++									LSN_FORMAT_ARGS(redo), rc)));
++				}
++			}
++			else if (fold_backoff > 0)
++				fold_backoff--;
++		}
++
 +		if (flush > pushed)
 +		{
 +			size_t		n = Min((size_t) (flush - pushed), (size_t) ZOU_WAL_CHUNK);
@@ -330,7 +407,9 @@ index 0000000..64e2897
 +			/*
 +			 * Fully drained and asked to stop. proc_exit runs
 +			 * zou_wal_on_exit, which seals the tail and releases the
-+			 * lease cleanly.
++			 * lease cleanly. A fold still in flight is abandoned, the
++			 * shim logs it, its unpublished capture is gc food, and the
++			 * next start refolds the same redo.
 +			 */
 +			ereport(LOG,
 +					(errmsg("zou wal pusher drained through %X/%X, shutting down",
@@ -339,41 +418,6 @@ index 0000000..64e2897
 +		}
 +		else
 +		{
-+			XLogRecPtr	redo;
-+
-+			/*
-+			 * Fully caught up is the only safe moment to fold: everything
-+			 * the completed checkpoint references, its own record
-+			 * included, is durable in the store. GetOldestRestartPoint
-+			 * reads the control file, so redo only moves once a
-+			 * checkpoint has fully completed and flushed its pages.
-+			 */
-+			GetOldestRestartPoint(&redo, &foldtli);
-+			if (redo > folded && pushed >= redo && fold_backoff == 0)
-+			{
-+				uint32		dropped = 0;
-+				int			rc = zou_wal_fold((uint64) redo, &dropped);
-+
-+				if (rc >= 0)
-+				{
-+					folded = redo;
-+					ereport(LOG,
-+							(errmsg("zou wal pusher folded a %s checkpoint at %X/%X, dropped %u sealed segments",
-+									rc == 1 ? "full" : "delta",
-+									LSN_FORMAT_ARGS(redo), dropped)));
-+				}
-+				else
-+				{
-+					/* about five seconds of idle passes before a retry */
-+					fold_backoff = 1000;
-+					ereport(WARNING,
-+							(errmsg("zou wal fold at %X/%X failed: %d, will retry",
-+									LSN_FORMAT_ARGS(redo), rc)));
-+				}
-+			}
-+			else if (fold_backoff > 0)
-+				fold_backoff--;
-+
 +			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 +							 5, PG_WAIT_EXTENSION);
 +			ResetLatch(MyLatch);

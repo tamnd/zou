@@ -55,6 +55,13 @@ pub const ZOU_ERR_BAD_ARGUMENT: i32 = -4;
 pub const ZOU_ERR_LEASE_HELD: i32 = -5;
 pub const ZOU_ERR_LEASE_LOST: i32 = -6;
 
+/// [`zou_wal_fold_poll`] answers, and [`zou_wal_fold_start`] borrows
+/// RUNNING for a refused second start. Errors stay negative.
+pub const ZOU_FOLD_IDLE: i32 = 0;
+pub const ZOU_FOLD_RUNNING: i32 = 1;
+pub const ZOU_FOLD_DONE_DELTA: i32 = 2;
+pub const ZOU_FOLD_DONE_FULL: i32 = 3;
+
 /// The chain reader behind the smgr read path. Unset until the first
 /// read, which attaches lazily so init stays cheap and a store with no
 /// checkpoints yet costs nothing. Off means every read goes to pg/,
@@ -209,7 +216,16 @@ fn drain_pending(shim: &Shim, fork: Option<pending::ForkId>) -> i32 {
         }
     };
     for (id, pages, size) in drained {
-        if pending::flush_fork(&shim.store, &shim.layout, id, &pages, size).is_err() {
+        if pending::flush_fork(
+            &shim.store,
+            &shim.layout,
+            shim.cache.as_ref(),
+            id,
+            &pages,
+            size,
+        )
+        .is_err()
+        {
             return ZOU_ERR_STORE;
         }
     }
@@ -236,11 +252,20 @@ fn with_shim(f: impl FnOnce(&'static Shim) -> i32) -> i32 {
 }
 
 fn read_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Result<Option<u32>, ()> {
+    if let Some(cache) = &shim.cache
+        && let Some(n) = cache.load_size((spc, db, rel, fork))
+    {
+        return Ok(Some(n));
+    }
     let key = shim.layout.pg_size(spc, db, rel, fork);
     match shim.store.get(&key) {
         Ok(Some((data, _))) => {
             let bytes: [u8; 4] = data.as_slice().try_into().map_err(|_| ())?;
-            Ok(Some(u32::from_le_bytes(bytes)))
+            let n = u32::from_le_bytes(bytes);
+            if let Some(cache) = &shim.cache {
+                cache.save_size((spc, db, rel, fork), n);
+            }
+            Ok(Some(n))
         }
         Ok(None) => Ok(None),
         Err(_) => Err(()),
@@ -288,8 +313,13 @@ fn write_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32)
     let key = shim.layout.pg_size(spc, db, rel, fork);
     shim.store
         .put(&key, &nblocks.to_le_bytes())
-        .map(|_| ())
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+    // Local copy only after the store accepted, so a cached size is
+    // never newer than the durable one.
+    if let Some(cache) = &shim.cache {
+        cache.save_size((spc, db, rel, fork), nblocks);
+    }
+    Ok(())
 }
 
 /// Block index of a pg/ object key, parsed from the 8 hex digit tail.
@@ -895,18 +925,20 @@ pub extern "C" fn zou_smgr_unlink(spc: u32, db: u32, rel: u32, fork: u32) -> i32
         } else {
             return ZOU_ERR_STORE;
         }
-        if let Some(cache) = &shim.cache {
-            cache.forget((spc, db, rel, fork));
-        }
         note_rel(shim, spc, db, rel);
         // SIZE goes first so the fork stops existing even if a block
-        // delete fails midway, leaving only unreachable garbage.
+        // delete fails midway, leaving only unreachable garbage. The
+        // cache forgets after the store delete, the other order would
+        // let a racing read_size replant a size the store just lost.
         if shim
             .store
             .delete(&shim.layout.pg_size(spc, db, rel, fork))
             .is_err()
         {
             return ZOU_ERR_STORE;
+        }
+        if let Some(cache) = &shim.cache {
+            cache.forget((spc, db, rel, fork));
         }
         let prefix = format!("{}/", shim.layout.pg_fork_prefix(spc, db, rel, fork));
         let Ok(keys) = shim.store.list(&prefix) else {
@@ -1161,22 +1193,99 @@ pub unsafe extern "C" fn zou_wal_append(
     })
 }
 
-/// Fold the completed checkpoint at `redo` into a checkpoint object and
-/// truncate the mirrored tail, see [`fold::fold`]. Called by the pusher
-/// from the data directory when it is fully caught up, so relative paths
-/// resolve inside PGDATA. Writes the count of dropped sealed segments
-/// through `out_dropped`. Returns 0 for a delta, 1 when the fold down
-/// policy promoted the capture to a full, negative on error. Errors are
-/// transient, the caller retries after a backoff.
+/// The fold in flight, at most one per process. The thread runs
+/// [`fold::prepare`] against the store alone, never the group commit,
+/// so the pusher keeps appending and publishing while it works and a
+/// shutdown can abandon it without a join: an unpublished capture left
+/// no manifest edit and its objects are gc food.
+struct FoldTask {
+    redo: u64,
+    handle: std::thread::JoinHandle<Result<fold::FoldOutcome, String>>,
+}
+
+static FOLD_TASK: Mutex<Option<FoldTask>> = Mutex::new(None);
+
+/// Start folding the completed checkpoint at `redo` on a background
+/// thread, see [`fold::prepare`]. Called by the pusher from the data
+/// directory once its pushed position covers `redo`, so relative paths
+/// resolve inside PGDATA and the checkpoint record the capture names
+/// is already durable in the stream. Returns `ZOU_FOLD_RUNNING`
+/// without starting anything while an earlier fold is still in
+/// flight, its result must be polled first.
+#[unsafe(no_mangle)]
+pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
+    wrap(|| {
+        let Some(pipe) = WAL.get() else {
+            return ZOU_ERR_NOT_INITIALIZED;
+        };
+        let (store, layout, epoch) = {
+            let pipe = pipe.lock().expect("wal pipe mutex poisoned");
+            if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
+                return ZOU_ERR_LEASE_LOST;
+            }
+            let Some(commit) = pipe.commit.as_ref() else {
+                return ZOU_ERR_NOT_INITIALIZED;
+            };
+            (Arc::clone(&pipe.store), pipe.layout.clone(), commit.epoch())
+        };
+        let mut slot = FOLD_TASK.lock().expect("fold slot mutex poisoned");
+        if slot.is_some() {
+            return ZOU_FOLD_RUNNING;
+        }
+        let handle = std::thread::Builder::new()
+            .name("zou-fold".into())
+            .spawn(move || fold::prepare(&*store, &layout, epoch, Path::new("."), redo));
+        match handle {
+            Ok(handle) => {
+                *slot = Some(FoldTask { redo, handle });
+                ZOU_OK
+            }
+            Err(e) => {
+                log::error!("zou_wal_fold_start: spawn: {e}");
+                ZOU_ERR_STORE
+            }
+        }
+    })
+}
+
+/// Collect the fold the pusher started, publishing it when it is done.
+/// Returns `ZOU_FOLD_IDLE` when nothing is in flight, `ZOU_FOLD_RUNNING`
+/// while the capture works, and on completion publishes the checkpoint
+/// and tail truncation through the group commit, writes the fold's redo
+/// and the count of dropped sealed segments through the out pointers,
+/// and answers `ZOU_FOLD_DONE_DELTA` or `ZOU_FOLD_DONE_FULL`. Negative
+/// means the fold failed or the publish did; either way the slot is
+/// clear, the error is in the log, and a retry at the same redo is safe
+/// because the fold is idempotent.
 ///
 /// # Safety
-/// `out_dropped` must be a valid pointer.
+/// `out_redo` and `out_dropped` must be valid pointers.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn zou_wal_fold(redo: u64, out_dropped: *mut u32) -> i32 {
+pub unsafe extern "C" fn zou_wal_fold_poll(out_redo: *mut u64, out_dropped: *mut u32) -> i32 {
     wrap(|| {
-        if out_dropped.is_null() {
+        if out_redo.is_null() || out_dropped.is_null() {
             return ZOU_ERR_BAD_ARGUMENT;
         }
+        let task = {
+            let mut slot = FOLD_TASK.lock().expect("fold slot mutex poisoned");
+            match slot.as_ref() {
+                None => return ZOU_FOLD_IDLE,
+                Some(task) if !task.handle.is_finished() => return ZOU_FOLD_RUNNING,
+                Some(_) => slot.take().expect("checked some"),
+            }
+        };
+        unsafe { *out_redo = task.redo };
+        let outcome = match task.handle.join() {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(e)) => {
+                log::error!("zou_wal_fold_poll: fold at {:#X}: {e}", task.redo);
+                return ZOU_ERR_STORE;
+            }
+            Err(_) => {
+                log::error!("zou_wal_fold_poll: fold thread panicked");
+                return ZOU_ERR_STORE;
+            }
+        };
         let Some(pipe) = WAL.get() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
@@ -1187,22 +1296,16 @@ pub unsafe extern "C" fn zou_wal_fold(redo: u64, out_dropped: *mut u32) -> i32 {
         let Some(commit) = pipe.commit.as_ref() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
-        match fold::fold(&*pipe.store, &pipe.layout, commit, Path::new("."), redo) {
-            Ok(stats) => {
-                unsafe { *out_dropped = stats.dropped as u32 };
-                // 1 tells the pusher the fold down policy promoted this
-                // fold to a full capture, 0 is the everyday delta.
-                match stats.kind {
-                    zou_store::manifest::CheckpointKind::Full => 1,
-                    zou_store::manifest::CheckpointKind::Delta => ZOU_OK,
-                }
-            }
-            Err(e) => {
-                // The bgworker's stderr lands in the server log, which is
-                // the only channel this shim has for the error detail.
-                log::error!("zou_wal_fold: {e}");
-                ZOU_ERR_STORE
-            }
+        let kind = outcome.stats.kind;
+        let dropped = outcome.stats.dropped;
+        if let Err(e) = commit.fold_tail(outcome.checkpoint, outcome.drop) {
+            log::error!("zou_wal_fold_poll: publish: {e}");
+            return ZOU_ERR_STORE;
+        }
+        unsafe { *out_dropped = dropped as u32 };
+        match kind {
+            zou_store::manifest::CheckpointKind::Full => ZOU_FOLD_DONE_FULL,
+            zou_store::manifest::CheckpointKind::Delta => ZOU_FOLD_DONE_DELTA,
         }
     })
 }
@@ -1213,6 +1316,12 @@ pub unsafe extern "C" fn zou_wal_fold(redo: u64, out_dropped: *mut u32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_wal_close() -> i32 {
     wrap(|| {
+        // A fold still in flight is abandoned, not joined: it holds its
+        // own store handle, its capture published nothing, and waiting
+        // out a full capture here would hold up shutdown for minutes.
+        if FOLD_TASK.lock().map(|s| s.is_some()).unwrap_or(false) {
+            log::info!("zou_wal_close: a fold is still running, abandoning it unpublished");
+        }
         let Some(pipe) = WAL.get() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
@@ -1264,6 +1373,20 @@ mod tests {
             );
         }
         let mut n = 0u32;
+        assert_eq!(
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            ZOU_OK
+        );
+        assert_eq!(n, 3);
+
+        // The size serves locally now: with the store copy deleted out
+        // from under it, nblocks still answers from the cache, which is
+        // the planner's round trip gone. The next size write puts the
+        // store copy back.
+        let shim = SHIM.get().unwrap();
+        shim.store
+            .delete(&shim.layout.pg_size(spc, db, rel, fork))
+            .unwrap();
         assert_eq!(
             unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
             ZOU_OK
@@ -1459,6 +1582,31 @@ mod tests {
             assert!(durable > last + 4096, "durable past payload each round");
             last = durable;
         }
+
+        // The fold pair: nothing in flight polls idle, a started fold
+        // polls running then surfaces its result. The capture fails
+        // here, the test's cwd is no PGDATA, but the lifecycle is the
+        // point: the error comes back through poll, the slot clears,
+        // and the pusher's retry story holds.
+        let (mut fredo, mut fdropped) = (0u64, 0u32);
+        assert_eq!(
+            unsafe { zou_wal_fold_poll(&mut fredo, &mut fdropped) },
+            ZOU_FOLD_IDLE
+        );
+        assert_eq!(zou_wal_fold_start(0x0100_4000), ZOU_OK);
+        let rc = loop {
+            match unsafe { zou_wal_fold_poll(&mut fredo, &mut fdropped) } {
+                ZOU_FOLD_RUNNING => std::thread::sleep(std::time::Duration::from_millis(10)),
+                rc => break rc,
+            }
+        };
+        assert_eq!(rc, ZOU_ERR_STORE, "no pg_control in cwd fails the fold");
+        assert_eq!(fredo, 0x0100_4000, "the failed fold names its redo");
+        assert_eq!(
+            unsafe { zou_wal_fold_poll(&mut fredo, &mut fdropped) },
+            ZOU_FOLD_IDLE,
+            "a collected fold clears the slot"
+        );
 
         assert_eq!(zou_wal_close(), ZOU_OK);
 
