@@ -32,7 +32,7 @@ pub struct HeldLease {
     manifest: Manifest,
     version: Version,
     /// Second of the last history snapshot this holder wrote, so a busy
-    /// publisher skips the extra PUT instead of racing put_new against
+    /// publisher skips the extra PUT instead of racing put_if_absent against
     /// its own earlier write within the same second.
     last_history_unix: u64,
 }
@@ -186,7 +186,7 @@ pub fn update_manifest(
         let mut snapshot = manifest.clone();
         snapshot.lease = None;
         let history = layout.manifest_history(manifest.epoch, now_unix);
-        match store.put_new(&history, &snapshot.to_json()) {
+        match store.put_if_absent(&history, &snapshot.to_json()) {
             Ok(_) | Err(CasError::AlreadyExists { .. }) => held.last_history_unix = now_unix,
             Err(e) => {
                 log::warn!("history snapshot {history} failed, pitr loses this second: {e}")
@@ -250,7 +250,7 @@ mod tests {
         let store = LocalFsStore::new(dir.path());
         let layout = TenantLayout::new("t1");
         store
-            .put_new(&layout.manifest(), &Manifest::new("t1", 18).to_json())
+            .put_if_absent(&layout.manifest(), &Manifest::new("t1", 18).to_json())
             .unwrap();
         (dir, store, layout)
     }
@@ -387,7 +387,7 @@ mod tests {
         let store: Arc<LocalFsStore> = Arc::new(LocalFsStore::new(dir.path()));
         let layout = TenantLayout::new("t1");
         store
-            .put_new(&layout.manifest(), &Manifest::new("t1", 18).to_json())
+            .put_if_absent(&layout.manifest(), &Manifest::new("t1", 18).to_json())
             .unwrap();
 
         let mut all_epochs = Vec::new();

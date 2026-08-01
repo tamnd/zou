@@ -84,7 +84,7 @@ impl TenantLayout {
     }
 
     /// One file inside a checkpoint's filesystem capture. Checkpoints are
-    /// immutable, these go through put_new.
+    /// immutable, these go through put_if_absent.
     pub fn chk_file(&self, id: &str, relpath: &str) -> String {
         format!("{}/chk/{id}/fs/{relpath}", self.prefix)
     }

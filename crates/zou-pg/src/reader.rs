@@ -718,11 +718,11 @@ mod tests {
         }
         if !run.is_empty() {
             store
-                .put_new(&layout.checkpoint_pages(id, 0), &run)
+                .put_if_absent(&layout.checkpoint_pages(id, 0), &run)
                 .unwrap();
         }
         store
-            .put_new(&layout.checkpoint_page_index(id), index.as_bytes())
+            .put_if_absent(&layout.checkpoint_page_index(id), index.as_bytes())
             .unwrap();
     }
 
@@ -740,7 +740,9 @@ mod tests {
                 owner: None,
             });
         }
-        store.put_new(&layout.manifest(), &m.to_json()).unwrap();
+        store
+            .put_if_absent(&layout.manifest(), &m.to_json())
+            .unwrap();
     }
 
     fn setup() -> (tempfile::TempDir, Arc<LocalFsStore>, TenantLayout) {
@@ -878,7 +880,7 @@ mod tests {
         );
         let delta = "runs 1024\nt 1663 5 20000 2\n";
         store
-            .put_new(&layout.checkpoint_page_index("d2"), delta.as_bytes())
+            .put_if_absent(&layout.checkpoint_page_index("d2"), delta.as_bytes())
             .unwrap();
         put_manifest(
             &*store,
@@ -1041,11 +1043,11 @@ mod tests {
         let (_d, store, layout) = setup();
         let full = "runs 1024\ns 1663 5 16384 0 4\ns 1663 5 20000 0 7\n";
         store
-            .put_new(&layout.checkpoint_page_index("f1"), full.as_bytes())
+            .put_if_absent(&layout.checkpoint_page_index("f1"), full.as_bytes())
             .unwrap();
         let delta = "runs 1024\nr 1663 5 20000\ns 1663 5 16384 0 6\n";
         store
-            .put_new(&layout.checkpoint_page_index("d2"), delta.as_bytes())
+            .put_if_absent(&layout.checkpoint_page_index("d2"), delta.as_bytes())
             .unwrap();
         put_manifest(
             &*store,
@@ -1072,11 +1074,11 @@ mod tests {
         let (_d, store, layout) = setup();
         let full = "runs 1024\ns 1663 5 16384 0 9\ns 1663 5 16384 1 3\ns 1663 5 20000 0 4\n";
         store
-            .put_new(&layout.checkpoint_page_index("f1"), full.as_bytes())
+            .put_if_absent(&layout.checkpoint_page_index("f1"), full.as_bytes())
             .unwrap();
         let delta = format!("runs 1024\nt 1663 5 16384 2\nt 1663 5 20000 {}\n", u32::MAX);
         store
-            .put_new(&layout.checkpoint_page_index("d2"), delta.as_bytes())
+            .put_if_absent(&layout.checkpoint_page_index("d2"), delta.as_bytes())
             .unwrap();
         put_manifest(
             &*store,
@@ -1148,13 +1150,13 @@ mod tests {
         }
         index.push_str("p 1663 5 16384 0 2\n");
         store
-            .put_new(&layout.checkpoint_pages("f1", 0), &run0)
+            .put_if_absent(&layout.checkpoint_pages("f1", 0), &run0)
             .unwrap();
         store
-            .put_new(&layout.checkpoint_pages("f1", 1), &[0x33; ZOU_PAGE_SIZE])
+            .put_if_absent(&layout.checkpoint_pages("f1", 1), &[0x33; ZOU_PAGE_SIZE])
             .unwrap();
         store
-            .put_new(&layout.checkpoint_page_index("f1"), index.as_bytes())
+            .put_if_absent(&layout.checkpoint_page_index("f1"), index.as_bytes())
             .unwrap();
         put_manifest(&*store, &layout, &[("f1", 0x100, CheckpointKind::Full)]);
 

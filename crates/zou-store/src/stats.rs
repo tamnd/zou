@@ -366,7 +366,7 @@ mod tests {
         store.get("tenants/a/pg/1/2/3/0/00000000").unwrap();
         store.get("tenants/a/pg/1/2/3/0/missing").unwrap();
         store
-            .put_new("tenants/a/wal/0000000000000001/00.wal", b"frame")
+            .put_if_absent("tenants/a/wal/0000000000000001/00.wal", b"frame")
             .unwrap();
         store.list("tenants/a/wal/").unwrap();
         store.delete("tenants/a/pg/1/2/3/0/00000001").unwrap();

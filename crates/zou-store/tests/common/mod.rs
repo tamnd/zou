@@ -30,9 +30,11 @@ fn run_contract_inner(store: Arc<dyn CasStore>, transient_io: bool) {
     create_requires_absence(&*store);
     swap_requires_the_current_version(&*store);
     immutable_objects_cannot_be_overwritten(&*store);
+    absence_returns_after_delete(&*store);
     unconditional_put_overwrites_and_delete_removes(&*store);
     list_returns_sorted_keys_under_a_prefix(&*store);
     ranged_reads_clamp_to_the_object(&*store);
+    concurrent_creators_elect_exactly_one_winner(Arc::clone(&store), transient_io);
     concurrent_swappers_never_lose_an_update(store, transient_io);
 }
 
@@ -96,19 +98,19 @@ fn swap_requires_the_current_version(store: &dyn CasStore) {
 
 fn immutable_objects_cannot_be_overwritten(store: &dyn CasStore) {
     let key = "contract/immutable/wal-seg";
-    store.put_new(key, b"frames").unwrap();
+    store.put_if_absent(key, b"frames").unwrap();
     assert!(matches!(
-        store.put_new(key, b"other"),
+        store.put_if_absent(key, b"other"),
         Err(CasError::AlreadyExists { .. })
     ));
     assert_eq!(store.get(key).unwrap().unwrap().0, b"frames");
 }
 
 fn list_returns_sorted_keys_under_a_prefix(store: &dyn CasStore) {
-    store.put_new("contract/list/b", b"2").unwrap();
-    store.put_new("contract/list/a", b"1").unwrap();
-    store.put_new("contract/list/sub/c", b"3").unwrap();
-    store.put_new("contract/other/x", b"4").unwrap();
+    store.put_if_absent("contract/list/b", b"2").unwrap();
+    store.put_if_absent("contract/list/a", b"1").unwrap();
+    store.put_if_absent("contract/list/sub/c", b"3").unwrap();
+    store.put_if_absent("contract/other/x", b"4").unwrap();
     assert_eq!(
         store.list("contract/list/").unwrap(),
         vec!["contract/list/a", "contract/list/b", "contract/list/sub/c"]
@@ -118,6 +120,78 @@ fn list_returns_sorted_keys_under_a_prefix(store: &dyn CasStore) {
         store.list("contract/list/su").unwrap(),
         vec!["contract/list/sub/c"]
     );
+}
+
+fn absence_returns_after_delete(store: &dyn CasStore) {
+    let key = "contract/recreate/obj";
+    store.put_if_absent(key, b"first").unwrap();
+    store.delete(key).unwrap();
+    // Delete restores absence, so a second create must win cleanly. The
+    // landing chain leans on this after GC reclaims a sealed segment.
+    let v = store.put_if_absent(key, b"second").unwrap();
+    let (data, current) = store.get(key).unwrap().unwrap();
+    assert_eq!(data, b"second");
+    assert_eq!(current, v);
+}
+
+/// The fencing race the v2 landing chain is built on: N threads race
+/// put_if_absent on one key, exactly one wins, every loser sees
+/// AlreadyExists, and what is stored is the winner's payload, never a
+/// blend. A backend that lets two creators through breaks the sealed
+/// chain protocol, so this property gets a bigger thread count than the
+/// swap counter.
+fn concurrent_creators_elect_exactly_one_winner(store: Arc<dyn CasStore>, transient_io: bool) {
+    const RACERS: usize = 16;
+    const ROUNDS: usize = 8;
+    for round in 0..ROUNDS {
+        let key = format!("contract/race/create-{round}");
+        let barrier = Arc::new(std::sync::Barrier::new(RACERS));
+        let handles: Vec<_> = (0..RACERS)
+            .map(|i| {
+                let store = Arc::clone(&store);
+                let key = key.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let payload = format!("creator-{i}");
+                    barrier.wait();
+                    loop {
+                        return match store.put_if_absent(&key, payload.as_bytes()) {
+                            Ok(_) => Some(payload),
+                            Err(CasError::AlreadyExists { .. }) => None,
+                            Err(CasError::Io { .. }) if transient_io => {
+                                // A retried create that lost its ack must
+                                // still resolve: reread, and if our bytes
+                                // landed we are the winner.
+                                match store.get(&key) {
+                                    Ok(Some((data, _))) if data == payload.as_bytes() => {
+                                        Some(payload)
+                                    }
+                                    Ok(Some(_)) => None,
+                                    _ => continue,
+                                }
+                            }
+                            Err(e) => panic!("unexpected error: {e}"),
+                        };
+                    }
+                })
+            })
+            .collect();
+        let winners: Vec<String> = handles
+            .into_iter()
+            .filter_map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "round {round}: exactly one creator must win, got {winners:?}"
+        );
+        let (data, _) = store.get(&key).unwrap().unwrap();
+        assert_eq!(
+            data,
+            winners[0].as_bytes(),
+            "round {round}: the stored bytes must be the winner's"
+        );
+    }
 }
 
 /// The classic CAS counter: N threads each add 1 through a read-modify-swap

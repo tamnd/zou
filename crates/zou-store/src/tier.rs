@@ -48,7 +48,7 @@ pub(crate) fn upload_with_retry(
     const ATTEMPTS: u32 = 5;
     let mut last = None;
     for attempt in 0..ATTEMPTS {
-        match store.put_new(key, data) {
+        match store.put_if_absent(key, data) {
             Ok(_) => return Ok(()),
             Err(CasError::AlreadyExists { .. }) => {
                 return match store.get(key)? {

@@ -289,13 +289,13 @@ mod tests {
     fn put_chk(store: &dyn CasStore, r: &str, id: &str) {
         let layout = TenantLayout::new(r);
         store
-            .put_new(&layout.chk_index(id), b"f base/one 100\n")
+            .put_if_absent(&layout.chk_index(id), b"f base/one 100\n")
             .unwrap();
         store
-            .put_new(&layout.checkpoint_page_index(id), b"runs 1024\n")
+            .put_if_absent(&layout.checkpoint_page_index(id), b"runs 1024\n")
             .unwrap();
         store
-            .put_new(&layout.checkpoint_pages(id, 0), &[0xAB; 16])
+            .put_if_absent(&layout.checkpoint_pages(id, 0), &[0xAB; 16])
             .unwrap();
     }
 
@@ -526,7 +526,7 @@ mod tests {
             owner: None,
         });
         let hkey = TenantLayout::new("p").manifest_history(1, 1000);
-        store.put_new(&hkey, &old.to_json()).unwrap();
+        store.put_if_absent(&hkey, &old.to_json()).unwrap();
 
         // Within retention the snapshot pins its checkpoint, a PITR
         // materialize at that second must still find everything.

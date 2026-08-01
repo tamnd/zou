@@ -390,7 +390,7 @@ fn pack_page_runs(
         if run.is_empty() {
             return Ok(());
         }
-        match store.put_new(&layout.checkpoint_pages(id, *runs), run) {
+        match store.put_if_absent(&layout.checkpoint_pages(id, *runs), run) {
             Ok(_) | Err(CasError::AlreadyExists { .. }) => {}
             Err(e) => return Err(format!("put run {runs}: {e}")),
         }
@@ -425,7 +425,7 @@ fn pack_page_runs(
     for (spc, db, rel, fork, n) in sizes {
         index.push_str(&format!("s {spc} {db} {rel} {fork} {n}\n"));
     }
-    match store.put_new(&layout.checkpoint_page_index(id), index.as_bytes()) {
+    match store.put_if_absent(&layout.checkpoint_page_index(id), index.as_bytes()) {
         Ok(_) | Err(CasError::AlreadyExists { .. }) => Ok((pages, runs as usize)),
         Err(e) => Err(format!("put PAGES: {e}")),
     }
@@ -855,10 +855,10 @@ mod tests {
             owner: None,
         });
         store
-            .put_new(&layout.chk_index("genesis"), b"f base/big 1000000\n")
+            .put_if_absent(&layout.chk_index("genesis"), b"f base/big 1000000\n")
             .unwrap();
         store
-            .put_new(&layout.manifest(), &genesis.to_json())
+            .put_if_absent(&layout.manifest(), &genesis.to_json())
             .unwrap();
         let held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
         let gc = GroupCommit::with_lease(
@@ -1024,12 +1024,14 @@ mod tests {
             owner: None,
         });
         store
-            .put_new(&layout.chk_index("genesis"), b"f base/small 100\n")
+            .put_if_absent(&layout.chk_index("genesis"), b"f base/small 100\n")
             .unwrap();
         store
-            .put_new(&layout.chk_index("d1"), b"f pg_xact/0000 600\n")
+            .put_if_absent(&layout.chk_index("d1"), b"f pg_xact/0000 600\n")
             .unwrap();
-        store.put_new(&layout.manifest(), &m.to_json()).unwrap();
+        store
+            .put_if_absent(&layout.manifest(), &m.to_json())
+            .unwrap();
 
         let held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
         let gc = GroupCommit::with_lease(
@@ -1109,12 +1111,12 @@ mod tests {
         let page = |b: u8| vec![b; ZOU_PAGE_SIZE];
         let put_chk = |id: &str, index: &str, run: &[Vec<u8>]| {
             store
-                .put_new(&parent.checkpoint_page_index(id), index.as_bytes())
+                .put_if_absent(&parent.checkpoint_page_index(id), index.as_bytes())
                 .unwrap();
             if !run.is_empty() {
                 let bytes: Vec<u8> = run.iter().flatten().copied().collect();
                 store
-                    .put_new(&parent.checkpoint_pages(id, 0), &bytes)
+                    .put_if_absent(&parent.checkpoint_pages(id, 0), &bytes)
                     .unwrap();
             }
         };
@@ -1157,7 +1159,9 @@ mod tests {
             from_lsn: Lsn(0x500),
             segments: vec!["0000000000000001/0000000000000000.wal".into()],
         });
-        store.put_new(&parent.manifest(), &pm.to_json()).unwrap();
+        store
+            .put_if_absent(&parent.manifest(), &pm.to_json())
+            .unwrap();
 
         zou_store::branch(&*store, "parent", "child", None, 5000).unwrap();
 
@@ -1247,12 +1251,12 @@ mod tests {
             owner: None,
         });
         store
-            .put_new(&layout.chk_index("genesis"), b"f base/huge 1000000\n")
+            .put_if_absent(&layout.chk_index("genesis"), b"f base/huge 1000000\n")
             .unwrap();
         for i in 1..=4u64 {
             let id = format!("d{i}");
             store
-                .put_new(&layout.chk_index(&id), b"f pg_xact/0000 1\n")
+                .put_if_absent(&layout.chk_index(&id), b"f pg_xact/0000 1\n")
                 .unwrap();
             m.checkpoints.push(CheckpointRef {
                 id,
