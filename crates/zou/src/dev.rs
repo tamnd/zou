@@ -93,6 +93,13 @@ pub fn run(args: &Args) -> Result<(), String> {
     fs::create_dir_all(&args.runtime)
         .map_err(|e| format!("create {}: {e}", args.runtime.display()))?;
     let pgdata = args.runtime.join("pgdata");
+    // The write-through page cache starts empty on every boot. It only
+    // ever mirrors what this instance wrote to or read from the store,
+    // and wiping it is what keeps a cache from a previous life from
+    // answering for a store some other node has advanced since.
+    let pagecache = args.runtime.join("pagecache");
+    let _ = fs::remove_dir_all(&pagecache);
+    fs::create_dir_all(&pagecache).map_err(|e| format!("create {}: {e}", pagecache.display()))?;
     let sock = args.runtime.join("sock");
     fs::create_dir_all(&sock).map_err(|e| format!("create {}: {e}", sock.display()))?;
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o700))
@@ -118,6 +125,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             .arg(&pgdata)
             .args(["--set", "io_method=sync"])
             .env("ZOU_TARGET", &args.target)
+            .env("ZOU_PAGE_CACHE", &pagecache)
             .output()
             .map_err(|e| format!("initdb: {e}"))?;
         if !out.status.success() {
@@ -162,6 +170,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             .arg(&sock)
             .args(["-c", "listen_addresses=127.0.0.1"])
             .env("ZOU_TARGET", &args.target)
+            .env("ZOU_PAGE_CACHE", &pagecache)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
