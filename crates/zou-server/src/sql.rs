@@ -18,11 +18,12 @@
 //!
 //! Connections are lazy. Building a pool never dials, so the server
 //! can come up before postgres does and the first request pays the
-//! connect. The first successful connection also makes sure the anon,
-//! authenticated, and service_role roles exist, since set_config role
-//! has nothing to switch to on a stock cluster. Supabase parity for
-//! their grants comes with tenant bootstrap, this is just enough for
-//! the pool to be usable and testable.
+//! connect. The first successful connection applies the tenant
+//! contract in the BOOTSTRAP batch: the anon, authenticated, and
+//! service_role roles, the auth schema with Supabase's uid, role,
+//! email, and jwt functions verbatim, and the open public schema
+//! grants that make row level security the actual guard, exactly the
+//! stance a Supabase project ships with.
 
 use std::sync::Arc;
 
@@ -72,13 +73,22 @@ struct Inner {
 #[derive(Clone)]
 pub struct Pool(Arc<Inner>);
 
-const ENSURE_ROLES: &str = "do $$
+/// The tenant contract, applied once per pool on the first connection.
+/// The whole batch runs as one implicit transaction under an advisory
+/// lock, so concurrent bootstrappers serialize instead of racing the
+/// if not exists checks, and it is idempotent throughout.
+///
+/// The auth.* function bodies are Supabase's own definitions verbatim,
+/// including the legacy request.jwt.claim.<name> fallbacks, because
+/// user policies copied from Supabase docs must behave identically.
+/// The public schema grants mirror Supabase's stance: the three API
+/// roles get everything and row level security is the actual guard,
+/// which is also why enabling RLS is the app's job, not ours.
+const BOOTSTRAP: &str = "
+select pg_advisory_xact_lock(730501);
+
+do $$
 begin
-    -- Serialize concurrent bootstrappers: two pools dialing their
-    -- first connection at once would both pass the if not exists
-    -- checks and one create role would lose the race. The xact lock
-    -- releases when the do block's implicit transaction commits.
-    perform pg_advisory_xact_lock(730501);
     if not exists (select 1 from pg_roles where rolname = 'anon') then
         create role anon nologin;
     end if;
@@ -89,7 +99,76 @@ begin
         create role service_role nologin bypassrls;
     end if;
 end
-$$";
+$$;
+
+create schema if not exists auth;
+grant usage on schema auth to anon, authenticated, service_role;
+
+create or replace function auth.uid() returns uuid as $$
+  select
+  coalesce(
+    nullif(current_setting('request.jwt.claim.sub', true), ''),
+    (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'sub')
+  )::uuid
+$$ language sql stable;
+
+create or replace function auth.role() returns text as $$
+  select
+  coalesce(
+    nullif(current_setting('request.jwt.claim.role', true), ''),
+    (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'role')
+  )::text
+$$ language sql stable;
+
+create or replace function auth.email() returns text as $$
+  select
+  coalesce(
+    nullif(current_setting('request.jwt.claim.email', true), ''),
+    (nullif(current_setting('request.jwt.claims', true), '')::jsonb ->> 'email')
+  )::text
+$$ language sql stable;
+
+create or replace function auth.jwt() returns jsonb as $$
+  select
+    coalesce(
+        nullif(current_setting('request.jwt.claim', true), ''),
+        nullif(current_setting('request.jwt.claims', true), '')
+    )::jsonb
+$$ language sql stable;
+
+grant execute on all functions in schema auth to anon, authenticated, service_role;
+
+do $$
+begin
+    -- Only the first bootstrap sweeps existing objects. The sweep
+    -- rewrites the acl of every table in public, so re running it on
+    -- every restart would both race concurrent DDL (tuple concurrently
+    -- updated) and silently undo revokes the operator made on purpose.
+    -- The marker is the default acl entry this block creates, not
+    -- has_schema_privilege, which is always true via PUBLIC.
+    if not exists (
+        select 1
+        from pg_default_acl d
+        join pg_namespace n on n.oid = d.defaclnamespace
+        cross join aclexplode(d.defaclacl) a
+        where n.nspname = 'public'
+          and d.defaclobjtype = 'r'
+          and a.grantee = 'anon'::regrole
+    ) then
+        grant usage on schema public to anon, authenticated, service_role;
+        grant all on all tables in schema public to anon, authenticated, service_role;
+        grant all on all sequences in schema public to anon, authenticated, service_role;
+        grant all on all functions in schema public to anon, authenticated, service_role;
+        alter default privileges in schema public
+            grant all on tables to anon, authenticated, service_role;
+        alter default privileges in schema public
+            grant all on sequences to anon, authenticated, service_role;
+        alter default privileges in schema public
+            grant all on functions to anon, authenticated, service_role;
+    end if;
+end
+$$;
+";
 
 impl Pool {
     /// Parse the dsn now, dial nothing. `max` caps the number of live
@@ -125,7 +204,7 @@ impl Pool {
         });
         self.0
             .bootstrapped
-            .get_or_try_init(|| client.batch_execute(ENSURE_ROLES))
+            .get_or_try_init(|| client.batch_execute(BOOTSTRAP))
             .await?;
         Ok((permit, client))
     }

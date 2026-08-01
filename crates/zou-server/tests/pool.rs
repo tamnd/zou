@@ -235,20 +235,27 @@ async fn bootstrap_created_the_three_roles() {
 async fn the_injected_role_carries_real_privileges() {
     let Some(pool) = pool_of(1) else { return };
     let admin = pool.unscoped().await.expect("unscoped");
+    // The table lives in a schema anon has no usage on. A revoke on a
+    // public table would not stick here: every test builds its own
+    // pool, and a concurrent bootstrap's blanket grant on all tables
+    // in public would re grant it mid test.
     admin
-        .execute("create table if not exists zou_pool_private (x int)", &[])
+        .execute("create schema if not exists zou_pool_hidden", &[])
+        .await
+        .expect("schema");
+    admin
+        .execute(
+            "create table if not exists zou_pool_hidden.private (x int)",
+            &[],
+        )
         .await
         .expect("create");
-    admin
-        .execute("revoke all on zou_pool_private from anon", &[])
-        .await
-        .expect("revoke");
     admin.commit().await.expect("finish");
 
     let ctx = RequestContext::bare("anon", "{}");
     let sess = pool.session(&ctx, false).await.expect("session");
     let err = sess
-        .query("select * from zou_pool_private", &[])
+        .query("select * from zou_pool_hidden.private", &[])
         .await
         .expect_err("anon reading an unGRANTed table");
     let msg = err.as_db_error().expect("a db error").message();
@@ -257,7 +264,7 @@ async fn the_injected_role_carries_real_privileges() {
 
     let admin = pool.unscoped().await.expect("unscoped");
     admin
-        .execute("drop table zou_pool_private", &[])
+        .execute("drop schema zou_pool_hidden cascade", &[])
         .await
         .expect("drop");
     admin.commit().await.expect("finish");
