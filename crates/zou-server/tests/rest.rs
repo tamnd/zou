@@ -36,6 +36,18 @@ fn app(dsn: &str) -> axum::Router {
         pg: Some(dsn.to_string()),
         rate: None,
         jwks: None,
+        schemas: vec![],
+    })
+    .expect("router builds")
+}
+
+fn app_with_schemas(dsn: &str, schemas: &[&str]) -> axum::Router {
+    router(Config {
+        jwt_secret: SECRET.to_vec(),
+        pg: Some(dsn.to_string()),
+        rate: None,
+        jwks: None,
+        schemas: schemas.iter().map(|s| s.to_string()).collect(),
     })
     .expect("router builds")
 }
@@ -1248,4 +1260,248 @@ async fn the_context_and_rls_hold_through_the_whole_door() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(body_text(res).await, "[]");
+}
+
+#[tokio::test]
+async fn the_schema_profiles_speak_postgrest() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop schema if exists zou_alt cascade",
+            "drop table if exists zou_profile_rows cascade",
+            "create schema zou_alt",
+            // The bootstrap only grants public and auth, so an extra
+            // exposed schema is the deployment's own grant to make.
+            "grant usage on schema zou_alt to anon, authenticated, service_role",
+            "create table zou_alt.zou_profile_rows (id int primary key, tag text)",
+            "insert into zou_alt.zou_profile_rows values (1, 'alt')",
+            "grant all on all tables in schema zou_alt to anon, authenticated, service_role",
+            "create function zou_alt.zou_profile_tag() returns text language sql stable \
+             as 'select tag from zou_alt.zou_profile_rows where id = 1'",
+            // Same table name in both schemas, so only the search_path
+            // can explain which rows come back.
+            "create table zou_profile_rows (id int primary key, tag text)",
+            "insert into zou_profile_rows values (1, 'pub')",
+        ],
+    )
+    .await;
+    let two = app_with_schemas(&dsn, &["public", "zou_alt"]);
+
+    let profiled =
+        |method: &str, uri: &str, body: &str, hdr: &str, value: &str, prefers: &[&str]| {
+            let mut b = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("apikey", anon_key());
+            if !hdr.is_empty() {
+                b = b.header(hdr, value);
+            }
+            for p in prefers {
+                b = b.header("prefer", *p);
+            }
+            let body = if body.is_empty() {
+                Body::empty()
+            } else {
+                Body::from(body.to_string())
+            };
+            b.body(body).unwrap()
+        };
+
+    // Accept-Profile picks the read's schema, and the response echoes
+    // it back as Content-Profile.
+    let res = two
+        .clone()
+        .oneshot(profiled(
+            "GET",
+            "/rest/v1/zou_profile_rows?select=tag",
+            "",
+            "accept-profile",
+            "zou_alt",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-profile"], "zou_alt");
+    assert_eq!(body_text(res).await, r#"[{"tag": "alt"}]"#);
+
+    // No header is the first exposed schema, and with more than one
+    // exposed the default still counts as negotiated.
+    let res = two
+        .clone()
+        .oneshot(get("/rest/v1/zou_profile_rows?select=tag"))
+        .await
+        .unwrap();
+    assert_eq!(res.headers()["content-profile"], "public");
+    assert_eq!(body_text(res).await, r#"[{"tag": "pub"}]"#);
+
+    // A read ignores Content-Profile, that header is the writes'.
+    let res = two
+        .clone()
+        .oneshot(profiled(
+            "GET",
+            "/rest/v1/zou_profile_rows?select=tag",
+            "",
+            "content-profile",
+            "zou_alt",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"tag": "pub"}]"#);
+
+    // An unexposed schema is the PGRST106 406, hint listing what is.
+    let res = two
+        .clone()
+        .oneshot(profiled(
+            "GET",
+            "/rest/v1/zou_profile_rows",
+            "",
+            "accept-profile",
+            "secret",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["code"], "PGRST106");
+    assert_eq!(e["message"], "Invalid schema: secret");
+    assert_eq!(e["details"], serde_json::Value::Null);
+    assert_eq!(
+        e["hint"],
+        "Only the following schemas are exposed: public, zou_alt"
+    );
+
+    // The refusal comes before the body is even looked at, upstream's
+    // getSchema ordering.
+    let res = two
+        .clone()
+        .oneshot(profiled(
+            "POST",
+            "/rest/v1/zou_profile_rows",
+            "not json at all",
+            "content-profile",
+            "secret",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["code"], "PGRST106");
+
+    // Content-Profile routes the write, and the representation
+    // carries the profile back.
+    let res = two
+        .clone()
+        .oneshot(profiled(
+            "POST",
+            "/rest/v1/zou_profile_rows",
+            r#"{"id": 2, "tag": "alt2"}"#,
+            "content-profile",
+            "zou_alt",
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(res.headers()["content-profile"], "zou_alt");
+    assert_eq!(body_text(res).await, r#"[{"id": 2, "tag": "alt2"}]"#);
+
+    // It landed in zou_alt and nowhere near public.
+    let res = two
+        .clone()
+        .oneshot(profiled(
+            "GET",
+            "/rest/v1/zou_profile_rows?select=tag&order=id.asc",
+            "",
+            "accept-profile",
+            "zou_alt",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"tag": "alt"},{"tag": "alt2"}]"#);
+    let res = two
+        .clone()
+        .oneshot(get("/rest/v1/zou_profile_rows?select=tag"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"tag": "pub"}]"#);
+
+    // A minimal write answers 204 with no content type, so no
+    // Content-Profile rides along either.
+    let res = two
+        .clone()
+        .oneshot(profiled(
+            "POST",
+            "/rest/v1/zou_profile_rows",
+            r#"{"id": 3, "tag": "alt3"}"#,
+            "content-profile",
+            "zou_alt",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(res.headers().get("content-profile").is_none());
+
+    // Rpc resolves the function in the profiled schema, GET so the
+    // Accept-Profile side is the one that counts.
+    let res = two
+        .clone()
+        .oneshot(profiled(
+            "GET",
+            "/rest/v1/rpc/zou_profile_tag",
+            "",
+            "accept-profile",
+            "zou_alt",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-profile"], "zou_alt");
+    assert_eq!(body_text(res).await, r#""alt""#);
+
+    // The same function is nowhere to be found in public.
+    let res = two
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_profile_tag"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // One exposed schema means nothing was negotiated, so a default
+    // deployment's responses look exactly as they did before.
+    let one = app(&dsn);
+    let res = one
+        .clone()
+        .oneshot(get("/rest/v1/zou_profile_rows?select=tag"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().get("content-profile").is_none());
+    assert_eq!(body_text(res).await, r#"[{"tag": "pub"}]"#);
+
+    let res = one
+        .clone()
+        .oneshot(profiled(
+            "GET",
+            "/rest/v1/zou_profile_rows",
+            "",
+            "accept-profile",
+            "zou_alt",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(
+        e["hint"], "Only the following schemas are exposed: public",
+        "an unexposed schema is unexposed even when it exists"
+    );
 }

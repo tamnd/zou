@@ -43,6 +43,10 @@ pub struct Config {
     pub pg: Option<String>,
     pub rate: Option<edge::Rate>,
     pub jwks: Option<String>,
+    /// The schemas the REST surface exposes, PostgREST's db-schemas.
+    /// The first is the default when no profile header picks one;
+    /// empty means just public, the fresh Supabase project shape.
+    pub schemas: Vec<String>,
 }
 
 /// Everything the handlers share: the config and, when postgres is
@@ -58,7 +62,10 @@ pub struct App {
 /// PostgREST's default db-pool size, a sane dev loop default here too.
 const POOL_SIZE: usize = 10;
 
-fn app_state(cfg: Config) -> Result<Arc<App>, String> {
+fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
+    if cfg.schemas.is_empty() {
+        cfg.schemas.push("public".to_string());
+    }
     let pool = match &cfg.pg {
         Some(dsn) => Some(sql::Pool::new(dsn, POOL_SIZE).map_err(|e| format!("pg dsn: {e}"))?),
         None => None,
@@ -294,6 +301,7 @@ mod tests {
             pg: None,
             rate: None,
             jwks: None,
+            schemas: vec![],
         })
         .unwrap()
     }
@@ -475,6 +483,7 @@ mod tests {
             pg: None,
             rate: None,
             jwks,
+            schemas: vec![],
         })
         .unwrap();
         Router::new()
@@ -587,6 +596,7 @@ mod tests {
                 per_second: 0.5,
             }),
             jwks: None,
+            schemas: vec![],
         })
         .unwrap();
         let key = anon_key();
