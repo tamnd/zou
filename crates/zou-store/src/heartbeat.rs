@@ -7,9 +7,9 @@
 //! runs out locally. The jitter keeps a fleet of writers from hammering
 //! the store in lockstep after a shared stall.
 //!
-//! The `HeldLease` lives behind the same `Arc<Mutex<_>>` the group commit
-//! pipeline uses for tail publishes. Both paths re-read the manifest
-//! before swapping, so a renewal never clobbers a wal_tail update and
+//! The `HeldLease` lives behind the same `Arc<Mutex<_>>` the fold path
+//! uses for checkpoint publishes. Both paths re-read the manifest
+//! before swapping, so a renewal never clobbers a checkpoint update and
 //! vice versa.
 //!
 //! Losing the lease here does not by itself stop the writer, the pipeline

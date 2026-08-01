@@ -4,7 +4,6 @@
 //! tenants/<ref>/
 //!   MANIFEST                      current manifest, swapped with CAS
 //!   manifests/<epoch>-<unix>.json manifest history
-//!   wal/<epoch>/<start-lsn>.wal   sealed WAL segments, immutable
 //!   chk/<chk-id>/INDEX            fs capture index for one checkpoint
 //!   chk/<chk-id>/fs/<path>        captured files
 //!   chk/<chk-id>/PAGES            page run index for one checkpoint
@@ -14,7 +13,17 @@
 //!
 //! Everything except `MANIFEST` is immutable once written.
 
-use crate::lsn::Lsn;
+use sha2::{Digest, Sha256};
+
+/// Deterministic 128-bit tenant id for the shared WAL: the first 16 bytes
+/// of sha256 over the tenant ref, big endian. Frames in the store carry
+/// this id forever, so the mapping must never change.
+pub fn tenant_id(tenant_ref: &str) -> u128 {
+    let digest = Sha256::digest(tenant_ref.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    u128::from_be_bytes(bytes)
+}
 
 /// Key builder for one tenant's prefix.
 ///
@@ -58,29 +67,6 @@ impl TenantLayout {
     /// the retention window.
     pub fn manifests_dir(&self) -> String {
         format!("{}/manifests/", self.prefix)
-    }
-
-    /// A sealed WAL segment. Segments live under the epoch that wrote them,
-    /// which is what makes zombie writers harmless: a stale epoch directory
-    /// is simply never referenced by the live manifest.
-    pub fn wal_segment(&self, epoch: u64, start: Lsn) -> String {
-        format!("{}/wal/{epoch:016}/{:016X}.wal", self.prefix, start.0)
-    }
-
-    pub fn wal_epoch_dir(&self, epoch: u64) -> String {
-        format!("{}/wal/{epoch:016}/", self.prefix)
-    }
-
-    /// The whole WAL prefix across every epoch. Recovery scans this,
-    /// because acked frames can postdate the last manifest publish.
-    pub fn wal_dir(&self) -> String {
-        format!("{}/wal/", self.prefix)
-    }
-
-    /// Resolve an epoch qualified segment name from manifest.wal_tail,
-    /// like `0000000000000007/000000000B000000.wal`, back to its key.
-    pub fn wal_segment_path(&self, qualified: &str) -> String {
-        format!("{}/wal/{qualified}", self.prefix)
     }
 
     /// One file inside a checkpoint's filesystem capture. Checkpoints are
@@ -156,10 +142,6 @@ mod tests {
         );
         assert_eq!(t.manifests_dir(), "tenants/acme-prod/manifests/");
         assert_eq!(
-            t.wal_segment(42, Lsn(0x8B00_0000)),
-            "tenants/acme-prod/wal/0000000000000042/000000008B000000.wal"
-        );
-        assert_eq!(
             t.checkpoint_page_index("chk-000121"),
             "tenants/acme-prod/chk/chk-000121/PAGES"
         );
@@ -174,19 +156,18 @@ mod tests {
     }
 
     #[test]
-    fn wal_keys_sort_by_lsn_within_an_epoch() {
-        let t = TenantLayout::new("a");
-        let a = t.wal_segment(7, Lsn(0x0FFF));
-        let b = t.wal_segment(7, Lsn(0x1000));
-        let c = t.wal_segment(7, Lsn(0x0001_0000_0000));
-        assert!(a < b && b < c);
+    fn tenant_ids_are_pinned_forever() {
+        // Frames in stores carry these ids, so the mapping must never
+        // drift. If this test fails the change orphans every stream.
+        assert_eq!(tenant_id("local"), 0x25bf8e1a2393f1108d37029b3df55932);
+        assert_eq!(tenant_id("acme-prod"), 0xd2836b7de9447c4aa93c2d1dc4328c15);
+        assert_ne!(tenant_id("a"), tenant_id("b"));
     }
 
     #[test]
     fn only_the_manifest_is_mutable() {
         let t = TenantLayout::new("acme");
         assert!(!t.is_immutable(&t.manifest()));
-        assert!(t.is_immutable(&t.wal_segment(1, Lsn(0))));
         assert!(t.is_immutable(&t.checkpoint_page_index("chk-1")));
         assert!(t.is_immutable(&t.manifest_history(1, 1000)));
         assert!(!t.is_immutable("tenants/other/MANIFEST"));

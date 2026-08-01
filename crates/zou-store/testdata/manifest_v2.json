@@ -1,5 +1,5 @@
 {
-  "format": 1,
+  "format": 2,
   "ref": "acme-prod",
   "epoch": 42,
   "lease": {
@@ -23,11 +23,5 @@
       "kind": "delta"
     }
   ],
-  "wal_tail": {
-    "epoch_dir": 42,
-    "from_lsn": "0/8B000000",
-    "segments": [
-      "000000008B000000.wal"
-    ]
-  }
+  "folded_upto": "0/8B000000"
 }

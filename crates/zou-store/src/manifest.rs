@@ -1,7 +1,7 @@
 //! The manifest, the root of truth for one logical database.
 //!
 //! A manifest names the Postgres version, the current checkpoint set, the
-//! WAL tail, the writer lease, and the branch provenance. It is small,
+//! fold watermark, the writer lease, and the branch provenance. It is small,
 //! human readable JSON on purpose: debugging a production database should
 //! start with `curl` and eyes, not a hex dump.
 
@@ -11,7 +11,8 @@ use crate::lsn::Lsn;
 
 /// Current manifest format. Readers refuse anything newer with a clear
 /// error instead of misreading it, and transparently accept anything older.
-pub const MANIFEST_FORMAT: u32 = 1;
+/// Format 2 dropped the per tenant WAL tail in favor of the shared log.
+pub const MANIFEST_FORMAT: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -19,6 +20,10 @@ pub enum ManifestError {
         "manifest format {found} is newer than this binary supports ({MANIFEST_FORMAT}), upgrade zou"
     )]
     FormatTooNew { found: u32 },
+    #[error(
+        "this store still carries a v1 per tenant WAL tail, fold it down with the previous zou binary before upgrading"
+    )]
+    V1WalTail,
     #[error("invalid manifest json: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -37,16 +42,12 @@ pub struct Manifest {
     pub pg: PgInfo,
     #[serde(default)]
     pub checkpoints: Vec<CheckpointRef>,
+    /// Pg lsn the checkpoint chain covers through, the redo of the last
+    /// fold. Frames of the shared log at or below this never need replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wal_tail: Option<WalTail>,
+    pub folded_upto: Option<Lsn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_of: Option<BranchOf>,
-    /// WAL inherited from ancestors at branch time, replayed before the
-    /// own tail. Static: the referenced segments are sealed and the list
-    /// never grows, it only goes away wholesale once a fold learns to
-    /// repack the window it covers.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub parent_tail: Vec<ParentTail>,
     /// Unix seconds of the last state changing publish. Rides into the
     /// manifest history copy, which is what PITR picks a snapshot by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,36 +93,10 @@ pub struct CheckpointRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WalTail {
-    /// Epoch of the session that last published this tail. Segments carry
-    /// their own epoch in their name, so the list can span sessions.
-    pub epoch_dir: u64,
-    /// Replay starts here, at or after the newest checkpoint LSN.
-    pub from_lsn: Lsn,
-    /// Sealed segment paths relative to wal/, oldest first, each of the
-    /// form `<epoch>/<start-lsn>.wal`. The list chains across writer
-    /// sessions until a checkpoint folds it down.
-    #[serde(default)]
-    pub segments: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchOf {
     #[serde(rename = "ref")]
     pub tenant_ref: String,
     pub at_lsn: Lsn,
-}
-
-/// One ancestor's WAL tail as inherited at branch time. Segment names
-/// are the usual `<epoch>/<start-lsn>.wal`, resolved under the named
-/// tenant's prefix, not ours.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ParentTail {
-    #[serde(rename = "ref")]
-    pub tenant_ref: String,
-    pub from_lsn: Lsn,
-    #[serde(default)]
-    pub segments: Vec<String>,
 }
 
 impl Manifest {
@@ -137,9 +112,8 @@ impl Manifest {
                 timeline: 1,
             },
             checkpoints: Vec::new(),
-            wal_tail: None,
+            folded_upto: None,
             branch_of: None,
-            parent_tail: Vec::new(),
             published_unix: None,
         }
     }
@@ -152,14 +126,23 @@ impl Manifest {
 
     pub fn from_json(data: &[u8]) -> Result<Self, ManifestError> {
         // Peek at the format before full deserialization so a newer manifest
-        // fails with "upgrade zou" instead of a random missing-field error.
+        // fails with "upgrade zou" instead of a random missing-field error,
+        // and a v1 store with unfolded WAL fails with a migration message
+        // instead of silently losing its tail.
         #[derive(Deserialize)]
-        struct FormatOnly {
+        struct Peek {
             format: u32,
+            #[serde(default)]
+            wal_tail: Option<serde_json::Value>,
+            #[serde(default)]
+            parent_tail: Vec<serde_json::Value>,
         }
-        let f: FormatOnly = serde_json::from_slice(data)?;
-        if f.format > MANIFEST_FORMAT {
-            return Err(ManifestError::FormatTooNew { found: f.format });
+        let p: Peek = serde_json::from_slice(data)?;
+        if p.format > MANIFEST_FORMAT {
+            return Err(ManifestError::FormatTooNew { found: p.format });
+        }
+        if p.wal_tail.as_ref().is_some_and(|v| !v.is_null()) || !p.parent_tail.is_empty() {
+            return Err(ManifestError::V1WalTail);
         }
         Ok(serde_json::from_slice(data)?)
     }
@@ -197,13 +180,8 @@ mod tests {
                     owner: None,
                 },
             ],
-            wal_tail: Some(WalTail {
-                epoch_dir: 42,
-                from_lsn: "0/8B000000".parse().unwrap(),
-                segments: vec!["000000008B000000.wal".into()],
-            }),
+            folded_upto: Some("0/8B000000".parse().unwrap()),
             branch_of: None,
-            parent_tail: Vec::new(),
             published_unix: None,
         }
     }
@@ -216,7 +194,7 @@ mod tests {
 
     #[test]
     fn matches_the_golden_file() {
-        let golden = include_str!("../testdata/manifest_v1.json");
+        let golden = include_str!("../testdata/manifest_v2.json");
         let m = Manifest::from_json(golden.as_bytes()).unwrap();
         assert_eq!(m, sample());
         // And what we write is exactly what the golden file holds, so any
@@ -243,19 +221,46 @@ mod tests {
             at_lsn: "0/8B000000".parse().unwrap(),
         });
         m.checkpoints[0].owner = Some("acme-prod".into());
-        m.parent_tail.push(ParentTail {
-            tenant_ref: "acme-prod".into(),
-            from_lsn: "0/8B000000".parse().unwrap(),
-            segments: vec!["0000000000000042/000000008B000000.wal".into()],
-        });
         m.published_unix = Some(1_767_100_123);
         assert_eq!(Manifest::from_json(&m.to_json()).unwrap(), m);
         // The plain sample serializes without any of the new keys, which
         // is what keeps the golden file byte for byte stable.
         let text = String::from_utf8(sample().to_json()).unwrap();
-        for key in ["owner", "parent_tail", "published_unix"] {
+        for key in ["owner", "published_unix"] {
             assert!(!text.contains(key), "{key} leaked into a plain manifest");
         }
+    }
+
+    #[test]
+    fn refuses_a_v1_manifest_with_an_unfolded_wal_tail() {
+        let json = r#"{
+            "format": 1,
+            "ref": "t1",
+            "epoch": 3,
+            "pg": {"version": 18, "timeline": 1},
+            "wal_tail": {"epoch_dir": 3, "from_lsn": "0/0", "segments": []}
+        }"#;
+        let err = Manifest::from_json(json.as_bytes()).unwrap_err();
+        assert!(matches!(err, ManifestError::V1WalTail));
+        assert!(err.to_string().contains("previous zou binary"));
+
+        let json = r#"{
+            "format": 1,
+            "ref": "t1",
+            "epoch": 3,
+            "pg": {"version": 18, "timeline": 1},
+            "parent_tail": [{"ref": "p", "from_lsn": "0/0", "segments": []}]
+        }"#;
+        let err = Manifest::from_json(json.as_bytes()).unwrap_err();
+        assert!(matches!(err, ManifestError::V1WalTail));
+    }
+
+    #[test]
+    fn accepts_a_folded_v1_manifest() {
+        let json = r#"{"format":1,"ref":"t1","epoch":0,"pg":{"version":18,"timeline":1}}"#;
+        let m = Manifest::from_json(json.as_bytes()).unwrap();
+        assert_eq!(m.tenant_ref, "t1");
+        assert_eq!(m.format, 1);
     }
 
     #[test]

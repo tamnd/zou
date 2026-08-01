@@ -2,12 +2,12 @@
 //!
 //! Usage: `zou-branch <store-root> <src> <dst> [--at <lsn>|--ts <unix>]`
 //!
-//! With no flag the branch is taken at the source's last published
-//! state. `--at` pins it to an LSN, which must be a checkpoint redo or
-//! sit in the still unfolded tail, and `--ts` materializes the newest
-//! manifest history snapshot at or before that unix second. The child
-//! references the parent's objects, nothing is copied, so the call
-//! finishes in the time of two manifest round trips.
+//! With no flag the branch is taken at the source's newest checkpoint.
+//! `--at` pins it to an LSN, which must name a checkpoint lsn exactly,
+//! and `--ts` materializes the newest manifest history snapshot at or
+//! before that unix second. The child references the parent's objects,
+//! nothing is copied, so the call finishes in the time of two manifest
+//! round trips.
 
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -71,10 +71,9 @@ fn main() -> ExitCode {
         Ok(m) => {
             let at = m.branch_of.as_ref().expect("a child names its parent");
             println!(
-                "branched {src} into {dst} at {:#X}, {} checkpoints and {} parent tail entries inherited",
+                "branched {src} into {dst} at {:#X}, {} checkpoints inherited",
                 at.at_lsn.0,
-                m.checkpoints.len(),
-                m.parent_tail.len()
+                m.checkpoints.len()
             );
             ExitCode::SUCCESS
         }

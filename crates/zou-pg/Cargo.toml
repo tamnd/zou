@@ -15,6 +15,7 @@ crate-type = ["staticlib", "rlib"]
 # The s3 feature so ZOU_TARGET can name an object store URL, which links
 # the S3 client into the postgres backend through the staticlib.
 zou-store = { path = "../zou-store", features = ["s3", "sqlite"] }
+zou-log = { path = "../zou-log" }
 crc32c = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }

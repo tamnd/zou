@@ -94,7 +94,6 @@ mod tests {
     use crate::cas::LocalFsStore;
     use crate::layout::TenantLayout;
     use crate::lease;
-    use crate::lsn::Lsn;
     use crate::manifest::Manifest;
 
     fn guarded() -> (tempfile::TempDir, GuardedStore<LocalFsStore>) {
@@ -108,7 +107,7 @@ mod tests {
         let (_d, store) = guarded();
         let t = TenantLayout::new("t1");
         for key in [
-            t.wal_segment(1, Lsn(0)),
+            t.chk_file("chk-1", "base/one"),
             t.checkpoint_page_index("chk-1"),
             t.checkpoint_pages("chk-1", 0),
             t.manifest_history(1, 1000),
@@ -128,7 +127,7 @@ mod tests {
     fn creates_pass_through_and_double_create_still_fails() {
         let (_d, store) = guarded();
         let t = TenantLayout::new("t1");
-        let key = t.wal_segment(1, Lsn(0));
+        let key = t.chk_file("chk-1", "base/two");
         store.put_if_absent(&key, b"frame").unwrap();
         assert!(matches!(
             store.put_if_absent(&key, b"other").unwrap_err(),

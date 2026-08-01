@@ -2,20 +2,16 @@
 //!
 //! A branch is a new tenant prefix whose manifest points into its
 //! parent's immutable objects: checkpoint refs are copied and tagged
-//! with their owning tenant, and the parent's published WAL tail is
-//! carried along as a parent_tail entry so replay reaches the branch
-//! point. Nothing is copied, so a branch is one manifest GET and one
-//! conditional PUT whatever the database size.
+//! with their owning tenant. Nothing else moves, so a branch is one
+//! manifest GET and one conditional PUT whatever the database size.
 //!
-//! The branch point is the parent's last published state, not its in
-//! flight head: an unpublished segment can still be racing an upload
-//! and referencing it would tie the child to a write that may lose its
-//! lease. An explicit at_lsn either names a checkpoint exactly, which
-//! yields the state at that fold with no tail at all, or lands at or
-//! past the newest checkpoint, which keeps the tail segments starting
-//! below it. Segments are sealed as a whole, so an at_lsn inside a
-//! segment rounds up to that segment's end on replay; PITR here is
-//! segment grained, finer grains would need record level truncation.
+//! Branch points are checkpoint lsns. The tenant's WAL lives in the
+//! shared log, which consolidation rewrites and gc trims on its own
+//! schedule, so a child cannot pin unfolded WAL the way it pins a
+//! capture. An at_lsn that names a checkpoint pins the chain there,
+//! the fold that made it already covers everything before it, and the
+//! default branch point is the newest checkpoint. Anything finer
+//! means folding first; PITR granularity is the fold cadence.
 //!
 //! Materializing at a timestamp picks the newest history snapshot at
 //! or before it, written by [`crate::lease::update_manifest`] on every
@@ -26,7 +22,7 @@
 use crate::cas::{CasError, CasStore};
 use crate::layout::TenantLayout;
 use crate::lsn::Lsn;
-use crate::manifest::{BranchOf, Manifest, ManifestError, ParentTail};
+use crate::manifest::{BranchOf, Manifest, ManifestError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BranchError {
@@ -37,9 +33,9 @@ pub enum BranchError {
     #[error("source has no checkpoint yet, run zou-bootstrap first")]
     NoCheckpoint,
     #[error(
-        "lsn {at_lsn} is not a checkpoint and lies below the newest checkpoint {newest}, that state was folded away"
+        "lsn {at_lsn} is not a checkpoint lsn, branch points are checkpoint lsns in this release, fold first"
     )]
-    AtLsnUnavailable { at_lsn: Lsn, newest: Lsn },
+    AtLsnUnavailable { at_lsn: Lsn },
     #[error("no history snapshot at or before unix {unix_ts}, the retention window has passed it")]
     NoHistory { unix_ts: u64 },
     #[error(transparent)]
@@ -70,9 +66,9 @@ pub fn branch(
 }
 
 /// Create `dst_ref` from the newest history snapshot of `src_ref` at
-/// or before `unix_ts`. The snapshot is branched at its head, its own
-/// wal_tail becoming a parent_tail entry, so the child sees exactly
-/// what the source had published at that moment.
+/// or before `unix_ts`. The snapshot is branched at its newest
+/// checkpoint, so the child sees the last fold the source had
+/// published at that moment.
 pub fn materialize_at(
     store: &dyn CasStore,
     src_ref: &str,
@@ -132,15 +128,13 @@ fn child_of(
     let Some(newest) = parent.checkpoints.last().map(|c| c.lsn) else {
         return Err(BranchError::NoCheckpoint);
     };
-    // The checkpoint subset and whether the tail rides along. An at_lsn
-    // naming a checkpoint pins the chain there and needs no WAL, the
-    // fold that made it already covers everything before it.
-    let (upto, with_tail, at) = match at_lsn {
-        None => (parent.checkpoints.len(), true, newest),
-        Some(at) if at >= newest => (parent.checkpoints.len(), true, at),
+    // An at_lsn must name a checkpoint exactly, which pins the chain
+    // there; the fold that made it already covers everything before it.
+    let (upto, at) = match at_lsn {
+        None => (parent.checkpoints.len(), newest),
         Some(at) => match parent.checkpoints.iter().rposition(|c| c.lsn == at) {
-            Some(i) => (i + 1, false, at),
-            None => return Err(BranchError::AtLsnUnavailable { at_lsn: at, newest }),
+            Some(i) => (i + 1, at),
+            None => return Err(BranchError::AtLsnUnavailable { at_lsn: at }),
         },
     };
 
@@ -156,28 +150,6 @@ fn child_of(
             c
         })
         .collect();
-    if with_tail {
-        // Ancestor tails first, they replay before the parent's own.
-        child.parent_tail = parent.parent_tail.clone();
-        if let Some(tail) = &parent.wal_tail {
-            let segments: Vec<String> = match at_lsn {
-                None => tail.segments.clone(),
-                Some(at) => tail
-                    .segments
-                    .iter()
-                    .filter(|s| crate::commit::segment_start_lsn(s).is_none_or(|start| start < at))
-                    .cloned()
-                    .collect(),
-            };
-            if !segments.is_empty() {
-                child.parent_tail.push(ParentTail {
-                    tenant_ref: src_ref.to_string(),
-                    from_lsn: tail.from_lsn,
-                    segments,
-                });
-            }
-        }
-    }
     child.branch_of = Some(BranchOf {
         tenant_ref: src_ref.to_string(),
         at_lsn: at,
@@ -204,7 +176,7 @@ fn publish_child(store: &dyn CasStore, dst_ref: &str, child: &Manifest) -> Resul
 mod tests {
     use super::*;
     use crate::cas::LocalFsStore;
-    use crate::manifest::{CheckpointKind, CheckpointRef, WalTail};
+    use crate::manifest::{CheckpointKind, CheckpointRef};
 
     fn chk(id: &str, lsn: u64, kind: CheckpointKind) -> CheckpointRef {
         CheckpointRef {
@@ -222,14 +194,7 @@ mod tests {
             chk("f1", 0x100, CheckpointKind::Full),
             chk("d2", 0x200, CheckpointKind::Delta),
         ];
-        m.wal_tail = Some(WalTail {
-            epoch_dir: 3,
-            from_lsn: Lsn(0x200),
-            segments: vec![
-                "0000000000000003/0000000000000200.wal".into(),
-                "0000000000000003/0000000000000400.wal".into(),
-            ],
-        });
+        m.folded_upto = Some(Lsn(0x200));
         m
     }
 
@@ -246,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn a_head_branch_inherits_the_chain_and_the_whole_tail() {
+    fn a_head_branch_inherits_the_chain_at_the_newest_checkpoint() {
         let (_d, store) = setup();
         let child = branch(&store, "p", "c", None, 5000).unwrap();
 
@@ -261,10 +226,10 @@ mod tests {
                 .all(|c| c.owner.as_deref() == Some("p")),
             "inherited refs are tagged with their owner"
         );
-        assert_eq!(child.parent_tail.len(), 1);
-        assert_eq!(child.parent_tail[0].tenant_ref, "p");
-        assert_eq!(child.parent_tail[0].segments.len(), 2);
-        assert!(child.wal_tail.is_none(), "the child has written nothing");
+        assert!(
+            child.folded_upto.is_none(),
+            "the child's own fold cursor starts fresh"
+        );
         let b = child.branch_of.unwrap();
         assert_eq!((b.tenant_ref.as_str(), b.at_lsn), ("p", Lsn(0x200)));
         assert_eq!(child.published_unix, Some(5000));
@@ -279,62 +244,32 @@ mod tests {
     }
 
     #[test]
-    fn an_at_lsn_naming_a_checkpoint_pins_the_chain_and_drops_the_tail() {
+    fn an_at_lsn_naming_a_checkpoint_pins_the_chain_there() {
         let (_d, store) = setup();
         let child = branch(&store, "p", "c", Some(Lsn(0x100)), 5000).unwrap();
         assert_eq!(child.checkpoints.len(), 1);
         assert_eq!(child.checkpoints[0].id, "f1");
-        assert!(
-            child.parent_tail.is_empty(),
-            "the fold at 0x100 already covers everything before it"
-        );
         assert_eq!(child.branch_of.unwrap().at_lsn, Lsn(0x100));
     }
 
     #[test]
-    fn an_at_lsn_past_the_newest_checkpoint_keeps_segments_below_it() {
+    fn an_at_lsn_off_the_checkpoint_grid_is_refused() {
         let (_d, store) = setup();
-        let child = branch(&store, "p", "c", Some(Lsn(0x300)), 5000).unwrap();
-        assert_eq!(child.checkpoints.len(), 2);
-        assert_eq!(
-            child.parent_tail[0].segments,
-            vec!["0000000000000003/0000000000000200.wal".to_string()],
-            "the segment starting at 0x400 lies wholly past the branch point"
-        );
+        // Between two checkpoints, and past the newest one: neither
+        // names a fold, so neither is a branch point.
+        for lsn in [0x180u64, 0x300] {
+            let err = branch(&store, "p", "c", Some(Lsn(lsn)), 5000).unwrap_err();
+            assert!(matches!(
+                err,
+                BranchError::AtLsnUnavailable { at_lsn } if at_lsn == Lsn(lsn)
+            ));
+        }
     }
 
     #[test]
-    fn an_at_lsn_inside_a_folded_window_is_refused() {
-        let (_d, store) = setup();
-        let err = branch(&store, "p", "c", Some(Lsn(0x180)), 5000).unwrap_err();
-        assert!(matches!(
-            err,
-            BranchError::AtLsnUnavailable {
-                at_lsn: Lsn(0x180),
-                newest: Lsn(0x200)
-            }
-        ));
-    }
-
-    #[test]
-    fn branching_a_branch_chains_owners_and_tails() {
+    fn branching_a_branch_chains_owners() {
         let (_d, store) = setup();
         branch(&store, "p", "c", None, 5000).unwrap();
-
-        // The middle branch grows its own tail before being branched.
-        let c_layout = TenantLayout::new("c");
-        let (data, v) = store.get(&c_layout.manifest()).unwrap().unwrap();
-        let mut c = Manifest::from_json(&data).unwrap();
-        c.epoch = 1;
-        c.wal_tail = Some(WalTail {
-            epoch_dir: 1,
-            from_lsn: Lsn(0x500),
-            segments: vec!["0000000000000001/0000000000000500.wal".into()],
-        });
-        store
-            .put_if_match(&c_layout.manifest(), &c.to_json(), Some(&v))
-            .unwrap();
-
         let g = branch(&store, "c", "g", None, 6000).unwrap();
         assert!(
             g.checkpoints
@@ -342,9 +277,6 @@ mod tests {
                 .all(|c| c.owner.as_deref() == Some("p")),
             "owner tags survive a second hop untouched"
         );
-        assert_eq!(g.parent_tail.len(), 2);
-        assert_eq!(g.parent_tail[0].tenant_ref, "p");
-        assert_eq!(g.parent_tail[1].tenant_ref, "c");
         assert_eq!(g.branch_of.unwrap().tenant_ref, "c");
     }
 
@@ -384,29 +316,28 @@ mod tests {
         // one is past the asked timestamp and must not win.
         let mut early = parent_manifest();
         early.checkpoints.truncate(1);
-        early.wal_tail = None;
         early.published_unix = Some(1000);
         store
             .put_if_absent(&p.manifest_history(3, 1000), &early.to_json())
             .unwrap();
         let mut middle = parent_manifest();
-        middle.wal_tail.as_mut().unwrap().segments.truncate(1);
         middle.published_unix = Some(2000);
         store
             .put_if_absent(&p.manifest_history(3, 2000), &middle.to_json())
             .unwrap();
         let mut late = parent_manifest();
+        late.checkpoints
+            .push(chk("d3", 0x300, CheckpointKind::Delta));
         late.published_unix = Some(3000);
         store
             .put_if_absent(&p.manifest_history(3, 3000), &late.to_json())
             .unwrap();
 
         let child = materialize_at(&store, "p", "c", 2500, 5000).unwrap();
-        assert_eq!(child.checkpoints.len(), 2);
         assert_eq!(
-            child.parent_tail[0].segments,
-            vec!["0000000000000003/0000000000000200.wal".to_string()],
-            "the child sees the tail as of the snapshot, not the head"
+            child.checkpoints.len(),
+            2,
+            "the child sees the chain as of the snapshot, not the head"
         );
 
         let err = materialize_at(&store, "p", "c2", 999, 5000).unwrap_err();

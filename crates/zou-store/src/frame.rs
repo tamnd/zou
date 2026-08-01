@@ -3,8 +3,8 @@
 //!
 //! Everything that enters a shard is a frame. Frames from many tenants
 //! interleave freely inside a landing segment, so unlike the v1 frame
-//! in [`crate::wal`] every frame carries its tenant ref, and the writer
-//! epoch is per tenant rather than per store. Block ref hints ride
+//! every frame carries its tenant ref, and the writer epoch is per
+//! tenant rather than per store. Block ref hints ride
 //! along uncompressed so the sequencer can tee filter per page shard
 //! without decrypting or parsing payloads: the compute already knows
 //! the block refs and pays nothing to repeat them.
@@ -34,9 +34,8 @@ use crate::lsn::Lsn;
 pub const FRAME2_HEADER_LEN: usize = 49;
 const CRC_END: usize = 8;
 
-/// Hard cap on one frame's uncompressed payload, same rationale as
-/// [`crate::wal::MAX_BODY_LEN`]: group commit seals batches far below
-/// this, the cap only exists to stop a hostile length field.
+/// Hard cap on one frame's uncompressed payload. Pushers seal batches
+/// far below this, the cap only exists to stop a hostile length field.
 pub const MAX_PAYLOAD_LEN: u32 = 64 * 1024 * 1024;
 
 /// Hard cap on block ref hints per frame. A full 4 MB batch of 8 KB
@@ -281,9 +280,9 @@ impl Frame2 {
 }
 
 /// Walks the interleaved frames of one landing segment region. No
-/// epoch filtering here, unlike [`crate::wal::SegmentReader`]: frames
-/// from many tenants share a segment and epoch admission already
-/// happened at the sequencer, so a consumer filters by tenant itself.
+/// epoch filtering here: frames from many tenants share a segment and
+/// epoch admission already happened at the sequencer, so a consumer
+/// filters by tenant itself.
 pub struct Frame2Stream<'a> {
     buf: &'a [u8],
 }
