@@ -263,7 +263,7 @@ impl Pool {
     /// connection, because whatever happened while it was down was
     /// missed, and a database with no event trigger installed, because
     /// then nothing will ever notify and the cache would go stale
-    /// forever; that deployment gets [`REFRESH`] instead, which is the
+    /// forever; that deployment gets the timed refresh instead, which is the
     /// honest fallback rather than a silent one.
     pub fn watch(&self, epoch: Arc<AtomicU64>) {
         let pool = self.clone();
