@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use zou_log::{
-    AppendError, CasSink, ChainError, SegmentBuilder, SegmentHeader, SegmentKind, Sequencer,
-    SequencerConfig, ShardManifest, chain_head, read_chain, segment_key, take_over, tenants_digest,
+    AppendError, ChainError, MediaSink, SegmentBuilder, SegmentHeader, SegmentKind, Sequencer,
+    SequencerConfig, ShardManifest, WalMedia, chain_head, read_chain, segment_key, take_over,
+    tenants_digest,
 };
 use zou_store::{CasError, CasStore, Frame2, LocalFsStore, Lsn, Version};
 
@@ -34,21 +35,23 @@ fn quick() -> SequencerConfig {
     }
 }
 
-fn store_in(dir: &tempfile::TempDir) -> Arc<dyn CasStore> {
-    Arc::new(LocalFsStore::new(dir.path()))
+fn store_in(dir: &tempfile::TempDir) -> (Arc<dyn CasStore>, Arc<WalMedia>) {
+    let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(dir.path()));
+    let media = Arc::new(WalMedia::single(Arc::clone(&store)));
+    (store, media)
 }
 
-fn resume(store: &Arc<dyn CasStore>, shard: u32, t: zou_log::Takeover) -> Sequencer {
-    let sink = Arc::new(CasSink::new(Arc::clone(store), shard));
+fn resume(media: &Arc<WalMedia>, shard: u32, t: zou_log::Takeover) -> Sequencer {
+    let sink = Arc::new(MediaSink::new(Arc::clone(media), shard));
     Sequencer::resume(shard, sink as _, quick(), t.next_seq, t.prev_digest)
 }
 
 #[test]
 fn bootstrap_takeover_on_an_empty_shard() {
     let dir = tempfile::tempdir().unwrap();
-    let store = store_in(&dir);
+    let (store, media) = store_in(&dir);
 
-    let t = take_over(store.as_ref(), 5, "node-a").unwrap();
+    let t = take_over(&media, 5, "node-a").unwrap();
     assert_eq!(t.chain_epoch, 1);
     assert_eq!(t.sealed_seq, 1);
     assert_eq!(t.next_seq, 2);
@@ -59,7 +62,7 @@ fn bootstrap_takeover_on_an_empty_shard() {
     assert_eq!(m.head, 1);
     assert_eq!(m.sealed_by, "node-a");
 
-    let chain = read_chain(store.as_ref(), 5, 0).unwrap();
+    let chain = read_chain(&media, 5, 0).unwrap();
     assert_eq!(chain.len(), 1);
     assert_eq!(chain[0].header.kind, SegmentKind::Seal);
     assert!(chain[0].frames.is_empty());
@@ -68,12 +71,12 @@ fn bootstrap_takeover_on_an_empty_shard() {
 #[test]
 fn the_seal_fences_a_live_sequencer_and_acked_writes_survive_takeover() {
     let dir = tempfile::tempdir().unwrap();
-    let store = store_in(&dir);
+    let (_store, media) = store_in(&dir);
     let shard = 9;
 
     // Node a takes the shard and commits three windows.
-    let ta = take_over(store.as_ref(), shard, "node-a").unwrap();
-    let seq_a = resume(&store, shard, ta);
+    let ta = take_over(&media, shard, "node-a").unwrap();
+    let seq_a = resume(&media, shard, ta);
     let mut acked = Vec::new();
     for (i, body) in [b"first".as_ref(), b"second", b"third"].iter().enumerate() {
         let lsn = 100 * (i as u64 + 1);
@@ -86,7 +89,7 @@ fn the_seal_fences_a_live_sequencer_and_acked_writes_survive_takeover() {
     }
 
     // Node b takes over while a still believes it holds the role.
-    let tb = take_over(store.as_ref(), shard, "node-b").unwrap();
+    let tb = take_over(&media, shard, "node-b").unwrap();
     assert_eq!(tb.chain_epoch, 2);
     assert_eq!(tb.sealed_seq, ta.next_seq + 3);
 
@@ -107,7 +110,7 @@ fn the_seal_fences_a_live_sequencer_and_acked_writes_survive_takeover() {
     seq_a.close().unwrap();
 
     // Node b commits on the chain it adopted.
-    let seq_b = resume(&store, shard, tb);
+    let seq_b = resume(&media, shard, tb);
     seq_b
         .append(vec![frame(2, 5000, b"the successor writes")])
         .unwrap()
@@ -117,7 +120,7 @@ fn the_seal_fences_a_live_sequencer_and_acked_writes_survive_takeover() {
 
     // The whole chain reads back with every digest link intact, every
     // acked write from a is inside it, and the zombie write is not.
-    let chain = read_chain(store.as_ref(), shard, 0).unwrap();
+    let chain = read_chain(&media, shard, 0).unwrap();
     let landed: Vec<&Frame2> = chain.iter().flat_map(|s| &s.frames).collect();
     for (lsn, body) in &acked {
         assert!(
@@ -139,11 +142,11 @@ fn the_seal_fences_a_live_sequencer_and_acked_writes_survive_takeover() {
 #[test]
 fn a_crash_between_seal_and_manifest_cas_wedges_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let store = store_in(&dir);
+    let (store, media) = store_in(&dir);
     let shard = 2;
 
-    let ta = take_over(store.as_ref(), shard, "node-a").unwrap();
-    let seq_a = resume(&store, shard, ta);
+    let ta = take_over(&media, shard, "node-a").unwrap();
+    let seq_a = resume(&media, shard, ta);
     seq_a
         .append(vec![frame(1, 10, b"before the crash")])
         .unwrap()
@@ -152,7 +155,7 @@ fn a_crash_between_seal_and_manifest_cas_wedges_nothing() {
     seq_a.close().unwrap();
 
     // A successor seals the head and dies before touching the manifest.
-    let head = chain_head(store.as_ref(), shard, 0).unwrap();
+    let head = chain_head(&media, shard, 0).unwrap();
     let orphan_seal = head + 1;
     let (bytes, _) = store.get(&segment_key(shard, head)).unwrap().unwrap();
     let (_, footer) = zou_log::read_footer(&bytes).unwrap();
@@ -168,11 +171,11 @@ fn a_crash_between_seal_and_manifest_cas_wedges_nothing() {
         .unwrap();
 
     // The next takeover probes past the orphan and carries on.
-    let tb = take_over(store.as_ref(), shard, "node-b").unwrap();
+    let tb = take_over(&media, shard, "node-b").unwrap();
     assert_eq!(tb.sealed_seq, orphan_seal + 1);
     assert_eq!(tb.chain_epoch, 2);
 
-    let seq_b = resume(&store, shard, tb);
+    let seq_b = resume(&media, shard, tb);
     seq_b
         .append(vec![frame(1, 20, b"after recovery")])
         .unwrap()
@@ -181,20 +184,20 @@ fn a_crash_between_seal_and_manifest_cas_wedges_nothing() {
     seq_b.close().unwrap();
 
     // The chain reads clean across the orphan seal.
-    let chain = read_chain(store.as_ref(), shard, 0).unwrap();
+    let chain = read_chain(&media, shard, 0).unwrap();
     assert_eq!(chain.last().unwrap().frames[0].payload, b"after recovery");
 }
 
 #[test]
 fn racing_successors_leave_one_clean_chain() {
     let dir = tempfile::tempdir().unwrap();
-    let store = store_in(&dir);
+    let (store, media) = store_in(&dir);
     let shard = 4;
 
     let racers: Vec<_> = (0..4)
         .map(|i| {
-            let store = Arc::clone(&store);
-            std::thread::spawn(move || take_over(store.as_ref(), shard, &format!("racer-{i}")))
+            let media = Arc::clone(&media);
+            std::thread::spawn(move || take_over(&media, shard, &format!("racer-{i}")))
         })
         .collect();
     let mut wins = 0;
@@ -212,16 +215,13 @@ fn racing_successors_leave_one_clean_chain() {
     // is fine, a seal is just a fence post, but the manifest must
     // never overshoot the store: probing from its head has to land on
     // the true head.
-    let chain = read_chain(store.as_ref(), shard, 0).unwrap();
+    let chain = read_chain(&media, shard, 0).unwrap();
     assert!(chain.len() >= wins);
     assert!(chain.iter().all(|s| s.header.kind == SegmentKind::Seal));
-    let true_head = chain_head(store.as_ref(), shard, 0).unwrap();
+    let true_head = chain_head(&media, shard, 0).unwrap();
     let (m, _) = ShardManifest::load(store.as_ref(), shard).unwrap().unwrap();
     assert!(m.head <= true_head);
-    assert_eq!(
-        chain_head(store.as_ref(), shard, m.head).unwrap(),
-        true_head
-    );
+    assert_eq!(chain_head(&media, shard, m.head).unwrap(), true_head);
 }
 
 /// Counts existence probes so the head search can prove it gallops.
@@ -257,7 +257,7 @@ impl CasStore for CountingStore {
 #[test]
 fn head_probes_cost_log_in_the_manifest_lag_not_linear() {
     let dir = tempfile::tempdir().unwrap();
-    let store = store_in(&dir);
+    let (store, _media) = store_in(&dir);
     let shard = 6;
 
     // A long lived sequencer landed 200 windows since the last takeover
@@ -277,11 +277,12 @@ fn head_probes_cost_log_in_the_manifest_lag_not_linear() {
         prev_digest = tenants_digest(&summaries);
     }
 
-    let counting = CountingStore {
+    let counting = Arc::new(CountingStore {
         inner: Arc::clone(&store),
         range_gets: AtomicUsize::new(0),
-    };
-    assert_eq!(chain_head(&counting, shard, 0).unwrap(), 200);
+    });
+    let counted = WalMedia::single(Arc::clone(&counting) as Arc<dyn CasStore>);
+    assert_eq!(chain_head(&counted, shard, 0).unwrap(), 200);
     let probes = counting.range_gets.load(Ordering::Relaxed);
     assert!(probes <= 20, "{probes} probes to find seq 200 in a gallop");
 }
@@ -289,11 +290,11 @@ fn head_probes_cost_log_in_the_manifest_lag_not_linear() {
 #[test]
 fn a_segment_that_does_not_link_is_refused_by_the_chain_read() {
     let dir = tempfile::tempdir().unwrap();
-    let store = store_in(&dir);
+    let (store, media) = store_in(&dir);
     let shard = 8;
 
-    let t = take_over(store.as_ref(), shard, "node-a").unwrap();
-    let seq = resume(&store, shard, t);
+    let t = take_over(&media, shard, "node-a").unwrap();
+    let seq = resume(&media, shard, t);
     seq.append(vec![frame(1, 10, b"good")])
         .unwrap()
         .wait()
@@ -303,7 +304,7 @@ fn a_segment_that_does_not_link_is_refused_by_the_chain_read() {
     // Plant a well formed segment at the next seq with a digest that
     // links to nothing, the shape a half landed write from a forgotten
     // epoch would have.
-    let head = chain_head(store.as_ref(), shard, 0).unwrap();
+    let head = chain_head(&media, shard, 0).unwrap();
     let (bytes, _) = SegmentBuilder::new(SegmentHeader {
         kind: SegmentKind::Landing,
         shard,
@@ -315,7 +316,7 @@ fn a_segment_that_does_not_link_is_refused_by_the_chain_read() {
         .put_if_absent(&segment_key(shard, head + 1), &bytes)
         .unwrap();
 
-    match read_chain(store.as_ref(), shard, 0) {
+    match read_chain(&media, shard, 0) {
         Err(ChainError::BrokenLink { seq, .. }) => assert_eq!(seq, head + 1),
         other => panic!("expected a broken link, got {other:?}"),
     }

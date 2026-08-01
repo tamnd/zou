@@ -14,6 +14,7 @@
 //! test double.
 
 pub mod chain;
+pub mod media;
 pub mod segment;
 pub mod sequencer;
 
@@ -21,8 +22,9 @@ pub use chain::{
     ChainError, ChainSegment, SHARD_MANIFEST_FORMAT, ShardManifest, Takeover, chain_head,
     manifest_key, read_chain, segment_key, take_over,
 };
+pub use media::{DEFAULT_HEDGE_AFTER, DurabilityMode, MediaSink, SealOutcome, WalMedia};
 pub use segment::{
     Footer, SEGMENT_VERSION, SegmentBuilder, SegmentDecodeError, SegmentHeader, SegmentKind,
     TenantRun, TenantSummary, decode_segment, read_footer, tenants_digest,
 };
-pub use sequencer::{AppendError, AppendTicket, CasSink, SegmentSink, Sequencer, SequencerConfig};
+pub use sequencer::{AppendError, AppendTicket, SegmentSink, Sequencer, SequencerConfig};
