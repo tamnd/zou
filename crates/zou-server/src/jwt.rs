@@ -16,8 +16,8 @@
 
 use base64ct::{Base64UrlUnpadded, Encoding};
 use hmac::{Hmac, KeyInit, Mac};
-use p256::ecdsa::signature::Verifier as _;
-use p256::ecdsa::{Signature, VerifyingKey};
+use p256::ecdsa::signature::{Signer as _, Verifier as _};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use sha2::Sha256;
 
 /// A verified token: the claim set as parsed JSON plus the fields the
@@ -61,7 +61,16 @@ pub struct Jwks {
 
 struct Jwk {
     kid: Option<String>,
-    key: VerifyingKey,
+    key: Public,
+}
+
+/// What a key in the verification set can check a signature with. An
+/// hmac secret is here because a project mid rotation names its old
+/// symmetric key by kid like any other, and GoTrue honours that kid
+/// rather than always reaching for the project secret.
+enum Public {
+    Ec(Box<VerifyingKey>),
+    Oct(Vec<u8>),
 }
 
 impl Jwks {
@@ -92,7 +101,10 @@ impl Jwks {
                 .get("kid")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            keys.push(Jwk { kid, key });
+            keys.push(Jwk {
+                kid,
+                key: Public::Ec(Box::new(key)),
+            });
         }
         if keys.is_empty() {
             return Err("jwks carries no usable P-256 keys".to_string());
@@ -100,17 +112,241 @@ impl Jwks {
         Ok(Jwks { keys })
     }
 
+    /// Everything a project can verify with: the keys an operator
+    /// pointed at, plus the public half of the keys this server signs
+    /// with. Both are needed at once during a rotation, and neither
+    /// replaces the other.
+    pub fn and(mut self, more: Jwks) -> Jwks {
+        self.keys.extend(more.keys);
+        self
+    }
+
     /// The keys worth trying for a token: a kid match when the header
     /// names one, every key when it does not.
     fn candidates(&self, kid: Option<&str>) -> Vec<&VerifyingKey> {
-        match kid {
-            Some(kid) => self
+        self.keys
+            .iter()
+            .filter(|k| kid.is_none() || k.kid.as_deref() == kid)
+            .filter_map(|k| match &k.key {
+                Public::Ec(key) => Some(key.as_ref()),
+                Public::Oct(_) => None,
+            })
+            .collect()
+    }
+
+    /// The hmac secret a kid names, when it names one in this set.
+    /// Without a match the caller falls back to the project secret,
+    /// which is what a token minted before any of this was configured
+    /// was signed with.
+    fn secret_for(&self, kid: Option<&str>) -> Option<&[u8]> {
+        let kid = kid?;
+        self.keys
+            .iter()
+            .filter(|k| k.kid.as_deref() == Some(kid))
+            .find_map(|k| match &k.key {
+                Public::Oct(secret) => Some(secret.as_slice()),
+                Public::Ec(_) => None,
+            })
+    }
+}
+
+/// The project's own signing keys, GoTrue's GOTRUE_JWT_KEYS: a json
+/// array of private JWKs, of which exactly one carries `sign` in its
+/// key_ops and is therefore the key new tokens are signed with. The
+/// others are the standby key and the ones rotated away from, kept so
+/// that tokens still in flight verify until they expire.
+///
+/// Supabase's console calls those states standby, in use, previously
+/// used and revoked. Revoked is the absence of the key from this array,
+/// everything else is a key with `verify` alone.
+pub struct KeySet {
+    keys: Vec<Private>,
+    /// Index into `keys` of the one that signs. Fixed at parse time,
+    /// because a set with none or several is a configuration error and
+    /// not something to discover while answering a request.
+    signing: usize,
+}
+
+struct Private {
+    kid: String,
+    material: Secret,
+}
+
+enum Secret {
+    /// A P-256 keypair. The public half is derived from the private
+    /// scalar rather than read from x and y, so a jwk whose coordinates
+    /// disagree with its d cannot publish a key that verifies nothing.
+    Ec(Box<SigningKey>),
+    Oct(Vec<u8>),
+}
+
+impl KeySet {
+    /// Parse GOTRUE_JWT_KEYS. Errors are the operator's to fix and are
+    /// worded for them, and they happen at startup rather than at the
+    /// first request.
+    pub fn parse(json: &str) -> Result<KeySet, String> {
+        let doc: serde_json::Value =
+            serde_json::from_str(json).map_err(|e| format!("jwt keys are not json: {e}"))?;
+        let entries = doc
+            .as_array()
+            .ok_or("jwt keys must be a json array of private jwks")?;
+        let mut keys = Vec::new();
+        let mut signing = Vec::new();
+        for entry in entries {
+            let kid = entry
+                .get("kid")
+                .and_then(|v| v.as_str())
+                .ok_or("a jwt key has no kid, and a key that cannot be named cannot be rotated")?
+                .to_string();
+            let ops: Vec<&str> = entry
+                .get("key_ops")
+                .and_then(|v| v.as_array())
+                .map(|v| v.iter().filter_map(|o| o.as_str()).collect())
+                .unwrap_or_default();
+            let material = material_of(entry, &kid)?;
+            if ops.contains(&"sign") {
+                signing.push(keys.len());
+            }
+            keys.push(Private { kid, material });
+        }
+        match signing.len() {
+            1 => Ok(KeySet {
+                keys,
+                signing: signing[0],
+            }),
+            0 => Err("no signing key detected, one jwt key needs sign in its key_ops".to_string()),
+            _ => Err("multiple signing keys detected, only 1 signing key is supported".to_string()),
+        }
+    }
+
+    /// The public half of the set, as the jwks endpoint serves it.
+    /// Symmetric keys are left out: publishing an hmac secret hands out
+    /// the ability to sign, which is the whole reason the asymmetric
+    /// format exists.
+    pub fn published(&self) -> serde_json::Value {
+        let keys: Vec<serde_json::Value> = self
+            .keys
+            .iter()
+            .filter_map(|k| match &k.material {
+                Secret::Ec(sk) => {
+                    let point = sk.verifying_key().to_sec1_point(false);
+                    Some(serde_json::json!({
+                        "kty": "EC",
+                        "crv": "P-256",
+                        "kid": k.kid,
+                        "alg": "ES256",
+                        "use": "sig",
+                        "key_ops": ["verify"],
+                        "x": Base64UrlUnpadded::encode_string(point.x().expect("an uncompressed point has x")),
+                        "y": Base64UrlUnpadded::encode_string(point.y().expect("an uncompressed point has y")),
+                    }))
+                }
+                Secret::Oct(_) => None,
+            })
+            .collect();
+        serde_json::json!({ "keys": keys })
+    }
+
+    /// The same keys as something [`verify_any`] can check against, the
+    /// symmetric ones included: this end holds them already, and a
+    /// token naming one by kid was signed with it.
+    pub fn verifiers(&self) -> Jwks {
+        Jwks {
+            keys: self
                 .keys
                 .iter()
-                .filter(|k| k.kid.as_deref() == Some(kid))
-                .map(|k| &k.key)
+                .map(|k| Jwk {
+                    kid: Some(k.kid.clone()),
+                    key: match &k.material {
+                        Secret::Ec(sk) => Public::Ec(Box::new(*sk.verifying_key())),
+                        Secret::Oct(secret) => Public::Oct(secret.clone()),
+                    },
+                })
                 .collect(),
-            None => self.keys.iter().map(|k| &k.key).collect(),
+        }
+    }
+
+    /// Sign with the one key that signs, naming it in the header so a
+    /// verifier picks the right one out of the published set without
+    /// trying all of them.
+    pub fn sign(&self, claims: &serde_json::Value) -> String {
+        let key = &self.keys[self.signing];
+        match &key.material {
+            Secret::Ec(sk) => {
+                let header = serde_json::json!({"alg": "ES256", "typ": "JWT", "kid": key.kid});
+                let signed = signing_input(&header, claims);
+                let sig: Signature = sk.sign(signed.as_bytes());
+                format!(
+                    "{signed}.{}",
+                    Base64UrlUnpadded::encode_string(&sig.to_bytes())
+                )
+            }
+            Secret::Oct(secret) => {
+                let header = serde_json::json!({"alg": "HS256", "typ": "JWT", "kid": key.kid});
+                let signed = signing_input(&header, claims);
+                format!("{signed}.{}", hs256(&signed, secret))
+            }
+        }
+    }
+}
+
+fn material_of(entry: &serde_json::Value, kid: &str) -> Result<Secret, String> {
+    match entry.get("kty").and_then(|v| v.as_str()) {
+        Some("EC") => {
+            if entry.get("crv").and_then(|v| v.as_str()) != Some("P-256") {
+                return Err(format!(
+                    "jwt key {kid} is not on P-256, which is all ES256 has"
+                ));
+            }
+            let d = coord(entry, "d")?;
+            let sk = SigningKey::from_slice(&d)
+                .map_err(|_| format!("jwt key {kid} has a d that is not a P-256 scalar"))?;
+            Ok(Secret::Ec(Box::new(sk)))
+        }
+        Some("oct") => {
+            let k = entry
+                .get("k")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("jwt key {kid} is an oct key with no k"))?;
+            let secret = Base64UrlUnpadded::decode_vec(k)
+                .map_err(|_| format!("jwt key {kid} has a k that is not base64url"))?;
+            Ok(Secret::Oct(secret))
+        }
+        other => Err(format!(
+            "jwt key {kid} is {}, and zou signs and verifies EC on P-256 and oct",
+            other.unwrap_or("missing its kty")
+        )),
+    }
+}
+
+fn signing_input(header: &serde_json::Value, claims: &serde_json::Value) -> String {
+    format!(
+        "{}.{}",
+        Base64UrlUnpadded::encode_string(header.to_string().as_bytes()),
+        Base64UrlUnpadded::encode_string(claims.to_string().as_bytes())
+    )
+}
+
+fn hs256(signed: &str, secret: &[u8]) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
+    mac.update(signed.as_bytes());
+    Base64UrlUnpadded::encode_string(&mac.finalize().into_bytes())
+}
+
+/// What signs the access tokens this server issues: the project secret
+/// on the legacy format, or the one key in the set that signs. Both are
+/// verifiable by anything holding the project's keys, the difference is
+/// whether verifying needs the secret or only the published half.
+pub enum Signer<'a> {
+    Secret(&'a [u8]),
+    Keys(&'a KeySet),
+}
+
+impl Signer<'_> {
+    pub fn sign(&self, claims: &serde_json::Value) -> String {
+        match self {
+            Signer::Secret(secret) => mint(claims, secret),
+            Signer::Keys(keys) => keys.sign(claims),
         }
     }
 }
@@ -119,11 +355,11 @@ fn coord(entry: &serde_json::Value, name: &str) -> Result<Vec<u8>, String> {
     let v = entry
         .get(name)
         .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("jwks EC key misses {name}"))?;
+        .ok_or_else(|| format!("jwk EC key misses {name}"))?;
     let bytes =
-        Base64UrlUnpadded::decode_vec(v).map_err(|_| format!("jwks {name} is not base64url"))?;
+        Base64UrlUnpadded::decode_vec(v).map_err(|_| format!("jwk {name} is not base64url"))?;
     if bytes.len() != 32 {
-        return Err(format!("jwks {name} is not 32 bytes"));
+        return Err(format!("jwk {name} is not 32 bytes"));
     }
     Ok(bytes)
 }
@@ -221,7 +457,15 @@ pub fn verify(token: &str, secret: &[u8]) -> Result<Verified, Reject> {
 pub fn verify_any(token: &str, secret: &[u8], jwks: Option<&Jwks>) -> Result<Verified, Reject> {
     let parts = split(token)?;
     match parts.header.get("alg").and_then(|a| a.as_str()) {
-        Some("HS256") => verify_hs256(&parts, secret)?,
+        Some("HS256") => {
+            // A kid naming a symmetric key in the set wins, and the
+            // project secret is what a token carrying no kid, or one
+            // this set never heard of, was signed with. That fallback
+            // is what keeps tokens issued before a rotation working.
+            let kid = parts.header.get("kid").and_then(|v| v.as_str());
+            let secret = jwks.and_then(|j| j.secret_for(kid)).unwrap_or(secret);
+            verify_hs256(&parts, secret)?
+        }
         Some("ES256") => match jwks {
             Some(jwks) => verify_es256(&parts, jwks)?,
             None => return Err(Reject::WrongAlgorithm),
@@ -260,7 +504,6 @@ pub fn key_claims(role: &str) -> serde_json::Value {
 mod tests {
     use super::*;
     use p256::ecdsa::SigningKey;
-    use p256::ecdsa::signature::Signer as _;
 
     const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long";
 
@@ -443,5 +686,187 @@ mod tests {
             Jwks::parse(r#"{"keys": [{"kty": "EC", "crv": "P-256", "x": "AAAA", "y": "AAAA"}]}"#)
                 .is_err()
         );
+    }
+
+    /// A private ES256 jwk, the shape Supabase hands an operator when
+    /// it creates a signing key. `ops` is what decides whether it is
+    /// the key in use or one being kept around to verify with.
+    fn private_ec(kid: &str, d: u8, ops: &[&str]) -> serde_json::Value {
+        let sk = SigningKey::from_slice(&[d; 32]).expect("a small scalar is valid");
+        let point = sk.verifying_key().to_sec1_point(false);
+        serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "kid": kid,
+            "alg": "ES256",
+            "key_ops": ops,
+            "d": Base64UrlUnpadded::encode_string(&sk.to_bytes()),
+            "x": Base64UrlUnpadded::encode_string(point.x().unwrap()),
+            "y": Base64UrlUnpadded::encode_string(point.y().unwrap()),
+        })
+    }
+
+    #[test]
+    fn a_key_set_signs_with_the_one_key_that_signs() {
+        let keys = KeySet::parse(
+            &serde_json::json!([
+                private_ec("standby", 3, &["verify"]),
+                private_ec("in-use", 4, &["sign", "verify"]),
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        let token = keys.sign(&serde_json::json!({"role": "authenticated"}));
+        let header: serde_json::Value = serde_json::from_slice(
+            &Base64UrlUnpadded::decode_vec(token.split('.').next().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["kid"], "in-use", "the standby key does not sign");
+
+        let v = verify_any(&token, SECRET, Some(&keys.verifiers())).unwrap();
+        assert_eq!(v.role.as_deref(), Some("authenticated"));
+    }
+
+    #[test]
+    fn a_rotation_keeps_verifying_what_the_old_key_signed() {
+        let before = KeySet::parse(
+            &serde_json::json!([private_ec("2025", 5, &["sign", "verify"])]).to_string(),
+        )
+        .unwrap();
+        let old_token = before.sign(&serde_json::json!({"role": "authenticated"}));
+
+        // What a rotation looks like in this config: the same array,
+        // with sign moved to the new key and the old one left in.
+        let after = KeySet::parse(
+            &serde_json::json!([
+                private_ec("2025", 5, &["verify"]),
+                private_ec("2026", 6, &["sign", "verify"]),
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let new_token = after.sign(&serde_json::json!({"role": "authenticated"}));
+        let verifiers = after.verifiers();
+
+        assert!(
+            verify_any(&old_token, SECRET, Some(&verifiers)).is_ok(),
+            "a token in flight when the key rotated still verifies"
+        );
+        assert!(verify_any(&new_token, SECRET, Some(&verifiers)).is_ok());
+
+        // Revoking the old key is dropping it from the array, and then
+        // its tokens stop verifying. That is the point of revoking.
+        let revoked = KeySet::parse(
+            &serde_json::json!([private_ec("2026", 6, &["sign", "verify"])]).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_any(&old_token, SECRET, Some(&revoked.verifiers())).unwrap_err(),
+            Reject::UnknownKey
+        );
+    }
+
+    #[test]
+    fn the_published_set_carries_public_halves_only() {
+        let keys = KeySet::parse(
+            &serde_json::json!([
+                private_ec("ec", 8, &["sign", "verify"]),
+                {"kty": "oct", "kid": "legacy", "alg": "HS256", "key_ops": ["verify"],
+                 "k": Base64UrlUnpadded::encode_string(SECRET)},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        let published = keys.published();
+        let entries = published["keys"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "an hmac secret is never published");
+        assert_eq!(entries[0]["kid"], "ec");
+        assert_eq!(entries[0]["alg"], "ES256");
+        assert_eq!(entries[0]["use"], "sig");
+        assert_eq!(entries[0]["key_ops"], serde_json::json!(["verify"]));
+        assert!(entries[0].get("d").is_none(), "the private scalar stays");
+        assert!(entries[0].get("k").is_none());
+
+        // And what it publishes is what verifies its tokens, which is
+        // the only reason to publish anything.
+        let token = keys.sign(&serde_json::json!({"role": "authenticated"}));
+        let public = Jwks::parse(&published.to_string()).unwrap();
+        assert!(verify_any(&token, b"not the secret", Some(&public)).is_ok());
+    }
+
+    #[test]
+    fn a_symmetric_key_is_still_named_by_its_kid() {
+        // GoTrue turns a plain jwt secret into an oct jwk, and a token
+        // naming that kid is verified with that key rather than with
+        // whatever the project secret happens to be now.
+        let keys = KeySet::parse(
+            &serde_json::json!([
+                {"kty": "oct", "kid": "legacy", "alg": "HS256", "key_ops": ["sign", "verify"],
+                 "k": Base64UrlUnpadded::encode_string(b"the-old-project-secret")},
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let token = keys.sign(&serde_json::json!({"role": "authenticated"}));
+        assert!(verify_any(&token, SECRET, Some(&keys.verifiers())).is_ok());
+        assert_eq!(
+            verify_any(&token, SECRET, None).unwrap_err(),
+            Reject::BadSignature,
+            "without the set it falls back to the project secret, which is not it"
+        );
+
+        // A token with no kid still lands on the project secret, which
+        // is what everything issued before any of this was configured
+        // was signed with.
+        let legacy = mint(&serde_json::json!({"role": "anon"}), SECRET);
+        assert!(verify_any(&legacy, SECRET, Some(&keys.verifiers())).is_ok());
+    }
+
+    #[test]
+    fn a_key_set_that_cannot_sign_is_a_config_error() {
+        let one = |ops: &[&str]| serde_json::json!([private_ec("a", 9, ops)]).to_string();
+        assert!(KeySet::parse(&one(&["verify"])).is_err());
+        assert!(
+            KeySet::parse(
+                &serde_json::json!([
+                    private_ec("a", 9, &["sign", "verify"]),
+                    private_ec("b", 10, &["sign", "verify"]),
+                ])
+                .to_string()
+            )
+            .is_err()
+        );
+        assert!(KeySet::parse("not json").is_err());
+        assert!(KeySet::parse(r#"{"keys": []}"#).is_err(), "not an array");
+        // No kid, an unsupported curve, an unsupported key type, and a
+        // d that is not a scalar. Each names the key in the message.
+        assert!(KeySet::parse(r#"[{"kty": "EC", "crv": "P-256", "key_ops": ["sign"]}]"#).is_err());
+        assert!(
+            KeySet::parse(r#"[{"kty": "EC", "crv": "P-521", "kid": "a", "key_ops": ["sign"]}]"#)
+                .is_err()
+        );
+        assert!(KeySet::parse(r#"[{"kty": "RSA", "kid": "a", "key_ops": ["sign"]}]"#).is_err());
+        assert!(
+            KeySet::parse(r#"[{"kty": "EC", "crv": "P-256", "kid": "a", "d": "AAAA"}]"#).is_err()
+        );
+    }
+
+    #[test]
+    fn the_signer_picks_the_key_set_over_the_secret() {
+        let keys = KeySet::parse(&serde_json::json!([private_ec("k", 11, &["sign"])]).to_string())
+            .unwrap();
+        let claims = serde_json::json!({"role": "authenticated"});
+        let by_secret = Signer::Secret(SECRET).sign(&claims);
+        let by_key = Signer::Keys(&keys).sign(&claims);
+        assert!(verify(&by_secret, SECRET).is_ok(), "still plain HS256");
+        assert_eq!(
+            verify(&by_key, SECRET).unwrap_err(),
+            Reject::WrongAlgorithm,
+            "the apikey path never takes an ES256 token"
+        );
+        assert!(verify_any(&by_key, SECRET, Some(&keys.verifiers())).is_ok());
     }
 }

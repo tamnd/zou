@@ -58,6 +58,13 @@ pub struct Config {
     /// check that a token came from the project it thinks it did.
     /// None takes GoTrue's own default rather than inventing one.
     pub external_url: Option<String>,
+    /// The project's own signing keys, GoTrue's GOTRUE_JWT_KEYS: a json
+    /// array of private JWKs with exactly one of them carrying sign in
+    /// its key_ops. Set, and access tokens are signed with that key and
+    /// its public half is served from the jwks endpoint. Unset, and
+    /// they are signed with jwt_secret on the legacy HS256 format,
+    /// which is what a fresh Supabase project still does.
+    pub jwt_keys: Option<String>,
 }
 
 /// Everything the handlers share: the config and, when postgres is
@@ -67,7 +74,12 @@ pub struct App {
     pub cfg: Config,
     pub pool: Option<sql::Pool>,
     pub limiter: Option<edge::RateLimit>,
+    /// Everything a bearer token may have been signed by: the jwks an
+    /// operator configured, and the public half of this project's own
+    /// signing keys.
     pub jwks: Option<jwt::Jwks>,
+    /// The private keys this server signs with, when it has any.
+    pub keys: Option<jwt::KeySet>,
     /// The fk catalog per exposed schema, each tagged with the epoch
     /// it was introspected under. A request reuses it while the epoch
     /// holds and reintrospects when the DDL watch moves it.
@@ -91,6 +103,15 @@ impl App {
             .unwrap_or("http://localhost:9999");
         format!("{}/auth/v1", base.trim_end_matches('/'))
     }
+
+    /// What signs an access token: the project's signing key when one
+    /// is configured, the project secret otherwise.
+    pub fn signer(&self) -> jwt::Signer<'_> {
+        match &self.keys {
+            Some(keys) => jwt::Signer::Keys(keys),
+            None => jwt::Signer::Secret(&self.cfg.jwt_secret),
+        }
+    }
 }
 
 /// PostgREST's default db-pool size, a sane dev loop default here too.
@@ -105,15 +126,26 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         None => None,
     };
     let limiter = cfg.rate.map(edge::RateLimit::new);
-    let jwks = match &cfg.jwks {
+    let configured = match &cfg.jwks {
         Some(json) => Some(jwt::Jwks::parse(json).map_err(|e| format!("jwks: {e}"))?),
         None => None,
+    };
+    let keys = match &cfg.jwt_keys {
+        Some(json) => Some(jwt::KeySet::parse(json).map_err(|e| format!("jwt keys: {e}"))?),
+        None => None,
+    };
+    // A rotation is two keys at once, so the set this verifies against
+    // is the union rather than whichever was configured last.
+    let jwks = match (configured, keys.as_ref().map(jwt::KeySet::verifiers)) {
+        (Some(a), Some(b)) => Some(a.and(b)),
+        (a, b) => a.or(b),
     };
     Ok(Arc::new(App {
         cfg,
         pool,
         limiter,
         jwks,
+        keys,
         catalog: tokio::sync::RwLock::new(HashMap::new()),
         epoch: Arc::new(AtomicU64::new(0)),
         watching: tokio::sync::OnceCell::new(),
@@ -245,6 +277,30 @@ async fn auth_health() -> Response {
     )
 }
 
+/// GET /auth/v1/.well-known/jwks.json, the public half of the
+/// project's signing keys.
+///
+/// No apikey. This is the one endpoint on the whole surface that has
+/// to be reachable by anything holding a token: a backend in another
+/// language verifying an access token fetches this with a plain http
+/// client and no Supabase credentials at all, and hosted Supabase
+/// serves it the same way. A project on the legacy HS256 secret
+/// publishes nothing, and an empty key set is the correct answer
+/// rather than an error, because the secret is not something to hand
+/// out.
+async fn well_known_jwks(axum::extract::State(app): axum::extract::State<Arc<App>>) -> Response {
+    let keys = match &app.keys {
+        Some(keys) => keys.published(),
+        None => serde_json::json!({"keys": []}),
+    };
+    let mut res = json_body(StatusCode::OK, keys);
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=600"),
+    );
+    res
+}
+
 /// An honest placeholder for surfaces that exist in the router but not
 /// yet in the code, with the milestone that will fill them in.
 pub(crate) fn not_yet(surface: &str) -> Response {
@@ -292,8 +348,14 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/realtime/v1/{*rest}", any(realtime_stub))
         .layer(middleware::from_fn_with_state(Arc::clone(&app), gate))
         .layer(middleware::from_fn_with_state(Arc::clone(&app), rate_limit))
+        .with_state(Arc::clone(&app));
+    // Outside the gate, deliberately. A verifier fetching the public
+    // keys has no apikey and no reason to have one.
+    let open = Router::new()
+        .route("/auth/v1/.well-known/jwks.json", get(well_known_jwks))
         .with_state(app);
     Ok(Router::new()
+        .merge(open)
         .merge(gated)
         .fallback(no_route)
         .layer(middleware::from_fn(edge::cors))
@@ -338,12 +400,49 @@ mod tests {
             jwks: None,
             schemas: vec![],
             external_url: None,
+            jwt_keys: None,
         })
         .unwrap()
     }
 
     fn anon_key() -> String {
         jwt::mint(&jwt::key_claims("anon"), SECRET)
+    }
+
+    /// One signing key, the shape a project has after Supabase
+    /// creates its first asymmetric key.
+    fn keys_json() -> String {
+        use base64ct::{Base64UrlUnpadded, Encoding};
+        use p256::ecdsa::SigningKey;
+        let sk = SigningKey::from_slice(&[12u8; 32]).unwrap();
+        let point = sk.verifying_key().to_sec1_point(false);
+        serde_json::json!([{
+            "kty": "EC",
+            "crv": "P-256",
+            "kid": "in-use",
+            "alg": "ES256",
+            "key_ops": ["sign", "verify"],
+            "d": Base64UrlUnpadded::encode_string(&sk.to_bytes()),
+            "x": Base64UrlUnpadded::encode_string(point.x().unwrap()),
+            "y": Base64UrlUnpadded::encode_string(point.y().unwrap()),
+        }])
+        .to_string()
+    }
+
+    fn config_with_keys() -> Config {
+        Config {
+            jwt_secret: SECRET.to_vec(),
+            pg: None,
+            rate: None,
+            jwks: None,
+            schemas: vec![],
+            external_url: None,
+            jwt_keys: Some(keys_json()),
+        }
+    }
+
+    fn app_with_keys() -> Router {
+        router(config_with_keys()).unwrap()
     }
 
     async fn body_json(res: Response) -> serde_json::Value {
@@ -365,6 +464,109 @@ mod tests {
             body["hint"],
             "No `apikey` request header or url param was found."
         );
+    }
+
+    #[tokio::test]
+    async fn the_jwks_endpoint_needs_no_apikey_and_publishes_no_secrets() {
+        // No apikey header on purpose. Whoever verifies a token has
+        // the token, not the project's credentials.
+        let res = app_with_keys()
+            .oneshot(get_req("/auth/v1/.well-known/jwks.json"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["cache-control"], "public, max-age=600");
+        let body = body_json(res).await;
+        let keys = body["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["kid"], "in-use");
+        assert_eq!(keys[0]["kty"], "EC");
+        assert_eq!(keys[0]["crv"], "P-256");
+        assert_eq!(keys[0]["alg"], "ES256");
+        assert_eq!(keys[0]["use"], "sig");
+        assert_eq!(keys[0]["key_ops"], serde_json::json!(["verify"]));
+        assert!(keys[0].get("d").is_none(), "the private scalar stays here");
+    }
+
+    #[tokio::test]
+    async fn a_project_on_the_legacy_secret_publishes_an_empty_set() {
+        // Not a 404 and not an error. The endpoint exists, the project
+        // just has nothing asymmetric to hand out, and its secret is
+        // not something to publish.
+        let res = app()
+            .oneshot(get_req("/auth/v1/.well-known/jwks.json"))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_json(res).await, serde_json::json!({"keys": []}));
+    }
+
+    #[tokio::test]
+    async fn what_the_key_set_signs_the_published_set_verifies() {
+        let state = app_state(config_with_keys()).unwrap();
+        let token = state
+            .signer()
+            .sign(&serde_json::json!({"role": "authenticated", "sub": "u1"}));
+
+        // What an outside service does: fetch the endpoint, verify with
+        // nothing else. The secret handed in is deliberately wrong, so
+        // only the published key can be what accepted this.
+        let published = body_json(
+            app_with_keys()
+                .oneshot(get_req("/auth/v1/.well-known/jwks.json"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let jwks = jwt::Jwks::parse(&published.to_string()).unwrap();
+        let verified = jwt::verify_any(&token, b"the wrong secret", Some(&jwks)).unwrap();
+        assert_eq!(verified.role.as_deref(), Some("authenticated"));
+
+        // And the gate in front of the project agrees.
+        let echo = Router::new()
+            .route(
+                "/echo",
+                get(|axum::Extension(ctx): axum::Extension<AuthContext>| async move { ctx.role }),
+            )
+            .layer(middleware::from_fn_with_state(Arc::clone(&state), gate))
+            .with_state(state);
+        let req = Request::builder()
+            .uri("/echo")
+            .header("apikey", anon_key())
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = echo.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&bytes[..], b"authenticated");
+    }
+
+    #[tokio::test]
+    async fn the_legacy_secret_still_verifies_while_the_keys_are_in_place() {
+        // The migration state: keys configured, old tokens still out
+        // there. Both have to pass or the rotation logs everyone out.
+        let state = app_state(config_with_keys()).unwrap();
+        let legacy = jwt::mint(
+            &serde_json::json!({"role": "authenticated", "sub": "u1"}),
+            SECRET,
+        );
+        let echo = Router::new()
+            .route(
+                "/echo",
+                get(|axum::Extension(ctx): axum::Extension<AuthContext>| async move { ctx.role }),
+            )
+            .layer(middleware::from_fn_with_state(Arc::clone(&state), gate))
+            .with_state(state);
+        let req = Request::builder()
+            .uri("/echo")
+            .header("apikey", anon_key())
+            .header("authorization", format!("Bearer {legacy}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = echo.oneshot(req).await.unwrap();
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        assert_eq!(&bytes[..], b"authenticated");
     }
 
     #[tokio::test]
@@ -521,6 +723,7 @@ mod tests {
             jwks,
             schemas: vec![],
             external_url: None,
+            jwt_keys: None,
         })
         .unwrap();
         Router::new()
@@ -635,6 +838,7 @@ mod tests {
             jwks: None,
             schemas: vec![],
             external_url: None,
+            jwt_keys: None,
         })
         .unwrap();
         let key = anon_key();

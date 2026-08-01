@@ -162,6 +162,7 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // say so rather than naming GoTrue's default port, which
             // nothing here listens on.
             external_url: Some(format!("http://127.0.0.1:{port}")),
+            jwt_keys: None,
         };
         if let Err(e) = zou_server::serve_blocking(listener, cfg) {
             log::error!("http server: {e}");

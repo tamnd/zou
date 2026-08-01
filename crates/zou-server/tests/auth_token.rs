@@ -39,8 +39,15 @@ fn app(dsn: &str) -> axum::Router {
         jwks: None,
         schemas: vec![],
         external_url: Some("https://zou.test".to_string()),
+        jwt_keys: None,
     })
     .expect("router builds")
+}
+
+/// The legacy signer, which is what a project with no signing keys
+/// configured issues on.
+fn signer() -> jwt::Signer<'static> {
+    jwt::Signer::Secret(SECRET)
 }
 
 fn anon_key() -> String {
@@ -135,7 +142,7 @@ async fn a_session_is_three_rows_and_a_full_claim_set() {
     let pool = Pool::new(&dsn, 4).expect("dsn parses");
     let user = seed_user(&pool, "claims").await;
 
-    let issued = auth::issue(&pool, &user, "password", SECRET, ISSUER)
+    let issued = auth::issue(&pool, &user, "password", &signer(), ISSUER)
         .await
         .expect("issue");
 
@@ -234,7 +241,7 @@ async fn the_refresh_grant_rotates_and_keeps_the_session() {
     let pool = Pool::new(&dsn, 4).expect("dsn parses");
     let app = app(&dsn);
     let user = seed_user(&pool, "rotate").await;
-    let first = auth::issue(&pool, &user, "password", SECRET, ISSUER)
+    let first = auth::issue(&pool, &user, "password", &signer(), ISSUER)
         .await
         .expect("issue");
     let first_session = claims_of(&first.access_token)["session_id"]
@@ -293,7 +300,7 @@ async fn a_lost_response_is_answered_with_the_token_that_was_issued() {
     let pool = Pool::new(&dsn, 4).expect("dsn parses");
     let app = app(&dsn);
     let user = seed_user(&pool, "lost").await;
-    let first = auth::issue(&pool, &user, "password", SECRET, ISSUER)
+    let first = auth::issue(&pool, &user, "password", &signer(), ISSUER)
         .await
         .expect("issue");
 
@@ -352,7 +359,7 @@ async fn a_stolen_token_takes_the_whole_family_down() {
     let pool = Pool::new(&dsn, 4).expect("dsn parses");
     let app = app(&dsn);
     let user = seed_user(&pool, "stolen").await;
-    let first = auth::issue(&pool, &user, "password", SECRET, ISSUER)
+    let first = auth::issue(&pool, &user, "password", &signer(), ISSUER)
         .await
         .expect("issue");
 
@@ -421,7 +428,7 @@ async fn a_token_whose_session_went_away_is_refused_and_deleted() {
     let pool = Pool::new(&dsn, 4).expect("dsn parses");
     let app = app(&dsn);
     let user = seed_user(&pool, "orphan").await;
-    let issued = auth::issue(&pool, &user, "password", SECRET, ISSUER)
+    let issued = auth::issue(&pool, &user, "password", &signer(), ISSUER)
         .await
         .expect("issue");
     let session_id = claims_of(&issued.access_token)["session_id"]
@@ -479,7 +486,7 @@ async fn an_expired_session_and_a_banned_user_are_told_apart() {
     let app = app(&dsn);
 
     let expired_user = seed_user(&pool, "expired").await;
-    let expired = auth::issue(&pool, &expired_user, "password", SECRET, ISSUER)
+    let expired = auth::issue(&pool, &expired_user, "password", &signer(), ISSUER)
         .await
         .expect("issue");
     let sess = pool.unscoped().await.expect("connect");
@@ -503,7 +510,7 @@ async fn an_expired_session_and_a_banned_user_are_told_apart() {
     assert_eq!(body["msg"], "Invalid Refresh Token: Session Expired");
 
     let banned_user = seed_user(&pool, "banned").await;
-    let banned = auth::issue(&pool, &banned_user, "password", SECRET, ISSUER)
+    let banned = auth::issue(&pool, &banned_user, "password", &signer(), ISSUER)
         .await
         .expect("issue");
     let sess = pool.unscoped().await.expect("connect");
