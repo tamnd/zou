@@ -10,7 +10,7 @@
 //! in [`segment`], the batching, admission and ack machinery in
 //! [`sequencer`], the fenced chain protocol with takeover in [`chain`],
 //! and the background fold of landing segments into sorted sealed
-//! segments in [`consolidate`] and [`sealed`]. Durability itself sits
+//! segments in [`mod@consolidate`] and [`sealed`]. Durability itself sits
 //! behind [`SegmentSink`], so the same sequencer runs over the sealed
 //! chain, a plain CAS store, or a test double.
 
