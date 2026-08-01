@@ -19,7 +19,7 @@
 //! Connections are lazy. Building a pool never dials, so the server
 //! can come up before postgres does and the first request pays the
 //! connect. The first successful connection applies the tenant
-//! contract in [`BOOTSTRAP`]: the anon, authenticated, and
+//! contract in the BOOTSTRAP batch: the anon, authenticated, and
 //! service_role roles, the auth schema with Supabase's uid, role,
 //! email, and jwt functions verbatim, and the open public schema
 //! grants that make row level security the actual guard, exactly the
