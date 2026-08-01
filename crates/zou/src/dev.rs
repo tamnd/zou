@@ -126,6 +126,22 @@ pub fn run(args: &Args) -> Result<(), String> {
     let pagecache = args.runtime.join("pagecache");
     let _ = fs::remove_dir_all(&pagecache);
     fs::create_dir_all(&pagecache).map_err(|e| format!("create {}: {e}", pagecache.display()))?;
+    // Store op counters for the whole process tree. Setting the
+    // variable in our own environment before the store opens covers
+    // this process and everything it spawns, initdb and postgres
+    // backends included, and they all bump the same mapped file. Fresh
+    // every boot so a run's counters start at zero, and an explicit
+    // ZOU_STORE_STATS from the caller wins. set_var is safe here, no
+    // thread exists yet.
+    if std::env::var_os("ZOU_STORE_STATS").is_none_or(|v| v.is_empty()) {
+        let stats = args.runtime.join("store-stats");
+        let _ = fs::remove_file(&stats);
+        unsafe { std::env::set_var("ZOU_STORE_STATS", &stats) };
+    }
+    log::info!(
+        "store op counters at {}, dump with zou stats",
+        std::env::var("ZOU_STORE_STATS").unwrap_or_default()
+    );
     let sock = args.runtime.join("sock");
     fs::create_dir_all(&sock).map_err(|e| format!("create {}: {e}", sock.display()))?;
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o700))
