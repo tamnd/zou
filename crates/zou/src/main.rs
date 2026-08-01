@@ -9,7 +9,7 @@ use std::process::ExitCode;
 /// The postmaster child, unix sockets, and signal forwarding are all
 /// unix machinery, so the dev subcommand only exists there.
 pub const DEV_USAGE: &str =
-    "usage: zou dev <target> [--pg-bin <dir>] [--port <n>] [--runtime <dir>]";
+    "usage: zou dev <target> [--pg-bin <dir>] [--port <n>] [--http <n>] [--runtime <dir>]";
 
 fn usage() -> ExitCode {
     eprintln!("zou {}", env!("CARGO_PKG_VERSION"));
