@@ -71,10 +71,10 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run the pool leak tests
+      - name: Run the pool leak and rls contract tests
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
-        run: cargo test -p zou-server --test pool -- --nocapture
+        run: cargo test -p zou-server --test pool --test rls -- --nocapture
 
   s3-contract:
     name: s3 contract (minio)
