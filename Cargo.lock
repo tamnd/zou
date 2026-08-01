@@ -1939,6 +1939,11 @@ dependencies = [
 [[package]]
 name = "zou-rest"
 version = "0.0.1"
+dependencies = [
+ "bytes",
+ "tokio",
+ "tokio-postgres",
+]
 
 [[package]]
 name = "zou-server"

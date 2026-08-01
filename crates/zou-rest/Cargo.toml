@@ -9,5 +9,10 @@ authors.workspace = true
 
 [dependencies]
 
+[dev-dependencies]
+bytes = "1"
+tokio = { workspace = true, features = ["macros"] }
+tokio-postgres = { workspace = true }
+
 [lints]
 workspace = true
