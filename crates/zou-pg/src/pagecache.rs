@@ -112,6 +112,10 @@ impl PageCache {
         self.dir.join(format!("{}.map", fork_stem(fork)))
     }
 
+    fn size_path(&self, fork: ForkId) -> PathBuf {
+        self.dir.join(format!("{}.size", fork_stem(fork)))
+    }
+
     fn open_rw(&self, path: &Path) -> Option<File> {
         match OpenOptions::new()
             .read(true)
@@ -165,6 +169,31 @@ impl PageCache {
         }
     }
 
+    /// The cached fork size, `None` on a miss. Sizes join the cache
+    /// because the planner asks for nblocks on every planning cycle
+    /// and a 4 byte SIZE round trip to a remote store per query is
+    /// the whole latency budget. Coherence adds one fact to the page
+    /// argument: Postgres serializes relation extension, so the fork
+    /// has a single size writer at a time, and a reader racing an
+    /// extend sees the old size exactly as a vanilla reader whose
+    /// lseek lands before the extend completes.
+    pub fn load_size(&self, fork: ForkId) -> Option<u32> {
+        let f = File::open(self.size_path(fork)).ok()?;
+        let mut n = [0u8; 4];
+        read_exact_at(&f, &mut n, 0).ok()?;
+        Some(u32::from_le_bytes(n))
+    }
+
+    /// Land a fork size, called only after the store accepted it, so
+    /// the local answer is never newer than the store. Absence is
+    /// never cached, an absent SIZE means the fork does not exist and
+    /// that answer has to keep coming from the store.
+    pub fn save_size(&self, fork: ForkId, nblocks: u32) {
+        if let Some(f) = self.open_rw(&self.size_path(fork)) {
+            let _ = write_all_at(&f, &nblocks.to_le_bytes(), 0);
+        }
+    }
+
     /// Drop every cached page at or past the new fork end. Shrinking
     /// the presence map is what forgets them, the data file follows so
     /// the space comes back.
@@ -181,6 +210,7 @@ impl PageCache {
     pub fn forget(&self, fork: ForkId) {
         let _ = std::fs::remove_file(self.map_path(fork));
         let _ = std::fs::remove_file(self.data_path(fork));
+        let _ = std::fs::remove_file(self.size_path(fork));
     }
 }
 
@@ -235,6 +265,25 @@ mod tests {
         cache.forget(FORK);
         assert!(cache.load(FORK, 0).is_none());
         assert_eq!(cache.load(other, 0).unwrap()[0], 2);
+    }
+
+    #[test]
+    fn sizes_roundtrip_and_forget_drops_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PageCache::at(dir.path());
+        assert!(cache.load_size(FORK).is_none());
+        cache.save_size(FORK, 6);
+        assert_eq!(cache.load_size(FORK), Some(6));
+        cache.save_size(FORK, 3);
+        assert_eq!(cache.load_size(FORK), Some(3));
+        // Zero is a real size, a created empty fork, not a miss.
+        cache.save_size(FORK, 0);
+        assert_eq!(cache.load_size(FORK), Some(0));
+        let other: ForkId = (1, 2, 4, 0);
+        cache.save_size(other, 9);
+        cache.forget(FORK);
+        assert!(cache.load_size(FORK).is_none());
+        assert_eq!(cache.load_size(other), Some(9));
     }
 
     #[test]

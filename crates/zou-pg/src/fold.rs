@@ -24,12 +24,15 @@
 //! segment file it opens, so the overlay must rebuild retained segment
 //! files from their start.
 //!
-//! The caller, the wal pusher, only folds while fully caught up, pushed
-//! equal to the local flush pointer, so the checkpoint record named by
-//! the captured pg_control is already durable in the store. Transaction
-//! status captured here can run slightly ahead of the record stream for
-//! commits that happened in the capture window; those commits were never
-//! acked, and the docs carry the caveat.
+//! The caller, the wal pusher, only starts a fold once pushed covers
+//! redo, so the checkpoint record named by the captured pg_control is
+//! already durable in the store, and then keeps pushing while the fold
+//! runs on its own thread. Concurrent pushes only widen the window in
+//! which live pages run ahead of redo, which replay idempotence already
+//! tolerates. Transaction status captured here can run slightly ahead
+//! of the record stream for commits that happened in the capture
+//! window; those commits were never acked, and the docs carry the
+//! caveat.
 //!
 //! The fold down policy keeps the chain short: once the deltas since
 //! the newest full outweigh it by a factor, the next fold captures a
@@ -590,18 +593,30 @@ fn pack_merged_full(
     pack_page_runs(store, layout, id, &refs, &[], &[], &sizes, &mut fetch)
 }
 
+/// Everything [`prepare`] produced and [`fold`] publishes: the ref the
+/// manifest gains, the sealed segments it sheds, and the stats. The
+/// split exists so the capture and pack can run on a thread that never
+/// touches the group commit, the publish is a manifest edit the caller
+/// applies when it collects the result.
+pub struct FoldOutcome {
+    pub checkpoint: CheckpointRef,
+    pub drop: Vec<String>,
+    pub stats: FoldStats,
+}
+
 /// Capture the checkpoint at `redo`, a delta normally or a full when
-/// the fold down policy says the chain has outgrown its base, and
-/// publish it together with the tail truncation. Idempotent per redo:
-/// the checkpoint id is derived from it and every step tolerates a
-/// retried run. Errors leave the manifest unchanged, the caller retries.
-pub fn fold(
+/// the fold down policy says the chain has outgrown its base, without
+/// publishing anything. Idempotent per redo: the checkpoint id is
+/// derived from it and every step tolerates a retried run. Errors
+/// leave the manifest unchanged and any objects written are gc food,
+/// the caller retries.
+pub fn prepare(
     store: &dyn CasStore,
     layout: &TenantLayout,
-    commit: &GroupCommit,
+    epoch: u64,
     pgdata: &Path,
     redo: u64,
-) -> Result<FoldStats, String> {
+) -> Result<FoldOutcome, String> {
     let (data, _) = store
         .get(&layout.manifest())
         .map_err(|e| format!("store: {e}"))?
@@ -657,7 +672,7 @@ pub fn fold(
     };
     let (pages, runs) = match kind {
         CheckpointKind::Delta => {
-            let out = delta_scan(store, layout, &manifest, commit.epoch(), redo)?;
+            let out = delta_scan(store, layout, &manifest, epoch, redo)?;
             let sizes = touched_sizes(store, layout, &out)?;
             pack_page_runs(
                 store,
@@ -695,26 +710,41 @@ pub fn fold(
         }
     }
     let dropped = drop.len();
-    commit
-        .fold_tail(
-            CheckpointRef {
-                id: id.clone(),
-                lsn: Lsn(redo),
-                kind,
-                owner: None,
-            },
-            drop,
-        )
-        .map_err(|e| format!("fold publish: {e}"))?;
-    Ok(FoldStats {
-        id,
-        kind,
-        files: files.len(),
-        bytes,
-        pages,
-        runs,
-        dropped,
+    Ok(FoldOutcome {
+        checkpoint: CheckpointRef {
+            id: id.clone(),
+            lsn: Lsn(redo),
+            kind,
+            owner: None,
+        },
+        drop,
+        stats: FoldStats {
+            id,
+            kind,
+            files: files.len(),
+            bytes,
+            pages,
+            runs,
+            dropped,
+        },
     })
+}
+
+/// [`prepare`] plus the publish: the synchronous shape, used by tests
+/// and by anyone who has the group commit at hand and does not mind
+/// blocking on the capture.
+pub fn fold(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    commit: &GroupCommit,
+    pgdata: &Path,
+    redo: u64,
+) -> Result<FoldStats, String> {
+    let out = prepare(store, layout, commit.epoch(), pgdata, redo)?;
+    commit
+        .fold_tail(out.checkpoint, out.drop)
+        .map_err(|e| format!("fold publish: {e}"))?;
+    Ok(out.stats)
 }
 
 #[cfg(test)]

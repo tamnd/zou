@@ -192,10 +192,13 @@ pub fn for_each_parallel<T: Sync>(items: &[T], op: impl Fn(&T) -> bool + Sync) -
 
 /// Flush one fork's drained pages and settle its SIZE marker. The
 /// pages go first, in parallel, and SIZE only ever grows here, the
-/// same rule the eager extend path follows.
+/// same rule the eager extend path follows. The settled size lands in
+/// the local cache too, whichever side won, otherwise a stale local
+/// size from before the buffering would outlive the drain.
 pub(crate) fn flush_fork(
     store: &Arc<dyn CasStore>,
     layout: &TenantLayout,
+    cache: Option<&crate::pagecache::PageCache>,
     fork: ForkId,
     pages: &[PendingPage],
     size: Option<u32>,
@@ -221,6 +224,9 @@ pub(crate) fn flush_fork(
         };
         if new_size > current {
             store.put(&key, &new_size.to_le_bytes()).map_err(|_| ())?;
+        }
+        if let Some(cache) = cache {
+            cache.save_size(fork, new_size.max(current));
         }
     }
     Ok(())
