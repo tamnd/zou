@@ -448,6 +448,212 @@ async fn the_write_path_speaks_postgrest() {
 }
 
 #[tokio::test]
+async fn the_rpc_surface_speaks_postgrest() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop function if exists zou_rpc_add(int, int), zou_rpc_evens(int), \
+             zou_rpc_shout(text), zou_rpc_touch(), zou_rpc_echo(jsonb), \
+             zou_rpc_sum(int[]), zou_rpc_over(int), zou_rpc_over(int, int), \
+             zou_rpc_list(int), zou_rpc_pair(int), zou_rpc_one()",
+            "drop table if exists zou_rpc_items, zou_rpc_owners cascade",
+            "create table zou_rpc_owners (id int primary key, name text)",
+            "create table zou_rpc_items (id int primary key, \
+             owner_id int references zou_rpc_owners(id), name text)",
+            "insert into zou_rpc_owners values (1, 'ann'), (2, 'bob')",
+            "insert into zou_rpc_items values (1, 1, 'hammer'), (2, 1, 'saw'), (3, 2, 'drill')",
+            "create function zou_rpc_add(a int, b int) returns int \
+             language sql immutable as 'select a + b'",
+            "create function zou_rpc_evens(top int) returns setof int \
+             language sql immutable as \
+             'select n from generate_series(0, top) n where n % 2 = 0'",
+            "create function zou_rpc_shout(msg text) returns text \
+             language sql immutable as 'select upper(msg)'",
+            "create function zou_rpc_touch() returns void \
+             language sql as 'insert into zou_rpc_items values (99, 1, ''tmp'')'",
+            "create function zou_rpc_echo(jsonb) returns jsonb \
+             language sql immutable as 'select $1'",
+            "create function zou_rpc_sum(variadic nums int[]) returns int \
+             language sql immutable as 'select sum(n)::int from unnest(nums) n'",
+            "create function zou_rpc_over(a int) returns int \
+             language sql immutable as 'select a'",
+            "create function zou_rpc_over(a int, b int default 1) returns int \
+             language sql immutable as 'select a + b'",
+            "create function zou_rpc_list(min_id int default 0) \
+             returns setof zou_rpc_items language sql stable as \
+             'select * from zou_rpc_items where id >= min_id'",
+            "create function zou_rpc_pair(a int) returns table(x int, y int) \
+             language sql immutable as 'select a, a * 2'",
+            "create function zou_rpc_one() returns zou_rpc_items \
+             language sql stable as 'select * from zou_rpc_items where id = 1'",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // A scalar via GET is the bare json value, arguments cast from
+    // the query string with percent decoding applied.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_rpc_add?a=2&b=3"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, "5");
+
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/rpc/zou_rpc_add",
+            r#"{"a": 2, "b": 40}"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "42");
+
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_rpc_shout?msg=hello+world"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#""HELLO WORLD""#);
+
+    // A set of scalars folds to a json array of bare values.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_rpc_evens?top=4"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "[0, 2, 4]");
+
+    // A set of table rows takes the whole read grammar: the arg
+    // binds, the rest of the query string filters and embeds on the
+    // result, and Content-Range reports like a read.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/rpc/zou_rpc_list?min_id=2&id=gt.2&select=name,zou_rpc_owners(name)",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-range"], "0-0/*");
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name": "drill", "zou_rpc_owners": {"name": "bob"}}]"#
+    );
+
+    // The same function over POST: body args, query string grammar,
+    // and the defaulted argument fills itself.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/rpc/zou_rpc_list?select=id&order=id",
+            "{}",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 2},{"id": 3}]"#);
+
+    // returns table(...) rows come out as objects.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_rpc_pair?a=21"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"x": 21, "y": 42}]"#);
+
+    // A non set function returning a rowtype is one bare object.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_rpc_one?select=id,name"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"{"id": 1, "name": "hammer"}"#);
+
+    // A variadic gathers repeated query params, or a json array.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_rpc_sum?nums=1&nums=2&nums=3"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "6");
+
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/rpc/zou_rpc_sum",
+            r#"{"nums": [1, 2, 3]}"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "6");
+
+    // A single unnamed json parameter takes the whole body.
+    let res = app
+        .clone()
+        .oneshot(req("POST", "/rest/v1/rpc/zou_rpc_echo", r#"{"k": 1}"#, &[]))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"{"k": 1}"#);
+
+    // GET runs read only, so a function that writes fails with pg's
+    // 25006 at PostgREST's 405; POST runs it for real.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_rpc_touch"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "25006");
+
+    let res = app
+        .clone()
+        .oneshot(req("POST", "/rest/v1/rpc/zou_rpc_touch", "", &[]))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rpc_items?select=name&id=eq.99"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"name": "tmp"}]"#);
+
+    // Overloads a call shape cannot split are PGRST203 at 300.
+    let res = app
+        .clone()
+        .oneshot(req("POST", "/rest/v1/rpc/zou_rpc_over", r#"{"a": 1}"#, &[]))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::MULTIPLE_CHOICES);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST203");
+
+    // A missing function is PGRST202 spelling the attempted call.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_rpc_nope?x=1"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST202");
+    assert_eq!(
+        body["message"],
+        "Could not find the function public.zou_rpc_nope(x) in the schema cache"
+    );
+}
+
+#[tokio::test]
 async fn an_rls_write_denial_comes_back_as_401() {
     let Some(dsn) = dsn() else { return };
     seed(

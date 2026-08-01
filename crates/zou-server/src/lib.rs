@@ -244,7 +244,7 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/auth/v1/health", get(auth_health))
         .route("/auth/v1/{*rest}", any(auth_stub))
         .route("/rest/v1/", any(rest_stub))
-        .route("/rest/v1/rpc/{func}", any(rest_stub))
+        .route("/rest/v1/rpc/{func}", any(rest::rpc))
         .route("/rest/v1/{table}", any(rest::table))
         .route("/storage/v1/{*rest}", any(storage_stub))
         .route("/realtime/v1/{*rest}", any(realtime_stub))
@@ -412,14 +412,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rpc_is_still_stubbed() {
+    async fn rpc_without_a_database_is_the_503_shape() {
         let req = Request::builder()
             .uri("/rest/v1/rpc/do_thing")
             .header("apikey", anon_key())
             .body(Body::empty())
             .unwrap();
         let res = app().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(res).await["code"], "PGRST000");
+    }
+
+    #[tokio::test]
+    async fn a_delete_on_rpc_is_pgrst101() {
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/rest/v1/rpc/do_thing")
+            .header("apikey", anon_key())
+            .body(Body::empty())
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let body = body_json(res).await;
+        assert_eq!(body["code"], "PGRST101");
+        assert_eq!(body["message"], "Cannot use the DELETE method on RPC");
     }
 
     #[tokio::test]

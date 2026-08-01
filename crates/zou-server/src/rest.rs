@@ -1,5 +1,5 @@
 //! The REST table surface: GET, HEAD, POST, PATCH, and DELETE on
-//! /rest/v1/{table}.
+//! /rest/v1/{table}, and function calls on /rest/v1/rpc/{fn}.
 //!
 //! A request's query string becomes a [`zou_rest::plan::Query`], the
 //! relationship catalog loads through INTROSPECT_SQL on the same
@@ -21,6 +21,16 @@
 //! turns a POST into an upsert, targeting the on_conflict columns or
 //! the table's primary key.
 //!
+//! RPC resolves the function like named notation would: pg_proc
+//! introspection finds every overload, the supplied argument names
+//! pick one, a json body binds whole and unpacks per argument while
+//! query string values bind one text parameter each. GET runs read
+//! only so a volatile function fails with pg's 25006, which maps to
+//! 405 exactly as PostgREST has it. What comes back follows the
+//! return type: void is 204, a scalar is the bare json value, a set
+//! of rows goes through the planner over a CTE so select, filters,
+//! order, and embeds apply to the result.
+//!
 //! Errors speak PostgREST throughout: the body is always the four
 //! key code, details, hint, message object, grammar problems are
 //! PGRST100, a missing relationship is PGRST200 and an ambiguous one
@@ -40,7 +50,7 @@ use zou_rest::catalog::{Catalog, FkRow, INTROSPECT_SQL};
 use zou_rest::filter::{self, Node, Parsed};
 use zou_rest::mutate::{self, Conflict, Returning};
 use zou_rest::plan::{self, PlanError, Query};
-use zou_rest::{order, page, select};
+use zou_rest::{order, page, rpc, select};
 
 use crate::sql::{RequestContext, Session};
 use crate::{App, AuthContext, json_body};
@@ -881,6 +891,247 @@ pub async fn table(
             }
         }
         _ => return crate::not_yet("this REST method"),
+    };
+    match result {
+        Ok(res) => res,
+        Err(e) => e.into_response(),
+    }
+}
+
+fn rpc_error(e: rpc::RpcError) -> RestError {
+    RestError {
+        status: match e.code {
+            "PGRST202" => StatusCode::NOT_FOUND,
+            "PGRST203" => StatusCode::MULTIPLE_CHOICES,
+            _ => StatusCode::BAD_REQUEST,
+        },
+        code: e.code.to_string(),
+        message: e.message,
+        details: e.details,
+        hint: None,
+    }
+}
+
+async fn invoke(
+    app: &App,
+    func: &str,
+    auth: &AuthContext,
+    req: &Parts,
+    body: Option<&[u8]>,
+) -> Result<Response, RestError> {
+    let is_post = body.is_some();
+    let pool = app.pool.as_ref().ok_or_else(no_database)?;
+    let authed = auth.role != "anon";
+    let ctx = request_context(auth, req);
+    // GET and HEAD run read only, so a volatile function fails with
+    // pg's 25006, which the status table maps to PostgREST's 405.
+    let sess = pool
+        .session(&ctx, !is_post)
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+
+    let rows = sess
+        .query(rpc::INTROSPECT_SQL, &[&SCHEMA, &func])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let overloads: Vec<rpc::Routine> = rows
+        .iter()
+        .map(|r| {
+            rpc::routine(rpc::RoutineRow {
+                arg_names: r.get(0),
+                arg_types: r.get(1),
+                arg_variadic: r.get(2),
+                defaults: r.get(3),
+                returns_set: r.get(4),
+                volatile: r.get(5),
+                rettype: r.get(6),
+                return_table: r.get(7),
+            })
+        })
+        .collect();
+
+    // Which query pairs are arguments: on a GET any key naming an
+    // argument of some overload, everything else stays with the
+    // result grammar. On a POST the body keys are the arguments and
+    // the whole query string is grammar.
+    let raw = req.uri.query().unwrap_or("");
+    let mut get_args: Vec<(String, String)> = Vec::new();
+    let mut residual: Vec<&str> = Vec::new();
+    let mut supplied: Vec<String> = Vec::new();
+    if is_post {
+        residual = raw.split('&').filter(|p| !p.is_empty()).collect();
+    } else {
+        for pair in raw.split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let key = decode(k);
+            // With no overloads at all everything non reserved
+            // counts as a supplied name, so the PGRST202 message
+            // spells the call the client attempted.
+            let named = if overloads.is_empty() {
+                !key.contains('.')
+                    && !matches!(
+                        key.as_str(),
+                        "select" | "order" | "limit" | "offset" | "apikey"
+                    )
+            } else {
+                overloads
+                    .iter()
+                    .any(|r| r.args.iter().any(|a| !a.name.is_empty() && a.name == key))
+            };
+            if named {
+                if !supplied.contains(&key) {
+                    supplied.push(key.clone());
+                }
+                get_args.push((key, decode(v)));
+            } else {
+                residual.push(pair);
+            }
+        }
+    }
+    let payload = match body {
+        Some(bytes) => {
+            let text = if bytes.is_empty() {
+                "{}".to_string()
+            } else {
+                String::from_utf8(bytes.to_vec())
+                    .map_err(|_| invalid_body("invalid utf-8 in the request body"))?
+            };
+            let v: serde_json::Value =
+                serde_json::from_str(&text).map_err(|e| invalid_body(e.to_string()))?;
+            if let Some(o) = v.as_object() {
+                supplied = o.keys().cloned().collect();
+            }
+            Some(text)
+        }
+        None => None,
+    };
+
+    let choice = rpc::choose(SCHEMA, func, &overloads, &supplied, is_post).map_err(rpc_error)?;
+    let kind = choice.routine.kind.clone();
+    let returns_set = choice.routine.returns_set;
+    let m = match payload {
+        Some(text) => rpc::call_json(SCHEMA, func, &choice, &supplied, text),
+        None => rpc::call_get(SCHEMA, func, choice.routine, &get_args),
+    };
+
+    match kind {
+        rpc::RetKind::Void => {
+            let params: Vec<Text> = m.params.into_iter().map(Text).collect();
+            sess.execute(&m.text, &param_refs(&params))
+                .await
+                .map_err(|e| pg_error(&e, authed))?;
+            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        rpc::RetKind::Scalar => {
+            let wrapped = rpc::scalar_wrap(func, m, returns_set);
+            let params: Vec<Text> = wrapped.params.into_iter().map(Text).collect();
+            let rows = sess
+                .query(&wrapped.text, &param_refs(&params))
+                .await
+                .map_err(|e| pg_error(&e, authed))?;
+            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            let out = rows
+                .first()
+                .and_then(|r| r.get::<_, Option<String>>(0))
+                .unwrap_or_else(|| if returns_set { "[]" } else { "null" }.to_string());
+            Ok((
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                out,
+            )
+                .into_response())
+        }
+        rpc::RetKind::Composite { table } => {
+            // Rows go through the planner over the call's CTE, so
+            // the whole select grammar applies, and when the return
+            // type is a real table's rowtype embeds resolve on it.
+            let logical = table.unwrap_or_else(|| func.to_string());
+            let joined = residual.join("&");
+            let (mut q, _) = parse_query(
+                &logical,
+                if joined.is_empty() {
+                    None
+                } else {
+                    Some(&joined)
+                },
+            )?;
+            apply_range(&mut q, &req.headers);
+            let catalog = load_catalog(&sess, authed).await?;
+            let r = rpc::representation(&catalog, m, &mut q).map_err(plan_error)?;
+            let text = format!(
+                "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
+                r.cte, r.select.text
+            );
+            let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
+            let rows = sess
+                .query(&text, &param_refs(&params))
+                .await
+                .map_err(|e| pg_error(&e, authed))?;
+            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            if returns_set {
+                let offset = q
+                    .offset
+                    .iter()
+                    .find(|(route, _)| route.is_empty())
+                    .map(|(_, n)| *n)
+                    .unwrap_or(0);
+                Ok((
+                    StatusCode::OK,
+                    [
+                        (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                        (header::CONTENT_RANGE, &content_range(offset, rows.len())),
+                    ],
+                    json_array(&rows),
+                )
+                    .into_response())
+            } else {
+                // A non set function is one row, and PostgREST hands
+                // it back as a bare object, not a one element array.
+                let out = rows
+                    .first()
+                    .map(|r| r.get::<_, String>(0))
+                    .unwrap_or_else(|| "null".to_string());
+                Ok((
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                    out,
+                )
+                    .into_response())
+            }
+        }
+    }
+}
+
+/// The /rest/v1/rpc/{func} handler. GET, HEAD, and POST call the
+/// function, anything else is PostgREST's PGRST101.
+pub async fn rpc(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::extract::Path(func): axum::extract::Path<String>,
+    axum::Extension(auth): axum::Extension<AuthContext>,
+    req: Request<Body>,
+) -> Response {
+    let method = req.method().clone();
+    let (parts, body) = req.into_parts();
+    let result = match method {
+        Method::GET | Method::HEAD => invoke(&app, &func, &auth, &parts, None).await,
+        Method::POST => match axum::body::to_bytes(body, BODY_LIMIT).await {
+            Ok(bytes) => invoke(&app, &func, &auth, &parts, Some(&bytes)).await,
+            Err(_) => Err(RestError {
+                status: StatusCode::PAYLOAD_TOO_LARGE,
+                code: "PGRST102".to_string(),
+                message: "The request body is too large".to_string(),
+                details: None,
+                hint: None,
+            }),
+        },
+        m => Err(RestError {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            code: "PGRST101".to_string(),
+            message: format!("Cannot use the {m} method on RPC"),
+            details: None,
+            hint: None,
+        }),
     };
     match result {
         Ok(res) => res,
