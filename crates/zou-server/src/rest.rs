@@ -1,14 +1,25 @@
-//! The REST read path: GET and HEAD on /rest/v1/{table}.
+//! The REST table surface: GET, HEAD, POST, PATCH, and DELETE on
+//! /rest/v1/{table}.
 //!
 //! A request's query string becomes a [`zou_rest::plan::Query`], the
 //! relationship catalog loads through INTROSPECT_SQL on the same
 //! transaction the query will run in, the planner emits one
 //! statement, and the rows come back as jsonb text the handler joins
-//! into the response array. Everything runs inside a read only
-//! transaction carrying the full request context, so RLS policies
-//! see role, request.jwt.claims, request.headers, request.cookies,
-//! request.method, and request.path exactly like they do behind
-//! Supabase.
+//! into the response array. Everything runs inside a transaction
+//! carrying the full request context, read only for reads, so RLS
+//! policies see role, request.jwt.claims, request.headers,
+//! request.cookies, request.method, and request.path exactly like
+//! they do behind Supabase.
+//!
+//! Writes go through the zou-rest mutation builders: the body binds
+//! whole as one json parameter, root filters become the mutation's
+//! WHERE, and Prefer picks the response. return=minimal answers 201
+//! or 204 empty, headers-only adds a Location built from the
+//! returned primary key, and representation mounts the mutation as a
+//! CTE and runs the request's select tree over the returned rows, so
+//! embeds work on writes exactly as on reads. Prefer resolution
+//! turns a POST into an upsert, targeting the on_conflict columns or
+//! the table's primary key.
 //!
 //! Errors speak PostgREST throughout: the body is always the four
 //! key code, details, hint, message object, grammar problems are
@@ -27,15 +38,30 @@ use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use zou_rest::catalog::{Catalog, FkRow, INTROSPECT_SQL};
 use zou_rest::filter::{self, Node, Parsed};
+use zou_rest::mutate::{self, Conflict, Returning};
 use zou_rest::plan::{self, PlanError, Query};
 use zou_rest::{order, page, select};
 
-use crate::sql::RequestContext;
+use crate::sql::{RequestContext, Session};
 use crate::{App, AuthContext, json_body};
 
 /// The one schema the REST surface serves until Accept-Profile
 /// lands, the same default a fresh Supabase project exposes.
 const SCHEMA: &str = "public";
+
+/// The most body a write accepts, 16 MiB like a generous PostgREST
+/// deployment; past it the response is 413.
+const BODY_LIMIT: usize = 1 << 24;
+
+/// The table's primary key columns in constraint order, for the
+/// default upsert target and the Location header.
+const PK_SQL: &str = "select a.attname::text \
+     from pg_constraint c \
+     join pg_class t on t.oid = c.conrelid \
+     join pg_namespace n on n.oid = t.relnamespace \
+     join pg_attribute a on a.attrelid = t.oid and a.attnum = any(c.conkey) \
+     where c.contype = 'p' and n.nspname = $1 and t.relname = $2 \
+     order by array_position(c.conkey, a.attnum)";
 
 /// A PostgREST shaped error: a status and the four body keys, with
 /// details and hint rendered as json null when absent, which is what
@@ -78,6 +104,18 @@ fn no_database() -> RestError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         code: "PGRST000".to_string(),
         message: "Database connection error. Retrying the connection.".to_string(),
+        details: None,
+        hint: None,
+    }
+}
+
+/// A body that is not the json a write needs, PostgREST's PGRST102
+/// carrying the parser's own message.
+fn invalid_body(message: impl Into<String>) -> RestError {
+    RestError {
+        status: StatusCode::BAD_REQUEST,
+        code: "PGRST102".to_string(),
+        message: message.into(),
         details: None,
         hint: None,
     }
@@ -162,16 +200,35 @@ fn route_of(prefix: &str) -> Vec<String> {
     }
 }
 
+/// The write only query parameters: on_conflict names the upsert
+/// target and columns narrows which body keys insert.
+#[derive(Debug, Default)]
+struct Extras {
+    on_conflict: Option<Vec<String>>,
+    columns: Option<Vec<String>>,
+}
+
+fn csv(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// One query string into the planner's input. Reserved words are
-/// select, order, limit, and offset, the last three optionally
-/// behind an embed route, apikey is the gate's and skipped, and
-/// every other key is a filter. A quoted column named "order" stays
-/// a filter because the quote survives into the key.
-fn parse_query(table: &str, raw: Option<&str>) -> Result<Query, RestError> {
+/// select, order, limit, offset, on_conflict, and columns, the
+/// pagination three optionally behind an embed route, apikey is the
+/// gate's and skipped, and every other key is a filter. A quoted
+/// column named "order" stays a filter because the quote survives
+/// into the key.
+fn parse_query(table: &str, raw: Option<&str>) -> Result<(Query, Extras), RestError> {
     let mut q = Query {
         table: table.to_string(),
         ..Query::default()
     };
+    let mut extras = Extras::default();
     let mut selected = false;
     for pair in raw.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -188,6 +245,12 @@ fn parse_query(table: &str, raw: Option<&str>) -> Result<Query, RestError> {
             "select" if prefix.is_empty() => {
                 q.select = select::parse(&value).map_err(|e| bad_grammar(e.to_string()))?;
                 selected = true;
+            }
+            "on_conflict" if prefix.is_empty() => {
+                extras.on_conflict = Some(csv(&value));
+            }
+            "columns" if prefix.is_empty() => {
+                extras.columns = Some(csv(&value));
             }
             "order" => {
                 let terms = order::parse(&value).map_err(|e| bad_grammar(e.to_string()))?;
@@ -215,7 +278,117 @@ fn parse_query(table: &str, raw: Option<&str>) -> Result<Query, RestError> {
     if !selected {
         q.select = select::parse("*").expect("* always parses");
     }
-    Ok(q)
+    Ok((q, extras))
+}
+
+/// What a write returns, the Prefer return token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ret {
+    Minimal,
+    HeadersOnly,
+    Representation,
+}
+
+/// The Prefer tokens a write honors. Unknown preferences pass
+/// through silently until handling=strict lands, and `applied`
+/// keeps the recognized ones in arrival order for the
+/// Preference-Applied header.
+#[derive(Debug)]
+struct Prefer {
+    ret: Ret,
+    /// Some(true) merges duplicates, Some(false) ignores them.
+    merge: Option<bool>,
+    applied: Vec<&'static str>,
+}
+
+fn parse_prefer(headers: &HeaderMap) -> Prefer {
+    let mut p = Prefer {
+        ret: Ret::Minimal,
+        merge: None,
+        applied: Vec::new(),
+    };
+    for value in headers.get_all("prefer") {
+        let Ok(line) = value.to_str() else { continue };
+        for item in line.split(',') {
+            let token = match item.trim() {
+                "return=minimal" => {
+                    p.ret = Ret::Minimal;
+                    "return=minimal"
+                }
+                "return=headers-only" => {
+                    p.ret = Ret::HeadersOnly;
+                    "return=headers-only"
+                }
+                "return=representation" => {
+                    p.ret = Ret::Representation;
+                    "return=representation"
+                }
+                "resolution=merge-duplicates" => {
+                    p.merge = Some(true);
+                    "resolution=merge-duplicates"
+                }
+                "resolution=ignore-duplicates" => {
+                    p.merge = Some(false);
+                    "resolution=ignore-duplicates"
+                }
+                _ => continue,
+            };
+            if !p.applied.contains(&token) {
+                p.applied.push(token);
+            }
+        }
+    }
+    p
+}
+
+/// An insert body into its column list and normalized payload: one
+/// object wraps into a single element array, the columns are the
+/// union of every element's keys so a key absent from one row
+/// inserts null there, and the columns parameter narrows the list
+/// when given, PostgREST's shapes.
+fn insert_payload(
+    bytes: &[u8],
+    columns: Option<&[String]>,
+) -> Result<(Vec<String>, String), RestError> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| invalid_body(e.to_string()))?;
+    let arr = match v {
+        serde_json::Value::Object(_) => vec![v],
+        serde_json::Value::Array(a) => a,
+        _ => {
+            return Err(invalid_body(
+                "the insert body must be a json object or array",
+            ));
+        }
+    };
+    let mut cols: Vec<String> = Vec::new();
+    for item in &arr {
+        let Some(obj) = item.as_object() else {
+            return Err(invalid_body(
+                "every element of an insert array must be an object",
+            ));
+        };
+        for key in obj.keys() {
+            if !cols.contains(key) {
+                cols.push(key.clone());
+            }
+        }
+    }
+    if let Some(list) = columns {
+        cols = list.to_vec();
+    }
+    Ok((cols, serde_json::Value::Array(arr).to_string()))
+}
+
+/// An update body into its column list and payload, one json object
+/// whose keys are the columns to set.
+fn update_payload(bytes: &[u8]) -> Result<(Vec<String>, String), RestError> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| invalid_body(e.to_string()))?;
+    let Some(obj) = v.as_object() else {
+        return Err(invalid_body("the update body must be a json object"));
+    };
+    Ok((obj.keys().cloned().collect(), v.to_string()))
 }
 
 /// The Range header as a root limit and offset, only when the query
@@ -386,13 +559,53 @@ fn content_range(offset: u64, rows: usize) -> String {
     }
 }
 
+/// The fk graph on the request's own transaction, one pg_constraint
+/// query; caching belongs to the catalog epoch work.
+async fn load_catalog(sess: &Session, authed: bool) -> Result<Catalog, RestError> {
+    let rows = sess
+        .query(INTROSPECT_SQL, &[&SCHEMA])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    Ok(Catalog::new(
+        rows.iter()
+            .map(|r| FkRow {
+                constraint: r.get(0),
+                table: r.get(1),
+                columns: r.get(2),
+                ref_table: r.get(3),
+                ref_columns: r.get(4),
+                unique: r.get(5),
+                in_pk: r.get(6),
+            })
+            .collect(),
+    ))
+}
+
+/// Rows of jsonb text joined into the response array by hand, which
+/// hands back the row count for Content-Range for free.
+fn json_array(rows: &[tokio_postgres::Row]) -> String {
+    let mut body = String::from("[");
+    for (i, row) in rows.iter().enumerate() {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str(&row.get::<_, String>(0));
+    }
+    body.push(']');
+    body
+}
+
+fn param_refs(params: &[Text]) -> Vec<&(dyn ToSql + Sync)> {
+    params.iter().map(|p| p as _).collect()
+}
+
 async fn read(
     app: &App,
     table: &str,
     auth: &AuthContext,
     req: &Parts,
 ) -> Result<Response, RestError> {
-    let mut q = parse_query(table, req.uri.query())?;
+    let (mut q, _) = parse_query(table, req.uri.query())?;
     apply_range(&mut q, &req.headers);
 
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
@@ -406,23 +619,7 @@ async fn read(
     // An early return past this point drops the session, which
     // forfeits the connection instead of pooling a dirty one, the
     // containment the pool promises.
-    let rows = sess
-        .query(INTROSPECT_SQL, &[&SCHEMA])
-        .await
-        .map_err(|e| pg_error(&e, authed))?;
-    let catalog = Catalog::new(
-        rows.iter()
-            .map(|r| FkRow {
-                constraint: r.get(0),
-                table: r.get(1),
-                columns: r.get(2),
-                ref_table: r.get(3),
-                ref_columns: r.get(4),
-                unique: r.get(5),
-                in_pk: r.get(6),
-            })
-            .collect(),
-    );
+    let catalog = load_catalog(&sess, authed).await?;
 
     let sql = plan::plan(&catalog, &q).map_err(plan_error)?;
     let wrapped = format!(
@@ -430,9 +627,8 @@ async fn read(
         sql.text
     );
     let params: Vec<Text> = sql.params.into_iter().map(Text).collect();
-    let refs: Vec<&(dyn ToSql + Sync)> = params.iter().map(|p| p as _).collect();
     let rows = sess
-        .query(&wrapped, &refs)
+        .query(&wrapped, &param_refs(&params))
         .await
         .map_err(|e| pg_error(&e, authed))?;
     sess.commit().await.map_err(|e| pg_error(&e, authed))?;
@@ -443,14 +639,7 @@ async fn read(
         .find(|(r, _)| r.is_empty())
         .map(|(_, n)| *n)
         .unwrap_or(0);
-    let mut body = String::from("[");
-    for (i, row) in rows.iter().enumerate() {
-        if i > 0 {
-            body.push(',');
-        }
-        body.push_str(&row.get::<_, String>(0));
-    }
-    body.push(']');
+    let body = json_array(&rows);
 
     Ok((
         StatusCode::OK,
@@ -463,22 +652,237 @@ async fn read(
         .into_response())
 }
 
-/// The /rest/v1/{table} handler. Reads are live, everything else
-/// answers the honest 501 until the mutations work lands.
+/// The headers every write response carries: content type always,
+/// Preference-Applied when any Prefer token was honored.
+fn write_headers(prefer: &Prefer, res: &mut Response) {
+    if !prefer.applied.is_empty() {
+        let joined = prefer.applied.join(", ");
+        if let Ok(v) = joined.parse() {
+            res.headers_mut().insert("preference-applied", v);
+        }
+    }
+}
+
+async fn write(
+    app: &App,
+    table: &str,
+    auth: &AuthContext,
+    req: &Parts,
+    bytes: &[u8],
+) -> Result<Response, RestError> {
+    let method = &req.method;
+    let prefer = parse_prefer(&req.headers);
+    let (mut q, extras) = parse_query(table, req.uri.query())?;
+
+    // Root filters belong to the mutation's WHERE. A condition whose
+    // field reaches into an embed, or anything routed at one, stays
+    // with the representation select, where the planner will accept
+    // or refuse it.
+    let mut root: Vec<Node> = Vec::new();
+    q.filters.retain(|(route, node)| {
+        let embedded = matches!(node, Node::Cond(c) if !c.field.embed.is_empty());
+        if route.is_empty() && !embedded {
+            root.push(node.clone());
+            return false;
+        }
+        true
+    });
+
+    let payload = match *method {
+        Method::POST => Some(insert_payload(bytes, extras.columns.as_deref())?),
+        Method::PATCH => Some(update_payload(bytes)?),
+        _ => None,
+    };
+
+    // A PATCH that carries no keys touches nothing: PostgREST's
+    // no-op answer, no database round trip.
+    if *method == Method::PATCH && payload.as_ref().is_some_and(|(c, _)| c.is_empty()) {
+        let mut res = if prefer.ret == Ret::Representation {
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                "[]",
+            )
+                .into_response()
+        } else {
+            StatusCode::NO_CONTENT.into_response()
+        };
+        write_headers(&prefer, &mut res);
+        return Ok(res);
+    }
+
+    let pool = app.pool.as_ref().ok_or_else(no_database)?;
+    let authed = auth.role != "anon";
+    let ctx = request_context(auth, req);
+    let sess = pool
+        .session(&ctx, false)
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+
+    // The primary key, only fetched when the upsert needs a default
+    // target or the Location header wants the columns.
+    let wants_location = *method == Method::POST && prefer.ret == Ret::HeadersOnly;
+    let needs_pk = wants_location
+        || (*method == Method::POST && prefer.merge.is_some() && extras.on_conflict.is_none());
+    let pk: Vec<String> = if needs_pk {
+        sess.query(PK_SQL, &[&SCHEMA, &table])
+            .await
+            .map_err(|e| pg_error(&e, authed))?
+            .iter()
+            .map(|r| r.get(0))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let conflict = match (*method == Method::POST, prefer.merge) {
+        (true, Some(merge)) => {
+            let target = extras.on_conflict.clone().unwrap_or_else(|| pk.clone());
+            if target.is_empty() {
+                return Err(bad_grammar(
+                    "an upsert needs a primary key or on_conflict columns",
+                ));
+            }
+            Some(if merge {
+                Conflict::Merge {
+                    target,
+                    set: payload.as_ref().map(|(c, _)| c.clone()).unwrap_or_default(),
+                }
+            } else {
+                Conflict::Ignore { target }
+            })
+        }
+        _ => None,
+    };
+
+    let returning = match prefer.ret {
+        Ret::Representation => Returning::Star,
+        // Location only makes sense for an insert; headers-only on
+        // an update or delete degrades to minimal like PostgREST.
+        Ret::HeadersOnly if wants_location => Returning::Cols(pk.clone()),
+        Ret::HeadersOnly | Ret::Minimal => Returning::None,
+    };
+
+    let m = match *method {
+        Method::POST => {
+            let (cols, body) = payload.expect("post parsed a payload");
+            mutate::insert(table, &cols, body, conflict.as_ref(), &returning)
+        }
+        Method::PATCH => {
+            let (cols, body) = payload.expect("patch parsed a payload");
+            mutate::update(table, &cols, body, &root, &returning)
+        }
+        Method::DELETE => mutate::delete(table, &root, &returning),
+        _ => unreachable!("the dispatcher only sends writes here"),
+    }
+    .map_err(|e| bad_grammar(e.message))?;
+
+    let created = *method == Method::POST;
+    let mut res = match prefer.ret {
+        Ret::Representation => {
+            let catalog = load_catalog(&sess, authed).await?;
+            let r = mutate::representation(&catalog, m, &mut q).map_err(plan_error)?;
+            let text = format!(
+                "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
+                r.cte, r.select.text
+            );
+            let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
+            let rows = sess
+                .query(&text, &param_refs(&params))
+                .await
+                .map_err(|e| pg_error(&e, authed))?;
+            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            (
+                if created {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::OK
+                },
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                json_array(&rows),
+            )
+                .into_response()
+        }
+        Ret::HeadersOnly if wants_location && !pk.is_empty() => {
+            // The returned key rides out through a CTE as jsonb text,
+            // no type juggling, and a single row becomes Location.
+            let text = format!(
+                "with \"{src}\" as ({}) select to_jsonb(\"_zou_row\")::text from \"{src}\" as \"_zou_row\"",
+                m.text,
+                src = mutate::SOURCE,
+            );
+            let params: Vec<Text> = m.params.into_iter().map(Text).collect();
+            let rows = sess
+                .query(&text, &param_refs(&params))
+                .await
+                .map_err(|e| pg_error(&e, authed))?;
+            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            let mut res = StatusCode::CREATED.into_response();
+            if rows.len() == 1
+                && let Ok(row) =
+                    serde_json::from_str::<serde_json::Value>(&rows[0].get::<_, String>(0))
+            {
+                let mut pairs = Vec::new();
+                for col in &pk {
+                    let v = match &row[col.as_str()] {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    pairs.push(format!("{col}=eq.{v}"));
+                }
+                let location = format!("/rest/v1/{table}?{}", pairs.join("&"));
+                if let Ok(v) = location.parse() {
+                    res.headers_mut().insert(header::LOCATION, v);
+                }
+            }
+            res
+        }
+        _ => {
+            let params: Vec<Text> = m.params.into_iter().map(Text).collect();
+            sess.execute(&m.text, &param_refs(&params))
+                .await
+                .map_err(|e| pg_error(&e, authed))?;
+            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            if created {
+                StatusCode::CREATED.into_response()
+            } else {
+                StatusCode::NO_CONTENT.into_response()
+            }
+        }
+    };
+    write_headers(&prefer, &mut res);
+    Ok(res)
+}
+
+/// The /rest/v1/{table} handler. Reads and writes are live, anything
+/// else answers the honest 501.
 pub async fn table(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     axum::extract::Path(table): axum::extract::Path<String>,
     axum::Extension(auth): axum::Extension<AuthContext>,
     req: Request<Body>,
 ) -> Response {
-    if req.method() != Method::GET && req.method() != Method::HEAD {
-        return crate::not_yet("this REST method");
-    }
-    // The body plays no part in a read, and holding the unsync Body
-    // across an await would unsend the future, so only the parts
-    // travel.
-    let (parts, _body) = req.into_parts();
-    match read(&app, &table, &auth, &parts).await {
+    let method = req.method().clone();
+    // Holding the unsync Body across an await would unsend the
+    // future, so it is consumed or dropped before any other await.
+    let (parts, body) = req.into_parts();
+    let result = match method {
+        Method::GET | Method::HEAD => read(&app, &table, &auth, &parts).await,
+        Method::POST | Method::PATCH | Method::DELETE => {
+            match axum::body::to_bytes(body, BODY_LIMIT).await {
+                Ok(bytes) => write(&app, &table, &auth, &parts, &bytes).await,
+                Err(_) => Err(RestError {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "PGRST102".to_string(),
+                    message: "The request body is too large".to_string(),
+                    details: None,
+                    hint: None,
+                }),
+            }
+        }
+        _ => return crate::not_yet("this REST method"),
+    };
+    match result {
         Ok(res) => res,
         Err(e) => e.into_response(),
     }
@@ -490,14 +894,14 @@ mod tests {
 
     #[test]
     fn a_bare_table_defaults_to_select_star() {
-        let q = parse_query("todos", None).unwrap();
+        let (q, _) = parse_query("todos", None).unwrap();
         assert_eq!(zou_rest::select::render(&q.select), "*");
         assert!(q.filters.is_empty());
     }
 
     #[test]
     fn reserved_words_route_and_everything_else_filters() {
-        let q = parse_query(
+        let (q, _) = parse_query(
             "todos",
             Some("select=id,orders(total)&orders.order=total.desc&orders.limit=2&status=eq.done&or=(id.eq.1,id.eq.2)&apikey=xyz"),
         )
@@ -511,7 +915,7 @@ mod tests {
 
     #[test]
     fn a_percent_encoded_value_survives_the_split() {
-        let q = parse_query("t", Some("name=eq.a%26b+c")).unwrap();
+        let (q, _) = parse_query("t", Some("name=eq.a%26b+c")).unwrap();
         match &q.filters[0].1 {
             Node::Cond(c) => match &c.value {
                 filter::Value::Lit(v) => assert_eq!(v, "a&b c"),
@@ -530,7 +934,7 @@ mod tests {
 
     #[test]
     fn a_quoted_column_named_order_stays_a_filter() {
-        let q = parse_query("t", Some("%22my.order%22=eq.1")).unwrap();
+        let (q, _) = parse_query("t", Some("%22my.order%22=eq.1")).unwrap();
         assert!(q.order.is_empty());
         assert_eq!(q.filters.len(), 1);
     }
@@ -540,12 +944,12 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::RANGE, "5-9".parse().unwrap());
 
-        let mut q = parse_query("t", None).unwrap();
+        let (mut q, _) = parse_query("t", None).unwrap();
         apply_range(&mut q, &headers);
         assert_eq!(q.offset, vec![(Vec::new(), 5)]);
         assert_eq!(q.limit, vec![(Vec::new(), 5)]);
 
-        let mut q = parse_query("t", Some("limit=1")).unwrap();
+        let (mut q, _) = parse_query("t", Some("limit=1")).unwrap();
         apply_range(&mut q, &headers);
         assert_eq!(q.limit, vec![(Vec::new(), 1)]);
         assert!(q.offset.is_empty());
@@ -615,5 +1019,66 @@ mod tests {
             "'orders' is not an embedded resource in this request".to_string(),
         ));
         assert_eq!(unrouted.code, "PGRST108");
+    }
+
+    #[test]
+    fn prefer_tokens_parse_and_the_rest_pass_through() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "prefer",
+            "return=representation, resolution=merge-duplicates, count=exact"
+                .parse()
+                .unwrap(),
+        );
+        let p = parse_prefer(&headers);
+        assert_eq!(p.ret, Ret::Representation);
+        assert_eq!(p.merge, Some(true));
+        assert_eq!(
+            p.applied,
+            vec!["return=representation", "resolution=merge-duplicates"],
+            "count is not honored yet so it is not applied"
+        );
+
+        let p = parse_prefer(&HeaderMap::new());
+        assert_eq!(p.ret, Ret::Minimal);
+        assert_eq!(p.merge, None);
+        assert!(p.applied.is_empty());
+    }
+
+    #[test]
+    fn insert_bodies_normalize_to_an_array_and_a_column_union() {
+        let (cols, payload) = insert_payload(br#"{"a":1,"b":2}"#, None).unwrap();
+        assert_eq!(cols, vec!["a", "b"]);
+        assert_eq!(payload, r#"[{"a":1,"b":2}]"#);
+
+        let (cols, _) = insert_payload(br#"[{"a":1},{"b":2,"a":3}]"#, None).unwrap();
+        assert_eq!(cols, vec!["a", "b"], "the union keeps first sight order");
+
+        let narrowing = vec!["a".to_string()];
+        let (cols, _) = insert_payload(br#"[{"a":1,"b":2}]"#, Some(&narrowing)).unwrap();
+        assert_eq!(cols, vec!["a"], "the columns parameter narrows");
+
+        assert_eq!(insert_payload(b"", None).unwrap_err().code, "PGRST102");
+        assert_eq!(insert_payload(b"42", None).unwrap_err().code, "PGRST102");
+        assert_eq!(insert_payload(b"[1,2]", None).unwrap_err().code, "PGRST102");
+    }
+
+    #[test]
+    fn update_bodies_are_one_object() {
+        let (cols, payload) = update_payload(br#"{"title":"x"}"#).unwrap();
+        assert_eq!(cols, vec!["title"]);
+        assert_eq!(payload, r#"{"title":"x"}"#);
+        assert_eq!(update_payload(b"[]").unwrap_err().code, "PGRST102");
+    }
+
+    #[test]
+    fn write_parameters_come_out_of_the_query_string() {
+        let (_, extras) =
+            parse_query("t", Some("on_conflict=id,tenant&columns=a,b&select=*")).unwrap();
+        assert_eq!(
+            extras.on_conflict,
+            Some(vec!["id".to_string(), "tenant".to_string()])
+        );
+        assert_eq!(extras.columns, Some(vec!["a".to_string(), "b".to_string()]));
     }
 }

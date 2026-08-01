@@ -374,9 +374,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_mutations_are_still_the_honest_501() {
+    async fn a_write_without_a_body_is_pgrst102() {
         let req = Request::builder()
             .method("POST")
+            .uri("/rest/v1/todos")
+            .header("apikey", anon_key())
+            .body(Body::empty())
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(res).await["code"], "PGRST102");
+    }
+
+    #[tokio::test]
+    async fn a_write_without_a_database_is_the_503_shape() {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/rest/v1/todos")
+            .header("apikey", anon_key())
+            .body(Body::from(r#"{"id":1}"#))
+            .unwrap();
+        let res = app().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body_json(res).await["code"], "PGRST000");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_rest_method_is_still_the_honest_501() {
+        let req = Request::builder()
+            .method("PUT")
             .uri("/rest/v1/todos")
             .header("apikey", anon_key())
             .body(Body::empty())
