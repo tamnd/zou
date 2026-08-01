@@ -31,6 +31,7 @@ pub mod auth;
 pub mod edge;
 pub mod jwt;
 pub mod openapi;
+pub mod password;
 pub mod rest;
 pub mod sql;
 
@@ -65,6 +66,12 @@ pub struct Config {
     /// they are signed with jwt_secret on the legacy HS256 format,
     /// which is what a fresh Supabase project still does.
     pub jwt_keys: Option<String>,
+    /// GoTrue's GOTRUE_MAILER_AUTOCONFIRM. True and a signup is
+    /// confirmed on the spot and answers with a session, which is what
+    /// the Supabase CLI sets locally because there is no inbox to read.
+    /// False and the signup answers with a user and waits for the
+    /// address to be proved, which is the hosted default.
+    pub mailer_autoconfirm: bool,
 }
 
 /// Everything the handlers share: the config and, when postgres is
@@ -340,6 +347,7 @@ pub fn router(cfg: Config) -> Result<Router, String> {
     let gated = Router::new()
         .route("/auth/v1/health", get(auth_health))
         .route("/auth/v1/token", post(auth::token))
+        .route("/auth/v1/signup", post(auth::signup))
         .route("/auth/v1/{*rest}", any(auth_stub))
         .route("/rest/v1/", any(rest::root))
         .route("/rest/v1/rpc/{func}", any(rest::rpc))
@@ -401,6 +409,7 @@ mod tests {
             schemas: vec![],
             external_url: None,
             jwt_keys: None,
+            mailer_autoconfirm: false,
         })
         .unwrap()
     }
@@ -438,6 +447,7 @@ mod tests {
             schemas: vec![],
             external_url: None,
             jwt_keys: Some(keys_json()),
+            mailer_autoconfirm: false,
         }
     }
 
@@ -724,6 +734,7 @@ mod tests {
             schemas: vec![],
             external_url: None,
             jwt_keys: None,
+            mailer_autoconfirm: false,
         })
         .unwrap();
         Router::new()
@@ -839,6 +850,7 @@ mod tests {
             schemas: vec![],
             external_url: None,
             jwt_keys: None,
+            mailer_autoconfirm: false,
         })
         .unwrap();
         let key = anon_key();
