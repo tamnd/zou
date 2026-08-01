@@ -7,16 +7,22 @@
 //! are writing, which is what gives the cell a fixed request ceiling.
 //!
 //! This crate holds the pieces of that role: the landing segment codec
-//! in [`segment`] and the batching, admission and ack machinery in
-//! [`sequencer`]. Durability itself sits behind [`SegmentSink`], so the
+//! in [`segment`], the batching, admission and ack machinery in
+//! [`sequencer`], and the fenced chain protocol with takeover in
+//! [`chain`]. Durability itself sits behind [`SegmentSink`], so the
 //! same sequencer runs over the sealed chain, a plain CAS store, or a
 //! test double.
 
+pub mod chain;
 pub mod segment;
 pub mod sequencer;
 
+pub use chain::{
+    ChainError, ChainSegment, SHARD_MANIFEST_FORMAT, ShardManifest, Takeover, chain_head,
+    manifest_key, read_chain, segment_key, take_over,
+};
 pub use segment::{
-    Footer, SEGMENT_VERSION, SegmentBuilder, SegmentDecodeError, SegmentHeader, TenantRun,
-    TenantSummary, decode_segment, read_footer, tenants_digest,
+    Footer, SEGMENT_VERSION, SegmentBuilder, SegmentDecodeError, SegmentHeader, SegmentKind,
+    TenantRun, TenantSummary, decode_segment, read_footer, tenants_digest,
 };
 pub use sequencer::{AppendError, AppendTicket, CasSink, SegmentSink, Sequencer, SequencerConfig};

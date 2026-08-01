@@ -1,0 +1,322 @@
+//! The chain protocol end to end on a real store: takeover fences a
+//! live sequencer through the seal segment, acked writes are always
+//! inside the chain the successor adopts, a crash between seal and
+//! manifest CAS wedges nothing, racing successors leave one clean
+//! chain, and head probes cost log, not linear.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use zou_log::{
+    AppendError, CasSink, ChainError, SegmentBuilder, SegmentHeader, SegmentKind, Sequencer,
+    SequencerConfig, ShardManifest, chain_head, read_chain, segment_key, take_over, tenants_digest,
+};
+use zou_store::{CasError, CasStore, Frame2, LocalFsStore, Lsn, Version};
+
+fn frame(tenant: u128, lsn: u64, body: &[u8]) -> Frame2 {
+    Frame2 {
+        tenant,
+        writer_epoch: 1,
+        start_lsn: Lsn(lsn),
+        end_lsn: Lsn(lsn + body.len() as u64),
+        contains_commit: true,
+        first_of_epoch: false,
+        hints: Vec::new(),
+        payload: body.to_vec(),
+    }
+}
+
+fn quick() -> SequencerConfig {
+    SequencerConfig {
+        window: Duration::from_millis(5),
+        ..SequencerConfig::default()
+    }
+}
+
+fn store_in(dir: &tempfile::TempDir) -> Arc<dyn CasStore> {
+    Arc::new(LocalFsStore::new(dir.path()))
+}
+
+fn resume(store: &Arc<dyn CasStore>, shard: u32, t: zou_log::Takeover) -> Sequencer {
+    let sink = Arc::new(CasSink::new(Arc::clone(store), shard));
+    Sequencer::resume(shard, sink as _, quick(), t.next_seq, t.prev_digest)
+}
+
+#[test]
+fn bootstrap_takeover_on_an_empty_shard() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+
+    let t = take_over(store.as_ref(), 5, "node-a").unwrap();
+    assert_eq!(t.chain_epoch, 1);
+    assert_eq!(t.sealed_seq, 1);
+    assert_eq!(t.next_seq, 2);
+    assert_eq!(t.prev_digest, tenants_digest(&[]));
+
+    let (m, _) = ShardManifest::load(store.as_ref(), 5).unwrap().unwrap();
+    assert_eq!(m.chain_epoch, 1);
+    assert_eq!(m.head, 1);
+    assert_eq!(m.sealed_by, "node-a");
+
+    let chain = read_chain(store.as_ref(), 5, 0).unwrap();
+    assert_eq!(chain.len(), 1);
+    assert_eq!(chain[0].header.kind, SegmentKind::Seal);
+    assert!(chain[0].frames.is_empty());
+}
+
+#[test]
+fn the_seal_fences_a_live_sequencer_and_acked_writes_survive_takeover() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let shard = 9;
+
+    // Node a takes the shard and commits three windows.
+    let ta = take_over(store.as_ref(), shard, "node-a").unwrap();
+    let seq_a = resume(&store, shard, ta);
+    let mut acked = Vec::new();
+    for (i, body) in [b"first".as_ref(), b"second", b"third"].iter().enumerate() {
+        let lsn = 100 * (i as u64 + 1);
+        seq_a
+            .append(vec![frame(1, lsn, body)])
+            .unwrap()
+            .wait()
+            .unwrap();
+        acked.push((Lsn(lsn), body.to_vec()));
+    }
+
+    // Node b takes over while a still believes it holds the role.
+    let tb = take_over(store.as_ref(), shard, "node-b").unwrap();
+    assert_eq!(tb.chain_epoch, 2);
+    assert_eq!(tb.sealed_seq, ta.next_seq + 3);
+
+    // Node a's next window lands on the seal's seq, loses the creation
+    // race, and the append fails instead of acking a lie.
+    let err = seq_a
+        .append(vec![frame(1, 999, b"zombie write")])
+        .unwrap()
+        .wait()
+        .unwrap_err();
+    assert!(matches!(err, AppendError::Store { .. }), "got {err}");
+    // The role is poisoned for good.
+    match seq_a.append(vec![frame(1, 1000, b"again")]) {
+        Err(AppendError::Poisoned) => {}
+        Err(e) => panic!("expected poisoned, got {e}"),
+        Ok(_) => panic!("expected poisoned, the append was admitted"),
+    }
+    seq_a.close().unwrap();
+
+    // Node b commits on the chain it adopted.
+    let seq_b = resume(&store, shard, tb);
+    seq_b
+        .append(vec![frame(2, 5000, b"the successor writes")])
+        .unwrap()
+        .wait()
+        .unwrap();
+    seq_b.close().unwrap();
+
+    // The whole chain reads back with every digest link intact, every
+    // acked write from a is inside it, and the zombie write is not.
+    let chain = read_chain(store.as_ref(), shard, 0).unwrap();
+    let landed: Vec<&Frame2> = chain.iter().flat_map(|s| &s.frames).collect();
+    for (lsn, body) in &acked {
+        assert!(
+            landed
+                .iter()
+                .any(|f| f.start_lsn == *lsn && &f.payload == body),
+            "acked write at {lsn:?} missing from the adopted chain"
+        );
+    }
+    assert!(landed.iter().all(|f| f.payload != b"zombie write"));
+    let seals: Vec<u64> = chain
+        .iter()
+        .filter(|s| s.header.kind == SegmentKind::Seal)
+        .map(|s| s.seq)
+        .collect();
+    assert_eq!(seals, vec![ta.sealed_seq, tb.sealed_seq]);
+}
+
+#[test]
+fn a_crash_between_seal_and_manifest_cas_wedges_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let shard = 2;
+
+    let ta = take_over(store.as_ref(), shard, "node-a").unwrap();
+    let seq_a = resume(&store, shard, ta);
+    seq_a
+        .append(vec![frame(1, 10, b"before the crash")])
+        .unwrap()
+        .wait()
+        .unwrap();
+    seq_a.close().unwrap();
+
+    // A successor seals the head and dies before touching the manifest.
+    let head = chain_head(store.as_ref(), shard, 0).unwrap();
+    let orphan_seal = head + 1;
+    let (bytes, _) = store.get(&segment_key(shard, head)).unwrap().unwrap();
+    let (_, footer) = zou_log::read_footer(&bytes).unwrap();
+    let (seal, _) = SegmentBuilder::new(SegmentHeader {
+        kind: SegmentKind::Seal,
+        shard,
+        seq: orphan_seal,
+        prev_digest: tenants_digest(&footer.tenants),
+    })
+    .finish();
+    store
+        .put_if_absent(&segment_key(shard, orphan_seal), &seal)
+        .unwrap();
+
+    // The next takeover probes past the orphan and carries on.
+    let tb = take_over(store.as_ref(), shard, "node-b").unwrap();
+    assert_eq!(tb.sealed_seq, orphan_seal + 1);
+    assert_eq!(tb.chain_epoch, 2);
+
+    let seq_b = resume(&store, shard, tb);
+    seq_b
+        .append(vec![frame(1, 20, b"after recovery")])
+        .unwrap()
+        .wait()
+        .unwrap();
+    seq_b.close().unwrap();
+
+    // The chain reads clean across the orphan seal.
+    let chain = read_chain(store.as_ref(), shard, 0).unwrap();
+    assert_eq!(chain.last().unwrap().frames[0].payload, b"after recovery");
+}
+
+#[test]
+fn racing_successors_leave_one_clean_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let shard = 4;
+
+    let racers: Vec<_> = (0..4)
+        .map(|i| {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || take_over(store.as_ref(), shard, &format!("racer-{i}")))
+        })
+        .collect();
+    let mut wins = 0;
+    for r in racers {
+        match r.join().unwrap() {
+            Ok(_) => wins += 1,
+            Err(ChainError::Contested { .. }) => {}
+            Err(e) => panic!("takeover failed for a reason besides losing: {e}"),
+        }
+    }
+    assert!(wins >= 1);
+
+    // One linear chain of seals with every link intact. A racer that
+    // lost the manifest CAS may have left an extra seal behind, which
+    // is fine, a seal is just a fence post, but the manifest must
+    // never overshoot the store: probing from its head has to land on
+    // the true head.
+    let chain = read_chain(store.as_ref(), shard, 0).unwrap();
+    assert!(chain.len() >= wins);
+    assert!(chain.iter().all(|s| s.header.kind == SegmentKind::Seal));
+    let true_head = chain_head(store.as_ref(), shard, 0).unwrap();
+    let (m, _) = ShardManifest::load(store.as_ref(), shard).unwrap().unwrap();
+    assert!(m.head <= true_head);
+    assert_eq!(
+        chain_head(store.as_ref(), shard, m.head).unwrap(),
+        true_head
+    );
+}
+
+/// Counts existence probes so the head search can prove it gallops.
+struct CountingStore {
+    inner: Arc<dyn CasStore>,
+    range_gets: AtomicUsize,
+}
+
+impl CasStore for CountingStore {
+    fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, CasError> {
+        self.inner.get(key)
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
+        self.range_gets.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_range(key, offset, len)
+    }
+    fn put_if_match(
+        &self,
+        key: &str,
+        data: &[u8],
+        expected: Option<&Version>,
+    ) -> Result<Version, CasError> {
+        self.inner.put_if_match(key, data, expected)
+    }
+    fn delete(&self, key: &str) -> Result<(), CasError> {
+        self.inner.delete(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+        self.inner.list(prefix)
+    }
+}
+
+#[test]
+fn head_probes_cost_log_in_the_manifest_lag_not_linear() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let shard = 6;
+
+    // A long lived sequencer landed 200 windows since the last takeover
+    // wrote the manifest.
+    let mut prev_digest = 0;
+    for seq in 1..=200u64 {
+        let (bytes, summaries) = SegmentBuilder::new(SegmentHeader {
+            kind: SegmentKind::Landing,
+            shard,
+            seq,
+            prev_digest,
+        })
+        .finish();
+        store
+            .put_if_absent(&segment_key(shard, seq), &bytes)
+            .unwrap();
+        prev_digest = tenants_digest(&summaries);
+    }
+
+    let counting = CountingStore {
+        inner: Arc::clone(&store),
+        range_gets: AtomicUsize::new(0),
+    };
+    assert_eq!(chain_head(&counting, shard, 0).unwrap(), 200);
+    let probes = counting.range_gets.load(Ordering::Relaxed);
+    assert!(probes <= 20, "{probes} probes to find seq 200 in a gallop");
+}
+
+#[test]
+fn a_segment_that_does_not_link_is_refused_by_the_chain_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let shard = 8;
+
+    let t = take_over(store.as_ref(), shard, "node-a").unwrap();
+    let seq = resume(&store, shard, t);
+    seq.append(vec![frame(1, 10, b"good")])
+        .unwrap()
+        .wait()
+        .unwrap();
+    seq.close().unwrap();
+
+    // Plant a well formed segment at the next seq with a digest that
+    // links to nothing, the shape a half landed write from a forgotten
+    // epoch would have.
+    let head = chain_head(store.as_ref(), shard, 0).unwrap();
+    let (bytes, _) = SegmentBuilder::new(SegmentHeader {
+        kind: SegmentKind::Landing,
+        shard,
+        seq: head + 1,
+        prev_digest: 0xdead_beef,
+    })
+    .finish();
+    store
+        .put_if_absent(&segment_key(shard, head + 1), &bytes)
+        .unwrap();
+
+    match read_chain(store.as_ref(), shard, 0) {
+        Err(ChainError::BrokenLink { seq, .. }) => assert_eq!(seq, head + 1),
+        other => panic!("expected a broken link, got {other:?}"),
+    }
+}
