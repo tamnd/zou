@@ -28,7 +28,8 @@ use std::time::{Duration, Instant};
 
 use zou_store::{CasError, CasStore, Frame2, Lsn};
 
-use crate::segment::{SegmentBuilder, SegmentHeader, tenants_digest};
+use crate::chain::segment_key;
+use crate::segment::{SegmentBuilder, SegmentHeader, SegmentKind, tenants_digest};
 
 /// Where closed batches go to become durable. `put_segment` must return
 /// only once the segment survives whatever the sink's durability story
@@ -56,7 +57,7 @@ impl CasSink {
 
 impl SegmentSink for CasSink {
     fn put_segment(&self, seq: u64, segment: &[u8]) -> Result<(), CasError> {
-        let key = format!("cellwal/{:04x}/{seq:016x}", self.shard);
+        let key = segment_key(self.shard, seq);
         self.store.put_if_absent(&key, segment).map(|_| ())
     }
 }
@@ -350,6 +351,7 @@ fn flusher_loop(shared: &Shared, sink: &dyn SegmentSink, shard: u32, config: &Se
         // Build and PUT outside the lock so appends keep staging the
         // next window while this one lands.
         let mut builder = SegmentBuilder::new(SegmentHeader {
+            kind: SegmentKind::Landing,
             shard,
             seq,
             prev_digest,

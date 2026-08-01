@@ -1920,6 +1920,8 @@ version = "0.0.1"
 dependencies = [
  "crc32c",
  "log",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "zou-store",

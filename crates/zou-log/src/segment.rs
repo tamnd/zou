@@ -21,7 +21,7 @@ pub const SEGMENT_MAGIC: [u8; 4] = *b"ZSEG";
 pub const FOOTER_MAGIC: [u8; 4] = *b"ZSGF";
 pub const SEGMENT_VERSION: u16 = 1;
 
-/// magic, version, reserved, shard, seq, prev tenants digest.
+/// magic, version, kind, shard, seq, prev tenants digest.
 const HEADER_LEN: usize = 4 + 2 + 2 + 4 + 8 + 8;
 /// footer body length, crc, footer magic.
 const TAIL_LEN: usize = 4 + 4 + 4;
@@ -29,8 +29,19 @@ const TAIL_LEN: usize = 4 + 4 + 4;
 const SUMMARY_FIXED_LEN: usize = 16 + 8 + 8 + 4 + 4;
 const RUN_LEN: usize = 8 + 8;
 
+/// What a chain position holds. Landing segments carry frames, a seal
+/// is an empty segment a successor PUTs to fence the old sequencer out
+/// of the chain (spec 03 section 5). The kind lives in the header so a
+/// reader walking the chain can skip seals without parsing footers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentKind {
+    Landing,
+    Seal,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentHeader {
+    pub kind: SegmentKind,
     pub shard: u32,
     pub seq: u64,
     /// Digest of the previous segment's per tenant tail lsns, the link
@@ -70,6 +81,8 @@ pub enum SegmentDecodeError {
     BadMagic,
     #[error("landing segment version {found} is newer than this zou, upgrade")]
     UnsupportedVersion { found: u16 },
+    #[error("segment kind {found} is newer than this zou, upgrade")]
+    UnknownKind { found: u16 },
     #[error("segment crc mismatch, the object is corrupt")]
     Corrupt,
     #[error("frame {index} is bad: {source}")]
@@ -113,7 +126,11 @@ impl SegmentBuilder {
         let mut buf = Vec::with_capacity(HEADER_LEN);
         buf.extend_from_slice(&SEGMENT_MAGIC);
         buf.extend_from_slice(&SEGMENT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes());
+        let kind: u16 = match header.kind {
+            SegmentKind::Landing => 0,
+            SegmentKind::Seal => 1,
+        };
+        buf.extend_from_slice(&kind.to_le_bytes());
         buf.extend_from_slice(&header.shard.to_le_bytes());
         buf.extend_from_slice(&header.seq.to_le_bytes());
         buf.extend_from_slice(&header.prev_digest.to_le_bytes());
@@ -212,7 +229,13 @@ fn parse_header(buf: &[u8]) -> Result<SegmentHeader, SegmentDecodeError> {
     if version != SEGMENT_VERSION {
         return Err(SegmentDecodeError::UnsupportedVersion { found: version });
     }
+    let kind = match u16::from_le_bytes(buf[6..8].try_into().unwrap()) {
+        0 => SegmentKind::Landing,
+        1 => SegmentKind::Seal,
+        found => return Err(SegmentDecodeError::UnknownKind { found }),
+    };
     Ok(SegmentHeader {
+        kind,
         shard: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
         seq: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
         prev_digest: u64::from_le_bytes(buf[20..28].try_into().unwrap()),
@@ -340,6 +363,7 @@ mod tests {
 
     fn build(seq: u64, prev_digest: u64, frames: &[Frame2]) -> (Vec<u8>, Vec<TenantSummary>) {
         let mut b = SegmentBuilder::new(SegmentHeader {
+            kind: SegmentKind::Landing,
             shard: 3,
             seq,
             prev_digest,
