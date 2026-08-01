@@ -299,7 +299,17 @@ enum Ret {
     Representation,
 }
 
-/// The Prefer tokens a write honors. Unknown preferences pass
+/// How Prefer count= wants the total computed: count(*) beside the
+/// read, the planner's row estimate, or exact bounded by the
+/// estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Count {
+    Exact,
+    Planned,
+    Estimated,
+}
+
+/// The Prefer tokens the surface honors. Unknown preferences pass
 /// through silently until handling=strict lands, and `applied`
 /// keeps the recognized ones in arrival order for the
 /// Preference-Applied header.
@@ -308,6 +318,7 @@ struct Prefer {
     ret: Ret,
     /// Some(true) merges duplicates, Some(false) ignores them.
     merge: Option<bool>,
+    count: Option<Count>,
     applied: Vec<&'static str>,
 }
 
@@ -315,6 +326,7 @@ fn parse_prefer(headers: &HeaderMap) -> Prefer {
     let mut p = Prefer {
         ret: Ret::Minimal,
         merge: None,
+        count: None,
         applied: Vec::new(),
     };
     for value in headers.get_all("prefer") {
@@ -340,6 +352,18 @@ fn parse_prefer(headers: &HeaderMap) -> Prefer {
                 "resolution=ignore-duplicates" => {
                     p.merge = Some(false);
                     "resolution=ignore-duplicates"
+                }
+                "count=exact" => {
+                    p.count = Some(Count::Exact);
+                    "count=exact"
+                }
+                "count=planned" => {
+                    p.count = Some(Count::Planned);
+                    "count=planned"
+                }
+                "count=estimated" => {
+                    p.count = Some(Count::Estimated);
+                    "count=estimated"
                 }
                 _ => continue,
             };
@@ -558,15 +582,44 @@ fn request_context(auth: &AuthContext, req: &Parts) -> RequestContext {
     }
 }
 
-/// PostgREST's Content-Range for an uncounted read: the served
-/// window when rows came back, */* when none did. Exact and
-/// estimated totals arrive with the counts work.
-fn content_range(offset: u64, rows: usize) -> String {
-    if rows == 0 {
-        "*/*".to_string()
+/// PostgREST's Content-Range: the served window over the total. The
+/// window collapses to * when no rows came back or the total is
+/// known to be zero, the total is * when nobody asked for one.
+fn content_range(offset: u64, rows: usize, total: Option<i64>) -> String {
+    let lower = offset as i64;
+    let upper = lower + rows as i64 - 1;
+    let window = if total == Some(0) || lower > upper {
+        "*".to_string()
     } else {
-        format!("{}-{}/*", offset, offset + rows as u64 - 1)
+        format!("{lower}-{upper}")
+    };
+    match total {
+        Some(t) => format!("{window}/{t}"),
+        None => format!("{window}/*"),
     }
+}
+
+/// The read status PostgREST derives from the window and the total:
+/// without a total everything is 200, a window past the total is
+/// 416, a window smaller than the total is 206.
+fn range_status(offset: u64, rows: usize, total: Option<i64>) -> StatusCode {
+    let lower = offset as i64;
+    let upper = lower + rows as i64 - 1;
+    match total {
+        Some(t) if lower > t => StatusCode::RANGE_NOT_SATISFIABLE,
+        Some(t) if 1 + upper - lower < t => StatusCode::PARTIAL_CONTENT,
+        _ => StatusCode::OK,
+    }
+}
+
+/// The 416 body, PostgREST's PGRST103 out of bounds spelling.
+fn out_of_bounds(offset: u64, total: i64) -> serde_json::Value {
+    serde_json::json!({
+        "code": "PGRST103",
+        "details": format!("An offset of {offset} was requested, but there are only {total} rows."),
+        "hint": null,
+        "message": "Requested range not satisfiable",
+    })
 }
 
 /// The fk graph on the request's own transaction, one pg_constraint
@@ -617,6 +670,7 @@ async fn read(
 ) -> Result<Response, RestError> {
     let (mut q, _) = parse_query(table, req.uri.query())?;
     apply_range(&mut q, &req.headers);
+    let prefer = parse_prefer(&req.headers);
 
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != "anon";
@@ -641,7 +695,63 @@ async fn read(
         .query(&wrapped, &param_refs(&params))
         .await
         .map_err(|e| pg_error(&e, authed))?;
+
+    // The total, when count= asked for one, on the same transaction
+    // so it sees the same snapshot. An unpaged exact total is just
+    // the page, PostgREST's shortcut; a paged one runs the count
+    // query, planned EXPLAINs it, and estimated takes exact bounded
+    // below by the plan's guess, which is PostgREST's arithmetic
+    // when no max-rows cap is configured.
+    let paged =
+        q.limit.iter().any(|(r, _)| r.is_empty()) || q.offset.iter().any(|(r, _)| r.is_empty());
+    let needs_exact = matches!(prefer.count, Some(Count::Exact | Count::Estimated));
+    let needs_planned = matches!(prefer.count, Some(Count::Planned | Count::Estimated));
+    let count_sql = if (needs_exact && paged) || needs_planned {
+        Some(plan::count(&catalog, &q).map_err(plan_error)?)
+    } else {
+        None
+    };
+    let count_params: Vec<Text> = count_sql
+        .as_ref()
+        .map(|c| c.params.iter().cloned().map(Text).collect())
+        .unwrap_or_default();
+    let exact: Option<i64> = if needs_exact {
+        if paged {
+            let c = count_sql.as_ref().expect("a paged exact built the count");
+            let text = format!("select count(*) from ({}) as \"_zou_count\"", c.text);
+            let crows = sess
+                .query(&text, &param_refs(&count_params))
+                .await
+                .map_err(|e| pg_error(&e, authed))?;
+            Some(crows[0].get(0))
+        } else {
+            Some(rows.len() as i64)
+        }
+    } else {
+        None
+    };
+    let planned: Option<i64> = if needs_planned {
+        let c = count_sql.as_ref().expect("planned built the count");
+        let text = format!("explain (format json) {}", c.text);
+        let erows = sess
+            .query(&text, &param_refs(&count_params))
+            .await
+            .map_err(|e| pg_error(&e, authed))?;
+        erows.first().and_then(|r| {
+            r.get::<_, serde_json::Value>(0)
+                .pointer("/0/Plan/Plan Rows")
+                .and_then(serde_json::Value::as_i64)
+        })
+    } else {
+        None
+    };
     sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+    let total = match prefer.count {
+        None => None,
+        Some(Count::Exact) => exact,
+        Some(Count::Planned) => planned,
+        Some(Count::Estimated) => exact.zip(planned).map(|(e, p)| e.max(p)),
+    };
 
     let offset = q
         .offset
@@ -649,17 +759,32 @@ async fn read(
         .find(|(r, _)| r.is_empty())
         .map(|(_, n)| *n)
         .unwrap_or(0);
-    let body = json_array(&rows);
-
-    Ok((
-        StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-            (header::CONTENT_RANGE, &content_range(offset, rows.len())),
-        ],
-        body,
-    )
-        .into_response())
+    let status = range_status(offset, rows.len(), total);
+    let mut res = if status == StatusCode::RANGE_NOT_SATISFIABLE {
+        json_body(status, out_of_bounds(offset, total.unwrap_or(0)))
+    } else {
+        (
+            status,
+            [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+            json_array(&rows),
+        )
+            .into_response()
+    };
+    if let Ok(v) = content_range(offset, rows.len(), total).parse() {
+        res.headers_mut().insert(header::CONTENT_RANGE, v);
+    }
+    let applied = match prefer.count {
+        Some(Count::Exact) => Some("count=exact"),
+        Some(Count::Planned) => Some("count=planned"),
+        Some(Count::Estimated) => Some("count=estimated"),
+        None => None,
+    };
+    if let Some(token) = applied
+        && let Ok(v) = token.parse()
+    {
+        res.headers_mut().insert("preference-applied", v);
+    }
+    Ok(res)
 }
 
 /// The headers every write response carries: content type always,
@@ -788,6 +913,7 @@ async fn write(
     .map_err(|e| bad_grammar(e.message))?;
 
     let created = *method == Method::POST;
+    let affected: u64;
     let mut res = match prefer.ret {
         Ret::Representation => {
             let catalog = load_catalog(&sess, authed).await?;
@@ -802,6 +928,7 @@ async fn write(
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            affected = rows.len() as u64;
             (
                 if created {
                     StatusCode::CREATED
@@ -827,6 +954,7 @@ async fn write(
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            affected = rows.len() as u64;
             let mut res = StatusCode::CREATED.into_response();
             if rows.len() == 1
                 && let Ok(row) =
@@ -849,7 +977,8 @@ async fn write(
         }
         _ => {
             let params: Vec<Text> = m.params.into_iter().map(Text).collect();
-            sess.execute(&m.text, &param_refs(&params))
+            affected = sess
+                .execute(&m.text, &param_refs(&params))
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
@@ -860,6 +989,19 @@ async fn write(
             }
         }
     };
+    // PostgREST's write Content-Range: an update shows the window it
+    // touched from zero, insert and delete collapse the window, and
+    // the total is the affected count only when count= asked.
+    let total =
+        matches!(prefer.count, Some(Count::Exact | Count::Estimated)).then_some(affected as i64);
+    let window = if *method == Method::PATCH {
+        content_range(0, affected as usize, total)
+    } else {
+        content_range(1, 0, total)
+    };
+    if let Ok(v) = window.parse() {
+        res.headers_mut().insert(header::CONTENT_RANGE, v);
+    }
     write_headers(&prefer, &mut res);
     Ok(res)
 }
@@ -1080,7 +1222,10 @@ async fn invoke(
                     StatusCode::OK,
                     [
                         (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-                        (header::CONTENT_RANGE, &content_range(offset, rows.len())),
+                        (
+                            header::CONTENT_RANGE,
+                            &content_range(offset, rows.len(), None),
+                        ),
                     ],
                     json_array(&rows),
                 )
@@ -1244,9 +1389,30 @@ mod tests {
 
     #[test]
     fn content_range_speaks_postgrest() {
-        assert_eq!(content_range(0, 0), "*/*");
-        assert_eq!(content_range(0, 3), "0-2/*");
-        assert_eq!(content_range(10, 5), "10-14/*");
+        assert_eq!(content_range(0, 0, None), "*/*");
+        assert_eq!(content_range(0, 3, None), "0-2/*");
+        assert_eq!(content_range(10, 5, None), "10-14/*");
+        assert_eq!(content_range(0, 3, Some(7)), "0-2/7");
+        assert_eq!(content_range(5, 0, Some(5)), "*/5");
+        assert_eq!(content_range(0, 0, Some(0)), "*/0");
+        // The write shapes: insert and delete collapse the window.
+        assert_eq!(content_range(1, 0, Some(4)), "*/4");
+        assert_eq!(content_range(0, 4, Some(4)), "0-3/4");
+    }
+
+    #[test]
+    fn range_status_speaks_postgrest() {
+        use axum::http::StatusCode;
+        assert_eq!(range_status(0, 3, None), StatusCode::OK);
+        assert_eq!(range_status(0, 7, Some(7)), StatusCode::OK);
+        assert_eq!(range_status(0, 3, Some(7)), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(range_status(5, 0, Some(5)), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            range_status(6, 0, Some(5)),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        // limit=0 with rows in the table is a partial answer.
+        assert_eq!(range_status(0, 0, Some(5)), StatusCode::PARTIAL_CONTENT);
     }
 
     #[test]
@@ -1284,10 +1450,14 @@ mod tests {
         let p = parse_prefer(&headers);
         assert_eq!(p.ret, Ret::Representation);
         assert_eq!(p.merge, Some(true));
+        assert_eq!(p.count, Some(Count::Exact));
         assert_eq!(
             p.applied,
-            vec!["return=representation", "resolution=merge-duplicates"],
-            "count is not honored yet so it is not applied"
+            vec![
+                "return=representation",
+                "resolution=merge-duplicates",
+                "count=exact"
+            ]
         );
 
         let p = parse_prefer(&HeaderMap::new());
