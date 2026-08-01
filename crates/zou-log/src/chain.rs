@@ -55,14 +55,36 @@ pub struct ShardManifest {
     /// The seal's seq as of the last takeover.
     pub head: u64,
     /// Everything at or below this seq has been consolidated and may be
-    /// deleted, so probes never look at or below it. Zero until the
-    /// consolidator exists.
+    /// deleted, so probes never look at or below it.
     pub consolidated_upto: u64,
+    /// Digest of the segment at `consolidated_upto`, so takeover and
+    /// recovery can link into the chain after GC has deleted the
+    /// landing objects at and below it. Meaningless while
+    /// `consolidated_upto` is zero, and zero happens to be the right
+    /// digest there too.
+    #[serde(default)]
+    pub consolidated_digest: u64,
+    /// The retained consolidation rounds, oldest and newest. Per tenant
+    /// durable watermarks live in the round indexes, not here, because
+    /// append scale data does not belong in a CAS object.
+    #[serde(default)]
+    pub rounds: Option<RoundRange>,
+    /// Rounds at or below this have had their landing segments deleted.
+    /// A GC hint like `head`, never an authority.
+    #[serde(default)]
+    pub gc_round: u64,
     /// The spec's {sealed_by, node, unix} marker. It rides here instead
     /// of inside the seal object so the seal stays a fixed size segment
     /// and the story has one authoritative copy.
     pub sealed_by: String,
     pub sealed_unix: u64,
+}
+
+/// Inclusive range of retained consolidation round numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoundRange {
+    pub first: u64,
+    pub last: u64,
 }
 
 impl ShardManifest {
@@ -156,7 +178,7 @@ pub fn chain_head(media: &WalMedia, shard: u32, floor: u64) -> Result<u64, Chain
     Ok(lo)
 }
 
-fn digest_of_segment(media: &WalMedia, shard: u32, seq: u64) -> Result<u64, ChainError> {
+pub(crate) fn digest_of_segment(media: &WalMedia, shard: u32, seq: u64) -> Result<u64, ChainError> {
     if seq == 0 {
         return Ok(0);
     }
@@ -188,8 +210,13 @@ pub fn take_over(media: &WalMedia, shard: u32, node: &str) -> Result<Takeover, C
 
         // The seal links to the head like any other segment, so a
         // reader walking the chain crosses takeovers without a special
-        // case.
-        let prev_digest = digest_of_segment(media, shard, head)?;
+        // case. If the head is the consolidated boundary its landing
+        // object may already be GC'd, so the digest comes from the
+        // manifest, which recorded it for exactly this moment.
+        let prev_digest = match manifest {
+            Some(m) if head == m.consolidated_upto => m.consolidated_digest,
+            _ => digest_of_segment(media, shard, head)?,
+        };
         let sealed_seq = head + 1;
         let builder = SegmentBuilder::new(SegmentHeader {
             kind: SegmentKind::Seal,
@@ -211,6 +238,9 @@ pub fn take_over(media: &WalMedia, shard: u32, node: &str) -> Result<Takeover, C
             chain_epoch: manifest.map_or(0, |m| m.chain_epoch) + 1,
             head: sealed_seq,
             consolidated_upto: manifest.map_or(0, |m| m.consolidated_upto),
+            consolidated_digest: manifest.map_or(0, |m| m.consolidated_digest),
+            rounds: manifest.and_then(|m| m.rounds),
+            gc_round: manifest.map_or(0, |m| m.gc_round),
             sealed_by: node.to_string(),
             sealed_unix: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -260,7 +290,21 @@ pub fn read_chain(
     shard: u32,
     from: u64,
 ) -> Result<Vec<ChainSegment>, ChainError> {
-    let mut prev_digest = digest_of_segment(media, shard, from)?;
+    let prev_digest = digest_of_segment(media, shard, from)?;
+    read_chain_linked(media, shard, from, prev_digest)
+}
+
+/// [`read_chain`] for callers that already know the digest at `from`,
+/// which is how a reader enters the chain at the consolidated boundary
+/// after GC has deleted the landing object there: the shard manifest
+/// carries the digest precisely so this link survives the object.
+pub fn read_chain_linked(
+    media: &WalMedia,
+    shard: u32,
+    from: u64,
+    prev_digest: u64,
+) -> Result<Vec<ChainSegment>, ChainError> {
+    let mut prev_digest = prev_digest;
     let mut out = Vec::new();
     let mut seq = from + 1;
     while let Some(bytes) = media.fetch(shard, seq)? {

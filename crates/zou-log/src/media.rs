@@ -193,6 +193,23 @@ impl WalMedia {
         }
     }
 
+    /// The GC rule: remove a consolidated seq from every medium it
+    /// could sit on, half landed losers included. Deleting a missing
+    /// key is a no op, so reruns after a crash converge.
+    pub fn delete_segment(&self, shard: u32, seq: u64) -> Result<(), CasError> {
+        let key = segment_key(shard, seq);
+        match self {
+            WalMedia::Single(store) => store.delete(&key),
+            WalMedia::Dual {
+                az1, az2, standard, ..
+            } => {
+                az1.delete(&key)?;
+                az2.delete(&key)?;
+                standard.delete(&key)
+            }
+        }
+    }
+
     /// The reader rule for recovery: the owner's bytes, or None if no
     /// owner holds the seq. A half landed loser on one medium never
     /// comes back from here.
