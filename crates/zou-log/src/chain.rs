@@ -24,6 +24,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use zou_store::{CasError, CasStore, Frame2, Version};
 
+use crate::media::{SealOutcome, WalMedia};
 use crate::segment::{
     Footer, SegmentBuilder, SegmentDecodeError, SegmentHeader, SegmentKind, decode_segment,
     read_footer, tenants_digest,
@@ -122,16 +123,13 @@ pub struct Takeover {
     pub prev_digest: u64,
 }
 
-fn exists(store: &dyn CasStore, shard: u32, seq: u64) -> Result<bool, CasError> {
-    Ok(store.get_range(&segment_key(shard, seq), 0, 1)?.is_some())
-}
-
 /// Find the chain head by probing forward from a known floor. The
-/// chain is gap free, presence is a prefix, so gallop then binary
-/// search: log cost in the distance since the manifest was last
-/// written, no LIST anywhere near the hot path.
-pub fn chain_head(store: &dyn CasStore, shard: u32, floor: u64) -> Result<u64, ChainError> {
-    if !exists(store, shard, floor + 1)? {
+/// chain is gap free and a seq only counts once an owner holds it
+/// under the media's presence rule, so presence is a prefix: gallop
+/// then binary search, log cost in the distance since the manifest was
+/// last written, no LIST anywhere near the hot path.
+pub fn chain_head(media: &WalMedia, shard: u32, floor: u64) -> Result<u64, ChainError> {
+    if !media.present(shard, floor + 1)? {
         return Ok(floor);
     }
     // Gallop: find a missing seq to bound the search.
@@ -139,7 +137,7 @@ pub fn chain_head(store: &dyn CasStore, shard: u32, floor: u64) -> Result<u64, C
     let mut step = 1u64;
     let hi = loop {
         let probe = lo.saturating_add(step);
-        if !exists(store, shard, probe)? {
+        if !media.present(shard, probe)? {
             break probe; // known absent
         }
         lo = probe;
@@ -149,7 +147,7 @@ pub fn chain_head(store: &dyn CasStore, shard: u32, floor: u64) -> Result<u64, C
     let (mut lo, mut hi) = (lo, hi);
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if exists(store, shard, mid)? {
+        if media.present(shard, mid)? {
             lo = mid;
         } else {
             hi = mid;
@@ -158,14 +156,13 @@ pub fn chain_head(store: &dyn CasStore, shard: u32, floor: u64) -> Result<u64, C
     Ok(lo)
 }
 
-fn digest_of_segment(store: &dyn CasStore, shard: u32, seq: u64) -> Result<u64, ChainError> {
+fn digest_of_segment(media: &WalMedia, shard: u32, seq: u64) -> Result<u64, ChainError> {
     if seq == 0 {
         return Ok(0);
     }
-    let bytes = store
-        .get(&segment_key(shard, seq))?
-        .ok_or(ChainError::BrokenLink { shard, seq })?
-        .0;
+    let bytes = media
+        .fetch(shard, seq)?
+        .ok_or(ChainError::BrokenLink { shard, seq })?;
     let (_, footer) =
         read_footer(&bytes).map_err(|source| ChainError::Segment { shard, seq, source })?;
     Ok(tenants_digest(&footer.tenants))
@@ -177,8 +174,9 @@ fn digest_of_segment(store: &dyn CasStore, shard: u32, seq: u64) -> Result<u64, 
 /// rival just retries against the new head, and after a few straight
 /// losses it returns Contested so a confused control plane backs off
 /// instead of dueling forever.
-pub fn take_over(store: &dyn CasStore, shard: u32, node: &str) -> Result<Takeover, ChainError> {
+pub fn take_over(media: &WalMedia, shard: u32, node: &str) -> Result<Takeover, ChainError> {
     const MAX_ATTEMPTS: u32 = 8;
+    let store = media.manifest_store().as_ref();
     for _ in 0..MAX_ATTEMPTS {
         let loaded = ShardManifest::load(store, shard)?;
         let (manifest, version) = match &loaded {
@@ -186,12 +184,12 @@ pub fn take_over(store: &dyn CasStore, shard: u32, node: &str) -> Result<Takeove
             None => (None, None),
         };
         let floor = manifest.map_or(0, |m| m.head.max(m.consolidated_upto));
-        let head = chain_head(store, shard, floor)?;
+        let head = chain_head(media, shard, floor)?;
 
         // The seal links to the head like any other segment, so a
         // reader walking the chain crosses takeovers without a special
         // case.
-        let prev_digest = digest_of_segment(store, shard, head)?;
+        let prev_digest = digest_of_segment(media, shard, head)?;
         let sealed_seq = head + 1;
         let builder = SegmentBuilder::new(SegmentHeader {
             kind: SegmentKind::Seal,
@@ -200,12 +198,11 @@ pub fn take_over(store: &dyn CasStore, shard: u32, node: &str) -> Result<Takeove
             prev_digest,
         });
         let (seal, summaries) = builder.finish();
-        match store.put_if_absent(&segment_key(shard, sealed_seq), &seal) {
-            Ok(_) => {}
+        match media.seal(shard, sealed_seq, &seal)? {
+            SealOutcome::Sealed => {}
             // The head moved, either the incumbent landed another
             // window or a rival sealed first. Probe again.
-            Err(CasError::AlreadyExists { .. }) => continue,
-            Err(e) => return Err(e.into()),
+            SealOutcome::Occupied => continue,
         }
 
         let next = ShardManifest {
@@ -253,18 +250,20 @@ pub struct ChainSegment {
 }
 
 /// Read the chain from `from` (exclusive) to the current head,
-/// verifying every digest link on the way. This is the recovery read:
-/// a half landed zombie PUT past the true head fails the link check
-/// and is ignored, exactly the chain rule in spec 03 section 5.
+/// verifying every digest link on the way. This is the recovery read,
+/// and both halves of the chain rule in spec 03 section 5 live here:
+/// the media's fetch only returns a seq's owner, so a half landed
+/// zombie PUT on one medium is invisible, and a well formed segment
+/// past the head that does not link to its predecessor is refused.
 pub fn read_chain(
-    store: &dyn CasStore,
+    media: &WalMedia,
     shard: u32,
     from: u64,
 ) -> Result<Vec<ChainSegment>, ChainError> {
-    let mut prev_digest = digest_of_segment(store, shard, from)?;
+    let mut prev_digest = digest_of_segment(media, shard, from)?;
     let mut out = Vec::new();
     let mut seq = from + 1;
-    while let Some((bytes, _)) = store.get(&segment_key(shard, seq))? {
+    while let Some(bytes) = media.fetch(shard, seq)? {
         let (header, frames, footer) =
             decode_segment(&bytes).map_err(|source| ChainError::Segment { shard, seq, source })?;
         if header.shard != shard || header.seq != seq || header.prev_digest != prev_digest {

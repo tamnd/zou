@@ -8,8 +8,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use zou_log::{
-    AppendError, CasSink, SegmentSink, Sequencer, SequencerConfig, decode_segment, read_footer,
-    tenants_digest,
+    AppendError, MediaSink, SegmentSink, Sequencer, SequencerConfig, WalMedia, decode_segment,
+    read_footer, tenants_digest,
 };
 use zou_store::{CasError, CasStore, Frame2, LocalFsStore, Lsn};
 
@@ -305,10 +305,11 @@ fn close_drains_the_open_batch() {
 }
 
 #[test]
-fn the_cas_sink_lands_fenced_objects_on_a_real_store() {
+fn the_media_sink_lands_fenced_objects_on_a_real_store() {
     let dir = tempfile::tempdir().unwrap();
     let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(dir.path()));
-    let sink = Arc::new(CasSink::new(Arc::clone(&store), 7));
+    let media = Arc::new(WalMedia::single(Arc::clone(&store)));
+    let sink = Arc::new(MediaSink::new(media, 7));
     let seq = Sequencer::resume(7, sink as _, quick(), 42, 0xabc);
 
     seq.append(vec![frame(3, 2, 700, b"onto the store")])
@@ -326,7 +327,7 @@ fn the_cas_sink_lands_fenced_objects_on_a_real_store() {
     assert_eq!(frames[0].payload, b"onto the store");
 
     // The fence: a second sequencer resuming at the same head loses.
-    let sink2 = Arc::new(CasSink::new(store, 7));
+    let sink2 = Arc::new(MediaSink::new(Arc::new(WalMedia::single(store)), 7));
     let seq2 = Sequencer::resume(7, sink2 as _, quick(), 42, 0xabc);
     let outcome = seq2
         .append(vec![frame(3, 2, 800, b"zombie")])

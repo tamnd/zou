@@ -26,9 +26,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use zou_store::{CasError, CasStore, Frame2, Lsn};
+use zou_store::{CasError, Frame2, Lsn};
 
-use crate::chain::segment_key;
 use crate::segment::{SegmentBuilder, SegmentHeader, SegmentKind, tenants_digest};
 
 /// Where closed batches go to become durable. `put_segment` must return
@@ -36,30 +35,10 @@ use crate::segment::{SegmentBuilder, SegmentHeader, SegmentKind, tenants_digest}
 /// is, because the sequencer acks commits on its return. An error is
 /// terminal for the shard: with a fenced chain it means another
 /// sequencer may own the head now, so the caller poisons itself.
+/// Deployments use [`MediaSink`](crate::MediaSink), which lands fenced
+/// objects on whatever media the cell's durability mode picked.
 pub trait SegmentSink: Send + Sync {
     fn put_segment(&self, seq: u64, segment: &[u8]) -> Result<(), CasError>;
-}
-
-/// The plain sink: one fenced object per segment on any CAS store,
-/// `cellwal/<shard>/<seq:016x>` created with put_if_absent. Losing the
-/// creation race surfaces as AlreadyExists, which is exactly the fence:
-/// someone else owns that chain position, this sequencer must stop.
-pub struct CasSink {
-    store: Arc<dyn CasStore>,
-    shard: u32,
-}
-
-impl CasSink {
-    pub fn new(store: Arc<dyn CasStore>, shard: u32) -> Self {
-        Self { store, shard }
-    }
-}
-
-impl SegmentSink for CasSink {
-    fn put_segment(&self, seq: u64, segment: &[u8]) -> Result<(), CasError> {
-        let key = segment_key(self.shard, seq);
-        self.store.put_if_absent(&key, segment).map(|_| ())
-    }
 }
 
 #[derive(Debug, Clone)]
