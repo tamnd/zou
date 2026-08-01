@@ -1,5 +1,5 @@
 [package]
-name = "zou-store-fuzz"
+name = "zou-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -10,10 +10,18 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 zou-store = { path = "../crates/zou-store" }
+zou-rest = { path = "../crates/zou-rest" }
 
 [[bin]]
 name = "wal_decode"
 path = "fuzz_targets/wal_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rest_filter"
+path = "fuzz_targets/rest_filter.rs"
 test = false
 doc = false
 bench = false
