@@ -57,11 +57,31 @@ kill_node() {
 }
 
 # Writes block until the lease is held, which after a node death means
-# waiting out the previous incarnation's TTL, so the window is long.
+# waiting out the previous incarnation's TTL, and a fresh attach then
+# replays the whole durable WAL overlay before accepting anything. On
+# a slow store that legitimately takes many minutes, so the clock here
+# measures stall, not wall time: as long as the server keeps logging
+# something we did not cause ourselves, keep waiting, under a one hour
+# cap. Our own probes append not-yet-accepting FATALs to the dev log
+# every second, so those lines are filtered out of the progress count
+# or the log would always look alive.
 wait_writable() {
-	for _ in $(seq 1 240); do
+	local devlog="$WORK/dev-$iter.log"
+	local stall=0 last=-1 lines
+	for _ in $(seq 1 3600); do
 		if q "insert into probe values(1)" >/dev/null 2>&1; then
 			return 0
+		fi
+		lines=$(grep -cv "accepting connections\|Consistent recovery state" \
+			"$devlog" 2>/dev/null || echo 0)
+		if [ "$lines" != "$last" ]; then
+			last=$lines
+			stall=0
+		else
+			stall=$((stall + 1))
+		fi
+		if [ "$stall" -ge 240 ]; then
+			break
 		fi
 		sleep 1
 	done
