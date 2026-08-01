@@ -77,6 +77,25 @@ Two rules here are stricter than GoTrue's. A server that offers no STARTTLS is r
 
 Once something is carrying the mail there is nothing left in the process, so `zou inbox` has nothing to print and `/dev/inbox` is not there at all.
 
+## Signing in with Google or Github
+
+Give a provider a client id and a secret and it turns up in the flow. The names are GoTrue's again with `GOTRUE_EXTERNAL_` swapped for `ZOU_EXTERNAL_`, so the values a project already has keep working.
+
+```bash
+ZOU_JWT_SECRET=$(openssl rand -hex 32) \
+ZOU_EXTERNAL_GOOGLE_CLIENT_ID=... \
+ZOU_EXTERNAL_GOOGLE_SECRET=... \
+ZOU_EXTERNAL_GITHUB_CLIENT_ID=... \
+ZOU_EXTERNAL_GITHUB_SECRET=... \
+  zou dev /tmp/mydb --http 54321
+```
+
+Half a credential is refused at startup rather than at the first sign in, because a provider that is configured wrong is worth hearing about before somebody clicks the button. Register `http://127.0.0.1:54321/auth/v1/callback` with the provider, or set `ZOU_EXTERNAL_GOOGLE_REDIRECT_URI` when it has to be something else, such as a proxy in front.
+
+The client library needs nothing new. `supabase.auth.signInWithOAuth({ provider: 'google' })` sends the browser to `/auth/v1/authorize`, the provider sends it back to `/auth/v1/callback`, and the session arrives either in the fragment or, when the client sent a PKCE challenge, as a code that `POST /auth/v1/token?grant_type=pkce` trades for one. Both of those endpoints are outside the apikey gate, because a browser following a redirect has no way to carry a header.
+
+An address a provider will not vouch for never links to an account that already holds it. Signing in at a provider with somebody else's address gets a new account with no address at all, which is what GoTrue does and the reason it does it.
+
 ## Where to go next
 
 - docs/architecture.md for the shape of the whole system

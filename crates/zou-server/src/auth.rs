@@ -2692,18 +2692,30 @@ fn same_site(site: &str, candidate: &str) -> bool {
 /// supabase clients parse the fragment themselves, so matching Go here
 /// is what keeps them parsing it.
 fn redirect(target: &str, pairs: &Vec<(&str, String)>) -> Response {
+    to(
+        StatusCode::SEE_OTHER,
+        &format!("{target}#{}", encoded(pairs)),
+    )
+}
+
+/// Go's url.Values.Encode: sorted by key, each side escaped.
+fn encoded(pairs: &[(&str, String)]) -> String {
     let mut pairs: Vec<&(&str, String)> = pairs.iter().collect();
     pairs.sort_by_key(|(k, _)| *k);
-    let fragment = pairs
+    pairs
         .iter()
         .map(|(k, v)| format!("{}={}", query_escape(k), query_escape(v)))
         .collect::<Vec<_>>()
-        .join("&");
-    let location = format!("{target}#{fragment}");
-    match axum::http::HeaderValue::from_str(&location) {
+        .join("&")
+}
+
+/// A redirect, or a 500 when the target is not something that fits in
+/// a header, which is the only way building one fails.
+fn to(status: StatusCode, location: &str) -> Response {
+    match axum::http::HeaderValue::from_str(location) {
         Ok(value) => {
             let mut res = Response::new(Body::empty());
-            *res.status_mut() = StatusCode::SEE_OTHER;
+            *res.status_mut() = status;
             res.headers_mut()
                 .insert(axum::http::header::LOCATION, value);
             res
@@ -2742,6 +2754,991 @@ fn query_object(query: &str) -> serde_json::Value {
             .or_insert_with(|| serde_json::Value::String(crate::rest::decode(value)));
     }
     serde_json::Value::Object(out)
+}
+
+/// GoTrue's GOTRUE_EXTERNAL_FLOW_STATE_EXPIRY_DURATION, which has a
+/// floor of five minutes and a default of the same: how long there is
+/// between being sent to a provider and coming back with something to
+/// trade.
+const FLOW_TTL: f64 = 300.0;
+
+/// GET /auth/v1/authorize, where a social sign in starts.
+///
+/// The answer is a redirect to the provider carrying a state parameter,
+/// and the state is the id of a row written here. Upstream used to sign
+/// a JWT for this and now writes a row instead, which is what makes a
+/// state single use: the row records that it has been spent, and a
+/// signature cannot.
+pub async fn authorize(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let query = query_object(req.uri().query().unwrap_or_default());
+    let name = field(&query, "provider");
+    let Some(provider) = app.cfg.oauth.get(name) else {
+        // Upstream prints the underlying error into this message, and
+        // the two it can be say different things: one means the name is
+        // not a provider at all, the other that it is one nobody
+        // configured. A client debugging a typo needs to be told which.
+        let why = match crate::oauth::Provider::named(&name.to_ascii_lowercase()) {
+            Some(_) => "provider is not enabled".to_string(),
+            None => format!("Provider {name} could not be found"),
+        };
+        return error_body(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            &format!("Unsupported provider: {why}"),
+        );
+    };
+    let challenge = field(&query, "code_challenge");
+    let method = field(&query, "code_challenge_method");
+    if let Err(e) = validate_pkce(method, challenge) {
+        return refusal(e, "authorize");
+    }
+    let referrer = landing(&app, field(&query, "redirect_to"), &referer(&req));
+    let state = match new_flow(pool, &provider.name, challenge, method, &referrer).await {
+        Ok(state) => state,
+        Err(e) => return refusal(e, "authorize"),
+    };
+    // 302 rather than the 303 a followed confirmation link gets,
+    // because that is what upstream sends and what every provider's
+    // registered redirect was tested against.
+    to(
+        StatusCode::FOUND,
+        &provider.authorize_url(
+            &callback_url(&app, provider),
+            &state,
+            field(&query, "scopes"),
+        ),
+    )
+}
+
+/// Where the provider sends the person back: whatever this provider was
+/// registered with, or this server's own callback.
+fn callback_url(app: &App, provider: &crate::oauth::Provider) -> String {
+    match provider.redirect_uri.is_empty() {
+        true => format!("{}/callback", app.issuer()),
+        false => provider.redirect_uri.clone(),
+    }
+}
+
+/// Upstream's validatePKCEParams. Both parameters or neither, and a
+/// challenge that is the right length and the right alphabet, which is
+/// RFC 7636 section 4.2.
+fn validate_pkce(method: &str, challenge: &str) -> Result<(), Error> {
+    if challenge.is_empty() != method.is_empty() {
+        return denied(
+            "validation_failed",
+            "PKCE flow requires code_challenge_method and code_challenge",
+        );
+    }
+    if challenge.is_empty() {
+        return Ok(());
+    }
+    if challenge.len() < 43 || challenge.len() > 128 {
+        return denied(
+            "validation_failed",
+            "code challenge has to be between 43 and 128 characters",
+        );
+    }
+    if !challenge
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-'))
+    {
+        return denied(
+            "validation_failed",
+            "code challenge can only contain alphanumeric characters, hyphens, periods, underscores and tildes",
+        );
+    }
+    match method.to_ascii_lowercase().as_str() {
+        "s256" | "plain" => Ok(()),
+        _ => denied("validation_failed", "Invalid code_challenge_method"),
+    }
+}
+
+/// Write down what this flow is, and hand back the id that goes to the
+/// provider as the state.
+///
+/// A flow with no challenge is the implicit flow, and it gets a row
+/// too: the row is what says which provider a callback belongs to and
+/// where its answer should land, neither of which can be taken from the
+/// callback request itself without trusting it.
+async fn new_flow(
+    pool: &Pool,
+    provider: &str,
+    challenge: &str,
+    method: &str,
+    referrer: &str,
+) -> Result<String, Error> {
+    let method = method.to_ascii_lowercase();
+    let sess = pool.admin().await?;
+    let found = sess
+        .query(
+            "insert into auth.flow_state
+                 (id, auth_code, code_challenge, code_challenge_method,
+                  provider_type, authentication_method, referrer,
+                  created_at, updated_at)
+             select gen_random_uuid(),
+                    case when $1::text = '' then null
+                         else gen_random_uuid()::text end,
+                    nullif($1::text, ''),
+                    case when $1::text = '' then null
+                         else $2::text::auth.code_challenge_method end,
+                    $3::text, 'oauth', $4::text, now(), now()
+             returning id::text",
+            &[&challenge, &method, &provider, &referrer],
+        )
+        .await;
+    let rows = match found {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return Err(e.into());
+        }
+    };
+    let state: String = rows[0].get(0);
+    sess.commit().await?;
+    Ok(state)
+}
+
+/// The flow a callback is resuming.
+struct Flow {
+    id: String,
+    provider: String,
+    referrer: String,
+    /// The challenge and its method, when this is a PKCE flow. None is
+    /// the implicit flow, which gets its session on the redirect.
+    challenge: Option<(String, String)>,
+    auth_code: String,
+}
+
+/// GET /auth/v1/callback, where the provider sends the person back.
+///
+/// Everything that can go wrong here goes back to the app as a redirect
+/// rather than as a status, because what is looking at this response is
+/// a browser mid navigation with no way to read a json body.
+pub async fn callback(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let query = query_object(req.uri().query().unwrap_or_default());
+    let site = app.site_url();
+
+    // The flow is loaded first because everything after it, including
+    // where a failure is sent, comes out of that row. A callback whose
+    // state does not load has nowhere of its own to go, so it goes to
+    // the site url.
+    let flow = match load_flow(pool, field(&query, "state")).await {
+        Ok(flow) => flow,
+        Err(e) => return oauth_refusal(&site, e),
+    };
+    let target = match flow.referrer.is_empty() {
+        true => site,
+        false => flow.referrer.clone(),
+    };
+
+    // The provider refused, or the person changed their mind at the
+    // consent screen. Its own words go back rather than ours, because
+    // access_denied from Google means what Google says it means.
+    let said_no = field(&query, "error");
+    if !said_no.is_empty() {
+        return oauth_redirect(&target, said_no, "", field(&query, "error_description"));
+    }
+    let code = field(&query, "code");
+    if code.is_empty() {
+        return oauth_refusal(
+            &target,
+            refused(
+                StatusCode::BAD_REQUEST,
+                "bad_oauth_callback",
+                "OAuth callback with missing authorization code missing",
+            ),
+        );
+    }
+    let Some(provider) = app.cfg.oauth.get(&flow.provider) else {
+        // The row names a provider that is no longer configured, which
+        // is a project that changed its mind between the two halves of
+        // one sign in.
+        return oauth_refusal(
+            &target,
+            refused(
+                StatusCode::BAD_REQUEST,
+                "oauth_provider_not_supported",
+                "Unsupported provider: provider is not enabled",
+            ),
+        );
+    };
+
+    let (person, tokens) = match ask_provider(&app, provider, code).await {
+        Ok(pair) => pair,
+        Err(e) => return oauth_refusal(&target, e),
+    };
+    if person.email.is_empty() {
+        return oauth_refusal(
+            &target,
+            refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected_failure",
+                "Error getting user email from external provider",
+            ),
+        );
+    }
+
+    let post = posting(&app, &flow.referrer, "");
+    match land(&app, pool, &flow, provider, &person, &tokens, &post).await {
+        Ok(response) => response,
+        Err(e) => oauth_refusal(&target, e),
+    }
+}
+
+/// Trade the code for a token and read the profile it opens, both on a
+/// blocking thread because the client underneath is a blocking one and
+/// a provider on the far side of the internet is not quick.
+async fn ask_provider(
+    app: &App,
+    provider: &crate::oauth::Provider,
+    code: &str,
+) -> Result<(crate::oauth::Person, crate::oauth::Tokens), Error> {
+    let http = Arc::clone(&app.web);
+    let redirect = callback_url(app, provider);
+    let provider = provider.clone();
+    let code = code.to_string();
+    let out = tokio::task::spawn_blocking(move || {
+        let tokens = crate::oauth::exchange(&provider, http.as_ref(), &code, &redirect)?;
+        let person = crate::oauth::person(&provider, http.as_ref(), &tokens.access_token)?;
+        Ok::<_, String>((person, tokens))
+    })
+    .await;
+    match out {
+        Ok(Ok(pair)) => Ok(pair),
+        Ok(Err(e)) => {
+            log::error!("oauth callback: {e}");
+            Err(refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected_failure",
+                &e,
+            ))
+        }
+        Err(e) => {
+            log::error!("oauth callback panicked: {e}");
+            Err(refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected_failure",
+                "Unexpected failure, please check server logs for more information",
+            ))
+        }
+    }
+}
+
+/// Read the flow back, in upstream's order of complaints. A state that
+/// is missing, malformed, unknown, expired or spent each says so
+/// differently, because a client debugging one of these needs to be
+/// told which it is.
+async fn load_flow(pool: &Pool, state: &str) -> Result<Flow, Error> {
+    if state.is_empty() {
+        return Err(refused(
+            StatusCode::BAD_REQUEST,
+            "bad_oauth_callback",
+            "OAuth state parameter missing",
+        ));
+    }
+    if !is_uuid(state) {
+        return Err(refused(
+            StatusCode::BAD_REQUEST,
+            "bad_oauth_state",
+            "OAuth state parameter is invalid",
+        ));
+    }
+    let sess = pool.admin().await?;
+    let found = sess
+        .query(
+            "select id::text, provider_type, coalesce(referrer, ''),
+                    coalesce(code_challenge, ''),
+                    coalesce(code_challenge_method::text, ''),
+                    coalesce(auth_code, ''),
+                    created_at < now() - make_interval(secs => $2::double precision),
+                    user_id is not null
+               from auth.flow_state where id = $1::text::uuid",
+            &[&state, &FLOW_TTL],
+        )
+        .await;
+    let rows = match found {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return Err(e.into());
+        }
+    };
+    let out = read_flow(rows.first());
+    sess.commit().await?;
+    out
+}
+
+fn read_flow(row: Option<&tokio_postgres::Row>) -> Result<Flow, Error> {
+    let Some(row) = row else {
+        return Err(refused(
+            StatusCode::BAD_REQUEST,
+            "bad_oauth_state",
+            "OAuth state not found or expired",
+        ));
+    };
+    if row.get::<_, bool>(6) {
+        return Err(refused(
+            StatusCode::BAD_REQUEST,
+            "bad_oauth_state",
+            "OAuth state has expired",
+        ));
+    }
+    let challenge: String = row.get(3);
+    let flow = Flow {
+        id: row.get(0),
+        provider: row.get(1),
+        referrer: row.get(2),
+        challenge: match challenge.is_empty() {
+            true => None,
+            false => Some((challenge, row.get(4))),
+        },
+        auth_code: row.get(5),
+    };
+    // A spent PKCE flow is one whose callback already ran, with the
+    // code waiting to be traded. Running it again would issue a second
+    // identity for the same consent, so it is refused rather than
+    // replayed.
+    if flow.challenge.is_some() && row.get::<_, bool>(7) {
+        return Err(refused(
+            StatusCode::BAD_REQUEST,
+            "flow_state_already_used",
+            "State has already been used",
+        ));
+    }
+    Ok(flow)
+}
+
+/// Everything the callback does once the provider has been believed:
+/// find or make the account, then either mark the flow for a client
+/// that will come back with a verifier, or hand out a session on the
+/// redirect itself.
+async fn land(
+    app: &App,
+    pool: &Pool,
+    flow: &Flow,
+    provider: &crate::oauth::Provider,
+    person: &crate::oauth::Person,
+    tokens: &crate::oauth::Tokens,
+    post: &Post<'_>,
+) -> Result<Response, Error> {
+    let sess = pool.admin().await?;
+    let out = settle(&sess, app, flow, provider, person, tokens, post).await;
+    match out {
+        Ok(landed) => {
+            // The unverified address branch commits and then refuses,
+            // because what it did before refusing was send a
+            // confirmation email, and a rollback would leave somebody
+            // holding a link that matches nothing.
+            sess.commit().await?;
+            match landed {
+                Landed::Answer(response) => Ok(*response),
+                Landed::Unverified(provider) => Err(refused(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "provider_email_needs_verification",
+                    &format!(
+                        "Unverified email with {provider}. A confirmation email has been sent to your {provider} email"
+                    ),
+                )),
+            }
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+enum Landed {
+    Answer(Box<Response>),
+    Unverified(String),
+}
+
+async fn settle(
+    sess: &sql::Session,
+    app: &App,
+    flow: &Flow,
+    provider: &crate::oauth::Provider,
+    person: &crate::oauth::Person,
+    tokens: &crate::oauth::Tokens,
+    post: &Post<'_>,
+) -> Result<Landed, Error> {
+    let user_id = match attach(sess, &provider.name, person, post).await? {
+        Attached::User(id) => id,
+        Attached::Unverified => return Ok(Landed::Unverified(provider.name.clone())),
+    };
+    let target = match flow.referrer.is_empty() {
+        true => app.site_url(),
+        false => flow.referrer.clone(),
+    };
+
+    if flow.challenge.is_none() {
+        // Implicit: the session rides back in the fragment, and the
+        // flow row has done its job.
+        let issued = start(sess, &user_id, "oauth", &app.signer(), &app.issuer()).await?;
+        sess.execute(
+            "delete from auth.flow_state where id = $1::text::uuid",
+            &[&flow.id],
+        )
+        .await?;
+        let mut fragment = vec![
+            ("access_token", issued.access_token.clone()),
+            ("expires_at", issued.expires_at.to_string()),
+            ("expires_in", issued.expires_in.to_string()),
+            ("refresh_token", issued.refresh_token.clone()),
+            ("provider_token", tokens.access_token.clone()),
+            ("sb", String::new()),
+            ("token_type", "bearer".to_string()),
+        ];
+        // Not every provider hands one out, and a client cannot tell an
+        // absent refresh token from an empty one if it is always there.
+        if !tokens.refresh_token.is_empty() {
+            fragment.push(("provider_refresh_token", tokens.refresh_token.clone()));
+        }
+        let location = format!("{target}#{}", encoded(&fragment));
+        return Ok(Landed::Answer(Box::new(to(StatusCode::FOUND, &location))));
+    }
+
+    // PKCE: the flow keeps the provider's tokens until a client comes
+    // back with the verifier, and the redirect carries only the code.
+    let claimed = sess
+        .execute(
+            "update auth.flow_state
+                set user_id = $2::text::uuid,
+                    provider_access_token = $3,
+                    provider_refresh_token = $4,
+                    auth_code_issued_at = now(),
+                    updated_at = now()
+              where id = $1::text::uuid and user_id is null",
+            &[
+                &flow.id,
+                &user_id,
+                &tokens.access_token,
+                &tokens.refresh_token,
+            ],
+        )
+        .await?;
+    if claimed == 0 {
+        // Two callbacks for one state raced, and this is the loser.
+        return Err(refused(
+            StatusCode::BAD_REQUEST,
+            "flow_state_already_used",
+            "State has already been used",
+        ));
+    }
+    Ok(Landed::Answer(Box::new(to(
+        StatusCode::FOUND,
+        &with_code(&target, &flow.auth_code),
+    ))))
+}
+
+/// The PKCE redirect: the code goes in the query string rather than the
+/// fragment, because a client has to send it to a server and a fragment
+/// never leaves the browser.
+fn with_code(target: &str, code: &str) -> String {
+    let (base, fragment) = target.split_once('#').unwrap_or((target, ""));
+    let separator = match base.contains('?') {
+        true => "&",
+        false => "?",
+    };
+    let mut out = format!("{base}{separator}code={}", query_escape(code));
+    if !fragment.is_empty() {
+        out.push('#');
+        out.push_str(fragment);
+    }
+    out
+}
+
+/// What the account came out as.
+enum Attached {
+    User(String),
+    /// The provider will not say the address is verified and this
+    /// project will not take its word for it, so a confirmation has
+    /// gone out instead and there is no session.
+    Unverified,
+}
+
+/// Which account an external identity belongs to, upstream's
+/// DetermineAccountLinking. Every provider here is in the one linking
+/// domain upstream calls default, which is what makes this readable: an
+/// identity that already exists wins, then a verified address that
+/// matches something, then a new account.
+enum Whose {
+    /// This identity has signed in before.
+    Known(String),
+    /// A different identity, or a plain account, already holds this
+    /// verified address.
+    Link(String),
+    /// Nobody, so an account is made.
+    Fresh,
+    /// More than one account holds it, which the schema is supposed to
+    /// prevent and which is never resolved by guessing.
+    Several,
+}
+
+async fn decide(
+    sess: &sql::Session,
+    provider: &str,
+    person: &crate::oauth::Person,
+    autoconfirm: bool,
+) -> Result<Whose, Error> {
+    let rows = sess
+        .query(
+            "select user_id::text from auth.identities
+              where provider_id = $1 and provider = $2",
+            &[&person.sub, &provider],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        return Ok(Whose::Known(row.get(0)));
+    }
+    // An address the provider will not vouch for links to nothing. This
+    // is the whole of the pre-account-takeover rule: sign up at a
+    // provider with somebody else's address, and without this you are
+    // handed their account.
+    if !person.email_verified && !autoconfirm {
+        return Ok(Whose::Fresh);
+    }
+    let email = person.email.to_ascii_lowercase();
+    let rows = sess
+        .query(
+            "select distinct user_id::text from auth.identities where email = $1",
+            &[&email],
+        )
+        .await?;
+    if rows.len() > 1 {
+        return Ok(Whose::Several);
+    }
+    if let Some(row) = rows.first() {
+        return Ok(Whose::Link(row.get(0)));
+    }
+    // No identity carries it, but an account might: a project whose
+    // users signed up before identities were backfilled, and the
+    // account an invite creates before it is accepted.
+    let rows = sess
+        .query(
+            "select id::text from auth.users
+              where email = $1 and is_sso_user = false and deleted_at is null",
+            &[&email],
+        )
+        .await?;
+    match rows.len() {
+        0 => Ok(Whose::Fresh),
+        1 => Ok(Whose::Link(rows[0].get(0))),
+        _ => Ok(Whose::Several),
+    }
+}
+
+/// Find or make the account this identity belongs to, and leave it in
+/// the state a session can be issued from.
+async fn attach(
+    sess: &sql::Session,
+    provider: &str,
+    person: &crate::oauth::Person,
+    post: &Post<'_>,
+) -> Result<Attached, Error> {
+    let whose = decide(sess, provider, person, post.autoconfirm).await?;
+    let email = person.email.to_ascii_lowercase();
+    let user_id = match whose {
+        Whose::Several => {
+            // The schema has a partial unique index that is supposed to
+            // make this impossible, so it is a state to report rather
+            // than one to pick a way out of.
+            log::error!("two accounts hold {email} in the same linking domain");
+            return Err(refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected_failure",
+                "Multiple accounts with the same email address in the same linking domain detected: default",
+            ));
+        }
+        Whose::Known(user_id) => {
+            sess.execute(
+                "update auth.identities
+                    set identity_data = $3::jsonb,
+                        last_sign_in_at = now(), updated_at = now()
+                  where provider_id = $1 and provider = $2",
+                &[&person.sub, &provider, &person.claims],
+            )
+            .await?;
+            user_id
+        }
+        Whose::Link(user_id) => {
+            new_identity(sess, &user_id, provider, person).await?;
+            user_id
+        }
+        Whose::Fresh => {
+            // A verified address that already belongs to somebody, on a
+            // provider that would not link, leaves the new account with
+            // no address at all rather than with a claim on theirs.
+            let taken: bool = sess
+                .query(
+                    "select exists (
+                         select 1 from auth.users
+                          where email = $1 and is_sso_user = false and deleted_at is null)",
+                    &[&email],
+                )
+                .await?[0]
+                .get(0);
+            let address = match taken {
+                true => String::new(),
+                false => email.clone(),
+            };
+            let rows = sess
+                .query(
+                    "insert into auth.users
+                         (instance_id, id, aud, role, email,
+                          raw_app_meta_data, raw_user_meta_data,
+                          confirmation_token, recovery_token,
+                          email_change_token_new, email_change,
+                          created_at, updated_at, is_anonymous, is_sso_user)
+                     values ('00000000-0000-0000-0000-000000000000', gen_random_uuid(),
+                             $2, 'authenticated', nullif($1::text, ''),
+                             jsonb_build_object('provider', $3::text,
+                                                'providers', jsonb_build_array($3::text)),
+                             $4::jsonb, '', '', '', '', now(), now(), false, false)
+                     returning id::text",
+                    &[&address, &AUD, &provider, &person.claims],
+                )
+                .await?;
+            let user_id: String = rows[0].get(0);
+            new_identity(sess, &user_id, provider, person).await?;
+            user_id
+        }
+    };
+
+    let state = sess
+        .query(
+            "select coalesce(email, ''), email_confirmed_at is not null,
+                    banned_until is not null and banned_until > now()
+               from auth.users where id = $1::text::uuid",
+            &[&user_id],
+        )
+        .await?;
+    let (address, confirmed, banned): (String, bool, bool) =
+        (state[0].get(0), state[0].get(1), state[0].get(2));
+    if banned {
+        return Err(refused(
+            StatusCode::FORBIDDEN,
+            "user_banned",
+            "User is banned",
+        ));
+    }
+
+    if address.is_empty() || confirmed {
+        merge_claims(sess, &user_id, &person.claims).await?;
+        providers_of(sess, &user_id).await?;
+        return Ok(Attached::User(user_id));
+    }
+
+    // The account is unconfirmed, so nothing on it has been proved and
+    // everything else attached to it is dropped: an unconfirmed signup
+    // somebody else started on this address must not survive as a way
+    // back in once the address is confirmed here.
+    sess.execute(
+        "update auth.users set encrypted_password = null where id = $1::text::uuid",
+        &[&user_id],
+    )
+    .await?;
+    sess.execute(
+        "update auth.users
+            set raw_user_meta_data = $2::jsonb, updated_at = now()
+          where id = $1::text::uuid",
+        &[&user_id, &person.claims],
+    )
+    .await?;
+    sess.execute(
+        "delete from auth.identities
+          where user_id = $1::text::uuid
+            and not (provider_id = $2 and provider = $3)",
+        &[&user_id, &person.sub, &provider],
+    )
+    .await?;
+    providers_of(sess, &user_id).await?;
+
+    if person.email_verified || post.autoconfirm {
+        sess.execute(
+            "update auth.users
+                set email_confirmed_at = now(), confirmation_token = '',
+                    updated_at = now()
+              where id = $1::text::uuid and email_confirmed_at is null",
+            &[&user_id],
+        )
+        .await?;
+        return Ok(Attached::User(user_id));
+    }
+
+    // The provider will not vouch for the address, so it is proved the
+    // same way a password signup proves one, and there is no session
+    // until it is.
+    within_limit(
+        sess,
+        &user_id,
+        "confirmation_sent_at",
+        post.settings.max_frequency,
+    )
+    .await?;
+    let code = mint_code(sess, &user_id, &address, "confirmation_token").await?;
+    send_code(
+        sess,
+        post,
+        &user_id,
+        Outgoing {
+            template: crate::mail::CONFIRMATION,
+            kind: "signup",
+            to: &address,
+            code: &code,
+            new_email: "",
+        },
+    )
+    .await?;
+    Ok(Attached::Unverified)
+}
+
+async fn new_identity(
+    sess: &sql::Session,
+    user_id: &str,
+    provider: &str,
+    person: &crate::oauth::Person,
+) -> Result<(), sql::Error> {
+    sess.execute(
+        "insert into auth.identities
+             (provider_id, user_id, identity_data, provider,
+              last_sign_in_at, created_at, updated_at)
+         values ($1, $2::text::uuid, $3::jsonb, $4, now(), now(), now())",
+        &[&person.sub, &user_id, &person.claims, &provider],
+    )
+    .await?;
+    Ok(())
+}
+
+/// What the provider said, folded into the user metadata, which is
+/// where a client reads a name and an avatar from.
+async fn merge_claims(
+    sess: &sql::Session,
+    user_id: &str,
+    claims: &serde_json::Value,
+) -> Result<(), sql::Error> {
+    sess.execute(
+        "update auth.users
+            set raw_user_meta_data = coalesce(raw_user_meta_data, '{}'::jsonb) || $2::jsonb,
+                updated_at = now()
+          where id = $1::text::uuid",
+        &[&user_id, &claims],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Rewrite app_metadata.providers from the identities that exist, which
+/// is upstream's UpdateAppMetaDataProviders. It is derived rather than
+/// appended to, so an identity that was just dropped stops being
+/// advertised.
+async fn providers_of(sess: &sql::Session, user_id: &str) -> Result<(), sql::Error> {
+    sess.execute(
+        "update auth.users u
+            set raw_app_meta_data = coalesce(u.raw_app_meta_data, '{}'::jsonb)
+                || jsonb_build_object('providers', p.list)
+                || case when jsonb_array_length(p.list) > 0
+                        then jsonb_build_object('provider', p.list->>0)
+                        else '{}'::jsonb end,
+                updated_at = now()
+           from (select coalesce(jsonb_agg(i.provider order by i.created_at), '[]'::jsonb) as list
+                   from auth.identities i where i.user_id = $1::text::uuid) p
+          where u.id = $1::text::uuid",
+        &[&user_id],
+    )
+    .await?;
+    Ok(())
+}
+
+/// A callback that failed, sent back to the app. The parameters go in
+/// the query string and again in the fragment, because upstream writes
+/// both and there are clients reading each.
+fn oauth_redirect(target: &str, error: &str, code: &str, description: &str) -> Response {
+    let mut pairs = vec![
+        ("error", error.to_string()),
+        ("error_description", description.to_string()),
+    ];
+    if !code.is_empty() {
+        pairs.push(("error_code", code.to_string()));
+    }
+    let query = encoded(&pairs);
+    pairs.push(("sb", String::new()));
+    let fragment = encoded(&pairs);
+    let (base, _) = target.split_once('#').unwrap_or((target, ""));
+    let separator = match base.contains('?') {
+        true => "&",
+        false => "?",
+    };
+    to(
+        StatusCode::FOUND,
+        &format!("{base}{separator}{query}#{fragment}"),
+    )
+}
+
+fn oauth_refusal(target: &str, e: Error) -> Response {
+    let (status, code, msg) = match e {
+        Error::Denied { status, code, msg } => (status, code, msg),
+        Error::NotYet(surface) => return not_yet(surface),
+        Error::Weak(_) => unreachable!("a callback never judges a password"),
+        Error::Db(e) => {
+            log::error!("oauth callback: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "unexpected_failure",
+                "Unexpected failure, please check server logs for more information".to_string(),
+            )
+        }
+    };
+    // Upstream names three refusals access_denied whatever their
+    // status, because to the app they are the same thing: the person
+    // did not get in.
+    let named = match code {
+        "signup_disabled" | "user_banned" | "provider_email_needs_verification" => "access_denied",
+        _ => oauth_error(status),
+    };
+    oauth_redirect(target, named, code, &msg)
+}
+
+/// The pkce grant: a client that started a flow trades the code it was
+/// redirected with, plus the verifier it never sent anywhere, for a
+/// session.
+pub async fn pkce_grant(
+    pool: &Pool,
+    auth_code: &str,
+    verifier: &str,
+    signer: &crate::jwt::Signer<'_>,
+    issuer: &str,
+) -> Result<(Issued, String, String), Error> {
+    if auth_code.is_empty() || verifier.is_empty() {
+        return denied(
+            "validation_failed",
+            "invalid request: both auth code and code verifier should be non-empty",
+        );
+    }
+    let sess = pool.admin().await?;
+    let out = redeem(&sess, auth_code, verifier, signer, issuer).await;
+    match out {
+        Ok(issued) => {
+            sess.commit().await?;
+            Ok(issued)
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+async fn redeem(
+    sess: &sql::Session,
+    auth_code: &str,
+    verifier: &str,
+    signer: &crate::jwt::Signer<'_>,
+    issuer: &str,
+) -> Result<(Issued, String, String), Error> {
+    // The row is locked for the length of the trade, so two clients
+    // sending the same code cannot both walk away with a session.
+    let rows = sess
+        .query(
+            "select id::text, user_id::text,
+                    coalesce(code_challenge, ''),
+                    coalesce(code_challenge_method::text, ''),
+                    coalesce(provider_access_token, ''),
+                    coalesce(provider_refresh_token, ''),
+                    created_at < now() - make_interval(secs => $2::double precision),
+                    authentication_method
+               from auth.flow_state
+              where auth_code = $1 and user_id is not null
+              for update",
+            &[&auth_code, &FLOW_TTL],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        // A code that was never issued and a flow whose callback has
+        // not run yet get the same answer, because telling them apart
+        // would say whether a code exists to somebody who does not hold
+        // the verifier.
+        return Err(refused(
+            StatusCode::NOT_FOUND,
+            "flow_state_not_found",
+            "invalid flow state, no valid flow state found",
+        ));
+    };
+    if row.get::<_, bool>(6) {
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "flow_state_expired",
+            "invalid flow state, flow state has expired",
+        ));
+    }
+    let (id, user_id): (String, String) = (row.get(0), row.get(1));
+    let (challenge, method): (String, String) = (row.get(2), row.get(3));
+    let (access, refresh): (String, String) = (row.get(4), row.get(5));
+    let proved: String = row.get(7);
+    verify_pkce(&challenge, &method, verifier)?;
+
+    let issued = start(sess, &user_id, &proved, signer, issuer).await?;
+    sess.execute(
+        "delete from auth.flow_state where id = $1::text::uuid",
+        &[&id],
+    )
+    .await?;
+    Ok((issued, access, refresh))
+}
+
+/// RFC 7636 section 4.6. s256 is the only method worth using and plain
+/// is the only one a client with no hash to hand can manage, so both
+/// are here, and neither is compared with an early return.
+fn verify_pkce(challenge: &str, method: &str, verifier: &str) -> Result<(), Error> {
+    let expected = match method.to_ascii_lowercase().as_str() {
+        "s256" => {
+            use base64ct::Encoding;
+            use sha2::Digest;
+            base64ct::Base64UrlUnpadded::encode_string(&sha2::Sha256::digest(verifier.as_bytes()))
+        }
+        "plain" => verifier.to_string(),
+        _ => {
+            return Err(refused(
+                StatusCode::BAD_REQUEST,
+                "bad_code_verifier",
+                "code challenge method not supported",
+            ));
+        }
+    };
+    match same_bytes(challenge.as_bytes(), expected.as_bytes()) {
+        true => Ok(()),
+        false => Err(refused(
+            StatusCode::BAD_REQUEST,
+            "bad_code_verifier",
+            "code challenge does not match previously saved code verifier",
+        )),
+    }
+}
+
+/// A comparison that takes the same time whatever the answer, so the
+/// number of leading bytes that matched is not something a caller can
+/// measure its way to.
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// POST /auth/v1/recover, the start of a password reset.
@@ -2969,9 +3966,9 @@ fn grant_type(uri: &axum::http::Uri) -> Option<String> {
 
 /// POST /auth/v1/token, the OAuth2 token endpoint GoTrue serves.
 ///
-/// The refresh_token and password grants are here. The rest need a
-/// credential this end cannot check yet, an id token from a provider or
-/// a signed challenge, and they answer 501 rather than pretending,
+/// The refresh_token, password and pkce grants are here. The rest need
+/// a credential this end cannot check yet, an id token from a provider
+/// or a signed challenge, and they answer 501 rather than pretending,
 /// because a grant that always fails is worse for a client than one
 /// that says it does not exist yet.
 pub async fn token(
@@ -2980,8 +3977,8 @@ pub async fn token(
 ) -> Response {
     let grant = grant_type(req.uri()).unwrap_or_default();
     match grant.as_str() {
-        "refresh_token" | "password" => {}
-        "id_token" | "pkce" | "web3" => {
+        "refresh_token" | "password" | "pkce" => {}
+        "id_token" | "web3" => {
             return not_yet(&format!("the {grant} grant"));
         }
         _ => {
@@ -2999,6 +3996,33 @@ pub async fn token(
         Ok(v) => v,
         Err(res) => return res,
     };
+
+    if grant == "pkce" {
+        return match pkce_grant(
+            pool,
+            field(&body, "auth_code"),
+            field(&body, "code_verifier"),
+            &app.signer(),
+            &app.issuer(),
+        )
+        .await
+        {
+            Ok((issued, access, refresh)) => {
+                // The provider's own tokens ride along, which is how a
+                // client that wants to call Google as this person gets
+                // something to call it with.
+                let mut answer = issued.json();
+                if !access.is_empty() {
+                    answer["provider_token"] = access.into();
+                }
+                if !refresh.is_empty() {
+                    answer["provider_refresh_token"] = refresh.into();
+                }
+                json_body(StatusCode::OK, answer)
+            }
+            Err(e) => refusal(e, "pkce grant"),
+        };
+    }
 
     let issued = if grant == "password" {
         let (email, phone) = (field(&body, "email"), field(&body, "phone"));
