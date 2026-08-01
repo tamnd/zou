@@ -146,6 +146,8 @@ jobs:
           target/release/zou info /tmp/zou-dev-store dev2 | tee /tmp/zou-info2.txt
           grep -q "branch of local" /tmp/zou-info2.txt
           grep -q "owned by local" /tmp/zou-info2.txt
+      - name: make demo, both acts
+        run: make demo 2>&1 | tee /tmp/zou-demo.log && grep -q "restarting from nothing but the store" /tmp/zou-demo.log
       - name: Smoke test on MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
