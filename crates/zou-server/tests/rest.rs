@@ -1505,3 +1505,283 @@ async fn the_schema_profiles_speak_postgrest() {
         "an unexposed schema is unexposed even when it exists"
     );
 }
+
+#[tokio::test]
+async fn the_openapi_document_speaks_postgrest() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_oa_children, zou_oa_parents cascade",
+            "drop view if exists zou_oa_view, zou_oa_agg cascade",
+            "drop function if exists zou_oa_add(integer, integer) cascade",
+            "drop function if exists zou_oa_touch(text) cascade",
+            "drop type if exists zou_oa_mood cascade",
+            "create type zou_oa_mood as enum ('sad', 'ok', 'happy')",
+            "create table zou_oa_parents (id int primary key, name text not null)",
+            "create table zou_oa_children (\
+               id serial primary key, \
+               parent_id int references zou_oa_parents(id), \
+               label varchar(20) default 'none'::character varying, \
+               tags text[], \
+               weight numeric, \
+               mood zou_oa_mood, \
+               body jsonb, \
+               seen boolean not null default false)",
+            "comment on table zou_oa_children is 'children summary\n\nchildren detail'",
+            "comment on column zou_oa_children.label is 'the label'",
+            "create view zou_oa_view as select id, name from zou_oa_parents",
+            "create view zou_oa_agg as select count(*) as n from zou_oa_parents",
+            "create function zou_oa_add(a integer, b integer default 1) returns integer \
+             language sql immutable as 'select a + b'",
+            "comment on function zou_oa_add(integer, integer) is 'adds\n\ntwo numbers'",
+            "create function zou_oa_touch(note text) returns void language sql volatile \
+             as 'select null::void'",
+            "grant all on all tables in schema public to anon, authenticated, service_role",
+            "grant usage, select on all sequences in schema public \
+             to anon, authenticated, service_role",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    let res = app.clone().oneshot(get("/rest/v1/")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()[axum::http::header::CONTENT_TYPE],
+        "application/openapi+json; charset=utf-8"
+    );
+    assert!(
+        res.headers().get("content-profile").is_none(),
+        "one exposed schema means nothing was negotiated"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+
+    assert_eq!(doc["swagger"], "2.0");
+    assert_eq!(
+        doc["info"]["title"], "standard public schema",
+        "public ships with a comment, and a schema comment names the document"
+    );
+    assert_eq!(doc["basePath"], "/rest/v1/");
+    assert_eq!(
+        doc["paths"]["/"]["get"]["summary"],
+        "OpenAPI description (this document)"
+    );
+
+    // The definition carries the type mapping, the length, the
+    // default, the enum, and the required list.
+    let def = &doc["definitions"]["zou_oa_children"];
+    assert_eq!(def["description"], "children summary\n\nchildren detail");
+    assert_eq!(
+        def["properties"]["label"],
+        serde_json::json!({
+            "default": "none",
+            "description": "the label",
+            "format": "character varying",
+            "maxLength": 20,
+            "type": "string",
+        })
+    );
+    assert_eq!(
+        def["properties"]["tags"],
+        serde_json::json!({
+            "format": "text[]",
+            "type": "array",
+            "items": {"type": "string"},
+        })
+    );
+    assert_eq!(
+        def["properties"]["weight"],
+        serde_json::json!({"format": "numeric", "type": "number"})
+    );
+    assert_eq!(
+        def["properties"]["body"],
+        serde_json::json!({"format": "jsonb"}),
+        "jsonb takes any shape, so it carries no type"
+    );
+    assert_eq!(
+        def["properties"]["mood"]["enum"],
+        serde_json::json!(["sad", "ok", "happy"]),
+        "the labels come back in their declared order"
+    );
+    assert_eq!(
+        def["properties"]["seen"],
+        serde_json::json!({"default": false, "format": "boolean", "type": "boolean"})
+    );
+    assert_eq!(
+        def["properties"]["id"]["description"],
+        "Note:\nThis is a Primary Key.<pk/>"
+    );
+    assert_eq!(
+        def["properties"]["parent_id"]["description"],
+        "Note:\nThis is a Foreign Key to `zou_oa_parents.id`.\
+         <fk table='zou_oa_parents' column='id'/>"
+    );
+    assert_eq!(def["required"], serde_json::json!(["id", "seen"]));
+
+    // A table gets the whole write trio, and so does an auto
+    // updatable view; a view postgres cannot write through does not.
+    let path = &doc["paths"]["/zou_oa_children"];
+    assert_eq!(path["get"]["summary"], "children summary");
+    assert_eq!(path["get"]["description"], "children detail");
+    assert_eq!(path["get"]["tags"], serde_json::json!(["zou_oa_children"]));
+    assert_eq!(
+        path["get"]["parameters"][0],
+        serde_json::json!({"$ref": "#/parameters/rowFilter.zou_oa_children.id"})
+    );
+    assert_eq!(
+        path["post"]["parameters"][0],
+        serde_json::json!({"$ref": "#/parameters/body.zou_oa_children"})
+    );
+    assert!(path["patch"].is_object() && path["delete"].is_object());
+    assert!(
+        doc["paths"]["/zou_oa_view"]["post"].is_object(),
+        "a simple view is auto updatable, so it keeps the write trio"
+    );
+    assert!(
+        doc["paths"]["/zou_oa_agg"]["get"].is_object()
+            && doc["paths"]["/zou_oa_agg"]["post"].is_null(),
+        "an aggregate view is not updatable, so it is read only"
+    );
+
+    // An immutable function answers GET and POST, a volatile one
+    // only POST.
+    let add = &doc["paths"]["/rpc/zou_oa_add"];
+    assert_eq!(add["get"]["tags"], serde_json::json!(["(rpc) zou_oa_add"]));
+    assert_eq!(add["get"]["summary"], "adds");
+    assert_eq!(
+        add["get"]["parameters"],
+        serde_json::json!([
+            {"name": "a", "required": true, "in": "query", "format": "int32", "type": "integer"},
+            {"name": "b", "required": false, "in": "query", "format": "int32", "type": "integer"},
+        ])
+    );
+    assert_eq!(
+        add["post"]["parameters"][0]["schema"]["required"],
+        serde_json::json!(["a"])
+    );
+    assert!(
+        doc["paths"]["/rpc/zou_oa_touch"]["get"].is_null(),
+        "a volatile function cannot be reached over GET"
+    );
+
+    // The root negotiates its own producible list, and a table
+    // cannot produce openapi at all.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/rest/v1/")
+                .header("apikey", anon_key())
+                .header("accept", "text/csv")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["code"], "PGRST107");
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/rest/v1/zou_oa_parents")
+                .header("apikey", anon_key())
+                .header("accept", "application/openapi+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/rest/v1/")
+                .header("apikey", anon_key())
+                .header("accept", "application/openapi+json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // The document is the role's own view of the schema: a table
+    // anon cannot touch is not in it.
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_oa_secret cascade",
+            "create table zou_oa_secret (id int primary key)",
+            "revoke all on zou_oa_secret from anon, authenticated, service_role",
+        ],
+    )
+    .await;
+    let res = app.clone().oneshot(get("/rest/v1/")).await.unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert!(
+        doc["definitions"]["zou_oa_secret"].is_null(),
+        "follow privileges is the default, so an unreachable table is unlisted"
+    );
+}
+
+#[tokio::test]
+async fn the_openapi_document_follows_the_profile() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop schema if exists zou_oa_alt cascade",
+            "create schema zou_oa_alt",
+            "comment on schema zou_oa_alt is 'Alt title\n\nAlt description'",
+            "grant usage on schema zou_oa_alt to anon, authenticated, service_role",
+            "create table zou_oa_alt.zou_oa_only_here (id int primary key)",
+            "grant all on all tables in schema zou_oa_alt to anon, authenticated, service_role",
+        ],
+    )
+    .await;
+    let two = app_with_schemas(&dsn, &["public", "zou_oa_alt"]);
+
+    let res = two
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/rest/v1/")
+                .header("apikey", anon_key())
+                .header("accept-profile", "zou_oa_alt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-profile"], "zou_oa_alt");
+    let doc: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(
+        doc["info"]["title"], "Alt title",
+        "the schema comment names the document"
+    );
+    assert_eq!(doc["info"]["description"], "Alt description");
+    assert!(doc["definitions"]["zou_oa_only_here"].is_object());
+
+    let res = two
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/rest/v1/")
+                .header("apikey", anon_key())
+                .header("accept-profile", "nope")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["code"], "PGRST106");
+}

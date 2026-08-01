@@ -26,6 +26,7 @@ use axum::{Router, middleware};
 
 pub mod edge;
 pub mod jwt;
+pub mod openapi;
 pub mod rest;
 pub mod sql;
 
@@ -219,9 +220,6 @@ pub(crate) fn not_yet(surface: &str) -> Response {
     )
 }
 
-async fn rest_stub() -> Response {
-    not_yet("this REST endpoint")
-}
 async fn auth_stub() -> Response {
     not_yet("this auth endpoint")
 }
@@ -250,7 +248,7 @@ pub fn router(cfg: Config) -> Result<Router, String> {
     let gated = Router::new()
         .route("/auth/v1/health", get(auth_health))
         .route("/auth/v1/{*rest}", any(auth_stub))
-        .route("/rest/v1/", any(rest_stub))
+        .route("/rest/v1/", any(rest::root))
         .route("/rest/v1/rpc/{func}", any(rest::rpc))
         .route("/rest/v1/{table}", any(rest::table))
         .route("/storage/v1/{*rest}", any(storage_stub))

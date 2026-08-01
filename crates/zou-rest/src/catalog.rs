@@ -127,6 +127,12 @@ impl Catalog {
         Catalog { fks }
     }
 
+    /// The foreign keys as introspected, which the OpenAPI document
+    /// reads to write its `<fk .../>` column notes.
+    pub fn fks(&self) -> &[FkRow] {
+        &self.fks
+    }
+
     /// Resolve the relationship an embed means: `parent` is the
     /// table the request is rooted on, `target` the relation the
     /// embed names, `hint` the word after `!` when the client
