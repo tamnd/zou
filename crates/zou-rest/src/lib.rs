@@ -7,6 +7,7 @@
 //! bottom: the filter grammar, then select parsing, then the SQL
 //! compiler and the embedding planner on top.
 
+pub mod catalog;
 pub mod filter;
 pub mod order;
 pub mod page;
