@@ -855,6 +855,331 @@ async fn the_count_preferences_speak_postgrest() {
 }
 
 #[tokio::test]
+async fn the_response_modes_speak_postgrest() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_media_items cascade",
+            "create table zou_media_items (id int primary key, name text, note text)",
+            "insert into zou_media_items values \
+             (1, 'ann', null), (2, 'bob', 'hi'), (3, 'a,b', null)",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    let accepting = |method: &str, uri: &str, body: &str, accept: &str, prefers: &[&str]| {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("apikey", anon_key())
+            .header("accept", accept);
+        for p in prefers {
+            b = b.header("prefer", *p);
+        }
+        let body = if body.is_empty() {
+            Body::empty()
+        } else {
+            Body::from(body.to_string())
+        };
+        b.body(body).unwrap()
+    };
+
+    // Csv the way PostgREST builds it in SQL: the header from the
+    // first row's keys, each line the record text with the parens
+    // shaved, nulls empty and commas quoted by postgres itself.
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items?order=id.asc",
+            "",
+            "text/csv",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "text/csv; charset=utf-8");
+    assert_eq!(
+        body_text(res).await,
+        "id,name,note\n1,ann,\n2,bob,hi\n3,\"a,b\","
+    );
+
+    // The header follows the select list, and an empty result is a
+    // lone newline, upstream's own shape.
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items?select=name&id=eq.2",
+            "",
+            "text/csv",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "name\nbob");
+
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items?id=gt.100",
+            "",
+            "text/csv",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "\n");
+
+    // A singular read hands back the bare object, and anything but
+    // exactly one row is the PGRST116 406.
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items?id=eq.1",
+            "",
+            "application/vnd.pgrst.object+json",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()["content-type"],
+        "application/vnd.pgrst.object+json; charset=utf-8"
+    );
+    assert_eq!(
+        body_text(res).await,
+        r#"{"id": 1, "name": "ann", "note": null}"#
+    );
+
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items?id=lte.2",
+            "",
+            "application/vnd.pgrst.object+json",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST116");
+    assert_eq!(
+        body["message"],
+        "Cannot coerce the result to a single JSON object"
+    );
+    assert_eq!(body["details"], "The result contains 2 rows");
+
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items?id=eq.999",
+            "",
+            "application/vnd.pgrst.object+json",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["details"], "The result contains 0 rows");
+
+    // nulls=stripped drops the null fields; the plain vendored
+    // array name folds down to plain json, the stripped one keeps
+    // its own content type.
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items?id=eq.1",
+            "",
+            "application/vnd.pgrst.object+json;nulls=stripped",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"{"id": 1, "name": "ann"}"#);
+
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items?order=id.asc",
+            "",
+            "application/vnd.pgrst.array+json",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.headers()["content-type"],
+        "application/json; charset=utf-8"
+    );
+
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items?select=id,note&order=id.asc",
+            "",
+            "application/vnd.pgrst.array+json;nulls=stripped",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.headers()["content-type"],
+        "application/vnd.pgrst.array+json;nulls=stripped; charset=utf-8"
+    );
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"id": 1},{"id": 2, "note": "hi"},{"id": 3}]"#
+    );
+
+    // An Accept nothing can produce is the PGRST107 406.
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "GET",
+            "/rest/v1/zou_media_items",
+            "",
+            "text/html",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST107");
+    assert_eq!(
+        body["message"],
+        "None of these media types are available: text/html"
+    );
+
+    // Writes negotiate too: a representation can come back as csv
+    // or as the bare object.
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "POST",
+            "/rest/v1/zou_media_items",
+            r#"{"id": 9, "name": "zed"}"#,
+            "text/csv",
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(res.headers()["content-type"], "text/csv; charset=utf-8");
+    assert_eq!(body_text(res).await, "id,name,note\n9,zed,");
+
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "POST",
+            "/rest/v1/zou_media_items",
+            r#"{"id": 10, "name": "yin"}"#,
+            "application/vnd.pgrst.object+json",
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(
+        body_text(res).await,
+        r#"{"id": 10, "name": "yin", "note": null}"#
+    );
+
+    // A singular write that lands on the wrong row count is refused
+    // and rolled back, PostgREST's condemned transaction.
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "POST",
+            "/rest/v1/zou_media_items",
+            r#"[{"id": 20, "name": "x"}, {"id": 21, "name": "y"}]"#,
+            "application/vnd.pgrst.object+json",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["details"], "The result contains 2 rows");
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_media_items?select=id&id=gte.20"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "[]", "the refused insert rolled back");
+
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "PATCH",
+            "/rest/v1/zou_media_items?id=lte.2",
+            r#"{"note": "clobbered"}"#,
+            "application/vnd.pgrst.object+json",
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_media_items?select=note&id=eq.2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"note": "hi"}]"#,
+        "the refused update rolled back"
+    );
+
+    // Csv on an update shows the touched row, and a delete that
+    // touches nothing under a singular accept is the 0 rows 406.
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "PATCH",
+            "/rest/v1/zou_media_items?id=eq.2",
+            r#"{"note": "yo"}"#,
+            "text/csv",
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-range"], "0-0/*");
+    assert_eq!(body_text(res).await, "id,name,note\n2,bob,yo");
+
+    let res = app
+        .clone()
+        .oneshot(accepting(
+            "DELETE",
+            "/rest/v1/zou_media_items?id=eq.999",
+            "",
+            "application/vnd.pgrst.object+json",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST116");
+    assert_eq!(body["details"], "The result contains 0 rows");
+}
+
+#[tokio::test]
 async fn the_context_and_rls_hold_through_the_whole_door() {
     let Some(dsn) = dsn() else { return };
     seed(
