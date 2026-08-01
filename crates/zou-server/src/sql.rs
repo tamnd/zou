@@ -74,6 +74,11 @@ pub struct Pool(Arc<Inner>);
 
 const ENSURE_ROLES: &str = "do $$
 begin
+    -- Serialize concurrent bootstrappers: two pools dialing their
+    -- first connection at once would both pass the if not exists
+    -- checks and one create role would lose the race. The xact lock
+    -- releases when the do block's implicit transaction commits.
+    perform pg_advisory_xact_lock(730501);
     if not exists (select 1 from pg_roles where rolname = 'anon') then
         create role anon nologin;
     end if;
