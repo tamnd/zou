@@ -20,6 +20,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "frame_v2"
+path = "fuzz_targets/frame_v2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rest_filter"
 path = "fuzz_targets/rest_filter.rs"
 test = false
