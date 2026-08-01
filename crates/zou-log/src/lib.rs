@@ -10,7 +10,9 @@
 //! in [`segment`], the batching, admission and ack machinery in
 //! [`sequencer`], the fenced chain protocol with takeover in [`chain`],
 //! and the background fold of landing segments into sorted sealed
-//! segments in [`mod@consolidate`] and [`sealed`]. Durability itself sits
+//! segments in [`mod@consolidate`] and [`sealed`]. Durable windows fan
+//! out to page services and replicas through the [`mod@tee`], with
+//! catch up served from the sealed rounds. Durability itself sits
 //! behind [`SegmentSink`], so the same sequencer runs over the sealed
 //! chain, a plain CAS store, or a test double.
 
@@ -20,6 +22,7 @@ pub mod media;
 pub mod sealed;
 pub mod segment;
 pub mod sequencer;
+pub mod tee;
 
 pub use chain::{
     ChainError, ChainSegment, RoundRange, SHARD_MANIFEST_FORMAT, ShardManifest, Takeover,
@@ -40,3 +43,4 @@ pub use segment::{
     TenantRun, TenantSummary, decode_segment, read_footer, tenants_digest,
 };
 pub use sequencer::{AppendError, AppendTicket, SegmentSink, Sequencer, SequencerConfig};
+pub use tee::{DEFAULT_TEE_BUFFER, Tee, TeeEvent, TeeFilter, TeeSubscription, catch_up};

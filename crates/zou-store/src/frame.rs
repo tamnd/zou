@@ -61,6 +61,21 @@ pub struct BlockRef {
     pub block: u32,
 }
 
+impl BlockRef {
+    /// The page shard stripe this block lands on, spec 04 section 1:
+    /// hash over (relfilenode, block >> 14), so 16384 consecutive
+    /// blocks of a relation, 128 MB, stay on one shard and sequential
+    /// scans do not fan out. The fork is deliberately not hashed, all
+    /// forks of a stripe live together. Format frozen: this function
+    /// decides data placement, changing it reshuffles every tenant.
+    pub fn page_shard(&self, shard_count: u32) -> u32 {
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&self.relfilenode.to_le_bytes());
+        bytes[4..].copy_from_slice(&(self.block >> 14).to_le_bytes());
+        crc32c::crc32c(&bytes) % shard_count.max(1)
+    }
+}
+
 /// One decoded v2 frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame2 {
@@ -475,5 +490,57 @@ mod tests {
         assert!(wire.len() < 3_000);
         let (decoded, _) = Frame2::decode(&wire).unwrap();
         assert_eq!(decoded.hints.len(), 100);
+    }
+}
+
+#[cfg(test)]
+mod page_shard_tests {
+    use super::*;
+
+    fn r(relfilenode: u32, block: u32) -> BlockRef {
+        BlockRef {
+            relfilenode,
+            fork: 0,
+            block,
+        }
+    }
+
+    /// Placement is format frozen: these exact values decide where a
+    /// tenant's pages live. If this test breaks, you changed data
+    /// placement for every existing tenant, not just a hash function.
+    #[test]
+    fn placement_values_are_pinned() {
+        assert_eq!(r(1663, 0).page_shard(64), 10);
+        assert_eq!(r(1663, 16384).page_shard(64), 50);
+        assert_eq!(r(16400, 123_456_789).page_shard(4), 3);
+    }
+
+    #[test]
+    fn a_stripe_is_16384_consecutive_blocks_and_forks_stay_together() {
+        let base = r(5000, 3 * 16384);
+        for block in 3 * 16384..3 * 16384 + 16384 {
+            assert_eq!(r(5000, block).page_shard(16), base.page_shard(16));
+        }
+        for fork in 0..4u8 {
+            let with_fork = BlockRef { fork, ..base };
+            assert_eq!(with_fork.page_shard(16), base.page_shard(16));
+        }
+        assert_ne!(
+            r(5000, 4 * 16384).page_shard(16),
+            u32::MAX,
+            "next stripe still maps somewhere"
+        );
+    }
+
+    #[test]
+    fn every_shard_of_a_small_count_gets_traffic() {
+        let count = 8;
+        let mut hit = vec![false; count as usize];
+        for i in 0..256u32 {
+            let s = r(1000 + i, i * 20_000).page_shard(count);
+            assert!(s < count);
+            hit[s as usize] = true;
+        }
+        assert!(hit.iter().all(|h| *h), "a dead shard means a skewed hash");
     }
 }

@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use zou_store::{CasError, Frame2, Lsn};
 
 use crate::segment::{SegmentBuilder, SegmentHeader, SegmentKind, tenants_digest};
+use crate::tee::Tee;
 
 /// Where closed batches go to become durable. `put_segment` must return
 /// only once the segment survives whatever the sink's durability story
@@ -49,6 +50,11 @@ pub struct SequencerConfig {
     pub batch_bytes: usize,
     /// Close early once this many frames are pending.
     pub batch_frames: usize,
+    /// Where durable windows fan out to subscribers (spec 03 section
+    /// 8). The tee sees a window only after its PUT returned, and
+    /// publishing never blocks or fails the flush: durability does not
+    /// depend on it.
+    pub tee: Option<Arc<Tee>>,
 }
 
 impl Default for SequencerConfig {
@@ -57,6 +63,7 @@ impl Default for SequencerConfig {
             window: Duration::from_millis(3),
             batch_bytes: 4 * 1024 * 1024,
             batch_frames: 4096,
+            tee: None,
         }
     }
 }
@@ -117,9 +124,9 @@ fn resolve(ticket: &TicketInner, result: Result<Lsn, AppendError>) {
 }
 
 struct StagedFrame {
-    tenant: u128,
-    start_lsn: Lsn,
-    end_lsn: Lsn,
+    /// Kept decoded alongside the wire bytes so the tee can filter by
+    /// hints and deliver without a decode on the flush path.
+    frame: Frame2,
     wire: Vec<u8>,
 }
 
@@ -200,15 +207,13 @@ impl Sequencer {
         // lock. A rejected append wastes the work, but rejection is a
         // once per failover event, not a hot path.
         let staged: Vec<StagedFrame> = frames
-            .iter()
-            .map(|f| StagedFrame {
-                tenant: f.tenant,
-                start_lsn: f.start_lsn,
-                end_lsn: f.end_lsn,
-                wire: f.encode(),
+            .into_iter()
+            .map(|f| {
+                let wire = f.encode();
+                StagedFrame { frame: f, wire }
             })
             .collect();
-        let durable_lsn = frames.iter().map(|f| f.end_lsn).max().unwrap();
+        let durable_lsn = staged.iter().map(|s| s.frame.end_lsn).max().unwrap();
 
         let mut state = self.shared.state.lock().unwrap();
         if state.shutdown {
@@ -217,19 +222,22 @@ impl Sequencer {
         if state.poisoned {
             return Err(AppendError::Poisoned);
         }
-        for f in &frames {
-            if let Some(&current) = state.epochs.get(&f.tenant)
-                && f.writer_epoch < current
+        for s in &staged {
+            if let Some(&current) = state.epochs.get(&s.frame.tenant)
+                && s.frame.writer_epoch < current
             {
                 return Err(AppendError::WrongEpoch {
-                    tenant: f.tenant,
+                    tenant: s.frame.tenant,
                     current,
                 });
             }
         }
-        for f in &frames {
-            let known = state.epochs.entry(f.tenant).or_insert(f.writer_epoch);
-            *known = (*known).max(f.writer_epoch);
+        for s in &staged {
+            let known = state
+                .epochs
+                .entry(s.frame.tenant)
+                .or_insert(s.frame.writer_epoch);
+            *known = (*known).max(s.frame.writer_epoch);
         }
 
         let ticket = Arc::new(TicketInner {
@@ -336,10 +344,20 @@ fn flusher_loop(shared: &Shared, sink: &dyn SegmentSink, shard: u32, config: &Se
             prev_digest,
         });
         for f in &batch.frames {
-            builder.push_encoded(f.tenant, f.start_lsn, f.end_lsn, &f.wire);
+            builder.push_encoded(f.frame.tenant, f.frame.start_lsn, f.frame.end_lsn, &f.wire);
         }
         let (segment, summaries) = builder.finish();
         let outcome = sink.put_segment(seq, &segment);
+
+        // The tee sees the window strictly after the PUT returned, so
+        // no subscriber can observe a frame that is not durable yet.
+        // Fan out is channel sends and never blocks the flusher.
+        if outcome.is_ok()
+            && let Some(tee) = &config.tee
+        {
+            let frames: Vec<Frame2> = batch.frames.into_iter().map(|s| s.frame).collect();
+            tee.publish(seq, &frames);
+        }
 
         state = shared.state.lock().unwrap();
         match outcome {
