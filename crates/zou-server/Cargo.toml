@@ -26,6 +26,8 @@ webpki-roots = { workspace = true }
 zou-rest = { path = "../zou-rest" }
 
 [dev-dependencies]
+base64ct = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 tower = { workspace = true, features = ["util"] }
 

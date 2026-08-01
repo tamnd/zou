@@ -145,6 +145,25 @@ await supabase.auth.signOut({ scope: 'others' }) // every session except this on
 
 `POST /auth/v1/logout` takes `global`, `local`, and `others`, defaults to `global` when the scope is missing, and answers 204 with no body. Any other scope is a 400 that names back what it was given. `POST /auth/v1/resend` sends a signup confirmation or an email change pair again, draws fresh codes rather than repeating the ones already mailed, waits out the same minute the first send started, and answers with an empty object whether or not there was anything to send, so it says nothing about who has an account here.
 
+## Managing accounts from a server
+
+`supabase.auth.admin` works against the same service_role key `zou dev` prints, and nothing else gets in. A request with no bearer token, with the anon key, or with an ordinary person's own access token is refused before it touches the database.
+
+```js
+const admin = createClient(url, serviceRoleKey).auth.admin
+
+await admin.createUser({ email: 'ada@example.com', password: '...', email_confirm: true })
+await admin.listUsers({ page: 1, perPage: 50 })
+await admin.getUserById(id)
+await admin.updateUserById(id, { ban_duration: '24h' })
+await admin.deleteUser(id)
+await admin.deleteUser(id, true)   // keep the row, take everything out of it
+```
+
+An account created this way needs no confirmation mail: `email_confirm` is the admin asserting the address, and the same is true of an address changed with `updateUserById`. With no password at all the account exists and cannot be signed in to until somebody sets one. `ban_duration` takes Go's duration spellings, `24h` or `1h30m`, and `none` lifts a ban.
+
+The second argument to `deleteUser` is a soft delete. The row stays, so an application's own rows pointing at `auth.users` still resolve, and the address, the number, the password, the metadata and every identity are replaced with a one way hash of themselves. Sessions and factors go for good either way.
+
 ## Where to go next
 
 - docs/architecture.md for the shape of the whole system

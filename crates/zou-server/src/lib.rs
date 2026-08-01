@@ -27,6 +27,7 @@ use axum::routing::{any, delete, get, post, put};
 use axum::{Router, middleware};
 use zou_rest::catalog::Catalog;
 
+pub mod admin;
 pub mod auth;
 pub mod edge;
 pub mod jwt;
@@ -528,6 +529,21 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route(
             "/auth/v1/user/identities/{identity_id}",
             delete(auth::unlink_identity),
+        )
+        // The admin box. Everything under it is the service role
+        // acting on somebody else's account, and every one of these
+        // refuses anything that is not holding an admin role, so the
+        // apikey gate in front is the outer of two doors rather than
+        // the only one.
+        .route(
+            "/auth/v1/admin/users",
+            get(admin::users).post(admin::user_create),
+        )
+        .route(
+            "/auth/v1/admin/users/{user_id}",
+            get(admin::user_get)
+                .put(admin::user_update)
+                .delete(admin::user_delete),
         )
         .route("/auth/v1/{*rest}", any(auth_stub))
         .route("/rest/v1/", any(rest::root))
