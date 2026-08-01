@@ -1,0 +1,584 @@
+column audit_log_entries.created_at timestamp with time zone null
+column audit_log_entries.id uuid not null
+column audit_log_entries.instance_id uuid null
+column audit_log_entries.ip_address character varying(64) not null default ''::character varying
+column audit_log_entries.payload json null
+column custom_oauth_providers.acceptable_client_ids text[] not null default '{}'::text[]
+column custom_oauth_providers.attribute_mapping jsonb not null default '{}'::jsonb
+column custom_oauth_providers.authorization_params jsonb not null default '{}'::jsonb
+column custom_oauth_providers.authorization_url text null
+column custom_oauth_providers.cached_discovery jsonb null
+column custom_oauth_providers.client_id text not null
+column custom_oauth_providers.client_secret text not null
+column custom_oauth_providers.created_at timestamp with time zone not null default now()
+column custom_oauth_providers.custom_claims_allowlist text[] not null default '{}'::text[]
+column custom_oauth_providers.discovery_cached_at timestamp with time zone null
+column custom_oauth_providers.discovery_url text null
+column custom_oauth_providers.email_optional boolean not null default false
+column custom_oauth_providers.enabled boolean not null default true
+column custom_oauth_providers.id uuid not null default gen_random_uuid()
+column custom_oauth_providers.identifier text not null
+column custom_oauth_providers.issuer text null
+column custom_oauth_providers.jwks_uri text null
+column custom_oauth_providers.name text not null
+column custom_oauth_providers.pkce_enabled boolean not null default true
+column custom_oauth_providers.provider_type text not null
+column custom_oauth_providers.scopes text[] not null default '{}'::text[]
+column custom_oauth_providers.skip_nonce_check boolean not null default false
+column custom_oauth_providers.token_url text null
+column custom_oauth_providers.updated_at timestamp with time zone not null default now()
+column custom_oauth_providers.userinfo_url text null
+column flow_state.auth_code text null
+column flow_state.auth_code_issued_at timestamp with time zone null
+column flow_state.authentication_method text not null
+column flow_state.code_challenge text null
+column flow_state.code_challenge_method auth.code_challenge_method null
+column flow_state.created_at timestamp with time zone null
+column flow_state.email_optional boolean not null default false
+column flow_state.id uuid not null
+column flow_state.invite_token text null
+column flow_state.linking_target_id uuid null
+column flow_state.oauth_client_state_id uuid null
+column flow_state.provider_access_token text null
+column flow_state.provider_refresh_token text null
+column flow_state.provider_type text not null
+column flow_state.referrer text null
+column flow_state.updated_at timestamp with time zone null
+column flow_state.user_id uuid null
+column identities.created_at timestamp with time zone null
+column identities.email text null default lower((identity_data ->> 'email'::text)) stored
+column identities.id uuid not null default gen_random_uuid()
+column identities.identity_data jsonb not null
+column identities.last_sign_in_at timestamp with time zone null
+column identities.provider text not null
+column identities.provider_id text not null
+column identities.updated_at timestamp with time zone null
+column identities.user_id uuid not null
+column instances.created_at timestamp with time zone null
+column instances.id uuid not null
+column instances.raw_base_config text null
+column instances.updated_at timestamp with time zone null
+column instances.uuid uuid null
+column mfa_amr_claims.authentication_method text not null
+column mfa_amr_claims.created_at timestamp with time zone not null
+column mfa_amr_claims.id uuid not null
+column mfa_amr_claims.session_id uuid not null
+column mfa_amr_claims.updated_at timestamp with time zone not null
+column mfa_challenges.created_at timestamp with time zone not null
+column mfa_challenges.factor_id uuid not null
+column mfa_challenges.id uuid not null
+column mfa_challenges.ip_address inet not null
+column mfa_challenges.otp_code text null
+column mfa_challenges.verified_at timestamp with time zone null
+column mfa_challenges.web_authn_session_data jsonb null
+column mfa_factors.created_at timestamp with time zone not null
+column mfa_factors.factor_type auth.factor_type not null
+column mfa_factors.friendly_name text null
+column mfa_factors.id uuid not null
+column mfa_factors.last_challenged_at timestamp with time zone null
+column mfa_factors.last_webauthn_challenge_data jsonb null
+column mfa_factors.phone text null
+column mfa_factors.secret text null
+column mfa_factors.status auth.factor_status not null
+column mfa_factors.updated_at timestamp with time zone not null
+column mfa_factors.user_id uuid not null
+column mfa_factors.web_authn_aaguid uuid null
+column mfa_factors.web_authn_credential jsonb null
+column oauth_authorizations.approved_at timestamp with time zone null
+column oauth_authorizations.authorization_code text null
+column oauth_authorizations.authorization_id text not null
+column oauth_authorizations.client_id uuid not null
+column oauth_authorizations.code_challenge text null
+column oauth_authorizations.code_challenge_method auth.code_challenge_method null
+column oauth_authorizations.created_at timestamp with time zone not null default now()
+column oauth_authorizations.expires_at timestamp with time zone not null default (now() + '00:03:00'::interval)
+column oauth_authorizations.id uuid not null
+column oauth_authorizations.nonce text null
+column oauth_authorizations.redirect_uri text not null
+column oauth_authorizations.resource text null
+column oauth_authorizations.response_type auth.oauth_response_type not null default 'code'::auth.oauth_response_type
+column oauth_authorizations.scope text not null
+column oauth_authorizations.state text null
+column oauth_authorizations.status auth.oauth_authorization_status not null default 'pending'::auth.oauth_authorization_status
+column oauth_authorizations.user_id uuid null
+column oauth_client_states.code_verifier text null
+column oauth_client_states.created_at timestamp with time zone not null
+column oauth_client_states.id uuid not null
+column oauth_client_states.provider_type text not null
+column oauth_clients.client_name text null
+column oauth_clients.client_secret_hash text null
+column oauth_clients.client_type auth.oauth_client_type not null default 'confidential'::auth.oauth_client_type
+column oauth_clients.client_uri text null
+column oauth_clients.created_at timestamp with time zone not null default now()
+column oauth_clients.deleted_at timestamp with time zone null
+column oauth_clients.grant_types text not null
+column oauth_clients.id uuid not null
+column oauth_clients.logo_uri text null
+column oauth_clients.redirect_uris text not null
+column oauth_clients.registration_type auth.oauth_registration_type not null
+column oauth_clients.token_endpoint_auth_method text not null
+column oauth_clients.updated_at timestamp with time zone not null default now()
+column oauth_consents.client_id uuid not null
+column oauth_consents.granted_at timestamp with time zone not null default now()
+column oauth_consents.id uuid not null
+column oauth_consents.revoked_at timestamp with time zone null
+column oauth_consents.scopes text not null
+column oauth_consents.user_id uuid not null
+column one_time_tokens.created_at timestamp without time zone not null default now()
+column one_time_tokens.id uuid not null
+column one_time_tokens.relates_to text not null
+column one_time_tokens.token_hash text not null
+column one_time_tokens.token_type auth.one_time_token_type not null
+column one_time_tokens.updated_at timestamp without time zone not null default now()
+column one_time_tokens.user_id uuid not null
+column refresh_tokens.created_at timestamp with time zone null
+column refresh_tokens.id bigint not null default nextval('auth.refresh_tokens_id_seq'::regclass)
+column refresh_tokens.instance_id uuid null
+column refresh_tokens.parent character varying(255) null
+column refresh_tokens.revoked boolean null
+column refresh_tokens.session_id uuid null
+column refresh_tokens.token character varying(255) null
+column refresh_tokens.updated_at timestamp with time zone null
+column refresh_tokens.user_id character varying(255) null
+column saml_providers.attribute_mapping jsonb null
+column saml_providers.created_at timestamp with time zone null
+column saml_providers.entity_id text not null
+column saml_providers.id uuid not null
+column saml_providers.metadata_url text null
+column saml_providers.metadata_xml text not null
+column saml_providers.name_id_format text null
+column saml_providers.sso_provider_id uuid not null
+column saml_providers.updated_at timestamp with time zone null
+column saml_relay_states.created_at timestamp with time zone null
+column saml_relay_states.flow_state_id uuid null
+column saml_relay_states.for_email text null
+column saml_relay_states.id uuid not null
+column saml_relay_states.redirect_to text null
+column saml_relay_states.request_id text not null
+column saml_relay_states.sso_provider_id uuid not null
+column saml_relay_states.updated_at timestamp with time zone null
+column schema_migrations.version character varying(255) not null
+column sessions.aal auth.aal_level null
+column sessions.created_at timestamp with time zone null
+column sessions.factor_id uuid null
+column sessions.id uuid not null
+column sessions.ip inet null
+column sessions.not_after timestamp with time zone null
+column sessions.oauth_client_id uuid null
+column sessions.refresh_token_counter bigint null
+column sessions.refresh_token_hmac_key text null
+column sessions.refreshed_at timestamp without time zone null
+column sessions.scopes text null
+column sessions.tag text null
+column sessions.updated_at timestamp with time zone null
+column sessions.user_agent text null
+column sessions.user_id uuid not null
+column sso_domains.created_at timestamp with time zone null
+column sso_domains.domain text not null
+column sso_domains.id uuid not null
+column sso_domains.sso_provider_id uuid not null
+column sso_domains.updated_at timestamp with time zone null
+column sso_providers.created_at timestamp with time zone null
+column sso_providers.disabled boolean null
+column sso_providers.id uuid not null
+column sso_providers.resource_id text null
+column sso_providers.updated_at timestamp with time zone null
+column users.aud character varying(255) null
+column users.banned_until timestamp with time zone null
+column users.confirmation_sent_at timestamp with time zone null
+column users.confirmation_token character varying(255) null
+column users.confirmed_at timestamp with time zone null default LEAST(email_confirmed_at, phone_confirmed_at) stored
+column users.created_at timestamp with time zone null
+column users.deleted_at timestamp with time zone null
+column users.email character varying(255) null
+column users.email_change character varying(255) null
+column users.email_change_confirm_status smallint null default 0
+column users.email_change_sent_at timestamp with time zone null
+column users.email_change_token_current character varying(255) null default ''::character varying
+column users.email_change_token_new character varying(255) null
+column users.email_confirmed_at timestamp with time zone null
+column users.encrypted_password character varying(255) null
+column users.id uuid not null
+column users.instance_id uuid null
+column users.invited_at timestamp with time zone null
+column users.is_anonymous boolean not null default false
+column users.is_sso_user boolean not null default false
+column users.is_super_admin boolean null
+column users.last_sign_in_at timestamp with time zone null
+column users.phone text null default NULL::character varying
+column users.phone_change text null default ''::character varying
+column users.phone_change_sent_at timestamp with time zone null
+column users.phone_change_token character varying(255) null default ''::character varying
+column users.phone_confirmed_at timestamp with time zone null
+column users.raw_app_meta_data jsonb null
+column users.raw_user_meta_data jsonb null
+column users.reauthentication_sent_at timestamp with time zone null
+column users.reauthentication_token character varying(255) null default ''::character varying
+column users.recovery_sent_at timestamp with time zone null
+column users.recovery_token character varying(255) null
+column users.role character varying(255) null
+column users.updated_at timestamp with time zone null
+column webauthn_challenges.challenge_type text not null
+column webauthn_challenges.created_at timestamp with time zone not null default now()
+column webauthn_challenges.expires_at timestamp with time zone not null
+column webauthn_challenges.id uuid not null default gen_random_uuid()
+column webauthn_challenges.session_data jsonb not null
+column webauthn_challenges.user_id uuid null
+column webauthn_credentials.aaguid uuid null
+column webauthn_credentials.attestation_type text not null default ''::text
+column webauthn_credentials.backed_up boolean not null default false
+column webauthn_credentials.backup_eligible boolean not null default false
+column webauthn_credentials.created_at timestamp with time zone not null default now()
+column webauthn_credentials.credential_id bytea not null
+column webauthn_credentials.friendly_name text not null default ''::text
+column webauthn_credentials.id uuid not null default gen_random_uuid()
+column webauthn_credentials.last_used_at timestamp with time zone null
+column webauthn_credentials.public_key bytea not null
+column webauthn_credentials.sign_count bigint not null default 0
+column webauthn_credentials.transports jsonb not null default '[]'::jsonb
+column webauthn_credentials.updated_at timestamp with time zone not null default now()
+column webauthn_credentials.user_id uuid not null
+comment audit_log_entries Auth: Audit trail for user actions.
+comment flow_state Stores metadata for all OAuth/SSO login flows
+comment identities Auth: Stores identities associated to a user.
+comment instances Auth: Manages users across multiple sites.
+comment mfa_amr_claims auth: stores authenticator method reference claims for multi factor authentication
+comment mfa_challenges auth: stores metadata about challenge requests made
+comment mfa_factors auth: stores metadata about factors
+comment oauth_client_states Stores OAuth states for third-party provider authentication flows where Supabase acts as the OAuth client.
+comment refresh_tokens Auth: Store of tokens used to refresh JWT tokens once they expire.
+comment saml_providers Auth: Manages SAML Identity Provider connections.
+comment saml_relay_states Auth: Contains SAML Relay State information for each Service Provider initiated login.
+comment schema_migrations Auth: Manages updates to the auth system.
+comment sessions Auth: Stores session data associated to a user.
+comment sso_domains Auth: Manages SSO email address domain mapping to an SSO Identity Provider.
+comment sso_providers Auth: Manages SSO identity provider information; see saml_providers for SAML.
+comment users Auth: Stores user login data within a secure schema.
+constraint audit_log_entries.audit_log_entries_id_not_null NOT NULL id
+constraint audit_log_entries.audit_log_entries_ip_address_not_null NOT NULL ip_address
+constraint audit_log_entries.audit_log_entries_pkey PRIMARY KEY (id)
+constraint custom_oauth_providers.custom_oauth_providers_acceptable_client_ids_not_null NOT NULL acceptable_client_ids
+constraint custom_oauth_providers.custom_oauth_providers_attribute_mapping_not_null NOT NULL attribute_mapping
+constraint custom_oauth_providers.custom_oauth_providers_authorization_params_not_null NOT NULL authorization_params
+constraint custom_oauth_providers.custom_oauth_providers_authorization_url_https CHECK (((authorization_url IS NULL) OR (authorization_url ~~ 'https://%'::text)))
+constraint custom_oauth_providers.custom_oauth_providers_authorization_url_length CHECK (((authorization_url IS NULL) OR (char_length(authorization_url) <= 2048)))
+constraint custom_oauth_providers.custom_oauth_providers_client_id_length CHECK (((char_length(client_id) >= 1) AND (char_length(client_id) <= 512)))
+constraint custom_oauth_providers.custom_oauth_providers_client_id_not_null NOT NULL client_id
+constraint custom_oauth_providers.custom_oauth_providers_client_secret_not_null NOT NULL client_secret
+constraint custom_oauth_providers.custom_oauth_providers_created_at_not_null NOT NULL created_at
+constraint custom_oauth_providers.custom_oauth_providers_custom_claims_allowlist_not_null NOT NULL custom_claims_allowlist
+constraint custom_oauth_providers.custom_oauth_providers_discovery_url_length CHECK (((discovery_url IS NULL) OR (char_length(discovery_url) <= 2048)))
+constraint custom_oauth_providers.custom_oauth_providers_email_optional_not_null NOT NULL email_optional
+constraint custom_oauth_providers.custom_oauth_providers_enabled_not_null NOT NULL enabled
+constraint custom_oauth_providers.custom_oauth_providers_id_not_null NOT NULL id
+constraint custom_oauth_providers.custom_oauth_providers_identifier_format CHECK ((identifier ~ '^[a-z0-9][a-z0-9:-]{0,48}[a-z0-9]$'::text))
+constraint custom_oauth_providers.custom_oauth_providers_identifier_key UNIQUE (identifier)
+constraint custom_oauth_providers.custom_oauth_providers_identifier_not_null NOT NULL identifier
+constraint custom_oauth_providers.custom_oauth_providers_issuer_length CHECK (((issuer IS NULL) OR ((char_length(issuer) >= 1) AND (char_length(issuer) <= 2048))))
+constraint custom_oauth_providers.custom_oauth_providers_jwks_uri_https CHECK (((jwks_uri IS NULL) OR (jwks_uri ~~ 'https://%'::text)))
+constraint custom_oauth_providers.custom_oauth_providers_jwks_uri_length CHECK (((jwks_uri IS NULL) OR (char_length(jwks_uri) <= 2048)))
+constraint custom_oauth_providers.custom_oauth_providers_name_length CHECK (((char_length(name) >= 1) AND (char_length(name) <= 100)))
+constraint custom_oauth_providers.custom_oauth_providers_name_not_null NOT NULL name
+constraint custom_oauth_providers.custom_oauth_providers_oauth2_requires_endpoints CHECK (((provider_type <> 'oauth2'::text) OR ((authorization_url IS NOT NULL) AND (token_url IS NOT NULL) AND (userinfo_url IS NOT NULL))))
+constraint custom_oauth_providers.custom_oauth_providers_oidc_discovery_url_https CHECK (((provider_type <> 'oidc'::text) OR (discovery_url IS NULL) OR (discovery_url ~~ 'https://%'::text)))
+constraint custom_oauth_providers.custom_oauth_providers_oidc_issuer_https CHECK (((provider_type <> 'oidc'::text) OR (issuer IS NULL) OR (issuer ~~ 'https://%'::text)))
+constraint custom_oauth_providers.custom_oauth_providers_oidc_requires_issuer CHECK (((provider_type <> 'oidc'::text) OR (issuer IS NOT NULL)))
+constraint custom_oauth_providers.custom_oauth_providers_pkce_enabled_not_null NOT NULL pkce_enabled
+constraint custom_oauth_providers.custom_oauth_providers_pkey PRIMARY KEY (id)
+constraint custom_oauth_providers.custom_oauth_providers_provider_type_check CHECK ((provider_type = ANY (ARRAY['oauth2'::text, 'oidc'::text])))
+constraint custom_oauth_providers.custom_oauth_providers_provider_type_not_null NOT NULL provider_type
+constraint custom_oauth_providers.custom_oauth_providers_scopes_not_null NOT NULL scopes
+constraint custom_oauth_providers.custom_oauth_providers_skip_nonce_check_not_null NOT NULL skip_nonce_check
+constraint custom_oauth_providers.custom_oauth_providers_token_url_https CHECK (((token_url IS NULL) OR (token_url ~~ 'https://%'::text)))
+constraint custom_oauth_providers.custom_oauth_providers_token_url_length CHECK (((token_url IS NULL) OR (char_length(token_url) <= 2048)))
+constraint custom_oauth_providers.custom_oauth_providers_updated_at_not_null NOT NULL updated_at
+constraint custom_oauth_providers.custom_oauth_providers_userinfo_url_https CHECK (((userinfo_url IS NULL) OR (userinfo_url ~~ 'https://%'::text)))
+constraint custom_oauth_providers.custom_oauth_providers_userinfo_url_length CHECK (((userinfo_url IS NULL) OR (char_length(userinfo_url) <= 2048)))
+constraint flow_state.flow_state_authentication_method_not_null NOT NULL authentication_method
+constraint flow_state.flow_state_email_optional_not_null NOT NULL email_optional
+constraint flow_state.flow_state_id_not_null NOT NULL id
+constraint flow_state.flow_state_pkey PRIMARY KEY (id)
+constraint flow_state.flow_state_provider_type_not_null NOT NULL provider_type
+constraint identities.identities_id_not_null NOT NULL provider_id
+constraint identities.identities_id_not_null1 NOT NULL id
+constraint identities.identities_identity_data_not_null NOT NULL identity_data
+constraint identities.identities_pkey PRIMARY KEY (id)
+constraint identities.identities_provider_id_provider_unique UNIQUE (provider_id, provider)
+constraint identities.identities_provider_not_null NOT NULL provider
+constraint identities.identities_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+constraint identities.identities_user_id_not_null NOT NULL user_id
+constraint instances.instances_id_not_null NOT NULL id
+constraint instances.instances_pkey PRIMARY KEY (id)
+constraint mfa_amr_claims.amr_id_pk PRIMARY KEY (id)
+constraint mfa_amr_claims.mfa_amr_claims_authentication_method_not_null NOT NULL authentication_method
+constraint mfa_amr_claims.mfa_amr_claims_created_at_not_null NOT NULL created_at
+constraint mfa_amr_claims.mfa_amr_claims_id_not_null NOT NULL id
+constraint mfa_amr_claims.mfa_amr_claims_session_id_authentication_method_pkey UNIQUE (session_id, authentication_method)
+constraint mfa_amr_claims.mfa_amr_claims_session_id_fkey FOREIGN KEY (session_id) REFERENCES auth.sessions(id) ON DELETE CASCADE
+constraint mfa_amr_claims.mfa_amr_claims_session_id_not_null NOT NULL session_id
+constraint mfa_amr_claims.mfa_amr_claims_updated_at_not_null NOT NULL updated_at
+constraint mfa_challenges.mfa_challenges_auth_factor_id_fkey FOREIGN KEY (factor_id) REFERENCES auth.mfa_factors(id) ON DELETE CASCADE
+constraint mfa_challenges.mfa_challenges_created_at_not_null NOT NULL created_at
+constraint mfa_challenges.mfa_challenges_factor_id_not_null NOT NULL factor_id
+constraint mfa_challenges.mfa_challenges_id_not_null NOT NULL id
+constraint mfa_challenges.mfa_challenges_ip_address_not_null NOT NULL ip_address
+constraint mfa_challenges.mfa_challenges_pkey PRIMARY KEY (id)
+constraint mfa_factors.mfa_factors_created_at_not_null NOT NULL created_at
+constraint mfa_factors.mfa_factors_factor_type_not_null NOT NULL factor_type
+constraint mfa_factors.mfa_factors_id_not_null NOT NULL id
+constraint mfa_factors.mfa_factors_last_challenged_at_key UNIQUE (last_challenged_at)
+constraint mfa_factors.mfa_factors_pkey PRIMARY KEY (id)
+constraint mfa_factors.mfa_factors_status_not_null NOT NULL status
+constraint mfa_factors.mfa_factors_updated_at_not_null NOT NULL updated_at
+constraint mfa_factors.mfa_factors_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+constraint mfa_factors.mfa_factors_user_id_not_null NOT NULL user_id
+constraint oauth_authorizations.oauth_authorizations_authorization_code_key UNIQUE (authorization_code)
+constraint oauth_authorizations.oauth_authorizations_authorization_code_length CHECK ((char_length(authorization_code) <= 255))
+constraint oauth_authorizations.oauth_authorizations_authorization_id_key UNIQUE (authorization_id)
+constraint oauth_authorizations.oauth_authorizations_authorization_id_not_null NOT NULL authorization_id
+constraint oauth_authorizations.oauth_authorizations_client_id_fkey FOREIGN KEY (client_id) REFERENCES auth.oauth_clients(id) ON DELETE CASCADE
+constraint oauth_authorizations.oauth_authorizations_client_id_not_null NOT NULL client_id
+constraint oauth_authorizations.oauth_authorizations_code_challenge_length CHECK ((char_length(code_challenge) <= 128))
+constraint oauth_authorizations.oauth_authorizations_created_at_not_null NOT NULL created_at
+constraint oauth_authorizations.oauth_authorizations_expires_at_future CHECK ((expires_at > created_at))
+constraint oauth_authorizations.oauth_authorizations_expires_at_not_null NOT NULL expires_at
+constraint oauth_authorizations.oauth_authorizations_id_not_null NOT NULL id
+constraint oauth_authorizations.oauth_authorizations_nonce_length CHECK ((char_length(nonce) <= 255))
+constraint oauth_authorizations.oauth_authorizations_pkey PRIMARY KEY (id)
+constraint oauth_authorizations.oauth_authorizations_redirect_uri_length CHECK ((char_length(redirect_uri) <= 2048))
+constraint oauth_authorizations.oauth_authorizations_redirect_uri_not_null NOT NULL redirect_uri
+constraint oauth_authorizations.oauth_authorizations_resource_length CHECK ((char_length(resource) <= 2048))
+constraint oauth_authorizations.oauth_authorizations_response_type_not_null NOT NULL response_type
+constraint oauth_authorizations.oauth_authorizations_scope_length CHECK ((char_length(scope) <= 4096))
+constraint oauth_authorizations.oauth_authorizations_scope_not_null NOT NULL scope
+constraint oauth_authorizations.oauth_authorizations_state_length CHECK ((char_length(state) <= 4096))
+constraint oauth_authorizations.oauth_authorizations_status_not_null NOT NULL status
+constraint oauth_authorizations.oauth_authorizations_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+constraint oauth_client_states.oauth_client_states_created_at_not_null NOT NULL created_at
+constraint oauth_client_states.oauth_client_states_id_not_null NOT NULL id
+constraint oauth_client_states.oauth_client_states_pkey PRIMARY KEY (id)
+constraint oauth_client_states.oauth_client_states_provider_type_not_null NOT NULL provider_type
+constraint oauth_clients.oauth_clients_client_name_length CHECK ((char_length(client_name) <= 1024))
+constraint oauth_clients.oauth_clients_client_type_not_null NOT NULL client_type
+constraint oauth_clients.oauth_clients_client_uri_length CHECK ((char_length(client_uri) <= 2048))
+constraint oauth_clients.oauth_clients_created_at_not_null NOT NULL created_at
+constraint oauth_clients.oauth_clients_grant_types_not_null NOT NULL grant_types
+constraint oauth_clients.oauth_clients_id_not_null NOT NULL id
+constraint oauth_clients.oauth_clients_logo_uri_length CHECK ((char_length(logo_uri) <= 2048))
+constraint oauth_clients.oauth_clients_pkey PRIMARY KEY (id)
+constraint oauth_clients.oauth_clients_redirect_uris_not_null NOT NULL redirect_uris
+constraint oauth_clients.oauth_clients_registration_type_not_null NOT NULL registration_type
+constraint oauth_clients.oauth_clients_token_endpoint_auth_method_check CHECK ((token_endpoint_auth_method = ANY (ARRAY['client_secret_basic'::text, 'client_secret_post'::text, 'none'::text])))
+constraint oauth_clients.oauth_clients_token_endpoint_auth_method_not_null NOT NULL token_endpoint_auth_method
+constraint oauth_clients.oauth_clients_updated_at_not_null NOT NULL updated_at
+constraint oauth_consents.oauth_consents_client_id_fkey FOREIGN KEY (client_id) REFERENCES auth.oauth_clients(id) ON DELETE CASCADE
+constraint oauth_consents.oauth_consents_client_id_not_null NOT NULL client_id
+constraint oauth_consents.oauth_consents_granted_at_not_null NOT NULL granted_at
+constraint oauth_consents.oauth_consents_id_not_null NOT NULL id
+constraint oauth_consents.oauth_consents_pkey PRIMARY KEY (id)
+constraint oauth_consents.oauth_consents_revoked_after_granted CHECK (((revoked_at IS NULL) OR (revoked_at >= granted_at)))
+constraint oauth_consents.oauth_consents_scopes_length CHECK ((char_length(scopes) <= 2048))
+constraint oauth_consents.oauth_consents_scopes_not_empty CHECK ((char_length(TRIM(BOTH FROM scopes)) > 0))
+constraint oauth_consents.oauth_consents_scopes_not_null NOT NULL scopes
+constraint oauth_consents.oauth_consents_user_client_unique UNIQUE (user_id, client_id)
+constraint oauth_consents.oauth_consents_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+constraint oauth_consents.oauth_consents_user_id_not_null NOT NULL user_id
+constraint one_time_tokens.one_time_tokens_created_at_not_null NOT NULL created_at
+constraint one_time_tokens.one_time_tokens_id_not_null NOT NULL id
+constraint one_time_tokens.one_time_tokens_pkey PRIMARY KEY (id)
+constraint one_time_tokens.one_time_tokens_relates_to_not_null NOT NULL relates_to
+constraint one_time_tokens.one_time_tokens_token_hash_check CHECK ((char_length(token_hash) > 0))
+constraint one_time_tokens.one_time_tokens_token_hash_not_null NOT NULL token_hash
+constraint one_time_tokens.one_time_tokens_token_type_not_null NOT NULL token_type
+constraint one_time_tokens.one_time_tokens_updated_at_not_null NOT NULL updated_at
+constraint one_time_tokens.one_time_tokens_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+constraint one_time_tokens.one_time_tokens_user_id_not_null NOT NULL user_id
+constraint refresh_tokens.refresh_tokens_id_not_null NOT NULL id
+constraint refresh_tokens.refresh_tokens_pkey PRIMARY KEY (id)
+constraint refresh_tokens.refresh_tokens_session_id_fkey FOREIGN KEY (session_id) REFERENCES auth.sessions(id) ON DELETE CASCADE
+constraint refresh_tokens.refresh_tokens_token_unique UNIQUE (token)
+constraint saml_providers.entity_id not empty CHECK ((char_length(entity_id) > 0))
+constraint saml_providers.metadata_url not empty CHECK (((metadata_url = NULL::text) OR (char_length(metadata_url) > 0)))
+constraint saml_providers.metadata_xml not empty CHECK ((char_length(metadata_xml) > 0))
+constraint saml_providers.saml_providers_entity_id_key UNIQUE (entity_id)
+constraint saml_providers.saml_providers_entity_id_not_null NOT NULL entity_id
+constraint saml_providers.saml_providers_id_not_null NOT NULL id
+constraint saml_providers.saml_providers_metadata_xml_not_null NOT NULL metadata_xml
+constraint saml_providers.saml_providers_pkey PRIMARY KEY (id)
+constraint saml_providers.saml_providers_sso_provider_id_fkey FOREIGN KEY (sso_provider_id) REFERENCES auth.sso_providers(id) ON DELETE CASCADE
+constraint saml_providers.saml_providers_sso_provider_id_not_null NOT NULL sso_provider_id
+constraint saml_relay_states.request_id not empty CHECK ((char_length(request_id) > 0))
+constraint saml_relay_states.saml_relay_states_flow_state_id_fkey FOREIGN KEY (flow_state_id) REFERENCES auth.flow_state(id) ON DELETE CASCADE
+constraint saml_relay_states.saml_relay_states_id_not_null NOT NULL id
+constraint saml_relay_states.saml_relay_states_pkey PRIMARY KEY (id)
+constraint saml_relay_states.saml_relay_states_request_id_not_null NOT NULL request_id
+constraint saml_relay_states.saml_relay_states_sso_provider_id_fkey FOREIGN KEY (sso_provider_id) REFERENCES auth.sso_providers(id) ON DELETE CASCADE
+constraint saml_relay_states.saml_relay_states_sso_provider_id_not_null NOT NULL sso_provider_id
+constraint schema_migrations.schema_migrations_pkey PRIMARY KEY (version)
+constraint schema_migrations.schema_migrations_version_not_null NOT NULL version
+constraint sessions.sessions_id_not_null NOT NULL id
+constraint sessions.sessions_oauth_client_id_fkey FOREIGN KEY (oauth_client_id) REFERENCES auth.oauth_clients(id) ON DELETE CASCADE
+constraint sessions.sessions_pkey PRIMARY KEY (id)
+constraint sessions.sessions_scopes_length CHECK ((char_length(scopes) <= 4096))
+constraint sessions.sessions_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+constraint sessions.sessions_user_id_not_null NOT NULL user_id
+constraint sso_domains.domain not empty CHECK ((char_length(domain) > 0))
+constraint sso_domains.sso_domains_domain_not_null NOT NULL domain
+constraint sso_domains.sso_domains_id_not_null NOT NULL id
+constraint sso_domains.sso_domains_pkey PRIMARY KEY (id)
+constraint sso_domains.sso_domains_sso_provider_id_fkey FOREIGN KEY (sso_provider_id) REFERENCES auth.sso_providers(id) ON DELETE CASCADE
+constraint sso_domains.sso_domains_sso_provider_id_not_null NOT NULL sso_provider_id
+constraint sso_providers.resource_id not empty CHECK (((resource_id = NULL::text) OR (char_length(resource_id) > 0)))
+constraint sso_providers.sso_providers_id_not_null NOT NULL id
+constraint sso_providers.sso_providers_pkey PRIMARY KEY (id)
+constraint users.users_email_change_confirm_status_check CHECK (((email_change_confirm_status >= 0) AND (email_change_confirm_status <= 2)))
+constraint users.users_id_not_null NOT NULL id
+constraint users.users_is_anonymous_not_null NOT NULL is_anonymous
+constraint users.users_is_sso_user_not_null NOT NULL is_sso_user
+constraint users.users_phone_key UNIQUE (phone)
+constraint users.users_pkey PRIMARY KEY (id)
+constraint webauthn_challenges.webauthn_challenges_challenge_type_check CHECK ((challenge_type = ANY (ARRAY['signup'::text, 'registration'::text, 'authentication'::text])))
+constraint webauthn_challenges.webauthn_challenges_challenge_type_not_null NOT NULL challenge_type
+constraint webauthn_challenges.webauthn_challenges_created_at_not_null NOT NULL created_at
+constraint webauthn_challenges.webauthn_challenges_expires_at_not_null NOT NULL expires_at
+constraint webauthn_challenges.webauthn_challenges_id_not_null NOT NULL id
+constraint webauthn_challenges.webauthn_challenges_pkey PRIMARY KEY (id)
+constraint webauthn_challenges.webauthn_challenges_session_data_not_null NOT NULL session_data
+constraint webauthn_challenges.webauthn_challenges_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+constraint webauthn_credentials.webauthn_credentials_attestation_type_not_null NOT NULL attestation_type
+constraint webauthn_credentials.webauthn_credentials_backed_up_not_null NOT NULL backed_up
+constraint webauthn_credentials.webauthn_credentials_backup_eligible_not_null NOT NULL backup_eligible
+constraint webauthn_credentials.webauthn_credentials_created_at_not_null NOT NULL created_at
+constraint webauthn_credentials.webauthn_credentials_credential_id_not_null NOT NULL credential_id
+constraint webauthn_credentials.webauthn_credentials_friendly_name_not_null NOT NULL friendly_name
+constraint webauthn_credentials.webauthn_credentials_id_not_null NOT NULL id
+constraint webauthn_credentials.webauthn_credentials_pkey PRIMARY KEY (id)
+constraint webauthn_credentials.webauthn_credentials_public_key_not_null NOT NULL public_key
+constraint webauthn_credentials.webauthn_credentials_sign_count_not_null NOT NULL sign_count
+constraint webauthn_credentials.webauthn_credentials_transports_not_null NOT NULL transports
+constraint webauthn_credentials.webauthn_credentials_updated_at_not_null NOT NULL updated_at
+constraint webauthn_credentials.webauthn_credentials_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
+constraint webauthn_credentials.webauthn_credentials_user_id_not_null NOT NULL user_id
+enum aal_level aal1,aal2,aal3
+enum code_challenge_method s256,plain
+enum factor_status unverified,verified
+enum factor_type totp,webauthn,phone
+enum oauth_authorization_status pending,approved,denied,expired
+enum oauth_client_type public,confidential
+enum oauth_registration_type dynamic,manual
+enum oauth_response_type code
+enum one_time_token_type confirmation_token,reauthentication_token,recovery_token,email_change_token_new,email_change_token_current,phone_change_token
+function email() returns text s
+function jwt() returns jsonb s
+function role() returns text s
+function uid() returns uuid s
+index CREATE INDEX audit_logs_instance_id_idx ON auth.audit_log_entries USING btree (instance_id)
+index CREATE INDEX custom_oauth_providers_created_at_idx ON auth.custom_oauth_providers USING btree (created_at)
+index CREATE INDEX custom_oauth_providers_enabled_idx ON auth.custom_oauth_providers USING btree (enabled)
+index CREATE INDEX custom_oauth_providers_identifier_idx ON auth.custom_oauth_providers USING btree (identifier)
+index CREATE INDEX custom_oauth_providers_provider_type_idx ON auth.custom_oauth_providers USING btree (provider_type)
+index CREATE INDEX factor_id_created_at_idx ON auth.mfa_factors USING btree (user_id, created_at)
+index CREATE INDEX flow_state_created_at_idx ON auth.flow_state USING btree (created_at DESC)
+index CREATE INDEX identities_email_idx ON auth.identities USING btree (email text_pattern_ops)
+index CREATE INDEX identities_user_id_idx ON auth.identities USING btree (user_id)
+index CREATE INDEX idx_auth_code ON auth.flow_state USING btree (auth_code)
+index CREATE INDEX idx_oauth_client_states_created_at ON auth.oauth_client_states USING btree (created_at)
+index CREATE INDEX idx_user_id_auth_method ON auth.flow_state USING btree (user_id, authentication_method)
+index CREATE INDEX mfa_challenge_created_at_idx ON auth.mfa_challenges USING btree (created_at DESC)
+index CREATE INDEX mfa_factors_user_id_idx ON auth.mfa_factors USING btree (user_id)
+index CREATE INDEX oauth_auth_pending_exp_idx ON auth.oauth_authorizations USING btree (expires_at) WHERE (status = 'pending'::auth.oauth_authorization_status)
+index CREATE INDEX oauth_clients_deleted_at_idx ON auth.oauth_clients USING btree (deleted_at)
+index CREATE INDEX oauth_consents_active_client_idx ON auth.oauth_consents USING btree (client_id) WHERE (revoked_at IS NULL)
+index CREATE INDEX oauth_consents_active_user_client_idx ON auth.oauth_consents USING btree (user_id, client_id) WHERE (revoked_at IS NULL)
+index CREATE INDEX oauth_consents_user_order_idx ON auth.oauth_consents USING btree (user_id, granted_at DESC)
+index CREATE INDEX one_time_tokens_relates_to_hash_idx ON auth.one_time_tokens USING hash (relates_to)
+index CREATE INDEX one_time_tokens_token_hash_hash_idx ON auth.one_time_tokens USING hash (token_hash)
+index CREATE INDEX refresh_tokens_instance_id_idx ON auth.refresh_tokens USING btree (instance_id)
+index CREATE INDEX refresh_tokens_instance_id_user_id_idx ON auth.refresh_tokens USING btree (instance_id, user_id)
+index CREATE INDEX refresh_tokens_parent_idx ON auth.refresh_tokens USING btree (parent)
+index CREATE INDEX refresh_tokens_session_id_revoked_idx ON auth.refresh_tokens USING btree (session_id, revoked)
+index CREATE INDEX refresh_tokens_updated_at_idx ON auth.refresh_tokens USING btree (updated_at DESC)
+index CREATE INDEX saml_providers_sso_provider_id_idx ON auth.saml_providers USING btree (sso_provider_id)
+index CREATE INDEX saml_relay_states_created_at_idx ON auth.saml_relay_states USING btree (created_at DESC)
+index CREATE INDEX saml_relay_states_for_email_idx ON auth.saml_relay_states USING btree (for_email)
+index CREATE INDEX saml_relay_states_sso_provider_id_idx ON auth.saml_relay_states USING btree (sso_provider_id)
+index CREATE INDEX sessions_not_after_idx ON auth.sessions USING btree (not_after DESC)
+index CREATE INDEX sessions_oauth_client_id_idx ON auth.sessions USING btree (oauth_client_id)
+index CREATE INDEX sessions_user_id_idx ON auth.sessions USING btree (user_id)
+index CREATE INDEX sso_domains_sso_provider_id_idx ON auth.sso_domains USING btree (sso_provider_id)
+index CREATE INDEX sso_providers_resource_id_pattern_idx ON auth.sso_providers USING btree (resource_id text_pattern_ops)
+index CREATE INDEX user_id_created_at_idx ON auth.sessions USING btree (user_id, created_at)
+index CREATE INDEX users_instance_id_email_idx ON auth.users USING btree (instance_id, email)
+index CREATE INDEX users_instance_id_idx ON auth.users USING btree (instance_id)
+index CREATE INDEX users_is_anonymous_idx ON auth.users USING btree (is_anonymous)
+index CREATE INDEX webauthn_challenges_expires_at_idx ON auth.webauthn_challenges USING btree (expires_at)
+index CREATE INDEX webauthn_challenges_user_id_idx ON auth.webauthn_challenges USING btree (user_id)
+index CREATE INDEX webauthn_credentials_user_id_idx ON auth.webauthn_credentials USING btree (user_id)
+index CREATE UNIQUE INDEX amr_id_pk ON auth.mfa_amr_claims USING btree (id)
+index CREATE UNIQUE INDEX audit_log_entries_pkey ON auth.audit_log_entries USING btree (id)
+index CREATE UNIQUE INDEX confirmation_token_idx ON auth.users USING btree (confirmation_token) WHERE ((confirmation_token)::text !~ '^[0-9 ]*$'::text)
+index CREATE UNIQUE INDEX custom_oauth_providers_identifier_key ON auth.custom_oauth_providers USING btree (identifier)
+index CREATE UNIQUE INDEX custom_oauth_providers_pkey ON auth.custom_oauth_providers USING btree (id)
+index CREATE UNIQUE INDEX email_change_token_current_idx ON auth.users USING btree (email_change_token_current) WHERE ((email_change_token_current)::text !~ '^[0-9 ]*$'::text)
+index CREATE UNIQUE INDEX email_change_token_new_idx ON auth.users USING btree (email_change_token_new) WHERE ((email_change_token_new)::text !~ '^[0-9 ]*$'::text)
+index CREATE UNIQUE INDEX flow_state_pkey ON auth.flow_state USING btree (id)
+index CREATE UNIQUE INDEX identities_pkey ON auth.identities USING btree (id)
+index CREATE UNIQUE INDEX identities_provider_id_provider_unique ON auth.identities USING btree (provider_id, provider)
+index CREATE UNIQUE INDEX instances_pkey ON auth.instances USING btree (id)
+index CREATE UNIQUE INDEX mfa_amr_claims_session_id_authentication_method_pkey ON auth.mfa_amr_claims USING btree (session_id, authentication_method)
+index CREATE UNIQUE INDEX mfa_challenges_pkey ON auth.mfa_challenges USING btree (id)
+index CREATE UNIQUE INDEX mfa_factors_last_challenged_at_key ON auth.mfa_factors USING btree (last_challenged_at)
+index CREATE UNIQUE INDEX mfa_factors_pkey ON auth.mfa_factors USING btree (id)
+index CREATE UNIQUE INDEX mfa_factors_user_friendly_name_unique ON auth.mfa_factors USING btree (friendly_name, user_id) WHERE (TRIM(BOTH FROM friendly_name) <> ''::text)
+index CREATE UNIQUE INDEX oauth_authorizations_authorization_code_key ON auth.oauth_authorizations USING btree (authorization_code)
+index CREATE UNIQUE INDEX oauth_authorizations_authorization_id_key ON auth.oauth_authorizations USING btree (authorization_id)
+index CREATE UNIQUE INDEX oauth_authorizations_pkey ON auth.oauth_authorizations USING btree (id)
+index CREATE UNIQUE INDEX oauth_client_states_pkey ON auth.oauth_client_states USING btree (id)
+index CREATE UNIQUE INDEX oauth_clients_pkey ON auth.oauth_clients USING btree (id)
+index CREATE UNIQUE INDEX oauth_consents_pkey ON auth.oauth_consents USING btree (id)
+index CREATE UNIQUE INDEX oauth_consents_user_client_unique ON auth.oauth_consents USING btree (user_id, client_id)
+index CREATE UNIQUE INDEX one_time_tokens_pkey ON auth.one_time_tokens USING btree (id)
+index CREATE UNIQUE INDEX one_time_tokens_user_id_token_type_key ON auth.one_time_tokens USING btree (user_id, token_type)
+index CREATE UNIQUE INDEX reauthentication_token_idx ON auth.users USING btree (reauthentication_token) WHERE ((reauthentication_token)::text !~ '^[0-9 ]*$'::text)
+index CREATE UNIQUE INDEX recovery_token_idx ON auth.users USING btree (recovery_token) WHERE ((recovery_token)::text !~ '^[0-9 ]*$'::text)
+index CREATE UNIQUE INDEX refresh_tokens_pkey ON auth.refresh_tokens USING btree (id)
+index CREATE UNIQUE INDEX refresh_tokens_token_unique ON auth.refresh_tokens USING btree (token)
+index CREATE UNIQUE INDEX saml_providers_entity_id_key ON auth.saml_providers USING btree (entity_id)
+index CREATE UNIQUE INDEX saml_providers_pkey ON auth.saml_providers USING btree (id)
+index CREATE UNIQUE INDEX saml_relay_states_pkey ON auth.saml_relay_states USING btree (id)
+index CREATE UNIQUE INDEX schema_migrations_pkey ON auth.schema_migrations USING btree (version)
+index CREATE UNIQUE INDEX sessions_pkey ON auth.sessions USING btree (id)
+index CREATE UNIQUE INDEX sso_domains_domain_idx ON auth.sso_domains USING btree (lower(domain))
+index CREATE UNIQUE INDEX sso_domains_pkey ON auth.sso_domains USING btree (id)
+index CREATE UNIQUE INDEX sso_providers_pkey ON auth.sso_providers USING btree (id)
+index CREATE UNIQUE INDEX sso_providers_resource_id_idx ON auth.sso_providers USING btree (lower(resource_id))
+index CREATE UNIQUE INDEX unique_phone_factor_per_user ON auth.mfa_factors USING btree (user_id, phone)
+index CREATE UNIQUE INDEX users_email_partial_key ON auth.users USING btree (email) WHERE (is_sso_user = false)
+index CREATE UNIQUE INDEX users_phone_key ON auth.users USING btree (phone)
+index CREATE UNIQUE INDEX users_pkey ON auth.users USING btree (id)
+index CREATE UNIQUE INDEX webauthn_challenges_pkey ON auth.webauthn_challenges USING btree (id)
+index CREATE UNIQUE INDEX webauthn_credentials_credential_id_key ON auth.webauthn_credentials USING btree (credential_id)
+index CREATE UNIQUE INDEX webauthn_credentials_pkey ON auth.webauthn_credentials USING btree (id)
+rls audit_log_entries on
+rls custom_oauth_providers off
+rls flow_state on
+rls identities on
+rls instances on
+rls mfa_amr_claims on
+rls mfa_challenges on
+rls mfa_factors on
+rls oauth_authorizations off
+rls oauth_client_states off
+rls oauth_clients off
+rls oauth_consents off
+rls one_time_tokens on
+rls refresh_tokens on
+rls saml_providers on
+rls saml_relay_states on
+rls schema_migrations on
+rls sessions on
+rls sso_domains on
+rls sso_providers on
+rls users on
+rls webauthn_challenges off
+rls webauthn_credentials off
