@@ -54,6 +54,21 @@ kill_node() {
 	pkill -9 -f "$RT" 2>/dev/null || true
 	wait "$DEVPID" 2>/dev/null || true
 	sleep 2
+	reap_shm
+}
+
+# A kill -9 leaks the postmaster's SysV interlock segment, and every
+# fresh attach uses a fresh runtime directory so a new key never
+# reclaims an old one. macOS caps the segment table at 32 ids, run2
+# died at iteration 17 with shmget ENOSPC on a perfectly good store.
+# Reap our own unattached segments after every kill.
+reap_shm() {
+	local ids
+	ids=$(ipcs -ma 2>/dev/null | awk -v u="$USER" \
+		'$1=="m" && $9==0 && $5==u {print $2}')
+	for id in $ids; do
+		ipcrm -m "$id" 2>/dev/null || true
+	done
 }
 
 # Writes block until the lease is held, which after a node death means
@@ -203,6 +218,7 @@ while [ "$SECONDS" -lt "$SOAK_SECONDS" ] && [ "$violations" -eq 0 ]; do
 		kill -9 "$SPID" 2>/dev/null || true
 		pkill -9 -f "$SRT" 2>/dev/null || true
 		wait "$SPID" 2>/dev/null || true
+		reap_shm
 		if [ -n "$stole" ]; then
 			say "VIOLATION: second instance wrote while the lease holder was alive"
 			violations=$((violations + 1))
