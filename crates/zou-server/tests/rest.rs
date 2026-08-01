@@ -62,6 +62,22 @@ fn get(uri: &str) -> Request<Body> {
         .unwrap()
 }
 
+fn req(method: &str, uri: &str, body: &str, prefers: &[&str]) -> Request<Body> {
+    let mut b = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("apikey", anon_key());
+    for p in prefers {
+        b = b.header("prefer", *p);
+    }
+    let body = if body.is_empty() {
+        Body::empty()
+    } else {
+        Body::from(body.to_string())
+    };
+    b.body(body).unwrap()
+}
+
 #[tokio::test]
 async fn the_read_path_speaks_postgrest() {
     let Some(dsn) = dsn() else { return };
@@ -196,6 +212,270 @@ async fn the_read_path_speaks_postgrest() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
     assert_eq!(body["code"], "PGRST100");
+}
+
+#[tokio::test]
+async fn the_write_path_speaks_postgrest() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_wr_books, zou_rest_wr_authors, zou_rest_wr_nopk cascade",
+            "create table zou_rest_wr_authors (id int primary key, name text)",
+            "create table zou_rest_wr_books (id int primary key, \
+             author_id int references zou_rest_wr_authors(id), \
+             title text, price int default 7)",
+            "create table zou_rest_wr_nopk (id int, title text)",
+            "insert into zou_rest_wr_authors values (1, 'ann'), (2, 'bob')",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // A bulk insert defaults to return=minimal: 201, empty body, and
+    // the column default fills what the payload left out.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wr_books",
+            r#"[{"id": 1, "author_id": 1, "title": "t1"}, {"id": 2, "author_id": 2, "title": "t2"}]"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(res.headers().get("preference-applied").is_none());
+    assert_eq!(body_text(res).await, "");
+
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_wr_books?select=title,price&order=id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"price": 7, "title": "t1"},{"price": 7, "title": "t2"}]"#
+    );
+
+    // return=representation answers with the planned select over the
+    // mutation CTE, embeds included, and echoes Preference-Applied.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wr_books?select=title,zou_rest_wr_authors(name)",
+            r#"{"id": 3, "author_id": 1, "title": "c1"}"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(res.headers()["preference-applied"], "return=representation");
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "c1", "zou_rest_wr_authors": {"name": "ann"}}]"#
+    );
+
+    // return=headers-only points Location at the new row by its pk.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wr_books",
+            r#"{"id": 42, "author_id": 2, "title": "h1"}"#,
+            &["return=headers-only"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(
+        res.headers()["location"],
+        "/rest/v1/zou_rest_wr_books?id=eq.42"
+    );
+    assert_eq!(body_text(res).await, "");
+
+    // merge-duplicates without on_conflict finds the pk by itself
+    // and overwrites the clashing row in place.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wr_books",
+            r#"{"id": 2, "author_id": 2, "title": "t2x"}"#,
+            &["resolution=merge-duplicates"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(
+        res.headers()["preference-applied"],
+        "resolution=merge-duplicates"
+    );
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_wr_books?select=title&id=eq.2"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"title": "t2x"}]"#);
+
+    // ignore-duplicates with an explicit on_conflict drops the clash
+    // and keeps the fresh row.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wr_books?on_conflict=id",
+            r#"[{"id": 2, "author_id": 2, "title": "nope"}, {"id": 4, "author_id": 2, "title": "t4"}]"#,
+            &["resolution=ignore-duplicates"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_wr_books?select=title&id=in.(2,4)&order=id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "t2x"},{"title": "t4"}]"#
+    );
+
+    // An upsert with no pk and no on_conflict has no target to name.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wr_nopk",
+            r#"{"id": 1, "title": "x"}"#,
+            &["resolution=merge-duplicates"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST100");
+
+    // PATCH takes the root filters into its WHERE and representation
+    // reads the touched rows back, 200 not 201.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_wr_books?id=eq.1&select=id,title",
+            r#"{"title": "p1"}"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1, "title": "p1"}]"#);
+
+    // A minimal PATCH is the bare 204.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_wr_books?id=eq.4",
+            r#"{"price": 9}"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_wr_books?select=price&id=eq.4"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"price": 9}]"#);
+
+    // A PATCH with no keys is PostgREST's no-op answer.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_wr_books?id=eq.4",
+            "{}",
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+    // DELETE with representation hands back the removed rows, then a
+    // minimal DELETE finishes the cleanup with a 204.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/rest/v1/zou_rest_wr_books?id=eq.42&select=id",
+            "",
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 42}]"#);
+
+    let res = app
+        .clone()
+        .oneshot(req("DELETE", "/rest/v1/zou_rest_wr_books?id=eq.4", "", &[]))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_wr_books?select=id&id=in.(4,42)"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "[]");
+
+    // A body that is not json never reaches the database.
+    let res = app
+        .clone()
+        .oneshot(req("POST", "/rest/v1/zou_rest_wr_books", "not json", &[]))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST102");
+}
+
+#[tokio::test]
+async fn an_rls_write_denial_comes_back_as_401() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_wr_notes cascade",
+            "create table zou_rest_wr_notes (id int primary key, body text)",
+            "alter table zou_rest_wr_notes enable row level security",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // RLS is on and no insert policy exists, so the anon write is
+    // refused by postgres and surfaces as PostgREST's 401.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wr_notes",
+            r#"{"id": 1, "body": "x"}"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "42501");
 }
 
 #[tokio::test]
