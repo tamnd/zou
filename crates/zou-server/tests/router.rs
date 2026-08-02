@@ -1,0 +1,328 @@
+//! The front door as a whole: the four Supabase prefixes, what answers
+//! under each of them, and what happens outside all four.
+//!
+//! Everything else in this crate tests one surface. This tests that the
+//! surfaces are wired to the paths a Supabase client already calls,
+//! which is a different claim and one nothing else makes. A client
+//! configured with a zou url and no other changes reaches /rest/v1 for
+//! data, /auth/v1 for sessions, and gets an honest 501 rather than a
+//! confusing 404 at /storage/v1 and /realtime/v1, which are the two
+//! surfaces later milestones fill in.
+//!
+//! Which side of the apikey gate each route sits on is part of the
+//! wiring and is tested here too. Four routes are deliberately outside
+//! it, and every one of them is outside it because the caller cannot
+//! reasonably be holding a key: a token verifier, a link in an email,
+//! and the two halves of a social sign in.
+//!
+//! No database. Nothing here gets far enough to need one.
+
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
+use zou_server::{Config, jwt, router};
+
+const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long";
+
+fn app() -> axum::Router {
+    router(Config {
+        jwt_secret: SECRET.to_vec(),
+        ..Config::default()
+    })
+    .expect("router builds")
+}
+
+fn anon_key() -> String {
+    jwt::mint(&jwt::key_claims("anon"), SECRET)
+}
+
+struct Answer {
+    status: StatusCode,
+    request_id: String,
+    body: serde_json::Value,
+}
+
+impl Answer {
+    fn message(&self) -> &str {
+        self.body["message"].as_str().unwrap_or("<none>")
+    }
+}
+
+/// A request with an apikey, which is what a configured client sends.
+async fn keyed(app: &axum::Router, method: &str, path: &str) -> Answer {
+    send(app, method, path, true).await
+}
+
+/// A request with none, which is what a mail client and a provider
+/// redirect send.
+async fn bare(app: &axum::Router, method: &str, path: &str) -> Answer {
+    send(app, method, path, false).await
+}
+
+async fn send(app: &axum::Router, method: &str, path: &str, key: bool) -> Answer {
+    let mut req = Request::builder().method(method).uri(path);
+    if key {
+        req = req.header("apikey", anon_key());
+    }
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .expect("router answers");
+    let status = res.status();
+    let request_id = res
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    Answer {
+        status,
+        request_id,
+        body,
+    }
+}
+
+/// The words the hosted edge answers an unmatched route with.
+const NO_ROUTE: &str = "no Route matched with those values";
+
+#[tokio::test]
+async fn all_four_prefixes_are_routed() {
+    let app = app();
+    // The claim is only that each prefix reaches something of its own
+    // rather than the fallback. What each of them then says is the
+    // subject of the tests below and of the other suites.
+    for path in [
+        "/rest/v1/todos",
+        "/rest/v1/",
+        "/rest/v1/rpc/whatever",
+        "/auth/v1/health",
+        "/auth/v1/settings",
+        "/storage/v1/bucket/object",
+        "/realtime/v1/websocket",
+    ] {
+        let answer = keyed(&app, "GET", path).await;
+        assert_ne!(
+            answer.message(),
+            NO_ROUTE,
+            "{path} fell through to the fallback",
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_two_stubbed_surfaces_say_so_rather_than_pretending_to_be_missing() {
+    let app = app();
+    // A 404 here would read as a wrong url and send somebody looking
+    // for a typo. A 501 that names the surface and says where it is
+    // tracked is the difference between a bug report and a wait.
+    let storage = keyed(&app, "GET", "/storage/v1/object/public/pics/cat.png").await;
+    assert_eq!(storage.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        storage.message(),
+        "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
+    );
+
+    let realtime = keyed(&app, "GET", "/realtime/v1/websocket").await;
+    assert_eq!(realtime.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        realtime.message(),
+        "the realtime surface is not implemented yet, tracked in tamnd/zou milestones",
+    );
+}
+
+#[tokio::test]
+async fn a_stub_answers_whatever_method_it_is_asked() {
+    let app = app();
+    // Both are routed with `any`, so an upload and a subscribe get the
+    // same answer as a read. A method that 405s under a stubbed
+    // surface would be a second wrong answer on top of the first.
+    for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] {
+        for path in ["/storage/v1/object/pics", "/realtime/v1/websocket"] {
+            let answer = keyed(&app, method, path).await;
+            assert_eq!(
+                answer.status,
+                StatusCode::NOT_IMPLEMENTED,
+                "{method} {path}",
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_auth_endpoint_nobody_wrote_yet_says_which_it_was() {
+    let app = app();
+    // The catch all under /auth/v1 is the same idea one prefix down.
+    // GoTrue has endpoints zou does not serve, and a client calling
+    // one should hear that rather than doubt the url.
+    let answer = keyed(&app, "POST", "/auth/v1/sso").await;
+    assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        answer.message(),
+        "this auth endpoint is not implemented yet, tracked in tamnd/zou milestones",
+    );
+}
+
+#[tokio::test]
+async fn anything_outside_the_four_prefixes_is_the_edges_own_404() {
+    let app = app();
+    for path in ["/", "/rest", "/auth", "/graphql/v1", "/functions/v1/hello"] {
+        let answer = keyed(&app, "GET", path).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            answer.message(),
+            NO_ROUTE,
+            "{path} should be answered in the hosted edge's words",
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_four_open_routes_need_no_apikey() {
+    let app = app();
+    // Every one of these is reachable by somebody who cannot be
+    // holding a key. A verifier fetching the public half of the
+    // signing keys, a link clicked in a mail client, and the two
+    // halves of a social sign in, which are navigations rather than
+    // fetches.
+    for (method, path) in [
+        ("GET", "/auth/v1/.well-known/jwks.json"),
+        ("GET", "/auth/v1/verify?token=nope&type=signup"),
+        ("POST", "/auth/v1/verify"),
+        ("GET", "/auth/v1/authorize?provider=github"),
+        ("GET", "/auth/v1/callback"),
+    ] {
+        let answer = bare(&app, method, path).await;
+        assert_ne!(
+            answer.status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} was refused for want of a key it cannot have",
+        );
+        assert_ne!(answer.message(), "No API key found in request");
+    }
+}
+
+#[tokio::test]
+async fn everything_else_is_behind_the_gate() {
+    let app = app();
+    for (method, path) in [
+        ("GET", "/rest/v1/todos"),
+        ("GET", "/auth/v1/health"),
+        ("GET", "/auth/v1/settings"),
+        ("POST", "/auth/v1/token"),
+        ("POST", "/auth/v1/signup"),
+        ("GET", "/auth/v1/user"),
+        ("GET", "/auth/v1/admin/users"),
+        ("POST", "/auth/v1/factors"),
+        ("GET", "/storage/v1/object/pics"),
+        ("GET", "/realtime/v1/websocket"),
+    ] {
+        let answer = bare(&app, method, path).await;
+        assert_eq!(
+            answer.status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} answered without a key",
+        );
+        assert_eq!(answer.message(), "No API key found in request");
+    }
+}
+
+#[tokio::test]
+async fn the_gate_is_reached_before_a_stub_is() {
+    let app = app();
+    // Ordering, not routing. The stubs sit inside the gated router, so
+    // an unkeyed request to an unbuilt surface hears about the key
+    // rather than about the surface. A stub outside the gate would be
+    // a hole that grows when the surface is built.
+    let answer = bare(&app, "GET", "/storage/v1/object/pics").await;
+    assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(answer.message(), "No API key found in request");
+}
+
+#[tokio::test]
+async fn every_answer_carries_a_request_id() {
+    let app = app();
+    // The id layer is outermost on purpose, so a 404 from the
+    // fallback and a 401 from the gate carry one as surely as a 200
+    // does. It is the only thing an operator has to join a complaint
+    // to a log line.
+    for (keyed_request, method, path) in [
+        (true, "GET", "/auth/v1/health"),
+        (true, "GET", "/storage/v1/object/pics"),
+        (true, "GET", "/nowhere"),
+        (false, "GET", "/rest/v1/todos"),
+        (false, "GET", "/auth/v1/.well-known/jwks.json"),
+    ] {
+        let answer = send(&app, method, path, keyed_request).await;
+        assert!(
+            !answer.request_id.is_empty(),
+            "{method} {path} came back with no id",
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_preflight_never_reaches_the_gate() {
+    let app = app();
+    // CORS sits outside the gate, so a browser asking permission gets
+    // an answer rather than a 401. A preflight carries no apikey by
+    // definition: it is the browser asking, not the application.
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/rest/v1/todos")
+                .header("origin", "https://app.zou.test")
+                .header("access-control-request-method", "POST")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router answers");
+    assert_ne!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        res.headers()["access-control-allow-origin"],
+        "https://app.zou.test",
+    );
+}
+
+#[tokio::test]
+async fn a_stubbed_surface_is_stubbed_all_the_way_to_its_root() {
+    let app = app();
+    // A wildcard segment matches neither the bare prefix nor the empty
+    // path after the slash, so both of those spellings need routes of
+    // their own or they answer as a url that does not exist rather
+    // than as a surface that does not exist yet.
+    for path in ["/storage/v1", "/storage/v1/"] {
+        let answer = keyed(&app, "GET", path).await;
+        assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
+        assert_eq!(
+            answer.message(),
+            "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
+        );
+    }
+    for path in ["/realtime/v1", "/realtime/v1/"] {
+        let answer = keyed(&app, "GET", path).await;
+        assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
+        assert_eq!(
+            answer.message(),
+            "the realtime surface is not implemented yet, tracked in tamnd/zou milestones",
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_two_built_prefixes_keep_their_own_shape() {
+    let app = app();
+    // The same treatment would be wrong here. /rest/v1/ is the OpenAPI
+    // document and is routed, /rest/v1 is not a url PostgREST serves,
+    // and /auth/v1 is not an endpoint GoTrue has. A prefix with real
+    // endpoints under it does not own its own root just by existing.
+    for path in ["/rest/v1", "/auth/v1", "/auth/v1/"] {
+        let answer = keyed(&app, "GET", path).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(answer.message(), NO_ROUTE, "{path}");
+    }
+}

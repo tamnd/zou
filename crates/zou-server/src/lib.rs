@@ -664,7 +664,17 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/rest/v1/", any(rest::root))
         .route("/rest/v1/rpc/{func}", any(rest::rpc))
         .route("/rest/v1/{table}", any(rest::table))
+        // Three spellings each, because a stubbed surface is stubbed all
+        // the way to its root. A wildcard segment matches neither the
+        // empty path nor the bare prefix, so without these two extra
+        // routes the shortest url under a surface that does not exist
+        // yet would be answered as a url that does not exist at all,
+        // which is a different and more confusing thing to hear.
+        .route("/storage/v1", any(storage_stub))
+        .route("/storage/v1/", any(storage_stub))
         .route("/storage/v1/{*rest}", any(storage_stub))
+        .route("/realtime/v1", any(realtime_stub))
+        .route("/realtime/v1/", any(realtime_stub))
         .route("/realtime/v1/{*rest}", any(realtime_stub))
         // The local loop's mailbox. It answers only while nothing is
         // carrying the mail anywhere and only to the service role,
