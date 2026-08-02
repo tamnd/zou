@@ -1,0 +1,46 @@
+[
+  {
+    "name": "an operator nobody has",
+    "why": "the message is ours rather than upstream's parse error, tamnd/zou#116"
+  },
+  {
+    "name": "an embed of something that is not related",
+    "why": "the details say 'in the schema cache' where upstream names the schema, tamnd/zou#116"
+  },
+  {
+    "name": "a body that is not json at all",
+    "why": "serde's message goes out where upstream says 'Empty or invalid json', tamnd/zou#116"
+  },
+  {
+    "name": "a row put in over the one that is there",
+    "why": "an upsert that updated answers 201, upstream answers 200, tamnd/zou#116"
+  },
+  {
+    "name": "a change to a column that is not there",
+    "why": "the raw 42703 goes out, naming the internal alias, where upstream has PGRST204, tamnd/zou#116"
+  },
+  {
+    "name": "a function called without an argument it needs",
+    "why": "upstream's hint about which function it looked for is missing, tamnd/zou#116"
+  },
+  {
+    "name": "a table nobody has",
+    "why": "the raw 42P01 goes out where upstream has PGRST205, tamnd/zou#116"
+  },
+  {
+    "name": "a column nobody has, in the select",
+    "why": "the message names the plan's alias, z0, rather than the table, tamnd/zou#116"
+  },
+  {
+    "name": "a column nobody has, in the order",
+    "why": "the message names the plan's alias, z0, rather than the table, tamnd/zou#116"
+  },
+  {
+    "name": "a table that is not in the schema that was named",
+    "why": "the raw 42P01 goes out where upstream has PGRST205, tamnd/zou#116"
+  },
+  {
+    "name": "what a table will take",
+    "why": "OPTIONS on a table is not built yet, tamnd/zou#116"
+  }
+]
