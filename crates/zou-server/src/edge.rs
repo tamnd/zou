@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Method, Request, StatusCode, header};
@@ -132,19 +132,39 @@ struct Bucket {
     last: Instant,
 }
 
-/// A token bucket per key. This is the skeleton the GoTrue per
-/// endpoint budgets will configure later, today zou dev runs without
-/// one and nothing is limited.
+/// The bucket map and when it was last swept, under one lock because
+/// they are read together.
+struct Buckets {
+    map: HashMap<String, Bucket>,
+    swept: Instant,
+}
+
+/// A token bucket per key. The apikey limiter uses one of these, and
+/// the GoTrue per endpoint budgets in `limit` use eleven.
 pub struct RateLimit {
     rate: Rate,
-    buckets: Mutex<HashMap<String, Bucket>>,
+    /// How long an idle bucket is kept, upstream's DefaultExpirationTTL.
+    /// It is memory management rather than policy: a bucket nobody has
+    /// touched for its whole ttl has refilled to full by then, and a
+    /// full bucket is the same thing as a missing one.
+    ttl: Option<Duration>,
+    buckets: Mutex<Buckets>,
 }
 
 impl RateLimit {
     pub fn new(rate: Rate) -> RateLimit {
+        RateLimit::keep(rate, None)
+    }
+
+    /// The same, dropping buckets nobody has spent from in `ttl`.
+    pub fn keep(rate: Rate, ttl: impl Into<Option<Duration>>) -> RateLimit {
         RateLimit {
             rate,
-            buckets: Mutex::new(HashMap::new()),
+            ttl: ttl.into(),
+            buckets: Mutex::new(Buckets {
+                map: HashMap::new(),
+                swept: Instant::now(),
+            }),
         }
     }
 
@@ -153,7 +173,16 @@ impl RateLimit {
     pub fn allow(&self, key: &str) -> bool {
         let now = Instant::now();
         let mut buckets = self.buckets.lock().expect("rate limit mutex");
-        let bucket = buckets.entry(key.to_string()).or_insert(Bucket {
+        // Sweeping once a ttl rather than once a request keeps this off
+        // the hot path: between sweeps the map holds at most one ttl's
+        // worth of callers, which is what it would hold anyway.
+        if let Some(ttl) = self.ttl
+            && now.duration_since(buckets.swept) >= ttl
+        {
+            buckets.map.retain(|_, b| now.duration_since(b.last) < ttl);
+            buckets.swept = now;
+        }
+        let bucket = buckets.map.entry(key.to_string()).or_insert(Bucket {
             tokens: f64::from(self.rate.burst),
             last: now,
         });
@@ -166,6 +195,13 @@ impl RateLimit {
         } else {
             false
         }
+    }
+
+    /// How many keys are being tracked, which is the only thing the
+    /// sweep changes and so the only way to see it happen.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.buckets.lock().expect("rate limit mutex").map.len()
     }
 
     /// Whole seconds until the next token, for Retry-After. At least
@@ -207,6 +243,38 @@ mod tests {
         assert!(!limit.allow("k"));
         // A different key has its own bucket.
         assert!(limit.allow("other"));
+    }
+
+    #[test]
+    fn an_idle_bucket_is_swept_and_a_busy_one_is_kept() {
+        let limit = RateLimit::keep(
+            Rate {
+                burst: 5,
+                per_second: 0.0,
+            },
+            std::time::Duration::from_millis(10),
+        );
+        assert!(limit.allow("gone"));
+        assert_eq!(limit.tracked(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        // The sweep runs on the next spend, and the key that spent it
+        // is the key that survives.
+        assert!(limit.allow("here"));
+        assert_eq!(limit.tracked(), 1);
+        assert!(limit.allow("here"));
+        assert_eq!(limit.tracked(), 1);
+    }
+
+    #[test]
+    fn without_a_ttl_nothing_is_swept() {
+        let limit = RateLimit::new(Rate {
+            burst: 5,
+            per_second: 0.0,
+        });
+        assert!(limit.allow("a"));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(limit.allow("b"));
+        assert_eq!(limit.tracked(), 2);
     }
 
     #[test]
