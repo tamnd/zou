@@ -74,7 +74,10 @@ jobs:
       - name: Run the pool leak, rls contract, rls attack, and auth tests
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
-        run: cargo test -p zou-server --test pool --test rls --test rest --test attack --test auth_schema --test auth_token --test auth_password --test auth_email --test auth_mail --test auth_oauth -- --nocapture
+        # Every integration target in this crate, so a suite that needs
+        # a database cannot be added without CI noticing it exists. The
+        # ones that do not need a database skip themselves.
+        run: cargo test -p zou-server --tests -- --nocapture
       - name: Run the compiled WHERE clauses against postgres
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres

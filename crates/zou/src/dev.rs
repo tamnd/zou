@@ -206,6 +206,10 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
         std::env::var("ZOU_DISABLE_SIGNUP").as_deref(),
         Ok("true") | Ok("1")
     );
+    let mfa = zou_server::mfa::from_env()?;
+    if !mfa.totp_enroll || !mfa.totp_verify {
+        log::info!("authenticator factors are off, /auth/v1/factors refuses by name");
+    }
     if !email_enabled {
         log::info!("email sign in is off, nothing here answers an address");
     }
@@ -272,6 +276,11 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
                 autoconfirm: sms_autoconfirm,
                 ..Default::default()
             },
+            // An authenticator app is on by default, the same as
+            // GoTrue. ZOU_MFA_TOTP_VERIFY_ENABLED=false turns MFA off
+            // without deleting anybody's factors, and the two
+            // ZOU_MFA_MAX_ envs move the ceilings.
+            mfa,
             // Everything else is GoTrue's default, including the
             // unlimited rate the dev loop wants: the real per endpoint
             // budgets arrive with the rest of the auth surface.

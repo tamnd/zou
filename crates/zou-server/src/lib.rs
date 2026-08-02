@@ -32,6 +32,7 @@ pub mod auth;
 pub mod edge;
 pub mod jwt;
 pub mod mail;
+pub mod mfa;
 pub mod oauth;
 pub mod openapi;
 pub mod password;
@@ -39,6 +40,7 @@ pub mod rest;
 pub mod sms;
 pub mod smtp;
 pub mod sql;
+pub mod totp;
 
 /// What the front door needs to know: the secret every key and token
 /// must verify against, and where postgres lives when there is one to
@@ -139,6 +141,11 @@ pub struct Config {
     /// Who carries the text messages. None is the dev sink, here for
     /// the same reasons `sender` is.
     pub texter: Option<Arc<dyn sms::Sender>>,
+    /// The second factor: which kinds may be enrolled, how many an
+    /// account may hold, and how long a challenge is good for. The
+    /// defaults are GoTrue's, which have TOTP on and everything else
+    /// off.
+    pub mfa: mfa::Settings,
     /// The external identity providers, GoTrue's GOTRUE_EXTERNAL_*.
     /// Empty is a project with no social login, which is what
     /// /authorize then says about every provider it is asked for.
@@ -175,6 +182,7 @@ impl Default for Config {
             phone_enabled: false,
             sms: sms::Settings::default(),
             texter: None,
+            mfa: mfa::Settings::default(),
             oauth: oauth::Providers::default(),
             http: None,
         }
@@ -602,6 +610,16 @@ pub fn router(cfg: Config) -> Result<Router, String> {
             "/auth/v1/user/identities/{identity_id}",
             delete(auth::unlink_identity),
         )
+        // The second factor. All four carry a bearer token and all four
+        // read or move the session it names, so they belong inside the
+        // gate rather than beside /verify.
+        .route("/auth/v1/factors", post(mfa::enroll))
+        .route("/auth/v1/factors/{factor_id}", delete(mfa::unenroll))
+        .route(
+            "/auth/v1/factors/{factor_id}/challenge",
+            post(mfa::challenge),
+        )
+        .route("/auth/v1/factors/{factor_id}/verify", post(mfa::verify))
         // The admin box. Everything under it is the service role
         // acting on somebody else's account, and every one of these
         // refuses anything that is not holding an admin role, so the
