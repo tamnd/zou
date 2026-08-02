@@ -1973,6 +1973,8 @@ dependencies = [
  "libc",
  "log",
  "serde_json",
+ "tokio",
+ "tokio-postgres",
  "zou-pg",
  "zou-server",
  "zou-store",

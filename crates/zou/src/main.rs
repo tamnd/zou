@@ -1,4 +1,5 @@
 mod branch;
+mod codegen;
 #[cfg(unix)]
 mod dev;
 #[cfg(unix)]
@@ -17,6 +18,7 @@ fn usage() -> ExitCode {
     eprintln!("zou {}", env!("CARGO_PKG_VERSION"));
     eprintln!("{DEV_USAGE}");
     eprintln!("       {}", branch::USAGE);
+    eprintln!("       {}", codegen::USAGE);
     eprintln!("       {}", info::USAGE);
     #[cfg(unix)]
     eprintln!("       {}", inbox::USAGE);
@@ -68,6 +70,7 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Some("branch") => simple(branch::run(&argv[1..])),
+        Some("gen") => simple(codegen::run(&argv[1..])),
         #[cfg(unix)]
         Some("inbox") => simple(inbox::run(&argv[1..])),
         Some("info") => simple(info::run(&argv[1..])),
