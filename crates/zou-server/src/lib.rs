@@ -30,6 +30,7 @@ use zou_rest::catalog::Catalog;
 pub mod admin;
 pub mod auth;
 pub mod edge;
+pub mod hook;
 pub mod jwt;
 pub mod mail;
 pub mod mfa;
@@ -146,6 +147,10 @@ pub struct Config {
     /// defaults are GoTrue's, which have TOTP on and everything else
     /// off.
     pub mfa: mfa::Settings,
+    /// Where a project puts its own code in the middle of a flow,
+    /// GoTrue's GOTRUE_HOOK_*. Nothing hooked is the usual project,
+    /// and the one hook built so far is the custom access token one.
+    pub hook: hook::Settings,
     /// The external identity providers, GoTrue's GOTRUE_EXTERNAL_*.
     /// Empty is a project with no social login, which is what
     /// /authorize then says about every provider it is asked for.
@@ -183,6 +188,7 @@ impl Default for Config {
             sms: sms::Settings::default(),
             texter: None,
             mfa: mfa::Settings::default(),
+            hook: hook::Settings::none(),
             oauth: oauth::Providers::default(),
             http: None,
         }

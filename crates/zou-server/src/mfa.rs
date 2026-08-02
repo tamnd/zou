@@ -28,8 +28,8 @@ use axum::http::{Request, StatusCode};
 use axum::response::Response;
 
 use crate::auth::{
-    Caller, Error, caller, denied, error_body, field, is_uuid, mint_for, no_database, now,
-    read_json, refusal, refused, still_there,
+    Caller, Error, Mint, caller, client_ip, denied, error_body, field, is_uuid, mint_for,
+    no_database, now, read_json, refusal, refused, still_there,
 };
 use crate::{App, json_body, sql};
 
@@ -536,7 +536,17 @@ async fn verifying(
         &[&caller.user_id],
     )
     .await?;
-    let issued = mint_for(sess, session_id, issued, &app.signer(), &app.issuer()).await?;
+    // The person just proved a second factor, which is what the hook
+    // is told this token was minted for, whatever the session was
+    // first proved with.
+    let issued = mint_for(
+        sess,
+        session_id,
+        issued,
+        TOTP,
+        &Mint::at(app, ip.to_string()),
+    )
+    .await?;
     Ok(issued.json())
 }
 
@@ -750,29 +760,6 @@ async fn is_aal2(sess: &sql::Session, session_id: &str) -> Result<bool, Error> {
         )
         .await?;
     Ok(rows.first().map(|row| row.get(0)).unwrap_or(false))
-}
-
-/// The address the request came from, as GoTrue reads it: the first
-/// address in X-Forwarded-For that parses, then the peer. Nothing in
-/// front of this server is trusted to be there, so an unproxied request
-/// with no peer address falls back to the unspecified address, and two
-/// requests that both fall back match each other.
-fn client_ip(req: &Request<Body>) -> String {
-    if let Some(header) = req
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        for candidate in header.split(',') {
-            if let Ok(ip) = candidate.trim().parse::<std::net::IpAddr>() {
-                return ip.to_string();
-            }
-        }
-    }
-    req.extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-        .map(|peer| peer.0.ip().to_string())
-        .unwrap_or_else(|| "0.0.0.0".to_string())
 }
 
 /// The host of a url, which is what an authenticator app is told it is

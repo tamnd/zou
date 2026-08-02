@@ -292,6 +292,46 @@ await admin.inviteUserByEmail('ada@example.com', { data: { team: 'core' } })
 
 The account it leaves has no password at all, so the invitation is the only way in until whoever takes it sets one, and it is marked `invited_at` so an application can tell an invited account from one that signed itself up. An address somebody has already confirmed is refused with `email_exists`; an account that never confirmed is invited where it stands, and the code it was holding stops working.
 
+## Putting your own claims in every token
+
+The claims in an access token are what `auth.jwt()` reads back inside every RLS policy, so a project that wants a policy to say `auth.jwt()->>'plan' = 'gold'` needs the plan in the token. The custom access token hook is a function in your own database that gets the claims this server was about to sign and hands back the claims it wants signed instead.
+
+```sql
+create function public.custom_access_token_hook(event jsonb) returns jsonb
+language plpgsql stable as $$
+declare
+  claims jsonb := event->'claims';
+  plan text;
+begin
+  select tier into plan from public.subscriptions where user_id = (event->>'user_id')::uuid;
+  claims := jsonb_set(claims, '{plan}', to_jsonb(coalesce(plan, 'free')));
+  return jsonb_set(event, '{claims}', claims);
+end;
+$$;
+```
+
+```
+ZOU_HOOK_CUSTOM_ACCESS_TOKEN_URI=pg-functions://postgres/public/custom_access_token_hook
+ZOU_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED=true
+```
+
+Every grant goes through it: password, refresh, magic link, phone code, social provider, anonymous, and the token pair a second factor hands back. The function is told which one it is in `event->>'authentication_method'`, and a refresh says `token_refresh` rather than repeating whatever the session was first proved with. It also gets `event->'metadata'` naming the call, the moment, and the address the request came from.
+
+The claims it returns replace the whole set rather than merging into it, so a hook that reads `event->'claims'` and puts it back changed is the shape to copy. What comes back still has to carry the claims a Supabase client and an RLS policy need, and a hook that drops one gets a 500 that names it rather than a token nothing downstream can use.
+
+The function runs inside the sign in's own transaction, which is the part worth knowing. What it writes commits with the sign in and rolls back with it, so a hook that keeps its own log of who signed in never records a sign in that did not happen. It gets two seconds. A hook that raises is a 500 and the sign in never happened.
+
+It can also refuse, which is how a project puts its own rule in front of every sign in:
+
+```sql
+return jsonb_build_object('error', jsonb_build_object(
+  'http_code', 403, 'message', 'only members of the company may sign in'));
+```
+
+The request fails with that message at that status, and the signup or sign in behind it goes back with it. A refusal on a refresh leaves the refresh token the client presented working, so a hook that breaks does not log everybody out.
+
+Leaving the URI set and `ZOU_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED` unset wires the hook up and leaves it switched off, which is how upstream lets an operator put the plumbing in place first. Only `pg-functions://` URIs work here so far. The HTTP variant of a hook is not built, and a URI naming an endpoint is refused at startup rather than quietly ignored.
+
 ## Where to go next
 
 - docs/architecture.md for the shape of the whole system
