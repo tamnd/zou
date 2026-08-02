@@ -222,6 +222,22 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             hook.custom_access_token.uri
         );
     }
+    let limit = zou_server::limit::from_env()?;
+    // The endpoint budgets are all configured and none of them do
+    // anything until this server can tell one caller from another, so
+    // the loop says which of the two it is rather than leaving an
+    // operator to find out by not being limited.
+    if limit.sb_forwarded_for {
+        log::info!("callers are counted by the sb-forwarded-for address");
+    } else if !limit.header.is_empty() {
+        log::info!("callers are counted by the {} header", limit.header);
+    } else if limit.peer {
+        log::info!("callers are counted by the socket they arrive on");
+    } else {
+        log::info!(
+            "per endpoint rate limits are off, set ZOU_RATE_LIMIT_HEADER or ZOU_RATE_LIMIT_PEER"
+        );
+    }
     let mfa = zou_server::mfa::from_env()?;
     if !mfa.totp_enroll || !mfa.totp_verify {
         log::info!("authenticator factors are off, /auth/v1/factors refuses by name");
@@ -303,9 +319,13 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // transaction, so what it writes commits with the sign in
             // and a refusal takes the sign in down with it.
             hook,
+            // GoTrue's own budgets, which limit nobody until this
+            // server is told how to tell callers apart, and which limit
+            // the mail and the text messages of the whole project
+            // whether or not it is.
+            limit,
             // Everything else is GoTrue's default, including the
-            // unlimited rate the dev loop wants: the real per endpoint
-            // budgets arrive with the rest of the auth surface.
+            // unlimited edge rate the dev loop wants.
             ..Default::default()
         };
         if let Err(e) = zou_server::serve_blocking(listener, cfg) {

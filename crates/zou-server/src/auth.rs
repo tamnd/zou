@@ -232,6 +232,10 @@ pub struct Post<'a> {
     /// Whether the project confirms its own signups, which decides
     /// whether a confirmation is posted at all.
     pub autoconfirm: bool,
+    /// How much mail and how many text messages the whole server will
+    /// send an hour. It travels with the sender because every flow that
+    /// posts anything already carries this.
+    pub limits: &'a crate::limit::Limits,
 }
 
 /// Build one from the app and from where this request asked a followed
@@ -252,6 +256,7 @@ pub fn posting<'a>(app: &'a App, wanted: &str, referer: &str) -> Post<'a> {
         site: app.site_url(),
         referrer: landing(app, wanted, referer),
         autoconfirm: app.cfg.mailer_autoconfirm,
+        limits: &app.limits,
     }
 }
 
@@ -308,6 +313,9 @@ pub(crate) async fn send_code(
     user_id: &str,
     out: Outgoing<'_>,
 ) -> Result<(), Error> {
+    // The whole server's mail budget, spent where upstream spends it,
+    // in the one function every outgoing email goes through.
+    post.limits.email_sent(post.autoconfirm)?;
     let rows = sess
         .query(
             "select coalesce(email, ''), coalesce(raw_user_meta_data, '{}'::jsonb)
@@ -467,6 +475,9 @@ pub(crate) async fn send_phone_code(
         )
         .await?;
     }
+    // The same for text messages, before the code is drawn, because a
+    // code drawn and not sent is a code the account is left holding.
+    post.limits.sms_sent(post.sms.autoconfirm)?;
     let code = mint_digits(sess, user_id, out.to, token_type, post.sms.digits()).await?;
     let text = crate::sms::Text {
         to: out.to.to_string(),
@@ -3586,6 +3597,11 @@ pub async fn signup(
     };
     let (wanted, from) = link_target(&req);
     let mint = Mint::of(&app, &req);
+    // Signup is the one endpoint whose budget depends on its body: an
+    // anonymous sign in spends a different one. So who this counts
+    // against is read here, while the request is still whole, and spent
+    // below once the body has said which of the two this is.
+    let who = app.limits.who(req.headers(), crate::limit::peer(&req));
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -3607,6 +3623,15 @@ pub async fn signup(
                 "Anonymous sign-ins are disabled",
             );
         }
+        // The budget is spent here, where upstream spends it: after
+        // the ask has been established as an anonymous one and before
+        // anything else is judged about it.
+        if !app
+            .limits
+            .allow(crate::limit::Point::Anonymous, who.as_deref())
+        {
+            return crate::limit::refused();
+        }
         // Upstream's order, which is worth keeping: a project with
         // anonymous sign in off says so even when signups are off too,
         // because the two settings are turned on in different places
@@ -3623,6 +3648,15 @@ pub async fn signup(
             Ok(issued) => json_body(StatusCode::OK, issued.json()),
             Err(e) => refusal(e, "anonymous signup"),
         };
+    }
+    // The other half of the split, on the otp budget rather than the
+    // anonymous one, and spent before the handler upstream calls the
+    // handler at all.
+    if !app
+        .limits
+        .allow(crate::limit::Point::Signup, who.as_deref())
+    {
+        return crate::limit::refused();
     }
     // The first thing the signup handler asks upstream, before the
     // password is even looked at, so a project that is closed says it is

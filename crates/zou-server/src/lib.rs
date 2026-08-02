@@ -32,6 +32,7 @@ pub mod auth;
 pub mod edge;
 pub mod hook;
 pub mod jwt;
+pub mod limit;
 pub mod mail;
 pub mod mfa;
 pub mod oauth;
@@ -151,6 +152,12 @@ pub struct Config {
     /// GoTrue's GOTRUE_HOOK_*. Nothing hooked is the usual project,
     /// and the one hook built so far is the custom access token one.
     pub hook: hook::Settings,
+    /// How often one caller may ask for a token, a code or a factor,
+    /// and how much mail this server will post an hour. GoTrue's
+    /// GOTRUE_RATE_LIMIT_*, defaults and all, and like upstream none of
+    /// the endpoint limits do anything until the server is told how to
+    /// tell one caller from another.
+    pub limit: limit::Settings,
     /// The external identity providers, GoTrue's GOTRUE_EXTERNAL_*.
     /// Empty is a project with no social login, which is what
     /// /authorize then says about every provider it is asked for.
@@ -189,6 +196,7 @@ impl Default for Config {
             texter: None,
             mfa: mfa::Settings::default(),
             hook: hook::Settings::none(),
+            limit: limit::Settings::default(),
             oauth: oauth::Providers::default(),
             http: None,
         }
@@ -202,6 +210,10 @@ pub struct App {
     pub cfg: Config,
     pub pool: Option<sql::Pool>,
     pub limiter: Option<edge::RateLimit>,
+    /// The per endpoint budgets and the two send budgets, built once
+    /// from the config because a bucket that was rebuilt per request
+    /// would be a bucket that is always full.
+    pub limits: limit::Limits,
     /// Everything a bearer token may have been signed by: the jwks an
     /// operator configured, and the public half of this project's own
     /// signing keys.
@@ -275,6 +287,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         None => None,
     };
     let limiter = cfg.rate.map(edge::RateLimit::new);
+    let limits = limit::Limits::new(cfg.limit.clone());
     let configured = match &cfg.jwks {
         Some(json) => Some(jwt::Jwks::parse(json).map_err(|e| format!("jwks: {e}"))?),
         None => None,
@@ -305,6 +318,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         cfg,
         pool,
         limiter,
+        limits,
         jwks,
         keys,
         mailer,
@@ -683,6 +697,14 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .merge(open)
         .merge(gated)
         .fallback(no_route)
+        // The per endpoint budgets, over both routers because /verify
+        // is outside the gate and is limited too. Inside the envelope
+        // so a client on the newer api version hears about a 429 in
+        // the shape it asked for.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&app),
+            limit::guard,
+        ))
         // Inside the request id, because the id is what a failure of
         // this server's own carries back, and outside everything that
         // answers, because every auth refusal leaves through it.
@@ -707,7 +729,12 @@ pub fn serve_blocking(listener: std::net::TcpListener, cfg: Config) -> Result<()
             .map_err(|e| format!("nonblocking: {e}"))?;
         let listener =
             tokio::net::TcpListener::from_std(listener).map_err(|e| format!("listener: {e}"))?;
-        axum::serve(listener, router(cfg)?)
+        // With the peer address kept, because it is the last thing a
+        // rate limit can be keyed on when nothing is forwarding, and
+        // because it is what the audit trail and the auth hooks are
+        // told the request came from when there is no header to read.
+        let service = router(cfg)?.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        axum::serve(listener, service)
             .await
             .map_err(|e| format!("serve: {e}"))
     })

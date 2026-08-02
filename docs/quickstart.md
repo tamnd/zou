@@ -332,6 +332,40 @@ The request fails with that message at that status, and the signup or sign in be
 
 Leaving the URI set and `ZOU_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED` unset wires the hook up and leaves it switched off, which is how upstream lets an operator put the plumbing in place first. Only `pg-functions://` URIs work here so far. The HTTP variant of a hook is not built, and a URI naming an endpoint is refused at startup rather than quietly ignored.
 
+## Rate limits
+
+Every auth endpoint has a budget, and they are GoTrue's own numbers: 150 token grants and 30 of everything else per caller per five minutes, 30 anonymous sign ins an hour, 15 factor challenges and verifications a minute, 30 emails and 30 text messages an hour for the whole project. A caller over budget gets a 429 with `over_request_rate_limit`.
+
+None of the per caller budgets do anything until this server can tell one caller from another, which is upstream's behaviour and the thing to know before relying on any of it. Behind a proxy or a load balancer, name the header it sets:
+
+```
+ZOU_RATE_LIMIT_HEADER=x-forwarded-for
+```
+
+Listening on a socket yourself, with nothing forwarding, count callers by where they connected from:
+
+```
+ZOU_RATE_LIMIT_PEER=true
+```
+
+Set neither and nobody is limited by endpoint, because there is nothing to count against. Do not set `ZOU_RATE_LIMIT_PEER` behind a proxy: every request arrives from the proxy, so every caller would share one bucket. The platform's own `Sb-Forwarded-For` is read first when `ZOU_SECURITY_SB_FORWARDED_FOR_ENABLED=true`, and it wins over the header above.
+
+The numbers themselves move with the same names GoTrue uses:
+
+```
+ZOU_RATE_LIMIT_TOKEN_REFRESH=150
+ZOU_RATE_LIMIT_VERIFY=30
+ZOU_RATE_LIMIT_OTP=30
+ZOU_RATE_LIMIT_ANONYMOUS_USERS=30
+ZOU_MFA_RATE_LIMIT_CHALLENGE_AND_VERIFY=15
+ZOU_RATE_LIMIT_EMAIL_SENT=30
+ZOU_RATE_LIMIT_SMS_SENT=30
+```
+
+`ZOU_RATE_LIMIT_OTP` is one number for six endpoints: signup, recover, magiclink, otp, resend, and updating a user. Each of them gets its own budget of that size rather than sharing one. All the endpoint budgets allow a burst of 30 whatever their refill is, except the anonymous one, which allows its whole hourly number at once.
+
+The two send limits are different in kind. They are not per caller, they are the whole project's, because what they protect is the mail and SMS account everybody shares. They refuse with `over_email_send_rate_limit` and `over_sms_send_rate_limit`, and the flow they refuse goes back with them, so an account is never left holding a code that was never posted. Both accept `events/duration` as well as a bare number, so `ZOU_RATE_LIMIT_EMAIL_SENT=10/1m` is a bucket of ten with one back every minute, while the bare `30` is thirty in an hour and then nothing until the hour turns over. A project that confirms its own signups does not spend either budget, which is upstream's behaviour today.
+
 ## Where to go next
 
 - docs/architecture.md for the shape of the whole system
