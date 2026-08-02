@@ -39,7 +39,7 @@ use crate::sql;
 /// One extensibility point, GoTrue's ExtensibilityPointConfiguration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Point {
-    /// GOTRUE_HOOK_<POINT>_ENABLED. A point with a URI and this unset
+    /// `GOTRUE_HOOK_<POINT>_ENABLED`. A point with a URI and this unset
     /// is configured and dormant, which is how upstream lets an
     /// operator leave the wiring in place and switch it off.
     pub enabled: bool,
