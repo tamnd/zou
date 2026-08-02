@@ -20,12 +20,13 @@
 //! and refuses. The two are told apart by parentage, not by guessing.
 //!
 //! The email flows here draw a six digit code, write down the hash of
-//! the address and the code together, and hand the code to the mailer.
-//! There is no mailer yet, so the code goes nowhere and every one of
-//! these endpoints answers with an acknowledgement and nothing else,
-//! which is what they answer upstream too. What is missing with it is
-//! the frequency limit GoTrue applies to sending: that is a property of
-//! the send rather than of the flow, so it lands with the sender.
+//! the address and the code together, and hand the code to the mailer,
+//! which posts it or keeps it in the dev inbox. Every one of these
+//! endpoints answers with an acknowledgement and nothing else whether
+//! or not there was anything to send, which is what they answer
+//! upstream too, and what keeps them from saying who has an account
+//! here. What is still missing is the per endpoint rate limit GoTrue
+//! applies on top of the one minute between sends.
 
 use std::sync::Arc;
 
@@ -3239,6 +3240,204 @@ pub(crate) fn field<'a>(body: &'a serde_json::Value, key: &str) -> &'a str {
     body.get(key).and_then(|v| v.as_str()).unwrap_or_default()
 }
 
+/// GET /auth/v1/settings, which is how a sign in screen learns what to
+/// draw: which social buttons to offer, whether there is a password
+/// field at all, whether to show a link to sign up.
+///
+/// Every field GoTrue publishes is here, and a provider this project
+/// does not serve says false rather than being left out. A client
+/// reading a field that is not there cannot tell not offered from not
+/// known, and the ones that guess guess wrong.
+pub async fn settings(axum::extract::State(app): axum::extract::State<Arc<App>>) -> Response {
+    let configured = |name: &str| app.cfg.oauth.get(name).is_some();
+    json_body(
+        StatusCode::OK,
+        serde_json::json!({
+            "external": {
+                "anonymous_users": app.cfg.anonymous_users,
+                "apple": configured("apple"),
+                "azure": false,
+                "bitbucket": false,
+                "discord": false,
+                "facebook": false,
+                "snapchat": false,
+                "figma": false,
+                "fly": false,
+                "github": configured("github"),
+                "gitlab": false,
+                "google": configured("google"),
+                "keycloak": false,
+                "kakao": false,
+                "linkedin": false,
+                "linkedin_oidc": false,
+                "notion": false,
+                "spotify": false,
+                "slack": false,
+                "slack_oidc": false,
+                "workos": false,
+                "twitch": false,
+                "twitter": false,
+                "email": app.cfg.email_enabled,
+                "phone": app.cfg.phone_enabled,
+                "zoom": false,
+            },
+            "disable_signup": app.cfg.disable_signup,
+            "mailer_autoconfirm": app.cfg.mailer_autoconfirm,
+            "phone_autoconfirm": app.cfg.sms.autoconfirm,
+            "sms_provider": app.texter.provider(),
+            // None of the three are built. They say so here rather than
+            // going missing, for the same reason the providers do.
+            "saml_enabled": false,
+            "saml_private_key_next_configured": false,
+            "passkeys_enabled": false,
+        }),
+    )
+}
+
+/// The header a client uses to ask for a newer error shape, and the one
+/// this answers with when it grants the ask.
+const API_VERSION: &str = "x-supabase-api-version";
+
+/// The one version there is to ask for. GoTrue has exactly two error
+/// shapes, the original and this one, and everything dated on or after
+/// it gets the newer of the two.
+const V2024: (u32, u32, u32) = (2024, 1, 1);
+
+/// The envelope every auth error leaves in, GoTrue's HandleResponseError.
+///
+/// Two things happen here and nowhere else, because upstream does both
+/// of them in one place too. A refusal a client asked for on the newer
+/// api version is rewritten from `{code, error_code, msg}` into
+/// `{code, message}`, where code is now the machine readable string
+/// rather than the http status repeated, and the version that was
+/// granted is echoed back. And a failure that is this server's own
+/// fault carries the request id, so a person holding a 500 and a person
+/// holding the logs have the same thing to search for.
+///
+/// It sits here rather than in each handler for the reason it sits in
+/// one function upstream: an error shape decided in forty places is
+/// forty places to get it wrong.
+pub(crate) async fn envelope(req: Request<Body>, next: axum::middleware::Next) -> Response {
+    let ours = req.uri().path().starts_with("/auth/v1/");
+    let asked = req
+        .headers()
+        .get(API_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(from_2024);
+    let id = req
+        .extensions()
+        .get::<crate::edge::RequestId>()
+        .map(|v| v.0.to_string());
+    let res = next.run(req).await;
+    // A body is only ever read back when something has to change in it,
+    // which is a refusal on the newer version or a failure that owes
+    // the caller a request id. Everything else is handed straight on.
+    let ours_to_fill = res.status().is_server_error() && id.is_some();
+    let refused = res.status().is_client_error() || res.status().is_server_error();
+    if !(ours && refused && (asked || ours_to_fill)) {
+        return res;
+    }
+    let (mut parts, body) = res.into_parts();
+    let Ok(bytes) = to_bytes(body, MAX_BODY).await else {
+        return error_body(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected_failure",
+            "Unexpected failure, please check server logs for more information",
+        );
+    };
+    let Some(mut fields) = gotrue_error(&bytes) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    let status = parts.status;
+    if ours_to_fill && !fields.contains_key("error_id") {
+        fields.insert("error_id".into(), id.unwrap_or_default().into());
+    }
+    if asked {
+        let code = match fields.get("error_code").and_then(|v| v.as_str()) {
+            Some(code) if !code.is_empty() => code.to_string(),
+            // Upstream fills a missing code in rather than leaving the
+            // field out, and which one it fills in depends on whose
+            // fault the failure was.
+            _ if status.is_server_error() => "unexpected_failure".to_string(),
+            _ => "unknown".to_string(),
+        };
+        let mut newer = serde_json::Map::new();
+        newer.insert("code".into(), code.into());
+        newer.insert(
+            "message".into(),
+            fields.get("msg").cloned().unwrap_or_default(),
+        );
+        // A weak password says which rule it broke, and that survives
+        // the rewrite because it is the only refusal with anything to
+        // say beyond a sentence.
+        if let Some(weak) = fields.get("weak_password") {
+            newer.insert("weak_password".into(), weak.clone());
+        }
+        fields = newer;
+        if let Ok(v) = axum::http::HeaderValue::from_str("2024-01-01") {
+            parts.headers.insert(API_VERSION, v);
+        }
+    }
+    let out = serde_json::Value::Object(fields).to_string();
+    // The body is a different length now, and a stale content-length is
+    // a truncated response rather than a wrong header.
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(out))
+}
+
+/// The fields of a GoTrue error body, or nothing when this is some other
+/// answer that happens to be json. The http status repeated under `code`
+/// and a sentence under `msg` is the shape, and nothing else this server
+/// sends looks like it.
+fn gotrue_error(bytes: &[u8]) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let serde_json::Value::Object(fields) = serde_json::from_slice(bytes).ok()? else {
+        return None;
+    };
+    let shaped = fields.get("code").is_some_and(serde_json::Value::is_number)
+        && fields.get("msg").is_some_and(serde_json::Value::is_string);
+    shaped.then_some(fields)
+}
+
+/// Whether an X-Supabase-Api-Version header names 2024-01-01 or later.
+///
+/// Upstream parses it as a plain date and falls back to the original
+/// version for anything it cannot read, so a header that is not a date
+/// and a header naming 2023 mean the same thing: the older shape. The
+/// day is checked against the month because Go's parser checks it, and
+/// a client sending the thirty first of February should get the same
+/// answer from both.
+fn from_2024(date: &str) -> bool {
+    let raw = date.as_bytes();
+    if raw.len() != 10 || raw[4] != b'-' || raw[7] != b'-' {
+        return false;
+    }
+    if !raw
+        .iter()
+        .enumerate()
+        .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    {
+        return false;
+    }
+    let read = |from: usize, to: usize| date[from..to].parse::<u32>().unwrap_or(0);
+    let (year, month, day) = (read(0, 4), read(5, 7), read(8, 10));
+    if !(1..=12).contains(&month) || day < 1 || day > days_in(year, month) {
+        return false;
+    }
+    (year, month, day) >= V2024
+}
+
+fn days_in(year: u32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => {
+            29
+        }
+        2 => 28,
+        _ => 0,
+    }
+}
+
 /// The user_metadata a signup carries, GoTrue's `data`. Anything that
 /// is not an object is nothing, which is what Go's decode into a map
 /// leaves behind for a null and what it refuses outright for a scalar.
@@ -3283,11 +3482,33 @@ pub async fn signup(
                 "Anonymous sign-ins are disabled",
             );
         }
+        // Upstream's order, which is worth keeping: a project with
+        // anonymous sign in off says so even when signups are off too,
+        // because the two settings are turned on in different places
+        // and the one that is nearer the ask is the useful answer.
+        if app.cfg.disable_signup {
+            return error_body(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "signup_disabled",
+                "Signups not allowed for this instance",
+            );
+        }
         let data = metadata(&body);
         return match sign_up_anonymously(pool, &data, &app.signer(), &app.issuer()).await {
             Ok(issued) => json_body(StatusCode::OK, issued.json()),
             Err(e) => refusal(e, "anonymous signup"),
         };
+    }
+    // The first thing the signup handler asks upstream, before the
+    // password is even looked at, so a project that is closed says it is
+    // closed rather than grading the password of someone it is not going
+    // to let in.
+    if app.cfg.disable_signup {
+        return error_body(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "signup_disabled",
+            "Signups not allowed for this instance",
+        );
     }
     // Upstream's order: the password is judged before anyone asks what
     // is being signed up, so a weak password is called weak whether or
@@ -3337,6 +3558,13 @@ pub async fn signup(
         };
     }
 
+    if !app.cfg.email_enabled {
+        return error_body(
+            StatusCode::BAD_REQUEST,
+            "email_provider_disabled",
+            "Email signups are disabled",
+        );
+    }
     match sign_up(
         pool,
         email,
@@ -4143,7 +4371,7 @@ async fn settle(
     // already known and the question is only whether this identity may
     // join it. Everything after this point is the same either way.
     let attached = match flow.target.is_empty() {
-        true => attach(sess, &provider.name, person, post).await?,
+        true => attach(sess, &provider.name, person, post, app.cfg.disable_signup).await?,
         false => link_to(sess, &flow.target, &provider.name, person, post).await?,
     };
     let user_id = match attached {
@@ -4322,6 +4550,7 @@ async fn attach(
     provider: &str,
     person: &crate::oauth::Person,
     post: &Post<'_>,
+    closed: bool,
 ) -> Result<Attached, Error> {
     let whose = decide(sess, provider, person, post.autoconfirm).await?;
     let email = person.email.to_ascii_lowercase();
@@ -4353,6 +4582,18 @@ async fn attach(
             user_id
         }
         Whose::Fresh => {
+            // The only branch that makes an account, so the only one a
+            // closed project turns away. Signing in through a provider
+            // as somebody the project already knows keeps working, which
+            // is the point of closing it rather than turning the
+            // provider off.
+            if closed {
+                return Err(refused(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "signup_disabled",
+                    "Signups not allowed for this instance",
+                ));
+            }
             // A verified address that already belongs to somebody, on a
             // provider that would not link, leaves the new account with
             // no address at all rather than with a claim on theirs.
@@ -4992,6 +5233,16 @@ pub async fn recover(
     let Some(pool) = &app.pool else {
         return no_database();
     };
+    // Upstream guards this one in the route rather than in the handler,
+    // so the refusal comes before the body is read at all and a request
+    // with nothing readable in it still hears why it was turned away.
+    if !app.cfg.email_enabled {
+        return error_body(
+            StatusCode::BAD_REQUEST,
+            "email_provider_disabled",
+            "Email logins are disabled",
+        );
+    }
     let (wanted, from) = link_target(&req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
@@ -5020,6 +5271,16 @@ pub async fn magiclink(
     let Some(pool) = &app.pool else {
         return no_database();
     };
+    // The magic link handler asks this first thing upstream, before the
+    // body, and at a different status from the one recover uses for the
+    // same sentence. Both are kept, because a client branches on both.
+    if !app.cfg.email_enabled {
+        return error_body(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "email_provider_disabled",
+            "Email logins are disabled",
+        );
+    }
     let (wanted, from) = link_target(&req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
@@ -5097,6 +5358,17 @@ pub async fn otp(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             "One of email or phone must be set",
+        );
+    }
+    // Upstream reaches the magic link handler from here, so the address
+    // half of this endpoint refuses in that handler's words and at its
+    // status, which is the last thing either of them asks rather than
+    // the first.
+    if !app.cfg.email_enabled {
+        return error_body(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "email_provider_disabled",
+            "Email logins are disabled",
         );
     }
     magic(&app, pool, &body, &posting(&app, &wanted, &from)).await
@@ -5272,7 +5544,10 @@ pub async fn resend(
         pool,
         &body,
         app.cfg.secure_email_change,
-        app.cfg.phone_enabled,
+        Media {
+            email: app.cfg.email_enabled,
+            phone: app.cfg.phone_enabled,
+        },
         &posting(&app, &wanted, &from),
     )
     .await
@@ -5283,13 +5558,23 @@ pub async fn resend(
     }
 }
 
+/// Which of the two media a project serves at all. They are carried
+/// together because resend is the one endpoint that has to answer for
+/// both, and two bare bools next to each other are two bools waiting to
+/// be passed the wrong way round.
+#[derive(Clone, Copy)]
+pub(crate) struct Media {
+    pub email: bool,
+    pub phone: bool,
+}
+
 /// Upstream's ResendConfirmationParams.Validate, in its order, and then
 /// the send itself.
 async fn again(
     pool: &Pool,
     body: &serde_json::Value,
     secure_change: bool,
-    phone_enabled: bool,
+    serves: Media,
     post: &Post<'_>,
 ) -> Result<String, Error> {
     let kind = field(body, "type");
@@ -5323,9 +5608,12 @@ async fn again(
         );
     }
     let (column, held) = if !email.is_empty() {
+        if !serves.email {
+            return denied("email_provider_disabled", "Email logins are disabled");
+        }
         ("email", validate_email(email)?)
     } else if !phone.is_empty() {
-        if !phone_enabled {
+        if !serves.phone {
             return denied("phone_provider_disabled", "Phone logins are disabled");
         }
         ("phone", validate_phone(phone)?)
@@ -5772,6 +6060,13 @@ pub async fn token(
         // simply a number nobody holds, which is what upstream does here
         // and the right answer for a sign in either way.
         let (column, held) = if !email.is_empty() {
+            if !app.cfg.email_enabled {
+                return error_body(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "email_provider_disabled",
+                    "Email logins are disabled",
+                );
+            }
             ("email", email.to_string())
         } else if !phone.is_empty() {
             if !app.cfg.phone_enabled {
@@ -5973,5 +6268,92 @@ mod tests {
             "outside base32: {token}"
         );
         assert_ne!(token, fresh_token(), "two draws are not the same token");
+    }
+
+    /// The envelope reads whatever the handler under it wrote, and
+    /// nothing in this server writes a refusal without a code. Upstream
+    /// still fills one in for a body that has none, because the newer
+    /// shape puts the code where the http status used to be and a client
+    /// branching on it would otherwise get null. The two fallbacks are
+    /// only reachable from a body written by hand, so that is what this
+    /// hands the middleware.
+    /// A handler that writes the shape by hand rather than through
+    /// error_body, which is the only way to reach the parts of the
+    /// envelope no route in this server can reach.
+    async fn handwritten(status: StatusCode) -> Response {
+        json_body(
+            status,
+            serde_json::json!({"code": status.as_u16(), "msg": "no code"}),
+        )
+    }
+
+    async fn under_the_envelope(uri: &str) -> (StatusCode, Option<String>, serde_json::Value) {
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route(
+                "/auth/v1/theirs",
+                axum::routing::get(|| handwritten(StatusCode::BAD_GATEWAY)),
+            )
+            .route(
+                "/auth/v1/ours",
+                axum::routing::get(|| handwritten(StatusCode::BAD_REQUEST)),
+            )
+            .route(
+                "/auth/v1/fine",
+                axum::routing::get(|| handwritten(StatusCode::OK)),
+            )
+            .route(
+                "/rest/v1/elsewhere",
+                axum::routing::get(|| handwritten(StatusCode::BAD_REQUEST)),
+            )
+            .layer(axum::middleware::from_fn(envelope));
+        let req = Request::builder()
+            .uri(uri)
+            .header(API_VERSION, "2024-01-01")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.expect("router answers");
+        let status = res.status();
+        let version = res
+            .headers()
+            .get(API_VERSION)
+            .map(|v| v.to_str().expect("ascii").to_string());
+        let bytes = to_bytes(res.into_body(), MAX_BODY).await.expect("a body");
+        (
+            status,
+            version,
+            serde_json::from_slice(&bytes).expect("json"),
+        )
+    }
+
+    /// The envelope reads whatever the handler under it wrote, and
+    /// nothing in this server writes a refusal without a code. Upstream
+    /// still fills one in for a body that has none, because the newer
+    /// shape puts the code where the http status used to be and a client
+    /// branching on it would otherwise get null.
+    #[tokio::test]
+    async fn a_refusal_with_no_code_of_its_own_is_given_one() {
+        for (path, code) in [("theirs", "unexpected_failure"), ("ours", "unknown")] {
+            let (_, version, body) = under_the_envelope(&format!("/auth/v1/{path}")).await;
+            assert_eq!(body["code"], code, "{path}");
+            assert_eq!(body["message"], "no code");
+            assert_eq!(version.as_deref(), Some("2024-01-01"));
+        }
+    }
+
+    /// The two things the envelope will not touch whatever it is asked
+    /// for: an answer that worked, and an answer from a surface that is
+    /// not this one. Neither is reachable through a route today, because
+    /// nothing outside the auth handlers writes this shape, and both are
+    /// what stops the middleware becoming the whole server's problem the
+    /// first time something does.
+    #[tokio::test]
+    async fn the_envelope_leaves_alone_what_is_not_an_auth_refusal() {
+        for path in ["/auth/v1/fine", "/rest/v1/elsewhere"] {
+            let (_, version, body) = under_the_envelope(path).await;
+            assert!(body["code"].is_number(), "{path} was rewritten: {body}");
+            assert_eq!(body["msg"], "no code", "{path}");
+            assert_eq!(version, None, "{path} was answered as a version it is not");
+        }
     }
 }

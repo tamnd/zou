@@ -158,6 +158,14 @@ pub trait Sender: Send + Sync {
 
     /// What to call this in a log line.
     fn describe(&self) -> String;
+
+    /// GOTRUE_SMS_PROVIDER, the name a client reads back from
+    /// /settings to know how the codes travel. Empty for the dev sink,
+    /// because a project with nothing configured has no provider and
+    /// upstream leaves the setting empty rather than inventing one.
+    fn provider(&self) -> &'static str {
+        ""
+    }
 }
 
 /// Hand a message to the sender without blocking the request thread.
@@ -458,6 +466,10 @@ impl Sender for Twilio {
     fn describe(&self) -> String {
         format!("twilio, account {}", self.account_sid)
     }
+
+    fn provider(&self) -> &'static str {
+        "twilio"
+    }
 }
 
 /// MessageBird, which is SMS and nothing else.
@@ -533,6 +545,10 @@ impl Sender for MessageBird {
 
     fn describe(&self) -> String {
         format!("messagebird, originator {}", self.originator)
+    }
+
+    fn provider(&self) -> &'static str {
+        "messagebird"
     }
 }
 
