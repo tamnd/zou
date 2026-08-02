@@ -394,6 +394,21 @@ Three things about this table surprise people, and all three are GoTrue's behavi
 
 The table is not swept. Rows accumulate for as long as the project keeps them, and deciding on a retention policy is the operator's job.
 
+## Types for the client
+
+`supabase-js` is generic over a `Database` type, and everything it knows about your tables comes from a file generated out of the catalog. `zou gen types typescript` writes that file.
+
+```bash
+zou gen types typescript --db-url postgresql://postgres@127.0.0.1:5432/postgres > database.types.ts
+zou gen types typescript --schema public,shop -o src/database.types.ts
+```
+
+The url can come from `--db-url`, `ZOU_DB_URL`, or `DATABASE_URL`, in that order. `--schema` takes a name, a comma separated list, or the flag repeated, and defaults to `public`. With no `--output` the file goes to stdout, so it pipes.
+
+The file is byte for byte the file `supabase gen types typescript` writes from the same schema, line breaks included. That matters because the file is checked into your repository: a generator that produced an equivalent file laid out differently would show up as a whole file diff the first time you switched, and again every time you switched back. The test that keeps it that way is a byte comparison against a file the supabase generator produced, over a fixture holding one instance of every shape that has ever been awkward.
+
+It only ever reads. There is a test that runs the whole command against a database set `default_transaction_read_only`, so pointing it at production is a question about your connection limit and nothing else.
+
 ## What answers where
 
 A Supabase client is pointed at one url and reaches four surfaces under it. All four are routed today and two of them are built.

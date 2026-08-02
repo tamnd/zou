@@ -5,6 +5,10 @@
 .DS_Store
 /data
 
+# cargo-mutants
+/mutants.out
+/mutants.out.old
+
 # cargo-fuzz
 fuzz/target/
 fuzz/corpus/
