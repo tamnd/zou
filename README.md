@@ -32,6 +32,8 @@ The full design lives in the [architecture docs](docs/), and the implementation 
 - [M4: Realtime and edge functions](https://github.com/tamnd/zou/issues/4)
 - [M5: Migration from Supabase, hardening, 1.0](https://github.com/tamnd/zou/issues/5)
 
+Supabase compatibility is measured rather than claimed. `conformance/` asks one suite of questions of the real PostgREST binary and of zou, and compares status, headers, and bodies. The REST suite stands at 71 of 82 cases, and the 11 that differ are listed with the reason each one differs, see [docs/conformance.md](docs/conformance.md).
+
 ## What it will look like
 
 Embedded, for tests and local dev:

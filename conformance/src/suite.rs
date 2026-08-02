@@ -1,0 +1,270 @@
+//! A suite: the schema it needs and the requests it makes.
+//!
+//! A suite is a directory under `conformance/suites`. `setup.sql` is
+//! applied to whatever database a target reads, `cases.json` is the
+//! requests, and `recorded.json` is what the reference answered the
+//! last time somebody recorded it.
+//!
+//! Cases are data rather than code because the same list has to reach
+//! three targets, and because the ported upstream fixtures land here as
+//! generated files. Nothing in a case is computed: no timestamps, no
+//! generated ids, no ordering left to the planner. A case whose answer
+//! is not the same twice is a case that cannot be diffed.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+/// Which key a request is sent with. `anon` and `service` are the two
+/// keys a Supabase project hands out, `authenticated` is a key signed
+/// with the same secret carrying the role a signed in person gets, and
+/// `none` sends neither, which is how the gate itself gets tested.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Key {
+    #[default]
+    Anon,
+    Authenticated,
+    Service,
+    None,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Case {
+    /// Unique within the suite, and the thing a report names. Prose
+    /// rather than an identifier, since it is read far more often than
+    /// it is typed.
+    pub name: String,
+    /// What the case is about, and the row it counts towards on the
+    /// scoreboard. Dotted, coarse on the left: `select.embed`.
+    pub feature: String,
+    #[serde(default = "get")]
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub key: Key,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Sent as is, so a case can test what a malformed body does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// Why this case exists, when that is not obvious from the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+fn get() -> String {
+    "GET".to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Cases {
+    pub suite: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note: Vec<String>,
+    pub cases: Vec<Case>,
+}
+
+/// One answer, kept in the shape it is compared in rather than the
+/// shape it arrived in.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Answer {
+    pub name: String,
+    pub status: u16,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// The parsed body when it was json, the text when it was not, and
+    /// null when there was none. Parsed, because the recording is read
+    /// by people and an escaped json string is not readable.
+    pub body: serde_json::Value,
+    /// The bytes as they arrived, kept only when they differ from
+    /// re-serializing `body`, which is how a whitespace or key order
+    /// difference stays visible without making every recording twice
+    /// the size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<String>,
+}
+
+impl Answer {
+    /// The body as it went over the wire, which is the kept bytes when
+    /// there are any and the parsed body written back out when there
+    /// are not.
+    pub fn text(&self) -> String {
+        match &self.raw {
+            Some(raw) => raw.clone(),
+            None => serde_json::to_string(&self.body).unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Recording {
+    pub suite: String,
+    /// What answered, in the words of the versions file.
+    pub recorded_from: String,
+    pub answers: Vec<Answer>,
+}
+
+/// A case zou is known to answer differently, and why. Checked in, so
+/// that the difference arrives in a pull request somebody read rather
+/// than in a CI run somebody ignored.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Known {
+    pub name: String,
+    pub why: String,
+}
+
+pub struct Suite {
+    pub name: String,
+    pub dir: PathBuf,
+    pub setup: String,
+    pub cases: Cases,
+    pub known: Vec<Known>,
+}
+
+/// Where the suites live, relative to the crate. Resolved from
+/// `CARGO_MANIFEST_DIR` so the binary works from any directory, since
+/// half of running this is running it from a script somewhere else.
+pub fn suites_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("suites")
+}
+
+impl Suite {
+    pub fn load(name: &str) -> Result<Suite, String> {
+        let dir = suites_dir().join(name);
+        if !dir.is_dir() {
+            return Err(format!(
+                "no suite named {name} in {}",
+                suites_dir().display()
+            ));
+        }
+        let setup = read(&dir.join("setup.sql"))?;
+        let cases: Cases = serde_json::from_str(&read(&dir.join("cases.json"))?)
+            .map_err(|e| format!("{name}/cases.json: {e}"))?;
+        if cases.suite != name {
+            return Err(format!(
+                "{name}/cases.json says it is the {} suite",
+                cases.suite
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for case in &cases.cases {
+            if !seen.insert(case.name.as_str()) {
+                return Err(format!(
+                    "{name}/cases.json has two cases named {:?}",
+                    case.name
+                ));
+            }
+        }
+        let path = dir.join("known.json");
+        let known: Vec<Known> = match path.is_file() {
+            true => serde_json::from_str(&read(&path)?)
+                .map_err(|e| format!("{}: {e}", path.display()))?,
+            false => Vec::new(),
+        };
+        for known in &known {
+            if !seen.contains(known.name.as_str()) {
+                return Err(format!(
+                    "{name}/known.json names {:?}, which is not a case",
+                    known.name
+                ));
+            }
+        }
+        Ok(Suite {
+            name: name.to_string(),
+            dir,
+            setup,
+            cases,
+            known,
+        })
+    }
+
+    /// The known list in the shape a report reads it.
+    pub fn known(&self) -> BTreeMap<String, String> {
+        self.known
+            .iter()
+            .map(|k| (k.name.clone(), k.why.clone()))
+            .collect()
+    }
+
+    pub fn recording_path(&self) -> PathBuf {
+        self.dir.join("recorded.json")
+    }
+
+    pub fn recording(&self) -> Result<Recording, String> {
+        let path = self.recording_path();
+        let text = read(&path)?;
+        let recording: Recording =
+            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(recording)
+    }
+
+    /// Every suite in the directory, in name order.
+    pub fn all() -> Result<Vec<String>, String> {
+        let dir = suites_dir();
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            if entry.path().is_dir()
+                && let Some(name) = entry.file_name().to_str()
+            {
+                names.push(name.to_string());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+}
+
+fn read(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_case_is_a_get_unless_it_says_otherwise() {
+        let case: Case =
+            serde_json::from_str(r#"{"name": "n", "feature": "f", "path": "/rest/v1/todos"}"#)
+                .expect("parses");
+        assert_eq!(case.method, "GET");
+        assert_eq!(case.key, Key::Anon);
+        assert!(case.headers.is_empty());
+    }
+
+    #[test]
+    fn every_suite_in_the_directory_loads() {
+        for name in Suite::all().expect("suites") {
+            let suite = Suite::load(&name).expect(&name);
+            assert!(!suite.cases.cases.is_empty(), "{name} has no cases");
+            assert!(!suite.setup.trim().is_empty(), "{name} has no setup");
+        }
+    }
+
+    /// The recording is what CI compares against, so a suite without
+    /// one is a suite nobody is checking.
+    #[test]
+    fn every_case_has_an_answer_recorded_for_it() {
+        for name in Suite::all().expect("suites") {
+            let suite = Suite::load(&name).expect(&name);
+            let recording = suite.recording().expect(&name);
+            let recorded: std::collections::BTreeSet<&str> =
+                recording.answers.iter().map(|a| a.name.as_str()).collect();
+            for case in &suite.cases.cases {
+                assert!(
+                    recorded.contains(case.name.as_str()),
+                    "{name}: nothing recorded for {:?}",
+                    case.name
+                );
+            }
+            assert_eq!(
+                recorded.len(),
+                recording.answers.len(),
+                "{name}: the recording has a name twice"
+            );
+        }
+    }
+}

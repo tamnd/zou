@@ -1,0 +1,56 @@
+{
+  "note": [
+    "The versions every compatibility claim in this repository is made against.",
+    "One file, because a claim about PostgREST behaviour is only a claim about",
+    "a version of PostgREST, and because the answer to 'compatible with what?'",
+    "should be one place rather than a grep.",
+    "",
+    "Everything except supabase-js comes from the image list the supabase CLI",
+    "builds its local stack from, which is what 'supabase start' gives people:",
+    "apps/cli-go/pkg/config/templates/Dockerfile in github.com/supabase/cli.",
+    "supabase-js has no image, so it is the latest 2.x on npm.",
+    "",
+    "Bumping anything here means re-recording the suites it covers, and the",
+    "re-recording is the point: a diff in conformance/suites is upstream",
+    "changing its mind, and it should be read rather than merged."
+  ],
+  "read_from": {
+    "source": "github.com/supabase/cli, apps/cli-go/pkg/config/templates/Dockerfile",
+    "on": "2026-08-02"
+  },
+  "postgrest": {
+    "version": "14.15",
+    "image": "postgrest/postgrest:v14.15",
+    "binary": "https://github.com/PostgREST/postgrest/releases/download/v14.15/",
+    "covers": ["rest"]
+  },
+  "gotrue": {
+    "version": "2.194.0",
+    "image": "supabase/gotrue:v2.194.0",
+    "covers": ["auth"]
+  },
+  "postgres_meta": {
+    "version": "0.96.6",
+    "image": "supabase/postgres-meta:v0.96.6",
+    "covers": ["gen types"]
+  },
+  "supabase_js": {
+    "version": "2.111.0",
+    "package": "@supabase/supabase-js",
+    "covers": ["client integration"]
+  },
+  "supabase_cli": {
+    "version": "2.111.0",
+    "package": "supabase",
+    "covers": ["the reference stack itself"]
+  },
+  "postgres": {
+    "supabase": "17.6.1.156",
+    "zou": "REL_18_4",
+    "note": [
+      "The one line where zou is deliberately ahead. supabase's local stack is",
+      "on 17, zou vendors 18, and a suite that depends on the difference is a",
+      "suite that is testing postgres rather than the api in front of it."
+    ]
+  }
+}

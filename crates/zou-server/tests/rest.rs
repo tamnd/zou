@@ -509,6 +509,8 @@ async fn the_rpc_surface_speaks_postgrest() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    // One value is one row, and upstream says so in the range.
+    assert_eq!(res.headers()["content-range"], "0-0/*");
     assert_eq!(body_text(res).await, "5");
 
     let res = app
@@ -630,6 +632,8 @@ async fn the_rpc_surface_speaks_postgrest() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    // Nothing to send back and a range all the same.
+    assert_eq!(res.headers()["content-range"], "0-0/*");
     let res = app
         .clone()
         .oneshot(get("/rest/v1/zou_rpc_items?select=name&id=eq.99"))

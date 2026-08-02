@@ -1,0 +1,522 @@
+{
+  "suite": "rest",
+  "note": [
+    "The paths are the ones a Supabase project answers on. A bare PostgREST is asked with --strip-prefix /rest/v1.",
+    "Every case that reads more than one row orders it, because a diff of two plans is not a diff of two answers.",
+    "The writing cases only touch conformance.scratch, which nothing reads, so they cannot move a later answer.",
+    "Nothing here sends no key at all: refusing that is the gateway in front of PostgREST rather than PostgREST, so a recording taken from PostgREST would be the wrong answer to keep.",
+    "The root of the REST surface is left out for the same reason it is not diffable: the OpenAPI document names the server it came from."
+  ],
+  "cases": [
+    {
+      "name": "every row of a table",
+      "feature": "select",
+      "path": "/rest/v1/tasks?order=id"
+    },
+    {
+      "name": "the columns asked for and no others",
+      "feature": "select",
+      "path": "/rest/v1/tasks?select=id,title&order=id"
+    },
+    {
+      "name": "a column under another name",
+      "feature": "select",
+      "path": "/rest/v1/tasks?select=name:title&order=id"
+    },
+    {
+      "name": "a column cast on the way out",
+      "feature": "select",
+      "path": "/rest/v1/tasks?select=id::text&order=id"
+    },
+    {
+      "name": "a field out of a json column as text",
+      "feature": "select",
+      "path": "/rest/v1/people?select=name,profile->>city&order=id"
+    },
+    {
+      "name": "a field out of a json column as json",
+      "feature": "select",
+      "path": "/rest/v1/people?select=name,profile->years&order=id"
+    },
+    {
+      "name": "an array column comes back as an array",
+      "feature": "select",
+      "path": "/rest/v1/people?select=id,tags&order=id"
+    },
+    {
+      "name": "a numeric column keeps its scale",
+      "feature": "select",
+      "path": "/rest/v1/projects?select=id,budget&order=id",
+      "note": "numeric is text on the wire, and 1200.50 is not 1200.5"
+    },
+    {
+      "name": "equals",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?done=eq.true&order=id"
+    },
+    {
+      "name": "not equals",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?project_id=neq.1&order=id"
+    },
+    {
+      "name": "greater than",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?rank=gt.1&order=id"
+    },
+    {
+      "name": "less than or equal",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?rank=lte.2&order=id"
+    },
+    {
+      "name": "one of a list",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?id=in.(1,3,5)&order=id"
+    },
+    {
+      "name": "like with a star for a wildcard",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?title=like.*the*&order=id"
+    },
+    {
+      "name": "like without regard for case",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?title=ilike.DRAW*&order=id"
+    },
+    {
+      "name": "is null",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?rank=is.null&order=id"
+    },
+    {
+      "name": "not, in front of another filter",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?rank=not.is.null&order=id"
+    },
+    {
+      "name": "either of two filters",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?or=(id.eq.1,rank.eq.1)&order=id"
+    },
+    {
+      "name": "both of two filters inside either",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?or=(and(project_id.eq.1,done.is.true),id.eq.5)&order=id"
+    },
+    {
+      "name": "an array that contains",
+      "feature": "filter",
+      "path": "/rest/v1/people?tags=cs.{roads}&order=id"
+    },
+    {
+      "name": "an array that overlaps",
+      "feature": "filter",
+      "path": "/rest/v1/people?tags=ov.{maps,nothing}&order=id"
+    },
+    {
+      "name": "a filter on a field inside json",
+      "feature": "filter",
+      "path": "/rest/v1/people?profile->>city=eq.leeds&order=id"
+    },
+    {
+      "name": "a filter on a date",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?due=gte.2024-01-01&order=id"
+    },
+    {
+      "name": "a value the column cannot hold",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?id=eq.notanumber"
+    },
+    {
+      "name": "an operator nobody has",
+      "feature": "filter",
+      "path": "/rest/v1/tasks?id=nope.1"
+    },
+    {
+      "name": "ordered by a text column",
+      "feature": "order",
+      "path": "/rest/v1/tasks?select=id,title&order=title"
+    },
+    {
+      "name": "ordered the other way",
+      "feature": "order",
+      "path": "/rest/v1/tasks?select=id,rank&order=rank.desc,id"
+    },
+    {
+      "name": "ordered with the nulls put last",
+      "feature": "order",
+      "path": "/rest/v1/tasks?select=id,rank&order=rank.asc.nullslast"
+    },
+    {
+      "name": "ordered by two columns",
+      "feature": "order",
+      "path": "/rest/v1/tasks?select=id,project_id&order=project_id.desc,id.asc"
+    },
+    {
+      "name": "a limit and an offset",
+      "feature": "range",
+      "path": "/rest/v1/tasks?select=id&order=id&limit=2&offset=1"
+    },
+    {
+      "name": "a range asked for in a header",
+      "feature": "range",
+      "path": "/rest/v1/tasks?select=id&order=id",
+      "headers": { "range": "0-1" }
+    },
+    {
+      "name": "a range that starts past the end",
+      "feature": "range",
+      "path": "/rest/v1/tasks?select=id&order=id",
+      "headers": { "range": "20-30" }
+    },
+    {
+      "name": "how many rows there are in all",
+      "feature": "range",
+      "path": "/rest/v1/tasks?select=id&order=id&limit=2",
+      "headers": { "prefer": "count=exact" }
+    },
+    {
+      "name": "a count with a filter on it",
+      "feature": "range",
+      "path": "/rest/v1/tasks?select=id&project_id=eq.1&order=id",
+      "headers": { "prefer": "count=exact" }
+    },
+    {
+      "name": "one row asked for as an object",
+      "feature": "single",
+      "path": "/rest/v1/tasks?id=eq.1",
+      "headers": { "accept": "application/vnd.pgrst.object+json" }
+    },
+    {
+      "name": "one row asked for where there are several",
+      "feature": "single",
+      "path": "/rest/v1/tasks?project_id=eq.1&order=id",
+      "headers": { "accept": "application/vnd.pgrst.object+json" }
+    },
+    {
+      "name": "one row asked for where there are none",
+      "feature": "single",
+      "path": "/rest/v1/tasks?id=eq.999",
+      "headers": { "accept": "application/vnd.pgrst.object+json" }
+    },
+    {
+      "name": "the row on the other end of a foreign key",
+      "feature": "embed",
+      "path": "/rest/v1/tasks?select=id,title,projects(name)&order=id"
+    },
+    {
+      "name": "the rows that point back",
+      "feature": "embed",
+      "path": "/rest/v1/projects?select=id,name,tasks(id,title)&order=id"
+    },
+    {
+      "name": "an embedded table filtered",
+      "feature": "embed",
+      "path": "/rest/v1/projects?select=id,tasks(id)&tasks.done=is.true&order=id"
+    },
+    {
+      "name": "an embedded table that has to be there",
+      "feature": "embed",
+      "path": "/rest/v1/projects?select=id,tasks!inner(id)&tasks.done=is.true&order=id"
+    },
+    {
+      "name": "an embedded table ordered and cut down",
+      "feature": "embed",
+      "path": "/rest/v1/projects?select=id,tasks(id)&tasks.order=id.desc&tasks.limit=1&order=id"
+    },
+    {
+      "name": "an embed of something that is not related",
+      "feature": "embed",
+      "path": "/rest/v1/projects?select=id,people(id)"
+    },
+    {
+      "name": "a row put in and handed back",
+      "feature": "insert",
+      "method": "POST",
+      "path": "/rest/v1/scratch",
+      "headers": { "content-type": "application/json", "prefer": "return=representation" },
+      "body": "{\"id\": 10, \"label\": \"ten\", \"count\": 10}"
+    },
+    {
+      "name": "a row put in with nothing handed back",
+      "feature": "insert",
+      "method": "POST",
+      "path": "/rest/v1/scratch",
+      "headers": { "content-type": "application/json", "prefer": "return=minimal" },
+      "body": "{\"id\": 11, \"label\": \"eleven\"}"
+    },
+    {
+      "name": "several rows put in at once",
+      "feature": "insert",
+      "method": "POST",
+      "path": "/rest/v1/scratch",
+      "headers": { "content-type": "application/json", "prefer": "return=representation" },
+      "body": "[{\"id\": 12, \"label\": \"twelve\"}, {\"id\": 13, \"label\": \"thirteen\"}]"
+    },
+    {
+      "name": "a row put in and only some columns handed back",
+      "feature": "insert",
+      "method": "POST",
+      "path": "/rest/v1/scratch?select=label",
+      "headers": { "content-type": "application/json", "prefer": "return=representation" },
+      "body": "{\"id\": 14, \"label\": \"fourteen\"}"
+    },
+    {
+      "name": "a row put in without something it needs",
+      "feature": "insert",
+      "method": "POST",
+      "path": "/rest/v1/scratch",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"id\": 15}"
+    },
+    {
+      "name": "a row put in where one already is",
+      "feature": "insert",
+      "method": "POST",
+      "path": "/rest/v1/scratch",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"id\": 1, \"label\": \"again\"}"
+    },
+    {
+      "name": "a body that is not json at all",
+      "feature": "insert",
+      "method": "POST",
+      "path": "/rest/v1/scratch",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"id\": 16, \"label\":"
+    },
+    {
+      "name": "a row put in over the one that is there",
+      "feature": "upsert",
+      "method": "POST",
+      "path": "/rest/v1/scratch",
+      "headers": {
+        "content-type": "application/json",
+        "prefer": "resolution=merge-duplicates,return=representation"
+      },
+      "body": "{\"id\": 2, \"label\": \"two again\", \"count\": 22}"
+    },
+    {
+      "name": "a row put in beside the one that is there",
+      "feature": "upsert",
+      "method": "POST",
+      "path": "/rest/v1/scratch",
+      "headers": {
+        "content-type": "application/json",
+        "prefer": "resolution=ignore-duplicates,return=representation"
+      },
+      "body": "[{\"id\": 3, \"label\": \"three again\"}, {\"id\": 17, \"label\": \"seventeen\"}]"
+    },
+    {
+      "name": "a row changed and handed back",
+      "feature": "update",
+      "method": "PATCH",
+      "path": "/rest/v1/scratch?id=eq.4",
+      "headers": { "content-type": "application/json", "prefer": "return=representation" },
+      "body": "{\"label\": \"four changed\"}"
+    },
+    {
+      "name": "a row changed with nothing handed back",
+      "feature": "update",
+      "method": "PATCH",
+      "path": "/rest/v1/scratch?id=eq.5",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"count\": 55}"
+    },
+    {
+      "name": "a change that matches no row",
+      "feature": "update",
+      "method": "PATCH",
+      "path": "/rest/v1/scratch?id=eq.999",
+      "headers": { "content-type": "application/json", "prefer": "return=representation" },
+      "body": "{\"label\": \"nobody\"}"
+    },
+    {
+      "name": "a change to a column that is not there",
+      "feature": "update",
+      "method": "PATCH",
+      "path": "/rest/v1/scratch?id=eq.4",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"nope\": 1}"
+    },
+    {
+      "name": "a row taken out and handed back",
+      "feature": "delete",
+      "method": "DELETE",
+      "path": "/rest/v1/scratch?id=eq.6",
+      "headers": { "prefer": "return=representation" }
+    },
+    {
+      "name": "a row taken out with nothing handed back",
+      "feature": "delete",
+      "method": "DELETE",
+      "path": "/rest/v1/scratch?id=eq.10"
+    },
+    {
+      "name": "a delete that matches no row",
+      "feature": "delete",
+      "method": "DELETE",
+      "path": "/rest/v1/scratch?id=eq.999",
+      "headers": { "prefer": "return=representation" }
+    },
+    {
+      "name": "a function called with a body",
+      "feature": "rpc",
+      "method": "POST",
+      "path": "/rest/v1/rpc/add",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"a\": 2, \"b\": 3}"
+    },
+    {
+      "name": "a function called in the query string",
+      "feature": "rpc",
+      "method": "GET",
+      "path": "/rest/v1/rpc/add?a=2&b=3"
+    },
+    {
+      "name": "a function that fills in an argument itself",
+      "feature": "rpc",
+      "method": "GET",
+      "path": "/rest/v1/rpc/greet"
+    },
+    {
+      "name": "a function that gives back rows",
+      "feature": "rpc",
+      "method": "POST",
+      "path": "/rest/v1/rpc/tasks_of",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"project\": 1}"
+    },
+    {
+      "name": "rows out of a function, filtered further",
+      "feature": "rpc",
+      "method": "POST",
+      "path": "/rest/v1/rpc/tasks_of?select=id,title&done=is.false&order=id",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"project\": 1}"
+    },
+    {
+      "name": "a function that gives back nothing",
+      "feature": "rpc",
+      "method": "POST",
+      "path": "/rest/v1/rpc/nothing",
+      "headers": { "content-type": "application/json" },
+      "body": "{}"
+    },
+    {
+      "name": "a function that raises",
+      "feature": "rpc",
+      "method": "POST",
+      "path": "/rest/v1/rpc/refuse",
+      "headers": { "content-type": "application/json" },
+      "body": "{}"
+    },
+    {
+      "name": "a function called without an argument it needs",
+      "feature": "rpc",
+      "method": "POST",
+      "path": "/rest/v1/rpc/add",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"a\": 2}"
+    },
+    {
+      "name": "a function nobody has",
+      "feature": "rpc",
+      "method": "POST",
+      "path": "/rest/v1/rpc/nope",
+      "headers": { "content-type": "application/json" },
+      "body": "{}"
+    },
+    {
+      "name": "a table nobody has",
+      "feature": "error",
+      "path": "/rest/v1/nope"
+    },
+    {
+      "name": "a column nobody has, in the select",
+      "feature": "error",
+      "path": "/rest/v1/tasks?select=nope"
+    },
+    {
+      "name": "a column nobody has, in the order",
+      "feature": "error",
+      "path": "/rest/v1/tasks?order=nope"
+    },
+    {
+      "name": "a table in another schema, named in a header",
+      "feature": "profile",
+      "path": "/rest/v1/conformance_notes?order=id",
+      "headers": { "accept-profile": "public" }
+    },
+    {
+      "name": "a table that is not in the schema that was named",
+      "feature": "profile",
+      "path": "/rest/v1/tasks?order=id",
+      "headers": { "accept-profile": "public" }
+    },
+    {
+      "name": "a schema nobody exposed",
+      "feature": "profile",
+      "path": "/rest/v1/tasks?order=id",
+      "headers": { "accept-profile": "information_schema" }
+    },
+    {
+      "name": "a write into a schema named in a header",
+      "feature": "profile",
+      "method": "POST",
+      "path": "/rest/v1/conformance_notes",
+      "headers": {
+        "content-type": "application/json",
+        "content-profile": "public",
+        "prefer": "return=representation"
+      },
+      "body": "{\"id\": 2, \"body\": \"written into public\"}"
+    },
+    {
+      "name": "a table nobody may read, read by nobody in particular",
+      "feature": "rls",
+      "path": "/rest/v1/secrets?order=id"
+    },
+    {
+      "name": "a table nobody may read, read by somebody signed in",
+      "feature": "rls",
+      "path": "/rest/v1/secrets?order=id",
+      "key": "authenticated"
+    },
+    {
+      "name": "a table nobody may read, read by the service key",
+      "feature": "rls",
+      "path": "/rest/v1/secrets?order=id",
+      "key": "service"
+    },
+    {
+      "name": "a row written into a table nobody may write",
+      "feature": "rls",
+      "method": "POST",
+      "path": "/rest/v1/secrets",
+      "headers": { "content-type": "application/json" },
+      "body": "{\"id\": 3, \"body\": \"should not land\"}"
+    },
+    {
+      "name": "what a table will take",
+      "feature": "options",
+      "method": "OPTIONS",
+      "path": "/rest/v1/tasks"
+    },
+    {
+      "name": "the head of a listing",
+      "feature": "head",
+      "method": "HEAD",
+      "path": "/rest/v1/tasks?select=id&order=id"
+    },
+    {
+      "name": "the head of a listing, counted",
+      "feature": "head",
+      "method": "HEAD",
+      "path": "/rest/v1/tasks?select=id",
+      "headers": { "prefer": "count=exact" }
+    }
+  ]
+}

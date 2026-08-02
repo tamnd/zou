@@ -1985,6 +1985,18 @@ name = "zou-chaos"
 version = "0.0.1"
 
 [[package]]
+name = "zou-conformance"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "ureq",
+ "zou-server",
+]
+
+[[package]]
 name = "zou-log"
 version = "0.0.1"
 dependencies = [
