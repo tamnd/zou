@@ -408,7 +408,7 @@ pub(crate) async fn send_phone_code(
 }
 
 /// Seconds since the epoch.
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -489,7 +489,7 @@ pub(crate) fn user_object() -> String {
             || {last_sign_in} || {invited} || {banned} || {deleted}
             || {confirmation_sent} || {recovery_sent} || {email_change_sent}
             || {phone_change_sent} || {reauth_sent}
-            || {new_email} || {new_phone})",
+            || {new_email} || {new_phone} || {factors})",
         created = ts("u.created_at"),
         updated = ts("u.updated_at"),
         confirmed_at = opt_ts("confirmed_at", "u.confirmed_at"),
@@ -506,6 +506,39 @@ pub(crate) fn user_object() -> String {
         reauth_sent = opt_ts("reauthentication_sent_at", "u.reauthentication_sent_at"),
         new_email = opt_text("new_email", "u.email_change"),
         new_phone = opt_text("new_phone", "u.phone_change"),
+        factors = factors_of(),
+    )
+}
+
+/// The factor list, as the key that is only there when the account has
+/// one. GoTrue eager loads factors with the user and Go's omitempty
+/// leaves an empty slice out entirely, so a client that has never
+/// touched MFA sees exactly what it saw before.
+///
+/// This is a subquery rather than a join because every caller of
+/// [`user_object`] already carries the identity join and none of them
+/// should have to learn about a second one.
+fn factors_of() -> String {
+    format!(
+        "(select case when count(*) = 0 then '{{}}'::jsonb
+                      else jsonb_build_object('factors', jsonb_agg(
+                               jsonb_build_object(
+                                   'id', f.id::text,
+                                   'created_at', {created},
+                                   'updated_at', {updated},
+                                   'status', f.status::text,
+                                   'factor_type', f.factor_type::text,
+                                   'phone', coalesce(f.phone, ''),
+                                   'last_challenged_at', case
+                                       when f.last_challenged_at is null then null
+                                       else {challenged} end
+                               ) || {friendly}
+                               order by f.created_at)) end
+            from auth.mfa_factors f where f.user_id = u.id)",
+        created = ts("f.created_at"),
+        updated = ts("f.updated_at"),
+        challenged = ts("f.last_challenged_at"),
+        friendly = opt_text("friendly_name", "f.friendly_name"),
     )
 }
 
@@ -555,7 +588,10 @@ pub(crate) async fn user_json(
 /// fields a client needs to reason about its own session. `aal` and
 /// `amr` come from the session and its amr rows, so a session that
 /// later passes MFA describes itself correctly without this query
-/// changing.
+/// changing. The amr entries are ordered most recent first and stamped
+/// with `updated_at` rather than `created_at`, which is what upstream's
+/// CalculateAALAndAMR does: a method proved again moves up the list
+/// rather than staying where it first appeared.
 async fn describe(
     sess: &sql::Session,
     session_id: &str,
@@ -586,8 +622,8 @@ async fn describe(
          left join lateral (
              select jsonb_agg(jsonb_build_object(
                         'method', a.authentication_method,
-                        'timestamp', floor(extract(epoch from a.created_at))::bigint
-                    ) order by a.created_at) as list
+                        'timestamp', floor(extract(epoch from a.updated_at))::bigint
+                    ) order by a.updated_at desc) as list
              from auth.mfa_amr_claims a where a.session_id = s.id
          ) amr on true
          {ids}
@@ -607,7 +643,7 @@ async fn describe(
 
 /// Sign the access token for a session and describe it, the last step
 /// of every grant.
-async fn mint_for(
+pub(crate) async fn mint_for(
     sess: &sql::Session,
     session_id: &str,
     refresh_token: String,
@@ -821,7 +857,7 @@ async fn rotate(
             }
         }
     } else {
-        swap(sess, &found).await?
+        swap(sess, found.id).await?
     };
 
     sess.execute(
@@ -868,7 +904,7 @@ async fn reused(
     // Zero is not a one second window, it is no window at all, which is
     // why the interval has to be positive before age is even asked.
     if REUSE_INTERVAL > 0 && found.age < REUSE_INTERVAL {
-        return Ok(Some(swap(sess, found).await?));
+        return Ok(Some(swap(sess, found.id).await?));
     }
     Ok(None)
 }
@@ -877,10 +913,10 @@ async fn reused(
 /// what lets the next request tell a lost response from a stolen
 /// token, so it is written even though nothing reads it on the happy
 /// path.
-async fn swap(sess: &sql::Session, found: &Presented) -> Result<String, Error> {
+pub(crate) async fn swap(sess: &sql::Session, id: i64) -> Result<String, Error> {
     sess.execute(
         "update auth.refresh_tokens set revoked = true, updated_at = now() where id = $1",
-        &[&found.id],
+        &[&id],
     )
     .await?;
     let token = fresh_token();
@@ -889,7 +925,7 @@ async fn swap(sess: &sql::Session, found: &Presented) -> Result<String, Error> {
              (token, user_id, revoked, created_at, updated_at, parent, session_id)
          select $1, user_id, false, now(), now(), token, session_id
          from auth.refresh_tokens where id = $2",
-        &[&token, &found.id],
+        &[&token, &id],
     )
     .await?;
     Ok(token)
@@ -3040,6 +3076,11 @@ pub struct Caller {
     /// endpoint input that decides whether this token was minted for
     /// the audience the request is being made against.
     pub aud: String,
+    /// The `is_anonymous` claim. An account with no way in of its own
+    /// is turned away from the endpoints that assume there is somebody
+    /// to fall back on, which is what GoTrue's requireNotAnonymous is
+    /// for.
+    pub anonymous: bool,
 }
 
 /// GoTrue's requireAuthentication, in its wording. The gate has already
@@ -3088,6 +3129,7 @@ pub(crate) fn caller(req: &Request<Body>) -> Result<Caller, Box<Response>> {
         session_id,
         role: ctx.role.clone(),
         aud: field(&ctx.claims, "aud").to_string(),
+        anonymous: ctx.claims["is_anonymous"].as_bool().unwrap_or(false),
     })
 }
 
@@ -3746,7 +3788,7 @@ fn redirect(target: &str, pairs: &Vec<(&str, String)>) -> Response {
 }
 
 /// Go's url.Values.Encode: sorted by key, each side escaped.
-fn encoded(pairs: &[(&str, String)]) -> String {
+pub(crate) fn encoded(pairs: &[(&str, String)]) -> String {
     let mut pairs: Vec<&(&str, String)> = pairs.iter().collect();
     pairs.sort_by_key(|(k, _)| *k);
     pairs

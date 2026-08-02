@@ -161,6 +161,41 @@ The account has no address, no identity, and an empty `app_metadata`, and its to
 
 The account becomes a permanent one by taking an address, either through `updateUser({ email })` or by linking a provider to it. The id does not change, so everything already written against it stays where it is. With `ZOU_MAILER_AUTOCONFIRM=true` the address is taken on the spot and the account stops being anonymous immediately; otherwise the ordinary email change mail goes out and the account stops being anonymous when the link is followed. Setting a password on an account that still has no address or number is refused, because there would be nothing to sign in with.
 
+## A second factor
+
+An authenticator app, on by default, the same as GoTrue. Enrolling draws a secret and hands back the QR code to point a phone at, and nothing has changed yet: the factor is unverified and the session is still `aal1`.
+
+```js
+const { data: factor } = await supabase.auth.mfa.enroll({
+  factorType: 'totp',
+  friendlyName: 'phone',
+})
+// factor.totp.qr_code is an svg, factor.totp.secret is the same secret in base32
+
+const { data: challenge } = await supabase.auth.mfa.challenge({ factorId: factor.id })
+await supabase.auth.mfa.verify({
+  factorId: factor.id,
+  challengeId: challenge.id,
+  code: '123456',
+})
+```
+
+The verify answers with a fresh token pair, and that pair is the point of the whole exchange. The access token says `aal2` and carries an `amr` array naming what the session has passed and when, most recent first, so a policy can read `auth.jwt()->>'aal'` and decide whether this session may see a table at all. The refresh token the session was holding is swapped for a new one, and every other session on the account is deleted, because a session that only ever typed a password should not still be sitting there once the account has a second factor.
+
+The level lives on the session rather than in the token, so the token a session was carrying before it verified is `aal2` too. What that buys is a client that does not have to chase its own tokens around: the session is what was lifted.
+
+A challenge is good for five minutes, can be spent once, and has to be verified from the address it was created from. A project may ask for less and will still get five minutes, which is the floor upstream applies. An account may hold ten factors, and adding a second one to an account that already has a working factor needs an `aal2` session, so somebody who learned the password cannot quietly add their own phone.
+
+```js
+await supabase.auth.mfa.getAuthenticatorAssuranceLevel() // { currentLevel, nextLevel }
+await supabase.auth.mfa.listFactors()
+await supabase.auth.mfa.unenroll({ factorId: factor.id })
+```
+
+Taking a verified factor away needs an `aal2` session as well, and it puts every session it had lifted back down to `aal1`. A half finished enrollment nobody ever proved can be taken away from where it stands, and one that has been sitting there five minutes is cleared out on its own the next time the account enrolls anything.
+
+`ZOU_MFA_TOTP_VERIFY_ENABLED=false` is how a project turns MFA off without deleting anybody's factors: what is enrolled stops being usable, and the challenge is refused before it is written. `ZOU_MFA_TOTP_ENROLL_ENABLED=false` closes the other end. Phone and WebAuthn factors are not built, and are refused the way an unconfigured GoTrue refuses them.
+
 ## Asking the project what it offers
 
 A sign in screen has to know which buttons to draw before anybody clicks one. `GET /auth/v1/settings` answers that, with no token beyond the anon key, and it is the same document GoTrue serves: every provider zou knows as a boolean under `external`, whether signups are open, whether an address or a number is taken at its word, and which provider carries the text messages.
