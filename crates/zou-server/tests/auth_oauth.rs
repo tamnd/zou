@@ -171,13 +171,20 @@ fn providers() -> oauth::Providers {
 /// decides whether an address the provider will not vouch for is taken
 /// at face value.
 fn app(dsn: &str, autoconfirm: bool) -> (axum::Router, Arc<Fake>) {
-    project(dsn, autoconfirm, true, false)
+    project(dsn, autoconfirm, true, false, false)
 }
 
 /// The same project with manual linking turned on, which is the one
 /// knob the linking endpoints are behind.
 fn linking(dsn: &str) -> (axum::Router, Arc<Fake>) {
-    project(dsn, true, true, true)
+    project(dsn, true, true, true, false)
+}
+
+/// And the same project with signups off, which is the one knob that
+/// tells signing in through a provider apart from signing up through
+/// one.
+fn closed(dsn: &str) -> (axum::Router, Arc<Fake>) {
+    project(dsn, true, true, false, true)
 }
 
 fn project(
@@ -185,6 +192,7 @@ fn project(
     autoconfirm: bool,
     secure_change: bool,
     manual_linking: bool,
+    disable_signup: bool,
 ) -> (axum::Router, Arc<Fake>) {
     let fake = Arc::new(Fake::default());
     let cfg = Config {
@@ -195,6 +203,7 @@ fn project(
         mailer_autoconfirm: autoconfirm,
         secure_email_change: secure_change,
         manual_linking,
+        disable_signup,
         oauth: providers(),
         http: Some(Arc::clone(&fake) as Arc<dyn oauth::Http>),
         ..Config::default()
@@ -957,6 +966,67 @@ async fn an_unverified_address_nobody_holds_is_mailed_rather_than_believed() {
 }
 
 #[tokio::test]
+async fn a_closed_project_lets_in_the_people_it_knows_and_nobody_else() {
+    let Some(dsn) = dsn() else { return };
+    let (open, _) = app(&dsn, true);
+    let (shut, fake) = closed(&dsn);
+    let pool = pool(&dsn).await;
+    let known = "known@zou.test";
+    let stranger = "stranger@zou.test";
+    wipe(&pool, &[known, stranger]).await;
+
+    // Somebody the project has never seen, arriving through a provider
+    // it does trust. The provider is not the question: the question is
+    // whether an account may be made, and on this project it may not.
+    fake.google("google-sub-stranger", stranger, true);
+    let state = start(&shut, "provider=google").await;
+    let landed = location(&go(&shut, &format!("/auth/v1/callback?state={state}&code=c")).await);
+    let back = parts(&landed);
+    assert_eq!(back["error"], "access_denied", "{landed}");
+    assert_eq!(back["error_code"], "signup_disabled");
+    assert_eq!(
+        back["error_description"],
+        "Signups not allowed for this instance"
+    );
+    let made: i64 = scalar(
+        &pool,
+        "select count(*) from auth.users where email = $1",
+        &[&stranger],
+    )
+    .await;
+    assert_eq!(made, 0, "and the refusal left nothing behind");
+
+    // Somebody who already has an account, made while the project was
+    // open. Signing in is not signing up, so the same closed project
+    // hands them a session and hangs the identity off the account they
+    // already had.
+    signed_up(&open, known).await;
+    fake.google("google-sub-known", known, true);
+    let state = start(&shut, "provider=google").await;
+    let landed = location(&go(&shut, &format!("/auth/v1/callback?state={state}&code=c")).await);
+    let back = parts(&landed);
+    assert!(
+        !back.contains_key("error"),
+        "an account that exists is let in: {landed}"
+    );
+    let token = back.get("access_token").expect("a token");
+    let email = claims(token)["email"]
+        .as_str()
+        .expect("an address")
+        .to_string();
+    assert_eq!(email, known);
+
+    let identities: i64 = scalar(
+        &pool,
+        "select count(*) from auth.identities i
+           join auth.users u on u.id = i.user_id where u.email = $1",
+        &[&known],
+    )
+    .await;
+    assert_eq!(identities, 2, "the password one and the google one");
+}
+
+#[tokio::test]
 async fn a_state_is_only_good_once_and_only_if_it_is_one() {
     let Some(dsn) = dsn() else { return };
     let (app, fake) = app(&dsn, false);
@@ -1117,7 +1187,7 @@ async fn an_address_the_person_has_moved_away_from_still_finds_them() {
     let Some(dsn) = dsn() else { return };
     // One confirmation to move, because the point here is the identity
     // and not the change of address.
-    let (app, fake) = project(&dsn, false, false, false);
+    let (app, fake) = project(&dsn, false, false, false, false);
     let pool = pool(&dsn).await;
     let (old, new) = ("moved-from@zou.test", "moved-to@zou.test");
     wipe(&pool, &[old, new]).await;

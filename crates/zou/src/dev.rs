@@ -195,6 +195,23 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
         std::env::var("ZOU_EXTERNAL_ANONYMOUS_USERS_ENABLED").as_deref(),
         Ok("true") | Ok("1")
     );
+    // Both of these are the other way round from the flags above: on
+    // and off are GoTrue's, and GoTrue serves addresses and takes
+    // signups unless it is told not to.
+    let email_enabled = !matches!(
+        std::env::var("ZOU_EXTERNAL_EMAIL_ENABLED").as_deref(),
+        Ok("false") | Ok("0")
+    );
+    let disable_signup = matches!(
+        std::env::var("ZOU_DISABLE_SIGNUP").as_deref(),
+        Ok("true") | Ok("1")
+    );
+    if !email_enabled {
+        log::info!("email sign in is off, nothing here answers an address");
+    }
+    if disable_signup {
+        log::info!("signups are off, invitations are the way in");
+    }
     // initdb ran without -U, so the cluster superuser is the OS user
     // and local connections are trust, the stock dev loop layout.
     let user = std::env::var("USER")
@@ -236,6 +253,13 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // which the client turns into a real account later by
             // setting an address on it.
             anonymous_users,
+            // On unless ZOU_EXTERNAL_EMAIL_ENABLED=false, which is what
+            // a project that signs everyone in by number or by social
+            // provider wants, and off unless ZOU_DISABLE_SIGNUP=true,
+            // which closes the door to everyone the project has not
+            // already invited. Both are readable back from /settings.
+            email_enabled,
+            disable_signup,
             // Off unless ZOU_EXTERNAL_PHONE_ENABLED=true, and then set
             // ZOU_SMS_PROVIDER=twilio or messagebird with its
             // credentials to send for real. With no provider the codes

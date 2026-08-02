@@ -117,6 +117,18 @@ pub struct Config {
     /// hand it over rather than configure a second one, and because a
     /// test needs to be able to watch a send fail.
     pub sender: Option<Arc<dyn mail::Sender>>,
+    /// GoTrue's GOTRUE_EXTERNAL_EMAIL_ENABLED, on by default there and
+    /// here. Off, and every way in that names an address is refused,
+    /// which is what a project that signs everyone in by number or by
+    /// social provider wants: an address left half served is an account
+    /// nobody can confirm.
+    pub email_enabled: bool,
+    /// GoTrue's GOTRUE_DISABLE_SIGNUP, off by default there and here.
+    /// On, and nobody new gets an account: signup and anonymous sign in
+    /// are refused, and a social sign in by someone the project has
+    /// never seen is refused at the callback. Invitations are the way
+    /// in, which is why they are not covered by it.
+    pub disable_signup: bool,
     /// GoTrue's GOTRUE_EXTERNAL_PHONE_ENABLED, off by default there and
     /// here. Off, and every phone endpoint refuses in upstream's words,
     /// which is what a project with no numbers to text wants.
@@ -158,6 +170,8 @@ impl Default for Config {
             anonymous_users: false,
             mail: mail::Settings::default(),
             sender: None,
+            email_enabled: true,
+            disable_signup: false,
             phone_enabled: false,
             sms: sms::Settings::default(),
             texter: None,
@@ -561,6 +575,10 @@ pub fn router(cfg: Config) -> Result<Router, String> {
     let app = app_state(cfg)?;
     let gated = Router::new()
         .route("/auth/v1/health", get(auth_health))
+        // What a sign in screen reads before it draws itself. It sits
+        // inside the gate because the hosted edge puts it there, not
+        // because there is a secret in it.
+        .route("/auth/v1/settings", get(auth::settings))
         .route("/auth/v1/token", post(auth::token))
         .route("/auth/v1/signup", post(auth::signup))
         .route("/auth/v1/recover", post(auth::recover))
@@ -641,6 +659,10 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .merge(open)
         .merge(gated)
         .fallback(no_route)
+        // Inside the request id, because the id is what a failure of
+        // this server's own carries back, and outside everything that
+        // answers, because every auth refusal leaves through it.
+        .layer(middleware::from_fn(auth::envelope))
         .layer(middleware::from_fn(edge::cors))
         .layer(middleware::from_fn(edge::request_id)))
 }

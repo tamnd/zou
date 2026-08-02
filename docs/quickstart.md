@@ -161,6 +161,48 @@ The account has no address, no identity, and an empty `app_metadata`, and its to
 
 The account becomes a permanent one by taking an address, either through `updateUser({ email })` or by linking a provider to it. The id does not change, so everything already written against it stays where it is. With `ZOU_MAILER_AUTOCONFIRM=true` the address is taken on the spot and the account stops being anonymous immediately; otherwise the ordinary email change mail goes out and the account stops being anonymous when the link is followed. Setting a password on an account that still has no address or number is refused, because there would be nothing to sign in with.
 
+## Asking the project what it offers
+
+A sign in screen has to know which buttons to draw before anybody clicks one. `GET /auth/v1/settings` answers that, with no token beyond the anon key, and it is the same document GoTrue serves: every provider zou knows as a boolean under `external`, whether signups are open, whether an address or a number is taken at its word, and which provider carries the text messages.
+
+```js
+const settings = await fetch(`${url}/auth/v1/settings`, {
+  headers: { apikey: anonKey },
+}).then((r) => r.json())
+
+settings.external.google      // true once a client id and a secret are set
+settings.disable_signup       // false unless the project closed the door
+settings.sms_provider         // "twilio", "messagebird", or ""
+```
+
+A provider nobody configured is `false` rather than missing, so a client can read the whole set without guarding every name.
+
+`GET /auth/v1/health` names the service and its version, which is what a health check and a client version negotiation both read.
+
+## Two shapes of refusal
+
+Every refusal from `/auth/v1/` carries a machine readable code as well as a sentence, and there are two shapes of it because GoTrue has two. Which one comes back is decided by the `X-Supabase-Api-Version` request header, exactly as it is upstream.
+
+```
+# no header, or anything before 2024-01-01: the shape that was always there
+{"code": 422, "error_code": "signup_disabled", "msg": "Signups not allowed for this instance"}
+
+# X-Supabase-Api-Version: 2024-01-01, echoed back on the response
+{"code": "signup_disabled", "message": "Signups not allowed for this instance"}
+```
+
+A header that is not a date is the older shape, and a date later than the newest one there is gets the newest one. The older shape also sends the code in an `x-sb-error-code` response header, and fills in `error_id` on a failure of the server's own so a report can be matched to a line in the log. The supabase-js clients send the header themselves, so most projects never see the older shape and no project has to choose.
+
+## Closing the door
+
+Two knobs decide who may make an account, and they are GoTrue's with `GOTRUE_` swapped for `ZOU_`.
+
+`ZOU_DISABLE_SIGNUP=true` stops new accounts everywhere at once: a signup with a password, a magic link or a one time code to somebody nobody knows, an anonymous sign in, and a first sign in through Google or Github are all refused with `signup_disabled`. Signing in still works, so a project that has finished taking on people keeps serving the ones it has, and a provider sign in by somebody who already has an account still lands and still links the identity.
+
+`ZOU_EXTERNAL_EMAIL_ENABLED=false` takes the address away as a way in, for a project that signs people in by phone or by provider alone. Signup, the password grant, magic link, recovery, a one time code by mail and a resend all refuse with `email_provider_disabled` and say which of the two it is: "Email signups are disabled" for the one that would make an account, "Email logins are disabled" for the ones that would not.
+
+Both show up in `/auth/v1/settings`, which is how a client knows not to draw the form in the first place.
+
 ## Reading and throwing away a session
 
 `GET /auth/v1/user` describes the account the token names, and refuses with `user_not_found` or `session_not_found` when the account or the session behind the token is gone. That is what makes a logout mean something: the token stays signed and inside its hour, but what it names is no longer there.
