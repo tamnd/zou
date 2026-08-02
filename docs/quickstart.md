@@ -366,6 +366,34 @@ ZOU_RATE_LIMIT_SMS_SENT=30
 
 The two send limits are different in kind. They are not per caller, they are the whole project's, because what they protect is the mail and SMS account everybody shares. They refuse with `over_email_send_rate_limit` and `over_sms_send_rate_limit`, and the flow they refuse goes back with them, so an account is never left holding a code that was never posted. Both accept `events/duration` as well as a bare number, so `ZOU_RATE_LIMIT_EMAIL_SENT=10/1m` is a bucket of ten with one back every minute, while the bare `30` is thirty in an hour and then nothing until the hour turns over. A project that confirms its own signups does not spend either budget, which is upstream's behaviour today.
 
+## The audit trail
+
+Every auth event writes a row to `auth.audit_log_entries`, on the same connection and inside the same transaction as the thing it describes. A signup whose transaction rolled back has no signup entry. Nothing has to be switched on and there is nothing to configure.
+
+A row is mostly one json payload:
+
+```sql
+select payload ->> 'action'         as action,
+       payload ->> 'actor_username' as who,
+       created_at
+  from auth.audit_log_entries
+ where payload ->> 'actor_id' = '0f8fad5b-d9cb-469f-a165-70867728950e'
+ order by created_at desc
+ limit 20;
+```
+
+`action` is one of `login`, `logout`, `user_signedup`, `user_invited`, `user_deleted`, `user_modified`, `user_recovery_requested`, `user_reauthenticate_requested`, `user_confirmation_requested`, `user_repeated_signup`, `user_updated_password`, `token_refreshed`, `token_revoked`, `identity_unlinked`, `factor_in_progress`, `challenge_created`, `verification_attempted`, or `factor_unenrolled`. Alongside it, `log_type` puts each of those in one of six families, `account`, `team`, `token`, `user`, `factor`, and `recovery_codes`, which is what a dashboard groups by. The names do not always line up with the families: `user_signedup` is a `team` event and `login` is an `account` one.
+
+`actor_id`, `actor_username` and `actor_via_sso` say who did it, and `actor_name` appears when the account carries a `full_name` in its metadata. Most events also carry a `traits` object with whatever the event has to say for itself, the provider on a login, the factor and challenge on a verification, the account acted on when an admin did the acting.
+
+Three things about this table surprise people, and all three are GoTrue's behaviour rather than choices made here:
+
+- The `ip_address` column is empty on almost every row. Only the four factor events fill it in. The address is in the request either way.
+- An admin acting through the service key is not a person. `actor_id` is the nil uuid and `actor_username` is the role name, so every service key action reads as `service_role` rather than naming whoever holds the key. What the admin acted on is in the traits.
+- An anonymous sign in writes nothing at all. Neither does a signup link generated through `/auth/v1/admin/generate_link`.
+
+The table is not swept. Rows accumulate for as long as the project keeps them, and deciding on a retention policy is the operator's job.
+
 ## Where to go next
 
 - docs/architecture.md for the shape of the whole system

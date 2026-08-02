@@ -20,6 +20,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 
+use crate::audit::{self, Action, Actor};
 use crate::auth::{
     Caller, Code, Error, Outgoing, Post, caller, confirm_address, denied, error_body, field,
     hash_off_thread, identities_join, is_uuid, keep_token, landing, link_target, merge_metadata,
@@ -524,7 +525,50 @@ async fn create(
         confirm_address(sess, &user_id, false).await?;
     }
     ban_account(sess, &user_id, ban).await?;
+    // An account made by an admin is filed as a signup, which reads
+    // oddly for something nobody asked for and is upstream's word.
+    let mut traits = about(sess, &user_id).await?;
+    if let Some(traits) = traits.as_object_mut() {
+        traits.insert("provider".to_string(), "email".into());
+    }
+    audit::record(
+        sess,
+        Actor::Role(&admin.role),
+        Action::UserSignedUp,
+        "",
+        Some(traits),
+    )
+    .await?;
     Ok(user_json(sess, &user_id).await?)
+}
+
+/// The traits every admin entry carries: who it was done to, and the
+/// address and the number that account holds. Read out of the row rather
+/// than carried in, because upstream writes the entry at the end of the
+/// change and names the account as it stands afterwards.
+///
+/// The actor is not the person holding the key. Upstream builds a
+/// throwaway user out of the role claim, so every one of these is filed
+/// against `service_role` and the trail cannot tell two keys apart. That
+/// is upstream's and it is kept, because a dashboard that groups by
+/// actor already groups this way.
+async fn about(sess: &sql::Session, user_id: &str) -> Result<serde_json::Value, sql::Error> {
+    let rows = sess
+        .query(
+            "select coalesce(email, ''), coalesce(phone, '')
+               from auth.users where id = $1::text::uuid",
+            &[&user_id],
+        )
+        .await?;
+    let (email, phone): (String, String) = match rows.first() {
+        Some(row) => (row.get(0), row.get(1)),
+        None => (String::new(), String::new()),
+    };
+    Ok(serde_json::json!({
+        "user_id": user_id,
+        "user_email": email,
+        "user_phone": phone,
+    }))
 }
 
 /// An account about to be written, which three of these endpoints make:
@@ -692,6 +736,14 @@ async fn amend(
         merge_metadata(sess, user_id, "raw_user_meta_data", &user_data).await?;
     }
     ban_account(sess, user_id, ban).await?;
+    audit::record(
+        sess,
+        Actor::Role(&admin.role),
+        Action::UserModified,
+        "",
+        Some(about(sess, user_id).await?),
+    )
+    .await?;
     Ok(user_json(sess, user_id).await?)
 }
 
@@ -876,6 +928,16 @@ async fn remove(
 ) -> Result<serde_json::Value, Error> {
     holder_still_there(sess, admin).await?;
     addressed(sess, user_id).await?;
+    // First, so the traits name the account rather than the tombstone,
+    // and so a hard delete has something to say about itself at all.
+    audit::record(
+        sess,
+        Actor::Role(&admin.role),
+        Action::UserDeleted,
+        "",
+        Some(about(sess, user_id).await?),
+    )
+    .await?;
     if !soft {
         sess.execute(
             "delete from auth.users where id = $1::text::uuid",
@@ -1109,6 +1171,18 @@ async fn link_for(
             )
             .await?;
             keep_token(sess, &account.id, "recovery_token", &hashed, &email).await?;
+            // The one entry on this endpoint written against the person
+            // rather than the role, which is upstream's and is what
+            // makes a generated recovery link read the same as one the
+            // person asked for themselves.
+            audit::record(
+                sess,
+                Actor::Account(&account.id),
+                Action::UserRecoveryRequested,
+                "",
+                None,
+            )
+            .await?;
             (account.id, hashed.clone())
         }
         "invite" => {
@@ -1118,6 +1192,14 @@ async fn link_for(
                 None => new_account(sess, &email, aud, "", &object_or_empty(body, "data")).await?,
             };
             invited(sess, &user_id, &email, &hashed).await?;
+            audit::record(
+                sess,
+                Actor::Role(&admin.role),
+                Action::UserInvited,
+                "",
+                Some(serde_json::json!({ "user_id": user_id, "user_email": email })),
+            )
+            .await?;
             (user_id, hashed.clone())
         }
         "signup" => {
@@ -1137,6 +1219,10 @@ async fn link_for(
                 }
             };
             awaiting_confirmation(sess, &user_id, &email, &hashed).await?;
+            // Nothing written. A generated signup link and a generated
+            // change of address link both leave no entry upstream, so an
+            // account can be brought into existence here and the trail
+            // will not say who did it.
             (user_id, hashed.clone())
         }
         "email_change_current" | "email_change_new" => {
@@ -1407,6 +1493,16 @@ async fn inviting(
         code: otp,
     };
     invited(sess, &user_id, &email, &code.hash).await?;
+    // No number in this one. An invitation goes to an address, and the
+    // two traits are the ones upstream writes.
+    audit::record(
+        sess,
+        Actor::Role(&admin.role),
+        Action::UserInvited,
+        "",
+        Some(serde_json::json!({ "user_id": user_id, "user_email": email })),
+    )
+    .await?;
     send_code(
         sess,
         post,

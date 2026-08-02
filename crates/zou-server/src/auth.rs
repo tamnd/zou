@@ -25,8 +25,11 @@
 //! endpoints answers with an acknowledgement and nothing else whether
 //! or not there was anything to send, which is what they answer
 //! upstream too, and what keeps them from saying who has an account
-//! here. What is still missing is the per endpoint rate limit GoTrue
-//! applies on top of the one minute between sends.
+//! here.
+//!
+//! Every one of these flows writes down what it did. The entries are in
+//! `audit`, on the connection the flow is already holding, so a flow
+//! that rolled back left no trace of having happened.
 
 use std::sync::Arc;
 
@@ -34,6 +37,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 
+use crate::audit::{self, Action, Actor};
 use crate::sql::{self, Pool};
 use crate::{App, json_body, no_content, not_yet};
 
@@ -847,6 +851,9 @@ struct Presented {
     /// Seconds since the token was last written, which is how long ago
     /// it was revoked when it is revoked.
     age: i64,
+    /// Who the token belongs to, carried for the audit entry and for
+    /// nothing else.
+    user_id: String,
 }
 
 /// The refresh_token grant. Rotation with reuse detection, in GoTrue's
@@ -889,7 +896,8 @@ async fn rotate(sess: &sql::Session, token: &str, mint: &Mint<'_>) -> Result<Iss
                     coalesce(u.banned_until > now(), false),
                     s.id is null,
                     coalesce(s.not_after < now(), false),
-                    coalesce(floor(extract(epoch from now() - t.updated_at))::bigint, 0)
+                    coalesce(floor(extract(epoch from now() - t.updated_at))::bigint, 0),
+                    coalesce(t.user_id, '')
              from auth.refresh_tokens t
              left join auth.sessions s on s.id = t.session_id
              left join auth.users u on u.id::text = t.user_id
@@ -913,6 +921,7 @@ async fn rotate(sess: &sql::Session, token: &str, mint: &Mint<'_>) -> Result<Iss
         session_gone: row.get(5),
         session_expired: row.get(6),
         age: row.get(7),
+        user_id: row.get(8),
     };
 
     if found.banned {
@@ -937,10 +946,11 @@ async fn rotate(sess: &sql::Session, token: &str, mint: &Mint<'_>) -> Result<Iss
     }
     let session_id = found.session_id.clone().expect("checked session_gone");
 
-    let issued = if found.revoked {
+    let already = if found.revoked {
         match reused(sess, &session_id, &found).await? {
-            Some(active) => active,
-            None => {
+            Revoked::Answered(active) => Some(active),
+            Revoked::Rotate => None,
+            Revoked::Stolen => {
                 // Nothing legitimate explains this: the token was
                 // revoked, it is not the parent of the live one, and
                 // the grace window is past. The whole family goes,
@@ -959,7 +969,29 @@ async fn rotate(sess: &sql::Session, token: &str, mint: &Mint<'_>) -> Result<Iss
             }
         }
     } else {
-        swap(sess, found.id).await?
+        None
+    };
+
+    // Every refresh that is going to be answered says so, including the
+    // one that hands back a token it has already issued. The theft path
+    // returned before reaching here, so a refused refresh leaves a trail
+    // of the revocations it caused and no refreshed entry at all.
+    //
+    // Before the swap rather than after, because the swap writes the
+    // revoked entry, and refreshed then revoked is the pair upstream
+    // leaves behind.
+    audit::record(
+        sess,
+        Actor::Account(&found.user_id),
+        Action::TokenRefreshed,
+        "",
+        None,
+    )
+    .await?;
+
+    let issued = match already {
+        Some(active) => active,
+        None => swap(sess, found.id).await?,
     };
 
     sess.execute(
@@ -975,16 +1007,26 @@ async fn rotate(sess: &sql::Session, token: &str, mint: &Mint<'_>) -> Result<Iss
     mint_for(sess, &session_id, issued, "token_refresh", mint).await
 }
 
-/// A revoked token was presented. Either it is the parent of the
-/// session's live token, which means the client never received the
-/// answer to its last refresh and gets that same answer again, or it
-/// falls inside the reuse window and rotates normally. Anything else
-/// is None, and the caller treats it as theft.
+/// What a revoked token turned out to be.
+enum Revoked {
+    /// The parent of the session's live token, which means the client
+    /// never received the answer to its last refresh. It gets that same
+    /// answer again, and nothing rotates.
+    Answered(String),
+    /// Inside the reuse window, so it rotates like any other.
+    Rotate,
+    /// None of the above.
+    Stolen,
+}
+
+/// Judge a revoked token that was presented anyway. It is an enum rather
+/// than the rotation itself because the caller has an entry to write
+/// between the judgement and the rotation.
 async fn reused(
     sess: &sql::Session,
     session_id: &str,
     found: &Presented,
-) -> Result<Option<String>, Error> {
+) -> Result<Revoked, Error> {
     let rows = sess
         .query(
             // The newest live token is the session's current one. There
@@ -1003,22 +1045,45 @@ async fn reused(
         let active: String = row.get(0);
         let parent: String = row.get(1);
         if parent == found.token {
-            return Ok(Some(active));
+            return Ok(Revoked::Answered(active));
         }
     }
     // Zero is not a one second window, it is no window at all, which is
     // why the interval has to be positive before age is even asked.
     if REUSE_INTERVAL > 0 && found.age < REUSE_INTERVAL {
-        return Ok(Some(swap(sess, found.id).await?));
+        return Ok(Revoked::Rotate);
     }
-    Ok(None)
+    Ok(Revoked::Stolen)
 }
 
 /// Revoke the presented token and issue its child. The parent link is
 /// what lets the next request tell a lost response from a stolen
 /// token, so it is written even though nothing reads it on the happy
 /// path.
+///
+/// The revoked entry is written here rather than at the two call sites,
+/// which is where upstream keeps it too: a swap is the only thing that
+/// revokes a token that its holder was still entitled to, and a refresh
+/// that handed back the token it had already issued is not one, so it
+/// writes no revoked entry.
 pub(crate) async fn swap(sess: &sql::Session, id: i64) -> Result<String, Error> {
+    let rows = sess
+        .query(
+            "select coalesce(user_id, '') from auth.refresh_tokens where id = $1",
+            &[&id],
+        )
+        .await?;
+    if let Some(row) = rows.first() {
+        let user_id: String = row.get(0);
+        audit::record(
+            sess,
+            Actor::Account(&user_id),
+            Action::TokenRevoked,
+            "",
+            None,
+        )
+        .await?;
+    }
     sess.execute(
         "update auth.refresh_tokens set revoked = true, updated_at = now() where id = $1",
         &[&id],
@@ -1079,9 +1144,17 @@ pub(crate) fn token_hash(email: &str, otp: &str) -> String {
 /// What a signup turned into. A project that confirms its own signups
 /// gets a session straight away, one that mails a confirmation gets the
 /// user and nothing else, which is the difference a client watches for.
+///
+/// `Taken` is the refusal, and it is an outcome rather than an error
+/// because of the audit entry: upstream records a repeated signup and
+/// then refuses, in that order, so the transaction has to commit before
+/// the 422 is written. Nothing else is in it by the time it commits,
+/// because the account already existed and the check that found it runs
+/// before anything is written.
 pub enum SignedUp {
     Session(Box<Issued>),
     Pending(serde_json::Value),
+    Taken,
 }
 
 /// GoTrue's email address check: present, short enough, one address,
@@ -1170,13 +1243,19 @@ async fn register(
         // registered, so it answers with a user shaped object that
         // belongs to nobody. A project that confirms its own signups
         // has no such secret to keep and says it plainly.
-        Some((_, true)) => {
+        Some((id, true)) => {
+            // The entry is written either way. It is the only thing this
+            // branch writes, which is what lets the refusal commit it.
+            audit::record(
+                sess,
+                Actor::Account(&id),
+                Action::UserRepeatedSignUp,
+                "",
+                Some(serde_json::json!({ "provider": "email" })),
+            )
+            .await?;
             if autoconfirm || post.sms.autoconfirm {
-                return Err(refused(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "user_already_exists",
-                    "User already registered",
-                ));
+                return Ok(SignedUp::Taken);
             }
             return Ok(SignedUp::Pending(
                 sanitized(sess, "email", email, data).await?,
@@ -1230,6 +1309,14 @@ async fn register(
     .await?;
 
     if !autoconfirm {
+        audit::record(
+            sess,
+            Actor::Account(&user_id),
+            Action::UserConfirmationRequested,
+            "",
+            Some(serde_json::json!({ "provider": "email" })),
+        )
+        .await?;
         // The code goes in the email and its hash goes here, one live
         // confirmation per user, which is upstream's rule: a second
         // signup on the same unconfirmed address replaces the first
@@ -1259,6 +1346,14 @@ async fn register(
         return Ok(SignedUp::Pending(user_json(sess, &user_id).await?));
     }
 
+    audit::record(
+        sess,
+        Actor::Account(&user_id),
+        Action::UserSignedUp,
+        "",
+        Some(serde_json::json!({ "provider": "email" })),
+    )
+    .await?;
     sess.execute(
         "update auth.users
             set email_confirmed_at = now(),
@@ -1273,6 +1368,19 @@ async fn register(
     sess.execute(
         "delete from auth.one_time_tokens where user_id = $1::text::uuid",
         &[&user_id],
+    )
+    .await?;
+    // Upstream signs the person in from a second transaction once the
+    // signup has committed, so the trail holds a signup and then a
+    // login. Here they are one transaction, which is the same two
+    // entries in the same order and no window where the account exists
+    // and the session does not.
+    audit::record(
+        sess,
+        Actor::Account(&user_id),
+        Action::Login,
+        "",
+        Some(serde_json::json!({ "provider": "email" })),
     )
     .await?;
     Ok(SignedUp::Session(Box::new(
@@ -1343,13 +1451,17 @@ async fn register_phone(
     let existing: Option<(String, bool)> = rows.first().map(|r| (r.get(0), r.get(1)));
 
     let user_id = match existing {
-        Some((_, true)) => {
+        Some((id, true)) => {
+            audit::record(
+                sess,
+                Actor::Account(&id),
+                Action::UserRepeatedSignUp,
+                "",
+                Some(serde_json::json!({ "provider": "phone" })),
+            )
+            .await?;
             if post.autoconfirm || post.sms.autoconfirm {
-                return Err(refused(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "user_already_exists",
-                    "User already registered",
-                ));
+                return Ok(SignedUp::Taken);
             }
             return Ok(SignedUp::Pending(
                 sanitized(sess, "phone", phone, data).await?,
@@ -1401,6 +1513,17 @@ async fn register_phone(
     .await?;
 
     if !post.sms.autoconfirm {
+        // The channel is not in this one, only in the confirmed branch
+        // below, which is upstream's asymmetry rather than an omission
+        // here.
+        audit::record(
+            sess,
+            Actor::Account(&user_id),
+            Action::UserConfirmationRequested,
+            "",
+            Some(serde_json::json!({ "provider": "phone" })),
+        )
+        .await?;
         send_phone_code(
             sess,
             post,
@@ -1415,8 +1538,24 @@ async fn register_phone(
         return Ok(SignedUp::Pending(user_json(sess, &user_id).await?));
     }
 
+    audit::record(
+        sess,
+        Actor::Account(&user_id),
+        Action::UserSignedUp,
+        "",
+        Some(serde_json::json!({ "provider": "phone", "channel": channel })),
+    )
+    .await?;
     confirm_phone(sess, &user_id).await?;
     forget_tokens(sess, &user_id).await?;
+    audit::record(
+        sess,
+        Actor::Account(&user_id),
+        Action::Login,
+        "",
+        Some(serde_json::json!({ "provider": "phone" })),
+    )
+    .await?;
     Ok(SignedUp::Session(Box::new(
         start(sess, &user_id, "password", mint).await?,
     )))
@@ -1628,6 +1767,16 @@ async fn sign_in(
             _ => denied("email_not_confirmed", "Email not confirmed"),
         };
     }
+    // The column the account was found by is the provider that signed
+    // them in, which is upstream's own reasoning for the trait.
+    audit::record(
+        sess,
+        Actor::Account(&user_id),
+        Action::Login,
+        "",
+        Some(serde_json::json!({ "provider": column })),
+    )
+    .await?;
     start(sess, &user_id, "password", mint).await
 }
 
@@ -2186,10 +2335,42 @@ async fn consume(
 ) -> Result<bool, Error> {
     match holder.kind.as_str() {
         "signup" | "invite" => {
+            audit::record(
+                sess,
+                Actor::Account(&holder.user_id),
+                Action::UserSignedUp,
+                "",
+                Some(serde_json::json!({ "provider": "email" })),
+            )
+            .await?;
             confirm_address(sess, &holder.user_id, false).await?;
             forget_tokens(sess, &holder.user_id).await?;
         }
         "recovery" | "magiclink" => {
+            // A recovery link followed by an account that never proved
+            // its address is the signup finishing, and is filed as one.
+            // Only an account that was already confirmed is signing in,
+            // and that has to be asked before the link confirms it.
+            let confirmed = confirmed_address(sess, &holder.user_id).await?;
+            if confirmed {
+                audit::record(
+                    sess,
+                    Actor::Account(&holder.user_id),
+                    Action::Login,
+                    "",
+                    None,
+                )
+                .await?;
+            } else {
+                audit::record(
+                    sess,
+                    Actor::Account(&holder.user_id),
+                    Action::UserSignedUp,
+                    "",
+                    Some(serde_json::json!({ "provider": "email" })),
+                )
+                .await?;
+            }
             sess.execute(
                 "update auth.users
                     set recovery_token = '', updated_at = now()
@@ -2204,11 +2385,27 @@ async fn consume(
             return change_address(sess, &holder.user_id, hash, rules).await;
         }
         "sms" => {
+            audit::record(
+                sess,
+                Actor::Account(&holder.user_id),
+                Action::UserSignedUp,
+                "",
+                Some(serde_json::json!({ "provider": "phone" })),
+            )
+            .await?;
             confirm_phone(sess, &holder.user_id).await?;
             not_anonymous(sess, &holder.user_id).await?;
             forget_tokens(sess, &holder.user_id).await?;
         }
         "phone_change" => {
+            audit::record(
+                sess,
+                Actor::Account(&holder.user_id),
+                Action::UserModified,
+                "",
+                None,
+            )
+            .await?;
             change_number(sess, &holder.user_id).await?;
             not_anonymous(sess, &holder.user_id).await?;
             forget_tokens(sess, &holder.user_id).await?;
@@ -2216,6 +2413,19 @@ async fn consume(
         _ => return denied("validation_failed", "Unsupported verification type"),
     }
     Ok(true)
+}
+
+/// Whether the account has proved its address, asked before something is
+/// about to prove it.
+async fn confirmed_address(sess: &sql::Session, user_id: &str) -> Result<bool, sql::Error> {
+    let rows = sess
+        .query(
+            "select email_confirmed_at is not null from auth.users
+              where id = $1::text::uuid",
+            &[&user_id],
+        )
+        .await?;
+    Ok(rows.first().is_some_and(|r| r.get(0)))
 }
 
 /// Move the address, or record that one of the two links has been
@@ -2274,6 +2484,19 @@ async fn change_address(
         }
         return Ok(false);
     }
+
+    // Past the half confirmation, so the address is actually moving.
+    // The entry goes here rather than at the top of this function
+    // because a first link that changed nothing but a status is not a
+    // modification of the account.
+    audit::record(
+        sess,
+        Actor::Account(user_id),
+        Action::UserModified,
+        "",
+        None,
+    )
+    .await?;
 
     // Upstream's createNewIdentity on this path. An account that has
     // never held an address has no email identity either, and the
@@ -2385,6 +2608,14 @@ async fn recovery_for(sess: &sql::Session, email: &str, post: &Post<'_>) -> Resu
         return Ok(());
     };
     let user_id: String = row.get(0);
+    audit::record(
+        sess,
+        Actor::Account(&user_id),
+        Action::UserRecoveryRequested,
+        "",
+        None,
+    )
+    .await?;
     within_limit(
         sess,
         &user_id,
@@ -2491,6 +2722,17 @@ async fn magic_for(
         )
         .await?;
     let user_id: String = rows[0].get(0);
+    // A magic link is a recovery request in the trail as well as in the
+    // schema, so a signup that came in through this endpoint leaves the
+    // signup entries `register` wrote and then this one.
+    audit::record(
+        sess,
+        Actor::Account(&user_id),
+        Action::UserRecoveryRequested,
+        "",
+        None,
+    )
+    .await?;
     within_limit(
         sess,
         &user_id,
@@ -2602,6 +2844,10 @@ async fn reauth_for(sess: &sql::Session, user_id: &str, post: &Post<'_>) -> Resu
                 "Please verify your phone first.",
             ));
         }
+        // Once per transport, after its own check, because upstream
+        // writes the entry only once both checks have passed and the two
+        // transports fail those checks in different places.
+        reauth_requested(sess, user_id).await?;
         return send_phone_code(
             sess,
             post,
@@ -2621,6 +2867,7 @@ async fn reauth_for(sess: &sql::Session, user_id: &str, post: &Post<'_>) -> Resu
             "Please verify your email first.",
         ));
     }
+    reauth_requested(sess, user_id).await?;
     within_limit(
         sess,
         user_id,
@@ -2646,6 +2893,19 @@ async fn reauth_for(sess: &sql::Session, user_id: &str, post: &Post<'_>) -> Resu
     )
     .await?;
     Ok(String::new())
+}
+
+/// The one entry `reauth_for` writes, named so the two transports write
+/// the same thing rather than nearly the same thing.
+async fn reauth_requested(sess: &sql::Session, user_id: &str) -> Result<(), sql::Error> {
+    audit::record(
+        sess,
+        Actor::Account(user_id),
+        Action::UserReauthenticateRequested,
+        "",
+        None,
+    )
+    .await
 }
 
 /// POST /auth/v1/reauthenticate.
@@ -3008,6 +3268,14 @@ async fn update_user(
         }
         let hash = hash_off_thread(password).await;
         set_password(sess, &caller.user_id, &hash, caller.session_id.as_deref()).await?;
+        audit::record(
+            sess,
+            Actor::Account(&caller.user_id),
+            Action::UserUpdatedPassword,
+            "",
+            None,
+        )
+        .await?;
     }
 
     if let Some(data) = body.get("data").filter(|v| v.is_object()) {
@@ -3053,7 +3321,16 @@ async fn update_user(
     {
         if post.sms.autoconfirm {
             // The project asked for no proof, so the number moves on the
-            // spot through the same code path a verified one takes.
+            // spot through the same code path a verified one takes,
+            // including the entry that path writes.
+            audit::record(
+                sess,
+                Actor::Account(&caller.user_id),
+                Action::UserModified,
+                "",
+                None,
+            )
+            .await?;
             sess.execute(
                 "update auth.users set phone_change = $2, updated_at = now()
                   where id = $1::text::uuid",
@@ -3078,6 +3355,17 @@ async fn update_user(
         }
     }
 
+    // Last, and whatever was asked for, including nothing: upstream
+    // writes this at the end of the transaction unconditionally, so a
+    // PUT with an empty body still leaves a modified entry behind.
+    audit::record(
+        sess,
+        Actor::Account(&caller.user_id),
+        Action::UserModified,
+        "",
+        None,
+    )
+    .await?;
     Ok(user_json(sess, &caller.user_id).await?)
 }
 
@@ -3702,6 +3990,7 @@ pub async fn signup(
         return match sign_up_by_phone(pool, phone, password, &channel, &data, &mint, &post).await {
             Ok(SignedUp::Session(issued)) => json_body(StatusCode::OK, issued.json()),
             Ok(SignedUp::Pending(user)) => json_body(StatusCode::OK, user),
+            Ok(SignedUp::Taken) => already_registered(),
             Err(e) => refusal(e, "signup"),
         };
     }
@@ -3725,8 +4014,21 @@ pub async fn signup(
     {
         Ok(SignedUp::Session(issued)) => json_body(StatusCode::OK, issued.json()),
         Ok(SignedUp::Pending(user)) => json_body(StatusCode::OK, user),
+        Ok(SignedUp::Taken) => already_registered(),
         Err(e) => refusal(e, "signup"),
     }
+}
+
+/// The answer to a signup on an address that is already confirmed, for a
+/// project that confirms its own signups and so has no secret to keep.
+/// It is written here rather than raised as a refusal from `register`,
+/// because the repeated signup entry has to commit first.
+fn already_registered() -> Response {
+    error_body(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "user_already_exists",
+        "User already registered",
+    )
 }
 
 /// POST /auth/v1/verify, where a client that holds the code, or the
@@ -4819,6 +5121,17 @@ async fn attach(
     }
 
     if address.is_empty() || confirmed {
+        // Nothing here is a signup even when the account was made a few
+        // statements ago, because an account whose address was already
+        // proved elsewhere is being signed in to rather than started.
+        audit::record(
+            sess,
+            Actor::Account(&user_id),
+            Action::Login,
+            "",
+            Some(serde_json::json!({ "provider": provider })),
+        )
+        .await?;
         merge_claims(sess, &user_id, &person.claims).await?;
         providers_of(sess, &user_id).await?;
         return Ok(Attached::User(user_id));
@@ -4850,6 +5163,14 @@ async fn attach(
     providers_of(sess, &user_id).await?;
 
     if person.email_verified || post.autoconfirm {
+        audit::record(
+            sess,
+            Actor::Account(&user_id),
+            Action::UserSignedUp,
+            "",
+            Some(serde_json::json!({ "provider": provider })),
+        )
+        .await?;
         sess.execute(
             "update auth.users
                 set email_confirmed_at = now(), confirmation_token = '',
@@ -4860,6 +5181,11 @@ async fn attach(
         .await?;
         return Ok(Attached::User(user_id));
     }
+
+    // The remaining branch writes nothing. It sends a confirmation and
+    // refuses, and upstream records neither the send nor the refusal,
+    // which leaves the one social sign in that fails silent in the
+    // trail.
 
     // The provider will not vouch for the address, so it is proved the
     // same way a password signup proves one, and there is no session
@@ -5098,7 +5424,7 @@ async fn unlink(sess: &sql::Session, user_id: &str, identity_id: &str) -> Result
     }
     let rows = sess
         .query(
-            "select id::text, provider from auth.identities
+            "select id::text, provider, provider_id from auth.identities
               where user_id = $1::text::uuid for update",
             &[&user_id],
         )
@@ -5121,6 +5447,21 @@ async fn unlink(sess: &sql::Session, user_id: &str, identity_id: &str) -> Result
         ));
     };
     let provider: String = row.get(1);
+    let provider_id: String = row.get(2);
+    // Before the delete, because the traits name the identity that is
+    // about to stop existing.
+    audit::record(
+        sess,
+        Actor::Account(user_id),
+        Action::IdentityUnlinked,
+        "",
+        Some(serde_json::json!({
+            "identity_id": identity_id,
+            "provider": provider,
+            "provider_id": provider_id,
+        })),
+    )
+    .await?;
     sess.execute(
         "delete from auth.identities where id = $1::text::uuid",
         &[&identity_id],
@@ -5305,7 +5646,8 @@ async fn redeem(
                     coalesce(provider_access_token, ''),
                     coalesce(provider_refresh_token, ''),
                     created_at < now() - make_interval(secs => $2::double precision),
-                    authentication_method
+                    authentication_method,
+                    provider_type
                from auth.flow_state
               where auth_code = $1 and user_id is not null
               for update",
@@ -5334,8 +5676,20 @@ async fn redeem(
     let (challenge, method): (String, String) = (row.get(2), row.get(3));
     let (access, refresh): (String, String) = (row.get(4), row.get(5));
     let proved: String = row.get(7);
+    let provider_type: String = row.get(8);
     verify_pkce(&challenge, &method, verifier)?;
 
+    // The one login entry whose trait is named provider_type rather than
+    // provider, and whose value is the flow's provider rather than the
+    // method that proved anything. Both are upstream's.
+    audit::record(
+        sess,
+        Actor::Account(&user_id),
+        Action::Login,
+        "",
+        Some(serde_json::json!({ "provider_type": provider_type })),
+    )
+    .await?;
     let issued = start(sess, &user_id, &proved, mint).await?;
     sess.execute(
         "delete from auth.flow_state where id = $1::text::uuid",
@@ -5667,6 +6021,17 @@ async fn texted(pool: &Pool, phone: &str, channel: &str, post: &Post<'_>) -> Res
             return Ok(String::new());
         };
         let user_id: String = row.get(0);
+        // A sign in code to a number is filed as a recovery request, the
+        // same as a magic link is, and it is the one send that carries
+        // the channel in its traits.
+        audit::record(
+            &sess,
+            Actor::Account(&user_id),
+            Action::UserRecoveryRequested,
+            "",
+            Some(serde_json::json!({ "channel": channel })),
+        )
+        .await?;
         send_phone_code(
             &sess,
             post,
@@ -5847,6 +6212,14 @@ async fn resent(
             if phone_confirmed {
                 return Ok(String::new());
             }
+            audit::record(
+                sess,
+                Actor::Account(&user_id),
+                Action::UserRecoveryRequested,
+                "",
+                None,
+            )
+            .await?;
             // Resend has no channel of its own, so it goes out the way
             // upstream sends it, which is always plain sms.
             return send_phone_code(
@@ -5886,6 +6259,19 @@ async fn resent(
             if confirmed {
                 return Ok(String::new());
             }
+            // The two resends that write anything are the two that
+            // start something over. A resent address change or number
+            // change writes nothing, which is upstream's, and is
+            // defensible: the change itself was already recorded when
+            // it was staged.
+            audit::record(
+                sess,
+                Actor::Account(&user_id),
+                Action::UserConfirmationRequested,
+                "",
+                None,
+            )
+            .await?;
             within_limit(
                 sess,
                 &user_id,
@@ -6039,6 +6425,16 @@ pub async fn logout(
 
 async fn log_out(sess: &sql::Session, caller: &Caller, scope: Scope) -> Result<(), Error> {
     still_there(sess, caller).await?;
+    // One entry whatever the scope, which is upstream's: the trail says
+    // somebody logged out and not how much of them logged out.
+    audit::record(
+        sess,
+        Actor::Account(&caller.user_id),
+        Action::Logout,
+        "",
+        None,
+    )
+    .await?;
     // A token that names no session cannot say which one to keep or
     // which one to drop, so both of the narrow scopes fall back to the
     // wide one, which is upstream's behaviour and the safe direction to

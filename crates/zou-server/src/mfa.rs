@@ -17,6 +17,12 @@
 //! second factor should not still have aal1 sessions lying around that
 //! never had to pass it.
 //!
+//! Every one of the four writes an audit entry, and these are the only
+//! entries in the trail whose `ip_address` column is filled in: upstream
+//! passes the address here and nowhere else, so a query that asks where
+//! a factor was enrolled from can be answered and the same query about a
+//! login cannot.
+//!
 //! Only TOTP is built. Phone and webauthn factors are refused with the
 //! codes upstream refuses them with when they are switched off, which
 //! is what an unconfigured GoTrue answers too.
@@ -27,6 +33,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::response::Response;
 
+use crate::audit::{self, Action, Actor};
 use crate::auth::{
     Caller, Error, Mint, caller, client_ip, denied, error_body, field, is_uuid, mint_for,
     no_database, now, read_json, refusal, refused, still_there,
@@ -173,6 +180,7 @@ pub async fn enroll(
     let Some(session_id) = caller.session_id.clone() else {
         return no_session();
     };
+    let ip = client_ip(&req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -188,7 +196,7 @@ pub async fn enroll(
         Ok(v) => v,
         Err(e) => return refusal(Error::Db(e), "enroll factor"),
     };
-    let out = enrolling(pool, &sess, &app, &caller, &session_id, &body, &issuer).await;
+    let out = enrolling(pool, &sess, &app, &caller, &session_id, &body, &issuer, &ip).await;
     finish(sess, out, "enroll factor").await
 }
 
@@ -201,6 +209,7 @@ async fn enrolling(
     session_id: &str,
     body: &serde_json::Value,
     issuer: &str,
+    ip: &str,
 ) -> Result<serde_json::Value, Error> {
     still_there(sess, caller).await?;
     // The switch is read before the body is judged, which is why a
@@ -269,6 +278,18 @@ async fn enrolling(
         )
         .await?;
     let id: String = rows[0].get(0);
+    // No factor_type in the traits. Upstream carries one on the phone
+    // and webauthn enrollments and leaves it off the TOTP one, so a
+    // reader who filters on it loses exactly the factors this server
+    // makes.
+    audit::record(
+        sess,
+        Actor::Account(&caller.user_id),
+        Action::FactorInProgress,
+        ip,
+        Some(serde_json::json!({ "factor_id": id })),
+    )
+    .await?;
     Ok(serde_json::json!({
         "id": id,
         "type": "totp",
@@ -398,6 +419,21 @@ async fn challenging(
         )
         .await?;
     let (id, expires_at): (String, i64) = (rows[0].get(0), rows[0].get(1));
+    // The status the factor held when it was challenged, not the one it
+    // will hold after a code comes back, which is what makes a trail of
+    // these readable: the first challenge against a factor says
+    // unverified and every one after it says verified.
+    audit::record(
+        sess,
+        Actor::Account(&caller.user_id),
+        Action::ChallengeCreated,
+        ip,
+        Some(serde_json::json!({
+            "factor_id": factor.id,
+            "factor_status": factor.status,
+        })),
+    )
+    .await?;
     // clock_timestamp rather than now, because the column is unique
     // across the whole table upstream and two challenges in one
     // transaction would otherwise be the same instant.
@@ -485,6 +521,22 @@ async fn verifying(
     if !crate::totp::valid(code, &factor.secret, now()) {
         return unprocessable("mfa_verification_failed", "Invalid TOTP code entered");
     }
+    // Attempted, and upstream means the word loosely: the entry is only
+    // written once the code has already checked out, so a wrong code
+    // leaves nothing behind and the trail cannot be used to count
+    // guesses against a factor.
+    audit::record(
+        sess,
+        Actor::Account(&caller.user_id),
+        Action::VerificationAttempted,
+        ip,
+        Some(serde_json::json!({
+            "factor_id": factor.id,
+            "challenge_id": challenge,
+            "factor_type": factor.kind,
+        })),
+    )
+    .await?;
     sess.execute(
         "update auth.mfa_challenges set verified_at = now() where id = $1::text::uuid",
         &[&challenge],
@@ -653,11 +705,12 @@ pub async fn unenroll(
     let Some(session_id) = caller.session_id.clone() else {
         return no_session();
     };
+    let ip = client_ip(&req);
     let sess = match pool.admin().await {
         Ok(v) => v,
         Err(e) => return refusal(Error::Db(e), "unenroll factor"),
     };
-    let out = unenrolling(&sess, &caller, &session_id, &factor_id).await;
+    let out = unenrolling(&sess, &caller, &session_id, &factor_id, &ip).await;
     finish(sess, out, "unenroll factor").await
 }
 
@@ -666,6 +719,7 @@ async fn unenrolling(
     caller: &Caller,
     session_id: &str,
     factor_id: &str,
+    ip: &str,
 ) -> Result<serde_json::Value, Error> {
     still_there(sess, caller).await?;
     let factor = owned_factor(sess, &caller.user_id, factor_id).await?;
@@ -696,6 +750,21 @@ async fn unenrolling(
     sess.execute(
         "delete from auth.mfa_factors where id = $1::text::uuid",
         &[&factor.id],
+    )
+    .await?;
+    // The session that did the unenrolling, which is the one trait here
+    // that is about the person rather than the factor, and the reason
+    // this is the only factor entry that carries one.
+    audit::record(
+        sess,
+        Actor::Account(&caller.user_id),
+        Action::FactorUnenrolled,
+        ip,
+        Some(serde_json::json!({
+            "factor_id": factor.id,
+            "factor_status": factor.status,
+            "session_id": session_id,
+        })),
     )
     .await?;
     Ok(serde_json::json!({"id": factor.id}))

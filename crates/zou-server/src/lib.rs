@@ -28,6 +28,7 @@ use axum::{Router, middleware};
 use zou_rest::catalog::Catalog;
 
 pub mod admin;
+pub mod audit;
 pub mod auth;
 pub mod edge;
 pub mod hook;
