@@ -52,6 +52,12 @@ pub struct Case {
     /// Why this case exists, when that is not obvious from the name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Whether the rows are different afterwards. A suite with a
+    /// `reset.sql` puts them back before every case that says yes, so
+    /// that a case is asked against the rows it was written against
+    /// rather than against whatever the case before it left.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub writes: bool,
 }
 
 fn get() -> String {
@@ -63,7 +69,25 @@ pub struct Cases {
     pub suite: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub note: Vec<String>,
+    /// The schemas a target has to expose for these cases to mean
+    /// anything, first one first, since the first is the one a request
+    /// that names no schema gets.
+    #[serde(default = "conformance_schemas")]
+    pub schemas: Vec<String>,
+    /// The role the anon key carries. Upstream's own fixtures grant to
+    /// a role of their own, so a suite derived from them asks under
+    /// that name rather than under Supabase's.
+    #[serde(default = "anon")]
+    pub anon_role: String,
     pub cases: Vec<Case>,
+}
+
+fn conformance_schemas() -> Vec<String> {
+    vec!["conformance".to_string(), "public".to_string()]
+}
+
+fn anon() -> String {
+    "anon".to_string()
 }
 
 /// One answer, kept in the shape it is compared in rather than the
@@ -119,6 +143,10 @@ pub struct Suite {
     pub name: String,
     pub dir: PathBuf,
     pub setup: String,
+    /// The rows on their own, when the suite has them apart from the
+    /// schema. Absent means the cases are asked in the order they are
+    /// written and live with what the ones before them did.
+    pub reset: Option<String>,
     pub cases: Cases,
     pub known: Vec<Known>,
 }
@@ -140,6 +168,11 @@ impl Suite {
             ));
         }
         let setup = read(&dir.join("setup.sql"))?;
+        let path = dir.join("reset.sql");
+        let reset = match path.is_file() {
+            true => Some(read(&path)?),
+            false => None,
+        };
         let cases: Cases = serde_json::from_str(&read(&dir.join("cases.json"))?)
             .map_err(|e| format!("{name}/cases.json: {e}"))?;
         if cases.suite != name {
@@ -175,6 +208,7 @@ impl Suite {
             name: name.to_string(),
             dir,
             setup,
+            reset,
             cases,
             known,
         })
@@ -190,6 +224,10 @@ impl Suite {
 
     pub fn recording_path(&self) -> PathBuf {
         self.dir.join("recorded.json")
+    }
+
+    pub fn known_path(&self) -> PathBuf {
+        self.dir.join("known.json")
     }
 
     pub fn recording(&self) -> Result<Recording, String> {

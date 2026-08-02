@@ -68,8 +68,14 @@ impl Target {
     ) -> Target {
         // Statuses are the answer here, not an error, and a slow target
         // should say so rather than hang a CI job for ten minutes.
+        // A 3xx is an answer like any other and gets compared like one.
+        // Following it would ask a second question and record what came
+        // back to that instead, and a 300 with no location, which is
+        // what PostgREST says when an embed is ambiguous, would not even
+        // be followable.
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .max_redirects(0)
             .timeout_global(Some(Duration::from_secs(30)))
             .build()
             .into();
@@ -173,12 +179,28 @@ impl Target {
             let result = client
                 .batch_execute(setup)
                 .await
-                .map_err(|e| format!("{}: setup.sql: {e}", self.name));
+                .map_err(|e| format!("{}: setup.sql: {}", self.name, because(&e)));
             drop(client);
             let _ = task.await;
             result
         })
     }
+}
+
+/// An error and everything under it, on one line.
+///
+/// tokio_postgres prints "db error" and keeps the statement that failed
+/// and the position in it in the source, which is the only part anybody
+/// reading a setup failure wants.
+fn because(error: &dyn std::error::Error) -> String {
+    let mut out = error.to_string();
+    let mut under = error.source();
+    while let Some(error) = under {
+        out.push_str(": ");
+        out.push_str(&error.to_string());
+        under = error.source();
+    }
+    out
 }
 
 /// The characters a url cannot carry, escaped, and nothing else.
@@ -280,6 +302,7 @@ mod tests {
             headers: BTreeMap::new(),
             body: None,
             note: None,
+            writes: false,
         }
     }
 

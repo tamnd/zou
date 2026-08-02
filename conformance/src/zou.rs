@@ -28,7 +28,11 @@ pub fn key(role: &str, secret: &str) -> String {
 }
 
 /// Start zou against `dsn` on a free port and wait until it answers.
-pub fn start(dsn: &str, secret: &[u8]) -> Result<Served, String> {
+///
+/// `schemas` comes from the suite, because a suite derived from
+/// upstream's fixtures keeps its tables where upstream keeps them and
+/// the reference is configured to match.
+pub fn start(dsn: &str, secret: &[u8], schemas: &[String]) -> Result<Served, String> {
     // Bound here rather than inside the thread, so a port that cannot
     // be had is an error the caller sees instead of a run that hangs.
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("binding a port: {e}"))?;
@@ -43,9 +47,8 @@ pub fn start(dsn: &str, secret: &[u8]) -> Result<Served, String> {
         external_url: Some(url.clone()),
         // What the reference is configured with, in the same order,
         // since the first is the one a request that names no schema
-        // gets. The suites keep their tables in the first and use the
-        // second only to have somewhere else to point at.
-        schemas: vec!["conformance".to_string(), "public".to_string()],
+        // gets.
+        schemas: schemas.to_vec(),
         mailer_autoconfirm: true,
         ..Config::default()
     };

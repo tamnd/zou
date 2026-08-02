@@ -1,0 +1,2578 @@
+[
+  {
+    "name": "query: causes a 404",
+    "why": "body {\"code\":\"42P01\",\"details\":null,\"hint\":null,\"message\":\"relation \\\"faketable\\\" does not exist\"} not {\"code\":\"PGRST205\",\"details\":null,\"hint\":null,\"message\":\"Could not find the table 'test.faketable' in the schema cache\"}"
+  },
+  {
+    "name": "query: matches not_null using is operator",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: not.is.not_null is equivalent to is.null",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: matches with null and not_null values in upper or mixed case (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: fails if 'is' used and there's no null or trilean value",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"is wants null, true, false, or unknown, not (nil) at offset 6\"} not {\"code\":\"PGRST100\",\"details\":\"unexpected \\\"i\\\" expecting isVal: (null, not_null, true, false, unknown)\",\"hint\":null,\"message\":\"\\\"failed to parse filter (is.nil)\\\" (line 1, column 5)\"}"
+  },
+  {
+    "name": "query: fails if 'is' used and there's no null or trilean value (2)",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"is wants null, true, false, or unknown, not (ok) at offset 5\"} not {\"code\":\"PGRST100\",\"details\":\"unexpected \\\"o\\\" expecting isVal: (null, not_null, true, false, unknown)\",\"hint\":null,\"message\":\"\\\"failed to parse filter (is.ok)\\\" (line 1, column 4)\"}"
+  },
+  {
+    "name": "query: can be used with or query param",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when the column type is a tsvector domain",
+    "why": "content-type \"application/json\" not \"application/json; charset=utf-8\""
+  },
+  {
+    "name": "query: works when the column type is a recursive tsvector domain",
+    "why": "content-type \"application/json\" not \"application/json; charset=utf-8\""
+  },
+  {
+    "name": "query: finds matches with to_tsquery (3)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can use lexeme boolean operators(&=%26, |=%7C, !) in to_tsquery (5)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can use lexeme boolean operators(&=%26, |=%7C, !) in to_tsquery (7)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can use lexeme boolean operators(&=%26, |=%7C, !) in to_tsquery (9)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: finds matches with plainto_tsquery (3)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: finds matches with websearch_to_tsquery (3)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can use boolean operators(and, or, -) in websearch_to_tsquery (5)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can use boolean operators(and, or, -) in websearch_to_tsquery (7)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can use boolean operators(and, or, -) in websearch_to_tsquery (9)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: finds matches with different dictionaries and uses them as configuration for to_tsvector() (2)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: finds matches with different dictionaries and uses them as configuration for to_tsvector() (3)",
+    "why": "content-range \"*/*\" not \"0-0/*\""
+  },
+  {
+    "name": "query: finds matches with different dictionaries and uses them as configuration for to_tsvector() (4)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: finds matches with different dictionaries and uses them as configuration for to_tsvector() (5)",
+    "why": "content-range \"*/*\" not \"0-0/*\""
+  },
+  {
+    "name": "query: finds matches with different dictionaries and uses them as configuration for to_tsvector() (6)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can be negated with not operator (7)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can be negated with not operator (9)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can be negated with not operator (11)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can be negated with not operator (13)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: finds matches (3)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: finds matches with different dictionaries and uses them as configuration for to_tsvector() (7)",
+    "why": "content-range \"*/*\" not \"0-0/*\""
+  },
+  {
+    "name": "query: finds matches with different dictionaries and uses them as configuration for to_tsvector() (8)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can be negated with not operator (15)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: can be used with or query param (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: can be used with or query param (3)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "query: cannot access a computed column that is outside of the config schema",
+    "why": "body {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column z0.always_false does not exist\"} not {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column items.always_false does not exist\"}"
+  },
+  {
+    "name": "query: errs when the embedded resource doesn't exist and an embedded filter is applied to it",
+    "why": "body {\"code\":\"PGRST108\",\"details\":null,\"hint\":null,\"message\":\"'non_existent_projects' is not an embedded resource in this request, the filter on it has nowhere to go\"} not {\"code\":\"PGRST108\",\"details\":null,\"hint\":\"Verify that 'non_existent_projects' is included in the 'select' query parameter.\",\"message\":\"'non_existent_projects' is not an embedded resource in this reque..."
+  },
+  {
+    "name": "query: errs when the embedded resource doesn't exist and an embedded filter is applied to it (2)",
+    "why": "body {\"code\":\"PGRST108\",\"details\":null,\"hint\":null,\"message\":\"'amiga_projectsss' is not an embedded resource in this request, the filter on it has nowhere to go\"} not {\"code\":\"PGRST108\",\"details\":null,\"hint\":\"Verify that 'amiga_projectsss' is included in the 'select' query parameter.\",\"message\":\"'amiga_projectsss' is not an embedded resource in this request\"}"
+  },
+  {
+    "name": "query: errs when the embedded resource doesn't exist and an embedded filter is applied to it (3)",
+    "why": "body {\"code\":\"PGRST108\",\"details\":null,\"hint\":null,\"message\":\"'projects.tasks2' is not an embedded resource in this request, the filter on it has nowhere to go\"} not {\"code\":\"PGRST108\",\"details\":null,\"hint\":\"Verify that 'tasks2' is included in the 'select' query parameter.\",\"message\":\"'tasks2' is not an embedded resource in this request\"}"
+  },
+  {
+    "name": "query: requesting parents and children",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: requesting parents and children while renaming them",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: requesting parents and filtering parent columns",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: requesting children with composite key",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when using column as target",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when using column as target (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when using column as target (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when using column as target (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when using column as hint",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when using column as hint (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: overloaded computed column on rpc",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: can request many to many relationships between partitioned tables ignoring the intermediate table partitions",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "query: cannot request partitions as children from a partitioned table",
+    "why": "body {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column z1.id does not exist\"} not {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'car_models' and 'car_model_sales_202101' in the schema 'test', but no matches were found.\",\"hint\":\"Perhaps you meant 'car..."
+  },
+  {
+    "name": "query: table not found error if first table does not exist",
+    "why": "status 400 not 404"
+  },
+  {
+    "name": "query: cannot request a partition as parent from a partitioned table",
+    "why": "body {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column z1.id does not exist\"} not {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'car_model_sales' and 'car_models_default' in the schema 'test', but no matches were found.\",\"hint\":\"Perhaps you meant 'ca..."
+  },
+  {
+    "name": "query: table not found error if first table does not exist (2)",
+    "why": "status 400 not 404"
+  },
+  {
+    "name": "query: can detect fk relations through views to tables in the public schema",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: can detect fk relations through materialized views to tables in the public schema",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: can request two parents",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: can detect relations in views from exposed schema that are based on tables in private schema and have columns renames",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when requesting parents and children on views",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when requesting parents and children on views with renamed keys",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: detects parent relations when having many views of a private table",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: detects parent relations when having many views of a private table (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: detects parent relations when having many views of a private table (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: detects parent relations when having many views of a private table (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: can detect fk relations through multiple views recursively when all views are in api schema",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works with views that have subselects",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works with views that have case subselects",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works with views that have subselect in the FROM clause",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works with views that have subselects in a function call",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works with views that have CTE",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when having a capitalized table name and camelCase fk column",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when embedding a view with a table that has a long compound pk",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when embedding a view with a table that has a long compound pk (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when embedding a view with a view that referes to a table that has a long compound pk",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when embedding a view with a view that referes to a table that has a long compound pk (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works when embedding two views that refer to tables with different column ordering",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: can embed a view that has group by",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: can embed a view that has a subselect containing a select in a where",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works with one to one relationships",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works with one to one relationships (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works with one to one relationships (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works with one to one relationships (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: ordering embeded entities",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: ordering embeded entities with alias",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: ordering embeded entities, two levels",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: ordering embeded parents does not break things",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: gives meaningful error message on bad syntax",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"unknown order modifier (nullslasttt) at offset 7\"} not {\"code\":\"PGRST100\",\"details\":\"unexpected 't' expecting \\\",\\\" or end of input\",\"hint\":null,\"message\":\"\\\"failed to parse order (id.asc.nullslasttt)\\\" (line 1, column 17)\"}"
+  },
+  {
+    "name": "query: fails if an operator is not given",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"unknown operator (0) at offset 0\"} not {\"code\":\"PGRST100\",\"details\":\"unexpected \\\"0\\\" expecting \\\"not\\\" or operator (eq, gt, ...)\",\"hint\":null,\"message\":\"\\\"failed to parse filter (0)\\\" (line 1, column 1)\"}"
+  },
+  {
+    "name": "query: accepts single double quotes as values",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works for integer",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works for text",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works for bool",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works for bytea",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works for char",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works for date",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works for real",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works for time",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: returns all results for not.in when no value is present",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: returns an empty result ignoring spaces",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: only returns an empty result set if the in value is empty",
+    "why": "body {\"code\":\"22P02\",\"details\":null,\"hint\":null,\"message\":\"invalid input syntax for type integer: \\\" \\\"\"} not {\"code\":\"22P02\",\"details\":null,\"hint\":null,\"message\":\"invalid input syntax for type integer: \\\"\\\"\"}"
+  },
+  {
+    "name": "query: can be embedded",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: works on nested relationships",
+    "why": "body [{\"id\":1,\"name\":\"Angela Martin\",\"users_tasks\":[{\"tasks\":{\"?column?\":1}},{\"tasks\":{\"?column?\":1}},{\"tasks\":{\"?column?\":1}},{\"tasks\":{\"?column?\":1}}]},{\"id\":2,\"name\":\"Michael Scott\",\"users_tasks\":[{\"tas... not [{\"id\":1,\"name\":\"Angela Martin\"},{\"id\":2,\"name\":\"Michael Scott\"},{\"id\":3,\"name\":\"Dwight Schrute\"}]"
+  },
+  {
+    "name": "query: works on nested relationships (2)",
+    "why": "body [{\"id\":1,\"name\":\"Angela Martin\",\"users_tasks\":[{\"tasks\":{\"?column?\":1}}]}] not [{\"id\":1,\"name\":\"Angela Martin\"}]"
+  },
+  {
+    "name": "query: works on nested relationships (3)",
+    "why": "body [{\"id\":1,\"name\":\"Angela Martin\",\"tasks\":[{\"projects\":{\"?column?\":1}},{\"projects\":{\"?column?\":1}},{\"projects\":{\"?column?\":1}},{\"projects\":{\"?column?\":1}}]},{\"id\":2,\"name\":\"Michael Scott\",\"tasks\":[{\"pro... not [{\"id\":1,\"name\":\"Angela Martin\"},{\"id\":2,\"name\":\"Michael Scott\"},{\"id\":3,\"name\":\"Dwight Schrute\"}]"
+  },
+  {
+    "name": "query: works on nested relationships (4)",
+    "why": "body [{\"id\":1,\"name\":\"Angela Martin\",\"tasks\":[{\"name\":\"Design w10\",\"projects\":{\"?column?\":1}}]}] not [{\"id\":1,\"name\":\"Angela Martin\",\"tasks\":[{\"name\":\"Design w10\"}]}]"
+  },
+  {
+    "name": "query: gives all columns",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: gives all columns (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: formats a single column",
+    "why": "body [{\"id\":1,\"label_color\":0},{\"id\":2,\"label_color\":256},{\"id\":3,\"label_color\":123456}] not [{\"id\":1,\"label_color\":\"#000000\"},{\"id\":2,\"label_color\":\"#000100\"},{\"id\":3,\"label_color\":\"#01E240\"}]"
+  },
+  {
+    "name": "query: formats two columns with different formatters",
+    "why": "body [{\"due_at\":\"2018-01-02T00:00:00+07:00\",\"id\":1,\"label_color\":0},{\"due_at\":\"2018-01-03T00:00:00+07:00\",\"id\":2,\"label_color\":256},{\"due_at\":\"2018-01-01T14:12:34.123456+07:00\",\"id\":3,\"label_color\":123456}... not [{\"due_at\":\"2018-01-02T00:00:00+07:00\",\"id\":1,\"label_color\":\"#000000\"},{\"due_at\":\"2018-01-03T00:00:00+07:00\",\"id\":2,\"label_color\":\"#000100\"},{\"due_at\":\"2018-01-01T14:12:34.123456+07:00\",\"id\":3,\"label_..."
+  },
+  {
+    "name": "query: fails in some reasonable way when selecting fields that don't exist",
+    "why": "body {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column z0.banana does not exist\"} not {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column datarep_todos.banana does not exist\"}"
+  },
+  {
+    "name": "query: formats columns in views including computed columns",
+    "why": "body [{\"dark_color\":0,\"id\":1,\"label_color\":0},{\"dark_color\":128,\"id\":2,\"label_color\":256},{\"dark_color\":61728,\"id\":3,\"label_color\":123456},{\"dark_color\":null,\"id\":4,\"label_color\":null}] not [{\"dark_color\":\"#000000\",\"id\":1,\"label_color\":\"#000000\"},{\"dark_color\":\"#000080\",\"id\":2,\"label_color\":\"#000100\"},{\"dark_color\":\"#00F120\",\"id\":3,\"label_color\":\"#01E240\"},{\"dark_color\":\"\",\"id\":4,\"label_..."
+  },
+  {
+    "name": "query: formats and allows rename",
+    "why": "body [{\"clr\":0,\"id\":1},{\"clr\":256,\"id\":2},{\"clr\":123456,\"id\":3}] not [{\"clr\":\"#000000\",\"id\":1},{\"clr\":\"#000100\",\"id\":2},{\"clr\":\"#01E240\",\"id\":3}]"
+  },
+  {
+    "name": "query: formats, renames and allows manual casting on top",
+    "why": "body [{\"clr\":\"0\",\"id\":1},{\"clr\":\"256\",\"id\":2},{\"clr\":\"123456\",\"id\":3}] not [{\"clr\":\"\\\"#000000\\\"\",\"id\":1},{\"clr\":\"\\\"#000100\\\"\",\"id\":2},{\"clr\":\"\\\"#01E240\\\"\",\"id\":3}]"
+  },
+  {
+    "name": "query: formats nulls",
+    "why": "body [{\"due_at\":\"2018-01-01T14:12:34.123456+07:00\",\"id\":3,\"label_color\":123456},{\"due_at\":null,\"id\":4,\"label_color\":null}] not [{\"due_at\":\"2018-01-01T14:12:34.123456+07:00\",\"id\":3,\"label_color\":\"#01E240\"},{\"due_at\":null,\"id\":4,\"label_color\":\"\"}]"
+  },
+  {
+    "name": "query: formats star select",
+    "why": "body [{\"budget\":12.5,\"created_at\":\"2017-12-14T01:02:30+07:00\",\"due_at\":\"2018-01-02T00:00:00+07:00\",\"icon_image\":\"\\\\x89504e470d0a1a0a0000000d4948445200000001000000010100000000376ef924000000001049444154789c6... not [{\"budget\":\"12.50\",\"created_at\":1513188150,\"due_at\":\"2018-01-02T00:00:00+07:00\",\"icon_image\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQAAAAA3bvkkAAAAABBJREFUeJxiYAEAAAAA//8DAAAABgAFBXv6vUAAAAAASUVORK5CYII=\",..."
+  },
+  {
+    "name": "query: formats implicit star select",
+    "why": "body [{\"budget\":12.5,\"created_at\":\"2017-12-14T01:02:30+07:00\",\"due_at\":\"2018-01-02T00:00:00+07:00\",\"icon_image\":\"\\\\x89504e470d0a1a0a0000000d4948445200000001000000010100000000376ef924000000001049444154789c6... not [{\"budget\":\"12.50\",\"created_at\":1513188150,\"due_at\":\"2018-01-02T00:00:00+07:00\",\"icon_image\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQAAAAA3bvkkAAAAABBJREFUeJxiYAEAAAAA//8DAAAABgAFBXv6vUAAAAAASUVORK5CYII=\",..."
+  },
+  {
+    "name": "query: formats star and explicit mix",
+    "why": "body [{\"budget\":12.5,\"created_at\":\"2017-12-14T01:02:30+07:00\",\"due_at\":\"2018-01-02T00:00:00+07:00\",\"icon_image\":\"\\\\x89504e470d0a1a0a0000000d4948445200000001000000010100000000376ef924000000001049444154789c6... not [{\"budget\":\"12.50\",\"created_at\":1513188150,\"due_at\":\"2018-01-02T00:00:00+07:00\",\"icon_image\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABAQAAAAA3bvkkAAAAABBJREFUeJxiYAEAAAAA//8DAAAABgAFBXv6vUAAAAAASUVORK5CYII=\",..."
+  },
+  {
+    "name": "query: formats through join",
+    "why": "body [{\"first_item\":{\"due_at\":\"2018-01-03T00:00:00+07:00\",\"label_color\":256},\"id\":1,\"name\":\"school related\"},{\"first_item\":{\"due_at\":\"2018-01-02T00:00:00+07:00\",\"label_color\":0},\"id\":2,\"name\":\"do these fir... not [{\"first_item\":{\"due_at\":\"2018-01-03T00:00:00+07:00\",\"label_color\":\"#000100\"},\"id\":1,\"name\":\"school related\"},{\"first_item\":{\"due_at\":\"2018-01-02T00:00:00+07:00\",\"label_color\":\"#000000\"},\"id\":2,\"name\"..."
+  },
+  {
+    "name": "query: formats through join with star select",
+    "why": "body [{\"id\":1,\"name\":\"school related\",\"second_item\":{\"budget\":0.0,\"created_at\":\"2017-12-14T01:02:30+07:00\",\"due_at\":\"2018-01-01T14:12:34.123456+07:00\",\"icon_image\":null,\"id\":3,\"label_color\":123456,\"name\":\"... not [{\"id\":1,\"name\":\"school related\",\"second_item\":{\"budget\":\"0.00\",\"created_at\":1513188150,\"due_at\":\"2018-01-01T14:12:34.123456+07:00\",\"icon_image\":null,\"id\":3,\"label_color\":\"#01E240\",\"name\":\"Algebra\"}},..."
+  },
+  {
+    "name": "query: uses text parser on value for filter given through query parameters",
+    "why": "content-range \"*/*\" not \"0-0/*\""
+  },
+  {
+    "name": "query: uses text parser for filter with 'IN' predicates",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: uses text parser for filter with 'NOT IN' predicates",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "query: uses text parser on value for filter across relations",
+    "why": "body [{\"datarep_todos\":{\"due_at\":\"2018-01-03T00:00:00+07:00\",\"label_color\":256},\"id\":1,\"name\":\"school related\"},{\"datarep_todos\":{\"due_at\":\"2018-01-02T00:00:00+07:00\",\"label_color\":0},\"id\":2,\"name\":\"do the... not [{\"datarep_todos\":null,\"id\":1,\"name\":\"school related\"},{\"datarep_todos\":{\"due_at\":\"2018-01-02T00:00:00+07:00\",\"label_color\":\"#000000\"},\"id\":2,\"name\":\"do these first\"}]"
+  },
+  {
+    "name": "query: return http status 404",
+    "why": "content-type \"application/json\" not \"application/json; charset=utf-8\""
+  },
+  {
+    "name": "andor: can handle eq and neq",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: can handle fts on tsvector columns (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: can handle fts on text and json columns",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "andor: can handle fts on text and json columns (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: can handle isdistinct",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: can handle cs and cd",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: eq, cs, like can be negated",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: isdistinct can be negated",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: allows whitespace",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: cannot have zero conditions",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"expected a field name at offset 1\"} not {\"code\":\"PGRST100\",\"details\":\"unexpected \\\")\\\" expecting field name (* or [a..z0..9_$]), negation operator (not) or logic operator (and, or)\",\"hint\":null,\"message\":\"\\\"failed to parse logic tree (())\\\"..."
+  },
+  {
+    "name": "andor: can have three conditions",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: can have three conditions (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: can have four conditions combining and/or",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: can have four conditions combining and/or (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "andor: succeeds when using and/or params",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "andor: can query columns that begin with and/or reserved words",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: can define a many-to-one relationship with SETOF and ROWS 1 and embed",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: can define a many-to-one relationship without SETOF and embed",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: can define a one-to-many relationship and embed",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: works with !inner and count=exact",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: works with !inner and count=exact (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: works with !inner and count=exact (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: works with rpc",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: works with rpc (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: works with mutations",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "computed: works with mutations (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: works with mutations (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: applies data representations to response (3)",
+    "why": "body [{\"id\":1,\"name\":\"sidney k. meier\"}] not [{\"id\":1,\"name\":\"Sidney K. Meier\"}]"
+  },
+  {
+    "name": "computed: applies data representations to response (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: works with self joins",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: can override many-to-one and one-to-many relationships",
+    "why": "content-range \"0-3/*\" not \"*/*\""
+  },
+  {
+    "name": "computed: can override many-to-one and one-to-many relationships (2)",
+    "why": "content-range \"0-1/*\" not \"*/*\""
+  },
+  {
+    "name": "computed: can override one-to-one relationships(would give disambiguation errors otherwise)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: can override one-to-one relationships(would give disambiguation errors otherwise) (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: creates queries with the right aliasing",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: creates queries with the right aliasing (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: creates queries with the right aliasing when following a normal embed",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: creates queries with the right aliasing when following a normal embed (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: tables",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: tables (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: rpc",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "computed: rpc (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "delete: fails with 404",
+    "why": "body {\"code\":\"42P01\",\"details\":null,\"hint\":null,\"message\":\"relation \\\"foozle\\\" does not exist\"} not {\"code\":\"PGRST205\",\"details\":null,\"hint\":null,\"message\":\"Could not find the table 'test.foozle' in the schema cache\"}"
+  },
+  {
+    "name": "delete: fails deleting the row when return=representation and selecting all the columns",
+    "why": "status 403 not 401"
+  },
+  {
+    "name": "delete: succeeds deleting the row when return=representation and selecting only the privileged columns",
+    "why": "status 403 not 200"
+  },
+  {
+    "name": "embed: errs when there are o2m and m2m cardinalities to the target table",
+    "why": "body {\"code\":\"PGRST201\",\"details\":\"big_projects!main_project, big_projects!jobs\",\"hint\":\"Try changing 'big_projects' to one of the following: big_projects!main_project, big_projects!jobs. Find the desired ... not {\"code\":\"PGRST201\",\"details\":[{\"cardinality\":\"many-to-one\",\"embedding\":\"sites with big_projects\",\"relationship\":\"main_project using sites(main_project_id) and big_projects(big_project_id)\"},{\"cardinal..."
+  },
+  {
+    "name": "embed: errs on an ambiguous embed that has a circular reference",
+    "why": "body {\"code\":\"PGRST201\",\"details\":\"departments!agents_department_id_fkey, departments!departments_head_id_fkey\",\"hint\":\"Try changing 'departments' to one of the following: departments!agents_department_id_... not {\"code\":\"PGRST201\",\"details\":[{\"cardinality\":\"one-to-many\",\"embedding\":\"agents with departments\",\"relationship\":\"departments_head_id_fkey using agents(id) and departments(head_id)\"},{\"cardinality\":\"ma..."
+  },
+  {
+    "name": "embed: errs when there are more than two fks on a junction table but it can be disambiguated with spread embeds",
+    "why": "body {\"code\":\"PGRST201\",\"details\":\"whatev_projects!whatev_jobs, whatev_projects!whatev_jobs, whatev_projects!whatev_jobs, whatev_projects!whatev_jobs\",\"hint\":\"Try changing 'whatev_projects' to one of the f... not {\"code\":\"PGRST201\",\"details\":[{\"cardinality\":\"many-to-many\",\"embedding\":\"whatev_sites with whatev_projects\",\"relationship\":\"whatev_jobs using whatev_jobs_site_id_1_fkey(site_id_1) and whatev_jobs_proj..."
+  },
+  {
+    "name": "embed: errs on an ambiguous embed that has two one-to-one relationships",
+    "why": "body {\"code\":\"PGRST201\",\"details\":\"second!first_second_id_1_fkey, second!first_second_id_2_fkey\",\"hint\":\"Try changing 'second' to one of the following: second!first_second_id_1_fkey, second!first_second_id... not {\"code\":\"PGRST201\",\"details\":[{\"cardinality\":\"one-to-one\",\"embedding\":\"first with second\",\"relationship\":\"first_second_id_1_fkey using first(second_id_1) and second(id)\"},{\"cardinality\":\"one-to-one\",\"..."
+  },
+  {
+    "name": "embed: errs with multiple references to the same composite key columns in a view",
+    "why": "status 400 not 300"
+  },
+  {
+    "name": "embed: can embed by FK name",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can embed by FK name and select the FK column at the same time",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can embed parent with view!fk and grandparent by using fk",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can embed by using a composite FK name",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: embeds by using two fks pointing to the same table",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: fails if the fk is not known",
+    "why": "body {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'message' and 'person' in the schema cache\",\"hint\":null,\"message\":\"Could not find a relationship between 'message' and 'pe... not {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'message' and 'person' using the hint 'space' in the schema 'test', but no matches were found.\",\"hint\":null,\"message\":\"Cou..."
+  },
+  {
+    "name": "embed: can request a parent with fk",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can request two parents with fks",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can specify a view!fk",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can disambiguate with the fk in case of an o2m and m2m relationship to the same table",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can embed by column",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can embed by column and select the column at the same time, if aliased",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can embed parent by using view!column and grandparent by using the column",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: will embed using a column that has uppercase chars",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: embeds by using two columns pointing to the same table",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can disambiguate with the column in case of an o2m and m2m relationship to the same table",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can specify all view column names that reference the same base column",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can specify all view column names that reference the same base column (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can specify all view column names that reference the same base column (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can specify all view column names that reference the same base column (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can specify the junction of an m2m relationship (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: embeds by using a column and a fk pointing to the same table",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: embeds parents recursively",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: embeds children recursively",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "embed: embeds parent and then embeds children",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: embeds parent and then embeds children on a view",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can specify all view column names that reference the same base column (5)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: can specify all view column names that reference the same base column (6)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: embeds parents",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: embeds children",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "embed: embeds children (2)",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "embed: embeds other relations(manager) besides the self reference",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: embeds other relations(manager) besides the self reference (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with no ambiguity when there's an exposed view of the junction",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with no ambiguity when there's an exposed view of the junction (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: doesn't work if the junction is only internal",
+    "why": "body {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'end_1' and 'end_2' in the schema cache\",\"hint\":null,\"message\":\"Could not find a relationship between 'end_1' and 'end_2' ... not {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'end_1' and 'end_2' in the schema 'test', but no matches were found.\",\"hint\":null,\"message\":\"Could not find a relationship..."
+  },
+  {
+    "name": "embed: shouldn't try to embed if the private junction has an exposed homonym",
+    "why": "body {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'schauspieler' and 'filme' in the schema cache\",\"hint\":null,\"message\":\"Could not find a relationship between 'schauspieler... not {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'schauspieler' and 'filme' in the schema 'test', but no matches were found.\",\"hint\":null,\"message\":\"Could not find a relat..."
+  },
+  {
+    "name": "embed: works with self reference both ways(m2o and o2m)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with self reference both ways(m2o and o2m) (2)",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "embed: has to be explicit for a view embedding (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: resolves when there's a table and view that point to the same col",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: resolves when there's a table and view that point to the same fk (composite pk)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: should not expose hidden FKs",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with views",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with views (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with views (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with views (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with views (5)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with views (6)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with views (7)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works with rpc (2)",
+    "why": "content-range \"0-1/*\" not \"0-1/2\""
+  },
+  {
+    "name": "embed: works when using hints (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works alongside another embedding",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works alongside another embedding (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "embed: works alongside another embedding (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "insert: rejects json array that isn't exclusivily composed of objects",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"every element of an insert array must be an object\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"All object keys must match\"}"
+  },
+  {
+    "name": "insert: rejects json array that has objects with different keys",
+    "why": "status 201 not 400"
+  },
+  {
+    "name": "insert: should not throw and return location header when selecting without PK (2)",
+    "why": "location \"/rest/v1/projects?id=eq.11\" not \"/projects?id=eq.11\""
+  },
+  {
+    "name": "insert: should not throw and return location header for partitioned tables when selecting without PK",
+    "why": "location \"/rest/v1/car_models?name=eq.Enzo&year=eq.2021\" not \"/car_models?name=eq.Enzo&year=eq.2021\""
+  },
+  {
+    "name": "insert: accepts disparate json types (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"23502\",\"details\":\"Failing row contains (null, null, null, null, null, null, null).\",\"hint\":null,\"message\":\"null value in column \\\"integer\\\" of relation \\\"menagerie\\\" violates not-null constra..."
+  },
+  {
+    "name": "insert: succeeds with 201 and location header (2)",
+    "why": "location \"/rest/v1/auto_incrementing_pk?id=eq.2\" not \"/auto_incrementing_pk?id=eq.2\""
+  },
+  {
+    "name": "insert: returns 201 but no location header",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "insert: fails with 400 and error (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"expected value at line 1 column 1\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "insert: fails with 400 and error (3)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "insert: serializes nested object",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "insert: serializes nested array",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "insert: disallows blank ?columns",
+    "why": "body {\"code\":\"23502\",\"details\":null,\"hint\":null,\"message\":\"null value in column \\\"id\\\" of relation \\\"articles\\\" violates not-null constraint\"} not {\"code\":\"PGRST100\",\"details\":\"unexpected end of input expecting field name (* or [a..z0..9_$])\",\"hint\":null,\"message\":\"\\\"failed to parse columns parameter ()\\\" (line 1, column 1)\"}"
+  },
+  {
+    "name": "insert: disallows ?columns which don't exist",
+    "why": "body {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column \\\"helicopter\\\" of relation \\\"articles\\\" does not exist\"} not {\"code\":\"PGRST204\",\"details\":null,\"hint\":null,\"message\":\"Could not find the 'helicopter' column of 'articles' in the schema cache\"}"
+  },
+  {
+    "name": "insert: returns missing table error even if also has invalid ?columns",
+    "why": "body {\"code\":\"42P01\",\"details\":null,\"hint\":null,\"message\":\"relation \\\"garlic\\\" does not exist\"} not {\"code\":\"PGRST205\",\"details\":null,\"hint\":null,\"message\":\"Could not find the table 'test.garlic' in the schema cache\"}"
+  },
+  {
+    "name": "insert: disallows array elements that are not json objects",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"every element of an insert array must be an object\"} not {\"code\":\"22023\",\"details\":null,\"hint\":null,\"message\":\"argument of json_to_recordset must be an array of objects\"}"
+  },
+  {
+    "name": "insert: inserts table default values(field-with_sep) when json keys are undefined",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: inserts view default values(field-with_sep) when json keys are undefined",
+    "why": "preference-applied absent not \"missing=default\""
+  },
+  {
+    "name": "insert: doesn't insert json duplicate keys(since it uses jsonb)",
+    "why": "preference-applied absent not \"missing=default\""
+  },
+  {
+    "name": "insert: inserts a default on a generated by default as identity column",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: inserts a default on a DOMAIN with default",
+    "why": "preference-applied absent not \"missing=default\""
+  },
+  {
+    "name": "insert: inserts a COLUMN default before a DOMAIN default with missing=default",
+    "why": "preference-applied absent not \"missing=default\""
+  },
+  {
+    "name": "insert: inserts json that has duplicate keys",
+    "why": "numbers written as 2,3 not 1,2,3"
+  },
+  {
+    "name": "insert: inserts json that has duplicate keys (2)",
+    "why": "numbers written as 2,3 not 1,2,3"
+  },
+  {
+    "name": "insert: succeeds with multipart response",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"parse error (not enough input) at \\\"\\\"\"}"
+  },
+  {
+    "name": "insert: returns full details of inserted record",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: can post nulls (2)",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: only returns the requested column header with its associated data",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: fails for too few",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"expected value at line 1 column 1\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"All lines must have same number of fields\"}"
+  },
+  {
+    "name": "insert: set user_id when inserting rows",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "insert: set user_id when inserting rows (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "insert: embeds parent after insert",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: succeeds inserting if correct select is applied",
+    "why": "status 403 not 201"
+  },
+  {
+    "name": "insert: fails inserting if more columns are selected",
+    "why": "status 403 not 401"
+  },
+  {
+    "name": "insert: fails inserting if select is not specified",
+    "why": "status 403 not 401"
+  },
+  {
+    "name": "insert: returns a location header with pks from both tables",
+    "why": "location absent not \"/with_multiple_pks?pk1=eq.1&pk2=eq.2\""
+  },
+  {
+    "name": "insert: returns a location header with a composite PK col",
+    "why": "location absent not \"/compound_pk_view?k1=eq.1&k2=eq.test\""
+  },
+  {
+    "name": "insert: should not throw and return location header when a PK is null",
+    "why": "location absent not \"/test_null_pk_competitors_sponsors?id=eq.1&sponsor_id=is.null\""
+  },
+  {
+    "name": "insert: parses values in POST body",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: parses values in POST body and formats individually selected values in return=representation",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: parses values in POST body and formats values in return=representation",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: ignores json keys not included in ?columns; parses only the ones specified",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: fails without parsing anything if at least one specified column doesn't exist",
+    "why": "body {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column \\\"helicopters\\\" of relation \\\"datarep_todos\\\" does not exist\"} not {\"code\":\"PGRST204\",\"details\":null,\"hint\":null,\"message\":\"Could not find the 'helicopters' column of 'datarep_todos' in the schema cache\"}"
+  },
+  {
+    "name": "insert: parses values in POST body (2)",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: parses values in POST body and formats individually selected values in return=representation (2)",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: parses values in POST body and formats values in return=representation (2)",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: ignores json keys not included in ?columns; parses only the ones specified (2)",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "insert: fails without parsing anything if at least one specified column doesn't exist (2)",
+    "why": "body {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column \\\"helicopters\\\" of relation \\\"datarep_todos_computed\\\" does not exist\"} not {\"code\":\"PGRST204\",\"details\":null,\"hint\":null,\"message\":\"Could not find the 'helicopters' column of 'datarep_todos_computed' in the schema cache\"}"
+  },
+  {
+    "name": "json: obtains a json subfield one level with casting",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "json: renames json subfield one level with casting",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "json: fails on bad casting (data of the wrong format)",
+    "why": "body {\"code\":\"22P02\",\"details\":null,\"hint\":null,\"message\":\"invalid input syntax for type integer: \\\"bar\\\"\"} not {\"code\":\"22P02\",\"details\":null,\"hint\":null,\"message\":\"invalid input syntax for type integer: \\\"baz\\\"\"}"
+  },
+  {
+    "name": "json: obtains a json subfield two levels with casting (int)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "json: renames json subfield two levels with casting (int)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "json: accepts non reserved special characters in the key's name",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "json: fails when there is a reserved special character in the key's name",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"expected a json path key at offset 6\"} not {\"code\":\"PGRST100\",\"details\":\"unexpected \\\"(\\\" expecting \\\"-\\\", digit or any non reserved character different from: .,>()\",\"hint\":null,\"message\":\"\\\"failed to parse select parameter (data->(!@)\\\" (line..."
+  },
+  {
+    "name": "json: can get array of ints and alias/cast it",
+    "why": "body [{\"data\":\"1\"},{\"data\":\"4\"}] not [{\"data\":1},{\"data\":4}]"
+  },
+  {
+    "name": "json: can get array of ints and alias/cast it (2)",
+    "why": "body [{\"idx0\":\"1\",\"idx1\":\"2\"},{\"idx0\":\"4\",\"idx1\":\"5\"}] not [{\"idx0\":1,\"idx1\":2},{\"idx0\":4,\"idx1\":5}]"
+  },
+  {
+    "name": "json: can get nested array of ints",
+    "why": "body [{\"data\":\"8\"},{\"data\":\"7\"}] not [{\"data\":8},{\"data\":7}]"
+  },
+  {
+    "name": "json: can get nested array of ints (2)",
+    "why": "body [{\"data\":null},{\"data\":\"6\"}] not [{\"data\":null},{\"data\":6}]"
+  },
+  {
+    "name": "json: can get array in object keys",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "json: can get array in object keys (2)",
+    "why": "body [{\"d\":null},{\"d\":\"8\"}] not [{\"d\":null},{\"d\":8}]"
+  },
+  {
+    "name": "json: only treats well formed numbers as indexes",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "json: obtains a composite type field",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: obtains a composite type field (2)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: obtains an array item",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: obtains an array item (2)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: can be filtered with and/or",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "json: can filter when the key's name has non reserved special characters",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "json: can filter composite type field",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: can filter array item",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: can filter array item (2)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: can filter array item (3)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: can filter array item (4)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: orders by composite type field",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: orders by composite type field (2)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: orders by array item",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: orders by array item (2)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: orders by array item (3)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: orders by array item (4)",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "json: can select with negative indexes",
+    "why": "body [{\"data\":\"3\"},{\"data\":\"6\"}] not [{\"data\":3},{\"data\":6}]"
+  },
+  {
+    "name": "json: can select with negative indexes (2)",
+    "why": "body [{\"data\":\"8\"},{\"data\":\"7\"}] not [{\"data\":8},{\"data\":7}]"
+  },
+  {
+    "name": "json: gives a meaningful error on bad syntax",
+    "why": "status 200 not 400"
+  },
+  {
+    "name": "json: works when an RPC returns a dynamic TABLE with a composite type",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "nulls: strips nulls when Accept: application/vnd.pgrst.array+json;nulls=stripped (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "nulls: strips nulls when Accept: application/vnd.pgrst.array+json;nulls=stripped (3)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "nulls: strips nulls when Accept: application/vnd.pgrst.array+json;nulls=stripped (5)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "nulls: strips nulls when Accept: application/vnd.pgrst.array+json;nulls=stripped (6)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "prefer: throws error when handling=strict and invalid prefs are given",
+    "why": "status 200 not 400"
+  },
+  {
+    "name": "prefer: throws error with post request",
+    "why": "status 201 not 400"
+  },
+  {
+    "name": "prefer: throws error with rpc",
+    "why": "status 200 not 400"
+  },
+  {
+    "name": "prefer: does not throw error when handling=lenient and invalid prefs",
+    "why": "preference-applied absent not \"handling=lenient\""
+  },
+  {
+    "name": "prefer: does not throw error with post request",
+    "why": "preference-applied \"return=representation\" not \"return=representation, handling=lenient\""
+  },
+  {
+    "name": "prefer: does not throw error with rpc",
+    "why": "preference-applied absent not \"handling=lenient\""
+  },
+  {
+    "name": "prefer: should change timezone with handling=strict",
+    "why": "preference-applied absent not \"handling=strict, timezone=America/Los_Angeles\""
+  },
+  {
+    "name": "prefer: should change timezone without handling=strict",
+    "why": "preference-applied absent not \"timezone=America/Los_Angeles\""
+  },
+  {
+    "name": "prefer: should throw error with handling=strict",
+    "why": "status 200 not 400"
+  },
+  {
+    "name": "prefer: should return with default timezone without handling or with handling=lenient (2)",
+    "why": "preference-applied absent not \"handling=lenient\""
+  },
+  {
+    "name": "prefer: should fail if items deleted more than 10",
+    "why": "status 204 not 400"
+  },
+  {
+    "name": "prefer: should succeed if items deleted less than 10",
+    "why": "preference-applied absent not \"handling=strict, max-affected=10\""
+  },
+  {
+    "name": "prefer: should fail if items updated more than 0",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"the update body must be a json object\"} not {\"code\":\"PGRST124\",\"details\":\"The query affects 1 rows\",\"hint\":null,\"message\":\"Query result exceeds max-affected preference constraint\"}"
+  },
+  {
+    "name": "prefer: should succeed if items updated equal 1",
+    "why": "preference-applied absent not \"handling=strict, max-affected=1\""
+  },
+  {
+    "name": "prefer: should not fail",
+    "why": "preference-applied absent not \"handling=lenient\""
+  },
+  {
+    "name": "prefer: should succeed if items deleted less than 10 (2)",
+    "why": "preference-applied absent not \"handling=lenient\""
+  },
+  {
+    "name": "prefer: should not fail (2)",
+    "why": "status 400 not 204"
+  },
+  {
+    "name": "prefer: should succeed if items updated equal 1 (2)",
+    "why": "preference-applied absent not \"handling=lenient\""
+  },
+  {
+    "name": "prefer: should fail with rpc when deleting rows more than prefered with returns setof",
+    "why": "status 200 not 400"
+  },
+  {
+    "name": "prefer: should fail with rpc when deleting rows more than prefered with returns table",
+    "why": "body {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column _zou_rpc.delete_items_returns_table does not exist\"} not {\"code\":\"PGRST124\",\"details\":\"The query affects 15 rows\",\"hint\":null,\"message\":\"Query result exceeds max-affected preference constraint\"}"
+  },
+  {
+    "name": "prefer: should succeed with rpc deleting rows less than prefered with returns setof",
+    "why": "preference-applied absent not \"handling=strict, max-affected=20\""
+  },
+  {
+    "name": "prefer: should succeed with rpc deleting rows less than prefered with returns table",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "prefer: should fail with rpc when returns void with handling=strict",
+    "why": "status 204 not 400"
+  },
+  {
+    "name": "range: returns whole range with status 200",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: returns range Content-Range with range/*",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: refuses a range with nonzero start when there are no items",
+    "why": "status 200 not 416"
+  },
+  {
+    "name": "range: refuses a range requesting start past last item",
+    "why": "status 200 not 416"
+  },
+  {
+    "name": "range: understands open-ended ranges",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: refuses a range requesting start past last item (2)",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: returns whole range with status 200 (2)",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: returns range Content-Range with range/* (2)",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: returns range Content-Range with range/* even using other filters",
+    "why": "content-range \"*/*\" not \"0-0/*\""
+  },
+  {
+    "name": "range: no parameters return everything",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: top level limit with parameter",
+    "why": "content-range \"*/*\" not \"0-2/*\""
+  },
+  {
+    "name": "range: headers override get parameters",
+    "why": "content-range \"*/*\" not \"0-2/*\""
+  },
+  {
+    "name": "range: limit and offset works on first level",
+    "why": "content-range \"*/*\" not \"2-4/*\""
+  },
+  {
+    "name": "range: limit and offset works on first level (2)",
+    "why": "content-range \"*/*\" not \"2-4/*\""
+  },
+  {
+    "name": "range: one or more items",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: succeeds if offset is negative as a no-op",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "range: fails if limit is negative",
+    "why": "status 400 not 416"
+  },
+  {
+    "name": "range: refuses a range requesting start past last item (3)",
+    "why": "content-range \"*/0\" not \"*/15\""
+  },
+  {
+    "name": "range: obtains a filtered range",
+    "why": "content-range \"*/753\" not \"0-6/753\""
+  },
+  {
+    "name": "range: obtains the full range",
+    "why": "content-range \"*/2260\" not \"0-14/2260\""
+  },
+  {
+    "name": "range: ignores limit/offset on the planned count",
+    "why": "content-range \"*/2260\" not \"3-4/2260\""
+  },
+  {
+    "name": "range: understands open-ended ranges (2)",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: fails with 416 for offside range (2)",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "range: refuses a range requesting start past last item (4)",
+    "why": "content-range \"*/*\" not \"0-14/*\""
+  },
+  {
+    "name": "raw: responds json to a GET request with Firefox Accept headers",
+    "why": "content-range \"*/*\" not \"0-0/*\""
+  },
+  {
+    "name": "raw: responds json to a GET request with Chrome Accept headers",
+    "why": "content-range \"*/*\" not \"0-0/*\""
+  },
+  {
+    "name": "related: works on a many-to-one relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a many-to-one relationship (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a many-to-one relationship (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a one-to-one relationship and jsonb column",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a one-to-one relationship and jsonb column (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on an embedded resource",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on an embedded resource (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on an embedded resource (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: fails when is not a to-one relationship",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"unexpected characters after the order list at offset 8\"} not {\"code\":\"PGRST118\",\"details\":\"'clients' and 'projects' do not form a many-to-one or one-to-one relationship\",\"hint\":null,\"message\":\"A related order on 'projects' is not possible\"}"
+  },
+  {
+    "name": "related: fails when is not a to-one relationship (2)",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"unexpected characters after the order list at offset 4\"} not {\"code\":\"PGRST118\",\"details\":\"'clients' and 'pros' do not form a many-to-one or one-to-one relationship\",\"hint\":null,\"message\":\"A related order on 'pros' is not possible\"}"
+  },
+  {
+    "name": "related: fails when is not a to-one relationship (3)",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"unexpected characters after the order list at offset 19\"} not {\"code\":\"PGRST118\",\"details\":\"'designers' and 'computed_videogames' do not form a many-to-one or one-to-one relationship\",\"hint\":null,\"message\":\"A related order on 'computed_videogames' is not possibl..."
+  },
+  {
+    "name": "related: fails when the resource is not embedded",
+    "why": "body {\"code\":\"PGRST100\",\"details\":null,\"hint\":null,\"message\":\"unexpected characters after the order list at offset 8\"} not {\"code\":\"PGRST108\",\"details\":null,\"hint\":\"Verify that 'clientsx' is included in the 'select' query parameter.\",\"message\":\"'clientsx' is not an embedded resource in this request\"}"
+  },
+  {
+    "name": "related: works on a many-to-one relationship (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a many-to-one relationship (5)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a many-to-one relationship (6)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a one-to-many relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a one-to-many relationship (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a one-to-many relationship (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a many-to-many relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on a many-to-many relationship (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works on nested embeds",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: can do an or across embeds",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: doesn't interfere filtering when embedding using the column name",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: doesn't interfere filtering on column names used for disambiguation",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: embeds verifying that the entire target table row is not null",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: embeds verifying that the entire target table row is not null (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works with count=exact",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works with count=exact (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works with count=exact (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works with count=planned",
+    "why": "status 400 not 206"
+  },
+  {
+    "name": "related: works with count=planned (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works with count=planned (3)",
+    "why": "status 400 not 206"
+  },
+  {
+    "name": "related: works with count=estimated",
+    "why": "status 400 not 206"
+  },
+  {
+    "name": "related: works with count=estimated (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "related: works with count=estimated (3)",
+    "why": "status 400 not 206"
+  },
+  {
+    "name": "rpc: using the Range header",
+    "why": "content-range \"*/*\" not \"1-1/*\""
+  },
+  {
+    "name": "rpc: using the Range header (2)",
+    "why": "status 200 not 206"
+  },
+  {
+    "name": "rpc: using limit and offset (4)",
+    "why": "status 200 not 206"
+  },
+  {
+    "name": "rpc: using limit and offset (5)",
+    "why": "status 200 not 206"
+  },
+  {
+    "name": "rpc: using limit and offset (6)",
+    "why": "status 200 not 206"
+  },
+  {
+    "name": "rpc: includes exact count if requested",
+    "why": "content-range \"0-4/*\" not \"0-4/5\""
+  },
+  {
+    "name": "rpc: includes exact count if requested (2)",
+    "why": "content-range \"0-1/*\" not \"0-1/2\""
+  },
+  {
+    "name": "rpc: includes exact count of 1 for functions that return a single scalar, domain or composite",
+    "why": "content-range \"0-0/*\" not \"0-0/1\""
+  },
+  {
+    "name": "rpc: includes exact count of 1 for functions that return a single scalar, domain or composite (2)",
+    "why": "content-range \"0-0/*\" not \"0-0/1\""
+  },
+  {
+    "name": "rpc: includes exact count of 1 for functions that return a single scalar, domain or composite (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns CSV",
+    "why": "content-type \"application/json; charset=utf-8\" not \"text/csv; charset=utf-8\""
+  },
+  {
+    "name": "rpc: returns CSV (2)",
+    "why": "content-type \"application/json; charset=utf-8\" not \"text/csv; charset=utf-8\""
+  },
+  {
+    "name": "rpc: returns CSV (3)",
+    "why": "content-type \"application/json; charset=utf-8\" not \"text/csv; charset=utf-8\""
+  },
+  {
+    "name": "rpc: without limit and offset",
+    "why": "content-range \"1-1/*\" not \"0-1/2\""
+  },
+  {
+    "name": "rpc: without limit and offset (2)",
+    "why": "content-range \"1-1/*\" not \"0-1/2\""
+  },
+  {
+    "name": "rpc: with limit and offset",
+    "why": "status 200 not 206"
+  },
+  {
+    "name": "rpc: with limit and offset (2)",
+    "why": "status 200 not 206"
+  },
+  {
+    "name": "rpc: does not throw an invalid range error",
+    "why": "status 200 not 206"
+  },
+  {
+    "name": "rpc: does not throw an invalid range error (2)",
+    "why": "status 200 not 206"
+  },
+  {
+    "name": "rpc: should fail with 404 and hint the closest proc on unknown proc name",
+    "why": "body {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.sayhell without parameters, but no matches were found in the schema cache.\",\"hint\":null,\"message\":\"Could not find the function test.sayhell... not {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.sayhell without parameters, but no matches were found in the schema cache.\",\"hint\":\"Perhaps you meant to call the function test.sayhello\",\"..."
+  },
+  {
+    "name": "rpc: should fail with 404 on unknown proc args (2)",
+    "why": "body {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.sayhello without parameters, but no matches were found in the schema cache.\",\"hint\":null,\"message\":\"Could not find the function test.sayhel... not {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.sayhello with parameter any_arg, but no matches were found in the schema cache.\",\"hint\":null,\"message\":\"Could not find the function test.sa..."
+  },
+  {
+    "name": "rpc: should fail with 404 and hint the closest args on unknown proc args",
+    "why": "body {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.sayhello without parameters, but no matches were found in the schema cache.\",\"hint\":null,\"message\":\"Could not find the function test.sayhel... not {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.sayhello with parameter nam, but no matches were found in the schema cache.\",\"hint\":\"Perhaps you meant to call the function test.sayhello(n..."
+  },
+  {
+    "name": "rpc: should not ignore unknown args and fail with 404",
+    "why": "status 200 not 404"
+  },
+  {
+    "name": "rpc: should fail with 404 for overloaded functions with unknown args",
+    "why": "status 200 not 404"
+  },
+  {
+    "name": "rpc: should fail with 404 for overloaded functions with unknown args (2)",
+    "why": "status 200 not 404"
+  },
+  {
+    "name": "rpc: should fail with 300 Multiple Choices without explicit type casts",
+    "why": "body {\"code\":\"PGRST203\",\"details\":null,\"hint\":null,\"message\":\"Could not choose the best candidate function between: test.overloaded_same_args(arg => integer), test.overloaded_same_args(arg => xml), test.ov... not {\"code\":\"PGRST203\",\"details\":null,\"hint\":\"Try renaming the parameters or the function itself in the database so function overloading can be resolved\",\"message\":\"Could not choose the best candidate fun..."
+  },
+  {
+    "name": "rpc: cannot embed if the related table is not in the exposed schema",
+    "why": "body {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'articles' and 'article_stars' in the schema cache\",\"hint\":null,\"message\":\"Could not find a relationship between 'articles... not {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'articles' and 'article_stars' in the schema 'test', but no matches were found.\",\"hint\":\"Perhaps you meant 'articleStars' ..."
+  },
+  {
+    "name": "rpc: cannot embed if the related table is not in the exposed schema (2)",
+    "why": "body {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'articles' and 'article_stars' in the schema cache\",\"hint\":null,\"message\":\"Could not find a relationship between 'articles... not {\"code\":\"PGRST200\",\"details\":\"Searched for a foreign key relationship between 'articles' and 'article_stars' in the schema 'test', but no matches were found.\",\"hint\":\"Perhaps you meant 'articleStars' ..."
+  },
+  {
+    "name": "rpc: can embed if the related tables are in a hidden schema but exposed as views",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: can embed if the related tables are in a hidden schema but exposed as views (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: can embed if rpc returns domain of table type",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: can embed if rpc returns domain of table type (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns empty json array",
+    "why": "content-range \"0-0/*\" not \"*/*\""
+  },
+  {
+    "name": "rpc: returns empty json array (2)",
+    "why": "content-range \"0-0/*\" not \"*/*\""
+  },
+  {
+    "name": "rpc: returns setof integers",
+    "why": "content-range \"0-0/*\" not \"0-2/*\""
+  },
+  {
+    "name": "rpc: returns composite type in exposed schema",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: cannot return composite type in hidden schema",
+    "why": "status 400 not 401"
+  },
+  {
+    "name": "rpc: returns domain of composite type",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns single row from table",
+    "why": "content-range absent not \"0-0/*\""
+  },
+  {
+    "name": "rpc: returns a record type",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns a record type (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns a setof record type",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns a setof record type (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns composite type",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: accepts a variety of arguments from an html form",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: rejects unknown content type even if payload is good",
+    "why": "status 200 not 406"
+  },
+  {
+    "name": "rpc: rejects unknown content type even if payload is good (2)",
+    "why": "status 200 not 406"
+  },
+  {
+    "name": "rpc: returns an object result when there is a single OUT param",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns an object result when there is a single OUT param (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns an object result when there is a single INOUT param",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns an object result when there are many OUT params",
+    "why": "content-range absent not \"0-0/*\""
+  },
+  {
+    "name": "rpc: returns an object result when there are many INOUT params",
+    "why": "content-range absent not \"0-0/*\""
+  },
+  {
+    "name": "rpc: returns an object result when there is a single-column TABLE return type",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: n=1 (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: n>1 (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: returns last value for repeated params without VARIADIC",
+    "why": "body \"Hello, ignored\" not \"Hello, world\""
+  },
+  {
+    "name": "rpc: returns last value for repeated non-variadic params in function with other VARIADIC arguments",
+    "why": "body \"Hello, ignored\" not \"Hello, world\""
+  },
+  {
+    "name": "rpc: can handle procs with args that have a DEFAULT value",
+    "why": "content-range absent not \"0-0/*\""
+  },
+  {
+    "name": "rpc: overloaded()",
+    "why": "content-range \"0-0/*\" not \"0-2/*\""
+  },
+  {
+    "name": "rpc: overloaded_html_form()",
+    "why": "content-range \"0-0/*\" not \"0-2/*\""
+  },
+  {
+    "name": "rpc: overloaded_html_form(int, int)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: overloaded_html_form(text, text, text)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "rpc: gives a parse filter error if GET style proc args are specified",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 2\"} not {\"code\":\"PGRST100\",\"details\":\"unexpected \\\"J\\\" expecting \\\"not\\\" or operator (eq, gt, ...)\",\"hint\":null,\"message\":\"\\\"failed to parse filter (John)\\\" (line 1, column 1)\"}"
+  },
+  {
+    "name": "rpc: ignores json keys not included in ?columns",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "rpc: only takes the first object in case of array of objects payload",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "rpc: gets the http path",
+    "why": "body \"/rest/v1/rpc/get_guc_value\" not \"/rpc/get_guc_value\""
+  },
+  {
+    "name": "rpc: should filter a proc that has arg name = filter name",
+    "why": "content-range \"0-3/*\" not \"0-1/*\""
+  },
+  {
+    "name": "rpc: should work with filters that have the not operator",
+    "why": "content-range \"0-3/*\" not \"0-1/*\""
+  },
+  {
+    "name": "rpc: should work with filters that have the not operator (2)",
+    "why": "content-range \"0-3/*\" not \"0-1/*\""
+  },
+  {
+    "name": "rpc: fails when setting headers with wrong json structure",
+    "why": "status 204 not 500"
+  },
+  {
+    "name": "rpc: fails when setting headers with wrong json structure (2)",
+    "why": "status 204 not 500"
+  },
+  {
+    "name": "rpc: fails when setting headers with wrong json structure (3)",
+    "why": "status 204 not 500"
+  },
+  {
+    "name": "rpc: fails when setting headers with wrong json structure (4)",
+    "why": "status 204 not 500"
+  },
+  {
+    "name": "rpc: can override the Location header on a trigger",
+    "why": "location absent not \"/stuff?id=eq.2&overriden=true\""
+  },
+  {
+    "name": "rpc: can override the status on RPC",
+    "why": "status 200 not 403"
+  },
+  {
+    "name": "rpc: can override the status through trigger",
+    "why": "status 400 not 205"
+  },
+  {
+    "name": "rpc: fails when setting invalid status guc",
+    "why": "status 200 not 500"
+  },
+  {
+    "name": "rpc: can insert text directly",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "rpc: can insert xml directly",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "rpc: will err when no function with single unnamed json parameter exists and application/json is specified",
+    "why": "body {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.unnamed_int_param with parameters x, y or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.\",\"hint... not {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.unnamed_int_param with parameters x, y or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.\",\"hint..."
+  },
+  {
+    "name": "rpc: will err when no function with single unnamed text parameter exists and text/plain is specified",
+    "why": "body {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.unnamed_int_param without parameters or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.\",\"hint\":... not {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.unnamed_int_param with a single unnamed text parameter, but no matches were found in the schema cache.\",\"hint\":null,\"message\":\"Could not fi..."
+  },
+  {
+    "name": "rpc: will err when no function with single unnamed text parameter exists and text/xml is specified",
+    "why": "body {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.unnamed_int_param without parameters or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.\",\"hint\":... not {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.unnamed_int_param with a single unnamed xml parameter, but no matches were found in the schema cache.\",\"hint\":null,\"message\":\"Could not fin..."
+  },
+  {
+    "name": "rpc: will err when no function with single unnamed bytea parameter exists and application/octet-stream is specified",
+    "why": "body {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.unnamed_int_param without parameters or with a single unnamed json/jsonb parameter, but no matches were found in the schema cache.\",\"hint\":... not {\"code\":\"PGRST202\",\"details\":\"Searched for the function test.unnamed_int_param with a single unnamed bytea parameter, but no matches were found in the schema cache.\",\"hint\":null,\"message\":\"Could not f..."
+  },
+  {
+    "name": "rpc: should be able to fallback to the single unnamed parameter function when other overloaded functions are not found (2)",
+    "why": "content-type \"application/json; charset=utf-8\" not \"text/plain; charset=utf-8\""
+  },
+  {
+    "name": "rpc: should fail to fallback to any single unnamed parameter function when using an unsupported Content-Type header",
+    "why": "status 400 not 404"
+  },
+  {
+    "name": "rpc: should fail with multiple choices when two fallback functions with single unnamed json and jsonb parameters exist",
+    "why": "status 200 not 300"
+  },
+  {
+    "name": "rpc: should fail on /rpc/unnamed_xml_param when posting invalid xml",
+    "why": "status 404 not 200"
+  },
+  {
+    "name": "rpc: modifies the param type from character to character varying",
+    "why": "body [{\"char_\":\"a\",\"char_arr\":[\"a\",\"a\"]}] not [{\"char_\":\"abcdefg\",\"char_arr\":[\"abc\",\"abcdefg\"]}]"
+  },
+  {
+    "name": "rpc: modifies the param type from character to character varying (2)",
+    "why": "body {\"code\":\"22023\",\"details\":null,\"hint\":null,\"message\":\"cannot extract elements from a scalar\"} not {\"code\":\"22001\",\"details\":null,\"hint\":null,\"message\":\"value too long for type character(5)\"}"
+  },
+  {
+    "name": "rpc: modifies the param type from bit to bit varying",
+    "why": "body [{\"bit_\":\"1\",\"bit_arr\":[\"1\",\"1\"]}] not [{\"bit_\":\"101010\",\"bit_arr\":[\"101\",\"101010\"]}]"
+  },
+  {
+    "name": "rpc: modifies the param type from bit to bit varying (2)",
+    "why": "body {\"code\":\"22023\",\"details\":null,\"hint\":null,\"message\":\"cannot extract elements from a scalar\"} not {\"code\":\"22026\",\"details\":null,\"hint\":null,\"message\":\"bit string length 6 does not match type bit(5)\"}"
+  },
+  {
+    "name": "rpc: gets message and details from raise sqlstate PGRST",
+    "why": "status 400 not 332"
+  },
+  {
+    "name": "rpc: returns error for invalid JSON in the MESSAGE option of the RAISE statement",
+    "why": "status 400 not 500"
+  },
+  {
+    "name": "rpc: returns error for invalid JSON in the DETAIL option of the RAISE statement",
+    "why": "status 400 not 500"
+  },
+  {
+    "name": "rpc: returns error for missing DETAIL option in the RAISE statement",
+    "why": "status 400 not 500"
+  },
+  {
+    "name": "single: can shape plurality singular object routes",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "single: works for one row with return=rep",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: works for one row with return=minimal",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: raises an error for multiple rows",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: raises an error for multiple rows with return=rep",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: raises an error for zero rows",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: raises an error for zero rows with return=rep",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: works for one row with return=rep (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: works for one row with return=minimal (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: raises an error when attempting to create multiple entities",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: raises an error when attempting to create multiple entities with return=rep",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: raises an error regardless of return=minimal",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: raises an error when creating zero entities",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "single: raises an error when creating zero entities with return=rep",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "spread: works on a many-to-one relationship (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should spread a column as a json array",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should spread a column as a json array (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should spread many columns as json arrays",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should spread many columns as json arrays (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should return an empty array when no elements are found",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should return a single null element array, not an empty one, when the row exists but the value happens to be null",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should work when selecting all columns",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should select spread columns from a nested one-to-one relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should select spread columns from a nested many-to-one relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should select spread columns from a nested one-to-many relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should select spread columns from a nested many-to-many relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show a nested non-spread one-to-one relationship as an array of objects",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show a nested non-spread many-to-one relationship as an array of objects",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show a nested non-spread one-to-many relationship as an array of arrays",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show a nested non-spread many-to-many relationship as an array of arrays",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should work when selecting all columns in a nested to-one resource",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: works when column filters are specified",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: works with inner joins or not.is.null filters",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: works with inner joins or not.is.null filters (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: orders all the resulting arrays according to the spread relationship ordering columns",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: orders all the resulting arrays according to the spread relationship ordering columns (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: orders all the resulting arrays according to the spread relationship ordering columns even if they aren't selected",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: orders all the resulting arrays according to the related ordering columns in the spread relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should spread a column as a json array (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should spread a column as a json array (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should spread many columns as json arrays (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should spread many columns as json arrays (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should return an empty array when no elements are found (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should return a single null element array, not an empty one, when the row exists but the value happens to be null (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should work when selecting all columns (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show spread columns from a nested one-to-one relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show spread columns from a nested many-to-one relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show spread columns from a nested one-to-many relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show spread columns from a nested many-to-many relationship",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show a nested non-spread one-to-one relationship as an array of objects (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show a nested non-spread many-to-one relationship as an array of objects (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show a nested non-spread one-to-many relationship as an array of arrays (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should show a nested non-spread many-to-many relationship as an array of arrays (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should work when selecting all columns in a nested to-one resource (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: works when column filters are specified (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: works with inner joins or not.is.null filters (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: works with inner joins or not.is.null filters (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: orders all the resulting arrays according to the spread relationship ordering columns (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: orders all the resulting arrays according to the spread relationship ordering columns (4)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: orders all the resulting arrays according to the spread relationship ordering columns even if they aren't selected (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: orders all the resulting arrays according to the related ordering columns in the spread relationship (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should work return the same as empty embeddings",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "spread: should work return the same as empty embeddings (2)",
+    "why": "body [{\"?column?\":1,\"name\":\"grandchild entity 1\",\"parent_name\":\"child entity 1\"},{\"?column?\":1,\"name\":\"grandchild entity 2\",\"parent_name\":\"child entity 1\"},{\"?column?\":1,\"name\":\"grandchild entity 3\",\"paren... not [{\"name\":\"grandchild entity 1\",\"parent_name\":\"child entity 1\"},{\"name\":\"grandchild entity 2\",\"parent_name\":\"child entity 1\"},{\"name\":\"grandchild entity 3\",\"parent_name\":\"child entity 2\"},{\"name\":\"(gra..."
+  },
+  {
+    "name": "spread: should work return the same as empty embeddings (3)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "update: indicates no table found by returning 404",
+    "why": "body {\"code\":\"42P01\",\"details\":null,\"hint\":null,\"message\":\"relation \\\"fake\\\" does not exist\"} not {\"code\":\"PGRST205\",\"details\":null,\"hint\":null,\"message\":\"Could not find the table 'test.fake' in the schema cache\"}"
+  },
+  {
+    "name": "update: fails with 400 and error",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"expected value at line 1 column 1\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: fails with 400 and error (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: can update multiple items (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: can update multiple items (4)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: can set a column to NULL",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: is successful",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: returns empty array when no rows updated and return=rep (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: can provide a representation",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: can return computed columns",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: can select overloaded computed columns",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: can select overloaded computed columns (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: ignores ?select= when return not set or return=minimal",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: ignores ?select= when return not set or return=minimal (2)",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"key must be a string at line 1 column 3\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  },
+  {
+    "name": "update: makes no updates and returns 204 without return= and without ?select=",
+    "why": "content-range absent not \"*/*\""
+  },
+  {
+    "name": "update: makes no updates and returns 204 without return= and without ?select= (2)",
+    "why": "status 400 not 204"
+  },
+  {
+    "name": "update: makes no updates and returns 204 without return= and without ?select= (3)",
+    "why": "status 400 not 204"
+  },
+  {
+    "name": "update: makes no updates and returns 204 without return= and with ?select=",
+    "why": "content-range absent not \"*/*\""
+  },
+  {
+    "name": "update: makes no updates and returns 204 without return= and with ?select= (2)",
+    "why": "status 400 not 204"
+  },
+  {
+    "name": "update: makes no updates and returns 204 without return= and with ?select= (3)",
+    "why": "status 400 not 204"
+  },
+  {
+    "name": "update: makes no updates and returns 200 with return=rep and without ?select=",
+    "why": "content-range absent not \"*/*\""
+  },
+  {
+    "name": "update: makes no updates and returns 200 with return=rep and with ?select=",
+    "why": "content-range absent not \"*/*\""
+  },
+  {
+    "name": "update: makes no updates and returns 200 with return=rep and with ?select= for overloaded computed columns",
+    "why": "content-range absent not \"*/*\""
+  },
+  {
+    "name": "update: ignores json keys not included in ?columns",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "update: ignores json keys and gives 200 if no record updated",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "update: disallows ?columns which don't exist",
+    "why": "status 200 not 400"
+  },
+  {
+    "name": "update: returns missing table error even if also has invalid ?columns",
+    "why": "status 400 not 404"
+  },
+  {
+    "name": "update: updates table using default values(field-with_sep) when json keys are undefined",
+    "why": "preference-applied absent not \"missing=default\""
+  },
+  {
+    "name": "update: updates table default values(field-with_sep) when json keys are undefined",
+    "why": "preference-applied absent not \"missing=default\""
+  },
+  {
+    "name": "update: updates view default values(field-with_sep) when json keys are undefined",
+    "why": "preference-applied absent not \"missing=default\""
+  },
+  {
+    "name": "update: without filters",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "update: with filters",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "update: without filters (2)",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "update: with filters (2)",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "update: without filters (3)",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "update: with filters (3)",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "update: parses values in payload",
+    "why": "status 400 not 204"
+  },
+  {
+    "name": "update: parses values in payload and formats individually selected values in return=representation",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "update: parses values in payload and formats values in return=representation",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "update: parses values in payload and formats individually selected values in return=representation (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "update: parses values in payload and formats values in return=representation (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "update: ignores json keys not included in ?columns; parses only the ones specified",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "update: fails if at least one specified column doesn't exist",
+    "why": "body {\"code\":\"42703\",\"details\":null,\"hint\":null,\"message\":\"column _zou_src.fake_id does not exist\"} not {\"code\":\"PGRST204\",\"details\":null,\"hint\":null,\"message\":\"Could not find the 'helicopters' column of 'datarep_todos_computed' in the schema cache\"}"
+  },
+  {
+    "name": "update: ignores json keys and gives 200 if no record updated (2)",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "update: works with request method PATCH and embedded resource",
+    "why": "status 300 not 200"
+  },
+  {
+    "name": "upsert: UPDATEs rows on pk conflict",
+    "why": "status 201 not 200"
+  },
+  {
+    "name": "upsert: succeeds when the payload has no elements",
+    "why": "status 400 not 200"
+  },
+  {
+    "name": "upsert: succeeds and ignores the Prefer: resolution header(no Preference-Applied present) if the table has no PK",
+    "why": "status 400 not 201"
+  },
+  {
+    "name": "upsert: fails if limit is specified",
+    "why": "status 501 not 400"
+  },
+  {
+    "name": "upsert: fails if offset is specified",
+    "why": "status 501 not 400"
+  },
+  {
+    "name": "upsert: rejects every other filter than pk cols eq's",
+    "why": "status 501 not 405"
+  },
+  {
+    "name": "upsert: rejects every other filter than pk cols eq's (2)",
+    "why": "status 501 not 405"
+  },
+  {
+    "name": "upsert: rejects every other filter than pk cols eq's (3)",
+    "why": "status 501 not 405"
+  },
+  {
+    "name": "upsert: rejects every other filter than pk cols eq's (4)",
+    "why": "status 501 not 405"
+  },
+  {
+    "name": "upsert: fails if not all composite key cols are specified as eq filters",
+    "why": "status 501 not 405"
+  },
+  {
+    "name": "upsert: fails if not all composite key cols are specified as eq filters (2)",
+    "why": "status 501 not 405"
+  },
+  {
+    "name": "upsert: fails if the uri primary key doesn't match the payload primary key",
+    "why": "status 501 not 400"
+  },
+  {
+    "name": "upsert: fails if the uri primary key doesn't match the payload primary key (2)",
+    "why": "status 501 not 400"
+  },
+  {
+    "name": "upsert: fails if the table has no PK",
+    "why": "status 501 not 405"
+  },
+  {
+    "name": "upsert: succeeds on table with single pk col (2)",
+    "why": "status 501 not 201"
+  },
+  {
+    "name": "upsert: succeeds on table with composite pk (2)",
+    "why": "status 501 not 201"
+  },
+  {
+    "name": "upsert: succeeds on a partitioned table with composite pk (2)",
+    "why": "status 501 not 201"
+  },
+  {
+    "name": "upsert: succeeds if the table has only PK cols and no other cols (4)",
+    "why": "status 501 not 201"
+  },
+  {
+    "name": "upsert: succeeds on table with single pk col (4)",
+    "why": "status 501 not 200"
+  },
+  {
+    "name": "upsert: succeeds if the payload has more than one row, but it only puts the first element",
+    "why": "body [{\"name\":\"Java\",\"rank\":1}] not [{\"name\":\"Java\",\"rank\":13}]"
+  },
+  {
+    "name": "upsert: succeeds if the payload has more than one row, but it only puts the first element (2)",
+    "why": "status 501 not 200"
+  },
+  {
+    "name": "upsert: succeeds on table with composite pk (4)",
+    "why": "status 501 not 200"
+  },
+  {
+    "name": "upsert: succeeds on a partitioned table with composite pk (4)",
+    "why": "status 501 not 200"
+  },
+  {
+    "name": "upsert: succeeds if the table has only PK cols and no other cols (6)",
+    "why": "status 501 not 200"
+  },
+  {
+    "name": "upsert: ignores the Range header (2)",
+    "why": "status 501 not 200"
+  },
+  {
+    "name": "upsert: works with return=representation and vnd.pgrst.object+json",
+    "why": "status 501 not 201"
+  },
+  {
+    "name": "upsert: works with PUT",
+    "why": "status 501 not 204"
+  },
+  {
+    "name": "upsert: works with request method PUT and return=minimal",
+    "why": "status 501 not 204"
+  },
+  {
+    "name": "upsert: works with request method PUT and embedded resource",
+    "why": "status 501 not 200"
+  },
+  {
+    "name": "upsert: works with batch upserts and embedded resource",
+    "why": "status 201 not 200"
+  },
+  {
+    "name": "options: fails with 404 for an unknown table",
+    "why": "status 501 not 404"
+  },
+  {
+    "name": "error: works with ApiRequest error",
+    "why": "content-type \"application/json\" not \"application/json; charset=utf-8\""
+  },
+  {
+    "name": "error: works with SchemaCache error",
+    "why": "body {\"code\":\"42P01\",\"details\":null,\"hint\":null,\"message\":\"relation \\\"non_existent_table\\\" does not exist\"} not {\"code\":\"PGRST205\",\"details\":null,\"hint\":null,\"message\":\"Could not find the table 'test.non_existent_table' in the schema cache\"}"
+  },
+  {
+    "name": "error: works with Jwt error",
+    "why": "status 403 not 401"
+  },
+  {
+    "name": "error: works with sqlstate PGRST custom error",
+    "why": "status 400 not 332"
+  },
+  {
+    "name": "error: show hint when similarity score is at least 75%",
+    "why": "body {\"code\":\"42P01\",\"details\":null,\"hint\":null,\"message\":\"relation \\\"projectx\\\" does not exist\"} not {\"code\":\"PGRST205\",\"details\":null,\"hint\":\"Perhaps you meant the table 'test.projects'\",\"message\":\"Could not find the table 'test.projectx' in the schema cache\"}"
+  },
+  {
+    "name": "error: show hint when similarity score is at least 75% (2)",
+    "why": "body {\"code\":\"42P01\",\"details\":null,\"hint\":null,\"message\":\"relation \\\"projecxx\\\" does not exist\"} not {\"code\":\"PGRST205\",\"details\":null,\"hint\":\"Perhaps you meant the table 'test.projects'\",\"message\":\"Could not find the table 'test.projecxx' in the schema cache\"}"
+  },
+  {
+    "name": "error: don't show hint when similarity score is less than 75%",
+    "why": "body {\"code\":\"42P01\",\"details\":null,\"hint\":null,\"message\":\"relation \\\"projxxxx\\\" does not exist\"} not {\"code\":\"PGRST205\",\"details\":null,\"hint\":null,\"message\":\"Could not find the table 'test.projxxxx' in the schema cache\"}"
+  },
+  {
+    "name": "plan: doesn't work if db-plan-enabled=false(the default)",
+    "why": "body {\"code\":\"PGRST107\",\"details\":null,\"hint\":null,\"message\":\"None of these media types are available: application/vnd.pgrst.plan\"} not {\"code\":\"PGRST107\",\"details\":null,\"hint\":null,\"message\":\"None of these media types are available: application/vnd.pgrst.plan+text; for=\\\"application/json\\\"\"}"
+  },
+  {
+    "name": "plan: doesn't work if db-plan-enabled=false(the default) (2)",
+    "why": "status 200 not 406"
+  },
+  {
+    "name": "plan: doesn't work if db-plan-enabled=false(the default) (3)",
+    "why": "body {\"code\":\"PGRST107\",\"details\":null,\"hint\":null,\"message\":\"None of these media types are available: application/vnd.pgrst.plan\"} not {\"code\":\"PGRST107\",\"details\":null,\"hint\":null,\"message\":\"None of these media types are available: application/vnd.pgrst.plan+text; for=\\\"application/json\\\"\"}"
+  },
+  {
+    "name": "safeupdate: works if no condition is present",
+    "why": "body {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"EOF while parsing a value at line 1 column 0\"} not {\"code\":\"PGRST102\",\"details\":null,\"hint\":null,\"message\":\"Empty or invalid json\"}"
+  }
+]

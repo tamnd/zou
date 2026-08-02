@@ -18,7 +18,12 @@
 //! machine and it fails on the day upstream and zou drift apart rather
 //! than on the day somebody remembers to look. `diff` is what you run
 //! when you have both up and you do not trust the recording.
+//!
+//! A fourth, `derive`, asks nothing. It reads a PostgREST checkout and
+//! writes a suite out of its spec files, which is how the second suite
+//! here got written.
 
+mod derive;
 mod diff;
 mod report;
 mod suite;
@@ -39,6 +44,11 @@ modes
   record    ask a target and write conformance/suites/<name>/recorded.json
   check     ask a target and compare it with that recording
   diff      ask two targets and compare them with each other
+  derive    read a PostgREST checkout and write a suite out of it, no target
+
+deriving
+  --from <path>            a PostgREST source tree at the pinned version
+  --suite <name>           the suite to write, which is created if it is new
 
 the target
   --url <url>              where it answers, no trailing slash needed
@@ -60,7 +70,10 @@ everything else
   --suite <name>           which suite, or all of them when repeated or absent
   --jwt-secret <secret>    the hs256 secret both ends sign with
   --json <path>            write the report as json as well
-  --no-setup               do not apply setup.sql, the database is ready";
+  --no-setup               do not apply setup.sql, the database is ready
+  --write-known            write the run's differences to known.json rather
+                           than failing over them, which is how a suite with
+                           hundreds of them gets a ratchet. Read the diff.";
 
 /// The secret supabase's own local stack ships with. Not a default
 /// worth hiding: every target in a conformance run has to sign with the
@@ -87,6 +100,8 @@ struct Args {
     jwt_secret: String,
     json: Option<String>,
     setup: bool,
+    from: Option<String>,
+    write_known: bool,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -110,13 +125,15 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         jwt_secret: DEMO_SECRET.to_string(),
         json: None,
         setup: true,
+        from: None,
+        write_known: false,
     };
     let mut it = argv.iter();
     args.mode = match it.next() {
         Some(mode) => mode.clone(),
         None => return Err("no mode".to_string()),
     };
-    if !matches!(args.mode.as_str(), "record" | "check" | "diff") {
+    if !matches!(args.mode.as_str(), "record" | "check" | "diff" | "derive") {
         return Err(format!("no mode named {:?}", args.mode));
     }
     while let Some(arg) = it.next() {
@@ -146,8 +163,30 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--jwt-secret" => args.jwt_secret = need("--jwt-secret")?,
             "--json" => args.json = Some(need("--json")?),
             "--no-setup" => args.setup = false,
+            "--from" => args.from = Some(need("--from")?),
+            "--write-known" => args.write_known = true,
             other => return Err(format!("no flag named {other:?}")),
         }
+    }
+    // Deriving reads a checkout and writes files. There is nothing to
+    // ask, so a target would be a command somebody meant differently.
+    if args.mode == "derive" {
+        if args.from.is_none() {
+            return Err("derive needs a --from pointing at a PostgREST checkout".to_string());
+        }
+        if args.suites.len() != 1 {
+            return Err("derive writes one suite, name it with --suite".to_string());
+        }
+        if args.url.is_some() || args.zou_dsn.is_some() {
+            return Err("derive asks nothing, so it takes no target".to_string());
+        }
+        return Ok(args);
+    }
+    if args.from.is_some() {
+        return Err(format!(
+            "{} reads a suite rather than deriving one",
+            args.mode
+        ));
     }
     if args.url.is_none() && args.zou_dsn.is_none() {
         return Err("no target: pass --url or --zou-dsn".to_string());
@@ -157,6 +196,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     }
     if args.mode == "diff" && args.reference_url.is_none() {
         return Err("diff needs a --reference-url to diff against".to_string());
+    }
+    if args.write_known && args.mode != "check" {
+        return Err("--write-known writes down what a check found, so it needs check".to_string());
     }
     if args.mode != "diff" && args.reference_url.is_some() {
         return Err(format!("{} takes one target, not a reference", args.mode));
@@ -186,60 +228,9 @@ fn main() -> ExitCode {
 
 /// True when everything matched.
 fn run(args: Args) -> Result<bool, String> {
-    let anon = args
-        .anon
-        .clone()
-        .unwrap_or_else(|| zou::key("anon", &args.jwt_secret));
-    let authenticated = args
-        .authenticated
-        .clone()
-        .unwrap_or_else(|| zou::key("authenticated", &args.jwt_secret));
-    let service = args
-        .service
-        .clone()
-        .unwrap_or_else(|| zou::key("service_role", &args.jwt_secret));
-
-    // Started before anything else so that a target that cannot come up
-    // is one message rather than a suite's worth of them.
-    let served = match &args.zou_dsn {
-        Some(dsn) => Some(zou::start(dsn, args.jwt_secret.as_bytes())?),
-        None => None,
-    };
-    let (url, dsn) = match &served {
-        Some(served) => (served.url.clone(), args.zou_dsn.clone()),
-        None => (args.url.clone().unwrap_or_default(), args.dsn.clone()),
-    };
-    let name = args.name.clone().unwrap_or_else(|| match &served {
-        Some(_) => "zou".to_string(),
-        None => url.clone(),
-    });
-    let target = Target::new(
-        &name,
-        &url,
-        Some(anon.clone()),
-        Some(authenticated.clone()),
-        Some(service.clone()),
-        dsn,
-        args.strip.clone(),
-    );
-
-    let reference = args.reference_url.as_ref().map(|url| {
-        let name = args.reference_name.clone().unwrap_or_else(|| url.clone());
-        Target::new(
-            &name,
-            url,
-            Some(args.reference_anon.clone().unwrap_or_else(|| anon.clone())),
-            Some(authenticated.clone()),
-            Some(
-                args.reference_service
-                    .clone()
-                    .unwrap_or_else(|| service.clone()),
-            ),
-            args.reference_dsn.clone(),
-            args.reference_strip.clone(),
-        )
-    });
-
+    if args.mode == "derive" {
+        return written(&args);
+    }
     let names = match args.suites.is_empty() {
         true => Suite::all()?,
         false => args.suites.clone(),
@@ -247,6 +238,64 @@ fn run(args: Args) -> Result<bool, String> {
     let mut reports = Vec::new();
     for suite in &names {
         let suite = Suite::load(suite)?;
+        // Per suite rather than once, because a suite says which
+        // schemas it needs and which role its anon key carries, and two
+        // suites do not have to agree about either.
+        let anon = args
+            .anon
+            .clone()
+            .unwrap_or_else(|| zou::key(&suite.cases.anon_role, &args.jwt_secret));
+        let authenticated = args
+            .authenticated
+            .clone()
+            .unwrap_or_else(|| zou::key("authenticated", &args.jwt_secret));
+        let service = args
+            .service
+            .clone()
+            .unwrap_or_else(|| zou::key("service_role", &args.jwt_secret));
+        // Started before anything is asked so that a target that cannot
+        // come up is one message rather than a suite's worth of them.
+        let served = match &args.zou_dsn {
+            Some(dsn) => Some(zou::start(
+                dsn,
+                args.jwt_secret.as_bytes(),
+                &suite.cases.schemas,
+            )?),
+            None => None,
+        };
+        let (url, dsn) = match &served {
+            Some(served) => (served.url.clone(), args.zou_dsn.clone()),
+            None => (args.url.clone().unwrap_or_default(), args.dsn.clone()),
+        };
+        let name = args.name.clone().unwrap_or_else(|| match &served {
+            Some(_) => "zou".to_string(),
+            None => url.clone(),
+        });
+        let target = Target::new(
+            &name,
+            &url,
+            Some(anon.clone()),
+            Some(authenticated.clone()),
+            Some(service.clone()),
+            dsn,
+            args.strip.clone(),
+        );
+        let reference = args.reference_url.as_ref().map(|url| {
+            let name = args.reference_name.clone().unwrap_or_else(|| url.clone());
+            Target::new(
+                &name,
+                url,
+                Some(args.reference_anon.clone().unwrap_or_else(|| anon.clone())),
+                Some(authenticated.clone()),
+                Some(
+                    args.reference_service
+                        .clone()
+                        .unwrap_or_else(|| service.clone()),
+                ),
+                args.reference_dsn.clone(),
+                args.reference_strip.clone(),
+            )
+        });
         let setup = match args.setup {
             true => Some(suite.setup.as_str()),
             false => None,
@@ -266,7 +315,13 @@ fn run(args: Args) -> Result<bool, String> {
                     path.display()
                 );
             }
-            "check" => reports.push(check(&suite, &target, setup)?),
+            "check" => {
+                let report = check(&suite, &target, setup)?;
+                if args.write_known {
+                    write_known(&suite, &report)?;
+                }
+                reports.push(report);
+            }
             "diff" => {
                 let reference = reference.as_ref().expect("parse checked for one");
                 reports.push(against(&suite, &target, reference, setup)?);
@@ -291,6 +346,65 @@ fn run(args: Args) -> Result<bool, String> {
     Ok(good)
 }
 
+/// Deriving: a checkout in, a suite on disk out.
+///
+/// The recording is deliberately not written or touched. A derived
+/// suite is a set of questions, and the answers still have to come from
+/// asking the reference, which is `record` and a running PostgREST.
+fn written(args: &Args) -> Result<bool, String> {
+    let from = std::path::PathBuf::from(args.from.clone().expect("parse checked for one"));
+    let name = args.suites.first().expect("parse checked for one");
+    let derived = derive::derive(&from, name)?;
+    let dir = suite::suites_dir().join(name);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    write(&dir.join("setup.sql"), &derived.setup)?;
+    write(&dir.join("reset.sql"), &derived.reset)?;
+    let cases = serde_json::to_string_pretty(&derived.cases)
+        .map_err(|e| format!("writing the cases: {e}"))?;
+    write(&dir.join("cases.json"), &format!("{cases}\n"))?;
+    for skipped in &derived.skipped {
+        println!("skipped {skipped}");
+    }
+    println!(
+        "derived {} cases into {}, {} requests not understood",
+        derived.cases.cases.len(),
+        dir.display(),
+        derived.skipped.len()
+    );
+    Ok(true)
+}
+
+/// The run's differences, written down as the list they are excused by.
+///
+/// Every entry says what actually differs, taken from the report, so
+/// the file reads as the list of things zou does not do yet rather than
+/// as a list of names. It is checked in, which is the whole point: the
+/// next run fails on anything that is not in it, and on anything in it
+/// that has started to agree.
+fn write_known(suite: &Suite, report: &Report) -> Result<(), String> {
+    let known: Vec<serde_json::Value> = report
+        .results
+        .iter()
+        .filter(|r| r.difference.verdict == diff::Verdict::Different)
+        .map(|r| {
+            serde_json::json!({
+                "name": r.name,
+                "why": r.difference.lines.first().cloned().unwrap_or_default(),
+            })
+        })
+        .collect();
+    let path = suite.known_path();
+    let text =
+        serde_json::to_string_pretty(&known).map_err(|e| format!("writing the known list: {e}"))?;
+    write(&path, &format!("{text}\n"))?;
+    println!("wrote {} differences to {}", known.len(), path.display());
+    Ok(())
+}
+
+fn write(path: &std::path::Path, text: &str) -> Result<(), String> {
+    std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// The suite's schema, and then every case in order.
 ///
 /// The setup runs immediately before the questions rather than once for
@@ -311,7 +425,21 @@ fn ask(target: &Target, suite: &Suite, setup: Option<&str>) -> Result<Asked, Str
         answers: Vec::new(),
         errors: Vec::new(),
     };
+    // Upstream's own suite gets this for free by rolling every
+    // transaction back. Here the rows go back the hard way, before any
+    // case that is going to change them, so that a case is asked
+    // against the rows it was written against and not against what the
+    // twenty cases before it left behind.
+    let reset = match setup.is_some() {
+        true => suite.reset.as_deref(),
+        false => None,
+    };
     for case in &suite.cases.cases {
+        if case.writes
+            && let Some(reset) = reset
+        {
+            target.set_up(reset)?;
+        }
         match target.send(case) {
             Ok(answer) => asked.answers.push(answer),
             Err(message) => asked.errors.push((case.name.clone(), message)),

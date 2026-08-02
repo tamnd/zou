@@ -14,17 +14,19 @@ Bumping a version means re-recording the suites it covers, and the re-recording 
 Today that is PostgREST 14.15, GoTrue 2.194.0, postgres-meta 0.96.6, supabase-js 2.111.0, and the Supabase CLI 2.111.0.
 The one line where zou is deliberately ahead is Postgres: the Supabase local stack is on 17 and zou vendors 18, and a suite that depends on the difference is a suite that is testing Postgres rather than the API in front of it.
 
-## Three modes
+## Four modes
 
 ```
 record  ask a reference and write down what it said
 check   ask a target and compare it with what was written down
 diff    ask two targets and compare them with each other
+derive  read a PostgREST checkout and write a suite out of it
 ```
 
 `check` is what CI runs on every push, because it needs no reference on the machine, and because it fails on the day the two drift apart rather than on the day somebody remembers to look.
 `diff` is what you run when you have both up and you do not trust the recording, and CI runs it too, against a PostgREST it downloads at the pinned version, so a release that answers differently cannot sit in the recording being believed.
 `record` is how a suite is created or refreshed, and it refuses to write a recording with a hole in it, since the hole is what every later run would be compared against.
+`derive` is how the second suite got written, and it is described below.
 
 ## What counts as the same answer
 
@@ -53,6 +55,11 @@ It is excused from the exit code and nothing else, because a scoreboard that qui
 
 A known case that starts passing also fails the run.
 That is deliberate: the list is meant to shrink, and the only way it shrinks is if the day it becomes wrong is a day CI complains.
+
+`check --write-known` writes the run's differences to that file instead of failing over them.
+It exists for a suite that arrives with hundreds of them at once, where the alternative is either not running the suite in CI or hand writing hundreds of lines that say what the report already said.
+The entries it writes carry the difference itself as the reason, `status 400 not 200` and the like, so the file reads as the list of things zou does not do yet.
+It is a thing to run once when a suite lands and then never again, and the diff it produces is the review.
 
 ## Running it
 
@@ -104,7 +111,49 @@ The feature is only for grouping the score.
 
 Adding a case means adding it to `cases.json` and re-running `record`, and the diff in `recorded.json` is the review: it is upstream's answer, written down, and if it is surprising then the case found something.
 
+A suite may also carry a `reset.sql`, which the `postgrest` suite does.
+It is applied before every case that writes, so that a case is asked against the rows it was written against rather than against what the twenty cases before it left behind.
+Upstream gets that for free by rolling every transaction back; here the answers are recorded, so the rows go back the hard way, and identically for both targets.
+
+## The suite derived from upstream
+
+The `rest` suite is hand written, 82 cases about the surface a Supabase project actually uses.
+The `postgrest` suite is not written at all.
+`derive` reads a PostgREST checkout at the pinned version, walks its spec files, and turns every request in them into a case: 1233 of them, out of the 22 spec modules the default test app in `Main.hs` runs.
+
+```
+git clone --branch v14.15 https://github.com/PostgREST/postgrest /tmp/postgrest-src
+cargo run -p zou-conformance -- derive --from /tmp/postgrest-src --suite postgrest
+```
+
+The line drawn around what to take is upstream's own: exactly the specs that run against the default configuration, because a spec that needs a server flag is testing that flag rather than the REST surface.
+What comes across is the request, never the expectation.
+Upstream's `shouldRespondWith` is ignored on purpose, since the whole design here is that the answer comes from asking the binary rather than from reading somebody's assertion about it.
+
+`setup.sql` and `reset.sql` are upstream's fixtures with four differences, each of them noted in the file.
+The psql variables and includes are gone, because it is applied over a connection rather than by psql.
+The rows that arrived over `copy ... from stdin` are inserts, for the same reason, whitespace intact.
+PostGIS is gone, because it is not in the Postgres CI runs and the specs that need it are not in this suite, and it goes a whole statement at a time by reference rather than by name, so the tables, the functions over them, and the media type handlers over those all go with the extension.
+And two statements are swept up: upstream creates two schemas whose names are made of the characters a URL has opinions about and never drops them, and upstream rewrites a function's OID in `pg_proc` on purpose to build the collision from PostgREST issue 4052, which leaves a `pg_depend` row naming an OID no function has.
+Neither matters upstream, where the fixtures load into a database made a moment earlier.
+Here the same file is applied once per target, so it has to be able to run twice.
+
+Two of the 1235 requests in those files are not understood by the deriver, both in `InsertSpec`, and it says so rather than quietly dropping them.
+
+The reference for this suite is configured the way upstream configures its own:
+
+```
+db-schemas = "test"
+db-anon-role = "postgrest_test_anonymous"
+db-extra-search-path = ""
+```
+
 ## Where zou stands
+
+The `postgrest` suite is 1233 cases against PostgREST 14.15, and zou passes 589 of them, 47%, with 644 known differences.
+That number is the honest one, and it is meant to be uncomfortable.
+The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, so 47% against it and 86% against the hand written suite are both true and they measure different things.
+The gap is broken down by feature and by shape in [tamnd/zou#118](https://github.com/tamnd/zou/issues/118), and it is a small number of missing features rather than 644 separate bugs: spread embeds through a to-many relationship, the parts of the query parser that answer `PGRST100`, relationship resolution that answers `PGRST200`, `OPTIONS`, `explain`, the media type handlers, `Range` on a table, and `preference-applied`.
 
 The REST suite is 82 cases against PostgREST 14.15, and zou passes 71 of them, 86%, with 11 known differences.
 Every difference left is a message, a code, or a header, not a wrong answer to a question about data: error messages that name an internal alias instead of the table, raw SQLSTATEs where upstream has `PGRST205` or `PGRST204`, four wordings of a hint or a detail, an upsert that answers 201 where upstream answers 200 on a merge that updated, and `OPTIONS` on a table.
