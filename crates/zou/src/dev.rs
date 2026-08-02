@@ -206,6 +206,22 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
         std::env::var("ZOU_DISABLE_SIGNUP").as_deref(),
         Ok("true") | Ok("1")
     );
+    let hook = zou_server::hook::from_env()?;
+    // Worth a line of its own: a hook that rewrites claims is the one
+    // piece of a project's own code running in the middle of every sign
+    // in, and the first place to look when a token carries something
+    // nothing in this server puts there.
+    if hook.custom_access_token.live() {
+        log::info!(
+            "every access token goes through {}",
+            hook.custom_access_token.uri
+        );
+    } else if !hook.custom_access_token.uri.is_empty() {
+        log::info!(
+            "{} is wired up and switched off, set ZOU_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED=true",
+            hook.custom_access_token.uri
+        );
+    }
     let mfa = zou_server::mfa::from_env()?;
     if !mfa.totp_enroll || !mfa.totp_verify {
         log::info!("authenticator factors are off, /auth/v1/factors refuses by name");
@@ -281,6 +297,12 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // without deleting anybody's factors, and the two
             // ZOU_MFA_MAX_ envs move the ceilings.
             mfa,
+            // Nothing unless ZOU_HOOK_CUSTOM_ACCESS_TOKEN_URI names a
+            // function, and then that function decides what every
+            // access token carries. It runs inside the sign in's own
+            // transaction, so what it writes commits with the sign in
+            // and a refusal takes the sign in down with it.
+            hook,
             // Everything else is GoTrue's default, including the
             // unlimited rate the dev loop wants: the real per endpoint
             // budgets arrive with the rest of the auth surface.

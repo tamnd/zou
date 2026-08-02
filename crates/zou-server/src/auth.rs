@@ -76,6 +76,77 @@ impl Issued {
     }
 }
 
+/// What a grant needs in order to hand back a session, beyond the
+/// rows it writes: what signs the access token, who it says issued it,
+/// the project's hooks, and the address the request came from, which
+/// is the one thing a hook is told that the database cannot answer for
+/// itself.
+pub struct Mint<'a> {
+    signer: crate::jwt::Signer<'a>,
+    issuer: String,
+    hook: &'a crate::hook::Settings,
+    ip: String,
+}
+
+/// A project with nothing hooked, which is what a caller that has no
+/// configuration to hand over gets.
+static NO_HOOKS: crate::hook::Settings = crate::hook::Settings::none();
+
+impl<'a> Mint<'a> {
+    /// What this server mints with, for this request.
+    pub(crate) fn of(app: &'a App, req: &Request<Body>) -> Mint<'a> {
+        Mint::at(app, client_ip(req))
+    }
+
+    /// The same, for a flow that has already read the address off the
+    /// request and left the request behind.
+    pub(crate) fn at(app: &'a App, ip: String) -> Mint<'a> {
+        Mint {
+            signer: app.signer(),
+            issuer: app.issuer(),
+            hook: &app.cfg.hook,
+            ip,
+        }
+    }
+
+    /// A mint with no hooks and no request behind it, for a caller
+    /// outside the HTTP surface.
+    pub fn plain(signer: crate::jwt::Signer<'a>, issuer: &str) -> Mint<'a> {
+        Mint {
+            signer,
+            issuer: issuer.to_string(),
+            hook: &NO_HOOKS,
+            ip: String::new(),
+        }
+    }
+}
+
+/// The address the request came from, as GoTrue reads it: the first
+/// address in X-Forwarded-For that parses, then the peer. Nothing in
+/// front of this server is trusted to be there, so an unproxied request
+/// with no peer address falls back to the unspecified address, and two
+/// requests that both fall back match each other.
+///
+/// It is what an mfa challenge is pinned to and what a hook is told,
+/// and both want the same answer to the same question.
+pub(crate) fn client_ip(req: &Request<Body>) -> String {
+    if let Some(header) = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
+        for candidate in header.split(',') {
+            if let Ok(ip) = candidate.trim().parse::<std::net::IpAddr>() {
+                return ip.to_string();
+            }
+        }
+    }
+    req.extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|peer| peer.0.ip().to_string())
+        .unwrap_or_else(|| "0.0.0.0".to_string())
+}
+
 /// Why a request failed. `Denied` carries GoTrue's own status,
 /// error_code and message so a client that branches on any of them sees
 /// what it would see against hosted Supabase. `Weak` is the one refusal
@@ -89,6 +160,16 @@ pub enum Error {
         msg: String,
     },
     Weak(crate::password::Weak),
+    /// The project's custom access token hook refused, or broke. It
+    /// answers like `Denied` and it is told apart from one because of
+    /// when it happens: the grant has already written everything it
+    /// was going to write, so the transaction has to roll back rather
+    /// than commit a session nobody was given.
+    Hook {
+        status: StatusCode,
+        code: &'static str,
+        msg: String,
+    },
     /// A branch upstream serves and this end does not yet, refused from
     /// inside the flow so that the checks before it still run in
     /// upstream's order.
@@ -642,19 +723,35 @@ async fn describe(
 }
 
 /// Sign the access token for a session and describe it, the last step
-/// of every grant.
+/// of every grant, and the one place a token is signed at all.
+///
+/// `method` is how the person proved themselves on this request, which
+/// is not always what the session's amr rows say: a refresh proves
+/// nothing new, and the hook is told so.
+///
+/// The project's custom access token hook runs here, between the
+/// claims being built and the token being signed, which is where
+/// upstream runs it. What it hands back replaces the claim set rather
+/// than being merged into it. `expires_at` in the answer is still this
+/// server's arithmetic, upstream's too: a hook that rewrites `exp`
+/// changes the token without changing the body around it.
 pub(crate) async fn mint_for(
     sess: &sql::Session,
     session_id: &str,
     refresh_token: String,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    method: &str,
+    mint: &Mint<'_>,
 ) -> Result<Issued, Error> {
     let iat = now();
     let exp = iat + ACCESS_TTL;
-    let (claims, user) = describe(sess, session_id, iat, exp, issuer).await?;
+    let (mut claims, user) = describe(sess, session_id, iat, exp, &mint.issuer).await?;
+    let point = &mint.hook.custom_access_token;
+    if point.live() {
+        let input = crate::hook::input(&claims, method, &mint.ip);
+        claims = crate::hook::customize(sess, point, &input).await?;
+    }
     Ok(Issued {
-        access_token: signer.sign(&claims),
+        access_token: mint.signer.sign(&claims),
         refresh_token,
         expires_in: ACCESS_TTL,
         expires_at: exp,
@@ -673,11 +770,10 @@ pub async fn issue(
     pool: &Pool,
     user_id: &str,
     method: &str,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<Issued, Error> {
     let sess = pool.admin().await?;
-    let issued = start(&sess, user_id, method, signer, issuer).await;
+    let issued = start(&sess, user_id, method, mint).await;
     match issued {
         Ok(issued) => {
             sess.commit().await?;
@@ -694,8 +790,7 @@ async fn start(
     sess: &sql::Session,
     user_id: &str,
     method: &str,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<Issued, Error> {
     let rows = sess
         .query(
@@ -726,7 +821,7 @@ async fn start(
         &[&user_id],
     )
     .await?;
-    mint_for(sess, &session_id, token, signer, issuer).await
+    mint_for(sess, &session_id, token, method, mint).await
 }
 
 /// What the presented refresh token turned out to be.
@@ -745,22 +840,23 @@ struct Presented {
 
 /// The refresh_token grant. Rotation with reuse detection, in GoTrue's
 /// order: find, judge, rotate, mint.
-pub async fn refresh(
-    pool: &Pool,
-    token: &str,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
-) -> Result<Issued, Error> {
+pub async fn refresh(pool: &Pool, token: &str, mint: &Mint<'_>) -> Result<Issued, Error> {
     let sess = pool.admin().await?;
-    let out = rotate(&sess, token, signer, issuer).await;
+    let out = rotate(&sess, token, mint).await;
     // A refusal can still have written: an orphaned token is deleted
     // and a stolen one takes its whole family down with it. Both have
     // to survive the response, so the transaction commits either way
     // and only a database error rolls back.
+    //
+    // A hook that refused is the other rollback, and it has to be: the
+    // rotation has already happened by the time the hook runs, so
+    // committing it would spend the client's refresh token on a token
+    // it never received and lock it out of a session it is still
+    // entitled to.
     match out {
-        Err(Error::Db(e)) => {
+        Err(e @ (Error::Db(_) | Error::Hook { .. })) => {
             let _ = sess.rollback().await;
-            Err(Error::Db(e))
+            Err(e)
         }
         other => {
             sess.commit().await?;
@@ -769,12 +865,7 @@ pub async fn refresh(
     }
 }
 
-async fn rotate(
-    sess: &sql::Session,
-    token: &str,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
-) -> Result<Issued, Error> {
+async fn rotate(sess: &sql::Session, token: &str, mint: &Mint<'_>) -> Result<Issued, Error> {
     if token.is_empty() {
         return denied("validation_failed", "refresh_token required");
     }
@@ -867,7 +958,10 @@ async fn rotate(
         &[&session_id],
     )
     .await?;
-    mint_for(sess, &session_id, issued, signer, issuer).await
+    // A refresh proves nothing new about who is asking, and
+    // upstream tells the hook exactly that rather than repeating
+    // whatever the session was first proved with.
+    mint_for(sess, &session_id, issued, "token_refresh", mint).await
 }
 
 /// A revoked token was presented. Either it is the parent of the
@@ -1043,8 +1137,7 @@ async fn register(
     email: &str,
     hash: &str,
     data: &serde_json::Value,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
     post: &Post<'_>,
 ) -> Result<SignedUp, Error> {
     let autoconfirm = post.autoconfirm;
@@ -1172,7 +1265,7 @@ async fn register(
     )
     .await?;
     Ok(SignedUp::Session(Box::new(
-        start(sess, &user_id, "password", signer, issuer).await?,
+        start(sess, &user_id, "password", mint).await?,
     )))
 }
 
@@ -1224,8 +1317,7 @@ async fn register_phone(
     hash: &str,
     channel: &str,
     data: &serde_json::Value,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
     post: &Post<'_>,
 ) -> Result<SignedUp, Error> {
     let rows = sess
@@ -1315,7 +1407,7 @@ async fn register_phone(
     confirm_phone(sess, &user_id).await?;
     forget_tokens(sess, &user_id).await?;
     Ok(SignedUp::Session(Box::new(
-        start(sess, &user_id, "password", signer, issuer).await?,
+        start(sess, &user_id, "password", mint).await?,
     )))
 }
 
@@ -1328,15 +1420,14 @@ pub async fn sign_up_by_phone(
     password: &str,
     channel: &str,
     data: &serde_json::Value,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
     post: &Post<'_>,
 ) -> Result<SignedUp, Error> {
     let phone = validate_phone(phone)?;
     validate_password(password)?;
     let hash = hash_off_thread(password).await;
     let sess = pool.admin().await?;
-    let out = register_phone(&sess, &phone, &hash, channel, data, signer, issuer, post).await;
+    let out = register_phone(&sess, &phone, &hash, channel, data, mint, post).await;
     match out {
         Ok(done) => {
             sess.commit().await?;
@@ -1355,8 +1446,7 @@ pub async fn sign_up(
     email: &str,
     password: &str,
     data: &serde_json::Value,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
     post: &Post<'_>,
 ) -> Result<SignedUp, Error> {
     let email = validate_email(email)?;
@@ -1365,7 +1455,7 @@ pub async fn sign_up(
     // before the connection is taken so a slow hash never holds one.
     let hash = hash_off_thread(password).await;
     let sess = pool.admin().await?;
-    let out = register(&sess, &email, &hash, data, signer, issuer, post).await;
+    let out = register(&sess, &email, &hash, data, mint, post).await;
     match out {
         Ok(done) => {
             sess.commit().await?;
@@ -1390,11 +1480,10 @@ pub async fn sign_up(
 pub async fn sign_up_anonymously(
     pool: &Pool,
     data: &serde_json::Value,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<Issued, Error> {
     let sess = pool.admin().await?;
-    let out = anonymously(&sess, data, signer, issuer).await;
+    let out = anonymously(&sess, data, mint).await;
     match out {
         Ok(issued) => {
             sess.commit().await?;
@@ -1410,8 +1499,7 @@ pub async fn sign_up_anonymously(
 async fn anonymously(
     sess: &sql::Session,
     data: &serde_json::Value,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<Issued, Error> {
     let rows = sess
         .query(
@@ -1429,7 +1517,7 @@ async fn anonymously(
         )
         .await?;
     let user_id: String = rows[0].get(0);
-    start(sess, &user_id, "anonymous", signer, issuer).await
+    start(sess, &user_id, "anonymous", mint).await
 }
 
 pub(crate) async fn hash_off_thread(password: &str) -> String {
@@ -1456,11 +1544,10 @@ pub async fn password_grant(
     column: &str,
     held: &str,
     password: &str,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<Issued, Error> {
     let sess = pool.admin().await?;
-    let out = sign_in(&sess, column, held, password, signer, issuer).await;
+    let out = sign_in(&sess, column, held, password, mint).await;
     match out {
         Ok(issued) => {
             sess.commit().await?;
@@ -1478,8 +1565,7 @@ async fn sign_in(
     column: &str,
     held: &str,
     password: &str,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<Issued, Error> {
     // A number is already in its stored form by the time it gets here.
     // An address is not, because people type them in whatever case they
@@ -1531,7 +1617,7 @@ async fn sign_in(
             _ => denied("email_not_confirmed", "Email not confirmed"),
         };
     }
-    start(sess, &user_id, "password", signer, issuer).await
+    start(sess, &user_id, "password", mint).await
 }
 
 /// The one message every bad credential gets, GoTrue's wording.
@@ -2236,8 +2322,7 @@ async fn verified(
     sess: &sql::Session,
     asked: &Asked,
     rules: &Rules,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<Option<Issued>, Error> {
     let holder = if asked.token.is_empty() {
         by_hash(sess, &asked.kind, &asked.hash, LINK_EXPIRED).await?
@@ -2249,20 +2334,17 @@ async fn verified(
     if !consume(sess, &holder, &asked.hash, rules).await? {
         return Ok(None);
     }
-    Ok(Some(
-        start(sess, &holder.user_id, "otp", signer, issuer).await?,
-    ))
+    Ok(Some(start(sess, &holder.user_id, "otp", mint).await?))
 }
 
 async fn confirm(
     pool: &Pool,
     asked: &Asked,
     rules: &Rules,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<Option<Issued>, Error> {
     let sess = pool.admin().await?;
-    let out = verified(&sess, asked, rules, signer, issuer).await;
+    let out = verified(&sess, asked, rules, mint).await;
     match out {
         Ok(done) => {
             sess.commit().await?;
@@ -2367,8 +2449,7 @@ async fn magic_for(
     sess: &sql::Session,
     email: &str,
     data: &serde_json::Value,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
     post: &Post<'_>,
 ) -> Result<(), Error> {
     let rows = sess
@@ -2384,7 +2465,7 @@ async fn magic_for(
         // it, and both are a signup as far as this endpoint is
         // concerned. The password is drawn and thrown away.
         let hash = hash_off_thread(&unguessable_password()).await;
-        register(sess, email, &hash, data, signer, issuer, post).await?;
+        register(sess, email, &hash, data, mint, post).await?;
         if !post.autoconfirm {
             // The confirmation this just wrote is the link, so there is
             // nothing else to send.
@@ -2429,13 +2510,12 @@ pub async fn send_magic_link(
     pool: &Pool,
     email: &str,
     data: &serde_json::Value,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
     post: &Post<'_>,
 ) -> Result<(), Error> {
     let email = validate_email(email)?;
     let sess = pool.admin().await?;
-    let out = magic_for(&sess, &email, data, signer, issuer, post).await;
+    let out = magic_for(&sess, &email, data, mint, post).await;
     match out {
         Ok(()) => {
             sess.commit().await?;
@@ -3236,7 +3316,9 @@ fn body_with(status: StatusCode, body: serde_json::Value, code: &str) -> Respons
 /// broken rather than re-deriving it from english.
 pub(crate) fn refusal(e: Error, doing: &str) -> Response {
     match e {
-        Error::Denied { status, code, msg } => error_body(status, code, &msg),
+        Error::Denied { status, code, msg } | Error::Hook { status, code, msg } => {
+            error_body(status, code, &msg)
+        }
         Error::Weak(weak) => body_with(
             StatusCode::UNPROCESSABLE_ENTITY,
             serde_json::json!({
@@ -3503,6 +3585,7 @@ pub async fn signup(
         return no_database();
     };
     let (wanted, from) = link_target(&req);
+    let mint = Mint::of(&app, &req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -3536,7 +3619,7 @@ pub async fn signup(
             );
         }
         let data = metadata(&body);
-        return match sign_up_anonymously(pool, &data, &app.signer(), &app.issuer()).await {
+        return match sign_up_anonymously(pool, &data, &mint).await {
             Ok(issued) => json_body(StatusCode::OK, issued.json()),
             Err(e) => refusal(e, "anonymous signup"),
         };
@@ -3582,18 +3665,7 @@ pub async fn signup(
                 "Phone signups are disabled",
             );
         }
-        return match sign_up_by_phone(
-            pool,
-            phone,
-            password,
-            &channel,
-            &data,
-            &app.signer(),
-            &app.issuer(),
-            &post,
-        )
-        .await
-        {
+        return match sign_up_by_phone(pool, phone, password, &channel, &data, &mint, &post).await {
             Ok(SignedUp::Session(issued)) => json_body(StatusCode::OK, issued.json()),
             Ok(SignedUp::Pending(user)) => json_body(StatusCode::OK, user),
             Err(e) => refusal(e, "signup"),
@@ -3612,8 +3684,7 @@ pub async fn signup(
         email,
         password,
         &data,
-        &app.signer(),
-        &app.issuer(),
+        &mint,
         &posting(&app, &wanted, &from),
     )
     .await
@@ -3633,6 +3704,7 @@ pub async fn verify(
     let Some(pool) = &app.pool else {
         return no_database();
     };
+    let mint = Mint::of(&app, &req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -3641,7 +3713,7 @@ pub async fn verify(
         Ok(v) => v,
         Err(e) => return refusal(e, "verify"),
     };
-    match confirm(pool, &asked, &rules(&app), &app.signer(), &app.issuer()).await {
+    match confirm(pool, &asked, &rules(&app), &mint).await {
         Ok(Some(issued)) => json_body(StatusCode::OK, issued.json()),
         // One of the two addresses has answered. The other one still
         // has to, so there is no session to hand out yet.
@@ -3667,6 +3739,7 @@ pub async fn verify_get(
     let Some(pool) = &app.pool else {
         return no_database();
     };
+    let mint = Mint::of(&app, &req);
     let query = query_object(req.uri().query().unwrap_or_default());
     let asked = match asked(&query, true) {
         Ok(v) => v,
@@ -3682,7 +3755,7 @@ pub async fn verify_get(
         .unwrap_or_default();
     let target = landing(&app, field(&query, "redirect_to"), referrer);
 
-    match confirm(pool, &asked, &rules(&app), &app.signer(), &app.issuer()).await {
+    match confirm(pool, &asked, &rules(&app), &mint).await {
         Ok(Some(issued)) => {
             let fragment = vec![
                 ("access_token", issued.access_token.clone()),
@@ -3704,7 +3777,9 @@ pub async fn verify_get(
         ),
         Err(e) => {
             let (status, code, msg) = match e {
-                Error::Denied { status, code, msg } => (status, code, msg),
+                Error::Denied { status, code, msg } | Error::Hook { status, code, msg } => {
+                    (status, code, msg)
+                }
                 Error::NotYet(surface) => return not_yet(surface),
                 Error::Weak(_) => unreachable!("a verify never judges a password"),
                 Error::Db(e) => {
@@ -4070,7 +4145,7 @@ pub async fn callback(
     req: Request<Body>,
 ) -> Response {
     let query = query_object(req.uri().query().unwrap_or_default());
-    came_back(app, query).await
+    came_back(app, query, client_ip(&req)).await
 }
 
 /// POST /auth/v1/callback, which is the same thing arriving as a form.
@@ -4084,6 +4159,7 @@ pub async fn callback_form(
     req: Request<Body>,
 ) -> Response {
     let query = query_object(req.uri().query().unwrap_or_default());
+    let ip = client_ip(&req);
     let bytes = match to_bytes(req.into_body(), MAX_BODY).await {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -4107,12 +4183,12 @@ pub async fn callback_form(
             fields.insert(key.clone(), value.clone());
         }
     }
-    came_back(app, serde_json::Value::Object(fields)).await
+    came_back(app, serde_json::Value::Object(fields), ip).await
 }
 
 /// The callback itself, once its parameters have been found wherever
 /// the provider chose to put them.
-async fn came_back(app: Arc<App>, query: serde_json::Value) -> Response {
+async fn came_back(app: Arc<App>, query: serde_json::Value, ip: String) -> Response {
     let Some(pool) = &app.pool else {
         return no_database();
     };
@@ -4182,7 +4258,18 @@ async fn came_back(app: Arc<App>, query: serde_json::Value) -> Response {
     }
 
     let post = posting(&app, &flow.referrer, "");
-    match land(&app, pool, &flow, provider, &person, &tokens, &post).await {
+    match land(
+        &app,
+        pool,
+        &flow,
+        provider,
+        &person,
+        &tokens,
+        &post,
+        &Mint::at(&app, ip),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(e) => oauth_refusal(&target, e),
     }
@@ -4355,6 +4442,7 @@ fn read_flow(row: Option<&tokio_postgres::Row>) -> Result<Flow, Error> {
 /// find or make the account, then either mark the flow for a client
 /// that will come back with a verifier, or hand out a session on the
 /// redirect itself.
+#[allow(clippy::too_many_arguments)]
 async fn land(
     app: &App,
     pool: &Pool,
@@ -4363,9 +4451,10 @@ async fn land(
     person: &crate::oauth::Person,
     tokens: &crate::oauth::Tokens,
     post: &Post<'_>,
+    mint: &Mint<'_>,
 ) -> Result<Response, Error> {
     let sess = pool.admin().await?;
-    let out = settle(&sess, app, flow, provider, person, tokens, post).await;
+    let out = settle(&sess, app, flow, provider, person, tokens, post, mint).await;
     match out {
         Ok(landed) => {
             // The unverified address branch commits and then refuses,
@@ -4400,6 +4489,7 @@ enum Landed {
     Unverified(&'static str, String),
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn settle(
     sess: &sql::Session,
     app: &App,
@@ -4408,6 +4498,7 @@ async fn settle(
     person: &crate::oauth::Person,
     tokens: &crate::oauth::Tokens,
     post: &Post<'_>,
+    mint: &Mint<'_>,
 ) -> Result<Landed, Error> {
     // A flow that names a target is a manual link: the account is
     // already known and the question is only whether this identity may
@@ -4430,7 +4521,7 @@ async fn settle(
     if flow.challenge.is_none() {
         // Implicit: the session rides back in the fragment, and the
         // flow row has done its job.
-        let issued = start(sess, &user_id, "oauth", &app.signer(), &app.issuer()).await?;
+        let issued = start(sess, &user_id, "oauth", mint).await?;
         sess.execute(
             "delete from auth.flow_state where id = $1::text::uuid",
             &[&flow.id],
@@ -5111,7 +5202,9 @@ fn oauth_redirect(target: &str, error: &str, code: &str, description: &str) -> R
 
 fn oauth_refusal(target: &str, e: Error) -> Response {
     let (status, code, msg) = match e {
-        Error::Denied { status, code, msg } => (status, code, msg),
+        Error::Denied { status, code, msg } | Error::Hook { status, code, msg } => {
+            (status, code, msg)
+        }
         Error::NotYet(surface) => return not_yet(surface),
         Error::Weak(_) => unreachable!("a callback never judges a password"),
         Error::Db(e) => {
@@ -5140,8 +5233,7 @@ pub async fn pkce_grant(
     pool: &Pool,
     auth_code: &str,
     verifier: &str,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<(Issued, String, String), Error> {
     if auth_code.is_empty() || verifier.is_empty() {
         return denied(
@@ -5150,7 +5242,7 @@ pub async fn pkce_grant(
         );
     }
     let sess = pool.admin().await?;
-    let out = redeem(&sess, auth_code, verifier, signer, issuer).await;
+    let out = redeem(&sess, auth_code, verifier, mint).await;
     match out {
         Ok(issued) => {
             sess.commit().await?;
@@ -5167,8 +5259,7 @@ async fn redeem(
     sess: &sql::Session,
     auth_code: &str,
     verifier: &str,
-    signer: &crate::jwt::Signer<'_>,
-    issuer: &str,
+    mint: &Mint<'_>,
 ) -> Result<(Issued, String, String), Error> {
     // The row is locked for the length of the trade, so two clients
     // sending the same code cannot both walk away with a session.
@@ -5211,7 +5302,7 @@ async fn redeem(
     let proved: String = row.get(7);
     verify_pkce(&challenge, &method, verifier)?;
 
-    let issued = start(sess, &user_id, &proved, signer, issuer).await?;
+    let issued = start(sess, &user_id, &proved, mint).await?;
     sess.execute(
         "delete from auth.flow_state where id = $1::text::uuid",
         &[&id],
@@ -5324,11 +5415,12 @@ pub async fn magiclink(
         );
     }
     let (wanted, from) = link_target(&req);
+    let mint = Mint::of(&app, &req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
     };
-    magic(&app, pool, &body, &posting(&app, &wanted, &from)).await
+    magic(pool, &body, &posting(&app, &wanted, &from), &mint).await
 }
 
 /// POST /auth/v1/otp, which is the magic link endpoint with a phone
@@ -5342,6 +5434,7 @@ pub async fn otp(
         return no_database();
     };
     let (wanted, from) = link_target(&req);
+    let mint = Mint::of(&app, &req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -5393,7 +5486,7 @@ pub async fn otp(
         }
     }
     if !phone.is_empty() {
-        return sms_otp(&app, pool, &body, &posting(&app, &wanted, &from)).await;
+        return sms_otp(&app, pool, &body, &posting(&app, &wanted, &from), &mint).await;
     }
     if email.is_empty() {
         return error_body(
@@ -5413,13 +5506,18 @@ pub async fn otp(
             "Email logins are disabled",
         );
     }
-    magic(&app, pool, &body, &posting(&app, &wanted, &from)).await
+    magic(pool, &body, &posting(&app, &wanted, &from), &mint).await
 }
 
 /// The body both of them share. The answer is empty and the same
 /// whether the address was known, which is what keeps either endpoint
 /// from being asked who has an account here.
-async fn magic(app: &App, pool: &Pool, body: &serde_json::Value, post: &Post<'_>) -> Response {
+async fn magic(
+    pool: &Pool,
+    body: &serde_json::Value,
+    post: &Post<'_>,
+    mint: &Mint<'_>,
+) -> Response {
     let email = field(body, "email");
     if email.is_empty() {
         // Upstream's wording, copied from recover, and its status,
@@ -5432,7 +5530,7 @@ async fn magic(app: &App, pool: &Pool, body: &serde_json::Value, post: &Post<'_>
         );
     }
     let data = metadata(body);
-    match send_magic_link(pool, email, &data, &app.signer(), &app.issuer(), post).await {
+    match send_magic_link(pool, email, &data, mint, post).await {
         Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
         Err(e) => refusal(e, "magic link"),
     }
@@ -5445,7 +5543,13 @@ async fn magic(app: &App, pool: &Pool, body: &serde_json::Value, post: &Post<'_>
 /// all registers people. Whether that signup sends the code or this does
 /// depends on autoconfirm, and so does whether the answer carries the
 /// provider's message id.
-async fn sms_otp(app: &App, pool: &Pool, body: &serde_json::Value, post: &Post<'_>) -> Response {
+async fn sms_otp(
+    app: &App,
+    pool: &Pool,
+    body: &serde_json::Value,
+    post: &Post<'_>,
+    mint: &Mint<'_>,
+) -> Response {
     if !app.cfg.phone_enabled {
         return error_body(
             StatusCode::BAD_REQUEST,
@@ -5471,17 +5575,8 @@ async fn sms_otp(app: &App, pool: &Pool, body: &serde_json::Value, post: &Post<'
         Err(e) => return refusal(e, "otp"),
     };
     if !confirmed {
-        let signed = sign_up_by_phone(
-            pool,
-            &phone,
-            &unguessable(64),
-            &channel,
-            &data,
-            &app.signer(),
-            &app.issuer(),
-            post,
-        )
-        .await;
+        let signed =
+            sign_up_by_phone(pool, &phone, &unguessable(64), &channel, &data, mint, post).await;
         if let Err(e) = signed {
             return refusal(e, "otp");
         }
@@ -6056,6 +6151,7 @@ pub async fn token(
     let Some(pool) = &app.pool else {
         return no_database();
     };
+    let mint = Mint::of(&app, &req);
     let body = match read_json(req.into_body()).await {
         Ok(v) => v,
         Err(res) => return res,
@@ -6066,8 +6162,7 @@ pub async fn token(
             pool,
             field(&body, "auth_code"),
             field(&body, "code_verifier"),
-            &app.signer(),
-            &app.issuer(),
+            &mint,
         )
         .await
         {
@@ -6126,23 +6221,9 @@ pub async fn token(
                 "missing email or phone",
             );
         };
-        password_grant(
-            pool,
-            column,
-            &held,
-            field(&body, "password"),
-            &app.signer(),
-            &app.issuer(),
-        )
-        .await
+        password_grant(pool, column, &held, field(&body, "password"), &mint).await
     } else {
-        refresh(
-            pool,
-            field(&body, "refresh_token"),
-            &app.signer(),
-            &app.issuer(),
-        )
-        .await
+        refresh(pool, field(&body, "refresh_token"), &mint).await
     };
 
     match issued {
