@@ -209,9 +209,9 @@ They are skipped behind an environment flag rather than deleted, so the day the 
 
 ## Where zou stands
 
-The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes 582 of them, 48%, with 635 known differences.
+The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes 582 of them, 47%, with 635 known differences.
 That number is the honest one, and it is meant to be uncomfortable.
-The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, so 48% against it and 86% against the hand written suite are both true and they measure different things.
+The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, so 47% against it and 86% against the hand written suite are both true and they measure different things.
 The gap is broken down by feature and by shape in [tamnd/zou#118](https://github.com/tamnd/zou/issues/118), and it is a small number of missing features rather than 635 separate bugs: spread embeds through a to-many relationship, the parts of the query parser that answer `PGRST100`, relationship resolution that answers `PGRST200`, `OPTIONS`, `explain`, the media type handlers, `Range` on a table, and `preference-applied`.
 
 supabase-js 2.111.0 runs 16 of its integration tests against zou and all 16 pass.
