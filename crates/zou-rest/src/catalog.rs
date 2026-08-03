@@ -36,6 +36,7 @@
 //! there for the same reason: a write has to spell out what it is
 //! unpacking a body into before either cast can be called.
 
+use std::collections::HashSet;
 use std::fmt;
 
 /// One foreign key, straight off [`INTROSPECT_SQL`]. `table` is the
@@ -237,6 +238,14 @@ select c.relname::text,
    and not a.attisdropped
  order by c.relname, a.attnum";
 
+/// Every timezone name postgres will accept, which is what decides
+/// whether `Prefer: timezone=` names a real one. It takes no
+/// parameter: the list is the installation's and not a schema's, and
+/// it is here rather than anywhere else because upstream's schema
+/// cache holds it too, loaded and expired with everything else the
+/// cache holds.
+pub const TIMEZONES_SQL: &str = "select name::text from pg_timezone_names";
+
 /// How the embedded rows relate to the outer ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -290,6 +299,7 @@ impl std::error::Error for EmbedError {}
 pub struct Catalog {
     fks: Vec<FkRow>,
     rels: Vec<Relation>,
+    timezones: HashSet<String>,
 }
 
 impl Catalog {
@@ -301,6 +311,7 @@ impl Catalog {
         Catalog {
             fks,
             rels: Vec::new(),
+            timezones: HashSet::new(),
         }
     }
 
@@ -325,6 +336,23 @@ impl Catalog {
             }
         }
         Catalog { rels, ..self }
+    }
+
+    /// The same catalog knowing which timezone names postgres has,
+    /// the answer to [`TIMEZONES_SQL`].
+    pub fn with_timezones(self, names: Vec<String>) -> Catalog {
+        Catalog {
+            timezones: names.into_iter().collect(),
+            ..self
+        }
+    }
+
+    /// Whether postgres would take this as a timezone. The names are
+    /// case sensitive here because they are case sensitive there: a
+    /// `SET timezone` to `utc` is not the `UTC` pg_timezone_names
+    /// lists, and upstream refuses it on exactly that ground.
+    pub fn has_timezone(&self, name: &str) -> bool {
+        self.timezones.contains(name)
     }
 
     /// The foreign keys as introspected, which the OpenAPI document

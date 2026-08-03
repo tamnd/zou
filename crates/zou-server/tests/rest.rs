@@ -2620,3 +2620,216 @@ async fn a_column_left_out_of_a_body_can_take_its_default() {
         "return=representation"
     );
 }
+
+/// The handling preference decides what an unrecognized preference
+/// costs, and the timezone preference is checked against the names
+/// postgres has before it is set for the length of the transaction.
+#[tokio::test]
+async fn a_preference_nobody_has_costs_what_handling_says_it_does() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_when cascade",
+            "create table zou_rest_when (id int primary key, t timestamptz)",
+            "insert into zou_rest_when values (1, '2023-10-18T12:37:59.611Z')",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // Strict refuses and names what it did not know.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_rest_when",
+            "",
+            &["handling=strict, anything"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST122");
+    assert_eq!(body["details"], "Invalid preferences: anything");
+    assert_eq!(
+        body["message"],
+        "Invalid preferences given with handling=strict"
+    );
+
+    // Lenient carries on and says which of the two it was.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_rest_when",
+            "",
+            &["handling=lenient, anything"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get("preference-applied").unwrap(),
+        "handling=lenient"
+    );
+
+    // A timezone postgres has renders the row in it.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_rest_when?select=t",
+            "",
+            &["handling=strict, timezone=America/Los_Angeles"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.headers().get("preference-applied").unwrap(),
+        "handling=strict, timezone=America/Los_Angeles"
+    );
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"t": "2023-10-18T05:37:59.611-07:00"}]"#
+    );
+
+    // One it does not have is refused under strict and ignored
+    // without it, which leaves the answer in the server's own zone.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_rest_when?select=t",
+            "",
+            &["handling=strict, timezone=Nowhere/Special"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(
+        body["details"],
+        "Invalid preferences: timezone=Nowhere/Special"
+    );
+
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_rest_when?select=t",
+            "",
+            &["timezone=Nowhere/Special"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().get("preference-applied").is_none());
+}
+
+/// max-affected caps what a mutation may touch, and the rows it
+/// already wrote go back when it does not hold.
+#[tokio::test]
+async fn a_write_that_touched_more_rows_than_asked_for_is_taken_back() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_capped cascade",
+            "create table zou_rest_capped (id int primary key, name text)",
+            "insert into zou_rest_capped \
+               select i, 'row ' || i from generate_series(1, 5) i",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    let count = |app: axum::Router| async move {
+        let res = app
+            .oneshot(get("/rest/v1/zou_rest_capped?select=id"))
+            .await
+            .unwrap();
+        serde_json::from_str::<Vec<serde_json::Value>>(&body_text(res).await)
+            .unwrap()
+            .len()
+    };
+
+    // Over the cap the whole delete is refused, and the rows are
+    // still there afterwards.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/rest/v1/zou_rest_capped?id=gt.0",
+            "",
+            &["handling=strict, max-affected=2"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST124");
+    assert_eq!(body["details"], "The query affects 5 rows");
+    assert_eq!(
+        body["message"],
+        "Query result exceeds max-affected preference constraint"
+    );
+    assert_eq!(count(app.clone()).await, 5);
+
+    // An update is judged the same way and taken back the same way.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_capped?id=gt.0",
+            r#"{"name": "renamed"}"#,
+            &["handling=strict, max-affected=0"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_capped?select=name&id=eq.1"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"name": "row 1"}]"#);
+
+    // Under the cap the write lands and says what it held itself to.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/rest/v1/zou_rest_capped?id=lt.3",
+            "",
+            &["handling=strict, max-affected=2"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        res.headers().get("preference-applied").unwrap(),
+        "handling=strict, max-affected=2"
+    );
+    assert_eq!(count(app.clone()).await, 3);
+
+    // Without strict the cap is not applied at all, so it neither
+    // binds nor is claimed.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/rest/v1/zou_rest_capped?id=gt.0",
+            "",
+            &["handling=lenient, max-affected=1"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        res.headers().get("preference-applied").unwrap(),
+        "handling=lenient"
+    );
+    assert_eq!(count(app.clone()).await, 0);
+}
