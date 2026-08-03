@@ -21,6 +21,8 @@ use crate::diff::{Difference, Verdict};
 pub struct Result {
     pub name: String,
     pub feature: String,
+    pub method: String,
+    pub path: String,
     pub difference: Difference,
 }
 
@@ -28,6 +30,52 @@ impl Result {
     fn differs(&self) -> bool {
         self.difference.verdict == Verdict::Different
     }
+
+    /// Which endpoint the case asked, which is a different cut through
+    /// the same run than the feature is. A feature says what somebody
+    /// was testing, an endpoint says what the server had to implement,
+    /// and "PATCH on a table is at 30%" is the one you can act on.
+    pub fn endpoint(&self) -> String {
+        format!("{} {}", self.method, endpoint(&self.path))
+    }
+}
+
+/// The path with the parts that name a particular table, function, or
+/// row taken out, since a scoreboard with a row per fixture table is a
+/// scoreboard about the fixtures.
+fn endpoint(path: &str) -> String {
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    match segments.as_slice() {
+        // The schema document, which is its own endpoint rather than a
+        // table whose name happens to be empty.
+        ["rest", "v1"] => "/rest/v1/".to_string(),
+        ["rest", "v1", "rpc", ..] => "/rest/v1/rpc/{function}".to_string(),
+        ["rest", "v1", _] => "/rest/v1/{table}".to_string(),
+        // Auth paths are a fixed vocabulary rather than names of things,
+        // so they stay as they are, apart from an id in the middle.
+        ["auth", "v1", ..] => {
+            let mut out = String::new();
+            for segment in segments {
+                out.push('/');
+                out.push_str(match is_id(segment) {
+                    true => "{id}",
+                    false => segment,
+                });
+            }
+            out
+        }
+        _ => path.to_string(),
+    }
+}
+
+/// A uuid or a number, which names a row rather than a route.
+fn is_id(segment: &str) -> bool {
+    if segment.is_empty() {
+        return false;
+    }
+    let uuid = segment.len() == 36 && segment.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    uuid || segment.chars().all(|c| c.is_ascii_digit())
 }
 
 pub struct Report {
@@ -86,9 +134,18 @@ impl Report {
 
     /// Per feature, in name order.
     pub fn by_feature(&self) -> Vec<(String, Counts)> {
-        let mut features: BTreeMap<&str, Counts> = BTreeMap::new();
+        self.grouped(|result| result.feature.clone())
+    }
+
+    /// Per endpoint, in name order.
+    pub fn by_endpoint(&self) -> Vec<(String, Counts)> {
+        self.grouped(Result::endpoint)
+    }
+
+    fn grouped(&self, key: impl Fn(&Result) -> String) -> Vec<(String, Counts)> {
+        let mut groups: BTreeMap<String, Counts> = BTreeMap::new();
         for result in &self.results {
-            let counts = features.entry(result.feature.as_str()).or_insert(Counts {
+            let counts = groups.entry(key(result)).or_insert(Counts {
                 same: 0,
                 written: 0,
                 different: 0,
@@ -99,10 +156,7 @@ impl Report {
                 Verdict::Different => counts.different += 1,
             }
         }
-        features
-            .into_iter()
-            .map(|(name, counts)| (name.to_string(), counts))
-            .collect()
+        groups.into_iter().collect()
     }
 
     /// Differences nobody wrote down, which is what a run is looking
@@ -209,6 +263,18 @@ impl Report {
                 })
             })
             .collect();
+        let endpoints: Vec<serde_json::Value> = self
+            .by_endpoint()
+            .into_iter()
+            .map(|(endpoint, counts)| {
+                serde_json::json!({
+                    "endpoint": endpoint,
+                    "passed": counts.passed(),
+                    "total": counts.total(),
+                    "percent": counts.percent(),
+                })
+            })
+            .collect();
         let cases: Vec<serde_json::Value> = self
             .results
             .iter()
@@ -235,11 +301,13 @@ impl Report {
             "total": counts.total(),
             "percent": counts.percent(),
             "written": counts.written,
+            "known": self.known.len(),
             "errors": self.errors.iter().map(|(name, message)| serde_json::json!({
                 "name": name,
                 "message": message,
             })).collect::<Vec<_>>(),
             "features": features,
+            "endpoints": endpoints,
             "cases": cases,
         })
     }
@@ -250,9 +318,15 @@ mod tests {
     use super::*;
 
     fn result(name: &str, feature: &str, verdict: Verdict) -> Result {
+        asked("GET", "/rest/v1/tasks", name, feature, verdict)
+    }
+
+    fn asked(method: &str, path: &str, name: &str, feature: &str, verdict: Verdict) -> Result {
         Result {
             name: name.to_string(),
             feature: feature.to_string(),
+            method: method.to_string(),
+            path: path.to_string(),
             difference: Difference {
                 verdict,
                 lines: match verdict {
@@ -391,5 +465,45 @@ mod tests {
         assert_eq!(json["cases"].as_array().expect("cases").len(), 2);
         assert_eq!(json["percent"], 50);
         assert_eq!(json["features"][0]["feature"], "select");
+        assert_eq!(json["endpoints"][0]["endpoint"], "GET /rest/v1/{table}");
+    }
+
+    /// The point of the endpoint cut is that it does not have a row per
+    /// fixture table. Two tables and a function are two endpoints, not
+    /// three.
+    #[test]
+    fn the_table_a_case_asked_is_not_part_of_the_endpoint() {
+        let report = report(vec![
+            asked("GET", "/rest/v1/items?id=eq.1", "a", "query", Verdict::Same),
+            asked("GET", "/rest/v1/projects", "b", "query", Verdict::Different),
+            asked("POST", "/rest/v1/rpc/add", "c", "rpc", Verdict::Same),
+        ]);
+        let endpoints = report.by_endpoint();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].0, "GET /rest/v1/{table}");
+        assert_eq!(endpoints[0].1.percent(), 50);
+        assert_eq!(endpoints[1].0, "POST /rest/v1/rpc/{function}");
+    }
+
+    /// An auth path is a route rather than a name, so it keeps its
+    /// words. A row id in the middle of one is not.
+    #[test]
+    fn an_auth_path_keeps_its_words_and_loses_its_ids() {
+        assert_eq!(
+            endpoint("/auth/v1/token?grant_type=password"),
+            "/auth/v1/token"
+        );
+        assert_eq!(
+            endpoint("/auth/v1/admin/users/8f2c5f70-6b3a-4c1d-9e2b-7a5d4c3b2a19"),
+            "/auth/v1/admin/users/{id}"
+        );
+    }
+
+    /// The schema document is an endpoint of its own, not a table whose
+    /// name is empty.
+    #[test]
+    fn the_root_is_its_own_endpoint() {
+        assert_eq!(endpoint("/rest/v1/"), "/rest/v1/");
+        assert_eq!(endpoint("/rest/v1"), "/rest/v1/");
     }
 }
