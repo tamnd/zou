@@ -180,8 +180,10 @@ fn no_database() -> RestError {
     }
 }
 
-/// A body that is not the json a write needs, PostgREST's PGRST102
-/// carrying the parser's own message.
+/// A body that is not the json a write needs, PostgREST's PGRST102.
+/// Upstream says the same sentence for every way a body can be
+/// wrong, so the parser's own account of it stays out of the
+/// response and goes nowhere near a client.
 fn invalid_body(message: impl Into<String>) -> RestError {
     RestError {
         status: StatusCode::BAD_REQUEST,
@@ -673,54 +675,75 @@ fn row_json(media: Media) -> &'static str {
 /// upstream. Callers prepend `with ... "_zou_source" as (...)`.
 const CSV_AGG: &str = "select (select coalesce(string_agg(a.k, ','), '') from (select json_object_keys(r)::text as k from (select row_to_json(hh) as r from \"_zou_source\" as hh limit 1) s) a) || E'\\n' || coalesce(string_agg(substring(\"_zou_t\"::text, 2, length(\"_zou_t\"::text) - 2), E'\\n'), ''), count(*) from (select * from \"_zou_source\") as \"_zou_t\"";
 
-/// An insert body into its column list and normalized payload: one
-/// object wraps into a single element array, the columns are the
-/// union of every element's keys so a key absent from one row
-/// inserts null there, and the columns parameter narrows the list
-/// when given, PostgREST's shapes.
+/// A write's body into the rows it carries. Every write reads it the
+/// same way: json or PGRST102, one object counted as a single row,
+/// anything that is not an object carrying no keys at all rather
+/// than being refused, which is why a body of `42` inserts one row
+/// of defaults.
+///
+/// The columns are the first row's keys and every other row has to
+/// agree with them, because upstream unpacks the whole array against
+/// one column list and a row with different keys would silently lose
+/// some. ?columns= says the list outright, and then the body is not
+/// inspected at all: an array of numbers reaches postgres and fails
+/// there, which is upstream's answer too.
+fn body_rows(
+    bytes: &[u8],
+    columns: Option<&[String]>,
+) -> Result<(Vec<String>, Vec<serde_json::Value>), RestError> {
+    let v: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| invalid_body("Empty or invalid json"))?;
+    let bulk = v.is_array();
+    let rows = match v {
+        serde_json::Value::Array(a) => a,
+        other => vec![other],
+    };
+    if let Some(list) = columns {
+        return Ok((list.to_vec(), rows));
+    }
+    let cols: Vec<String> = rows
+        .first()
+        .and_then(|row| row.as_object())
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    // A lone object never disagrees with itself, and neither does a
+    // scalar, so only an array is held to this.
+    if bulk {
+        for row in &rows {
+            let Some(obj) = row.as_object() else {
+                return Err(invalid_body("All object keys must match"));
+            };
+            if obj.len() != cols.len() || !cols.iter().all(|c| obj.contains_key(c)) {
+                return Err(invalid_body("All object keys must match"));
+            }
+        }
+    }
+    Ok((cols, rows))
+}
+
+/// An insert body into its column list and normalized payload, which
+/// is always an array so that json_populate_recordset can unpack it.
 fn insert_payload(
     bytes: &[u8],
     columns: Option<&[String]>,
 ) -> Result<(Vec<String>, String), RestError> {
-    let v: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| invalid_body(e.to_string()))?;
-    let arr = match v {
-        serde_json::Value::Object(_) => vec![v],
-        serde_json::Value::Array(a) => a,
-        _ => {
-            return Err(invalid_body(
-                "the insert body must be a json object or array",
-            ));
-        }
-    };
-    let mut cols: Vec<String> = Vec::new();
-    for item in &arr {
-        let Some(obj) = item.as_object() else {
-            return Err(invalid_body(
-                "every element of an insert array must be an object",
-            ));
-        };
-        for key in obj.keys() {
-            if !cols.contains(key) {
-                cols.push(key.clone());
-            }
-        }
-    }
-    if let Some(list) = columns {
-        cols = list.to_vec();
-    }
-    Ok((cols, serde_json::Value::Array(arr).to_string()))
+    let (cols, rows) = body_rows(bytes, columns)?;
+    Ok((cols, serde_json::Value::Array(rows).to_string()))
 }
 
-/// An update body into its column list and payload, one json object
-/// whose keys are the columns to set.
-fn update_payload(bytes: &[u8]) -> Result<(Vec<String>, String), RestError> {
-    let v: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|e| invalid_body(e.to_string()))?;
-    let Some(obj) = v.as_object() else {
-        return Err(invalid_body("the update body must be a json object"));
+/// An update body into its column list and payload. An update writes
+/// one row, so an array of them is not refused, it is read down to
+/// its first element the way upstream's LIMIT 1 reads it, and an
+/// empty one leaves no columns to set at all.
+fn update_payload(
+    bytes: &[u8],
+    columns: Option<&[String]>,
+) -> Result<(Vec<String>, String), RestError> {
+    let (cols, rows) = body_rows(bytes, columns)?;
+    let Some(first) = rows.into_iter().next() else {
+        return Ok((Vec::new(), "null".to_string()));
     };
-    Ok((obj.keys().cloned().collect(), v.to_string()))
+    Ok((cols, first.to_string()))
 }
 
 /// The Range header as a root limit and offset, only when the query
@@ -1229,34 +1252,11 @@ async fn write(
 
     let payload = match *method {
         Method::POST | Method::PUT => Some(insert_payload(bytes, extras.columns.as_deref())?),
-        Method::PATCH => Some(update_payload(bytes)?),
+        Method::PATCH => Some(update_payload(bytes, extras.columns.as_deref())?),
         _ => None,
     };
 
     let media = negotiate(&req.headers)?;
-
-    // A PATCH that carries no keys touches nothing: PostgREST's
-    // no-op answer, no database round trip.
-    if *method == Method::PATCH && payload.as_ref().is_some_and(|(c, _)| c.is_empty()) {
-        if media.is_single() {
-            return Err(not_single(0));
-        }
-        let mut res = if prefer.ret == Ret::Representation {
-            let body = if media == Media::Csv { "\n" } else { "[]" };
-            let mut res = (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, media.content_type())],
-                body,
-            )
-                .into_response();
-            profile_header(&mut res, schema, negotiated);
-            res
-        } else {
-            StatusCode::NO_CONTENT.into_response()
-        };
-        write_headers(&prefer, &mut res);
-        return Ok(res);
-    }
 
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != "anon";
@@ -2270,29 +2270,72 @@ mod tests {
     }
 
     #[test]
-    fn insert_bodies_normalize_to_an_array_and_a_column_union() {
+    fn insert_bodies_normalize_to_an_array_and_the_first_row_names_the_columns() {
         let (cols, payload) = insert_payload(br#"{"a":1,"b":2}"#, None).unwrap();
         assert_eq!(cols, vec!["a", "b"]);
         assert_eq!(payload, r#"[{"a":1,"b":2}]"#);
 
-        let (cols, _) = insert_payload(br#"[{"a":1},{"b":2,"a":3}]"#, None).unwrap();
-        assert_eq!(cols, vec!["a", "b"], "the union keeps first sight order");
+        let (cols, _) = insert_payload(br#"[{"a":1,"b":2},{"b":3,"a":4}]"#, None).unwrap();
+        assert_eq!(cols, vec!["a", "b"], "order across rows is not a mismatch");
 
         let narrowing = vec!["a".to_string()];
         let (cols, _) = insert_payload(br#"[{"a":1,"b":2}]"#, Some(&narrowing)).unwrap();
         assert_eq!(cols, vec!["a"], "the columns parameter narrows");
+        assert!(
+            insert_payload(b"[1,2]", Some(&narrowing)).is_ok(),
+            "and it stops the body being read, so postgres refuses this one"
+        );
 
-        assert_eq!(insert_payload(b"", None).unwrap_err().code, "PGRST102");
-        assert_eq!(insert_payload(b"42", None).unwrap_err().code, "PGRST102");
-        assert_eq!(insert_payload(b"[1,2]", None).unwrap_err().code, "PGRST102");
+        // A body that is not json is one sentence, whatever serde
+        // thought of it, and a body that is not an object at all is
+        // a row of defaults rather than a refusal.
+        let e = insert_payload(b"", None).unwrap_err();
+        assert_eq!(
+            (e.code.as_str(), e.message.as_str()),
+            ("PGRST102", "Empty or invalid json")
+        );
+        assert_eq!(
+            insert_payload(b"}{", None).unwrap_err().message,
+            "Empty or invalid json"
+        );
+        let (cols, payload) = insert_payload(b"42", None).unwrap();
+        assert!(cols.is_empty());
+        assert_eq!(payload, "[42]");
+
+        for body in [
+            &br#"[1,2]"#[..],
+            br#"[{"a":1},{"b":2}]"#,
+            br#"[{"a":1},{"a":2,"b":3}]"#,
+        ] {
+            let e = insert_payload(body, None).unwrap_err();
+            assert_eq!(e.message, "All object keys must match", "for {body:?}");
+        }
     }
 
     #[test]
-    fn update_bodies_are_one_object() {
-        let (cols, payload) = update_payload(br#"{"title":"x"}"#).unwrap();
+    fn update_bodies_are_read_down_to_one_row() {
+        let (cols, payload) = update_payload(br#"{"title":"x"}"#, None).unwrap();
         assert_eq!(cols, vec!["title"]);
         assert_eq!(payload, r#"{"title":"x"}"#);
-        assert_eq!(update_payload(b"[]").unwrap_err().code, "PGRST102");
+
+        let (cols, payload) = update_payload(br#"[{"a":1},{"a":2}]"#, None).unwrap();
+        assert_eq!(cols, vec!["a"]);
+        assert_eq!(
+            payload, r#"{"a":1}"#,
+            "the first row is the one that writes"
+        );
+
+        // Nothing to set, which is a statement rather than an error.
+        for body in [&b"[]"[..], b"{}", b"[{}]", b"42"] {
+            let (cols, _) = update_payload(body, None).unwrap();
+            assert!(cols.is_empty(), "for {body:?}");
+        }
+        let named = vec!["a".to_string()];
+        let (cols, _) = update_payload(b"[]", Some(&named)).unwrap();
+        assert!(
+            cols.is_empty(),
+            "an empty array has no row to take them from"
+        );
     }
 
     #[test]

@@ -209,6 +209,14 @@ pub fn upsert_one(
 /// is in scope and would otherwise make every shared column
 /// ambiguous. No filters updates the whole table, PostgREST's
 /// stance.
+///
+/// A body with no columns in it is not an error and not a no-op
+/// either. `update t set` is not a statement postgres will take, so
+/// upstream answers with a select of the same shape that returns
+/// nothing, and the filters go with the columns: the row count is
+/// zero whatever the url said. It has to be a select of the table
+/// rather than nothing at all, because a representation reads the
+/// column types off it.
 pub fn update(
     table: &str,
     columns: &[String],
@@ -217,7 +225,10 @@ pub fn update(
     returning: &Returning,
 ) -> Result<Sql, CompileError> {
     if columns.is_empty() {
-        return err("an update needs at least one column to set");
+        return Ok(Sql {
+            text: format!("select * from {} where false", quote_ident(table)),
+            params: Vec::new(),
+        });
     }
     let t = quote_ident(table);
     let s = quote_ident(SRC);
@@ -536,8 +547,18 @@ mod tests {
         assert!(!s.text.contains(" where "), "{}", s.text);
         assert!(s.text.ends_with(r#" returning "t"."id""#), "{}", s.text);
 
-        let e = update("t", &[], "{}".into(), &[], &Returning::None).unwrap_err();
-        assert!(e.message.contains("at least one column"), "{e}");
+        // Nothing to set is a statement of the same shape that
+        // returns nothing, and the url's filters go with it.
+        let s = update(
+            "t",
+            &[],
+            "{}".into(),
+            &[node("id", "eq.4")],
+            &Returning::None,
+        )
+        .unwrap();
+        assert_eq!(s.text, r#"select * from "t" where false"#);
+        assert!(s.params.is_empty());
     }
 
     #[test]
