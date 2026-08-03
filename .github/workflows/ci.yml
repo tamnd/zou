@@ -86,6 +86,11 @@ jobs:
   conformance:
     name: conformance (postgrest)
     runs-on: ubuntu-latest
+    # The postgrest suite is 1233 cases asked twice, and on a slow runner
+    # the whole job has taken 45 minutes. A number here so that a job
+    # which has stopped making progress is killed rather than sitting on
+    # the six hour default.
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:18
@@ -194,6 +199,67 @@ jobs:
           name: conformance
           path: /tmp/conformance.json
           if-no-files-found: ignore
+
+  supabase-js:
+    name: conformance (supabase-js)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      # serve prints the url last, after it has taken a connection and
+      # applied the fixture, so a line starting with url is the whole
+      # readiness check. The fixture has a foreign key into auth.users,
+      # which zou creates on its first connection, and that ordering is
+      # the reason serve applies it rather than a psql step here.
+      - name: Start zou on the port a local supabase project uses
+        run: |
+          cargo run -p zou-conformance -- serve \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --setup /tmp/zou-conformance/js/setup.sql \
+            > /tmp/serve.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q '^url ' /tmp/serve.log && break
+            sleep 1
+          done
+          cat /tmp/serve.log
+          grep -q '^url ' /tmp/serve.log
+      - name: Run supabase-js's own integration suite against it
+        working-directory: /tmp/zou-conformance/js
+        env:
+          ZOU_URL: http://127.0.0.1:54321
+          ZOU_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+        run: |
+          npm ci
+          npm test
+      - name: Keep the server log
+        if: always()
+        run: cat /tmp/serve.log
 
   s3-contract:
     name: s3 contract (minio)

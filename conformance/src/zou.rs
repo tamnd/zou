@@ -33,9 +33,20 @@ pub fn key(role: &str, secret: &str) -> String {
 /// upstream's fixtures keeps its tables where upstream keeps them and
 /// the reference is configured to match.
 pub fn start(dsn: &str, secret: &[u8], schemas: &[String]) -> Result<Served, String> {
+    start_at(0, dsn, secret, schemas)
+}
+
+/// The same, on a port somebody has to know in advance.
+///
+/// A suite written here is asked over a client this harness controls,
+/// so it does not care what port zou got. A suite written in another
+/// language is asked over a client somebody else wrote, and all that
+/// one takes is a url, so it has to be a url that was agreed on.
+pub fn start_at(port: u16, dsn: &str, secret: &[u8], schemas: &[String]) -> Result<Served, String> {
     // Bound here rather than inside the thread, so a port that cannot
     // be had is an error the caller sees instead of a run that hangs.
-    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("binding a port: {e}"))?;
+    let listener =
+        TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("binding a port: {e}"))?;
     let port = listener
         .local_addr()
         .map_err(|e| format!("the port it got: {e}"))?
@@ -58,17 +69,16 @@ pub fn start(dsn: &str, secret: &[u8], schemas: &[String]) -> Result<Served, Str
         }
     });
     wait_for(&url)?;
+    warm(&url, secret)?;
     Ok(Served { url })
 }
 
 /// Poll until something answers, which is quick, but not instant: the
 /// runtime and the pool are built after the thread starts.
 fn wait_for(url: &str) -> Result<(), String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(1)))
-        .build()
-        .into();
+    // A second, not thirty: a poll that hangs is a poll that should be
+    // tried again rather than waited on.
+    let agent = agent(1);
     let health = format!("{url}/auth/v1/health");
     for _ in 0..100 {
         if agent.get(&health).call().is_ok() {
@@ -77,6 +87,40 @@ fn wait_for(url: &str) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(50));
     }
     Err(format!("{url} never answered"))
+}
+
+/// Answering is not the same as being ready. zou installs the auth
+/// schema on the first connection it takes out of the pool, and the
+/// health endpoint answers without taking one, so a server that has
+/// said hello may still be a server with no auth.users in the database
+/// behind it. Anything applied in between, a fixture with a foreign key
+/// into auth.users for instance, would fail on a race nobody can see.
+///
+/// So ask it for something that has to reach postgres, and treat any
+/// answer at all as the pool having been used. The status does not
+/// matter here: an empty schema is a legitimate 200 and an unreadable
+/// one is a legitimate error, and either way the bootstrap has run by
+/// the time the response comes back.
+fn warm(url: &str, secret: &[u8]) -> Result<(), String> {
+    let secret = String::from_utf8_lossy(secret).into_owned();
+    let anon = key("anon", &secret);
+    // Thirty seconds, because this one is allowed to be slow: it is the
+    // request that dials postgres, takes the advisory lock and applies
+    // the whole auth schema.
+    agent(30)
+        .get(&format!("{url}/rest/v1/"))
+        .header("apikey", &anon)
+        .call()
+        .map_err(|e| format!("{url} answered health but not rest: {e}"))?;
+    Ok(())
+}
+
+fn agent(seconds: u64) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(Duration::from_secs(seconds)))
+        .build()
+        .into()
 }
 
 #[cfg(test)]

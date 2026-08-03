@@ -25,19 +25,21 @@ Bumping a version means re-recording the suites it covers, and the re-recording 
 Today that is PostgREST 14.15, GoTrue 2.194.0, postgres-meta 0.96.6, supabase-js 2.111.0, and the Supabase CLI 2.111.0.
 The one line where zou is deliberately ahead is Postgres: the Supabase local stack is on 17 and zou vendors 18, and a suite that depends on the difference is a suite that is testing Postgres rather than the API in front of it.
 
-## Four modes
+## Five modes
 
 ```
 record  ask a reference and write down what it said
 check   ask a target and compare it with what was written down
 diff    ask two targets and compare them with each other
 derive  read a PostgREST checkout and write a suite out of it
+serve   start zou on a port and wait, for a suite asked from somewhere else
 ```
 
 `check` is what CI runs on every push, because it needs no reference on the machine, and because it fails on the day the two drift apart rather than on the day somebody remembers to look.
 `diff` is what you run when you have both up and you do not trust the recording, and CI runs it too, against a PostgREST it downloads at the pinned version, so a release that answers differently cannot sit in the recording being believed.
 `record` is how a suite is created or refreshed, and it refuses to write a recording with a hole in it, since the hole is what every later run would be compared against.
 `derive` is how the second suite got written, and it is described below.
+`serve` asks nothing at all, and is described below too.
 
 ## What counts as the same answer
 
@@ -168,12 +170,44 @@ db-anon-role = "postgrest_test_anonymous"
 db-extra-search-path = ""
 ```
 
+## The suite asked from somewhere else
+
+Every suite above is asked by this harness, over an HTTP client written here.
+That is the right way to compare two servers and the wrong way to answer a different question: whether the client a person actually installs works against zou.
+supabase-js does its own URL building, its own token refresh, its own retries and its own error shapes, and a harness that reimplements them is testing the reimplementation.
+
+So there is a suite that is not asked from here.
+It is supabase-js's own `test/integration.test.ts`, in `js/` in the conformance repository, run against zou with the URL and the keys made pluggable and nothing else touched.
+The assertions are upstream's, which is the one case where copying an assertion proves something: upstream wrote them about upstream's own client, against the stack `supabase start` brings up.
+
+`serve` is what gives it somewhere to point.
+
+```
+cargo run -p zou-conformance -- serve \
+  --zou-dsn postgresql://postgres@127.0.0.1:5432/zoujs \
+  --setup /tmp/zou-conformance/js/setup.sql &
+
+cd /tmp/zou-conformance/js && npm ci && npm test
+```
+
+It starts zou on 54321, the port the Supabase CLI serves a local project on, prints the three keys minted from the secret so a shell script does not have to know how, and then stays up until it is killed.
+
+`--setup` is applied after the server is up rather than before, and the ordering is the whole reason the flag exists.
+zou installs the auth schema on the first connection it takes out of its pool, the fixture has a foreign key into `auth.users`, and the health endpoint answers without taking a connection.
+So `serve` makes zou answer a request that has to reach Postgres before it says it is ready, and the `url` line it prints last is a readiness check CI can grep for.
+
+16 of the 34 tests run and zou passes all 16: the client constructing, the PostgREST block, the RLS block, the Authentication block, and the timeout configuration block.
+The other 18 are Realtime and Storage, which zou does not serve on this URL yet.
+They are skipped behind an environment flag rather than deleted, so the day the feature lands the test runs exactly as upstream wrote it.
+
 ## Where zou stands
 
 The `postgrest` suite is 1233 cases against PostgREST 14.15, and zou passes 589 of them, 47%, with 644 known differences.
 That number is the honest one, and it is meant to be uncomfortable.
 The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, so 47% against it and 86% against the hand written suite are both true and they measure different things.
 The gap is broken down by feature and by shape in [tamnd/zou#118](https://github.com/tamnd/zou/issues/118), and it is a small number of missing features rather than 644 separate bugs: spread embeds through a to-many relationship, the parts of the query parser that answer `PGRST100`, relationship resolution that answers `PGRST200`, `OPTIONS`, `explain`, the media type handlers, `Range` on a table, and `preference-applied`.
+
+supabase-js 2.111.0 runs 16 of its integration tests against zou and all 16 pass.
 
 The REST suite is 82 cases against PostgREST 14.15, and zou passes 71 of them, 86%, with 11 known differences.
 Every difference left is a message, a code, or a header, not a wrong answer to a question about data: error messages that name an internal alias instead of the table, raw SQLSTATEs where upstream has `PGRST205` or `PGRST204`, four wordings of a hint or a detail, an upsert that answers 201 where upstream answers 200 on a merge that updated, and `OPTIONS` on a table.
