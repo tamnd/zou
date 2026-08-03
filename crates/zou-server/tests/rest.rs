@@ -624,6 +624,157 @@ async fn a_put_replaces_the_row_the_url_names() {
 }
 
 #[tokio::test]
+async fn a_write_reads_its_body_the_way_postgrest_reads_it() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_body cascade",
+            "create table zou_rest_body (id int primary key, name text, rank int default 7)",
+            "insert into zou_rest_body values (1, 'java', 13), (2, 'go', 19)",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // Whatever the parser thought of it, a body that is not json is
+    // one sentence.
+    for body in ["", "}{ x = 2", "{ name: \"go\" }"] {
+        let res = app
+            .clone()
+            .oneshot(req("PATCH", "/rest/v1/zou_rest_body?id=eq.1", body, &[]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{body:?}");
+        let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+        assert_eq!(e["code"], "PGRST102", "{body:?}");
+        assert_eq!(e["message"], "Empty or invalid json", "{body:?}");
+    }
+
+    // An array of rows that disagree about their keys is refused
+    // before it reaches postgres, because one column list unpacks
+    // all of them and a row with other keys would lose them.
+    for body in [
+        r#"[{"id": 8, "name": "perl"}, {"id": 9}]"#,
+        r#"[{"id": 8}, {"id": 9, "name": "perl"}]"#,
+        "[1, 2]",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(req("POST", "/rest/v1/zou_rest_body", body, &[]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{body:?}");
+        let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+        assert_eq!(e["message"], "All object keys must match", "{body:?}");
+    }
+    // Order is not disagreement, and ?columns= says the list
+    // outright, which stops the body being read at all.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_body",
+            r#"[{"id": 8, "name": "perl"}, {"name": "raku", "id": 9}]"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_body?columns=id",
+            r#"[{"id": 10, "name": "perl"}, {"id": 11}]"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_body?select=name&id=eq.10"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"name": null}]"#);
+
+    // An update writes one row, so an array is read down to its
+    // first element rather than refused, and ?columns= narrows what
+    // that element gets to set.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_body?id=eq.1",
+            r#"[{"rank": 41}, {"rank": 42}]"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-range"], "0-0/*");
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"id": 1, "name": "java", "rank": 41}]"#
+    );
+
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_body?id=eq.1&columns=rank",
+            r#"{"rank": 43, "name": "not this"}"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"id": 1, "name": "java", "rank": 43}]"#
+    );
+
+    // A body with nothing in it to set is not an error and not a
+    // no-op either: it is an update that matches no row, whatever
+    // the url said, and it says so in the window.
+    for body in ["{}", "[]", "[{}]", "42"] {
+        let res = app
+            .clone()
+            .oneshot(req("PATCH", "/rest/v1/zou_rest_body", body, &[]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT, "{body:?}");
+        assert_eq!(res.headers()["content-range"], "*/*", "{body:?}");
+    }
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_body",
+            "{}",
+            &["return=representation", "count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-range"], "*/0");
+    assert_eq!(body_text(res).await, "[]");
+
+    // And nothing of it landed: the rows are the ones the seed and
+    // the inserts above left.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_body?select=id,rank&order=id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"id": 1, "rank": 43},{"id": 2, "rank": 19},{"id": 8, "rank": 7},{"id": 9, "rank": 7},{"id": 10, "rank": 7},{"id": 11, "rank": 7}]"#
+    );
+}
+
+#[tokio::test]
 async fn the_rpc_surface_speaks_postgrest() {
     let Some(dsn) = dsn() else { return };
     seed(
