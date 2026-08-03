@@ -61,11 +61,12 @@ pub struct Routine {
 }
 
 /// Every overload of one function name in one schema. Bind the
-/// schema as $1 and the function name as $2. Six columns per row:
+/// schema as $1 and the function name as $2. Nine columns per row:
 /// input argument names (empty string for unnamed), their types via
 /// format_type, a variadic flag per argument, the count of trailing
 /// defaults, then proretset, provolatile = 'v', the return type's
-/// name, and the table whose rowtype it is when there is one.
+/// name, the table whose rowtype it is when there is one, and
+/// whether the result is named in OUT or TABLE arguments.
 ///
 /// proallargtypes and proargmodes only exist once OUT or TABLE
 /// arguments appear, so both coalesce back to the plain input
@@ -100,7 +101,8 @@ select coalesce((select array_agg(coalesce(f.names[u.ord], '') order by u.ord)
           from pg_type t
           join pg_class c on c.oid = t.typrelid
          where t.oid = f.prorettype
-           and c.relkind in ('r', 'v', 'p', 'm', 'f'))
+           and c.relkind in ('r', 'v', 'p', 'm', 'f')),
+       coalesce((select bool_or(m in ('o', 't')) from unnest(f.modes) m), false)
   from fns f
  order by f.oid";
 
@@ -116,6 +118,9 @@ pub struct RoutineRow {
     pub volatile: bool,
     pub rettype: String,
     pub return_table: Option<String>,
+    /// Whether the function names its result in OUT or TABLE
+    /// arguments rather than returning a bare type.
+    pub out_args: bool,
 }
 
 /// Assemble one overload from an [`INTROSPECT_SQL`] row.
@@ -135,9 +140,15 @@ pub fn routine(row: RoutineRow) -> Routine {
             variadic,
         })
         .collect();
+    // A function with OUT or TABLE arguments returns rows whatever
+    // its return type says. Postgres only writes `record` there when
+    // there are two or more of them: one on its own collapses to that
+    // argument's own type, and a function whose result is a table of
+    // one column would otherwise read as a scalar and come back as a
+    // bare value where upstream sends an object.
     let kind = if row.rettype == "void" {
         RetKind::Void
-    } else if row.return_table.is_some() || row.rettype == "record" {
+    } else if row.return_table.is_some() || row.rettype == "record" || row.out_args {
         RetKind::Composite {
             table: row.return_table,
         }
@@ -371,17 +382,21 @@ pub fn call_get(schema: &str, name: &str, routine: &Routine, args: &[(String, St
 /// text: one row's bare value, or a set folded to a json array.
 /// The output column of `select * from "f"(...)` is named after the
 /// function, which is what the wrap reads.
+///
+/// The second column is how many rows there were, which is worth
+/// carrying because a folded set has no rows left to count and
+/// max-affected has to count them.
 pub fn scalar_wrap(name: &str, call: Sql, set: bool) -> Sql {
     let src = quote_ident(SOURCE);
     let col = quote_ident(name);
     let text = if set {
         format!(
-            "with {src} as ({}) select coalesce(jsonb_agg(to_jsonb({src}.{col})), '[]'::jsonb)::text from {src}",
+            "with {src} as ({}) select coalesce(jsonb_agg(to_jsonb({src}.{col})), '[]'::jsonb)::text, count(*)::bigint from {src}",
             call.text
         )
     } else {
         format!(
-            "with {src} as ({}) select to_jsonb({src}.{col})::text from {src}",
+            "with {src} as ({}) select to_jsonb({src}.{col})::text, 1::bigint from {src}",
             call.text
         )
     };
@@ -423,6 +438,7 @@ mod tests {
             volatile: false,
             rettype: "integer".into(),
             return_table: None,
+            out_args: false,
         }
     }
 
@@ -444,6 +460,7 @@ mod tests {
             routine(RoutineRow {
                 rettype: ret.into(),
                 return_table: table.map(str::to_string),
+                out_args: false,
                 ..row(&[], &[], 0)
             })
             .kind

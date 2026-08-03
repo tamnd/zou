@@ -48,7 +48,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use zou_rest::catalog::{
-    COLUMNS_SQL, Catalog, Column, ColumnRow, FkRow, INTROSPECT_SQL, RELATIONS_SQL,
+    COLUMNS_SQL, Catalog, Column, ColumnRow, FkRow, INTROSPECT_SQL, RELATIONS_SQL, TIMEZONES_SQL,
 };
 use zou_rest::filter::{self, Node, Op, Parsed};
 use zou_rest::mutate::{self, Conflict, Missing, Returning};
@@ -191,6 +191,49 @@ fn invalid_body(message: impl Into<String>) -> RestError {
         status: StatusCode::BAD_REQUEST,
         code: "PGRST102".to_string(),
         message: message.into(),
+        details: None,
+        hint: None,
+    }
+}
+
+/// Preferences the request asked for that nobody has, refused
+/// because it also asked to be told, PostgREST's PGRST122. The
+/// details name them in the order the header listed them.
+fn invalid_prefs(tokens: &[String]) -> RestError {
+    RestError {
+        status: StatusCode::BAD_REQUEST,
+        code: "PGRST122".to_string(),
+        message: "Invalid preferences given with handling=strict".to_string(),
+        details: Some(format!("Invalid preferences: {}", tokens.join(", "))),
+        hint: None,
+    }
+}
+
+/// A mutation that touched more rows than max-affected allowed,
+/// PostgREST's PGRST124. The rows are already written when this is
+/// raised and the transaction is what takes them back, so nothing
+/// reaches this without a rollback behind it.
+fn too_many_affected(rows: u64) -> RestError {
+    RestError {
+        status: StatusCode::BAD_REQUEST,
+        code: "PGRST124".to_string(),
+        message: "Query result exceeds max-affected preference constraint".to_string(),
+        details: Some(format!("The query affects {rows} rows")),
+        hint: None,
+    }
+}
+
+/// max-affected asked of a function that does not return rows,
+/// PostgREST's PGRST128. There is nothing to count, and counting the
+/// call itself as one row would let a function that deleted a
+/// thousand of them pass.
+fn not_set_returning() -> RestError {
+    RestError {
+        status: StatusCode::BAD_REQUEST,
+        code: "PGRST128".to_string(),
+        message: "Function must return SETOF or TABLE when max-affected preference is used with \
+                  handling=strict"
+            .to_string(),
         details: None,
         hint: None,
     }
@@ -464,10 +507,17 @@ enum Count {
     Estimated,
 }
 
-/// The Prefer tokens the surface honors. Unknown preferences pass
-/// through silently until handling=strict lands, and `applied`
-/// keeps the recognized ones in arrival order for the
-/// Preference-Applied header.
+/// What an unrecognized preference costs. Strict refuses the whole
+/// request, lenient carries on and says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handling {
+    Strict,
+    Lenient,
+}
+
+/// The Prefer tokens the surface honors. `applied` keeps the
+/// recognized ones in arrival order and `invalid` the rest, since
+/// under handling=strict the refusal has to name them.
 #[derive(Debug)]
 struct Prefer {
     ret: Ret,
@@ -476,7 +526,16 @@ struct Prefer {
     count: Option<Count>,
     /// What a write puts in a column its body said nothing about.
     missing: Missing,
-    applied: Vec<&'static str>,
+    handling: Option<Handling>,
+    /// The timezone as the request spelled it, before anything has
+    /// said whether postgres has one by that name.
+    timezone: Option<String>,
+    /// The most rows a mutation may touch. It only binds under
+    /// handling=strict, which is upstream's rule and not a shortcut:
+    /// asked for on its own the token is not applied at all.
+    max_affected: Option<i64>,
+    applied: Vec<String>,
+    invalid: Vec<String>,
 }
 
 fn parse_prefer(headers: &HeaderMap) -> Prefer {
@@ -485,12 +544,43 @@ fn parse_prefer(headers: &HeaderMap) -> Prefer {
         merge: None,
         count: None,
         missing: Missing::Null,
+        handling: None,
+        timezone: None,
+        max_affected: None,
         applied: Vec::new(),
+        invalid: Vec::new(),
     };
     for value in headers.get_all("prefer") {
         let Ok(line) = value.to_str() else { continue };
         for item in line.split(',') {
-            let token = match item.trim() {
+            let item = item.trim();
+            // A timezone is checked against the schema cache, not
+            // here, so it waits for one. A max-affected that is not a
+            // number is neither applied nor refused: upstream reads
+            // it with a parser that gives up quietly, and a caller
+            // who wrote max-affected=lots gets the request they would
+            // have got without it.
+            if let Some(tz) = item.strip_prefix("timezone=") {
+                p.timezone = Some(tz.to_string());
+                continue;
+            }
+            if let Some(n) = item.strip_prefix("max-affected=") {
+                if let Ok(n) = n.parse::<i64>()
+                    && n >= 0
+                {
+                    p.max_affected = Some(n);
+                }
+                continue;
+            }
+            let token = match item {
+                "handling=strict" => {
+                    p.handling = Some(Handling::Strict);
+                    "handling=strict"
+                }
+                "handling=lenient" => {
+                    p.handling = Some(Handling::Lenient);
+                    "handling=lenient"
+                }
                 "return=minimal" => {
                     p.ret = Ret::Minimal;
                     "return=minimal"
@@ -531,14 +621,51 @@ fn parse_prefer(headers: &HeaderMap) -> Prefer {
                     p.missing = Missing::Null;
                     "missing=null"
                 }
-                _ => continue,
+                other => {
+                    if !other.is_empty() && !p.invalid.iter().any(|t| t == other) {
+                        p.invalid.push(other.to_string());
+                    }
+                    continue;
+                }
             };
-            if !p.applied.contains(&token) {
-                p.applied.push(token);
+            if !p.applied.iter().any(|t| t == token) {
+                p.applied.push(token.to_string());
             }
         }
     }
     p
+}
+
+impl Prefer {
+    /// The preferences judged against the schema cache, which is
+    /// where the timezone names are and therefore the first point a
+    /// timezone can be called wrong. Under handling=strict anything
+    /// unrecognized refuses the request; otherwise the request goes
+    /// on without it.
+    fn check(&mut self, catalog: &Catalog) -> Result<(), RestError> {
+        if let Some(tz) = &self.timezone {
+            let token = format!("timezone={tz}");
+            if catalog.has_timezone(tz) {
+                self.applied.push(token);
+            } else {
+                self.timezone = None;
+                self.invalid.push(token);
+            }
+        }
+        if self.handling == Some(Handling::Strict) && !self.invalid.is_empty() {
+            return Err(invalid_prefs(&self.invalid));
+        }
+        Ok(())
+    }
+
+    /// Whether max-affected binds this request, which takes both the
+    /// token and handling=strict.
+    fn cap(&self) -> Option<i64> {
+        match self.handling {
+            Some(Handling::Strict) => self.max_affected,
+            _ => None,
+        }
+    }
 }
 
 /// The response shape the Accept header negotiated. Plain json
@@ -1039,7 +1166,36 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
             },
         })
         .collect();
-    Ok(Catalog::new(fks).with_relations(names, cols))
+    let rows = sess
+        .query(TIMEZONES_SQL, &[])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let zones = rows.iter().map(|r| r.get(0)).collect();
+    Ok(Catalog::new(fks)
+        .with_relations(names, cols)
+        .with_timezones(zones))
+}
+
+/// The preferences settled against the loaded catalog and put to
+/// work: the timezone is checked against the names postgres has, a
+/// strict request carrying anything unrecognized is refused here, and
+/// a timezone that survived is set for the length of the transaction.
+///
+/// Local like everything else the request injects, so the connection
+/// goes back to the pool with the timezone it came out with.
+async fn settle_prefs(
+    prefer: &mut Prefer,
+    catalog: &Catalog,
+    sess: &Session,
+    authed: bool,
+) -> Result<(), RestError> {
+    prefer.check(catalog)?;
+    if let Some(tz) = &prefer.timezone {
+        sess.query("select set_config('timezone', $1, true)", &[tz])
+            .await
+            .map_err(|e| pg_error(&e, authed))?;
+    }
+    Ok(())
 }
 
 /// The catalog for the profiled schema, introspected once per epoch
@@ -1107,7 +1263,7 @@ async fn read(
 ) -> Result<Response, RestError> {
     let (mut q, _) = parse_query(table, req.uri.query())?;
     apply_range(&mut q, &req.headers);
-    let prefer = parse_prefer(&req.headers);
+    let mut prefer = parse_prefer(&req.headers);
 
     let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
@@ -1122,6 +1278,7 @@ async fn read(
     // forfeits the connection instead of pooling a dirty one, the
     // containment the pool promises.
     let catalog = load_catalog(app, &sess, authed, schema).await?;
+    settle_prefs(&mut prefer, &catalog, &sess, authed).await?;
     if catalog.relation(table).is_none() {
         return Err(no_table(&catalog, schema, table));
     }
@@ -1235,34 +1392,55 @@ async fn read(
     // Upstream builds the read headers once, so even the 416 keeps
     // its Content-Profile.
     profile_header(&mut res, schema, negotiated);
-    let applied = match prefer.count {
-        Some(Count::Exact) => Some("count=exact"),
-        Some(Count::Planned) => Some("count=planned"),
-        Some(Count::Estimated) => Some("count=estimated"),
-        None => None,
-    };
-    if let Some(token) = applied
-        && let Ok(v) = token.parse()
-    {
-        res.headers_mut().insert("preference-applied", v);
-    }
+    applied_header(&prefer, Surface::Read, &req.method, false, &mut res);
     Ok(res)
 }
 
-/// The headers every write response carries: content type always,
-/// Preference-Applied when any Prefer token was honored.
+/// Which handler is answering. A preference is echoed only where it
+/// is honored, and what honors what is not guessable from the method
+/// alone: a POST to a table applies resolution and missing, a POST to
+/// a function applies neither, and a PATCH applies missing but not
+/// resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Surface {
+    Read,
+    Write,
+    Rpc,
+}
+
+/// Preference-Applied, the tokens that were honored in the order
+/// upstream writes them, which is its own and not the order the
+/// request listed them.
 ///
-/// The missing preference is about reading a body, so a method that
-/// has no body neither applies it nor says it did, which a DELETE
-/// carrying the token shows.
-fn write_headers(prefer: &Prefer, method: &Method, res: &mut Response) {
-    let body = matches!(*method, Method::POST | Method::PATCH);
+/// `capped` says the request actually held itself to max-affected,
+/// which takes handling=strict and a method that counts rows.
+fn applied_header(
+    prefer: &Prefer,
+    surface: Surface,
+    method: &Method,
+    capped: bool,
+    res: &mut Response,
+) {
+    let write = surface == Surface::Write;
+    let cap = prefer
+        .cap()
+        .filter(|_| capped)
+        .map(|n| format!("max-affected={n}"));
     let mut applied: Vec<&str> = prefer
         .applied
         .iter()
-        .copied()
-        .filter(|t| body || !t.starts_with("missing="))
+        .map(String::as_str)
+        .filter(|t| match t.split('=').next().unwrap_or("") {
+            "return" => write,
+            "resolution" => write && matches!(*method, Method::POST | Method::PUT),
+            // The missing preference is about reading a body, so a
+            // method that has no body neither applies it nor says it
+            // did, which a DELETE carrying the token shows.
+            "missing" => write && matches!(*method, Method::POST | Method::PATCH),
+            _ => true,
+        })
         .collect();
+    applied.extend(cap.as_deref());
     applied.sort_by_key(|t| rank(t));
     if applied.is_empty() {
         return;
@@ -1272,16 +1450,27 @@ fn write_headers(prefer: &Prefer, method: &Method, res: &mut Response) {
     }
 }
 
-/// Where a preference sits in Preference-Applied, which upstream
-/// writes in an order of its own rather than in the order the
-/// request listed them.
+/// Where a preference sits in Preference-Applied.
 fn rank(token: &str) -> u8 {
     match token.split('=').next().unwrap_or("") {
         "resolution" => 0,
         "missing" => 1,
         "return" => 2,
         "count" => 3,
-        _ => 4,
+        "handling" => 4,
+        "timezone" => 5,
+        _ => 6,
+    }
+}
+
+/// The affected count judged against max-affected. Over it the write
+/// is refused, and since the rows are written by then the only thing
+/// that takes them back is the transaction not landing, which is
+/// upstream's ABORT where a COMMIT would have gone.
+fn over_cap(cap: Option<i64>, affected: u64) -> Option<RestError> {
+    match cap {
+        Some(n) if affected as i64 > n => Some(too_many_affected(affected)),
+        _ => None,
     }
 }
 
@@ -1323,7 +1512,7 @@ async fn write(
     bytes: &[u8],
 ) -> Result<Response, RestError> {
     let method = &req.method;
-    let prefer = parse_prefer(&req.headers);
+    let mut prefer = parse_prefer(&req.headers);
     // The schema check runs before the payload parse, upstream's
     // getSchema order, so PGRST106 beats a bad body.
     let (schema, negotiated) = profile(&app.cfg.schemas, method, &req.headers)?;
@@ -1383,8 +1572,18 @@ async fn write(
     // about that table's columns. Everything downstream of here can
     // assume the relation exists.
     let catalog = load_catalog(app, &sess, authed, schema).await?;
+    settle_prefs(&mut prefer, &catalog, &sess, authed).await?;
     let Some(relation) = catalog.relation(table) else {
         return Err(no_table(&catalog, schema, table));
+    };
+
+    // What max-affected binds. An insert is not counted at all,
+    // upstream's own reading: the rows a POST writes are the rows the
+    // caller sent, and a PUT writes exactly the one the url named, so
+    // the only counts worth capping are the ones the url decided.
+    let cap = match *method {
+        Method::PATCH | Method::DELETE => prefer.cap(),
+        _ => None,
     };
 
     // The primary key, only fetched when the upsert needs a default
@@ -1502,6 +1701,10 @@ async fn write(
                     .map_err(|e| pg_error(&e, authed))?;
                 affected = rows[0].get::<_, i64>(1) as u64;
                 let status = written(&sess, method, affected, authed).await?;
+                if let Some(e) = over_cap(cap, affected) {
+                    sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
+                    return Err(e);
+                }
                 sess.commit().await.map_err(|e| pg_error(&e, authed))?;
                 (
                     status,
@@ -1524,6 +1727,10 @@ async fn write(
                 let status = written(&sess, method, affected, authed).await?;
                 if media.is_single() && rows.len() != 1 {
                     return Err(not_single(rows.len()));
+                }
+                if let Some(e) = over_cap(cap, affected) {
+                    sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
+                    return Err(e);
                 }
                 sess.commit().await.map_err(|e| pg_error(&e, authed))?;
                 let body = if media.is_single() {
@@ -1586,6 +1793,10 @@ async fn write(
             if media.is_single() && affected != 1 {
                 return Err(not_single(affected as usize));
             }
+            if let Some(e) = over_cap(cap, affected) {
+                sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
+                return Err(e);
+            }
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
             if *method == Method::POST {
                 StatusCode::CREATED.into_response()
@@ -1614,7 +1825,7 @@ async fn write(
     if prefer.ret == Ret::Representation {
         profile_header(&mut res, schema, negotiated);
     }
-    write_headers(&prefer, method, &mut res);
+    applied_header(&prefer, Surface::Write, method, cap.is_some(), &mut res);
     Ok(res)
 }
 
@@ -1853,6 +2064,7 @@ async fn invoke(
     body: Option<&[u8]>,
 ) -> Result<Response, RestError> {
     let is_post = body.is_some();
+    let mut prefer = parse_prefer(&req.headers);
     let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != "anon";
@@ -1863,6 +2075,13 @@ async fn invoke(
         .session(&ctx, !is_post)
         .await
         .map_err(|e| pg_error(&e, authed))?;
+
+    // A call reads the schema cache for the same reasons a table
+    // does, and it is cached per epoch either way, so the preferences
+    // are settled here rather than in the one arm that would have
+    // loaded it anyway.
+    let catalog = load_catalog(app, &sess, authed, schema).await?;
+    settle_prefs(&mut prefer, &catalog, &sess, authed).await?;
 
     let rows = sess
         .query(rpc::INTROSPECT_SQL, &[&schema, &func])
@@ -1880,6 +2099,7 @@ async fn invoke(
                 volatile: r.get(5),
                 rettype: r.get(6),
                 return_table: r.get(7),
+                out_args: r.get(8),
             })
         })
         .collect();
@@ -1943,6 +2163,13 @@ async fn invoke(
     let choice = rpc::choose(schema, func, &overloads, &supplied, is_post).map_err(rpc_error)?;
     let kind = choice.routine.kind.clone();
     let returns_set = choice.routine.returns_set;
+    // A cap on rows counts the rows a call returns, so a function
+    // that returns none has nothing to be judged on and is refused
+    // outright rather than passing for free.
+    let cap = prefer.cap();
+    if cap.is_some() && !returns_set {
+        return Err(not_set_returning());
+    }
     let m = match payload {
         Some(text) => rpc::call_json(schema, func, &choice, &supplied, text),
         None => rpc::call_get(schema, func, choice.routine, &get_args),
@@ -1957,7 +2184,10 @@ async fn invoke(
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
             // Nothing to send and a range all the same, because
             // upstream counts the one row the call was.
-            Ok((StatusCode::NO_CONTENT, [(header::CONTENT_RANGE, "0-0/*")]).into_response())
+            let mut res =
+                (StatusCode::NO_CONTENT, [(header::CONTENT_RANGE, "0-0/*")]).into_response();
+            applied_header(&prefer, Surface::Rpc, &req.method, false, &mut res);
+            Ok(res)
         }
         rpc::RetKind::Scalar => {
             let wrapped = rpc::scalar_wrap(func, m, returns_set);
@@ -1966,6 +2196,13 @@ async fn invoke(
                 .query(&wrapped.text, &param_refs(&params))
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
+            // The wrap counts the rows it folded, which is the only
+            // place the count survives once a set is one json array.
+            let affected = rows.first().map(|r| r.get::<_, i64>(1) as u64).unwrap_or(0);
+            if let Some(e) = over_cap(cap, affected) {
+                sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
+                return Err(e);
+            }
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
             let out = rows
                 .first()
@@ -1983,6 +2220,7 @@ async fn invoke(
             )
                 .into_response();
             profile_header(&mut res, schema, negotiated);
+            applied_header(&prefer, Surface::Rpc, &req.method, cap.is_some(), &mut res);
             Ok(res)
         }
         rpc::RetKind::Composite { table } => {
@@ -2000,7 +2238,6 @@ async fn invoke(
                 },
             )?;
             apply_range(&mut q, &req.headers);
-            let catalog = load_catalog(app, &sess, authed, schema).await?;
             let r = rpc::representation(&catalog, m, &mut q).map_err(plan_error)?;
             let text = format!(
                 "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
@@ -2011,6 +2248,10 @@ async fn invoke(
                 .query(&text, &param_refs(&params))
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
+            if let Some(e) = over_cap(cap, rows.len() as u64) {
+                sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
+                return Err(e);
+            }
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
             if returns_set {
                 let offset = q
@@ -2032,6 +2273,7 @@ async fn invoke(
                 )
                     .into_response();
                 profile_header(&mut res, schema, negotiated);
+                applied_header(&prefer, Surface::Rpc, &req.method, cap.is_some(), &mut res);
                 Ok(res)
             } else {
                 // A non set function is one row, and PostgREST hands
@@ -2047,6 +2289,7 @@ async fn invoke(
                 )
                     .into_response();
                 profile_header(&mut res, schema, negotiated);
+                applied_header(&prefer, Surface::Rpc, &req.method, false, &mut res);
                 Ok(res)
             }
         }
@@ -2297,6 +2540,150 @@ mod tests {
         assert_eq!(p.ret, Ret::Minimal);
         assert_eq!(p.merge, None);
         assert!(p.applied.is_empty());
+    }
+
+    fn prefer(line: &str) -> Prefer {
+        let mut h = HeaderMap::new();
+        h.insert("prefer", line.parse().unwrap());
+        parse_prefer(&h)
+    }
+
+    /// The catalog a preference is judged against, which for this
+    /// purpose is a list of timezone names and nothing else.
+    fn zones() -> Catalog {
+        Catalog::new(Vec::new()).with_timezones(vec!["UTC".to_string(), "Asia/Bangkok".to_string()])
+    }
+
+    #[test]
+    fn a_preference_nobody_has_is_refused_only_when_strict_asked_to_be_told() {
+        let mut p = prefer("handling=strict, anything");
+        assert_eq!(p.invalid, vec!["anything"]);
+        let e = p.check(&zones()).unwrap_err();
+        assert_eq!(e.code, "PGRST122");
+        assert_eq!(e.details.as_deref(), Some("Invalid preferences: anything"));
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+
+        // Lenient carries on, and so does saying nothing about it.
+        let mut p = prefer("handling=lenient, anything");
+        assert!(p.check(&zones()).is_ok());
+        let mut p = prefer("anything");
+        assert!(p.check(&zones()).is_ok());
+        assert!(p.applied.is_empty());
+    }
+
+    #[test]
+    fn a_timezone_is_judged_against_the_names_postgres_has() {
+        let mut p = prefer("timezone=Asia/Bangkok");
+        assert!(p.check(&zones()).is_ok());
+        assert_eq!(p.timezone.as_deref(), Some("Asia/Bangkok"));
+        assert_eq!(p.applied, vec!["timezone=Asia/Bangkok"]);
+
+        // Case counts, because it counts to postgres.
+        let mut p = prefer("handling=strict, timezone=utc");
+        let e = p.check(&zones()).unwrap_err();
+        assert_eq!(
+            e.details.as_deref(),
+            Some("Invalid preferences: timezone=utc")
+        );
+
+        // Without strict the request goes on in the default zone.
+        let mut p = prefer("timezone=Nowhere/Special");
+        assert!(p.check(&zones()).is_ok());
+        assert_eq!(p.timezone, None);
+        assert!(p.applied.is_empty());
+    }
+
+    #[test]
+    fn max_affected_binds_only_alongside_strict() {
+        assert_eq!(prefer("handling=strict, max-affected=10").cap(), Some(10));
+        assert_eq!(prefer("handling=lenient, max-affected=10").cap(), None);
+        assert_eq!(prefer("max-affected=10").cap(), None);
+        // A count that is not one is neither applied nor refused.
+        let p = prefer("handling=strict, max-affected=lots");
+        assert_eq!(p.cap(), None);
+        assert!(p.invalid.is_empty());
+        assert_eq!(prefer("handling=strict, max-affected=-1").cap(), None);
+        assert_eq!(
+            over_cap(Some(2), 3).map(|e| e.details).unwrap(),
+            Some("The query affects 3 rows".to_string())
+        );
+        assert!(over_cap(Some(2), 2).is_none());
+        assert!(over_cap(None, 9000).is_none());
+    }
+
+    #[test]
+    fn preference_applied_says_what_the_request_honored_in_upstreams_order() {
+        let applied = |line: &str, surface, method: Method, capped| {
+            let mut p = prefer(line);
+            p.check(&zones()).unwrap();
+            let mut res = StatusCode::OK.into_response();
+            applied_header(&p, surface, &method, capped, &mut res);
+            res.headers()
+                .get("preference-applied")
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+
+        // Not the order the request listed them in.
+        assert_eq!(
+            applied(
+                "timezone=UTC, handling=strict, count=exact, return=representation, \
+                 missing=default, resolution=merge-duplicates",
+                Surface::Write,
+                Method::POST,
+                false
+            )
+            .as_deref(),
+            Some(
+                "resolution=merge-duplicates, missing=default, return=representation, \
+                 count=exact, handling=strict, timezone=UTC"
+            )
+        );
+
+        // A read applies none of the three a write does.
+        assert_eq!(
+            applied(
+                "return=representation, missing=default, resolution=merge-duplicates, count=exact",
+                Surface::Read,
+                Method::GET,
+                false
+            )
+            .as_deref(),
+            Some("count=exact")
+        );
+        // A patch fills defaults but does not resolve duplicates.
+        assert_eq!(
+            applied(
+                "missing=default, resolution=merge-duplicates",
+                Surface::Write,
+                Method::PATCH,
+                false
+            )
+            .as_deref(),
+            Some("missing=default")
+        );
+        // A function call applies neither, and a cap it held itself
+        // to is said last.
+        assert_eq!(
+            applied(
+                "return=representation, handling=strict, max-affected=20",
+                Surface::Rpc,
+                Method::POST,
+                true
+            )
+            .as_deref(),
+            Some("handling=strict, max-affected=20")
+        );
+        assert_eq!(
+            applied(
+                "handling=strict, max-affected=20",
+                Surface::Read,
+                Method::GET,
+                false
+            )
+            .as_deref(),
+            Some("handling=strict")
+        );
+        assert_eq!(applied("", Surface::Read, Method::GET, false), None);
     }
 
     #[test]
