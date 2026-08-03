@@ -25,14 +25,15 @@ Bumping a version means re-recording the suites it covers, and the re-recording 
 Today that is PostgREST 14.15, GoTrue 2.194.0, postgres-meta 0.96.6, supabase-js 2.111.0, and the Supabase CLI 2.111.0.
 The one line where zou is deliberately ahead is Postgres: the Supabase local stack is on 17 and zou vendors 18, and a suite that depends on the difference is a suite that is testing Postgres rather than the API in front of it.
 
-## Five modes
+## Six modes
 
 ```
-record  ask a reference and write down what it said
-check   ask a target and compare it with what was written down
-diff    ask two targets and compare them with each other
-derive  read a PostgREST checkout and write a suite out of it
-serve   start zou on a port and wait, for a suite asked from somewhere else
+record      ask a reference and write down what it said
+check       ask a target and compare it with what was written down
+diff        ask two targets and compare them with each other
+derive      read a PostgREST checkout and write a suite out of it
+serve       start zou on a port and wait, for a suite asked from somewhere else
+scoreboard  turn the json those runs wrote into the published markdown
 ```
 
 `check` is what CI runs on every push, because it needs no reference on the machine, and because it fails on the day the two drift apart rather than on the day somebody remembers to look.
@@ -40,6 +41,7 @@ serve   start zou on a port and wait, for a suite asked from somewhere else
 `record` is how a suite is created or refreshed, and it refuses to write a recording with a hole in it, since the hole is what every later run would be compared against.
 `derive` is how the second suite got written, and it is described below.
 `serve` asks nothing at all, and is described below too.
+`scoreboard` asks nothing either: it reads the json those runs wrote and renders [the scoreboard](scoreboard.md), which is described at the end.
 
 ## What counts as the same answer
 
@@ -222,3 +224,24 @@ They are tracked in [tamnd/zou#116](https://github.com/tamnd/zou/issues/116).
 
 The 49 cases that pass "written differently" are all the same two things: zou puts a space after each colon where PostgREST puts a newline between rows, and a `select=*` comes back with the columns in a different order.
 Neither is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.
+
+## The scoreboard
+
+Those paragraphs are prose, and prose goes stale.
+[docs/scoreboard.md](scoreboard.md) is the same numbers generated out of the run, and CI rewrites it on every merge to main, out of the json the two conformance jobs uploaded rather than out of a run of its own.
+Rendering it from a fresh run would publish a number nobody had failed a build over.
+
+```
+cargo run -p zou-conformance -- scoreboard \
+  --report /tmp/conformance.json \
+  --js /tmp/js.json \
+  --pin "$(jq -r .ref conformance/suites.json)" \
+  --out docs/scoreboard.md
+```
+
+Two cuts through the same run, and the second one is the useful one.
+A feature says what somebody was testing, which is how the suite is organised, and it is upstream's vocabulary: `upsert` is at 52% and that is not a piece of work.
+An endpoint says what the server had to implement, with the fixture's table and function names taken out, and `PATCH /rest/v1/{table}` at 28% is.
+
+There is no date and no run number in the file, so a merge that moved no number leaves no diff and makes no commit.
+The commit it does make carries `[skip ci]`, so the workflow does not start again to measure what it has just measured.

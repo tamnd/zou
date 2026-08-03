@@ -256,10 +256,66 @@ jobs:
           ZOU_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
         run: |
           npm ci
-          npm test
+          npm test -- --reporter=default --reporter=json --outputFile.json=/tmp/js.json
       - name: Keep the server log
         if: always()
         run: cat /tmp/serve.log
+      # For the scoreboard, which is generated in a job of its own out
+      # of what the runs wrote rather than out of a second run.
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-js
+          path: /tmp/js.json
+          if-no-files-found: ignore
+
+  # The numbers a merge measured, in a file in the repository rather
+  # than in a log that expires. Only on main, and only out of the
+  # artifacts the two conformance jobs left behind: rendering it here
+  # from a run of its own would be a second measurement, and then the
+  # published number would be one nobody had failed a build over.
+  scoreboard:
+    name: scoreboard
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [conformance, supabase-js]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: conformance
+          path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
+          name: supabase-js
+          path: /tmp/reports
+      - name: Render it
+        run: |
+          cargo run -p zou-conformance -- scoreboard \
+            --report /tmp/reports/conformance.json \
+            --js /tmp/reports/js.json \
+            --pin "$(jq -r .ref conformance/suites.json)" \
+            --out docs/scoreboard.md
+      # Nothing in the file moves on its own, so a merge that changed no
+      # number leaves no diff and there is no commit. The skip marker
+      # keeps the one that does from starting the whole workflow again
+      # to measure what it just measured.
+      - name: Commit it if a number moved
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- docs/scoreboard.md; then
+            echo "no number moved"
+            exit 0
+          fi
+          git add docs/scoreboard.md
+          git commit -m "Scoreboard for ${GITHUB_SHA:0:12} [skip ci]"
+          git push origin HEAD:main
 
   s3-contract:
     name: s3 contract (minio)

@@ -31,10 +31,15 @@
 //! And a fifth, `serve`, answers rather than asks. It starts zou on a
 //! port and waits, so that a suite written in another language, against
 //! a client somebody else wrote, has a url to point at.
+//!
+//! A sixth, `scoreboard`, asks nothing and serves nothing. It turns the
+//! json a run wrote into the markdown CI commits, so that the numbers
+//! are in the repository rather than in a log that expires.
 
 mod derive;
 mod diff;
 mod report;
+mod scoreboard;
 mod suite;
 mod target;
 mod zou;
@@ -56,6 +61,13 @@ modes
   derive    read a PostgREST checkout and write a suite out of it, no target
   serve     start zou on a port and wait, for a suite that is not asked
             from here: the supabase-js one, or a browser
+  scoreboard  turn the json those runs wrote into markdown, no target
+
+the scoreboard
+  --report <path>          a report json a check wrote with --json, repeatable
+  --js <path>              vitest's json from the supabase-js run
+  --pin <sha>              the zou-conformance commit the suites came from
+  --out <path>             where to write it, stdout when absent
 
 serving
   --zou-dsn <dsn>          the database it reads
@@ -131,6 +143,10 @@ struct Args {
     port: u16,
     schemas: Vec<String>,
     setup_sql: Option<String>,
+    reports: Vec<String>,
+    js: Option<String>,
+    pin: Option<String>,
+    out: Option<String>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -160,6 +176,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         port: 54321,
         schemas: vec!["public".to_string()],
         setup_sql: None,
+        reports: Vec::new(),
+        js: None,
+        pin: None,
+        out: None,
     };
     let mut it = argv.iter();
     args.mode = match it.next() {
@@ -168,7 +188,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     };
     if !matches!(
         args.mode.as_str(),
-        "record" | "check" | "diff" | "derive" | "serve"
+        "record" | "check" | "diff" | "derive" | "serve" | "scoreboard"
     ) {
         return Err(format!("no mode named {:?}", args.mode));
     }
@@ -203,6 +223,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--write-known" => args.write_known = true,
             "--suites" => args.suites_dir = Some(need("--suites")?),
             "--setup" => args.setup_sql = Some(need("--setup")?),
+            "--report" => args.reports.push(need("--report")?),
+            "--js" => args.js = Some(need("--js")?),
+            "--pin" => args.pin = Some(need("--pin")?),
+            "--out" => args.out = Some(need("--out")?),
             "--port" => {
                 let value = need("--port")?;
                 args.port = value
@@ -218,6 +242,25 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             other => return Err(format!("no flag named {other:?}")),
         }
+    }
+    // The scoreboard reads what a run already wrote. It asks nothing,
+    // needs no database, and cannot be run against a target, which is
+    // the point: the numbers on it came out of a run somebody can point
+    // at rather than out of the command that rendered them.
+    if args.mode == "scoreboard" {
+        if args.reports.is_empty() {
+            return Err("scoreboard needs a --report to read".to_string());
+        }
+        if args.url.is_some() || args.zou_dsn.is_some() {
+            return Err("scoreboard reads a report, so it takes no target".to_string());
+        }
+        return Ok(args);
+    }
+    if !args.reports.is_empty() || args.js.is_some() || args.pin.is_some() || args.out.is_some() {
+        return Err(format!(
+            "--report, --js, --pin and --out are for scoreboard, not {}",
+            args.mode
+        ));
     }
     // Serving asks nothing and reads no suite. It is zou on a port and
     // a process that stays up, so the only thing it needs is a database.
@@ -304,6 +347,9 @@ fn run(args: Args) -> Result<bool, String> {
     }
     if args.mode == "serve" {
         return holding(&args);
+    }
+    if args.mode == "scoreboard" {
+        return published(&args);
     }
     let names = match args.suites.is_empty() {
         true => Suite::all()?,
@@ -418,6 +464,29 @@ fn run(args: Args) -> Result<bool, String> {
         std::fs::write(path, format!("{text}\n")).map_err(|e| format!("{path}: {e}"))?;
     }
     Ok(good)
+}
+
+/// The scoreboard: the json a run wrote, as the markdown CI commits.
+///
+/// It writes over the file rather than appending to it, and it puts no
+/// date in it, so the diff of a merge is the numbers that moved and
+/// nothing else. A merge that changes no number changes no file, and
+/// then there is no commit at all.
+fn published(args: &Args) -> Result<bool, String> {
+    let runs = scoreboard::read(&args.reports)?;
+    let js = match &args.js {
+        Some(path) => Some(scoreboard::read_js(path)?),
+        None => None,
+    };
+    let text = scoreboard::render(&runs, js.as_ref(), args.pin.as_deref());
+    match &args.out {
+        Some(path) => {
+            std::fs::write(path, &text).map_err(|e| format!("{path}: {e}"))?;
+            println!("wrote {path}, {} suites", runs.len());
+        }
+        None => print!("{text}"),
+    }
+    Ok(true)
 }
 
 /// Serving: zou on a known port, and then nothing.
@@ -602,6 +671,8 @@ fn fill(report: &mut Report, suite: &Suite, expected: &[suite::Answer], found: &
             (Some(want), Some(got)) => report.results.push(CaseResult {
                 name: case.name.clone(),
                 feature: case.feature.clone(),
+                method: case.method.clone(),
+                path: case.path.clone(),
                 difference: compare(want, got),
             }),
             (None, Some(_)) => report
@@ -741,5 +812,32 @@ mod tests {
         .expect("parses");
         assert_eq!(args.setup_sql.as_deref(), Some("js/setup.sql"));
         assert!(parse(&argv(&["check", "--url", "u", "--setup", "js/setup.sql"])).is_err());
+    }
+
+    #[test]
+    fn the_scoreboard_reads_reports_and_asks_nothing() {
+        let args = parse(&argv(&[
+            "scoreboard",
+            "--report",
+            "rest.json",
+            "--report",
+            "postgrest.json",
+            "--out",
+            "docs/scoreboard.md",
+        ]))
+        .expect("parses");
+        assert_eq!(args.reports, ["rest.json", "postgrest.json"]);
+        assert_eq!(args.out.as_deref(), Some("docs/scoreboard.md"));
+        assert!(parse(&argv(&["scoreboard", "--out", "docs/scoreboard.md"])).is_err());
+        assert!(parse(&argv(&["scoreboard", "--report", "r.json", "--url", "u"])).is_err());
+    }
+
+    /// A scoreboard rendered from a run that is happening right now is
+    /// a scoreboard nobody can point at afterwards, so the flags for it
+    /// do not exist in the modes that ask.
+    #[test]
+    fn a_report_is_not_something_a_run_takes() {
+        assert!(parse(&argv(&["check", "--url", "u", "--report", "r.json"])).is_err());
+        assert!(parse(&argv(&["serve", "--zou-dsn", "d", "--pin", "abc"])).is_err());
     }
 }
