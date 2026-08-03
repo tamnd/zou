@@ -17,6 +17,11 @@
 //! "_zou_mut" and the planner's root level reads from it while
 //! relationships still resolve against the real table, so embeds
 //! work on writes exactly as on reads.
+//!
+//! PUT is the odd one. Its filters are the primary key and they
+//! compile against the payload rather than against the table, so a
+//! body that disagrees with the url matches nothing and the statement
+//! writes nothing, which is the whole of the check.
 
 use crate::catalog::Catalog;
 use crate::filter::Node;
@@ -123,6 +128,78 @@ pub fn insert(
         text,
         params: vec![payload],
     })
+}
+
+/// The setting a PUT counts its updated rows in, and the read that
+/// asks for the count afterwards. It is transaction local, so it is
+/// gone by the time the connection goes back to the pool.
+pub const UPDATED_SQL: &str =
+    "select coalesce(nullif(current_setting('zou.updated', true), '')::int, 0)";
+
+/// The condition on the conflict clause of a PUT, which counts the
+/// rows that clause updated and then lets every one of them through:
+/// set_config returns the new value, and a number is never the empty
+/// string. It is the only condition there, so nothing can reorder
+/// around it, which is what a side effect in a WHERE needs.
+const COUNT_UPDATE: &str = "set_config('zou.updated', (coalesce(nullif(current_setting('zou.updated', true), '')::int, 0) + 1)::text, true) <> ''";
+
+/// PUT's upsert, the one row PostgREST calls a single upsert. The
+/// conflict target is the primary key, always, and the url's filters
+/// are compiled against the unpacked payload rather than against the
+/// table: a body whose key is not the url's key survives no filter,
+/// no row goes in, and the router reads the count of nothing as the
+/// mismatch. Subtracting the counted updates from the rows written
+/// says whether the row was inserted, which is the 201 against the
+/// 200.
+pub fn upsert_one(
+    table: &str,
+    columns: &[String],
+    payload: String,
+    pk: &[String],
+    filters: &[Node],
+    returning: &Returning,
+) -> Result<Sql, CompileError> {
+    if pk.is_empty() {
+        return err("a put needs a primary key to conflict on");
+    }
+    let t = quote_ident(table);
+    let s = quote_ident(SRC);
+    let cols = ident_list(columns);
+    let mut text = if columns.is_empty() {
+        format!("insert into {t} select from json_populate_recordset(null::{t}, $1) as {s}")
+    } else {
+        format!(
+            "insert into {t} ({cols}) select {cols} from json_populate_recordset(null::{t}, $1) as {s}"
+        )
+    };
+    let mut params = vec![payload];
+    if !filters.is_empty() {
+        let compiled = where_clause_from(filters, Some(SRC), params)?;
+        params = compiled.params;
+        text.push_str(" where ");
+        text.push_str(&compiled.text);
+    }
+    let target = ident_list(pk);
+    if columns.is_empty() {
+        // Nothing to merge, so the conflict absorbs and the count of
+        // updates stays at nothing, same as an insert that found no
+        // conflict at all.
+        text.push_str(&format!(" on conflict ({target}) do nothing"));
+    } else {
+        let sets: Vec<String> = columns
+            .iter()
+            .map(|c| {
+                let c = quote_ident(c);
+                format!("{c} = excluded.{c}")
+            })
+            .collect();
+        text.push_str(&format!(
+            " on conflict ({target}) do update set {} where {COUNT_UPDATE}",
+            sets.join(", ")
+        ));
+    }
+    text.push_str(&returning_sql(returning, None));
+    Ok(Sql { text, params })
 }
 
 /// Update the filtered rows from one json object parameter. The
@@ -369,6 +446,64 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.message.contains("conflict target"), "{e}");
+    }
+
+    #[test]
+    fn a_put_filters_the_payload_not_the_table() {
+        let s = upsert_one(
+            "tiobe_pls",
+            &cols(&["name", "rank"]),
+            r#"[{"name":"Go","rank":19}]"#.into(),
+            &cols(&["name"]),
+            &[node("name", "eq.Go")],
+            &Returning::Star,
+        )
+        .unwrap();
+        assert!(
+            s.text
+                .contains(r#"as "_zou_src" where "_zou_src"."name" = $2"#),
+            "{}",
+            s.text
+        );
+        assert!(
+            s.text.contains(
+                r#"on conflict ("name") do update set "name" = excluded."name", "rank" = excluded."rank" where set_config("#
+            ),
+            "{}",
+            s.text
+        );
+        assert!(s.text.ends_with(" returning *"), "{}", s.text);
+        assert_eq!(s.params, vec![r#"[{"name":"Go","rank":19}]"#, "Go"]);
+    }
+
+    #[test]
+    fn a_put_with_nothing_to_merge_lets_the_conflict_absorb() {
+        let s = upsert_one(
+            "only_pk",
+            &[],
+            "[{}]".into(),
+            &cols(&["id"]),
+            &[node("id", "eq.1")],
+            &Returning::None,
+        )
+        .unwrap();
+        assert!(
+            s.text.ends_with(r#" on conflict ("id") do nothing"#),
+            "{}",
+            s.text
+        );
+        assert!(!s.text.contains("set_config"), "{}", s.text);
+
+        let e = upsert_one(
+            "no_pk",
+            &cols(&["a"]),
+            "[]".into(),
+            &[],
+            &[],
+            &Returning::None,
+        )
+        .unwrap_err();
+        assert!(e.message.contains("primary key"), "{e}");
     }
 
     #[test]

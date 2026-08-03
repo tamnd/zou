@@ -1006,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_rest_method_is_still_the_honest_501() {
         let req = Request::builder()
-            .method("PUT")
+            .method("TRACE")
             .uri("/rest/v1/todos")
             .header("apikey", anon_key())
             .body(Body::empty())

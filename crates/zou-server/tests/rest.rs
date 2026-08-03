@@ -457,6 +457,173 @@ async fn the_write_path_speaks_postgrest() {
 }
 
 #[tokio::test]
+async fn a_put_replaces_the_row_the_url_names() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_put, zou_rest_put_pair, zou_rest_put_nopk cascade",
+            "create table zou_rest_put (name text primary key, rank int)",
+            "create table zou_rest_put_pair \
+             (first text, last text, salary int, primary key (first, last))",
+            "create table zou_rest_put_nopk (a text, b text)",
+            "insert into zou_rest_put values ('java', 13)",
+            "insert into zou_rest_put_pair values ('frances', 'roe', 60000)",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // A row the table does not have yet is a creation, and the same
+    // url a second time is not.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/rest/v1/zou_rest_put?name=eq.go",
+            r#"[{"name": "go", "rank": 19}]"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(body_text(res).await, r#"[{"name": "go", "rank": 19}]"#);
+
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/rest/v1/zou_rest_put?name=eq.go",
+            r#"[{"name": "go", "rank": 20}]"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"name": "go", "rank": 20}]"#);
+
+    // No Prefer at all is the bare 204, and it carries no window,
+    // because the url named the row rather than a range of them.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/rest/v1/zou_rest_put?name=eq.java",
+            r#"[{"name": "java", "rank": 1}]"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert!(res.headers().get("content-range").is_none());
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_put?select=rank&name=eq.java"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"rank": 1}]"#);
+
+    // Every element the url does not name is filtered out of the
+    // payload, so a body of two rows puts the one that matches.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/rest/v1/zou_rest_put?name=eq.java",
+            r#"[{"name": "java", "rank": 2}, {"name": "swift", "rank": 12}]"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"name": "java", "rank": 2}]"#);
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_put?select=name&name=eq.swift"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "[]");
+
+    // A composite key needs all of its columns, and either half of
+    // it alone names a set rather than a row.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/rest/v1/zou_rest_put_pair?first=eq.frances&last=eq.roe",
+            r#"[{"first": "frances", "last": "roe", "salary": 70000}]"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"last": "roe", "first": "frances", "salary": 70000}]"#
+    );
+
+    for uri in [
+        "/rest/v1/zou_rest_put_pair?first=eq.frances",
+        "/rest/v1/zou_rest_put?rank=eq.19",
+        "/rest/v1/zou_rest_put?name=not.eq.go",
+        "/rest/v1/zou_rest_put?name=in.(go)",
+        "/rest/v1/zou_rest_put?and=(name.eq.go)",
+        "/rest/v1/zou_rest_put",
+        "/rest/v1/zou_rest_put_nopk?a=eq.one&b=eq.two",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(req("PUT", uri, r#"[{"a": "one", "b": "two"}]"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED, "{uri}");
+        let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+        assert_eq!(body["code"], "PGRST105", "{uri}");
+    }
+
+    // Paging a url that names one row is a contradiction, and it is
+    // refused before the key is even looked up.
+    for uri in [
+        "/rest/v1/zou_rest_put?name=eq.go&limit=1",
+        "/rest/v1/zou_rest_put?name=eq.go&offset=1",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(req("PUT", uri, r#"[{"name": "go"}]"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+        assert_eq!(body["code"], "PGRST114", "{uri}");
+    }
+
+    // A body whose key is not the url's key writes nothing, and the
+    // nothing is what the mismatch is read off.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/rest/v1/zou_rest_put?name=eq.rust",
+            r#"[{"name": "perl", "rank": 17}]"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST115");
+
+    // And the refusal rolled back, so the earlier rows are the only
+    // rows and perl never landed.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_put?select=name&order=name"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"name": "go"},{"name": "java"}]"#);
+}
+
+#[tokio::test]
 async fn the_rpc_surface_speaks_postgrest() {
     let Some(dsn) = dsn() else { return };
     seed(

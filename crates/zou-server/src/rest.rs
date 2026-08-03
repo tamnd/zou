@@ -48,7 +48,7 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use zou_rest::catalog::{Catalog, FkRow, INTROSPECT_SQL};
-use zou_rest::filter::{self, Node, Parsed};
+use zou_rest::filter::{self, Node, Op, Parsed};
 use zou_rest::mutate::{self, Conflict, Returning};
 use zou_rest::plan::{self, PlanError, Query};
 use zou_rest::{order, page, rpc, select};
@@ -190,6 +190,60 @@ fn invalid_body(message: impl Into<String>) -> RestError {
         details: None,
         hint: None,
     }
+}
+
+/// The three ways a PUT is refused. PostgREST reads the url of a PUT
+/// as naming one row, so paging it is meaningless, filtering it by
+/// anything but the whole primary key names something else, and a
+/// body carrying a different key names a second row.
+fn put_paged() -> RestError {
+    RestError {
+        status: StatusCode::BAD_REQUEST,
+        code: "PGRST114".to_string(),
+        message: "limit/offset querystring parameters are not allowed for PUT".to_string(),
+        details: None,
+        hint: None,
+    }
+}
+
+fn put_filters() -> RestError {
+    RestError {
+        status: StatusCode::METHOD_NOT_ALLOWED,
+        code: "PGRST105".to_string(),
+        message: "Filters must include all and only primary key columns with 'eq' operators"
+            .to_string(),
+        details: None,
+        hint: None,
+    }
+}
+
+fn put_mismatch() -> RestError {
+    RestError {
+        status: StatusCode::BAD_REQUEST,
+        code: "PGRST115".to_string(),
+        message: "Payload values do not match URL in primary key column(s)".to_string(),
+        details: None,
+        hint: None,
+    }
+}
+
+/// Whether the url's filters are exactly the primary key, each one an
+/// unnegated `eq` with no quantifier, and no logic tree anywhere. A
+/// table with no primary key fails this the moment it is asked, which
+/// is the same answer PostgREST gives it.
+fn keys_the_row(filters: &[Node], pk: &[String]) -> bool {
+    if pk.is_empty() || filters.len() != pk.len() {
+        return false;
+    }
+    let mut named: Vec<&str> = Vec::new();
+    for node in filters {
+        let Node::Cond(c) = node else { return false };
+        if c.negated || c.op != Op::Eq || c.quant.is_some() || !c.field.path.is_empty() {
+            return false;
+        }
+        named.push(&c.field.column);
+    }
+    pk.iter().all(|col| named.contains(&col.as_str()))
 }
 
 /// A parameter sent in text format and accepted for any type, which
@@ -1105,6 +1159,36 @@ fn write_headers(prefer: &Prefer, res: &mut Response) {
     }
 }
 
+/// The status a representation carries, and the point a PUT's row
+/// count is judged. A POST is always a creation. A PUT is one row or
+/// it is a mismatch, and it is a creation only when the conflict
+/// clause updated nothing, which the statement counted as it ran.
+async fn written(
+    sess: &Session,
+    method: &Method,
+    affected: u64,
+    authed: bool,
+) -> Result<StatusCode, RestError> {
+    if *method == Method::POST {
+        return Ok(StatusCode::CREATED);
+    }
+    if *method != Method::PUT {
+        return Ok(StatusCode::OK);
+    }
+    if affected != 1 {
+        return Err(put_mismatch());
+    }
+    let rows = sess
+        .query(mutate::UPDATED_SQL, &[])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    Ok(if rows[0].get::<_, i32>(0) == 0 {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    })
+}
+
 async fn write(
     app: &App,
     table: &str,
@@ -1118,6 +1202,16 @@ async fn write(
     // getSchema order, so PGRST106 beats a bad body.
     let (schema, negotiated) = profile(&app.cfg.schemas, method, &req.headers)?;
     let (mut q, extras) = parse_query(table, req.uri.query())?;
+
+    // A PUT names one row, so a window over it is a contradiction and
+    // upstream refuses it while it is still reading the request, ahead
+    // of the body and ahead of the primary key.
+    let put = *method == Method::PUT;
+    if put
+        && (q.limit.iter().any(|(r, _)| r.is_empty()) || q.offset.iter().any(|(r, _)| r.is_empty()))
+    {
+        return Err(put_paged());
+    }
 
     // Root filters belong to the mutation's WHERE. A condition whose
     // field reaches into an embed, or anything routed at one, stays
@@ -1134,7 +1228,7 @@ async fn write(
     });
 
     let payload = match *method {
-        Method::POST => Some(insert_payload(bytes, extras.columns.as_deref())?),
+        Method::POST | Method::PUT => Some(insert_payload(bytes, extras.columns.as_deref())?),
         Method::PATCH => Some(update_payload(bytes)?),
         _ => None,
     };
@@ -1175,7 +1269,8 @@ async fn write(
     // The primary key, only fetched when the upsert needs a default
     // target or the Location header wants the columns.
     let wants_location = *method == Method::POST && prefer.ret == Ret::HeadersOnly;
-    let needs_pk = wants_location
+    let needs_pk = put
+        || wants_location
         || (*method == Method::POST && prefer.merge.is_some() && extras.on_conflict.is_none());
     let pk: Vec<String> = if needs_pk {
         sess.query(PK_SQL, &[&schema, &table])
@@ -1187,6 +1282,14 @@ async fn write(
     } else {
         Vec::new()
     };
+
+    // What a PUT is allowed to be filtered by, which is the primary
+    // key and nothing else. The answer is 405 rather than 400 because
+    // upstream reads it as the url naming a set, and a set is not a
+    // thing PUT knows how to replace.
+    if put && !keys_the_row(&root, &pk) {
+        return Err(put_filters());
+    }
 
     let conflict = match (*method == Method::POST, prefer.merge) {
         (true, Some(merge)) => {
@@ -1225,23 +1328,21 @@ async fn write(
             let (cols, body) = payload.expect("patch parsed a payload");
             mutate::update(table, &cols, body, &root, &returning)
         }
+        Method::PUT => {
+            let (cols, body) = payload.expect("put parsed a payload");
+            mutate::upsert_one(table, &cols, body, &pk, &root, &returning)
+        }
         Method::DELETE => mutate::delete(table, &root, &returning),
         _ => unreachable!("the dispatcher only sends writes here"),
     }
     .map_err(|e| bad_grammar(e.message))?;
 
-    let created = *method == Method::POST;
     let affected: u64;
     let mut res = match prefer.ret {
         Ret::Representation => {
             let catalog = load_catalog(app, &sess, authed, schema).await?;
             let r = mutate::representation(&catalog, m, &mut q).map_err(plan_error)?;
             let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
-            let status = if created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            };
             if media == Media::Csv {
                 let text = format!(
                     "with {}, \"_zou_source\" as ({}) {}",
@@ -1252,6 +1353,7 @@ async fn write(
                     .await
                     .map_err(|e| pg_error(&e, authed))?;
                 affected = rows[0].get::<_, i64>(1) as u64;
+                let status = written(&sess, method, affected, authed).await?;
                 sess.commit().await.map_err(|e| pg_error(&e, authed))?;
                 (
                     status,
@@ -1270,11 +1372,12 @@ async fn write(
                     .query(&text, &param_refs(&params))
                     .await
                     .map_err(|e| pg_error(&e, authed))?;
+                affected = rows.len() as u64;
+                let status = written(&sess, method, affected, authed).await?;
                 if media.is_single() && rows.len() != 1 {
                     return Err(not_single(rows.len()));
                 }
                 sess.commit().await.map_err(|e| pg_error(&e, authed))?;
-                affected = rows.len() as u64;
                 let body = if media.is_single() {
                     rows[0].get::<_, String>(0)
                 } else {
@@ -1327,11 +1430,16 @@ async fn write(
                 .execute(&m.text, &param_refs(&params))
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
+            // A PUT that wrote no row still has to be judged, and it
+            // answers 204 either way once it has been.
+            if put && affected != 1 {
+                return Err(put_mismatch());
+            }
             if media.is_single() && affected != 1 {
                 return Err(not_single(affected as usize));
             }
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
-            if created {
+            if *method == Method::POST {
                 StatusCode::CREATED.into_response()
             } else {
                 StatusCode::NO_CONTENT.into_response()
@@ -1340,7 +1448,9 @@ async fn write(
     };
     // PostgREST's write Content-Range: an update shows the window it
     // touched from zero, insert and delete collapse the window, and
-    // the total is the affected count only when count= asked.
+    // the total is the affected count only when count= asked. A PUT
+    // carries none, because the row it wrote is the row the url named
+    // and a window over one named row says nothing.
     let total =
         matches!(prefer.count, Some(Count::Exact | Count::Estimated)).then_some(affected as i64);
     let window = if *method == Method::PATCH {
@@ -1348,7 +1458,7 @@ async fn write(
     } else {
         content_range(1, 0, total)
     };
-    if let Ok(v) = window.parse() {
+    if !put && let Ok(v) = window.parse() {
         res.headers_mut().insert(header::CONTENT_RANGE, v);
     }
     // Content-Profile rides with Content-Type, so only the
@@ -1374,7 +1484,7 @@ pub async fn table(
     let (parts, body) = req.into_parts();
     let result = match method {
         Method::GET | Method::HEAD => read(&app, &table, &auth, &parts).await,
-        Method::POST | Method::PATCH | Method::DELETE => {
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE => {
             match axum::body::to_bytes(body, BODY_LIMIT).await {
                 Ok(bytes) => write(&app, &table, &auth, &parts, &bytes).await,
                 Err(_) => Err(RestError {
@@ -2183,6 +2293,35 @@ mod tests {
         assert_eq!(cols, vec!["title"]);
         assert_eq!(payload, r#"{"title":"x"}"#);
         assert_eq!(update_payload(b"[]").unwrap_err().code, "PGRST102");
+    }
+
+    #[test]
+    fn a_put_is_filtered_by_its_key_or_it_is_refused() {
+        fn root(query: &str) -> Vec<Node> {
+            let (q, _) = parse_query("t", Some(query)).unwrap();
+            q.filters.into_iter().map(|(_, node)| node).collect()
+        }
+        let one = vec!["id".to_string()];
+        let two = vec!["first".to_string(), "last".to_string()];
+
+        assert!(keys_the_row(&root("id=eq.1"), &one));
+        assert!(keys_the_row(&root("last=eq.roe&first=eq.frances"), &two));
+
+        // Everything else is the same refusal: a column that is not
+        // the key, an operator that is not eq, a negation, a tree, a
+        // key only half named, no filter at all, and no key at all.
+        for query in [
+            "rank=eq.19",
+            "id=in.(1)",
+            "id=not.eq.1",
+            "and=(id.eq.1)",
+            "id=eq.1&rank=eq.19",
+            "",
+        ] {
+            assert!(!keys_the_row(&root(query), &one), "{query}");
+        }
+        assert!(!keys_the_row(&root("first=eq.frances"), &two));
+        assert!(!keys_the_row(&root("id=eq.1"), &[]));
     }
 
     #[test]
