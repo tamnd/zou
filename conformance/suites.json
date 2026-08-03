@@ -1,0 +1,13 @@
+{
+  "note": [
+    "Which questions this checkout of zou is measured against.",
+    "The suites are recordings of what upstream answered, so they are",
+    "upstream's data rather than zou's code and they live in their own",
+    "repository. Pinned to a commit rather than to a branch, because a",
+    "recording that moves under CI is a recording nobody is comparing",
+    "against: bumping this line is how a new suite, a re-recording, or a",
+    "pruned known list arrives, and the bump is a diff somebody reads."
+  ],
+  "repository": "https://github.com/tamnd/zou-conformance",
+  "ref": "49707afd5f9bfb64e401d9ad3a32a19fa2f903f0"
+}

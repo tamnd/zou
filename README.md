@@ -32,6 +32,8 @@ The full design lives in the [architecture docs](docs/), and the implementation 
 - [M4: Realtime and edge functions](https://github.com/tamnd/zou/issues/4)
 - [M5: Migration from Supabase, hardening, 1.0](https://github.com/tamnd/zou/issues/5)
 
+Supabase compatibility is measured rather than claimed. `conformance/` asks the real PostgREST binary and zou the same questions, and compares status, headers, and bodies. There are two suites: a hand written one about the surface a Supabase project uses, which stands at 71 of 82 cases, and one derived from PostgREST's own spec files, 1233 requests, which stands at 589. The questions and the recorded answers live in [tamnd/zou-conformance](https://github.com/tamnd/zou-conformance), pinned to a commit here, and every case that differs is listed with the reason it differs, see [docs/conformance.md](docs/conformance.md).
+
 ## What it will look like
 
 Embedded, for tests and local dev:
