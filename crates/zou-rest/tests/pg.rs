@@ -419,7 +419,7 @@ async fn planned_queries_return_postgrest_shaped_rows() {
 /// embed resolving against the real table.
 #[tokio::test]
 async fn mutations_execute_and_read_back_through_the_planner() {
-    use zou_rest::mutate::{self, Conflict, Returning};
+    use zou_rest::mutate::{self, Conflict, Missing, Returning};
     use zou_rest::{plan, select};
 
     let Some(c) = client().await else { return };
@@ -457,6 +457,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
         None,
         &cols(&["id", "author_id", "title"]),
         r#"[{"id":1,"author_id":1,"title":"a1"},{"id":2,"author_id":2,"title":"b1"}]"#.into(),
+        Missing::Null,
         None,
         &Returning::Cols(cols(&["id", "price"])),
     )
@@ -472,6 +473,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
         None,
         &cols(&["id", "author_id", "title"]),
         r#"[{"id":2,"author_id":2,"title":"b2"},{"id":3,"author_id":1,"title":"a2"}]"#.into(),
+        Missing::Null,
         Some(&Conflict::Merge {
             target: cols(&["id"]),
             set: cols(&["author_id", "title"]),
@@ -489,6 +491,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
         None,
         &cols(&["id", "author_id", "title"]),
         r#"[{"id":3,"author_id":2,"title":"zzz"},{"id":4,"author_id":2,"title":"b3"}]"#.into(),
+        Missing::Null,
         Some(&Conflict::Ignore {
             target: cols(&["id"]),
         }),
@@ -506,6 +509,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
         None,
         &cols(&["price"]),
         r#"{"price":30}"#.into(),
+        Missing::Null,
         &nodes(&[("id", "gte.3")]),
         &Returning::Star,
     )
@@ -552,6 +556,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
         None,
         &cols(&["id", "author_id", "title"]),
         r#"[{"id":9,"author_id":1,"title":"a9"}]"#.into(),
+        Missing::Null,
         None,
         &Returning::Star,
     )

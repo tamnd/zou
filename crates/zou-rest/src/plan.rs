@@ -803,6 +803,7 @@ mod tests {
                 from_text: Some("test.color".into()),
                 from_json: Some("test.color".into()),
                 type_name: "test.color".into(),
+                default_expr: None,
             },
         };
         let plain = |table: &str, name: &str| ColumnRow {

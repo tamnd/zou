@@ -137,6 +137,10 @@ pub struct Column {
     pub from_text: Option<String>,
     /// Reads one out of the json a body carries, the cast from json.
     pub from_json: Option<String>,
+    /// What postgres would put here if a write said nothing, the
+    /// default expression as postgres spells it back. Only
+    /// `Prefer: missing=default` reads it.
+    pub default_expr: Option<String>,
 }
 
 /// One row of [`COLUMNS_SQL`], a column and the relation it sits in.
@@ -175,6 +179,15 @@ select c.relname::text
 /// way a column definition list has to have it, schema qualified
 /// when the search path would not find it and with its modifiers
 /// carried along.
+///
+/// The default expression is where postgres keeps four different
+/// things. A plain default is in pg_attrdef. A domain's default is
+/// on the type and only counts when the column has none of its own.
+/// An identity column has no default row at all and its sequence is
+/// found through the dependency postgres recorded, spelled back as
+/// the nextval call that would have been there. A stored generated
+/// column has an expression nobody may write to, so it has none
+/// here.
 pub const COLUMNS_SQL: &str = "\
 select c.relname::text,
        a.attname::text,
@@ -199,10 +212,24 @@ select c.relname::text,
          where ct.castsource = 'json'::regtype
            and ct.casttarget = a.atttypid
            and ct.castmethod = 'f'),
-       format_type(a.atttypid, a.atttypmod)
+       format_type(a.atttypid, a.atttypmod),
+       case when t.typbasetype <> 0 and ad.adbin is null
+              then pg_get_expr(t.typdefaultbin, 0)
+            when a.attidentity = 'd'
+              then format('nextval(%L)', seq.objid::regclass)
+            when a.attgenerated = 's' then null
+            else pg_get_expr(ad.adbin, ad.adrelid)
+       end
   from pg_class c
   join pg_namespace n on n.oid = c.relnamespace
   join pg_attribute a on a.attrelid = c.oid
+  join pg_type t on t.oid = a.atttypid
+  left join pg_attrdef ad
+    on ad.adrelid = a.attrelid and ad.adnum = a.attnum
+  left join pg_depend seq
+    on seq.refobjid = a.attrelid
+   and seq.refobjsubid = a.attnum
+   and seq.deptype = 'i'
  where n.nspname = $1
    and c.relkind in ('r', 'v', 'm', 'f', 'p')
    and not c.relispartition
@@ -702,6 +729,7 @@ mod tests {
                         from_text: Some("test.color".into()),
                         from_json: Some("test.color".into()),
                         type_name: "test.color".into(),
+                        default_expr: None,
                     },
                 },
                 col("todos", "name"),
