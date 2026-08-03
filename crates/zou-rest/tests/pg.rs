@@ -454,6 +454,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
     // fills the absent price.
     let s = mutate::insert(
         "books",
+        None,
         &cols(&["id", "author_id", "title"]),
         r#"[{"id":1,"author_id":1,"title":"a1"},{"id":2,"author_id":2,"title":"b1"}]"#.into(),
         None,
@@ -468,6 +469,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
     // still inserts the fresh one.
     let s = mutate::insert(
         "books",
+        None,
         &cols(&["id", "author_id", "title"]),
         r#"[{"id":2,"author_id":2,"title":"b2"},{"id":3,"author_id":1,"title":"a2"}]"#.into(),
         Some(&Conflict::Merge {
@@ -484,6 +486,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
     // ignore-duplicates drops the clash instead.
     let s = mutate::insert(
         "books",
+        None,
         &cols(&["id", "author_id", "title"]),
         r#"[{"id":3,"author_id":2,"title":"zzz"},{"id":4,"author_id":2,"title":"b3"}]"#.into(),
         Some(&Conflict::Ignore {
@@ -546,6 +549,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
     );
     let m = mutate::insert(
         "books",
+        None,
         &cols(&["id", "author_id", "title"]),
         r#"[{"id":9,"author_id":1,"title":"a9"}]"#.into(),
         None,
