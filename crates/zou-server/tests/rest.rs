@@ -2400,3 +2400,99 @@ async fn a_data_representation_is_what_the_client_sees() {
         .unwrap();
     assert_eq!(body_text(res).await, "[{\"shade\": \"\\\"#ff0000\\\"\"}]");
 }
+
+#[tokio::test]
+async fn a_data_representation_reads_a_written_value_back_in() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_wpaint cascade",
+            "drop domain if exists zou_rest_wcolor cascade",
+            "create domain zou_rest_wcolor as int4",
+            "create function zou_rest_wjson(zou_rest_wcolor) returns json as \
+             $$ select to_json('#' || lpad(to_hex($1::int), 6, '0')) $$ language sql immutable",
+            "create cast (zou_rest_wcolor as json) with function zou_rest_wjson(zou_rest_wcolor)",
+            // The one a write needs: the body carries json, not the
+            // text a url carries, so this is a second function and a
+            // second cast even where the two parse the same string.
+            "create function zou_rest_wread(json) returns zou_rest_wcolor as \
+             $$ select (('x' || lpad(substring(($1 #>> '{}') from 2), 8, '0'))::bit(32)::int)::zou_rest_wcolor $$ \
+             language sql immutable",
+            "create cast (json as zou_rest_wcolor) with function zou_rest_wread(json)",
+            "create table zou_rest_wpaint (id int primary key, shade zou_rest_wcolor, note text)",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // An insert of one object, and the representation it hands back
+    // has been through the cast the other way.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wpaint?select=id,shade",
+            r##"{"id": 1, "shade": "#ff0000", "note": "warm"}"##,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(body_text(res).await, r##"[{"id": 1, "shade": "#ff0000"}]"##);
+
+    // What actually landed is the integer, which is the point of the
+    // whole arrangement.
+    let pool = Pool::new(&dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    let rows = sess
+        .query("select shade::int from zou_rest_wpaint where id = 1", &[])
+        .await
+        .expect("read back");
+    assert_eq!(rows[0].get::<_, i32>(0), 16711680);
+    sess.commit().await.expect("park");
+
+    // An array body takes the same path, one row per element.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wpaint?select=id,shade&order=id",
+            r##"[{"id": 2, "shade": "#0000ff"},{"id": 3, "shade": "#00ff00"}]"##,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r##"[{"id": 2, "shade": "#0000ff"},{"id": 3, "shade": "#00ff00"}]"##
+    );
+
+    // And an update, which declares only the column it writes.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_wpaint?id=eq.1&select=id,shade",
+            r##"{"shade": "#010203"}"##,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r##"[{"id": 1, "shade": "#010203"}]"##);
+
+    // A write that touches nothing represented is left on the plain
+    // path, and still writes what it was given.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_wpaint?id=eq.1&select=id,note",
+            r#"{"note": "chilly"}"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"id": 1, "note": "chilly"}]"#);
+}

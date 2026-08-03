@@ -23,7 +23,7 @@
 //! body that disagrees with the url matches nothing and the statement
 //! writes nothing, which is the whole of the check.
 
-use crate::catalog::{Catalog, Relation};
+use crate::catalog::{Catalog, Column, Relation};
 use crate::filter::Node;
 use crate::plan::{PlanError, Query, plan_from};
 use crate::sql::{CompileError, Sql, quote_ident, where_clause_from};
@@ -33,6 +33,10 @@ pub const SOURCE: &str = "_zou_mut";
 
 /// The alias the unpacked payload travels under inside a statement.
 const SRC: &str = "_zou_src";
+
+/// The alias the column definition list hangs off, one step further
+/// in than [`SRC`], where the casts are still uncalled.
+const BODY: &str = "_zou_body";
 
 fn err<T>(message: impl Into<String>) -> Result<T, CompileError> {
     Err(CompileError {
@@ -76,6 +80,7 @@ pub enum Conflict {
 /// list.
 pub fn insert(
     table: &str,
+    rel: Option<&Relation>,
     columns: &[String],
     payload: String,
     conflict: Option<&Conflict>,
@@ -83,16 +88,11 @@ pub fn insert(
 ) -> Result<Sql, CompileError> {
     let t = quote_ident(table);
     let cols = ident_list(columns);
+    let src = rows_of(table, rel, columns);
     let mut text = if columns.is_empty() {
-        format!(
-            "insert into {t} select from json_populate_recordset(null::{t}, $1) as {}",
-            quote_ident(SRC)
-        )
+        format!("insert into {t} select from {src}")
     } else {
-        format!(
-            "insert into {t} ({cols}) select {cols} from json_populate_recordset(null::{t}, $1) as {}",
-            quote_ident(SRC)
-        )
+        format!("insert into {t} ({cols}) select {cols} from {src}")
     };
     match conflict {
         None => {}
@@ -164,14 +164,12 @@ pub fn upsert_one(
         return err("a put needs a primary key to conflict on");
     }
     let t = quote_ident(table);
-    let s = quote_ident(SRC);
     let cols = ident_list(columns);
+    let src = rows_of(table, rel, columns);
     let mut text = if columns.is_empty() {
-        format!("insert into {t} select from json_populate_recordset(null::{t}, $1) as {s}")
+        format!("insert into {t} select from {src}")
     } else {
-        format!(
-            "insert into {t} ({cols}) select {cols} from json_populate_recordset(null::{t}, $1) as {s}"
-        )
+        format!("insert into {t} ({cols}) select {cols} from {src}")
     };
     let mut params = vec![payload];
     if !filters.is_empty() {
@@ -242,8 +240,9 @@ pub fn update(
         })
         .collect();
     let mut text = format!(
-        "update {t} set {} from (select * from json_populate_record(null::{t}, $1)) as {s}",
-        sets.join(", ")
+        "update {t} set {} from {}",
+        sets.join(", "),
+        row_of(table, rel, columns)
     );
     let mut params = vec![payload];
     if !filters.is_empty() {
@@ -328,6 +327,78 @@ fn returning_sql(r: &Returning, qualifier: Option<&str>) -> String {
     }
 }
 
+/// The rows of a json array body, ready to be selected from.
+///
+/// The plain shape is `json_populate_recordset` against the table's
+/// own row type, which is what postgres types every value with. A
+/// relation carrying a data representation cannot use it: the values
+/// of such a column arrive as json and the type reads json through a
+/// function postgres records and refuses to apply, so the body
+/// unpacks through a column definition list that types those columns
+/// as json and the function is called here, by name, the way
+/// upstream calls it.
+fn rows_of(table: &str, rel: Option<&Relation>, columns: &[String]) -> String {
+    match body_cast(rel, columns) {
+        Some((list, defs)) => format!(
+            "(select {list} from json_to_recordset($1) as {}({defs})) as {}",
+            quote_ident(BODY),
+            quote_ident(SRC)
+        ),
+        None => format!(
+            "json_populate_recordset(null::{}, $1) as {}",
+            quote_ident(table),
+            quote_ident(SRC)
+        ),
+    }
+}
+
+/// The one row of a json object body, [`rows_of`] for an update.
+fn row_of(table: &str, rel: Option<&Relation>, columns: &[String]) -> String {
+    match body_cast(rel, columns) {
+        Some((list, defs)) => format!(
+            "(select {list} from json_to_record($1) as {}({defs})) as {}",
+            quote_ident(BODY),
+            quote_ident(SRC)
+        ),
+        None => format!(
+            "(select * from json_populate_record(null::{}, $1)) as {}",
+            quote_ident(table),
+            quote_ident(SRC)
+        ),
+    }
+}
+
+/// The select list and the column definition list a represented body
+/// needs, or nothing at all when no column being written reads json
+/// through a cast. Nothing at all is every ordinary write, which is
+/// why the plain shape is still the one almost every statement gets.
+fn body_cast(rel: Option<&Relation>, columns: &[String]) -> Option<(String, String)> {
+    let rel = rel?;
+    let cols: Vec<&Column> = columns.iter().filter_map(|c| rel.column(c)).collect();
+    // A name the relation does not have leaves nothing to declare a
+    // type for, so the plain shape takes it and postgres says what
+    // it thinks. The router has usually refused it long before here.
+    if cols.len() != columns.len() || !cols.iter().any(|c| c.from_json.is_some()) {
+        return None;
+    }
+    let mut list = Vec::with_capacity(cols.len());
+    let mut defs = Vec::with_capacity(cols.len());
+    for c in &cols {
+        let name = quote_ident(&c.name);
+        match &c.from_json {
+            Some(func) => {
+                list.push(format!("{func}({name}) as {name}"));
+                defs.push(format!("{name} json"));
+            }
+            None => {
+                list.push(name.to_string());
+                defs.push(format!("{name} {}", c.type_name));
+            }
+        }
+    }
+    Some((list.join(", "), defs.join(", ")))
+}
+
 fn ident_list(cols: &[String]) -> String {
     cols.iter()
         .map(|c| quote_ident(c))
@@ -359,6 +430,7 @@ mod tests {
     fn a_plain_insert() {
         let s = insert(
             "books",
+            None,
             &cols(&["id", "title"]),
             "[]".into(),
             None,
@@ -374,7 +446,7 @@ mod tests {
 
     #[test]
     fn an_empty_body_inserts_default_rows() {
-        let s = insert("books", &[], "[{}]".into(), None, &Returning::Star).unwrap();
+        let s = insert("books", None, &[], "[{}]".into(), None, &Returning::Star).unwrap();
         assert_eq!(
             s.text,
             r#"insert into "books" select from json_populate_recordset(null::"books", $1) as "_zou_src" returning *"#
@@ -386,6 +458,7 @@ mod tests {
         let ignore_all = Conflict::Ignore { target: vec![] };
         let s = insert(
             "t",
+            None,
             &cols(&["a"]),
             "[]".into(),
             Some(&ignore_all),
@@ -399,6 +472,7 @@ mod tests {
         };
         let s = insert(
             "t",
+            None,
             &cols(&["a"]),
             "[]".into(),
             Some(&ignore),
@@ -417,6 +491,7 @@ mod tests {
         };
         let s = insert(
             "t",
+            None,
             &cols(&["a", "b"]),
             "[]".into(),
             Some(&merge),
@@ -438,6 +513,7 @@ mod tests {
         };
         let s = insert(
             "t",
+            None,
             &cols(&["id"]),
             "[]".into(),
             Some(&hollow),
@@ -457,6 +533,7 @@ mod tests {
         };
         let e = insert(
             "t",
+            None,
             &cols(&["a"]),
             "[]".into(),
             Some(&bad),
@@ -574,6 +651,110 @@ mod tests {
         assert!(s.params.is_empty());
     }
 
+    /// A relation whose `label_color` reads json through a cast and
+    /// whose other two columns are ordinary.
+    fn painted() -> Relation {
+        Relation {
+            name: "todos".into(),
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    type_name: "bigint".into(),
+                    ..Column::default()
+                },
+                Column {
+                    name: "label_color".into(),
+                    type_name: "test.color".into(),
+                    to_json: Some("test.json".into()),
+                    from_text: Some("test.color".into()),
+                    from_json: Some("test.color".into()),
+                },
+                Column {
+                    name: "name".into(),
+                    type_name: "text".into(),
+                    ..Column::default()
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_written_value_is_read_through_the_cast_its_type_has() {
+        let rel = painted();
+        let s = insert(
+            "todos",
+            Some(&rel),
+            &cols(&["id", "label_color"]),
+            r#"[{"id":1,"label_color":"000100"}]"#.into(),
+            None,
+            &Returning::None,
+        )
+        .unwrap();
+        assert_eq!(
+            s.text,
+            r#"insert into "todos" ("id", "label_color") select "id", "label_color" from (select "id", test.color("label_color") as "label_color" from json_to_recordset($1) as "_zou_body"("id" bigint, "label_color" json)) as "_zou_src""#
+        );
+
+        // An update takes the object shape of the same thing, and
+        // only the columns it is writing are declared.
+        let s = update(
+            "todos",
+            Some(&rel),
+            &cols(&["label_color"]),
+            r#"{"label_color":"000100"}"#.into(),
+            &[node("id", "eq.7")],
+            &Returning::None,
+        )
+        .unwrap();
+        assert_eq!(
+            s.text,
+            r#"update "todos" set "label_color" = "_zou_src"."label_color" from (select test.color("label_color") as "label_color" from json_to_record($1) as "_zou_body"("label_color" json)) as "_zou_src" where "todos"."id" = $2"#
+        );
+        assert_eq!(s.params, vec![r#"{"label_color":"000100"}"#, "7"]);
+    }
+
+    #[test]
+    fn a_body_with_nothing_to_cast_unpacks_the_plain_way() {
+        // The column definition list exists to put the call
+        // somewhere. A write that touches no represented column has
+        // no call to place, so it stays on the row type postgres
+        // already knows, which is every ordinary write.
+        let rel = painted();
+        let s = insert(
+            "todos",
+            Some(&rel),
+            &cols(&["id", "name"]),
+            "[]".into(),
+            None,
+            &Returning::None,
+        )
+        .unwrap();
+        assert!(
+            s.text
+                .contains(r#"json_populate_recordset(null::"todos", $1)"#),
+            "{}",
+            s.text
+        );
+        // And so does a write naming a column the relation does not
+        // have, which has no type to declare and is somebody else's
+        // refusal.
+        let s = insert(
+            "todos",
+            Some(&rel),
+            &cols(&["label_color", "nope"]),
+            "[]".into(),
+            None,
+            &Returning::None,
+        )
+        .unwrap();
+        assert!(
+            s.text
+                .contains(r#"json_populate_recordset(null::"todos", $1)"#),
+            "{}",
+            s.text
+        );
+    }
+
     #[test]
     fn a_delete_speaks_plainly() {
         let s = delete(
@@ -599,6 +780,7 @@ mod tests {
         let sneaky = cols(&[r#"a"; drop table books; --"#]);
         let s = insert(
             "books",
+            None,
             &sneaky,
             "[]".into(),
             None,
@@ -625,6 +807,7 @@ mod tests {
         }]);
         let m = insert(
             "books",
+            None,
             &cols(&["id", "title"]),
             "[]".into(),
             None,

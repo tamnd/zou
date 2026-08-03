@@ -30,8 +30,11 @@
 //! `json(the_domain)` function behind a cast is written out through
 //! that function instead of by its own output, and one with a
 //! `the_domain(text)` function reads the values a url carries
-//! through that. The planner asks [`Column`] for them and splices the
-//! function name postgres quoted.
+//! through that, and one with a `the_domain(json)` function reads
+//! the values a body carries. The planner asks [`Column`] for them
+//! and splices the function name postgres quoted. The type name is
+//! there for the same reason: a write has to spell out what it is
+//! unpacking a body into before either cast can be called.
 
 use std::fmt;
 
@@ -125,10 +128,15 @@ impl Relation {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Column {
     pub name: String,
+    /// What postgres calls the type, spelled the way a column
+    /// definition list wants it. Only a write needs it.
+    pub type_name: String,
     /// Writes a value of this type as json, the cast to json.
     pub to_json: Option<String>,
     /// Reads one out of the text a url carries, the cast from text.
     pub from_text: Option<String>,
+    /// Reads one out of the json a body carries, the cast from json.
+    pub from_json: Option<String>,
 }
 
 /// One row of [`COLUMNS_SQL`], a column and the relation it sits in.
@@ -162,6 +170,11 @@ select c.relname::text
 /// nothing else does. Only casts written as a function count, since
 /// a binary or i/o cast has no name to call, and postgres quotes the
 /// names it hands back so the planner can splice them.
+///
+/// The type name comes back from format_type, which spells it the
+/// way a column definition list has to have it, schema qualified
+/// when the search path would not find it and with its modifiers
+/// carried along.
 pub const COLUMNS_SQL: &str = "\
 select c.relname::text,
        a.attname::text,
@@ -178,7 +191,15 @@ select c.relname::text,
           join pg_namespace fn on fn.oid = f.pronamespace
          where ct.castsource = 'text'::regtype
            and ct.casttarget = a.atttypid
-           and ct.castmethod = 'f')
+           and ct.castmethod = 'f'),
+       (select quote_ident(fn.nspname) || '.' || quote_ident(f.proname)
+          from pg_cast ct
+          join pg_proc f on f.oid = ct.castfunc
+          join pg_namespace fn on fn.oid = f.pronamespace
+         where ct.castsource = 'json'::regtype
+           and ct.casttarget = a.atttypid
+           and ct.castmethod = 'f'),
+       format_type(a.atttypid, a.atttypmod)
   from pg_class c
   join pg_namespace n on n.oid = c.relnamespace
   join pg_attribute a on a.attrelid = c.oid
@@ -679,6 +700,8 @@ mod tests {
                         name: "label_color".into(),
                         to_json: Some("test.json".into()),
                         from_text: Some("test.color".into()),
+                        from_json: Some("test.color".into()),
+                        type_name: "test.color".into(),
                     },
                 },
                 col("todos", "name"),

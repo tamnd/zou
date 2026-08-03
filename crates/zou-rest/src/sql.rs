@@ -549,6 +549,8 @@ mod tests {
                     name: "label_color".into(),
                     to_json: Some("test.json".into()),
                     from_text: Some("test.color".into()),
+                    from_json: Some("test.color".into()),
+                    type_name: "test.color".into(),
                 },
                 Column {
                     name: "name".into(),

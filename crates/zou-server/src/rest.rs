@@ -1022,6 +1022,8 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
                 name: r.get(1),
                 to_json: r.get(2),
                 from_text: r.get(3),
+                from_json: r.get(4),
+                type_name: r.get(5),
             },
         })
         .collect();
@@ -1416,7 +1418,14 @@ async fn write(
     let m = match *method {
         Method::POST => {
             let (cols, body) = payload.expect("post parsed a payload");
-            mutate::insert(table, &cols, body, conflict.as_ref(), &returning)
+            mutate::insert(
+                table,
+                Some(relation),
+                &cols,
+                body,
+                conflict.as_ref(),
+                &returning,
+            )
         }
         Method::PATCH => {
             let (cols, body) = payload.expect("patch parsed a payload");

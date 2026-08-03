@@ -801,6 +801,8 @@ mod tests {
                 name: name.into(),
                 to_json: Some("test.json".into()),
                 from_text: Some("test.color".into()),
+                from_json: Some("test.color".into()),
+                type_name: "test.color".into(),
             },
         };
         let plain = |table: &str, name: &str| ColumnRow {
