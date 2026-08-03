@@ -51,7 +51,7 @@ use zou_rest::catalog::{
     COLUMNS_SQL, Catalog, Column, ColumnRow, FkRow, INTROSPECT_SQL, RELATIONS_SQL,
 };
 use zou_rest::filter::{self, Node, Op, Parsed};
-use zou_rest::mutate::{self, Conflict, Returning};
+use zou_rest::mutate::{self, Conflict, Missing, Returning};
 use zou_rest::plan::{self, PlanError, Query};
 use zou_rest::{order, page, rpc, select};
 
@@ -474,6 +474,8 @@ struct Prefer {
     /// Some(true) merges duplicates, Some(false) ignores them.
     merge: Option<bool>,
     count: Option<Count>,
+    /// What a write puts in a column its body said nothing about.
+    missing: Missing,
     applied: Vec<&'static str>,
 }
 
@@ -482,6 +484,7 @@ fn parse_prefer(headers: &HeaderMap) -> Prefer {
         ret: Ret::Minimal,
         merge: None,
         count: None,
+        missing: Missing::Null,
         applied: Vec::new(),
     };
     for value in headers.get_all("prefer") {
@@ -519,6 +522,14 @@ fn parse_prefer(headers: &HeaderMap) -> Prefer {
                 "count=estimated" => {
                     p.count = Some(Count::Estimated);
                     "count=estimated"
+                }
+                "missing=default" => {
+                    p.missing = Missing::Default;
+                    "missing=default"
+                }
+                "missing=null" => {
+                    p.missing = Missing::Null;
+                    "missing=null"
                 }
                 _ => continue,
             };
@@ -1024,6 +1035,7 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
                 from_text: r.get(3),
                 from_json: r.get(4),
                 type_name: r.get(5),
+                default_expr: r.get(6),
             },
         })
         .collect();
@@ -1239,12 +1251,37 @@ async fn read(
 
 /// The headers every write response carries: content type always,
 /// Preference-Applied when any Prefer token was honored.
-fn write_headers(prefer: &Prefer, res: &mut Response) {
-    if !prefer.applied.is_empty() {
-        let joined = prefer.applied.join(", ");
-        if let Ok(v) = joined.parse() {
-            res.headers_mut().insert("preference-applied", v);
-        }
+///
+/// The missing preference is about reading a body, so a method that
+/// has no body neither applies it nor says it did, which a DELETE
+/// carrying the token shows.
+fn write_headers(prefer: &Prefer, method: &Method, res: &mut Response) {
+    let body = matches!(*method, Method::POST | Method::PATCH);
+    let mut applied: Vec<&str> = prefer
+        .applied
+        .iter()
+        .copied()
+        .filter(|t| body || !t.starts_with("missing="))
+        .collect();
+    applied.sort_by_key(|t| rank(t));
+    if applied.is_empty() {
+        return;
+    }
+    if let Ok(v) = applied.join(", ").parse() {
+        res.headers_mut().insert("preference-applied", v);
+    }
+}
+
+/// Where a preference sits in Preference-Applied, which upstream
+/// writes in an order of its own rather than in the order the
+/// request listed them.
+fn rank(token: &str) -> u8 {
+    match token.split('=').next().unwrap_or("") {
+        "resolution" => 0,
+        "missing" => 1,
+        "return" => 2,
+        "count" => 3,
+        _ => 4,
     }
 }
 
@@ -1423,13 +1460,22 @@ async fn write(
                 Some(relation),
                 &cols,
                 body,
+                prefer.missing,
                 conflict.as_ref(),
                 &returning,
             )
         }
         Method::PATCH => {
             let (cols, body) = payload.expect("patch parsed a payload");
-            mutate::update(table, Some(relation), &cols, body, &root, &returning)
+            mutate::update(
+                table,
+                Some(relation),
+                &cols,
+                body,
+                prefer.missing,
+                &root,
+                &returning,
+            )
         }
         Method::PUT => {
             let (cols, body) = payload.expect("put parsed a payload");
@@ -1568,7 +1614,7 @@ async fn write(
     if prefer.ret == Ret::Representation {
         profile_header(&mut res, schema, negotiated);
     }
-    write_headers(&prefer, &mut res);
+    write_headers(&prefer, method, &mut res);
     Ok(res)
 }
 

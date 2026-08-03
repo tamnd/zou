@@ -5,7 +5,10 @@
 //! the table's row type, so postgres types every value the same way
 //! it types the read path's filter literals. The only identifiers
 //! spliced here are the column names lifted from the body's keys and
-//! the conflict targets, and every one goes through quote_ident.
+//! the conflict targets, and every one goes through quote_ident. The
+//! defaults `Prefer: missing=default` merges into the body are the
+//! one other thing spliced, and they come off the catalog rather
+//! than off the request.
 //!
 //! Update and delete compile their filters through the same WHERE
 //! compiler as reads, qualified with the table name because the
@@ -37,6 +40,24 @@ const SRC: &str = "_zou_src";
 /// The alias the column definition list hangs off, one step further
 /// in than [`SRC`], where the casts are still uncalled.
 const BODY: &str = "_zou_body";
+
+/// One element of a json array body, while the defaults are being
+/// merged under it.
+const ELEM: &str = "_zou_elem";
+
+/// What a write puts in a column the body said nothing about, the
+/// Prefer missing token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Missing {
+    /// Null, which is what unpacking a body without the key gives
+    /// on its own, so nothing has to be done to get it.
+    #[default]
+    Null,
+    /// Whatever the column defaults to. Nothing about an absent key
+    /// says default, so the default has to be put into the body
+    /// before the body is unpacked.
+    Default,
+}
 
 fn err<T>(message: impl Into<String>) -> Result<T, CompileError> {
     Err(CompileError {
@@ -83,12 +104,13 @@ pub fn insert(
     rel: Option<&Relation>,
     columns: &[String],
     payload: String,
+    missing: Missing,
     conflict: Option<&Conflict>,
     returning: &Returning,
 ) -> Result<Sql, CompileError> {
     let t = quote_ident(table);
     let cols = ident_list(columns);
-    let src = rows_of(table, rel, columns);
+    let src = rows_of(table, rel, columns, missing);
     let mut text = if columns.is_empty() {
         format!("insert into {t} select from {src}")
     } else {
@@ -151,6 +173,11 @@ const COUNT_UPDATE: &str = "set_config('zou.updated', (coalesce(nullif(current_s
 /// mismatch. Subtracting the counted updates from the rows written
 /// says whether the row was inserted, which is the 201 against the
 /// 200.
+///
+/// It takes no missing preference. A PUT's columns are the body's
+/// own keys, so there is never a column it is writing that the body
+/// did not name, and upstream neither fills a default here nor
+/// echoes the token back.
 pub fn upsert_one(
     table: &str,
     rel: Option<&Relation>,
@@ -165,7 +192,7 @@ pub fn upsert_one(
     }
     let t = quote_ident(table);
     let cols = ident_list(columns);
-    let src = rows_of(table, rel, columns);
+    let src = rows_of(table, rel, columns, Missing::Null);
     let mut text = if columns.is_empty() {
         format!("insert into {t} select from {src}")
     } else {
@@ -221,6 +248,7 @@ pub fn update(
     rel: Option<&Relation>,
     columns: &[String],
     payload: String,
+    missing: Missing,
     filters: &[Node],
     returning: &Returning,
 ) -> Result<Sql, CompileError> {
@@ -242,7 +270,7 @@ pub fn update(
     let mut text = format!(
         "update {t} set {} from {}",
         sets.join(", "),
-        row_of(table, rel, columns)
+        row_of(table, rel, columns, missing)
     );
     let mut params = vec![payload];
     if !filters.is_empty() {
@@ -337,15 +365,30 @@ fn returning_sql(r: &Returning, qualifier: Option<&str>) -> String {
 /// unpacks through a column definition list that types those columns
 /// as json and the function is called here, by name, the way
 /// upstream calls it.
-fn rows_of(table: &str, rel: Option<&Relation>, columns: &[String]) -> String {
+///
+/// A write asking for the defaults merges them under every element
+/// of the body first, so a key the element carries wins and a key it
+/// lacks arrives as the default. That merge is a jsonb operator, so
+/// the whole body crosses as jsonb from there on.
+fn rows_of(table: &str, rel: Option<&Relation>, columns: &[String], missing: Missing) -> String {
+    let (json, body) = match defaults_of(rel, columns, missing) {
+        Some(obj) => {
+            let e = quote_ident(ELEM);
+            (
+                "jsonb",
+                format!("(select jsonb_agg({obj} || {e}) from jsonb_array_elements($1) as {e})"),
+            )
+        }
+        None => ("json", "$1".to_string()),
+    };
     match body_cast(rel, columns) {
         Some((list, defs)) => format!(
-            "(select {list} from json_to_recordset($1) as {}({defs})) as {}",
+            "(select {list} from {json}_to_recordset({body}) as {}({defs})) as {}",
             quote_ident(BODY),
             quote_ident(SRC)
         ),
         None => format!(
-            "json_populate_recordset(null::{}, $1) as {}",
+            "{json}_populate_recordset(null::{}, {body}) as {}",
             quote_ident(table),
             quote_ident(SRC)
         ),
@@ -353,19 +396,60 @@ fn rows_of(table: &str, rel: Option<&Relation>, columns: &[String]) -> String {
 }
 
 /// The one row of a json object body, [`rows_of`] for an update.
-fn row_of(table: &str, rel: Option<&Relation>, columns: &[String]) -> String {
+fn row_of(table: &str, rel: Option<&Relation>, columns: &[String], missing: Missing) -> String {
+    let (json, body) = match defaults_of(rel, columns, missing) {
+        Some(obj) => ("jsonb", format!("({obj} || $1)")),
+        None => ("json", "$1".to_string()),
+    };
     match body_cast(rel, columns) {
         Some((list, defs)) => format!(
-            "(select {list} from json_to_record($1) as {}({defs})) as {}",
+            "(select {list} from {json}_to_record({body}) as {}({defs})) as {}",
             quote_ident(BODY),
             quote_ident(SRC)
         ),
         None => format!(
-            "(select * from json_populate_record(null::{}, $1)) as {}",
+            "(select * from {json}_populate_record(null::{}, {body})) as {}",
             quote_ident(table),
             quote_ident(SRC)
         ),
     }
+}
+
+/// The object of column defaults the body is merged under, or
+/// nothing when the write did not ask for them or no column it is
+/// writing has one.
+///
+/// Every column of the write that has a default goes in, whether or
+/// not the body names it, because the body is merged over the top
+/// and wins wherever it says anything. That is upstream's shape and
+/// it saves knowing which keys each element of a bulk body carries.
+///
+/// The default is postgres's own spelling of the expression, read
+/// off the catalog and spliced as it stands. It has to be: a
+/// `nextval` call or a `now()` is the default, not the value it
+/// would have produced when the cache was filled.
+fn defaults_of(rel: Option<&Relation>, columns: &[String], missing: Missing) -> Option<String> {
+    if missing == Missing::Null {
+        return None;
+    }
+    let rel = rel?;
+    let pairs: Vec<String> = columns
+        .iter()
+        .filter_map(|c| rel.column(c))
+        .filter_map(|c| {
+            let d = c.default_expr.as_ref()?;
+            Some(format!("{}, {d}", quote_text(&c.name)))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(format!("jsonb_build_object({})", pairs.join(", ")))
+}
+
+/// A column name as a string literal, which is what a json key is.
+fn quote_text(name: &str) -> String {
+    format!("'{}'", name.replace('\'', "''"))
 }
 
 /// The select list and the column definition list a represented body
@@ -433,6 +517,7 @@ mod tests {
             None,
             &cols(&["id", "title"]),
             "[]".into(),
+            Missing::Null,
             None,
             &Returning::None,
         )
@@ -446,7 +531,16 @@ mod tests {
 
     #[test]
     fn an_empty_body_inserts_default_rows() {
-        let s = insert("books", None, &[], "[{}]".into(), None, &Returning::Star).unwrap();
+        let s = insert(
+            "books",
+            None,
+            &[],
+            "[{}]".into(),
+            Missing::Null,
+            None,
+            &Returning::Star,
+        )
+        .unwrap();
         assert_eq!(
             s.text,
             r#"insert into "books" select from json_populate_recordset(null::"books", $1) as "_zou_src" returning *"#
@@ -461,6 +555,7 @@ mod tests {
             None,
             &cols(&["a"]),
             "[]".into(),
+            Missing::Null,
             Some(&ignore_all),
             &Returning::None,
         )
@@ -475,6 +570,7 @@ mod tests {
             None,
             &cols(&["a"]),
             "[]".into(),
+            Missing::Null,
             Some(&ignore),
             &Returning::None,
         )
@@ -494,6 +590,7 @@ mod tests {
             None,
             &cols(&["a", "b"]),
             "[]".into(),
+            Missing::Null,
             Some(&merge),
             &Returning::None,
         )
@@ -516,6 +613,7 @@ mod tests {
             None,
             &cols(&["id"]),
             "[]".into(),
+            Missing::Null,
             Some(&hollow),
             &Returning::None,
         )
@@ -536,6 +634,7 @@ mod tests {
             None,
             &cols(&["a"]),
             "[]".into(),
+            Missing::Null,
             Some(&bad),
             &Returning::None,
         )
@@ -611,6 +710,7 @@ mod tests {
             None,
             &cols(&["title", "price"]),
             r#"{"title":"x"}"#.into(),
+            Missing::Null,
             &[node("id", "eq.7")],
             &Returning::Star,
         )
@@ -629,6 +729,7 @@ mod tests {
             None,
             &cols(&["a"]),
             "{}".into(),
+            Missing::Null,
             &[],
             &Returning::Cols(cols(&["id"])),
         )
@@ -643,6 +744,7 @@ mod tests {
             None,
             &[],
             "{}".into(),
+            Missing::Null,
             &[node("id", "eq.4")],
             &Returning::None,
         )
@@ -668,6 +770,7 @@ mod tests {
                     to_json: Some("test.json".into()),
                     from_text: Some("test.color".into()),
                     from_json: Some("test.color".into()),
+                    default_expr: None,
                 },
                 Column {
                     name: "name".into(),
@@ -686,6 +789,7 @@ mod tests {
             Some(&rel),
             &cols(&["id", "label_color"]),
             r#"[{"id":1,"label_color":"000100"}]"#.into(),
+            Missing::Null,
             None,
             &Returning::None,
         )
@@ -702,6 +806,7 @@ mod tests {
             Some(&rel),
             &cols(&["label_color"]),
             r#"{"label_color":"000100"}"#.into(),
+            Missing::Null,
             &[node("id", "eq.7")],
             &Returning::None,
         )
@@ -725,6 +830,7 @@ mod tests {
             Some(&rel),
             &cols(&["id", "name"]),
             "[]".into(),
+            Missing::Null,
             None,
             &Returning::None,
         )
@@ -743,6 +849,7 @@ mod tests {
             Some(&rel),
             &cols(&["label_color", "nope"]),
             "[]".into(),
+            Missing::Null,
             None,
             &Returning::None,
         )
@@ -752,6 +859,112 @@ mod tests {
                 .contains(r#"json_populate_recordset(null::"todos", $1)"#),
             "{}",
             s.text
+        );
+    }
+
+    /// The same three columns as [`painted`], two of them with a
+    /// default and the middle one without, so the object a write
+    /// builds can be watched leaving one out.
+    fn defaulted() -> Relation {
+        let mut rel = painted();
+        rel.column_mut("id").default_expr = Some("nextval('todos_id_seq')".into());
+        rel.column_mut("label_color").default_expr = Some("0".into());
+        rel
+    }
+
+    impl Relation {
+        fn column_mut(&mut self, name: &str) -> &mut Column {
+            self.columns
+                .iter_mut()
+                .find(|c| c.name == name)
+                .expect("the fixture has that column")
+        }
+    }
+
+    #[test]
+    fn a_column_the_body_left_out_takes_the_default_it_was_given() {
+        let rel = defaulted();
+        let s = insert(
+            "todos",
+            Some(&rel),
+            &cols(&["id", "name"]),
+            r#"[{"name":"a"}]"#.into(),
+            Missing::Default,
+            None,
+            &Returning::None,
+        )
+        .unwrap();
+        // The defaults go under the element rather than over it, so
+        // a body that does name the column still wins, and `name`
+        // has no default to put anywhere.
+        assert_eq!(
+            s.text,
+            r#"insert into "todos" ("id", "name") select "id", "name" from jsonb_populate_recordset(null::"todos", (select jsonb_agg(jsonb_build_object('id', nextval('todos_id_seq')) || "_zou_elem") from jsonb_array_elements($1) as "_zou_elem")) as "_zou_src""#
+        );
+
+        // An update merges the same object under the one object its
+        // body is.
+        let s = update(
+            "todos",
+            Some(&rel),
+            &cols(&["id", "name"]),
+            r#"{"name":"a"}"#.into(),
+            Missing::Default,
+            &[],
+            &Returning::None,
+        )
+        .unwrap();
+        assert!(
+            s.text.contains(
+                r#"jsonb_populate_record(null::"todos", (jsonb_build_object('id', nextval('todos_id_seq')) || $1))"#
+            ),
+            "{}",
+            s.text
+        );
+    }
+
+    #[test]
+    fn a_default_and_a_cast_are_both_on_the_way_in() {
+        // The default is a json value like any other by the time the
+        // column definition list sees it, so the cast from json
+        // fires on a default exactly as it fires on a body's value.
+        let rel = defaulted();
+        let s = insert(
+            "todos",
+            Some(&rel),
+            &cols(&["label_color", "name"]),
+            "[{}]".into(),
+            Missing::Default,
+            None,
+            &Returning::None,
+        )
+        .unwrap();
+        assert_eq!(
+            s.text,
+            r#"insert into "todos" ("label_color", "name") select "label_color", "name" from (select test.color("label_color") as "label_color", "name" from jsonb_to_recordset((select jsonb_agg(jsonb_build_object('label_color', 0) || "_zou_elem") from jsonb_array_elements($1) as "_zou_elem")) as "_zou_body"("label_color" json, "name" text)) as "_zou_src""#
+        );
+    }
+
+    #[test]
+    fn nothing_to_default_is_the_body_as_it_arrived() {
+        // Asking for the defaults where no column being written has
+        // one would build an empty object to merge, which is the
+        // body again. The plain shape says the same thing and says
+        // it in json, so the ask leaves no trace.
+        let rel = defaulted();
+        let s = insert(
+            "todos",
+            Some(&rel),
+            &cols(&["name"]),
+            "[]".into(),
+            Missing::Default,
+            None,
+            &Returning::None,
+        )
+        .unwrap();
+        assert_eq!(
+            s.text,
+            r#"insert into "todos" ("name") select "name" from json_populate_recordset(null::"todos", $1) as "_zou_src""#
         );
     }
 
@@ -783,6 +996,7 @@ mod tests {
             None,
             &sneaky,
             "[]".into(),
+            Missing::Null,
             None,
             &Returning::Cols(sneaky.clone()),
         )
@@ -810,6 +1024,7 @@ mod tests {
             None,
             &cols(&["id", "title"]),
             "[]".into(),
+            Missing::Null,
             None,
             &Returning::Star,
         )
