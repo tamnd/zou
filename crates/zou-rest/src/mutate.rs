@@ -23,7 +23,7 @@
 //! body that disagrees with the url matches nothing and the statement
 //! writes nothing, which is the whole of the check.
 
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, Relation};
 use crate::filter::Node;
 use crate::plan::{PlanError, Query, plan_from};
 use crate::sql::{CompileError, Sql, quote_ident, where_clause_from};
@@ -153,6 +153,7 @@ const COUNT_UPDATE: &str = "set_config('zou.updated', (coalesce(nullif(current_s
 /// 200.
 pub fn upsert_one(
     table: &str,
+    rel: Option<&Relation>,
     columns: &[String],
     payload: String,
     pk: &[String],
@@ -174,7 +175,7 @@ pub fn upsert_one(
     };
     let mut params = vec![payload];
     if !filters.is_empty() {
-        let compiled = where_clause_from(filters, Some(SRC), params)?;
+        let compiled = where_clause_from(filters, Some(SRC), params, rel)?;
         params = compiled.params;
         text.push_str(" where ");
         text.push_str(&compiled.text);
@@ -219,6 +220,7 @@ pub fn upsert_one(
 /// column types off it.
 pub fn update(
     table: &str,
+    rel: Option<&Relation>,
     columns: &[String],
     payload: String,
     filters: &[Node],
@@ -245,7 +247,7 @@ pub fn update(
     );
     let mut params = vec![payload];
     if !filters.is_empty() {
-        let compiled = where_clause_from(filters, Some(table), params)?;
+        let compiled = where_clause_from(filters, Some(table), params, rel)?;
         params = compiled.params;
         text.push_str(" where ");
         text.push_str(&compiled.text);
@@ -256,11 +258,16 @@ pub fn update(
 
 /// Delete the filtered rows. No filters deletes the whole table,
 /// PostgREST's stance, the router decides whether to allow that.
-pub fn delete(table: &str, filters: &[Node], returning: &Returning) -> Result<Sql, CompileError> {
+pub fn delete(
+    table: &str,
+    rel: Option<&Relation>,
+    filters: &[Node],
+    returning: &Returning,
+) -> Result<Sql, CompileError> {
     let mut text = format!("delete from {}", quote_ident(table));
     let mut params = Vec::new();
     if !filters.is_empty() {
-        let compiled = where_clause_from(filters, Some(table), params)?;
+        let compiled = where_clause_from(filters, Some(table), params, rel)?;
         params = compiled.params;
         text.push_str(" where ");
         text.push_str(&compiled.text);
@@ -463,6 +470,7 @@ mod tests {
     fn a_put_filters_the_payload_not_the_table() {
         let s = upsert_one(
             "tiobe_pls",
+            None,
             &cols(&["name", "rank"]),
             r#"[{"name":"Go","rank":19}]"#.into(),
             &cols(&["name"]),
@@ -491,6 +499,7 @@ mod tests {
     fn a_put_with_nothing_to_merge_lets_the_conflict_absorb() {
         let s = upsert_one(
             "only_pk",
+            None,
             &[],
             "[{}]".into(),
             &cols(&["id"]),
@@ -507,6 +516,7 @@ mod tests {
 
         let e = upsert_one(
             "no_pk",
+            None,
             &cols(&["a"]),
             "[]".into(),
             &[],
@@ -521,6 +531,7 @@ mod tests {
     fn an_update_binds_the_payload_first() {
         let s = update(
             "books",
+            None,
             &cols(&["title", "price"]),
             r#"{"title":"x"}"#.into(),
             &[node("id", "eq.7")],
@@ -538,6 +549,7 @@ mod tests {
     fn an_unfiltered_update_touches_the_whole_table() {
         let s = update(
             "t",
+            None,
             &cols(&["a"]),
             "{}".into(),
             &[],
@@ -551,6 +563,7 @@ mod tests {
         // returns nothing, and the url's filters go with it.
         let s = update(
             "t",
+            None,
             &[],
             "{}".into(),
             &[node("id", "eq.4")],
@@ -565,6 +578,7 @@ mod tests {
     fn a_delete_speaks_plainly() {
         let s = delete(
             "books",
+            None,
             &[node("id", "eq.4")],
             &Returning::Cols(cols(&["id"])),
         )
@@ -575,7 +589,7 @@ mod tests {
         );
         assert_eq!(s.params, vec!["4"]);
 
-        let s = delete("books", &[], &Returning::None).unwrap();
+        let s = delete("books", None, &[], &Returning::None).unwrap();
         assert_eq!(s.text, r#"delete from "books""#);
         assert!(s.params.is_empty());
     }

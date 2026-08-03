@@ -47,7 +47,9 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
-use zou_rest::catalog::{Catalog, FkRow, INTROSPECT_SQL, RELATIONS_SQL, Relation};
+use zou_rest::catalog::{
+    COLUMNS_SQL, Catalog, Column, ColumnRow, FkRow, INTROSPECT_SQL, RELATIONS_SQL,
+};
 use zou_rest::filter::{self, Node, Op, Parsed};
 use zou_rest::mutate::{self, Conflict, Returning};
 use zou_rest::plan::{self, PlanError, Query};
@@ -1007,14 +1009,23 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
         .query(RELATIONS_SQL, &[&schema])
         .await
         .map_err(|e| pg_error(&e, authed))?;
-    let rels = rows
+    let names = rows.iter().map(|r| r.get(0)).collect();
+    let rows = sess
+        .query(COLUMNS_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let cols = rows
         .iter()
-        .map(|r| Relation {
-            name: r.get(0),
-            columns: r.get(1),
+        .map(|r| ColumnRow {
+            table: r.get(0),
+            column: Column {
+                name: r.get(1),
+                to_json: r.get(2),
+                from_text: r.get(3),
+            },
         })
         .collect();
-    Ok(Catalog::new(fks).with_relations(rels))
+    Ok(Catalog::new(fks).with_relations(names, cols))
 }
 
 /// The catalog for the profiled schema, introspected once per epoch
@@ -1369,7 +1380,7 @@ async fn write(
     // comes after the PUT check because a PUT the url has already
     // ruled out is not a write whose columns anybody is waiting on.
     if let Some((cols, _)) = &payload
-        && let Some(missing) = cols.iter().find(|c| !relation.columns.contains(c))
+        && let Some(missing) = cols.iter().find(|c| !relation.has(c))
     {
         return Err(no_column(table, missing));
     }
@@ -1409,13 +1420,13 @@ async fn write(
         }
         Method::PATCH => {
             let (cols, body) = payload.expect("patch parsed a payload");
-            mutate::update(table, &cols, body, &root, &returning)
+            mutate::update(table, Some(relation), &cols, body, &root, &returning)
         }
         Method::PUT => {
             let (cols, body) = payload.expect("put parsed a payload");
-            mutate::upsert_one(table, &cols, body, &pk, &root, &returning)
+            mutate::upsert_one(table, Some(relation), &cols, body, &pk, &root, &returning)
         }
-        Method::DELETE => mutate::delete(table, &root, &returning),
+        Method::DELETE => mutate::delete(table, Some(relation), &root, &returning),
         _ => unreachable!("the dispatcher only sends writes here"),
     }
     .map_err(|e| bad_grammar(e.message))?;

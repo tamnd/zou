@@ -32,7 +32,7 @@
 
 use std::fmt;
 
-use crate::catalog::{Catalog, EmbedError, Kind, Rel};
+use crate::catalog::{Catalog, Column, EmbedError, Kind, Rel, Relation};
 use crate::filter::Node;
 use crate::order::{Direction, Nulls, Term};
 use crate::select::{Col, Embed, Item, Join};
@@ -266,15 +266,31 @@ impl Planner<'_> {
         let mut cols: Vec<OutCol> = Vec::new();
         let mut laterals: Vec<String> = Vec::new();
 
+        let rel = self.catalog.relation(table);
         for item in items {
             match item {
-                Item::Star => cols.push(OutCol {
-                    expr: format!("{}.*", quote_ident(alias)),
-                    rendered: format!("{}.*", quote_ident(alias)),
-                    aggregated: false,
-                    splat: true,
-                }),
-                Item::Col(c) => cols.push(self.col(alias, c)?),
+                // A relation with a column that is written out
+                // through a cast has its star spelled out, because
+                // the call has to go somewhere and `t.*` has no room
+                // for one. Every other star stays a star.
+                Item::Star => match rel.filter(|r| r.represented()) {
+                    Some(rel) => cols.extend(rel.columns.iter().map(|c| {
+                        let expr = represented(alias, c);
+                        OutCol {
+                            rendered: format!("{expr} as {}", quote_ident(&c.name)),
+                            expr,
+                            aggregated: false,
+                            splat: false,
+                        }
+                    })),
+                    None => cols.push(OutCol {
+                        expr: format!("{}.*", quote_ident(alias)),
+                        rendered: format!("{}.*", quote_ident(alias)),
+                        aggregated: false,
+                        splat: true,
+                    }),
+                },
+                Item::Col(c) => cols.push(self.col(alias, rel, c)?),
                 Item::Embed(e) => {
                     self.embed(table, alias, e, path, false, &mut cols, &mut laterals)?
                 }
@@ -335,7 +351,9 @@ impl Planner<'_> {
             .map(|(_, n)| n.clone())
             .collect();
         if !mine.is_empty() {
-            let compiled = where_clause_from(&mine, Some(alias), std::mem::take(&mut self.params))?;
+            let rel = self.catalog.relation(table);
+            let compiled =
+                where_clause_from(&mine, Some(alias), std::mem::take(&mut self.params), rel)?;
             self.params = compiled.params;
             conjuncts.push(compiled.text);
         }
@@ -400,7 +418,9 @@ impl Planner<'_> {
             .map(|(_, n)| n.clone())
             .collect();
         if !mine.is_empty() {
-            let compiled = where_clause_from(&mine, Some(alias), std::mem::take(&mut self.params))?;
+            let rel = self.catalog.relation(table);
+            let compiled =
+                where_clause_from(&mine, Some(alias), std::mem::take(&mut self.params), rel)?;
             self.params = compiled.params;
             conjuncts.push(compiled.text);
         }
@@ -431,10 +451,22 @@ impl Planner<'_> {
 
     /// One column pick: the expression, its casts, its aggregate,
     /// and the output key PostgREST would use.
-    fn col(&self, alias: &str, c: &Col) -> Result<OutCol, PlanError> {
+    ///
+    /// A data representation goes on first and the request's own
+    /// cast on top of it, so `label_color::text` is the text of what
+    /// the client would have been shown rather than the text of what
+    /// the column holds. An aggregate takes the column bare: nothing
+    /// sums a json value, and upstream has no case for it either.
+    fn col(&self, alias: &str, rel: Option<&Relation>, c: &Col) -> Result<OutCol, PlanError> {
         let mut expr = match &c.field {
             Some(f) => {
-                let mut e = field_expr(Some(alias), &f.name, &f.path);
+                let mut e = match rel.filter(|_| c.agg.is_none() && f.path.is_empty()) {
+                    Some(rel) => match rel.column(&f.name) {
+                        Some(col) => represented(alias, col),
+                        None => field_expr(Some(alias), &f.name, &f.path),
+                    },
+                    None => field_expr(Some(alias), &f.name, &f.path),
+                };
                 if let Some(cast) = &f.cast {
                     e = format!("{e}::{}", checked_cast(cast)?);
                 }
@@ -560,6 +592,17 @@ impl Planner<'_> {
     }
 }
 
+/// One column of a level as the client should see it: the column
+/// itself, or the call that writes it as json when its type carries
+/// a cast to json. The function name arrived quoted from postgres.
+fn represented(alias: &str, col: &Column) -> String {
+    let plain = format!("{}.{}", quote_ident(alias), quote_ident(&col.name));
+    match &col.to_json {
+        Some(func) => format!("{func}({plain})"),
+        None => plain,
+    }
+}
+
 /// The join condition between a child level and its parent, straight
 /// column pairs, or an IN subquery through the junction of a many to
 /// many so the child level still reads from exactly one table.
@@ -652,7 +695,7 @@ fn order_sql(alias: &str, terms: &[Term]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::FkRow;
+    use crate::catalog::{ColumnRow, FkRow};
     use crate::filter::{Parsed, parse_pair};
     use crate::{order, select};
 
@@ -746,6 +789,124 @@ mod tests {
             Ok(sql) => panic!("planned as {}", sql.text),
             Err(e) => e,
         }
+    }
+
+    /// Two relations whose colour column is a domain with a cast to
+    /// json, and a foreign key between them so the cast can be
+    /// watched crossing into an embed.
+    fn painted() -> Catalog {
+        let colour = |table: &str, name: &str| ColumnRow {
+            table: table.into(),
+            column: Column {
+                name: name.into(),
+                to_json: Some("test.json".into()),
+                from_text: Some("test.color".into()),
+            },
+        };
+        let plain = |table: &str, name: &str| ColumnRow {
+            table: table.into(),
+            column: Column {
+                name: name.into(),
+                ..Column::default()
+            },
+        };
+        Catalog::new(vec![fk(
+            "notes_todo_id_fkey",
+            "notes",
+            &["todo_id"],
+            "todos",
+            &["id"],
+        )])
+        .with_relations(
+            vec!["notes".into(), "todos".into(), "users".into()],
+            vec![
+                plain("todos", "id"),
+                colour("todos", "label_color"),
+                plain("notes", "id"),
+                plain("notes", "todo_id"),
+                colour("notes", "tint"),
+                plain("users", "id"),
+            ],
+        )
+    }
+
+    fn painted_text(table: &str, sel: &str) -> String {
+        let q = query(table, sel);
+        plan(&painted(), &q).unwrap_or_else(|e| panic!("{e}")).text
+    }
+
+    #[test]
+    fn a_column_is_written_out_through_the_cast_its_type_has() {
+        assert!(
+            painted_text("todos", "id,label_color")
+                .contains(r#""z0"."id" as "id", test.json("z0"."label_color") as "label_color""#),
+            "{}",
+            painted_text("todos", "id,label_color")
+        );
+        // The request's own cast goes on top of the representation
+        // rather than instead of it, so this is the text of what the
+        // client would have been shown.
+        assert!(
+            painted_text("todos", "label_color::text")
+                .contains(r#"test.json("z0"."label_color")::text as "label_color""#),
+            "{}",
+            painted_text("todos", "label_color::text")
+        );
+    }
+
+    #[test]
+    fn a_star_is_spelled_out_only_where_a_cast_needs_the_room() {
+        assert_eq!(
+            painted_text("todos", "*"),
+            r#"select "z0"."id" as "id", test.json("z0"."label_color") as "label_color" from "todos" as "z0""#
+        );
+        // A relation with nothing to represent keeps its star, which
+        // is what upstream leaves alone too.
+        assert_eq!(
+            painted_text("users", "*"),
+            r#"select "z0".* from "users" as "z0""#
+        );
+    }
+
+    #[test]
+    fn an_embed_is_cast_the_same_way_the_root_is() {
+        assert!(
+            painted_text("todos", "label_color,notes(tint)")
+                .contains(r#"select test.json("z1"."tint") as "tint" from "notes" as "z1""#),
+            "{}",
+            painted_text("todos", "label_color,notes(tint)")
+        );
+    }
+
+    #[test]
+    fn what_is_not_the_column_itself_is_left_alone() {
+        // An aggregate takes the column bare: nothing sums a json
+        // value, and a json path has already left the column's type
+        // behind by the time it lands.
+        assert!(
+            painted_text("todos", "label_color.count()").contains(r#"count("z0"."label_color")"#),
+            "{}",
+            painted_text("todos", "label_color.count()")
+        );
+        assert!(
+            painted_text("todos", "label_color->shade").contains(r#""z0"."label_color"->'shade'"#),
+            "{}",
+            painted_text("todos", "label_color->shade")
+        );
+    }
+
+    #[test]
+    fn a_filter_reads_its_value_through_the_relation_it_names() {
+        let mut q = query("todos", "id");
+        filt(&mut q, "label_color", "eq.red");
+        let s = plan(&painted(), &q).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            s.text
+                .ends_with(r#" where "z0"."label_color" = test.color($1)"#),
+            "{}",
+            s.text
+        );
+        assert_eq!(s.params, vec!["red"]);
     }
 
     #[test]

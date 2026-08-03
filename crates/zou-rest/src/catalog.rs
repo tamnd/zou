@@ -17,12 +17,21 @@
 //! none or several.
 //!
 //! Alongside the graph the catalog holds the relations themselves
-//! and their columns, [`RELATIONS_SQL`] and [`Relation`]. That list
-//! is the difference between a request answered and a request
-//! refused before any SQL is written: a table nobody has is a 404
-//! naming the schema, and a column a write names but the table does
-//! not have is a 400, rather than whatever postgres would have said
-//! about the statement that got built anyway.
+//! and their columns, [`RELATIONS_SQL`], [`COLUMNS_SQL`] and
+//! [`Relation`]. That list is the difference between a request
+//! answered and a request refused before any SQL is written: a table
+//! nobody has is a 404 naming the schema, and a column a write names
+//! but the table does not have is a 400, rather than whatever
+//! postgres would have said about the statement that got built
+//! anyway.
+//!
+//! Each column also carries the casts its type was given to and from
+//! json, which is all a data representation is: a domain with a
+//! `json(the_domain)` function behind a cast is written out through
+//! that function instead of by its own output, and one with a
+//! `the_domain(text)` function reads the values a url carries
+//! through that. The planner asks [`Column`] for them and splices the
+//! function name postgres quoted.
 
 use std::fmt;
 
@@ -76,37 +85,109 @@ select c.conname::text,
    and pns.nspname = $1
  order by c.conname";
 
-/// One relation the schema exposes and the columns it has, straight
-/// off [`RELATIONS_SQL`]. Views and foreign tables are relations
-/// here for the same reason they are in PostgREST: a client asks for
-/// them by name over the same url and does not care what backs them.
+/// One relation the schema exposes and the columns it has. Views and
+/// foreign tables are relations here for the same reason they are in
+/// PostgREST: a client asks for them by name over the same url and
+/// does not care what backs them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Relation {
     pub name: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<Column>,
 }
 
-/// The relations one schema exposes. Bind the schema name as $1.
+impl Relation {
+    /// The column of that name, if the relation has one.
+    pub fn column(&self, name: &str) -> Option<&Column> {
+        self.columns.iter().find(|c| c.name == name)
+    }
+
+    /// Whether the relation has a column of that name at all, which
+    /// is the question a write's column list asks.
+    pub fn has(&self, name: &str) -> bool {
+        self.column(name).is_some()
+    }
+
+    /// Whether any column here is written out through a cast, which
+    /// is what makes `*` worth expanding into a column list: the
+    /// expansion exists to have somewhere to put the call.
+    pub fn represented(&self) -> bool {
+        self.columns.iter().any(|c| c.to_json.is_some())
+    }
+}
+
+/// One column of a relation, and the two functions its type was
+/// given for crossing into json and back out of a url.
+///
+/// A type with neither is every ordinary column, and both names are
+/// already quoted the way postgres quotes an identifier, so a
+/// planner splices them and nothing here has to know what characters
+/// a function name may hold.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Column {
+    pub name: String,
+    /// Writes a value of this type as json, the cast to json.
+    pub to_json: Option<String>,
+    /// Reads one out of the text a url carries, the cast from text.
+    pub from_text: Option<String>,
+}
+
+/// One row of [`COLUMNS_SQL`], a column and the relation it sits in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRow {
+    pub table: String,
+    pub column: Column,
+}
+
+/// The relations one schema exposes, one name per row. Bind the
+/// schema name as $1.
 ///
 /// Partitions are left out, which is upstream's rule and not an
 /// accident of the query: a partition is reachable through the table
 /// it partitions, and naming one directly is a 404 from PostgREST
-/// even though pg_class has it. Dropped columns are left out too,
-/// because attnum keeps their slot and nothing else does.
+/// even though pg_class has it.
 pub const RELATIONS_SQL: &str = "\
-select c.relname::text,
-       coalesce((select array_agg(a.attname::text order by a.attnum)
-                   from pg_attribute a
-                  where a.attrelid = c.oid
-                    and a.attnum > 0
-                    and not a.attisdropped),
-                '{}')
+select c.relname::text
   from pg_class c
   join pg_namespace n on n.oid = c.relnamespace
  where n.nspname = $1
    and c.relkind in ('r', 'v', 'm', 'f', 'p')
    and not c.relispartition
  order by c.relname";
+
+/// The columns of those relations, one per row, each with the cast
+/// functions its type carries. Bind the schema name as $1, the same
+/// one [`RELATIONS_SQL`] took.
+///
+/// Dropped columns are left out because attnum keeps their slot and
+/// nothing else does. Only casts written as a function count, since
+/// a binary or i/o cast has no name to call, and postgres quotes the
+/// names it hands back so the planner can splice them.
+pub const COLUMNS_SQL: &str = "\
+select c.relname::text,
+       a.attname::text,
+       (select quote_ident(fn.nspname) || '.' || quote_ident(f.proname)
+          from pg_cast ct
+          join pg_proc f on f.oid = ct.castfunc
+          join pg_namespace fn on fn.oid = f.pronamespace
+         where ct.castsource = a.atttypid
+           and ct.casttarget = 'json'::regtype
+           and ct.castmethod = 'f'),
+       (select quote_ident(fn.nspname) || '.' || quote_ident(f.proname)
+          from pg_cast ct
+          join pg_proc f on f.oid = ct.castfunc
+          join pg_namespace fn on fn.oid = f.pronamespace
+         where ct.castsource = 'text'::regtype
+           and ct.casttarget = a.atttypid
+           and ct.castmethod = 'f')
+  from pg_class c
+  join pg_namespace n on n.oid = c.relnamespace
+  join pg_attribute a on a.attrelid = c.oid
+ where n.nspname = $1
+   and c.relkind in ('r', 'v', 'm', 'f', 'p')
+   and not c.relispartition
+   and a.attnum > 0
+   and not a.attisdropped
+ order by c.relname, a.attnum";
 
 /// How the embedded rows relate to the outer ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,8 +256,26 @@ impl Catalog {
         }
     }
 
-    /// The same catalog with the schema's relations in it.
-    pub fn with_relations(self, rels: Vec<Relation>) -> Catalog {
+    /// The same catalog with the schema's relations in it: the names
+    /// [`RELATIONS_SQL`] answered with, and the columns
+    /// [`COLUMNS_SQL`] answered with sorted onto them. Both go in at
+    /// once because a name with no columns is a relation and a
+    /// column with no name to hang on is nothing, and taking them
+    /// one at a time would let a caller do it in the order that
+    /// loses the columns.
+    pub fn with_relations(self, names: Vec<String>, columns: Vec<ColumnRow>) -> Catalog {
+        let mut rels: Vec<Relation> = names
+            .into_iter()
+            .map(|name| Relation {
+                name,
+                columns: Vec::new(),
+            })
+            .collect();
+        for row in columns {
+            if let Some(rel) = rels.iter_mut().find(|r| r.name == row.table) {
+                rel.columns.push(row.column);
+            }
+        }
         Catalog { rels, ..self }
     }
 
@@ -532,23 +631,37 @@ mod tests {
         assert_eq!(e.code, "PGRST201");
     }
 
-    fn rel(name: &str, columns: &[&str]) -> Relation {
-        Relation {
-            name: name.to_string(),
-            columns: columns.iter().map(|c| c.to_string()).collect(),
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn col(table: &str, column: &str) -> ColumnRow {
+        ColumnRow {
+            table: table.to_string(),
+            column: Column {
+                name: column.to_string(),
+                ..Column::default()
+            },
         }
     }
 
     #[test]
     fn a_relation_is_looked_up_by_name_with_its_columns() {
-        let c = Catalog::new(Vec::new()).with_relations(vec![
-            rel("projects", &["id", "name"]),
-            rel("tasks", &["id"]),
-        ]);
-        assert_eq!(
-            c.relation("projects").map(|r| r.columns.as_slice()),
-            Some(["id".to_string(), "name".to_string()].as_slice())
+        let c = Catalog::new(Vec::new()).with_relations(
+            names(&["projects", "tasks"]),
+            vec![
+                col("projects", "id"),
+                col("projects", "name"),
+                col("tasks", "id"),
+                // A column of something outside the list has nowhere
+                // to go and goes nowhere.
+                col("secrets", "token"),
+            ],
         );
+        let projects = c.relation("projects").expect("the relation");
+        assert!(projects.has("id") && projects.has("name"));
+        assert!(!projects.has("token"));
+        assert_eq!(c.relation("tasks").map(|r| r.columns.len()), Some(1));
         assert!(c.relation("nope").is_none());
         // A catalog nobody gave relations to has none, rather than
         // claiming every name is missing.
@@ -556,15 +669,44 @@ mod tests {
     }
 
     #[test]
+    fn a_column_carries_the_casts_its_type_was_given() {
+        let c = Catalog::new(Vec::new()).with_relations(
+            names(&["todos"]),
+            vec![
+                ColumnRow {
+                    table: "todos".into(),
+                    column: Column {
+                        name: "label_color".into(),
+                        to_json: Some("test.json".into()),
+                        from_text: Some("test.color".into()),
+                    },
+                },
+                col("todos", "name"),
+            ],
+        );
+        let todos = c.relation("todos").expect("the relation");
+        assert_eq!(
+            todos
+                .column("label_color")
+                .and_then(|c| c.to_json.as_deref()),
+            Some("test.json")
+        );
+        assert!(todos.column("name").expect("a column").to_json.is_none());
+        assert!(todos.represented());
+
+        let plain =
+            Catalog::new(Vec::new()).with_relations(names(&["todos"]), vec![col("todos", "name")]);
+        assert!(!plain.relation("todos").expect("the relation").represented());
+    }
+
+    #[test]
     fn a_near_enough_name_is_worth_suggesting() {
         // The three the recordings pin down, one edit, two edits,
         // and four, against a name of eight characters.
-        let c = Catalog::new(Vec::new()).with_relations(vec![
-            rel("big_projects", &[]),
-            rel("products", &[]),
-            rel("profiles", &[]),
-            rel("projects", &[]),
-        ]);
+        let c = Catalog::new(Vec::new()).with_relations(
+            names(&["big_projects", "products", "profiles", "projects"]),
+            Vec::new(),
+        );
         assert_eq!(c.nearest("projectx"), Some("projects"));
         assert_eq!(c.nearest("projecxx"), Some("projects"));
         assert_eq!(c.nearest("projxxxx"), None);

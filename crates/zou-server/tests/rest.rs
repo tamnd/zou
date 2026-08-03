@@ -2309,3 +2309,94 @@ async fn the_schema_cache_answers_for_tables_and_columns_nobody_has() {
     );
     assert_eq!(body_text(res).await, "");
 }
+
+#[tokio::test]
+async fn a_data_representation_is_what_the_client_sees() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_paint cascade",
+            "drop domain if exists zou_rest_color cascade",
+            "create domain zou_rest_color as int4",
+            // Postgres itself will not apply either of these, and
+            // says so when they are made: a cast whose source or
+            // target is a domain is recorded and ignored. Upstream
+            // reads the record and calls the function by name, which
+            // is the whole of what a data representation is.
+            "create function zou_rest_json(zou_rest_color) returns json as \
+             $$ select to_json('#' || lpad(to_hex($1::int), 6, '0')) $$ language sql immutable",
+            "create cast (zou_rest_color as json) with function zou_rest_json(zou_rest_color)",
+            "create function zou_rest_read(text) returns zou_rest_color as \
+             $$ select (('x' || lpad(substring($1 from 2), 8, '0'))::bit(32)::int)::zou_rest_color $$ \
+             language sql immutable",
+            "create cast (text as zou_rest_color) with function zou_rest_read(text)",
+            "create table zou_rest_paint (id int primary key, shade zou_rest_color, note text)",
+            "insert into zou_rest_paint values (1, 16711680, 'warm'), (2, 255, 'cool')",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // Named in the select, the column comes out as what the cast
+    // makes of it rather than as what it holds.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_paint?select=id,shade&order=id"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r##"[{"id": 1, "shade": "#ff0000"},{"id": 2, "shade": "#0000ff"}]"##
+    );
+
+    // A star has to be spelled out for the call to go anywhere, and
+    // every column it spells out keeps its name. The key order is
+    // the one jsonb gives every other row here.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_paint?id=eq.1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r##"[{"id": 1, "note": "warm", "shade": "#ff0000"}]"##
+    );
+
+    // The url is text, so a filter reads its value through the cast
+    // the other way, and #ff0000 finds the row holding 16711680.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_paint?select=note&shade=eq.%23ff0000",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"note": "warm"}]"#);
+
+    // And a write filtered the same way, whose representation comes
+    // back through the cast as well.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PATCH",
+            "/rest/v1/zou_rest_paint?shade=eq.%230000ff&select=id,shade",
+            r#"{"note": "chilly"}"#,
+            &["return=representation"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r##"[{"id": 2, "shade": "#0000ff"}]"##);
+
+    // The request's own cast sits on top of the representation
+    // rather than instead of it, so this is the text of the hex
+    // string, quotes and all, and not the text of the integer.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_paint?select=shade::text&id=eq.1"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "[{\"shade\": \"\\\"#ff0000\\\"\"}]");
+}
