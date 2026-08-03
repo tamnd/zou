@@ -27,6 +27,10 @@
 //! A fourth, `derive`, asks nothing. It reads a PostgREST checkout and
 //! writes a suite out of its spec files, which is how the second suite
 //! here got written.
+//!
+//! And a fifth, `serve`, answers rather than asks. It starts zou on a
+//! port and waits, so that a suite written in another language, against
+//! a client somebody else wrote, has a url to point at.
 
 mod derive;
 mod diff;
@@ -50,6 +54,19 @@ modes
   check     ask a target and compare it with that recording
   diff      ask two targets and compare them with each other
   derive    read a PostgREST checkout and write a suite out of it, no target
+  serve     start zou on a port and wait, for a suite that is not asked
+            from here: the supabase-js one, or a browser
+
+serving
+  --zou-dsn <dsn>          the database it reads
+  --port <n>               where it answers, default 54321, the port the
+                           supabase CLI serves a local project on
+  --schemas <a,b>          what a request that names no schema gets,
+                           default public
+  --setup <path>           a sql file to apply once the server is up, which
+                           is where the fixture of a suite asked elsewhere
+                           goes. Applied after the auth schema exists, so it
+                           may reference auth.users
 
 deriving
   --from <path>            a PostgREST source tree at the pinned version
@@ -111,6 +128,9 @@ struct Args {
     from: Option<String>,
     write_known: bool,
     suites_dir: Option<String>,
+    port: u16,
+    schemas: Vec<String>,
+    setup_sql: Option<String>,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -137,13 +157,19 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         from: None,
         write_known: false,
         suites_dir: None,
+        port: 54321,
+        schemas: vec!["public".to_string()],
+        setup_sql: None,
     };
     let mut it = argv.iter();
     args.mode = match it.next() {
         Some(mode) => mode.clone(),
         None => return Err("no mode".to_string()),
     };
-    if !matches!(args.mode.as_str(), "record" | "check" | "diff" | "derive") {
+    if !matches!(
+        args.mode.as_str(),
+        "record" | "check" | "diff" | "derive" | "serve"
+    ) {
         return Err(format!("no mode named {:?}", args.mode));
     }
     while let Some(arg) = it.next() {
@@ -176,8 +202,39 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--from" => args.from = Some(need("--from")?),
             "--write-known" => args.write_known = true,
             "--suites" => args.suites_dir = Some(need("--suites")?),
+            "--setup" => args.setup_sql = Some(need("--setup")?),
+            "--port" => {
+                let value = need("--port")?;
+                args.port = value
+                    .parse()
+                    .map_err(|_| format!("--port takes a number, not {value:?}"))?;
+            }
+            "--schemas" => {
+                args.schemas = need("--schemas")?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             other => return Err(format!("no flag named {other:?}")),
         }
+    }
+    // Serving asks nothing and reads no suite. It is zou on a port and
+    // a process that stays up, so the only thing it needs is a database.
+    if args.mode == "serve" {
+        if args.zou_dsn.is_none() {
+            return Err("serve needs a --zou-dsn to read".to_string());
+        }
+        if args.url.is_some() || args.reference_url.is_some() {
+            return Err("serve is the target, so it takes no other one".to_string());
+        }
+        if args.schemas.is_empty() {
+            return Err("--schemas needs at least one".to_string());
+        }
+        return Ok(args);
+    }
+    if args.setup_sql.is_some() {
+        return Err("--setup is for serve, the other modes apply the suite's own".to_string());
     }
     // Deriving reads a checkout and writes files. There is nothing to
     // ask, so a target would be a command somebody meant differently.
@@ -244,6 +301,9 @@ fn main() -> ExitCode {
 fn run(args: Args) -> Result<bool, String> {
     if args.mode == "derive" {
         return written(&args);
+    }
+    if args.mode == "serve" {
+        return holding(&args);
     }
     let names = match args.suites.is_empty() {
         true => Suite::all()?,
@@ -358,6 +418,41 @@ fn run(args: Args) -> Result<bool, String> {
         std::fs::write(path, format!("{text}\n")).map_err(|e| format!("{path}: {e}"))?;
     }
     Ok(good)
+}
+
+/// Serving: zou on a known port, and then nothing.
+///
+/// Everything else here asks the questions itself. This exists for the
+/// suites that cannot be asked from here, the supabase-js one first,
+/// where the client is somebody else's library in somebody else's
+/// language and the only thing it takes is a url and a key. The keys
+/// are printed because they are minted from the secret and a shell
+/// script should not have to know how.
+///
+/// It never returns. The process is killed by whatever started it,
+/// which is how a server in a CI step is always ended.
+///
+/// `--setup` is applied after the server is up rather than before,
+/// because zou installs the auth schema on its first connection and a
+/// fixture with a foreign key into auth.users would otherwise be a race
+/// against the server's own bootstrap. start_at does not come back until
+/// that has happened.
+fn holding(args: &Args) -> Result<bool, String> {
+    let dsn = args.zou_dsn.as_deref().expect("parse checked for one");
+    let served = zou::start_at(args.port, dsn, args.jwt_secret.as_bytes(), &args.schemas)?;
+    if let Some(path) = &args.setup_sql {
+        let sql = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        target::apply(dsn, &sql, "serve")?;
+        println!("setup {path}");
+    }
+    println!("url {}", served.url);
+    for role in ["anon", "authenticated", "service_role"] {
+        println!("{role} {}", zou::key(role, &args.jwt_secret));
+    }
+    println!("schemas {}", args.schemas.join(","));
+    loop {
+        std::thread::park();
+    }
 }
 
 /// Deriving: a checkout in, a suite on disk out.
@@ -609,5 +704,42 @@ mod tests {
     #[test]
     fn a_flag_nobody_has_is_an_error() {
         assert!(parse(&argv(&["check", "--url", "u", "--fast"])).is_err());
+    }
+
+    /// The port is the point of serve: the suite that uses it is asked
+    /// by somebody else's client, and that client is handed a url.
+    #[test]
+    fn serve_answers_where_a_local_supabase_project_does() {
+        let args = parse(&argv(&["serve", "--zou-dsn", "d"])).expect("parses");
+        assert_eq!(args.port, 54321);
+        assert_eq!(args.schemas, ["public"]);
+        assert!(args.setup_sql.is_none());
+        let args = parse(&argv(&["serve", "--zou-dsn", "d", "--port", "8000"])).expect("parses");
+        assert_eq!(args.port, 8000);
+    }
+
+    #[test]
+    fn serve_is_the_target_rather_than_asking_one() {
+        assert!(parse(&argv(&["serve"])).is_err());
+        assert!(parse(&argv(&["serve", "--zou-dsn", "d", "--url", "u"])).is_err());
+        assert!(parse(&argv(&["serve", "--zou-dsn", "d", "--port", "eight"])).is_err());
+    }
+
+    /// A fixture applied by hand belongs to the suite that is asked
+    /// elsewhere. The modes that read a suite already have its own
+    /// setup.sql, so --setup there is a command somebody meant
+    /// differently.
+    #[test]
+    fn a_setup_file_is_for_serving_and_nothing_else() {
+        let args = parse(&argv(&[
+            "serve",
+            "--zou-dsn",
+            "d",
+            "--setup",
+            "js/setup.sql",
+        ]))
+        .expect("parses");
+        assert_eq!(args.setup_sql.as_deref(), Some("js/setup.sql"));
+        assert!(parse(&argv(&["check", "--url", "u", "--setup", "js/setup.sql"])).is_err());
     }
 }

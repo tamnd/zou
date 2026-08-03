@@ -167,23 +167,7 @@ impl Target {
             Some(dsn) => dsn,
             None => return Ok(()),
         };
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("tokio: {e}"))?;
-        runtime.block_on(async {
-            let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| format!("{}: connecting to set up: {e}", self.name))?;
-            let task = tokio::spawn(connection);
-            let result = client
-                .batch_execute(setup)
-                .await
-                .map_err(|e| format!("{}: setup.sql: {}", self.name, because(&e)));
-            drop(client);
-            let _ = task.await;
-            result
-        })
+        apply(dsn, setup, &self.name)
     }
 
     /// Refuse a database that would answer a timestamp differently here
@@ -240,6 +224,36 @@ impl Target {
             }
         })
     }
+}
+
+/// A sql file, applied to a database over one connection.
+///
+/// Its own connection every time rather than a pool: this runs once
+/// before anything is asked, and a setup that leaves a session with a
+/// changed search_path or a held advisory lock behind should not be able
+/// to hand that to a case.
+///
+/// One batch, so the file can hold plpgsql blocks and dollar quoting
+/// without being split up here. `whose` only ever appears in the error,
+/// to say which target's database refused it.
+pub fn apply(dsn: &str, sql: &str, whose: &str) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio: {e}"))?;
+    runtime.block_on(async {
+        let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(|e| format!("{whose}: connecting to set up: {e}"))?;
+        let task = tokio::spawn(connection);
+        let result = client
+            .batch_execute(sql)
+            .await
+            .map_err(|e| format!("{whose}: setup.sql: {}", because(&e)));
+        drop(client);
+        let _ = task.await;
+        result
+    })
 }
 
 /// An error and everything under it, on one line.

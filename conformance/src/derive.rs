@@ -119,11 +119,16 @@ pub fn derive(from: &Path, suite: &str) -> Result<Derived, String> {
     let reset = format!("{}\n{}", TRUNCATE, sql(&data));
     let mut cases = Vec::new();
     let mut skipped = Vec::new();
+    let mut guessed = 0;
     let mut taken: BTreeMap<String, usize> = BTreeMap::new();
     for spec in SPECS {
         let text = read(&spec_dir.join(spec.file))?;
         let (found, missed) = scan(&text, spec);
         for mut case in found {
+            if a_guess(&case) {
+                guessed += 1;
+                continue;
+            }
             // Two `it` blocks in one file can be worded the same, and
             // one `it` block can make four requests, so the name gets a
             // number when it has to and reads as prose when it does not.
@@ -141,7 +146,7 @@ pub fn derive(from: &Path, suite: &str) -> Result<Derived, String> {
         reset,
         cases: Cases {
             suite: suite.to_string(),
-            note: note(&skipped),
+            note: note(&skipped, guessed),
             schemas: vec!["test".to_string()],
             anon_role: "postgrest_test_anonymous".to_string(),
             cases,
@@ -150,7 +155,32 @@ pub fn derive(from: &Path, suite: &str) -> Result<Derived, String> {
     })
 }
 
-fn note(skipped: &[String]) -> Vec<String> {
+/// A request whose answer is the planner's guess rather than a fact.
+///
+/// `count=planned` puts the planner's row estimate in Content-Range, and
+/// `count=estimated` is the same number whenever it is over the
+/// threshold. That estimate is a property of the physical table at the
+/// moment of the query: it moves with the page count, so a table that a
+/// few writing cases have churned answers differently from the same
+/// table an autovacuum has just been over, and postgres 17 and 18 need
+/// not agree either.
+///
+/// Upstream can ask it because upstream runs against a database made
+/// seconds earlier in a fixed order. Here the answer is recorded on one
+/// machine and compared on another, days apart, so the case fails or
+/// passes on the weather. Four of them flipped between two runs of the
+/// same commit, which is the worst kind of case to have in a ratchet:
+/// it teaches everybody that a red conformance job means nothing.
+///
+/// So the suite does not ask. Not excused, not known, not asked, and the
+/// score does not count them either way.
+fn a_guess(case: &Case) -> bool {
+    case.headers.get("Prefer").is_some_and(|prefer| {
+        prefer.contains("count=planned") || prefer.contains("count=estimated")
+    })
+}
+
+fn note(skipped: &[String], guessed: usize) -> Vec<String> {
     vec![
         "Generated. Run `zou-conformance derive --from <postgrest checkout>`".to_string(),
         "rather than editing this by hand, and read the diff when you do.".to_string(),
@@ -167,6 +197,11 @@ fn note(skipped: &[String]) -> Vec<String> {
         ),
         "are not here. They are the ones built out of a helper or a variable".to_string(),
         "rather than written out, and they are listed by the deriver when it runs.".to_string(),
+        String::new(),
+        format!("{guessed} more are left out on purpose: they ask for count=planned or"),
+        "count=estimated, and the answer to those is the planner's row estimate,".to_string(),
+        "which moves with the page count of the table and so is not a function".to_string(),
+        "of the request. A recording of a guess is not something to compare.".to_string(),
     ]
 }
 
@@ -983,6 +1018,26 @@ mod tests {
         assert_eq!(case.headers["Range"], "0-1");
         assert_eq!(case.headers["Range-Unit"], "items");
         assert_eq!(case.headers["Prefer"], "count=exact");
+    }
+
+    /// The scanner still reads them. They are dropped afterwards, in
+    /// `derive`, so that the count of what was left out is a number
+    /// rather than a silence.
+    #[test]
+    fn a_case_that_asks_for_a_guess_is_not_asked() {
+        let mut case = one("  it \"counts\" $\n    get \"/items\"\n");
+        assert!(!a_guess(&case));
+        case.headers
+            .insert("Prefer".to_string(), "count=exact".to_string());
+        assert!(!a_guess(&case));
+        case.headers
+            .insert("Prefer".to_string(), "count=planned".to_string());
+        assert!(a_guess(&case));
+        case.headers.insert(
+            "Prefer".to_string(),
+            "count=estimated, return=representation".to_string(),
+        );
+        assert!(a_guess(&case));
     }
 
     /// A head has no body even though the call writes one.
