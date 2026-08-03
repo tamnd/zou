@@ -47,7 +47,7 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
-use zou_rest::catalog::{Catalog, FkRow, INTROSPECT_SQL};
+use zou_rest::catalog::{Catalog, FkRow, INTROSPECT_SQL, RELATIONS_SQL, Relation};
 use zou_rest::filter::{self, Node, Op, Parsed};
 use zou_rest::mutate::{self, Conflict, Returning};
 use zou_rest::plan::{self, PlanError, Query};
@@ -189,6 +189,42 @@ fn invalid_body(message: impl Into<String>) -> RestError {
         status: StatusCode::BAD_REQUEST,
         code: "PGRST102".to_string(),
         message: message.into(),
+        details: None,
+        hint: None,
+    }
+}
+
+/// The table the schema does not have, PostgREST's PGRST205. It is a
+/// 404 and not a 400 because the url named a resource and there is
+/// no such resource, and the message names the schema as well as the
+/// table, since the same name in another profile may well exist and
+/// that is the likelier mistake.
+///
+/// This is the answer instead of postgres's own 42P01 because the
+/// statement is never written: the check is a lookup in a list zou
+/// already holds, so a caller asking for a table nobody has costs a
+/// round trip to nothing.
+fn no_table(catalog: &Catalog, schema: &str, table: &str) -> RestError {
+    RestError {
+        status: StatusCode::NOT_FOUND,
+        code: "PGRST205".to_string(),
+        message: format!("Could not find the table '{schema}.{table}' in the schema cache"),
+        details: None,
+        hint: catalog
+            .nearest(table)
+            .map(|near| format!("Perhaps you meant the table '{schema}.{near}'")),
+    }
+}
+
+/// A column a write named that the table does not have, PostgREST's
+/// PGRST204. Unlike a column in `select=` or `order=`, which reaches
+/// postgres and comes back as a 42703, a write's columns are known
+/// before the statement is built and upstream refuses them there.
+fn no_column(table: &str, column: &str) -> RestError {
+    RestError {
+        status: StatusCode::BAD_REQUEST,
+        code: "PGRST204".to_string(),
+        message: format!("Could not find the '{column}' column of '{table}' in the schema cache"),
         details: None,
         hint: None,
     }
@@ -945,26 +981,40 @@ fn out_of_bounds(offset: u64, total: i64) -> serde_json::Value {
     })
 }
 
-/// The fk graph on the request's own transaction, one pg_constraint
-/// query.
+/// The fk graph and the relation list on the request's own
+/// transaction, two catalog queries. They go together because they
+/// are cached together and expire together: one epoch moved the
+/// schema, and a graph that has been rebuilt against a table list
+/// that has not is worse than either being stale.
 async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalog, RestError> {
     let rows = sess
         .query(INTROSPECT_SQL, &[&schema])
         .await
         .map_err(|e| pg_error(&e, authed))?;
-    Ok(Catalog::new(
-        rows.iter()
-            .map(|r| FkRow {
-                constraint: r.get(0),
-                table: r.get(1),
-                columns: r.get(2),
-                ref_table: r.get(3),
-                ref_columns: r.get(4),
-                unique: r.get(5),
-                in_pk: r.get(6),
-            })
-            .collect(),
-    ))
+    let fks = rows
+        .iter()
+        .map(|r| FkRow {
+            constraint: r.get(0),
+            table: r.get(1),
+            columns: r.get(2),
+            ref_table: r.get(3),
+            ref_columns: r.get(4),
+            unique: r.get(5),
+            in_pk: r.get(6),
+        })
+        .collect();
+    let rows = sess
+        .query(RELATIONS_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let rels = rows
+        .iter()
+        .map(|r| Relation {
+            name: r.get(0),
+            columns: r.get(1),
+        })
+        .collect();
+    Ok(Catalog::new(fks).with_relations(rels))
 }
 
 /// The catalog for the profiled schema, introspected once per epoch
@@ -1047,6 +1097,9 @@ async fn read(
     // forfeits the connection instead of pooling a dirty one, the
     // containment the pool promises.
     let catalog = load_catalog(app, &sess, authed, schema).await?;
+    if catalog.relation(table).is_none() {
+        return Err(no_table(&catalog, schema, table));
+    }
 
     let sql = plan::plan(&catalog, &q).map_err(plan_error)?;
     let media = negotiate(&req.headers)?;
@@ -1250,8 +1303,18 @@ async fn write(
         true
     });
 
+    // A body zou cannot read is refused before a connection is taken
+    // out of the pool, which is where it stays: the schema cache
+    // decides the rest and it needs a session to be filled.
+    //
+    // ?columns= is a POST and a PATCH parameter. A PUT reads its
+    // columns off the body whatever the url says, which is worth
+    // stating because it is not obviously deliberate upstream and it
+    // is observable: a PUT with ?columns= naming one column writes
+    // every column the body carries.
     let payload = match *method {
-        Method::POST | Method::PUT => Some(insert_payload(bytes, extras.columns.as_deref())?),
+        Method::POST => Some(insert_payload(bytes, extras.columns.as_deref())?),
+        Method::PUT => Some(insert_payload(bytes, None)?),
         Method::PATCH => Some(update_payload(bytes, extras.columns.as_deref())?),
         _ => None,
     };
@@ -1265,6 +1328,14 @@ async fn write(
         .session(&ctx, false)
         .await
         .map_err(|e| pg_error(&e, authed))?;
+
+    // The table the url named, before anything it might have said
+    // about that table's columns. Everything downstream of here can
+    // assume the relation exists.
+    let catalog = load_catalog(app, &sess, authed, schema).await?;
+    let Some(relation) = catalog.relation(table) else {
+        return Err(no_table(&catalog, schema, table));
+    };
 
     // The primary key, only fetched when the upsert needs a default
     // target or the Location header wants the columns.
@@ -1289,6 +1360,18 @@ async fn write(
     // thing PUT knows how to replace.
     if put && !keys_the_row(&root, &pk) {
         return Err(put_filters());
+    }
+
+    // The write's own columns, which are ?columns= when the url said
+    // so and the body's keys otherwise. A name the table does not
+    // have is answered here rather than by postgres, which would
+    // have said 42703 about a statement nobody meant to write. It
+    // comes after the PUT check because a PUT the url has already
+    // ruled out is not a write whose columns anybody is waiting on.
+    if let Some((cols, _)) = &payload
+        && let Some(missing) = cols.iter().find(|c| !relation.columns.contains(c))
+    {
+        return Err(no_column(table, missing));
     }
 
     let conflict = match (*method == Method::POST, prefer.merge) {
@@ -1340,7 +1423,6 @@ async fn write(
     let affected: u64;
     let mut res = match prefer.ret {
         Ret::Representation => {
-            let catalog = load_catalog(app, &sess, authed, schema).await?;
             let r = mutate::representation(&catalog, m, &mut q).map_err(plan_error)?;
             let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
             if media == Media::Csv {
@@ -1470,6 +1552,38 @@ async fn write(
     Ok(res)
 }
 
+/// What a table will take. The list is the same for every table
+/// upstream serves, which is worth saying out loud: it is not a
+/// permission check and a caller who reads it as one will be
+/// surprised by the first 401. The only thing it answers is whether
+/// the table is there, and that answer is the 404.
+async fn options(
+    app: &App,
+    table: &str,
+    auth: &AuthContext,
+    req: &Parts,
+) -> Result<Response, RestError> {
+    let (schema, _) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
+    let pool = app.pool.as_ref().ok_or_else(no_database)?;
+    let authed = auth.role != "anon";
+    let ctx = request_context(auth, req, schema);
+    let sess = pool
+        .session(&ctx, true)
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let catalog = load_catalog(app, &sess, authed, schema).await?;
+    if catalog.relation(table).is_none() {
+        return Err(no_table(&catalog, schema, table));
+    }
+    sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+    let mut res = StatusCode::OK.into_response();
+    res.headers_mut().insert(
+        header::ALLOW,
+        header::HeaderValue::from_static("OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE"),
+    );
+    Ok(res)
+}
+
 /// The /rest/v1/{table} handler. Reads and writes are live, anything
 /// else answers the honest 501.
 pub async fn table(
@@ -1496,6 +1610,7 @@ pub async fn table(
                 }),
             }
         }
+        Method::OPTIONS => options(&app, &table, &auth, &parts).await,
         _ => return crate::not_yet("this REST method"),
     };
     match result {
