@@ -54,7 +54,7 @@ use zou_rest::plan::{self, PlanError, Query};
 use zou_rest::{order, page, rpc, select};
 
 use crate::sql::{RequestContext, Session};
-use crate::{App, AuthContext, json_body, openapi};
+use crate::{App, AuthContext, openapi};
 
 /// PostgREST's getSchema: writes pick their schema through
 /// Content-Profile, everything else through Accept-Profile, a header
@@ -127,16 +127,37 @@ pub struct RestError {
 
 impl RestError {
     fn into_response(self) -> Response {
-        json_body(
-            self.status,
+        let status = self.status;
+        let mut res = error_body(
+            status,
             serde_json::json!({
                 "code": self.code,
                 "details": self.details,
                 "hint": self.hint,
                 "message": self.message,
             }),
-        )
+        );
+        // A 401 has to say what it wants instead, or it is a refusal
+        // with no way back in. Upstream sends the bare challenge for
+        // everything a row level security policy turned away.
+        if status == StatusCode::UNAUTHORIZED {
+            res.headers_mut()
+                .insert(header::WWW_AUTHENTICATE, "Bearer".parse().expect("a token"));
+        }
+        res
     }
+}
+
+/// An error on the REST surface. PostgREST names the charset on every
+/// answer it sends, including the ones that went wrong, and GoTrue does
+/// not, so this is not the same builder the auth surface uses.
+fn error_body(status: StatusCode, body: serde_json::Value) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        body.to_string(),
+    )
+        .into_response()
 }
 
 fn bad_grammar(message: impl Into<String>) -> RestError {
@@ -1049,7 +1070,7 @@ async fn read(
         .unwrap_or(0);
     let status = range_status(offset, returned, total);
     let mut res = if status == StatusCode::RANGE_NOT_SATISFIABLE {
-        json_body(status, out_of_bounds(offset, total.unwrap_or(0)))
+        error_body(status, out_of_bounds(offset, total.unwrap_or(0)))
     } else {
         (status, [(header::CONTENT_TYPE, media.content_type())], body).into_response()
     };
@@ -1643,7 +1664,9 @@ async fn invoke(
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
-            Ok(StatusCode::NO_CONTENT.into_response())
+            // Nothing to send and a range all the same, because
+            // upstream counts the one row the call was.
+            Ok((StatusCode::NO_CONTENT, [(header::CONTENT_RANGE, "0-0/*")]).into_response())
         }
         rpc::RetKind::Scalar => {
             let wrapped = rpc::scalar_wrap(func, m, returns_set);
@@ -1657,9 +1680,14 @@ async fn invoke(
                 .first()
                 .and_then(|r| r.get::<_, Option<String>>(0))
                 .unwrap_or_else(|| if returns_set { "[]" } else { "null" }.to_string());
+            // One value is one row as far as the range goes, which
+            // is how upstream counts it.
             let mut res = (
                 StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                [
+                    (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                    (header::CONTENT_RANGE, "0-0/*"),
+                ],
                 out,
             )
                 .into_response();
@@ -1812,6 +1840,34 @@ mod tests {
         let e = parse_query("t", Some("name=zzz.1")).unwrap_err();
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
         assert_eq!(e.code, "PGRST100");
+    }
+
+    /// PostgREST names the charset on everything it sends, the errors
+    /// as much as the rows. The auth surface copies GoTrue instead,
+    /// which does not, so this is the one place it is decided.
+    #[test]
+    fn an_error_says_which_charset_it_is_in() {
+        let res = bad_grammar("no").into_response();
+        assert_eq!(
+            res.headers()[header::CONTENT_TYPE],
+            "application/json; charset=utf-8"
+        );
+        assert!(res.headers().get(header::WWW_AUTHENTICATE).is_none());
+    }
+
+    /// A refusal that does not say what it wants instead is a door
+    /// with no handle on it.
+    #[test]
+    fn a_refusal_carries_the_challenge_and_the_others_do_not() {
+        let refused = RestError {
+            status: StatusCode::UNAUTHORIZED,
+            code: "42501".to_string(),
+            message: "no".to_string(),
+            details: None,
+            hint: None,
+        };
+        let res = refused.into_response();
+        assert_eq!(res.headers()[header::WWW_AUTHENTICATE], "Bearer");
     }
 
     #[test]

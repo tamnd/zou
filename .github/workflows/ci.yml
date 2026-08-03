@@ -83,6 +83,118 @@ jobs:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
         run: cargo test -p zou-rest --test pg -- --nocapture
 
+  conformance:
+    name: conformance (postgrest)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      ZOU_CONFORMANCE_SUITES: /tmp/zou-conformance/suites
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The questions and the recordings are upstream's data rather than
+      # zou's code, so they are a repository of their own, pinned to a
+      # commit here. A recording that moved under CI would be a
+      # recording nobody is comparing against.
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      - name: Fetch the PostgREST the suites were recorded from
+        run: |
+          version=$(jq -r .postgrest.version /tmp/zou-conformance/versions.json)
+          asset="postgrest-v$version-linux-static-x86-64.tar.xz"
+          curl -sSfL -o /tmp/postgrest.tar.xz \
+            "https://github.com/PostgREST/postgrest/releases/download/v$version/$asset"
+          tar -xJf /tmp/postgrest.tar.xz -C /tmp
+          /tmp/postgrest --version
+      - name: Test the harness against the suites it reads
+        run: cargo test -p zou-conformance
+      - name: Check zou against the recording
+        run: |
+          cargo run -p zou-conformance -- check \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --json /tmp/conformance.json
+      # The recording is the thing every check is measured against, so a
+      # release of PostgREST that answers differently has to fail here
+      # rather than sit in the file being believed. Same suite, same
+      # database, both targets asked in turn.
+      #
+      # A suite is diffed against a PostgREST configured the way that
+      # suite was recorded from, which is why there are two of these and
+      # not one: the rest suite keeps its tables in conformance, and the
+      # postgrest suite keeps them where upstream's own fixtures do.
+      - name: Diff the rest suite against a live PostgREST
+        run: |
+          cat > /tmp/rest.conf <<CONF
+          db-uri = "$ZOU_CONFORMANCE_DSN"
+          db-schemas = "conformance,public"
+          db-anon-role = "anon"
+          jwt-secret = "$ZOU_CONFORMANCE_SECRET"
+          server-port = 3999
+          db-pool = 4
+          CONF
+          psql "$ZOU_CONFORMANCE_DSN" -v ON_ERROR_STOP=1 -f /tmp/zou-conformance/suites/rest/setup.sql
+          /tmp/postgrest /tmp/rest.conf &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:3999/ >/dev/null && break
+            sleep 1
+          done
+          cargo run -p zou-conformance -- diff --suite rest \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --reference-url http://127.0.0.1:3999 \
+            --reference-name "postgrest live" \
+            --reference-dsn "$ZOU_CONFORMANCE_DSN" \
+            --reference-strip-prefix /rest/v1 \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET"
+      - name: Diff the postgrest suite against a live PostgREST
+        run: |
+          cat > /tmp/upstream.conf <<CONF
+          db-uri = "$ZOU_CONFORMANCE_DSN"
+          db-schemas = "test"
+          db-anon-role = "postgrest_test_anonymous"
+          db-extra-search-path = ""
+          jwt-secret = "$ZOU_CONFORMANCE_SECRET"
+          server-port = 3998
+          db-pool = 4
+          CONF
+          psql "$ZOU_CONFORMANCE_DSN" -v ON_ERROR_STOP=1 -f /tmp/zou-conformance/suites/postgrest/setup.sql
+          /tmp/postgrest /tmp/upstream.conf &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:3998/ >/dev/null && break
+            sleep 1
+          done
+          cargo run -p zou-conformance -- diff --suite postgrest \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --reference-url http://127.0.0.1:3998 \
+            --reference-name "postgrest live" \
+            --reference-dsn "$ZOU_CONFORMANCE_DSN" \
+            --reference-strip-prefix /rest/v1 \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET"
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance
+          path: /tmp/conformance.json
+          if-no-files-found: ignore
+
   s3-contract:
     name: s3 contract (minio)
     runs-on: ubuntu-latest
