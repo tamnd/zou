@@ -15,6 +15,14 @@
 //! names, which relationship is meant, with the PGRST200 and
 //! PGRST201 errors PostgREST clients branch on when the answer is
 //! none or several.
+//!
+//! Alongside the graph the catalog holds the relations themselves
+//! and their columns, [`RELATIONS_SQL`] and [`Relation`]. That list
+//! is the difference between a request answered and a request
+//! refused before any SQL is written: a table nobody has is a 404
+//! naming the schema, and a column a write names but the table does
+//! not have is a 400, rather than whatever postgres would have said
+//! about the statement that got built anyway.
 
 use std::fmt;
 
@@ -68,6 +76,38 @@ select c.conname::text,
    and pns.nspname = $1
  order by c.conname";
 
+/// One relation the schema exposes and the columns it has, straight
+/// off [`RELATIONS_SQL`]. Views and foreign tables are relations
+/// here for the same reason they are in PostgREST: a client asks for
+/// them by name over the same url and does not care what backs them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Relation {
+    pub name: String,
+    pub columns: Vec<String>,
+}
+
+/// The relations one schema exposes. Bind the schema name as $1.
+///
+/// Partitions are left out, which is upstream's rule and not an
+/// accident of the query: a partition is reachable through the table
+/// it partitions, and naming one directly is a 404 from PostgREST
+/// even though pg_class has it. Dropped columns are left out too,
+/// because attnum keeps their slot and nothing else does.
+pub const RELATIONS_SQL: &str = "\
+select c.relname::text,
+       coalesce((select array_agg(a.attname::text order by a.attnum)
+                   from pg_attribute a
+                  where a.attrelid = c.oid
+                    and a.attnum > 0
+                    and not a.attisdropped),
+                '{}')
+  from pg_class c
+  join pg_namespace n on n.oid = c.relnamespace
+ where n.nspname = $1
+   and c.relkind in ('r', 'v', 'm', 'f', 'p')
+   and not c.relispartition
+ order by c.relname";
+
 /// How the embedded rows relate to the outer ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -120,17 +160,54 @@ impl std::error::Error for EmbedError {}
 #[derive(Debug, Default)]
 pub struct Catalog {
     fks: Vec<FkRow>,
+    rels: Vec<Relation>,
 }
 
 impl Catalog {
+    /// A catalog of the foreign keys alone, which is all the embed
+    /// planner reads. A catalog built this way knows of no relations
+    /// at all, so [`Catalog::relation`] answers none for every name
+    /// and the caller must not read that as a missing table.
     pub fn new(fks: Vec<FkRow>) -> Catalog {
-        Catalog { fks }
+        Catalog {
+            fks,
+            rels: Vec::new(),
+        }
+    }
+
+    /// The same catalog with the schema's relations in it.
+    pub fn with_relations(self, rels: Vec<Relation>) -> Catalog {
+        Catalog { rels, ..self }
     }
 
     /// The foreign keys as introspected, which the OpenAPI document
     /// reads to write its `<fk .../>` column notes.
     pub fn fks(&self) -> &[FkRow] {
         &self.fks
+    }
+
+    /// The relation of that name, if the schema has one.
+    pub fn relation(&self, name: &str) -> Option<&Relation> {
+        self.rels.iter().find(|r| r.name == name)
+    }
+
+    /// The relation this name is close enough to be a typo for, when
+    /// there is one. PostgREST offers the suggestion at a similarity
+    /// of 75% and keeps quiet below it, which is the difference
+    /// between `projecxx`, near enough to `projects` to be worth
+    /// saying, and `projxxxx`, which is somebody asking for
+    /// something else.
+    pub fn nearest(&self, name: &str) -> Option<&str> {
+        let mut best: Option<(f64, &str)> = None;
+        for rel in &self.rels {
+            let score = similarity(name, &rel.name);
+            // Strictly better, so a tie keeps the earlier name and
+            // the suggestion does not depend on how the rows landed.
+            if score >= 0.75 && best.is_none_or(|(seen, _)| score > seen) {
+                best = Some((score, &rel.name));
+            }
+        }
+        best.map(|(_, name)| name)
     }
 
     /// Resolve the relationship an embed means: `parent` is the
@@ -253,6 +330,33 @@ struct Cand {
 
 fn pairs(outer: &[String], inner: &[String]) -> Vec<(String, String)> {
     outer.iter().cloned().zip(inner.iter().cloned()).collect()
+}
+
+/// How alike two names are, one minus the edit distance over the
+/// longer of them, so it runs from 0 for nothing in common to 1 for
+/// the same word. Nothing here needs the distance itself, only
+/// whether a typo is close enough to be worth suggesting, and a
+/// distance on its own cannot say that: two edits is most of a short
+/// name and nothing much of a long one.
+fn similarity(a: &str, b: &str) -> f64 {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let longer = a.len().max(b.len());
+    if longer == 0 {
+        return 1.0;
+    }
+    // One row of the Levenshtein matrix at a time, which is all the
+    // next row reads.
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut row = vec![0; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = prev[j] + usize::from(ca != cb);
+            row[j + 1] = substitute.min(prev[j + 1] + 1).min(row[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut row);
+    }
+    1.0 - prev[b.len()] as f64 / longer as f64
 }
 
 #[cfg(test)]
@@ -426,5 +530,56 @@ mod tests {
         // cannot split them.
         let e = c.resolve("employees", "employees", None).unwrap_err();
         assert_eq!(e.code, "PGRST201");
+    }
+
+    fn rel(name: &str, columns: &[&str]) -> Relation {
+        Relation {
+            name: name.to_string(),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_relation_is_looked_up_by_name_with_its_columns() {
+        let c = Catalog::new(Vec::new()).with_relations(vec![
+            rel("projects", &["id", "name"]),
+            rel("tasks", &["id"]),
+        ]);
+        assert_eq!(
+            c.relation("projects").map(|r| r.columns.as_slice()),
+            Some(["id".to_string(), "name".to_string()].as_slice())
+        );
+        assert!(c.relation("nope").is_none());
+        // A catalog nobody gave relations to has none, rather than
+        // claiming every name is missing.
+        assert!(Catalog::new(Vec::new()).relation("projects").is_none());
+    }
+
+    #[test]
+    fn a_near_enough_name_is_worth_suggesting() {
+        // The three the recordings pin down, one edit, two edits,
+        // and four, against a name of eight characters.
+        let c = Catalog::new(Vec::new()).with_relations(vec![
+            rel("big_projects", &[]),
+            rel("products", &[]),
+            rel("profiles", &[]),
+            rel("projects", &[]),
+        ]);
+        assert_eq!(c.nearest("projectx"), Some("projects"));
+        assert_eq!(c.nearest("projecxx"), Some("projects"));
+        assert_eq!(c.nearest("projxxxx"), None);
+        assert_eq!(c.nearest("projects"), Some("projects"));
+    }
+
+    #[test]
+    fn similarity_is_the_edit_distance_over_the_longer_name() {
+        assert_eq!(similarity("same", "same"), 1.0);
+        assert_eq!(similarity("", ""), 1.0);
+        assert_eq!(similarity("abcd", "abcx"), 0.75);
+        assert_eq!(similarity("abcd", "xyzw"), 0.0);
+        // The same two edits against a longer name, which is why the
+        // distance alone cannot decide anything.
+        assert_eq!(similarity("ab", "abcd"), 0.5);
+        assert_eq!(similarity("abcdefgh", "abcdefxy"), 0.75);
     }
 }

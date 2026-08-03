@@ -175,7 +175,9 @@ async fn the_read_path_speaks_postgrest() {
     assert_eq!(res.headers()["content-range"], "*/*");
     assert_eq!(body_text(res).await, "[]");
 
-    // A missing table surfaces the pg error with PostgREST's 404.
+    // A table the schema does not have is answered from the schema
+    // cache, never from postgres, so no statement is written and the
+    // message names the schema the caller was profiled into.
     let res = app
         .clone()
         .oneshot(get("/rest/v1/zou_rest_nope"))
@@ -183,8 +185,16 @@ async fn the_read_path_speaks_postgrest() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
     let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
-    assert_eq!(body["code"], "42P01");
-    assert!(body.get("details").is_some() && body.get("hint").is_some());
+    assert_eq!(body["code"], "PGRST205");
+    assert_eq!(
+        body["message"],
+        "Could not find the table 'public.zou_rest_nope' in the schema cache"
+    );
+    // Near enough to a table that is there to be worth suggesting.
+    assert_eq!(
+        body["hint"],
+        "Perhaps you meant the table 'public.zou_rest_notes'"
+    );
 
     // Two fks to the same table is the 300 with the hint spellings,
     // and the hint resolves it.
@@ -2159,4 +2169,143 @@ async fn the_catalog_follows_the_ddl_epoch() {
         body, r#"[{"id": 10, "zou_ep_parents": {"name": "ann"}}]"#,
         "the new foreign key reached the cached catalog"
     );
+}
+
+#[tokio::test]
+async fn the_schema_cache_answers_for_tables_and_columns_nobody_has() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_cache_widgets cascade",
+            "drop view if exists zou_cache_widget_view",
+            "create table zou_cache_widgets (id int primary key, name text)",
+            "insert into zou_cache_widgets values (1, 'one')",
+            "create view zou_cache_widget_view as select id from zou_cache_widgets",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // A table nobody has, on every method that names one, and the
+    // suggestion when the name is nearly a table that is there.
+    for (method, uri) in [
+        ("GET", "/rest/v1/zou_cache_widgex"),
+        ("HEAD", "/rest/v1/zou_cache_widgex"),
+        ("POST", "/rest/v1/zou_cache_widgex"),
+        ("PATCH", "/rest/v1/zou_cache_widgex?id=eq.1"),
+        ("PUT", "/rest/v1/zou_cache_widgex?id=eq.1"),
+        ("DELETE", "/rest/v1/zou_cache_widgex?id=eq.1"),
+        ("OPTIONS", "/rest/v1/zou_cache_widgex"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(req(method, uri, r#"{"id": 2}"#, &[]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{method} {uri}");
+        if method == "HEAD" {
+            continue;
+        }
+        let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+        assert_eq!(e["code"], "PGRST205", "{method}");
+        assert_eq!(
+            e["message"], "Could not find the table 'public.zou_cache_widgex' in the schema cache",
+            "{method}"
+        );
+        assert_eq!(
+            e["hint"], "Perhaps you meant the table 'public.zou_cache_widgets'",
+            "{method}"
+        );
+    }
+
+    // Nothing like anything, so nothing suggested.
+    let res = app.clone().oneshot(get("/rest/v1/zqx")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["hint"], serde_json::Value::Null);
+
+    // A view is a relation the cache has, like any other.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_cache_widget_view"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+
+    // A column a write names and the table does not have, from the
+    // body and from ?columns=, and never from postgres.
+    for (method, uri, body) in [
+        ("POST", "/rest/v1/zou_cache_widgets", r#"{"nope": 1}"#),
+        (
+            "PATCH",
+            "/rest/v1/zou_cache_widgets?id=eq.1",
+            r#"{"nope": 1}"#,
+        ),
+        (
+            "PUT",
+            "/rest/v1/zou_cache_widgets?id=eq.1",
+            r#"{"nope": 1}"#,
+        ),
+        (
+            "POST",
+            "/rest/v1/zou_cache_widgets?columns=id,nope",
+            r#"{"id": 2}"#,
+        ),
+        (
+            "PATCH",
+            "/rest/v1/zou_cache_widgets?id=eq.1&columns=nope",
+            r#"{"id": 2}"#,
+        ),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(req(method, uri, body, &[]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+        assert_eq!(e["code"], "PGRST204", "{method} {uri}");
+        assert_eq!(
+            e["message"],
+            "Could not find the 'nope' column of 'zou_cache_widgets' in the schema cache",
+            "{method} {uri}"
+        );
+    }
+
+    // A PUT reads its columns off the body, so ?columns= narrowing
+    // it is not a refusal and not a narrowing either: rank is
+    // written even though the url did not name it.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/rest/v1/zou_cache_widgets?id=eq.1&columns=id",
+            r#"{"id": 1, "name": "renamed"}"#,
+            &[],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_cache_widgets?id=eq.1"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"id": 1, "name": "renamed"}]"#);
+
+    // What a table will take, which is the same list for every table
+    // and only says the table is there.
+    let res = app
+        .clone()
+        .oneshot(req("OPTIONS", "/rest/v1/zou_cache_widgets", "", &[]))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()["allow"],
+        "OPTIONS,GET,HEAD,POST,PUT,PATCH,DELETE"
+    );
+    assert_eq!(body_text(res).await, "");
 }

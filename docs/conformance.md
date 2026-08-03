@@ -211,16 +211,16 @@ They are skipped behind an environment flag rather than deleted, so the day the 
 
 ## Where zou stands
 
-The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes 659 of them, 54%, with 558 known differences.
+The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes 676 of them, 55%, with 541 known differences.
 That number is the honest one, and it is meant to be uncomfortable.
-The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, so 54% against it and 87% against the hand written suite are both true and they measure different things.
-The gap is broken down by feature and by shape in [tamnd/zou#118](https://github.com/tamnd/zou/issues/118), and it is a small number of missing features rather than 558 separate bugs: spread embeds through a to-many relationship, the parts of the query parser that answer `PGRST100`, relationship resolution that answers `PGRST200`, `OPTIONS`, `explain`, the media type handlers, `Range` on a table, and `preference-applied`.
+The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, so 55% against it and 92% against the hand written suite are both true and they measure different things.
+The gap is a checklist in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125), grouped by what has to be built rather than by the endpoint it shows up on, and it is a small number of missing features rather than 541 separate bugs: relationship resolution that answers `PGRST200`, spread embeds, function overload resolution, the parts of the query parser that answer `PGRST100`, `Prefer` handling, `Range` on a table, the media type handlers, and `explain`.
 
 supabase-js 2.111.0 runs 16 of its integration tests against zou and all 16 pass.
 
-The REST suite is 82 cases against PostgREST 14.15, and zou passes 72 of them, 87%, with 10 known differences.
-Every difference left is a message, a code, or a header, not a wrong answer to a question about data: error messages that name an internal alias instead of the table, raw SQLSTATEs where upstream has `PGRST205` or `PGRST204`, three wordings of a hint or a detail, an upsert that answers 201 where upstream answers 200 on a merge that updated, and `OPTIONS` on a table.
-They are tracked in [tamnd/zou#116](https://github.com/tamnd/zou/issues/116).
+The REST suite is 82 cases against PostgREST 14.15, and zou passes 76 of them, 92%, with 6 known differences.
+Every difference left is a message, a code, or a header, not a wrong answer to a question about data: two error messages that name an internal alias instead of the table, three wordings of a hint or a detail, and an upsert that answers 201 where upstream answers 200 on a merge that updated.
+They are tracked in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125) with everything else.
 
 The 49 cases that pass "written differently" are all the same two things: zou puts a space after each colon where PostgREST puts a newline between rows, and a `select=*` comes back with the columns in a different order.
 Neither is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.
