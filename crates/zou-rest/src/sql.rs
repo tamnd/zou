@@ -10,12 +10,21 @@
 //! literal parameter, and a text search configuration binds behind a
 //! ::regconfig cast.
 //!
+//! A column whose type reads values out of text through a cast, a
+//! data representation, is the one place a literal does not face its
+//! column bare: the placeholder goes through that function first, on
+//! every operator that compares the column with a value of it. Which
+//! operators those are was read off a live 14.15 rather than reasoned
+//! about, and the surprise is `isdistinct`, which compares and is
+//! left uncast anyway.
+//!
 //! Conditions on embedded resources need the fk graph and the lateral
 //! join shape, so anything with an embed path is refused here and
 //! waits for the embedding planner.
 
 use std::fmt;
 
+use crate::catalog::Relation;
 use crate::filter::{Cond, LogicOp, Node, Op, Quant, Value};
 use crate::scan::{JsonKey, JsonStep};
 
@@ -51,17 +60,20 @@ pub struct Sql {
 /// Compile the conjunction of these trees into one WHERE fragment.
 /// Every query pair on a request is one node, PostgREST ands them.
 pub fn where_clause(nodes: &[Node]) -> Result<Sql, CompileError> {
-    where_clause_from(nodes, None, Vec::new())
+    where_clause_from(nodes, None, Vec::new(), None)
 }
 
 /// The planner's entry: columns qualify with `qualifier` when given,
-/// and placeholder numbering continues from wherever `params` already
+/// placeholder numbering continues from wherever `params` already
 /// stands, so fragments from different subqueries share one dense
-/// parameter list.
+/// parameter list, and `rel` is the relation the columns belong to,
+/// which is how a literal finds the cast its column reads text
+/// through. No relation is every column taken bare.
 pub fn where_clause_from(
     nodes: &[Node],
     qualifier: Option<&str>,
     params: Vec<String>,
+    rel: Option<&Relation>,
 ) -> Result<Sql, CompileError> {
     if nodes.is_empty() {
         return err("nothing to compile");
@@ -69,6 +81,7 @@ pub fn where_clause_from(
     let mut c = Compiler {
         params,
         qualifier: qualifier.map(str::to_string),
+        rel,
     };
     let mut parts = Vec::with_capacity(nodes.len());
     for node in nodes {
@@ -80,15 +93,49 @@ pub fn where_clause_from(
     })
 }
 
-struct Compiler {
+struct Compiler<'a> {
     params: Vec<String>,
     qualifier: Option<String>,
+    rel: Option<&'a Relation>,
 }
 
-impl Compiler {
+impl Compiler<'_> {
     fn bind(&mut self, value: &str) -> String {
         self.params.push(value.to_string());
         format!("${}", self.params.len())
+    }
+
+    /// A literal bound and then read the way its column reads text.
+    /// The function wraps whatever the placeholder stands for, which
+    /// for a quantifier is a whole array and is why upstream refuses
+    /// that pair too rather than casting element by element.
+    fn bind_read(&mut self, read: Option<&str>, value: &str) -> String {
+        let hole = self.bind(value);
+        match read {
+            Some(func) => format!("{func}({hole})"),
+            None => hole,
+        }
+    }
+
+    /// The cast this condition's column reads text through, if its
+    /// type has one and if the operator is comparing the column with
+    /// a value of it.
+    ///
+    /// Three kinds of condition are not. A pattern is a pattern
+    /// rather than a value, and a live 14.15 leaves `like` and
+    /// `ilike` bound as they came, quantified or not. A json path
+    /// steps inside the column and lands on json rather than on the
+    /// column's own type. `is` takes a keyword and the full text
+    /// family takes a query, neither of which reaches this at all.
+    ///
+    /// `isdistinct` is the odd one, since it is a comparison and
+    /// upstream still leaves it uncast. Recorded rather than
+    /// reasoned: that is what the binary generates.
+    fn read_cast(&self, c: &Cond) -> Option<String> {
+        if pattern_op(c.op) || matches!(c.op, Op::IsDistinct) || !c.field.path.is_empty() {
+            return None;
+        }
+        self.rel?.column(&c.field.column)?.from_text.clone()
     }
 
     fn node(&mut self, node: &Node) -> Result<String, CompileError> {
@@ -124,6 +171,8 @@ impl Compiler {
             ));
         }
         let lhs = field_expr(self.qualifier.as_deref(), &c.field.column, &c.field.path);
+        let read = self.read_cast(c);
+        let read = read.as_deref();
 
         let expr = if let Some(quant) = c.quant {
             let Value::Array(elems) = &c.value else {
@@ -135,14 +184,15 @@ impl Compiler {
                 Quant::Any => "ANY",
                 Quant::All => "ALL",
             };
-            format!("{lhs} {sym} {q}({})", self.bind(&literal))
+            format!("{lhs} {sym} {q}({})", self.bind_read(read, &literal))
         } else {
             match c.op {
                 Op::In => {
                     let Value::List(elems) = &c.value else {
                         unreachable!("the grammar gives in a list");
                     };
-                    let holes: Vec<String> = elems.iter().map(|e| self.bind(e)).collect();
+                    let holes: Vec<String> =
+                        elems.iter().map(|e| self.bind_read(read, e)).collect();
                     format!("{lhs} IN ({})", holes.join(", "))
                 }
                 Op::Is => {
@@ -154,7 +204,7 @@ impl Compiler {
                 }
                 Op::IsDistinct => {
                     let lit = lit_value(&c.value);
-                    format!("{lhs} IS DISTINCT FROM {}", self.bind(lit))
+                    format!("{lhs} IS DISTINCT FROM {}", self.bind_read(read, lit))
                 }
                 Op::Fts | Op::Plfts | Op::Phfts | Op::Wfts => {
                     let func = match c.op {
@@ -184,7 +234,7 @@ impl Compiler {
                     if pattern_op(c.op) {
                         lit = lit.replace('*', "%");
                     }
-                    format!("{lhs} {sym} {}", self.bind(&lit))
+                    format!("{lhs} {sym} {}", self.bind_read(read, &lit))
                 }
             }
         };
@@ -307,6 +357,7 @@ pub(crate) fn quote_ident(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Column;
     use crate::filter::{Parsed, parse_pair};
 
     fn node(key: &str, value: &str) -> Node {
@@ -486,6 +537,113 @@ mod tests {
 
         let e = where_clause(&[]).unwrap_err();
         assert_eq!(e.message, "nothing to compile");
+    }
+
+    /// A relation whose `label_color` reads text through a cast and
+    /// whose `name` is a plain one.
+    fn painted() -> Relation {
+        Relation {
+            name: "todos".into(),
+            columns: vec![
+                Column {
+                    name: "label_color".into(),
+                    to_json: Some("test.json".into()),
+                    from_text: Some("test.color".into()),
+                },
+                Column {
+                    name: "name".into(),
+                    ..Column::default()
+                },
+            ],
+        }
+    }
+
+    fn painted_clause(key: &str, value: &str) -> Sql {
+        let rel = painted();
+        where_clause_from(&[node(key, value)], None, Vec::new(), Some(&rel))
+            .unwrap_or_else(|e| panic!("{key}={value} failed: {e}"))
+    }
+
+    #[test]
+    fn a_url_value_is_read_through_the_cast_its_column_has() {
+        let s = painted_clause("label_color", "eq.red");
+        assert_eq!(s.text, r#""label_color" = test.color($1)"#);
+        assert_eq!(s.params, vec!["red"]);
+
+        // A column of a plain type, and a column of no relation at
+        // all, are bound the way they always were.
+        assert_eq!(painted_clause("name", "eq.x").text, r#""name" = $1"#);
+        assert_eq!(
+            where_clause(&[node("label_color", "eq.red")]).unwrap().text,
+            r#""label_color" = $1"#
+        );
+    }
+
+    #[test]
+    fn a_comparison_reads_its_value_whatever_the_operator_is() {
+        // Every one of these is generated with the call in it by a
+        // live 14.15, including the one where the call cannot work.
+        // Upstream wraps the placeholder without asking whether the
+        // function will take what it stands for, so a quantifier
+        // hands it a whole array and postgres answers 42809.
+        assert_eq!(
+            painted_clause("label_color", "gte.red").text,
+            r#""label_color" >= test.color($1)"#
+        );
+        assert_eq!(
+            painted_clause("label_color", "match.^re").text,
+            r#""label_color" ~ test.color($1)"#
+        );
+        assert_eq!(
+            painted_clause("label_color", "cs.red").text,
+            r#""label_color" @> test.color($1)"#
+        );
+        assert_eq!(
+            painted_clause("label_color", "not.eq.red").text,
+            r#"NOT ("label_color" = test.color($1))"#
+        );
+        assert_eq!(
+            painted_clause("label_color", "in.(red,blue)").text,
+            r#""label_color" IN (test.color($1), test.color($2))"#
+        );
+        assert_eq!(
+            painted_clause("label_color", "eq(any).{red,blue}").text,
+            r#""label_color" = ANY(test.color($1))"#
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_value_of_the_column_is_not_cast() {
+        // A pattern is a pattern rather than a colour, `is` takes a
+        // keyword, full text search takes a query, and a json path
+        // has left the column's type behind before it is compared.
+        // `isdistinct` is a comparison and is uncast anyway, which
+        // is upstream's own exception and not a rule anybody would
+        // arrive at.
+        assert_eq!(
+            painted_clause("label_color", "like.re*").text,
+            r#""label_color" LIKE $1"#
+        );
+        assert_eq!(
+            painted_clause("label_color", "ilike(all).{re*,b*}").text,
+            r#""label_color" ILIKE ALL($1)"#
+        );
+        assert_eq!(
+            painted_clause("label_color", "isdistinct.red").text,
+            r#""label_color" IS DISTINCT FROM $1"#
+        );
+        assert_eq!(
+            painted_clause("label_color", "is.null").text,
+            r#""label_color" IS NULL"#
+        );
+        assert_eq!(
+            painted_clause("label_color", "fts.cat").text,
+            r#""label_color" @@ to_tsquery($1)"#
+        );
+        assert_eq!(
+            painted_clause("label_color->>shade", "eq.dark").text,
+            r#""label_color"->>'shade' = $1"#
+        );
     }
 
     #[test]

@@ -500,6 +500,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
     // and the qualified RETURNING dodges the payload columns.
     let s = mutate::update(
         "books",
+        None,
         &cols(&["price"]),
         r#"{"price":30}"#.into(),
         &nodes(&[("id", "gte.3")]),
@@ -513,6 +514,7 @@ async fn mutations_execute_and_read_back_through_the_planner() {
     // Delete hands back what it removed.
     let s = mutate::delete(
         "books",
+        None,
         &nodes(&[("id", "eq.4")]),
         &Returning::Cols(cols(&["id"])),
     )
