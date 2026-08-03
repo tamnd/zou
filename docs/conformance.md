@@ -140,7 +140,7 @@ Upstream gets that for free by rolling every transaction back; here the answers 
 
 The `rest` suite is hand written, 82 cases about the surface a Supabase project actually uses.
 The `postgrest` suite is not written at all.
-`derive` reads a PostgREST checkout at the pinned version, walks its spec files, and turns every request in them into a case: 1233 of them, out of the 22 spec modules the default test app in `Main.hs` runs.
+`derive` reads a PostgREST checkout at the pinned version, walks its spec files, and turns every request in them into a case: 1217 of them, out of the 22 spec modules the default test app in `Main.hs` runs.
 
 ```
 git clone --branch v14.15 https://github.com/PostgREST/postgrest /tmp/postgrest-src
@@ -160,7 +160,14 @@ And two statements are swept up: upstream creates two schemas whose names are ma
 Neither matters upstream, where the fixtures load into a database made a moment earlier.
 Here the same file is applied once per target, so it has to be able to run twice.
 
-Two of the 1235 requests in those files are not understood by the deriver, both in `InsertSpec`, and it says so rather than quietly dropping them.
+Two of the requests in those files are not understood by the deriver, both in `InsertSpec`, and it says so rather than quietly dropping them.
+
+Sixteen more are left out on purpose, and the reason is worth writing down because it is the one kind of case this design cannot handle.
+They ask for `Prefer: count=planned` or `count=estimated`, and the answer to those is the planner's row estimate in `Content-Range`.
+That estimate is a property of the physical table at the moment of the query rather than of the request: it moves with the page count, so a table that a few writing cases have churned answers differently from the same table an autovacuum has just been over.
+Four of them flipped between two runs of the same commit in CI, 400 to 960 and 1200 to 1600 on a four row table.
+Upstream can ask them because upstream runs against a database made seconds earlier in a fixed order; here the answer is recorded on one machine and compared on another, days apart.
+They are not excused and not known, they are not asked, because a recording of a guess is not something to compare and a ratchet that goes red at random teaches everybody to ignore it.
 
 The reference for this suite is configured the way upstream configures its own:
 
@@ -202,10 +209,10 @@ They are skipped behind an environment flag rather than deleted, so the day the 
 
 ## Where zou stands
 
-The `postgrest` suite is 1233 cases against PostgREST 14.15, and zou passes 589 of them, 47%, with 644 known differences.
+The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes 582 of them, 48%, with 635 known differences.
 That number is the honest one, and it is meant to be uncomfortable.
-The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, so 47% against it and 86% against the hand written suite are both true and they measure different things.
-The gap is broken down by feature and by shape in [tamnd/zou#118](https://github.com/tamnd/zou/issues/118), and it is a small number of missing features rather than 644 separate bugs: spread embeds through a to-many relationship, the parts of the query parser that answer `PGRST100`, relationship resolution that answers `PGRST200`, `OPTIONS`, `explain`, the media type handlers, `Range` on a table, and `preference-applied`.
+The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, so 48% against it and 86% against the hand written suite are both true and they measure different things.
+The gap is broken down by feature and by shape in [tamnd/zou#118](https://github.com/tamnd/zou/issues/118), and it is a small number of missing features rather than 635 separate bugs: spread embeds through a to-many relationship, the parts of the query parser that answer `PGRST100`, relationship resolution that answers `PGRST200`, `OPTIONS`, `explain`, the media type handlers, `Range` on a table, and `preference-applied`.
 
 supabase-js 2.111.0 runs 16 of its integration tests against zou and all 16 pass.
 
