@@ -44,7 +44,7 @@
 
 use std::fmt;
 
-use crate::catalog::{Catalog, Column, EmbedError, Kind, Rel, Relation};
+use crate::catalog::{Catalog, Column, Details, EmbedError, Kind, Rel, Relation};
 use crate::filter::{Node, Op, Value};
 use crate::order::{Direction, Nulls, Term};
 use crate::select::{Col, Embed, Item, Join};
@@ -225,7 +225,7 @@ fn not_implemented(details: &str) -> EmbedError {
     EmbedError {
         code: "PGRST127",
         message: "Feature not implemented".into(),
-        details: Some(details.to_string()),
+        details: Some(Details::Text(details.to_string())),
         hint: None,
     }
 }
@@ -237,9 +237,9 @@ fn unordered_relationship(parent: &str, key: &str) -> EmbedError {
     EmbedError {
         code: "PGRST118",
         message: format!("A related order on '{key}' is not possible"),
-        details: Some(format!(
+        details: Some(Details::Text(format!(
             "'{parent}' and '{key}' do not form a many-to-one or one-to-one relationship"
-        )),
+        ))),
         hint: None,
     }
 }
@@ -1458,7 +1458,7 @@ mod tests {
         assert_eq!(e.code, "PGRST127");
         assert_eq!(e.message, "Feature not implemented");
         assert_eq!(
-            e.details.as_deref(),
+            e.details.as_ref().and_then(Details::text),
             Some("Aggregates are not implemented for one-to-many or many-to-many spreads.")
         );
     }
@@ -1536,7 +1536,7 @@ mod tests {
         assert_eq!(e.code, "PGRST118");
         assert_eq!(e.message, "A related order on 'orders' is not possible");
         assert_eq!(
-            e.details.as_deref(),
+            e.details.as_ref().and_then(Details::text),
             Some("'users' and 'orders' do not form a many-to-one or one-to-one relationship")
         );
 
