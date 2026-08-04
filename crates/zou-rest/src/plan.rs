@@ -141,7 +141,14 @@ pub fn plan_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sq
     };
     let root = p.next_alias();
     let text = p
-        .level(&q.table, &root, &q.select, &[], None, Wanted::default())?
+        .level(
+            &q.table,
+            &root,
+            &q.select,
+            &[],
+            Link::Root,
+            Wanted::default(),
+        )?
         .sql;
     Ok(Sql {
         text,
@@ -167,7 +174,7 @@ pub fn count(catalog: &Catalog, q: &Query) -> Result<Sql, PlanError> {
         next: 0,
     };
     let root = p.next_alias();
-    let text = p.count_level(&q.table, &root, &q.select, &[], None)?;
+    let text = p.count_level(&q.table, &root, &q.select, &[], Link::Root)?;
     Ok(Sql {
         text,
         params: p.params,
@@ -355,6 +362,22 @@ struct Embedded {
     kind: Kind,
 }
 
+/// How a level hangs off the one around it.
+///
+/// A foreign key gives a condition to put in the where clause and
+/// leaves the from clause alone. A computed relationship is the other
+/// way round: the parent row is the function's argument, so the link
+/// is in the from clause and there is no condition to add anywhere.
+enum Link {
+    /// The root, with nothing around it.
+    Root,
+    /// A join condition, already rendered against both aliases.
+    On(String),
+    /// A call taking the parent row, already rendered, which the
+    /// level reads from instead of from its table.
+    Call(String),
+}
+
 impl Planner<'_> {
     fn next_alias(&mut self) -> String {
         let a = format!("z{}", self.next);
@@ -363,15 +386,14 @@ impl Planner<'_> {
     }
 
     /// One SELECT over one table: the root or the inside of an embed
-    /// lateral. `link` is the join condition to the parent, already
-    /// rendered against both aliases.
+    /// lateral. `link` is how this level reaches the one around it.
     fn level(
         &mut self,
         table: &str,
         alias: &str,
         items: &[Item],
         path: &[String],
-        link: Option<String>,
+        link: Link,
         wanted: Wanted,
     ) -> Result<Level, PlanError> {
         let mut cols: Vec<OutCol> = Vec::new();
@@ -489,16 +511,9 @@ impl Planner<'_> {
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        // The root reads from the source relation when the query is
-        // a representation over a mutation CTE, embeds keep reading
-        // their real tables.
-        let from = match &self.q.source {
-            Some(s) if path.is_empty() => s.as_str(),
-            _ => table,
-        };
         sql.push_str(&format!(
             " from {} as {}",
-            quote_ident(from),
+            from_sql(&link, &self.q.source, table, path),
             quote_ident(alias)
         ));
         for l in &laterals {
@@ -507,7 +522,7 @@ impl Planner<'_> {
         }
 
         let mut conjuncts: Vec<String> = Vec::new();
-        if let Some(link) = link {
+        if let Link::On(link) = link {
             conjuncts.push(link);
         }
         let mine: Vec<Node> = self
@@ -592,20 +607,16 @@ impl Planner<'_> {
         alias: &str,
         items: &[Item],
         path: &[String],
-        link: Option<String>,
+        link: Link,
     ) -> Result<String, PlanError> {
-        let from = match &self.q.source {
-            Some(s) if path.is_empty() => s.as_str(),
-            _ => table,
-        };
         let mut sql = format!(
             "select 1 from {} as {}",
-            quote_ident(from),
+            from_sql(&link, &self.q.source, table, path),
             quote_ident(alias)
         );
 
         let mut conjuncts: Vec<String> = Vec::new();
-        if let Some(link) = link {
+        if let Link::On(link) = link {
             conjuncts.push(link);
         }
         let mine: Vec<Node> = self
@@ -680,7 +691,7 @@ impl Planner<'_> {
         let mut child_path = path.to_vec();
         child_path.push(key_of(e).to_string());
         let link = link_sql(&rel, alias, &child, junction.as_deref());
-        self.count_level(&rel.table, &child, &e.items, &child_path, Some(link))
+        self.count_level(&rel.table, &child, &e.items, &child_path, link)
     }
 
     /// One column pick: the expression, its casts, its aggregate,
@@ -782,7 +793,7 @@ impl Planner<'_> {
             &child,
             &e.items,
             &child_path,
-            Some(link),
+            link,
             child_wanted,
         )?;
 
@@ -915,10 +926,43 @@ fn represented(alias: &str, col: &Column) -> String {
     }
 }
 
-/// The join condition between a child level and its parent, straight
-/// column pairs, or an IN subquery through the junction of a many to
-/// many so the child level still reads from exactly one table.
-fn link_sql(rel: &Rel, parent: &str, child: &str, junction: Option<&str>) -> String {
+/// What a level reads from: its table, the source relation when the
+/// query is a representation over a mutation or an rpc CTE, or the
+/// call of a computed relationship. Only the root reads a source, the
+/// embeds under it keep reading their real tables.
+fn from_sql(link: &Link, source: &Option<String>, table: &str, path: &[String]) -> String {
+    match (link, source) {
+        (Link::Call(call), _) => call.clone(),
+        (_, Some(s)) if path.is_empty() => quote_ident(s),
+        _ => quote_ident(table),
+    }
+}
+
+/// How a child level reaches its parent: the call of a computed
+/// relationship, or else a join condition, straight column pairs or
+/// through the junction of a many to many so the child level still
+/// reads from exactly one table.
+///
+/// The parent row goes into the call cast to the relation the
+/// function takes. That cast is what picks one of two functions of
+/// the same name apart, and it is also what lets the row of a
+/// mutation's CTE go in, since a CTE has a row type of its own that
+/// no function was declared over.
+fn link_sql(rel: &Rel, parent: &str, child: &str, junction: Option<&str>) -> Link {
+    if let Some(call) = &rel.call {
+        return Link::Call(format!(
+            "{}({}::{})",
+            quote_ident(&call.function),
+            quote_ident(parent),
+            quote_ident(&call.arg)
+        ));
+    }
+    Link::On(join_sql(rel, parent, child, junction))
+}
+
+/// The join condition itself, once the relationship is known to have
+/// one.
+fn join_sql(rel: &Rel, parent: &str, child: &str, junction: Option<&str>) -> String {
     match &rel.via {
         None => rel
             .join
@@ -1043,7 +1087,7 @@ fn order_terms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnRow, FkRow};
+    use crate::catalog::{ColumnRow, ComputedRow, FkRow};
     use crate::filter::{Parsed, parse_pair};
     use crate::{order, select};
 
@@ -1275,6 +1319,74 @@ mod tests {
         assert_eq!(
             text(&q),
             r#"select "z0"."id" as "id", to_jsonb("e_z1") as "users" from "orders" as "z0" left join lateral (select "z1"."id" as "id" from "users" as "z1" where "z1"."id" = "z0"."user_id") as "e_z1" on true"#
+        );
+    }
+
+    /// The shop with three functions over it: one listing a user's
+    /// orders, one naming an order's user, and one called `users`,
+    /// which is the name the foreign key between them already
+    /// answered to.
+    fn computed() -> Catalog {
+        let row = |function: &str, table: &str, ftable: &str, single: bool| ComputedRow {
+            function: function.into(),
+            table: table.into(),
+            ftable: ftable.into(),
+            single,
+        };
+        shop().with_computed(vec![
+            row("recent_orders", "users", "orders", false),
+            row("buyer", "orders", "users", true),
+            row("users", "orders", "users", true),
+        ])
+    }
+
+    fn computed_text(table: &str, sel: &str) -> String {
+        let q = query(table, sel);
+        plan(&computed(), &q).unwrap_or_else(|e| panic!("{e}")).text
+    }
+
+    #[test]
+    fn a_computed_embed_calls_the_function_on_the_parent_row() {
+        // No join condition anywhere: the argument is the join, and
+        // the cast on it is what tells two functions of one name
+        // apart.
+        assert_eq!(
+            computed_text("users", "id,recent_orders(id)"),
+            r#"select "z0"."id" as "id", coalesce("e_z1"."j", '[]'::jsonb) as "recent_orders" from "users" as "z0" left join lateral (select jsonb_agg(to_jsonb("r_z1")) as "j" from (select "z1"."id" as "id" from "recent_orders"("z0"::"users") as "z1") as "r_z1") as "e_z1" on true"#
+        );
+    }
+
+    #[test]
+    fn a_function_that_gives_back_one_row_is_a_to_one() {
+        assert_eq!(
+            computed_text("orders", "id,buyer(id)"),
+            r#"select "z0"."id" as "id", to_jsonb("e_z1") as "buyer" from "orders" as "z0" left join lateral (select "z1"."id" as "id" from "buyer"("z0"::"orders") as "z1") as "e_z1" on true"#
+        );
+    }
+
+    #[test]
+    fn a_function_named_after_a_table_takes_the_embed_over() {
+        // The foreign key is still there and `users` still reaches
+        // the users table, but through the function now.
+        assert!(
+            computed_text("orders", "users(id)")
+                .contains(r#"from "users"("z0"::"orders") as "z1""#),
+            "{}",
+            computed_text("orders", "users(id)")
+        );
+        // And the key it replaced is gone rather than left as a
+        // second answer, so neither of the key's other spellings
+        // reaches it either.
+        let q = query("orders", "orders_user_id_fkey(id)");
+        assert!(matches!(plan(&computed(), &q), Err(PlanError::Embed(_))));
+    }
+
+    #[test]
+    fn the_count_query_calls_it_too() {
+        let q = query("users", "id,recent_orders!inner(id)");
+        assert_eq!(
+            count(&computed(), &q).unwrap().text,
+            r#"select 1 from "users" as "z0" where exists (select 1 from "recent_orders"("z0"::"users") as "z1")"#
         );
     }
 
