@@ -23,6 +23,14 @@
 //! named count, and a bare `!inner` is the join flag while `!"inner"`
 //! is a hint named inner.
 //!
+//! A select list may be written with spaces after its commas, and a
+//! name may be written with spaces around it, because upstream builds
+//! an unquoted name out of letters, digits, `_`, `$` and spaces and
+//! then strips the ends off it. So `id, name` is two columns rather
+//! than a column called ` name`, `clients (id)` is an embed, and
+//! `first name` is still one column called `first name`. A quoted name
+//! keeps whatever is inside the quotes.
+//!
 //! Every parse renders back to a canonical string via [`render`], and
 //! reparsing that string yields an equal tree. The canonical form
 //! writes the hint before the join flag; parsing accepts either order.
@@ -140,7 +148,18 @@ fn name_break(b: u8) -> bool {
 fn parse_items(cur: &mut Cur) -> Result<Vec<Item>, Error> {
     let mut out = Vec::new();
     loop {
-        out.push(parse_item(cur)?);
+        let item = parse_item(cur)?;
+        // A column takes the spaces before the comma into its own name
+        // and gives them back when it is trimmed. An embed ends on its
+        // closing bracket with nothing left to take them with, so the
+        // list steps over them, and only as far as a comma, because
+        // upstream reads them as the front of the separator: a list
+        // that ends on a bracket and a space is a parse error there
+        // too.
+        if matches!(item, Item::Embed(_) | Item::Spread(_)) {
+            cur.skip_spaces_before(b',');
+        }
+        out.push(item);
         if cur.eat(b',') {
             continue;
         }
@@ -150,7 +169,33 @@ fn parse_items(cur: &mut Cur) -> Result<Vec<Item>, Error> {
 
 /// A name at the cursor, and whether it was quoted, which exempts it
 /// from being read as `*`, `count()`, `inner`, or `left`.
+///
+/// Unquoted, the spaces around it are not part of it. Upstream gets
+/// there by a route worth knowing about: a space is one of the
+/// characters an identifier is made of, so `id, name` reads the second
+/// name as ` name` and then strips it. That is why `select=first name`
+/// is a column called `first name` and `select=id, name` is not a
+/// column called ` name`, and why the spaces come off both ends rather
+/// than only the front.
 fn parse_name(cur: &mut Cur) -> Result<(String, bool), Error> {
+    let (name, quoted) = parse_raw_name(cur)?;
+    let name = match quoted {
+        true => name,
+        false => name.trim_matches([' ', '\t']).to_string(),
+    };
+    if name.is_empty() {
+        return cur.err("expected a name");
+    }
+    Ok((name, quoted))
+}
+
+/// The same, with the spaces left on.
+///
+/// One caller wants them: `!inner` is matched as a word rather than
+/// read as a name, so upstream takes `!inner (id)` as a hint that
+/// failed to be followed by a list rather than as an inner join, while
+/// `!hint (id)` is a hint with the space stripped off it.
+fn parse_raw_name(cur: &mut Cur) -> Result<(String, bool), Error> {
     let quoted = cur.peek() == Some(b'"');
     let name = if quoted {
         scan_quoted(cur)?
@@ -215,11 +260,14 @@ fn parse_cast(cur: &mut Cur) -> Result<Option<String>, Error> {
     if !cur.eat_str("::") {
         return Ok(None);
     }
+    // A type name is an identifier like any other, so `id::text , x`
+    // leaves its trailing space on the type and the type gives it back.
     let name = scan_name(cur, name_break);
+    let name = name.trim_matches([' ', '\t']);
     if name.is_empty() {
         return cur.err("expected a type after ::");
     }
-    Ok(Some(name))
+    Ok(Some(name.to_string()))
 }
 
 fn parse_agg(cur: &mut Cur) -> Result<(Option<Agg>, Option<String>), Error> {
@@ -252,12 +300,19 @@ fn parse_embed_tail(
     let mut join = None;
     while cur.eat(b'!') {
         let at = cur.pos;
-        let (flag, fq) = parse_name(cur)?;
-        let flag_join = match (flag.as_str(), fq) {
+        let (raw, fq) = parse_raw_name(cur)?;
+        let flag_join = match (raw.as_str(), fq) {
             ("inner", false) => Some(Join::Inner),
             ("left", false) => Some(Join::Left),
             _ => None,
         };
+        let flag = match fq {
+            true => raw,
+            false => raw.trim_matches([' ', '\t']).to_string(),
+        };
+        if flag.is_empty() {
+            return cur.err("expected a name");
+        }
         if let Some(j) = flag_join {
             if join.is_some() {
                 return Err(Error {
@@ -294,9 +349,15 @@ fn parse_embed_tail(
 }
 
 /// True when a name cannot be written bare in a select item: it
-/// contains a delimiter, an arrow, or would be read as the star item.
+/// contains a delimiter, an arrow, would be read as the star item, or
+/// carries a space on an end, where a bare one would lose it.
 fn name_needs_quotes(s: &str) -> bool {
-    s.is_empty() || s == "*" || s.bytes().any(|b| name_break(b) || b == b'\\') || s.contains("->")
+    s.is_empty()
+        || s == "*"
+        || s.bytes().any(|b| name_break(b) || b == b'\\')
+        || s.contains("->")
+        || s.starts_with([' ', '\t'])
+        || s.ends_with([' ', '\t'])
 }
 
 struct Name<'a>(&'a str);
@@ -632,6 +693,88 @@ mod tests {
     }
 
     #[test]
+    fn a_list_may_be_written_with_spaces() {
+        let items = ok("id, name");
+        assert_eq!(items.len(), 2);
+        assert_eq!(col(&items[1]).field.as_ref().unwrap().name, "name");
+
+        let items = ok(" id , name ");
+        assert_eq!(col(&items[0]).field.as_ref().unwrap().name, "id");
+        assert_eq!(col(&items[1]).field.as_ref().unwrap().name, "name");
+
+        // Inside a name a space is a plain identifier character, only
+        // the ends come off.
+        let items = ok("first name");
+        assert_eq!(col(&items[0]).field.as_ref().unwrap().name, "first name");
+
+        let items = ok("alias : name");
+        let c = col(&items[0]);
+        assert_eq!(c.alias.as_deref(), Some("alias"));
+        assert_eq!(c.field.as_ref().unwrap().name, "name");
+
+        let items = ok("amount :: numeric");
+        let f = col(&items[0]).field.as_ref().unwrap();
+        assert_eq!(f.name, "amount");
+        assert_eq!(f.cast.as_deref(), Some("numeric"));
+
+        let items = ok("id, clients (id, name), x");
+        let e = embed(&items[1]);
+        assert_eq!(e.relation, "clients");
+        assert_eq!(col(&e.items[1]).field.as_ref().unwrap().name, "name");
+        assert_eq!(col(&items[2]).field.as_ref().unwrap().name, "x");
+
+        let items = ok("...clients (id), t !hint (id), u ! inner (id)");
+        let Item::Spread(e) = &items[0] else { panic!() };
+        assert_eq!(e.relation, "clients");
+        assert_eq!(embed(&items[1]).hint.as_deref(), Some("hint"));
+        // A space in front of inner makes it a hint, since the join
+        // flags are matched as words before the name rule sees them.
+        assert_eq!(embed(&items[2]).hint.as_deref(), Some("inner"));
+        assert_eq!(embed(&items[2]).join, None);
+    }
+
+    #[test]
+    fn a_quoted_name_keeps_its_spaces() {
+        let items = ok("\" name \"");
+        assert_eq!(col(&items[0]).field.as_ref().unwrap().name, " name ");
+        assert_eq!(render(&items), "\" name \"");
+
+        // Bare, it would read back short, so rendering quotes it.
+        let items = vec![Item::Col(Col {
+            alias: None,
+            field: Some(FieldSel {
+                name: "name ".into(),
+                path: Vec::new(),
+                cast: None,
+            }),
+            agg: None,
+            agg_cast: None,
+        })];
+        assert_eq!(render(&items), "\"name \"");
+        assert_eq!(parse(&render(&items)).unwrap(), items);
+    }
+
+    #[test]
+    fn spaces_the_grammar_does_not_take() {
+        // An embed ends on its bracket and has nothing to carry the
+        // spaces after it, so they are only allowed where a comma
+        // follows.
+        ok("clients(id) , x");
+        assert_eq!(
+            fail("clients(id) ").message,
+            "unexpected characters after the select list"
+        );
+        assert_eq!(fail("a(b(c) )").message, "unterminated embedded resource");
+
+        // An aggregate ends the same way and does not even get the
+        // comma.
+        assert_eq!(
+            fail("id.sum() , x").message,
+            "unexpected characters after the select list"
+        );
+    }
+
+    #[test]
     fn errors_point_at_the_problem() {
         assert_eq!(fail("a,,b").message, "expected a name");
         assert_eq!(
@@ -683,6 +826,9 @@ mod tests {
         "\"first name\"",
         "\"*\"",
         "*,rel(*),id",
+        "id, name",
+        "id, clients (id, name), x",
+        "\" name \"",
     ];
 
     #[test]
