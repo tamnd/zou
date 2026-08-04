@@ -315,6 +315,7 @@ impl std::error::Error for EmbedError {}
 pub struct Catalog {
     fks: Vec<FkRow>,
     rels: Vec<Relation>,
+    views: HashSet<String>,
     timezones: HashSet<String>,
     schema: String,
 }
@@ -328,9 +329,28 @@ impl Catalog {
         Catalog {
             fks,
             rels: Vec::new(),
+            views: HashSet::new(),
             timezones: HashSet::new(),
             schema: String::new(),
         }
+    }
+
+    /// The same catalog knowing which of its relations are views,
+    /// which resolution reads and nothing else does: a relationship
+    /// whose far end is a view can only be embedded under that
+    /// view's name, never under the constraint or the column the key
+    /// is on. Those two spellings belong to the table the view
+    /// borrowed the key from, and upstream keeps them there.
+    pub fn with_views(self, names: Vec<String>) -> Catalog {
+        Catalog {
+            views: names.into_iter().collect(),
+            ..self
+        }
+    }
+
+    /// Whether that name is a view rather than a table.
+    pub fn is_view(&self, name: &str) -> bool {
+        self.views.contains(name)
     }
 
     /// The same catalog knowing which schema it was read out of,
@@ -428,6 +448,7 @@ impl Catalog {
             if fk.ref_table == parent {
                 cands.push(Cand {
                     card: if fk.unique { Card::O2O } else { Card::O2M },
+                    view: self.is_view(&fk.table),
                     rel: Rel {
                         kind: if fk.unique { Kind::ToOne } else { Kind::ToMany },
                         table: fk.table.clone(),
@@ -441,6 +462,7 @@ impl Catalog {
             if fk.table == parent {
                 cands.push(Cand {
                     card: if fk.unique { Card::O2O } else { Card::M2O },
+                    view: self.is_view(&fk.ref_table),
                     rel: Rel {
                         kind: Kind::ToOne,
                         table: fk.ref_table.clone(),
@@ -463,6 +485,7 @@ impl Catalog {
                 }
                 cands.push(Cand {
                     card: Card::M2M,
+                    view: self.is_view(&b.ref_table),
                     rel: Rel {
                         kind: Kind::ToMany,
                         table: b.ref_table.clone(),
@@ -489,9 +512,10 @@ impl Catalog {
     /// The target is a name for the relationship rather than for the
     /// relation: `clients`, the foreign table, but equally
     /// `projects_client_id_fkey`, the constraint, or `client_id`,
-    /// the column the constraint is on. Upstream refuses the last
-    /// two when the foreign table is a view, which cannot arise
-    /// here because a foreign key never points at one.
+    /// the column the constraint is on. The last two are refused
+    /// when the foreign table is a view, which is what keeps a view
+    /// over one end of a key from making every embed by column name
+    /// ambiguous.
     ///
     /// A self relationship is the one place the target alone cannot
     /// say which way the join runs, since both ends carry the same
@@ -554,6 +578,9 @@ impl Catalog {
 struct Cand {
     rel: Rel,
     card: Card,
+    /// Whether the far end is a view, which narrows what the embed
+    /// may call this relationship.
+    view: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,8 +641,15 @@ impl Cand {
         match hint {
             None => {
                 target == self.rel.table
-                    || self.cons() == Some(target)
-                    || self.near_col() == Some(target)
+                    // The constraint and the column are the table's
+                    // names for the key, and a view that borrowed
+                    // the key did not borrow them. Without this a
+                    // view over either end of a key would make every
+                    // embed by column name ambiguous, since the view
+                    // answers to the same column as the table it
+                    // took it from.
+                    || (!self.view
+                        && (self.cons() == Some(target) || self.near_col() == Some(target)))
             }
             Some(h) => {
                 target == self.rel.table
@@ -881,6 +915,57 @@ mod tests {
         // A hint may name either end of the pair.
         let r = c.resolve("orders", "users", Some("id")).unwrap();
         assert_eq!(r.join, vec![("user_id".into(), "id".into())]);
+    }
+
+    /// A view over one end of a key answers to its own name and to
+    /// nothing else, or every embed by column name would be
+    /// ambiguous the moment somebody wrote a view.
+    #[test]
+    fn a_view_does_not_answer_to_the_key_the_table_lent_it() {
+        let c = Catalog::new(vec![
+            fk(
+                "orders_user_id_fkey",
+                "orders",
+                &["user_id"],
+                "users",
+                &["id"],
+            ),
+            // What deriving a view relationship adds: the same key
+            // again, pointing at a view over the users table.
+            fk(
+                "orders_user_id_fkey",
+                "orders",
+                &["user_id"],
+                "user_list",
+                &["id"],
+            ),
+        ])
+        .with_views(names(&["user_list"]));
+
+        // Both are reachable by name.
+        assert_eq!(c.resolve("orders", "users", None).unwrap().table, "users");
+        assert_eq!(
+            c.resolve("orders", "user_list", None).unwrap().table,
+            "user_list"
+        );
+
+        // The constraint and the column pick the table out, and the
+        // view sitting on the same key is not a second answer.
+        assert_eq!(
+            c.resolve("orders", "orders_user_id_fkey", None)
+                .unwrap()
+                .table,
+            "users"
+        );
+        assert_eq!(c.resolve("orders", "user_id", None).unwrap().table, "users");
+
+        // Without knowing which is the view there is no way to
+        // choose, and both spellings are ambiguous.
+        let blind = Catalog::new(c.fks().to_vec());
+        assert_eq!(
+            blind.resolve("orders", "user_id", None).unwrap_err().code,
+            "PGRST201"
+        );
     }
 
     fn names(list: &[&str]) -> Vec<String> {
