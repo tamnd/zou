@@ -3,10 +3,14 @@
 //! Every embedded resource becomes a lateral subquery against the
 //! target table, to many aggregated with jsonb_agg over to_jsonb, to
 //! one carrying the child's own columns and folded to json on the way
-//! out, and spreads merged into the parent's column list. The default
-//! join is left, so parents keep their rows and an absent embed reads
-//! as `[]` or `null`; `!inner` swaps the lateral in as a plain join,
-//! which is what makes a filter on the embed remove parent rows.
+//! out, and spreads merged into the parent's column list. Spreading a
+//! to many merges a list per column instead: the lateral aggregates
+//! each of the child's columns on its own, so `...processes(name)`
+//! gives the parent one `name` holding every child's name in the
+//! order the embed asked for. The default join is left, so parents
+//! keep their rows and an absent embed reads as `[]` or `null`;
+//! `!inner` swaps the lateral in as a plain join, which is what makes
+//! a filter on the embed remove parent rows.
 //!
 //! The level around a lateral can still point at it, which is what
 //! `order=clients(name)` and `clients=is.null` need: the first orders
@@ -35,8 +39,8 @@
 //! Aggregates group by every non aggregated output expression, the
 //! PostgREST rule, and jsonb embed columns take part since jsonb has
 //! equality. What the planner refuses, it refuses loudly: mixing an
-//! aggregate with `*` or with a spread, spreading a to many, casting
-//! to a type that is not a plain identifier.
+//! aggregate with `*` or with a spread, aggregating inside a spread
+//! to many, casting to a type that is not a plain identifier.
 
 use std::fmt;
 
@@ -136,7 +140,9 @@ pub fn plan_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sq
         next: 0,
     };
     let root = p.next_alias();
-    let text = p.level(&q.table, &root, &q.select, &[], None)?;
+    let text = p
+        .level(&q.table, &root, &q.select, &[], None, Wanted::default())?
+        .sql;
     Ok(Sql {
         text,
         params: p.params,
@@ -202,6 +208,18 @@ fn not_embedded(name: &str) -> EmbedError {
         hint: Some(format!(
             "Verify that '{name}' is included in the 'select' query parameter."
         )),
+    }
+}
+
+/// PostgREST's PGRST127: a shape the planner reads and does not
+/// build. Aggregating inside a spread of a to many is upstream's own
+/// gap, and zou keeps the same hole so the answer is the same answer.
+fn not_implemented(details: &str) -> EmbedError {
+    EmbedError {
+        code: "PGRST127",
+        message: "Feature not implemented".into(),
+        details: Some(details.to_string()),
+        hint: None,
     }
 }
 
@@ -298,6 +316,32 @@ struct OutCol {
     aggregated: bool,
     /// `z.*` and spread `e.*` items, which cannot GROUP BY.
     splat: bool,
+    /// The names this item answers to in the response. One for an
+    /// ordinary column, the whole of a spread's column list for a
+    /// spread, and none for a star nobody asked to have spelled out.
+    keys: Vec<String>,
+}
+
+/// What the thing around a level needs from it beyond the SQL.
+///
+/// A spread of a to many reads its body one column at a time, so the
+/// body has to spell out every column it selects, stars and all, and
+/// its order has to come back out rather than be written into it,
+/// because the order belongs inside the aggregate. A spread of a to
+/// one nested in one has to spell its columns out too, since they
+/// become the outer spread's columns, but it keeps its own order.
+#[derive(Clone, Copy, Default)]
+struct Wanted {
+    names: bool,
+    order: bool,
+}
+
+/// A planned level: the SELECT, the keys its select list answers to,
+/// and the order terms it handed back instead of applying.
+struct Level {
+    sql: String,
+    keys: Vec<String>,
+    order: Vec<String>,
 }
 
 /// An embedded resource as the level around it sees it: the name it
@@ -328,7 +372,8 @@ impl Planner<'_> {
         items: &[Item],
         path: &[String],
         link: Option<String>,
-    ) -> Result<String, PlanError> {
+        wanted: Wanted,
+    ) -> Result<Level, PlanError> {
         let mut cols: Vec<OutCol> = Vec::new();
         let mut laterals: Vec<String> = Vec::new();
         let mut embeds: Vec<Embedded> = Vec::new();
@@ -339,8 +384,10 @@ impl Planner<'_> {
                 // A relation with a column that is written out
                 // through a cast has its star spelled out, because
                 // the call has to go somewhere and `t.*` has no room
-                // for one. Every other star stays a star.
-                Item::Star => match rel.filter(|r| r.represented()) {
+                // for one. A star inside a spread of a to many is
+                // spelled out too, since every column of it has to be
+                // aggregated by name. Every other star stays a star.
+                Item::Star => match rel.filter(|r| r.represented() || wanted.names) {
                     Some(rel) => cols.extend(rel.columns.iter().map(|c| {
                         let expr = represented(alias, c);
                         OutCol {
@@ -348,6 +395,7 @@ impl Planner<'_> {
                             expr,
                             aggregated: false,
                             splat: false,
+                            keys: vec![c.name.clone()],
                         }
                     })),
                     None => cols.push(OutCol {
@@ -355,6 +403,7 @@ impl Planner<'_> {
                         rendered: format!("{}.*", quote_ident(alias)),
                         aggregated: false,
                         splat: true,
+                        keys: Vec::new(),
                     }),
                 },
                 Item::Col(c) => cols.push(self.col(alias, rel, c)?),
@@ -364,6 +413,7 @@ impl Planner<'_> {
                     e,
                     path,
                     false,
+                    wanted,
                     &mut cols,
                     &mut laterals,
                     &mut embeds,
@@ -374,6 +424,7 @@ impl Planner<'_> {
                     e,
                     path,
                     true,
+                    wanted,
                     &mut cols,
                     &mut laterals,
                     &mut embeds,
@@ -390,12 +441,44 @@ impl Planner<'_> {
                 rendered: format!("{}.*", quote_ident(alias)),
                 aggregated: false,
                 splat: true,
+                keys: Vec::new(),
             });
         }
 
         let grouped = cols.iter().any(|c| c.aggregated);
         if grouped && cols.iter().any(|c| c.splat) {
             return refuse("an aggregate cannot mix with * or a spread in one select list");
+        }
+        if grouped && wanted.order {
+            return Err(not_implemented(
+                "Aggregates are not implemented for one-to-many or many-to-many spreads.",
+            )
+            .into());
+        }
+        let keys: Vec<String> = cols.iter().flat_map(|c| c.keys.clone()).collect();
+
+        // The order of a spread of a to many is not this level's to
+        // apply: it goes inside the aggregate that folds each column
+        // up. The columns it names have to be selected here anyway,
+        // under names of their own, because nothing can be ordered by
+        // what the subquery did not carry out.
+        let mut lifted: Vec<String> = Vec::new();
+        let terms = self.q.order.iter().find(|(r, _)| r == path);
+        if let (true, Some((_, terms))) = (wanted.order, terms) {
+            for (i, (expr, dir)) in order_terms(table, alias, terms, &embeds)?
+                .into_iter()
+                .enumerate()
+            {
+                let name = quote_ident(&format!("{alias}_o{}", i + 1));
+                cols.push(OutCol {
+                    rendered: format!("{expr} as {name}"),
+                    expr,
+                    aggregated: false,
+                    splat: false,
+                    keys: Vec::new(),
+                });
+                lifted.push(format!("{name}{dir}"));
+            }
         }
 
         let mut sql = String::from("select ");
@@ -484,7 +567,7 @@ impl Planner<'_> {
             }
         }
 
-        if let Some((_, terms)) = self.q.order.iter().find(|(r, _)| r == path) {
+        if let (false, Some((_, terms))) = (wanted.order, terms) {
             sql.push_str(" order by ");
             sql.push_str(&order_sql(table, alias, terms, &embeds)?);
         }
@@ -494,7 +577,11 @@ impl Planner<'_> {
         if let Some((_, n)) = self.q.offset.iter().find(|(r, _)| r == path) {
             sql.push_str(&format!(" offset {n}"));
         }
-        Ok(sql)
+        Ok(Level {
+            sql,
+            keys,
+            order: lifted,
+        })
     }
 
     /// One level of the count query: `select 1` from this table with
@@ -649,6 +736,7 @@ impl Planner<'_> {
             expr,
             aggregated: c.agg.is_some(),
             splat: false,
+            keys: vec![key],
         })
     }
 
@@ -662,6 +750,7 @@ impl Planner<'_> {
         e: &Embed,
         path: &[String],
         spread: bool,
+        wanted: Wanted,
         cols: &mut Vec<OutCol>,
         laterals: &mut Vec<String>,
         embeds: &mut Vec<Embedded>,
@@ -669,19 +758,33 @@ impl Planner<'_> {
         let rel = self
             .catalog
             .resolve(parent_table, &e.relation, e.hint.as_deref())?;
-        if spread && rel.kind == Kind::ToMany {
-            return refuse(format!(
-                "a spread embed needs a to one relationship, '{}' is to many here",
-                e.relation
-            ));
-        }
 
         let child = self.next_alias();
         let junction = rel.via.as_ref().map(|_| self.next_alias());
         let mut child_path = path.to_vec();
         child_path.push(key_of(e).to_string());
         let link = link_sql(&rel, parent_alias, &child, junction.as_deref());
-        let body = self.level(&rel.table, &child, &e.items, &child_path, Some(link))?;
+        let child_wanted = match (spread, rel.kind) {
+            (false, _) => Wanted::default(),
+            (true, Kind::ToMany) => Wanted {
+                names: true,
+                order: true,
+            },
+            // A spread of a to one hands its columns straight up, so
+            // it owes its own parent whatever its parent was owed.
+            (true, Kind::ToOne) => Wanted {
+                names: wanted.names,
+                order: false,
+            },
+        };
+        let body = self.level(
+            &rel.table,
+            &child,
+            &e.items,
+            &child_path,
+            Some(link),
+            child_wanted,
+        )?;
 
         let name = format!("e_{child}");
         let wrap = quote_ident(&name);
@@ -690,17 +793,64 @@ impl Planner<'_> {
         embeds.push(Embedded {
             key: key_of(e).to_string(),
             alias: name,
-            kind: if spread { Kind::ToOne } else { rel.kind },
+            kind: rel.kind,
         });
         if spread {
+            // A spread of a to many has no one row to merge in, so
+            // each column of the child comes back as the list of that
+            // column over every child row, ordered the way the embed
+            // asked to be. The row aggregate rides along beside them
+            // to answer whether the embed found anything at all.
+            if rel.kind == Kind::ToMany {
+                let sub = quote_ident(&format!("s_{child}"));
+                let order = match body.order.is_empty() {
+                    true => String::new(),
+                    false => format!(
+                        " order by {}",
+                        body.order
+                            .iter()
+                            .map(|t| format!("{sub}.{t}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                };
+                let mut picks = vec![format!("json_agg({sub})::jsonb as \"j\"")];
+                for k in &body.keys {
+                    let col = quote_ident(k);
+                    picks.push(format!(
+                        "coalesce(json_agg({sub}.{col}{order}), '[]')::jsonb as {col}"
+                    ));
+                    cols.push(OutCol {
+                        expr: format!("{wrap}.{col}"),
+                        rendered: format!("{wrap}.{col} as {col}"),
+                        aggregated: false,
+                        splat: false,
+                        keys: vec![k.clone()],
+                    });
+                }
+                let lateral = format!(
+                    "(select {} from ({}) as {sub}) as {wrap}",
+                    picks.join(", "),
+                    body.sql
+                );
+                if inner {
+                    laterals.push(format!(
+                        "join lateral {lateral} on {wrap}.\"j\" is not null"
+                    ));
+                } else {
+                    laterals.push(format!("left join lateral {lateral} on true"));
+                }
+                return Ok(());
+            }
             let joiner = if inner { "join" } else { "left join" };
-            laterals.push(format!("{joiner} lateral ({body}) as {wrap} on true"));
+            laterals.push(format!("{joiner} lateral ({}) as {wrap} on true", body.sql));
             if !e.items.is_empty() {
                 cols.push(OutCol {
                     expr: format!("{wrap}.*"),
                     rendered: format!("{wrap}.*"),
                     aggregated: false,
                     splat: true,
+                    keys: body.keys,
                 });
             }
             return Ok(());
@@ -710,7 +860,8 @@ impl Planner<'_> {
             Kind::ToMany => {
                 let row = quote_ident(&format!("r_{child}"));
                 let lateral = format!(
-                    "(select jsonb_agg(to_jsonb({row})) as \"j\" from ({body}) as {row}) as {wrap}"
+                    "(select jsonb_agg(to_jsonb({row})) as \"j\" from ({}) as {row}) as {wrap}",
+                    body.sql
                 );
                 if inner {
                     laterals.push(format!(
@@ -726,6 +877,7 @@ impl Planner<'_> {
                         expr,
                         aggregated: false,
                         splat: false,
+                        keys: vec![key_of(e).to_string()],
                     });
                 }
             }
@@ -735,7 +887,7 @@ impl Planner<'_> {
             // json is built on the way out instead.
             Kind::ToOne => {
                 let joiner = if inner { "join" } else { "left join" };
-                laterals.push(format!("{joiner} lateral ({body}) as {wrap} on true"));
+                laterals.push(format!("{joiner} lateral ({}) as {wrap} on true", body.sql));
                 if !e.items.is_empty() {
                     let expr = format!("to_jsonb({wrap})");
                     cols.push(OutCol {
@@ -743,6 +895,7 @@ impl Planner<'_> {
                         expr,
                         aggregated: false,
                         splat: false,
+                        keys: vec![key_of(e).to_string()],
                     });
                 }
             }
@@ -840,6 +993,22 @@ fn order_sql(
     terms: &[Term],
     embeds: &[Embedded],
 ) -> Result<String, PlanError> {
+    Ok(order_terms(table, alias, terms, embeds)?
+        .into_iter()
+        .map(|(expr, dir)| format!("{expr}{dir}"))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+/// Each order term as what it sorts and how, kept apart because a
+/// spread of a to many selects the what under a name of its own and
+/// carries only the how into the aggregate.
+fn order_terms(
+    table: &str,
+    alias: &str,
+    terms: &[Term],
+    embeds: &[Embedded],
+) -> Result<Vec<(String, String)>, PlanError> {
     let mut out = Vec::with_capacity(terms.len());
     for t in terms {
         let qualifier = match &t.relation {
@@ -855,20 +1024,20 @@ fn order_sql(
                 &e.alias
             }
         };
-        let mut s = field_expr(Some(qualifier), &t.name, &t.path);
+        let mut dir = String::new();
         match t.direction {
-            Some(Direction::Asc) => s.push_str(" asc"),
-            Some(Direction::Desc) => s.push_str(" desc"),
+            Some(Direction::Asc) => dir.push_str(" asc"),
+            Some(Direction::Desc) => dir.push_str(" desc"),
             None => {}
         }
         match t.nulls {
-            Some(Nulls::First) => s.push_str(" nulls first"),
-            Some(Nulls::Last) => s.push_str(" nulls last"),
+            Some(Nulls::First) => dir.push_str(" nulls first"),
+            Some(Nulls::Last) => dir.push_str(" nulls last"),
             None => {}
         }
-        out.push(s);
+        out.push((field_expr(Some(qualifier), &t.name, &t.path), dir));
     }
-    Ok(out.join(", "))
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1140,10 +1309,46 @@ mod tests {
             text(&q),
             r#"select "z0"."id" as "id", "e_z1".* from "orders" as "z0" left join lateral (select "z1"."id" as "id" from "users" as "z1" where "z1"."id" = "z0"."user_id") as "e_z1" on true"#
         );
+    }
 
-        let q = query("users", "id,...orders(id)");
-        let e = fails(&q);
-        assert!(e.to_string().contains("to one"), "{e}");
+    /// Spreading a list gives the parent one column per column of the
+    /// child, each holding the list of that column, and the order the
+    /// embed asked for rides inside the aggregate rather than being
+    /// applied to rows that are about to be folded up.
+    #[test]
+    fn a_spread_of_a_list_merges_a_list_per_column() {
+        let q = query("users", "id,...orders(total)");
+        assert_eq!(
+            text(&q),
+            r#"select "z0"."id" as "id", "e_z1"."total" as "total" from "users" as "z0" left join lateral (select json_agg("s_z1")::jsonb as "j", coalesce(json_agg("s_z1"."total"), '[]')::jsonb as "total" from (select "z1"."total" as "total" from "orders" as "z1" where "z1"."user_id" = "z0"."id") as "s_z1") as "e_z1" on true"#
+        );
+
+        let mut q = query("users", "id,...orders(total)");
+        q.order
+            .push((vec!["orders".into()], order::parse("id.desc").unwrap()));
+        let t = text(&q);
+        assert!(t.contains(r#""z1"."id" as "z1_o1" from "orders""#), "{t}");
+        assert!(
+            t.contains(r#"json_agg("s_z1"."total" order by "s_z1"."z1_o1" desc)"#),
+            "{t}"
+        );
+        assert!(!t.contains("order by \"z1\""), "{t}");
+    }
+
+    /// An aggregate inside a spread of a list is upstream's own gap,
+    /// and answering it with the same code is the compatible answer.
+    #[test]
+    fn an_aggregate_cannot_ride_inside_a_spread_of_a_list() {
+        let q = query("users", "id,...orders(total.sum())");
+        let PlanError::Embed(e) = fails(&q) else {
+            panic!("expected an embed error");
+        };
+        assert_eq!(e.code, "PGRST127");
+        assert_eq!(e.message, "Feature not implemented");
+        assert_eq!(
+            e.details.as_deref(),
+            Some("Aggregates are not implemented for one-to-many or many-to-many spreads.")
+        );
     }
 
     #[test]

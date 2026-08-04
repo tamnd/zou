@@ -3095,3 +3095,99 @@ async fn an_embed_can_be_named_by_the_key_that_makes_it() {
         r#"{"code":"PGRST200","details":"Searched for a foreign key relationship between 'zou_rest_staff' and 'zou_rest_dept' using the hint 'nowhere' in the schema 'public', but no matches were found.","hint":null,"message":"Could not find a relationship between 'zou_rest_staff' and 'zou_rest_dept' in the schema cache"}"#
     );
 }
+
+/// Spreading a list has no one row to merge into the parent, so each
+/// column of the child arrives as the list of that column over every
+/// child row: a key per column, empty rather than missing when the
+/// parent has no children, ordered the way the embed asked to be.
+#[tokio::test]
+async fn a_spread_of_a_list_arrives_one_column_at_a_time() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_player cascade",
+            "drop table if exists zou_rest_team cascade",
+            "create table zou_rest_team (id int primary key, name text)",
+            "create table zou_rest_player (\
+               id int primary key, \
+               name text, \
+               team_id int references zou_rest_team (id), \
+               coach_id int references zou_rest_player (id))",
+            "insert into zou_rest_team values (1, 'maps'), (2, 'roads'), (3, 'labs')",
+            "insert into zou_rest_player values \
+               (1, 'ada', 1, null), (3, 'cy', 1, 1), (2, 'bob', 2, 1)",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // The embed's order belongs inside the aggregate, since the rows
+    // it sorts are gone by the time the list exists.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_team?select=name,...zou_rest_player(players:name)\
+             &order=name&zou_rest_player.order=name.desc",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name": "labs", "players": []},{"name": "maps", "players": ["cy", "ada"]},{"name": "roads", "players": ["bob"]}]"#
+    );
+
+    // An embed inside the spread is a column of the child like any
+    // other, so it comes up as the list of what each child saw.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_team?select=name,...zou_rest_player(id,coach_id(name))\
+             &order=name&zou_rest_player.order=id.asc",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"id": [], "name": "labs", "coach_id": []},{"id": [1, 3], "name": "maps", "coach_id": [null, {"name": "ada"}]},{"id": [2], "name": "roads", "coach_id": [{"name": "ada"}]}]"#
+    );
+
+    // A star spreads every column of the child.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_team?select=team:name,...zou_rest_player(*)&id=eq.2",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"id": [2], "name": ["bob"], "team": "roads", "team_id": [2], "coach_id": [1]}]"#
+    );
+
+    // The parent without children is still a parent, unless the embed
+    // is inner, and it is the one the null test finds.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_team?select=team:name,...zou_rest_player!inner(name)\
+             &order=name&zou_rest_player.order=name",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name": ["ada", "cy"], "team": "maps"},{"name": ["bob"], "team": "roads"}]"#
+    );
+
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_team?select=name,...zou_rest_player(players:name)\
+             &zou_rest_player=is.null",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"name": "labs", "players": []}]"#);
+}
