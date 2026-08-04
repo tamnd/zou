@@ -3660,3 +3660,95 @@ async fn a_view_embeds_on_the_keys_of_the_tables_under_it() {
     let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
     assert_eq!(e["code"], "PGRST200");
 }
+
+#[tokio::test]
+async fn a_json_path_reads_whatever_the_column_holds() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_json_rows cascade",
+            "drop type if exists zou_json_point cascade",
+            "create type zou_json_point as (x int, y int)",
+            "create table zou_json_rows (\
+             id int primary key, doc jsonb, at zou_json_point, arr int[], odd jsonb)",
+            "insert into zou_json_rows values \
+             (1, '{\"a\": {\"b\": \"7\"}, \"list\": [10, 20, 30]}', '(1,9)', '{5,6,7}', \
+             '{\"a!@\": 1, \"23-x-45\": 2, \"0xy1\": 3}'), \
+             (2, '{\"a\": {\"b\": \"8\"}, \"list\": [40, 50, 60]}', '(2,8)', '{8,9,10}', \
+             '{\"a!@\": 4, \"23-x-45\": 5, \"0xy1\": 6}')",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // A composite type and an array are not json, so an arrow into
+    // one reads the column as json first.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_json_rows?select=id,at-%3E%3Ex,arr-%3E0&order=id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"x": "1", "id": 1, "arr": 5},{"x": "2", "id": 2, "arr": 8}]"#
+    );
+
+    // The same path filters and orders, and a negative index counts
+    // from the end.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_json_rows?select=id&at-%3E%3Ey=eq.8&order=arr-%3E%3E-1.desc",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+
+    // A cast over a path takes brackets, since `::` binds tighter
+    // than the arrow and would otherwise land on the key.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_json_rows?select=id,n:doc-%3Ea-%3E%3Eb::int&order=id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"n": 7, "id": 1},{"n": 8, "id": 2}]"#
+    );
+
+    // Only the six bytes the grammar needs end a key, a dash joins
+    // two pieces of one, and digits are an index only when nothing
+    // but an arrow, a cast, a dot or a comma follows them.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_json_rows?select=odd-%3E%3Ea!@,odd-%3E%3E23-x-45,odd-%3E%3E0xy1&id=eq.1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"a!@": "1", "0xy1": "3", "23-x-45": "2"}]"#
+    );
+
+    // A jsonb column is read as it is, so an index into a list is
+    // still an index.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_json_rows?select=id&doc-%3Elist-%3E%3E1=eq.50",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+}

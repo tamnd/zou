@@ -111,7 +111,7 @@ fn parse_term(cur: &mut Cur) -> Result<Term, Error> {
         relation = Some(name);
         name = parse_field(cur)?;
     }
-    let path = parse_json_path(cur, name_break)?;
+    let path = parse_json_path(cur)?;
     if relation.is_some() {
         cur.expect(b')', "unterminated related order")?;
     }

@@ -174,38 +174,88 @@ pub(crate) fn scan_quoted(cur: &mut Cur) -> Result<String, Error> {
 
 /// The arrow chain after a column name, empty when the next bytes are
 /// not `->`.
-pub(crate) fn parse_json_path(cur: &mut Cur, brk: fn(u8) -> bool) -> Result<Vec<JsonStep>, Error> {
+///
+/// A key inside the chain is read by its own rule rather than by the
+/// grammar the column name came from. Upstream gives it one, and it
+/// is a wider rule than any name's: `!` and `@` and `#` are ordinary
+/// characters in a json key and only the six the grammar has other
+/// uses for end one.
+pub(crate) fn parse_json_path(cur: &mut Cur) -> Result<Vec<JsonStep>, Error> {
     let mut path = Vec::new();
     while cur.eat_str("->") {
         let text = cur.eat(b'>');
-        let key = parse_json_key(cur, brk)?;
+        let key = parse_json_key(cur)?;
         path.push(JsonStep { text, key });
     }
     Ok(path)
 }
 
-fn parse_json_key(cur: &mut Cur, brk: fn(u8) -> bool) -> Result<JsonKey, Error> {
-    let bytes = cur.s.as_bytes();
-    let digit_at = |i: usize| bytes.get(i).is_some_and(|b| b.is_ascii_digit());
-    let index = digit_at(cur.pos) || (cur.peek() == Some(b'-') && digit_at(cur.pos + 1));
-    if index {
+/// Bytes that end a piece of a json path key, upstream's
+/// `noneOf "(-:.,>)"`. The dash is handled a step up, since a dash
+/// only ends a key when it is the head of the next arrow.
+fn json_key_break(b: u8) -> bool {
+    matches!(b, b'(' | b')' | b':' | b'.' | b',' | b'>')
+}
+
+fn parse_json_key(cur: &mut Cur) -> Result<JsonKey, Error> {
+    if let Some(n) = json_index(cur) {
+        return Ok(JsonKey::Index(n));
+    }
+    if cur.peek() == Some(b'"') {
+        return Ok(JsonKey::Name(scan_quoted(cur)?));
+    }
+    let mut parts = Vec::new();
+    loop {
         let start = cur.pos;
-        if cur.peek() == Some(b'-') {
+        while cur.peek().is_some_and(|b| !json_key_break(b) && b != b'-') {
             cur.bump();
         }
-        while cur.peek().is_some_and(|b| b.is_ascii_digit()) {
-            cur.bump();
+        if cur.pos == start {
+            return cur.err("expected a json path key");
         }
-        return match cur.s[start..cur.pos].parse::<i64>() {
-            Ok(n) => Ok(JsonKey::Index(n)),
-            Err(_) => cur.err("json index out of range"),
-        };
+        parts.push(cur.s[start..cur.pos].trim_matches([' ', '\t']));
+        // A dash is part of the key and joins two pieces of it, which
+        // is how `23-xy-45` stays one key, unless it is the head of
+        // the arrow that starts the next step.
+        if cur.peek() == Some(b'-') && !cur.starts("->") {
+            cur.bump();
+            continue;
+        }
+        return Ok(JsonKey::Name(parts.join("-")));
     }
-    let name = scan_name(cur, brk);
-    if name.is_empty() {
-        return cur.err("expected a json path key");
+}
+
+/// The index a step reads as a number, `None` when the step is a key.
+///
+/// Digits alone are not an index. Upstream asks for what follows them
+/// as well, `->`, `::`, `.`, `,` or nothing, so `0xy1` is the key
+/// `0xy1` rather than the index 0 with a key stuck to it, and only a
+/// well formed number counts.
+fn json_index(cur: &mut Cur) -> Option<i64> {
+    let bytes = cur.s.as_bytes();
+    let mut at = cur.pos;
+    if bytes.get(at) == Some(&b'-') {
+        at += 1;
     }
-    Ok(JsonKey::Name(name))
+    let digits = at;
+    while bytes.get(at).is_some_and(|b| b.is_ascii_digit()) {
+        at += 1;
+    }
+    if at == digits {
+        return None;
+    }
+    let rest = &cur.s[at..];
+    let ends = rest.is_empty()
+        || rest.starts_with("->")
+        || rest.starts_with("::")
+        || rest.starts_with('.')
+        || rest.starts_with(',');
+    if !ends {
+        return None;
+    }
+    let n = cur.s[cur.pos..at].parse::<i64>().ok()?;
+    cur.pos = at;
+    Some(n)
 }
 
 pub(crate) fn fmt_path(f: &mut fmt::Formatter<'_>, path: &[JsonStep]) -> fmt::Result {

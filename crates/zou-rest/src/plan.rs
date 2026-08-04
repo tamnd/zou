@@ -368,6 +368,9 @@ struct Embedded {
     key: String,
     alias: String,
     kind: Kind,
+    /// The relation underneath, which an order term on it needs in
+    /// order to know how to read a column of it.
+    table: String,
 }
 
 /// How a level hangs off the one around it.
@@ -495,7 +498,7 @@ impl Planner<'_> {
         let mut lifted: Vec<String> = Vec::new();
         let terms = self.q.order.iter().find(|(r, _)| r == path);
         if let (true, Some((_, terms))) = (wanted.order, terms) {
-            for (i, (expr, dir)) in order_terms(table, alias, terms, &embeds)?
+            for (i, (expr, dir)) in order_terms(self.catalog, table, alias, terms, &embeds)?
                 .into_iter()
                 .enumerate()
             {
@@ -592,7 +595,7 @@ impl Planner<'_> {
 
         if let (false, Some((_, terms))) = (wanted.order, terms) {
             sql.push_str(" order by ");
-            sql.push_str(&order_sql(table, alias, terms, &embeds)?);
+            sql.push_str(&order_sql(self.catalog, table, alias, terms, &embeds)?);
         }
         if let Some((_, n)) = self.q.limit.iter().find(|(r, _)| r == path) {
             sql.push_str(&format!(" limit {n}"));
@@ -710,17 +713,27 @@ impl Planner<'_> {
     /// the client would have been shown rather than the text of what
     /// the column holds. An aggregate takes the column bare: nothing
     /// sums a json value, and upstream has no case for it either.
+    ///
+    /// A cast over a json path takes brackets, because `::` binds
+    /// tighter than `->>` and `data->>0::int` would otherwise ask
+    /// postgres for the key `0::int` and hand back the text it found
+    /// there. Upstream writes `CAST( ... AS ... )` around the whole
+    /// field for the same reason.
     fn col(&self, alias: &str, rel: Option<&Relation>, c: &Col) -> Result<OutCol, PlanError> {
         let mut expr = match &c.field {
             Some(f) => {
+                let json = rel.is_none_or(|r| r.steps_as_json(&f.name));
                 let mut e = match rel.filter(|_| c.agg.is_none() && f.path.is_empty()) {
                     Some(rel) => match rel.column(&f.name) {
                         Some(col) => represented(alias, col),
-                        None => field_expr(Some(alias), &f.name, &f.path),
+                        None => field_expr(Some(alias), &f.name, &f.path, json),
                     },
-                    None => field_expr(Some(alias), &f.name, &f.path),
+                    None => field_expr(Some(alias), &f.name, &f.path, json),
                 };
                 if let Some(cast) = &f.cast {
+                    if !f.path.is_empty() {
+                        e = format!("({e})");
+                    }
                     e = format!("{e}::{}", checked_cast(cast)?);
                 }
                 e
@@ -813,6 +826,7 @@ impl Planner<'_> {
             key: key_of(e).to_string(),
             alias: name,
             kind: rel.kind,
+            table: rel.table.clone(),
         });
         if spread {
             // A spread of a to many has no one row to merge in, so
@@ -1040,12 +1054,13 @@ fn checked_cast(cast: &str) -> Result<&str, PlanError> {
 /// for a to one: a list has no single value to sort a parent row by,
 /// and upstream answers PGRST118 rather than picking one.
 fn order_sql(
+    catalog: &Catalog,
     table: &str,
     alias: &str,
     terms: &[Term],
     embeds: &[Embedded],
 ) -> Result<String, PlanError> {
-    Ok(order_terms(table, alias, terms, embeds)?
+    Ok(order_terms(catalog, table, alias, terms, embeds)?
         .into_iter()
         .map(|(expr, dir)| format!("{expr}{dir}"))
         .collect::<Vec<_>>()
@@ -1056,6 +1071,7 @@ fn order_sql(
 /// spread of a to many selects the what under a name of its own and
 /// carries only the how into the aggregate.
 fn order_terms(
+    catalog: &Catalog,
     table: &str,
     alias: &str,
     terms: &[Term],
@@ -1063,6 +1079,7 @@ fn order_terms(
 ) -> Result<Vec<(String, String)>, PlanError> {
     let mut out = Vec::with_capacity(terms.len());
     for t in terms {
+        let mut owner = table;
         let qualifier = match &t.relation {
             None => alias,
             Some(name) => {
@@ -1073,6 +1090,7 @@ fn order_terms(
                 if e.kind == Kind::ToMany {
                     return Err(unordered_relationship(table, name).into());
                 }
+                owner = &e.table;
                 &e.alias
             }
         };
@@ -1087,7 +1105,10 @@ fn order_terms(
             Some(Nulls::Last) => dir.push_str(" nulls last"),
             None => {}
         }
-        out.push((field_expr(Some(qualifier), &t.name, &t.path), dir));
+        let to_json = catalog
+            .relation(owner)
+            .is_none_or(|r| r.steps_as_json(&t.name));
+        out.push((field_expr(Some(qualifier), &t.name, &t.path, to_json), dir));
     }
     Ok(out)
 }
@@ -1213,6 +1234,14 @@ mod tests {
                 ..Column::default()
             },
         };
+        let jsonb = |table: &str, name: &str| ColumnRow {
+            table: table.into(),
+            column: Column {
+                name: name.into(),
+                type_name: "jsonb".into(),
+                ..Column::default()
+            },
+        };
         Catalog::new(vec![fk(
             "notes_todo_id_fkey",
             "notes",
@@ -1225,6 +1254,7 @@ mod tests {
             vec![
                 plain("todos", "id"),
                 colour("todos", "label_color"),
+                jsonb("todos", "data"),
                 plain("notes", "id"),
                 plain("notes", "todo_id"),
                 colour("notes", "tint"),
@@ -1261,7 +1291,7 @@ mod tests {
     fn a_star_is_spelled_out_only_where_a_cast_needs_the_room() {
         assert_eq!(
             painted_text("todos", "*"),
-            r#"select "z0"."id" as "id", test.json("z0"."label_color") as "label_color" from "todos" as "z0""#
+            r#"select "z0"."id" as "id", test.json("z0"."label_color") as "label_color", "z0"."data" as "data" from "todos" as "z0""#
         );
         // A relation with nothing to represent keeps its star, which
         // is what upstream leaves alone too.
@@ -1292,9 +1322,21 @@ mod tests {
             painted_text("todos", "label_color.count()")
         );
         assert!(
-            painted_text("todos", "label_color->shade").contains(r#""z0"."label_color"->'shade'"#),
+            painted_text("todos", "label_color->shade")
+                .contains(r#"to_jsonb("z0"."label_color")->'shade'"#),
             "{}",
             painted_text("todos", "label_color->shade")
+        );
+    }
+
+    #[test]
+    fn a_cast_over_a_json_path_takes_brackets() {
+        // `::` binds tighter than `->>`, so without them the cast
+        // lands on the key and the value comes back as text.
+        assert!(
+            painted_text("todos", "data->>0::int").contains(r#"("z0"."data"->>0)::int as "data""#),
+            "{}",
+            painted_text("todos", "data->>0::int")
         );
     }
 
