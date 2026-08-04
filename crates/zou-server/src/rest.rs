@@ -1189,7 +1189,8 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
                 from_text: r.get(3),
                 from_json: r.get(4),
                 type_name: r.get(5),
-                default_expr: r.get(6),
+                base_type: r.get(6),
+                default_expr: r.get(7),
             },
         })
         .collect();

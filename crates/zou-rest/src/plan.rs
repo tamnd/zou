@@ -1224,6 +1224,7 @@ mod tests {
                 from_text: Some("test.color".into()),
                 from_json: Some("test.color".into()),
                 type_name: "test.color".into(),
+                base_type: "test.color".into(),
                 default_expr: None,
             },
         };
@@ -1239,6 +1240,7 @@ mod tests {
             column: Column {
                 name: name.into(),
                 type_name: "jsonb".into(),
+                base_type: "jsonb".into(),
                 ..Column::default()
             },
         };

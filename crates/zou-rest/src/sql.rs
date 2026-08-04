@@ -288,17 +288,37 @@ impl Compiler<'_> {
                         Op::Wfts => "websearch_to_tsquery",
                         _ => unreachable!(),
                     };
+                    // The vector is made here rather than left to the
+                    // operator. Postgres has no `@@` over jsonb at
+                    // all, and the one over text builds its vector
+                    // with the default configuration whatever the
+                    // request asked for, so a column that is not
+                    // already a tsvector goes through to_tsvector
+                    // with the configuration the request named.
+                    let searched = match self
+                        .rel
+                        .is_some_and(|r| r.searches_as_text(&c.field.column))
+                    {
+                        false => lhs,
+                        true => match &c.config {
+                            Some(cfg) => {
+                                let cfg = self.bind(cfg);
+                                format!("to_tsvector({cfg}::regconfig, {lhs})")
+                            }
+                            None => format!("to_tsvector({lhs})"),
+                        },
+                    };
                     match &c.config {
                         Some(cfg) => {
                             // Bound, not spliced: the config came off
                             // the wire like everything else.
                             let cfg = self.bind(cfg);
                             let query = self.bind(lit_value(&c.value));
-                            format!("{lhs} @@ {func}({cfg}::regconfig, {query})")
+                            format!("{searched} @@ {func}({cfg}::regconfig, {query})")
                         }
                         None => {
                             let query = self.bind(lit_value(&c.value));
-                            format!("{lhs} @@ {func}({query})")
+                            format!("{searched} @@ {func}({query})")
                         }
                     }
                 }
@@ -582,7 +602,27 @@ mod tests {
     }
 
     #[test]
+    fn the_vector_is_made_where_the_column_is_not_one() {
+        // A column that is already a tsvector faces the operator
+        // bare, and the configuration reaches both halves of the
+        // comparison, since the vector and the query have to be
+        // built by the same dictionary to match.
+        assert_eq!(
+            painted_clause("searched", "fts.cat").text,
+            r#""searched" @@ to_tsquery($1)"#
+        );
+        let s = painted_clause("name", "phfts(german).Art Spass");
+        assert_eq!(
+            s.text,
+            r#"to_tsvector($1::regconfig, "name") @@ phraseto_tsquery($2::regconfig, $3)"#
+        );
+        assert_eq!(s.params, vec!["german", "german", "Art Spass"]);
+    }
+
+    #[test]
     fn full_text_search() {
+        // Nobody said what `body` is, and upstream leaves a column
+        // it could not look up to the operator.
         let s = sql("body", "fts.cat");
         assert_eq!(s.text, r#""body" @@ to_tsquery($1)"#);
         assert_eq!(s.params, vec!["cat"]);
@@ -660,6 +700,7 @@ mod tests {
                     from_text: Some("test.color".into()),
                     from_json: Some("test.color".into()),
                     type_name: "test.color".into(),
+                    base_type: "test.color".into(),
                     default_expr: None,
                 },
                 Column {
@@ -669,6 +710,13 @@ mod tests {
                 Column {
                     name: "notes".into(),
                     type_name: "jsonb".into(),
+                    base_type: "jsonb".into(),
+                    ..Column::default()
+                },
+                Column {
+                    name: "searched".into(),
+                    type_name: "test.vector".into(),
+                    base_type: "tsvector".into(),
                     ..Column::default()
                 },
             ],
@@ -755,7 +803,7 @@ mod tests {
         );
         assert_eq!(
             painted_clause("label_color", "fts.cat").text,
-            r#""label_color" @@ to_tsquery($1)"#
+            r#"to_tsvector("label_color") @@ to_tsquery($1)"#
         );
         // An arrow into a column that is not json reads it as json
         // first, and a column that already is one is left alone so
