@@ -583,6 +583,54 @@ fn write(path: &std::path::Path, text: &str) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Statistics that hold still for the length of a run.
+///
+/// The order of the rows inside an embed is not something either server
+/// promises. It falls out of the plan, and the plan changes the moment
+/// the planner learns how many rows a fixture table holds: with no
+/// statistics postgres hashes one side of the join, with statistics it
+/// hashes the other, and the same question gets the same rows back in a
+/// different order. A run is twelve hundred cases and several minutes
+/// long, autovacuum wakes up every minute, and the writing cases put
+/// the rows back three hundred and sixty seven times, so somewhere in
+/// the middle of a run autovacuum analyzes the fixtures and every case
+/// after that point is answered off a different plan than every case
+/// before it. Which cases those are depends on how fast the machine is,
+/// which is how a recording made on one machine stops reproducing on
+/// another and how a change to something unrelated moves five cases
+/// across the line.
+///
+/// So the fixtures are told not to be analyzed, once, immediately after
+/// they are created and before anything is asked. Nothing here needs a
+/// good plan. It needs the same plan on the first case as on the last,
+/// and the same plan in CI as on a laptop.
+///
+/// Only ordinary tables, since a partitioned parent is never autoanalyzed
+/// and a materialized view is only analyzed when it is refreshed. Each
+/// one in its own block, so that a database somebody else owns loses the
+/// tables it can and keeps going rather than failing the run.
+const STILL: &str = "\
+do $$
+declare
+  relation regclass;
+begin
+  for relation in
+    select c.oid::regclass
+      from pg_class c
+      join pg_namespace n on n.oid = c.relnamespace
+     where c.relkind = 'r'
+       and n.nspname not in ('pg_catalog', 'information_schema')
+  loop
+    begin
+      execute format('alter table %s set (autovacuum_enabled = off)', relation);
+    exception when insufficient_privilege then
+      null;
+    end;
+  end loop;
+end
+$$;
+";
+
 /// The suite's schema, and then every case in order.
 ///
 /// The setup runs immediately before the questions rather than once for
@@ -594,6 +642,7 @@ fn ask(target: &Target, suite: &Suite, setup: Option<&str>) -> Result<Asked, Str
     target.utc()?;
     if let Some(setup) = setup {
         target.set_up(setup)?;
+        target.set_up(STILL)?;
         // A target that keeps its own picture of the schema has just
         // been told the schema moved, and it is told over a
         // notification rather than over the connection the setup ran
