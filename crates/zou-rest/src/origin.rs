@@ -20,7 +20,7 @@
 //! [`origins`] reads that format and pulls the target list out of it.
 //!
 //! One step at a time, because `resorigtbl` names whatever the view
-//! selected from, which may be another view. [`derive`] walks the
+//! selected from, which may be another view. [`derive()`] walks the
 //! chain until it reaches a relation that is not a view here, which
 //! is how a view over a view over a table ends up with the table's
 //! keys.
