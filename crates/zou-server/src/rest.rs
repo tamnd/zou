@@ -1167,7 +1167,8 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
     let zones = rows.iter().map(|r| r.get(0)).collect();
     Ok(Catalog::new(fks)
         .with_relations(names, cols)
-        .with_timezones(zones))
+        .with_timezones(zones)
+        .with_schema(schema))
 }
 
 /// The preferences settled against the loaded catalog and put to

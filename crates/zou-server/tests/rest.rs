@@ -2967,3 +2967,131 @@ async fn an_order_and_a_filter_can_reach_into_an_embed() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     assert!(body_text(res).await.contains("42703"));
 }
+
+/// A relationship answers to every name it has: the table on the
+/// other end, the constraint that makes it, and the foreign key
+/// column the constraint sits on. A table that points at itself has
+/// two relationships under one name and takes its direction from
+/// which of those names the request used.
+#[tokio::test]
+async fn an_embed_can_be_named_by_the_key_that_makes_it() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_staff cascade",
+            "drop table if exists zou_rest_dept cascade",
+            "create table zou_rest_dept (id int primary key, name text)",
+            "create table zou_rest_staff (\
+               id int primary key, \
+               name text, \
+               dept_id int constraint works_in references zou_rest_dept (id), \
+               boss_id int references zou_rest_staff (id))",
+            "insert into zou_rest_dept values (1, 'maps'), (2, 'roads')",
+            "insert into zou_rest_staff values \
+               (1, 'ada', 1, null), (2, 'bob', 2, 1)",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // The foreign key column names the relationship, and the key it
+    // comes back under is the word the request used.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_staff?select=name,dept_id(name)&id=eq.2",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name": "bob", "dept_id": {"name": "roads"}}]"#
+    );
+
+    // So does the constraint, under whatever name it was given.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_staff?select=name,dept:works_in(name)&id=eq.2",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"dept": {"name": "roads"}, "name": "bob"}]"#
+    );
+
+    // A hint may name either end of the pair it joins on, so the
+    // referenced column reaches the same relationship the fk column
+    // does.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_staff?select=name,zou_rest_dept!id(name)&id=eq.1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name": "ada", "zou_rest_dept": {"name": "maps"}}]"#
+    );
+
+    // The table's own name, on a table that points at itself, is the
+    // list of rows pointing back.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_staff?select=name,reports:zou_rest_staff(name)&id=eq.1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name": "ada", "reports": [{"name": "bob"}]}]"#
+    );
+
+    // And the column's name is the one row it points at.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_staff?select=name,boss_id(name)&id=eq.2",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name": "bob", "boss_id": {"name": "ada"}}]"#
+    );
+
+    // A hint on the table name says which column the list comes back
+    // through, which is the only spelling that survives a table with
+    // more than one reference to itself.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_staff?select=name,reports:zou_rest_staff!boss_id(name)&id=eq.1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name": "ada", "reports": [{"name": "bob"}]}]"#
+    );
+
+    // A name that is none of those is still nothing, and the details
+    // say which schema was looked in and what the hint was.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_staff?select=name,zou_rest_dept!nowhere(name)",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_text(res).await,
+        r#"{"code":"PGRST200","details":"Searched for a foreign key relationship between 'zou_rest_staff' and 'zou_rest_dept' using the hint 'nowhere' in the schema 'public', but no matches were found.","hint":null,"message":"Could not find a relationship between 'zou_rest_staff' and 'zou_rest_dept' in the schema cache"}"#
+    );
+}
