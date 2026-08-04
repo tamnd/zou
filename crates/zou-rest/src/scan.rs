@@ -84,6 +84,17 @@ impl<'a> Cur<'a> {
         self.s.as_bytes()[self.pos..].starts_with(w.as_bytes())
     }
 
+    /// Step over spaces and tabs.
+    ///
+    /// Only a grammar that allows them unconditionally may call this.
+    /// A logic tree does, around every bracket and comma in it, which
+    /// is what upstream's `lexeme` combinator means.
+    pub(crate) fn skip_spaces(&mut self) {
+        while matches!(self.peek(), Some(b' ') | Some(b'\t')) {
+            self.bump();
+        }
+    }
+
     /// Step over spaces and tabs, but only when they lead to `b`.
     ///
     /// The conditional half is the point. Where the grammar allows
