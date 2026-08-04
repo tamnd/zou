@@ -62,6 +62,20 @@ Numbers are compared twice, once parsed and once as they were written.
 A parsed body cannot tell 1200.50 and 1200.5 apart, because a double cannot, and a client reading a price can, so the literals are scanned out of the raw text and compared as a sorted multiset.
 Sorted, because key order is already allowed to differ and this must not be the one thing that turns that back into a failure.
 
+## The same answer twice
+
+A recording is only worth comparing against if the same question gets the same answer tomorrow, and one thing in postgres makes that untrue on its own: the planner.
+
+The order of the rows inside an embed is not something PostgREST or zou promises.
+It falls out of the plan.
+With no statistics postgres hashes one side of the join and with statistics it hashes the other, and the rows come back in a different order without anything having changed about the question or the data.
+A run is twelve hundred cases and several minutes long, autovacuum wakes up every minute, and the writing cases put the rows back three hundred and sixty seven times, so on any long enough run autovacuum analyzes the fixtures somewhere in the middle and every case after that point is answered off a different plan than every case before it.
+Where that line falls depends on how fast the machine is, which is how a recording made on a laptop stops reproducing in CI, and how a change to something else entirely moves a handful of cases across it.
+
+So the harness turns autovacuum off on every table in the database, once, immediately after `setup.sql` has created them and before anything is asked.
+Nothing in a conformance run needs a good plan.
+It needs the same plan on the first case as on the last, and the same plan in CI as on a laptop.
+
 ## Known differences
 
 `suites/<name>/known.json` names the cases where zou is known to answer differently, and why, with the issue tracking the fix.
