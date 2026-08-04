@@ -48,8 +48,8 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use zou_rest::catalog::{
-    COLUMNS_SQL, COMPUTED_SQL, Catalog, Column, ColumnRow, ComputedRow, FkRow, INTROSPECT_SQL,
-    RELATIONS_SQL, TIMEZONES_SQL,
+    COLUMNS_SQL, COMPUTED_SQL, Catalog, Column, ColumnRow, ComputedRow, Details, FkRow,
+    INTROSPECT_SQL, RELATIONS_SQL, TIMEZONES_SQL,
 };
 use zou_rest::filter::{self, Node, Op, Parsed};
 use zou_rest::mutate::{self, Conflict, Missing, Returning};
@@ -120,13 +120,34 @@ const PK_SQL: &str = "select a.attname::text \
 /// A PostgREST shaped error: a status and the four body keys, with
 /// details and hint rendered as json null when absent, which is what
 /// supabase-js expects to destructure.
+///
+/// The details are a json value rather than a string because one
+/// error's are not a sentence: an ambiguous embed answers with the
+/// list of relationships it found, an object each.
 #[derive(Debug)]
 pub struct RestError {
     pub status: StatusCode,
     pub code: String,
     pub message: String,
-    pub details: Option<String>,
+    pub details: Option<serde_json::Value>,
     pub hint: Option<String>,
+}
+
+/// The details of an embed or rpc error as the body carries them.
+fn detail_json(details: Details) -> serde_json::Value {
+    match details {
+        Details::Text(s) => serde_json::Value::String(s),
+        Details::Rels(rels) => rels
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "cardinality": r.cardinality,
+                    "embedding": r.embedding,
+                    "relationship": r.relationship,
+                })
+            })
+            .collect(),
+    }
 }
 
 impl RestError {
@@ -206,7 +227,7 @@ fn invalid_prefs(tokens: &[String]) -> RestError {
         status: StatusCode::BAD_REQUEST,
         code: "PGRST122".to_string(),
         message: "Invalid preferences given with handling=strict".to_string(),
-        details: Some(format!("Invalid preferences: {}", tokens.join(", "))),
+        details: Some(format!("Invalid preferences: {}", tokens.join(", ")).into()),
         hint: None,
     }
 }
@@ -220,7 +241,7 @@ fn too_many_affected(rows: u64) -> RestError {
         status: StatusCode::BAD_REQUEST,
         code: "PGRST124".to_string(),
         message: "Query result exceeds max-affected preference constraint".to_string(),
-        details: Some(format!("The query affects {rows} rows")),
+        details: Some(format!("The query affects {rows} rows").into()),
         hint: None,
     }
 }
@@ -831,7 +852,7 @@ fn not_single(rows: usize) -> RestError {
         status: StatusCode::NOT_ACCEPTABLE,
         code: "PGRST116".to_string(),
         message: "Cannot coerce the result to a single JSON object".to_string(),
-        details: Some(format!("The result contains {rows} rows")),
+        details: Some(format!("The result contains {rows} rows").into()),
         hint: None,
     }
 }
@@ -1006,14 +1027,14 @@ fn pg_error(e: &tokio_postgres::Error, authed: bool) -> RestError {
             status: status_for(db.code().code(), db.message(), authed),
             code: db.code().code().to_string(),
             message: db.message().to_string(),
-            details: db.detail().map(str::to_string),
+            details: db.detail().map(Into::into),
             hint: db.hint().map(str::to_string),
         },
         None => RestError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "PGRST001".to_string(),
             message: "Database connection error. Retrying the connection.".to_string(),
-            details: Some(e.to_string()),
+            details: Some(e.to_string().into()),
             hint: None,
         },
     }
@@ -1029,7 +1050,7 @@ fn plan_error(e: PlanError) -> RestError {
             },
             code: e.code.to_string(),
             message: e.message,
-            details: e.details,
+            details: e.details.map(detail_json),
             hint: e.hint,
         },
         PlanError::Compile(c) => bad_grammar(c.message),
@@ -2132,7 +2153,7 @@ fn rpc_error(e: rpc::RpcError) -> RestError {
         },
         code: e.code.to_string(),
         message: e.message,
-        details: e.details,
+        details: e.details.map(Into::into),
         hint: None,
     }
 }
@@ -2599,6 +2620,30 @@ mod tests {
         assert_eq!(unrouted.status, StatusCode::BAD_REQUEST);
     }
 
+    /// A sentence goes out as a string and the relationships of an
+    /// ambiguous embed go out as a list of objects, which is the one
+    /// place the details key is not a sentence.
+    #[test]
+    fn the_details_of_an_ambiguity_go_out_as_a_list() {
+        use zou_rest::catalog::RelDetail;
+        assert_eq!(
+            detail_json(Details::Text("a sentence".into())),
+            serde_json::json!("a sentence")
+        );
+        assert_eq!(
+            detail_json(Details::Rels(vec![RelDetail {
+                cardinality: "many-to-one",
+                embedding: "orders with addresses".into(),
+                relationship: "k using orders(a) and addresses(id)".into(),
+            }])),
+            serde_json::json!([{
+                "cardinality": "many-to-one",
+                "embedding": "orders with addresses",
+                "relationship": "k using orders(a) and addresses(id)",
+            }])
+        );
+    }
+
     #[test]
     fn prefer_tokens_parse_and_the_rest_pass_through() {
         let mut headers = HeaderMap::new();
@@ -2645,7 +2690,10 @@ mod tests {
         assert_eq!(p.invalid, vec!["anything"]);
         let e = p.check(&zones()).unwrap_err();
         assert_eq!(e.code, "PGRST122");
-        assert_eq!(e.details.as_deref(), Some("Invalid preferences: anything"));
+        assert_eq!(
+            e.details.as_ref().and_then(|d| d.as_str()),
+            Some("Invalid preferences: anything")
+        );
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
 
         // Lenient carries on, and so does saying nothing about it.
@@ -2667,7 +2715,7 @@ mod tests {
         let mut p = prefer("handling=strict, timezone=utc");
         let e = p.check(&zones()).unwrap_err();
         assert_eq!(
-            e.details.as_deref(),
+            e.details.as_ref().and_then(|d| d.as_str()),
             Some("Invalid preferences: timezone=utc")
         );
 
@@ -2690,7 +2738,7 @@ mod tests {
         assert_eq!(prefer("handling=strict, max-affected=-1").cap(), None);
         assert_eq!(
             over_cap(Some(2), 3).map(|e| e.details).unwrap(),
-            Some("The query affects 3 rows".to_string())
+            Some("The query affects 3 rows".into())
         );
         assert!(over_cap(Some(2), 2).is_none());
         assert!(over_cap(None, 9000).is_none());
@@ -2846,7 +2894,10 @@ mod tests {
             e.message,
             "Cannot coerce the result to a single JSON object"
         );
-        assert_eq!(e.details.as_deref(), Some("The result contains 2 rows"));
+        assert_eq!(
+            e.details.as_ref().and_then(|d| d.as_str()),
+            Some("The result contains 2 rows")
+        );
     }
 
     #[test]

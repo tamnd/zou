@@ -369,8 +369,41 @@ pub struct Junction {
 pub struct EmbedError {
     pub code: &'static str,
     pub message: String,
-    pub details: Option<String>,
+    pub details: Option<Details>,
     pub hint: Option<String>,
+}
+
+/// What an error's details key carries. Most of them are a sentence.
+/// An ambiguous embed is the exception: it answers with the list of
+/// relationships it found, one object each, since the client that has
+/// to choose between them needs to read them apart rather than out of
+/// a sentence. This crate has no json in it, so the shape is a type
+/// and the server writes it out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Details {
+    Text(String),
+    Rels(Vec<RelDetail>),
+}
+
+impl Details {
+    /// The sentence, when the details are one.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Details::Text(s) => Some(s),
+            Details::Rels(_) => None,
+        }
+    }
+}
+
+/// One relationship as an ambiguity error describes it: the pair being
+/// embedded, the cardinality named the way upstream names it, and the
+/// relationship written out with the columns it joins on, which is
+/// what tells two keys between the same two tables apart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelDetail {
+    pub cardinality: &'static str,
+    pub embedding: String,
+    pub relationship: String,
 }
 
 impl fmt::Display for EmbedError {
@@ -646,6 +679,12 @@ impl Catalog {
     ) -> Result<Rel, EmbedError> {
         let mut cands = self.candidates(parent);
         cands.retain(|c| c.wanted(parent, target, hint));
+        // Only an error reads the order, and two parts of it do: the
+        // details and the hint list them, and a client comparing the
+        // two side by side is entitled to find them in the same order.
+        // Upstream's is the order its relationships sort in, which is
+        // what [`Cand::order`] spells out.
+        cands.sort_by_key(Cand::order);
 
         match cands.len() {
             0 => Err(EmbedError {
@@ -653,12 +692,12 @@ impl Catalog {
                 message: format!(
                     "Could not find a relationship between '{parent}' and '{target}' in the schema cache"
                 ),
-                details: Some(format!(
+                details: Some(Details::Text(format!(
                     "Searched for a foreign key relationship between '{parent}' and '{target}'{} in the schema '{}', but no matches were found.",
                     hint.map(|h| format!(" using the hint '{h}'"))
                         .unwrap_or_default(),
                     self.schema,
-                )),
+                ))),
                 hint: None,
             }),
             1 => Ok(cands.pop().expect("checked len").rel),
@@ -669,7 +708,9 @@ impl Catalog {
                     message: format!(
                         "Could not embed because more than one relationship was found for '{parent}' and '{target}'"
                     ),
-                    details: Some(spellings.join(", ")),
+                    details: Some(Details::Rels(
+                        cands.iter().filter_map(|c| c.detail(parent)).collect(),
+                    )),
                     hint: Some(format!(
                         "Try changing '{target}' to one of the following: {}. Find the desired relationship in the 'details' key.",
                         spellings
@@ -697,6 +738,19 @@ struct Cand {
     /// may call this relationship.
     view: bool,
 }
+
+/// The far table, the cardinality, the junction, the two constraints
+/// and the two column lists, which is [`Cand::order`]'s answer written
+/// down once rather than three times.
+type Order = (
+    String,
+    u8,
+    String,
+    String,
+    String,
+    Vec<(String, String)>,
+    Vec<(String, String)>,
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Card {
@@ -796,6 +850,87 @@ impl Cand {
             None => &self.rel.constraint,
         };
         format!("{}!{by}", self.rel.table)
+    }
+
+    /// This relationship as the ambiguity error describes it. A key is
+    /// named by the constraint and written out from both ends, the
+    /// parent's columns and the foreign table's. A many to many is
+    /// named by the junction instead and written out as the two keys
+    /// the junction holds, so its columns are the bridge's on both
+    /// sides rather than either end's.
+    ///
+    /// A computed relationship has none of that to say and never has
+    /// to: it takes over the name it is called by, so it is never one
+    /// of several answers. Upstream leaves an empty object here for
+    /// the same reason.
+    fn detail(&self, parent: &str) -> Option<RelDetail> {
+        if self.rel.call.is_some() {
+            return None;
+        }
+        let cols = |names: Vec<&String>| {
+            names
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let relationship = match &self.rel.via {
+            Some(j) => format!(
+                "{} using {}({}) and {}({})",
+                j.table,
+                self.rel.constraint,
+                cols(self.rel.join.iter().map(|(_, far)| far).collect()),
+                j.constraint,
+                cols(j.join.iter().map(|(near, _)| near).collect()),
+            ),
+            None => format!(
+                "{} using {parent}({}) and {}({})",
+                self.rel.constraint,
+                cols(self.rel.join.iter().map(|(near, _)| near).collect()),
+                self.rel.table,
+                cols(self.rel.join.iter().map(|(_, far)| far).collect()),
+            ),
+        };
+        Some(RelDetail {
+            cardinality: match self.card {
+                Card::O2M => "one-to-many",
+                Card::M2O => "many-to-one",
+                Card::O2O => "one-to-one",
+                Card::M2M => "many-to-many",
+            },
+            embedding: format!("{parent} with {}", self.rel.table),
+            relationship,
+        })
+    }
+
+    /// Where this relationship falls in the order an error lists them
+    /// in: the table on the far end, then the cardinality, then
+    /// whatever makes the relationship, the constraint and its columns
+    /// for a key and the junction and both of its keys for a many to
+    /// many. That is upstream's derived ordering on a relationship,
+    /// field by field, and the cardinality is part of it because the
+    /// constructors are written one to many, many to one, one to one,
+    /// many to many, in that order.
+    fn order(&self) -> Order {
+        let card = match self.card {
+            Card::O2M => 0,
+            Card::M2O => 1,
+            Card::O2O => 2,
+            Card::M2M => 3,
+        };
+        let (junction, second, target) = match &self.rel.via {
+            Some(j) => (j.table.clone(), j.constraint.clone(), j.join.clone()),
+            None => (String::new(), String::new(), Vec::new()),
+        };
+        (
+            self.rel.table.clone(),
+            card,
+            junction,
+            self.rel.constraint.clone(),
+            second,
+            self.rel.join.clone(),
+            target,
+        )
     }
 }
 
@@ -955,6 +1090,133 @@ mod tests {
         let hint = e.hint.expect("a hint");
         assert!(hint.contains("addresses!orders_billing_address_id_fkey"));
         assert!(hint.contains("addresses!orders_shipping_address_id_fkey"));
+    }
+
+    /// The details are the list the client has to choose from, so
+    /// each relationship is written out from both ends rather than
+    /// named. Two keys between the same two tables have the same
+    /// everything except the columns, which is the whole reason the
+    /// columns are in there.
+    #[test]
+    fn the_details_write_each_relationship_out_from_both_ends() {
+        let c = shop();
+        let e = c.resolve("orders", "addresses", None).unwrap_err();
+        let Some(Details::Rels(rels)) = e.details else {
+            panic!("expected a list of relationships");
+        };
+        assert_eq!(
+            rels,
+            vec![
+                RelDetail {
+                    cardinality: "many-to-one",
+                    embedding: "orders with addresses".into(),
+                    relationship:
+                        "orders_billing_address_id_fkey using orders(billing_address_id) and addresses(id)"
+                            .into(),
+                },
+                RelDetail {
+                    cardinality: "many-to-one",
+                    embedding: "orders with addresses".into(),
+                    relationship:
+                        "orders_shipping_address_id_fkey using orders(shipping_address_id) and addresses(id)"
+                            .into(),
+                },
+            ]
+        );
+    }
+
+    /// A many to many is named by its junction and written out as the
+    /// two keys the junction holds, so both column lists are the
+    /// bridge's rather than either end's.
+    #[test]
+    fn a_junction_is_written_out_as_the_two_keys_it_holds() {
+        let mut fks = vec![
+            fk(
+                "main_project",
+                "sites",
+                &["main_project_id"],
+                "big_projects",
+                &["big_project_id"],
+            ),
+            fk("jobs_site_id_fkey", "jobs", &["site_id"], "sites", &["id"]),
+            fk(
+                "jobs_big_project_id_fkey",
+                "jobs",
+                &["big_project_id"],
+                "big_projects",
+                &["big_project_id"],
+            ),
+        ];
+        fks[1].in_pk = true;
+        fks[2].in_pk = true;
+        let e = Catalog::new(fks)
+            .resolve("sites", "big_projects", None)
+            .unwrap_err();
+        let Some(Details::Rels(rels)) = e.details else {
+            panic!("expected a list of relationships");
+        };
+        assert_eq!(
+            rels,
+            vec![
+                RelDetail {
+                    cardinality: "many-to-one",
+                    embedding: "sites with big_projects".into(),
+                    relationship:
+                        "main_project using sites(main_project_id) and big_projects(big_project_id)"
+                            .into(),
+                },
+                RelDetail {
+                    cardinality: "many-to-many",
+                    embedding: "sites with big_projects".into(),
+                    relationship:
+                        "jobs using jobs_site_id_fkey(site_id) and jobs_big_project_id_fkey(big_project_id)"
+                            .into(),
+                },
+            ]
+        );
+    }
+
+    /// Cardinality decides the order before anything the schema is
+    /// named after does, and the details and the hint are listed in
+    /// the same one: a client reading them side by side is matching
+    /// the second entry of the list to the second word of the hint.
+    #[test]
+    fn the_cardinality_orders_the_list_and_the_hint_follows_it() {
+        let c = Catalog::new(vec![
+            fk(
+                "agents_department_id_fkey",
+                "agents",
+                &["department_id"],
+                "departments",
+                &["id"],
+            ),
+            fk(
+                "departments_head_id_fkey",
+                "departments",
+                &["head_id"],
+                "agents",
+                &["id"],
+            ),
+        ]);
+        let e = c.resolve("agents", "departments", None).unwrap_err();
+        let Some(Details::Rels(rels)) = e.details else {
+            panic!("expected a list of relationships");
+        };
+        assert_eq!(
+            rels.iter().map(|r| r.cardinality).collect::<Vec<_>>(),
+            vec!["one-to-many", "many-to-one"]
+        );
+        assert_eq!(
+            rels[0].relationship,
+            "departments_head_id_fkey using agents(id) and departments(head_id)"
+        );
+        assert_eq!(
+            e.hint.expect("a hint"),
+            "Try changing 'departments' to one of the following: \
+             'departments!departments_head_id_fkey', \
+             'departments!agents_department_id_fkey'. \
+             Find the desired relationship in the 'details' key."
+        );
     }
 
     #[test]
