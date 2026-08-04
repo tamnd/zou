@@ -248,16 +248,28 @@ impl Compiler<'_> {
                     let Value::List(elems) = &c.value else {
                         unreachable!("the grammar gives in a list");
                     };
-                    let holes: Vec<String> =
-                        elems.iter().map(|e| self.bind_read(read, e)).collect();
-                    format!("{lhs} IN ({})", holes.join(", "))
+                    // A list of one empty element is the empty list,
+                    // which `IN ()` has no syntax for. Upstream writes
+                    // every list as an array to have somewhere to put
+                    // this one, and the empty array is what it writes.
+                    if elems.len() == 1 && elems[0].is_empty() {
+                        format!("{lhs} = ANY('{{}}')")
+                    } else {
+                        let holes: Vec<String> =
+                            elems.iter().map(|e| self.bind_read(read, e)).collect();
+                        format!("{lhs} IN ({})", holes.join(", "))
+                    }
                 }
                 Op::Is => {
                     let Value::Lit(word) = &c.value else {
                         unreachable!("is never takes a list");
                     };
                     // The grammar lowercased and validated the word.
-                    format!("{lhs} IS {}", word.to_ascii_uppercase())
+                    // Only one of them is two words in SQL.
+                    match word.as_str() {
+                        "not_null" => format!("{lhs} IS NOT NULL"),
+                        w => format!("{lhs} IS {}", w.to_ascii_uppercase()),
+                    }
                 }
                 Op::IsDistinct => {
                     let lit = lit_value(&c.value);
@@ -497,11 +509,26 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_in_list_asks_the_empty_array() {
+        // `IN ()` is not syntax and `= ANY('{}')` is, which is why
+        // the empty list is written as an array and binds nothing.
+        let s = sql("id", "in.()");
+        assert_eq!(s.text, r#""id" = ANY('{}')"#);
+        assert!(s.params.is_empty());
+        let s = sql("id", "not.in.()");
+        assert_eq!(s.text, r#"NOT ("id" = ANY('{}'))"#);
+    }
+
+    #[test]
     fn is_and_isdistinct() {
         assert_eq!(sql("deleted_at", "is.null").text, r#""deleted_at" IS NULL"#);
         assert_eq!(sql("active", "is.true").text, r#""active" IS TRUE"#);
         assert_eq!(sql("active", "is.false").text, r#""active" IS FALSE"#);
         assert_eq!(sql("active", "is.unknown").text, r#""active" IS UNKNOWN"#);
+        assert_eq!(
+            sql("deleted_at", "is.not_null").text,
+            r#""deleted_at" IS NOT NULL"#
+        );
         assert_eq!(
             sql("active", "not.is.null").text,
             r#"NOT ("active" IS NULL)"#

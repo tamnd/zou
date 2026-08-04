@@ -486,7 +486,6 @@ async fn the_grammar_does_not_carry_sql() {
         "/rest/v1/zou_atk_grammar?select=*&order=(select%20body%20from%20zou_atk_grammar).asc",
         "/rest/v1/zou_atk_grammar?limit=1;drop%20table%20zou_atk_grammar",
         "/rest/v1/zou_atk_grammar?offset=-1",
-        "/rest/v1/zou_atk_grammar?id=in.(1,2);--",
         "/rest/v1/zou_atk_grammar?select=*,zou_atk_grammar!inner(*)",
     ] {
         let res = app
@@ -505,6 +504,24 @@ async fn the_grammar_does_not_carry_sql() {
             "{uri} returned more than it should: {body}"
         );
     }
+    // Sql after a value that the grammar has finished reading. The
+    // parser stops at the closing bracket and never looks at the rest,
+    // the way upstream's does, so this is a plain filter with a tail
+    // nobody carried anywhere. The row it answers with is the caller's
+    // own and the table is still there afterwards.
+    let res = app
+        .clone()
+        .oneshot(as_user(
+            "GET",
+            "/rest/v1/zou_atk_grammar?select=id&id=in.(1,2);drop%20table%20zou_atk_grammar;--",
+            Some(&one),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+
     assert_eq!(
         truth(&dsn, "zou_atk_grammar").await,
         "1:one,2:two",

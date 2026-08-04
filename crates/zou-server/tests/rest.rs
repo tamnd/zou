@@ -1223,6 +1223,99 @@ async fn a_call_is_asked_the_way_its_return_type_reads() {
 }
 
 #[tokio::test]
+async fn a_filter_takes_the_strings_upstream_takes() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_filter_rows cascade",
+            "create table zou_filter_rows (\
+             id int primary key, arr int[], done bool, and_col text, or_col text)",
+            "insert into zou_filter_rows values \
+             (1, '{1,2}', true, 'x', 'y'), \
+             (2, '{1,2,3}', false, 'x', 'y'), \
+             (3, '{9}', null, 'x', 'y')",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // Spaces go around the brackets and the commas of a tree, and a
+    // name gives up the ones on its ends.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_filter_rows?select=id&and=(%20or%20(%20id.eq.1%20,%20id.eq.3%20)%20,%20id.in.(%201,%203%20)%20)",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 3}]"#);
+
+    // The commas inside an array literal are the array's, not the
+    // tree's, and a negation still reaches the condition behind one.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_filter_rows?select=id&and=(arr.cs.%7B1,2%7D,arr.not.cd.%7B1,2%7D)",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+
+    // A column named after a keyword is a column, since only the
+    // bracket makes the word a group.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_filter_rows?select=id&or=(and_col.eq.z,%20or_col.eq.y)&limit=1",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+
+    // is takes not_null in any case, and the trileans keep working.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_filter_rows?select=id&done=is.NoT_NuLl"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 2}]"#);
+
+    // An in list with nothing in it matches nothing, and negated it
+    // matches everything, which is what the empty array does.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_filter_rows?select=id&id=in.(%20%20)"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, "[]");
+
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_filter_rows?select=id&id=not.in.()"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 2},{"id": 3}]"#);
+
+    // A bracket too many is a bracket nobody looks at.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_filter_rows?select=id&and=(id.eq.1,id.neq.2))",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+}
+
+#[tokio::test]
 async fn an_rls_write_denial_comes_back_as_401() {
     let Some(dsn) = dsn() else { return };
     seed(

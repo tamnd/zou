@@ -11,11 +11,25 @@
 //! Quoting works the way PostgREST documents it. Inside in lists,
 //! any/all arrays, and logic trees a double quoted string protects
 //! reserved characters, with backslash escaping the next character.
-//! A top level scalar takes the rest of the value verbatim, quotes
-//! included, because nothing needs delimiting there. Field names may
-//! be double quoted anywhere a name is read from the key or a tree,
-//! which is also how a column that collides with or, and, or not is
-//! addressed.
+//! A quote that does not close, or that closes somewhere other than
+//! the end of the element, is not an error: the element is taken bare
+//! and the quotes are part of it. A top level scalar takes the rest of
+//! the value verbatim, quotes included, because nothing needs
+//! delimiting there. Field names may be double quoted anywhere a name
+//! is read from the key or a tree, which is also how a column that
+//! collides with or, and, or not is addressed.
+//!
+//! Spaces are allowed around the brackets and commas of a logic tree
+//! and after the bracket that opens an in list, and an unquoted name
+//! gives up the spaces on its ends. A value keeps whatever spaces it
+//! was written with, since a value runs to the delimiter that ends it.
+//! Inside a tree a value may also be a postgres array literal, whose
+//! braces hold commas that do not end it.
+//!
+//! Nothing after a parsed value or tree is read, and nothing complains
+//! about it either. Upstream parses each query string value with a
+//! parser that is not asked to reach the end of its input, so a
+//! bracket too many is a bracket nobody looks at.
 //!
 //! Every parse renders back to a canonical pair via [`Parsed::render`],
 //! and reparsing that pair yields an equal tree. The fuzz target lives
@@ -266,9 +280,6 @@ pub fn parse_pair(key: &str, value: &str) -> Result<Parsed, Error> {
         let embed = embed_names(&kc, segs)?;
         let mut vc = Cur::new(value);
         let kids = parse_group_body(&mut vc)?;
-        if !vc.done() {
-            return vc.err("unexpected characters after the group");
-        }
         return Ok(Parsed::Logic {
             embed,
             op,
@@ -318,7 +329,11 @@ fn parse_segment(cur: &mut Cur) -> Result<Seg, Error> {
     let name = if quoted {
         scan_quoted(cur)?
     } else {
-        scan_name(cur, name_break)
+        // Upstream builds an unquoted name out of letters, digits,
+        // underscore, dollar and space, and trims it once it is read,
+        // so the spaces around a name are never part of it and quotes
+        // are the only way to ask for a column whose name has one.
+        scan_name(cur, name_break).trim_matches([' ', '\t']).into()
     };
     if name.is_empty() {
         return cur.err("expected a field name");
@@ -361,10 +376,12 @@ fn parse_cond_rhs(cur: &mut Cur, field: Field, in_tree: bool) -> Result<Cond, Er
     cur.expect(b'.', "expected . after the operator")?;
 
     let mut value = if op == Op::In {
+        cur.skip_spaces();
         cur.expect(b'(', "in wants a (list)")?;
-        if cur.peek() == Some(b')') {
-            return cur.err("in wants at least one value");
-        }
+        // An empty list is one empty element, which is also what
+        // `in.("")` reads as. The compiler turns either into the
+        // empty array, the way upstream does.
+        cur.skip_spaces();
         Value::List(parse_elements(cur, b')', "unterminated list")?)
     } else if quant.is_some() {
         cur.expect(b'{', "any and all want an {array}")?;
@@ -374,22 +391,23 @@ fn parse_cond_rhs(cur: &mut Cur, field: Field, in_tree: bool) -> Result<Cond, Er
             Value::Array(parse_elements(cur, b'}', "unterminated array")?)
         }
     } else if in_tree {
-        Value::Lit(scan_element(cur, b",)")?)
+        Value::Lit(scan_array(cur).unwrap_or_else(|| scan_element(cur, b",)")))
     } else {
         Value::Lit(cur.take_rest())
     };
-
-    if !in_tree && !cur.done() {
-        return cur.err("unexpected characters after the value");
-    }
 
     if op == Op::Is {
         let Value::Lit(s) = &value else {
             unreachable!("is never takes a list");
         };
         let lower = s.to_ascii_lowercase();
-        if !matches!(lower.as_str(), "null" | "true" | "false" | "unknown") {
-            return cur.err(format!("is wants null, true, false, or unknown, not ({s})"));
+        if !matches!(
+            lower.as_str(),
+            "null" | "not_null" | "true" | "false" | "unknown"
+        ) {
+            return cur.err(format!(
+                "is wants null, not_null, true, false, or unknown, not ({s})"
+            ));
         }
         value = Value::Lit(lower);
     }
@@ -407,7 +425,7 @@ fn parse_cond_rhs(cur: &mut Cur, field: Field, in_tree: bool) -> Result<Cond, Er
 fn parse_elements(cur: &mut Cur, close: u8, unterminated: &str) -> Result<Vec<String>, Error> {
     let mut out = Vec::new();
     loop {
-        out.push(scan_element(cur, &[b',', close])?);
+        out.push(scan_element(cur, &[b',', close]));
         if cur.eat(b',') {
             continue;
         }
@@ -418,15 +436,21 @@ fn parse_elements(cur: &mut Cur, close: u8, unterminated: &str) -> Result<Vec<St
 
 /// One literal in a delimited context: quoted with escapes, or bare
 /// up to the next terminator.
-fn scan_element(cur: &mut Cur, terms: &[u8]) -> Result<String, Error> {
+///
+/// A quote only quotes when the string it opens closes at a
+/// terminator. Anything else, an opening quote with no closing one or
+/// a closing one with more text behind it, is an element that happens
+/// to have quotes in it, which is how `in.(")` asks for a single
+/// double quote.
+fn scan_element(cur: &mut Cur, terms: &[u8]) -> String {
     if cur.peek() == Some(b'"') {
-        let s = scan_quoted(cur)?;
-        if let Some(b) = cur.peek()
-            && !terms.contains(&b)
+        let start = cur.pos;
+        if let Ok(s) = scan_quoted(cur)
+            && cur.peek().is_none_or(|b| terms.contains(&b))
         {
-            return cur.err("expected a separator after the quoted value");
+            return s;
         }
-        return Ok(s);
+        cur.pos = start;
     }
     let start = cur.pos;
     while let Some(b) = cur.peek() {
@@ -435,35 +459,56 @@ fn scan_element(cur: &mut Cur, terms: &[u8]) -> Result<String, Error> {
         }
         cur.bump();
     }
-    Ok(cur.s[start..cur.pos].to_string())
+    cur.s[start..cur.pos].to_string()
+}
+
+/// A postgres array literal sitting where a value inside a tree goes.
+///
+/// The commas inside the braces belong to the array rather than to the
+/// tree, so `and=(arr.cs.{1,2})` is one condition and not two halves
+/// of nothing. Upstream reads it with no nesting, a brace then
+/// anything that is not a brace then a brace, and anything else falls
+/// back to an ordinary element.
+fn scan_array(cur: &mut Cur) -> Option<String> {
+    if cur.peek() != Some(b'{') {
+        return None;
+    }
+    let bytes = cur.s.as_bytes();
+    let mut at = cur.pos + 1;
+    while matches!(bytes.get(at), Some(b) if !matches!(b, b'{' | b'}')) {
+        at += 1;
+    }
+    if bytes.get(at) != Some(&b'}') {
+        return None;
+    }
+    let start = cur.pos;
+    cur.pos = at + 1;
+    Some(cur.s[start..cur.pos].to_string())
 }
 
 /// The body of a logic group, cursor sitting on the opening paren.
 fn parse_group_body(cur: &mut Cur) -> Result<Vec<Node>, Error> {
+    cur.skip_spaces();
     cur.expect(b'(', "a group wants a (list)")?;
+    cur.skip_spaces();
     let mut kids = Vec::new();
     loop {
         kids.push(parse_item(cur)?);
+        cur.skip_spaces();
         if cur.eat(b',') {
+            cur.skip_spaces();
             continue;
         }
         cur.expect(b')', "unterminated group")?;
+        cur.skip_spaces();
         return Ok(kids);
     }
 }
 
 fn parse_item(cur: &mut Cur) -> Result<Node, Error> {
-    for (prefix, op, negated) in [
-        ("not.and(", LogicOp::And, true),
-        ("not.or(", LogicOp::Or, true),
-        ("and(", LogicOp::And, false),
-        ("or(", LogicOp::Or, false),
-    ] {
-        if cur.starts(prefix) {
-            cur.pos += prefix.len() - 1;
-            let kids = parse_group_body(cur)?;
-            return Ok(Node::Group { op, negated, kids });
-        }
+    if let Some((op, negated)) = group_head(cur) {
+        let kids = parse_group_body(cur)?;
+        return Ok(Node::Group { op, negated, kids });
     }
     let seg = parse_segment(cur)?;
     cur.expect(b'.', "expected . after the field")?;
@@ -475,19 +520,53 @@ fn parse_item(cur: &mut Cur) -> Result<Node, Error> {
     parse_cond_rhs(cur, field, true).map(Node::Cond)
 }
 
+/// The `[not.]and` or `[not.]or` that opens a nested group, consumed
+/// when it is one and left alone when it is not.
+///
+/// The bracket is what decides. A column may be named `and`, and a
+/// column named `and_starting_col` is nothing but a column, so the
+/// word only means a group once a bracket follows it. Upstream gets
+/// there by reading the item as a condition first and falling back to
+/// a group when that fails, which comes to the same place.
+fn group_head(cur: &mut Cur) -> Option<(LogicOp, bool)> {
+    let start = cur.pos;
+    let negated = cur.eat_str("not.");
+    let name = scan_name(cur, name_break);
+    let op = match name.trim_matches([' ', '\t']) {
+        "and" => LogicOp::And,
+        "or" => LogicOp::Or,
+        _ => {
+            cur.pos = start;
+            return None;
+        }
+    };
+    cur.skip_spaces();
+    if cur.peek() == Some(b'(') {
+        Some((op, negated))
+    } else {
+        cur.pos = start;
+        None
+    }
+}
+
 /// True when a name cannot be written bare: it contains a delimiter,
-/// an arrow, or collides with a logic keyword.
+/// an arrow, a space on an end that reading it back would take off, or
+/// it collides with a logic keyword.
 fn name_needs_quotes(s: &str) -> bool {
     s.is_empty()
         || s.bytes().any(|b| name_break(b) || b == b'\\')
         || s.contains("->")
+        || s.trim_matches([' ', '\t']) != s
         || matches!(s, "or" | "and" | "not")
 }
 
 /// True when an element cannot be written bare inside a delimited
-/// context.
+/// context. A space on the front counts, since the bracket that opens
+/// an in list eats the spaces after it and a first element written
+/// bare would come back short.
 fn element_needs_quotes(s: &str) -> bool {
     s.is_empty()
+        || s.starts_with([' ', '\t'])
         || s.bytes()
             .any(|b| matches!(b, b',' | b'(' | b')' | b'"' | b'{' | b'}' | b'\\'))
 }
@@ -741,16 +820,33 @@ mod tests {
             cond(&p).value,
             Value::List(vec!["a,b".into(), "c".into(), "d\"e".into(), "".into()])
         );
-        assert_eq!(fail("id", "in.()").message, "in wants at least one value");
         assert_eq!(fail("id", "in.(1,2").message, "unterminated list");
-        assert_eq!(
-            fail("id", "in.(1)x").message,
-            "unexpected characters after the value"
-        );
-        assert_eq!(
-            fail("id", "in.(\"a\"b)").message,
-            "expected a separator after the quoted value"
-        );
+    }
+
+    #[test]
+    fn an_empty_in_list_is_one_empty_element() {
+        // Which is what the compiler turns into the empty array, and
+        // is also all `in.("")` can mean.
+        let p = ok("id", "in.()");
+        assert_eq!(cond(&p).value, Value::List(vec!["".into()]));
+        let p = ok("id", "in.(   )");
+        assert_eq!(cond(&p).value, Value::List(vec!["".into()]));
+        let p = ok("id", "in.(\"\")");
+        assert_eq!(cond(&p).value, Value::List(vec!["".into()]));
+        // Only the spaces the bracket leads with come off. The ones
+        // after a comma belong to the element they lead.
+        let p = ok("id", "in.( ,3)");
+        assert_eq!(cond(&p).value, Value::List(vec!["".into(), "3".into()]));
+        let p = ok("id", "in.( 1, 2 )");
+        assert_eq!(cond(&p).value, Value::List(vec!["1".into(), " 2 ".into()]));
+    }
+
+    #[test]
+    fn a_quote_that_does_not_close_at_the_end_is_a_character() {
+        let p = ok("name", "in.(\")");
+        assert_eq!(cond(&p).value, Value::List(vec!["\"".into()]));
+        let p = ok("name", "in.(\"a\"b)");
+        assert_eq!(cond(&p).value, Value::List(vec!["\"a\"b".into()]));
     }
 
     #[test]
@@ -798,7 +894,9 @@ mod tests {
         let p = ok("flag", "is.TRUE");
         assert_eq!(cond(&p).value, Value::Lit("true".into()));
         assert_eq!(p.render(), ("flag".into(), "is.true".into()));
-        for v in ["null", "true", "false", "unknown"] {
+        let p = ok("flag", "is.NoT_NuLl");
+        assert_eq!(cond(&p).value, Value::Lit("not_null".into()));
+        for v in ["null", "not_null", "true", "false", "unknown"] {
             ok("flag", &format!("is.{v}"));
         }
         assert!(fail("flag", "is.maybe").message.contains("is wants"));
@@ -885,6 +983,93 @@ mod tests {
     }
 
     #[test]
+    fn a_tree_takes_spaces_around_its_brackets_and_commas() {
+        let p = ok(
+            "and",
+            "( and ( id.in.( 1, 2 ) , id.eq.3 ) , or ( id.eq.2 , id.eq.3 ) )",
+        );
+        let Parsed::Logic { op, kids, .. } = &p else {
+            panic!("expected logic, got {p:?}")
+        };
+        assert_eq!(*op, LogicOp::And);
+        assert_eq!(kids.len(), 2);
+        let Node::Group { op, kids, .. } = &kids[0] else {
+            panic!("expected a nested group, got {:?}", kids[0])
+        };
+        assert_eq!(*op, LogicOp::And);
+        assert_eq!(kids.len(), 2);
+
+        // The negation of a nested group is read after the spaces too.
+        let p = ok("and", "( id.eq.1, not.or(id.eq.2, id.eq.3) )");
+        let Parsed::Logic { kids, .. } = &p else {
+            panic!()
+        };
+        let Node::Cond(c) = &kids[0] else { panic!() };
+        assert_eq!(c.field.column, "id");
+        let Node::Group { negated, .. } = &kids[1] else {
+            panic!("expected a nested group, got {:?}", kids[1])
+        };
+        assert!(*negated);
+    }
+
+    #[test]
+    fn a_column_named_after_a_keyword_is_still_a_column() {
+        // The bracket is what makes the word a group, so a name that
+        // begins with one, or is one, reads as the name it is.
+        let p = ok("or", "(and_starting_col.eq.1,or_starting_col.eq.2)");
+        let Parsed::Logic { kids, .. } = &p else {
+            panic!()
+        };
+        let Node::Cond(c) = &kids[0] else { panic!() };
+        assert_eq!(c.field.column, "and_starting_col");
+        let Node::Cond(c) = &kids[1] else { panic!() };
+        assert_eq!(c.field.column, "or_starting_col");
+
+        let p = ok("or", "(and.eq.1,not.eq.2)");
+        let Parsed::Logic { kids, .. } = &p else {
+            panic!()
+        };
+        let Node::Cond(c) = &kids[0] else { panic!() };
+        assert_eq!(c.field.column, "and");
+        let Node::Cond(c) = &kids[1] else { panic!() };
+        assert_eq!(c.field.column, "not");
+    }
+
+    #[test]
+    fn an_array_inside_a_tree_keeps_its_commas() {
+        let p = ok("and", "(arr.cs.{1,2,3},arr.not.isdistinct.{1,2})");
+        let Parsed::Logic { kids, .. } = &p else {
+            panic!()
+        };
+        let Node::Cond(c) = &kids[0] else { panic!() };
+        assert_eq!(c.value, Value::Lit("{1,2,3}".into()));
+        let Node::Cond(c) = &kids[1] else { panic!() };
+        assert!(c.negated);
+        assert_eq!(c.value, Value::Lit("{1,2}".into()));
+
+        // A brace with no partner is an ordinary value that happens
+        // to start with one.
+        let p = ok("and", "(a.eq.{1,b.eq.2)");
+        let Parsed::Logic { kids, .. } = &p else {
+            panic!()
+        };
+        assert_eq!(kids.len(), 2);
+        let Node::Cond(c) = &kids[0] else { panic!() };
+        assert_eq!(c.value, Value::Lit("{1".into()));
+    }
+
+    #[test]
+    fn nothing_after_a_tree_is_read() {
+        // Upstream's parser is not asked to reach the end of its
+        // input, so a bracket too many is a bracket nobody looks at.
+        let p = ok("and", "(id.eq.1,id.neq.2))");
+        let Parsed::Logic { kids, .. } = &p else {
+            panic!()
+        };
+        assert_eq!(kids.len(), 2);
+    }
+
+    #[test]
     fn tree_conditions_quote_and_carry_everything_conds_do() {
         let p = ok("or", "(name.eq.\"Smith, John\",id.in.(1,2),b.not.like.x*)");
         let Parsed::Logic { kids, .. } = &p else {
@@ -912,10 +1097,6 @@ mod tests {
     fn tree_errors_point_at_the_problem() {
         assert_eq!(fail("or", "(a.eq.1").message, "unterminated group");
         assert_eq!(fail("or", "()").message, "expected a field name");
-        assert_eq!(
-            fail("or", "(a.eq.1)x").message,
-            "unexpected characters after the group"
-        );
         assert_eq!(fail("or", "a.eq.1").message, "a group wants a (list)");
         assert!(fail("or", "(a.foo.1)").message.contains("unknown operator"));
         assert_eq!(
@@ -964,8 +1145,11 @@ mod tests {
         ("a.b.c", "neq.1"),
         ("id", "in.(1,2,3)"),
         ("id", "not.in.(1,2)"),
+        ("id", "in.()"),
+        ("name", "in.(\")"),
         ("name", "in.(\"a,b\",c,\"d\\\"e\",\"\")"),
         ("flag", "is.null"),
+        ("flag", "is.not_null"),
         ("flag", "is.TRUE"),
         ("flag", "not.is.unknown"),
         ("flag", "isdistinct.5"),
@@ -999,6 +1183,9 @@ mod tests {
         ("or", "(data->>k.eq.1,b.is.null)"),
         ("or", "(a.eq(any).{1,2},b.eq.2)"),
         ("or", "(\"not\".eq.1,\"or\".eq.2)"),
+        ("or", "(arr.cs.{1,2,3},arr.cd.{1})"),
+        ("or", "( id.eq.1, and(id.eq.2, id.eq.3) )"),
+        ("or", "(and_starting_col.eq.1,\" spaced \".eq.2)"),
     ];
 
     #[test]
