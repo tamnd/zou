@@ -948,7 +948,15 @@ fn update_payload(
 /// The Range header as a root limit and offset, only when the query
 /// string did not already page the root, and silently ignored when
 /// it is not a parseable items range, both PostgREST's stance.
-fn apply_range(q: &mut Query, headers: &HeaderMap) {
+///
+/// It is also only read on a GET. Upstream says so in one line, "the
+/// Range header must be ignored for all methods other than GET", and
+/// means the method literally: a HEAD carrying a range gets the whole
+/// set, and so does a POST to a function.
+fn apply_range(q: &mut Query, method: &Method, headers: &HeaderMap) {
+    if method != Method::GET {
+        return;
+    }
     let already =
         q.limit.iter().any(|(r, _)| r.is_empty()) || q.offset.iter().any(|(r, _)| r.is_empty());
     if already {
@@ -1364,7 +1372,7 @@ async fn read(
     req: &Parts,
 ) -> Result<Response, RestError> {
     let (mut q, _) = parse_query(table, req.uri.query())?;
-    apply_range(&mut q, &req.headers);
+    apply_range(&mut q, &req.method, &req.headers);
     let mut prefer = parse_prefer(&req.headers);
 
     let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
@@ -2272,6 +2280,10 @@ async fn invoke(
     if cap.is_some() && !returns_set {
         return Err(not_set_returning());
     }
+    // Only an exact total is answered on a call. Upstream's planned
+    // and estimated ones come off the plan of the count query, which
+    // is a second statement, and nothing asks a function for one.
+    let exact = matches!(prefer.count, Some(Count::Exact));
     let m = match payload {
         Some(text) => rpc::call_json(schema, func, &choice, &supplied, text),
         None => rpc::call_get(schema, func, choice.routine, &get_args),
@@ -2286,8 +2298,14 @@ async fn invoke(
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
             // Nothing to send and a range all the same, because
             // upstream counts the one row the call was.
-            let mut res =
-                (StatusCode::NO_CONTENT, [(header::CONTENT_RANGE, "0-0/*")]).into_response();
+            let mut res = (
+                StatusCode::NO_CONTENT,
+                [(
+                    header::CONTENT_RANGE,
+                    content_range(0, 1, exact.then_some(1)),
+                )],
+            )
+                .into_response();
             applied_header(&prefer, Surface::Rpc, &req.method, false, &mut res);
             Ok(res)
         }
@@ -2310,13 +2328,17 @@ async fn invoke(
                 .first()
                 .and_then(|r| r.get::<_, Option<String>>(0))
                 .unwrap_or_else(|| if returns_set { "[]" } else { "null" }.to_string());
-            // One value is one row as far as the range goes, which
-            // is how upstream counts it.
+            // One value is one row as far as the range goes and a
+            // folded set is as many rows as it folded, which is how
+            // upstream counts them. Nothing here is paged, so an
+            // exact total is the page it just built.
+            let page = if returns_set { affected as usize } else { 1 };
+            let total = exact.then_some(page as i64);
             let mut res = (
-                StatusCode::OK,
+                range_status(0, page, total),
                 [
                     (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-                    (header::CONTENT_RANGE, "0-0/*"),
+                    (header::CONTENT_RANGE, &content_range(0, page, total)),
                 ],
                 out,
             )
@@ -2339,61 +2361,122 @@ async fn invoke(
                     Some(&joined)
                 },
             )?;
-            apply_range(&mut q, &req.headers);
+            apply_range(&mut q, &req.method, &req.headers);
             let r = rpc::representation(&catalog, m, &mut q).map_err(plan_error)?;
-            let text = format!(
-                "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
-                r.cte, r.select.text
-            );
-            let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
-            let rows = sess
-                .query(&text, &param_refs(&params))
-                .await
-                .map_err(|e| pg_error(&e, authed))?;
-            if let Some(e) = over_cap(cap, rows.len() as u64) {
-                sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
-                return Err(e);
-            }
-            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
-            if returns_set {
-                let offset = q
-                    .offset
-                    .iter()
-                    .find(|(route, _)| route.is_empty())
-                    .map(|(_, n)| *n)
-                    .unwrap_or(0);
-                let mut res = (
-                    StatusCode::OK,
-                    [
-                        (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-                        (
-                            header::CONTENT_RANGE,
-                            &content_range(offset, rows.len(), None),
-                        ),
-                    ],
-                    json_array(&rows),
-                )
-                    .into_response();
-                profile_header(&mut res, schema, negotiated);
-                applied_header(&prefer, Surface::Rpc, &req.method, cap.is_some(), &mut res);
-                Ok(res)
-            } else {
+            if !returns_set {
+                let text = format!(
+                    "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
+                    r.cte, r.select.text
+                );
+                let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
+                let rows = sess
+                    .query(&text, &param_refs(&params))
+                    .await
+                    .map_err(|e| pg_error(&e, authed))?;
+                sess.commit().await.map_err(|e| pg_error(&e, authed))?;
                 // A non set function is one row, and PostgREST hands
                 // it back as a bare object, not a one element array.
+                // One row is also what it counts, whatever came back.
                 let out = rows
                     .first()
                     .map(|r| r.get::<_, String>(0))
                     .unwrap_or_else(|| "null".to_string());
                 let mut res = (
                     StatusCode::OK,
-                    [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                    [
+                        (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                        (
+                            header::CONTENT_RANGE,
+                            &content_range(0, 1, exact.then_some(1)),
+                        ),
+                    ],
                     out,
                 )
                     .into_response();
                 profile_header(&mut res, schema, negotiated);
                 applied_header(&prefer, Surface::Rpc, &req.method, false, &mut res);
-                Ok(res)
+                return Ok(res);
             }
+            // A page that is the whole set is its own total, and a
+            // paged one needs counting. The count reads the rows the
+            // call already left in the CTE rather than calling the
+            // function a second time, which is what upstream's second
+            // CTE is for and the only way a volatile call stays one
+            // call. Both totals ride out of the one statement,
+            // because a window past the end has no row to carry it.
+            let paged = q.limit.iter().any(|(r, _)| r.is_empty())
+                || q.offset.iter().any(|(r, _)| r.is_empty());
+            let counted = if exact && paged {
+                Some(plan::count_from(&catalog, &q, r.select.params.clone()).map_err(plan_error)?)
+            } else {
+                None
+            };
+            let (cte, total_sql, params) = match counted {
+                Some(c) => (
+                    format!("{}, \"_zou_count\" as ({})", r.cte, c.text),
+                    "(select count(*) from \"_zou_count\")::bigint",
+                    c.params,
+                ),
+                None => (r.cte, "null::bigint", r.select.params),
+            };
+            // The array is joined out of the row texts rather than
+            // built by jsonb_agg, which is the same bytes a read
+            // sends: an aggregate would space the commas out.
+            let text = format!(
+                "with {cte} select '[' || coalesce(string_agg(to_jsonb(\"_zou_row\")::text, ','), '') || ']', \
+                 count(*)::bigint, {total_sql} from ({}) as \"_zou_row\"",
+                r.select.text
+            );
+            let params: Vec<Text> = params.into_iter().map(Text).collect();
+            let rows = sess
+                .query(&text, &param_refs(&params))
+                .await
+                .map_err(|e| pg_error(&e, authed))?;
+            let page = rows
+                .first()
+                .map(|r| r.get::<_, i64>(1) as usize)
+                .unwrap_or(0);
+            if let Some(e) = over_cap(cap, page as u64) {
+                sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
+                return Err(e);
+            }
+            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            let out = rows
+                .first()
+                .and_then(|r| r.get::<_, Option<String>>(0))
+                .unwrap_or_else(|| "[]".to_string());
+            let total = if exact {
+                Some(
+                    rows.first()
+                        .and_then(|r| r.get::<_, Option<i64>>(2))
+                        .unwrap_or(page as i64),
+                )
+            } else {
+                None
+            };
+            let offset = q
+                .offset
+                .iter()
+                .find(|(route, _)| route.is_empty())
+                .map(|(_, n)| *n)
+                .unwrap_or(0);
+            let status = range_status(offset, page, total);
+            let mut res = if status == StatusCode::RANGE_NOT_SATISFIABLE {
+                error_body(status, out_of_bounds(offset, total.unwrap_or(0)))
+            } else {
+                (
+                    status,
+                    [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                    out,
+                )
+                    .into_response()
+            };
+            if let Ok(v) = content_range(offset, page, total).parse() {
+                res.headers_mut().insert(header::CONTENT_RANGE, v);
+            }
+            profile_header(&mut res, schema, negotiated);
+            applied_header(&prefer, Surface::Rpc, &req.method, cap.is_some(), &mut res);
+            Ok(res)
         }
     }
 }
@@ -2519,14 +2602,30 @@ mod tests {
         headers.insert(header::RANGE, "5-9".parse().unwrap());
 
         let (mut q, _) = parse_query("t", None).unwrap();
-        apply_range(&mut q, &headers);
+        apply_range(&mut q, &Method::GET, &headers);
         assert_eq!(q.offset, vec![(Vec::new(), 5)]);
         assert_eq!(q.limit, vec![(Vec::new(), 5)]);
 
         let (mut q, _) = parse_query("t", Some("limit=1")).unwrap();
-        apply_range(&mut q, &headers);
+        apply_range(&mut q, &Method::GET, &headers);
         assert_eq!(q.limit, vec![(Vec::new(), 1)]);
         assert!(q.offset.is_empty());
+    }
+
+    #[test]
+    fn only_a_get_reads_the_range_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "1-1".parse().unwrap());
+
+        // A HEAD asks the same question a GET does and still gets
+        // the whole set, which is upstream reading the method and
+        // not the shape of the request.
+        for method in [Method::HEAD, Method::POST] {
+            let (mut q, _) = parse_query("t", None).unwrap();
+            apply_range(&mut q, &method, &headers);
+            assert!(q.limit.is_empty(), "{method} took the range");
+            assert!(q.offset.is_empty(), "{method} took the range");
+        }
     }
 
     #[test]

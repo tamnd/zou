@@ -164,13 +164,21 @@ pub fn plan_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sq
 /// output columns, order, and paging all drop out, which is exactly
 /// PostgREST's readPlanToCountQuery.
 pub fn count(catalog: &Catalog, q: &Query) -> Result<Sql, PlanError> {
+    count_from(catalog, q, Vec::new())
+}
+
+/// The same, numbered from wherever `params` already stands. A call
+/// binds its arguments first and both the rows and the total are
+/// read out of one statement, so the count's own placeholders carry
+/// on from the ones the representation already took.
+pub fn count_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sql, PlanError> {
     let routes = collect_routes(&q.select);
     let filters = route_filters(q, &routes)?;
     let mut p = Planner {
         catalog,
         q,
         filters,
-        params: Vec::new(),
+        params,
         next: 0,
     };
     let root = p.next_alias();
