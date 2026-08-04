@@ -2833,3 +2833,137 @@ async fn a_write_that_touched_more_rows_than_asked_for_is_taken_back() {
     );
     assert_eq!(count(app.clone()).await, 0);
 }
+
+/// An order term and a filter can both name an embedded resource
+/// rather than a column of the table the url names: one sorts the
+/// parent by something on the other side of the join, the other asks
+/// whether the join found anything.
+#[tokio::test]
+async fn an_order_and_a_filter_can_reach_into_an_embed() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_task cascade",
+            "drop table if exists zou_rest_crew cascade",
+            "create table zou_rest_crew (id int primary key, name text)",
+            "create table zou_rest_task (\
+               id int primary key, \
+               title text, \
+               crew_id int references zou_rest_crew (id))",
+            "insert into zou_rest_crew values (1, 'maps'), (2, 'roads')",
+            "insert into zou_rest_task values \
+               (1, 'draw', 2), (2, 'name', 1), (3, 'walk', null)",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // The sort key is a column of the embed, and a task with no crew
+    // sorts where a null sorts.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_task?select=title,zou_rest_crew(name)\
+             &order=zou_rest_crew(name).asc.nullslast",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "name", "zou_rest_crew": {"name": "maps"}},{"title": "draw", "zou_rest_crew": {"name": "roads"}},{"title": "walk", "zou_rest_crew": null}]"#
+    );
+
+    // The embed does not have to be selected for its columns to be
+    // sortable, and an alias is the name the term uses.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_task?select=title,crew:zou_rest_crew()\
+             &order=crew(name).desc.nullslast",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "draw"},{"title": "name"},{"title": "walk"}]"#
+    );
+
+    // Sorting a parent by a list is refused rather than guessed at.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_crew?select=name,zou_rest_task(title)\
+             &order=zou_rest_task(title)",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_text(res).await,
+        r#"{"code":"PGRST118","details":"'zou_rest_crew' and 'zou_rest_task' do not form a many-to-one or one-to-one relationship","hint":null,"message":"A related order on 'zou_rest_task' is not possible"}"#
+    );
+
+    // A name the select tree does not embed has nowhere to go.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_task?select=title&order=zou_rest_crew(name)",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_text(res).await,
+        r#"{"code":"PGRST108","details":null,"hint":"Verify that 'zou_rest_crew' is included in the 'select' query parameter.","message":"'zou_rest_crew' is not an embedded resource in this request"}"#
+    );
+
+    // The null test is about the whole row of the embed, so it keeps
+    // the rows that found one and drops the rest.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_task?select=title,zou_rest_crew()\
+             &zou_rest_crew=not.is.null&order=id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "draw"},{"title": "name"}]"#
+    );
+
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_task?select=title,zou_rest_crew()\
+             &zou_rest_crew=is.null"))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"title": "walk"}]"#);
+
+    // A to many answers the same question about its own filters, and
+    // the count that comes back with it is over the same predicate.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/zou_rest_crew?select=name,zou_rest_task()\
+             &zou_rest_task.title=eq.draw&zou_rest_task=not.is.null",
+            "",
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.headers().get("content-range").unwrap(), "0-0/1");
+    assert_eq!(body_text(res).await, r#"[{"name": "roads"}]"#);
+
+    // Every other operator reads the name as a column, which is what
+    // lets a table carry a column and an embed of the same name.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_task?select=title,zou_rest_crew()\
+             &zou_rest_crew=eq.1"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    assert!(body_text(res).await.contains("42703"));
+}

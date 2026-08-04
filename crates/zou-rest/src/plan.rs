@@ -2,11 +2,19 @@
 //!
 //! Every embedded resource becomes a lateral subquery against the
 //! target table, to many aggregated with jsonb_agg over to_jsonb, to
-//! one carried as a single jsonb value, and spreads merged into the
-//! parent's column list. The default join is left, so parents keep
-//! their rows and an absent embed reads as `[]` or `null`; `!inner`
-//! swaps the lateral in as a plain join, which is what makes a filter
-//! on the embed remove parent rows.
+//! one carrying the child's own columns and folded to json on the way
+//! out, and spreads merged into the parent's column list. The default
+//! join is left, so parents keep their rows and an absent embed reads
+//! as `[]` or `null`; `!inner` swaps the lateral in as a plain join,
+//! which is what makes a filter on the embed remove parent rows.
+//!
+//! The level around a lateral can still point at it, which is what
+//! `order=clients(name)` and `clients=is.null` need: the first orders
+//! by a column of the lateral, the second asks whether the lateral
+//! found anything at all. Only a to one can be ordered by, since a
+//! list has no one value to sort a parent row by, and only `is.null`
+//! and `not.is.null` reach an embed by name at all, every other
+//! operator reading the name as a column of the level itself.
 //!
 //! Nested filters, order, limit, and offset route to their embed by
 //! path: the query pair `orders.status=eq.x` carries its path in the
@@ -33,10 +41,10 @@
 use std::fmt;
 
 use crate::catalog::{Catalog, Column, EmbedError, Kind, Rel, Relation};
-use crate::filter::Node;
+use crate::filter::{Node, Op, Value};
 use crate::order::{Direction, Nulls, Term};
 use crate::select::{Col, Embed, Item, Join};
-use crate::sql::{CompileError, Sql, field_expr, quote_ident, where_clause_from};
+use crate::sql::{CompileError, EmbedTest, Sql, field_expr, quote_ident, where_clause_over};
 
 /// Why a query cannot plan: a relationship problem with its PGRST
 /// code, a filter that cannot compile, or a shape the planner
@@ -111,13 +119,13 @@ pub fn plan_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sq
     let routes = collect_routes(&q.select);
     let filters = route_filters(q, &routes)?;
     for (route, _) in q.order.iter().filter(|(r, _)| !r.is_empty()) {
-        check_route(&routes, route, "order")?;
+        check_route(&routes, route)?;
     }
     for (route, _) in q.limit.iter().filter(|(r, _)| !r.is_empty()) {
-        check_route(&routes, route, "limit")?;
+        check_route(&routes, route)?;
     }
     for (route, _) in q.offset.iter().filter(|(r, _)| !r.is_empty()) {
-        check_route(&routes, route, "offset")?;
+        check_route(&routes, route)?;
     }
 
     let mut p = Planner {
@@ -181,14 +189,43 @@ fn collect_routes(items: &[Item]) -> Vec<Vec<String>> {
     out
 }
 
-fn check_route(routes: &[Vec<String>], route: &[String], what: &str) -> Result<(), PlanError> {
-    if routes.iter().any(|r| r == route) {
-        return Ok(());
+/// PostgREST's PGRST108: a filter, an order, or a page was addressed
+/// to something the select tree does not embed. The message names one
+/// resource rather than the path it was written as, and upstream
+/// names the first segment that has nowhere to go, so
+/// `nope.deeper.id=eq.1` is about `nope`.
+fn not_embedded(name: &str) -> EmbedError {
+    EmbedError {
+        code: "PGRST108",
+        message: format!("'{name}' is not an embedded resource in this request"),
+        details: None,
+        hint: Some(format!(
+            "Verify that '{name}' is included in the 'select' query parameter."
+        )),
     }
-    refuse(format!(
-        "'{}' is not an embedded resource in this request, the {what} on it has nowhere to go",
-        route.join(".")
-    ))
+}
+
+/// PostgREST's PGRST118: an order term reached into an embed that
+/// brings back a list, and a list has no one value to sort a parent
+/// row by.
+fn unordered_relationship(parent: &str, key: &str) -> EmbedError {
+    EmbedError {
+        code: "PGRST118",
+        message: format!("A related order on '{key}' is not possible"),
+        details: Some(format!(
+            "'{parent}' and '{key}' do not form a many-to-one or one-to-one relationship"
+        )),
+        hint: None,
+    }
+}
+
+fn check_route(routes: &[Vec<String>], route: &[String]) -> Result<(), PlanError> {
+    for n in 1..=route.len() {
+        if !routes.iter().any(|r| r.as_slice() == &route[..n]) {
+            return Err(not_embedded(&route[n - 1]).into());
+        }
+    }
+    Ok(())
 }
 
 /// Normalize every filter onto its full route: a condition carries
@@ -210,10 +247,28 @@ fn route_filters(q: &Query, routes: &[Vec<String>]) -> Result<Vec<(Vec<String>, 
                 (route.clone(), other.clone())
             }
         };
-        check_route(routes, &full, "filter")?;
+        check_route(routes, &full)?;
         out.push((full, node));
     }
     Ok(out)
+}
+
+/// Whether a filter tree asks an embed by name whether it found
+/// anything. `is.null` and `not.is.null` are the only tests that reach
+/// an embed, so they are the only ones the count query has to turn
+/// into an EXISTS and the only ones the planner has to hand the read
+/// query a predicate for.
+fn asks_null(node: &Node, key: &str) -> bool {
+    match node {
+        Node::Cond(c) => {
+            c.field.column == key
+                && c.field.path.is_empty()
+                && c.op == Op::Is
+                && c.quant.is_none()
+                && matches!(&c.value, Value::Lit(w) if w == "null")
+        }
+        Node::Group { kids, .. } => kids.iter().any(|k| asks_null(k, key)),
+    }
 }
 
 fn no_embeds_inside(node: &Node) -> Result<(), PlanError> {
@@ -245,6 +300,17 @@ struct OutCol {
     splat: bool,
 }
 
+/// An embedded resource as the level around it sees it: the name it
+/// answers to, the lateral alias its columns hang off, and whether it
+/// brings back one row or a list. A filter and an order term at this
+/// level can both name it, and what they are allowed to do with it
+/// depends on the kind.
+struct Embedded {
+    key: String,
+    alias: String,
+    kind: Kind,
+}
+
 impl Planner<'_> {
     fn next_alias(&mut self) -> String {
         let a = format!("z{}", self.next);
@@ -265,6 +331,7 @@ impl Planner<'_> {
     ) -> Result<String, PlanError> {
         let mut cols: Vec<OutCol> = Vec::new();
         let mut laterals: Vec<String> = Vec::new();
+        let mut embeds: Vec<Embedded> = Vec::new();
 
         let rel = self.catalog.relation(table);
         for item in items {
@@ -291,22 +358,38 @@ impl Planner<'_> {
                     }),
                 },
                 Item::Col(c) => cols.push(self.col(alias, rel, c)?),
-                Item::Embed(e) => {
-                    self.embed(table, alias, e, path, false, &mut cols, &mut laterals)?
-                }
-                Item::Spread(e) => {
-                    self.embed(table, alias, e, path, true, &mut cols, &mut laterals)?
-                }
+                Item::Embed(e) => self.embed(
+                    table,
+                    alias,
+                    e,
+                    path,
+                    false,
+                    &mut cols,
+                    &mut laterals,
+                    &mut embeds,
+                )?,
+                Item::Spread(e) => self.embed(
+                    table,
+                    alias,
+                    e,
+                    path,
+                    true,
+                    &mut cols,
+                    &mut laterals,
+                    &mut embeds,
+                )?,
             }
         }
         if cols.is_empty() {
-            // An empty embed selects nothing but still joins, the
-            // inner flag is its whole point.
+            // An empty embed selects nothing of its own but still
+            // joins, the inner flag is its whole point, and the level
+            // around it can still order by one of its columns. So the
+            // body carries every column and the embed drops the value.
             cols.push(OutCol {
-                expr: "1".into(),
-                rendered: "1".into(),
+                expr: format!("{}.*", quote_ident(alias)),
+                rendered: format!("{}.*", quote_ident(alias)),
                 aggregated: false,
-                splat: false,
+                splat: true,
             });
         }
 
@@ -352,8 +435,35 @@ impl Planner<'_> {
             .collect();
         if !mine.is_empty() {
             let rel = self.catalog.relation(table);
-            let compiled =
-                where_clause_from(&mine, Some(alias), std::mem::take(&mut self.params), rel)?;
+            // A read query has the laterals in front of it, so asking
+            // whether an embed found anything is a test on the lateral
+            // itself: the whole row for a to one, the aggregate for a
+            // to many, which is null when jsonb_agg saw no rows.
+            let tests: Vec<EmbedTest> = embeds
+                .iter()
+                .map(|e| {
+                    let w = quote_ident(&e.alias);
+                    match e.kind {
+                        Kind::ToOne => EmbedTest {
+                            key: e.key.clone(),
+                            present: format!("{w} is distinct from null"),
+                            absent: format!("{w} is not distinct from null"),
+                        },
+                        Kind::ToMany => EmbedTest {
+                            key: e.key.clone(),
+                            present: format!("{w}.\"j\" is not null"),
+                            absent: format!("{w}.\"j\" is null"),
+                        },
+                    }
+                })
+                .collect();
+            let compiled = where_clause_over(
+                &mine,
+                Some(alias),
+                std::mem::take(&mut self.params),
+                rel,
+                &tests,
+            )?;
             self.params = compiled.params;
             conjuncts.push(compiled.text);
         }
@@ -376,7 +486,7 @@ impl Planner<'_> {
 
         if let Some((_, terms)) = self.q.order.iter().find(|(r, _)| r == path) {
             sql.push_str(" order by ");
-            sql.push_str(&order_sql(alias, terms));
+            sql.push_str(&order_sql(table, alias, terms, &embeds)?);
         }
         if let Some((_, n)) = self.q.limit.iter().find(|(r, _)| r == path) {
             sql.push_str(&format!(" limit {n}"));
@@ -418,9 +528,34 @@ impl Planner<'_> {
             .map(|(_, n)| n.clone())
             .collect();
         if !mine.is_empty() {
+            // The count query has no laterals, so a filter that asks
+            // an embed whether it found anything is answered by an
+            // EXISTS over the same child level, its own filters and
+            // its own link included.
+            let mut tests: Vec<EmbedTest> = Vec::new();
+            for item in items {
+                let (Item::Embed(e) | Item::Spread(e)) = item else {
+                    continue;
+                };
+                let key = key_of(e).to_string();
+                if !mine.iter().any(|n| asks_null(n, &key)) {
+                    continue;
+                }
+                let sub = self.exists_level(table, alias, e, path)?;
+                tests.push(EmbedTest {
+                    key,
+                    present: format!("exists ({sub})"),
+                    absent: format!("not exists ({sub})"),
+                });
+            }
             let rel = self.catalog.relation(table);
-            let compiled =
-                where_clause_from(&mine, Some(alias), std::mem::take(&mut self.params), rel)?;
+            let compiled = where_clause_over(
+                &mine,
+                Some(alias),
+                std::mem::take(&mut self.params),
+                rel,
+                &tests,
+            )?;
             self.params = compiled.params;
             conjuncts.push(compiled.text);
         }
@@ -431,15 +566,7 @@ impl Planner<'_> {
             if e.join != Some(Join::Inner) {
                 continue;
             }
-            let rel = self
-                .catalog
-                .resolve(table, &e.relation, e.hint.as_deref())?;
-            let child = self.next_alias();
-            let junction = rel.via.as_ref().map(|_| self.next_alias());
-            let mut child_path = path.to_vec();
-            child_path.push(key_of(e).to_string());
-            let link = link_sql(&rel, alias, &child, junction.as_deref());
-            let sub = self.count_level(&e.relation, &child, &e.items, &child_path, Some(link))?;
+            let sub = self.exists_level(table, alias, e, path)?;
             conjuncts.push(format!("exists ({sub})"));
         }
         if !conjuncts.is_empty() {
@@ -447,6 +574,26 @@ impl Planner<'_> {
             sql.push_str(&conjuncts.join(" AND "));
         }
         Ok(sql)
+    }
+
+    /// The count query's child level for one embed, the body an EXISTS
+    /// takes: linked to its parent, carrying its own filters.
+    fn exists_level(
+        &mut self,
+        table: &str,
+        alias: &str,
+        e: &Embed,
+        path: &[String],
+    ) -> Result<String, PlanError> {
+        let rel = self
+            .catalog
+            .resolve(table, &e.relation, e.hint.as_deref())?;
+        let child = self.next_alias();
+        let junction = rel.via.as_ref().map(|_| self.next_alias());
+        let mut child_path = path.to_vec();
+        child_path.push(key_of(e).to_string());
+        let link = link_sql(&rel, alias, &child, junction.as_deref());
+        self.count_level(&e.relation, &child, &e.items, &child_path, Some(link))
     }
 
     /// One column pick: the expression, its casts, its aggregate,
@@ -517,6 +664,7 @@ impl Planner<'_> {
         spread: bool,
         cols: &mut Vec<OutCol>,
         laterals: &mut Vec<String>,
+        embeds: &mut Vec<Embedded>,
     ) -> Result<(), PlanError> {
         let rel = self
             .catalog
@@ -535,24 +683,32 @@ impl Planner<'_> {
         let link = link_sql(&rel, parent_alias, &child, junction.as_deref());
         let body = self.level(&e.relation, &child, &e.items, &child_path, Some(link))?;
 
-        let wrap = quote_ident(&format!("e_{child}"));
+        let name = format!("e_{child}");
+        let wrap = quote_ident(&name);
         let inner = e.join == Some(Join::Inner);
         let key = quote_ident(key_of(e));
+        embeds.push(Embedded {
+            key: key_of(e).to_string(),
+            alias: name,
+            kind: if spread { Kind::ToOne } else { rel.kind },
+        });
         if spread {
             let joiner = if inner { "join" } else { "left join" };
             laterals.push(format!("{joiner} lateral ({body}) as {wrap} on true"));
-            cols.push(OutCol {
-                expr: format!("{wrap}.*"),
-                rendered: format!("{wrap}.*"),
-                aggregated: false,
-                splat: true,
-            });
+            if !e.items.is_empty() {
+                cols.push(OutCol {
+                    expr: format!("{wrap}.*"),
+                    rendered: format!("{wrap}.*"),
+                    aggregated: false,
+                    splat: true,
+                });
+            }
             return Ok(());
         }
 
-        let row = quote_ident(&format!("r_{child}"));
         match rel.kind {
             Kind::ToMany => {
+                let row = quote_ident(&format!("r_{child}"));
                 let lateral = format!(
                     "(select jsonb_agg(to_jsonb({row})) as \"j\" from ({body}) as {row}) as {wrap}"
                 );
@@ -573,15 +729,18 @@ impl Planner<'_> {
                     });
                 }
             }
+            // The lateral carries the child's columns rather than the
+            // json it becomes, so the level around it can order by one
+            // of them and can ask whether the whole row is there. The
+            // json is built on the way out instead.
             Kind::ToOne => {
                 let joiner = if inner { "join" } else { "left join" };
-                laterals.push(format!(
-                    "{joiner} lateral (select to_jsonb({row}) as \"j\" from ({body}) as {row}) as {wrap} on true"
-                ));
+                laterals.push(format!("{joiner} lateral ({body}) as {wrap} on true"));
                 if !e.items.is_empty() {
+                    let expr = format!("to_jsonb({wrap})");
                     cols.push(OutCol {
-                        expr: format!("{wrap}.\"j\""),
-                        rendered: format!("{wrap}.\"j\" as {key}"),
+                        rendered: format!("{expr} as {key}"),
+                        expr,
                         aggregated: false,
                         splat: false,
                     });
@@ -671,25 +830,45 @@ fn checked_cast(cast: &str) -> Result<&str, PlanError> {
     }
 }
 
-fn order_sql(alias: &str, terms: &[Term]) -> String {
-    terms
-        .iter()
-        .map(|t| {
-            let mut s = field_expr(Some(alias), &t.name, &t.path);
-            match t.direction {
-                Some(Direction::Asc) => s.push_str(" asc"),
-                Some(Direction::Desc) => s.push_str(" desc"),
-                None => {}
+/// The ORDER BY of one level. A term that names an embedded resource
+/// orders by that embed's lateral alias, which is why it only works
+/// for a to one: a list has no single value to sort a parent row by,
+/// and upstream answers PGRST118 rather than picking one.
+fn order_sql(
+    table: &str,
+    alias: &str,
+    terms: &[Term],
+    embeds: &[Embedded],
+) -> Result<String, PlanError> {
+    let mut out = Vec::with_capacity(terms.len());
+    for t in terms {
+        let qualifier = match &t.relation {
+            None => alias,
+            Some(name) => {
+                let e = embeds
+                    .iter()
+                    .find(|e| &e.key == name)
+                    .ok_or_else(|| not_embedded(name))?;
+                if e.kind == Kind::ToMany {
+                    return Err(unordered_relationship(table, name).into());
+                }
+                &e.alias
             }
-            match t.nulls {
-                Some(Nulls::First) => s.push_str(" nulls first"),
-                Some(Nulls::Last) => s.push_str(" nulls last"),
-                None => {}
-            }
-            s
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+        };
+        let mut s = field_expr(Some(qualifier), &t.name, &t.path);
+        match t.direction {
+            Some(Direction::Asc) => s.push_str(" asc"),
+            Some(Direction::Desc) => s.push_str(" desc"),
+            None => {}
+        }
+        match t.nulls {
+            Some(Nulls::First) => s.push_str(" nulls first"),
+            Some(Nulls::Last) => s.push_str(" nulls last"),
+            None => {}
+        }
+        out.push(s);
+    }
+    Ok(out.join(", "))
 }
 
 #[cfg(test)]
@@ -926,7 +1105,7 @@ mod tests {
         let q = query("orders", "id,users(id)");
         assert_eq!(
             text(&q),
-            r#"select "z0"."id" as "id", "e_z1"."j" as "users" from "orders" as "z0" left join lateral (select to_jsonb("r_z1") as "j" from (select "z1"."id" as "id" from "users" as "z1" where "z1"."id" = "z0"."user_id") as "r_z1") as "e_z1" on true"#
+            r#"select "z0"."id" as "id", to_jsonb("e_z1") as "users" from "orders" as "z0" left join lateral (select "z1"."id" as "id" from "users" as "z1" where "z1"."id" = "z0"."user_id") as "e_z1" on true"#
         );
     }
 
@@ -1006,12 +1185,101 @@ mod tests {
     }
 
     #[test]
+    fn an_order_term_can_name_a_to_one_embed() {
+        let mut q = query("orders", "id,users(name)");
+        q.order
+            .push((Vec::new(), order::parse("users(name).desc").unwrap()));
+        let t = text(&q);
+        assert!(t.ends_with(r#"order by "e_z1"."name" desc"#), "{t}");
+
+        // An empty embed still exposes its columns, which is how
+        // ordering by something the client never asked to see works.
+        let mut q = query("orders", "id,users()");
+        q.order
+            .push((Vec::new(), order::parse("users(name)").unwrap()));
+        let t = text(&q);
+        assert!(t.contains(r#"select "z1".* from "users""#), "{t}");
+        assert!(t.ends_with(r#"order by "e_z1"."name""#), "{t}");
+
+        // The alias is the name, when there is one.
+        let mut q = query("orders", "id,who:users(name)");
+        q.order
+            .push((Vec::new(), order::parse("who(name)").unwrap()));
+        assert!(text(&q).ends_with(r#"order by "e_z1"."name""#));
+    }
+
+    #[test]
+    fn a_related_order_needs_a_to_one_that_is_embedded() {
+        let mut q = query("users", "id,orders(id)");
+        q.order
+            .push((Vec::new(), order::parse("orders(id)").unwrap()));
+        let PlanError::Embed(e) = fails(&q) else {
+            panic!("not an embed error")
+        };
+        assert_eq!(e.code, "PGRST118");
+        assert_eq!(e.message, "A related order on 'orders' is not possible");
+        assert_eq!(
+            e.details.as_deref(),
+            Some("'users' and 'orders' do not form a many-to-one or one-to-one relationship")
+        );
+
+        let mut q = query("orders", "id,users(name)");
+        q.order
+            .push((Vec::new(), order::parse("usersx(name)").unwrap()));
+        let PlanError::Embed(e) = fails(&q) else {
+            panic!("not an embed error")
+        };
+        assert_eq!(e.code, "PGRST108");
+        assert_eq!(
+            e.message,
+            "'usersx' is not an embedded resource in this request"
+        );
+    }
+
+    #[test]
+    fn a_filter_can_ask_whether_an_embed_found_anything() {
+        // A to one is the whole row of its lateral.
+        let mut q = query("orders", "id,users()");
+        filt(&mut q, "users", "not.is.null");
+        let t = text(&q);
+        assert!(t.contains(r#"where "e_z1" is distinct from null"#), "{t}");
+
+        let mut q = query("orders", "id,users()");
+        filt(&mut q, "users", "is.null");
+        assert!(text(&q).contains(r#"where "e_z1" is not distinct from null"#));
+
+        // A to many is the aggregate, which is null when jsonb_agg
+        // saw no rows at all.
+        let mut q = query("users", "id,orders()");
+        filt(&mut q, "orders", "not.is.null");
+        assert!(text(&q).contains(r#"where "e_z1"."j" is not null"#));
+
+        // Every other operator reads the name as a column.
+        let mut q = query("orders", "id,users()");
+        filt(&mut q, "users", "eq.2");
+        assert!(text(&q).contains(r#""z0"."users" = $1"#));
+    }
+
+    #[test]
+    fn the_count_query_answers_an_embed_test_with_an_exists() {
+        let mut q = query("users", "id,orders()");
+        filt(&mut q, "orders", "is.null");
+        filt(&mut q, "orders.total", "gte.100");
+        let sql = count(&shop(), &q).unwrap();
+        assert_eq!(
+            sql.text,
+            r#"select 1 from "users" as "z0" where not exists (select 1 from "orders" as "z1" where "z1"."user_id" = "z0"."id" AND "z1"."total" >= $1)"#
+        );
+        assert_eq!(sql.params, vec!["100"]);
+    }
+
+    #[test]
     fn an_empty_inner_embed_is_pure_existence() {
         let mut q = query("users", "id,orders!inner()");
         filt(&mut q, "orders.total", "gte.100");
         let t = text(&q);
         assert!(t.starts_with(r#"select "z0"."id" as "id" from"#), "{t}");
-        assert!(t.contains(r#"select 1 from "orders""#), "{t}");
+        assert!(t.contains(r#"select "z1".* from "orders""#), "{t}");
         assert!(t.contains(r#"is not null"#), "{t}");
     }
 

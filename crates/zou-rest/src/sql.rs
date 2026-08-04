@@ -57,6 +57,22 @@ pub struct Sql {
     pub params: Vec<String>,
 }
 
+/// What an embedded resource answers when a filter names it rather
+/// than a column: `posts=not.is.null` asks whether the embed found
+/// anything. The two predicates are handed in already rendered
+/// because what they are depends on the query. The read query has a
+/// lateral join to point at, and the count query, which has no
+/// laterals at all, has an EXISTS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedTest {
+    /// The name the embed goes by, its alias or its relation.
+    pub key: String,
+    /// What `not.is.null` compiles to.
+    pub present: String,
+    /// What `is.null` compiles to.
+    pub absent: String,
+}
+
 /// Compile the conjunction of these trees into one WHERE fragment.
 /// Every query pair on a request is one node, PostgREST ands them.
 pub fn where_clause(nodes: &[Node]) -> Result<Sql, CompileError> {
@@ -75,6 +91,21 @@ pub fn where_clause_from(
     params: Vec<String>,
     rel: Option<&Relation>,
 ) -> Result<Sql, CompileError> {
+    where_clause_over(nodes, qualifier, params, rel, &[])
+}
+
+/// The same, for a level that has embedded resources a filter is
+/// allowed to name. Only `is.null` and `not.is.null` reach them: every
+/// other operator reads the name as a column, which is upstream's own
+/// rule and is why a table with a column and an embed of the same name
+/// answers both.
+pub fn where_clause_over(
+    nodes: &[Node],
+    qualifier: Option<&str>,
+    params: Vec<String>,
+    rel: Option<&Relation>,
+    embeds: &[EmbedTest],
+) -> Result<Sql, CompileError> {
     if nodes.is_empty() {
         return err("nothing to compile");
     }
@@ -82,6 +113,7 @@ pub fn where_clause_from(
         params,
         qualifier: qualifier.map(str::to_string),
         rel,
+        embeds,
     };
     let mut parts = Vec::with_capacity(nodes.len());
     for node in nodes {
@@ -97,6 +129,7 @@ struct Compiler<'a> {
     params: Vec<String>,
     qualifier: Option<String>,
     rel: Option<&'a Relation>,
+    embeds: &'a [EmbedTest],
 }
 
 impl Compiler<'_> {
@@ -163,12 +196,36 @@ impl Compiler<'_> {
         }
     }
 
+    /// The predicate a null test on an embedded resource compiles to,
+    /// when the name is one and the test is that. The embed wins over
+    /// a column of the same name here and loses to it everywhere
+    /// else, which is what a live 14.15 does.
+    fn embed_test(&self, c: &Cond) -> Option<&str> {
+        if c.op != Op::Is || !c.field.path.is_empty() || c.quant.is_some() {
+            return None;
+        }
+        let Value::Lit(word) = &c.value else {
+            return None;
+        };
+        if word != "null" {
+            return None;
+        }
+        let test = self.embeds.iter().find(|e| e.key == c.field.column)?;
+        Some(match c.negated {
+            true => &test.present,
+            false => &test.absent,
+        })
+    }
+
     fn cond(&mut self, c: &Cond) -> Result<String, CompileError> {
         if !c.field.embed.is_empty() {
             return err(format!(
                 "a filter on the embedded resource ({}) needs the embedding planner",
                 c.field.embed.join(".")
             ));
+        }
+        if let Some(test) = self.embed_test(c) {
+            return Ok(test.to_string());
         }
         let lhs = field_expr(self.qualifier.as_deref(), &c.field.column, &c.field.path);
         let read = self.read_cast(c);

@@ -7,6 +7,12 @@
 //! Embed scoped ordering arrives on a different query key entirely,
 //! `posts.order=...`, so this module only ever sees the value side.
 //!
+//! A term can also name a column of an embedded resource rather than
+//! one of its own, `order=clients(name).desc`, which is how a list is
+//! sorted by something on the other side of a join. The parens are
+//! what tells the two apart, and everything after them reads the same
+//! way, json path included.
+//!
 //! Bare names break on the same bytes as the filter grammar, and the
 //! modifier words never collide with column names because a term
 //! always starts with the column: `order=asc` orders by a column
@@ -53,6 +59,10 @@ impl Nulls {
 /// canonical form does not have to invent them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Term {
+    /// The embedded resource the column belongs to, when the term was
+    /// written `relation(column)`. `None` is a column of the level
+    /// the order was asked on.
+    pub relation: Option<String>,
     pub name: String,
     pub path: Vec<JsonStep>,
     pub direction: Option<Direction>,
@@ -79,7 +89,7 @@ fn name_break(b: u8) -> bool {
     matches!(b, b'.' | b',' | b'(' | b')' | b'"' | b'{' | b'}')
 }
 
-fn parse_term(cur: &mut Cur) -> Result<Term, Error> {
+fn parse_field(cur: &mut Cur) -> Result<String, Error> {
     let name = if cur.peek() == Some(b'"') {
         scan_quoted(cur)?
     } else {
@@ -88,7 +98,23 @@ fn parse_term(cur: &mut Cur) -> Result<Term, Error> {
     if name.is_empty() {
         return cur.err("expected a field name");
     }
+    Ok(name)
+}
+
+fn parse_term(cur: &mut Cur) -> Result<Term, Error> {
+    let mut name = parse_field(cur)?;
+    // A paren after the first name makes it the embedded resource and
+    // what is inside it the column, which is the only place an order
+    // term reaches past the level it was asked on.
+    let mut relation = None;
+    if cur.eat(b'(') {
+        relation = Some(name);
+        name = parse_field(cur)?;
+    }
     let path = parse_json_path(cur, name_break)?;
+    if relation.is_some() {
+        cur.expect(b')', "unterminated related order")?;
+    }
 
     let mut direction = None;
     let mut nulls = None;
@@ -144,6 +170,7 @@ fn parse_term(cur: &mut Cur) -> Result<Term, Error> {
     }
 
     Ok(Term {
+        relation,
         name,
         path,
         direction,
@@ -157,14 +184,25 @@ fn name_needs_quotes(s: &str) -> bool {
     s.is_empty() || s.bytes().any(|b| name_break(b) || b == b'\\') || s.contains("->")
 }
 
+fn write_name(f: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
+    if name_needs_quotes(name) {
+        write_escaped(f, name)
+    } else {
+        write!(f, "{name}")
+    }
+}
+
 impl fmt::Display for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if name_needs_quotes(&self.name) {
-            write_escaped(f, &self.name)?;
-        } else {
-            write!(f, "{}", self.name)?;
+        if let Some(rel) = &self.relation {
+            write_name(f, rel)?;
+            write!(f, "(")?;
         }
+        write_name(f, &self.name)?;
         fmt_path(f, &self.path)?;
+        if self.relation.is_some() {
+            write!(f, ")")?;
+        }
         if let Some(d) = self.direction {
             write!(f, ".{}", d.name())?;
         }
@@ -269,6 +307,32 @@ mod tests {
     }
 
     #[test]
+    fn a_term_can_name_an_embedded_resource() {
+        let terms = ok("clients(name).desc");
+        assert_eq!(terms[0].relation.as_deref(), Some("clients"));
+        assert_eq!(terms[0].name, "name");
+        assert_eq!(terms[0].direction, Some(Direction::Desc));
+
+        let terms = ok("trash_details(jsonb_col->key).asc");
+        assert_eq!(terms[0].relation.as_deref(), Some("trash_details"));
+        assert_eq!(terms[0].path.len(), 1);
+
+        // One of each, since a related term is still a term.
+        let terms = ok("clients(name),id.desc");
+        assert_eq!(terms[0].relation.as_deref(), Some("clients"));
+        assert_eq!(terms[1].relation, None);
+
+        // The parens are the only difference, so a quoted name that
+        // has one inside stays a plain column.
+        let terms = ok("\"a(b\"");
+        assert_eq!(terms[0].relation, None);
+        assert_eq!(terms[0].name, "a(b");
+
+        assert_eq!(fail("clients(name").message, "unterminated related order");
+        assert_eq!(fail("clients()").message, "expected a field name");
+    }
+
+    #[test]
     fn errors() {
         assert_eq!(fail("").message, "expected a field name");
         assert_eq!(fail("a,").message, "expected a field name");
@@ -299,6 +363,12 @@ mod tests {
         "asc",
         "asc.desc",
         "nullsfirst.nullsfirst",
+        "clients(name)",
+        "clients(name).desc.nullslast",
+        "trash_details(jsonb_col->key).asc",
+        "\"weird rel\"(\"weird col\")",
+        "clients(name),id.desc",
+        "\"a(b\"",
     ];
 
     #[test]

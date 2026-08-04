@@ -1033,13 +1033,7 @@ fn plan_error(e: PlanError) -> RestError {
         PlanError::Compile(c) => bad_grammar(c.message),
         PlanError::Other(m) => RestError {
             status: StatusCode::BAD_REQUEST,
-            // The one refusal PostgREST names separately: paging or
-            // filtering a route the select tree does not embed.
-            code: if m.contains("is not an embedded resource") {
-                "PGRST108".to_string()
-            } else {
-                "PGRST100".to_string()
-            },
+            code: "PGRST100".to_string(),
             message: m,
             details: None,
             hint: None,
@@ -2508,10 +2502,14 @@ mod tests {
             hint: None,
         }));
         assert_eq!(many.status, StatusCode::MULTIPLE_CHOICES);
-        let unrouted = plan_error(PlanError::Other(
-            "'orders' is not an embedded resource in this request".to_string(),
-        ));
+        let unrouted = plan_error(PlanError::Embed(EmbedError {
+            code: "PGRST108",
+            message: "'orders' is not an embedded resource in this request".to_string(),
+            details: None,
+            hint: Some("Verify that 'orders' is included in the 'select' query parameter.".into()),
+        }));
         assert_eq!(unrouted.code, "PGRST108");
+        assert_eq!(unrouted.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
