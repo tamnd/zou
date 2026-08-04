@@ -156,6 +156,15 @@ impl Relation {
             None => true,
         }
     }
+
+    /// Whether a text search over this column has to make the vector
+    /// itself. A tsvector already is one, and a column nobody here
+    /// has is left alone, because upstream has no type to decide
+    /// against and will not guess one.
+    pub fn searches_as_text(&self, column: &str) -> bool {
+        self.column(column)
+            .is_some_and(|c| c.base_type != "tsvector")
+    }
 }
 
 /// One column of a relation, and the two functions its type was
@@ -171,6 +180,11 @@ pub struct Column {
     /// What postgres calls the type, spelled the way a column
     /// definition list wants it. Only a write needs it.
     pub type_name: String,
+    /// The same type with every domain over it resolved away, so a
+    /// domain over tsvector reads as `tsvector` here and as its own
+    /// name above. A rule about what a type can do asks this one, a
+    /// rule about how a value is spelled asks the other.
+    pub base_type: String,
     /// Writes a value of this type as json, the cast to json.
     pub to_json: Option<String>,
     /// Reads one out of the text a url carries, the cast from text.
@@ -220,6 +234,13 @@ select c.relname::text
 /// when the search path would not find it and with its modifiers
 /// carried along.
 ///
+/// The base type next to it is the same type with the domains taken
+/// off, which takes a recursive walk because a domain may be over a
+/// domain. A type postgres itself owns is spelled without modifiers,
+/// since what asks for this name asks what the type can do and not
+/// how wide it is, and a type from anywhere else keeps the nominal
+/// spelling, because that is the only name a query may use.
+///
 /// The default expression is where postgres keeps four different
 /// things. A plain default is in pg_attrdef. A domain's default is
 /// on the type and only counts when the column has none of its own.
@@ -229,6 +250,20 @@ select c.relname::text
 /// column has an expression nobody may write to, so it has none
 /// here.
 pub const COLUMNS_SQL: &str = "\
+with recursive base_types as (
+select oid,
+       typbasetype,
+       typnamespace as base_namespace,
+       coalesce(nullif(typbasetype, 0), oid) as base_type
+  from pg_type
+ union
+select t.oid,
+       b.typbasetype,
+       b.typnamespace,
+       coalesce(nullif(b.typbasetype, 0), b.oid)
+  from base_types t
+  join pg_type b on b.oid = t.typbasetype
+)
 select c.relname::text,
        a.attname::text,
        (select quote_ident(fn.nspname) || '.' || quote_ident(f.proname)
@@ -253,6 +288,15 @@ select c.relname::text,
            and ct.casttarget = a.atttypid
            and ct.castmethod = 'f'),
        format_type(a.atttypid, a.atttypmod),
+       case when t.typtype = 'd'
+              then case when bt.base_namespace = 'pg_catalog'::regnamespace
+                          then format_type(bt.base_type, null)
+                        else format_type(a.atttypid, a.atttypmod)
+                   end
+            when t.typnamespace = 'pg_catalog'::regnamespace
+              then format_type(a.atttypid, null)
+            else format_type(a.atttypid, a.atttypmod)
+       end,
        case when t.typbasetype <> 0 and ad.adbin is null
               then pg_get_expr(t.typdefaultbin, 0)
             when a.attidentity = 'd'
@@ -264,6 +308,7 @@ select c.relname::text,
   join pg_namespace n on n.oid = c.relnamespace
   join pg_attribute a on a.attrelid = c.oid
   join pg_type t on t.oid = a.atttypid
+  left join base_types bt on bt.oid = a.atttypid and bt.typbasetype = 0
   left join pg_attrdef ad
     on ad.adrelid = a.attrelid and ad.adnum = a.attnum
   left join pg_depend seq
@@ -1594,6 +1639,7 @@ mod tests {
                         from_text: Some("test.color".into()),
                         from_json: Some("test.color".into()),
                         type_name: "test.color".into(),
+                        base_type: "test.color".into(),
                         default_expr: None,
                     },
                 },

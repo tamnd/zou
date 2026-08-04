@@ -762,11 +762,13 @@ mod tests {
                 Column {
                     name: "id".into(),
                     type_name: "bigint".into(),
+                    base_type: "bigint".into(),
                     ..Column::default()
                 },
                 Column {
                     name: "label_color".into(),
                     type_name: "test.color".into(),
+                    base_type: "test.color".into(),
                     to_json: Some("test.json".into()),
                     from_text: Some("test.color".into()),
                     from_json: Some("test.color".into()),
@@ -775,6 +777,7 @@ mod tests {
                 Column {
                     name: "name".into(),
                     type_name: "text".into(),
+                    base_type: "text".into(),
                     ..Column::default()
                 },
             ],

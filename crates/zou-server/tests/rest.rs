@@ -3752,3 +3752,58 @@ async fn a_json_path_reads_whatever_the_column_holds() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
 }
+
+#[tokio::test]
+async fn a_text_search_makes_the_vector_it_needs() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_fts_rows cascade",
+            "drop domain if exists zou_fts_vector cascade",
+            "create domain zou_fts_vector as tsvector",
+            "create table zou_fts_rows (\
+             id int primary key, body text, doc jsonb, vec zou_fts_vector)",
+            "insert into zou_fts_rows values \
+             (1, 'fat cats ate rats', '{\"a\": \"fat cats ate rats\"}', \
+              to_tsvector('fat cats ate rats')), \
+             (2, 'ein Spass am Arbeiten', '{\"a\": \"ein Spass am Arbeiten\"}', \
+              to_tsvector('ein Spass am Arbeiten'))",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // Postgres has no `@@` over jsonb at all, so the vector has to be
+    // made before the operator sees the column.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_fts_rows?select=id&doc=fts.fat"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+
+    // The configuration builds the vector as well as the query. The
+    // german dictionary stems Arbeiten to arbeit, and the default one
+    // does not, so this pair only matches when both halves agree.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_fts_rows?select=id&body=plfts(german).Arbeit",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+
+    // A column that is already a vector faces the operator bare, and
+    // a domain over one is still one.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_fts_rows?select=id&vec=fts.rat"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+}
