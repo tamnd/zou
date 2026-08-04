@@ -77,6 +77,15 @@ pub struct FkRow {
 
 /// The catalog side of the introspection: every fk in one schema.
 /// Bind the schema name as $1.
+///
+/// A partition is not a table the api has, [`RELATIONS_SQL`] leaves
+/// them out, so neither are the keys it inherited: postgres copies
+/// every key of a partitioned table onto each partition and records
+/// the copy with `conparentid` pointing back at the original, and the
+/// original is the only one that names a relationship anybody can ask
+/// for. Without that a partitioned junction is as many junctions as
+/// it has partitions, which is an ambiguous embed where upstream has
+/// one relationship.
 pub const INTROSPECT_SQL: &str = "\
 select c.conname::text,
        child.relname::text,
@@ -103,6 +112,7 @@ select c.conname::text,
   join pg_class parent on parent.oid = c.confrelid
   join pg_namespace pns on pns.oid = parent.relnamespace
  where c.contype = 'f'
+   and c.conparentid = 0
    and cns.nspname = $1
    and pns.nspname = $1
  order by c.conname";
@@ -538,16 +548,65 @@ impl Catalog {
     /// saying, and `projxxxx`, which is somebody asking for
     /// something else.
     pub fn nearest(&self, name: &str) -> Option<&str> {
-        let mut best: Option<(f64, &str)> = None;
-        for rel in &self.rels {
-            let score = similarity(name, &rel.name);
-            // Strictly better, so a tie keeps the earlier name and
-            // the suggestion does not depend on how the rows landed.
-            if score >= 0.75 && best.is_none_or(|(seen, _)| score > seen) {
-                best = Some((score, &rel.name));
-            }
+        closest(self.rels.iter().map(|r| r.name.as_str()), name, 0.75)
+    }
+
+    /// The suggestion an embed that found nothing gets, which depends
+    /// on which half of it was wrong. A parent nothing hangs off is
+    /// the misspelling, and the schema's related tables are what it
+    /// might have meant. A parent that does have relationships is
+    /// taken at its word and the target is the misspelling, against
+    /// the tables that parent's own relationships reach.
+    ///
+    /// A target that is already one of those names gets no suggestion
+    /// out of it, since then the embed did find the relation and it
+    /// is the hint after `!` that went wrong. Upstream drops the
+    /// exact match rather than the whole answer, so a second name
+    /// close enough to the first can still be offered.
+    ///
+    /// The two halves are held to different bars. A parent is a table
+    /// name and is judged the way [`Catalog::nearest`] judges one, at
+    /// three quarters, since the field it is matched against is every
+    /// related table in the schema and a loose match there suggests
+    /// tables that have nothing to do with the request. A target is
+    /// judged more loosely because the field is much smaller: the
+    /// tables one table's own relationships reach, where being the
+    /// nearest of them means something.
+    fn misspelling(&self, parent: &str, target: &str) -> Option<String> {
+        let cands = self.candidates(parent);
+        let (wrong, names, min) = if cands.is_empty() {
+            (parent, self.related(), 0.75)
+        } else {
+            (
+                target,
+                cands.iter().map(|c| c.rel.table.clone()).collect(),
+                0.5,
+            )
+        };
+        let best = closest(
+            names.iter().map(String::as_str).filter(|n| *n != wrong),
+            wrong,
+            min,
+        )?;
+        Some(format!("Perhaps you meant '{best}' instead of '{wrong}'."))
+    }
+
+    /// Every table in the schema that some relationship starts or
+    /// ends at, which is the field a misspelled parent is matched
+    /// against. A table no key and no function reaches is not one an
+    /// embed could have meant.
+    fn related(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for fk in &self.fks {
+            names.push(fk.table.clone());
+            names.push(fk.ref_table.clone());
         }
-        best.map(|(_, name)| name)
+        for c in &self.computed {
+            names.push(c.table.clone());
+        }
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// Every relationship leading out of one relation, each with the
@@ -698,7 +757,7 @@ impl Catalog {
                         .unwrap_or_default(),
                     self.schema,
                 ))),
-                hint: None,
+                hint: self.misspelling(parent, target),
             }),
             1 => Ok(cands.pop().expect("checked len").rel),
             _ => {
@@ -932,6 +991,20 @@ impl Cand {
             target,
         )
     }
+}
+
+/// The name in the list this word is closest to, when one of them is
+/// close enough to be worth suggesting. Ties keep the earlier name,
+/// so the suggestion does not depend on the order rows landed in.
+fn closest<'a>(names: impl Iterator<Item = &'a str>, word: &str, min: f64) -> Option<&'a str> {
+    let mut best: Option<(f64, &str)> = None;
+    for name in names {
+        let score = similarity(word, name);
+        if score >= min && best.is_none_or(|(seen, _)| score > seen) {
+            best = Some((score, name));
+        }
+    }
+    best.map(|(_, name)| name)
 }
 
 fn pairs(outer: &[String], inner: &[String]) -> Vec<(String, String)> {
@@ -1254,6 +1327,50 @@ mod tests {
             .resolve("orders", "addresses", Some("no_such_fk"))
             .unwrap_err();
         assert_eq!(e.code, "PGRST200");
+    }
+
+    /// Which half of the embed the suggestion is about depends on
+    /// which half the schema recognises.
+    #[test]
+    fn a_relationship_nobody_has_suggests_the_name_that_is_near_it() {
+        let c = shop();
+
+        assert_eq!(
+            c.resolve("users", "order", None).unwrap_err().hint,
+            Some("Perhaps you meant 'orders' instead of 'order'.".to_string())
+        );
+
+        // Nothing hangs off 'userss', so it is the word that is
+        // wrong, and the field is every table a relationship reaches.
+        assert_eq!(
+            c.resolve("userss", "orders", None).unwrap_err().hint,
+            Some("Perhaps you meant 'users' instead of 'userss'.".to_string())
+        );
+
+        // Not every miss is a typo. 'product' is nothing like the
+        // tables users reaches, and a suggestion would be noise.
+        assert_eq!(c.resolve("users", "product", None).unwrap_err().hint, None);
+
+        // A parent is matched against every related table in the
+        // schema, so it is held to the bar a table name is held to.
+        // Halfway to 'order_items' is not a misspelling of it.
+        assert_eq!(
+            c.resolve("produc_items", "orders", None).unwrap_err().hint,
+            None
+        );
+    }
+
+    /// A target that is a relationship of the parent is not the
+    /// misspelling, whatever else the schema is named: the embed
+    /// found it and the hint after `!` is what went wrong.
+    #[test]
+    fn a_target_that_exists_is_never_the_suggestion() {
+        let c = shop();
+        let e = c
+            .resolve("orders", "users", Some("no_such_fk"))
+            .unwrap_err();
+        assert_eq!(e.code, "PGRST200");
+        assert_eq!(e.hint, None);
     }
 
     #[test]
