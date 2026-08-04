@@ -1122,6 +1122,106 @@ async fn a_call_answers_with_the_range_a_read_would() {
     assert_eq!(body_text(res).await, r#"{"id": 1}"#);
 }
 
+/// What a call hands back decides how it is asked. A row is
+/// expanded in the from clause so the select grammar has columns to
+/// work on, and a value is selected as a value, which is the only
+/// way to ask for a `record`. A domain is neither: it is whatever
+/// it was declared over.
+#[tokio::test]
+async fn a_call_is_asked_the_way_its_return_type_reads() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop function if exists zou_ret_point(), zou_ret_domain(), \
+             zou_ret_record(), zou_ret_records(), zou_ret_rows(int), \
+             zou_ret_inout(int), zou_ret_wide()",
+            "drop domain if exists zou_point_domain",
+            "drop domain if exists zou_rows_domain",
+            "drop type if exists zou_point",
+            "drop table if exists zou_ret_items cascade",
+            "create type zou_point as (x int, y int)",
+            "create domain zou_point_domain as zou_point",
+            "create table zou_ret_items (id int primary key, name text)",
+            "insert into zou_ret_items values (1, 'a'), (2, 'b')",
+            "create domain zou_rows_domain as zou_ret_items",
+            "create function zou_ret_point() returns zou_point \
+             language sql immutable as 'select row(10, 5)::zou_point'",
+            "create function zou_ret_domain() returns zou_point_domain \
+             language sql immutable as 'select row(10, 5)::zou_point_domain'",
+            "create function zou_ret_record() returns record \
+             language sql stable as 'select * from zou_ret_items where id = 1'",
+            "create function zou_ret_records() returns setof record \
+             language sql stable as 'select * from zou_ret_items order by id'",
+            "create function zou_ret_rows(min_id int) returns setof zou_rows_domain \
+             language sql stable as \
+             'select i::zou_rows_domain from zou_ret_items i \
+              where i.id >= min_id order by i.id'",
+            "create function zou_ret_inout(inout num int) \
+             language sql immutable as 'select num + 1'",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // A composite type nobody can embed on is still a row, and one
+    // row is an object rather than a list of one.
+    for name in ["zou_ret_point", "zou_ret_domain"] {
+        let res = app
+            .clone()
+            .oneshot(get(&format!("/rest/v1/rpc/{name}")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{name}");
+        assert_eq!(res.headers()["content-range"], "0-0/*");
+        assert_eq!(body_text(res).await, r#"{"x": 10, "y": 5}"#, "{name}");
+    }
+
+    // A record has no columns to expand, which is what postgres
+    // means by "a column definition list is required". It travels
+    // as a value and writes itself out as an object all the same.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_ret_record"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"{"id": 1, "name": "a"}"#);
+
+    // A set of them is as many rows as the set has.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_ret_records"))
+        .await
+        .unwrap();
+    assert_eq!(res.headers()["content-range"], "0-1/*");
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]"#
+    );
+
+    // A domain over a table's rowtype is that table, so the select
+    // grammar applies and the columns are the table's own.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_ret_rows?min_id=2&select=name"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"name": "b"}]"#);
+
+    // One INOUT argument reads as a scalar from the return type
+    // alone, and postgres names the output column after it, so the
+    // answer is an object.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_ret_inout?num=2"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"{"num": 3}"#);
+}
+
 #[tokio::test]
 async fn an_rls_write_denial_comes_back_as_401() {
     let Some(dsn) = dsn() else { return };
