@@ -227,7 +227,12 @@ impl Compiler<'_> {
         if let Some(test) = self.embed_test(c) {
             return Ok(test.to_string());
         }
-        let lhs = field_expr(self.qualifier.as_deref(), &c.field.column, &c.field.path);
+        let lhs = field_expr(
+            self.qualifier.as_deref(),
+            &c.field.column,
+            &c.field.path,
+            self.rel.is_none_or(|r| r.steps_as_json(&c.field.column)),
+        );
         let read = self.read_cast(c);
         let read = read.as_deref();
 
@@ -384,13 +389,31 @@ fn array_literal(elems: &[String], patterns: bool) -> String {
 /// strings, index keys as bare integers, qualified when the caller
 /// works across more than one table in scope. The planner leans on
 /// this for select items and order terms too.
-pub(crate) fn field_expr(qualifier: Option<&str>, column: &str, path: &[JsonStep]) -> String {
+///
+/// A step into a column that is not already json reads the column
+/// through `to_jsonb` first, because `->` is an operator on json and
+/// jsonb and on nothing else: that is what lets an arrow walk into a
+/// composite type, into an array, and into a column whose type
+/// nobody looked up. A column that is json or jsonb is left alone,
+/// since the wrap would only stop an index on it from being used.
+pub(crate) fn field_expr(
+    qualifier: Option<&str>,
+    column: &str,
+    path: &[JsonStep],
+    to_json: bool,
+) -> String {
     let mut out = String::new();
+    if to_json && !path.is_empty() {
+        out.push_str("to_jsonb(");
+    }
     if let Some(q) = qualifier {
         out.push_str(&quote_ident(q));
         out.push('.');
     }
     out.push_str(&quote_ident(column));
+    if to_json && !path.is_empty() {
+        out.push(')');
+    }
     for JsonStep { text, key } in path {
         out.push_str(if *text { "->>" } else { "->" });
         match key {
@@ -580,19 +603,21 @@ mod tests {
 
     #[test]
     fn json_paths_and_identifier_quoting() {
+        // Nobody said what `data` is, and a column of a type nobody
+        // looked up is read as json, which is upstream's rule too.
         let s = sql("data->phones->0->>number", "eq.123");
-        assert_eq!(s.text, r#""data"->'phones'->0->>'number' = $1"#);
+        assert_eq!(s.text, r#"to_jsonb("data")->'phones'->0->>'number' = $1"#);
 
         let s = sql("\"weird\\\"name\"", "eq.1");
         assert_eq!(s.text, r#""weird""name" = $1"#);
 
         let s = sql("data->>it's", "eq.1");
-        assert_eq!(s.text, r#""data"->>'it''s' = $1"#);
+        assert_eq!(s.text, r#"to_jsonb("data")->>'it''s' = $1"#);
 
         // A key that spells like a placeholder stays a quoted
         // literal, only the bind on the right is a parameter.
         let s = sql("data->$1", "eq.x");
-        assert_eq!(s.text, r#""data"->'$1' = $1"#);
+        assert_eq!(s.text, r#"to_jsonb("data")->'$1' = $1"#);
         assert_eq!(s.params, vec!["x"]);
     }
 
@@ -639,6 +664,11 @@ mod tests {
                 },
                 Column {
                     name: "name".into(),
+                    ..Column::default()
+                },
+                Column {
+                    name: "notes".into(),
+                    type_name: "jsonb".into(),
                     ..Column::default()
                 },
             ],
@@ -727,9 +757,16 @@ mod tests {
             painted_clause("label_color", "fts.cat").text,
             r#""label_color" @@ to_tsquery($1)"#
         );
+        // An arrow into a column that is not json reads it as json
+        // first, and a column that already is one is left alone so
+        // an index on it can still be used.
         assert_eq!(
             painted_clause("label_color->>shade", "eq.dark").text,
-            r#""label_color"->>'shade' = $1"#
+            r#"to_jsonb("label_color")->>'shade' = $1"#
+        );
+        assert_eq!(
+            painted_clause("notes->>shade", "eq.dark").text,
+            r#""notes"->>'shade' = $1"#
         );
     }
 

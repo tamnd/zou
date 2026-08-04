@@ -145,6 +145,17 @@ impl Relation {
     pub fn represented(&self) -> bool {
         self.columns.iter().any(|c| c.to_json.is_some())
     }
+
+    /// Whether an arrow into this column has to read it as json
+    /// first. Everything does except json and jsonb themselves, and
+    /// a column nobody here has is a column of a type nobody looked
+    /// up, which upstream reads as json too.
+    pub fn steps_as_json(&self, column: &str) -> bool {
+        match self.column(column) {
+            Some(c) => !matches!(c.type_name.as_str(), "json" | "jsonb"),
+            None => true,
+        }
+    }
 }
 
 /// One column of a relation, and the two functions its type was

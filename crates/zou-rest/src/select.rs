@@ -245,7 +245,7 @@ fn parse_item(cur: &mut Cur) -> Result<Item, Error> {
         return Ok(Item::Embed(embed));
     }
 
-    let path = parse_json_path(cur, name_break)?;
+    let path = parse_json_path(cur)?;
     let cast = parse_cast(cur)?;
     let (agg, agg_cast) = parse_agg(cur)?;
     Ok(Item::Col(Col {

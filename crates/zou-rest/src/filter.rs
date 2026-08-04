@@ -338,7 +338,7 @@ fn parse_segment(cur: &mut Cur) -> Result<Seg, Error> {
     if name.is_empty() {
         return cur.err("expected a field name");
     }
-    let path = parse_json_path(cur, name_break)?;
+    let path = parse_json_path(cur)?;
     Ok(Seg { name, path, quoted })
 }
 
