@@ -342,6 +342,21 @@ fn parse_segment(cur: &mut Cur) -> Result<Seg, Error> {
     Ok(Seg { name, path, quoted })
 }
 
+/// Whether a query string value spells an operator and a literal
+/// rather than a bare value. That is the whole difference between a
+/// filter and an argument on a call: `id=gt.2` narrows the result
+/// and `id=5` is what the function is called with, and a request may
+/// carry both under the one name. Everywhere else a bare value is an
+/// error, which is why only a call asks this.
+pub fn is_operator(value: &str) -> bool {
+    let field = Field {
+        embed: Vec::new(),
+        column: String::new(),
+        path: Vec::new(),
+    };
+    parse_cond_rhs(&mut Cur::new(value), field, false).is_ok()
+}
+
 /// Parse `[not.]op[(modifier)].value` at the cursor. In a tree the
 /// literal ends at a comma or closing paren, at top level it runs to
 /// the end of the string verbatim.
@@ -1198,6 +1213,18 @@ mod tests {
             assert_eq!(first, second, "{key}={value} via {rk}={rv}");
             let (rk2, rv2) = second.render();
             assert_eq!((rk, rv), (rk2, rv2), "render must be a fixpoint");
+        }
+    }
+
+    #[test]
+    fn an_operator_is_what_tells_a_filter_from_an_argument() {
+        for value in ["gt.2", "eq.1", "not.is.null", "in.(1,2)", "eq(any).{1,2}"] {
+            assert!(is_operator(value), "{value} spells an operator");
+        }
+        // A bare value, and a value whose leading word is not an
+        // operator at all, are both arguments to the call.
+        for value in ["5", "hello", "gtx.2", "2020-01-01"] {
+            assert!(!is_operator(value), "{value} is a value");
         }
     }
 }
