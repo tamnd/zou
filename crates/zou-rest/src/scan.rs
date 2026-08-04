@@ -84,6 +84,21 @@ impl<'a> Cur<'a> {
         self.s.as_bytes()[self.pos..].starts_with(w.as_bytes())
     }
 
+    /// Step over spaces and tabs, but only when they lead to `b`.
+    ///
+    /// The conditional half is the point. Where the grammar allows
+    /// spaces it allows them as part of a token that has to be there,
+    /// so spaces leading to nothing are still the error they were.
+    pub(crate) fn skip_spaces_before(&mut self, b: u8) {
+        let mut at = self.pos;
+        while matches!(self.s.as_bytes().get(at), Some(b' ') | Some(b'\t')) {
+            at += 1;
+        }
+        if self.s.as_bytes().get(at) == Some(&b) {
+            self.pos = at;
+        }
+    }
+
     pub(crate) fn err<T>(&self, message: impl Into<String>) -> Result<T, Error> {
         Err(Error {
             message: message.into(),
