@@ -2209,7 +2209,7 @@ async fn invoke(
                 volatile: r.get(5),
                 rettype: r.get(6),
                 return_table: r.get(7),
-                out_args: r.get(8),
+                composite: r.get(8),
             })
         })
         .collect();
@@ -2310,7 +2310,7 @@ async fn invoke(
             Ok(res)
         }
         rpc::RetKind::Scalar => {
-            let wrapped = rpc::scalar_wrap(func, m, returns_set);
+            let wrapped = rpc::scalar_wrap(m, returns_set);
             let params: Vec<Text> = wrapped.params.into_iter().map(Text).collect();
             let rows = sess
                 .query(&wrapped.text, &param_refs(&params))

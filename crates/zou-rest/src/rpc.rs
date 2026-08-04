@@ -1,8 +1,8 @@
 //! Function calls, the /rest/v1/rpc/{fn} surface.
 //!
-//! PostgREST turns a request into a `select * from "fn"(...)` with
-//! named notation, so callers hit overloads, defaults, and variadic
-//! parameters exactly as SQL would resolve them. The work splits
+//! PostgREST turns a request into a call with named notation, so
+//! callers hit overloads, defaults, and variadic parameters exactly
+//! as SQL would resolve them. The work splits
 //! three ways: [`INTROSPECT_SQL`] pulls every overload of a name
 //! out of pg_proc, [`choose`] picks the one the supplied argument
 //! names identify with PostgREST's PGRST202 and PGRST203 errors
@@ -24,6 +24,12 @@ use crate::sql::{Sql, quote_ident};
 /// The CTE alias function results travel under when the select
 /// grammar applies to them.
 pub const SOURCE: &str = "_zou_rpc";
+
+/// The column a call that hands back a value rather than a row
+/// travels under. Naming it here rather than letting postgres name
+/// the output column after the function keeps the wrap independent
+/// of what the function was called.
+pub const VALUE: &str = "_zou_val";
 
 /// One input argument of one overload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,14 +72,28 @@ pub struct Routine {
 /// format_type, a variadic flag per argument, the count of trailing
 /// defaults, then proretset, provolatile = 'v', the return type's
 /// name, the table whose rowtype it is when there is one, and
-/// whether the result is named in OUT or TABLE arguments.
+/// whether the result is a row rather than a value.
 ///
 /// proallargtypes and proargmodes only exist once OUT or TABLE
 /// arguments appear, so both coalesce back to the plain input
 /// columns, and the mode filter keeps i, b, and v: IN, INOUT, and
 /// VARIADIC are what a caller can supply.
+///
+/// A domain is not a type of its own here. `bases` walks typbasetype
+/// down to whatever the domain was declared over, and every question
+/// about the return type is asked of that, because a domain over a
+/// table's rowtype returns rows and postgres will not say so.
 pub const INTROSPECT_SQL: &str = "\
-with fns as (
+with recursive bases as (
+  select oid, typbasetype, coalesce(nullif(typbasetype, 0), oid) as base
+    from pg_type
+  union
+  select t.oid, b.typbasetype, coalesce(nullif(b.typbasetype, 0), b.oid)
+    from bases t
+    join pg_type b on b.oid = t.typbasetype
+),
+base_types as (select oid, base from bases where typbasetype = 0),
+fns as (
   select p.oid, p.pronargdefaults, p.proretset, p.provolatile, p.prorettype,
          coalesce(p.proallargtypes, p.proargtypes::oid[]) as types,
          coalesce(p.proargmodes,
@@ -96,14 +116,16 @@ select coalesce((select array_agg(coalesce(f.names[u.ord], '') order by u.ord)
        f.pronargdefaults::int,
        f.proretset,
        f.provolatile = 'v',
-       format_type(f.prorettype, null)::text,
+       format_type(t.oid, null)::text,
        (select c.relname::text
-          from pg_type t
-          join pg_class c on c.oid = t.typrelid
-         where t.oid = f.prorettype
+          from pg_class c
+         where c.oid = t.typrelid
            and c.relkind in ('r', 'v', 'p', 'm', 'f')),
-       coalesce((select bool_or(m in ('o', 't')) from unnest(f.modes) m), false)
+       (t.typtype = 'c'
+        or coalesce((select bool_or(m in ('o', 'b', 't')) from unnest(f.modes) m), false))
   from fns f
+  join base_types b on b.oid = f.prorettype
+  join pg_type t on t.oid = b.base
  order by f.oid";
 
 /// One overload as [`INTROSPECT_SQL`] hands it over, the raw
@@ -118,9 +140,9 @@ pub struct RoutineRow {
     pub volatile: bool,
     pub rettype: String,
     pub return_table: Option<String>,
-    /// Whether the function names its result in OUT or TABLE
-    /// arguments rather than returning a bare type.
-    pub out_args: bool,
+    /// Whether the result is a row: a composite type, a table's own
+    /// rowtype, or a result named in OUT, INOUT or TABLE arguments.
+    pub composite: bool,
 }
 
 /// Assemble one overload from an [`INTROSPECT_SQL`] row.
@@ -140,15 +162,19 @@ pub fn routine(row: RoutineRow) -> Routine {
             variadic,
         })
         .collect();
-    // A function with OUT or TABLE arguments returns rows whatever
-    // its return type says. Postgres only writes `record` there when
-    // there are two or more of them: one on its own collapses to that
-    // argument's own type, and a function whose result is a table of
-    // one column would otherwise read as a scalar and come back as a
-    // bare value where upstream sends an object.
+    // A function with OUT, INOUT or TABLE arguments returns rows
+    // whatever its return type says, because postgres names the
+    // output columns after them. One INOUT argument is the case that
+    // reads wrong from the return type alone: it collapses to that
+    // argument's own type and still comes back as an object.
+    //
+    // `record` is not a row here. It has no columns to expand, which
+    // is what postgres means by "a column definition list is
+    // required", so it travels as a value and the value happens to
+    // write itself out as an object.
     let kind = if row.rettype == "void" {
         RetKind::Void
-    } else if row.return_table.is_some() || row.rettype == "record" || row.out_args {
+    } else if row.composite {
         RetKind::Composite {
             table: row.return_table,
         }
@@ -276,6 +302,20 @@ fn qualified(schema: &str, name: &str) -> String {
     format!("{}.{}", quote_ident(schema), quote_ident(name))
 }
 
+/// How the call itself is spelled once the arguments are bound. A
+/// result that is a row goes in the from clause, where postgres
+/// expands it into the columns the select grammar then works on. A
+/// result that is a value goes in the select list under [`VALUE`],
+/// because there is nothing to expand: `record` has no columns
+/// until somebody writes a column definition list, and a set of
+/// values in a select list is as many rows as the set has.
+fn call_sql(kind: &RetKind, f: &str, args: &str) -> String {
+    match kind {
+        RetKind::Scalar => format!("select {f}({args}) as {}", quote_ident(VALUE)),
+        _ => format!("select * from {f}({args})"),
+    }
+}
+
 /// The expression pulling one named argument out of the json body
 /// parameter. json stays json, an array type unpacks element by
 /// element because a json array's text is not a postgres array
@@ -308,7 +348,7 @@ pub fn call_json(
     if choice.unnamed_json {
         let t = &choice.routine.args[0].type_name;
         return Sql {
-            text: format!("select * from {f}($1::{t})"),
+            text: call_sql(&choice.routine.kind, &f, &format!("$1::{t}")),
             params: vec![body],
         };
     }
@@ -332,7 +372,7 @@ pub fn call_json(
         vec![body]
     };
     Sql {
-        text: format!("select * from {f}({})", parts.join(", ")),
+        text: call_sql(&choice.routine.kind, &f, &parts.join(", ")),
         params,
     }
 }
@@ -373,22 +413,21 @@ pub fn call_get(schema: &str, name: &str, routine: &Routine, args: &[(String, St
         }
     }
     Sql {
-        text: format!("select * from {f}({})", parts.join(", ")),
+        text: call_sql(&routine.kind, &f, &parts.join(", ")),
         params,
     }
 }
 
-/// Wrap a scalar returning call so the value rides out as json
-/// text: one row's bare value, or a set folded to a json array.
-/// The output column of `select * from "f"(...)` is named after the
-/// function, which is what the wrap reads.
+/// Wrap a value returning call so the value rides out as json text:
+/// one row's bare value, or a set folded to a json array. The value
+/// is under [`VALUE`], which is what the wrap reads.
 ///
 /// The second column is how many rows there were, which is worth
 /// carrying because a folded set has no rows left to count and
 /// max-affected has to count them.
-pub fn scalar_wrap(name: &str, call: Sql, set: bool) -> Sql {
+pub fn scalar_wrap(call: Sql, set: bool) -> Sql {
     let src = quote_ident(SOURCE);
-    let col = quote_ident(name);
+    let col = quote_ident(VALUE);
     let text = if set {
         format!(
             "with {src} as ({}) select coalesce(jsonb_agg(to_jsonb({src}.{col})), '[]'::jsonb)::text, count(*)::bigint from {src}",
@@ -438,7 +477,7 @@ mod tests {
             volatile: false,
             rettype: "integer".into(),
             return_table: None,
-            out_args: false,
+            composite: false,
         }
     }
 
@@ -456,23 +495,52 @@ mod tests {
 
     #[test]
     fn the_return_contract_sorts_into_kinds() {
-        let kind = |ret: &str, table: Option<&str>| {
+        let kind = |ret: &str, table: Option<&str>, composite: bool| {
             routine(RoutineRow {
                 rettype: ret.into(),
                 return_table: table.map(str::to_string),
-                out_args: false,
+                composite,
                 ..row(&[], &[], 0)
             })
             .kind
         };
-        assert_eq!(kind("void", None), RetKind::Void);
-        assert_eq!(kind("integer", None), RetKind::Scalar);
-        assert_eq!(kind("record", None), RetKind::Composite { table: None });
+        assert_eq!(kind("void", None, false), RetKind::Void);
+        assert_eq!(kind("integer", None, false), RetKind::Scalar);
+        // `record` is a value, not a row: there is nothing to expand
+        // until somebody names the columns.
+        assert_eq!(kind("record", None, false), RetKind::Scalar);
+        // A composite type nobody can embed on is still a row.
         assert_eq!(
-            kind("books", Some("books")),
+            kind("point_2d", None, true),
+            RetKind::Composite { table: None }
+        );
+        assert_eq!(
+            kind("books", Some("books"), true),
             RetKind::Composite {
                 table: Some("books".into())
             }
+        );
+    }
+
+    #[test]
+    fn a_value_is_selected_and_a_row_is_expanded() {
+        let scalar = plain(&["a"], &["integer"], 0);
+        let s = call_get("public", "f", &scalar, &[("a".into(), "1".into())]);
+        assert_eq!(
+            s.text,
+            "select \"public\".\"f\"(\"a\" := $1::integer) as \"_zou_val\""
+        );
+
+        let composite = routine(RoutineRow {
+            rettype: "books".into(),
+            return_table: Some("books".into()),
+            composite: true,
+            ..row(&["a"], &["integer"], 0)
+        });
+        let s = call_get("public", "f", &composite, &[("a".into(), "1".into())]);
+        assert_eq!(
+            s.text,
+            "select * from \"public\".\"f\"(\"a\" := $1::integer)"
         );
     }
 
@@ -530,7 +598,7 @@ mod tests {
         let c = choose("public", "f", &overloads, &["x".into()], true).unwrap();
         assert!(c.unnamed_json);
         let s = call_json("public", "f", &c, &["x".into()], r#"{"x": 1}"#.into());
-        assert_eq!(s.text, r#"select * from "public"."f"($1::jsonb)"#);
+        assert_eq!(s.text, r#"select "public"."f"($1::jsonb) as "_zou_val""#);
         assert_eq!(s.params, vec![r#"{"x": 1}"#.to_string()]);
 
         // Without a json body the same miss is the plain 404.
@@ -554,13 +622,13 @@ mod tests {
         let s = call_json("public", "f", &c, &supplied, "{}".into());
         assert_eq!(
             s.text,
-            "select * from \"public\".\"f\"(\
+            "select \"public\".\"f\"(\
              \"n\" := (($1::jsonb)->>'n')::integer, \
              \"tag\" := (($1::jsonb)->>'tag')::text, \
              \"opts\" := (($1::jsonb)->'opts')::jsonb, \
              \"ids\" := coalesce((select array_agg(\"_zou_el\".v) \
              from jsonb_array_elements_text(($1::jsonb)->'ids') as \"_zou_el\"(v)), \
-             array[]::text[])::integer[])"
+             array[]::text[])::integer[]) as \"_zou_val\""
         );
         assert_eq!(s.params.len(), 1);
     }
@@ -570,7 +638,7 @@ mod tests {
         let overloads = vec![plain(&["min_id"], &["integer"], 1)];
         let c = choose("public", "f", &overloads, &[], true).unwrap();
         let s = call_json("public", "f", &c, &[], "{}".into());
-        assert_eq!(s.text, r#"select * from "public"."f"()"#);
+        assert_eq!(s.text, r#"select "public"."f"() as "_zou_val""#);
         assert!(s.params.is_empty());
     }
 
@@ -592,9 +660,9 @@ mod tests {
         );
         assert_eq!(
             s.text,
-            "select * from \"public\".\"f\"(\
+            "select \"public\".\"f\"(\
              \"a\" := $1::integer, \
-             variadic \"v\" := array[$2, $3]::integer[])"
+             variadic \"v\" := array[$2, $3]::integer[]) as \"_zou_val\""
         );
         assert_eq!(s.params, vec!["1".to_string(), "2".into(), "3".into()]);
     }
