@@ -593,7 +593,7 @@ impl Planner<'_> {
         let mut child_path = path.to_vec();
         child_path.push(key_of(e).to_string());
         let link = link_sql(&rel, alias, &child, junction.as_deref());
-        self.count_level(&e.relation, &child, &e.items, &child_path, Some(link))
+        self.count_level(&rel.table, &child, &e.items, &child_path, Some(link))
     }
 
     /// One column pick: the expression, its casts, its aggregate,
@@ -681,7 +681,7 @@ impl Planner<'_> {
         let mut child_path = path.to_vec();
         child_path.push(key_of(e).to_string());
         let link = link_sql(&rel, parent_alias, &child, junction.as_deref());
-        let body = self.level(&e.relation, &child, &e.items, &child_path, Some(link))?;
+        let body = self.level(&rel.table, &child, &e.items, &child_path, Some(link))?;
 
         let name = format!("e_{child}");
         let wrap = quote_ident(&name);

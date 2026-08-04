@@ -11,10 +11,21 @@
 //! The crate stays free of database dependencies, [`INTROSPECT_SQL`]
 //! is the query and the caller feeds the resulting rows back in as
 //! [`FkRow`] values. Resolution then answers the planner's question:
-//! given the table a request is rooted on and the relation an embed
+//! given the table a request is rooted on and the word an embed
 //! names, which relationship is meant, with the PGRST200 and
 //! PGRST201 errors PostgREST clients branch on when the answer is
 //! none or several.
+//!
+//! That word is a name for the relationship rather than for the
+//! relation on the other end. A relationship answers to the foreign
+//! table, `clients`, to the constraint that makes it,
+//! `projects_client_id_fkey`, and to the foreign key column the
+//! constraint sits on, `client_id`, and a hint after `!` may name
+//! any of those or the junction table of a many to many. The one
+//! place the name cannot say which way the join runs is a table
+//! pointing at itself, where the convention decides: the table name
+//! is the list pointing back, the column name is the one row it
+//! points at.
 //!
 //! Alongside the graph the catalog holds the relations themselves
 //! and their columns, [`RELATIONS_SQL`], [`COLUMNS_SQL`] and
@@ -260,6 +271,11 @@ pub enum Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rel {
     pub kind: Kind,
+    /// The relation on the other side of the join. Not always the
+    /// word the embed used: a constraint name or a foreign key
+    /// column name names a relationship too, and the client keeps
+    /// its own word for the key it gets back.
+    pub table: String,
     pub constraint: String,
     /// Column pairs joining the outer table to the embedded table,
     /// or to the junction when `via` is set.
@@ -300,6 +316,7 @@ pub struct Catalog {
     fks: Vec<FkRow>,
     rels: Vec<Relation>,
     timezones: HashSet<String>,
+    schema: String,
 }
 
 impl Catalog {
@@ -312,6 +329,16 @@ impl Catalog {
             fks,
             rels: Vec::new(),
             timezones: HashSet::new(),
+            schema: String::new(),
+        }
+    }
+
+    /// The same catalog knowing which schema it was read out of,
+    /// which only the PGRST200 details say out loud.
+    pub fn with_schema(self, schema: &str) -> Catalog {
+        Catalog {
+            schema: schema.to_string(),
+            ..self
         }
     }
 
@@ -385,44 +412,42 @@ impl Catalog {
         best.map(|(_, name)| name)
     }
 
-    /// Resolve the relationship an embed means: `parent` is the
-    /// table the request is rooted on, `target` the relation the
-    /// embed names, `hint` the word after `!` when the client
-    /// disambiguates by constraint, fk column, or junction table.
-    pub fn resolve(
-        &self,
-        parent: &str,
-        target: &str,
-        hint: Option<&str>,
-    ) -> Result<Rel, EmbedError> {
+    /// Every relationship leading out of one relation, each with the
+    /// name of what sits on the other end. Which of them an embed
+    /// means is [`Catalog::resolve`]'s question, and it is a separate
+    /// one: a relationship is reachable under its foreign table's
+    /// name, under the constraint that makes it, and under the
+    /// foreign key column, so the list has to be built before any of
+    /// those names is tried.
+    fn candidates(&self, parent: &str) -> Vec<Cand> {
         let mut cands: Vec<Cand> = Vec::new();
 
         for fk in &self.fks {
             // The embedded table holds the fk: to many, or to one
             // behind a unique constraint.
-            if fk.table == target && fk.ref_table == parent {
+            if fk.ref_table == parent {
                 cands.push(Cand {
+                    card: if fk.unique { Card::O2O } else { Card::O2M },
                     rel: Rel {
                         kind: if fk.unique { Kind::ToOne } else { Kind::ToMany },
+                        table: fk.table.clone(),
                         constraint: fk.constraint.clone(),
                         join: pairs(&fk.ref_columns, &fk.columns),
                         via: None,
                     },
-                    fk_columns: fk.columns.clone(),
-                    spelled: format!("{target}!{}", fk.constraint),
                 });
             }
             // The outer table holds the fk: always to one.
-            if fk.table == parent && fk.ref_table == target {
+            if fk.table == parent {
                 cands.push(Cand {
+                    card: if fk.unique { Card::O2O } else { Card::M2O },
                     rel: Rel {
                         kind: Kind::ToOne,
+                        table: fk.ref_table.clone(),
                         constraint: fk.constraint.clone(),
                         join: pairs(&fk.columns, &fk.ref_columns),
                         via: None,
                     },
-                    fk_columns: fk.columns.clone(),
-                    spelled: format!("{target}!{}", fk.constraint),
                 });
             }
         }
@@ -433,15 +458,14 @@ impl Catalog {
                 continue;
             }
             for b in &self.fks {
-                if !(b.in_pk && b.table == a.table && b.ref_table == target) {
-                    continue;
-                }
-                if std::ptr::eq(a, b) {
+                if !(b.in_pk && b.table == a.table) || std::ptr::eq(a, b) {
                     continue;
                 }
                 cands.push(Cand {
+                    card: Card::M2M,
                     rel: Rel {
                         kind: Kind::ToMany,
+                        table: b.ref_table.clone(),
                         constraint: a.constraint.clone(),
                         join: pairs(&a.ref_columns, &a.columns),
                         via: Some(Junction {
@@ -450,19 +474,39 @@ impl Catalog {
                             join: pairs(&b.columns, &b.ref_columns),
                         }),
                     },
-                    fk_columns: Vec::new(),
-                    spelled: format!("{target}!{}", a.table),
                 });
             }
         }
 
-        if let Some(h) = hint {
-            cands.retain(|c| {
-                c.rel.constraint == h
-                    || (c.fk_columns.len() == 1 && c.fk_columns[0] == h)
-                    || c.rel.via.as_ref().is_some_and(|j| j.table == h)
-            });
-        }
+        cands
+    }
+
+    /// Resolve the relationship an embed means: `parent` is the
+    /// table the request is rooted on, `target` the word the embed
+    /// names, `hint` the word after `!` when the client
+    /// disambiguates by constraint, fk column, or junction table.
+    ///
+    /// The target is a name for the relationship rather than for the
+    /// relation: `clients`, the foreign table, but equally
+    /// `projects_client_id_fkey`, the constraint, or `client_id`,
+    /// the column the constraint is on. Upstream refuses the last
+    /// two when the foreign table is a view, which cannot arise
+    /// here because a foreign key never points at one.
+    ///
+    /// A self relationship is the one place the target alone cannot
+    /// say which way the join runs, since both ends carry the same
+    /// name. The convention is that the table name means the one to
+    /// many and the foreign key column means the many to one, and a
+    /// hint on the table name means the one to many named by the
+    /// column it comes back through.
+    pub fn resolve(
+        &self,
+        parent: &str,
+        target: &str,
+        hint: Option<&str>,
+    ) -> Result<Rel, EmbedError> {
+        let mut cands = self.candidates(parent);
+        cands.retain(|c| c.wanted(parent, target, hint));
 
         match cands.len() {
             0 => Err(EmbedError {
@@ -471,13 +515,16 @@ impl Catalog {
                     "Could not find a relationship between '{parent}' and '{target}' in the schema cache"
                 ),
                 details: Some(format!(
-                    "Searched for a foreign key relationship between '{parent}' and '{target}' in the schema cache"
+                    "Searched for a foreign key relationship between '{parent}' and '{target}'{} in the schema '{}', but no matches were found.",
+                    hint.map(|h| format!(" using the hint '{h}'"))
+                        .unwrap_or_default(),
+                    self.schema,
                 )),
                 hint: None,
             }),
             1 => Ok(cands.pop().expect("checked len").rel),
             _ => {
-                let spellings: Vec<String> = cands.iter().map(|c| c.spelled.clone()).collect();
+                let spellings: Vec<String> = cands.iter().map(Cand::spelled).collect();
                 Err(EmbedError {
                     code: "PGRST201",
                     message: format!(
@@ -486,7 +533,11 @@ impl Catalog {
                     details: Some(spellings.join(", ")),
                     hint: Some(format!(
                         "Try changing '{target}' to one of the following: {}. Find the desired relationship in the 'details' key.",
-                        spellings.join(", ")
+                        spellings
+                            .iter()
+                            .map(|s| format!("'{s}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )),
                 })
             }
@@ -494,13 +545,97 @@ impl Catalog {
     }
 }
 
+/// One relationship out of the parent, with the cardinality spelled
+/// the way upstream spells it. [`Kind`] is coarser on purpose, since
+/// codegen only cares whether it is building one row or a list, but
+/// resolution reads the difference: the self relationship convention
+/// is a rule about direction and nothing else says which way a
+/// relationship between a table and itself runs.
 struct Cand {
     rel: Rel,
-    /// The fk columns on whichever side holds them, what a column
-    /// hint matches.
-    fk_columns: Vec<String>,
-    /// The hint spelling offered in the ambiguity error.
-    spelled: String,
+    card: Card,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Card {
+    O2M,
+    M2O,
+    O2O,
+    M2M,
+}
+
+impl Cand {
+    /// The one column on the parent's side, when the relationship
+    /// joins on exactly one. A junction has none: the columns it
+    /// joins on belong to the bridge rather than to either end, and
+    /// upstream never matches a name against them.
+    fn near_col(&self) -> Option<&str> {
+        match (&self.rel.via, self.rel.join.as_slice()) {
+            (None, [(near, _)]) => Some(near),
+            _ => None,
+        }
+    }
+
+    /// The one column on the far side, the other half of the same
+    /// pair. A hint may name either end, `clients!client_id` and
+    /// `clients!id` both reaching the same relationship.
+    fn far_col(&self) -> Option<&str> {
+        match (&self.rel.via, self.rel.join.as_slice()) {
+            (None, [(_, far)]) => Some(far),
+            _ => None,
+        }
+    }
+
+    /// The constraint, when the relationship is made by one. A many
+    /// to many is made by two and is named by its junction instead,
+    /// so nothing here answers to a constraint name.
+    fn cons(&self) -> Option<&str> {
+        (self.card != Card::M2M).then_some(self.rel.constraint.as_str())
+    }
+
+    /// Whether this is the relationship the embed named.
+    fn wanted(&self, parent: &str, target: &str, hint: Option<&str>) -> bool {
+        if self.rel.table == parent {
+            // A self relationship, where the table name is the same
+            // on both ends and the direction has to come from
+            // somewhere else. One to one and many to many are not
+            // covered by the convention and upstream leaves them
+            // unreachable.
+            return match hint {
+                None => {
+                    (target == self.rel.table && self.card == Card::O2M)
+                        || (self.card == Card::M2O && self.near_col() == Some(target))
+                }
+                Some(h) => {
+                    target == self.rel.table && self.card == Card::O2M && self.far_col() == Some(h)
+                }
+            };
+        }
+        match hint {
+            None => {
+                target == self.rel.table
+                    || self.cons() == Some(target)
+                    || self.near_col() == Some(target)
+            }
+            Some(h) => {
+                target == self.rel.table
+                    && (self.cons() == Some(h)
+                        || self.near_col() == Some(h)
+                        || self.far_col() == Some(h)
+                        || self.rel.via.as_ref().is_some_and(|j| j.table == h))
+            }
+        }
+    }
+
+    /// The spelling the ambiguity error offers, the target and the
+    /// hint that would have picked this one out.
+    fn spelled(&self) -> String {
+        let by = match &self.rel.via {
+            Some(j) => &j.table,
+            None => &self.rel.constraint,
+        };
+        format!("{}!{by}", self.rel.table)
+    }
 }
 
 fn pairs(outer: &[String], inner: &[String]) -> Vec<(String, String)> {
@@ -699,12 +834,53 @@ mod tests {
     }
 
     #[test]
-    fn self_reference_needs_a_direction() {
+    fn a_self_reference_takes_its_direction_by_convention() {
         let c = shop();
-        // Both directions of manager_id match, even the column hint
-        // cannot split them.
-        let e = c.resolve("employees", "employees", None).unwrap_err();
-        assert_eq!(e.code, "PGRST201");
+
+        // The table name is the list of employees who report here.
+        let r = c.resolve("employees", "employees", None).unwrap();
+        assert_eq!(r.kind, Kind::ToMany);
+        assert_eq!(r.join, vec![("id".into(), "manager_id".into())]);
+
+        // The column name is the one they report to.
+        let r = c.resolve("employees", "manager_id", None).unwrap();
+        assert_eq!(r.kind, Kind::ToOne);
+        assert_eq!(r.table, "employees");
+        assert_eq!(r.join, vec![("manager_id".into(), "id".into())]);
+
+        // A hint on the table name names the column the list comes
+        // back through, which is the only spelling that survives
+        // more than one self reference.
+        let r = c
+            .resolve("employees", "employees", Some("manager_id"))
+            .unwrap();
+        assert_eq!(r.kind, Kind::ToMany);
+        let e = c.resolve("employees", "employees", Some("id")).unwrap_err();
+        assert_eq!(e.code, "PGRST200");
+    }
+
+    #[test]
+    fn a_relationship_answers_to_its_constraint_and_its_column() {
+        let c = shop();
+
+        let r = c.resolve("orders", "orders_user_id_fkey", None).unwrap();
+        assert_eq!(r.kind, Kind::ToOne);
+        assert_eq!(r.table, "users");
+
+        let r = c.resolve("orders", "user_id", None).unwrap();
+        assert_eq!(r.kind, Kind::ToOne);
+        assert_eq!(r.table, "users");
+        assert_eq!(r.join, vec![("user_id".into(), "id".into())]);
+
+        // The other side answers to its own constraint, and the
+        // column that names it there is the one the parent joins on.
+        let r = c.resolve("users", "orders_user_id_fkey", None).unwrap();
+        assert_eq!(r.kind, Kind::ToMany);
+        assert_eq!(r.table, "orders");
+
+        // A hint may name either end of the pair.
+        let r = c.resolve("orders", "users", Some("id")).unwrap();
+        assert_eq!(r.join, vec![("user_id".into(), "id".into())]);
     }
 
     fn names(list: &[&str]) -> Vec<String> {
