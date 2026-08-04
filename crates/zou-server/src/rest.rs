@@ -2163,8 +2163,35 @@ fn rpc_error(e: rpc::RpcError) -> RestError {
         code: e.code.to_string(),
         message: e.message,
         details: e.details.map(Into::into),
-        hint: None,
+        hint: e.hint,
     }
+}
+
+/// What the body of a call is, read off the content type the way the
+/// single unnamed parameter rule needs it. A request that says
+/// nothing is saying json, which is what everything else on this
+/// surface assumes too.
+fn payload_of(headers: &HeaderMap) -> rpc::Payload {
+    let raw = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+    match raw.split(';').next().unwrap_or("").trim() {
+        "application/json" | "" => rpc::Payload::Json,
+        "text/plain" => rpc::Payload::Text,
+        "text/xml" => rpc::Payload::Xml,
+        "application/octet-stream" => rpc::Payload::Bytes,
+        _ => rpc::Payload::Other,
+    }
+}
+
+/// Whether a query key belongs to the result grammar rather than to
+/// the function's arguments. Upstream's list of reserved words, plus
+/// the gate's apikey, which is nobody's argument.
+fn grammar_key(key: &str) -> bool {
+    let word = key.rsplit_once('.').map_or(key, |(_, w)| w);
+    matches!(word, "order" | "limit" | "offset" | "and" | "or")
+        || matches!(key, "select" | "columns" | "on_conflict" | "apikey")
 }
 
 async fn invoke(
@@ -2215,10 +2242,18 @@ async fn invoke(
         })
         .collect();
 
-    // Which query pairs are arguments: on a GET any key naming an
-    // argument of some overload, everything else stays with the
-    // result grammar. On a POST the body keys are the arguments and
-    // the whole query string is grammar.
+    // Which query pairs are arguments: on a GET every pair the
+    // result grammar has no word for and whose value is a bare one,
+    // since a value with an operator in front of it is a filter over
+    // what the call returns. The two can share a name, so `?id=5`
+    // calls the function and `?id=gt.2` narrows its answer. On a
+    // POST the body keys are the arguments and the whole query
+    // string is grammar.
+    //
+    // A name no overload has is an argument all the same. Upstream
+    // resolves the call against everything the client wrote, so a
+    // typo is a function nobody has rather than an argument quietly
+    // dropped.
     let raw = req.uri.query().unwrap_or("");
     let mut get_args: Vec<(String, String)> = Vec::new();
     let mut residual: Vec<&str> = Vec::new();
@@ -2227,30 +2262,20 @@ async fn invoke(
         residual = raw.split('&').filter(|p| !p.is_empty()).collect();
     } else {
         for pair in raw.split('&').filter(|p| !p.is_empty()) {
-            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            let key = decode(k);
-            // With no overloads at all everything non reserved
-            // counts as a supplied name, so the PGRST202 message
-            // spells the call the client attempted.
-            let named = if overloads.is_empty() {
-                !key.contains('.')
-                    && !matches!(
-                        key.as_str(),
-                        "select" | "order" | "limit" | "offset" | "apikey"
-                    )
-            } else {
-                overloads
-                    .iter()
-                    .any(|r| r.args.iter().any(|a| !a.name.is_empty() && a.name == key))
-            };
-            if named {
-                if !supplied.contains(&key) {
-                    supplied.push(key.clone());
-                }
-                get_args.push((key, decode(v)));
-            } else {
+            let Some((k, v)) = pair.split_once('=') else {
                 residual.push(pair);
+                continue;
+            };
+            let key = decode(k);
+            let value = decode(v);
+            if grammar_key(&key) || filter::is_operator(&value) {
+                residual.push(pair);
+                continue;
             }
+            if !supplied.contains(&key) {
+                supplied.push(key.clone());
+            }
+            get_args.push((key, value));
         }
     }
     let payload = match body {
@@ -2271,7 +2296,31 @@ async fn invoke(
         None => None,
     };
 
-    let choice = rpc::choose(schema, func, &overloads, &supplied, is_post).map_err(rpc_error)?;
+    let choice = match rpc::choose(
+        schema,
+        func,
+        &overloads,
+        &supplied,
+        payload_of(&req.headers),
+        is_post,
+    ) {
+        Ok(c) => c,
+        Err(mut e) => {
+            // A name the schema has no function of at all is the one
+            // case worth a second query: the suggestion is the
+            // nearest name it does have, and nothing loaded so far
+            // knows the others.
+            if e.unknown_name {
+                let rows = sess
+                    .query(rpc::NAMES_SQL, &[&schema])
+                    .await
+                    .map_err(|x| pg_error(&x, authed))?;
+                let names: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+                e.hint = rpc::name_hint(schema, func, &names);
+            }
+            return Err(rpc_error(e));
+        }
+    };
     let kind = choice.routine.kind.clone();
     let returns_set = choice.routine.returns_set;
     // A cap on rows counts the rows a call returns, so a function
@@ -2553,6 +2602,53 @@ mod tests {
             },
             other => panic!("expected a condition, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_grammar_words_are_the_ones_a_call_keeps_for_itself() {
+        for key in [
+            "select",
+            "columns",
+            "on_conflict",
+            "apikey",
+            "order",
+            "limit",
+            "offset",
+            "and",
+            "or",
+            "orders.order",
+            "orders.and",
+        ] {
+            assert!(grammar_key(key), "{key} is grammar");
+        }
+        // A word that only looks like one of them is an argument.
+        for key in ["id", "ordering", "selected", "my.select", "limits"] {
+            assert!(!grammar_key(key), "{key} is an argument");
+        }
+    }
+
+    #[test]
+    fn the_content_type_says_what_the_body_could_pass_as() {
+        let of = |ct: Option<&str>| {
+            let mut h = HeaderMap::new();
+            if let Some(ct) = ct {
+                h.insert(header::CONTENT_TYPE, ct.parse().unwrap());
+            }
+            payload_of(&h)
+        };
+        assert_eq!(of(None), rpc::Payload::Json);
+        assert_eq!(of(Some("application/json")), rpc::Payload::Json);
+        assert_eq!(
+            of(Some("application/json; charset=utf-8")),
+            rpc::Payload::Json
+        );
+        assert_eq!(of(Some("text/plain")), rpc::Payload::Text);
+        assert_eq!(of(Some("text/xml")), rpc::Payload::Xml);
+        assert_eq!(of(Some("application/octet-stream")), rpc::Payload::Bytes);
+        assert_eq!(
+            of(Some("application/x-www-form-urlencoded")),
+            rpc::Payload::Other
+        );
     }
 
     #[test]

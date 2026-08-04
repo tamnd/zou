@@ -1052,15 +1052,64 @@ impl Cand {
 /// The name in the list this word is closest to, when one of them is
 /// close enough to be worth suggesting. Ties keep the earlier name,
 /// so the suggestion does not depend on the order rows landed in.
-fn closest<'a>(names: impl Iterator<Item = &'a str>, word: &str, min: f64) -> Option<&'a str> {
-    let mut best: Option<(f64, &str)> = None;
-    for name in names {
-        let score = similarity(word, name);
-        if score >= min && best.is_none_or(|(seen, _)| score > seen) {
-            best = Some((score, name));
+/// The name a word is likeliest to be a misspelling of, or none when
+/// nothing is close enough.
+///
+/// A name only runs against the word at all if the two share a run of
+/// letters, and then it is scored by [`similarity`]. That is upstream's
+/// fuzzy set in the two parts it comes in: an index of letter runs
+/// finds the candidates, and the edit distance ranks them. Both parts
+/// matter, because the runs are read off the names with punctuation
+/// stripped and the distance is not, so `(any_arg)` and `(name)` are
+/// three edits apart and still share nothing worth suggesting.
+///
+/// Runs of three are tried before runs of two, and a suggestion from
+/// the longer run wins outright, since a name that shares a whole
+/// three letters with the word is a likelier typo than one that
+/// happens to share a pair.
+pub(crate) fn closest<'a>(
+    names: impl Iterator<Item = &'a str> + Clone,
+    word: &str,
+    min: f64,
+) -> Option<&'a str> {
+    let lowered = word.to_lowercase();
+    for run in [3, 2] {
+        let mut best: Option<(f64, &str)> = None;
+        for name in names.clone() {
+            if !shares_run(&lowered, name, run) {
+                continue;
+            }
+            let score = similarity(&lowered, &name.to_lowercase());
+            if score >= min && best.is_none_or(|(seen, _)| score > seen) {
+                best = Some((score, name));
+            }
+        }
+        if best.is_some() {
+            return best.map(|(_, name)| name);
         }
     }
-    best.map(|(_, name)| name)
+    None
+}
+
+/// Whether two names have any run of that many letters in common.
+/// The runs come off the names with everything that is not a letter,
+/// a digit, a space or a comma dropped, and with a dash on each end
+/// so that a shared beginning or ending counts for something.
+fn shares_run(a: &str, b: &str, run: usize) -> bool {
+    let held = runs(a, run);
+    runs(b, run).iter().any(|r| held.contains(r))
+}
+
+fn runs(name: &str, run: usize) -> Vec<String> {
+    let kept: String = name
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace() || *c == ',')
+        .collect();
+    let padded: Vec<char> = format!("-{kept}-").chars().collect();
+    (0..padded.len().saturating_sub(run - 1))
+        .map(|i| padded[i..i + run].iter().collect())
+        .collect()
 }
 
 fn pairs(outer: &[String], inner: &[String]) -> Vec<(String, String)> {
@@ -1685,5 +1734,51 @@ mod tests {
         // distance alone cannot decide anything.
         assert_eq!(similarity("ab", "abcd"), 0.5);
         assert_eq!(similarity("abcdefgh", "abcdefxy"), 0.75);
+    }
+
+    #[test]
+    fn a_suggestion_needs_a_shared_run_before_it_is_scored() {
+        let names = ["(name)"];
+        // Three edits over six letters is halfway, well over the bar a
+        // parameter list is held to, and still no suggestion: the two
+        // share no run of letters once the punctuation is dropped.
+        assert!(similarity("(any_arg)", "(name)") > 0.33);
+        assert_eq!(closest(names.into_iter(), "(any_arg)", 0.33), None);
+
+        // A run of two is enough when nothing shares a run of three.
+        assert_eq!(
+            closest(["(x, y)"].into_iter(), "(a, b)", 0.33),
+            Some("(x, y)")
+        );
+    }
+
+    #[test]
+    fn the_longer_run_decides_before_the_shorter_one_is_read() {
+        // `(x, y)` is the closer of the two by score, and it never
+        // gets compared: `(a, bcdef)` shares a run of three, which
+        // settles the suggestion before any run of two is looked at.
+        let names = ["(a, bcdef)", "(x, y)"];
+        assert!(similarity("(a, b)", "(x, y)") > similarity("(a, b)", "(a, bcdef)"));
+        assert_eq!(
+            closest(names.into_iter(), "(a, b)", 0.33),
+            Some("(a, bcdef)")
+        );
+    }
+
+    #[test]
+    fn ties_and_scores_pick_among_what_the_run_turned_up() {
+        // Two overloads sharing a run with the call, the nearer one
+        // suggested.
+        let names = ["(a, b)", "(a, b, c)"];
+        assert_eq!(
+            closest(names.into_iter(), "(a, b, wrong_arg)", 0.33),
+            Some("(a, b, c)")
+        );
+        // Nothing close enough is no suggestion, however many share a
+        // run.
+        assert_eq!(
+            closest(names.into_iter(), "(a, b, c, d, e, f, g)", 0.75),
+            None
+        );
     }
 }
