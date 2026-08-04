@@ -3081,7 +3081,10 @@ async fn an_embed_can_be_named_by_the_key_that_makes_it() {
     );
 
     // A name that is none of those is still nothing, and the details
-    // say which schema was looked in and what the hint was.
+    // say which schema was looked in and what the hint was. The
+    // suggestion is the other name this table's relationships answer
+    // to, since the one that was asked for is a relationship the
+    // parent has and the hint after ! is what went wrong.
     let res = app
         .clone()
         .oneshot(get(
@@ -3092,7 +3095,7 @@ async fn an_embed_can_be_named_by_the_key_that_makes_it() {
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     assert_eq!(
         body_text(res).await,
-        r#"{"code":"PGRST200","details":"Searched for a foreign key relationship between 'zou_rest_staff' and 'zou_rest_dept' using the hint 'nowhere' in the schema 'public', but no matches were found.","hint":null,"message":"Could not find a relationship between 'zou_rest_staff' and 'zou_rest_dept' in the schema cache"}"#
+        r#"{"code":"PGRST200","details":"Searched for a foreign key relationship between 'zou_rest_staff' and 'zou_rest_dept' using the hint 'nowhere' in the schema 'public', but no matches were found.","hint":"Perhaps you meant 'zou_rest_staff' instead of 'zou_rest_dept'.","message":"Could not find a relationship between 'zou_rest_staff' and 'zou_rest_dept' in the schema cache"}"#
     );
 }
 

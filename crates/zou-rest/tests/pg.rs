@@ -253,6 +253,76 @@ async fn the_introspection_query_reads_the_fk_graph() {
         .expect("cleanup");
 }
 
+/// A partitioned table's keys, which only postgres can tell apart. A
+/// partition carries a copy of every key its parent declared, and the
+/// copy is a row of pg_constraint like any other: nothing about the
+/// name, the columns or the tables says it was inherited, only
+/// conparentid does. Left in, a partitioned junction is one
+/// relationship per partition and every embed through it is
+/// ambiguous.
+#[tokio::test]
+async fn an_inherited_key_is_not_a_relationship_of_its_own() {
+    let Some(c) = client().await else { return };
+
+    c.batch_execute(
+        "drop schema if exists zou_part cascade;
+         create schema zou_part;
+         set search_path to zou_part;
+         create table models (id int primary key);
+         create table sales (
+             id int,
+             model_id int references models,
+             sold_on date not null,
+             primary key (id, sold_on)
+         ) partition by range (sold_on);
+         create table sales_2101 partition of sales
+             for values from ('2021-01-01') to ('2021-02-01');
+         create table sales_2102 partition of sales
+             for values from ('2021-02-01') to ('2021-03-01');",
+    )
+    .await
+    .expect("partitioned schema");
+
+    let rows = c
+        .query(INTROSPECT_SQL, &[&"zou_part"])
+        .await
+        .expect("introspect");
+    let fks: Vec<FkRow> = rows
+        .iter()
+        .map(|r| FkRow {
+            constraint: r.get(0),
+            table: r.get(1),
+            columns: r.get(2),
+            ref_table: r.get(3),
+            ref_columns: r.get(4),
+            unique: r.get(5),
+            in_pk: r.get(6),
+        })
+        .collect();
+    assert_eq!(fks.len(), 1, "the declared key and no copies: {fks:?}");
+    assert_eq!(fks[0].table, "sales");
+
+    let catalog = Catalog::new(fks).with_schema("zou_part");
+    assert_eq!(
+        catalog.resolve("models", "sales", None).unwrap().kind,
+        Kind::ToMany
+    );
+
+    // The partition is not a relation the api has, so an embed of it
+    // is a relationship nobody has, spelled near enough to the one
+    // they meant to say so.
+    let e = catalog.resolve("models", "sales_2101", None).unwrap_err();
+    assert_eq!(e.code, "PGRST200");
+    assert_eq!(
+        e.hint,
+        Some("Perhaps you meant 'sales' instead of 'sales_2101'.".to_string())
+    );
+
+    c.batch_execute("drop schema zou_part cascade")
+        .await
+        .expect("cleanup");
+}
+
 /// The computed relationship query against real functions, and the
 /// call it plans executed. What makes this worth a live server is
 /// that none of it can be checked anywhere else: which functions
