@@ -994,6 +994,134 @@ async fn the_rpc_surface_speaks_postgrest() {
     );
 }
 
+/// A call reports its window the way a read does: every answer
+/// carries a Content-Range, a total arrives only when count= asked
+/// for one, and a page smaller than the total is a 206. The Range
+/// header is read on a GET and on nothing else, which is upstream
+/// reading the method rather than the shape of the request.
+#[tokio::test]
+async fn a_call_answers_with_the_range_a_read_would() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop function if exists zou_range_list(int), zou_range_evens(int), \
+             zou_range_one(), zou_range_none()",
+            "drop table if exists zou_range_items cascade",
+            "create table zou_range_items (id int primary key, name text)",
+            "insert into zou_range_items values (1, 'a'), (2, 'b'), (3, 'c')",
+            "create function zou_range_list(min_id int default 0) \
+             returns setof zou_range_items language sql stable as \
+             'select * from zou_range_items where id >= min_id order by id'",
+            "create function zou_range_evens(top int) returns setof int \
+             language sql immutable as \
+             'select n from generate_series(0, top) n where n % 2 = 0'",
+            "create function zou_range_one() returns zou_range_items \
+             language sql stable as 'select * from zou_range_items where id = 1'",
+            "create function zou_range_none() returns setof zou_range_items \
+             language sql stable as 'select * from zou_range_items where false'",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // The whole set, no total asked for.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_range_list?select=id"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-range"], "0-2/*");
+
+    // A page of a known total is a 206, and the total counts the
+    // rows the call returned rather than the ones it handed back.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/rpc/zou_range_list?select=id&limit=1&offset=1",
+            "",
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(res.headers()["content-range"], "1-1/3");
+    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+
+    // A window that starts past the end is the read path's 416, and
+    // it needs the total to know that, so it needs the count to
+    // survive a page with no rows in it.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/rpc/zou_range_list?select=id&offset=100",
+            "",
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(res.headers()["content-range"], "*/3");
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST103");
+
+    // The Range header pages a GET.
+    let ranged = Request::builder()
+        .uri("/rest/v1/rpc/zou_range_list?select=id")
+        .header("apikey", anon_key())
+        .header("range", "1-1")
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(ranged).await.unwrap();
+    assert_eq!(res.headers()["content-range"], "1-1/*");
+    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+
+    // The same header on a POST is not a page at all.
+    let posted = Request::builder()
+        .method("POST")
+        .uri("/rest/v1/rpc/zou_range_list?select=id")
+        .header("apikey", anon_key())
+        .header("range", "1-1")
+        .body(Body::from("{}"))
+        .unwrap();
+    let res = app.clone().oneshot(posted).await.unwrap();
+    assert_eq!(res.headers()["content-range"], "0-2/*");
+
+    // A folded set of scalars counts what it folded, and an empty
+    // one has no window to report.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_range_evens?top=4"))
+        .await
+        .unwrap();
+    assert_eq!(res.headers()["content-range"], "0-2/*");
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_range_none"))
+        .await
+        .unwrap();
+    assert_eq!(res.headers()["content-range"], "*/*");
+
+    // A function that returns one row is one row, and an exact
+    // total of one is what upstream sends for it.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "GET",
+            "/rest/v1/rpc/zou_range_one?select=id",
+            "",
+            &["count=exact"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-range"], "0-0/1");
+    assert_eq!(body_text(res).await, r#"{"id": 1}"#);
+}
+
 #[tokio::test]
 async fn an_rls_write_denial_comes_back_as_401() {
     let Some(dsn) = dsn() else { return };
