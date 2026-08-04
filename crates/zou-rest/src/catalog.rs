@@ -27,6 +27,13 @@
 //! is the list pointing back, the column name is the one row it
 //! points at.
 //!
+//! Not every relationship is a foreign key. A function of one
+//! argument taking a row of one relation and returning rows of
+//! another is a relationship too, [`COMPUTED_SQL`], and the embed
+//! names it by the function's name. There is no join condition to
+//! write for one: the parent row goes in as the argument, and that
+//! is the whole of the link.
+//!
 //! Alongside the graph the catalog holds the relations themselves
 //! and their columns, [`RELATIONS_SQL`], [`COLUMNS_SQL`] and
 //! [`Relation`]. That list is the difference between a request
@@ -249,6 +256,55 @@ select c.relname::text,
    and not a.attisdropped
  order by c.relname, a.attnum";
 
+/// One computed relationship, straight off [`COMPUTED_SQL`].
+/// `function` is the name an embed calls it by, `table` the relation
+/// whose row it takes, `ftable` the relation whose rows it gives
+/// back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComputedRow {
+    pub function: String,
+    pub table: String,
+    pub ftable: String,
+    /// The function gives back at most one row, either because it
+    /// returns a bare row rather than a set or because it told the
+    /// planner it returns exactly one. This is the whole of the
+    /// cardinality: there is no key to look at.
+    pub single: bool,
+}
+
+/// The functions of one schema that read as relationships: one
+/// argument, a relation's row type in and a relation's row type out.
+/// Bind the schema name as $1.
+///
+/// A row type is how a relation appears in a function signature, so
+/// the join back to pg_class is on reltype rather than on any name,
+/// and it is what decides the question: a function over an integer or
+/// over a composite type nobody has a table for is an ordinary
+/// function and not a relationship.
+///
+/// Rows rather than sets is the cardinality. A function that does not
+/// return a set gives back one row by construction, and one that
+/// declares it returns a single row is taken at its word, which is
+/// how `ROWS 1` on a `SETOF` is written and read.
+pub const COMPUTED_SQL: &str = "\
+select p.proname::text,
+       arg.relname::text,
+       ret.relname::text,
+       not p.proretset or p.prorows = 1
+  from pg_proc p
+  join pg_namespace pn on pn.oid = p.pronamespace
+  join pg_class arg on arg.reltype = p.proargtypes[0]
+  join pg_namespace an on an.oid = arg.relnamespace
+  join pg_class ret on ret.reltype = p.prorettype
+  join pg_namespace rn on rn.oid = ret.relnamespace
+ where p.pronargs = 1
+   and arg.relkind in ('r', 'v', 'm', 'f', 'p')
+   and ret.relkind in ('r', 'v', 'm', 'f', 'p')
+   and pn.nspname = $1
+   and an.nspname = $1
+   and rn.nspname = $1
+ order by p.proname, arg.relname";
+
 /// Every timezone name postgres will accept, which is what decides
 /// whether `Prefer: timezone=` names a real one. It takes no
 /// parameter: the list is the installation's and not a schema's, and
@@ -284,6 +340,20 @@ pub struct Rel {
     /// the embedded side, and the pairs joining junction columns to
     /// embedded table columns.
     pub via: Option<Junction>,
+    /// The call a computed relationship is made of. When it is set
+    /// `join` is empty and stays empty: the argument is the join.
+    pub call: Option<Call>,
+}
+
+/// The function behind a computed relationship, and the relation
+/// whose row it takes. Both are needed to write the call: the row
+/// goes in cast to that relation, which is what tells postgres which
+/// of two functions of the same name was meant, and what lets the row
+/// of a mutation's CTE go in at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Call {
+    pub function: String,
+    pub arg: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +384,7 @@ impl std::error::Error for EmbedError {}
 #[derive(Debug, Default)]
 pub struct Catalog {
     fks: Vec<FkRow>,
+    computed: Vec<ComputedRow>,
     rels: Vec<Relation>,
     views: HashSet<String>,
     timezones: HashSet<String>,
@@ -328,10 +399,24 @@ impl Catalog {
     pub fn new(fks: Vec<FkRow>) -> Catalog {
         Catalog {
             fks,
+            computed: Vec::new(),
             rels: Vec::new(),
             views: HashSet::new(),
             timezones: HashSet::new(),
             schema: String::new(),
+        }
+    }
+
+    /// The same catalog with the schema's computed relationships in
+    /// it, the answer to [`COMPUTED_SQL`]. They are not added to the
+    /// foreign keys, they replace them: a function named after a
+    /// table the parent already has a key to is how a schema takes
+    /// that embed over, and the key it overrides goes away entirely
+    /// rather than becoming a second answer.
+    pub fn with_computed(self, rows: Vec<ComputedRow>) -> Catalog {
+        Catalog {
+            computed: rows,
+            ..self
         }
     }
 
@@ -455,6 +540,7 @@ impl Catalog {
                         constraint: fk.constraint.clone(),
                         join: pairs(&fk.ref_columns, &fk.columns),
                         via: None,
+                        call: None,
                     },
                 });
             }
@@ -469,6 +555,7 @@ impl Catalog {
                         constraint: fk.constraint.clone(),
                         join: pairs(&fk.columns, &fk.ref_columns),
                         via: None,
+                        call: None,
                     },
                 });
             }
@@ -496,9 +583,37 @@ impl Catalog {
                             constraint: b.constraint.clone(),
                             join: pairs(&b.columns, &b.ref_columns),
                         }),
+                        call: None,
                     },
                 });
             }
+        }
+
+        // A computed relationship takes over the name it is called
+        // by. Every key to a table of that name goes, however the
+        // embed would have spelled it, because upstream holds the
+        // relationships of a pair under one key and the function
+        // replaces what is under it rather than joining it. What the
+        // function itself gives back does not come into it: two
+        // functions over the same table are two names and never one
+        // another's key.
+        for c in self.computed.iter().filter(|c| c.table == parent) {
+            cands.retain(|cand| cand.rel.call.is_some() || cand.rel.table != c.function);
+            cands.push(Cand {
+                card: if c.single { Card::M2O } else { Card::O2M },
+                view: self.is_view(&c.ftable),
+                rel: Rel {
+                    kind: if c.single { Kind::ToOne } else { Kind::ToMany },
+                    table: c.ftable.clone(),
+                    constraint: c.function.clone(),
+                    join: Vec::new(),
+                    via: None,
+                    call: Some(Call {
+                        function: c.function.clone(),
+                        arg: c.table.clone(),
+                    }),
+                },
+            });
         }
 
         cands
@@ -622,6 +737,13 @@ impl Cand {
 
     /// Whether this is the relationship the embed named.
     fn wanted(&self, parent: &str, target: &str, hint: Option<&str>) -> bool {
+        // A computed relationship answers to the function's name and
+        // to nothing else. It has no constraint and no column for the
+        // other spellings to name, and a hint on one is not an error
+        // upstream, it simply makes no difference.
+        if let Some(call) = &self.rel.call {
+            return target == call.function;
+        }
         if self.rel.table == parent {
             // A self relationship, where the table name is the same
             // on both ends and the direction has to come from
@@ -664,6 +786,11 @@ impl Cand {
     /// The spelling the ambiguity error offers, the target and the
     /// hint that would have picked this one out.
     fn spelled(&self) -> String {
+        // A computed relationship is already spelled the only way it
+        // can be, by the function it calls.
+        if let Some(call) = &self.rel.call {
+            return call.function.clone();
+        }
         let by = match &self.rel.via {
             Some(j) => &j.table,
             None => &self.rel.constraint,
@@ -891,6 +1018,65 @@ mod tests {
         assert_eq!(r.kind, Kind::ToMany);
         let e = c.resolve("employees", "employees", Some("id")).unwrap_err();
         assert_eq!(e.code, "PGRST200");
+    }
+
+    #[test]
+    fn a_computed_relationship_answers_to_the_function_and_nothing_else() {
+        let c = shop().with_computed(vec![ComputedRow {
+            function: "recent_orders".into(),
+            table: "users".into(),
+            ftable: "orders".into(),
+            single: false,
+        }]);
+
+        let r = c.resolve("users", "recent_orders", None).unwrap();
+        assert_eq!(r.kind, Kind::ToMany);
+        assert_eq!(r.table, "orders");
+        assert_eq!(r.call.unwrap().arg, "users");
+        assert!(r.join.is_empty());
+
+        // A hint makes no difference to one, which is upstream's
+        // answer too: the filter that picks a computed relationship
+        // out reads the target and never looks at the hint.
+        assert!(
+            c.resolve("users", "recent_orders", Some("nonsense"))
+                .is_ok()
+        );
+
+        // The function is a name the parent has, not one the schema
+        // has: the same word from anywhere else is a 400 as before.
+        assert_eq!(
+            c.resolve("orders", "recent_orders", None).unwrap_err().code,
+            "PGRST200"
+        );
+    }
+
+    /// A function whose name is a table the parent already reaches
+    /// replaces that whole relationship, so the key it overrides
+    /// stops answering to its constraint and its column as well.
+    #[test]
+    fn a_function_named_after_a_table_replaces_the_key_to_it() {
+        let c = shop().with_computed(vec![ComputedRow {
+            function: "users".into(),
+            table: "orders".into(),
+            ftable: "users".into(),
+            single: true,
+        }]);
+
+        let r = c.resolve("orders", "users", None).unwrap();
+        assert_eq!(r.kind, Kind::ToOne);
+        assert!(r.call.is_some());
+        for spelling in ["orders_user_id_fkey", "user_id"] {
+            assert_eq!(
+                c.resolve("orders", spelling, None).unwrap_err().code,
+                "PGRST200",
+                "{spelling}"
+            );
+        }
+
+        // Only the key of that pair goes. The other way round is a
+        // different key and the function does not reach it.
+        assert!(c.resolve("users", "orders", None).is_ok());
     }
 
     #[test]

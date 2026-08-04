@@ -253,6 +253,103 @@ async fn the_introspection_query_reads_the_fk_graph() {
         .expect("cleanup");
 }
 
+/// The computed relationship query against real functions, and the
+/// call it plans executed. What makes this worth a live server is
+/// that none of it can be checked anywhere else: which functions
+/// count as relationships is a question about pg_proc, and whether
+/// the call postgres accepts is a question for postgres.
+#[tokio::test]
+async fn the_computed_query_reads_the_functions_over_a_relation() {
+    use zou_rest::catalog::{COMPUTED_SQL, ComputedRow};
+    use zou_rest::{plan, select};
+
+    let Some(c) = client().await else { return };
+
+    c.batch_execute(
+        "drop schema if exists zou_computed cascade;
+         create schema zou_computed;
+         set search_path to zou_computed;
+         create table users (id int primary key, name text);
+         create table orders (id int primary key, user_id int, total int);
+         insert into users values (1, 'ann'), (2, 'bob');
+         insert into orders values (10, 1, 100), (11, 1, 50), (12, 2, 75);
+         create function big_orders(users) returns setof orders as $$
+           select * from orders where user_id = $1.id and total > 60
+         $$ language sql stable;
+         create function buyer(orders) returns setof users rows 1 as $$
+           select * from users where id = $1.user_id
+         $$ language sql stable;
+         -- One argument but not a relation's row, so not a
+         -- relationship however it is spelled.
+         create function louder(text) returns text as $$
+           select upper($1)
+         $$ language sql immutable;",
+    )
+    .await
+    .expect("computed schema");
+
+    let rows = c
+        .query(COMPUTED_SQL, &[&"zou_computed"])
+        .await
+        .expect("introspect");
+    let computed: Vec<ComputedRow> = rows
+        .iter()
+        .map(|r| ComputedRow {
+            function: r.get(0),
+            table: r.get(1),
+            ftable: r.get(2),
+            single: r.get(3),
+        })
+        .collect();
+    assert_eq!(
+        computed,
+        vec![
+            ComputedRow {
+                function: "big_orders".into(),
+                table: "users".into(),
+                ftable: "orders".into(),
+                single: false,
+            },
+            ComputedRow {
+                function: "buyer".into(),
+                table: "orders".into(),
+                ftable: "users".into(),
+                single: true,
+            },
+        ],
+    );
+
+    // The call itself, run: the parent row goes in as the argument
+    // and there is no join condition anywhere in the statement.
+    let catalog = Catalog::new(Vec::new()).with_computed(computed);
+    let q = plan::Query {
+        table: "users".into(),
+        select: select::parse("name,big_orders(total)").expect("select"),
+        ..plan::Query::default()
+    };
+    let sql = plan::plan(&catalog, &q).expect("plan");
+    let text = format!(
+        "select to_jsonb(t)::text from ({}) as t order by 1",
+        sql.text
+    );
+    let rows = c
+        .query(&text, &[])
+        .await
+        .unwrap_or_else(|e| panic!("{text}: {e}"));
+    let got: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    assert_eq!(
+        got,
+        vec![
+            r#"{"name": "ann", "big_orders": [{"total": 100}]}"#,
+            r#"{"name": "bob", "big_orders": [{"total": 75}]}"#,
+        ]
+    );
+
+    c.batch_execute("drop schema zou_computed cascade")
+        .await
+        .expect("cleanup");
+}
+
 /// The planner's output executed for real: every lateral shape runs
 /// and the rows come back as the json a PostgREST client expects.
 /// Its own schema name, the introspection test drops zou_embed while

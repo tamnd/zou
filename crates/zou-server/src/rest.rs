@@ -48,7 +48,8 @@ use axum::http::{HeaderMap, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use zou_rest::catalog::{
-    COLUMNS_SQL, Catalog, Column, ColumnRow, FkRow, INTROSPECT_SQL, RELATIONS_SQL, TIMEZONES_SQL,
+    COLUMNS_SQL, COMPUTED_SQL, Catalog, Column, ColumnRow, ComputedRow, FkRow, INTROSPECT_SQL,
+    RELATIONS_SQL, TIMEZONES_SQL,
 };
 use zou_rest::filter::{self, Node, Op, Parsed};
 use zou_rest::mutate::{self, Conflict, Missing, Returning};
@@ -1164,11 +1165,25 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
         })
         .collect();
     let rows = sess
+        .query(COMPUTED_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let computed = rows
+        .iter()
+        .map(|r| ComputedRow {
+            function: r.get(0),
+            table: r.get(1),
+            ftable: r.get(2),
+            single: r.get(3),
+        })
+        .collect();
+    let rows = sess
         .query(TIMEZONES_SQL, &[])
         .await
         .map_err(|e| pg_error(&e, authed))?;
     let zones = rows.iter().map(|r| r.get(0)).collect();
     Ok(Catalog::new(fks)
+        .with_computed(computed)
         .with_relations(names, cols)
         .with_views(views)
         .with_timezones(zones)
