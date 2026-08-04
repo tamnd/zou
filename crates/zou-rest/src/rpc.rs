@@ -267,8 +267,8 @@ pub struct Choice<'a> {
 
 /// Pick the overload the supplied argument names identify.
 ///
-/// The overloads sort into two piles. One holds those the names fit
-/// by [`fits_keys`], the resolution named notation would do. The
+/// The overloads sort into two piles. One holds those the names fit,
+/// which is the resolution named notation would do. The
 /// other holds those taking a single unnamed parameter the body
 /// could pass whole, which only a POST can reach and only for a
 /// content type the parameter's type answers to. The named pile
