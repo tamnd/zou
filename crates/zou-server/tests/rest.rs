@@ -3191,3 +3191,148 @@ async fn a_spread_of_a_list_arrives_one_column_at_a_time() {
         .unwrap();
     assert_eq!(body_text(res).await, r#"[{"name": "labs", "players": []}]"#);
 }
+
+#[tokio::test]
+async fn a_view_embeds_on_the_keys_of_the_tables_under_it() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop schema if exists zou_view_hidden cascade",
+            "drop table if exists zou_view_tags, zou_view_books, zou_view_authors cascade",
+            "create table zou_view_authors (id int primary key, name text)",
+            "create table zou_view_books (id int primary key, \
+             author_id int references zou_view_authors(id), title text)",
+            "create table zou_view_tags (id int primary key, tag text)",
+            // A view renaming the key column, which is why the name
+            // cannot be what the relationship is found by.
+            "create view zou_view_book_list as \
+             select id as ident, author_id as written_by, title from zou_view_books",
+            "create view zou_view_author_list as select id, name from zou_view_authors",
+            // The key column dropped: this one has no relationship at
+            // all, and asking for one is an error.
+            "create view zou_view_titles as select title from zou_view_books",
+            // A view over a view in a schema nobody exposes and anon
+            // cannot enter.
+            "create schema zou_view_hidden",
+            "create view zou_view_hidden.middle as \
+             select id, author_id, title from zou_view_books",
+            "create view zou_view_outer as \
+             select id as bid, author_id as by_who, title from zou_view_hidden.middle",
+            // A junction whose table is out of reach, so the many to
+            // many exists only through the view.
+            "create table zou_view_hidden.book_tags (\
+             book_id int references zou_view_books(id), \
+             tag_id int references zou_view_tags(id), \
+             primary key (book_id, tag_id))",
+            "create view zou_view_junction as \
+             select book_id, tag_id from zou_view_hidden.book_tags",
+            "insert into zou_view_authors values (1, 'ann'), (2, 'bob')",
+            "insert into zou_view_books values (10, 1, 'a1'), (11, 2, 'b1')",
+            "insert into zou_view_tags values (100, 'old'), (101, 'new')",
+            "insert into zou_view_hidden.book_tags values (10, 100), (10, 101)",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // The view is the child of the key its column carries, under the
+    // name it gave that column.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_view_book_list?select=title,zou_view_authors(name)&order=ident",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "a1", "zou_view_authors": {"name": "ann"}},{"title": "b1", "zou_view_authors": {"name": "bob"}}]"#
+    );
+
+    // And the parent of it, which the table on the other end can
+    // embed as readily as it embeds the real one.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_view_books?select=title,zou_view_author_list(name)&order=id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "a1", "zou_view_author_list": {"name": "ann"}},{"title": "b1", "zou_view_author_list": {"name": "bob"}}]"#
+    );
+
+    // Two views over the two ends of one key are related to each
+    // other, and the way back is a list.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_view_author_list?select=name,zou_view_book_list(title)&order=id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name": "ann", "zou_view_book_list": [{"title": "a1"}]},{"name": "bob", "zou_view_book_list": [{"title": "b1"}]}]"#
+    );
+
+    // A view over a view keeps the key, and the view in between is
+    // read for its parse tree without anon being able to reach it.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_view_outer?select=title,zou_view_author_list(name)&order=bid",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "a1", "zou_view_author_list": {"name": "ann"}},{"title": "b1", "zou_view_author_list": {"name": "bob"}}]"#
+    );
+
+    // Both ends of the junction are the view's, so the many to many
+    // through it is found the same way it is found through a table.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_view_books?select=title,zou_view_tags(tag)&id=eq.10",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "a1", "zou_view_tags": [{"tag": "old"}, {"tag": "new"}]}]"#
+    );
+
+    // Naming the key by its column reaches the table it is on. The
+    // view holding the same key is not a second answer, or writing
+    // a view would make this spelling ambiguous everywhere.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_view_books?select=title,author_id(name)&order=id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"title": "a1", "author_id": {"name": "ann"}},{"title": "b1", "author_id": {"name": "bob"}}]"#
+    );
+
+    // A view that did not select the key column does not have the
+    // key, and no relationship is invented for it.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_view_titles?select=title,zou_view_authors(name)",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["code"], "PGRST200");
+}

@@ -52,6 +52,7 @@ use zou_rest::catalog::{
 };
 use zou_rest::filter::{self, Node, Op, Parsed};
 use zou_rest::mutate::{self, Conflict, Missing, Returning};
+use zou_rest::origin::{self, KeyRow, VIEW_KEYS_SQL, VIEWS_SQL, ViewRow};
 use zou_rest::plan::{self, PlanError, Query};
 use zou_rest::{order, page, rpc, select};
 
@@ -1125,7 +1126,7 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
         .query(INTROSPECT_SQL, &[&schema])
         .await
         .map_err(|e| pg_error(&e, authed))?;
-    let fks = rows
+    let mut fks: Vec<FkRow> = rows
         .iter()
         .map(|r| FkRow {
             constraint: r.get(0),
@@ -1137,6 +1138,8 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
             in_pk: r.get(6),
         })
         .collect();
+    let (view_fks, views) = view_keys(sess, authed, schema).await?;
+    fks.extend(view_fks);
     let rows = sess
         .query(RELATIONS_SQL, &[&schema])
         .await
@@ -1167,8 +1170,76 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
     let zones = rows.iter().map(|r| r.get(0)).collect();
     Ok(Catalog::new(fks)
         .with_relations(names, cols)
+        .with_views(views)
         .with_timezones(zones)
         .with_schema(schema))
+}
+
+/// The foreign keys the schema's views inherit from the tables under
+/// them, and the names of the views themselves, two more catalog
+/// queries on the same transaction.
+///
+/// A view has no key of its own, so an embed on one has to be traced
+/// back through the columns it selects. Both queries reach outside
+/// the exposed schema on purpose: the view underneath and the table
+/// holding the key may be somewhere nobody can name, and the
+/// relationship is still real from here. The names come back with
+/// the keys because resolution treats a relationship to a view more
+/// narrowly than one to a table and has to be able to tell them
+/// apart.
+async fn view_keys(
+    sess: &Session,
+    authed: bool,
+    schema: &str,
+) -> Result<(Vec<FkRow>, Vec<String>), RestError> {
+    let rows = sess
+        .query(VIEWS_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let views: Vec<ViewRow> = rows
+        .iter()
+        .map(|r| ViewRow {
+            oid: r.get(0),
+            schema: r.get(1),
+            name: r.get(2),
+            attnums: r.get::<_, Option<Vec<i32>>>(3).unwrap_or_default(),
+            columns: r.get::<_, Option<Vec<String>>>(4).unwrap_or_default(),
+            tree: r.get(5),
+        })
+        .collect();
+    // Only the ones a request can name: the rest were read for the
+    // sake of the chain that runs through them.
+    let names: Vec<String> = views
+        .iter()
+        .filter(|v| v.schema == schema)
+        .map(|v| v.name.clone())
+        .collect();
+    if views.is_empty() {
+        return Ok((Vec::new(), names));
+    }
+    let rows = sess
+        .query(VIEW_KEYS_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let keys: Vec<KeyRow> = rows
+        .iter()
+        .map(|r| KeyRow {
+            constraint: r.get(0),
+            schema: r.get(1),
+            table: r.get(2),
+            oid: r.get(3),
+            attnums: r.get(4),
+            columns: r.get(5),
+            ref_schema: r.get(6),
+            ref_table: r.get(7),
+            ref_oid: r.get(8),
+            ref_attnums: r.get(9),
+            ref_columns: r.get(10),
+            unique: r.get(11),
+            in_pk: r.get(12),
+        })
+        .collect();
+    Ok((origin::derive(schema, &views, &keys), names))
 }
 
 /// The preferences settled against the loaded catalog and put to
