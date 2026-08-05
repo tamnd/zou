@@ -1279,6 +1279,42 @@ fn csv_rows(bytes: &[u8]) -> Result<(Vec<String>, Vec<serde_json::Value>), RestE
     Ok((cols, rows))
 }
 
+/// A write's body, read.
+///
+/// `raw` is the json text exactly as it arrived, and it is the thing
+/// that goes on to postgres when there is one. `rows` is the parse of
+/// it, which is only ever consulted for the column names and for the
+/// checks the names need: re-encoding the parse would quietly drop a
+/// duplicate key the sender wrote on purpose. A csv and a form have
+/// no json text of their own, so they leave `raw` empty and the parse
+/// is all there is.
+#[derive(Debug)]
+struct Written<'a> {
+    cols: Vec<String>,
+    rows: Vec<serde_json::Value>,
+    raw: Option<&'a str>,
+}
+
+impl<'a> Written<'a> {
+    /// A body zou built out of something that was not json.
+    fn read(cols: Vec<String>, rows: Vec<serde_json::Value>) -> Self {
+        Written {
+            cols,
+            rows,
+            raw: None,
+        }
+    }
+
+    /// A body that arrived as json, keeping the bytes it arrived as.
+    fn sent(cols: Vec<String>, rows: Vec<serde_json::Value>, raw: &'a str) -> Self {
+        Written {
+            cols,
+            rows,
+            raw: Some(raw),
+        }
+    }
+}
+
 /// A write's body into the rows it carries.
 ///
 /// A json body is one object counted as a single row, and anything
@@ -1295,33 +1331,37 @@ fn csv_rows(bytes: &[u8]) -> Result<(Vec<String>, Vec<serde_json::Value>), RestE
 /// there, which is upstream's answer too. It only speaks for a json
 /// body: a csv and a form name their own columns, and upstream lets
 /// them.
-fn body_rows(
+fn body_rows<'a>(
     content: &Content,
-    bytes: &[u8],
+    bytes: &'a [u8],
     columns: Option<&[String]>,
-) -> Result<(Vec<String>, Vec<serde_json::Value>), RestError> {
+) -> Result<Written<'a>, RestError> {
     match content {
         Content::Json => {}
-        Content::Csv => return csv_rows(bytes),
+        Content::Csv => {
+            let (cols, rows) = csv_rows(bytes)?;
+            return Ok(Written::read(cols, rows));
+        }
         Content::Form => {
             let mut row = serde_json::Map::new();
             for (k, v) in form_pairs(bytes) {
                 row.insert(k, serde_json::Value::String(v));
             }
             let cols: Vec<String> = row.keys().cloned().collect();
-            return Ok((cols, vec![serde_json::Value::Object(row)]));
+            return Ok(Written::read(cols, vec![serde_json::Value::Object(row)]));
         }
         Content::Value(_) | Content::Other(_) => return Err(unreadable(&content.name())),
     }
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_body("Empty or invalid json"))?;
     let v: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|_| invalid_body("Empty or invalid json"))?;
+        serde_json::from_str(text).map_err(|_| invalid_body("Empty or invalid json"))?;
     let bulk = v.is_array();
     let rows = match v {
         serde_json::Value::Array(a) => a,
         other => vec![other],
     };
     if let Some(list) = columns {
-        return Ok((list.to_vec(), rows));
+        return Ok(Written::sent(list.to_vec(), rows, text));
     }
     let cols: Vec<String> = rows
         .first()
@@ -1340,34 +1380,64 @@ fn body_rows(
             }
         }
     }
-    Ok((cols, rows))
+    Ok(Written::sent(cols, rows, text))
 }
 
-/// An insert body into its column list and normalized payload, which
-/// is always an array so that json_populate_recordset can unpack it.
+/// Whether a json body is an array, read off the text rather than
+/// off the parse so that the text is what goes on. Upstream asks the
+/// same question the same way, of the first byte that is not json's
+/// insignificant whitespace.
+fn sent_an_array(raw: &str) -> bool {
+    raw.trim_start_matches([' ', '\t', '\n', '\r'])
+        .starts_with('[')
+}
+
+/// An insert body into its column list and the payload it binds,
+/// which is always a json array so that one shape unpacks it.
+///
+/// A json body goes on as the bytes that arrived rather than as
+/// anything zou wrote back out, which is upstream's rule and is
+/// observable: postgres keeps what a `json` column was sent, so
+/// `{"a": 1, "a": 2}` is stored with both keys, and re-encoding the
+/// parse would have dropped one of them. The parse here is only for
+/// the column names and the check that the rows agree on them. One
+/// object is an array of one, spelled by putting brackets around the
+/// text rather than around the parse, for the same reason.
 fn insert_payload(
     content: &Content,
     bytes: &[u8],
     columns: Option<&[String]>,
 ) -> Result<(Vec<String>, String), RestError> {
-    let (cols, rows) = body_rows(content, bytes, columns)?;
-    Ok((cols, serde_json::Value::Array(rows).to_string()))
+    let body = body_rows(content, bytes, columns)?;
+    let text = match body.raw {
+        Some(raw) if sent_an_array(raw) => raw.to_string(),
+        Some(raw) => format!("[{raw}]"),
+        None => serde_json::Value::Array(body.rows).to_string(),
+    };
+    Ok((body.cols, text))
 }
 
 /// An update body into its column list and payload. An update writes
 /// one row, so an array of them is not refused, it is read down to
 /// its first element the way upstream's LIMIT 1 reads it, and an
 /// empty one leaves no columns to set at all.
+///
+/// The one object case is the body itself, for the reason
+/// [`insert_payload`] gives. An array is read down here rather than
+/// in SQL, so the element that survives is the parse of it.
 fn update_payload(
     content: &Content,
     bytes: &[u8],
     columns: Option<&[String]>,
 ) -> Result<(Vec<String>, String), RestError> {
-    let (cols, rows) = body_rows(content, bytes, columns)?;
-    let Some(first) = rows.into_iter().next() else {
+    let body = body_rows(content, bytes, columns)?;
+    if let Some(raw) = body.raw.filter(|raw| !sent_an_array(raw)) {
+        return Ok((body.cols, raw.to_string()));
+    }
+    let Some(first) = body.rows.into_iter().next() else {
         return Ok((Vec::new(), "null".to_string()));
     };
-    Ok((cols, first.to_string()))
+    Ok((body.cols, first.to_string()))
 }
 
 /// The Range header as a root limit and offset, only when the query
@@ -2898,7 +2968,7 @@ async fn invoke(
     // read before the body for the same reason: a POST that gets both
     // wrong is answered about the half the client wrote first.
     let joined = residual.join("&");
-    let (query, _) = parse_query(func, (!joined.is_empty()).then_some(joined.as_str()))?;
+    let (query, extras) = parse_query(func, (!joined.is_empty()).then_some(joined.as_str()))?;
 
     // What the body says, which is the content type and then the
     // bytes. A form is argument pairs the same way a query string
@@ -2919,10 +2989,23 @@ async fn invoke(
                 };
                 let v: serde_json::Value = serde_json::from_str(&text)
                     .map_err(|_| invalid_body("Empty or invalid json"))?;
-                if let Some(o) = v.as_object() {
+                // An array of objects calls the function once, on the
+                // first of them, which is what upstream's LIMIT 1 over
+                // the unpacked body comes to.
+                let first = match &v {
+                    serde_json::Value::Array(a) => a.first(),
+                    other => Some(other),
+                };
+                if let Some(o) = first.and_then(|f| f.as_object()) {
                     supplied = o.keys().cloned().collect();
                 }
-                payload = Some(text);
+                payload = Some(match &v {
+                    serde_json::Value::Array(_) => match first {
+                        Some(f) => f.to_string(),
+                        None => "{}".to_string(),
+                    },
+                    _ => text,
+                });
             }
             Content::Csv => {
                 // A call takes one row of arguments, so a csv is read
@@ -2947,6 +3030,20 @@ async fn invoke(
             }
             Content::Other(name) => return Err(unreadable(name)),
         }
+    }
+
+    // ?columns= names the arguments outright, and then the body's own
+    // keys are not read at all. It is the same rule a write has, and
+    // it decides the call as well as the arguments: a key the list
+    // leaves out is not something the function is asked for, so a
+    // body carrying more than the function takes still resolves.
+    // Only a json body has keys of its own to overrule, which is why
+    // a form and a csv are left alone here.
+    if matches!(content, Content::Json)
+        && body.is_some()
+        && let Some(list) = &extras.columns
+    {
+        supplied = list.clone();
     }
 
     let choice = match rpc::choose(
@@ -3473,7 +3570,8 @@ mod tests {
     /// word NULL is the only null in it.
     #[test]
     fn a_csv_body_is_its_records_under_its_header() {
-        let (cols, rows) = body_rows(&Content::Csv, b"id,name\n1,foo\n2,NULL", None).unwrap();
+        let body = body_rows(&Content::Csv, b"id,name\n1,foo\n2,NULL", None).unwrap();
+        let (cols, rows) = (body.cols, body.rows);
         assert_eq!(cols, ["id", "name"]);
         assert_eq!(
             rows,
@@ -3494,7 +3592,8 @@ mod tests {
     /// it is a number and nothing in it is null.
     #[test]
     fn a_form_body_is_one_row_of_text() {
-        let (cols, rows) = body_rows(&Content::Form, b"id=1&name=foo+bar", None).unwrap();
+        let body = body_rows(&Content::Form, b"id=1&name=foo+bar", None).unwrap();
+        let (cols, rows) = (body.cols, body.rows);
         assert_eq!(cols, ["id", "name"]);
         assert_eq!(
             rows,
@@ -3502,7 +3601,7 @@ mod tests {
         );
         // A table takes one row, so a repeated key is the last one
         // written rather than a list.
-        let (_, rows) = body_rows(&Content::Form, b"a=1&a=2", None).unwrap();
+        let rows = body_rows(&Content::Form, b"a=1&a=2", None).unwrap().rows;
         assert_eq!(rows, vec![serde_json::json!({"a": "2"})]);
         // A call takes the pairs instead, repeats and order kept,
         // which is what fills a variadic argument.

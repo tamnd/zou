@@ -1,9 +1,10 @@
 //! Mutation statements: insert, upsert, update, and delete.
 //!
 //! The body a client sends never splices into SQL. It binds whole as
-//! one json parameter and json_populate_recordset unpacks it against
-//! the table's row type, so postgres types every value the same way
-//! it types the read path's filter literals. The only identifiers
+//! one json parameter and json_to_recordset unpacks it under a column
+//! definition list built from the catalog, so postgres types every
+//! value the same way it types the read path's filter literals, and
+//! the body reaches it as the bytes that arrived. The only identifiers
 //! spliced here are the column names lifted from the body's keys and
 //! the conflict targets, and every one goes through quote_ident. The
 //! defaults `Prefer: missing=default` merges into the body are the
@@ -371,14 +372,15 @@ fn returning_sql(r: &Returning, qualifier: Option<&str>) -> String {
 
 /// The rows of a json array body, ready to be selected from.
 ///
-/// The plain shape is `json_populate_recordset` against the table's
-/// own row type, which is what postgres types every value with. A
-/// relation carrying a data representation cannot use it: the values
-/// of such a column arrive as json and the type reads json through a
-/// function postgres records and refuses to apply, so the body
-/// unpacks through a column definition list that types those columns
-/// as json and the function is called here, by name, the way
-/// upstream calls it.
+/// The shape is `json_to_recordset` under a column definition list,
+/// which is what upstream writes and is the only shape a data
+/// representation can use: the values of such a column arrive as
+/// json and the type reads json through a function postgres records
+/// and refuses to apply, so the column is declared json and the
+/// function is called by name. A write naming no columns at all, or
+/// naming one the catalog has no type for, has no list to write and
+/// falls back to `json_populate_recordset` against the table's own
+/// row type.
 ///
 /// A write asking for the defaults merges them under every element
 /// of the body first, so a key the element carries wins and a key it
@@ -466,17 +468,24 @@ fn quote_text(name: &str) -> String {
     format!("'{}'", name.replace('\'', "''"))
 }
 
-/// The select list and the column definition list a represented body
-/// needs, or nothing at all when no column being written reads json
-/// through a cast. Nothing at all is every ordinary write, which is
-/// why the plain shape is still the one almost every statement gets.
+/// The select list and the column definition list the body unpacks
+/// through, or nothing at all when there is no list to write.
+///
+/// A column reading json through a cast is declared `json` and the
+/// cast is called here, by name, the way upstream calls it, since
+/// postgres records such a cast and refuses to apply it. Every other
+/// column is declared as the type the catalog has for it, which is
+/// `format_type` and so is spelled the way a column definition list
+/// wants it.
 fn body_cast(rel: Option<&Relation>, columns: &[String]) -> Option<(String, String)> {
     let rel = rel?;
     let cols: Vec<&Column> = columns.iter().filter_map(|c| rel.column(c)).collect();
     // A name the relation does not have leaves nothing to declare a
     // type for, so the plain shape takes it and postgres says what
     // it thinks. The router has usually refused it long before here.
-    if cols.len() != columns.len() || !cols.iter().any(|c| c.from_json.is_some()) {
+    // A write of no columns has no list either, and takes the shape
+    // that needs none.
+    if cols.is_empty() || cols.len() != columns.len() {
         return None;
     }
     let mut list = Vec::with_capacity(cols.len());
@@ -863,11 +872,10 @@ mod tests {
     }
 
     #[test]
-    fn a_body_with_nothing_to_cast_unpacks_the_plain_way() {
-        // The column definition list exists to put the call
-        // somewhere. A write that touches no represented column has
-        // no call to place, so it stays on the row type postgres
-        // already knows, which is every ordinary write.
+    fn a_body_with_nothing_to_cast_still_declares_its_columns() {
+        // Every column the catalog has a type for is declared, cast
+        // or no cast, because the definition list is also what tells
+        // postgres the body has to be objects.
         let rel = painted();
         let s = insert(
             "todos",
@@ -881,13 +889,13 @@ mod tests {
         .unwrap();
         assert!(
             s.text
-                .contains(r#"json_populate_recordset(null::"todos", $1)"#),
+                .contains(r#"json_to_recordset($1) as "_zou_body"("id" bigint, "name" text)"#),
             "{}",
             s.text
         );
-        // And so does a write naming a column the relation does not
-        // have, which has no type to declare and is somebody else's
-        // refusal.
+        // A write naming a column the relation does not have has no
+        // type to declare and is somebody else's refusal, so it goes
+        // the plain way and postgres says what it thinks.
         let s = insert(
             "todos",
             Some(&rel),
@@ -903,6 +911,22 @@ mod tests {
                 .contains(r#"json_populate_recordset(null::"todos", $1)"#),
             "{}",
             s.text
+        );
+        // And so does a write naming no columns at all, which is a
+        // row of defaults per element and has no list to write.
+        let s = insert(
+            "todos",
+            Some(&rel),
+            &[],
+            "[{}]".into(),
+            Missing::Null,
+            None,
+            &Returning::None,
+        )
+        .unwrap();
+        assert_eq!(
+            s.text,
+            r#"insert into "todos" select from json_populate_recordset(null::"todos", $1) as "_zou_src""#
         );
     }
 
@@ -943,7 +967,7 @@ mod tests {
         // has no default to put anywhere.
         assert_eq!(
             s.text,
-            r#"insert into "todos" ("id", "name") select "id", "name" from jsonb_populate_recordset(null::"todos", (select jsonb_agg(jsonb_build_object('id', nextval('todos_id_seq')) || "_zou_elem") from jsonb_array_elements($1) as "_zou_elem")) as "_zou_src""#
+            r#"insert into "todos" ("id", "name") select "id", "name" from (select "id", "name" from jsonb_to_recordset((select jsonb_agg(jsonb_build_object('id', nextval('todos_id_seq')) || "_zou_elem") from jsonb_array_elements($1) as "_zou_elem")) as "_zou_body"("id" bigint, "name" text)) as "_zou_src""#
         );
 
         // An update merges the same object under the one object its
@@ -960,7 +984,7 @@ mod tests {
         .unwrap();
         assert!(
             s.text.contains(
-                r#"jsonb_populate_record(null::"todos", (jsonb_build_object('id', nextval('todos_id_seq')) || $1))"#
+                r#"jsonb_to_record((jsonb_build_object('id', nextval('todos_id_seq')) || $1)) as "_zou_body"("id" bigint, "name" text)"#
             ),
             "{}",
             s.text
@@ -1008,7 +1032,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.text,
-            r#"insert into "todos" ("name") select "name" from json_populate_recordset(null::"todos", $1) as "_zou_src""#
+            r#"insert into "todos" ("name") select "name" from (select "name" from json_to_recordset($1) as "_zou_body"("name" text)) as "_zou_src""#
         );
     }
 
