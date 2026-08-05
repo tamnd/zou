@@ -31,6 +31,13 @@ pub const SOURCE: &str = "_zou_rpc";
 /// of what the function was called.
 pub const VALUE: &str = "_zou_val";
 
+/// The row a json body unpacks into, which the arguments then read.
+const BODY: &str = "_zou_arg";
+
+/// The call itself when the body sits beside it in the from clause
+/// and the two have to be told apart.
+const CALL: &str = "_zou_call";
+
 /// One input argument of one overload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arg {
@@ -40,6 +47,15 @@ pub struct Arg {
     /// format_type output, spliced into casts verbatim. It comes
     /// from the catalog, never from the client.
     pub type_name: String,
+    /// The type an incoming value is cast to, which is the declared
+    /// one except for the two that carry a length nobody wrote.
+    /// `character` and `bit` are `character(1)` and `bit(1)`, so a
+    /// cast to either pads or truncates the value on the way in, and
+    /// upstream casts to the varying form instead, which takes what
+    /// it is given up to the maximum. The declared type is still what
+    /// the argument is, so it is what an ambiguous call reports and
+    /// what a single unnamed parameter takes the body as.
+    pub cast_type: String,
     pub has_default: bool,
     pub variadic: bool,
 }
@@ -73,13 +89,21 @@ pub struct Routine {
 }
 
 /// Every overload of one function name in one schema. Bind the
-/// schema as $1 and the function name as $2. Ten columns per row:
+/// schema as $1 and the function name as $2. Eleven columns per row:
 /// input argument names (empty string for unnamed), their types via
-/// format_type, a variadic flag per argument, the count of trailing
-/// defaults, then proretset, provolatile = 'v', the return type's
-/// name, the table whose rowtype it is when there is one, whether
-/// the result is a row rather than a value, and the media type the
-/// return type names when it names one.
+/// format_type, the type each one casts an incoming value to, a
+/// variadic flag per argument, the count of trailing defaults, then
+/// proretset, provolatile = 'v', the return type's name, the table
+/// whose rowtype it is when there is one, whether the result is a row
+/// rather than a value, and the media type the return type names when
+/// it names one.
+///
+/// The cast column is the declared type for all but four entries.
+/// `character` and `bit` written without a length are `character(1)`
+/// and `bit(1)`, so casting a value to one of them pads or truncates
+/// it, which is not what a caller who wrote no length asked for.
+/// Upstream casts to the varying form and so does this, arrays
+/// included.
 ///
 /// proallargtypes and proargmodes only exist once OUT or TABLE
 /// arguments appear, so both coalesce back to the plain input
@@ -133,6 +157,15 @@ args as (
          coalesce((select array_agg(format_type(u.t, null) order by u.ord)
                      from unnest(f.types) with ordinality u(t, ord)
                     where f.modes[u.ord] in ('i', 'b', 'v')), '{}'::text[]) as types,
+         coalesce((select array_agg(case u.t
+                                      when 'bit'::regtype then 'bit varying'
+                                      when 'bit[]'::regtype then 'bit varying[]'
+                                      when 'character'::regtype then 'character varying'
+                                      when 'character[]'::regtype then 'character varying[]'
+                                      else format_type(u.t, null)
+                                    end order by u.ord)
+                     from unnest(f.types) with ordinality u(t, ord)
+                    where f.modes[u.ord] in ('i', 'b', 'v')), '{}'::text[]) as casts,
          coalesce((select array_agg((f.modes[u.ord] = 'v') order by u.ord)
                      from unnest(f.types) with ordinality u(t, ord)
                     where f.modes[u.ord] in ('i', 'b', 'v')), '{}'::bool[]) as variadic
@@ -140,6 +173,7 @@ args as (
 )
 select a.names,
        a.types,
+       a.casts,
        a.variadic,
        f.pronargdefaults::int,
        f.proretset,
@@ -192,6 +226,9 @@ select distinct p.proname::text
 pub struct RoutineRow {
     pub arg_names: Vec<String>,
     pub arg_types: Vec<String>,
+    /// The type each argument casts an incoming value to, which is
+    /// [`Arg::cast_type`].
+    pub arg_casts: Vec<String>,
     pub arg_variadic: Vec<bool>,
     pub defaults: i32,
     pub returns_set: bool,
@@ -213,11 +250,13 @@ pub fn routine(row: RoutineRow) -> Routine {
         .arg_names
         .into_iter()
         .zip(row.arg_types)
+        .zip(row.arg_casts)
         .zip(row.arg_variadic)
         .enumerate()
-        .map(|(i, ((name, type_name), variadic))| Arg {
+        .map(|(i, (((name, type_name), cast_type), variadic))| Arg {
             name,
             type_name,
+            cast_type,
             has_default: i >= first_default,
             variadic,
         })
@@ -513,27 +552,40 @@ fn call_sql(kind: &RetKind, f: &str, args: &str) -> String {
     }
 }
 
-/// The expression pulling one named argument out of the json body
-/// parameter. json stays json, an array type unpacks element by
-/// element because a json array's text is not a postgres array
-/// literal, and everything else goes through text into the declared
-/// type, the same trust-the-server stance the filters take.
-fn json_arg(arg: &Arg) -> String {
-    let key = arg.name.replace('\'', "''");
-    match arg.type_name.as_str() {
-        "json" | "jsonb" => format!("(($1::jsonb)->'{key}')::{}", arg.type_name),
-        t if t.ends_with("[]") => format!(
-            "coalesce((select array_agg(\"_zou_el\".v) \
-             from jsonb_array_elements_text(($1::jsonb)->'{key}') as \"_zou_el\"(v)), \
-             array[]::text[])::{t}"
+/// The call itself with the body beside it in the from clause, which
+/// is the shape a json body needs: the arguments are columns of a row
+/// postgres unpacked, so the call has to be lateral to it.
+///
+/// A result that is a value is wrapped in a select of its own so that
+/// it has a name to be read by, the same name [`call_sql`] gives it in
+/// the select list, since the from clause names a set of values after
+/// the function rather than after anything this could ask for.
+fn call_beside(kind: &RetKind, f: &str, from: &str, args: &str) -> String {
+    let call = quote_ident(CALL);
+    match kind {
+        RetKind::Scalar => format!(
+            "select {call}.{v} from {from}, lateral (select {f}({args}) as {v}) as {call}",
+            v = quote_ident(VALUE)
         ),
-        t => format!("(($1::jsonb)->>'{key}')::{t}"),
+        _ => format!("select {call}.* from {from}, lateral {f}({args}) as {call}"),
     }
 }
 
-/// Build the call for a json body: the body is $1 and each supplied
-/// argument unpacks from it by name, or the whole body passes when
-/// the function takes one unnamed json parameter.
+/// Build the call for a json body: the body is $1 and the supplied
+/// arguments are unpacked out of it under a column definition list,
+/// or the whole body passes when the function takes one unnamed json
+/// parameter.
+///
+/// The definition list is what makes a body value arrive as the type
+/// the argument is. Postgres reads a json value into a declared type
+/// with the same rules it reads any json into a record with, so an
+/// array argument takes a json array and takes a string holding a
+/// postgres array literal, and neither of those is a rule written
+/// here. Upstream builds the same from clause for the same reason.
+///
+/// The body is one object by the time it gets here. Upstream reaches
+/// that with `LIMIT 1` over the unpacked array, which is the same
+/// answer arrived at earlier.
 pub fn call_json(
     schema: &str,
     name: &str,
@@ -549,33 +601,35 @@ pub fn call_json(
             params: vec![body],
         };
     }
+    let src = quote_ident(BODY);
+    let mut defs = Vec::new();
     let mut parts = Vec::new();
     for arg in &choice.routine.args {
         if !supplied.contains(&arg.name) {
             continue;
         }
+        let ident = quote_ident(&arg.name);
+        defs.push(format!("{ident} {}", arg.cast_type));
         let prefix = if arg.variadic { "variadic " } else { "" };
-        parts.push(format!(
-            "{prefix}{} := {}",
-            quote_ident(&arg.name),
-            json_arg(arg)
-        ));
+        parts.push(format!("{prefix}{ident} := {src}.{ident}"));
     }
-    // Every part reads from $1, so the payload only binds when at
-    // least one argument was supplied; a bare call takes nothing.
-    let params = if parts.is_empty() {
-        Vec::new()
-    } else {
-        vec![body]
-    };
+    // The body only binds when at least one argument was supplied,
+    // since a call taking none has nothing to unpack it for.
+    if parts.is_empty() {
+        return Sql {
+            text: call_sql(&choice.routine.kind, &f, ""),
+            params: Vec::new(),
+        };
+    }
+    let from = format!("json_to_record($1) as {src}({})", defs.join(", "));
     Sql {
-        text: call_sql(&choice.routine.kind, &f, &parts.join(", ")),
-        params,
+        text: call_beside(&choice.routine.kind, &f, &from, &parts.join(", ")),
+        params: vec![body],
     }
 }
 
 /// Build the call for query string arguments: each value binds as
-/// its own text parameter cast to the declared type, and a variadic
+/// its own text parameter cast to the argument's type, and a variadic
 /// argument collects every repetition of its name into one array.
 ///
 /// A name repeated for an argument that is not variadic is the last
@@ -607,11 +661,11 @@ pub fn call_get(schema: &str, name: &str, routine: &Routine, args: &[(String, St
             parts.push(format!(
                 "variadic {ident} := array[{}]::{}",
                 elems.join(", "),
-                arg.type_name
+                arg.cast_type
             ));
         } else {
             params.push(values[values.len() - 1].to_string());
-            parts.push(format!("{ident} := ${}::{}", params.len(), arg.type_name));
+            parts.push(format!("{ident} := ${}::{}", params.len(), arg.cast_type));
         }
     }
     Sql {
@@ -696,6 +750,7 @@ mod tests {
         RoutineRow {
             arg_names: names.iter().map(|s| s.to_string()).collect(),
             arg_types: types.iter().map(|s| s.to_string()).collect(),
+            arg_casts: types.iter().map(|s| s.to_string()).collect(),
             arg_variadic: vec![false; names.len()],
             defaults,
             returns_set: false,
@@ -957,8 +1012,12 @@ mod tests {
         assert!(call(&overloads, &[], Payload::Text, true).is_err());
     }
 
+    /// The body unpacks once, under a column definition list, and the
+    /// call reads the row it made. Nothing here says what a json array
+    /// or a json object becomes, because postgres already knows: the
+    /// declared type of the column is the whole instruction.
     #[test]
-    fn a_json_call_unpacks_the_body_per_argument() {
+    fn a_json_call_unpacks_the_body_under_its_argument_types() {
         let r = plain(
             &["n", "tag", "opts", "ids"],
             &["integer", "text", "jsonb", "integer[]"],
@@ -973,13 +1032,14 @@ mod tests {
         let s = call_json("public", "f", &c, &supplied, "{}".into());
         assert_eq!(
             s.text,
-            "select \"public\".\"f\"(\
-             \"n\" := (($1::jsonb)->>'n')::integer, \
-             \"tag\" := (($1::jsonb)->>'tag')::text, \
-             \"opts\" := (($1::jsonb)->'opts')::jsonb, \
-             \"ids\" := coalesce((select array_agg(\"_zou_el\".v) \
-             from jsonb_array_elements_text(($1::jsonb)->'ids') as \"_zou_el\"(v)), \
-             array[]::text[])::integer[]) as \"_zou_val\""
+            "select \"_zou_call\".\"_zou_val\" \
+             from json_to_record($1) as \"_zou_arg\"(\
+             \"n\" integer, \"tag\" text, \"opts\" jsonb, \"ids\" integer[]), \
+             lateral (select \"public\".\"f\"(\
+             \"n\" := \"_zou_arg\".\"n\", \
+             \"tag\" := \"_zou_arg\".\"tag\", \
+             \"opts\" := \"_zou_arg\".\"opts\", \
+             \"ids\" := \"_zou_arg\".\"ids\") as \"_zou_val\") as \"_zou_call\""
         );
         assert_eq!(s.params.len(), 1);
     }
@@ -1016,6 +1076,44 @@ mod tests {
              variadic \"v\" := array[$2, $3]::integer[]) as \"_zou_val\""
         );
         assert_eq!(s.params, vec!["1".to_string(), "2".into(), "3".into()]);
+    }
+
+    /// `character` is `character(1)`, so casting to it keeps one
+    /// letter of whatever was sent. The value is cast to the varying
+    /// form instead, from the query string and from a json body
+    /// alike, and the declared type is still what the argument is.
+    #[test]
+    fn a_length_less_char_takes_the_value_it_was_given() {
+        let r = routine(RoutineRow {
+            arg_casts: vec!["character varying".into(), "character varying[]".into()],
+            ..row(&["c", "arr"], &["character", "character[]"], 0)
+        });
+        let s = call_get(
+            "public",
+            "f",
+            &r,
+            &[("c".into(), "abcdefg".into()), ("arr".into(), "{a}".into())],
+        );
+        assert_eq!(
+            s.text,
+            "select \"public\".\"f\"(\
+             \"c\" := $1::character varying, \
+             \"arr\" := $2::character varying[]) as \"_zou_val\""
+        );
+        let overloads = [r];
+        let supplied = ["c".to_string(), "arr".to_string()];
+        let c = call(&overloads, &supplied, Payload::Json, true).unwrap();
+        let s = call_json("public", "f", &c, &supplied, r#"{"c": "abcdefg"}"#.into());
+        assert!(
+            s.text
+                .contains("as \"_zou_arg\"(\"c\" character varying, \"arr\" character varying[])"),
+            "{}",
+            s.text
+        );
+        // The two the substitution is for are the only ones it
+        // touches, and the catalog is where it happens.
+        assert!(INTROSPECT_SQL.contains("when 'character'::regtype then 'character varying'"));
+        assert!(INTROSPECT_SQL.contains("when 'bit'::regtype then 'bit varying'"));
     }
 
     #[test]

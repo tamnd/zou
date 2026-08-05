@@ -2904,14 +2904,15 @@ async fn invoke(
             rpc::routine(rpc::RoutineRow {
                 arg_names: r.get(0),
                 arg_types: r.get(1),
-                arg_variadic: r.get(2),
-                defaults: r.get(3),
-                returns_set: r.get(4),
-                volatile: r.get(5),
-                rettype: r.get(6),
-                return_table: r.get(7),
-                composite: r.get(8),
-                media: r.get(9),
+                arg_casts: r.get(2),
+                arg_variadic: r.get(3),
+                defaults: r.get(4),
+                returns_set: r.get(5),
+                volatile: r.get(6),
+                rettype: r.get(7),
+                return_table: r.get(8),
+                composite: r.get(9),
+                media: r.get(10),
             })
         })
         .collect();
