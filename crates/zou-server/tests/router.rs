@@ -39,6 +39,7 @@ fn anon_key() -> String {
 struct Answer {
     status: StatusCode,
     request_id: String,
+    content_type: String,
     body: serde_json::Value,
 }
 
@@ -76,11 +77,18 @@ async fn send(app: &axum::Router, method: &str, path: &str, key: bool) -> Answer
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
     let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     Answer {
         status,
         request_id,
+        content_type,
         body,
     }
 }
@@ -309,6 +317,34 @@ async fn a_stubbed_surface_is_stubbed_all_the_way_to_its_root() {
         assert_eq!(
             answer.message(),
             "the realtime surface is not implemented yet, tracked in tamnd/zou milestones",
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_url_that_missed_the_rest_surface_is_told_so_by_the_rest_surface() {
+    let app = app();
+    // Three ways to miss it: too many segments, a prefix that is not a
+    // segment at all because the slash was dropped, and a rpc name with
+    // a path stuck on the end. None of them is a table, and all of them
+    // are this api, so the caller hears this api's error rather than the
+    // gateway's.
+    for path in [
+        "/rest/v1/first/second/third",
+        "/rest/v1todos",
+        "/rest/v1/rpc/add_them/again",
+    ] {
+        let answer = keyed(&app, "GET", path).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(answer.body["code"], "PGRST125", "{path}");
+        assert_eq!(
+            answer.message(),
+            "Invalid path specified in request URL",
+            "{path}",
+        );
+        assert_eq!(
+            answer.content_type, "application/json; charset=utf-8",
+            "{path}"
         );
     }
 }

@@ -29,11 +29,12 @@ pub fn key(role: &str, secret: &str) -> String {
 
 /// Start zou against `dsn` on a free port and wait until it answers.
 ///
-/// `schemas` comes from the suite, because a suite derived from
-/// upstream's fixtures keeps its tables where upstream keeps them and
-/// the reference is configured to match.
-pub fn start(dsn: &str, secret: &[u8], schemas: &[String]) -> Result<Served, String> {
-    start_at(0, dsn, secret, schemas)
+/// `schemas` and `anon` come from the suite, because a suite derived
+/// from upstream's fixtures keeps its tables where upstream keeps them
+/// and calls its unauthenticated role what upstream calls it, and the
+/// reference is configured to match both.
+pub fn start(dsn: &str, secret: &[u8], schemas: &[String], anon: &str) -> Result<Served, String> {
+    start_at(0, dsn, secret, schemas, anon)
 }
 
 /// The same, on a port somebody has to know in advance.
@@ -42,7 +43,13 @@ pub fn start(dsn: &str, secret: &[u8], schemas: &[String]) -> Result<Served, Str
 /// so it does not care what port zou got. A suite written in another
 /// language is asked over a client somebody else wrote, and all that
 /// one takes is a url, so it has to be a url that was agreed on.
-pub fn start_at(port: u16, dsn: &str, secret: &[u8], schemas: &[String]) -> Result<Served, String> {
+pub fn start_at(
+    port: u16,
+    dsn: &str,
+    secret: &[u8],
+    schemas: &[String],
+    anon: &str,
+) -> Result<Served, String> {
     // Bound here rather than inside the thread, so a port that cannot
     // be had is an error the caller sees instead of a run that hangs.
     let listener =
@@ -60,6 +67,7 @@ pub fn start_at(port: u16, dsn: &str, secret: &[u8], schemas: &[String]) -> Resu
         // since the first is the one a request that names no schema
         // gets.
         schemas: schemas.to_vec(),
+        anon_role: anon.to_string(),
         mailer_autoconfirm: true,
         ..Config::default()
     };

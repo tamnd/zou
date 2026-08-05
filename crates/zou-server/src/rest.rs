@@ -89,6 +89,7 @@ fn profile<'a>(
                     "Only the following schemas are exposed: {}",
                     schemas.join(", ")
                 )),
+                headers: None,
             }),
         },
         None => Ok((schemas[0].as_str(), schemas.len() != 1)),
@@ -132,6 +133,14 @@ pub struct RestError {
     pub message: String,
     pub details: Option<serde_json::Value>,
     pub hint: Option<String>,
+    /// Headers the answer carries. Absent for every refusal this server
+    /// decided on its own, and only ever set by a function that raised
+    /// its own response with `RAISE SQLSTATE 'PGRST'`, which is allowed
+    /// to name headers because it is naming the whole answer. Boxed
+    /// because this error is the Err of nearly every function on this
+    /// surface and it is not worth two dozen bytes on all of them for
+    /// the one case that fills it.
+    pub headers: Option<Box<Vec<(String, String)>>>,
 }
 
 /// The details of an embed or rpc error as the body carries them.
@@ -170,6 +179,17 @@ impl RestError {
             res.headers_mut()
                 .insert(header::WWW_AUTHENTICATE, "Bearer".parse().expect("a token"));
         }
+        // Whatever the function that wrote this answer asked to be sent
+        // with it. A name or a value http will not hold is dropped
+        // rather than fatal: the rest of the answer is still the answer.
+        for (name, value) in self.headers.map(|h| *h).unwrap_or_default() {
+            if let (Ok(name), Ok(value)) = (
+                header::HeaderName::try_from(&name),
+                header::HeaderValue::try_from(&value),
+            ) {
+                res.headers_mut().insert(name, value);
+            }
+        }
         res
     }
 }
@@ -186,6 +206,27 @@ fn error_body(status: StatusCode, body: serde_json::Value) -> Response {
         .into_response()
 }
 
+/// What a url under the rest prefix that names no route gets.
+///
+/// The router already turns away a path with the wrong number of
+/// segments, and a path that only looks like it has the right number:
+/// `/rest/v1tsearch_to_tsvector` is not the table `tsearch_to_tsvector`
+/// under the prefix, it is a path that happens to start with the same
+/// letters. Either way the surface it missed is this one, so the answer
+/// is this surface's, in this surface's shape, rather than the
+/// gateway's line about no route matching.
+pub(crate) fn invalid_path() -> Response {
+    RestError {
+        status: StatusCode::NOT_FOUND,
+        code: "PGRST125".to_string(),
+        message: "Invalid path specified in request URL".to_string(),
+        details: None,
+        hint: None,
+        headers: None,
+    }
+    .into_response()
+}
+
 fn bad_grammar(message: impl Into<String>) -> RestError {
     RestError {
         status: StatusCode::BAD_REQUEST,
@@ -193,6 +234,7 @@ fn bad_grammar(message: impl Into<String>) -> RestError {
         message: message.into(),
         details: None,
         hint: None,
+        headers: None,
     }
 }
 
@@ -203,6 +245,7 @@ fn no_database() -> RestError {
         message: "Database connection error. Retrying the connection.".to_string(),
         details: None,
         hint: None,
+        headers: None,
     }
 }
 
@@ -217,6 +260,7 @@ fn invalid_body(message: impl Into<String>) -> RestError {
         message: message.into(),
         details: None,
         hint: None,
+        headers: None,
     }
 }
 
@@ -230,6 +274,7 @@ fn invalid_prefs(tokens: &[String]) -> RestError {
         message: "Invalid preferences given with handling=strict".to_string(),
         details: Some(format!("Invalid preferences: {}", tokens.join(", ")).into()),
         hint: None,
+        headers: None,
     }
 }
 
@@ -244,6 +289,7 @@ fn too_many_affected(rows: u64) -> RestError {
         message: "Query result exceeds max-affected preference constraint".to_string(),
         details: Some(format!("The query affects {rows} rows").into()),
         hint: None,
+        headers: None,
     }
 }
 
@@ -260,6 +306,7 @@ fn not_set_returning() -> RestError {
             .to_string(),
         details: None,
         hint: None,
+        headers: None,
     }
 }
 
@@ -282,6 +329,7 @@ fn no_table(catalog: &Catalog, schema: &str, table: &str) -> RestError {
         hint: catalog
             .nearest(table)
             .map(|near| format!("Perhaps you meant the table '{schema}.{near}'")),
+        headers: None,
     }
 }
 
@@ -296,6 +344,7 @@ fn no_column(table: &str, column: &str) -> RestError {
         message: format!("Could not find the '{column}' column of '{table}' in the schema cache"),
         details: None,
         hint: None,
+        headers: None,
     }
 }
 
@@ -310,6 +359,7 @@ fn put_paged() -> RestError {
         message: "limit/offset querystring parameters are not allowed for PUT".to_string(),
         details: None,
         hint: None,
+        headers: None,
     }
 }
 
@@ -321,6 +371,7 @@ fn put_filters() -> RestError {
             .to_string(),
         details: None,
         hint: None,
+        headers: None,
     }
 }
 
@@ -331,6 +382,7 @@ fn put_mismatch() -> RestError {
         message: "Payload values do not match URL in primary key column(s)".to_string(),
         details: None,
         hint: None,
+        headers: None,
     }
 }
 
@@ -793,6 +845,7 @@ fn unacceptable(offered: Vec<String>) -> RestError {
         ),
         details: None,
         hint: None,
+        headers: None,
     }
 }
 
@@ -858,6 +911,7 @@ fn not_single(rows: usize) -> RestError {
         message: "Cannot coerce the result to a single JSON object".to_string(),
         details: Some(format!("The result contains {rows} rows").into()),
         hint: None,
+        headers: None,
     }
 }
 
@@ -1164,14 +1218,20 @@ fn status_for(code: &str, message: &str, authed: bool) -> StatusCode {
 /// error carries its SQLSTATE through the table above, anything
 /// else, a dropped connection or a refused dial, is the connection
 /// error shape with status 503.
+///
+/// One SQLSTATE is not an error at all. `PGRST` is how a function
+/// writes the whole answer itself, so it is taken apart rather than
+/// reported.
 fn pg_error(e: &tokio_postgres::Error, authed: bool) -> RestError {
     match e.as_db_error() {
+        Some(db) if db.code().code() == "PGRST" => raised(db.message(), db.detail()),
         Some(db) => RestError {
             status: status_for(db.code().code(), db.message(), authed),
             code: db.code().code().to_string(),
             message: db.message().to_string(),
             details: db.detail().map(Into::into),
             hint: db.hint().map(str::to_string),
+            headers: None,
         },
         None => RestError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1179,7 +1239,112 @@ fn pg_error(e: &tokio_postgres::Error, authed: bool) -> RestError {
             message: "Database connection error. Retrying the connection.".to_string(),
             details: Some(e.to_string().into()),
             hint: None,
+            headers: None,
         },
+    }
+}
+
+/// A `RAISE SQLSTATE 'PGRST'` taken apart.
+///
+/// A function raising this is not reporting a failure, it is writing
+/// the answer: the status, the headers and the body are all its own,
+/// which is how a function answers with a redirect or a 402 without
+/// this server knowing anything about either. MESSAGE is the body, the
+/// same four keys every other error here has, and DETAIL is the
+/// envelope. Both have to be json objects with the keys upstream
+/// names, all of them strings but the status, and when either is not,
+/// the answer is this server's 500 saying which half and what it
+/// should have looked like: a function that meant to write an answer
+/// and wrote nothing readable is a bug in the function rather than
+/// something to pass on.
+fn raised(message: &str, detail: Option<&str>) -> RestError {
+    const BODY_HINT: &str = "MESSAGE must be a JSON object with obligatory keys: 'code', 'message' and optional keys: 'details', 'hint'.";
+    const ENVELOPE_HINT: &str = "DETAIL must be a JSON object with obligatory keys: 'status', 'headers' and optional key: 'status_text'.";
+    let unreadable = |details: String, hint: &str| RestError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "PGRST121".to_string(),
+        message: "Could not parse JSON in the \"RAISE SQLSTATE 'PGRST'\" error".to_string(),
+        details: Some(details.into()),
+        hint: Some(hint.to_string()),
+        headers: None,
+    };
+    let bad_body = || {
+        unreadable(
+            format!("Invalid JSON value for MESSAGE: '{message}'"),
+            BODY_HINT,
+        )
+    };
+    let body = match serde_json::from_str::<serde_json::Value>(message) {
+        Ok(serde_json::Value::Object(body)) => body,
+        _ => return bad_body(),
+    };
+    // A key that has to be there and has to be a string, and one that
+    // may be missing but may not be anything else. Absent and null are
+    // the same absence, which is what the json library upstream reads
+    // through does.
+    let need = |map: &serde_json::Map<String, serde_json::Value>, key: &str| {
+        map.get(key).and_then(|v| v.as_str()).map(str::to_string)
+    };
+    let may = |map: &serde_json::Map<String, serde_json::Value>, key: &str| match map.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(()),
+    };
+    let (Some(code), Some(text)) = (need(&body, "code"), need(&body, "message")) else {
+        return bad_body();
+    };
+    let (Ok(details), Ok(hint)) = (may(&body, "details"), may(&body, "hint")) else {
+        return bad_body();
+    };
+    let Some(detail) = detail else {
+        return unreadable(
+            "DETAIL is missing in the RAISE statement".to_string(),
+            ENVELOPE_HINT,
+        );
+    };
+    let bad_envelope = || {
+        unreadable(
+            format!("Invalid JSON value for DETAIL: '{detail}'"),
+            ENVELOPE_HINT,
+        )
+    };
+    let envelope = match serde_json::from_str::<serde_json::Value>(detail) {
+        Ok(serde_json::Value::Object(envelope)) => envelope,
+        _ => return bad_envelope(),
+    };
+    // status_text is read so that a DETAIL naming it wrongly is the
+    // parse error it is upstream, and then dropped: the words on the
+    // status line are hyper's, and nothing above this server picks
+    // them.
+    if may(&envelope, "status_text").is_err() {
+        return bad_envelope();
+    }
+    let (Some(status), Some(serde_json::Value::Object(headers))) = (
+        envelope.get("status").and_then(serde_json::Value::as_u64),
+        envelope.get("headers"),
+    ) else {
+        return bad_envelope();
+    };
+    let mut named = Vec::new();
+    for (name, value) in headers {
+        match value.as_str() {
+            Some(value) => named.push((name.clone(), value.to_string())),
+            None => return bad_envelope(),
+        }
+    }
+    RestError {
+        // A status the http crate will not hold is not worth guessing
+        // at, and a function that wrote one has the same bug as a
+        // function that wrote no json.
+        status: u16::try_from(status)
+            .ok()
+            .and_then(|n| StatusCode::from_u16(n).ok())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        code,
+        message: text,
+        details: details.map(Into::into),
+        hint,
+        headers: Some(Box::new(named)),
     }
 }
 
@@ -1195,6 +1360,7 @@ fn plan_error(e: PlanError) -> RestError {
             message: e.message,
             details: e.details.map(detail_json),
             hint: e.hint,
+            headers: None,
         },
         PlanError::Compile(c) => bad_grammar(c.message),
         PlanError::Other(m) => RestError {
@@ -1203,6 +1369,7 @@ fn plan_error(e: PlanError) -> RestError {
             message: m,
             details: None,
             hint: None,
+            headers: None,
         },
     }
 }
@@ -1513,7 +1680,7 @@ async fn read(
 
     let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
-    let authed = auth.role != "anon";
+    let authed = auth.role != app.cfg.anon_role;
     let ctx = request_context(auth, req, schema);
     let sess = pool
         .session(&ctx, true)
@@ -1808,7 +1975,7 @@ async fn write(
     let media = negotiate(&req.headers)?;
 
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
-    let authed = auth.role != "anon";
+    let authed = auth.role != app.cfg.anon_role;
     let ctx = request_context(auth, req, schema);
     let sess = pool
         .session(&ctx, false)
@@ -2089,7 +2256,7 @@ async fn options(
 ) -> Result<Response, RestError> {
     let (schema, _) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
-    let authed = auth.role != "anon";
+    let authed = auth.role != app.cfg.anon_role;
     let ctx = request_context(auth, req, schema);
     let sess = pool
         .session(&ctx, true)
@@ -2131,6 +2298,7 @@ pub async fn table(
                     message: "The request body is too large".to_string(),
                     details: None,
                     hint: None,
+                    headers: None,
                 }),
             }
         }
@@ -2153,7 +2321,7 @@ async fn describe(app: &App, auth: &AuthContext, req: &Parts) -> Result<Response
     negotiate_openapi(&req.headers)?;
 
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
-    let authed = auth.role != "anon";
+    let authed = auth.role != app.cfg.anon_role;
     let ctx = request_context(auth, req, schema);
     let sess = pool
         .session(&ctx, true)
@@ -2300,6 +2468,7 @@ fn rpc_error(e: rpc::RpcError) -> RestError {
         message: e.message,
         details: e.details.map(Into::into),
         hint: e.hint,
+        headers: None,
     }
 }
 
@@ -2323,7 +2492,7 @@ async fn invoke(
     let mut prefer = parse_prefer(&req.headers);
     let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
-    let authed = auth.role != "anon";
+    let authed = auth.role != app.cfg.anon_role;
     let ctx = request_context(auth, req, schema);
     // GET and HEAD run read only, so a volatile function fails with
     // pg's 25006, which the status table maps to PostgREST's 405.
@@ -2747,6 +2916,7 @@ pub async fn rpc(
                 message: "The request body is too large".to_string(),
                 details: None,
                 hint: None,
+                headers: None,
             }),
         },
         m => Err(RestError {
@@ -2755,6 +2925,7 @@ pub async fn rpc(
             message: format!("Cannot use the {m} method on RPC"),
             details: None,
             hint: None,
+            headers: None,
         }),
     };
     match result {
@@ -3023,6 +3194,7 @@ mod tests {
             message: "no".to_string(),
             details: None,
             hint: None,
+            headers: None,
         };
         let res = refused.into_response();
         assert_eq!(res.headers()[header::WWW_AUTHENTICATE], "Bearer");
@@ -3623,5 +3795,96 @@ mod tests {
             Some(vec!["id".to_string(), "tenant".to_string()])
         );
         assert_eq!(extras.columns, Some(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn a_function_that_raises_pgrst_writes_the_whole_answer() {
+        let e = raised(
+            r#"{"code":"123","message":"ABC","details":"DEF","hint":"XYZ"}"#,
+            Some(r#"{"status":332,"status_text":"My Custom Status","headers":{"X-Header":"str"}}"#),
+        );
+        assert_eq!(e.status.as_u16(), 332);
+        assert_eq!(e.code, "123");
+        assert_eq!(e.message, "ABC");
+        assert_eq!(e.details, Some("DEF".into()));
+        assert_eq!(e.hint, Some("XYZ".to_string()));
+        assert_eq!(
+            e.headers.as_deref(),
+            Some(&vec![("X-Header".to_string(), "str".to_string())]),
+        );
+        // The two optional keys of the body really are optional.
+        let e = raised(
+            r#"{"code":"123","message":"ABC"}"#,
+            Some(r#"{"status":404,"headers":{}}"#),
+        );
+        assert_eq!(e.status, StatusCode::NOT_FOUND);
+        assert_eq!(e.details, None);
+        assert_eq!(e.hint, None);
+        assert!(e.headers.is_none_or(|h| h.is_empty()));
+    }
+
+    #[test]
+    fn a_raise_that_wrote_no_answer_is_this_servers_own_five_hundred() {
+        let detail = r#"{"status":332,"headers":{}}"#;
+        for (message, detail, details) in [
+            (
+                "INVALID",
+                Some(detail),
+                "Invalid JSON value for MESSAGE: 'INVALID'",
+            ),
+            // Obligatory means obligatory, and a key of the wrong type
+            // is as unreadable as no key at all.
+            (
+                r#"{"message":"ABC"}"#,
+                Some(detail),
+                "Invalid JSON value for MESSAGE: '{\"message\":\"ABC\"}'",
+            ),
+            (
+                r#"{"code":"123","message":"ABC","hint":7}"#,
+                Some(detail),
+                "Invalid JSON value for MESSAGE: '{\"code\":\"123\",\"message\":\"ABC\",\"hint\":7}'",
+            ),
+            (
+                r#"{"code":"123","message":"ABC"}"#,
+                None,
+                "DETAIL is missing in the RAISE statement",
+            ),
+            (
+                r#"{"code":"123","message":"ABC"}"#,
+                Some("INVALID"),
+                "Invalid JSON value for DETAIL: 'INVALID'",
+            ),
+            (
+                r#"{"code":"123","message":"ABC"}"#,
+                Some(r#"{"status":332}"#),
+                "Invalid JSON value for DETAIL: '{\"status\":332}'",
+            ),
+            (
+                r#"{"code":"123","message":"ABC"}"#,
+                Some(r#"{"status":332,"headers":{"X-Header":7}}"#),
+                "Invalid JSON value for DETAIL: '{\"status\":332,\"headers\":{\"X-Header\":7}}'",
+            ),
+        ] {
+            let e = raised(message, detail);
+            assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR, "{message}");
+            assert_eq!(e.code, "PGRST121", "{message}");
+            assert_eq!(
+                e.message,
+                "Could not parse JSON in the \"RAISE SQLSTATE 'PGRST'\" error",
+            );
+            assert_eq!(e.details, Some(details.into()), "{message}");
+            assert!(e.hint.is_some(), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_status_no_answer_can_carry_is_the_bug_it_is() {
+        let e = raised(
+            r#"{"code":"123","message":"ABC"}"#,
+            Some(r#"{"status":99,"headers":{}}"#),
+        );
+        assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
+        // The body is still the function's own, because it wrote one.
+        assert_eq!(e.code, "123");
     }
 }

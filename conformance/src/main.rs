@@ -75,6 +75,8 @@ serving
                            supabase CLI serves a local project on
   --schemas <a,b>          what a request that names no schema gets,
                            default public
+  --anon-role <role>       the role a request with no role of its own runs
+                           as, default anon
   --setup <path>           a sql file to apply once the server is up, which
                            is where the fixture of a suite asked elsewhere
                            goes. Applied after the auth schema exists, so it
@@ -142,6 +144,7 @@ struct Args {
     suites_dir: Option<String>,
     port: u16,
     schemas: Vec<String>,
+    anon_role: String,
     setup_sql: Option<String>,
     reports: Vec<String>,
     js: Option<String>,
@@ -175,6 +178,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         suites_dir: None,
         port: 54321,
         schemas: vec!["public".to_string()],
+        anon_role: "anon".to_string(),
         setup_sql: None,
         reports: Vec::new(),
         js: None,
@@ -233,6 +237,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("--port takes a number, not {value:?}"))?;
             }
+            "--anon-role" => args.anon_role = need("--anon-role")?,
             "--schemas" => {
                 args.schemas = need("--schemas")?
                     .split(',')
@@ -380,6 +385,7 @@ fn run(args: Args) -> Result<bool, String> {
                 dsn,
                 args.jwt_secret.as_bytes(),
                 &suite.cases.schemas,
+                &suite.cases.anon_role,
             )?),
             None => None,
         };
@@ -508,7 +514,13 @@ fn published(args: &Args) -> Result<bool, String> {
 /// that has happened.
 fn holding(args: &Args) -> Result<bool, String> {
     let dsn = args.zou_dsn.as_deref().expect("parse checked for one");
-    let served = zou::start_at(args.port, dsn, args.jwt_secret.as_bytes(), &args.schemas)?;
+    let served = zou::start_at(
+        args.port,
+        dsn,
+        args.jwt_secret.as_bytes(),
+        &args.schemas,
+        &args.anon_role,
+    )?;
     if let Some(path) = &args.setup_sql {
         let sql = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         target::apply(dsn, &sql, "serve")?;
