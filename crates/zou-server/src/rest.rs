@@ -228,6 +228,21 @@ fn bad_grammar(message: impl Into<String>) -> RestError {
     }
 }
 
+/// A window that ends before it starts. It is the same code and the
+/// same status as an offset past the last row, because upstream reads
+/// both of them the same way: a range the request asked for and the
+/// table cannot answer.
+fn negative_limit() -> RestError {
+    RestError {
+        status: StatusCode::RANGE_NOT_SATISFIABLE,
+        code: "PGRST103".to_string(),
+        message: "Requested range not satisfiable".to_string(),
+        details: Some("Limit should be greater than or equal to zero.".into()),
+        hint: None,
+        headers: None,
+    }
+}
+
 fn no_database() -> RestError {
     RestError {
         status: StatusCode::SERVICE_UNAVAILABLE,
@@ -652,6 +667,11 @@ fn parse_query(table: &str, raw: Option<&str>) -> Result<(Query, Extras), RestEr
     };
     let mut extras = Extras::default();
     let mut selected = false;
+    // Held back until the whole query string has been read, because a
+    // limit and an offset on the same route are one window and it
+    // takes both of them to say where that window is.
+    let mut limits: Vec<(Vec<String>, i64)> = Vec::new();
+    let mut offsets: Vec<(Vec<String>, i64)> = Vec::new();
     for pair in raw.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let key = decode(k);
@@ -680,11 +700,11 @@ fn parse_query(table: &str, raw: Option<&str>) -> Result<(Query, Extras), RestEr
             }
             "limit" => {
                 let n = page::parse_limit(&value).map_err(|e| bad_grammar(e.to_string()))?;
-                q.limit.push((route_of(prefix), n));
+                limits.push((route_of(prefix), n));
             }
             "offset" => {
                 let n = page::parse_offset(&value).map_err(|e| bad_grammar(e.to_string()))?;
-                q.offset.push((route_of(prefix), n));
+                offsets.push((route_of(prefix), n));
             }
             _ => match filter::parse_pair(&key, &value).map_err(|e| bad_grammar(e.to_string()))? {
                 Parsed::Filter(cond) => q.filters.push((Vec::new(), Node::Cond(cond))),
@@ -700,7 +720,51 @@ fn parse_query(table: &str, raw: Option<&str>) -> Result<(Query, Extras), RestEr
     if !selected {
         q.select = select::parse("*").expect("* always parses");
     }
+    window(&mut q, &limits, &offsets)?;
     Ok((q, extras))
+}
+
+/// The limits and offsets of one query string turned into the ones
+/// the planner gets.
+///
+/// PostgREST does not carry a limit and an offset, it carries the
+/// window they describe, `[offset, offset + limit - 1]`, and then
+/// intersects it with everything from row zero on. That intersection
+/// is the whole behaviour of a negative one of either. An offset
+/// below zero is taken back to zero, and the rows it would have
+/// skipped come off the limit, so `limit=5&offset=-1` is four rows
+/// from the start. A window ending before it starts is a limit under
+/// zero, which is refused as a range nobody can satisfy, and a window
+/// ending exactly one before it starts is the way to ask for no rows
+/// at all.
+fn window(
+    q: &mut Query,
+    limits: &[(Vec<String>, i64)],
+    offsets: &[(Vec<String>, i64)],
+) -> Result<(), RestError> {
+    for (route, limit) in limits {
+        let offset = offsets
+            .iter()
+            .find(|(r, _)| r == route)
+            .map(|(_, o)| *o)
+            .unwrap_or(0);
+        let first = offset.max(0);
+        let last = offset.saturating_add(*limit).saturating_sub(1);
+        let rows = last.saturating_sub(first).saturating_add(1);
+        if rows < 0 {
+            return Err(negative_limit());
+        }
+        q.limit.push((route.clone(), rows as u64));
+    }
+    for (route, offset) in offsets {
+        // A negative offset is where the window would have started,
+        // and it starts at zero instead, which is the same request as
+        // one that named no offset at all.
+        if *offset >= 0 {
+            q.offset.push((route.clone(), *offset as u64));
+        }
+    }
+    Ok(())
 }
 
 /// What a write returns, the Prefer return token.
@@ -2070,30 +2134,38 @@ fn over_cap(cap: Option<i64>, affected: u64) -> Option<RestError> {
     }
 }
 
-/// The status a representation carries, and the point a PUT's row
-/// count is judged. A POST is always a creation. A PUT is one row or
-/// it is a mismatch, and it is a creation only when the conflict
-/// clause updated nothing, which the statement counted as it ran.
+/// The status a write carries, and the point a PUT's row count is
+/// judged.
+///
+/// A creation is a row that was not there before, so both of the
+/// statements that can find one already there ask what they wrote:
+/// a POST resolving duplicates by merging them, and a PUT, which is
+/// an upsert of one row. Everything else is a creation on its face.
+/// The count is the net one the statement kept as it ran, up per row
+/// written and down again per row the conflict clause turned into an
+/// update, so nothing new leaves it at zero.
 async fn written(
     sess: &Session,
     method: &Method,
+    merge: bool,
     affected: u64,
     authed: bool,
 ) -> Result<StatusCode, RestError> {
-    if *method == Method::POST {
+    let put = *method == Method::PUT;
+    if *method == Method::POST && !merge {
         return Ok(StatusCode::CREATED);
     }
-    if *method != Method::PUT {
+    if !put && *method != Method::POST {
         return Ok(StatusCode::OK);
     }
-    if affected != 1 {
+    if put && affected != 1 {
         return Err(put_mismatch());
     }
     let rows = sess
-        .query(mutate::UPDATED_SQL, &[])
+        .query(mutate::INSERTED_SQL, &[])
         .await
         .map_err(|e| pg_error(&e, authed))?;
-    Ok(if rows[0].get::<_, i32>(0) == 0 {
+    Ok(if rows[0].get::<_, i32>(0) > 0 {
         StatusCode::CREATED
     } else {
         StatusCode::OK
@@ -2210,25 +2282,24 @@ async fn write(
         return Err(no_column(table, missing));
     }
 
+    // What the upsert conflicts on: the on_conflict parameter's
+    // columns, or the primary key. A table with neither has nothing
+    // to conflict on, which is not an error, it is an insert. Upstream
+    // drops the clause and, since it did not resolve anything, also
+    // drops the preference from the answer.
+    let target = extras.on_conflict.clone().unwrap_or_else(|| pk.clone());
+    if target.is_empty() {
+        prefer.applied.retain(|t| !t.starts_with("resolution="));
+    }
     let conflict = match (*method == Method::POST, prefer.merge) {
-        (true, Some(merge)) => {
-            let target = extras.on_conflict.clone().unwrap_or_else(|| pk.clone());
-            if target.is_empty() {
-                return Err(bad_grammar(
-                    "an upsert needs a primary key or on_conflict columns",
-                ));
-            }
-            Some(if merge {
-                Conflict::Merge {
-                    target,
-                    set: payload.as_ref().map(|(c, _)| c.clone()).unwrap_or_default(),
-                }
-            } else {
-                Conflict::Ignore { target }
-            })
-        }
+        (true, Some(true)) => Some(Conflict::Merge {
+            target,
+            set: payload.as_ref().map(|(c, _)| c.clone()).unwrap_or_default(),
+        }),
+        (true, Some(false)) => Some(Conflict::Ignore { target }),
         _ => None,
     };
+    let merging = matches!(conflict, Some(Conflict::Merge { .. }));
 
     let returning = match prefer.ret {
         Ret::Representation => Returning::Star,
@@ -2291,7 +2362,7 @@ async fn write(
                     .await
                     .map_err(|e| pg_error(&e, authed))?;
                 affected = rows[0].get::<_, i64>(1) as u64;
-                let status = written(&sess, method, affected, authed).await?;
+                let status = written(&sess, method, merging, affected, authed).await?;
                 if let Some(e) = over_cap(cap, affected) {
                     sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
                     return Err(e);
@@ -2319,7 +2390,7 @@ async fn write(
                     .await
                     .map_err(|e| pg_error(&e, authed))?;
                 affected = rows.len() as u64;
-                let status = written(&sess, method, affected, authed).await?;
+                let status = written(&sess, method, merging, affected, authed).await?;
                 if media.is_single() && rows.len() != 1 {
                     return Err(not_single(rows.len()));
                 }
@@ -2356,13 +2427,16 @@ async fn write(
             if media.is_single() && rows.len() != 1 {
                 return Err(not_single(rows.len()));
             }
+            affected = rows.len() as u64;
+            // Before the commit, since the count the status turns on
+            // is transaction local.
+            let status = written(&sess, method, merging, affected, authed).await?;
             gucs = Gucs::read(
                 sess.commit_reading(GUCS_SQL)
                     .await
                     .map_err(|e| pg_error(&e, authed))?,
             );
-            affected = rows.len() as u64;
-            let mut res = StatusCode::CREATED.into_response();
+            let mut res = status.into_response();
             if rows.len() == 1
                 && let Ok(row) =
                     serde_json::from_str::<serde_json::Value>(&rows[0].get::<_, String>(0))
@@ -2409,16 +2483,21 @@ async fn write(
                 sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
                 return Err(e);
             }
+            // A minimal answer still says whether it created anything,
+            // so the insert count is read here too, and before the
+            // commit takes it away. A PUT is the one write that does
+            // not: it answers 204 either way.
+            let status = if *method == Method::POST {
+                written(&sess, method, merging, affected, authed).await?
+            } else {
+                StatusCode::NO_CONTENT
+            };
             gucs = Gucs::read(
                 sess.commit_reading(GUCS_SQL)
                     .await
                     .map_err(|e| pg_error(&e, authed))?,
             );
-            if *method == Method::POST {
-                StatusCode::CREATED.into_response()
-            } else {
-                StatusCode::NO_CONTENT.into_response()
-            }
+            status.into_response()
         }
     };
     // PostgREST's write Content-Range: an update shows the window it
@@ -3180,6 +3259,37 @@ mod tests {
         assert_eq!(q.limit, vec![(vec!["orders".to_string()], 2)]);
         assert_eq!(q.filters.len(), 2, "the apikey pair is the gate's");
         assert!(q.filters.iter().all(|(route, _)| route.is_empty()));
+    }
+
+    #[test]
+    fn a_window_is_where_it_starts_and_how_far_it_reaches() {
+        let (q, _) = parse_query("t", Some("limit=5&offset=10")).unwrap();
+        assert_eq!(q.limit, vec![(vec![], 5)]);
+        assert_eq!(q.offset, vec![(vec![], 10)]);
+
+        // Nobody starts before the first row. The offset goes back to
+        // zero and the rows it would have skipped come off the limit.
+        let (q, _) = parse_query("t", Some("limit=5&offset=-1")).unwrap();
+        assert_eq!(q.limit, vec![(vec![], 4)]);
+        assert!(q.offset.is_empty());
+
+        // On its own it is the request that named no offset at all.
+        let (q, _) = parse_query("t", Some("select=id&offset=-4")).unwrap();
+        assert!(q.limit.is_empty() && q.offset.is_empty());
+
+        // Asking for no rows is a window ending one before it starts,
+        // which is the one empty window that is not an error.
+        let (q, _) = parse_query("t", Some("limit=0")).unwrap();
+        assert_eq!(q.limit, vec![(vec![], 0)]);
+        let (q, _) = parse_query("t", Some("limit=4&offset=-4")).unwrap();
+        assert_eq!(q.limit, vec![(vec![], 0)]);
+
+        // And one that ends any earlier is a range nobody can answer.
+        for query in ["limit=-1", "limit=3&offset=-4", "orders.limit=-1"] {
+            let e = parse_query("t", Some(query)).unwrap_err();
+            assert_eq!(e.status, StatusCode::RANGE_NOT_SATISFIABLE, "{query}");
+            assert_eq!(e.code, "PGRST103", "{query}");
+        }
     }
 
     #[test]
