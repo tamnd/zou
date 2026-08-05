@@ -38,10 +38,10 @@ index b885513..24c245d 100644
  		 */
 diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
 new file mode 100644
-index 0000000..64e2897
+index 0000000..23bc879
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,489 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -52,10 +52,11 @@ index 0000000..64e2897
 + *	  in whichever process holds WALWriteLock, so the push cannot happen
 + *	  at the flush site. Instead one background worker, the zou wal
 + *	  pusher, owns the lease and tails pg_wal: it reads every byte the
-+ *	  cluster has flushed locally, appends it to the zou group commit
-+ *	  pipeline, and publishes the durable LSN into shared memory.
-+ *	  Committing backends wait on that LSN after their local flush, the
-+ *	  same shape as a synchronous replication ack.
++ *	  cluster has flushed locally, stages it into the zou group commit
++ *	  pipeline, and publishes the durable LSN into shared memory as the
++ *	  store acknowledges batches. Committing backends wake the pusher
++ *	  after their local flush and wait on that LSN, the same shape as a
++ *	  synchronous replication ack.
 + *
 + *	  Part of the zou patch series, not upstream PostgreSQL.
 + *
@@ -88,6 +89,7 @@ index 0000000..64e2897
 +						 uint64 *out_resume);
 +extern int	zou_wal_append(const uint8 *data, size_t len, uint64 pg_lsn,
 +						   uint64 *out_durable);
++extern int	zou_wal_durable(uint64 *out_pg_lsn);
 +extern int	zou_wal_fold_start(uint64 redo);
 +extern int	zou_wal_fold_poll(uint64 *out_redo, uint32 *out_dropped);
 +extern int	zou_wal_close(void);
@@ -107,6 +109,15 @@ index 0000000..64e2897
 +{
 +	pg_atomic_uint64 durable_lsn;
 +	ConditionVariable durable_cv;
++
++	/*
++	 * The pusher's process latch, so committing backends can wake it
++	 * the moment their WAL is flushed and ready to push. It points at
++	 * the pusher's PGPROC latch, which lives in shared memory for the
++	 * postmaster's whole life, and a spurious set after a pusher
++	 * restart is harmless, latch waits are loop guarded.
++	 */
++	Latch	   *pusher_latch;
 +} ZouWalShmemStruct;
 +
 +static ZouWalShmemStruct *ZouWalShmem;
@@ -134,6 +145,7 @@ index 0000000..64e2897
 +	{
 +		pg_atomic_init_u64(&ZouWalShmem->durable_lsn, 0);
 +		ConditionVariableInit(&ZouWalShmem->durable_cv);
++		ZouWalShmem->pusher_latch = NULL;
 +	}
 +}
 +
@@ -216,6 +228,7 @@ index 0000000..64e2897
 +	const char *target = getenv("ZOU_TARGET");
 +	TimeLineID	tli;
 +	XLogRecPtr	pushed;
++	XLogRecPtr	published;
 +	XLogRecPtr	folded;
 +	TimeLineID	foldtli;
 +	bool		fold_running = false;
@@ -289,6 +302,10 @@ index 0000000..64e2897
 +			(errmsg("zou wal pusher mirroring from %X/%X into \"%s\"",
 +					LSN_FORMAT_ARGS(pushed), target)));
 +	zou_wal_publish(pushed);
++	published = pushed;
++
++	/* Let committing backends wake us the moment they have flushed. */
++	ZouWalShmem->pusher_latch = MyLatch;
 +
 +	/*
 +	 * Folding starts from the checkpoint already completed at startup, the
@@ -377,15 +394,20 @@ index 0000000..64e2897
 +			uint64		durable;
 +			int			rc;
 +
++			/*
++			 * The append stages the chunk and returns, the store lands
++			 * it behind our back and the poll below picks the ack up.
++			 * A full pipeline blocks inside the shim, which is the
++			 * backpressure that bounds staged WAL in memory.
++			 */
 +			zou_wal_read_range(pushed, n, tli, buf);
 +			rc = zou_wal_append((const uint8 *) buf, n, (uint64) pushed, &durable);
 +			if (rc != 0)
 +				ereport(FATAL,
 +						(errmsg("zou wal pusher append failed: %d", rc)));
 +			pushed += n;
-+			zou_wal_publish(pushed);
 +		}
-+		else if (ShutdownRequestPending)
++		else if (ShutdownRequestPending && published == pushed)
 +		{
 +			/*
 +			 * The flush pointer is drained, but WAL can still sit in
@@ -394,7 +416,7 @@ index 0000000..64e2897
 +			 * worker exits will flush pages whose LSNs point at those
 +			 * records, and the write gate would wait for them forever.
 +			 * Force the rest out and keep pushing until insert, flush,
-+			 * and pushed all agree.
++			 * pushed, and the durable watermark all agree.
 +			 */
 +			XLogRecPtr	insert = GetXLogInsertRecPtr();
 +
@@ -405,11 +427,11 @@ index 0000000..64e2897
 +			}
 +
 +			/*
-+			 * Fully drained and asked to stop. proc_exit runs
-+			 * zou_wal_on_exit, which seals the tail and releases the
-+			 * lease cleanly. A fold still in flight is abandoned, the
-+			 * shim logs it, its unpublished capture is gc food, and the
-+			 * next start refolds the same redo.
++			 * Fully drained, fully durable, and asked to stop.
++			 * proc_exit runs zou_wal_on_exit, which seals the tail and
++			 * releases the lease cleanly. A fold still in flight is
++			 * abandoned, the shim logs it, its unpublished capture is
++			 * gc food, and the next start refolds the same redo.
 +			 */
 +			ereport(LOG,
 +					(errmsg("zou wal pusher drained through %X/%X, shutting down",
@@ -418,9 +440,36 @@ index 0000000..64e2897
 +		}
 +		else
 +		{
++			/*
++			 * Nothing new to read. While staged chunks are in flight
++			 * the nap stays short so the poll below publishes their
++			 * acks promptly, idle it stretches, and backends set our
++			 * latch when they commit so the stretch costs them nothing.
++			 */
 +			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-+							 5, PG_WAIT_EXTENSION);
++							 published < pushed ? 1 : 5, PG_WAIT_EXTENSION);
 +			ResetLatch(MyLatch);
++		}
++
++		/*
++		 * Publish whatever the pipeline made durable since the last
++		 * look. The commit gate sleeps on this value, so it has to move
++		 * every iteration, not only when new WAL shows up. An append
++		 * that failed after staging surfaces here, and the restart
++		 * re-pushes from the store's stream end.
++		 */
++		{
++			uint64		durable = 0;
++			int			rc = zou_wal_durable(&durable);
++
++			if (rc != 0)
++				ereport(FATAL,
++						(errmsg("zou wal pusher durability poll failed: %d", rc)));
++			if ((XLogRecPtr) durable > published)
++			{
++				zou_wal_publish((XLogRecPtr) durable);
++				published = (XLogRecPtr) durable;
++			}
 +		}
 +	}
 +}
@@ -451,6 +500,15 @@ index 0000000..64e2897
 +
 +	if ((XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn) >= lsn)
 +		return;
++
++	/*
++	 * Poke the pusher: our WAL is flushed and ready for it, and it may
++	 * be sitting in its idle nap. The unlocked read is fine, the
++	 * pointer is set once per pusher start and targets shared memory
++	 * that never moves.
++	 */
++	if (ZouWalShmem->pusher_latch != NULL)
++		SetLatch(ZouWalShmem->pusher_latch);
 +
 +	ConditionVariablePrepareToSleep(&ZouWalShmem->durable_cv);
 +	while ((XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn) < lsn)

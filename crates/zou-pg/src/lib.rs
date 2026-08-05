@@ -101,12 +101,13 @@ pub(crate) mod testv2 {
 use std::ffi::{CStr, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, SystemTime};
 
 use zou_log::{
-    AppendError, MediaSink, Sequencer, SequencerConfig, WalMedia, consolidate, gc_landing,
-    stream_end, take_over,
+    AppendError, AppendTicket, MediaSink, Sequencer, SequencerConfig, WalMedia, consolidate,
+    gc_landing, stream_end, take_over,
 };
 use zou_store::heartbeat::Heartbeat;
 use zou_store::layout::TenantLayout;
@@ -1030,6 +1031,74 @@ pub extern "C" fn zou_smgr_unlink(spc: u32, db: u32, rel: u32, fork: u32) -> i32
 /// the shard 0 sequencer of the shared WAL in process and every chunk
 /// becomes one frame on the fenced chain. The wire rpc replaces the
 /// call later without touching the C surface.
+/// The waiter behind the staged append path. [`zou_wal_append`] hands
+/// each ticket here and returns, one thread resolves them in submission
+/// order and advances the durable watermark [`zou_wal_durable`] reports.
+/// FIFO is enough because the sequencer resolves tickets in submission
+/// order too, so waiting on the head never holds up a resolved
+/// successor.
+struct WalWaiter {
+    /// Staged tickets with the end Postgres LSN their chunk covers.
+    /// `None` once the close drained the queue and dropped the sender.
+    tx: Option<mpsc::SyncSender<(AppendTicket, u64)>>,
+    /// End Postgres LSN of the last chunk the store acknowledged.
+    durable: Arc<AtomicU64>,
+    /// First staged append failure as a ZOU_ERR code, sticky, zero
+    /// while the pipeline is healthy.
+    failed: Arc<AtomicI32>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WalWaiter {
+    /// The queue bound is the pipeline depth: this many chunks staged
+    /// but not yet durable. A full queue blocks the next append, the
+    /// backpressure that keeps a stalled store from buffering unbounded
+    /// WAL in this process.
+    const DEPTH: usize = 64;
+
+    fn spawn(resume: u64) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<(AppendTicket, u64)>(Self::DEPTH);
+        let durable = Arc::new(AtomicU64::new(resume));
+        let failed = Arc::new(AtomicI32::new(0));
+        let (thread_durable, thread_failed) = (Arc::clone(&durable), Arc::clone(&failed));
+        let handle = std::thread::Builder::new()
+            .name("zou-wal-waiter".into())
+            .spawn(move || {
+                while let Ok((ticket, end)) = rx.recv() {
+                    match ticket.wait() {
+                        Ok(_) => thread_durable.store(end, Ordering::Release),
+                        Err(e) => {
+                            let rc = match e {
+                                AppendError::WrongEpoch { .. } => ZOU_ERR_LEASE_LOST,
+                                _ => ZOU_ERR_STORE,
+                            };
+                            thread_failed.store(rc, Ordering::Release);
+                            return;
+                        }
+                    }
+                }
+            })
+            .expect("spawn zou-wal-waiter");
+        WalWaiter {
+            tx: Some(tx),
+            durable,
+            failed,
+            handle: Some(handle),
+        }
+    }
+
+    /// Drop the queue and join the thread, then report the sticky
+    /// failure. Only safe once every staged ticket can resolve, which
+    /// [`Sequencer::close`] guarantees.
+    fn drain(&mut self) -> i32 {
+        drop(self.tx.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.failed.load(Ordering::Acquire)
+    }
+}
+
 struct WalPipe {
     seq: Option<Sequencer>,
     media: Arc<WalMedia>,
@@ -1039,6 +1108,7 @@ struct WalPipe {
     layout: TenantLayout,
     tenant: u128,
     writer_epoch: u32,
+    waiter: WalWaiter,
     /// Whether this session has appended yet, so the first frame can
     /// carry `first_of_epoch` and mark the takeover boundary in the
     /// stream.
@@ -1143,6 +1213,9 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             layout,
             tenant,
             writer_epoch,
+            // The watermark starts at the resume point: everything the
+            // chain already holds is durable by definition.
+            waiter: WalWaiter::spawn(resume),
             first_appended: false,
         },
         resume,
@@ -1154,7 +1227,16 @@ fn close_wal_pipe(pipe: &mut WalPipe) -> i32 {
     if let Some(seq) = pipe.seq.take() {
         if seq.close().is_err() {
             rc = ZOU_ERR_STORE;
-        } else {
+        }
+        // The close resolved every staged ticket, so the waiter can
+        // finish its queue and exit. Its sticky failure is part of the
+        // close verdict: a chunk that died between staging and here
+        // must not read as a clean shutdown.
+        let failed = pipe.waiter.drain();
+        if rc == ZOU_OK && failed != 0 {
+            rc = failed;
+        }
+        if rc == ZOU_OK {
             // Best effort: fold the landing chain into a sealed round so
             // the next start probes a short tail. Failure costs nothing,
             // the next fold poll runs the same pass.
@@ -1219,10 +1301,14 @@ pub unsafe extern "C" fn zou_wal_open(
     })
 }
 
-/// Append one chunk of WAL starting at Postgres LSN `pg_lsn` and block
-/// until it is durable on the store. On success writes the durable zou
-/// stream position through `out_durable`, which is diagnostics only, the
-/// caller's durability cursor is `pg_lsn + len`.
+/// Stage one chunk of WAL starting at Postgres LSN `pg_lsn` into the
+/// group commit pipeline and return without waiting on the store.
+/// Durability is a separate question answered by [`zou_wal_durable`]:
+/// its watermark reaches `pg_lsn + len` once this chunk's batch lands.
+/// `out_durable` receives the watermark as of this call, diagnostics
+/// only. A full pipeline, sixty four staged chunks, blocks here until
+/// the store drains, and a failure from any earlier staged chunk
+/// surfaces on this and every later call.
 ///
 /// # Safety
 /// `data` must point to `len` readable bytes and `out_durable` must be a
@@ -1245,6 +1331,10 @@ pub unsafe extern "C" fn zou_wal_append(
         if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
             return ZOU_ERR_LEASE_LOST;
         }
+        let rc = pipe.waiter.failed.load(Ordering::Acquire);
+        if rc != 0 {
+            return rc;
+        }
         let Some(seq) = pipe.seq.as_ref() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
@@ -1265,14 +1355,41 @@ pub unsafe extern "C" fn zou_wal_append(
             Err(_) => return ZOU_ERR_STORE,
         };
         pipe.first_appended = true;
-        match ticket.wait() {
-            Ok(durable) => {
-                unsafe { *out_durable = durable.0 };
-                ZOU_OK
-            }
-            Err(AppendError::WrongEpoch { .. }) => ZOU_ERR_LEASE_LOST,
-            Err(_) => ZOU_ERR_STORE,
+        let tx = pipe.waiter.tx.as_ref().expect("append after close");
+        if tx.send((ticket, pg_lsn + len as u64)).is_err() {
+            // The waiter exited on a failed ticket, report why.
+            let rc = pipe.waiter.failed.load(Ordering::Acquire);
+            return if rc != 0 { rc } else { ZOU_ERR_STORE };
         }
+        unsafe { *out_durable = pipe.waiter.durable.load(Ordering::Acquire) };
+        ZOU_OK
+    })
+}
+
+/// The durable watermark of the append pipeline: the end Postgres LSN of
+/// the last chunk the store acknowledged, in submission order, so every
+/// byte below it is durable. Starts at the resume point [`zou_wal_open`]
+/// reported. A failed append turns this and every later poll into its
+/// error code, the pusher treats that as fatal.
+///
+/// # Safety
+/// `out_pg_lsn` must be a valid pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zou_wal_durable(out_pg_lsn: *mut u64) -> i32 {
+    wrap(|| {
+        if out_pg_lsn.is_null() {
+            return ZOU_ERR_BAD_ARGUMENT;
+        }
+        let Some(pipe) = WAL.get() else {
+            return ZOU_ERR_NOT_INITIALIZED;
+        };
+        let pipe = pipe.lock().expect("wal pipe mutex poisoned");
+        let rc = pipe.waiter.failed.load(Ordering::Acquire);
+        if rc != 0 {
+            return rc;
+        }
+        unsafe { *out_pg_lsn = pipe.waiter.durable.load(Ordering::Acquire) };
+        ZOU_OK
     })
 }
 
@@ -1684,8 +1801,9 @@ mod tests {
             ZOU_ERR_BAD_ARGUMENT
         );
 
-        // Each append blocks until durable, and the ack is byte exact:
-        // the durable position is the end lsn of the frame just landed.
+        // Appends stage and return, durability comes back through the
+        // poll: the watermark climbs to the end lsn of the last staged
+        // chunk once its batch lands, and never past it.
         let chunk = vec![7u8; 4096];
         let mut durable = 0u64;
         for i in 0..8 {
@@ -1694,7 +1812,19 @@ mod tests {
                 unsafe { zou_wal_append(chunk.as_ptr(), chunk.len(), pg_lsn, &mut durable) },
                 ZOU_OK
             );
-            assert_eq!(durable, pg_lsn + 4096, "durable is the frame end lsn");
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert_eq!(unsafe { zou_wal_durable(&mut durable) }, ZOU_OK);
+            assert!(durable <= start + 8 * 4096, "watermark never overshoots");
+            if durable == start + 8 * 4096 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "durability stuck at {durable:#x}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
         // The fold pair: nothing in flight polls idle, a started fold
