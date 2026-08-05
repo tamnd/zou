@@ -24,9 +24,11 @@
 //! path: the query pair `orders.status=eq.x` carries its path in the
 //! filter's field, `orders.order=total.desc` and `orders.limit=2`
 //! carry it in the parameter name and arrive here as explicit routes.
-//! A route that names no embed in the select tree is refused the way
-//! PostgREST refuses it, since silently dropping a filter is the one
-//! thing a REST layer must never do.
+//! A segment reaches an embed by the alias it was given or by the
+//! relation it reads, either one, and a route that names no embed in
+//! the select tree is refused the way PostgREST refuses it, since
+//! silently dropping a filter is the one thing a REST layer must
+//! never do.
 //!
 //! Every level reads from exactly one table under an alias, the
 //! table's own name at the root and a generated z{n} per embed, so a
@@ -91,8 +93,9 @@ fn refuse<T>(message: impl Into<String>) -> Result<T, PlanError> {
 }
 
 /// Everything the router collected for one read request. Routes are
-/// embed paths, alias when the embed has one, relation name
-/// otherwise; the empty route is the root.
+/// embed paths written the way the request wrote them, each segment
+/// the alias of an embed or the relation it reads; the empty route is
+/// the root.
 #[derive(Debug, Default)]
 pub struct Query {
     pub table: String,
@@ -122,22 +125,10 @@ pub fn plan(catalog: &Catalog, q: &Query) -> Result<Sql, PlanError> {
 /// own filters follow, one dense parameter list across the whole
 /// statement.
 pub fn plan_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sql, PlanError> {
-    let routes = collect_routes(&q.select);
-    let filters = route_filters(q, &routes)?;
-    for (route, _) in q.order.iter().filter(|(r, _)| !r.is_empty()) {
-        check_route(&routes, route)?;
-    }
-    for (route, _) in q.limit.iter().filter(|(r, _)| !r.is_empty()) {
-        check_route(&routes, route)?;
-    }
-    for (route, _) in q.offset.iter().filter(|(r, _)| !r.is_empty()) {
-        check_route(&routes, route)?;
-    }
-
     let mut p = Planner {
         catalog,
         q,
-        filters,
+        routed: routed(q)?,
         params,
         next: 0,
     };
@@ -174,12 +165,10 @@ pub fn count(catalog: &Catalog, q: &Query) -> Result<Sql, PlanError> {
 /// read out of one statement, so the count's own placeholders carry
 /// on from the ones the representation already took.
 pub fn count_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sql, PlanError> {
-    let routes = collect_routes(&q.select);
-    let filters = route_filters(q, &routes)?;
     let mut p = Planner {
         catalog,
         q,
-        filters,
+        routed: routed(q)?,
         params,
         next: 0,
     };
@@ -191,25 +180,81 @@ pub fn count_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<S
     })
 }
 
-/// The key an embed answers to in routes and in the response.
+/// Whether an embed has anything to put in the parent row.
+///
+/// Upstream's rule and it reads down the whole tree: a level with no
+/// columns of its own whose embeds have none either brings back
+/// nothing, and an embed that brings back nothing is left out of the
+/// parent row rather than written as an empty object. The join is
+/// still made, so an `!inner` under it and a filter under that still
+/// decide which parent rows survive. It is only the value that goes.
+fn brings_nothing_back(items: &[Item]) -> bool {
+    items.iter().all(|item| match item {
+        Item::Embed(e) | Item::Spread(e) => brings_nothing_back(&e.items),
+        _ => false,
+    })
+}
+
+/// The key an embed answers to in the response, and the key the
+/// planner labels its level with.
 fn key_of(e: &Embed) -> &str {
     e.alias.as_deref().unwrap_or(&e.relation)
 }
 
-fn collect_routes(items: &[Item]) -> Vec<Vec<String>> {
-    let mut out = vec![Vec::new()];
-    walk(items, &mut Vec::new(), &mut out);
-    fn walk(items: &[Item], path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
-        for item in items {
-            if let Item::Embed(e) | Item::Spread(e) = item {
-                path.push(key_of(e).to_string());
-                out.push(path.clone());
-                walk(&e.items, path, out);
-                path.pop();
-            }
-        }
+/// Everything a request routed somewhere, with every route rewritten
+/// to the keys the levels answer to.
+#[derive(Default)]
+struct Routed {
+    filters: Vec<(Vec<String>, Node)>,
+    order: Vec<(Vec<String>, Vec<Term>)>,
+    limit: Vec<(Vec<String>, u64)>,
+    offset: Vec<(Vec<String>, u64)>,
+}
+
+fn routed(q: &Query) -> Result<Routed, PlanError> {
+    let mut out = Routed {
+        filters: route_filters(q)?,
+        ..Routed::default()
+    };
+    for (route, terms) in &q.order {
+        out.order
+            .push((resolve_route(&q.select, route)?, terms.clone()));
     }
-    out
+    for (route, n) in &q.limit {
+        out.limit.push((resolve_route(&q.select, route)?, *n));
+    }
+    for (route, n) in &q.offset {
+        out.offset.push((resolve_route(&q.select, route)?, *n));
+    }
+    Ok(out)
+}
+
+/// Walk one route down the select tree, giving back the keys of the
+/// embeds it names.
+///
+/// A segment names an embed by its alias or by the relation it reads,
+/// which is the pair upstream matches on, so `tasks.order=name.asc`
+/// reaches `the_tasks:tasks(...)` and so does `the_tasks.order`. What
+/// comes back is spelled the way the level is spelled, since that is
+/// what the planner has to compare against on the way down.
+fn resolve_route(items: &[Item], route: &[String]) -> Result<Vec<String>, PlanError> {
+    let mut out = Vec::with_capacity(route.len());
+    let mut level = items;
+    for segment in route {
+        let found = level.iter().find_map(|item| match item {
+            Item::Embed(e) | Item::Spread(e) => {
+                let named = e.relation == *segment || e.alias.as_deref() == Some(segment.as_str());
+                named.then_some(e)
+            }
+            _ => None,
+        });
+        let Some(e) = found else {
+            return Err(not_embedded(segment).into());
+        };
+        out.push(key_of(e).to_string());
+        level = &e.items;
+    }
+    Ok(out)
 }
 
 /// PostgREST's PGRST108: a filter, an order, or a page was addressed
@@ -254,19 +299,10 @@ fn unordered_relationship(parent: &str, key: &str) -> EmbedError {
     }
 }
 
-fn check_route(routes: &[Vec<String>], route: &[String]) -> Result<(), PlanError> {
-    for n in 1..=route.len() {
-        if !routes.iter().any(|r| r.as_slice() == &route[..n]) {
-            return Err(not_embedded(&route[n - 1]).into());
-        }
-    }
-    Ok(())
-}
-
 /// Normalize every filter onto its full route: a condition carries
 /// the rest of its path in the field, groups must already sit where
 /// they apply.
-fn route_filters(q: &Query, routes: &[Vec<String>]) -> Result<Vec<(Vec<String>, Node)>, PlanError> {
+fn route_filters(q: &Query) -> Result<Vec<(Vec<String>, Node)>, PlanError> {
     let mut out = Vec::with_capacity(q.filters.len());
     for (route, node) in &q.filters {
         let (full, node) = match node {
@@ -282,8 +318,7 @@ fn route_filters(q: &Query, routes: &[Vec<String>]) -> Result<Vec<(Vec<String>, 
                 (route.clone(), other.clone())
             }
         };
-        check_route(routes, &full)?;
-        out.push((full, node));
+        out.push((resolve_route(&q.select, &full)?, node));
     }
     Ok(out)
 }
@@ -319,7 +354,7 @@ fn no_embeds_inside(node: &Node) -> Result<(), PlanError> {
 struct Planner<'a> {
     catalog: &'a Catalog,
     q: &'a Query,
-    filters: Vec<(Vec<String>, Node)>,
+    routed: Routed,
     params: Vec<String>,
     next: usize,
 }
@@ -523,7 +558,7 @@ impl Planner<'_> {
         // under names of their own, because nothing can be ordered by
         // what the subquery did not carry out.
         let mut lifted: Vec<String> = Vec::new();
-        let terms = self.q.order.iter().find(|(r, _)| r == path);
+        let terms = self.routed.order.iter().find(|(r, _)| r == path);
         if let (true, Some((_, terms))) = (wanted.order, terms) {
             for (i, (expr, dir)) in order_terms(self.catalog, table, alias, terms, &embeds)?
                 .into_iter()
@@ -564,6 +599,7 @@ impl Planner<'_> {
             conjuncts.push(link);
         }
         let mine: Vec<Node> = self
+            .routed
             .filters
             .iter()
             .filter(|(r, _)| r == path)
@@ -624,10 +660,10 @@ impl Planner<'_> {
             sql.push_str(" order by ");
             sql.push_str(&order_sql(self.catalog, table, alias, terms, &embeds)?);
         }
-        if let Some((_, n)) = self.q.limit.iter().find(|(r, _)| r == path) {
+        if let Some((_, n)) = self.routed.limit.iter().find(|(r, _)| r == path) {
             sql.push_str(&format!(" limit {n}"));
         }
-        if let Some((_, n)) = self.q.offset.iter().find(|(r, _)| r == path) {
+        if let Some((_, n)) = self.routed.offset.iter().find(|(r, _)| r == path) {
             sql.push_str(&format!(" offset {n}"));
         }
         Ok(Level {
@@ -658,6 +694,7 @@ impl Planner<'_> {
             conjuncts.push(link);
         }
         let mine: Vec<Node> = self
+            .routed
             .filters
             .iter()
             .filter(|(r, _)| r == path)
@@ -930,7 +967,7 @@ impl Planner<'_> {
                 } else {
                     laterals.push(format!("left join lateral {lateral} on true"));
                 }
-                if !e.items.is_empty() {
+                if !brings_nothing_back(&e.items) {
                     let expr = format!("coalesce({wrap}.\"j\", '[]'::jsonb)");
                     cols.push(OutCol {
                         rendered: format!("{expr} as {key}"),
@@ -948,7 +985,7 @@ impl Planner<'_> {
             Kind::ToOne => {
                 let joiner = if inner { "join" } else { "left join" };
                 laterals.push(format!("{joiner} lateral ({}) as {wrap} on true", body.sql));
-                if !e.items.is_empty() {
+                if !brings_nothing_back(&e.items) {
                     let expr = format!("to_jsonb({wrap})");
                     cols.push(OutCol {
                         rendered: format!("{expr} as {key}"),
@@ -1572,15 +1609,53 @@ mod tests {
     }
 
     #[test]
-    fn routes_answer_to_the_alias() {
+    fn routes_answer_to_the_alias_and_to_the_relation() {
         let mut q = query("users", "id,o:orders(id)");
         filt(&mut q, "o.total", "gte.1");
         assert!(text(&q).contains(r#""z1"."total" >= $1"#));
 
+        // An alias renames the key in the answer and does not take
+        // the relation's own name away from the route, which is the
+        // pair upstream matches a path segment against.
         let mut q = query("users", "id,o:orders(id)");
         filt(&mut q, "orders.total", "gte.1");
+        assert!(text(&q).contains(r#""z1"."total" >= $1"#));
+
+        let mut q = query("users", "id,o:orders(id)");
+        filt(&mut q, "nope.total", "gte.1");
         let e = fails(&q);
         assert!(e.to_string().contains("not an embedded resource"), "{e}");
+    }
+
+    /// An embed with nothing under it joins and is not in the answer,
+    /// and what counts as nothing reads all the way down: a chain of
+    /// embeds that never selects a column brings nothing back at any
+    /// level of it.
+    #[test]
+    fn an_embed_that_brings_nothing_back_is_joined_and_not_selected() {
+        let t = text(&query("users", "id,orders()"));
+        assert!(t.starts_with(r#"select "users"."id" as "id" from"#), "{t}");
+        assert!(t.contains("left join lateral"), "{t}");
+
+        let t = text(&query("users", "id,orders(order_items())"));
+        assert!(t.starts_with(r#"select "users"."id" as "id" from"#), "{t}");
+        assert!(t.contains(r#"from "order_items" as "z2""#), "{t}");
+
+        // One column anywhere under it and the whole chain is back.
+        let t = text(&query("users", "id,orders(order_items(id))"));
+        assert!(t.contains(r#"as "orders""#), "{t}");
+        assert!(t.contains(r#"as "order_items""#), "{t}");
+    }
+
+    /// A select list of nothing at all, which is what `select=` sends.
+    /// Upstream reads it as no items and a level with no items takes
+    /// every column, so the two arrive at the same place.
+    #[test]
+    fn a_select_of_nothing_is_every_column() {
+        assert_eq!(
+            text(&query("users", "")),
+            r#"select "users".* from "users" as "users""#
+        );
     }
 
     #[test]
