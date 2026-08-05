@@ -304,6 +304,190 @@ fn close_drains_the_open_batch() {
     assert_eq!(sink.puts.lock().unwrap().len(), 1);
 }
 
+/// Blocks the PUT for one seq until released, lets every other seq
+/// through, and records entry order, to prove windows land in
+/// parallel while acks still wait for chain order.
+struct HoldSink {
+    hold: u64,
+    open: Mutex<bool>,
+    open_cv: Condvar,
+    entered: Mutex<Vec<u64>>,
+    entered_cv: Condvar,
+}
+
+impl HoldSink {
+    fn new(hold: u64) -> Self {
+        Self {
+            hold,
+            open: Mutex::new(false),
+            open_cv: Condvar::new(),
+            entered: Mutex::new(Vec::new()),
+            entered_cv: Condvar::new(),
+        }
+    }
+    fn release(&self) {
+        *self.open.lock().unwrap() = true;
+        self.open_cv.notify_all();
+    }
+    fn wait_entered(&self, want: &[u64]) {
+        let mut entered = self.entered.lock().unwrap();
+        while entered.as_slice() != want {
+            let (next, timed_out) = self
+                .entered_cv
+                .wait_timeout(entered, Duration::from_secs(10))
+                .unwrap();
+            entered = next;
+            assert!(
+                !timed_out.timed_out(),
+                "sink never saw {want:?}: {entered:?}"
+            );
+        }
+    }
+}
+
+impl SegmentSink for HoldSink {
+    fn put_segment(&self, seq: u64, _segment: &[u8]) -> Result<(), CasError> {
+        {
+            let mut entered = self.entered.lock().unwrap();
+            entered.push(seq);
+            self.entered_cv.notify_all();
+        }
+        if seq == self.hold {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.open_cv.wait(open).unwrap();
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn windows_land_in_parallel_and_ack_in_chain_order() {
+    let sink = Arc::new(HoldSink::new(1));
+    let config = SequencerConfig {
+        window: Duration::from_millis(5),
+        ..SequencerConfig::default()
+    };
+    let seq = Sequencer::start(0, Arc::clone(&sink) as _, config);
+
+    let first = seq.append(vec![frame(1, 1, 100, b"held window")]).unwrap();
+    sink.wait_entered(&[1]);
+    let second = seq.append(vec![frame(1, 1, 200, b"lands ahead")]).unwrap();
+    // Window two reaches the store while window one is still on the
+    // wire: that is the pipeline.
+    sink.wait_entered(&[1, 2]);
+
+    // Window two's PUT has returned by now, or will shortly, but its
+    // ack must sit parked behind the held predecessor.
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(first.try_wait().is_none(), "held window acked early");
+    assert!(
+        second.try_wait().is_none(),
+        "a window acked over a hole in the chain"
+    );
+
+    sink.release();
+    assert_eq!(first.wait().unwrap(), Lsn(111));
+    assert_eq!(second.wait().unwrap(), Lsn(211));
+    seq.close().unwrap();
+}
+
+/// Fails the PUT for seq 1, but only after seq 2 has entered, so the
+/// failure lands behind a window the store already accepted.
+struct FailBehindSink {
+    entered: Mutex<Vec<u64>>,
+    cv: Condvar,
+}
+
+impl SegmentSink for FailBehindSink {
+    fn put_segment(&self, seq: u64, _segment: &[u8]) -> Result<(), CasError> {
+        let mut entered = self.entered.lock().unwrap();
+        entered.push(seq);
+        self.cv.notify_all();
+        if seq == 1 {
+            while !entered.contains(&2) {
+                entered = self.cv.wait(entered).unwrap();
+            }
+            return Err(CasError::AlreadyExists {
+                key: "cellwal/0000/0000000000000001".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_failed_window_fails_every_window_behind_it() {
+    let sink = Arc::new(FailBehindSink {
+        entered: Mutex::new(Vec::new()),
+        cv: Condvar::new(),
+    });
+    let seq = Sequencer::start(0, Arc::clone(&sink) as _, quick());
+
+    let first = seq
+        .append(vec![frame(1, 1, 100, b"loses the fence")])
+        .unwrap();
+    // Wait for window one to reach the store so window two goes to a
+    // second batch behind it.
+    while !sink.entered.lock().unwrap().contains(&1) {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let second = seq
+        .append(vec![frame(1, 1, 200, b"landed orphan")])
+        .unwrap();
+
+    match first.wait() {
+        Err(AppendError::Store { source }) => {
+            assert!(matches!(*source, CasError::AlreadyExists { .. }))
+        }
+        other => panic!("the fenced window must fail: {other:?}"),
+    }
+    // Window two landed on the store, but behind a hole, and calling
+    // it durable would be a lie.
+    match second.wait() {
+        Err(AppendError::Poisoned) => {}
+        other => panic!("the orphan behind the hole must fail: {other:?}"),
+    }
+    match seq.append(vec![frame(1, 1, 300, b"after")]) {
+        Err(AppendError::Poisoned) => {}
+        Err(e) => panic!("wrong rejection: {e}"),
+        Ok(_) => panic!("a poisoned sequencer accepted work"),
+    }
+    seq.close().unwrap();
+}
+
+#[test]
+fn close_drains_every_window_in_flight() {
+    /// A slow store: every PUT takes a beat, so close has real work.
+    struct SlowSink(RecordingSink);
+    impl SegmentSink for SlowSink {
+        fn put_segment(&self, seq: u64, segment: &[u8]) -> Result<(), CasError> {
+            std::thread::sleep(Duration::from_millis(30));
+            self.0.put_segment(seq, segment)
+        }
+    }
+    let sink = Arc::new(SlowSink(RecordingSink::default()));
+    let config = SequencerConfig {
+        window: Duration::from_millis(1),
+        ..SequencerConfig::default()
+    };
+    let seq = Sequencer::start(0, Arc::clone(&sink) as _, config);
+    let mut tickets = Vec::new();
+    for i in 0..4u64 {
+        tickets.push(seq.append(vec![frame(1, 1, 100 * i, b"drained")]).unwrap());
+        std::thread::sleep(Duration::from_millis(3));
+    }
+    seq.close().unwrap();
+    for t in &tickets {
+        assert!(
+            matches!(t.try_wait(), Some(Ok(_))),
+            "close returned before a window in flight resolved"
+        );
+    }
+    assert_eq!(sink.0.puts.lock().unwrap().len(), 4);
+}
+
 #[test]
 fn the_media_sink_lands_fenced_objects_on_a_real_store() {
     let dir = tempfile::tempdir().unwrap();

@@ -283,8 +283,91 @@ fn head_probes_cost_log_in_the_manifest_lag_not_linear() {
     });
     let counted = WalMedia::single(Arc::clone(&counting) as Arc<dyn CasStore>);
     assert_eq!(chain_head(&counted, shard, 0).unwrap(), 200);
+    // Log probes for the boundary plus a backscan bounded by the
+    // inflight cap to pin the first hole under a pipelined flusher.
+    // The point stands: cost grows with the log of the manifest lag,
+    // not the lag itself.
     let probes = counting.range_gets.load(Ordering::Relaxed);
-    assert!(probes <= 20, "{probes} probes to find seq 200 in a gallop");
+    let bound = 20 + zou_log::MAX_INFLIGHT;
+    assert!(
+        probes <= bound,
+        "{probes} probes to find seq 200, the bound is {bound}"
+    );
+}
+
+/// Plant a well formed landing segment at a seq, digest links be
+/// damned, the shape a pipelined flusher's straggler has after a
+/// crash landed n+1 without n.
+fn plant_landing(store: &Arc<dyn CasStore>, shard: u32, seq: u64, prev_digest: u64) {
+    let (bytes, _) = SegmentBuilder::new(SegmentHeader {
+        kind: SegmentKind::Landing,
+        shard,
+        seq,
+        prev_digest,
+    })
+    .finish();
+    store
+        .put_if_absent(&segment_key(shard, seq), &bytes)
+        .unwrap();
+}
+
+#[test]
+fn takeover_stops_at_a_crash_hole_and_sweeps_the_stragglers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, media) = store_in(&dir);
+    let shard = 11;
+
+    // A pipelined flusher crashed mid flight: windows 1 and 2 landed,
+    // 3 never made it, 4 and 6 did.
+    plant_landing(&store, shard, 1, 0);
+    let (bytes, _) = store.get(&segment_key(shard, 1)).unwrap().unwrap();
+    let (_, footer) = zou_log::read_footer(&bytes).unwrap();
+    plant_landing(&store, shard, 2, tenants_digest(&footer.tenants));
+    plant_landing(&store, shard, 4, 0xdead);
+    plant_landing(&store, shard, 6, 0xbeef);
+
+    // The head is the seq before the hole, not the highest object.
+    let t = take_over(&media, shard, "node-b").unwrap();
+    assert_eq!(t.sealed_seq, 3, "the seal goes into the hole");
+    assert_eq!(t.next_seq, 4);
+
+    // The stragglers are gone, so the resumed sequencer lands at 4
+    // without reading its own dead windows as a rival's fence.
+    assert!(store.get(&segment_key(shard, 4)).unwrap().is_none());
+    assert!(store.get(&segment_key(shard, 6)).unwrap().is_none());
+    let seq = resume(&media, shard, t);
+    seq.append(vec![frame(1, 10, b"after the crash")])
+        .unwrap()
+        .wait()
+        .unwrap();
+    seq.close().unwrap();
+
+    let chain = read_chain(&media, shard, 0).unwrap();
+    assert_eq!(chain.last().unwrap().frames[0].payload, b"after the crash");
+}
+
+#[test]
+fn the_straggler_sweep_spares_a_rival_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, media) = store_in(&dir);
+    let shard = 12;
+
+    // A crash hole at 2, and a rival's seal already sitting at 3.
+    plant_landing(&store, shard, 1, 0);
+    let (seal, _) = SegmentBuilder::new(SegmentHeader {
+        kind: SegmentKind::Seal,
+        shard,
+        seq: 3,
+        prev_digest: 0x5ea1,
+    })
+    .finish();
+    store.put_if_absent(&segment_key(shard, 3), &seal).unwrap();
+
+    let t = take_over(&media, shard, "node-c").unwrap();
+    assert_eq!(t.sealed_seq, 2);
+    // The rival's seal survives the sweep: deleting it would hand the
+    // rival's chain a hole under writes it already acked.
+    assert!(store.get(&segment_key(shard, 3)).unwrap().is_some());
 }
 
 #[test]

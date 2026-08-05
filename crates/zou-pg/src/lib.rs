@@ -106,8 +106,8 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, SystemTime};
 
 use zou_log::{
-    AppendError, AppendTicket, MediaSink, Sequencer, SequencerConfig, WalMedia, consolidate,
-    gc_landing, stream_end, take_over,
+    AppendError, AppendTicket, MediaSink, Sequencer, WalMedia, consolidate, gc_landing, stream_end,
+    take_over,
 };
 use zou_store::heartbeat::Heartbeat;
 use zou_store::layout::TenantLayout;
@@ -1135,6 +1135,28 @@ pub(crate) const WAL_SHARD: u32 = 0;
 /// separated so tests can run several writer sessions in one process.
 /// Returns the pipe plus the Postgres LSN to resume pushing from, zero
 /// when the store holds no WAL yet.
+/// The sequencer defaults, with two knobs for bench work. The window
+/// trades commit latency against request count and ZOU_WAL_INFLIGHT
+/// caps how many landing PUTs ride the wire at once; both fall back
+/// to the library defaults when unset or unparsable.
+fn sequencer_config_from_env() -> zou_log::SequencerConfig {
+    let mut config = zou_log::SequencerConfig::default();
+    if let Some(ms) = std::env::var("ZOU_WAL_WINDOW_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        && ms > 0.0
+    {
+        config.window = std::time::Duration::from_secs_f64(ms / 1000.0);
+    }
+    if let Some(n) = std::env::var("ZOU_WAL_INFLIGHT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        config.inflight = n.clamp(1, zou_log::MAX_INFLIGHT);
+    }
+    config
+}
+
 fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     init_logging();
     let store: Arc<dyn CasStore> = match open_store(target) {
@@ -1174,7 +1196,16 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         Arc::clone(&held),
         WAL_LEASE_TTL_SECS,
     );
-    let media = Arc::new(WalMedia::single(Arc::clone(&store)));
+    // The landing chain hedges its creation PUTs: past an adaptive
+    // delay a second identical attempt races the first and the fastest
+    // success wins, which cuts the store's latency tail out of the
+    // commit path. With ordered acks one slow PUT otherwise stalls
+    // every window behind it. ZOU_WAL_HEDGE=off keeps the raw store.
+    let landing: Arc<dyn CasStore> = match std::env::var("ZOU_WAL_HEDGE").as_deref() {
+        Ok("off") => Arc::clone(&store),
+        _ => Arc::new(zou_store::HedgedStore::new(Arc::clone(&store))),
+    };
+    let media = Arc::new(WalMedia::single(landing));
     let takeover = match take_over(&media, WAL_SHARD, &holder) {
         Ok(takeover) => takeover,
         Err(e) => {
@@ -1199,7 +1230,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     let seq = Sequencer::resume(
         WAL_SHARD,
         sink,
-        SequencerConfig::default(),
+        sequencer_config_from_env(),
         takeover.next_seq,
         takeover.prev_digest,
     );
