@@ -159,6 +159,35 @@ async fn the_read_path_speaks_postgrest() {
     assert_eq!(res.headers()["content-range"], "1-1/*");
     assert_eq!(body_text(res).await, r#"[{"name": "bob"}]"#);
 
+    // A window that starts below the first row starts at the first
+    // row, and the rows it would have skipped come off the limit.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_authors?select=name&order=name&offset=-4",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.headers()["content-range"], "0-1/*");
+    assert_eq!(body_text(res).await, r#"[{"name": "ann"},{"name": "bob"}]"#);
+
+    // A window that ends before it starts is a range and not a
+    // grammar, so it is refused as one.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_authors?select=name&limit=-1"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert!(res.headers().get("content-range").is_none());
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST103");
+    assert_eq!(body["message"], "Requested range not satisfiable");
+    assert_eq!(
+        body["details"],
+        "Limit should be greater than or equal to zero."
+    );
+
     // The Range header pages when the query string did not.
     let mut req = get("/rest/v1/zou_rest_authors?select=name&order=name");
     req.headers_mut().insert("range", "0-0".parse().unwrap());
@@ -317,7 +346,8 @@ async fn the_write_path_speaks_postgrest() {
     assert_eq!(body_text(res).await, "");
 
     // merge-duplicates without on_conflict finds the pk by itself
-    // and overwrites the clashing row in place.
+    // and overwrites the clashing row in place. Nothing was created,
+    // so the answer is 200 and not 201.
     let res = app
         .clone()
         .oneshot(req(
@@ -328,11 +358,25 @@ async fn the_write_path_speaks_postgrest() {
         ))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::CREATED);
+    assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         res.headers()["preference-applied"],
         "resolution=merge-duplicates"
     );
+
+    // One row of the batch was new, which is enough to call the whole
+    // thing a creation.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/rest/v1/zou_rest_wr_books",
+            r#"[{"id": 2, "author_id": 2, "title": "t2x"}, {"id": 9, "author_id": 1, "title": "t9"}]"#,
+            &["resolution=merge-duplicates", "return=headers-only"],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
     let res = app
         .clone()
         .oneshot(get("/rest/v1/zou_rest_wr_books?select=title&id=eq.2"))
@@ -365,7 +409,10 @@ async fn the_write_path_speaks_postgrest() {
         r#"[{"title": "t2x"},{"title": "t4"}]"#
     );
 
-    // An upsert with no pk and no on_conflict has no target to name.
+    // An upsert with no pk and no on_conflict has no target to name,
+    // so there is nothing to resolve and it is a plain insert. The
+    // preference is not refused and not applied either, which is the
+    // one place a recognized token is left out of the answer.
     let res = app
         .clone()
         .oneshot(req(
@@ -376,9 +423,8 @@ async fn the_write_path_speaks_postgrest() {
         ))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
-    assert_eq!(body["code"], "PGRST100");
+    assert_eq!(res.status(), StatusCode::CREATED);
+    assert!(res.headers().get("preference-applied").is_none());
 
     // PATCH takes the root filters into its WHERE and representation
     // reads the touched rows back, 200 not 201.

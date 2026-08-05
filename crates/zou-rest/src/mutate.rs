@@ -79,11 +79,12 @@ pub enum Returning {
 
 /// How an insert treats a conflicting row, PostgREST's resolution
 /// preferences. The target is the conflict column list, the primary
-/// key by default or the on_conflict parameter's columns.
+/// key by default or the on_conflict parameter's columns. An empty
+/// target is nothing to conflict on, whichever resolution asked, and
+/// what comes out is a plain insert.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Conflict {
-    /// resolution=ignore-duplicates. An empty target is the bare
-    /// `on conflict do nothing`, any unique constraint absorbs.
+    /// resolution=ignore-duplicates.
     Ignore { target: Vec<String> },
     /// resolution=merge-duplicates: the body's columns overwrite
     /// from excluded. An empty set degrades to do nothing, there is
@@ -116,16 +117,23 @@ pub fn insert(
     } else {
         format!("insert into {t} ({cols}) select {cols} from {src}")
     };
+    // A merging upsert counts, because its status turns on whether
+    // anything was inserted. Ignoring one does not: a row it swallowed
+    // is a row upstream still calls a creation.
+    let merging = matches!(conflict, Some(Conflict::Merge { .. }));
+    if merging {
+        text.push_str(&format!(" where {COUNT_INSERT}"));
+    }
     match conflict {
+        // No conflict target, no conflict clause. A table with no
+        // primary key and no on_conflict has nothing to conflict on,
+        // and upstream writes the plain insert rather than refusing
+        // the request.
         None => {}
-        Some(Conflict::Ignore { target }) if target.is_empty() => {
-            text.push_str(" on conflict do nothing");
+        Some(Conflict::Ignore { target } | Conflict::Merge { target, .. }) if target.is_empty() => {
         }
         Some(Conflict::Ignore { target }) => {
             text.push_str(&format!(" on conflict ({}) do nothing", ident_list(target)));
-        }
-        Some(Conflict::Merge { target, .. }) if target.is_empty() => {
-            return err("a merging upsert needs its conflict target columns");
         }
         Some(Conflict::Merge { target, set }) if set.is_empty() => {
             text.push_str(&format!(" on conflict ({}) do nothing", ident_list(target)));
@@ -139,7 +147,7 @@ pub fn insert(
                 })
                 .collect();
             text.push_str(&format!(
-                " on conflict ({}) do update set {}",
+                " on conflict ({}) do update set {} where {COUNT_UPDATE}",
                 ident_list(target),
                 sets.join(", ")
             ));
@@ -152,27 +160,32 @@ pub fn insert(
     })
 }
 
-/// The setting a PUT counts its updated rows in, and the read that
-/// asks for the count afterwards. It is transaction local, so it is
-/// gone by the time the connection goes back to the pool.
-pub const UPDATED_SQL: &str =
-    "select coalesce(nullif(current_setting('zou.updated', true), '')::int, 0)";
+/// The setting an upsert counts itself in, and the read that asks for
+/// the count afterwards. It is transaction local, so it is gone by
+/// the time the connection goes back to the pool.
+///
+/// One counter, counting up on the way in and down again for a row
+/// the conflict clause turned into an update, so what is left is the
+/// number of rows that were actually new. Two counters would say the
+/// same thing and cost a column to read it in.
+pub const INSERTED_SQL: &str =
+    "select coalesce(nullif(current_setting('zou.inserted', true), '')::int, 0)";
 
-/// The condition on the conflict clause of a PUT, which counts the
-/// rows that clause updated and then lets every one of them through:
+/// The condition on the insert's own select, counting every row that
+/// goes in, and the one on the conflict clause, taking back the ones
+/// that turned out to be updates. Both let every row through:
 /// set_config returns the new value, and a number is never the empty
-/// string. It is the only condition there, so nothing can reorder
-/// around it, which is what a side effect in a WHERE needs.
-const COUNT_UPDATE: &str = "set_config('zou.updated', (coalesce(nullif(current_setting('zou.updated', true), '')::int, 0) + 1)::text, true) <> ''";
+/// string.
+const COUNT_INSERT: &str = "set_config('zou.inserted', (coalesce(nullif(current_setting('zou.inserted', true), '')::int, 0) + 1)::text, true) <> ''";
+const COUNT_UPDATE: &str = "set_config('zou.inserted', (coalesce(nullif(current_setting('zou.inserted', true), '')::int, 0) - 1)::text, true) <> ''";
 
 /// PUT's upsert, the one row PostgREST calls a single upsert. The
 /// conflict target is the primary key, always, and the url's filters
 /// are compiled against the unpacked payload rather than against the
 /// table: a body whose key is not the url's key survives no filter,
 /// no row goes in, and the router reads the count of nothing as the
-/// mismatch. Subtracting the counted updates from the rows written
-/// says whether the row was inserted, which is the 201 against the
-/// 200.
+/// mismatch. It counts in `zou.inserted` like a merging upsert does,
+/// and a net of one row inserted is the 201 against the 200.
 ///
 /// It takes no missing preference. A PUT's columns are the body's
 /// own keys, so there is never a column it is writing that the body
@@ -199,10 +212,11 @@ pub fn upsert_one(
         format!("insert into {t} ({cols}) select {cols} from {src}")
     };
     let mut params = vec![payload];
+    text.push_str(&format!(" where {COUNT_INSERT}"));
     if !filters.is_empty() {
         let compiled = where_clause_from(filters, Some(SRC), params, rel)?;
         params = compiled.params;
-        text.push_str(" where ");
+        text.push_str(" and ");
         text.push_str(&compiled.text);
     }
     let target = ident_list(pk);
@@ -560,7 +574,10 @@ mod tests {
             &Returning::None,
         )
         .unwrap();
-        assert!(s.text.ends_with(" on conflict do nothing"), "{}", s.text);
+        // Nothing to conflict on, so there is no conflict clause and
+        // no counting either.
+        assert!(!s.text.contains("on conflict"), "{}", s.text);
+        assert!(!s.text.contains("set_config"), "{}", s.text);
 
         let ignore = Conflict::Ignore {
             target: cols(&["id"]),
@@ -580,6 +597,8 @@ mod tests {
             "{}",
             s.text
         );
+        // An ignored duplicate is still a creation, so nothing counts.
+        assert!(!s.text.contains("set_config"), "{}", s.text);
 
         let merge = Conflict::Merge {
             target: cols(&["id"]),
@@ -595,10 +614,23 @@ mod tests {
             &Returning::None,
         )
         .unwrap();
+        // One counter up on the way in and down again for whatever
+        // the conflict clause caught.
         assert!(
-            s.text.ends_with(
-                r#" on conflict ("id") do update set "a" = excluded."a", "b" = excluded."b""#
+            s.text
+                .contains(r#"as "_zou_src" where set_config('zou.inserted'"#),
+            "{}",
+            s.text
+        );
+        assert!(
+            s.text.contains(
+                r#" on conflict ("id") do update set "a" = excluded."a", "b" = excluded."b" where set_config('zou.inserted'"#
             ),
+            "{}",
+            s.text
+        );
+        assert!(
+            s.text.contains(" + 1)::text") && s.text.contains(" - 1)::text"),
             "{}",
             s.text
         );
@@ -624,22 +656,25 @@ mod tests {
             s.text
         );
 
-        // A merge with no target has no valid SQL spelling.
-        let bad = Conflict::Merge {
+        // A merge with no target is a plain insert. There is nothing
+        // to conflict on, so every row it writes is a new one, and it
+        // still counts them to be able to say so.
+        let no_target = Conflict::Merge {
             target: vec![],
             set: cols(&["a"]),
         };
-        let e = insert(
+        let s = insert(
             "t",
             None,
             &cols(&["a"]),
             "[]".into(),
             Missing::Null,
-            Some(&bad),
+            Some(&no_target),
             &Returning::None,
         )
-        .unwrap_err();
-        assert!(e.message.contains("conflict target"), "{e}");
+        .unwrap();
+        assert!(!s.text.contains("on conflict"), "{}", s.text);
+        assert!(s.text.contains("set_config('zou.inserted'"), "{}", s.text);
     }
 
     #[test]
@@ -654,9 +689,11 @@ mod tests {
             &Returning::Star,
         )
         .unwrap();
+        // The counter goes first and the url's own filter after it,
+        // upstream's order.
         assert!(
             s.text
-                .contains(r#"as "_zou_src" where "_zou_src"."name" = $2"#),
+                .contains(r#"::text, true) <> '' and "_zou_src"."name" = $2"#),
             "{}",
             s.text
         );
@@ -688,7 +725,10 @@ mod tests {
             "{}",
             s.text
         );
-        assert!(!s.text.contains("set_config"), "{}", s.text);
+        // The row still counts on the way in. Nothing takes it back,
+        // but nothing was updated either, so a row that did go in is
+        // the creation it looks like.
+        assert!(!s.text.contains(" - 1)::text"), "{}", s.text);
 
         let e = upsert_one(
             "no_pk",
