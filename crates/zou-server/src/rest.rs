@@ -44,7 +44,7 @@ use std::sync::atomic::Ordering;
 
 use axum::body::Body;
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use zou_rest::catalog::{
@@ -298,6 +298,132 @@ fn not_set_returning() -> RestError {
         hint: None,
         headers: None,
     }
+}
+
+/// What a function said about the response it wanted, left behind in
+/// the transaction it ran in.
+///
+/// This is the settings half of what a function can say about its own
+/// response. The other half is `RAISE SQLSTATE 'PGRST'`, which
+/// replaces the response outright and gives up the transaction to do
+/// it; these two amend a response the handler built and let the work
+/// stand.
+#[derive(Debug, Default)]
+struct Gucs {
+    headers: Option<String>,
+    status: Option<String>,
+}
+
+/// Both settings, read on the commit. They are transaction local, so
+/// they have to be read before it, and upstream selects them beside
+/// the body in the one statement it builds. zou's statements are
+/// shaped by the route rather than by one template, so they ride out
+/// on the commit instead, which is a round trip that was being spent
+/// anyway. `nullif` is upstream's too: a setting reset to the empty
+/// string is a setting nobody made.
+const GUCS_SQL: &str = "select nullif(current_setting('response.headers', true), ''), \
+                        nullif(current_setting('response.status', true), '')";
+
+impl Gucs {
+    /// What `GUCS_SQL` came back with, in the order it selected them.
+    fn read(columns: Vec<Option<String>>) -> Gucs {
+        let mut columns = columns.into_iter();
+        Gucs {
+            headers: columns.next().flatten(),
+            status: columns.next().flatten(),
+        }
+    }
+}
+
+/// A response.headers that is not a list of one key objects,
+/// PostgREST's PGRST111. Upstream decodes the setting into a list of
+/// its GucHeader, whose parser takes an object of exactly one key
+/// holding a string and nothing else, so every way of being wrong
+/// gets this one sentence.
+fn bad_guc_headers() -> RestError {
+    RestError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "PGRST111".to_string(),
+        message: "response.headers guc must be a JSON array composed of objects with a single key \
+                  and a string value"
+            .to_string(),
+        details: None,
+        hint: None,
+        headers: None,
+    }
+}
+
+/// A response.status that is not a status code, PostgREST's PGRST112.
+fn bad_guc_status() -> RestError {
+    RestError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "PGRST112".to_string(),
+        message: "response.status guc must be a valid status code".to_string(),
+        details: None,
+        hint: None,
+        headers: None,
+    }
+}
+
+/// The status a function asked for. Upstream reads it with `decimal`
+/// and keeps only the number, discarding whatever followed, so `205`
+/// and `205 Reset Content` are the same answer and a word is no
+/// answer at all.
+fn guc_status(raw: &str) -> Result<StatusCode, RestError> {
+    let digits: String = raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits
+        .parse::<u16>()
+        .ok()
+        .and_then(|n| StatusCode::from_u16(n).ok())
+        .ok_or_else(bad_guc_status)
+}
+
+/// The headers a function asked for, in the order it wrote them. Each
+/// element is one header, which is what makes a name repeated across
+/// elements a name sent twice.
+fn guc_headers(raw: &str) -> Result<Vec<(HeaderName, HeaderValue)>, RestError> {
+    let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|_| bad_guc_headers())?;
+    let list = parsed.as_array().ok_or_else(bad_guc_headers)?;
+    let mut out = Vec::new();
+    for item in list {
+        let object = item
+            .as_object()
+            .filter(|o| o.len() == 1)
+            .ok_or_else(bad_guc_headers)?;
+        let (name, value) = object.iter().next().expect("one key");
+        let text = value.as_str().ok_or_else(bad_guc_headers)?;
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| bad_guc_headers())?;
+        let value = HeaderValue::from_str(text).map_err(|_| bad_guc_headers())?;
+        out.push((name, value));
+    }
+    Ok(out)
+}
+
+/// Upstream's addHeadersIfNotIncluded, read from the other end: a
+/// header the function set stands, and the one the handler computed
+/// under that name goes. Everything the function did not mention is
+/// left where it was, so a status of its own does not cost it the
+/// Content-Range.
+///
+/// The status is decoded first, which is upstream's order and decides
+/// which of the two errors a response that got both wrong answers
+/// with.
+fn override_response(gucs: &Gucs, res: &mut Response) -> Result<(), RestError> {
+    let status = gucs.status.as_deref().map(guc_status).transpose()?;
+    let headers = match gucs.headers.as_deref() {
+        Some(raw) => guc_headers(raw)?,
+        None => Vec::new(),
+    };
+    if let Some(status) = status {
+        *res.status_mut() = status;
+    }
+    for (name, _) in &headers {
+        res.headers_mut().remove(name);
+    }
+    for (name, value) in headers {
+        res.headers_mut().append(name, value);
+    }
+    Ok(())
 }
 
 /// The table the schema does not have, PostgREST's PGRST205. It is a
@@ -1831,7 +1957,11 @@ async fn read(
     } else {
         None
     };
-    sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+    let gucs = Gucs::read(
+        sess.commit_reading(GUCS_SQL)
+            .await
+            .map_err(|e| pg_error(&e, authed))?,
+    );
     let total = match prefer.count {
         None => None,
         Some(Count::Exact) => exact,
@@ -1858,6 +1988,7 @@ async fn read(
     // its Content-Profile.
     profile_header(&mut res, schema, negotiated);
     applied_header(&prefer, Surface::Read, &req.method, false, &mut res);
+    override_response(&gucs, &mut res)?;
     Ok(res)
 }
 
@@ -2142,6 +2273,10 @@ async fn write(
     .map_err(|e| bad_grammar(e.message))?;
 
     let affected: u64;
+    // Filled in by whichever arm commits, since each of them commits
+    // at a different point and a setting lives only as long as the
+    // transaction that made it.
+    let gucs: Gucs;
     let mut res = match prefer.ret {
         Ret::Representation => {
             let r = mutate::representation(&catalog, m, &mut q).map_err(plan_error)?;
@@ -2161,7 +2296,11 @@ async fn write(
                     sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
                     return Err(e);
                 }
-                sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+                gucs = Gucs::read(
+                    sess.commit_reading(GUCS_SQL)
+                        .await
+                        .map_err(|e| pg_error(&e, authed))?,
+                );
                 (
                     status,
                     [(header::CONTENT_TYPE, media.content_type())],
@@ -2188,7 +2327,11 @@ async fn write(
                     sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
                     return Err(e);
                 }
-                sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+                gucs = Gucs::read(
+                    sess.commit_reading(GUCS_SQL)
+                        .await
+                        .map_err(|e| pg_error(&e, authed))?,
+                );
                 let body = if media.is_single() {
                     rows[0].get::<_, String>(0)
                 } else {
@@ -2213,7 +2356,11 @@ async fn write(
             if media.is_single() && rows.len() != 1 {
                 return Err(not_single(rows.len()));
             }
-            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            gucs = Gucs::read(
+                sess.commit_reading(GUCS_SQL)
+                    .await
+                    .map_err(|e| pg_error(&e, authed))?,
+            );
             affected = rows.len() as u64;
             let mut res = StatusCode::CREATED.into_response();
             if rows.len() == 1
@@ -2262,7 +2409,11 @@ async fn write(
                 sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
                 return Err(e);
             }
-            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            gucs = Gucs::read(
+                sess.commit_reading(GUCS_SQL)
+                    .await
+                    .map_err(|e| pg_error(&e, authed))?,
+            );
             if *method == Method::POST {
                 StatusCode::CREATED.into_response()
             } else {
@@ -2291,6 +2442,7 @@ async fn write(
         profile_header(&mut res, schema, negotiated);
     }
     applied_header(&prefer, Surface::Write, method, cap.is_some(), &mut res);
+    override_response(&gucs, &mut res)?;
     Ok(res)
 }
 
@@ -2730,7 +2882,11 @@ async fn invoke(
             sess.execute(&m.text, &param_refs(&params))
                 .await
                 .map_err(|e| pg_error(&e, authed))?;
-            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            let gucs = Gucs::read(
+                sess.commit_reading(GUCS_SQL)
+                    .await
+                    .map_err(|e| pg_error(&e, authed))?,
+            );
             // Nothing to send and a range all the same, because
             // upstream counts the one row the call was.
             let mut res = (
@@ -2742,6 +2898,7 @@ async fn invoke(
             )
                 .into_response();
             applied_header(&prefer, Surface::Rpc, &req.method, false, &mut res);
+            override_response(&gucs, &mut res)?;
             Ok(res)
         }
         rpc::RetKind::Scalar => {
@@ -2770,7 +2927,11 @@ async fn invoke(
                 sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
                 return Err(e);
             }
-            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            let gucs = Gucs::read(
+                sess.commit_reading(GUCS_SQL)
+                    .await
+                    .map_err(|e| pg_error(&e, authed))?,
+            );
             // Nothing is the empty body everywhere except json, where
             // nothing is still something to write.
             let out = rows
@@ -2799,6 +2960,7 @@ async fn invoke(
                 .into_response();
             profile_header(&mut res, schema, negotiated);
             applied_header(&prefer, Surface::Rpc, &req.method, cap.is_some(), &mut res);
+            override_response(&gucs, &mut res)?;
             Ok(res)
         }
         rpc::RetKind::Composite { table } => {
@@ -2834,7 +2996,11 @@ async fn invoke(
                     .query(&text, &param_refs(&params))
                     .await
                     .map_err(|e| pg_error(&e, authed))?;
-                sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+                let gucs = Gucs::read(
+                    sess.commit_reading(GUCS_SQL)
+                        .await
+                        .map_err(|e| pg_error(&e, authed))?,
+                );
                 // A non set function is one row, and PostgREST hands
                 // it back as a bare object, not a one element array.
                 // One row is also what it counts, whatever came back.
@@ -2856,6 +3022,7 @@ async fn invoke(
                     .into_response();
                 profile_header(&mut res, schema, negotiated);
                 applied_header(&prefer, Surface::Rpc, &req.method, false, &mut res);
+                override_response(&gucs, &mut res)?;
                 return Ok(res);
             }
             // A page that is the whole set is its own total, and a
@@ -2911,7 +3078,11 @@ async fn invoke(
                 sess.rollback().await.map_err(|x| pg_error(&x, authed))?;
                 return Err(e);
             }
-            sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            let gucs = Gucs::read(
+                sess.commit_reading(GUCS_SQL)
+                    .await
+                    .map_err(|e| pg_error(&e, authed))?,
+            );
             let out = rows
                 .first()
                 .and_then(|r| r.get::<_, Option<String>>(0))
@@ -2942,6 +3113,7 @@ async fn invoke(
             }
             profile_header(&mut res, schema, negotiated);
             applied_header(&prefer, Surface::Rpc, &req.method, cap.is_some(), &mut res);
+            override_response(&gucs, &mut res)?;
             Ok(res)
         }
     }
@@ -3926,6 +4098,108 @@ mod tests {
             assert_eq!(e.details, Some(details.into()), "{message}");
             assert!(e.hint.is_some(), "{message}");
         }
+    }
+
+    /// Upstream reads the status with `decimal`, which keeps the
+    /// leading digits and drops what followed, so a reason phrase
+    /// after the number costs nothing and a word alone is nothing.
+    #[test]
+    fn a_status_is_the_number_it_starts_with() {
+        for (raw, want) in [
+            ("205", Some(StatusCode::RESET_CONTENT)),
+            ("403", Some(StatusCode::FORBIDDEN)),
+            ("205 Reset Content", Some(StatusCode::RESET_CONTENT)),
+            ("unknown", None),
+            ("", None),
+            ("-1", None),
+            (" 200", None),
+            ("99", None),
+            ("70000", None),
+        ] {
+            assert_eq!(guc_status(raw).ok(), want, "{raw}");
+        }
+    }
+
+    /// A single key object holding a string, and every other shape is
+    /// the one sentence upstream says about all of them.
+    #[test]
+    fn a_header_is_one_key_holding_a_string() {
+        assert_eq!(
+            guc_headers(r#"[{"X-Test": "one"}, {"X-Test": "two"}]"#)
+                .unwrap()
+                .len(),
+            2,
+        );
+        for raw in [
+            r#"{"X-Test": "one"}"#,
+            r#"[{"X-Test": "one", "X-Other": "two"}]"#,
+            r#"[{"X-Test": 7}]"#,
+            r#"[{}]"#,
+            r#"["X-Test"]"#,
+            "not json at all",
+        ] {
+            let e = guc_headers(raw).expect_err(raw);
+            assert_eq!(e.code, "PGRST111", "{raw}");
+            assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR, "{raw}");
+        }
+    }
+
+    /// What the function set stands where the handler computed the
+    /// same name, and everything else it did not mention stays. A
+    /// name it wrote twice is sent twice, which is the only reason
+    /// the list is a list of objects rather than one object.
+    #[test]
+    fn what_a_function_set_wins_and_the_rest_stays() {
+        let mut res = (
+            StatusCode::CREATED,
+            [
+                (header::LOCATION, "/stuff?id=eq.1"),
+                (header::CONTENT_RANGE, "*/*"),
+            ],
+        )
+            .into_response();
+        let gucs = Gucs {
+            headers: Some(
+                r#"[{"Location": "/stuff?id=eq.2"}, {"X-Two": "a"}, {"X-Two": "b"}]"#.to_string(),
+            ),
+            status: Some("205".to_string()),
+        };
+        override_response(&gucs, &mut res).unwrap();
+        assert_eq!(res.status(), StatusCode::RESET_CONTENT);
+        assert_eq!(res.headers()[header::LOCATION], "/stuff?id=eq.2");
+        assert_eq!(res.headers()[header::CONTENT_RANGE], "*/*");
+        let two: Vec<&str> = res
+            .headers()
+            .get_all("x-two")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(two, vec!["a", "b"]);
+    }
+
+    /// A response that got both wrong answers with the status, which
+    /// is the order upstream decodes them in.
+    #[test]
+    fn the_status_is_decoded_first() {
+        let mut res = StatusCode::OK.into_response();
+        let gucs = Gucs {
+            headers: Some("not json".to_string()),
+            status: Some("unknown".to_string()),
+        };
+        assert_eq!(
+            override_response(&gucs, &mut res).unwrap_err().code,
+            "PGRST112"
+        );
+    }
+
+    /// Nothing set is nothing changed, which is every request that
+    /// never calls a function that says anything.
+    #[test]
+    fn a_response_nobody_spoke_for_is_left_alone() {
+        let mut res = StatusCode::NO_CONTENT.into_response();
+        override_response(&Gucs::default(), &mut res).unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(res.headers().is_empty());
     }
 
     #[test]
