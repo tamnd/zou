@@ -8,7 +8,9 @@
 //! compiler and the embedding planner on top.
 
 pub mod catalog;
+pub mod csv;
 pub mod filter;
+pub mod media;
 pub mod mutate;
 pub mod order;
 pub mod origin;

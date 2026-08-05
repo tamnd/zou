@@ -52,10 +52,11 @@ use zou_rest::catalog::{
     INTROSPECT_SQL, RELATIONS_SQL, TIMEZONES_SQL,
 };
 use zou_rest::filter::{self, Node, Op, Parsed};
+use zou_rest::media::MediaType;
 use zou_rest::mutate::{self, Conflict, Missing, Returning};
 use zou_rest::origin::{self, KeyRow, VIEW_KEYS_SQL, VIEWS_SQL, ViewRow};
 use zou_rest::plan::{self, PlanError, Query};
-use zou_rest::{order, page, rpc, select};
+use zou_rest::{csv as csvbody, media, order, page, rpc, select};
 
 use crate::sql::{RequestContext, Session};
 use crate::{App, AuthContext, openapi};
@@ -695,33 +696,41 @@ impl Prefer {
 /// covers application/json, */*, and the vendored array+json name,
 /// which PostgREST folds into plain json unless nulls=stripped
 /// rides along.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Media {
-    Json { stripped: bool },
-    Single { stripped: bool },
+    Json {
+        stripped: bool,
+    },
+    Single {
+        stripped: bool,
+    },
     Csv,
+    /// A media type one function answers in, named by the domain it
+    /// returns. The value goes out as its own text with nothing
+    /// wrapped around it, which is the whole point: a function can
+    /// hand back an xml document or a png rather than a json string
+    /// holding one.
+    Custom(String),
 }
 
 impl Media {
-    fn content_type(self) -> &'static str {
+    fn content_type(&self) -> String {
         match self {
-            Media::Json { stripped: false } => "application/json; charset=utf-8",
-            Media::Json { stripped: true } => {
-                "application/vnd.pgrst.array+json;nulls=stripped; charset=utf-8"
-            }
-            Media::Single { stripped: false } => "application/vnd.pgrst.object+json; charset=utf-8",
-            Media::Single { stripped: true } => {
-                "application/vnd.pgrst.object+json;nulls=stripped; charset=utf-8"
-            }
-            Media::Csv => "text/csv; charset=utf-8",
+            Media::Json { stripped: false } => media::content_type(&MediaType::Json),
+            Media::Json { stripped: true } => media::content_type(&MediaType::ArrayStripped),
+            Media::Single { stripped } => media::content_type(&MediaType::Single {
+                stripped: *stripped,
+            }),
+            Media::Csv => media::content_type(&MediaType::Csv),
+            Media::Custom(name) => media::content_type(&media::decode(name)),
         }
     }
 
-    fn is_single(self) -> bool {
+    fn is_single(&self) -> bool {
         matches!(self, Media::Single { .. })
     }
 
-    fn stripped(self) -> bool {
+    fn stripped(&self) -> bool {
         matches!(
             self,
             Media::Json { stripped: true } | Media::Single { stripped: true }
@@ -730,36 +739,17 @@ impl Media {
 }
 
 /// One Accept item into its handler, or into the name the 406
-/// message echoes: canonical for media types PostgREST knows but
-/// cannot produce from a table, verbatim for everything else.
+/// message echoes, which is the name of what was asked for rather
+/// than the string that asked: a request for
+/// `application/vnd.pgrst.plan` is refused by its full name,
+/// options and all.
 fn decode_media(item: &str) -> Result<Media, String> {
-    let mut parts = item.split(';');
-    let mime = parts.next().unwrap_or("").to_ascii_lowercase();
-    let mut stripped = false;
-    for param in parts {
-        if let Some((k, v)) = param.split_once('=')
-            && k.eq_ignore_ascii_case("nulls")
-            && v.trim_matches('"') == "stripped"
-        {
-            stripped = true;
-        }
-    }
-    match mime.as_str() {
-        "*/*" | "application/json" => Ok(Media::Json { stripped: false }),
-        "application/vnd.pgrst.array+json" | "application/vnd.pgrst.array" => {
-            Ok(Media::Json { stripped })
-        }
-        "application/vnd.pgrst.object+json" | "application/vnd.pgrst.object" => {
-            Ok(Media::Single { stripped })
-        }
-        "text/csv" => Ok(Media::Csv),
-        "text/plain"
-        | "text/xml"
-        | "application/geo+json"
-        | "application/openapi+json"
-        | "application/x-www-form-urlencoded"
-        | "application/octet-stream" => Err(mime),
-        _ => Err(item.to_string()),
+    match media::decode(item) {
+        MediaType::Json | MediaType::Any => Ok(Media::Json { stripped: false }),
+        MediaType::ArrayStripped => Ok(Media::Json { stripped: true }),
+        MediaType::Single { stripped } => Ok(Media::Single { stripped }),
+        MediaType::Csv => Ok(Media::Csv),
+        other => Err(media::mime(&other)),
     }
 }
 
@@ -806,14 +796,31 @@ fn unacceptable(offered: Vec<String>) -> RestError {
     }
 }
 
-/// Content negotiation for a table or an rpc: the first weighed item
-/// with a handler wins.
+/// Content negotiation for a table: the first weighed item with a
+/// handler wins.
 fn negotiate(headers: &HeaderMap) -> Result<Media, RestError> {
+    negotiate_call(headers, None)
+}
+
+/// Content negotiation for a call, which is a table's plus whatever
+/// media type the function itself answers in.
+///
+/// The function's own handler is looked up first, so a function
+/// returning a domain named `text/csv` writes the csv rather than
+/// the csv aggregate. It is not looked up under `*/*` though: a
+/// client that stated no preference gets json, and the only way to
+/// the function's own type is to name it.
+fn negotiate_call(headers: &HeaderMap, custom: Option<&str>) -> Result<Media, RestError> {
     let Some(items) = accept_items(headers) else {
         return Ok(Media::Json { stripped: false });
     };
     let mut offered: Vec<String> = Vec::new();
     for mime in &items {
+        if let Some(name) = custom
+            && media::decode(mime) == media::decode(name)
+        {
+            return Ok(Media::Custom(name.to_string()));
+        }
         match decode_media(mime) {
             Ok(m) => return Ok(m),
             Err(name) => offered.push(name),
@@ -832,13 +839,10 @@ fn negotiate_openapi(headers: &HeaderMap) -> Result<(), RestError> {
     };
     let mut offered: Vec<String> = Vec::new();
     for mime in &items {
-        let name = mime.split(';').next().unwrap_or("").to_ascii_lowercase();
-        match name.as_str() {
-            "application/openapi+json" | "application/json" | "*/*" => return Ok(()),
-            _ => offered.push(match decode_media(mime) {
-                Ok(_) => name,
-                Err(verbatim) => verbatim,
-            }),
+        let kind = media::decode(mime);
+        match kind {
+            MediaType::OpenApi | MediaType::Json | MediaType::Any => return Ok(()),
+            _ => offered.push(media::mime(&kind)),
         }
     }
     Err(unacceptable(offered))
@@ -859,7 +863,7 @@ fn not_single(rows: usize) -> RestError {
 
 /// The per-row json expression, stripping nulls when the vendored
 /// nulls=stripped parameter asked for it.
-fn row_json(media: Media) -> &'static str {
+fn row_json(media: &Media) -> &'static str {
     if media.stripped() {
         "jsonb_strip_nulls(to_jsonb(\"_zou_row\"))"
     } else {
@@ -874,22 +878,151 @@ fn row_json(media: Media) -> &'static str {
 /// upstream. Callers prepend `with ... "_zou_source" as (...)`.
 const CSV_AGG: &str = "select (select coalesce(string_agg(a.k, ','), '') from (select json_object_keys(r)::text as k from (select row_to_json(hh) as r from \"_zou_source\" as hh limit 1) s) a) || E'\\n' || coalesce(string_agg(substring(\"_zou_t\"::text, 2, length(\"_zou_t\"::text) - 2), E'\\n'), ''), count(*) from (select * from \"_zou_source\") as \"_zou_t\"";
 
-/// A write's body into the rows it carries. Every write reads it the
-/// same way: json or PGRST102, one object counted as a single row,
-/// anything that is not an object carrying no keys at all rather
-/// than being refused, which is why a body of `42` inserts one row
-/// of defaults.
+/// What the body is written as, which is the Content-Type header and
+/// nothing else: no sniffing, and a request that says nothing is
+/// saying json.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Content {
+    Json,
+    Csv,
+    Form,
+    /// A body that is one value, which only a call can take and only
+    /// into a single unnamed parameter.
+    Value(rpc::Payload),
+    /// A media type no body on this surface may be written in, held
+    /// by its name for the refusal.
+    Other(String),
+}
+
+impl Content {
+    /// What the body said it was, which is what a refusal names.
+    fn name(&self) -> String {
+        let kind = match self {
+            Content::Json => MediaType::Json,
+            Content::Csv => MediaType::Csv,
+            Content::Form => MediaType::Form,
+            Content::Value(rpc::Payload::Xml) => MediaType::Xml,
+            Content::Value(rpc::Payload::Bytes) => MediaType::Bytes,
+            Content::Value(_) => MediaType::Text,
+            Content::Other(name) => return name.clone(),
+        };
+        media::mime(&kind)
+    }
+}
+
+fn content_of(headers: &HeaderMap) -> Content {
+    let raw = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if raw.trim().is_empty() {
+        return Content::Json;
+    }
+    match media::decode(raw) {
+        MediaType::Json => Content::Json,
+        MediaType::Csv => Content::Csv,
+        MediaType::Form => Content::Form,
+        MediaType::Text => Content::Value(rpc::Payload::Text),
+        MediaType::Xml => Content::Value(rpc::Payload::Xml),
+        MediaType::Bytes => Content::Value(rpc::Payload::Bytes),
+        other => Content::Other(media::mime(&other)),
+    }
+}
+
+/// What resolution makes of the body: which single unnamed parameter
+/// it could pass to, if any.
+fn payload_of(content: &Content) -> rpc::Payload {
+    match content {
+        Content::Json => rpc::Payload::Json,
+        Content::Value(p) => *p,
+        _ => rpc::Payload::Other,
+    }
+}
+
+/// The PGRST102 for a body written in a media type nothing here
+/// reads. It is the content type that is refused, not the body, so
+/// nobody looks at the bytes.
+fn unreadable(name: &str) -> RestError {
+    invalid_body(format!("Content-Type not acceptable: {name}"))
+}
+
+/// A form body as its pairs, in the order they were written and with
+/// repeats kept, which is what fills a variadic argument.
+fn form_pairs(bytes: &[u8]) -> Vec<(String, String)> {
+    String::from_utf8_lossy(bytes)
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (decode(k), decode(v)),
+            None => (decode(p), String::new()),
+        })
+        .collect()
+}
+
+/// A csv body as the rows it carries, the header naming the keys.
+fn csv_rows(bytes: &[u8]) -> Result<(Vec<String>, Vec<serde_json::Value>), RestError> {
+    let table = csvbody::read(bytes).map_err(invalid_body)?;
+    let rows: Vec<serde_json::Value> = table
+        .rows
+        .into_iter()
+        .map(|row| {
+            serde_json::Value::Object(
+                table
+                    .header
+                    .iter()
+                    .cloned()
+                    .zip(row.into_iter().map(|f| match f {
+                        Some(text) => serde_json::Value::String(text),
+                        None => serde_json::Value::Null,
+                    }))
+                    .collect(),
+            )
+        })
+        .collect();
+    // A csv with nothing under its header writes no columns, the
+    // same as the empty json array it amounts to.
+    let cols = if rows.is_empty() {
+        Vec::new()
+    } else {
+        table.header
+    };
+    Ok((cols, rows))
+}
+
+/// A write's body into the rows it carries.
+///
+/// A json body is one object counted as a single row, and anything
+/// that is not an object carries no keys at all rather than being
+/// refused, which is why a body of `42` inserts one row of defaults.
+/// A csv is its records, a form is one row of text, and every other
+/// content type is refused unread.
 ///
 /// The columns are the first row's keys and every other row has to
 /// agree with them, because upstream unpacks the whole array against
 /// one column list and a row with different keys would silently lose
 /// some. ?columns= says the list outright, and then the body is not
 /// inspected at all: an array of numbers reaches postgres and fails
-/// there, which is upstream's answer too.
+/// there, which is upstream's answer too. It only speaks for a json
+/// body: a csv and a form name their own columns, and upstream lets
+/// them.
 fn body_rows(
+    content: &Content,
     bytes: &[u8],
     columns: Option<&[String]>,
 ) -> Result<(Vec<String>, Vec<serde_json::Value>), RestError> {
+    match content {
+        Content::Json => {}
+        Content::Csv => return csv_rows(bytes),
+        Content::Form => {
+            let mut row = serde_json::Map::new();
+            for (k, v) in form_pairs(bytes) {
+                row.insert(k, serde_json::Value::String(v));
+            }
+            let cols: Vec<String> = row.keys().cloned().collect();
+            return Ok((cols, vec![serde_json::Value::Object(row)]));
+        }
+        Content::Value(_) | Content::Other(_) => return Err(unreadable(&content.name())),
+    }
     let v: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|_| invalid_body("Empty or invalid json"))?;
     let bulk = v.is_array();
@@ -923,10 +1056,11 @@ fn body_rows(
 /// An insert body into its column list and normalized payload, which
 /// is always an array so that json_populate_recordset can unpack it.
 fn insert_payload(
+    content: &Content,
     bytes: &[u8],
     columns: Option<&[String]>,
 ) -> Result<(Vec<String>, String), RestError> {
-    let (cols, rows) = body_rows(bytes, columns)?;
+    let (cols, rows) = body_rows(content, bytes, columns)?;
     Ok((cols, serde_json::Value::Array(rows).to_string()))
 }
 
@@ -935,10 +1069,11 @@ fn insert_payload(
 /// its first element the way upstream's LIMIT 1 reads it, and an
 /// empty one leaves no columns to set at all.
 fn update_payload(
+    content: &Content,
     bytes: &[u8],
     columns: Option<&[String]>,
 ) -> Result<(Vec<String>, String), RestError> {
-    let (cols, rows) = body_rows(bytes, columns)?;
+    let (cols, rows) = body_rows(content, bytes, columns)?;
     let Some(first) = rows.into_iter().next() else {
         return Ok((Vec::new(), "null".to_string()));
     };
@@ -1410,7 +1545,7 @@ async fn read(
     } else {
         let wrapped = format!(
             "select {}::text from ({}) as \"_zou_row\"",
-            row_json(media),
+            row_json(&media),
             sql.text
         );
         let rows = sess
@@ -1662,10 +1797,11 @@ async fn write(
     // stating because it is not obviously deliberate upstream and it
     // is observable: a PUT with ?columns= naming one column writes
     // every column the body carries.
+    let content = content_of(&req.headers);
     let payload = match *method {
-        Method::POST => Some(insert_payload(bytes, extras.columns.as_deref())?),
-        Method::PUT => Some(insert_payload(bytes, None)?),
-        Method::PATCH => Some(update_payload(bytes, extras.columns.as_deref())?),
+        Method::POST => Some(insert_payload(&content, bytes, extras.columns.as_deref())?),
+        Method::PUT => Some(insert_payload(&content, bytes, None)?),
+        Method::PATCH => Some(update_payload(&content, bytes, extras.columns.as_deref())?),
         _ => None,
     };
 
@@ -1827,7 +1963,7 @@ async fn write(
                 let text = format!(
                     "with {} select {}::text from ({}) as \"_zou_row\"",
                     r.cte,
-                    row_json(media),
+                    row_json(&media),
                     r.select.text
                 );
                 let rows = sess
@@ -2167,24 +2303,6 @@ fn rpc_error(e: rpc::RpcError) -> RestError {
     }
 }
 
-/// What the body of a call is, read off the content type the way the
-/// single unnamed parameter rule needs it. A request that says
-/// nothing is saying json, which is what everything else on this
-/// surface assumes too.
-fn payload_of(headers: &HeaderMap) -> rpc::Payload {
-    let raw = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json");
-    match raw.split(';').next().unwrap_or("").trim() {
-        "application/json" | "" => rpc::Payload::Json,
-        "text/plain" => rpc::Payload::Text,
-        "text/xml" => rpc::Payload::Xml,
-        "application/octet-stream" => rpc::Payload::Bytes,
-        _ => rpc::Payload::Other,
-    }
-}
-
 /// Whether a query key belongs to the result grammar rather than to
 /// the function's arguments. Upstream's list of reserved words, plus
 /// the gate's apikey, which is nobody's argument.
@@ -2238,6 +2356,7 @@ async fn invoke(
                 rettype: r.get(6),
                 return_table: r.get(7),
                 composite: r.get(8),
+                media: r.get(9),
             })
         })
         .collect();
@@ -2255,53 +2374,93 @@ async fn invoke(
     // typo is a function nobody has rather than an argument quietly
     // dropped.
     let raw = req.uri.query().unwrap_or("");
-    let mut get_args: Vec<(String, String)> = Vec::new();
+    let mut args: Vec<(String, String)> = Vec::new();
     let mut residual: Vec<&str> = Vec::new();
     let mut supplied: Vec<String> = Vec::new();
+    let mut default_select = true;
     if is_post {
         residual = raw.split('&').filter(|p| !p.is_empty()).collect();
-    } else {
-        for pair in raw.split('&').filter(|p| !p.is_empty()) {
-            let Some((k, v)) = pair.split_once('=') else {
+    }
+    for pair in raw.split('&').filter(|p| !p.is_empty()) {
+        let Some((k, v)) = pair.split_once('=') else {
+            if !is_post {
                 residual.push(pair);
-                continue;
-            };
-            let key = decode(k);
-            let value = decode(v);
-            if grammar_key(&key) || filter::is_operator(&value) {
-                residual.push(pair);
-                continue;
             }
-            if !supplied.contains(&key) {
-                supplied.push(key.clone());
+            continue;
+        };
+        let key = decode(k);
+        let value = decode(v);
+        if key == "select" {
+            default_select = false;
+        }
+        if is_post {
+            continue;
+        }
+        if grammar_key(&key) || filter::is_operator(&value) {
+            residual.push(pair);
+            continue;
+        }
+        if !supplied.contains(&key) {
+            supplied.push(key.clone());
+        }
+        args.push((key, value));
+    }
+
+    // What the body says, which is the content type and then the
+    // bytes. A form is argument pairs the same way a query string
+    // is, so both go on to bind one text parameter per value; a json
+    // body and a csv read down to one object of arguments; and a
+    // body that is one value carries no argument names at all, only
+    // itself.
+    let content = content_of(&req.headers);
+    let mut payload: Option<String> = None;
+    if let Some(bytes) = body {
+        match &content {
+            Content::Json => {
+                let text = if bytes.is_empty() {
+                    "{}".to_string()
+                } else {
+                    String::from_utf8(bytes.to_vec())
+                        .map_err(|_| invalid_body("invalid utf-8 in the request body"))?
+                };
+                let v: serde_json::Value = serde_json::from_str(&text)
+                    .map_err(|_| invalid_body("Empty or invalid json"))?;
+                if let Some(o) = v.as_object() {
+                    supplied = o.keys().cloned().collect();
+                }
+                payload = Some(text);
             }
-            get_args.push((key, value));
+            Content::Csv => {
+                // A call takes one row of arguments, so a csv is read
+                // down to its first record the way an update body is.
+                let (cols, rows) = csv_rows(bytes)?;
+                supplied = cols;
+                payload = Some(match rows.into_iter().next() {
+                    Some(row) => row.to_string(),
+                    None => "{}".to_string(),
+                });
+            }
+            Content::Form => {
+                for (k, v) in form_pairs(bytes) {
+                    if !supplied.contains(&k) {
+                        supplied.push(k.clone());
+                    }
+                    args.push((k, v));
+                }
+            }
+            Content::Value(_) => {
+                payload = Some(String::from_utf8_lossy(bytes).into_owned());
+            }
+            Content::Other(name) => return Err(unreadable(name)),
         }
     }
-    let payload = match body {
-        Some(bytes) => {
-            let text = if bytes.is_empty() {
-                "{}".to_string()
-            } else {
-                String::from_utf8(bytes.to_vec())
-                    .map_err(|_| invalid_body("invalid utf-8 in the request body"))?
-            };
-            let v: serde_json::Value =
-                serde_json::from_str(&text).map_err(|e| invalid_body(e.to_string()))?;
-            if let Some(o) = v.as_object() {
-                supplied = o.keys().cloned().collect();
-            }
-            Some(text)
-        }
-        None => None,
-    };
 
     let choice = match rpc::choose(
         schema,
         func,
         &overloads,
         &supplied,
-        payload_of(&req.headers),
+        payload_of(&content),
         is_post,
     ) {
         Ok(c) => c,
@@ -2321,6 +2480,12 @@ async fn invoke(
             return Err(rpc_error(e));
         }
     };
+    // The function's own media type is only on offer when the call
+    // hands back what the function returns. A select list of its own
+    // makes the answer a shape the request invented, and nothing the
+    // function declared speaks for that.
+    let custom = choice.routine.media.as_deref().filter(|_| default_select);
+    let media = negotiate_call(&req.headers, custom)?;
     let kind = choice.routine.kind.clone();
     let returns_set = choice.routine.returns_set;
     // A cap on rows counts the rows a call returns, so a function
@@ -2336,7 +2501,7 @@ async fn invoke(
     let exact = matches!(prefer.count, Some(Count::Exact));
     let m = match payload {
         Some(text) => rpc::call_json(schema, func, &choice, &supplied, text),
-        None => rpc::call_get(schema, func, choice.routine, &get_args),
+        None => rpc::call_get(schema, func, choice.routine, &args),
     };
 
     match kind {
@@ -2360,7 +2525,19 @@ async fn invoke(
             Ok(res)
         }
         rpc::RetKind::Scalar => {
-            let wrapped = rpc::scalar_wrap(m, returns_set);
+            // Three ways to write one value out, all of them two
+            // columns: what to send and how many rows it was. json
+            // wraps, csv tabulates under the column the value
+            // travelled in, and the function's own media type sends
+            // the value itself with nothing around it.
+            let wrapped = match &media {
+                Media::Custom(_) => rpc::value_wrap(m),
+                Media::Csv => zou_rest::sql::Sql {
+                    text: format!("with \"_zou_source\" as ({}) {CSV_AGG}", m.text),
+                    params: m.params,
+                },
+                _ => rpc::scalar_wrap(m, returns_set),
+            };
             let params: Vec<Text> = wrapped.params.into_iter().map(Text).collect();
             let rows = sess
                 .query(&wrapped.text, &param_refs(&params))
@@ -2374,10 +2551,17 @@ async fn invoke(
                 return Err(e);
             }
             sess.commit().await.map_err(|e| pg_error(&e, authed))?;
+            // Nothing is the empty body everywhere except json, where
+            // nothing is still something to write.
             let out = rows
                 .first()
                 .and_then(|r| r.get::<_, Option<String>>(0))
-                .unwrap_or_else(|| if returns_set { "[]" } else { "null" }.to_string());
+                .unwrap_or_else(|| match &media {
+                    Media::Json { .. } | Media::Single { .. } => {
+                        if returns_set { "[]" } else { "null" }.to_string()
+                    }
+                    _ => String::new(),
+                });
             // One value is one row as far as the range goes and a
             // folded set is as many rows as it folded, which is how
             // upstream counts them. Nothing here is paged, so an
@@ -2387,8 +2571,8 @@ async fn invoke(
             let mut res = (
                 range_status(0, page, total),
                 [
-                    (header::CONTENT_TYPE, "application/json; charset=utf-8"),
-                    (header::CONTENT_RANGE, &content_range(0, page, total)),
+                    (header::CONTENT_TYPE, media.content_type()),
+                    (header::CONTENT_RANGE, content_range(0, page, total)),
                 ],
                 out,
             )
@@ -2414,10 +2598,17 @@ async fn invoke(
             apply_range(&mut q, &req.method, &req.headers);
             let r = rpc::representation(&catalog, m, &mut q).map_err(plan_error)?;
             if !returns_set {
-                let text = format!(
-                    "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
-                    r.cte, r.select.text
-                );
+                let text = if media == Media::Csv {
+                    format!(
+                        "with {}, \"_zou_source\" as ({}) {CSV_AGG}",
+                        r.cte, r.select.text
+                    )
+                } else {
+                    format!(
+                        "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
+                        r.cte, r.select.text
+                    )
+                };
                 let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
                 let rows = sess
                     .query(&text, &param_refs(&params))
@@ -2434,10 +2625,10 @@ async fn invoke(
                 let mut res = (
                     StatusCode::OK,
                     [
-                        (header::CONTENT_TYPE, "application/json; charset=utf-8"),
+                        (header::CONTENT_TYPE, media.content_type()),
                         (
                             header::CONTENT_RANGE,
-                            &content_range(0, 1, exact.then_some(1)),
+                            content_range(0, 1, exact.then_some(1)),
                         ),
                     ],
                     out,
@@ -2471,12 +2662,22 @@ async fn invoke(
             };
             // The array is joined out of the row texts rather than
             // built by jsonb_agg, which is the same bytes a read
-            // sends: an aggregate would space the commas out.
-            let text = format!(
-                "with {cte} select '[' || coalesce(string_agg(to_jsonb(\"_zou_row\")::text, ','), '') || ']', \
-                 count(*)::bigint, {total_sql} from ({}) as \"_zou_row\"",
-                r.select.text
-            );
+            // sends: an aggregate would space the commas out. csv
+            // goes through the same aggregate a read uses, one CTE
+            // further along so the total can ride out beside it.
+            let text = if media == Media::Csv {
+                format!(
+                    "with {cte}, \"_zou_source\" as ({}), \"_zou_csv\" as ({CSV_AGG}) \
+                     select \"_zou_csv\".*, {total_sql} from \"_zou_csv\"",
+                    r.select.text
+                )
+            } else {
+                format!(
+                    "with {cte} select '[' || coalesce(string_agg(to_jsonb(\"_zou_row\")::text, ','), '') || ']', \
+                     count(*)::bigint, {total_sql} from ({}) as \"_zou_row\"",
+                    r.select.text
+                )
+            };
             let params: Vec<Text> = params.into_iter().map(Text).collect();
             let rows = sess
                 .query(&text, &param_refs(&params))
@@ -2494,7 +2695,7 @@ async fn invoke(
             let out = rows
                 .first()
                 .and_then(|r| r.get::<_, Option<String>>(0))
-                .unwrap_or_else(|| "[]".to_string());
+                .unwrap_or_else(|| if media == Media::Csv { "" } else { "[]" }.to_string());
             let total = if exact {
                 Some(
                     rows.first()
@@ -2514,12 +2715,7 @@ async fn invoke(
             let mut res = if status == StatusCode::RANGE_NOT_SATISFIABLE {
                 error_body(status, out_of_bounds(offset, total.unwrap_or(0)))
             } else {
-                (
-                    status,
-                    [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
-                    out,
-                )
-                    .into_response()
+                (status, [(header::CONTENT_TYPE, media.content_type())], out).into_response()
             };
             if let Ok(v) = content_range(offset, page, total).parse() {
                 res.headers_mut().insert(header::CONTENT_RANGE, v);
@@ -2634,7 +2830,7 @@ mod tests {
             if let Some(ct) = ct {
                 h.insert(header::CONTENT_TYPE, ct.parse().unwrap());
             }
-            payload_of(&h)
+            payload_of(&content_of(&h))
         };
         assert_eq!(of(None), rpc::Payload::Json);
         assert_eq!(of(Some("application/json")), rpc::Payload::Json);
@@ -2648,6 +2844,152 @@ mod tests {
         assert_eq!(
             of(Some("application/x-www-form-urlencoded")),
             rpc::Payload::Other
+        );
+        assert_eq!(of(Some("text/csv")), rpc::Payload::Other);
+        assert_eq!(of(Some("audio/mpeg3")), rpc::Payload::Other);
+    }
+
+    /// An empty Content-Type is no Content-Type: hyper sends the
+    /// header on a body-less request and the value is the empty
+    /// string, which is not a media type and must not be refused as
+    /// one.
+    #[test]
+    fn a_body_that_named_nothing_is_read_as_json() {
+        let mut h = HeaderMap::new();
+        h.insert(header::CONTENT_TYPE, "".parse().unwrap());
+        assert_eq!(content_of(&h), Content::Json);
+        assert_eq!(content_of(&HeaderMap::new()), Content::Json);
+        assert_eq!(
+            content_of(&h.clone()).name(),
+            "application/json".to_string()
+        );
+        h.insert(header::CONTENT_TYPE, "audio/mpeg3".parse().unwrap());
+        assert_eq!(
+            content_of(&h),
+            Content::Other("audio/mpeg3".to_string()),
+            "a type nothing reads keeps its name for the refusal"
+        );
+        assert_eq!(
+            unreadable(&content_of(&h).name()).message,
+            "Content-Type not acceptable: audio/mpeg3"
+        );
+    }
+
+    /// A function's own media type is only reached by naming it. No
+    /// Accept at all, or a star, is json, because the handler is not
+    /// registered under either.
+    #[test]
+    fn a_functions_own_media_type_has_to_be_asked_for_by_name() {
+        let accept = |v: Option<&str>| {
+            let mut h = HeaderMap::new();
+            if let Some(v) = v {
+                h.insert(header::ACCEPT, v.parse().unwrap());
+            }
+            negotiate_call(&h, Some("text/plain"))
+        };
+        assert_eq!(accept(None).unwrap(), Media::Json { stripped: false });
+        assert_eq!(
+            accept(Some("*/*")).unwrap(),
+            Media::Json { stripped: false }
+        );
+        assert_eq!(
+            accept(Some("text/plain")).unwrap(),
+            Media::Custom("text/plain".to_string())
+        );
+        assert_eq!(
+            accept(Some("text/plain; charset=utf-8")).unwrap(),
+            Media::Custom("text/plain".to_string()),
+            "a parameter nobody reads does not hide the type"
+        );
+        // Without the function's own type on offer the same request
+        // has nothing left to be answered in.
+        let mut h = HeaderMap::new();
+        h.insert(header::ACCEPT, "text/plain".parse().unwrap());
+        let e = negotiate_call(&h, None).unwrap_err();
+        assert_eq!(e.code, "PGRST107");
+        assert_eq!(
+            e.message,
+            "None of these media types are available: text/plain"
+        );
+    }
+
+    /// The 406 names what was asked for the way this surface spells
+    /// it, not the way the request wrote it, which is why a bare plan
+    /// comes back with the media type it is a plan of on it.
+    #[test]
+    fn the_refusal_spells_the_name_back_in_full() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::ACCEPT,
+            "application/vnd.pgrst.plan".parse().unwrap(),
+        );
+        assert_eq!(
+            negotiate(&h).unwrap_err().message,
+            "None of these media types are available: \
+             application/vnd.pgrst.plan+text; for=\"application/json\""
+        );
+    }
+
+    /// A csv body is rows of text under the header's names, and the
+    /// word NULL is the only null in it.
+    #[test]
+    fn a_csv_body_is_its_records_under_its_header() {
+        let (cols, rows) = body_rows(&Content::Csv, b"id,name\n1,foo\n2,NULL", None).unwrap();
+        assert_eq!(cols, ["id", "name"]);
+        assert_eq!(
+            rows,
+            vec![
+                serde_json::json!({"id": "1", "name": "foo"}),
+                serde_json::json!({"id": "2", "name": null}),
+            ]
+        );
+        assert_eq!(
+            body_rows(&Content::Csv, b"id,name\n1", None)
+                .unwrap_err()
+                .message,
+            "All lines must have same number of fields"
+        );
+    }
+
+    /// A form body is one row of text whatever it says, so nothing in
+    /// it is a number and nothing in it is null.
+    #[test]
+    fn a_form_body_is_one_row_of_text() {
+        let (cols, rows) = body_rows(&Content::Form, b"id=1&name=foo+bar", None).unwrap();
+        assert_eq!(cols, ["id", "name"]);
+        assert_eq!(
+            rows,
+            vec![serde_json::json!({"id": "1", "name": "foo bar"})]
+        );
+        // A table takes one row, so a repeated key is the last one
+        // written rather than a list.
+        let (_, rows) = body_rows(&Content::Form, b"a=1&a=2", None).unwrap();
+        assert_eq!(rows, vec![serde_json::json!({"a": "2"})]);
+        // A call takes the pairs instead, repeats and order kept,
+        // which is what fills a variadic argument.
+        assert_eq!(
+            form_pairs(b"v=hi&v=there"),
+            vec![
+                ("v".to_string(), "hi".to_string()),
+                ("v".to_string(), "there".to_string()),
+            ]
+        );
+    }
+
+    /// A body nothing here reads is refused on its content type, and
+    /// the bytes are never looked at.
+    #[test]
+    fn a_body_in_a_type_nothing_reads_is_refused_unread() {
+        let e = body_rows(&Content::Other("audio/mpeg3".to_string()), b"", None).unwrap_err();
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.code, "PGRST102");
+        assert_eq!(e.message, "Content-Type not acceptable: audio/mpeg3");
+        // A value body is one value, which a table has no column for.
+        assert_eq!(
+            body_rows(&Content::Value(rpc::Payload::Text), b"hi", None)
+                .unwrap_err()
+                .message,
+            "Content-Type not acceptable: text/plain"
         );
     }
 
@@ -3171,34 +3513,38 @@ mod tests {
 
     #[test]
     fn insert_bodies_normalize_to_an_array_and_the_first_row_names_the_columns() {
-        let (cols, payload) = insert_payload(br#"{"a":1,"b":2}"#, None).unwrap();
+        let (cols, payload) = insert_payload(&Content::Json, br#"{"a":1,"b":2}"#, None).unwrap();
         assert_eq!(cols, vec!["a", "b"]);
         assert_eq!(payload, r#"[{"a":1,"b":2}]"#);
 
-        let (cols, _) = insert_payload(br#"[{"a":1,"b":2},{"b":3,"a":4}]"#, None).unwrap();
+        let (cols, _) =
+            insert_payload(&Content::Json, br#"[{"a":1,"b":2},{"b":3,"a":4}]"#, None).unwrap();
         assert_eq!(cols, vec!["a", "b"], "order across rows is not a mismatch");
 
         let narrowing = vec!["a".to_string()];
-        let (cols, _) = insert_payload(br#"[{"a":1,"b":2}]"#, Some(&narrowing)).unwrap();
+        let (cols, _) =
+            insert_payload(&Content::Json, br#"[{"a":1,"b":2}]"#, Some(&narrowing)).unwrap();
         assert_eq!(cols, vec!["a"], "the columns parameter narrows");
         assert!(
-            insert_payload(b"[1,2]", Some(&narrowing)).is_ok(),
+            insert_payload(&Content::Json, b"[1,2]", Some(&narrowing)).is_ok(),
             "and it stops the body being read, so postgres refuses this one"
         );
 
         // A body that is not json is one sentence, whatever serde
         // thought of it, and a body that is not an object at all is
         // a row of defaults rather than a refusal.
-        let e = insert_payload(b"", None).unwrap_err();
+        let e = insert_payload(&Content::Json, b"", None).unwrap_err();
         assert_eq!(
             (e.code.as_str(), e.message.as_str()),
             ("PGRST102", "Empty or invalid json")
         );
         assert_eq!(
-            insert_payload(b"}{", None).unwrap_err().message,
+            insert_payload(&Content::Json, b"}{", None)
+                .unwrap_err()
+                .message,
             "Empty or invalid json"
         );
-        let (cols, payload) = insert_payload(b"42", None).unwrap();
+        let (cols, payload) = insert_payload(&Content::Json, b"42", None).unwrap();
         assert!(cols.is_empty());
         assert_eq!(payload, "[42]");
 
@@ -3207,18 +3553,19 @@ mod tests {
             br#"[{"a":1},{"b":2}]"#,
             br#"[{"a":1},{"a":2,"b":3}]"#,
         ] {
-            let e = insert_payload(body, None).unwrap_err();
+            let e = insert_payload(&Content::Json, body, None).unwrap_err();
             assert_eq!(e.message, "All object keys must match", "for {body:?}");
         }
     }
 
     #[test]
     fn update_bodies_are_read_down_to_one_row() {
-        let (cols, payload) = update_payload(br#"{"title":"x"}"#, None).unwrap();
+        let (cols, payload) = update_payload(&Content::Json, br#"{"title":"x"}"#, None).unwrap();
         assert_eq!(cols, vec!["title"]);
         assert_eq!(payload, r#"{"title":"x"}"#);
 
-        let (cols, payload) = update_payload(br#"[{"a":1},{"a":2}]"#, None).unwrap();
+        let (cols, payload) =
+            update_payload(&Content::Json, br#"[{"a":1},{"a":2}]"#, None).unwrap();
         assert_eq!(cols, vec!["a"]);
         assert_eq!(
             payload, r#"{"a":1}"#,
@@ -3227,11 +3574,11 @@ mod tests {
 
         // Nothing to set, which is a statement rather than an error.
         for body in [&b"[]"[..], b"{}", b"[{}]", b"42"] {
-            let (cols, _) = update_payload(body, None).unwrap();
+            let (cols, _) = update_payload(&Content::Json, body, None).unwrap();
             assert!(cols.is_empty(), "for {body:?}");
         }
         let named = vec!["a".to_string()];
-        let (cols, _) = update_payload(b"[]", Some(&named)).unwrap();
+        let (cols, _) = update_payload(&Content::Json, b"[]", Some(&named)).unwrap();
         assert!(
             cols.is_empty(),
             "an empty array has no row to take them from"
