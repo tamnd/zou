@@ -17,11 +17,18 @@
 //!   is to step down, not to retry into someone else's chain.
 //! - Empty windows PUT nothing. An idle shard costs zero requests.
 //!
-//! Deliberately synchronous, plain threads and condvars, matching the
-//! v1 group commit in zou-store. Frames are encoded on the append path
-//! so the flush path only copies bytes.
+//! Landing is pipelined: the chain digest links window content, not
+//! acks, so window n+1 builds and lands while n is still in flight,
+//! up to [`SequencerConfig::inflight`] at once. That takes the commit
+//! cycle from the mean PUT latency, which a fat tailed store drags
+//! way past its p50, down to the batch window plus one PUT. Acks
+//! still resolve strictly in chain order, because a segment behind a
+//! hole is unreachable by the digest walk and calling it durable
+//! would be a lie. Plain threads and condvars throughout. Frames are
+//! encoded on the append path so the flush path only copies bytes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -42,6 +49,12 @@ pub trait SegmentSink: Send + Sync {
     fn put_segment(&self, seq: u64, segment: &[u8]) -> Result<(), CasError>;
 }
 
+/// The hard cap on [`SequencerConfig::inflight`]. Takeover leans on
+/// it: a crash leaves stragglers at most this far past the first hole
+/// in the chain, so the head search and the straggler sweep both know
+/// where to stop looking.
+pub const MAX_INFLIGHT: usize = 64;
+
 #[derive(Debug, Clone)]
 pub struct SequencerConfig {
     /// Batch window, commit p50 is about half of this plus the PUT p50.
@@ -50,6 +63,12 @@ pub struct SequencerConfig {
     pub batch_bytes: usize,
     /// Close early once this many frames are pending.
     pub batch_frames: usize,
+    /// Landing PUTs in flight at once, between 1 and [`MAX_INFLIGHT`].
+    /// One is the fully serial chain. More lets the next window land
+    /// while its predecessors are still on the wire, which is what
+    /// keeps the commit cycle at the window instead of the mean PUT
+    /// latency. Acks resolve in chain order no matter the setting.
+    pub inflight: usize,
     /// Where durable windows fan out to subscribers (spec 03 section
     /// 8). The tee sees a window only after its PUT returned, and
     /// publishing never blocks or fails the flush: durability does not
@@ -63,6 +82,7 @@ impl Default for SequencerConfig {
             window: Duration::from_millis(3),
             batch_bytes: 4 * 1024 * 1024,
             batch_frames: 4096,
+            inflight: 16,
             tee: None,
         }
     }
@@ -153,11 +173,134 @@ struct Shared {
     work: Condvar,
 }
 
-/// The role. Owns the flusher thread; drop or [`Sequencer::close`]
-/// drains the open batch before the thread exits.
+/// One closed batch on its way to the store.
+struct Dispatch {
+    seq: u64,
+    segment: Vec<u8>,
+    /// Decoded frames for the tee, empty when no tee is configured.
+    frames: Vec<Frame2>,
+    tickets: Vec<(Arc<TicketInner>, Lsn)>,
+}
+
+/// Ordered resolution for landed windows. Put workers park their
+/// outcome here and only the contiguous prefix resolves, in chain
+/// order: a window whose predecessor has not landed is not durable no
+/// matter what the store said about the window itself.
+///
+/// Lock order is lander state before sequencer state, never the other
+/// way around.
+struct Lander {
+    shard: u32,
+    tee: Option<Arc<Tee>>,
+    state: Mutex<LanderState>,
+    moved: Condvar,
+}
+
+struct LanderState {
+    /// The next seq to resolve; everything below it already resolved.
+    next_ack: u64,
+    /// Landed out of order, waiting for their predecessors.
+    parked: BTreeMap<u64, (Dispatch, Result<(), CasError>)>,
+    /// A window failed; everything at or past it resolves as failed.
+    failed: bool,
+    /// Dispatched but not yet resolved, the flusher's admission gate.
+    outstanding: usize,
+}
+
+impl Lander {
+    fn complete(&self, shared: &Shared, d: Dispatch, outcome: Result<(), CasError>) {
+        let mut st = self.state.lock().unwrap();
+        st.parked.insert(d.seq, (d, outcome));
+        while let Some((&seq, _)) = st.parked.first_key_value() {
+            if seq != st.next_ack {
+                break;
+            }
+            let (d, outcome) = st.parked.remove(&seq).unwrap();
+            if st.failed {
+                // An earlier window failed, so this one sits behind a
+                // hole even if its own PUT landed.
+                for (ticket, _) in &d.tickets {
+                    resolve(ticket, Err(AppendError::Poisoned));
+                }
+            } else {
+                match outcome {
+                    Ok(()) => {
+                        for (ticket, lsn) in &d.tickets {
+                            resolve(ticket, Ok(*lsn));
+                        }
+                        // The tee sees windows strictly in order and
+                        // strictly after the whole prefix is durable.
+                        // Fan out is channel sends and never blocks.
+                        if let Some(tee) = &self.tee {
+                            tee.publish(seq, &d.frames);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("shard {} seq {seq} landing put failed: {e}", self.shard);
+                        st.failed = true;
+                        shared.state.lock().unwrap().poisoned = true;
+                        let source = Arc::new(e);
+                        for (ticket, _) in &d.tickets {
+                            resolve(
+                                ticket,
+                                Err(AppendError::Store {
+                                    source: Arc::clone(&source),
+                                }),
+                            );
+                        }
+                    }
+                }
+            }
+            st.next_ack = seq + 1;
+            st.outstanding -= 1;
+        }
+        drop(st);
+        self.moved.notify_all();
+    }
+
+    /// Block until fewer than `limit` windows are dispatched and
+    /// unresolved, then claim a slot. The bound covers parked windows
+    /// too, not just PUTs on the wire, so a crash leaves stragglers at
+    /// most [`MAX_INFLIGHT`] past the first hole.
+    fn admit(&self, limit: usize) {
+        let mut st = self.state.lock().unwrap();
+        while st.outstanding >= limit {
+            st = self.moved.wait(st).unwrap();
+        }
+        st.outstanding += 1;
+    }
+
+    fn wait_drained(&self) {
+        let mut st = self.state.lock().unwrap();
+        while st.outstanding > 0 {
+            st = self.moved.wait(st).unwrap();
+        }
+    }
+}
+
+fn put_worker(
+    rx: &Mutex<Receiver<Dispatch>>,
+    sink: &dyn SegmentSink,
+    shared: &Shared,
+    lander: &Lander,
+) {
+    loop {
+        // Holding the receiver lock across the blocking recv is fine:
+        // idle workers queue on the mutex instead of the channel.
+        let d = match rx.lock().unwrap().recv() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let outcome = sink.put_segment(d.seq, &d.segment);
+        lander.complete(shared, d, outcome);
+    }
+}
+
+/// The role. Owns the flusher and put worker threads; drop or
+/// [`Sequencer::close`] drains every staged window before they exit.
 pub struct Sequencer {
     shared: Arc<Shared>,
-    handle: Option<JoinHandle<()>>,
+    handles: Vec<JoinHandle<()>>,
 }
 
 impl Sequencer {
@@ -176,6 +319,10 @@ impl Sequencer {
         next_seq: u64,
         prev_digest: u64,
     ) -> Self {
+        assert!(
+            (1..=MAX_INFLIGHT).contains(&config.inflight),
+            "inflight must be between 1 and {MAX_INFLIGHT}"
+        );
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 batch: None,
@@ -187,14 +334,36 @@ impl Sequencer {
             }),
             work: Condvar::new(),
         });
-        let handle = {
+        let lander = Arc::new(Lander {
+            shard,
+            tee: config.tee.clone(),
+            state: Mutex::new(LanderState {
+                next_ack: next_seq,
+                parked: BTreeMap::new(),
+                failed: false,
+                outstanding: 0,
+            }),
+            moved: Condvar::new(),
+        });
+        let (tx, rx) = mpsc::sync_channel::<Dispatch>(config.inflight);
+        let rx = Arc::new(Mutex::new(rx));
+        let mut handles = Vec::with_capacity(config.inflight + 1);
+        for _ in 0..config.inflight {
+            let rx = Arc::clone(&rx);
+            let sink = Arc::clone(&sink);
             let shared = Arc::clone(&shared);
-            std::thread::spawn(move || flusher_loop(&shared, &*sink, shard, &config))
-        };
-        Self {
-            shared,
-            handle: Some(handle),
+            let lander = Arc::clone(&lander);
+            handles.push(std::thread::spawn(move || {
+                put_worker(&rx, &*sink, &shared, &lander)
+            }));
         }
+        {
+            let shared = Arc::clone(&shared);
+            handles.push(std::thread::spawn(move || {
+                flusher_loop(&shared, shard, &config, tx, &lander)
+            }));
+        }
+        Self { shared, handles }
     }
 
     /// Stage frames for the batch in flight and return the ticket that
@@ -272,14 +441,18 @@ impl Sequencer {
             .copied()
     }
 
-    /// Drain the open batch and stop. Every staged append resolves,
-    /// durably or with the failure, before this returns.
+    /// Drain the open batch and every window in flight, then stop.
+    /// Every staged append resolves, durably or with the failure,
+    /// before this returns.
     pub fn close(mut self) -> std::thread::Result<()> {
         self.begin_shutdown();
-        match self.handle.take() {
-            Some(handle) => handle.join(),
-            None => Ok(()),
+        let mut result = Ok(());
+        for handle in self.handles.drain(..) {
+            if let Err(e) = handle.join() {
+                result = Err(e);
+            }
         }
+        result
     }
 
     fn begin_shutdown(&self) {
@@ -291,18 +464,24 @@ impl Sequencer {
 impl Drop for Sequencer {
     fn drop(&mut self) {
         self.begin_shutdown();
-        if let Some(handle) = self.handle.take() {
+        for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
     }
 }
 
-fn flusher_loop(shared: &Shared, sink: &dyn SegmentSink, shard: u32, config: &SequencerConfig) {
+fn flusher_loop(
+    shared: &Shared,
+    shard: u32,
+    config: &SequencerConfig,
+    tx: SyncSender<Dispatch>,
+    lander: &Lander,
+) {
     let mut state = shared.state.lock().unwrap();
     loop {
         let Some(batch) = state.batch.as_ref() else {
             if state.shutdown {
-                return;
+                break;
             }
             state = shared.work.wait(state).unwrap();
             continue;
@@ -335,8 +514,8 @@ fn flusher_loop(shared: &Shared, sink: &dyn SegmentSink, shard: u32, config: &Se
         let prev_digest = state.prev_digest;
         drop(state);
 
-        // Build and PUT outside the lock so appends keep staging the
-        // next window while this one lands.
+        // Build outside the lock so appends keep staging the next
+        // window while this one encodes.
         let mut builder = SegmentBuilder::new(SegmentHeader {
             kind: SegmentKind::Landing,
             shard,
@@ -347,40 +526,44 @@ fn flusher_loop(shared: &Shared, sink: &dyn SegmentSink, shard: u32, config: &Se
             builder.push_encoded(f.frame.tenant, f.frame.start_lsn, f.frame.end_lsn, &f.wire);
         }
         let (segment, summaries) = builder.finish();
-        let outcome = sink.put_segment(seq, &segment);
 
-        // The tee sees the window strictly after the PUT returned, so
-        // no subscriber can observe a frame that is not durable yet.
-        // Fan out is channel sends and never blocks the flusher.
-        if outcome.is_ok()
-            && let Some(tee) = &config.tee
-        {
-            let frames: Vec<Frame2> = batch.frames.into_iter().map(|s| s.frame).collect();
-            tee.publish(seq, &frames);
-        }
-
+        // The chain links window content, not acks, so the position
+        // advances the moment the segment is built and the next window
+        // lands behind this one without waiting for its PUT.
         state = shared.state.lock().unwrap();
-        match outcome {
-            Ok(()) => {
-                state.next_seq = seq + 1;
-                state.prev_digest = tenants_digest(&summaries);
-                for (ticket, durable_lsn) in &batch.tickets {
-                    resolve(ticket, Ok(*durable_lsn));
-                }
+        state.next_seq = seq + 1;
+        state.prev_digest = tenants_digest(&summaries);
+        drop(state);
+
+        let frames = if lander.tee.is_some() {
+            batch.frames.into_iter().map(|s| s.frame).collect()
+        } else {
+            Vec::new()
+        };
+        let dispatch = Dispatch {
+            seq,
+            segment,
+            frames,
+            tickets: batch.tickets,
+        };
+        lander.admit(config.inflight);
+        if let Err(mpsc::SendError(d)) = tx.send(dispatch) {
+            // The workers are gone, which takes a panic in the sink.
+            // Fail the batch loudly instead of hanging its committers.
+            for (ticket, _) in &d.tickets {
+                resolve(ticket, Err(AppendError::Poisoned));
             }
-            Err(e) => {
-                log::error!("shard {shard} seq {seq} landing put failed: {e}");
-                state.poisoned = true;
-                let source = Arc::new(e);
-                for (ticket, _) in &batch.tickets {
-                    resolve(
-                        ticket,
-                        Err(AppendError::Store {
-                            source: Arc::clone(&source),
-                        }),
-                    );
-                }
-            }
+            let mut st = lander.state.lock().unwrap();
+            st.failed = true;
+            st.outstanding -= 1;
+            drop(st);
+            shared.state.lock().unwrap().poisoned = true;
         }
+        state = shared.state.lock().unwrap();
     }
+    // Shutdown: nothing left to stage. Close the channel so idle
+    // workers exit, then wait for every window in flight to resolve.
+    drop(state);
+    drop(tx);
+    lander.wait_drained();
 }

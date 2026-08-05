@@ -42,7 +42,9 @@ pub use segment::{
     Footer, SEGMENT_VERSION, SegmentBuilder, SegmentDecodeError, SegmentHeader, SegmentKind,
     TenantRun, TenantSummary, decode_segment, read_footer, tenants_digest,
 };
-pub use sequencer::{AppendError, AppendTicket, SegmentSink, Sequencer, SequencerConfig};
+pub use sequencer::{
+    AppendError, AppendTicket, MAX_INFLIGHT, SegmentSink, Sequencer, SequencerConfig,
+};
 pub use tee::{
     DEFAULT_TEE_BUFFER, Tee, TeeEvent, TeeFilter, TeeSubscription, catch_up, stream_end,
 };

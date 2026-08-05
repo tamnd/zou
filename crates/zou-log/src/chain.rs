@@ -29,6 +29,7 @@ use crate::segment::{
     Footer, SegmentBuilder, SegmentDecodeError, SegmentHeader, SegmentKind, decode_segment,
     read_footer, tenants_digest,
 };
+use crate::sequencer::MAX_INFLIGHT;
 
 pub const SHARD_MANIFEST_FORMAT: u32 = 1;
 
@@ -147,9 +148,14 @@ pub struct Takeover {
 
 /// Find the chain head by probing forward from a known floor. The
 /// chain is gap free and a seq only counts once an owner holds it
-/// under the media's presence rule, so presence is a prefix: gallop
-/// then binary search, log cost in the distance since the manifest was
-/// last written, no LIST anywhere near the hot path.
+/// under the media's presence rule. Presence is contiguous only below
+/// the first hole: a pipelined flusher can land seq n+1 while n never
+/// makes it, so a crash leaves stragglers up to
+/// [`MAX_INFLIGHT`] past the hole. Gallop then
+/// binary search still finds a present seq with an absent successor
+/// in log cost, and a backscan bounded by that same cap pins the
+/// first hole, which is the only honest head: the digest walk cannot
+/// reach anything past it. No LIST anywhere near the hot path.
 pub fn chain_head(media: &WalMedia, shard: u32, floor: u64) -> Result<u64, ChainError> {
     if !media.present(shard, floor + 1)? {
         return Ok(floor);
@@ -173,6 +179,16 @@ pub fn chain_head(media: &WalMedia, shard: u32, floor: u64) -> Result<u64, Chain
             lo = mid;
         } else {
             hi = mid;
+        }
+    }
+    // lo is present with lo + 1 absent, but lo may itself be a
+    // straggler past the first hole. Stragglers reach at most
+    // MAX_INFLIGHT past that hole, so it sits in this window or lo is
+    // the true head.
+    let base = (floor + 1).max(lo.saturating_sub(MAX_INFLIGHT as u64));
+    for seq in base..=lo {
+        if !media.present(shard, seq)? {
+            return Ok(seq - 1);
         }
     }
     Ok(lo)
@@ -249,6 +265,7 @@ pub fn take_over(media: &WalMedia, shard: u32, node: &str) -> Result<Takeover, C
         let body = serde_json::to_vec_pretty(&next).expect("shard manifest serializes");
         match store.put_if_match(&manifest_key(shard), &body, version) {
             Ok(_) => {
+                sweep_stragglers(media, shard, sealed_seq)?;
                 return Ok(Takeover {
                     chain_epoch: next.chain_epoch,
                     sealed_seq,
@@ -268,6 +285,38 @@ pub fn take_over(media: &WalMedia, shard: u32, node: &str) -> Result<Takeover, C
         shard,
         attempts: MAX_ATTEMPTS,
     })
+}
+
+/// A crash of a pipelined flusher can leave landing segments past the
+/// first hole in the chain. The digest walk stops at the seal, so they
+/// are unreachable, but they sit exactly where the resumed sequencer
+/// lands next and a stale object there reads as a fence and poisons
+/// the new owner on its first window. Sweep them out, only once the
+/// manifest CAS has named us the owner so no rival's fresh chain is
+/// anywhere near these seqs. Only landing segments go: a seal past
+/// ours means a rival fenced us after our seal landed, and deleting it
+/// would hand that rival's chain a hole under writes it already acked.
+fn sweep_stragglers(media: &WalMedia, shard: u32, sealed_seq: u64) -> Result<(), ChainError> {
+    let mut seq = sealed_seq;
+    let mut gap = 0usize;
+    while gap < MAX_INFLIGHT {
+        seq += 1;
+        if !media.present(shard, seq)? {
+            gap += 1;
+            continue;
+        }
+        gap = 0;
+        let Some(bytes) = media.fetch(shard, seq)? else {
+            continue;
+        };
+        let (header, _) =
+            read_footer(&bytes).map_err(|source| ChainError::Segment { shard, seq, source })?;
+        if header.kind != SegmentKind::Landing {
+            break;
+        }
+        media.delete_segment(shard, seq)?;
+    }
+    Ok(())
 }
 
 /// One decoded chain position.
