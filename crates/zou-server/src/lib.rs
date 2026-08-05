@@ -63,6 +63,14 @@ pub struct Config {
     /// The first is the default when no profile header picks one;
     /// empty means just public, the fresh Supabase project shape.
     pub schemas: Vec<String>,
+    /// The role a request with no role of its own runs as, PostgREST's
+    /// db-anon-role. Supabase names it `anon` and so does this by
+    /// default. It is not only the fallback: it is also how a refusal
+    /// tells the two audiences apart, since permission denied to a
+    /// caller who never said who they were is a 401 with a challenge
+    /// on it, and the same refusal to a caller who did is a 403 with
+    /// nothing to try next.
+    pub anon_role: String,
     /// Where this server answers from the outside, GoTrue's
     /// API_EXTERNAL_URL. It is the `iss` claim of every access token,
     /// with /auth/v1 appended, which is the one place a client can
@@ -180,6 +188,7 @@ impl Default for Config {
             rate: None,
             jwks: None,
             schemas: Vec::new(),
+            anon_role: "anon".to_string(),
             external_url: None,
             jwt_keys: None,
             mailer_autoconfirm: false,
@@ -504,7 +513,7 @@ async fn dev_inbox(
 ) -> Response {
     let (inbox, sink) = (readable_inbox(&app, &ctx), readable_sink(&app, &ctx));
     if inbox.is_none() && sink.is_none() {
-        return no_route().await;
+        return kong_no_route();
     }
     let messages: Vec<serde_json::Value> = match inbox {
         Some(inbox) => inbox.kept().iter().map(mail::Mail::as_json).collect(),
@@ -528,7 +537,7 @@ async fn dev_inbox_clear(
 ) -> Response {
     let (inbox, sink) = (readable_inbox(&app, &ctx), readable_sink(&app, &ctx));
     if inbox.is_none() && sink.is_none() {
-        return no_route().await;
+        return kong_no_route();
     }
     if let Some(inbox) = inbox {
         inbox.clear();
@@ -589,12 +598,32 @@ async fn realtime_stub() -> Response {
 
 /// Anything outside the four prefixes, in the words the hosted edge
 /// uses for an unmatched route.
-async fn no_route() -> Response {
+///
+/// Except a url that was aiming at the rest surface, which hears from
+/// the rest surface instead. The test is the string rather than the
+/// segments on purpose: a client that dropped a slash is talking to
+/// this api and should be told so in the shape it can read, not handed
+/// the gateway's line about routes. The bare prefix with nothing after
+/// it is not aiming at anything, and keeps the gateway's words.
+async fn no_route(uri: axum::http::Uri) -> Response {
+    match uri.path().strip_prefix(REST_PREFIX) {
+        Some(rest) if !rest.is_empty() => rest::invalid_path(),
+        _ => kong_no_route(),
+    }
+}
+
+/// The gateway's words for a url it has no route for, which a surface
+/// that is switched off answers with too, so that off is
+/// indistinguishable from never built.
+fn kong_no_route() -> Response {
     json_body(
         StatusCode::NOT_FOUND,
         serde_json::json!({"message": "no Route matched with those values"}),
     )
 }
+
+/// Where the rest surface lives, without its trailing slash.
+const REST_PREFIX: &str = "/rest/v1";
 
 /// The whole front door as one axum router. Layer order matters:
 /// request id outermost so even a 404 or a 429 carries one, CORS next

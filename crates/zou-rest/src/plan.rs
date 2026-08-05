@@ -28,9 +28,11 @@
 //! PostgREST refuses it, since silently dropping a filter is the one
 //! thing a REST layer must never do.
 //!
-//! Every level reads from exactly one table under a generated alias,
-//! z0 for the root and z{n} per embed, so a self referencing embed
-//! joins two aliases of the same table instead of colliding, and a
+//! Every level reads from exactly one table under an alias, the
+//! table's own name at the root and a generated z{n} per embed, so a
+//! self referencing embed joins two aliases of the same table instead
+//! of colliding, a message from postgres about a column that is not
+//! there still names the table the caller asked for, and a
 //! many to many walks its junction through an IN subquery rather
 //! than a second FROM entry. All literals still bind as parameters
 //! through the WHERE compiler, the planner itself splices only
@@ -139,7 +141,7 @@ pub fn plan_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<Sq
         params,
         next: 0,
     };
-    let root = p.next_alias();
+    let root = p.root_alias();
     let text = p
         .level(
             &q.table,
@@ -181,7 +183,7 @@ pub fn count_from(catalog: &Catalog, q: &Query, params: Vec<String>) -> Result<S
         params,
         next: 0,
     };
-    let root = p.next_alias();
+    let root = p.root_alias();
     let text = p.count_level(&q.table, &root, &q.select, &[], Link::Root)?;
     Ok(Sql {
         text,
@@ -390,6 +392,31 @@ enum Link {
 }
 
 impl Planner<'_> {
+    /// The name the root level goes by.
+    ///
+    /// It is the table's own name rather than a generated alias,
+    /// because it is the word the caller wrote and the word postgres
+    /// puts in a message about a column that is not there: a request
+    /// for a column items does not have should hear about items. Two
+    /// roots keep the generated alias anyway. A mutation's root is the
+    /// CTE holding the rows it just wrote rather than the table, and a
+    /// table whose name is already shaped like one of these aliases
+    /// would collide with the first embed.
+    fn root_alias(&mut self) -> String {
+        let table = &self.q.table;
+        let alias_shaped = table.len() > 1
+            && table.starts_with('z')
+            && table[1..].bytes().all(|b| b.is_ascii_digit());
+        if self.q.source.is_some() || alias_shaped {
+            return self.next_alias();
+        }
+        let root = table.clone();
+        // The embeds carry on from z1 as if the root had taken z0, so
+        // that the alias of a level still says how deep it is.
+        self.next = 1;
+        root
+    }
+
     fn next_alias(&mut self) -> String {
         let a = format!("z{}", self.next);
         self.next += 1;
@@ -1273,8 +1300,9 @@ mod tests {
     #[test]
     fn a_column_is_written_out_through_the_cast_its_type_has() {
         assert!(
-            painted_text("todos", "id,label_color")
-                .contains(r#""z0"."id" as "id", test.json("z0"."label_color") as "label_color""#),
+            painted_text("todos", "id,label_color").contains(
+                r#""todos"."id" as "id", test.json("todos"."label_color") as "label_color""#
+            ),
             "{}",
             painted_text("todos", "id,label_color")
         );
@@ -1283,7 +1311,7 @@ mod tests {
         // client would have been shown.
         assert!(
             painted_text("todos", "label_color::text")
-                .contains(r#"test.json("z0"."label_color")::text as "label_color""#),
+                .contains(r#"test.json("todos"."label_color")::text as "label_color""#),
             "{}",
             painted_text("todos", "label_color::text")
         );
@@ -1293,13 +1321,13 @@ mod tests {
     fn a_star_is_spelled_out_only_where_a_cast_needs_the_room() {
         assert_eq!(
             painted_text("todos", "*"),
-            r#"select "z0"."id" as "id", test.json("z0"."label_color") as "label_color", "z0"."data" as "data" from "todos" as "z0""#
+            r#"select "todos"."id" as "id", test.json("todos"."label_color") as "label_color", "todos"."data" as "data" from "todos" as "todos""#
         );
         // A relation with nothing to represent keeps its star, which
         // is what upstream leaves alone too.
         assert_eq!(
             painted_text("users", "*"),
-            r#"select "z0".* from "users" as "z0""#
+            r#"select "users".* from "users" as "users""#
         );
     }
 
@@ -1319,13 +1347,14 @@ mod tests {
         // value, and a json path has already left the column's type
         // behind by the time it lands.
         assert!(
-            painted_text("todos", "label_color.count()").contains(r#"count("z0"."label_color")"#),
+            painted_text("todos", "label_color.count()")
+                .contains(r#"count("todos"."label_color")"#),
             "{}",
             painted_text("todos", "label_color.count()")
         );
         assert!(
             painted_text("todos", "label_color->shade")
-                .contains(r#"to_jsonb("z0"."label_color")->'shade'"#),
+                .contains(r#"to_jsonb("todos"."label_color")->'shade'"#),
             "{}",
             painted_text("todos", "label_color->shade")
         );
@@ -1336,7 +1365,8 @@ mod tests {
         // `::` binds tighter than `->>`, so without them the cast
         // lands on the key and the value comes back as text.
         assert!(
-            painted_text("todos", "data->>0::int").contains(r#"("z0"."data"->>0)::int as "data""#),
+            painted_text("todos", "data->>0::int")
+                .contains(r#"("todos"."data"->>0)::int as "data""#),
             "{}",
             painted_text("todos", "data->>0::int")
         );
@@ -1349,7 +1379,7 @@ mod tests {
         let s = plan(&painted(), &q).unwrap_or_else(|e| panic!("{e}"));
         assert!(
             s.text
-                .ends_with(r#" where "z0"."label_color" = test.color($1)"#),
+                .ends_with(r#" where "todos"."label_color" = test.color($1)"#),
             "{}",
             s.text
         );
@@ -1361,7 +1391,7 @@ mod tests {
         let q = query("users", "id,orders(id)");
         assert_eq!(
             text(&q),
-            r#"select "z0"."id" as "id", coalesce("e_z1"."j", '[]'::jsonb) as "orders" from "users" as "z0" left join lateral (select jsonb_agg(to_jsonb("r_z1")) as "j" from (select "z1"."id" as "id" from "orders" as "z1" where "z1"."user_id" = "z0"."id") as "r_z1") as "e_z1" on true"#
+            r#"select "users"."id" as "id", coalesce("e_z1"."j", '[]'::jsonb) as "orders" from "users" as "users" left join lateral (select jsonb_agg(to_jsonb("r_z1")) as "j" from (select "z1"."id" as "id" from "orders" as "z1" where "z1"."user_id" = "users"."id") as "r_z1") as "e_z1" on true"#
         );
     }
 
@@ -1370,7 +1400,7 @@ mod tests {
         let q = query("orders", "id,users(id)");
         assert_eq!(
             text(&q),
-            r#"select "z0"."id" as "id", to_jsonb("e_z1") as "users" from "orders" as "z0" left join lateral (select "z1"."id" as "id" from "users" as "z1" where "z1"."id" = "z0"."user_id") as "e_z1" on true"#
+            r#"select "orders"."id" as "id", to_jsonb("e_z1") as "users" from "orders" as "orders" left join lateral (select "z1"."id" as "id" from "users" as "z1" where "z1"."id" = "orders"."user_id") as "e_z1" on true"#
         );
     }
 
@@ -1404,7 +1434,7 @@ mod tests {
         // apart.
         assert_eq!(
             computed_text("users", "id,recent_orders(id)"),
-            r#"select "z0"."id" as "id", coalesce("e_z1"."j", '[]'::jsonb) as "recent_orders" from "users" as "z0" left join lateral (select jsonb_agg(to_jsonb("r_z1")) as "j" from (select "z1"."id" as "id" from "recent_orders"("z0"::"users") as "z1") as "r_z1") as "e_z1" on true"#
+            r#"select "users"."id" as "id", coalesce("e_z1"."j", '[]'::jsonb) as "recent_orders" from "users" as "users" left join lateral (select jsonb_agg(to_jsonb("r_z1")) as "j" from (select "z1"."id" as "id" from "recent_orders"("users"::"users") as "z1") as "r_z1") as "e_z1" on true"#
         );
     }
 
@@ -1412,7 +1442,7 @@ mod tests {
     fn a_function_that_gives_back_one_row_is_a_to_one() {
         assert_eq!(
             computed_text("orders", "id,buyer(id)"),
-            r#"select "z0"."id" as "id", to_jsonb("e_z1") as "buyer" from "orders" as "z0" left join lateral (select "z1"."id" as "id" from "buyer"("z0"::"orders") as "z1") as "e_z1" on true"#
+            r#"select "orders"."id" as "id", to_jsonb("e_z1") as "buyer" from "orders" as "orders" left join lateral (select "z1"."id" as "id" from "buyer"("orders"::"orders") as "z1") as "e_z1" on true"#
         );
     }
 
@@ -1422,7 +1452,7 @@ mod tests {
         // the users table, but through the function now.
         assert!(
             computed_text("orders", "users(id)")
-                .contains(r#"from "users"("z0"::"orders") as "z1""#),
+                .contains(r#"from "users"("orders"::"orders") as "z1""#),
             "{}",
             computed_text("orders", "users(id)")
         );
@@ -1438,7 +1468,7 @@ mod tests {
         let q = query("users", "id,recent_orders!inner(id)");
         assert_eq!(
             count(&computed(), &q).unwrap().text,
-            r#"select 1 from "users" as "z0" where exists (select 1 from "recent_orders"("z0"::"users") as "z1")"#
+            r#"select 1 from "users" as "users" where exists (select 1 from "recent_orders"("users"::"users") as "z1")"#
         );
     }
 
@@ -1449,7 +1479,7 @@ mod tests {
         let sql = plan(&shop(), &q).unwrap();
         assert_eq!(
             sql.text,
-            r#"select "z0"."id" as "id", coalesce("e_z1"."j", '[]'::jsonb) as "orders" from "users" as "z0" join lateral (select jsonb_agg(to_jsonb("r_z1")) as "j" from (select "z1"."id" as "id" from "orders" as "z1" where "z1"."user_id" = "z0"."id" AND "z1"."total" >= $1) as "r_z1") as "e_z1" on "e_z1"."j" is not null"#
+            r#"select "users"."id" as "id", coalesce("e_z1"."j", '[]'::jsonb) as "orders" from "users" as "users" join lateral (select jsonb_agg(to_jsonb("r_z1")) as "j" from (select "z1"."id" as "id" from "orders" as "z1" where "z1"."user_id" = "users"."id" AND "z1"."total" >= $1) as "r_z1") as "e_z1" on "e_z1"."j" is not null"#
         );
         assert_eq!(sql.params, vec!["100"]);
     }
@@ -1460,7 +1490,7 @@ mod tests {
         let t = text(&q);
         assert!(
             t.contains(
-                r#"where ("z1"."id") in (select "z2"."product_id" from "order_items" as "z2" where "z2"."order_id" = "z0"."id")"#
+                r#"where ("z1"."id") in (select "z2"."product_id" from "order_items" as "z2" where "z2"."order_id" = "orders"."id")"#
             ),
             "{t}"
         );
@@ -1471,7 +1501,7 @@ mod tests {
         let q = query("orders", "id,...users(id)");
         assert_eq!(
             text(&q),
-            r#"select "z0"."id" as "id", "e_z1".* from "orders" as "z0" left join lateral (select "z1"."id" as "id" from "users" as "z1" where "z1"."id" = "z0"."user_id") as "e_z1" on true"#
+            r#"select "orders"."id" as "id", "e_z1".* from "orders" as "orders" left join lateral (select "z1"."id" as "id" from "users" as "z1" where "z1"."id" = "orders"."user_id") as "e_z1" on true"#
         );
     }
 
@@ -1484,7 +1514,7 @@ mod tests {
         let q = query("users", "id,...orders(total)");
         assert_eq!(
             text(&q),
-            r#"select "z0"."id" as "id", "e_z1"."total" as "total" from "users" as "z0" left join lateral (select json_agg("s_z1")::jsonb as "j", coalesce(json_agg("s_z1"."total"), '[]')::jsonb as "total" from (select "z1"."total" as "total" from "orders" as "z1" where "z1"."user_id" = "z0"."id") as "s_z1") as "e_z1" on true"#
+            r#"select "users"."id" as "id", "e_z1"."total" as "total" from "users" as "users" left join lateral (select json_agg("s_z1")::jsonb as "j", coalesce(json_agg("s_z1"."total"), '[]')::jsonb as "total" from (select "z1"."total" as "total" from "orders" as "z1" where "z1"."user_id" = "users"."id") as "s_z1") as "e_z1" on true"#
         );
 
         let mut q = query("users", "id,...orders(total)");
@@ -1523,7 +1553,7 @@ mod tests {
         q.limit.push((vec!["orders".into()], 2));
         let t = text(&q);
         assert!(
-            t.contains(r#""z0"."id" order by "z1"."total" desc limit 2) as "r_z1""#),
+            t.contains(r#""users"."id" order by "z1"."total" desc limit 2) as "r_z1""#),
             "{t}"
         );
     }
@@ -1533,7 +1563,7 @@ mod tests {
         let q = query("orders", "user_id,total.sum()");
         assert_eq!(
             text(&q),
-            r#"select "z0"."user_id" as "user_id", sum("z0"."total") as "sum" from "orders" as "z0" group by "z0"."user_id""#
+            r#"select "orders"."user_id" as "user_id", sum("orders"."total") as "sum" from "orders" as "orders" group by "orders"."user_id""#
         );
 
         let q = query("orders", "*,count()");
@@ -1626,7 +1656,7 @@ mod tests {
         // Every other operator reads the name as a column.
         let mut q = query("orders", "id,users()");
         filt(&mut q, "users", "eq.2");
-        assert!(text(&q).contains(r#""z0"."users" = $1"#));
+        assert!(text(&q).contains(r#""orders"."users" = $1"#));
     }
 
     #[test]
@@ -1637,7 +1667,7 @@ mod tests {
         let sql = count(&shop(), &q).unwrap();
         assert_eq!(
             sql.text,
-            r#"select 1 from "users" as "z0" where not exists (select 1 from "orders" as "z1" where "z1"."user_id" = "z0"."id" AND "z1"."total" >= $1)"#
+            r#"select 1 from "users" as "users" where not exists (select 1 from "orders" as "z1" where "z1"."user_id" = "users"."id" AND "z1"."total" >= $1)"#
         );
         assert_eq!(sql.params, vec!["100"]);
     }
@@ -1647,7 +1677,7 @@ mod tests {
         let mut q = query("users", "id,orders!inner()");
         filt(&mut q, "orders.total", "gte.100");
         let t = text(&q);
-        assert!(t.starts_with(r#"select "z0"."id" as "id" from"#), "{t}");
+        assert!(t.starts_with(r#"select "users"."id" as "id" from"#), "{t}");
         assert!(t.contains(r#"select "z1".* from "orders""#), "{t}");
         assert!(t.contains(r#"is not null"#), "{t}");
     }
@@ -1660,7 +1690,7 @@ mod tests {
         let sql = count(&shop(), &q).unwrap();
         assert_eq!(
             sql.text,
-            r#"select 1 from "users" as "z0" where "z0"."id" >= $1"#
+            r#"select 1 from "users" as "users" where "users"."id" >= $1"#
         );
         assert_eq!(sql.params, vec!["5"]);
 
@@ -1670,7 +1700,7 @@ mod tests {
         let sql = count(&shop(), &q).unwrap();
         assert_eq!(
             sql.text,
-            r#"select 1 from "users" as "z0" where exists (select 1 from "orders" as "z1" where "z1"."user_id" = "z0"."id" AND "z1"."total" >= $1)"#
+            r#"select 1 from "users" as "users" where exists (select 1 from "orders" as "z1" where "z1"."user_id" = "users"."id" AND "z1"."total" >= $1)"#
         );
         assert_eq!(sql.params, vec!["100"]);
 
@@ -1678,7 +1708,7 @@ mod tests {
         let mut q = query("users", "id,orders(id)");
         filt(&mut q, "orders.total", "gte.100");
         let sql = count(&shop(), &q).unwrap();
-        assert_eq!(sql.text, r#"select 1 from "users" as "z0""#);
+        assert_eq!(sql.text, r#"select 1 from "users" as "users""#);
         assert!(sql.params.is_empty());
     }
 
