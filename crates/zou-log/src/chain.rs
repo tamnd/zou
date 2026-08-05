@@ -151,7 +151,7 @@ pub struct Takeover {
 /// under the media's presence rule. Presence is contiguous only below
 /// the first hole: a pipelined flusher can land seq n+1 while n never
 /// makes it, so a crash leaves stragglers up to
-/// [`MAX_INFLIGHT`](crate::MAX_INFLIGHT) past the hole. Gallop then
+/// [`MAX_INFLIGHT`] past the hole. Gallop then
 /// binary search still finds a present seq with an absent successor
 /// in log cost, and a backscan bounded by that same cap pins the
 /// first hole, which is the only honest head: the digest walk cannot

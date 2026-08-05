@@ -485,7 +485,14 @@ fn close_drains_every_window_in_flight() {
             "close returned before a window in flight resolved"
         );
     }
-    assert_eq!(sink.0.puts.lock().unwrap().len(), 4);
+    // A coarse timer can batch two appends into one window, so count
+    // frames on the store, not PUTs: close must leave none behind.
+    let puts = sink.0.puts.lock().unwrap();
+    let landed: usize = puts
+        .iter()
+        .map(|(_, bytes)| decode_segment(bytes).unwrap().1.len())
+        .sum();
+    assert_eq!(landed, 4);
 }
 
 #[test]
