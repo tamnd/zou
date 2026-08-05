@@ -39,9 +39,13 @@
 use std::fmt;
 
 use crate::scan::{
-    Cur, DIGIT, FIELD_NAME, fmt_path, parse_json_path, scan_name, scan_quoted, word, write_escaped,
+    Cur, DIGIT, END, FIELD_NAME, fmt_path, parse_json_path, scan_name, scan_quoted, word,
+    write_escaped,
 };
 pub use crate::scan::{Error, JsonKey, JsonStep};
+
+/// The comma between names, quoted the way parsec quotes it.
+const COMMA: &str = "\",\"";
 
 /// Every aggregate token, in the order upstream tries them.
 const AGGREGATES: &[&str] = &["sum", "avg", "count", "max", "min"];
@@ -155,6 +159,13 @@ pub fn parse(value: &str) -> Result<Vec<Item>, Error> {
 /// calling out, since a write with no columns is a write of nothing
 /// and upstream would rather say so on the way in than let the
 /// insert answer for it.
+///
+/// The whole value has to be a list, which is stricter than upstream:
+/// parsec's `P.parse` stops at the first thing it cannot take and
+/// hands back what it has, so `id);drop table t;--` is the one column
+/// `id` over there. These names go straight into the column list of a
+/// write, and a tail somebody appended to them is better refused than
+/// quietly dropped.
 pub fn columns(value: &str) -> Result<Vec<String>, Error> {
     let mut cur = Cur::new(value);
     let mut out = Vec::new();
@@ -162,7 +173,10 @@ pub fn columns(value: &str) -> Result<Vec<String>, Error> {
         out.push(parse_name(&mut cur)?.0);
         cur.skip_spaces();
         if !cur.eat(b',') {
-            return Ok(out);
+            return match cur.done() {
+                true => Ok(out),
+                false => cur.leftover(&[COMMA, END]),
+            };
         }
         cur.skip_spaces();
     }
@@ -530,6 +544,23 @@ mod tests {
             Item::Embed(e) => e,
             other => panic!("expected an embed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_column_list_is_the_whole_value() {
+        assert_eq!(columns("id,name").unwrap(), ["id", "name"]);
+        assert_eq!(columns("id, name").unwrap(), ["id", "name"]);
+        assert_eq!(columns("\"a,b\"").unwrap(), ["a,b"]);
+        assert_eq!(
+            columns("").unwrap_err().to_string(),
+            format!("unexpected end of input expecting {NAME}")
+        );
+        // The tail is not a name and not another item, and it does not
+        // get to go along for the ride either.
+        assert_eq!(
+            columns("id);drop table t;--").unwrap_err().to_string(),
+            "unexpected ')' expecting \",\" or end of input"
+        );
     }
 
     #[test]
