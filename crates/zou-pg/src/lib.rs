@@ -1306,9 +1306,9 @@ pub unsafe extern "C" fn zou_wal_open(
 /// Durability is a separate question answered by [`zou_wal_durable`]:
 /// its watermark reaches `pg_lsn + len` once this chunk's batch lands.
 /// `out_durable` receives the watermark as of this call, diagnostics
-/// only. A full pipeline blocks here until the store drains below
-/// [`WalWaiter::DEPTH`] staged chunks, and a failure from any earlier
-/// staged chunk surfaces on this and every later call.
+/// only. A full pipeline, sixty four staged chunks, blocks here until
+/// the store drains, and a failure from any earlier staged chunk
+/// surfaces on this and every later call.
 ///
 /// # Safety
 /// `data` must point to `len` readable bytes and `out_durable` must be a
