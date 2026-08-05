@@ -484,7 +484,9 @@ async fn the_grammar_does_not_carry_sql() {
         "/rest/v1/zou_atk_grammar?select=*&order=id;drop%20table%20zou_atk_grammar",
         "/rest/v1/zou_atk_grammar?select=*&order=(select%20body%20from%20zou_atk_grammar).asc",
         "/rest/v1/zou_atk_grammar?limit=1;drop%20table%20zou_atk_grammar",
-        "/rest/v1/zou_atk_grammar?offset=-1",
+        // A sign is part of the number. Everything after the digits is
+        // not, and there is no number for it to be part of.
+        "/rest/v1/zou_atk_grammar?offset=-1;drop%20table%20zou_atk_grammar",
         "/rest/v1/zou_atk_grammar?select=*,zou_atk_grammar!inner(*)",
     ] {
         let res = app
