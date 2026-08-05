@@ -125,15 +125,21 @@ pub enum Item {
 }
 
 /// Parse a whole select value into its items. The caller has already
-/// url decoded it. An empty value is an error here; defaulting a
-/// missing select parameter to `*` is the router's call.
+/// url decoded it.
+///
+/// An empty value gives an empty list rather than an error, and what
+/// a level with no items of its own means is the planner's call: the
+/// root takes every column, which is what `select=` asks for, and an
+/// embed joins and brings nothing back.
+///
+/// Nothing after the list is read. Upstream parses with parsec's
+/// `P.parse`, which never asks for end of input, so a select list
+/// with a bracket too many after it is the list without the bracket.
+/// That is not the same as forgiving: an item that started and then
+/// went wrong is still an error, because the input it went wrong on
+/// was already taken.
 pub fn parse(value: &str) -> Result<Vec<Item>, Error> {
-    let mut cur = Cur::new(value);
-    let items = parse_items(&mut cur)?;
-    if !cur.done() {
-        return cur.err("unexpected characters after the select list");
-    }
-    Ok(items)
+    parse_items(&mut Cur::new(value))
 }
 
 /// Bytes that end a bare name in a select item. Unlike the filter
@@ -146,6 +152,15 @@ fn name_break(b: u8) -> bool {
 }
 
 fn parse_items(cur: &mut Cur) -> Result<Vec<Item>, Error> {
+    // A list of none is a list. Upstream separates its items with
+    // parsec's `sepBy`, which takes zero of them, so an empty select
+    // value and an embed written `clients()` both read as no items
+    // at all. Only the first one may be missing, though: a list that
+    // ends on its separator has taken the separator and owes an item
+    // for it, which is why `id,` is still an error.
+    if cur.done() || cur.peek() == Some(b')') {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     loop {
         let item = parse_item(cur)?;
@@ -332,13 +347,8 @@ fn parse_embed_tail(
         }
     }
     cur.expect(b'(', "an embedded resource wants a (list)")?;
-    let items = if cur.eat(b')') {
-        Vec::new()
-    } else {
-        let items = parse_items(cur)?;
-        cur.expect(b')', "unterminated embedded resource")?;
-        items
-    };
+    let items = parse_items(cur)?;
+    cur.expect(b')', "unterminated embedded resource")?;
     Ok(Embed {
         alias,
         relation,
@@ -509,7 +519,10 @@ mod tests {
         assert_eq!(c.field.as_ref().unwrap().name, "full_name");
 
         assert_eq!(fail("a:*").message, "* takes no alias");
-        assert_eq!(fail("").message, "expected a name");
+        // No items at all, which is what `select=` sends and what the
+        // planner turns back into every column. A list that ends on
+        // its comma is still short an item.
+        assert!(ok("").is_empty());
         assert_eq!(fail("a,").message, "expected a name");
     }
 
@@ -758,37 +771,40 @@ mod tests {
     fn spaces_the_grammar_does_not_take() {
         // An embed ends on its bracket and has nothing to carry the
         // spaces after it, so they are only allowed where a comma
-        // follows.
-        ok("clients(id) , x");
-        assert_eq!(
-            fail("clients(id) ").message,
-            "unexpected characters after the select list"
-        );
+        // follows. Where no comma follows, the list is over and the
+        // spaces are somebody else's problem.
+        assert_eq!(ok("clients(id) , x").len(), 2);
+        assert_eq!(ok("clients(id) ").len(), 1);
         assert_eq!(fail("a(b(c) )").message, "unterminated embedded resource");
 
         // An aggregate ends the same way and does not even get the
-        // comma.
-        assert_eq!(
-            fail("id.sum() , x").message,
-            "unexpected characters after the select list"
-        );
+        // comma, so the list is one item and the rest is unread.
+        assert_eq!(ok("id.sum() , x").len(), 1);
     }
 
     #[test]
     fn errors_point_at_the_problem() {
         assert_eq!(fail("a,,b").message, "expected a name");
-        assert_eq!(
-            fail("a)b").message,
-            "unexpected characters after the select list"
-        );
-        assert_eq!(
-            fail("*::text").message,
-            "unexpected characters after the select list"
-        );
         assert_eq!(fail("a->>").message, "expected a json path key");
         let e = fail("x,a.median()");
         assert!(e.message.contains("unknown aggregate"));
         assert_eq!(e.at, 4);
+    }
+
+    /// Upstream stops where the list stops and never asks for end of
+    /// input, so what comes after it is nobody's error. What went
+    /// wrong inside an item that had already started still is: the
+    /// input it went wrong on was taken before it failed.
+    #[test]
+    fn what_comes_after_the_list_is_not_read() {
+        assert_eq!(ok("a)b").len(), 1);
+        assert_eq!(ok("*::text"), vec![Item::Star]);
+        assert_eq!(
+            ok("name,...processes(process:name,...process_costs(cost)))").len(),
+            2
+        );
+        assert_eq!(fail("a->>").message, "expected a json path key");
+        assert_eq!(fail("a(b->>)").message, "expected a json path key");
     }
 
     const CORPUS: &[&str] = &[
