@@ -511,6 +511,39 @@ impl Session {
         self.end("commit").await
     }
 
+    /// Read one row out of the transaction and commit, in the round
+    /// trip the commit was going to cost anyway. Both statements go
+    /// out as one simple query batch, which is why the columns come
+    /// back as text and why `sql` may not carry parameters.
+    ///
+    /// This is for the settings a request leaves behind: they live
+    /// only as long as the transaction, so they have to be read
+    /// before the commit, and a statement of their own would be a
+    /// second round trip on every request that ever reads them.
+    pub async fn commit_reading(mut self, sql: &str) -> Result<Vec<Option<String>>, Error> {
+        let client = self.client.take().expect("session ended twice");
+        if !self.in_txn {
+            self.pool.park(client).await;
+            return Ok(Vec::new());
+        }
+        let read = client.simple_query(&format!("{sql}; commit")).await;
+        let messages = match read {
+            // The connection is dropped rather than pooled, the same
+            // containment a failed commit gets.
+            Err(e) => return Err(e),
+            Ok(m) => m,
+        };
+        let mut row = Vec::new();
+        for message in messages {
+            if let tokio_postgres::SimpleQueryMessage::Row(r) = message {
+                row = (0..r.len()).map(|i| r.get(i).map(str::to_string)).collect();
+                break;
+            }
+        }
+        self.pool.park(client).await;
+        Ok(row)
+    }
+
     /// Roll back and hand the connection back to the pool.
     pub async fn rollback(self) -> Result<(), Error> {
         self.end("rollback").await

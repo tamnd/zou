@@ -999,6 +999,99 @@ async fn the_rpc_surface_speaks_postgrest() {
 /// for one, and a page smaller than the total is a 206. The Range
 /// header is read on a GET and on nothing else, which is upstream
 /// reading the method rather than the shape of the request.
+/// The two settings a function can leave behind about the response
+/// it wants: `response.status` and `response.headers`. They are read
+/// back after the call, on the commit, and amend the response the
+/// handler already built.
+#[tokio::test]
+async fn a_function_says_what_it_wants_the_response_to_be() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop function if exists zou_guc_status(), zou_guc_headers(), \
+             zou_guc_bad_status(), zou_guc_bad_headers(), zou_guc_quiet()",
+            "drop table if exists zou_guc_rows cascade",
+            "create table zou_guc_rows (id int primary key)",
+            "insert into zou_guc_rows values (1)",
+            "create function zou_guc_status() returns setof zou_guc_rows \
+             language sql volatile as $$ \
+             select set_config('response.status', '205', true); \
+             select * from zou_guc_rows $$",
+            "create function zou_guc_headers() returns setof zou_guc_rows \
+             language sql volatile as $$ \
+             select set_config('response.headers', \
+               '[{\"Location\": \"/elsewhere\"}, {\"X-Two\": \"a\"}, {\"X-Two\": \"b\"}]', true); \
+             select * from zou_guc_rows $$",
+            "create function zou_guc_bad_status() returns setof zou_guc_rows \
+             language sql volatile as $$ \
+             select set_config('response.status', 'unknown', true); \
+             select * from zou_guc_rows $$",
+            "create function zou_guc_bad_headers() returns setof zou_guc_rows \
+             language sql volatile as $$ \
+             select set_config('response.headers', '{\"X-One\": \"a\"}', true); \
+             select * from zou_guc_rows $$",
+            "create function zou_guc_quiet() returns setof zou_guc_rows \
+             language sql stable as 'select * from zou_guc_rows'",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    let res = app
+        .clone()
+        .oneshot(req("POST", "/rest/v1/rpc/zou_guc_status", "{}", &[]))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::RESET_CONTENT);
+    // A status of its own costs the response nothing else it had.
+    assert_eq!(res.headers()["content-range"], "0-0/*");
+
+    let res = app
+        .clone()
+        .oneshot(req("POST", "/rest/v1/rpc/zou_guc_headers", "{}", &[]))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["location"], "/elsewhere");
+    let two: Vec<&str> = res
+        .headers()
+        .get_all("x-two")
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect();
+    assert_eq!(two, vec!["a", "b"]);
+
+    // Both errors are a 500, and the work the function did still
+    // stands, because upstream builds the response after the
+    // transaction has landed.
+    for (func, code) in [
+        ("zou_guc_bad_status", "PGRST112"),
+        ("zou_guc_bad_headers", "PGRST111"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(req("POST", &format!("/rest/v1/rpc/{func}"), "{}", &[]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR, "{func}");
+        assert!(res.headers().get("content-range").is_none(), "{func}");
+        let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+        assert_eq!(body["code"], code, "{func}");
+    }
+
+    // A setting one call made is gone by the next, since it lived in
+    // that call's transaction and the connection is scrubbed on its
+    // way back to the pool.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/rpc/zou_guc_quiet"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(res.headers().get("location").is_none());
+}
+
 #[tokio::test]
 async fn a_call_answers_with_the_range_a_read_would() {
     let Some(dsn) = dsn() else { return };
