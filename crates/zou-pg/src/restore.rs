@@ -44,6 +44,9 @@ use crate::WAL_SHARD;
 /// and a cluster built with --wal-segsize would need it here.
 pub const WAL_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 
+/// XLOG_BLCKSZ, initdb's default WAL page size.
+const WAL_PAGE_SIZE: u64 = 8192;
+
 /// pg_control layout facts this tool relies on, checked against the
 /// vendored src/include/catalog/pg_control.h. The state field follows
 /// system_identifier (8 bytes) and two version fields (4 bytes each).
@@ -271,7 +274,13 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
         .ok_or_else(|| format!("{store_root} has no manifest, nothing to restore"))?;
     let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
     // WAL past the newest checkpoint comes straight from the shared log,
-    // the same read the barrier and the folder do.
+    // the same read the barrier and the folder do. The floor is the
+    // checkpoint's redo location and usually sits mid WAL page, but
+    // recovery reads whole pages and the head of that page, its page
+    // header included, lives in frames that end at or before the floor.
+    // Catching up from the page boundary pulls those frames back in;
+    // anything a checkpoint capture already laid down is simply
+    // overwritten with the same bytes.
     let floor = manifest
         .checkpoints
         .last()
@@ -281,7 +290,7 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
         &media,
         WAL_SHARD,
         &TeeFilter::Tenant(tenant_id(tenant)),
-        Lsn(floor),
+        Lsn(floor & !(WAL_PAGE_SIZE - 1)),
     )
     .map_err(|e| format!("wal catch up: {e}"))?;
     restore_manifest(&*store, &layout, &manifest, &frames, pgdata)
@@ -560,6 +569,68 @@ mod tests {
 
         // A second restore refuses to clobber the first.
         assert!(restore(store_root, "local", &pgdata).is_err());
+    }
+
+    #[test]
+    fn the_overlay_covers_the_wal_page_under_the_newest_checkpoint() {
+        // The newest checkpoint's redo usually sits mid WAL page, and
+        // recovery reads that page whole: its header and the bytes up
+        // to the redo point came from frames that end at or before the
+        // floor. Cutting the catch up exactly at the floor drops them
+        // and leaves the page head zeroed, which is an unreadable
+        // checkpoint record and a cluster that will not start.
+        let store_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let store_root = store_dir.path().to_str().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let layout = TenantLayout::new("local");
+
+        let control = synthetic_control(DB_IN_PRODUCTION);
+        store
+            .put_if_absent(&layout.chk_file("genesis", "global/pg_control"), &control)
+            .unwrap();
+        let index = format!("f global/pg_control {}\nd pg_wal\n", control.len());
+        store
+            .put_if_absent(&layout.chk_index("genesis"), index.as_bytes())
+            .unwrap();
+        let floor = 0x0100_24F0u64;
+        let mut manifest = Manifest::new("local", 18);
+        manifest.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(floor),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        store
+            .put_if_absent(&layout.manifest(), &manifest.to_json())
+            .unwrap();
+
+        // One frame fills the page head and ends exactly at the floor,
+        // the next starts there. Both must land in the overlay.
+        let mut wal2 = V2Wal::open(
+            Arc::new(LocalFsStore::new(store_dir.path())) as Arc<dyn CasStore>,
+            "local",
+            1,
+        );
+        wal2.push(0x0100_1F00, &vec![0xAAu8; 0x5F0]);
+        wal2.push(floor, &vec![0xBBu8; 0x100]);
+        wal2.close();
+
+        let pgdata = out_dir.path().join("restored");
+        let stats = restore(store_root, "local", &pgdata).unwrap();
+        assert_eq!(stats.wal_records, 2, "the page head frame is kept");
+        assert_eq!(stats.wal_bytes, 0x5F0 + 0x100);
+
+        let seg = std::fs::read(pgdata.join("pg_wal/000000010000000000000001")).unwrap();
+        let page = 0x0100_2000usize % WAL_SEGMENT_SIZE as usize;
+        assert!(
+            seg[page..page + 0x4F0].iter().all(|b| *b == 0xAA),
+            "the page head under the floor is real WAL, not zeros"
+        );
+        assert!(
+            seg[page + 0x4F0..page + 0x5F0].iter().all(|b| *b == 0xBB),
+            "the stream past the floor follows"
+        );
     }
 
     #[test]
