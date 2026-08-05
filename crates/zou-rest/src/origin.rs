@@ -35,7 +35,16 @@ use std::collections::BTreeMap;
 use crate::catalog::FkRow;
 
 /// Every view in the schema, and every view those are built on, with
-/// the parse tree of each one's rule. Bind the schema name as $1.
+/// the parse tree of the rule that defines each one. Bind the schema
+/// name as $1.
+///
+/// The rule that defines a view is its `_RETURN`, `ev_type` 1, and a
+/// view may have others: an `INSTEAD OF INSERT` rule is a second
+/// `pg_rewrite` row on the same relation, holding the parse tree of
+/// the insert it rewrites to. That tree has a target list as well,
+/// naming columns of whatever it writes, and taking it for the
+/// view's own would trace the view's columns back to the wrong
+/// table.
 ///
 /// The recursion is not decoration. A view in the exposed schema may
 /// select from a view in a schema nobody exposes, and that hidden
@@ -73,7 +82,7 @@ select c.oid::int8,
   from seen
   join pg_class c on c.oid = seen.oid
   join pg_namespace n on n.oid = c.relnamespace
-  join pg_rewrite r on r.ev_class = c.oid
+  join pg_rewrite r on r.ev_class = c.oid and r.ev_type = '1'
  order by c.oid";
 
 /// Every foreign key that touches a relation the schema's views are
@@ -140,6 +149,46 @@ select c.conname::text,
      or c.confrelid in (select oid from uses))
  order by c.conname, child.relname";
 
+/// Every primary key on a relation the schema's views are built on,
+/// by oid and attribute number. Bind the schema name as $1, the same
+/// one [`VIEWS_SQL`] took.
+///
+/// The same reach outside the exposed schema as [`VIEW_KEYS_SQL`],
+/// and for the same reason: the table a view hides may sit where no
+/// request can name it, and its key is still the key the view
+/// inherits.
+pub const VIEW_PKS_SQL: &str = "\
+with recursive uses as (
+  select c.oid
+    from pg_class c
+    join pg_namespace n on n.oid = c.relnamespace
+   where c.relkind in ('v', 'm')
+     and n.nspname = $1
+  union
+  select d.refobjid
+    from uses
+    join pg_rewrite r on r.ev_class = uses.oid
+    join pg_depend d
+      on d.classid = 'pg_rewrite'::regclass
+     and d.objid = r.oid
+     and d.refclassid = 'pg_class'::regclass
+     and d.refobjid <> uses.oid
+)
+select c.conrelid::int8,
+       (select array_agg(k.attnum::int4 order by k.ord)
+          from unnest(c.conkey) with ordinality k(attnum, ord))
+  from pg_constraint c
+ where c.contype = 'p'
+   and c.conrelid in (select oid from uses)
+ order by c.conname";
+
+/// One primary key as [`VIEW_PKS_SQL`] hands it over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PkRow {
+    pub oid: i64,
+    pub attnums: Vec<i32>,
+}
+
 /// One view as [`VIEWS_SQL`] hands it over.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewRow {
@@ -195,29 +244,7 @@ pub struct Origin {
 /// table it cannot see, so a row is only written for an end that is
 /// either a view here or a table here.
 pub fn derive(schema: &str, views: &[ViewRow], keys: &[KeyRow]) -> Vec<FkRow> {
-    // Every view's columns traced back as far as they go, keyed by
-    // where they landed, since that is the direction the keys are
-    // looked up in.
-    let steps: BTreeMap<i64, Vec<Origin>> = views
-        .iter()
-        .map(|view| (view.oid, origins(&view.tree)))
-        .collect();
-    let mut from: BTreeMap<(i64, i32), Vec<(usize, String)>> = BTreeMap::new();
-    for (at, view) in views.iter().enumerate() {
-        if view.schema != schema {
-            continue;
-        }
-        for origin in steps.get(&view.oid).into_iter().flatten() {
-            let Some(name) = view.column(origin.column) else {
-                continue;
-            };
-            for (table, column) in traced(&steps, *origin) {
-                from.entry((table, column))
-                    .or_default()
-                    .push((at, name.to_string()));
-            }
-        }
-    }
+    let from = back(schema, views);
 
     // The ones pointing at a table come first and the ones pointing
     // at a view after, because the openapi document notes a column's
@@ -269,6 +296,82 @@ pub fn derive(schema: &str, views: &[ViewRow], keys: &[KeyRow]) -> Vec<FkRow> {
     }
     rows.append(&mut onto_views);
     rows
+}
+
+/// The primary key each of the schema's views inherits, under its
+/// own column names.
+///
+/// Same trace as [`derive()`] and the same rule at the end of it: a
+/// view holding only part of a key holds no key at all, so a view
+/// that selects one half of a compound primary key has none. A view
+/// may reach more than one, `select * from a, b` being the plain
+/// case, and then it has every column of both, which is upstream's
+/// answer as well.
+///
+/// A view that selects the same column twice holds the key twice
+/// over, and only the first spelling is taken. Nothing here needs
+/// the others, and putting both in would write a key column into a
+/// `Location` header twice.
+///
+/// The columns come back in the view's own column order rather than
+/// the key's, which is the order the row a write returns is written
+/// in, and that row is what the header is read out of.
+pub fn primary_keys(schema: &str, views: &[ViewRow], pks: &[PkRow]) -> Vec<(String, Vec<String>)> {
+    let from = back(schema, views);
+    let mut found: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for pk in pks {
+        let mut taken: Vec<usize> = Vec::new();
+        for (at, columns) in ends(&from, pk.oid, &pk.attnums) {
+            // Every way round of a key a view holds more than once
+            // is in there, and only the first is upstream's pick.
+            if taken.contains(&at) {
+                continue;
+            }
+            taken.push(at);
+            let held = found.entry(at).or_default();
+            for column in columns {
+                if !held.contains(&column) {
+                    held.push(column);
+                }
+            }
+        }
+    }
+    found
+        .into_iter()
+        .map(|(at, mut columns)| {
+            let view = &views[at];
+            columns.sort_by_key(|c| view.columns.iter().position(|n| n == c));
+            (view.name.clone(), columns)
+        })
+        .collect()
+}
+
+/// Every view's columns traced back as far as they go, keyed by
+/// where they landed, since that is the direction a key is looked up
+/// in. The value is which view and under what name, the view by its
+/// index in the list it was handed over in.
+fn back(schema: &str, views: &[ViewRow]) -> BTreeMap<(i64, i32), Vec<(usize, String)>> {
+    let steps: BTreeMap<i64, Vec<Origin>> = views
+        .iter()
+        .map(|view| (view.oid, origins(&view.tree)))
+        .collect();
+    let mut from: BTreeMap<(i64, i32), Vec<(usize, String)>> = BTreeMap::new();
+    for (at, view) in views.iter().enumerate() {
+        if view.schema != schema {
+            continue;
+        }
+        for origin in steps.get(&view.oid).into_iter().flatten() {
+            let Some(name) = view.column(origin.column) else {
+                continue;
+            };
+            for (table, column) in traced(&steps, *origin) {
+                from.entry((table, column))
+                    .or_default()
+                    .push((at, name.to_string()));
+            }
+        }
+    }
+    from
 }
 
 impl ViewRow {
@@ -808,6 +911,82 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].columns, vec!["by"]);
         assert_eq!(rows[1].columns, vec!["author"]);
+    }
+
+    /// A view's primary key is the table's, under the names the view
+    /// selected those columns as.
+    #[test]
+    fn a_view_borrows_the_key_of_the_table_under_it() {
+        let views = vec![view(10, "books_view", &["ident", "written_by"], TREE)];
+        let pks = vec![PkRow {
+            oid: 6474601,
+            attnums: vec![1],
+        }];
+        assert_eq!(
+            primary_keys("test", &views, &pks),
+            vec![("books_view".to_string(), vec!["ident".to_string()])]
+        );
+    }
+
+    /// Two tables joined into one view means two keys borrowed, and
+    /// the view has every column of both. `select * from a, b` is
+    /// the plain case and upstream answers the same way.
+    #[test]
+    fn a_view_over_two_tables_borrows_both_keys() {
+        let tree = "({QUERY :targetList ({TARGETENTRY :resno 1 :resorigtbl 1 \
+            :resorigcol 1 :resjunk false} {TARGETENTRY :resno 2 :resorigtbl 2 \
+            :resorigcol 1 :resjunk false})})";
+        let views = vec![view(10, "both", &["pk1", "pk2"], tree)];
+        let pks = vec![
+            PkRow {
+                oid: 1,
+                attnums: vec![1],
+            },
+            PkRow {
+                oid: 2,
+                attnums: vec![1],
+            },
+        ];
+        assert_eq!(
+            primary_keys("test", &views, &pks),
+            vec![(
+                "both".to_string(),
+                vec!["pk1".to_string(), "pk2".to_string()]
+            )]
+        );
+    }
+
+    /// A view selecting the same key column twice holds the key
+    /// twice, and only the first spelling is taken: a `Location`
+    /// header naming the same row twice is nobody's answer.
+    #[test]
+    fn a_key_column_selected_twice_is_taken_once() {
+        let tree = "({QUERY :targetList ({TARGETENTRY :resno 1 :resorigtbl 1 \
+            :resorigcol 2 :resjunk false} {TARGETENTRY :resno 2 :resorigtbl 1 \
+            :resorigcol 2 :resjunk false})})";
+        let views = vec![view(10, "twice", &["by", "author"], tree)];
+        let pks = vec![PkRow {
+            oid: 1,
+            attnums: vec![2],
+        }];
+        assert_eq!(
+            primary_keys("test", &views, &pks),
+            vec![("twice".to_string(), vec!["by".to_string()])]
+        );
+    }
+
+    /// Half a composite key is no key here either, for the same
+    /// reason: half of one addresses a set and not a row.
+    #[test]
+    fn part_of_a_primary_key_is_no_key() {
+        let tree = "({QUERY :targetList ({TARGETENTRY :resno 1 :resorigtbl 1 \
+            :resorigcol 2 :resjunk false})})";
+        let views = vec![view(10, "half", &["one"], tree)];
+        let pks = vec![PkRow {
+            oid: 1,
+            attnums: vec![2, 3],
+        }];
+        assert_eq!(primary_keys("test", &views, &pks), Vec::new());
     }
 
     /// Half of a composite key is not the key, and a relationship

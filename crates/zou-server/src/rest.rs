@@ -49,12 +49,12 @@ use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use zou_rest::catalog::{
     COLUMNS_SQL, COMPUTED_SQL, Catalog, Column, ColumnRow, ComputedRow, Details, FkRow,
-    INTROSPECT_SQL, RELATIONS_SQL, TIMEZONES_SQL,
+    INTROSPECT_SQL, KEYS_SQL, RELATIONS_SQL, TIMEZONES_SQL,
 };
 use zou_rest::filter::{self, Node, Op, Parsed};
 use zou_rest::media::MediaType;
 use zou_rest::mutate::{self, Conflict, Missing, Returning};
-use zou_rest::origin::{self, KeyRow, VIEW_KEYS_SQL, VIEWS_SQL, ViewRow};
+use zou_rest::origin::{self, KeyRow, PkRow, VIEW_KEYS_SQL, VIEW_PKS_SQL, VIEWS_SQL, ViewRow};
 use zou_rest::plan::{self, PlanError, Query};
 use zou_rest::{csv as csvbody, media, order, page, rpc, select};
 
@@ -108,16 +108,6 @@ fn profile_header(res: &mut Response, schema: &str, negotiated: bool) {
 /// The most body a write accepts, 16 MiB like a generous PostgREST
 /// deployment; past it the response is 413.
 const BODY_LIMIT: usize = 1 << 24;
-
-/// The table's primary key columns in constraint order, for the
-/// default upsert target and the Location header.
-const PK_SQL: &str = "select a.attname::text \
-     from pg_constraint c \
-     join pg_class t on t.oid = c.conrelid \
-     join pg_namespace n on n.oid = t.relnamespace \
-     join pg_attribute a on a.attrelid = t.oid and a.attnum = any(c.conkey) \
-     where c.contype = 'p' and n.nspname = $1 and t.relname = $2 \
-     order by array_position(c.conkey, a.attnum)";
 
 /// A PostgREST shaped error: a status and the four body keys, with
 /// details and hint rendered as json null when absent, which is what
@@ -472,6 +462,28 @@ pub(crate) fn decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent encoding the other way, for the query string zou writes
+/// rather than the one it was sent: a `Location` header.
+///
+/// Unreserved is the url standard's own set, letters, digits and
+/// `-_.~`, and everything else is a pair of hex digits. That is
+/// narrow on purpose, and it is upstream's, whose `renderSimpleQuery`
+/// encodes each side of each pair the same way. A space becomes %20
+/// rather than a plus, since the plus is a decoding courtesy and not
+/// something anything has to write.
+fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// The route an `orders.items.order` style key addresses, the
@@ -1401,11 +1413,26 @@ fn request_context(auth: &AuthContext, req: &Parts, schema: &str) -> RequestCont
         role: auth.role.clone(),
         claims: auth.claims.to_string(),
         method: req.method.as_str().to_string(),
-        path: req.uri.path().to_string(),
+        path: mounted_at(req.uri.path()),
         headers: serde_json::Value::Object(headers).to_string(),
         cookies: serde_json::Value::Object(cookies).to_string(),
         search_path: format!("\"{}\"", schema.replace('"', "\"\"")),
     }
+}
+
+/// The path as PostgREST would have seen it, which is the path with
+/// this gateway's mount prefix taken off.
+///
+/// `request.path` is a setting a function reads, and what it is for
+/// is telling the function which url it was called over. PostgREST
+/// serves at the root, so the answer there is `/rpc/name`, and the
+/// hosted Supabase edge strips `/rest/v1` before proxying, so the
+/// answer there is the same. A path that is not under the prefix at
+/// all is left alone rather than trimmed to nothing.
+fn mounted_at(path: &str) -> String {
+    path.strip_prefix(crate::REST_PREFIX)
+        .unwrap_or(path)
+        .to_string()
 }
 
 /// PostgREST's Content-Range: the served window over the total. The
@@ -1470,13 +1497,23 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
             in_pk: r.get(6),
         })
         .collect();
-    let (view_fks, views) = view_keys(sess, authed, schema).await?;
+    let (view_fks, views, mut keys) = view_keys(sess, authed, schema).await?;
     fks.extend(view_fks);
     let rows = sess
         .query(RELATIONS_SQL, &[&schema])
         .await
         .map_err(|e| pg_error(&e, authed))?;
     let names = rows.iter().map(|r| r.get(0)).collect();
+    let rows = sess
+        .query(KEYS_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    keys.extend(rows.iter().map(|r| {
+        (
+            r.get(0),
+            r.get::<_, Option<Vec<String>>>(1).unwrap_or_default(),
+        )
+    }));
     let rows = sess
         .query(COLUMNS_SQL, &[&schema])
         .await
@@ -1517,28 +1554,28 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
     Ok(Catalog::new(fks)
         .with_computed(computed)
         .with_relations(names, cols)
+        .with_keys(keys)
         .with_views(views)
         .with_timezones(zones)
         .with_schema(schema))
 }
 
-/// The foreign keys the schema's views inherit from the tables under
-/// them, and the names of the views themselves, two more catalog
-/// queries on the same transaction.
+/// The keys the schema's views inherit from the tables under them,
+/// foreign and primary alike, and the names of the views
+/// themselves, three more catalog queries on the same transaction.
 ///
-/// A view has no key of its own, so an embed on one has to be traced
-/// back through the columns it selects. Both queries reach outside
+/// A view has no key of its own, so both kinds have to be traced
+/// back through the columns it selects. The queries reach outside
 /// the exposed schema on purpose: the view underneath and the table
-/// holding the key may be somewhere nobody can name, and the
-/// relationship is still real from here. The names come back with
-/// the keys because resolution treats a relationship to a view more
-/// narrowly than one to a table and has to be able to tell them
-/// apart.
+/// holding the key may be somewhere nobody can name, and the key is
+/// still the view's from here. The names come back with them
+/// because resolution treats a relationship to a view more narrowly
+/// than one to a table and has to be able to tell them apart.
 async fn view_keys(
     sess: &Session,
     authed: bool,
     schema: &str,
-) -> Result<(Vec<FkRow>, Vec<String>), RestError> {
+) -> Result<(Vec<FkRow>, Vec<String>, Vec<(String, Vec<String>)>), RestError> {
     let rows = sess
         .query(VIEWS_SQL, &[&schema])
         .await
@@ -1562,7 +1599,7 @@ async fn view_keys(
         .map(|v| v.name.clone())
         .collect();
     if views.is_empty() {
-        return Ok((Vec::new(), names));
+        return Ok((Vec::new(), names, Vec::new()));
     }
     let rows = sess
         .query(VIEW_KEYS_SQL, &[&schema])
@@ -1586,7 +1623,22 @@ async fn view_keys(
             in_pk: r.get(12),
         })
         .collect();
-    Ok((origin::derive(schema, &views, &keys), names))
+    let rows = sess
+        .query(VIEW_PKS_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let pks: Vec<PkRow> = rows
+        .iter()
+        .map(|r| PkRow {
+            oid: r.get(0),
+            attnums: r.get::<_, Option<Vec<i32>>>(1).unwrap_or_default(),
+        })
+        .collect();
+    Ok((
+        origin::derive(schema, &views, &keys),
+        names,
+        origin::primary_keys(schema, &views, &pks),
+    ))
 }
 
 /// The preferences settled against the loaded catalog and put to
@@ -2000,22 +2052,12 @@ async fn write(
         _ => None,
     };
 
-    // The primary key, only fetched when the upsert needs a default
-    // target or the Location header wants the columns.
+    // The primary key, which an upsert with no target of its own
+    // conflicts on, a PUT is filtered by, and a Location header is
+    // written out of. It comes off the catalog rather than out of a
+    // query here, so a view has one as surely as a table does.
     let wants_location = *method == Method::POST && prefer.ret == Ret::HeadersOnly;
-    let needs_pk = put
-        || wants_location
-        || (*method == Method::POST && prefer.merge.is_some() && extras.on_conflict.is_none());
-    let pk: Vec<String> = if needs_pk {
-        sess.query(PK_SQL, &[&schema, &table])
-            .await
-            .map_err(|e| pg_error(&e, authed))?
-            .iter()
-            .map(|r| r.get(0))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let pk: Vec<String> = relation.keys.clone();
 
     // What a PUT is allowed to be filtered by, which is the primary
     // key and nothing else. The answer is 405 rather than 400 because
@@ -2180,13 +2222,22 @@ async fn write(
             {
                 let mut pairs = Vec::new();
                 for col in &pk {
-                    let v = match &row[col.as_str()] {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
+                    // Upstream reads the row with json_each_text and
+                    // coalesces, so a key column that came back null
+                    // is written as the filter that would find it
+                    // again rather than as the word null.
+                    let filter = match &row[col.as_str()] {
+                        serde_json::Value::Null => "is.null".to_string(),
+                        serde_json::Value::String(s) => format!("eq.{s}"),
+                        other => format!("eq.{other}"),
                     };
-                    pairs.push(format!("{col}=eq.{v}"));
+                    pairs.push(format!("{}={}", escape(col), escape(&filter)));
                 }
-                let location = format!("/rest/v1/{table}?{}", pairs.join("&"));
+                // No mount prefix. PostgREST serves at the root and
+                // writes the table's own name, and the prefix here
+                // is this gateway's, which the hosted one strips
+                // before the request ever arrives.
+                let location = format!("/{table}?{}", pairs.join("&"));
                 if let Ok(v) = location.parse() {
                     res.headers_mut().insert(header::LOCATION, v);
                 }

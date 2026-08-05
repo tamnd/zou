@@ -758,6 +758,7 @@ mod tests {
     fn painted() -> Relation {
         Relation {
             name: "todos".into(),
+            keys: vec!["id".into()],
             columns: vec![
                 Column {
                     name: "id".into(),

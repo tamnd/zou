@@ -125,6 +125,10 @@ select c.conname::text,
 pub struct Relation {
     pub name: String,
     pub columns: Vec<Column>,
+    /// The columns of its primary key, in the order the key was
+    /// declared in. A view has one of these too, borrowed from the
+    /// table under it the way its foreign keys are.
+    pub keys: Vec<String>,
 }
 
 impl Relation {
@@ -219,6 +223,25 @@ select c.relname::text
    and c.relkind in ('r', 'v', 'm', 'f', 'p')
    and not c.relispartition
  order by c.relname";
+
+/// The primary key of each of those relations, one row per table,
+/// the columns in the order the key declares them. Bind the schema
+/// name as $1, the same one [`RELATIONS_SQL`] took.
+///
+/// Only tables answer here. A view has no key postgres would record
+/// and gets one from [`crate::origin`] instead, out of the columns
+/// it borrowed, which is the same place its foreign keys come from.
+pub const KEYS_SQL: &str = "\
+select t.relname::text,
+       (select array_agg(a.attname::text order by k.ord)
+          from unnest(c.conkey) with ordinality k(attnum, ord)
+          join pg_attribute a
+            on a.attrelid = t.oid and a.attnum = k.attnum)
+  from pg_constraint c
+  join pg_class t on t.oid = c.conrelid
+  join pg_namespace n on n.oid = t.relnamespace
+ where c.contype = 'p' and n.nspname = $1
+ order by t.relname";
 
 /// The columns of those relations, one per row, each with the cast
 /// functions its type carries. Bind the schema name as $1, the same
@@ -559,6 +582,7 @@ impl Catalog {
             .map(|name| Relation {
                 name,
                 columns: Vec::new(),
+                keys: Vec::new(),
             })
             .collect();
         for row in columns {
@@ -567,6 +591,20 @@ impl Catalog {
             }
         }
         Catalog { rels, ..self }
+    }
+
+    /// The same catalog with each relation's primary key on it, the
+    /// answer to [`KEYS_SQL`] and the one [`crate::origin`] traced
+    /// for the views, in either order. A name the catalog does not
+    /// have is dropped rather than added, since a key belongs to a
+    /// relation and there is no relation here to hang it on.
+    pub fn with_keys(mut self, keys: Vec<(String, Vec<String>)>) -> Catalog {
+        for (name, columns) in keys {
+            if let Some(rel) = self.rels.iter_mut().find(|r| r.name == name) {
+                rel.keys = columns;
+            }
+        }
+        self
     }
 
     /// The same catalog knowing which timezone names postgres has,

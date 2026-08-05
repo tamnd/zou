@@ -310,10 +310,10 @@ async fn the_write_path_speaks_postgrest() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
-    assert_eq!(
-        res.headers()["location"],
-        "/rest/v1/zou_rest_wr_books?id=eq.42"
-    );
+    // No mount prefix in it: PostgREST serves at the root and the
+    // hosted edge takes /rest/v1 off before the request arrives, so
+    // the header names the table and nothing else.
+    assert_eq!(res.headers()["location"], "/zou_rest_wr_books?id=eq.42");
     assert_eq!(body_text(res).await, "");
 
     // merge-duplicates without on_conflict finds the pk by itself
@@ -1889,7 +1889,10 @@ async fn the_context_and_rls_hold_through_the_whole_door() {
     let rows: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
     let row = &rows[0];
     assert_eq!(row["method"], "GET");
-    assert_eq!(row["path"], "/rest/v1/zou_rest_ctx");
+    // request.path is what PostgREST would have seen, the path with
+    // the mount prefix off, which is what a function reading the
+    // setting to route on is expecting.
+    assert_eq!(row["path"], "/zou_rest_ctx");
     assert_eq!(row["probe"], "hello");
     assert_eq!(row["cookie"], "s1");
     assert_eq!(row["sub"], "11111111-1111-1111-1111-111111111111");

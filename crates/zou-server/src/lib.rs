@@ -623,7 +623,7 @@ fn kong_no_route() -> Response {
 }
 
 /// Where the rest surface lives, without its trailing slash.
-const REST_PREFIX: &str = "/rest/v1";
+pub(crate) const REST_PREFIX: &str = "/rest/v1";
 
 /// The whole front door as one axum router. Layer order matters:
 /// request id outermost so even a 404 or a 429 carries one, CORS next
