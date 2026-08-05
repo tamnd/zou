@@ -1,0 +1,276 @@
+Answer smgrnblocks from shared memory.
+
+The planner calls smgrnblocks for every table and index it plans
+over, on every query. Stock Postgres answers with an lseek so nobody
+notices, but under zou the answer lives in the store and each call
+became a store round trip, which multiplied every statement by the
+store latency, about 2x on the pgbench commit path once the heap and
+its index are counted. The chain fence makes this node the single
+writer of its relations and every size change flows through the smgr,
+so a shared hash kept current by extend, zeroextend, truncate and
+unlink is as authoritative as the store itself. A miss reads the
+store once per relation fork and seeds without overwriting, since a
+concurrent extend already knows a newer size than the store told us.
+Create drops any cached entry instead of seeding one, covering redo
+creates over existing pages and locator reuse on paths that skip
+zouunlink. A full table degrades to uncached rather than erroring.
+
+--- a/src/backend/storage/ipc/ipci.c
++++ b/src/backend/storage/ipc/ipci.c
+@@ -144,6 +144,7 @@ CalculateShmemSize(int *num_semaphores)
+ 	size = add_size(size, PgArchShmemSize());
+ 	size = add_size(size, ApplyLauncherShmemSize());
+ 	size = add_size(size, ZouWalShmemSize());
++	size = add_size(size, ZouRelSizeShmemSize());
+ 	size = add_size(size, BTreeShmemSize());
+ 	size = add_size(size, SyncScanShmemSize());
+ 	size = add_size(size, AsyncShmemSize());
+@@ -336,6 +337,7 @@ CreateOrAttachShmemStructs(void)
+ 	PgArchShmemInit();
+ 	ApplyLauncherShmemInit();
+ 	ZouWalShmemInit();
++	ZouRelSizeShmemInit();
+ 	SlotSyncShmemInit();
+ 
+ 	/*
+--- a/src/backend/storage/smgr/zou_smgr.c
++++ b/src/backend/storage/smgr/zou_smgr.c
+@@ -32,7 +32,10 @@
+ #include "storage/aio.h"
+ #include "storage/bufmgr.h"
+ #include "storage/bufpage.h"
++#include "storage/lwlock.h"
++#include "storage/shmem.h"
+ #include "storage/zou_smgr.h"
++#include "utils/hsearch.h"
+ 
+ /* C ABI of the zou-pg crate (crates/zou-pg). */
+ extern int	zou_pg_init(const char *target);
+@@ -82,6 +85,137 @@ zou_check(int rc, const char *op, SMgrRelation reln, ForkNumber forknum)
+ 						forknum)));
+ }
+ 
++/*
++ * Relation sizes answered from shared memory.
++ *
++ * Stock Postgres answers smgrnblocks with an lseek, cheap enough that
++ * the planner asks for every table and index it plans over, on every
++ * query. Under zou the honest answer lives in the store, and a store
++ * round trip per planned relation multiplies each statement by the
++ * store latency. This node is the only writer of its relations, the
++ * chain fence guarantees it, and every size change flows through this
++ * smgr, so a shared table kept current by extend, truncate and unlink
++ * is as authoritative as the store. A miss pays the store read once
++ * per relation fork; a full table just means paying it again.
++ */
++typedef struct ZouRelSizeKey
++{
++	RelFileLocator locator;
++	ForkNumber	forknum;
++} ZouRelSizeKey;
++
++typedef struct ZouRelSizeEntry
++{
++	ZouRelSizeKey key;
++	BlockNumber nblocks;
++} ZouRelSizeEntry;
++
++typedef struct ZouRelSizeCtl
++{
++	int			tranche;
++	LWLock		lock;
++} ZouRelSizeCtl;
++
++#define ZOU_RELSIZE_ENTRIES 4096
++
++static ZouRelSizeCtl *ZouRelSize = NULL;
++static HTAB *ZouRelSizeHash = NULL;
++
++typedef enum ZouRelSizeMode
++{
++	ZOU_RELSIZE_SEED,			/* keep an existing entry, fill a miss */
++	ZOU_RELSIZE_GROW,			/* raise to nblocks, never lower */
++	ZOU_RELSIZE_SET,			/* overwrite */
++} ZouRelSizeMode;
++
++Size
++ZouRelSizeShmemSize(void)
++{
++	return add_size(MAXALIGN(sizeof(ZouRelSizeCtl)),
++					hash_estimate_size(ZOU_RELSIZE_ENTRIES,
++									   sizeof(ZouRelSizeEntry)));
++}
++
++void
++ZouRelSizeShmemInit(void)
++{
++	HASHCTL		info;
++	bool		found;
++
++	ZouRelSize = (ZouRelSizeCtl *)
++		ShmemInitStruct("zou relsize", sizeof(ZouRelSizeCtl), &found);
++	if (!found)
++	{
++		ZouRelSize->tranche = LWLockNewTrancheId();
++		LWLockInitialize(&ZouRelSize->lock, ZouRelSize->tranche);
++	}
++	LWLockRegisterTranche(ZouRelSize->tranche, "zou_relsize");
++
++	info.keysize = sizeof(ZouRelSizeKey);
++	info.entrysize = sizeof(ZouRelSizeEntry);
++	ZouRelSizeHash = ShmemInitHash("zou relsize hash",
++								   ZOU_RELSIZE_ENTRIES,
++								   ZOU_RELSIZE_ENTRIES,
++								   &info, HASH_ELEM | HASH_BLOBS);
++}
++
++static bool
++zou_relsize_lookup(SMgrRelation reln, ForkNumber forknum, BlockNumber *nblocks)
++{
++	ZouRelSizeKey key = {0};
++	ZouRelSizeEntry *entry;
++
++	if (ZouRelSizeHash == NULL)
++		return false;
++	key.locator = reln->smgr_rlocator.locator;
++	key.forknum = forknum;
++	LWLockAcquire(&ZouRelSize->lock, LW_SHARED);
++	entry = hash_search(ZouRelSizeHash, &key, HASH_FIND, NULL);
++	if (entry != NULL)
++		*nblocks = entry->nblocks;
++	LWLockRelease(&ZouRelSize->lock);
++	return entry != NULL;
++}
++
++static void
++zou_relsize_note(RelFileLocator locator, ForkNumber forknum,
++				 BlockNumber nblocks, ZouRelSizeMode mode)
++{
++	ZouRelSizeKey key = {0};
++	ZouRelSizeEntry *entry;
++	bool		found;
++
++	if (ZouRelSizeHash == NULL)
++		return;
++	key.locator = locator;
++	key.forknum = forknum;
++	LWLockAcquire(&ZouRelSize->lock, LW_EXCLUSIVE);
++	/* HASH_ENTER_NULL: a full table degrades to uncached, never errors */
++	entry = hash_search(ZouRelSizeHash, &key, HASH_ENTER_NULL, &found);
++	if (entry != NULL)
++	{
++		if (!found ||
++			mode == ZOU_RELSIZE_SET ||
++			(mode == ZOU_RELSIZE_GROW && nblocks > entry->nblocks))
++			entry->nblocks = nblocks;
++	}
++	LWLockRelease(&ZouRelSize->lock);
++}
++
++static void
++zou_relsize_forget(RelFileLocator locator, ForkNumber forknum)
++{
++	ZouRelSizeKey key = {0};
++
++	if (ZouRelSizeHash == NULL)
++		return;
++	key.locator = locator;
++	key.forknum = forknum;
++	LWLockAcquire(&ZouRelSize->lock, LW_EXCLUSIVE);
++	(void) hash_search(ZouRelSizeHash, &key, HASH_REMOVE, NULL);
++	LWLockRelease(&ZouRelSize->lock);
++}
++
+ bool
+ zou_smgr_routable(SMgrRelation reln)
+ {
+@@ -119,6 +253,14 @@ zouclose(SMgrRelation reln, ForkNumber forknum)
+ void
+ zoucreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
+ {
++	/*
++	 * Drop any cached size rather than seed one. A redo create lands on
++	 * a relation that may already hold pages, and a reused locator may
++	 * have skipped zouunlink (dropdb removes whole directories), so the
++	 * only safe size after create is the one the store reports on the
++	 * next nblocks miss.
++	 */
++	zou_relsize_forget(reln->smgr_rlocator.locator, forknum);
+ 	zou_check(zou_smgr_create(ZOU_LOCATOR(reln), (uint32) forknum),
+ 			  "create", reln, forknum);
+ }
+@@ -143,10 +285,16 @@ zouunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
+ 	if (forknum == InvalidForkNumber)
+ 	{
+ 		for (int fork = 0; fork <= MAX_FORKNUM; fork++)
++		{
++			zou_relsize_forget(rlocator.locator, (ForkNumber) fork);
+ 			(void) zou_smgr_unlink(spc, db, rel, (uint32) fork);
++		}
+ 	}
+ 	else
++	{
++		zou_relsize_forget(rlocator.locator, forknum);
+ 		(void) zou_smgr_unlink(spc, db, rel, (uint32) forknum);
++	}
+ 	/* like mdunlink, unlink failures are not worth erroring over */
+ }
+ 
+@@ -172,6 +320,8 @@ zouextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 							  (uint32) blocknum, (const uint8 *) buffer,
+ 							  zou_skip_fsync(skipFsync)),
+ 			  "extend", reln, forknum);
++	zou_relsize_note(reln->smgr_rlocator.locator, forknum,
++					 blocknum + 1, ZOU_RELSIZE_GROW);
+ }
+ 
+ void
+@@ -181,6 +331,8 @@ zouzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 	zou_check(zou_smgr_zeroextend(ZOU_LOCATOR(reln), (uint32) forknum,
+ 								  (uint32) blocknum, (uint32) nblocks),
+ 			  "zeroextend", reln, forknum);
++	zou_relsize_note(reln->smgr_rlocator.locator, forknum,
++					 blocknum + (BlockNumber) nblocks, ZOU_RELSIZE_GROW);
+ }
+ 
+ bool
+@@ -326,10 +478,20 @@ zouwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ BlockNumber
+ zounblocks(SMgrRelation reln, ForkNumber forknum)
+ {
++	BlockNumber cached;
+ 	uint32		n = 0;
+ 
++	if (zou_relsize_lookup(reln, forknum, &cached))
++		return cached;
+ 	zou_check(zou_smgr_nblocks(ZOU_LOCATOR(reln), (uint32) forknum, &n),
+ 			  "nblocks", reln, forknum);
++
++	/*
++	 * Seed, do not overwrite: an extend that landed while we read from
++	 * the store already knows a newer size than the store told us.
++	 */
++	zou_relsize_note(reln->smgr_rlocator.locator, forknum,
++					 (BlockNumber) n, ZOU_RELSIZE_SEED);
+ 	return (BlockNumber) n;
+ }
+ 
+@@ -340,6 +502,8 @@ zoutruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks,
+ 	zou_check(zou_smgr_truncate(ZOU_LOCATOR(reln), (uint32) forknum,
+ 								(uint32) nblocks),
+ 			  "truncate", reln, forknum);
++	zou_relsize_note(reln->smgr_rlocator.locator, forknum,
++					 nblocks, ZOU_RELSIZE_SET);
+ }
+ 
+ void
+--- a/src/include/storage/zou_smgr.h
++++ b/src/include/storage/zou_smgr.h
+@@ -55,4 +55,7 @@ extern void zouregistersync(SMgrRelation reln, ForkNumber forknum);
+ extern int	zoufd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+ 				  uint32 *off);
+ 
++extern Size ZouRelSizeShmemSize(void);
++extern void ZouRelSizeShmemInit(void);
++
+ #endif							/* ZOU_SMGR_H */
