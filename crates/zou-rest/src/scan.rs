@@ -11,19 +11,148 @@ use std::fmt;
 
 /// Where and why a parse failed. `at` is a zero based byte offset
 /// into whichever string was being read.
+///
+/// The shape is upstream's, which is parsec's: a position, the token
+/// the grammar could not take there, and the set of things it would
+/// have taken instead. A sentence would be easier to write and worse
+/// to read, since what a client needs is the list of what was allowed
+/// and not our opinion of what they meant, so the scanners carry the
+/// list and `Display` renders it the way parsec's
+/// `showErrorMessages` does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error {
-    pub message: String,
+    pub found: Found,
+    /// What the grammar would have taken, in the order it offers
+    /// them, already quoted where parsec quotes them.
+    pub expecting: Vec<String>,
     pub at: usize,
+}
+
+/// The token half of a parse error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Found {
+    /// The input ran out.
+    End,
+    /// A byte no rule could take. parsec shows it the way it shows a
+    /// one character string, in double quotes.
+    Token(char),
+    /// Input left over where the grammar wanted the end of it. This
+    /// is `eof`'s own complaint rather than a rule's, and parsec
+    /// shows the character in single quotes, which is the only
+    /// visible difference between the two.
+    Leftover(char),
+}
+
+impl fmt::Display for Found {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Found::End => write!(f, "end of input"),
+            Found::Token(c) => write!(f, "\"{c}\""),
+            Found::Leftover(c) => write!(f, "'{c}'"),
+        }
+    }
+}
+
+impl Error {
+    /// Rename what was expected, when the rule that failed did so
+    /// without taking anything.
+    ///
+    /// This is parsec's `<?>`, which relabels an alternative only
+    /// while it is still at its own starting position: once a rule has
+    /// taken a byte its own error is the specific one and a label over
+    /// the top of it would say less.
+    pub(crate) fn label(mut self, start: usize, expecting: &[&str]) -> Error {
+        if self.at == start {
+            self.expecting = expecting.iter().map(|s| s.to_string()).collect();
+        }
+        self
+    }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at offset {}", self.message, self.at)
+        write!(f, "unexpected {}", self.found)?;
+        let mut seen: Vec<&str> = Vec::new();
+        for want in &self.expecting {
+            if !seen.contains(&want.as_str()) {
+                seen.push(want);
+            }
+        }
+        for (i, want) in seen.iter().enumerate() {
+            let sep = match i {
+                0 => " expecting ",
+                _ if i + 1 == seen.len() => " or ",
+                _ => ", ",
+            };
+            write!(f, "{sep}{want}")?;
+        }
+        Ok(())
     }
 }
 
 impl std::error::Error for Error {}
+
+/// A parse failure and the parameter it happened in, which is what
+/// the message names. `skew` is how many characters the parser had
+/// already read before `input` started, which is only ever nonzero
+/// for a logic tree, where upstream parses the key's operator and the
+/// value as one string and then quotes the value alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub what: &'static str,
+    pub input: String,
+    pub skew: usize,
+    pub error: Error,
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "failed to parse {} ({}): {}",
+            self.what, self.input, self.error
+        )
+    }
+}
+
+/// A word as parsec quotes one, which is how every literal the
+/// grammars expect is written in an error.
+pub(crate) fn word(s: &str) -> String {
+    format!("\"{s}\"")
+}
+
+/// The label of a name in any of the grammars.
+pub(crate) const FIELD_NAME: &str = "field name (* or [a..z0..9_$])";
+
+/// The label of a key inside a json path.
+pub(crate) const JSON_KEY: &str = "any non reserved character different from: .,>()";
+
+pub(crate) const DELIMITER: &str = "delimiter (.)";
+
+pub(crate) const END: &str = "end of input";
+
+pub(crate) const DIGIT: &str = "digit";
+
+/// How far into `rest` a set of alternatives gets before none of them
+/// can go on.
+///
+/// parsec keeps the furthest position any alternative reached, the
+/// backtracked ones included, so a value that shares a prefix with one
+/// of the words is reported at the byte where that word stopped
+/// matching rather than at the word's start. `is.nil` is the one worth
+/// remembering: it points at the `i`, because `null` got that far.
+pub(crate) fn reach(rest: &str, words: &[&str]) -> usize {
+    words
+        .iter()
+        .map(|w| {
+            w.bytes()
+                .zip(rest.bytes())
+                .take_while(|(a, b)| a == b)
+                .count()
+        })
+        .max()
+        .unwrap_or(0)
+}
 
 /// One json arrow step hung off a column, `->key`, `->>key`, or an
 /// array index in either flavor.
@@ -110,15 +239,92 @@ impl<'a> Cur<'a> {
         }
     }
 
-    pub(crate) fn err<T>(&self, message: impl Into<String>) -> Result<T, Error> {
+    /// The token at an offset, or the end of the input.
+    pub(crate) fn found(&self, at: usize) -> Found {
+        match self.s[at.min(self.s.len())..].chars().next() {
+            None => Found::End,
+            Some(c) => Found::Token(c),
+        }
+    }
+
+    pub(crate) fn err<T>(&self, expecting: &[&str]) -> Result<T, Error> {
+        self.err_at(self.pos, expecting)
+    }
+
+    pub(crate) fn err_at<T>(&self, at: usize, expecting: &[&str]) -> Result<T, Error> {
         Err(Error {
-            message: message.into(),
+            found: self.found(at),
+            expecting: expecting.iter().map(|s| s.to_string()).collect(),
+            at,
+        })
+    }
+
+    /// The error for a set of alternatives written `try (string w)`,
+    /// none of which matched.
+    ///
+    /// Upstream reports all of these at the position the attempt
+    /// started, since a word is taken or not taken as one thing, and
+    /// where they all report the same position the character named is
+    /// the one that broke the alternative offered first. So `id.ac`
+    /// points at the `a` and complains about the `c`, which is where
+    /// `asc` stopped, and `id.nulsfist` points at the same place and
+    /// complains about the `n`, which is where `asc` stopped as well.
+    pub(crate) fn err_word<T>(
+        &self,
+        at: usize,
+        words: &[&str],
+        expecting: &[&str],
+    ) -> Result<T, Error> {
+        let found = self.found(at + reach(&self.s[at.min(self.s.len())..], &words[..1]));
+        Err(Error {
+            found,
+            expecting: expecting.iter().map(|s| s.to_string()).collect(),
+            at,
+        })
+    }
+
+    /// The same for alternatives that are matched a character at a
+    /// time and without regard to case, upstream's `ciString`, where
+    /// the position does follow the match: `is.nil` points at the `i`
+    /// rather than at the `n`, because `null` got that far.
+    pub(crate) fn err_ci_word<T>(
+        &self,
+        at: usize,
+        words: &[&str],
+        expecting: &[&str],
+    ) -> Result<T, Error> {
+        let rest = self.s[at.min(self.s.len())..].to_ascii_lowercase();
+        self.err_at(at + reach(&rest, words), expecting)
+    }
+
+    /// The error for input left where the grammar wanted the end of
+    /// it, which quotes the character the other way.
+    pub(crate) fn leftover<T>(&self, expecting: &[&str]) -> Result<T, Error> {
+        let found = match self.found(self.pos) {
+            Found::Token(c) => Found::Leftover(c),
+            other => other,
+        };
+        Err(Error {
+            found,
+            expecting: expecting.iter().map(|s| s.to_string()).collect(),
             at: self.pos,
         })
     }
 
-    pub(crate) fn expect(&mut self, b: u8, what: &str) -> Result<(), Error> {
-        if self.eat(b) { Ok(()) } else { self.err(what) }
+    pub(crate) fn expect(&mut self, b: u8) -> Result<(), Error> {
+        let quoted = word(&(b as char).to_string());
+        self.expect_as(b, &[&quoted])
+    }
+
+    /// The same for a byte the grammar has a name for, the way `.`
+    /// between an operator and its value is upstream's delimiter
+    /// rather than a full stop.
+    pub(crate) fn expect_as(&mut self, b: u8, expecting: &[&str]) -> Result<(), Error> {
+        if self.eat(b) {
+            Ok(())
+        } else {
+            self.err(expecting)
+        }
     }
 
     pub(crate) fn take_rest(&mut self) -> String {
@@ -142,11 +348,11 @@ pub(crate) fn scan_name(cur: &mut Cur, brk: fn(u8) -> bool) -> String {
 }
 
 pub(crate) fn scan_quoted(cur: &mut Cur) -> Result<String, Error> {
-    cur.expect(b'"', "expected an opening quote")?;
+    cur.expect(b'"')?;
     let mut out = Vec::new();
     loop {
         match cur.peek() {
-            None => return cur.err("unterminated quoted string"),
+            None => return cur.err(&[&word("\"")]),
             Some(b'"') => {
                 cur.bump();
                 break;
@@ -154,7 +360,7 @@ pub(crate) fn scan_quoted(cur: &mut Cur) -> Result<String, Error> {
             Some(b'\\') => {
                 cur.bump();
                 match cur.peek() {
-                    None => return cur.err("unterminated quoted string"),
+                    None => return cur.err(&[&word("\"")]),
                     Some(b) => {
                         out.push(b);
                         cur.bump();
@@ -201,6 +407,24 @@ fn parse_json_key(cur: &mut Cur) -> Result<JsonKey, Error> {
     if let Some(n) = json_index(cur) {
         return Ok(JsonKey::Index(n));
     }
+    // A sign is the front of an index and nothing else, since a dash
+    // cannot start a key. So once it is there the failure is the
+    // index's rather than the key's, and it is reported past the sign
+    // where the number should have been.
+    if cur.peek() == Some(b'-') {
+        let digits = cur.pos + 1;
+        let mut at = digits;
+        while cur.s.as_bytes().get(at).is_some_and(u8::is_ascii_digit) {
+            at += 1;
+        }
+        if at == digits {
+            return cur.err_at(digits, &[DIGIT]);
+        }
+        return cur.err_at(
+            at,
+            &[DIGIT, &word("->"), &word("::"), &word("."), &word(","), END],
+        );
+    }
     if cur.peek() == Some(b'"') {
         return Ok(JsonKey::Name(scan_quoted(cur)?));
     }
@@ -211,7 +435,14 @@ fn parse_json_key(cur: &mut Cur) -> Result<JsonKey, Error> {
             cur.bump();
         }
         if cur.pos == start {
-            return cur.err("expected a json path key");
+            // A key that has already taken a piece and a dash is past
+            // the point where naming what a key looks like would say
+            // anything, the same way a label stops applying upstream
+            // once the rule under it has consumed input.
+            if parts.is_empty() {
+                return cur.err(&[&word("-"), DIGIT, JSON_KEY]);
+            }
+            return cur.err(&[]);
         }
         parts.push(cur.s[start..cur.pos].trim_matches([' ', '\t']));
         // A dash is part of the key and joins two pieces of it, which

@@ -20,7 +20,13 @@
 
 use std::fmt;
 
-use crate::scan::{Cur, fmt_path, parse_json_path, scan_name, scan_quoted, write_escaped};
+use crate::scan::{
+    Cur, DELIMITER, END, FIELD_NAME, fmt_path, parse_json_path, scan_name, scan_quoted, word,
+    write_escaped,
+};
+
+/// The comma between terms, quoted the way parsec quotes it.
+const COMMA: &str = "\",\"";
 
 pub use crate::scan::{Error, JsonKey, JsonStep};
 
@@ -79,7 +85,7 @@ pub fn parse(value: &str) -> Result<Vec<Term>, Error> {
         terms.push(parse_term(&mut cur)?);
     }
     if !cur.done() {
-        return cur.err("unexpected characters after the order list");
+        return cur.leftover(&[COMMA, END]);
     }
     Ok(terms)
 }
@@ -96,7 +102,7 @@ fn parse_field(cur: &mut Cur) -> Result<String, Error> {
         scan_name(cur, name_break)
     };
     if name.is_empty() {
-        return cur.err("expected a field name");
+        return cur.err(&[FIELD_NAME]);
     }
     Ok(name)
 }
@@ -113,60 +119,52 @@ fn parse_term(cur: &mut Cur) -> Result<Term, Error> {
     }
     let path = parse_json_path(cur)?;
     if relation.is_some() {
-        cur.expect(b')', "unterminated related order")?;
+        cur.expect(b')')?;
     }
 
+    // A direction then a nulls placement, each at most once and in
+    // that order, and each of them matched as a word rather than read
+    // as one. The difference shows up on the way out: `id.asc.nullsl`
+    // is a term that stops after `asc` and leaves the rest to whoever
+    // wanted the end of the value, and `id.ascending` is a direction
+    // with something stuck to it, which is the same thing one dot
+    // earlier.
     let mut direction = None;
     let mut nulls = None;
-    while cur.eat(b'.') {
+    while nulls.is_none() && cur.eat(b'.') {
         let at = cur.pos;
-        let word = scan_name(cur, name_break);
-        if word.is_empty() {
-            return Err(Error {
-                message: "expected an order modifier".into(),
-                at,
-            });
+        let mut words: Vec<&str> = Vec::new();
+        if direction.is_none() {
+            words.push("asc");
+            words.push("desc");
         }
-        let dir = match word.as_str() {
-            "asc" => Some(Direction::Asc),
-            "desc" => Some(Direction::Desc),
-            _ => None,
-        };
-        if let Some(d) = dir {
-            if direction.is_some() {
-                return Err(Error {
-                    message: "a term takes one direction".into(),
-                    at,
-                });
+        words.push("nullsfirst");
+        words.push("nullslast");
+        let taken = words.iter().copied().find(|w| cur.eat_str(w));
+        match taken {
+            Some("asc") => direction = Some(Direction::Asc),
+            Some("desc") => direction = Some(Direction::Desc),
+            Some("nullsfirst") => nulls = Some(Nulls::First),
+            Some("nullslast") => nulls = Some(Nulls::Last),
+            _ => {
+                let quoted: Vec<String> = words.iter().map(|w| word(w)).collect();
+                let expecting: Vec<&str> = quoted.iter().map(String::as_str).collect();
+                return cur.err_word(at, &words, &expecting);
             }
-            if nulls.is_some() {
-                return Err(Error {
-                    message: "the direction goes before the nulls".into(),
-                    at,
-                });
-            }
-            direction = Some(d);
-            continue;
         }
-        let n = match word.as_str() {
-            "nullsfirst" => Some(Nulls::First),
-            "nullslast" => Some(Nulls::Last),
-            _ => None,
-        };
-        if let Some(n) = n {
-            if nulls.is_some() {
-                return Err(Error {
-                    message: "a term takes one nulls placement".into(),
-                    at,
-                });
-            }
-            nulls = Some(n);
-            continue;
+    }
+
+    // A term ends where the next one begins or where the value does,
+    // and until the nulls placement is in there is always another
+    // modifier it could have taken instead.
+    if !cur.done() && cur.peek() != Some(b',') {
+        let mut wants: Vec<&str> = Vec::new();
+        if nulls.is_none() {
+            wants.push(DELIMITER);
         }
-        return Err(Error {
-            message: format!("unknown order modifier ({word})"),
-            at,
-        });
+        wants.push(COMMA);
+        wants.push(END);
+        return cur.leftover(&wants);
     }
 
     Ok(Term {
@@ -234,10 +232,10 @@ mod tests {
         parse(value).unwrap_or_else(|e| panic!("{value} failed: {e}"))
     }
 
-    fn fail(value: &str) -> Error {
+    fn fail(value: &str) -> String {
         match parse(value) {
             Ok(terms) => panic!("{value} parsed as {terms:?}"),
-            Err(e) => e,
+            Err(e) => e.to_string(),
         }
     }
 
@@ -264,14 +262,20 @@ mod tests {
         assert_eq!(terms[0].direction, Some(Direction::Desc));
         assert_eq!(terms[0].nulls, Some(Nulls::Last));
 
+        // The direction goes first, so a nulls placement closes the
+        // term and what follows it belongs to the next one.
         assert_eq!(
-            fail("age.nullsfirst.desc").message,
-            "the direction goes before the nulls"
+            fail("age.nullsfirst.desc"),
+            "unexpected '.' expecting \",\" or end of input"
         );
-        assert_eq!(fail("age.asc.desc").message, "a term takes one direction");
         assert_eq!(
-            fail("age.nullsfirst.nullslast").message,
-            "a term takes one nulls placement"
+            fail("age.nullsfirst.nullslast"),
+            "unexpected '.' expecting \",\" or end of input"
+        );
+        // A second direction is read where a nulls placement was due.
+        assert_eq!(
+            fail("age.asc.desc"),
+            "unexpected \"d\" expecting \"nullsfirst\" or \"nullslast\""
         );
     }
 
@@ -328,20 +332,37 @@ mod tests {
         assert_eq!(terms[0].relation, None);
         assert_eq!(terms[0].name, "a(b");
 
-        assert_eq!(fail("clients(name").message, "unterminated related order");
-        assert_eq!(fail("clients()").message, "expected a field name");
+        assert_eq!(
+            fail("clients(name"),
+            "unexpected end of input expecting \")\""
+        );
+        assert_eq!(
+            fail("clients()"),
+            "unexpected \")\" expecting field name (* or [a..z0..9_$])"
+        );
     }
 
     #[test]
     fn errors() {
-        assert_eq!(fail("").message, "expected a field name");
-        assert_eq!(fail("a,").message, "expected a field name");
-        assert_eq!(fail(",a").message, "expected a field name");
-        assert!(fail("a.upward").message.contains("unknown order modifier"));
-        assert_eq!(fail("a.").message, "expected an order modifier");
+        let name = "expecting field name (* or [a..z0..9_$])";
+        assert_eq!(fail(""), format!("unexpected end of input {name}"));
+        assert_eq!(fail("a,"), format!("unexpected end of input {name}"));
+        assert_eq!(fail(",a"), format!("unexpected \",\" {name}"));
+
+        let modifiers = "\"asc\", \"desc\", \"nullsfirst\" or \"nullslast\"";
         assert_eq!(
-            fail("a b)c").message,
-            "unexpected characters after the order list"
+            fail("a.upward"),
+            format!("unexpected \"u\" expecting {modifiers}")
+        );
+        assert_eq!(
+            fail("a."),
+            format!("unexpected end of input expecting {modifiers}")
+        );
+        // Leftovers are the end of the value complaining, which is the
+        // one place a character is quoted the other way.
+        assert_eq!(
+            fail("a b)c"),
+            "unexpected ')' expecting delimiter (.), \",\" or end of input"
         );
     }
 

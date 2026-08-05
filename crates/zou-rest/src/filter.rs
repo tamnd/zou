@@ -37,8 +37,53 @@
 
 use std::fmt;
 
-use crate::scan::{Cur, fmt_path, parse_json_path, scan_name, scan_quoted, write_escaped};
-pub use crate::scan::{Error, JsonKey, JsonStep};
+use crate::scan::{
+    Cur, DELIMITER, END, FIELD_NAME, fmt_path, parse_json_path, scan_name, scan_quoted, word,
+    write_escaped,
+};
+pub use crate::scan::{Error, Failure, JsonKey, JsonStep};
+
+/// Every operator token. The order is the one upstream tries them in,
+/// which only shows in an error: the character a message names is the
+/// one that broke the longest of these that started to match.
+const OPERATORS: &[&str] = &[
+    "in",
+    "is",
+    "isdistinct",
+    "fts",
+    "plfts",
+    "phfts",
+    "wfts",
+    "neq",
+    "cs",
+    "cd",
+    "ov",
+    "sl",
+    "sr",
+    "nxr",
+    "nxl",
+    "adj",
+    "eq",
+    "gte",
+    "gt",
+    "lte",
+    "lt",
+    "like",
+    "ilike",
+    "match",
+    "imatch",
+];
+
+/// What upstream calls the operator slot when it names it rather than
+/// listing every word that fits in it.
+const OPERATOR: &str = "operator (eq, gt, ...)";
+
+/// The values `is` takes, matched without regard to case.
+const IS_VALUES: &[&str] = &["null", "not_null", "true", "false", "unknown"];
+
+const IS_VAL: &str = "isVal: (null, not_null, true, false, unknown)";
+
+const NOT_WORD: &str = "\"not\"";
 
 /// A filter operator, the token between the two dots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +287,55 @@ pub enum Parsed {
 /// Parse one query pair. The caller has already url decoded both
 /// sides and decided the key is not one of the reserved words like
 /// select, order, or limit.
-pub fn parse_pair(key: &str, value: &str) -> Result<Parsed, Error> {
+pub fn parse_pair(key: &str, value: &str) -> Result<Parsed, Failure> {
+    // Which of the two sides went wrong decides what the message
+    // calls the thing it could not read, and the key decides which of
+    // the two names the key itself goes by, so both are settled here
+    // rather than by the caller.
+    let logic_key = matches!(key.rsplit('.').next(), Some("and") | Some("or"));
+    fn side(what: &'static str, input: &str, skew: usize) -> impl Fn(Error) -> Failure {
+        let input = input.to_string();
+        move |error| Failure {
+            what,
+            input: input.clone(),
+            skew,
+            error,
+        }
+    }
+    let in_key = side(if logic_key { "logic path" } else { "tree path" }, key, 0);
+    let (embed, op, negated) = match parse_key(key).map_err(in_key)? {
+        Key::Logic { embed, op, negated } => (embed, op, negated),
+        Key::Field(field) => {
+            let mut vc = Cur::new(value);
+            let cond = parse_cond_rhs(&mut vc, field, false).map_err(side("filter", value, 0))?;
+            return Ok(Parsed::Filter(cond));
+        }
+    };
+    // Upstream parses the operator from the key and the value as one
+    // string, `or(a.eq.1)`, so a position in the tree counts from the
+    // front of the operator while the message quotes the value alone.
+    let skew = op.name().len() + if negated { 4 } else { 0 };
+    let mut vc = Cur::new(value);
+    let kids = parse_group_body(&mut vc).map_err(side("logic tree", value, skew))?;
+    Ok(Parsed::Logic {
+        embed,
+        op,
+        negated,
+        kids,
+    })
+}
+
+/// What one query key names.
+enum Key {
+    Field(Field),
+    Logic {
+        embed: Vec<String>,
+        op: LogicOp,
+        negated: bool,
+    },
+}
+
+fn parse_key(key: &str) -> Result<Key, Error> {
     let mut kc = Cur::new(key);
     let mut segs: Vec<Seg> = Vec::new();
     loop {
@@ -251,14 +344,14 @@ pub fn parse_pair(key: &str, value: &str) -> Result<Parsed, Error> {
         segs.push(seg);
         if kc.eat(b'.') {
             if had_path {
-                return kc.err("a json path ends the field");
+                return kc.err(&[END]);
             }
             continue;
         }
         if kc.done() {
             break;
         }
-        return kc.err("unexpected character in the field");
+        return kc.leftover(&[END]);
     }
 
     let last = segs.last().expect("the loop always pushes one segment");
@@ -278,26 +371,16 @@ pub fn parse_pair(key: &str, value: &str) -> Result<Parsed, Error> {
             segs.pop();
         }
         let embed = embed_names(&kc, segs)?;
-        let mut vc = Cur::new(value);
-        let kids = parse_group_body(&mut vc)?;
-        return Ok(Parsed::Logic {
-            embed,
-            op,
-            negated,
-            kids,
-        });
+        return Ok(Key::Logic { embed, op, negated });
     }
 
     let last = segs.pop().expect("checked non empty above");
     let embed = embed_names(&kc, segs)?;
-    let field = Field {
+    Ok(Key::Field(Field {
         embed,
         column: last.name,
         path: last.path,
-    };
-    let mut vc = Cur::new(value);
-    let cond = parse_cond_rhs(&mut vc, field, false)?;
-    Ok(Parsed::Filter(cond))
+    }))
 }
 
 /// A parsed key segment: a name, its json path, and whether the name
@@ -312,7 +395,7 @@ fn embed_names(kc: &Cur, segs: Vec<Seg>) -> Result<Vec<String>, Error> {
     let mut out = Vec::with_capacity(segs.len());
     for s in segs {
         if !s.path.is_empty() {
-            return kc.err("a json path ends the field");
+            return kc.err(&[END]);
         }
         out.push(s.name);
     }
@@ -336,7 +419,7 @@ fn parse_segment(cur: &mut Cur) -> Result<Seg, Error> {
         scan_name(cur, name_break).trim_matches([' ', '\t']).into()
     };
     if name.is_empty() {
-        return cur.err("expected a field name");
+        return cur.err(&[FIELD_NAME]);
     }
     let path = parse_json_path(cur)?;
     Ok(Seg { name, path, quoted })
@@ -363,47 +446,86 @@ pub fn is_operator(value: &str) -> bool {
 fn parse_cond_rhs(cur: &mut Cur, field: Field, in_tree: bool) -> Result<Cond, Error> {
     let negated = cur.eat_str("not.");
     let at = cur.pos;
+    // Every way to write the operator slot is a word, an optional
+    // bracket, and the delimiter, and upstream tries all of them
+    // behind `try` under one label. So whatever any of them was
+    // reaching for, what the client is told is that an operator goes
+    // here, and the only thing the attempts decide is where the
+    // finger points: at the furthest byte any of them read.
+    //
+    // The `not.` in front is not under that label and keeps its own
+    // complaint, and it is the only reason `expecting` here is ever
+    // more than one thing: it is offered alongside the operator while
+    // the position is still the front of the value.
+    let slot = |at: usize, p: usize| -> Vec<&'static str> {
+        match !negated && p == at {
+            true => vec![NOT_WORD, OPERATOR],
+            false => vec![OPERATOR],
+        }
+    };
     let opname = scan_name(cur, name_break);
-    if opname.is_empty() {
-        return cur.err("expected an operator");
-    }
     let Some(op) = Op::parse(&opname) else {
-        return Err(Error {
-            message: format!("unknown operator ({opname})"),
-            at,
-        });
+        let rest = &cur.s[at.min(cur.s.len())..];
+        // A word that got as far as the delimiter and found something
+        // else there is the deepest any attempt reached, `eqx` points
+        // at the `x`. A `not` with no delimiter after it is the same
+        // thing one alternative up, and says so in its own words.
+        if !negated && rest.starts_with("not") {
+            return cur.err_at(at + 3, &[DELIMITER]);
+        }
+        let deepest = OPERATORS
+            .iter()
+            .filter(|w| rest.starts_with(**w))
+            .map(|w| at + w.len())
+            .max();
+        return match deepest {
+            Some(p) => cur.err_at(p, &slot(at, p)),
+            // Nothing matched at all, so the position is the front of
+            // the slot and the character named is the one that broke
+            // the first alternative upstream offers.
+            None => cur.err_word(at, &[if negated { "in" } else { "not" }], &slot(at, at)),
+        };
     };
     let mut quant = None;
     let mut config = None;
-    if cur.eat(b'(') {
+    // Only two operators take a bracket, and on any other one the
+    // bracket is simply not the delimiter that was due.
+    if cur.peek() == Some(b'(') && (op.is_fts() || op.quantifiable()) {
+        cur.bump();
+        let modifier = cur.pos;
         let m = scan_name(cur, name_break);
-        if op.is_fts() {
+        if op.is_fts() && !m.is_empty() {
             config = Some(m);
         } else if m == "any" && op.quantifiable() {
             quant = Some(Quant::Any);
         } else if m == "all" && op.quantifiable() {
             quant = Some(Quant::All);
         } else {
-            return cur.err(format!("unexpected modifier ({m}) for {opname}"));
+            return cur.err_at(modifier, &slot(at, modifier));
         }
-        cur.expect(b')', "unterminated modifier")?;
+        if !cur.eat(b')') {
+            return cur.err_at(cur.pos, &slot(at, cur.pos));
+        }
     }
-    cur.expect(b'.', "expected . after the operator")?;
+    if !cur.eat(b'.') {
+        return cur.err_at(cur.pos, &slot(at, cur.pos));
+    }
 
+    let literal = cur.pos;
     let mut value = if op == Op::In {
         cur.skip_spaces();
-        cur.expect(b'(', "in wants a (list)")?;
+        cur.expect(b'(')?;
         // An empty list is one empty element, which is also what
         // `in.("")` reads as. The compiler turns either into the
         // empty array, the way upstream does.
         cur.skip_spaces();
-        Value::List(parse_elements(cur, b')', "unterminated list")?)
+        Value::List(parse_elements(cur, b')')?)
     } else if quant.is_some() {
-        cur.expect(b'{', "any and all want an {array}")?;
+        cur.expect(b'{')?;
         if cur.eat(b'}') {
             Value::Array(Vec::new())
         } else {
-            Value::Array(parse_elements(cur, b'}', "unterminated array")?)
+            Value::Array(parse_elements(cur, b'}')?)
         }
     } else if in_tree {
         Value::Lit(scan_array(cur).unwrap_or_else(|| scan_element(cur, b",)")))
@@ -416,13 +538,8 @@ fn parse_cond_rhs(cur: &mut Cur, field: Field, in_tree: bool) -> Result<Cond, Er
             unreachable!("is never takes a list");
         };
         let lower = s.to_ascii_lowercase();
-        if !matches!(
-            lower.as_str(),
-            "null" | "not_null" | "true" | "false" | "unknown"
-        ) {
-            return cur.err(format!(
-                "is wants null, not_null, true, false, or unknown, not ({s})"
-            ));
+        if !IS_VALUES.contains(&lower.as_str()) {
+            return cur.err_ci_word(literal, IS_VALUES, &[IS_VAL]);
         }
         value = Value::Lit(lower);
     }
@@ -437,14 +554,14 @@ fn parse_cond_rhs(cur: &mut Cur, field: Field, in_tree: bool) -> Result<Cond, Er
     })
 }
 
-fn parse_elements(cur: &mut Cur, close: u8, unterminated: &str) -> Result<Vec<String>, Error> {
+fn parse_elements(cur: &mut Cur, close: u8) -> Result<Vec<String>, Error> {
     let mut out = Vec::new();
     loop {
         out.push(scan_element(cur, &[b',', close]));
         if cur.eat(b',') {
             continue;
         }
-        cur.expect(close, unterminated)?;
+        cur.expect_as(close, &[&word(","), &word(&(close as char).to_string())])?;
         return Ok(out);
     }
 }
@@ -504,7 +621,7 @@ fn scan_array(cur: &mut Cur) -> Option<String> {
 /// The body of a logic group, cursor sitting on the opening paren.
 fn parse_group_body(cur: &mut Cur) -> Result<Vec<Node>, Error> {
     cur.skip_spaces();
-    cur.expect(b'(', "a group wants a (list)")?;
+    cur.expect(b'(')?;
     cur.skip_spaces();
     let mut kids = Vec::new();
     loop {
@@ -514,7 +631,7 @@ fn parse_group_body(cur: &mut Cur) -> Result<Vec<Node>, Error> {
             cur.skip_spaces();
             continue;
         }
-        cur.expect(b')', "unterminated group")?;
+        cur.expect_as(b')', &[&word(","), &word(")")])?;
         cur.skip_spaces();
         return Ok(kids);
     }
@@ -525,8 +642,56 @@ fn parse_item(cur: &mut Cur) -> Result<Node, Error> {
         let kids = parse_group_body(cur)?;
         return Ok(Node::Group { op, negated, kids });
     }
+    // An item is read as a condition first and as a group only when
+    // that fails, which is upstream's order and decides whose
+    // complaint the client gets to hear.
+    let start = cur.pos;
+    let failed = match parse_condition(cur) {
+        Ok(node) => return Ok(node),
+        Err(e) => e,
+    };
+    cur.pos = start;
+
+    // The group reading gets to speak over the condition's failure
+    // whenever it took anything of its own: the `not.` in front, or
+    // enough of `and` or `or` to be sure that is what was meant. It
+    // is a group that cannot be finished at this point, since a whole
+    // one was already ruled out above, so all there is to say is what
+    // was missing.
+    let negated = cur.eat_str("not.");
+    let rest = &cur.s[cur.pos..];
+    let head = ["and", "or"].into_iter().find(|w| rest.starts_with(w));
+    if let Some(w) = head {
+        cur.pos += w.len();
+        cur.skip_spaces();
+        return cur.err(&[&word("(")]);
+    }
+    if negated {
+        return cur.err(&["logic operator (and, or)"]);
+    }
+    // `or` is the one word here that is not tried first and thrown
+    // away whole, so a value that shares its first letter has already
+    // committed to it by the time the second one does not fit.
+    if rest.starts_with('o') && rest.len() > 1 {
+        return cur.err_word(cur.pos, &["or"], &[&word("or")]);
+    }
+    // Neither reading took anything, so the client is told all three
+    // things an item can begin with.
+    Err(failed.label(
+        start,
+        &[
+            FIELD_NAME,
+            "negation operator (not)",
+            "logic operator (and, or)",
+        ],
+    ))
+}
+
+/// One item of a logic group read as a condition, which is what an
+/// item is unless it turns out to be a nested group.
+fn parse_condition(cur: &mut Cur) -> Result<Node, Error> {
     let seg = parse_segment(cur)?;
-    cur.expect(b'.', "expected . after the field")?;
+    cur.expect_as(b'.', &[DELIMITER])?;
     let field = Field {
         embed: Vec::new(),
         column: seg.name,
@@ -744,10 +909,10 @@ mod tests {
         parse_pair(key, value).unwrap_or_else(|e| panic!("{key}={value} failed: {e}"))
     }
 
-    fn fail(key: &str, value: &str) -> Error {
+    fn fail(key: &str, value: &str) -> String {
         match parse_pair(key, value) {
             Ok(p) => panic!("{key}={value} parsed as {p:?}"),
-            Err(e) => e,
+            Err(f) => f.error.to_string(),
         }
     }
 
@@ -835,7 +1000,10 @@ mod tests {
             cond(&p).value,
             Value::List(vec!["a,b".into(), "c".into(), "d\"e".into(), "".into()])
         );
-        assert_eq!(fail("id", "in.(1,2").message, "unterminated list");
+        assert_eq!(
+            fail("id", "in.(1,2"),
+            "unexpected end of input expecting \",\" or \")\""
+        );
     }
 
     #[test]
@@ -877,20 +1045,18 @@ mod tests {
         assert_eq!(cond(&p).quant, Some(Quant::All));
         let p = ok("age", "gt(any).{}");
         assert_eq!(cond(&p).value, Value::Array(vec![]));
-        assert!(
-            fail("id", "in(any).(1)")
-                .message
-                .contains("unexpected modifier")
-        );
-        assert!(
-            fail("age", "eq(some).{1}")
-                .message
-                .contains("unexpected modifier")
+        // A bracket is part of the operator slot, so a bracket where
+        // the operator takes none, or one holding a word that is not
+        // a quantifier, is the slot itself complaining.
+        assert_eq!(
+            fail("id", "in(any).(1)"),
+            format!("unexpected \"(\" expecting {OPERATOR}")
         );
         assert_eq!(
-            fail("age", "eq(any).1").message,
-            "any and all want an {array}"
+            fail("age", "eq(some).{1}"),
+            format!("unexpected \"s\" expecting {OPERATOR}")
         );
+        assert_eq!(fail("age", "eq(any).1"), "unexpected \"1\" expecting \"{\"");
     }
 
     #[test]
@@ -914,7 +1080,10 @@ mod tests {
         for v in ["null", "not_null", "true", "false", "unknown"] {
             ok("flag", &format!("is.{v}"));
         }
-        assert!(fail("flag", "is.maybe").message.contains("is wants"));
+        assert_eq!(
+            fail("flag", "is.maybe"),
+            format!("unexpected \"m\" expecting {IS_VAL}")
+        );
         ok("flag", "not.is.null");
     }
 
@@ -941,8 +1110,8 @@ mod tests {
         let p = ok("data->-1", "eq.9");
         assert_eq!(cond(&p).field.path[0].key, JsonKey::Index(-1));
         assert_eq!(
-            fail("a->>b.c", "eq.1").message,
-            "a json path ends the field"
+            fail("a->>b.c", "eq.1"),
+            "unexpected \"c\" expecting end of input"
         );
     }
 
@@ -1110,24 +1279,55 @@ mod tests {
 
     #[test]
     fn tree_errors_point_at_the_problem() {
-        assert_eq!(fail("or", "(a.eq.1").message, "unterminated group");
-        assert_eq!(fail("or", "()").message, "expected a field name");
-        assert_eq!(fail("or", "a.eq.1").message, "a group wants a (list)");
-        assert!(fail("or", "(a.foo.1)").message.contains("unknown operator"));
         assert_eq!(
-            fail("or", "(a.eq)").message,
-            "expected . after the operator"
+            fail("or", "(a.eq.1"),
+            "unexpected end of input expecting \",\" or \")\""
+        );
+        assert_eq!(
+            fail("or", "()"),
+            format!(
+                "unexpected \")\" expecting {FIELD_NAME}, negation operator (not) or logic operator (and, or)"
+            )
+        );
+        assert_eq!(fail("or", "a.eq.1"), "unexpected \"a\" expecting \"(\"");
+        assert_eq!(
+            fail("or", "(a.foo.1)"),
+            format!("unexpected \"f\" expecting {NOT_WORD} or {OPERATOR}")
+        );
+        assert_eq!(
+            fail("or", "(a.eq)"),
+            format!("unexpected \")\" expecting {OPERATOR}")
         );
     }
 
     #[test]
     fn key_errors() {
-        assert_eq!(fail("", "eq.1").message, "expected a field name");
-        assert_eq!(fail("a.", "eq.1").message, "expected a field name");
-        assert_eq!(fail("a..b", "eq.1").message, "expected a field name");
-        assert_eq!(fail("age", "gte").message, "expected . after the operator");
-        assert!(fail("age", "foo.1").message.contains("unknown operator"));
-        assert_eq!(fail("a->>", "eq.1").message, "expected a json path key");
+        assert_eq!(
+            fail("", "eq.1"),
+            format!("unexpected end of input expecting {FIELD_NAME}")
+        );
+        assert_eq!(
+            fail("a.", "eq.1"),
+            format!("unexpected end of input expecting {FIELD_NAME}")
+        );
+        assert_eq!(
+            fail("a..b", "eq.1"),
+            format!("unexpected \".\" expecting {FIELD_NAME}")
+        );
+        // A word that reached the delimiter and did not find one is
+        // reported where the delimiter was due.
+        assert_eq!(
+            fail("age", "gte"),
+            format!("unexpected end of input expecting {OPERATOR}")
+        );
+        assert_eq!(
+            fail("age", "foo.1"),
+            format!("unexpected \"f\" expecting {NOT_WORD} or {OPERATOR}")
+        );
+        assert_eq!(
+            fail("a->>", "eq.1"),
+            "unexpected end of input expecting \"-\", digit or any non reserved character different from: .,>()"
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
 //! before it starts is an error here and a 416 at the HTTP layer, per
 //! what PostgREST does.
 
-use crate::scan::Error;
+use crate::scan::{Cur, DIGIT, END, Error, word};
 
 /// An items range from the Range header, zero based and inclusive on
 /// both ends, `last` is `None` for the open ended form.
@@ -39,73 +39,68 @@ impl Range {
 
 /// Parse a limit value, an integer that may be negative.
 pub fn parse_limit(value: &str) -> Result<i64, Error> {
-    signed(value, "limit")
+    signed(value)
 }
 
 /// Parse an offset value, an integer that may be negative.
 pub fn parse_offset(value: &str) -> Result<i64, Error> {
-    signed(value, "offset")
+    signed(value)
 }
 
 /// Parse a Range header value, `first-last` or `first-`.
-pub fn parse_range(header: &str) -> Result<Range, Error> {
-    let Some(dash) = header.find('-') else {
-        return Err(Error {
-            message: "a range is first-last or first-".into(),
-            at: header.len(),
-        });
+///
+/// A header nobody can read is a header nobody reads: upstream takes
+/// the range off a request that has a well formed one and ignores the
+/// rest, so there is nothing to say about a bad one and no error to
+/// say it with.
+pub fn parse_range(header: &str) -> Option<Range> {
+    let dash = header.find('-')?;
+    let first = number(&header[..dash])?;
+    let last = match dash + 1 == header.len() {
+        true => None,
+        false => Some(number(&header[dash + 1..])?),
     };
-    let first = number(header, 0, dash, "range start")?;
-    let last = if dash + 1 == header.len() {
-        None
-    } else {
-        Some(number(header, dash + 1, header.len(), "range end")?)
-    };
-    if let Some(l) = last
-        && l < first
-    {
-        return Err(Error {
-            message: "the range ends before it starts".into(),
-            at: dash + 1,
-        });
+    if last.is_some_and(|l| l < first) {
+        return None;
     }
-    Ok(Range { first, last })
+    Some(Range { first, last })
 }
 
 /// Strict decimal with an optional leading minus, which is the whole
 /// difference between a paging parameter and the Range header: the
 /// header's grammar is a regex over digits and a parameter's is a
 /// Haskell `readMaybe` over an Integer.
-fn signed(value: &str, what: &str) -> Result<i64, Error> {
-    let (sign, digits) = match value.strip_prefix('-') {
-        Some(rest) => (-1, rest),
-        None => (1, value),
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Error {
-            message: format!("{what} wants an integer"),
-            at: 0,
-        });
+fn signed(value: &str) -> Result<i64, Error> {
+    let cur = Cur::new(value);
+    let signed = value.starts_with('-');
+    let at = usize::from(signed);
+    let taken = value[at..].bytes().take_while(u8::is_ascii_digit).count();
+    if taken == 0 {
+        let wants: &[&str] = match signed {
+            true => &[DIGIT],
+            false => &[&word("-"), DIGIT],
+        };
+        return cur.err_at(at, wants);
     }
-    digits.parse::<i64>().map(|n| sign * n).map_err(|_| Error {
-        message: format!("{what} is out of range"),
+    if at + taken < value.len() {
+        return cur.err_at(at + taken, &[DIGIT, END]);
+    }
+    // An Integer is what upstream reads these into and it has no
+    // ceiling. Ours does, and a number past it is still a number, so
+    // it is worth saying which of the two complaints this is.
+    value.parse::<i64>().map_err(|_| Error {
+        found: cur.found(0),
+        expecting: vec!["an integer that fits in 64 bits".to_string()],
         at: 0,
     })
 }
 
-/// Strict decimal in `s[from..to]`: digits only, no sign, no blanks.
-fn number(s: &str, from: usize, to: usize, what: &str) -> Result<u64, Error> {
-    let digits = &s[from..to];
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(Error {
-            message: format!("{what} wants a non negative integer"),
-            at: from,
-        });
+/// Strict decimal: digits only, no sign, no blanks.
+fn number(s: &str) -> Option<u64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    digits.parse::<u64>().map_err(|_| Error {
-        message: format!("{what} is out of range"),
-        at: from,
-    })
+    s.parse::<u64>().ok()
 }
 
 #[cfg(test)]
@@ -160,12 +155,11 @@ mod tests {
 
     #[test]
     fn bad_ranges() {
-        assert_eq!(
-            parse_range("24-0").unwrap_err().message,
-            "the range ends before it starts"
-        );
+        // A range that ends before it starts is one of these rather
+        // than a 416: only a well formed header gets that far.
+        assert_eq!(parse_range("24-0"), None);
         for bad in ["", "-", "-24", "a-b", "0-24extra", "0 - 24", "1--2"] {
-            assert!(parse_range(bad).is_err(), "{bad:?} must not parse");
+            assert_eq!(parse_range(bad), None, "{bad:?} must not parse");
         }
     }
 }

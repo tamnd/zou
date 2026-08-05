@@ -51,7 +51,7 @@ use zou_rest::catalog::{
     COLUMNS_SQL, COMPUTED_SQL, Catalog, Column, ColumnRow, ComputedRow, Details, FkRow,
     INTROSPECT_SQL, KEYS_SQL, RELATIONS_SQL, TIMEZONES_SQL,
 };
-use zou_rest::filter::{self, Node, Op, Parsed};
+use zou_rest::filter::{self, Error as GrammarError, Failure, Node, Op, Parsed};
 use zou_rest::media::MediaType;
 use zou_rest::mutate::{self, Conflict, Missing, Returning};
 use zou_rest::origin::{self, KeyRow, PkRow, VIEW_KEYS_SQL, VIEW_PKS_SQL, VIEWS_SQL, ViewRow};
@@ -217,7 +217,47 @@ pub(crate) fn invalid_path() -> Response {
     .into_response()
 }
 
-fn bad_grammar(message: impl Into<String>) -> RestError {
+/// A parameter the grammar could not read, in the two halves
+/// upstream answers with.
+///
+/// The message is parsec's source position, which names the parameter
+/// and quotes the value it was given, and the details are parsec's
+/// own: the token that stopped it and the set of things that would
+/// have fit there instead. The set is the useful half, so it is the
+/// one the parsers carry.
+fn bad_grammar(f: &Failure) -> RestError {
+    let at = f.error.at.min(f.input.len());
+    let column = f.input[..at].chars().count() + 1 + f.skew;
+    RestError {
+        status: StatusCode::BAD_REQUEST,
+        code: "PGRST100".to_string(),
+        message: format!(
+            "\"failed to parse {} ({})\" (line 1, column {column})",
+            f.what, f.input
+        ),
+        details: Some(f.error.to_string().into()),
+        hint: None,
+        headers: None,
+    }
+}
+
+/// The same for one of the parameters that is read on its own, where
+/// the whole value is what the parser was handed.
+fn failed(what: &'static str, input: &str) -> impl Fn(GrammarError) -> RestError {
+    let input = input.to_string();
+    move |error| {
+        bad_grammar(&Failure {
+            what,
+            input: input.clone(),
+            skew: 0,
+            error,
+        })
+    }
+}
+
+/// A request the grammar read and the planner refused, which carries
+/// a sentence rather than a position.
+fn bad_request(message: impl Into<String>) -> RestError {
     RestError {
         status: StatusCode::BAD_REQUEST,
         code: "PGRST100".to_string(),
@@ -645,15 +685,6 @@ struct Extras {
     columns: Option<Vec<String>>,
 }
 
-fn csv(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
 /// One query string into the planner's input. Reserved words are
 /// select, order, limit, offset, on_conflict, and columns, the
 /// pagination three optionally behind an embed route, apikey is the
@@ -685,28 +716,31 @@ fn parse_query(table: &str, raw: Option<&str>) -> Result<(Query, Extras), RestEr
         };
         match word {
             "select" if prefix.is_empty() => {
-                q.select = select::parse(&value).map_err(|e| bad_grammar(e.to_string()))?;
+                q.select = select::parse(&value).map_err(failed("select parameter", &value))?;
                 selected = true;
             }
             "on_conflict" if prefix.is_empty() => {
-                extras.on_conflict = Some(csv(&value));
+                let names =
+                    select::columns(&value).map_err(failed("on_conflict parameter", &value))?;
+                extras.on_conflict = Some(names);
             }
             "columns" if prefix.is_empty() => {
-                extras.columns = Some(csv(&value));
+                let names = select::columns(&value).map_err(failed("columns parameter", &value))?;
+                extras.columns = Some(names);
             }
             "order" => {
-                let terms = order::parse(&value).map_err(|e| bad_grammar(e.to_string()))?;
+                let terms = order::parse(&value).map_err(failed("order", &value))?;
                 q.order.push((route_of(prefix), terms));
             }
             "limit" => {
-                let n = page::parse_limit(&value).map_err(|e| bad_grammar(e.to_string()))?;
+                let n = page::parse_limit(&value).map_err(failed("limit", &value))?;
                 limits.push((route_of(prefix), n));
             }
             "offset" => {
-                let n = page::parse_offset(&value).map_err(|e| bad_grammar(e.to_string()))?;
+                let n = page::parse_offset(&value).map_err(failed("offset", &value))?;
                 offsets.push((route_of(prefix), n));
             }
-            _ => match filter::parse_pair(&key, &value).map_err(|e| bad_grammar(e.to_string()))? {
+            _ => match filter::parse_pair(&key, &value).map_err(|f| bad_grammar(&f))? {
                 Parsed::Filter(cond) => q.filters.push((Vec::new(), Node::Cond(cond))),
                 Parsed::Logic {
                     embed,
@@ -1356,7 +1390,7 @@ fn apply_range(q: &mut Query, method: &Method, headers: &HeaderMap) {
     let Some(range) = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| page::parse_range(v).ok())
+        .and_then(page::parse_range)
     else {
         return;
     };
@@ -1564,7 +1598,7 @@ fn plan_error(e: PlanError) -> RestError {
             hint: e.hint,
             headers: None,
         },
-        PlanError::Compile(c) => bad_grammar(c.message),
+        PlanError::Compile(c) => bad_request(c.message),
         PlanError::Other(m) => RestError {
             status: StatusCode::BAD_REQUEST,
             code: "PGRST100".to_string(),
@@ -2341,7 +2375,7 @@ async fn write(
         Method::DELETE => mutate::delete(table, Some(relation), &root, &returning),
         _ => unreachable!("the dispatcher only sends writes here"),
     }
-    .map_err(|e| bad_grammar(e.message))?;
+    .map_err(|e| bad_request(e.message))?;
 
     let affected: u64;
     // Filled in by whichever arm commits, since each of them commits
@@ -2857,6 +2891,15 @@ async fn invoke(
         args.push((key, value));
     }
 
+    // Whatever is left is grammar over what the call returns, and it
+    // is read here rather than in the one arm that goes on to use it,
+    // because a query string nobody can read is a bad request no
+    // matter what the function returns or what the body says. It is
+    // read before the body for the same reason: a POST that gets both
+    // wrong is answered about the half the client wrote first.
+    let joined = residual.join("&");
+    let (query, _) = parse_query(func, (!joined.is_empty()).then_some(joined.as_str()))?;
+
     // What the body says, which is the content type and then the
     // bytes. A form is argument pairs the same way a query string
     // is, so both go on to bind one text parameter per value; a json
@@ -3046,16 +3089,8 @@ async fn invoke(
             // Rows go through the planner over the call's CTE, so
             // the whole select grammar applies, and when the return
             // type is a real table's rowtype embeds resolve on it.
-            let logical = table.unwrap_or_else(|| func.to_string());
-            let joined = residual.join("&");
-            let (mut q, _) = parse_query(
-                &logical,
-                if joined.is_empty() {
-                    None
-                } else {
-                    Some(&joined)
-                },
-            )?;
+            let mut q = query;
+            q.table = table.unwrap_or_else(|| func.to_string());
             apply_range(&mut q, &req.method, &req.headers);
             let r = rpc::representation(&catalog, m, &mut q).map_err(plan_error)?;
             if !returns_set {
@@ -3497,11 +3532,38 @@ mod tests {
         );
     }
 
+    /// The two halves of a parse error: the message names the
+    /// parameter and quotes what it was given, with a position that
+    /// counts characters from the front of it, and the details are
+    /// what the grammar would have taken there instead.
     #[test]
     fn a_broken_filter_is_pgrst100() {
         let e = parse_query("t", Some("name=zzz.1")).unwrap_err();
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
         assert_eq!(e.code, "PGRST100");
+        assert_eq!(
+            e.message,
+            "\"failed to parse filter (zzz.1)\" (line 1, column 1)"
+        );
+        assert_eq!(
+            e.details,
+            Some("unexpected \"z\" expecting \"not\" or operator (eq, gt, ...)".into())
+        );
+
+        // A logic tree counts from the front of the operator, which
+        // upstream reads out of the key and parses with the value.
+        let e = parse_query("t", Some("or=()")).unwrap_err();
+        assert_eq!(
+            e.message,
+            "\"failed to parse logic tree (())\" (line 1, column 4)"
+        );
+
+        // And a position counts characters rather than bytes.
+        let e = parse_query("t", Some("order=\u{e9}\u{e9}.ascc")).unwrap_err();
+        assert_eq!(
+            e.message,
+            "\"failed to parse order (\u{e9}\u{e9}.ascc)\" (line 1, column 7)"
+        );
     }
 
     /// PostgREST names the charset on everything it sends, the errors
@@ -3509,7 +3571,7 @@ mod tests {
     /// which does not, so this is the one place it is decided.
     #[test]
     fn an_error_says_which_charset_it_is_in() {
-        let res = bad_grammar("no").into_response();
+        let res = bad_request("no").into_response();
         assert_eq!(
             res.headers()[header::CONTENT_TYPE],
             "application/json; charset=utf-8"
