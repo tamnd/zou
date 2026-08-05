@@ -301,7 +301,7 @@ pub fn derive(schema: &str, views: &[ViewRow], keys: &[KeyRow]) -> Vec<FkRow> {
 /// The primary key each of the schema's views inherits, under its
 /// own column names.
 ///
-/// Same trace as [`derive`] and the same rule at the end of it: a
+/// Same trace as [`derive()`] and the same rule at the end of it: a
 /// view holding only part of a key holds no key at all, so a view
 /// that selects one half of a compound primary key has none. A view
 /// may reach more than one, `select * from a, b` being the plain
