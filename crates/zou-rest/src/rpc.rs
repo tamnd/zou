@@ -64,15 +64,22 @@ pub struct Routine {
     pub kind: RetKind,
     pub returns_set: bool,
     pub volatile: bool,
+    /// The media type the call answers in when the client asks for
+    /// it by name, which a function declares by returning a domain
+    /// named after one. Nothing else on this surface can produce it,
+    /// so it is the function's own and travels with the overload
+    /// rather than with the request.
+    pub media: Option<String>,
 }
 
 /// Every overload of one function name in one schema. Bind the
-/// schema as $1 and the function name as $2. Nine columns per row:
+/// schema as $1 and the function name as $2. Ten columns per row:
 /// input argument names (empty string for unnamed), their types via
 /// format_type, a variadic flag per argument, the count of trailing
 /// defaults, then proretset, provolatile = 'v', the return type's
-/// name, the table whose rowtype it is when there is one, and
-/// whether the result is a row rather than a value.
+/// name, the table whose rowtype it is when there is one, whether
+/// the result is a row rather than a value, and the media type the
+/// return type names when it names one.
 ///
 /// proallargtypes and proargmodes only exist once OUT or TABLE
 /// arguments appear, so both coalesce back to the plain input
@@ -83,6 +90,13 @@ pub struct Routine {
 /// down to whatever the domain was declared over, and every question
 /// about the return type is asked of that, because a domain over a
 /// table's rowtype returns rows and postgres will not say so.
+///
+/// Except one question. The domain's own name is how a function
+/// declares what media type it answers in, so the last column asks
+/// the undropped return type whether its name is a media type name.
+/// A set of them is not one: a media type is one body and a function
+/// returning a set has as many as it has rows, which is why upstream
+/// registers no handler for those.
 ///
 /// The last clause drops what no request could call. An argument
 /// with no name cannot be named in a call, so a function may have at
@@ -136,7 +150,12 @@ select a.names,
          where c.oid = t.typrelid
            and c.relkind in ('r', 'v', 'p', 'm', 'f')),
        (t.typtype = 'c'
-        or coalesce((select bool_or(m in ('o', 'b', 't')) from unnest(f.modes) m), false))
+        or coalesce((select bool_or(m in ('o', 'b', 't')) from unnest(f.modes) m), false)),
+       (select lower(d.typname)::text
+          from pg_type d
+         where d.oid = f.prorettype
+           and not f.proretset
+           and (d.typname ~ '^[A-Za-z0-9.-]+/[A-Za-z0-9.+-]+$' or d.typname = '*/*'))
   from fns f
   join args a on a.oid = f.oid
   join base_types b on b.oid = f.prorettype
@@ -182,6 +201,8 @@ pub struct RoutineRow {
     /// Whether the result is a row: a composite type, a table's own
     /// rowtype, or a result named in OUT, INOUT or TABLE arguments.
     pub composite: bool,
+    /// The return type's own name when that name is a media type.
+    pub media: Option<String>,
 }
 
 /// Assemble one overload from an [`INTROSPECT_SQL`] row.
@@ -220,11 +241,15 @@ pub fn routine(row: RoutineRow) -> Routine {
     } else {
         RetKind::Scalar
     };
+    // A row is many values and a value is one body, so only the
+    // second can be handed over as a media type of its own.
+    let value = kind == RetKind::Scalar;
     Routine {
         args,
         kind,
         returns_set: row.returns_set,
         volatile: row.volatile,
+        media: row.media.filter(|_| value),
     }
 }
 
@@ -622,6 +647,29 @@ pub fn scalar_wrap(call: Sql, set: bool) -> Sql {
     }
 }
 
+/// Wrap a value returning call so the value rides out as itself.
+///
+/// This is the shape a function gets when it declares a media type
+/// of its own: nothing wraps the value, no quotes go around it and no
+/// brackets go around that, the body is what the function returned.
+/// A null returned nothing, which is an empty body rather than the
+/// four letters, and the caller reads that as null too.
+///
+/// The count is one because a value is one row by definition. Only a
+/// value can carry a media type this way, a row being many values and
+/// so many bodies.
+pub fn value_wrap(call: Sql) -> Sql {
+    let src = quote_ident(SOURCE);
+    let col = quote_ident(VALUE);
+    Sql {
+        text: format!(
+            "with {src} as ({}) select {src}.{col}::text, 1::bigint from {src}",
+            call.text
+        ),
+        params: call.params,
+    }
+}
+
 /// Plan the request's select tree over the rows a call returns,
 /// the same two piece assembly mutations use, just under the
 /// [`SOURCE`] alias and with an ordinary CTE instead of a data
@@ -655,6 +703,7 @@ mod tests {
             rettype: "integer".into(),
             return_table: None,
             composite: false,
+            media: None,
         }
     }
 
@@ -706,6 +755,23 @@ mod tests {
                 table: Some("books".into())
             }
         );
+    }
+
+    #[test]
+    fn only_a_value_carries_a_media_type_of_its_own() {
+        let media = |composite: bool| {
+            routine(RoutineRow {
+                media: Some("text/plain".into()),
+                rettype: "text".into(),
+                composite,
+                ..row(&[], &[], 0)
+            })
+            .media
+        };
+        assert_eq!(media(false), Some("text/plain".to_string()));
+        // A row is written out as one body per column layout, not as
+        // one body, so the name on the return type says nothing.
+        assert_eq!(media(true), None);
     }
 
     #[test]
