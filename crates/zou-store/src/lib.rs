@@ -6,6 +6,7 @@
 //! also carries the writer lease. WAL lives outside the tenant prefixes in
 //! the shared log the zou-log crate owns.
 
+pub mod bloom;
 pub mod branch;
 pub mod cas;
 pub mod delay;
@@ -13,6 +14,7 @@ pub mod frame;
 pub mod guard;
 pub mod heartbeat;
 pub mod hedge;
+pub mod layer;
 pub mod layout;
 pub mod lease;
 pub mod lsn;
@@ -27,6 +29,7 @@ pub mod sqlite;
 pub mod stats;
 pub mod zoufile;
 
+pub use bloom::Bloom;
 pub use branch::{BranchError, branch, materialize_at, snapshot_at};
 pub use cas::{CasError, CasStore, LocalFsStore, Version};
 pub use delay::{DelayConfig, DelayStore};
@@ -34,6 +37,11 @@ pub use frame::{BlockRef, Frame2, Frame2DecodeError, Frame2Stream, MAX_HINTS, MA
 pub use guard::GuardedStore;
 pub use heartbeat::Heartbeat;
 pub use hedge::HedgedStore;
+pub use layer::{
+    DeltaEntry, ImageEntry, LayerBlock, LayerBuildError, LayerDecodeError, LayerFooter, LayerKey,
+    LayerKind, build_delta, build_image, decode_delta, decode_delta_block, decode_image,
+    decode_image_block, read_layer_footer,
+};
 pub use layout::tenant_id;
 pub use lease::{DEFAULT_TTL_SECS, HeldLease, LeaseError};
 pub use lsn::Lsn;

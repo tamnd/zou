@@ -42,6 +42,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "delta_layer"
+path = "fuzz_targets/delta_layer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_layer"
+path = "fuzz_targets/image_layer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rest_filter"
 path = "fuzz_targets/rest_filter.rs"
 test = false

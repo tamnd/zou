@@ -8,11 +8,15 @@
 //!   chk/<chk-id>/fs/<path>        captured files
 //!   chk/<chk-id>/PAGES            page run index for one checkpoint
 //!   chk/<chk-id>/<n>.pages        sorted page images
+//!   shards/<shard>/d-….dl         delta layers, WAL records by key
+//!   shards/<shard>/i-….il         image layers, pages at one lsn
 //!   files/<bucket>/<key>          Storage API user files
 //! ```
 //!
 //! Everything except `MANIFEST` is immutable once written.
 
+use crate::layer::LayerKey;
+use crate::lsn::Lsn;
 use sha2::{Digest, Sha256};
 
 /// Deterministic 128-bit tenant id for the shared WAL: the first 16 bytes
@@ -121,6 +125,51 @@ impl TenantLayout {
         format!("{}/files/{bucket}/{key}", self.prefix)
     }
 
+    /// One shard of the layer store. Listed on attach to load the
+    /// shard's layer map, swept by compaction gc.
+    pub fn shard_prefix(&self, shard: u16) -> String {
+        format!("{}/shards/{shard:04x}/", self.prefix)
+    }
+
+    /// A delta layer object. The name is the coverage: the key range
+    /// and lsn range the layer holds, so a listing alone rebuilds the
+    /// layer map without opening anything.
+    pub fn delta_layer(
+        &self,
+        shard: u16,
+        key_min: &LayerKey,
+        key_max: &LayerKey,
+        lsn_min: Lsn,
+        lsn_max: Lsn,
+    ) -> String {
+        format!(
+            "{}d-{}-{}-{:016x}-{:016x}.dl",
+            self.shard_prefix(shard),
+            key_min.hex(),
+            key_max.hex(),
+            lsn_min.0,
+            lsn_max.0
+        )
+    }
+
+    /// An image layer object: every page in the key range materialized
+    /// at one lsn.
+    pub fn image_layer(
+        &self,
+        shard: u16,
+        key_min: &LayerKey,
+        key_max: &LayerKey,
+        lsn: Lsn,
+    ) -> String {
+        format!(
+            "{}i-{}-{}-{:016x}.il",
+            self.shard_prefix(shard),
+            key_min.hex(),
+            key_max.hex(),
+            lsn.0
+        )
+    }
+
     /// Whether a key must never be overwritten. The manifest is the only
     /// mutable object in the prefix.
     pub fn is_immutable(&self, key: &str) -> bool {
@@ -153,6 +202,19 @@ mod tests {
             t.file("avatars", "u1/pic.png"),
             "tenants/acme-prod/files/avatars/u1/pic.png"
         );
+        assert_eq!(t.shard_prefix(3), "tenants/acme-prod/shards/0003/");
+        let lo = LayerKey::page(1663, 5, 16384, 0, 0);
+        let hi = LayerKey::page(1663, 5, 16384, 0, 8191);
+        assert_eq!(
+            t.delta_layer(0, &lo, &hi, Lsn(0x16d69a8), Lsn(0x1a03b20)),
+            "tenants/acme-prod/shards/0000/d-000000067f00000005000040000000000000-00000006\
+             7f00000005000040000000001fff-00000000016d69a8-0000000001a03b20.dl"
+        );
+        assert_eq!(
+            t.image_layer(0, &lo, &hi, Lsn(0x16d69a8)),
+            "tenants/acme-prod/shards/0000/i-000000067f00000005000040000000000000-00000006\
+             7f00000005000040000000001fff-00000000016d69a8.il"
+        );
     }
 
     #[test]
@@ -170,6 +232,9 @@ mod tests {
         assert!(!t.is_immutable(&t.manifest()));
         assert!(t.is_immutable(&t.checkpoint_page_index("chk-1")));
         assert!(t.is_immutable(&t.manifest_history(1, 1000)));
+        let k = LayerKey::page(1, 1, 1, 0, 0);
+        assert!(t.is_immutable(&t.delta_layer(0, &k, &k, Lsn(1), Lsn(2))));
+        assert!(t.is_immutable(&t.image_layer(0, &k, &k, Lsn(1))));
         assert!(!t.is_immutable("tenants/other/MANIFEST"));
     }
 }

@@ -5,6 +5,7 @@ mod dev;
 #[cfg(unix)]
 mod inbox;
 mod info;
+mod inspect;
 mod stats;
 
 use std::process::ExitCode;
@@ -20,6 +21,7 @@ fn usage() -> ExitCode {
     eprintln!("       {}", branch::USAGE);
     eprintln!("       {}", codegen::USAGE);
     eprintln!("       {}", info::USAGE);
+    eprintln!("       {}", inspect::USAGE);
     #[cfg(unix)]
     eprintln!("       {}", inbox::USAGE);
     eprintln!("       {}", stats::USAGE);
@@ -74,6 +76,7 @@ fn main() -> ExitCode {
         #[cfg(unix)]
         Some("inbox") => simple(inbox::run(&argv[1..])),
         Some("info") => simple(info::run(&argv[1..])),
+        Some("inspect") => simple(inspect::run(&argv[1..])),
         Some("stats") => simple(stats::run(&argv[1..])),
         _ => usage(),
     }
