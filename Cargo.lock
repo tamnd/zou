@@ -1975,6 +1975,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-postgres",
+ "zou-log",
  "zou-pg",
  "zou-server",
  "zou-store",
@@ -2017,6 +2018,7 @@ dependencies = [
  "env_logger",
  "log",
  "tempfile",
+ "zou-log",
  "zou-store",
 ]
 

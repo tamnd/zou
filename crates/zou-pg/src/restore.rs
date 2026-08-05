@@ -1,6 +1,7 @@
 //! Attach a node from the store alone: rebuild a data directory from the
-//! checkpoint captures and overlay the mirrored WAL, so a plain server
-//! start runs crash recovery to the end of the durable stream.
+//! checkpoint captures and overlay the tenant's WAL out of the shared
+//! log, so a plain server start runs crash recovery to the end of the
+//! durable stream.
 //!
 //! Three steps.
 //! The newest full capture under `chk/<id>/fs/` is written back exactly
@@ -12,34 +13,39 @@
 //! restored WAL. So the state field is flipped to in production, turning
 //! the start into ordinary crash recovery. A delta pg_control comes from
 //! a running server and already says so.
-//! Then every record in the WAL stream, a Postgres LSN header plus raw
-//! bytes, is written into the pg_wal segment file it came from, and
-//! recovery replays to the last durable record.
+//! Then every frame of the tenant's stream past the newest checkpoint,
+//! a raw chunk with its Postgres LSN range, is written into the pg_wal
+//! segment file it came from, and recovery replays to the last durable
+//! frame.
 //!
-//! A branched tenant restores the same way with two twists: inherited
-//! checkpoints read their files from the owner's prefix, and the frozen
-//! parent tail entries replay before the tenant's own stream, oldest
-//! ancestor first, because the child's WAL begins where the parent's
-//! tail ended.
+//! A branched tenant restores the same way with one twist: inherited
+//! checkpoints read their files from the owner's prefix. Branches cut
+//! at a checkpoint lsn, so a child inherits no unfolded WAL.
 //!
 //! Time travel is the same machinery pointed at a history snapshot:
 //! [`restore_at`] picks the newest published manifest at or before a
-//! timestamp and replays that manifest's own frozen tail, so the result
-//! is exactly what an attach at that moment would have seen. The store
-//! is never written.
+//! timestamp and stops at that manifest's newest checkpoint. WAL past
+//! it replays nothing, the shared log moved on after the snapshot, so
+//! point in time granularity is the fold cadence in this release. The
+//! store is never written.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use zou_store::commit::{reconcile_tail, segment_epoch, split_records};
+use zou_log::{TeeFilter, WalMedia, catch_up};
 use zou_store::layout::TenantLayout;
 use zou_store::manifest::CheckpointKind;
-use zou_store::{CasStore, Manifest, SegmentReader, open_store};
+use zou_store::{CasStore, Frame2, Lsn, Manifest, open_store, tenant_id};
+
+use crate::WAL_SHARD;
 
 /// initdb's default, pinned for v0. The capture records no segment size,
 /// and a cluster built with --wal-segsize would need it here.
 pub const WAL_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
+
+/// XLOG_BLCKSZ, initdb's default WAL page size.
+const WAL_PAGE_SIZE: u64 = 8192;
 
 /// pg_control layout facts this tool relies on, checked against the
 /// vendored src/include/catalog/pg_control.h. The state field follows
@@ -239,42 +245,18 @@ fn overlay_wal_chunk(
     Ok(())
 }
 
-/// Replay one list of mirrored segments into pg_wal. Returns records
-/// written, chunk bytes, and the LSN right after the last byte.
-fn overlay_segments(
-    store: &dyn CasStore,
-    layout: &TenantLayout,
-    segments: &[String],
-    tli: u32,
-    pg_wal: &Path,
-) -> Result<(usize, u64, u64), String> {
+/// Replay the tenant's frames into pg_wal. Returns frames written,
+/// chunk bytes, and the LSN right after the last byte.
+fn overlay_frames(frames: &[Frame2], tli: u32, pg_wal: &Path) -> Result<(usize, u64, u64), String> {
     let mut records = 0usize;
     let mut total = 0u64;
     let mut end = 0u64;
-    for name in segments {
-        let epoch = segment_epoch(name).ok_or_else(|| format!("bad segment name {name:?}"))?;
-        let (bytes, _) = store
-            .get(&layout.wal_segment_path(name))
-            .map_err(|e| format!("store: {e}"))?
-            .ok_or_else(|| format!("segment {name} is missing"))?;
-        for frame in SegmentReader::new(&bytes, epoch) {
-            // Segments upload whole, so a decode failure is real
-            // corruption, never a torn tail.
-            let frame = frame.map_err(|e| format!("segment {name}: {e}"))?;
-            for record in
-                split_records(&frame.payload).ok_or_else(|| format!("bad batch in {name}"))?
-            {
-                if record.len() < 8 {
-                    return Err(format!("short record in {name}"));
-                }
-                let lsn = u64::from_le_bytes(record[..8].try_into().expect("checked"));
-                let chunk = &record[8..];
-                overlay_wal_chunk(pg_wal, tli, lsn, chunk)?;
-                records += 1;
-                total += chunk.len() as u64;
-                end = end.max(lsn + chunk.len() as u64);
-            }
-        }
+    for frame in frames {
+        let lsn = frame.start_lsn.0;
+        overlay_wal_chunk(pg_wal, tli, lsn, &frame.payload)?;
+        records += 1;
+        total += frame.payload.len() as u64;
+        end = end.max(lsn + frame.payload.len() as u64);
     }
     Ok((records, total, end))
 }
@@ -291,18 +273,35 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
         .map_err(|e| format!("store: {e}"))?
         .ok_or_else(|| format!("{store_root} has no manifest, nothing to restore"))?;
     let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
-    // The live head may hold segments published after the manifest's own
-    // tail was folded, so the tail is reconciled against the wal/ listing.
-    let tail = reconcile_tail(&*store, &layout, &manifest).map_err(|e| format!("store: {e}"))?;
-    restore_manifest(&*store, &layout, &manifest, tail, pgdata)
+    // WAL past the newest checkpoint comes straight from the shared log,
+    // the same read the barrier and the folder do. The floor is the
+    // checkpoint's redo location and usually sits mid WAL page, but
+    // recovery reads whole pages and the head of that page, its page
+    // header included, lives in frames that end at or before the floor.
+    // Catching up from the page boundary pulls those frames back in;
+    // anything a checkpoint capture already laid down is simply
+    // overwritten with the same bytes.
+    let floor = manifest
+        .checkpoints
+        .last()
+        .map_or(0, |checkpoint| checkpoint.lsn.0);
+    let media = WalMedia::single(Arc::clone(&store));
+    let frames = catch_up(
+        &media,
+        WAL_SHARD,
+        &TeeFilter::Tenant(tenant_id(tenant)),
+        Lsn(floor & !(WAL_PAGE_SIZE - 1)),
+    )
+    .map_err(|e| format!("wal catch up: {e}"))?;
+    restore_manifest(&*store, &layout, &manifest, &frames, pgdata)
 }
 
 /// Restore the newest history snapshot of `tenant` at or before
 /// `unix_ts` into `pgdata`. This is time travel as a read only attach:
-/// nothing in the store changes, and the snapshot's own frozen wal_tail
-/// replays verbatim. Listing live epoch dirs here would pull in WAL
-/// written after the snapshot, so reconcile_tail is deliberately not
-/// used.
+/// nothing in the store changes, and the result stops at the snapshot's
+/// newest checkpoint. The shared log kept moving after the snapshot was
+/// published, so replaying it here would pull the restore past the
+/// chosen moment; point in time granularity is the fold cadence.
 pub fn restore_at(
     store_root: &str,
     tenant: &str,
@@ -312,17 +311,16 @@ pub fn restore_at(
     let store: Arc<dyn CasStore> = Arc::from(open_store(store_root)?);
     let layout = TenantLayout::new(tenant);
     let snapshot = zou_store::snapshot_at(&*store, tenant, unix_ts).map_err(|e| e.to_string())?;
-    let tail = snapshot.wal_tail.clone();
-    restore_manifest(&*store, &layout, &snapshot, tail, pgdata)
+    restore_manifest(&*store, &layout, &snapshot, &[], pgdata)
 }
 
 /// Materialize one manifest, live head or history snapshot, into a fresh
-/// `pgdata` and overlay `tail` on top of any inherited parent tails.
+/// `pgdata` and overlay `frames` past its newest checkpoint.
 fn restore_manifest(
     store: &dyn CasStore,
     layout: &TenantLayout,
     manifest: &Manifest,
-    tail: Option<zou_store::manifest::WalTail>,
+    frames: &[Frame2],
     pgdata: &Path,
 ) -> Result<RestoreStats, String> {
     if pgdata.exists() {
@@ -357,26 +355,11 @@ fn restore_manifest(
     patch_control_state(&mut control)?;
     std::fs::write(&control_path, &control).map_err(|e| format!("write pg_control: {e}"))?;
 
-    let mut wal_records = 0usize;
-    let mut wal_bytes = 0u64;
     let mut wal_end = chain.last().expect("chain is nonempty").lsn.0;
     let tli = manifest.pg.timeline;
     let pg_wal = pgdata.join("pg_wal");
-    // Inherited parent tails first, oldest ancestor to newest, then the
-    // tenant's own stream on top of them.
-    for pt in &manifest.parent_tail {
-        let lay = TenantLayout::new(&pt.tenant_ref);
-        let (r, b, e) = overlay_segments(store, &lay, &pt.segments, tli, &pg_wal)?;
-        wal_records += r;
-        wal_bytes += b;
-        wal_end = wal_end.max(e);
-    }
-    if let Some(tail) = tail {
-        let (r, b, e) = overlay_segments(store, layout, &tail.segments, tli, &pg_wal)?;
-        wal_records += r;
-        wal_bytes += b;
-        wal_end = wal_end.max(e);
-    }
+    let (wal_records, wal_bytes, end) = overlay_frames(frames, tli, &pg_wal)?;
+    wal_end = wal_end.max(end);
 
     Ok(RestoreStats {
         files,
@@ -390,8 +373,9 @@ fn restore_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zou_store::manifest::{CheckpointRef, WalTail};
-    use zou_store::{GroupCommit, GroupCommitConfig, LocalFsStore, Lsn};
+    use crate::testv2::V2Wal;
+    use zou_store::LocalFsStore;
+    use zou_store::manifest::CheckpointRef;
 
     #[test]
     fn wal_file_names_match_postgres() {
@@ -524,24 +508,17 @@ mod tests {
             .put_if_absent(&layout.manifest(), &manifest.to_json())
             .unwrap();
 
-        // A pusher session: two chunks, the second crossing into the next
-        // 16MB segment to exercise the split.
-        let gc = GroupCommit::new(
+        // A pusher session appends two frames to the shared log, the
+        // second crossing into the next 16MB segment to exercise the
+        // split on overlay.
+        let mut wal2 = V2Wal::open(
             Arc::new(LocalFsStore::new(store_dir.path())) as Arc<dyn CasStore>,
-            layout.clone(),
+            "local",
             1,
-            1,
-            Lsn(0x0100_0028),
-            GroupCommitConfig::default(),
         );
-        let push = |pg_lsn: u64, fill: u8, len: usize| {
-            let mut record = pg_lsn.to_le_bytes().to_vec();
-            record.extend(std::iter::repeat_n(fill, len));
-            gc.append(&record).unwrap().wait().unwrap();
-        };
-        push(0x0100_0028, 0x22, 4096);
-        push(2 * WAL_SEGMENT_SIZE - 100, 0x33, 300);
-        gc.close().unwrap();
+        wal2.push(0x0100_0028, &vec![0x22u8; 4096]);
+        wal2.push(2 * WAL_SEGMENT_SIZE - 100, &vec![0x33u8; 300]);
+        wal2.close();
 
         let pgdata = out_dir.path().join("restored");
         let stats = restore(store_root, "local", &pgdata).unwrap();
@@ -595,7 +572,69 @@ mod tests {
     }
 
     #[test]
-    fn restore_at_replays_the_snapshot_tail_not_the_live_head() {
+    fn the_overlay_covers_the_wal_page_under_the_newest_checkpoint() {
+        // The newest checkpoint's redo usually sits mid WAL page, and
+        // recovery reads that page whole: its header and the bytes up
+        // to the redo point came from frames that end at or before the
+        // floor. Cutting the catch up exactly at the floor drops them
+        // and leaves the page head zeroed, which is an unreadable
+        // checkpoint record and a cluster that will not start.
+        let store_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let store_root = store_dir.path().to_str().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let layout = TenantLayout::new("local");
+
+        let control = synthetic_control(DB_IN_PRODUCTION);
+        store
+            .put_if_absent(&layout.chk_file("genesis", "global/pg_control"), &control)
+            .unwrap();
+        let index = format!("f global/pg_control {}\nd pg_wal\n", control.len());
+        store
+            .put_if_absent(&layout.chk_index("genesis"), index.as_bytes())
+            .unwrap();
+        let floor = 0x0100_24F0u64;
+        let mut manifest = Manifest::new("local", 18);
+        manifest.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(floor),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        store
+            .put_if_absent(&layout.manifest(), &manifest.to_json())
+            .unwrap();
+
+        // One frame fills the page head and ends exactly at the floor,
+        // the next starts there. Both must land in the overlay.
+        let mut wal2 = V2Wal::open(
+            Arc::new(LocalFsStore::new(store_dir.path())) as Arc<dyn CasStore>,
+            "local",
+            1,
+        );
+        wal2.push(0x0100_1F00, &vec![0xAAu8; 0x5F0]);
+        wal2.push(floor, &vec![0xBBu8; 0x100]);
+        wal2.close();
+
+        let pgdata = out_dir.path().join("restored");
+        let stats = restore(store_root, "local", &pgdata).unwrap();
+        assert_eq!(stats.wal_records, 2, "the page head frame is kept");
+        assert_eq!(stats.wal_bytes, 0x5F0 + 0x100);
+
+        let seg = std::fs::read(pgdata.join("pg_wal/000000010000000000000001")).unwrap();
+        let page = 0x0100_2000usize % WAL_SEGMENT_SIZE as usize;
+        assert!(
+            seg[page..page + 0x4F0].iter().all(|b| *b == 0xAA),
+            "the page head under the floor is real WAL, not zeros"
+        );
+        assert!(
+            seg[page + 0x4F0..page + 0x5F0].iter().all(|b| *b == 0xBB),
+            "the stream past the floor follows"
+        );
+    }
+
+    #[test]
+    fn restore_at_stops_at_the_snapshot_checkpoint_not_the_live_head() {
         let store_dir = tempfile::tempdir().unwrap();
         let out_dir = tempfile::tempdir().unwrap();
         let store_root = store_dir.path().to_str().unwrap();
@@ -635,59 +674,42 @@ mod tests {
             .put_if_absent(&layout.manifest(), &manifest.to_json())
             .unwrap();
 
-        // Two pusher sessions, one sealed segment each, so the store
-        // ends up holding WAL from after the snapshot below.
-        let push = |epoch: u64, pg_lsn: u64, fill: u8, len: usize| {
-            let gc = GroupCommit::new(
-                Arc::new(LocalFsStore::new(store_dir.path())) as Arc<dyn CasStore>,
-                layout.clone(),
-                epoch,
-                epoch,
-                Lsn(epoch * 0x1000),
-                GroupCommitConfig::default(),
-            );
-            let mut record = pg_lsn.to_le_bytes().to_vec();
-            record.extend(std::iter::repeat_n(fill, len));
-            gc.append(&record).unwrap().wait().unwrap();
-            gc.close().unwrap();
-        };
-        push(1, 0x0100_0028, 0x22, 4096);
-        push(2, 0x0100_5000, 0x33, 100);
-        let live = reconcile_tail(&store, &layout, &manifest)
-            .unwrap()
-            .expect("two sessions sealed segments");
-        assert_eq!(live.segments.len(), 2);
-
-        // A history snapshot published between the two sessions: it
-        // froze the tail at the first segment, the second is future to
-        // it even though the live listing holds both.
-        let mut snapshot = manifest.clone();
-        snapshot.wal_tail = Some(WalTail {
-            epoch_dir: 1,
-            from_lsn: Lsn(0x0100_0028),
-            segments: vec![live.segments[0].clone()],
-        });
+        // The snapshot is published first, then WAL keeps landing in
+        // the shared log, so the live head has moved past it.
+        let snapshot = manifest.clone();
         store
             .put_if_absent(&layout.manifest_history(1, 1000), &snapshot.to_json())
             .unwrap();
+        let mut wal2 = V2Wal::open(
+            Arc::new(LocalFsStore::new(store_dir.path())) as Arc<dyn CasStore>,
+            "local",
+            1,
+        );
+        wal2.push(0x0100_0028, &vec![0x22u8; 4096]);
+        wal2.push(0x0100_5000, &[0x33u8; 100]);
+        wal2.close();
 
-        // Time travel to the snapshot: only the first session's record
-        // replays, the store's newer WAL stays out of the tree.
+        // Time travel to the snapshot: the tree stops at the snapshot's
+        // newest checkpoint, nothing from the stream lands. That is the
+        // granularity this release offers, branch points and time
+        // travel both sit on the checkpoint grid.
         let at_dir = out_dir.path().join("at");
         let stats = restore_at(store_root, "local", 1500, &at_dir).unwrap();
-        assert_eq!(stats.wal_records, 1);
-        assert_eq!(stats.wal_bytes, 4096);
+        assert_eq!(stats.wal_records, 0);
+        assert_eq!(stats.wal_bytes, 0);
         let seg1 = std::fs::read(at_dir.join("pg_wal/000000010000000000000001")).unwrap();
         let off = (0x0100_0028 % WAL_SEGMENT_SIZE) as usize;
-        assert!(seg1[off..off + 4096].iter().all(|b| *b == 0x22));
-        let later = (0x0100_5000 % WAL_SEGMENT_SIZE) as usize;
-        assert_eq!(seg1[later], 0x11, "the newer record never landed");
+        assert_eq!(seg1[off], 0x11, "the stream never lands in time travel");
 
-        // The live restore of the same store replays both records.
+        // The live restore of the same store replays both frames.
         let live_dir = out_dir.path().join("live");
         let stats = restore(store_root, "local", &live_dir).unwrap();
         assert_eq!(stats.wal_records, 2);
         assert_eq!(stats.wal_bytes, 4096 + 100);
+        let seg1 = std::fs::read(live_dir.join("pg_wal/000000010000000000000001")).unwrap();
+        assert!(seg1[off..off + 4096].iter().all(|b| *b == 0x22));
+        let later = (0x0100_5000 % WAL_SEGMENT_SIZE) as usize;
+        assert_eq!(seg1[later], 0x33);
 
         // Before the earliest snapshot there is nothing to travel to.
         let err = restore_at(store_root, "local", 500, &out_dir.path().join("gone")).unwrap_err();
@@ -695,10 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_restores_parent_files_and_replays_the_parent_tail() {
-        use std::sync::Mutex;
-        use zou_store::{TailConfig, lease};
-
+    fn a_branch_restores_parent_files_and_inherits_no_tail() {
         let store_dir = tempfile::tempdir().unwrap();
         let out_dir = tempfile::tempdir().unwrap();
         let store_root = store_dir.path().to_str().unwrap();
@@ -738,34 +757,27 @@ mod tests {
             .put_if_absent(&layout.manifest(), &manifest.to_json())
             .unwrap();
 
-        // A leased session pushes and publishes the tail, which is the
-        // state a branch inherits.
-        let held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
-        let gc = GroupCommit::with_lease(
-            Arc::clone(&store) as Arc<dyn CasStore>,
-            layout.clone(),
-            Arc::new(Mutex::new(held)),
-            Lsn(0x0100_0028),
-            GroupCommitConfig::default(),
-            TailConfig::default(),
-        );
-        let mut record = 0x0100_0028u64.to_le_bytes().to_vec();
-        record.extend(std::iter::repeat_n(0x22u8, 4096));
-        gc.append(&record).unwrap().wait().unwrap();
-        gc.close().unwrap();
+        // The parent appends WAL after the checkpoint, then the branch
+        // is taken. The cut is the checkpoint lsn, so that stream stays
+        // the parent's and the child inherits files only.
+        let mut wal2 = V2Wal::open(Arc::clone(&store) as Arc<dyn CasStore>, "local", 1);
+        wal2.push(0x0100_0028, &vec![0x22u8; 4096]);
+        wal2.close();
 
         zou_store::branch(&*store, "local", "b1", None, 5000).unwrap();
 
         let pgdata = out_dir.path().join("child");
         let stats = restore(store_root, "b1", &pgdata).unwrap();
         assert_eq!(stats.files, 3, "the tree comes from the parent capture");
-        assert_eq!(stats.wal_records, 1, "the parent tail replays");
-        assert_eq!(stats.wal_bytes, 4096);
+        assert_eq!(stats.wal_records, 0, "no tail crosses a branch point");
+        assert_eq!(stats.wal_bytes, 0);
 
         assert_eq!(std::fs::read(pgdata.join("PG_VERSION")).unwrap(), b"18\n");
         let seg1 = std::fs::read(pgdata.join("pg_wal/000000010000000000000001")).unwrap();
         let off = (0x0100_0028 % WAL_SEGMENT_SIZE) as usize;
-        assert!(seg1[off..off + 4096].iter().all(|b| *b == 0x22));
-        assert_eq!(seg1[off - 1], 0x11, "capture bytes around it survive");
+        assert_eq!(
+            seg1[off], 0x11,
+            "the parent stream never lands in the child"
+        );
     }
 }

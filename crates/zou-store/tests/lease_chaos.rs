@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use zou_store::layout::TenantLayout;
 use zou_store::lease;
-use zou_store::{CasError, CasStore, GuardedStore, LocalFsStore, Lsn, Manifest, Version};
+use zou_store::{CasError, CasStore, GuardedStore, LocalFsStore, Manifest, Version};
 
 /// Deterministic per-seed RNG, same xorshift used elsewhere in the crate.
 struct Rng(u64);
@@ -158,12 +158,14 @@ fn contender(h: &Arc<Harness>, node: usize, generations: usize) {
             );
         }
 
-        // Do a stint of writing: a WAL segment under our epoch dir, with
-        // renewals in between, dying whenever the store kills us.
+        // Do a stint of writing: a write once object under our epoch
+        // dir, with renewals in between, dying whenever the store kills
+        // us. The key shape is the retired v1 segment layout, kept as a
+        // plain literal because the test only needs epoch scoped write
+        // once keys, not the WAL itself.
         for stint in 0..3u64 {
-            let key = h
-                .layout
-                .wal_segment(held.epoch, Lsn(generation as u64 * 10 + stint + 1));
+            let lsn = generation as u64 * 10 + stint + 1;
+            let key = format!("tenants/chaos/wal/{:016}/{lsn:016X}.wal", held.epoch);
             if h.store.put_if_absent(&key, holder.as_bytes()).is_ok() {
                 h.segments.lock().unwrap().insert(key, held.epoch);
             }
@@ -260,7 +262,7 @@ fn run_seed(seed: u64) {
             "seed {seed}: acked segment {key} vanished"
         );
         assert!(
-            key.starts_with(&harness.layout.wal_epoch_dir(*epoch)),
+            key.starts_with(&format!("tenants/chaos/wal/{epoch:016}/")),
             "seed {seed}: segment {key} outside its epoch dir"
         );
         let holder = &epochs[epoch];

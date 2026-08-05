@@ -11,18 +11,18 @@
 //! Freshness is the hard part: a run image was packed at fold time and
 //! the block may have changed since. The argument that serving is safe
 //! has three legs. First, the write gate: a page object never mutates
-//! before the WAL covering it is durable in the mirrored stream, so
-//! every change newer than the chain has a WAL object visible to a
-//! LIST. Second, Postgres serializes eviction against reads through
+//! before the WAL covering it is durable in the shared log, so every
+//! change newer than the chain has a landing segment on the fenced
+//! chain. Second, Postgres serializes eviction against reads through
 //! the buffer mapping table: an evicting backend finishes its write
 //! before another backend can start reading the same block, so by the
-//! time this reader runs, the change's WAL upload has completed.
-//! Third, the barrier below LISTs the stream before every run served
-//! read, scans whatever it has not seen, and any block or relation the
-//! new records touch goes into a dirty set that forces pg/ for good.
-//! A block that is in the chain, not dirtied by any record at or above
-//! the newest checkpoint's redo, and not written by this process, is
-//! exactly its run image.
+//! time this reader runs, the change's WAL append has completed.
+//! Third, the barrier below probes the chain forward from its cursor
+//! before every run served read, scans whatever is new, and any block
+//! or relation the new records touch goes into a dirty set that forces
+//! pg/ for good. A block that is in the chain, not dirtied by any
+//! record at or above the newest checkpoint's redo, and not written by
+//! this process, is exactly its run image.
 //!
 //! Relation level staleness needs its own barrier: smgr truncate and
 //! create records name a relation with no block references, and after
@@ -38,42 +38,39 @@
 //! relations never enter the runs at all, the fold skips them, because
 //! their writes bypass the WAL and no barrier can see them.
 //!
-//! A branched tenant complicates the walk in two bounded ways. The
+//! A branched tenant complicates the walk in one bounded way: the
 //! inherited checkpoints carry an owner tag, so their PAGES indexes
-//! and run objects are fetched under the owner's prefix, and the
-//! manifest's parent tail names the parent WAL segments the fold had
-//! not consumed at branch time. That segment list is frozen, the
-//! parent moved on in its own prefix, so one static scan at attach
-//! folds its dirtying into the same sets the live barrier feeds. An
-//! incomplete trailing parent record can never complete and is
-//! dropped, which is correct: the write gate never let its pages
-//! reach any store state the child inherited.
+//! and run objects are fetched under the owner's prefix. Branches cut
+//! at a checkpoint lsn, so a child inherits no unfolded WAL and the
+//! barrier only ever watches the child's own stream.
 //!
 //! Any parse error, store error, or coverage gap poisons the reader,
 //! which then declines every read and the smgr falls back to pg/.
 //!
-//! The LIST would be the whole read cost if it ran every time, so the
-//! barrier is gated on the durable LSN the wal pusher publishes into
-//! shared memory. The write gate reads that same value before letting
-//! a page object mutate, so a change to any block always advances the
-//! published LSN before the page can change, and a read that sees an
-//! unchanged value since its last scan can skip the LIST outright. A
-//! zero means no pusher has published, initdb, recovery, or a store
-//! opened readonly, and the reader falls back to listing every time.
-//! Run slabs go through [`crate::cache::SlabCache`], RAM in front of
-//! an optional shared disk tier, keyed by checkpoint id, run, and
-//! offset, which is content addressed because run objects are
+//! The chain probes would be the whole read cost if they ran every
+//! time, so the barrier is gated on the durable LSN the wal pusher
+//! publishes into shared memory. The write gate reads that same value
+//! before letting a page object mutate, so a change to any block
+//! always advances the published LSN before the page can change, and a
+//! read that sees an unchanged value since its last scan can skip the
+//! probes outright. A zero means no pusher has published, initdb,
+//! recovery, or a store opened readonly, and the reader probes every
+//! time. Run slabs go through [`crate::cache::SlabCache`], RAM in
+//! front of an optional shared disk tier, keyed by checkpoint id, run,
+//! and offset, which is content addressed because run objects are
 //! immutable.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
+use zou_log::{ShardManifest, TeeFilter, WalMedia, catch_up, decode_segment};
 use zou_store::layout::TenantLayout;
 use zou_store::manifest::{CheckpointKind, Manifest};
-use zou_store::{CasStore, SegmentReader};
+use zou_store::{CasStore, Lsn, tenant_id};
 
-use crate::ZOU_PAGE_SIZE;
 use crate::cache::{CacheConfig, SlabCache};
 use crate::walscan::{self, BlockRef, RelTag, WalWindow};
+use crate::{WAL_SHARD, ZOU_PAGE_SIZE};
 
 /// Readahead unit for run objects. Neighboring pages of a sequential
 /// scan land in the same slab, one range request instead of 128.
@@ -190,9 +187,10 @@ impl ChkIndex {
     }
 }
 
-/// One epoch's mirrored stream, reassembled incrementally. The window
-/// only ever holds bytes past the last complete record scanned, the
-/// consumed prefix is dropped to keep memory bounded.
+/// The tenant's stream past the newest checkpoint, reassembled
+/// incrementally from shared log frames. The window only ever holds
+/// bytes past the last complete record scanned, the consumed prefix is
+/// dropped to keep memory bounded.
 struct TailScan {
     window: WalWindow,
     started: bool,
@@ -212,8 +210,8 @@ impl TailScan {
 
     /// Append one pushed chunk. Bytes below the floor predate the
     /// newest checkpoint and are clipped, an overlap with bytes already
-    /// held is clipped too, and a gap is an error, the stream within an
-    /// epoch is contiguous.
+    /// held is clipped too, and a gap is an error, the tenant's stream
+    /// is contiguous.
     fn append(&mut self, lsn: u64, bytes: &[u8], floor: u64) -> Result<(), String> {
         let end = lsn + bytes.len() as u64;
         if !self.started {
@@ -229,12 +227,19 @@ impl TailScan {
             return Ok(());
         }
         if lsn > have {
-            return Err(format!("wal gap in epoch stream at {have:#X}"));
+            return Err(format!("wal gap in the stream at {have:#X}"));
         }
         self.window
             .buf
             .extend_from_slice(&bytes[(have - lsn) as usize..]);
         Ok(())
+    }
+
+    /// The Postgres LSN the scan holds bytes through, the resume point
+    /// for a catch up read. `None` before the first byte arrived.
+    fn end(&self) -> Option<u64> {
+        self.started
+            .then(|| self.window.base + self.window.buf.len() as u64)
     }
 
     /// Scan the complete records the window now covers into the dirty
@@ -265,32 +270,6 @@ impl TailScan {
     }
 }
 
-/// Feed one segment's frames into the per epoch tail scans. Shared by
-/// the live barrier and the static parent tail pass at attach.
-fn scan_segment_into(
-    scans: &mut BTreeMap<u64, TailScan>,
-    name: &str,
-    bytes: &[u8],
-    floor: u64,
-) -> Result<(), String> {
-    let epoch = zou_store::commit::segment_epoch(name)
-        .ok_or_else(|| format!("bad segment name {name:?}"))?;
-    let tail = scans.entry(epoch).or_insert_with(TailScan::new);
-    for frame in SegmentReader::new(bytes, epoch) {
-        let frame = frame.map_err(|e| format!("segment {name}: {e}"))?;
-        let records = zou_store::commit::split_records(&frame.payload)
-            .ok_or_else(|| format!("bad batch in {name}"))?;
-        for record in records {
-            if record.len() < 8 {
-                return Err(format!("short record in {name}"));
-            }
-            let lsn = u64::from_le_bytes(record[..8].try_into().expect("checked length"));
-            tail.append(lsn, &record[8..], floor)?;
-        }
-    }
-    Ok(())
-}
-
 /// Why an attach failed. A fatal failure means the manifest is a
 /// branch: the pg/ prefix of a branch holds only its own divergent
 /// writes, so falling back to it would read zeros where inherited
@@ -313,10 +292,16 @@ pub struct ChainReader {
     /// cutoff per relation. Blocks below it still serve from the
     /// chain, the truncate never touched them.
     dirty_truncs: BTreeMap<RelTag, u32>,
-    tails: BTreeMap<u64, TailScan>,
-    seen: BTreeSet<String>,
+    /// The shared log the barrier watches, over the same store.
+    media: Arc<WalMedia>,
+    /// This tenant's frame id in the shared log.
+    tenant: u128,
+    tail: TailScan,
+    /// The next chain position the barrier probes. Everything below it
+    /// has been fetched and fed into the tail scan.
+    next_seq: u64,
     /// The published durable LSN the last barrier ran under. A read
-    /// whose durable LSN has not moved past this skips the LIST.
+    /// whose durable LSN has not moved past this skips the probes.
     scanned_durable: u64,
     cache: SlabCache,
     poisoned: bool,
@@ -339,7 +324,7 @@ impl ChainReader {
     /// under the parent's mutable prefix, which moved on after the
     /// branch and must never serve.
     pub fn attach(
-        store: &dyn CasStore,
+        store: &Arc<dyn CasStore>,
         layout: &TenantLayout,
     ) -> Result<Option<Self>, AttachError> {
         let soft = |why: String| AttachError { fatal: false, why };
@@ -350,9 +335,8 @@ impl ChainReader {
             return Ok(None);
         };
         let manifest = Manifest::from_json(&data).map_err(|e| soft(format!("manifest: {e}")))?;
-        let branched = manifest.branch_of.is_some()
-            || !manifest.parent_tail.is_empty()
-            || manifest.checkpoints.iter().any(|c| c.owner.is_some());
+        let branched =
+            manifest.branch_of.is_some() || manifest.checkpoints.iter().any(|c| c.owner.is_some());
         let fail = |why: String| AttachError {
             fatal: branched,
             why,
@@ -410,42 +394,44 @@ impl ChainReader {
         }
         // The dirty floor: the newest checkpoint's redo, which by the
         // suffix rule is exactly where the newest index's window ends.
-        // The stream holds everything from here on, folds only drop
-        // WAL below it.
+        // The stream holds everything from here on, folds only raise
+        // the replay floor below it.
         let floor = manifest.checkpoints.last().expect("full exists").lsn.0;
-        // The inherited parent tail is a frozen segment list, scan it
-        // once here. The floor is a fold redo, so a record boundary,
-        // which makes the clip in TailScan::append sound for parent
-        // bytes too. Per entry local scans keep parent epochs out of
-        // the live tails map, a parent epoch number could collide with
-        // this tenant's own.
+        // The history is in the shared log: one catch up read pulls
+        // every frame of this tenant past the floor out of the sealed
+        // rounds and the landing tail, and the live barrier takes over
+        // from the consolidated boundary. Frames the catch up already
+        // delivered clip as overlaps when the barrier re-fetches their
+        // landing segments.
+        let media = Arc::new(WalMedia::single(Arc::clone(store)));
+        let tenant = tenant_id(layout.tenant_ref());
+        let next_seq = match ShardManifest::load(&**store, WAL_SHARD) {
+            Ok(Some((m, _))) => m.consolidated_upto + 1,
+            Ok(None) => 1,
+            Err(e) => return Err(fail(format!("shard manifest: {e}"))),
+        };
+        let mut tail = TailScan::new();
+        let frames = catch_up(&media, WAL_SHARD, &TeeFilter::Tenant(tenant), Lsn(floor))
+            .map_err(|e| fail(format!("catch up: {e}")))?;
+        for frame in &frames {
+            tail.append(frame.start_lsn.0, &frame.payload, floor)
+                .map_err(fail)?;
+        }
         let mut dirty = BTreeSet::new();
         let mut dirty_rels = BTreeSet::new();
         let mut dirty_truncs = BTreeMap::new();
-        for pt in &manifest.parent_tail {
-            let lay = TenantLayout::new(&pt.tenant_ref);
-            let mut scans: BTreeMap<u64, TailScan> = BTreeMap::new();
-            for name in &pt.segments {
-                let key = lay.wal_segment_path(name);
-                let (bytes, _) = store
-                    .get(&key)
-                    .map_err(|e| fail(format!("store: {e}")))?
-                    .ok_or_else(|| fail(format!("inherited segment {key} is missing")))?;
-                scan_segment_into(&mut scans, name, &bytes, floor).map_err(fail)?;
-            }
-            for tail in scans.values_mut() {
-                tail.scan(&mut dirty, &mut dirty_rels, &mut dirty_truncs)
-                    .map_err(fail)?;
-            }
-        }
+        tail.scan(&mut dirty, &mut dirty_rels, &mut dirty_truncs)
+            .map_err(fail)?;
         Ok(Some(Self {
             chain,
             floor,
             dirty,
             dirty_rels,
             dirty_truncs,
-            tails: BTreeMap::new(),
-            seen: BTreeSet::new(),
+            media,
+            tenant,
+            tail,
+            next_seq,
             scanned_durable: 0,
             cache: SlabCache::new(CacheConfig::from_env()),
             poisoned: false,
@@ -543,13 +529,7 @@ impl ChainReader {
     /// pusher has published one; an unchanged nonzero value since the
     /// last barrier means the stream cannot hold anything new and the
     /// LIST is skipped.
-    pub fn read(
-        &mut self,
-        store: &dyn CasStore,
-        layout: &TenantLayout,
-        r: BlockRef,
-        durable: u64,
-    ) -> Option<Vec<u8>> {
+    pub fn read(&mut self, store: &dyn CasStore, r: BlockRef, durable: u64) -> Option<Vec<u8>> {
         if self.poisoned {
             return None;
         }
@@ -580,7 +560,7 @@ impl ChainReader {
         }
         let (lay, id, run, off) = hit?;
         if durable == 0 || durable > self.scanned_durable {
-            if let Err(e) = self.barrier(store, layout) {
+            if let Err(e) = self.barrier() {
                 self.poison(&e);
                 return None;
             }
@@ -603,35 +583,65 @@ impl ChainReader {
         }
     }
 
-    /// The freshness barrier: list the stream across every epoch, fetch
-    /// and scan whatever is new. Any WAL object covering a change to
-    /// the block being served must be visible to this LIST, see the
-    /// module docs. Zombie epochs are scanned too, their dirtying is a
-    /// false positive at worst and pg/ absorbs it.
-    fn barrier(&mut self, store: &dyn CasStore, layout: &TenantLayout) -> Result<(), String> {
-        let dir = layout.wal_dir();
-        for key in store.list(&dir).map_err(|e| format!("store: {e}"))? {
-            if self.seen.contains(&key) {
-                continue;
+    /// The freshness barrier: probe the fenced chain forward from the
+    /// cursor and feed this tenant's frames into the tail scan. Every
+    /// durable append lands on the chain before its pages can mutate,
+    /// so the probe sees any WAL covering a change to the block being
+    /// served, see the module docs. Frames of other tenants and zombie
+    /// writers are skipped by tenant id; a rejected zombie frame never
+    /// lands at all, admission happens before the PUT.
+    fn barrier(&mut self) -> Result<(), String> {
+        loop {
+            match self.media.fetch(WAL_SHARD, self.next_seq) {
+                Ok(Some(bytes)) => {
+                    let (_, frames, _) = decode_segment(&bytes)
+                        .map_err(|e| format!("landing segment {}: {e}", self.next_seq))?;
+                    for frame in frames {
+                        if frame.tenant == self.tenant {
+                            self.tail
+                                .append(frame.start_lsn.0, &frame.payload, self.floor)?;
+                        }
+                    }
+                    self.next_seq += 1;
+                }
+                Ok(None) => {
+                    // Either the head, or the segment was consolidated
+                    // and collected while this reader slept. The shard
+                    // manifest tells which: a consolidated boundary at
+                    // or past the cursor means the missing frames are
+                    // in the sealed rounds, catch up from there and
+                    // jump the cursor over the collected prefix.
+                    let store = self.media.manifest_store();
+                    let boundary = match ShardManifest::load(store.as_ref(), WAL_SHARD) {
+                        Ok(Some((m, _))) => m.consolidated_upto,
+                        Ok(None) => break,
+                        Err(e) => return Err(format!("shard manifest: {e}")),
+                    };
+                    if boundary < self.next_seq {
+                        break;
+                    }
+                    let applied = self.tail.end().unwrap_or(self.floor);
+                    let frames = catch_up(
+                        &self.media,
+                        WAL_SHARD,
+                        &TeeFilter::Tenant(self.tenant),
+                        Lsn(applied),
+                    )
+                    .map_err(|e| format!("catch up: {e}"))?;
+                    for frame in &frames {
+                        self.tail
+                            .append(frame.start_lsn.0, &frame.payload, self.floor)?;
+                    }
+                    self.next_seq = boundary + 1;
+                }
+                Err(e) => return Err(format!("store: {e}")),
             }
-            let name = key
-                .strip_prefix(&dir)
-                .ok_or_else(|| format!("unexpected key {key} under the wal prefix"))?;
-            let (bytes, _) = store
-                .get(&key)
-                .map_err(|e| format!("store: {e}"))?
-                .ok_or_else(|| format!("listed segment {key} vanished"))?;
-            scan_segment_into(&mut self.tails, name, &bytes, self.floor)?;
-            self.seen.insert(key);
         }
-        for tail in self.tails.values_mut() {
-            tail.scan(
-                &mut self.dirty,
-                &mut self.dirty_rels,
-                &mut self.dirty_truncs,
-            )?;
-        }
-        Ok(())
+        self.tail.scan(
+            &mut self.dirty,
+            &mut self.dirty_rels,
+            &mut self.dirty_truncs,
+        )
     }
 
     /// Range read the page out of its run object through the slab
@@ -672,10 +682,11 @@ impl ChainReader {
 mod tests {
     use super::*;
     use crate::restore::WAL_SEGMENT_SIZE;
+    use crate::testv2::V2Wal;
     use crate::walscan::testwal::Builder;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use zou_store::manifest::CheckpointRef;
-    use zou_store::{GroupCommit, GroupCommitConfig, LocalFsStore, Lsn, TailConfig, lease};
+    use zou_store::{LocalFsStore, Lsn};
 
     fn blk(rel: u32, blk: u32) -> BlockRef {
         BlockRef {
@@ -751,23 +762,9 @@ mod tests {
         (dir, store, TenantLayout::new("local"))
     }
 
-    /// A group commit for pushing tail WAL the way the pusher does.
-    fn commit(store: &Arc<LocalFsStore>, layout: &TenantLayout) -> GroupCommit {
-        let held = lease::acquire(&**store, layout, "test", 15, 1000).unwrap();
-        GroupCommit::with_lease(
-            Arc::clone(store) as Arc<dyn CasStore>,
-            layout.clone(),
-            Arc::new(Mutex::new(held)),
-            Lsn(0),
-            GroupCommitConfig::default(),
-            TailConfig::default(),
-        )
-    }
-
-    fn push(gc: &GroupCommit, pg_lsn: u64, bytes: &[u8]) {
-        let mut record = pg_lsn.to_le_bytes().to_vec();
-        record.extend_from_slice(bytes);
-        gc.append(&record).unwrap().wait().unwrap();
+    /// The store as the trait object attach wants.
+    fn dyn_store(store: &Arc<LocalFsStore>) -> Arc<dyn CasStore> {
+        Arc::clone(store) as Arc<dyn CasStore>
     }
 
     #[test]
@@ -782,12 +779,14 @@ mod tests {
         );
         put_manifest(&*store, &layout, &[("f1", 0x100, CheckpointKind::Full)]);
 
-        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        let page = rd.read(&*store, &layout, blk(16384, 1), 0).unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
+        let page = rd.read(&*store, blk(16384, 1), 0).unwrap();
         assert_eq!(page.len(), ZOU_PAGE_SIZE);
         assert!(page.iter().all(|b| *b == 0xBB));
-        assert!(rd.read(&*store, &layout, blk(16384, 7), 0).is_none());
-        assert!(rd.read(&*store, &layout, blk(999, 0), 0).is_none());
+        assert!(rd.read(&*store, blk(16384, 7), 0).is_none());
+        assert!(rd.read(&*store, blk(999, 0), 0).is_none());
         assert!(!rd.poisoned());
     }
 
@@ -811,10 +810,12 @@ mod tests {
             ],
         );
 
-        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        let newest = rd.read(&*store, &layout, blk(16384, 0), 0).unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
+        let newest = rd.read(&*store, blk(16384, 0), 0).unwrap();
         assert!(newest.iter().all(|b| *b == 0xCC));
-        let older = rd.read(&*store, &layout, blk(16384, 1), 0).unwrap();
+        let older = rd.read(&*store, blk(16384, 1), 0).unwrap();
         assert!(older.iter().all(|b| *b == 0xBB));
     }
 
@@ -844,14 +845,16 @@ mod tests {
             ],
         );
 
-        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
         // The truncated relation's own delta pages still serve, images
         // packed after the event are current.
-        let own = rd.read(&*store, &layout, blk(20000, 1), 0).unwrap();
+        let own = rd.read(&*store, blk(20000, 1), 0).unwrap();
         assert!(own.iter().all(|b| *b == 0xC1));
         // Older copies of it are dead, the untouched relation is fine.
-        assert!(rd.read(&*store, &layout, blk(20000, 0), 0).is_none());
-        assert!(rd.read(&*store, &layout, blk(16384, 0), 0).is_some());
+        assert!(rd.read(&*store, blk(20000, 0), 0).is_none());
+        assert!(rd.read(&*store, blk(16384, 0), 0).is_some());
     }
 
     #[test]
@@ -891,12 +894,14 @@ mod tests {
             ],
         );
 
-        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
         // Blocks below the cutoff survived the truncate byte for byte.
-        let page = rd.read(&*store, &layout, blk(20000, 1), 0).unwrap();
+        let page = rd.read(&*store, blk(20000, 1), 0).unwrap();
         assert!(page.iter().all(|b| *b == 0xA1));
         // The truncated block and the fsm fork are dead.
-        assert!(rd.read(&*store, &layout, blk(20000, 5), 0).is_none());
+        assert!(rd.read(&*store, blk(20000, 5), 0).is_none());
         let fsm = BlockRef {
             spc: 1663,
             db: 5,
@@ -904,7 +909,7 @@ mod tests {
             fork: 1,
             blk: 0,
         };
-        assert!(rd.read(&*store, &layout, fsm, 0).is_none());
+        assert!(rd.read(&*store, fsm, 0).is_none());
         assert!(!rd.poisoned());
     }
 
@@ -926,7 +931,7 @@ mod tests {
         );
         put_manifest(&*store, &layout, &[("f1", floor, CheckpointKind::Full)]);
 
-        let gc = commit(&store, &layout);
+        let mut wal2 = V2Wal::open(dyn_store(&store), "local", 1);
         let mut wal = Builder::new(floor);
         wal.record(&[(blk(16384, 0), false)], b"dirty block zero");
         // A truncate of relation 30000 down to one block: the survivor
@@ -939,17 +944,19 @@ mod tests {
         trunc.extend_from_slice(&7u32.to_le_bytes());
         wal.record_with(&[], &trunc, 0x20, 2);
         let (lsn, bytes) = wal.stream();
-        push(&gc, lsn, bytes);
+        wal2.push(lsn, bytes);
 
-        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        assert!(rd.read(&*store, &layout, blk(16384, 0), 0).is_none());
-        assert!(rd.read(&*store, &layout, blk(30000, 1), 0).is_none());
-        let survivor = rd.read(&*store, &layout, blk(30000, 0), 0).unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
+        assert!(rd.read(&*store, blk(16384, 0), 0).is_none());
+        assert!(rd.read(&*store, blk(30000, 1), 0).is_none());
+        let survivor = rd.read(&*store, blk(30000, 0), 0).unwrap();
         assert!(survivor.iter().all(|b| *b == 0xDD));
-        let clean = rd.read(&*store, &layout, blk(16384, 1), 0).unwrap();
+        let clean = rd.read(&*store, blk(16384, 1), 0).unwrap();
         assert!(clean.iter().all(|b| *b == 0xBB));
         assert!(!rd.poisoned());
-        gc.close().unwrap();
+        wal2.close();
     }
 
     #[test]
@@ -959,27 +966,29 @@ mod tests {
         put_chk(&*store, &layout, "f1", &[(blk(16384, 0), 0xAA)], &[]);
         put_manifest(&*store, &layout, &[("f1", floor, CheckpointKind::Full)]);
 
-        let gc = commit(&store, &layout);
+        let mut wal2 = V2Wal::open(dyn_store(&store), "local", 1);
         let mut wal = Builder::new(floor);
         wal.record(&[(blk(16384, 0), false)], b"not yet whole");
         let (lsn, bytes) = wal.stream();
         let cut = bytes.len() - 10;
-        push(&gc, lsn, &bytes[..cut]);
+        wal2.push(lsn, &bytes[..cut]);
 
-        // The record is only partially mirrored: the write gate says
+        // The record is only partially in the log: the write gate says
         // its pages cannot be in the store yet, so serving the chain
         // image is still correct and nothing poisons.
-        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        let page = rd.read(&*store, &layout, blk(16384, 0), 0).unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
+        let page = rd.read(&*store, blk(16384, 0), 0).unwrap();
         assert!(page.iter().all(|b| *b == 0xAA));
         assert!(!rd.poisoned());
 
         // Once the rest arrives the record completes and dirties the
         // block, the resumed scan picks up exactly where it stopped.
-        push(&gc, lsn + cut as u64, &bytes[cut..]);
-        assert!(rd.read(&*store, &layout, blk(16384, 0), 0).is_none());
+        wal2.push(lsn + cut as u64, &bytes[cut..]);
+        assert!(rd.read(&*store, blk(16384, 0), 0).is_none());
         assert!(!rd.poisoned());
-        gc.close().unwrap();
+        wal2.close();
     }
 
     #[test]
@@ -994,11 +1003,13 @@ mod tests {
         );
         put_manifest(&*store, &layout, &[("f1", 0x100, CheckpointKind::Full)]);
 
-        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
         rd.note_write(blk(16384, 0));
         rd.note_rel(tag(20000));
-        assert!(rd.read(&*store, &layout, blk(16384, 0), 0).is_none());
-        assert!(rd.read(&*store, &layout, blk(20000, 0), 0).is_none());
+        assert!(rd.read(&*store, blk(16384, 0), 0).is_none());
+        assert!(rd.read(&*store, blk(20000, 0), 0).is_none());
     }
 
     #[test]
@@ -1013,7 +1024,7 @@ mod tests {
                 ("d2", 0x200, CheckpointKind::Delta),
             ],
         );
-        let err = match ChainReader::attach(&*store, &layout) {
+        let err = match ChainReader::attach(&dyn_store(&store), &layout) {
             Err(e) => e,
             Ok(_) => panic!("attach must refuse the gap"),
         };
@@ -1033,8 +1044,10 @@ mod tests {
                 ("d1", 0x200, CheckpointKind::Delta),
             ],
         );
-        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
-        let page = rd.read(&*store, &layout, blk(16384, 0), 0).unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
+        let page = rd.read(&*store, blk(16384, 0), 0).unwrap();
         assert!(page.iter().all(|b| *b == 0xAB));
     }
 
@@ -1058,7 +1071,9 @@ mod tests {
             ],
         );
 
-        let rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
+        let rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
         assert!(!rd.branched());
         assert_eq!(rd.fork_size(1663, 5, 16384, 0), Some(6), "newest s wins");
         assert_eq!(
@@ -1089,7 +1104,9 @@ mod tests {
             ],
         );
 
-        let rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
+        let rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             rd.fork_size(1663, 5, 16384, 0),
             Some(2),
@@ -1116,7 +1133,7 @@ mod tests {
             &[("genesis", 0x100, CheckpointKind::Full)],
         );
         zou_store::branch(&*store, "local", "child", None, 5000).unwrap();
-        let err = match ChainReader::attach(&*store, &TenantLayout::new("child")) {
+        let err = match ChainReader::attach(&dyn_store(&store), &TenantLayout::new("child")) {
             Err(e) => e,
             Ok(_) => panic!("a branch with nothing to serve inherited pages from must refuse"),
         };
@@ -1130,13 +1147,21 @@ mod tests {
     #[test]
     fn nothing_to_serve_attaches_as_none() {
         let (_d, store, layout) = setup();
-        assert!(ChainReader::attach(&*store, &layout).unwrap().is_none());
+        assert!(
+            ChainReader::attach(&dyn_store(&store), &layout)
+                .unwrap()
+                .is_none()
+        );
         put_manifest(
             &*store,
             &layout,
             &[("genesis", 0x100, CheckpointKind::Full)],
         );
-        assert!(ChainReader::attach(&*store, &layout).unwrap().is_none());
+        assert!(
+            ChainReader::attach(&dyn_store(&store), &layout)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1160,15 +1185,17 @@ mod tests {
             .unwrap();
         put_manifest(&*store, &layout, &[("f1", 0x100, CheckpointKind::Full)]);
 
-        let mut rd = ChainReader::attach(&*store, &layout).unwrap().unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &layout)
+            .unwrap()
+            .unwrap();
         for (i, fill) in [(0u32, 0x11u8), (1, 0x22), (2, 0x33)] {
-            let page = rd.read(&*store, &layout, blk(16384, i), 0).unwrap();
+            let page = rd.read(&*store, blk(16384, i), 0).unwrap();
             assert!(page.iter().all(|b| *b == fill), "block {i}");
         }
     }
 
     #[test]
-    fn a_branch_child_serves_inherited_runs_and_scans_the_parent_tail() {
+    fn a_branch_child_serves_inherited_runs_and_ignores_the_parent_stream() {
         let (_d, store, layout) = setup();
         let floor = WAL_SEGMENT_SIZE;
         put_chk(
@@ -1180,25 +1207,31 @@ mod tests {
         );
         put_manifest(&*store, &layout, &[("f1", floor, CheckpointKind::Full)]);
 
-        // The parent pushes tail WAL dirtying block 0, publishes it,
-        // and only then is the branch taken at head.
-        let gc = commit(&store, &layout);
+        // The parent appends WAL dirtying block 0 after the checkpoint,
+        // then the branch is taken. The cut is the checkpoint lsn, so
+        // the parent's unfolded stream is after the branch point and
+        // must not leak into the child.
+        let mut wal2 = V2Wal::open(dyn_store(&store), "local", 1);
         let mut wal = Builder::new(floor);
-        wal.record(&[(blk(16384, 0), false)], b"parent change before branch");
+        wal.record(&[(blk(16384, 0), false)], b"parent change after the cut");
         let (lsn, bytes) = wal.stream();
-        push(&gc, lsn, bytes);
-        gc.close().unwrap();
+        wal2.push(lsn, bytes);
+        wal2.close();
         zou_store::branch(&*store, "local", "child", None, 5000).unwrap();
 
         let child = TenantLayout::new("child");
-        let mut rd = ChainReader::attach(&*store, &child).unwrap().unwrap();
-        // The untouched block serves out of the parent's run object,
-        // the child prefix holds no chk/ at all.
-        let page = rd.read(&*store, &child, blk(16384, 1), 0).unwrap();
+        let mut rd = ChainReader::attach(&dyn_store(&store), &child)
+            .unwrap()
+            .unwrap();
+        assert!(rd.branched());
+        // Both blocks serve out of the parent's run objects, the child
+        // prefix holds no chk/ at all. Block 0 serves its checkpoint
+        // image too: the parent's later WAL belongs to the parent's
+        // stream, the child's own stream is empty.
+        let page = rd.read(&*store, blk(16384, 1), 0).unwrap();
         assert!(page.iter().all(|b| *b == 0xBB));
-        // The parent tail dirtied block 0 before the branch, pg/ must
-        // answer even though the child's own stream is empty.
-        assert!(rd.read(&*store, &child, blk(16384, 0), 0).is_none());
+        let page = rd.read(&*store, blk(16384, 0), 0).unwrap();
+        assert!(page.iter().all(|b| *b == 0xAA));
         assert!(!rd.poisoned());
     }
 
@@ -1280,7 +1313,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stable_durable_lsn_skips_the_list_barrier() {
+    fn a_stable_durable_lsn_skips_the_chain_probes() {
         let (_d, store, layout) = setup();
         put_chk(
             &*store,
@@ -1290,24 +1323,29 @@ mod tests {
             &[],
         );
         put_manifest(&*store, &layout, &[("f1", 0x100, CheckpointKind::Full)]);
-        let counting = CountingStore::new(Arc::clone(&store));
+        let counting = Arc::new(CountingStore::new(Arc::clone(&store)));
+        let sd = Arc::clone(&counting) as Arc<dyn CasStore>;
 
-        let mut rd = ChainReader::attach(&counting, &layout).unwrap().unwrap();
-        // The first read always scans, nothing has been listed yet.
-        rd.read(&counting, &layout, blk(16384, 0), 0x500).unwrap();
-        assert_eq!(counting.lists(), 1);
-        // The published LSN has not moved, no reason to list again.
-        rd.read(&counting, &layout, blk(16384, 1), 0x500).unwrap();
-        rd.read(&counting, &layout, blk(16384, 0), 0x500).unwrap();
-        assert_eq!(counting.lists(), 1);
-        // Zero means nobody publishes, every read must list.
-        rd.read(&counting, &layout, blk(16384, 0), 0).unwrap();
-        assert_eq!(counting.lists(), 2);
-        // An advance means the stream may hold new WAL, list once more.
-        rd.read(&counting, &layout, blk(16384, 0), 0x600).unwrap();
-        assert_eq!(counting.lists(), 3);
-        rd.read(&counting, &layout, blk(16384, 0), 0x600).unwrap();
-        assert_eq!(counting.lists(), 3);
+        let mut rd = ChainReader::attach(&sd, &layout).unwrap().unwrap();
+        let attached = counting.gets();
+        // The first read always probes: one landing fetch finds the
+        // head, one shard manifest read confirms nothing was collected
+        // behind the cursor.
+        rd.read(&*counting, blk(16384, 0), 0x500).unwrap();
+        assert_eq!(counting.gets(), attached + 2);
+        // The published LSN has not moved, no reason to probe again.
+        rd.read(&*counting, blk(16384, 1), 0x500).unwrap();
+        rd.read(&*counting, blk(16384, 0), 0x500).unwrap();
+        assert_eq!(counting.gets(), attached + 2);
+        // Zero means nobody publishes, every read must probe.
+        rd.read(&*counting, blk(16384, 0), 0).unwrap();
+        assert_eq!(counting.gets(), attached + 4);
+        // An advance means the stream may hold new WAL, probe once more.
+        rd.read(&*counting, blk(16384, 0), 0x600).unwrap();
+        assert_eq!(counting.gets(), attached + 6);
+        rd.read(&*counting, blk(16384, 0), 0x600).unwrap();
+        assert_eq!(counting.gets(), attached + 6);
+        assert_eq!(counting.lists(), 0, "no LIST anywhere on the read path");
     }
 
     #[test]
@@ -1322,30 +1360,26 @@ mod tests {
             &[],
         );
         put_manifest(&*store, &layout, &[("f1", floor, CheckpointKind::Full)]);
-        let counting = CountingStore::new(Arc::clone(&store));
+        let counting = Arc::new(CountingStore::new(Arc::clone(&store)));
+        let sd = Arc::clone(&counting) as Arc<dyn CasStore>;
 
-        let mut rd = ChainReader::attach(&counting, &layout).unwrap().unwrap();
-        rd.read(&counting, &layout, blk(16384, 0), floor).unwrap();
+        let mut rd = ChainReader::attach(&sd, &layout).unwrap().unwrap();
+        rd.read(&*counting, blk(16384, 0), floor).unwrap();
 
         // WAL arrives dirtying block 0 and the pusher publishes past
         // it, exactly what a concurrent writer looks like.
-        let gc = commit(&store, &layout);
+        let mut wal2 = V2Wal::open(dyn_store(&store), "local", 1);
         let mut wal = Builder::new(floor);
         wal.record(&[(blk(16384, 0), false)], b"concurrent change");
         let (lsn, bytes) = wal.stream();
-        push(&gc, lsn, bytes);
+        wal2.push(lsn, bytes);
         let advanced = floor + bytes.len() as u64;
 
-        assert!(
-            rd.read(&counting, &layout, blk(16384, 0), advanced)
-                .is_none()
-        );
-        let clean = rd
-            .read(&counting, &layout, blk(16384, 1), advanced)
-            .unwrap();
+        assert!(rd.read(&*counting, blk(16384, 0), advanced).is_none());
+        let clean = rd.read(&*counting, blk(16384, 1), advanced).unwrap();
         assert!(clean.iter().all(|b| *b == 0xBB));
         assert!(!rd.poisoned());
-        gc.close().unwrap();
+        wal2.close();
     }
 
     #[test]
@@ -1359,12 +1393,13 @@ mod tests {
             &[],
         );
         put_manifest(&*store, &layout, &[("f1", 0x100, CheckpointKind::Full)]);
-        let counting = CountingStore::new(Arc::clone(&store));
+        let counting = Arc::new(CountingStore::new(Arc::clone(&store)));
+        let sd = Arc::clone(&counting) as Arc<dyn CasStore>;
 
-        let mut rd = ChainReader::attach(&counting, &layout).unwrap().unwrap();
-        rd.read(&counting, &layout, blk(16384, 0), 0x500).unwrap();
-        rd.read(&counting, &layout, blk(16384, 1), 0x500).unwrap();
-        rd.read(&counting, &layout, blk(16384, 0), 0x500).unwrap();
+        let mut rd = ChainReader::attach(&sd, &layout).unwrap().unwrap();
+        rd.read(&*counting, blk(16384, 0), 0x500).unwrap();
+        rd.read(&*counting, blk(16384, 1), 0x500).unwrap();
+        rd.read(&*counting, blk(16384, 0), 0x500).unwrap();
         assert_eq!(counting.ranges(), 1, "one slab covers both pages");
     }
 
@@ -1403,53 +1438,52 @@ mod tests {
                 ("d5", floor, CheckpointKind::Delta),
             ],
         );
-        let gc = commit(&store, &layout);
+        let mut wal2 = V2Wal::open(dyn_store(&store), "local", 1);
         let mut wal = Builder::new(floor);
         wal.record(&[(blk(50000, 0), false)], b"tail noise");
         let (lsn, bytes) = wal.stream();
-        push(&gc, lsn, bytes);
+        wal2.push(lsn, bytes);
+        wal2.close();
         let durable = floor + bytes.len() as u64;
 
-        let counting = CountingStore::new(Arc::clone(&store));
-        let mut rd = ChainReader::attach(&counting, &layout).unwrap().unwrap();
+        let counting = Arc::new(CountingStore::new(Arc::clone(&store)));
+        let sd = Arc::clone(&counting) as Arc<dyn CasStore>;
+        let mut rd = ChainReader::attach(&sd, &layout).unwrap().unwrap();
         assert_eq!(
             rd.chain.len(),
             5,
             "the whole walk is the full and four deltas"
         );
-        assert_eq!(
-            counting.gets(),
-            6,
-            "attach reads the manifest and five indexes"
-        );
+        let attached = counting.gets();
 
         // The worst case read misses all four deltas and lands in the
-        // full: one LIST, one sealed segment GET for the tail, one
-        // ranged GET for the run slab, and nothing else.
-        let page = rd.read(&counting, &layout, blk(16384, 0), durable).unwrap();
+        // full: the probes walk the landing chain, here the takeover
+        // seal and the frame window, then one head miss and one shard
+        // manifest read, and the page itself is one ranged GET for the
+        // run slab. Nothing else.
+        let page = rd.read(&*counting, blk(16384, 0), durable).unwrap();
         assert!(page.iter().all(|b| *b == 0xF1));
-        assert_eq!(counting.lists(), 1);
-        assert_eq!(counting.gets(), 7, "the tail is one sealed segment");
+        assert_eq!(
+            counting.gets(),
+            attached + 4,
+            "the tail is two landing segments plus the probe overhead"
+        );
         assert_eq!(counting.ranges(), 1);
 
         // Steady state: the durable LSN has not moved and the slab is
         // warm, so the neighboring block costs zero store operations.
-        let page = rd.read(&counting, &layout, blk(16384, 1), durable).unwrap();
+        let page = rd.read(&*counting, blk(16384, 1), durable).unwrap();
         assert!(page.iter().all(|b| *b == 0xF2));
-        assert_eq!(counting.lists(), 1);
-        assert_eq!(counting.gets(), 7);
+        assert_eq!(counting.gets(), attached + 4);
         assert_eq!(counting.ranges(), 1);
 
         // A delta hit stops the walk at its index and costs one ranged
         // GET for that run object.
-        let page = rd
-            .read(&counting, &layout, blk(16384, 13), durable)
-            .unwrap();
+        let page = rd.read(&*counting, blk(16384, 13), durable).unwrap();
         assert!(page.iter().all(|b| *b == 0xD5));
-        assert_eq!(counting.lists(), 1);
-        assert_eq!(counting.gets(), 7);
+        assert_eq!(counting.gets(), attached + 4);
         assert_eq!(counting.ranges(), 2);
+        assert_eq!(counting.lists(), 0, "no LIST anywhere on the read path");
         assert!(!rd.poisoned());
-        gc.close().unwrap();
     }
 }

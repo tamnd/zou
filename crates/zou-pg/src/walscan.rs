@@ -15,8 +15,7 @@
 //! opens every 16MB segment, the cursor skips them and validates the
 //! page magic as it goes.
 
-use zou_store::layout::TenantLayout;
-use zou_store::{CasStore, SegmentReader};
+use zou_store::Frame2;
 
 use crate::restore::WAL_SEGMENT_SIZE;
 
@@ -95,70 +94,31 @@ pub struct WalWindow {
     pub covered_from: u64,
 }
 
-/// Read every chunk the named stream segments hold and lay the ones
-/// intersecting `[from, to)` into one contiguous window.
-pub fn assemble_window(
-    store: &dyn CasStore,
-    layout: &TenantLayout,
-    segments: &[String],
-    from: u64,
-    to: u64,
-) -> Result<WalWindow, String> {
-    let sources = [(layout.clone(), segments.to_vec())];
-    assemble_window_from(store, &sources, from, to)
-}
-
-/// The multi source form: each entry names the tenant prefix its
-/// segments live under. A branched tenant assembles the frozen parent
-/// tails and its own stream into one window, listed parents first so
-/// the tenant's own bytes win where the streams overlap, the region a
-/// parent's incomplete trailing record left behind and the child's
-/// first records overwrote.
-pub fn assemble_window_from(
-    store: &dyn CasStore,
-    sources: &[(TenantLayout, Vec<String>)],
-    from: u64,
-    to: u64,
-) -> Result<WalWindow, String> {
+/// Lay the frames of one tenant's shared log stream that intersect
+/// `[from, to)` into one contiguous window. A frame's payload is a raw
+/// chunk of the Postgres stream and its lsn range says where the bytes
+/// sit, so retried frames overlap harmlessly: later copies write the
+/// same bytes.
+pub fn assemble_window_frames(frames: &[Frame2], from: u64, to: u64) -> WalWindow {
     let mut buf = vec![0u8; (to.saturating_sub(from)) as usize];
     let mut covered_from = to;
-    for (layout, segments) in sources {
-        for name in segments {
-            let epoch = zou_store::commit::segment_epoch(name)
-                .ok_or_else(|| format!("bad segment name {name:?}"))?;
-            let Some((bytes, _)) = store
-                .get(&layout.wal_segment_path(name))
-                .map_err(|e| format!("store: {e}"))?
-            else {
-                continue;
-            };
-            for frame in SegmentReader::new(&bytes, epoch) {
-                let frame = frame.map_err(|e| format!("segment {name}: {e}"))?;
-                let records = zou_store::commit::split_records(&frame.payload)
-                    .ok_or_else(|| format!("bad batch in {name}"))?;
-                for record in records {
-                    if record.len() < 8 {
-                        return Err(format!("short record in {name}"));
-                    }
-                    let lsn = u64::from_le_bytes(record[..8].try_into().expect("checked length"));
-                    let wal = &record[8..];
-                    let (start, end) = (lsn.max(from), (lsn + wal.len() as u64).min(to));
-                    if start >= end {
-                        continue;
-                    }
-                    covered_from = covered_from.min(start);
-                    let src = (start - lsn) as usize..(end - lsn) as usize;
-                    let dst = (start - from) as usize..(end - from) as usize;
-                    buf[dst].copy_from_slice(&wal[src]);
-                }
-            }
+    for frame in frames {
+        let lsn = frame.start_lsn.0;
+        let wal = &frame.payload;
+        let (start, end) = (lsn.max(from), (lsn + wal.len() as u64).min(to));
+        if start >= end {
+            continue;
         }
+        covered_from = covered_from.min(start);
+        let src = (start - lsn) as usize..(end - lsn) as usize;
+        let dst = (start - from) as usize..(end - from) as usize;
+        buf[dst].copy_from_slice(&wal[src]);
     }
-    Ok(WalWindow {
+    WalWindow {
         base: from,
         buf,
         covered_from,
-    })
+    }
 }
 
 /// Why a scan step could not proceed. Truncation means the window ends

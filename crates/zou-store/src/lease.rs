@@ -149,9 +149,9 @@ pub fn release(
 
 /// Mutate the manifest while holding the lease. Re-reads, verifies we are
 /// still the holder, applies `mutate`, and swaps. This is how the writer
-/// publishes wal_tail and checkpoint updates: every such write doubles as
-/// an ownership check, so a stolen lease surfaces as `Lost` here instead
-/// of silently corrupting the manifest.
+/// publishes checkpoint and fold cursor updates: every such write doubles
+/// as an ownership check, so a stolen lease surfaces as `Lost` here
+/// instead of silently corrupting the manifest.
 ///
 /// A swap that changed anything besides the lease also lands a history
 /// snapshot under `manifests/`, at most one per second, which is the

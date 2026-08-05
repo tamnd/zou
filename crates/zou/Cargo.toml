@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+zou-log = { path = "../zou-log" }
 zou-pg = { path = "../zou-pg" }
 zou-store = { path = "../zou-store" }
 env_logger = { workspace = true }

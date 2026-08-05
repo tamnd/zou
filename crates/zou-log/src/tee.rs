@@ -205,6 +205,53 @@ impl TeeSubscription {
 /// consolidated boundary. Frames come back in lsn order. This is the
 /// catch up path for a subscriber that fell behind or just arrived,
 /// and it costs range GETs plus the landing tail, no LIST.
+/// The durable end of one tenant's stream: the newest round's watermark
+/// for the tenant joined with the landing tail past the consolidated
+/// boundary. None when the tenant has never appended. Costs one shard
+/// manifest GET, at most one round index GET, and the landing chain,
+/// with no LIST and no sealed object reads.
+pub fn stream_end(
+    media: &WalMedia,
+    wal_shard: u32,
+    tenant: u128,
+) -> Result<Option<Lsn>, ConsolidateError> {
+    let store = media.manifest_store();
+    let Some((manifest, _)) = ShardManifest::load(store.as_ref(), wal_shard)? else {
+        return Ok(None);
+    };
+    let mut end: Option<Lsn> = None;
+    if let Some(rounds) = manifest.rounds {
+        // The newest round's index carries every tenant's watermark
+        // forward, so one GET answers for the whole sealed history.
+        let index = RoundIndex::load(store.as_ref(), wal_shard, rounds.last)?.ok_or(
+            ConsolidateError::BadRound {
+                shard: wal_shard,
+                round: rounds.last,
+                reason: "a retained round index is missing".to_string(),
+            },
+        )?;
+        for t in &index.tenants {
+            if t.tenant == tenant {
+                end = Some(Lsn(t.watermark));
+            }
+        }
+    }
+    let tail = read_chain_linked(
+        media,
+        wal_shard,
+        manifest.consolidated_upto,
+        manifest.consolidated_digest,
+    )?;
+    for segment in tail {
+        for frame in segment.frames {
+            if frame.tenant == tenant && end.is_none_or(|e| frame.end_lsn > e) {
+                end = Some(frame.end_lsn);
+            }
+        }
+    }
+    Ok(end)
+}
+
 pub fn catch_up(
     media: &WalMedia,
     wal_shard: u32,

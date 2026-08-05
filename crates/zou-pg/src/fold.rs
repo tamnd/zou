@@ -1,14 +1,15 @@
 //! The checkpoint fold: turn the WAL a completed Postgres checkpoint made
-//! redundant into a delta checkpoint object and truncate the mirrored
-//! tail.
+//! redundant into a delta checkpoint object and raise the tenant's
+//! replay floor in the shared log.
 //!
 //! After a checkpoint completes, every page change before its redo
 //! location is on the page store, so WAL before redo is only needed to
 //! carry the non relation state forward: transaction status, the control
 //! file, relation maps. The fold captures exactly that state as a delta
-//! checkpoint at the redo LSN, then drops the sealed stream segments that
-//! lie entirely before it. Restore applies the newest full capture, the
-//! deltas after it, and replays the remaining tail.
+//! checkpoint at the redo LSN, then publishes `folded_upto` so readers
+//! know frames at or below it never need replay. Restore applies the
+//! newest full capture, the deltas after it, and replays the remaining
+//! stream past the last checkpoint.
 //!
 //! Each checkpoint also carries sorted page runs: the blocks its WAL
 //! window dirtied, packed in (relation, block) order into immutable run
@@ -18,11 +19,6 @@
 //! newer than redo; that is the same replay-idempotence argument
 //! Postgres recovery itself rests on, a checkpoint is a consistent
 //! starting point, not a point in time snapshot.
-//!
-//! The truncation cut is the 16MB pg_wal segment boundary below redo, not
-//! redo itself: the xlog reader validates the first page header of any
-//! segment file it opens, so the overlay must rebuild retained segment
-//! files from their start.
 //!
 //! The caller, the wal pusher, only starts a fold once pushed covers
 //! redo, so the checkpoint record named by the captured pg_control is
@@ -41,14 +37,16 @@
 
 use std::path::Path;
 
+use zou_log::{TeeFilter, WalMedia, catch_up};
 use zou_store::layout::TenantLayout;
+use zou_store::lease::{self, HeldLease, LeaseError};
 use zou_store::manifest::{CheckpointKind, CheckpointRef};
-use zou_store::{CasError, CasStore, GroupCommit, Lsn, Manifest, SegmentReader};
+use zou_store::{CasError, CasStore, Lsn, Manifest};
 
-use crate::ZOU_PAGE_SIZE;
 use crate::capture;
-use crate::restore::{WAL_SEGMENT_SIZE, control_redo};
+use crate::restore::control_redo;
 use crate::walscan::{self, BlockRef};
+use crate::{WAL_SHARD, ZOU_PAGE_SIZE};
 
 /// A new full checkpoint replaces the delta chain once the deltas
 /// outweigh the newest full by this factor. Restore cost stays bounded
@@ -78,7 +76,6 @@ pub struct FoldStats {
     pub bytes: u64,
     pub pages: usize,
     pub runs: usize,
-    pub dropped: usize,
 }
 
 /// The layout holding a checkpoint's objects: an inherited ref names
@@ -140,84 +137,24 @@ fn chain_wants_full(
     Ok(delta_bytes > fold_down_factor().saturating_mul(full_bytes))
 }
 
-/// First Postgres LSN covered by a stored segment, from the 8 byte
-/// header of its first record. Stream order is push order is pg order,
-/// so this bounds everything in earlier segments from above.
-pub(crate) fn segment_first_pg_lsn(
-    store: &dyn CasStore,
-    layout: &TenantLayout,
-    name: &str,
-) -> Result<u64, String> {
-    let epoch = zou_store::commit::segment_epoch(name)
-        .ok_or_else(|| format!("bad segment name {name:?}"))?;
-    let (bytes, _) = store
-        .get(&layout.wal_segment_path(name))
-        .map_err(|e| format!("store: {e}"))?
-        .ok_or_else(|| format!("segment {name} is missing"))?;
-    let frame = SegmentReader::new(&bytes, epoch)
-        .next()
-        .ok_or_else(|| format!("segment {name} is empty"))?
-        .map_err(|e| format!("segment {name}: {e}"))?;
-    let records = zou_store::commit::split_records(&frame.payload)
-        .ok_or_else(|| format!("bad batch in {name}"))?;
-    let first = records
-        .first()
-        .ok_or_else(|| format!("empty batch in {name}"))?;
-    if first.len() < 8 {
-        return Err(format!("short record in {name}"));
-    }
-    Ok(u64::from_le_bytes(
-        first[..8].try_into().expect("checked length"),
-    ))
-}
-
 /// Pages per run object, 8MB runs in v0. The spec targets bigger runs
 /// once the read path range reads them, the index records the value so
 /// a reader never has to guess.
 const RUN_PAGES: usize = 1024;
 
-/// The stream segments worth scanning: the published tail plus this
-/// session's own segments uploaded after the last publish, which the
-/// manifest has not learned about yet. Unpublished objects from any
-/// other epoch stay untrusted, a zombie writer may still be uploading.
-fn scan_segments(
-    store: &dyn CasStore,
-    layout: &TenantLayout,
-    manifest: &Manifest,
-    epoch: u64,
-) -> Result<Vec<String>, String> {
-    let mut segments: Vec<String> = manifest
-        .wal_tail
-        .as_ref()
-        .map(|t| t.segments.clone())
-        .unwrap_or_default();
-    for key in store
-        .list(&layout.wal_epoch_dir(epoch))
-        .map_err(|e| format!("store: {e}"))?
-    {
-        let name = key.rsplit('/').next().unwrap_or_default();
-        let qualified = format!("{epoch:016}/{name}");
-        if !segments.contains(&qualified) {
-            segments.push(qualified);
-        }
-    }
-    Ok(segments)
-}
-
 /// The blocks dirtied since the previous checkpoint, scanned out of the
-/// WAL the stream holds over that window, plus the relations its smgr
-/// create and truncate records name. Completeness rests on the write
-/// gate: no page object mutates before its WAL is durable in the
+/// WAL the shared log holds over that window, plus the relations its
+/// smgr create and truncate records name. Completeness rests on the
+/// write gate: no page object mutates before its WAL is durable in the
 /// stream, so the stream names every page the fold must carry. The
 /// relation events ride into the PAGES index as r lines because a
 /// truncate or a file recreation makes older checkpoint copies of the
 /// relation stale without any block reference saying so, and the read
-/// path needs that barrier long after this WAL is dropped.
+/// path needs that barrier long after this WAL is gone from the log.
 fn delta_scan(
-    store: &dyn CasStore,
-    layout: &TenantLayout,
+    media: &WalMedia,
+    tenant: u128,
     manifest: &Manifest,
-    epoch: u64,
     redo: u64,
 ) -> Result<walscan::ScanOut, String> {
     let prev = manifest
@@ -225,22 +162,9 @@ fn delta_scan(
         .last()
         .map(|c| c.lsn.0)
         .ok_or_else(|| "delta fold with no prior checkpoint".to_string())?;
-    // A branched tenant's window begins in the frozen parent tails: its
-    // first fold covers WAL from the inherited checkpoint through the
-    // branch point into its own stream, and the blocks those parent
-    // records dirtied must land in this delta, the fold raises the read
-    // floor past them for good. Parents go first so the tenant's own
-    // bytes win where the streams overlap.
-    let mut sources: Vec<(TenantLayout, Vec<String>)> = manifest
-        .parent_tail
-        .iter()
-        .map(|pt| (TenantLayout::new(&pt.tenant_ref), pt.segments.clone()))
-        .collect();
-    sources.push((
-        layout.clone(),
-        scan_segments(store, layout, manifest, epoch)?,
-    ));
-    let window = walscan::assemble_window_from(store, &sources, prev, redo)?;
+    let frames = catch_up(media, WAL_SHARD, &TeeFilter::Tenant(tenant), Lsn(prev))
+        .map_err(|e| format!("catch up: {e}"))?;
+    let window = walscan::assemble_window_frames(&frames, prev, redo);
     // Coverage can start after the previous checkpoint when that one
     // predates the stream, the genesis capture does. Records in the gap
     // are older than the stream's first push, so their page effects are
@@ -432,13 +356,10 @@ fn pack_page_runs(
 }
 
 /// Whether the manifest still leans on state it does not own: a branch
-/// origin, a frozen parent tail, or checkpoints tagged with another
-/// owner. Once a merged full publishes and prunes those, the tenant
-/// packs like any other.
+/// origin or checkpoints tagged with another owner. Once a merged full
+/// publishes and prunes those, the tenant packs like any other.
 fn branched(m: &Manifest) -> bool {
-    m.branch_of.is_some()
-        || !m.parent_tail.is_empty()
-        || m.checkpoints.iter().any(|c| c.owner.is_some())
+    m.branch_of.is_some() || m.checkpoints.iter().any(|c| c.owner.is_some())
 }
 
 /// The full capture for a branched manifest. Packing from pg/ alone
@@ -593,14 +514,13 @@ fn pack_merged_full(
     pack_page_runs(store, layout, id, &refs, &[], &[], &sizes, &mut fetch)
 }
 
-/// Everything [`prepare`] produced and [`fold`] publishes: the ref the
-/// manifest gains, the sealed segments it sheds, and the stats. The
-/// split exists so the capture and pack can run on a thread that never
-/// touches the group commit, the publish is a manifest edit the caller
-/// applies when it collects the result.
+/// Everything [`prepare`] produced and [`publish`] applies: the ref
+/// the manifest gains and the stats. The split exists so the capture
+/// and pack can run on a thread that never touches the lease, the
+/// publish is a manifest edit the caller applies when it collects the
+/// result.
 pub struct FoldOutcome {
     pub checkpoint: CheckpointRef,
-    pub drop: Vec<String>,
     pub stats: FoldStats,
 }
 
@@ -613,7 +533,8 @@ pub struct FoldOutcome {
 pub fn prepare(
     store: &dyn CasStore,
     layout: &TenantLayout,
-    epoch: u64,
+    media: &WalMedia,
+    tenant: u128,
     pgdata: &Path,
     redo: u64,
 ) -> Result<FoldOutcome, String> {
@@ -672,7 +593,7 @@ pub fn prepare(
     };
     let (pages, runs) = match kind {
         CheckpointKind::Delta => {
-            let out = delta_scan(store, layout, &manifest, epoch, redo)?;
+            let out = delta_scan(media, tenant, &manifest, redo)?;
             let sizes = touched_sizes(store, layout, &out)?;
             pack_page_runs(
                 store,
@@ -694,22 +615,6 @@ pub fn prepare(
         }
     };
 
-    // Droppable prefix of the published tail. A sealed segment goes once
-    // its successor starts at or below the cut, everything it covers is
-    // then before the retained window. Unpublished segments are newer
-    // than the checkpoint and never candidates.
-    let cut = redo & !(WAL_SEGMENT_SIZE - 1);
-    let mut drop = Vec::new();
-    if let Some(tail) = &manifest.wal_tail {
-        for pair in tail.segments.windows(2) {
-            if segment_first_pg_lsn(store, layout, &pair[1])? <= cut {
-                drop.push(pair[0].clone());
-            } else {
-                break;
-            }
-        }
-    }
-    let dropped = drop.len();
     Ok(FoldOutcome {
         checkpoint: CheckpointRef {
             id: id.clone(),
@@ -717,7 +622,6 @@ pub fn prepare(
             kind,
             owner: None,
         },
-        drop,
         stats: FoldStats {
             id,
             kind,
@@ -725,24 +629,59 @@ pub fn prepare(
             bytes,
             pages,
             runs,
-            dropped,
         },
     })
 }
 
-/// [`prepare`] plus the publish: the synchronous shape, used by tests
-/// and by anyone who has the group commit at hand and does not mind
-/// blocking on the capture.
+/// Publish a prepared checkpoint into the manifest under the lease:
+/// push the ref if a retry has not already, prune everything a full
+/// supersedes, and raise `folded_upto` to the fold's redo. Retries the
+/// CAS race a bounded number of times, every other error propagates,
+/// and [`LeaseError::Lost`] means stop writing.
+pub fn publish(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    held: &mut HeldLease,
+    checkpoint: &CheckpointRef,
+    redo: u64,
+    now_unix: u64,
+) -> Result<(), LeaseError> {
+    for _ in 0..5 {
+        let result = lease::update_manifest(store, layout, held, now_unix, |m| {
+            if !m.checkpoints.iter().any(|c| c.id == checkpoint.id) {
+                m.checkpoints.push(checkpoint.clone());
+            }
+            if checkpoint.kind == CheckpointKind::Full
+                && let Some(pos) = m.checkpoints.iter().rposition(|c| c.id == checkpoint.id)
+            {
+                m.checkpoints.drain(..pos);
+            }
+            m.folded_upto = Some(Lsn(redo));
+        });
+        match result {
+            Err(LeaseError::Raced) => continue,
+            other => return other,
+        }
+    }
+    Err(LeaseError::Raced)
+}
+
+/// [`prepare`] plus [`publish`]: the synchronous shape, used by tests
+/// and by anyone who holds the lease and does not mind blocking on the
+/// capture.
+#[allow(clippy::too_many_arguments)]
 pub fn fold(
     store: &dyn CasStore,
     layout: &TenantLayout,
-    commit: &GroupCommit,
+    media: &WalMedia,
+    tenant: u128,
+    held: &mut HeldLease,
     pgdata: &Path,
     redo: u64,
+    now_unix: u64,
 ) -> Result<FoldStats, String> {
-    let out = prepare(store, layout, commit.epoch(), pgdata, redo)?;
-    commit
-        .fold_tail(out.checkpoint, out.drop)
+    let out = prepare(store, layout, media, tenant, pgdata, redo)?;
+    publish(store, layout, held, &out.checkpoint, redo, now_unix)
         .map_err(|e| format!("fold publish: {e}"))?;
     Ok(out.stats)
 }
@@ -750,9 +689,11 @@ pub fn fold(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::restore::WAL_SEGMENT_SIZE;
+    use crate::testv2::V2Wal;
     use crate::walscan::testwal::Builder;
-    use std::sync::{Arc, Mutex};
-    use zou_store::{GroupCommitConfig, LocalFsStore, TailConfig, lease};
+    use std::sync::Arc;
+    use zou_store::LocalFsStore;
 
     fn synthetic_control(redo: u64) -> Vec<u8> {
         // Same shape the restore tests use: state in production at 16,
@@ -860,38 +801,27 @@ mod tests {
         store
             .put_if_absent(&layout.manifest(), &genesis.to_json())
             .unwrap();
-        let held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
-        let gc = GroupCommit::with_lease(
-            Arc::clone(&store) as Arc<dyn CasStore>,
-            layout.clone(),
-            Arc::new(Mutex::new(held)),
-            Lsn(0),
-            GroupCommitConfig::default(),
-            TailConfig {
-                seal_bytes: 1,
-                ..TailConfig::default()
-            },
-        );
-        // Three sealed segments: two garbage chunks below the scan
-        // window that exist to exercise the drop logic, then the real
-        // WAL. Only the first lies entirely below the cut.
-        let push = |pg_lsn: u64, bytes: &[u8]| {
-            let mut record = pg_lsn.to_le_bytes().to_vec();
-            record.extend_from_slice(bytes);
-            gc.append(&record).unwrap().wait().unwrap();
-        };
-        push(0x100, &[0x5A; 100]);
-        push(0x200, &[0x5A; 100]);
+        let mut held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
+        let epoch = u32::try_from(held.epoch).unwrap();
+        let mut wal2 = V2Wal::open(Arc::clone(&store) as Arc<dyn CasStore>, "local", epoch);
+        // Two chunks wholly below the scan window, retries the scan
+        // must clip away, then the real WAL.
+        wal2.push(0x100, &[0x5A; 100]);
+        wal2.push(0x200, &[0x5A; 100]);
         let (stream_lsn, stream_bytes) = wal.stream();
-        push(stream_lsn, stream_bytes);
-        let before = manifest_of(&*store, &layout).wal_tail.unwrap();
-        assert_eq!(before.segments.len(), 3);
+        wal2.push(stream_lsn, stream_bytes);
 
-        let stats = fold(&*store, &layout, &gc, pgdata, redo).unwrap();
-        assert_eq!(
-            stats.dropped, 1,
-            "only the first segment's successor starts below the cut"
-        );
+        let stats = fold(
+            &*store,
+            &layout,
+            &wal2.media,
+            wal2.tenant,
+            &mut held,
+            pgdata,
+            redo,
+            2000,
+        )
+        .unwrap();
         assert_eq!(stats.kind, CheckpointKind::Delta);
         assert_eq!(stats.files, 2);
         assert_eq!(
@@ -901,8 +831,7 @@ mod tests {
         assert_eq!(stats.runs, 1);
 
         let m = manifest_of(&*store, &layout);
-        let tail = m.wal_tail.unwrap();
-        assert_eq!(tail.segments, before.segments[1..].to_vec());
+        assert_eq!(m.folded_upto, Some(Lsn(redo)));
         assert_eq!(m.checkpoints.len(), 2);
         let chk = &m.checkpoints[1];
         assert_eq!(chk.lsn, Lsn(redo));
@@ -944,17 +873,37 @@ mod tests {
         );
 
         // Folding the same redo again is a no op on the manifest.
-        let again = fold(&*store, &layout, &gc, pgdata, redo).unwrap();
-        assert_eq!(again.dropped, 0);
+        let again = fold(
+            &*store,
+            &layout,
+            &wal2.media,
+            wal2.tenant,
+            &mut held,
+            pgdata,
+            redo,
+            2001,
+        )
+        .unwrap();
+        assert_eq!(again.kind, CheckpointKind::Delta);
         assert_eq!(manifest_of(&*store, &layout).checkpoints.len(), 2);
 
         // A capture whose pg_control moved past the fold is refused.
         let newer = synthetic_control(redo + 0x1000);
         std::fs::write(pgdata.join("global/pg_control"), &newer).unwrap();
-        let err = fold(&*store, &layout, &gc, pgdata, redo).unwrap_err();
+        let err = fold(
+            &*store,
+            &layout,
+            &wal2.media,
+            wal2.tenant,
+            &mut held,
+            pgdata,
+            redo,
+            2002,
+        )
+        .unwrap_err();
         assert!(err.contains("past the fold"));
 
-        gc.close().unwrap();
+        wal2.close();
     }
 
     #[test]
@@ -1033,20 +982,22 @@ mod tests {
             .put_if_absent(&layout.manifest(), &m.to_json())
             .unwrap();
 
-        let held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
-        let gc = GroupCommit::with_lease(
-            Arc::clone(&store) as Arc<dyn CasStore>,
-            layout.clone(),
-            Arc::new(Mutex::new(held)),
-            Lsn(0),
-            GroupCommitConfig::default(),
-            TailConfig::default(),
-        );
-        let mut record = 0x100u64.to_le_bytes().to_vec();
-        record.extend_from_slice(b"payload");
-        gc.append(&record).unwrap().wait().unwrap();
+        let mut held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
+        let epoch = u32::try_from(held.epoch).unwrap();
+        let mut wal2 = V2Wal::open(Arc::clone(&store) as Arc<dyn CasStore>, "local", epoch);
+        wal2.push(0x100, b"payload");
 
-        let stats = fold(&*store, &layout, &gc, pgdata, redo).unwrap();
+        let stats = fold(
+            &*store,
+            &layout,
+            &wal2.media,
+            wal2.tenant,
+            &mut held,
+            pgdata,
+            redo,
+            2000,
+        )
+        .unwrap();
         assert_eq!(stats.kind, CheckpointKind::Full);
         assert_eq!(stats.pages, 2);
         assert_eq!(stats.runs, 1);
@@ -1090,7 +1041,7 @@ mod tests {
         assert_eq!(run[0], 0xCC);
         assert_eq!(run[ZOU_PAGE_SIZE], 0xDD);
 
-        gc.close().unwrap();
+        wal2.close();
     }
 
     #[test]
@@ -1154,11 +1105,6 @@ mod tests {
                 owner: None,
             });
         }
-        pm.wal_tail = Some(zou_store::manifest::WalTail {
-            epoch_dir: 1,
-            from_lsn: Lsn(0x500),
-            segments: vec!["0000000000000001/0000000000000000.wal".into()],
-        });
         store
             .put_if_absent(&parent.manifest(), &pm.to_json())
             .unwrap();
@@ -1183,20 +1129,22 @@ mod tests {
         std::fs::write(pgdata.join("PG_VERSION"), b"18\n").unwrap();
         std::fs::write(pgdata.join("pg_wal/000000010000000000000001"), b"wal").unwrap();
 
-        let held = lease::acquire(&*store, &child, "test", 15, 1000).unwrap();
-        let gc = GroupCommit::with_lease(
-            Arc::clone(&store) as Arc<dyn CasStore>,
-            child.clone(),
-            Arc::new(Mutex::new(held)),
-            Lsn(0),
-            GroupCommitConfig::default(),
-            TailConfig::default(),
-        );
-        let mut record = 0x100u64.to_le_bytes().to_vec();
-        record.extend_from_slice(b"payload");
-        gc.append(&record).unwrap().wait().unwrap();
+        let mut held = lease::acquire(&*store, &child, "test", 15, 1000).unwrap();
+        let epoch = u32::try_from(held.epoch).unwrap();
+        let mut wal2 = V2Wal::open(Arc::clone(&store) as Arc<dyn CasStore>, "child", epoch);
+        wal2.push(0x100, b"payload");
 
-        let stats = fold(&*store, &child, &gc, pgdata, redo).unwrap();
+        let stats = fold(
+            &*store,
+            &child,
+            &wal2.media,
+            wal2.tenant,
+            &mut held,
+            pgdata,
+            redo,
+            6000,
+        )
+        .unwrap();
         assert_eq!(stats.kind, CheckpointKind::Full);
         assert_eq!(stats.pages, 3);
         assert_eq!(stats.runs, 1);
@@ -1222,17 +1170,16 @@ mod tests {
         assert_eq!(run[ZOU_PAGE_SIZE], 0x33, "the newest chain image serves");
         assert_eq!(run[2 * ZOU_PAGE_SIZE], 0x66, "the recreated incarnation");
 
-        // Published, the chain prunes to the new full, the frozen
-        // parent tail lets go, and nothing in the manifest names the
-        // parent's objects anymore: the branch is self sufficient and
-        // gc may unpin the parent.
+        // Published, the chain prunes to the new full and nothing in
+        // the manifest names the parent's objects anymore: the branch
+        // is self sufficient and gc may unpin the parent.
         let m = manifest_of(&*store, &child);
         assert_eq!(m.checkpoints.len(), 1);
         assert_eq!(m.checkpoints[0].kind, CheckpointKind::Full);
         assert_eq!(m.checkpoints[0].owner, None);
-        assert!(m.parent_tail.is_empty());
+        assert_eq!(m.folded_upto, Some(Lsn(redo)));
 
-        gc.close().unwrap();
+        wal2.close();
     }
 
     #[test]

@@ -33,16 +33,85 @@ pub mod reader;
 pub mod restore;
 pub mod walscan;
 
+/// A real shard sequencer over any store for the writer side of tests:
+/// the same take_over plus resume wiring open_wal_pipe does, minus the
+/// lease machinery, so fold, reader, and restore tests push tenant WAL
+/// through the actual chain instead of a mock.
+#[cfg(test)]
+pub(crate) mod testv2 {
+    use std::sync::Arc;
+
+    use zou_log::{MediaSink, Sequencer, SequencerConfig, WalMedia, take_over};
+    use zou_store::{CasStore, Frame2, Lsn, tenant_id};
+
+    use crate::WAL_SHARD;
+
+    pub struct V2Wal {
+        pub media: Arc<WalMedia>,
+        pub seq: Sequencer,
+        pub tenant: u128,
+        pub epoch: u32,
+        first_appended: bool,
+    }
+
+    impl V2Wal {
+        pub fn open(store: Arc<dyn CasStore>, tenant_ref: &str, epoch: u32) -> Self {
+            let media = Arc::new(WalMedia::single(store));
+            let takeover = take_over(&media, WAL_SHARD, "testv2").unwrap();
+            let sink = Arc::new(MediaSink::new(Arc::clone(&media), WAL_SHARD));
+            let seq = Sequencer::resume(
+                WAL_SHARD,
+                sink,
+                SequencerConfig::default(),
+                takeover.next_seq,
+                takeover.prev_digest,
+            );
+            Self {
+                media,
+                seq,
+                tenant: tenant_id(tenant_ref),
+                epoch,
+                first_appended: false,
+            }
+        }
+
+        /// Append one chunk of tenant WAL at `pg_lsn` and wait until it
+        /// is durable on the chain.
+        pub fn push(&mut self, pg_lsn: u64, bytes: &[u8]) {
+            let frame = Frame2 {
+                tenant: self.tenant,
+                writer_epoch: self.epoch,
+                start_lsn: Lsn(pg_lsn),
+                end_lsn: Lsn(pg_lsn + bytes.len() as u64),
+                contains_commit: true,
+                first_of_epoch: !self.first_appended,
+                hints: Vec::new(),
+                payload: bytes.to_vec(),
+            };
+            self.seq.append(vec![frame]).unwrap().wait().unwrap();
+            self.first_appended = true;
+        }
+
+        pub fn close(self) {
+            self.seq.close().unwrap();
+        }
+    }
+}
+
 use std::ffi::{CStr, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
+use zou_log::{
+    AppendError, MediaSink, Sequencer, SequencerConfig, WalMedia, consolidate, gc_landing,
+    stream_end, take_over,
+};
 use zou_store::heartbeat::Heartbeat;
 use zou_store::layout::TenantLayout;
 use zou_store::lease;
-use zou_store::{CasStore, GroupCommit, GroupCommitConfig, Lsn, Manifest, TailConfig, open_store};
+use zou_store::{CasStore, Frame2, HeldLease, Lsn, Manifest, open_store, tenant_id};
 
 /// Postgres BLCKSZ. The patch checks this against its own BLCKSZ at init.
 pub const ZOU_PAGE_SIZE: usize = 8192;
@@ -124,7 +193,7 @@ fn with_reader<R>(
         *slot = if std::env::var("ZOU_CHAIN_READER").is_ok_and(|v| v == "0") {
             ReaderSlot::Off
         } else {
-            match reader::ChainReader::attach(&*shim.store, &shim.layout) {
+            match reader::ChainReader::attach(&shim.store, &shim.layout) {
                 Ok(Some(rd)) => {
                     unsafe { atexit(log_cache_summary_at_exit) };
                     ReaderSlot::On(Box::new(rd))
@@ -152,7 +221,7 @@ fn with_reader<R>(
 }
 
 fn chain_read(shim: &Shim, r: walscan::BlockRef, durable: u64) -> Result<Option<Vec<u8>>, ()> {
-    with_reader(shim, |rd| rd.read(&*shim.store, &shim.layout, r, durable)).map(Option::flatten)
+    with_reader(shim, |rd| rd.read(&*shim.store, r, durable)).map(Option::flatten)
 }
 
 /// Tell an attached reader this process wrote a page, see
@@ -956,11 +1025,24 @@ pub extern "C" fn zou_smgr_unlink(spc: u32, db: u32, rel: u32, fork: u32) -> i32
 /// worker, which is the sole holder of the writer lease. Backends never
 /// touch this, they wait on the durable LSN the worker publishes into
 /// Postgres shared memory.
+///
+/// In this release the append rpc is a function call: the pusher hosts
+/// the shard 0 sequencer of the shared WAL in process and every chunk
+/// becomes one frame on the fenced chain. The wire rpc replaces the
+/// call later without touching the C surface.
 struct WalPipe {
-    commit: Option<GroupCommit>,
+    seq: Option<Sequencer>,
+    media: Arc<WalMedia>,
     heartbeat: Option<Heartbeat>,
+    held: Arc<Mutex<HeldLease>>,
     store: Arc<dyn CasStore>,
     layout: TenantLayout,
+    tenant: u128,
+    writer_epoch: u32,
+    /// Whether this session has appended yet, so the first frame can
+    /// carry `first_of_epoch` and mark the takeover boundary in the
+    /// stream.
+    first_appended: bool,
 }
 
 static WAL: OnceLock<Mutex<WalPipe>> = OnceLock::new();
@@ -974,55 +1056,16 @@ fn now_unix() -> u64 {
 
 const WAL_LEASE_TTL_SECS: u64 = 15;
 
-/// Where a resuming pusher picks up: the Postgres LSN right after the last
-/// record in the store, and the zou stream position the next frame starts
-/// at. Computed by reading the newest segment back.
-struct ResumePoint {
-    pg_lsn: u64,
-    stream_lsn: u64,
-}
-
-/// Read the last segment of the reconciled tail and derive the resume
-/// point from its last record's Postgres LSN header. None means the store
-/// holds no WAL yet.
-fn resume_point(
-    store: &dyn CasStore,
-    layout: &TenantLayout,
-    tail: Option<&zou_store::manifest::WalTail>,
-) -> Result<Option<ResumePoint>, i32> {
-    let Some(last) = tail.and_then(|t| t.segments.last()) else {
-        return Ok(None);
-    };
-    let epoch = zou_store::commit::segment_epoch(last).ok_or(ZOU_ERR_STORE)?;
-    let key = layout.wal_segment_path(last);
-    let (bytes, _) = store
-        .get(&key)
-        .map_err(|_| ZOU_ERR_STORE)?
-        .ok_or(ZOU_ERR_STORE)?;
-    // Segments are one frame uploaded atomically, but read them all and
-    // keep the newest anyway, torn history must fail loudly here.
-    let mut newest = None;
-    for frame in zou_store::SegmentReader::new(&bytes, epoch) {
-        newest = Some(frame.map_err(|_| ZOU_ERR_STORE)?);
-    }
-    let frame = newest.ok_or(ZOU_ERR_STORE)?;
-    let records = zou_store::commit::split_records(&frame.payload).ok_or(ZOU_ERR_STORE)?;
-    let record = records.last().ok_or(ZOU_ERR_STORE)?;
-    if record.len() < 8 {
-        return Err(ZOU_ERR_STORE);
-    }
-    let start = u64::from_le_bytes(record[..8].try_into().expect("checked length"));
-    Ok(Some(ResumePoint {
-        pg_lsn: start + (record.len() as u64 - 8),
-        stream_lsn: frame.end_lsn.0,
-    }))
-}
+/// The WAL shard the single tenant of a self hosted store pins to. The
+/// pusher hosts this one shard's sequencer, a cell with many shards
+/// spreads tenants across them later.
+pub(crate) const WAL_SHARD: u32 = 0;
 
 /// The lease, heartbeat, and pipeline setup behind [`zou_wal_open`],
 /// separated so tests can run several writer sessions in one process.
 /// Returns the pipe plus the Postgres LSN to resume pushing from, zero
-/// when the store holds no WAL and pushing starts at `flush_lsn`.
-fn open_wal_pipe(target: &str, flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
+/// when the store holds no WAL yet.
+fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     init_logging();
     let store: Arc<dyn CasStore> = match open_store(target) {
         Ok(store) => Arc::from(store),
@@ -1048,16 +1091,11 @@ fn open_wal_pipe(target: &str, flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         Err(lease::LeaseError::Held { .. }) => return Err(ZOU_ERR_LEASE_HELD),
         Err(_) => return Err(ZOU_ERR_STORE),
     };
-    // The manifest tail can lag reality: frames become durable, and acked,
-    // on upload, and sessions can die before publishing. The scan is the
-    // truth, and seeding the pipeline with it makes the next publish carry
-    // the whole history forward.
-    let tail = zou_store::commit::reconcile_tail(&*store, &layout, held.manifest())
-        .map_err(|_| ZOU_ERR_STORE)?;
-    let resume = resume_point(&*store, &layout, tail.as_ref())?;
-    let (resume_pg, stream_start) = match &resume {
-        Some(point) => (point.pg_lsn, point.stream_lsn),
-        None => (0, flush_lsn),
+    // The lease epoch fences frames in the shared log too: the sequencer
+    // rejects appends from an epoch below the newest it has admitted.
+    let Ok(writer_epoch) = u32::try_from(held.epoch) else {
+        log::error!("zou_wal_open: lease epoch {} does not fit u32", held.epoch);
+        return Err(ZOU_ERR_STORE);
     };
     let held = Arc::new(Mutex::new(held));
     let heartbeat = Heartbeat::spawn(
@@ -1066,32 +1104,67 @@ fn open_wal_pipe(target: &str, flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         Arc::clone(&held),
         WAL_LEASE_TTL_SECS,
     );
-    let mut builder = GroupCommit::builder(Arc::clone(&store), layout.clone())
-        .lease(held)
-        .start_lsn(Lsn(stream_start))
-        .config(GroupCommitConfig::default())
-        .tail_config(TailConfig::default());
-    if let Some(tail) = tail {
-        builder = builder.initial_tail(tail);
-    }
-    let commit = builder.build();
+    let media = Arc::new(WalMedia::single(Arc::clone(&store)));
+    let takeover = match take_over(&media, WAL_SHARD, &holder) {
+        Ok(takeover) => takeover,
+        Err(e) => {
+            log::error!("zou_wal_open: takeover: {e}");
+            return Err(ZOU_ERR_STORE);
+        }
+    };
+    // The resume point comes from the chain after the takeover sealed
+    // it, so no rival can still be appending below it. It is byte exact:
+    // frames carry the chunk's Postgres LSN range, and the consolidator
+    // treats a gap or an overlap not starting at the watermark as
+    // corruption, so the pusher must continue from exactly here.
+    let tenant = tenant_id(layout.tenant_ref());
+    let resume = match stream_end(&media, WAL_SHARD, tenant) {
+        Ok(end) => end.map_or(0, |lsn| lsn.0),
+        Err(e) => {
+            log::error!("zou_wal_open: stream end: {e}");
+            return Err(ZOU_ERR_STORE);
+        }
+    };
+    let sink = Arc::new(MediaSink::new(Arc::clone(&media), WAL_SHARD));
+    let seq = Sequencer::resume(
+        WAL_SHARD,
+        sink,
+        SequencerConfig::default(),
+        takeover.next_seq,
+        takeover.prev_digest,
+    );
     Ok((
         WalPipe {
-            commit: Some(commit),
+            seq: Some(seq),
+            media,
             heartbeat: Some(heartbeat),
+            held,
             store,
             layout,
+            tenant,
+            writer_epoch,
+            first_appended: false,
         },
-        resume_pg,
+        resume,
     ))
 }
 
 fn close_wal_pipe(pipe: &mut WalPipe) -> i32 {
     let mut rc = ZOU_OK;
-    if let Some(commit) = pipe.commit.take()
-        && commit.close().is_err()
-    {
-        rc = ZOU_ERR_STORE;
+    if let Some(seq) = pipe.seq.take() {
+        if seq.close().is_err() {
+            rc = ZOU_ERR_STORE;
+        } else {
+            // Best effort: fold the landing chain into a sealed round so
+            // the next start probes a short tail. Failure costs nothing,
+            // the next fold poll runs the same pass.
+            if let Err(e) = consolidate(&pipe.media, WAL_SHARD) {
+                log::info!("zou_wal_close: consolidate: {e}");
+            }
+            if let Err(e) = gc_landing(&pipe.media, WAL_SHARD, Duration::from_secs(600)) {
+                log::info!("zou_wal_close: gc landing: {e}");
+            }
+        }
     }
     if let Some(heartbeat) = pipe.heartbeat.take()
         && heartbeat.detach().is_err()
@@ -1102,13 +1175,13 @@ fn close_wal_pipe(pipe: &mut WalPipe) -> i32 {
 }
 
 /// Open the WAL pipeline: genesis manifest if the store is empty, writer
-/// lease, heartbeat renewal, group commit chained onto the WAL already in
-/// the store.
+/// lease, heartbeat renewal, shared log takeover, and the shard sequencer
+/// resumed onto the fenced chain.
 ///
-/// Each appended record is a contiguous chunk of WAL prefixed with its
-/// Postgres start LSN, which makes the stream self describing for the
+/// Each appended chunk becomes one frame whose lsn range is the chunk's
+/// Postgres LSN range, which makes the stream self describing for the
 /// recovery path. When the store already holds WAL, `out_resume` receives
-/// the Postgres LSN right after its last record and the caller must push
+/// the Postgres LSN right after its last frame and the caller must push
 /// from there, re-reading its local pg_wal, so bytes flushed after the
 /// previous pusher died are not skipped. It stays zero when the store is
 /// empty and pushing starts at `flush_lsn`.
@@ -1168,26 +1241,36 @@ pub unsafe extern "C" fn zou_wal_append(
         let Some(pipe) = WAL.get() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
-        let pipe = pipe.lock().expect("wal pipe mutex poisoned");
+        let mut pipe = pipe.lock().expect("wal pipe mutex poisoned");
         if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
             return ZOU_ERR_LEASE_LOST;
         }
-        let Some(commit) = pipe.commit.as_ref() else {
+        let Some(seq) = pipe.seq.as_ref() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
         let chunk = unsafe { std::slice::from_raw_parts(data, len) };
-        let mut record = Vec::with_capacity(8 + len);
-        record.extend_from_slice(&pg_lsn.to_le_bytes());
-        record.extend_from_slice(chunk);
-        let ticket = match commit.append(&record) {
+        let frame = Frame2 {
+            tenant: pipe.tenant,
+            writer_epoch: pipe.writer_epoch,
+            start_lsn: Lsn(pg_lsn),
+            end_lsn: Lsn(pg_lsn + len as u64),
+            contains_commit: true,
+            first_of_epoch: !pipe.first_appended,
+            hints: Vec::new(),
+            payload: chunk.to_vec(),
+        };
+        let ticket = match seq.append(vec![frame]) {
             Ok(ticket) => ticket,
+            Err(AppendError::WrongEpoch { .. }) => return ZOU_ERR_LEASE_LOST,
             Err(_) => return ZOU_ERR_STORE,
         };
+        pipe.first_appended = true;
         match ticket.wait() {
             Ok(durable) => {
                 unsafe { *out_durable = durable.0 };
                 ZOU_OK
             }
+            Err(AppendError::WrongEpoch { .. }) => ZOU_ERR_LEASE_LOST,
             Err(_) => ZOU_ERR_STORE,
         }
     })
@@ -1218,15 +1301,20 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
         let Some(pipe) = WAL.get() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
-        let (store, layout, epoch) = {
+        let (store, layout, media, tenant) = {
             let pipe = pipe.lock().expect("wal pipe mutex poisoned");
             if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
                 return ZOU_ERR_LEASE_LOST;
             }
-            let Some(commit) = pipe.commit.as_ref() else {
+            if pipe.seq.is_none() {
                 return ZOU_ERR_NOT_INITIALIZED;
-            };
-            (Arc::clone(&pipe.store), pipe.layout.clone(), commit.epoch())
+            }
+            (
+                Arc::clone(&pipe.store),
+                pipe.layout.clone(),
+                Arc::clone(&pipe.media),
+                pipe.tenant,
+            )
         };
         let mut slot = FOLD_TASK.lock().expect("fold slot mutex poisoned");
         if slot.is_some() {
@@ -1234,7 +1322,7 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
         }
         let handle = std::thread::Builder::new()
             .name("zou-fold".into())
-            .spawn(move || fold::prepare(&*store, &layout, epoch, Path::new("."), redo));
+            .spawn(move || fold::prepare(&*store, &layout, &media, tenant, Path::new("."), redo));
         match handle {
             Ok(handle) => {
                 *slot = Some(FoldTask { redo, handle });
@@ -1293,15 +1381,43 @@ pub unsafe extern "C" fn zou_wal_fold_poll(out_redo: *mut u64, out_dropped: *mut
         if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
             return ZOU_ERR_LEASE_LOST;
         }
-        let Some(commit) = pipe.commit.as_ref() else {
-            return ZOU_ERR_NOT_INITIALIZED;
-        };
         let kind = outcome.stats.kind;
-        let dropped = outcome.stats.dropped;
-        if let Err(e) = commit.fold_tail(outcome.checkpoint, outcome.drop) {
-            log::error!("zou_wal_fold_poll: publish: {e}");
-            return ZOU_ERR_STORE;
+        let checkpoint = outcome.checkpoint;
+        let redo = task.redo;
+        {
+            let mut held = pipe.held.lock().expect("lease mutex poisoned");
+            match fold::publish(
+                &*pipe.store,
+                &pipe.layout,
+                &mut held,
+                &checkpoint,
+                redo,
+                now_unix(),
+            ) {
+                Ok(()) => {}
+                Err(lease::LeaseError::Lost { .. }) => return ZOU_ERR_LEASE_LOST,
+                Err(e) => {
+                    log::error!("zou_wal_fold_poll: publish: {e}");
+                    return ZOU_ERR_STORE;
+                }
+            }
         }
+        // A fold marks the natural moment to fold the shared log too:
+        // landing segments consolidate into a sealed round and old
+        // landing objects past the safety window drop.
+        let dropped = match consolidate(&pipe.media, WAL_SHARD) {
+            Ok(_) => match gc_landing(&pipe.media, WAL_SHARD, Duration::from_secs(600)) {
+                Ok(dropped) => dropped,
+                Err(e) => {
+                    log::info!("zou_wal_fold_poll: gc landing: {e}");
+                    0
+                }
+            },
+            Err(e) => {
+                log::info!("zou_wal_fold_poll: consolidate: {e}");
+                0
+            }
+        };
         unsafe { *out_dropped = dropped as u32 };
         match kind {
             zou_store::manifest::CheckpointKind::Full => ZOU_FOLD_DONE_FULL,
@@ -1310,9 +1426,9 @@ pub unsafe extern "C" fn zou_wal_fold_poll(out_redo: *mut u64, out_dropped: *mut
     })
 }
 
-/// Seal the open segment, publish wal_tail, and release the lease.
-/// Called when the pusher worker exits so a clean shutdown leaves an
-/// exact manifest and the next start acquires the lease immediately.
+/// Flush the open batch, stop the sequencer, and release the lease.
+/// Called when the pusher worker exits so a clean shutdown leaves a
+/// quiet chain and the next start acquires the lease immediately.
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_wal_close() -> i32 {
     wrap(|| {
@@ -1568,19 +1684,17 @@ mod tests {
             ZOU_ERR_BAD_ARGUMENT
         );
 
-        // Each append blocks until durable, the stream position advances
-        // past the payload plus its pg LSN header every time.
+        // Each append blocks until durable, and the ack is byte exact:
+        // the durable position is the end lsn of the frame just landed.
         let chunk = vec![7u8; 4096];
         let mut durable = 0u64;
-        let mut last = start;
         for i in 0..8 {
             let pg_lsn = start + i * 4096;
             assert_eq!(
                 unsafe { zou_wal_append(chunk.as_ptr(), chunk.len(), pg_lsn, &mut durable) },
                 ZOU_OK
             );
-            assert!(durable > last + 4096, "durable past payload each round");
-            last = durable;
+            assert_eq!(durable, pg_lsn + 4096, "durable is the frame end lsn");
         }
 
         // The fold pair: nothing in flight polls idle, a started fold
@@ -1616,48 +1730,52 @@ mod tests {
         let (mut pipe, resumed) = open_wal_pipe(target_str, start + 999).unwrap();
         assert_eq!(resumed, start + 8 * 4096);
         {
-            let commit = pipe.commit.as_ref().unwrap();
-            let mut record = resumed.to_le_bytes().to_vec();
-            record.extend_from_slice(&[9u8; 128]);
-            commit.append(&record).unwrap().wait().unwrap();
+            let seq = pipe.seq.as_ref().unwrap();
+            let frame = Frame2 {
+                tenant: pipe.tenant,
+                writer_epoch: pipe.writer_epoch,
+                start_lsn: Lsn(resumed),
+                end_lsn: Lsn(resumed + 128),
+                contains_commit: true,
+                first_of_epoch: true,
+                hints: Vec::new(),
+                payload: vec![9u8; 128],
+            };
+            seq.append(vec![frame]).unwrap().wait().unwrap();
         }
         assert_eq!(close_wal_pipe(&mut pipe), ZOU_OK);
 
-        // The manifest tail chains both sessions, and every record round
-        // trips with its pg LSN header.
+        // Both sessions chain in the shared log: a catch up read hands
+        // back every frame in lsn order, byte exact, whether it sits in
+        // a sealed round or on the landing tail, and each session's
+        // first frame carries the takeover marker.
         let store = LocalFsStore::new(dir.path());
         let layout = TenantLayout::new("local");
         let (data, _) = store.get(&layout.manifest()).unwrap().unwrap();
         let manifest = Manifest::from_json(&data).unwrap();
-        let tail = manifest.wal_tail.expect("tail published");
-        assert!(!tail.segments.is_empty());
         assert!(manifest.lease.is_none(), "lease released on close");
-        let epochs: std::collections::BTreeSet<u64> = tail
-            .segments
-            .iter()
-            .map(|s| zou_store::commit::segment_epoch(s).unwrap())
-            .collect();
-        assert_eq!(epochs.len(), 2, "two writer sessions in one tail");
 
-        let mut records = Vec::new();
-        for name in &tail.segments {
-            let epoch = zou_store::commit::segment_epoch(name).unwrap();
-            let (bytes, _) = store.get(&layout.wal_segment_path(name)).unwrap().unwrap();
-            for frame in zou_store::SegmentReader::new(&bytes, epoch) {
-                let frame = frame.expect("well formed frame");
-                records.extend(
-                    zou_store::commit::split_records(&frame.payload).expect("well formed batch"),
-                );
-            }
+        let media = WalMedia::single(Arc::new(LocalFsStore::new(dir.path())) as Arc<dyn CasStore>);
+        let frames = zou_log::catch_up(
+            &media,
+            WAL_SHARD,
+            &zou_log::TeeFilter::Tenant(tenant_id("local")),
+            Lsn(0),
+        )
+        .unwrap();
+        assert_eq!(frames.len(), 9);
+        let epochs: std::collections::BTreeSet<u32> =
+            frames.iter().map(|f| f.writer_epoch).collect();
+        assert_eq!(epochs.len(), 2, "two writer sessions in one stream");
+        for (i, frame) in frames.iter().take(8).enumerate() {
+            assert_eq!(frame.start_lsn.0, start + i as u64 * 4096);
+            assert_eq!(frame.payload.len(), 4096);
+            assert!(frame.payload.iter().all(|b| *b == 7));
+            assert_eq!(frame.first_of_epoch, i == 0, "frame {i}");
         }
-        assert_eq!(records.len(), 9);
-        for (i, record) in records.iter().take(8).enumerate() {
-            let lsn = u64::from_le_bytes(record[..8].try_into().unwrap());
-            assert_eq!(lsn, start + i as u64 * 4096);
-            assert_eq!(record.len(), 8 + 4096);
-        }
-        let last = records.last().unwrap();
-        assert_eq!(u64::from_le_bytes(last[..8].try_into().unwrap()), resumed);
-        assert_eq!(last.len(), 8 + 128);
+        let last = frames.last().unwrap();
+        assert_eq!(last.start_lsn.0, resumed);
+        assert_eq!(last.payload.len(), 128);
+        assert!(last.first_of_epoch, "a new session marks its takeover");
     }
 }

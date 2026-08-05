@@ -1,13 +1,13 @@
 //! `zou branch <target> <src> <dst> [--at <ts|lsn>]`: copy on write
 //! branch of a tenant inside a store.
 //!
-//! With no flag the branch is taken at the source's last published
-//! state. An `--at` value shaped like a Postgres LSN, `X/Y` or `0x`
-//! hex, pins it to a checkpoint redo or a point in the still unfolded
-//! tail. Plain digits are a unix second and materialize the newest
-//! manifest history snapshot at or before it. Either way the child
-//! only references the parent's objects, nothing is copied, so the
-//! call finishes in the time of two manifest round trips.
+//! With no flag the branch is taken at the source's newest checkpoint.
+//! An `--at` value shaped like a Postgres LSN, `X/Y` or `0x` hex, must
+//! name a checkpoint lsn exactly, branch points are checkpoint lsns in
+//! this release. Plain digits are a unix second and materialize the
+//! newest manifest history snapshot at or before it. Either way the
+//! child only references the parent's objects, nothing is copied, so
+//! the call finishes in the time of two manifest round trips.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -63,10 +63,9 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         .as_ref()
         .ok_or("a child names its parent")?;
     println!(
-        "branched {src} into {dst} at {:#X}, {} checkpoints and {} parent tail entries inherited",
+        "branched {src} into {dst} at {:#X}, {} checkpoints inherited",
         of.at_lsn.0,
-        manifest.checkpoints.len(),
-        manifest.parent_tail.len()
+        manifest.checkpoints.len()
     );
     Ok(())
 }
