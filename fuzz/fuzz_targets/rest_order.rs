@@ -26,7 +26,7 @@ fuzz_target!(|data: &str| {
 
     let _ = page::parse_limit(page_part);
     let _ = page::parse_offset(page_part);
-    if let Ok(r) = page::parse_range(page_part) {
+    if let Some(r) = page::parse_range(page_part) {
         assert_eq!(r.offset(), r.first);
         if let Some(limit) = r.limit() {
             assert!(limit >= 1, "an accepted range spans at least one row");

@@ -38,8 +38,17 @@
 
 use std::fmt;
 
-use crate::scan::{Cur, fmt_path, parse_json_path, scan_name, scan_quoted, write_escaped};
+use crate::scan::{
+    Cur, DIGIT, END, FIELD_NAME, fmt_path, parse_json_path, scan_name, scan_quoted, word,
+    write_escaped,
+};
 pub use crate::scan::{Error, JsonKey, JsonStep};
+
+/// The comma between names, quoted the way parsec quotes it.
+const COMMA: &str = "\",\"";
+
+/// Every aggregate token, in the order upstream tries them.
+const AGGREGATES: &[&str] = &["sum", "avg", "count", "max", "min"];
 
 /// An aggregate function, the token before the empty parens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +151,37 @@ pub fn parse(value: &str) -> Result<Vec<Item>, Error> {
     parse_items(&mut Cur::new(value))
 }
 
+/// Parse the `columns` or `on_conflict` parameter, which is a list of
+/// plain names and not a select list: no arrows, no casts, no
+/// embedded resources.
+///
+/// The list has to have a name in it. `?columns=` is the one worth
+/// calling out, since a write with no columns is a write of nothing
+/// and upstream would rather say so on the way in than let the
+/// insert answer for it.
+///
+/// The whole value has to be a list, which is stricter than upstream:
+/// parsec's `P.parse` stops at the first thing it cannot take and
+/// hands back what it has, so `id);drop table t;--` is the one column
+/// `id` over there. These names go straight into the column list of a
+/// write, and a tail somebody appended to them is better refused than
+/// quietly dropped.
+pub fn columns(value: &str) -> Result<Vec<String>, Error> {
+    let mut cur = Cur::new(value);
+    let mut out = Vec::new();
+    loop {
+        out.push(parse_name(&mut cur)?.0);
+        cur.skip_spaces();
+        if !cur.eat(b',') {
+            return match cur.done() {
+                true => Ok(out),
+                false => cur.leftover(&[COMMA, END]),
+            };
+        }
+        cur.skip_spaces();
+    }
+}
+
 /// Bytes that end a bare name in a select item. Unlike the filter
 /// grammar this breaks on the alias and cast colon and the hint bang.
 fn name_break(b: u8) -> bool {
@@ -199,7 +239,7 @@ fn parse_name(cur: &mut Cur) -> Result<(String, bool), Error> {
         false => name.trim_matches([' ', '\t']).to_string(),
     };
     if name.is_empty() {
-        return cur.err("expected a name");
+        return cur.err(&[FIELD_NAME]);
     }
     Ok((name, quoted))
 }
@@ -218,7 +258,7 @@ fn parse_raw_name(cur: &mut Cur) -> Result<(String, bool), Error> {
         scan_name(cur, name_break)
     };
     if name.is_empty() {
-        return cur.err("expected a name");
+        return cur.err(&[FIELD_NAME]);
     }
     Ok((name, quoted))
 }
@@ -232,15 +272,17 @@ fn parse_item(cur: &mut Cur) -> Result<Item, Error> {
 
     let (mut name, mut quoted) = parse_name(cur)?;
     let mut alias = None;
+    let mut named_at = cur.pos;
     if cur.peek() == Some(b':') && !cur.starts("::") {
         cur.bump();
         alias = Some(name);
+        named_at = cur.pos;
         (name, quoted) = parse_name(cur)?;
     }
 
     if name == "*" && !quoted {
         if alias.is_some() {
-            return cur.err("* takes no alias");
+            return cur.err_at(named_at, &[]);
         }
         return Ok(Item::Star);
     }
@@ -280,7 +322,7 @@ fn parse_cast(cur: &mut Cur) -> Result<Option<String>, Error> {
     let name = scan_name(cur, name_break);
     let name = name.trim_matches([' ', '\t']);
     if name.is_empty() {
-        return cur.err("expected a type after ::");
+        return cur.err(&["letter", DIGIT]);
     }
     Ok(Some(name.to_string()))
 }
@@ -292,13 +334,12 @@ fn parse_agg(cur: &mut Cur) -> Result<(Option<Agg>, Option<String>), Error> {
     let at = cur.pos;
     let name = scan_name(cur, name_break);
     let Some(agg) = Agg::parse(&name) else {
-        return Err(Error {
-            message: format!("unknown aggregate ({name})"),
-            at,
-        });
+        let quoted: Vec<String> = AGGREGATES.iter().map(|a| word(a)).collect();
+        let expecting: Vec<&str> = quoted.iter().map(String::as_str).collect();
+        return cur.err_word(at, AGGREGATES, &expecting);
     };
     if !cur.eat_str("()") {
-        return cur.err("an aggregate wants ()");
+        return cur.err(&[&word("()")]);
     }
     let cast = parse_cast(cur)?;
     Ok((Some(agg), cast))
@@ -326,29 +367,29 @@ fn parse_embed_tail(
             false => raw.trim_matches([' ', '\t']).to_string(),
         };
         if flag.is_empty() {
-            return cur.err("expected a name");
+            return cur.err(&[FIELD_NAME]);
         }
-        if let Some(j) = flag_join {
-            if join.is_some() {
-                return Err(Error {
-                    message: "an embed takes one of inner or left".into(),
-                    at,
-                });
-            }
-            join = Some(j);
-        } else {
-            if hint.is_some() {
-                return Err(Error {
-                    message: "an embed takes one hint".into(),
-                    at,
-                });
-            }
-            hint = Some(flag);
+        let taken = match flag_join {
+            Some(_) => join.is_some(),
+            None => hint.is_some(),
+        };
+        // A second one of either is where the flags stop, and what
+        // may follow them is the join words or the list itself.
+        if taken {
+            return cur.err_word(
+                at,
+                &["inner", "left"],
+                &[&word("inner"), &word("left"), &word("(")],
+            );
+        }
+        match flag_join {
+            Some(j) => join = Some(j),
+            None => hint = Some(flag),
         }
     }
-    cur.expect(b'(', "an embedded resource wants a (list)")?;
+    cur.expect(b'(')?;
     let items = parse_items(cur)?;
-    cur.expect(b')', "unterminated embedded resource")?;
+    cur.expect_as(b')', &[&word(","), &word(")")])?;
     Ok(Embed {
         alias,
         relation,
@@ -480,12 +521,16 @@ mod tests {
         parse(value).unwrap_or_else(|e| panic!("{value} failed: {e}"))
     }
 
-    fn fail(value: &str) -> Error {
+    fn fail(value: &str) -> String {
         match parse(value) {
             Ok(items) => panic!("{value} parsed as {items:?}"),
-            Err(e) => e,
+            Err(e) => e.to_string(),
         }
     }
+
+    const NAME: &str = "field name (* or [a..z0..9_$])";
+    const KEY: &str = "\"-\", digit or any non reserved character different from: .,>()";
+    const AGGREGATES: &str = "\"sum\", \"avg\", \"count\", \"max\" or \"min\"";
 
     fn col(item: &Item) -> &Col {
         match item {
@@ -499,6 +544,23 @@ mod tests {
             Item::Embed(e) => e,
             other => panic!("expected an embed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_column_list_is_the_whole_value() {
+        assert_eq!(columns("id,name").unwrap(), ["id", "name"]);
+        assert_eq!(columns("id, name").unwrap(), ["id", "name"]);
+        assert_eq!(columns("\"a,b\"").unwrap(), ["a,b"]);
+        assert_eq!(
+            columns("").unwrap_err().to_string(),
+            format!("unexpected end of input expecting {NAME}")
+        );
+        // The tail is not a name and not another item, and it does not
+        // get to go along for the ride either.
+        assert_eq!(
+            columns("id);drop table t;--").unwrap_err().to_string(),
+            "unexpected ')' expecting \",\" or end of input"
+        );
     }
 
     #[test]
@@ -518,12 +580,15 @@ mod tests {
         assert_eq!(c.alias.as_deref(), Some("first"));
         assert_eq!(c.field.as_ref().unwrap().name, "full_name");
 
-        assert_eq!(fail("a:*").message, "* takes no alias");
+        assert_eq!(fail("a:*"), "unexpected \"*\"");
         // No items at all, which is what `select=` sends and what the
         // planner turns back into every column. A list that ends on
         // its comma is still short an item.
         assert!(ok("").is_empty());
-        assert_eq!(fail("a,").message, "expected a name");
+        assert_eq!(
+            fail("a,"),
+            format!("unexpected end of input expecting {NAME}")
+        );
     }
 
     #[test]
@@ -560,7 +625,10 @@ mod tests {
         assert_eq!(c.alias.as_deref(), Some("city"));
         assert_eq!(c.field.as_ref().unwrap().cast.as_deref(), Some("text"));
 
-        assert_eq!(fail("a::").message, "expected a type after ::");
+        assert_eq!(
+            fail("a::"),
+            "unexpected end of input expecting letter or digit"
+        );
     }
 
     #[test]
@@ -590,9 +658,13 @@ mod tests {
             assert_eq!(col(&ok(v)[0]).agg, Some(agg));
         }
 
-        assert!(fail("a.median()").message.contains("unknown aggregate"));
-        assert_eq!(fail("a.sum").message, "an aggregate wants ()");
-        assert_eq!(fail("a.sum(x)").message, "an aggregate wants ()");
+        let aggregates = "\"sum\", \"avg\", \"count\", \"max\" or \"min\"";
+        assert_eq!(
+            fail("a.median()"),
+            format!("unexpected \"m\" expecting {aggregates}")
+        );
+        assert_eq!(fail("a.sum"), "unexpected end of input expecting \"()\"");
+        assert_eq!(fail("a.sum(x)"), "unexpected \"(\" expecting \"()\"");
     }
 
     #[test]
@@ -653,13 +725,26 @@ mod tests {
         let items = ok("rel()");
         assert!(embed(&items[0]).items.is_empty());
 
-        assert_eq!(fail("rel!fk!fk2(a)").message, "an embed takes one hint");
+        // A second bang has nothing left to introduce, since the hint
+        // is taken and the join word is the only other thing that
+        // goes there.
+        let after_hint = "expecting \"inner\", \"left\" or \"(\"";
         assert_eq!(
-            fail("rel!inner!left(a)").message,
-            "an embed takes one of inner or left"
+            fail("rel!fk!fk2(a)"),
+            format!("unexpected \"f\" {after_hint}")
         );
-        assert_eq!(fail("rel(a").message, "unterminated embedded resource");
-        assert_eq!(fail("rel!(a)").message, "expected a name");
+        assert_eq!(
+            fail("rel!inner!left(a)"),
+            format!("unexpected \"l\" {after_hint}")
+        );
+        assert_eq!(
+            fail("rel(a"),
+            "unexpected end of input expecting \",\" or \")\""
+        );
+        assert_eq!(
+            fail("rel!(a)"),
+            format!("unexpected \"(\" expecting {NAME}")
+        );
     }
 
     #[test]
@@ -684,10 +769,7 @@ mod tests {
         let Item::Spread(e) = &items[0] else { panic!() };
         assert_eq!(e.join, Some(Join::Inner));
 
-        assert_eq!(
-            fail("...a:b(c)").message,
-            "an embedded resource wants a (list)"
-        );
+        assert_eq!(fail("...a:b(c)"), "unexpected \":\" expecting \"(\"");
     }
 
     #[test]
@@ -775,7 +857,10 @@ mod tests {
         // spaces are somebody else's problem.
         assert_eq!(ok("clients(id) , x").len(), 2);
         assert_eq!(ok("clients(id) ").len(), 1);
-        assert_eq!(fail("a(b(c) )").message, "unterminated embedded resource");
+        assert_eq!(
+            fail("a(b(c) )"),
+            "unexpected \" \" expecting \",\" or \")\""
+        );
 
         // An aggregate ends the same way and does not even get the
         // comma, so the list is one item and the rest is unread.
@@ -784,10 +869,16 @@ mod tests {
 
     #[test]
     fn errors_point_at_the_problem() {
-        assert_eq!(fail("a,,b").message, "expected a name");
-        assert_eq!(fail("a->>").message, "expected a json path key");
-        let e = fail("x,a.median()");
-        assert!(e.message.contains("unknown aggregate"));
+        assert_eq!(fail("a,,b"), format!("unexpected \",\" expecting {NAME}"));
+        assert_eq!(
+            fail("a->>"),
+            format!("unexpected end of input expecting {KEY}")
+        );
+        let e = parse("x,a.median()").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            format!("unexpected \"m\" expecting {AGGREGATES}")
+        );
         assert_eq!(e.at, 4);
     }
 
@@ -803,8 +894,11 @@ mod tests {
             ok("name,...processes(process:name,...process_costs(cost)))").len(),
             2
         );
-        assert_eq!(fail("a->>").message, "expected a json path key");
-        assert_eq!(fail("a(b->>)").message, "expected a json path key");
+        assert_eq!(
+            fail("a->>"),
+            format!("unexpected end of input expecting {KEY}")
+        );
+        assert_eq!(fail("a(b->>)"), format!("unexpected \")\" expecting {KEY}"));
     }
 
     const CORPUS: &[&str] = &[
