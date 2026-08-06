@@ -23,7 +23,9 @@
 //! service_role roles, the auth schema with Supabase's uid, role,
 //! email, and jwt functions verbatim, and the open public schema
 //! grants that make row level security the actual guard, exactly the
-//! stance a Supabase project ships with.
+//! stance a Supabase project ships with. Then the two schemas whose
+//! definitions belong to somebody else, auth and storage, each applied
+//! only to a database that does not have one already.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -209,16 +211,47 @@ $$;
 /// scripts/auth-schema-refresh.sh for how and why.
 const AUTH_SCHEMA: &str = include_str!("auth-schema.sql");
 
-/// Create the auth schema when the database has none, and leave it
-/// completely alone when it has one.
+/// The canonical storage schema, the shape storage-api's own
+/// migrations leave behind. Generated the same way and for the same
+/// reasons, see scripts/storage-schema-refresh.sh.
+const STORAGE_SCHEMA: &str = include_str!("storage-schema.sql");
+
+/// The grants the storage schema arrives without.
 ///
-/// The check is `auth.users`, not the schema, because zou's own
-/// bootstrap creates the schema for the auth.uid() helpers before this
-/// ever runs. An existing auth.users means somebody else's schema,
-/// most likely a real GoTrue's, possibly several versions behind this
-/// one. Half applying today's ddl over that would leave a shape that
-/// is neither version, so the only safe move is to do nothing.
-/// Migrating an older schema forward is GoTrue's own job.
+/// Upstream these are inside the migrations, granting to roles the
+/// migrations also create, and the tables end up owned by
+/// supabase_storage_admin with everyone else granted in. Under zou the
+/// connecting role creates the tables and already owns them, so the
+/// only part left to do is let the three api roles at them, which is
+/// the same stance the bootstrap takes for public and for auth: the
+/// roles get everything and row level security is the actual guard.
+/// Row level security is on for every table here, so this grants
+/// nothing away that a policy has not been asked about.
+const STORAGE_GRANTS: &str = "
+grant usage on schema storage to anon, authenticated, service_role;
+grant all on all tables in schema storage to anon, authenticated, service_role;
+grant all on all sequences in schema storage to anon, authenticated, service_role;
+grant all on all functions in schema storage to anon, authenticated, service_role;
+alter default privileges in schema storage
+    grant all on tables to anon, authenticated, service_role;
+alter default privileges in schema storage
+    grant all on sequences to anon, authenticated, service_role;
+alter default privileges in schema storage
+    grant all on functions to anon, authenticated, service_role;
+";
+
+/// Create a schema somebody else owns the definition of when the
+/// database has none, and leave it completely alone when it has one.
+///
+/// `marker` is a table rather than the schema, because zou's own
+/// bootstrap creates the auth schema for the auth.uid() helpers before
+/// this ever runs, and because a schema with nothing in it is not
+/// evidence of anything. An existing marker means somebody else's
+/// schema, most likely a real GoTrue's or a real storage-api's,
+/// possibly several versions behind this one. Half applying today's
+/// ddl over that would leave a shape that is neither version, so the
+/// only safe move is to do nothing. Migrating an older schema forward
+/// is that server's own job.
 ///
 /// Its own transaction, so that two servers starting against a fresh
 /// database do not both decide it is empty and both start creating.
@@ -228,20 +261,28 @@ const AUTH_SCHEMA: &str = include_str!("auth-schema.sql");
 /// under two locks one connection can be replacing auth.uid inside the
 /// bootstrap while another replaces it here, which postgres reports as
 /// a deadlock on pg_proc or as tuple concurrently updated. One lock over
-/// everything that writes the auth schema is the whole fix.
-async fn ensure_auth_schema(client: &Client) -> Result<(), tokio_postgres::Error> {
+/// everything that writes these schemas is the whole fix.
+async fn ensure_foreign_schema(
+    client: &Client,
+    marker: &str,
+    ddl: &[&str],
+) -> Result<(), tokio_postgres::Error> {
     client
         .batch_execute("begin; select pg_advisory_xact_lock(730501)")
         .await?;
     let fresh: bool = client
-        .query_one("select to_regclass('auth.users') is null", &[])
+        .query_one("select to_regclass($1) is null", &[&marker])
         .await?
         .get(0);
-    let applied = if fresh {
-        client.batch_execute(AUTH_SCHEMA).await
-    } else {
-        Ok(())
-    };
+    let mut applied = Ok(());
+    if fresh {
+        for batch in ddl {
+            applied = client.batch_execute(batch).await;
+            if applied.is_err() {
+                break;
+            }
+        }
+    }
     match applied {
         Ok(()) => client.batch_execute("commit").await,
         Err(e) => {
@@ -298,7 +339,13 @@ impl Pool {
             .bootstrapped
             .get_or_try_init(|| async {
                 client.batch_execute(BOOTSTRAP).await?;
-                ensure_auth_schema(&client).await
+                ensure_foreign_schema(&client, "auth.users", &[AUTH_SCHEMA]).await?;
+                ensure_foreign_schema(
+                    &client,
+                    "storage.objects",
+                    &[STORAGE_SCHEMA, STORAGE_GRANTS],
+                )
+                .await
             })
             .await?;
         Ok((permit, client))

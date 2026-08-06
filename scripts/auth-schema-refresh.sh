@@ -141,5 +141,7 @@ echo "wrote $out ($(wc -l < "$out" | tr -d ' ') lines)"
 
 fp="$root/crates/zou-server/tests/fixtures/gotrue-auth-fingerprint.txt"
 mkdir -p "$(dirname "$fp")"
-psql "$DSN" -qAt -f "$root/scripts/auth-schema-fingerprint.sql" > "$fp"
+psql "$DSN" -qAt \
+    -c "set zou.fingerprint_schema = 'auth'" \
+    -f "$root/scripts/schema-fingerprint.sql" > "$fp"
 echo "wrote $fp ($(wc -l < "$fp" | tr -d ' ') lines)"
