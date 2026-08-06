@@ -27,6 +27,7 @@ pub mod cache;
 pub mod capture;
 pub mod fold;
 pub mod gc;
+pub mod getpage;
 pub mod ingest;
 pub mod pagecache;
 pub mod pending;
