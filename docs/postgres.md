@@ -92,12 +92,13 @@ Without that gate a kill -9 could leave future pages in the store, and a node at
 CI runs three cycles on every PR that touches the server.
 One known limit: an in place crash restart replays local WAL the store has not seen yet and can push pages early during recovery, so after a crash a node should reattach with `zou-restore`; the fix, starting the pusher at consistent state, is tracked in the milestone issue.
 
-The mirrored tail would grow without bound, so the pusher folds it at every completed Postgres checkpoint.
+The mirrored tail would grow without bound, so the shim folds it at every completed Postgres checkpoint.
+The whole fold lifecycle, capture, publish, and shared log consolidation, runs on a thread of its own inside the shim, so the pusher loop never spends a store call on a fold's behalf and commit acks never wait one out; the loop only starts a fold and later harvests its verdict with a mutex peek.
 Once a checkpoint completes, every page change before its redo location is on the page store, and the WAL before redo is only needed for the state that does not flow through the storage manager.
 The fold captures exactly that as a delta checkpoint under `chk/<redo>/`: pg_control, the transaction status SLRUs (pg_xact, pg_multixact, pg_commit_ts), two phase state, the relation maps, and the config files.
 It then drops the sealed stream segments that lie entirely below the 16MB pg_wal segment boundary under redo, in the same manifest swap that records the checkpoint, so no failure between the two steps can lose WAL coverage.
 The cut sits at the segment boundary rather than at redo itself because the xlog reader validates the first page header of any segment file it opens, so restore must rebuild retained segment files from their start.
-The pusher only folds while fully caught up, pushed equal to the local flush, which guarantees the checkpoint record named by the captured pg_control is already durable in the store.
+The pusher only starts a fold once its pushed position covers the checkpoint's redo, which guarantees the checkpoint record named by the captured pg_control is already durable in the store.
 Transaction status captured in the fold can run slightly ahead of the record stream for commits landing in the capture window, which is safe because those commits were never acked.
 Dropped segment objects stay in the bucket until the garbage collection job arrives, so a restore may overlay more WAL files than the manifest references, which recovery ignores because replay starts at the restored redo.
 
