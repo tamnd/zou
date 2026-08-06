@@ -239,10 +239,11 @@ fn record_block_refs(
     out: &mut Vec<BlockRef>,
     rels: &mut Vec<RelTag>,
     truncs: &mut Vec<(RelTag, u32)>,
-) -> Result<(), ScanErr> {
+) -> Result<bool, ScanErr> {
     let mut p = 0usize;
     let mut remaining = tot_len - RECORD_HEADER;
     let mut datatotal = 0u64;
+    let mut saw_image = false;
     let mut rel: Option<(u32, u32, u32)> = None;
     let take = |p: &mut usize, n: usize| -> Result<&[u8], ScanErr> {
         let s = header
@@ -279,6 +280,7 @@ fn record_block_refs(
                 remaining = remaining.saturating_sub(3);
                 datatotal += data_len as u64;
                 if fork_flags & BKPBLOCK_HAS_IMAGE != 0 {
+                    saw_image = true;
                     let img = take(&mut p, 5)?;
                     let length =
                         u16::from_le_bytes(img[..2].try_into().expect("checked length")) as u64;
@@ -358,7 +360,7 @@ fn record_block_refs(
             _ => {}
         }
     }
-    Ok(())
+    Ok(saw_image)
 }
 
 /// The scan loop shared by the strict and tolerant entry points. With
@@ -507,12 +509,11 @@ pub struct WalRecord {
 }
 
 impl WalRecord {
-    /// The blocks this record references, parsed from its header items.
-    pub fn block_refs(&self) -> Result<Vec<BlockRef>, String> {
+    fn parse_refs(&self) -> Result<(Vec<BlockRef>, bool), String> {
         let mut refs = Vec::new();
         let mut rels = Vec::new();
         let mut truncs = Vec::new();
-        record_block_refs(
+        let image = record_block_refs(
             &self.bytes[RECORD_HEADER as usize..],
             self.bytes.len() as u64,
             self.info,
@@ -525,7 +526,22 @@ impl WalRecord {
             ScanErr::Corrupt(msg) => msg,
             ScanErr::Truncated => "record header items overrun".to_string(),
         })?;
-        Ok(refs)
+        Ok((refs, image))
+    }
+
+    /// The blocks this record references, parsed from its header items.
+    pub fn block_refs(&self) -> Result<Vec<BlockRef>, String> {
+        self.parse_refs().map(|(refs, _)| refs)
+    }
+
+    /// Whether any block reference in this record carries a full page
+    /// image. With `full_page_writes` off nothing gets one as torn
+    /// page protection anymore; the images left are the records whose
+    /// redo is the image itself, log_newpage from index builds and
+    /// bulk loads plus the hint bit images a checksummed cluster
+    /// forces, all under the xlog rmgr.
+    pub fn carries_image(&self) -> Result<bool, String> {
+        self.parse_refs().map(|(_, image)| image)
     }
 }
 
@@ -696,6 +712,40 @@ pub(crate) mod testwal {
             }
         }
 
+        /// One record whose single block reference carries a full page
+        /// image, the shape log_newpage writes: no hole, no
+        /// compression, the image bytes in the data region.
+        pub(crate) fn image_record(&mut self, r: BlockRef, image: &[u8], rmid: u8) {
+            let mut items = Vec::new();
+            items.push(0u8);
+            items.push((r.fork as u8) | BKPBLOCK_HAS_IMAGE);
+            items.extend_from_slice(&0u16.to_le_bytes());
+            items.extend_from_slice(&(image.len() as u16).to_le_bytes());
+            items.extend_from_slice(&0u16.to_le_bytes());
+            items.push(0);
+            items.extend_from_slice(&r.spc.to_le_bytes());
+            items.extend_from_slice(&r.db.to_le_bytes());
+            items.extend_from_slice(&r.rel.to_le_bytes());
+            items.extend_from_slice(&r.blk.to_le_bytes());
+            items.push(XLR_BLOCK_ID_DATA_SHORT);
+            items.push(0);
+            let tot_len = RECORD_HEADER + items.len() as u64 + image.len() as u64;
+            let mut record = Vec::new();
+            record.extend_from_slice(&(tot_len as u32).to_le_bytes());
+            record.extend_from_slice(&7u32.to_le_bytes());
+            record.extend_from_slice(&0u64.to_le_bytes());
+            record.push(0);
+            record.push(rmid);
+            record.extend_from_slice(&[0, 0]);
+            record.extend_from_slice(&0u32.to_le_bytes());
+            record.extend_from_slice(&items);
+            record.extend_from_slice(image);
+            self.write(&record);
+            while !self.pos().is_multiple_of(MAXALIGN) {
+                self.bytes.push(0);
+            }
+        }
+
         /// The raw stream bytes and their base LSN, one pushable chunk.
         pub(crate) fn stream(&self) -> (u64, &[u8]) {
             (self.base, &self.bytes)
@@ -742,6 +792,24 @@ mod tests {
             refs,
             vec![blk(999, 0), blk(16384, 1), blk(16384, 2), blk(16384, 3)]
         );
+    }
+
+    #[test]
+    fn a_record_reports_whether_a_block_carries_an_image() {
+        let mut b = Builder::new(WAL_SEGMENT_SIZE);
+        b.record(&[(blk(16384, 0), false)], b"plain");
+        b.image_record(blk(16384, 1), &[0xAB; 128], 0);
+        let end = b.pos();
+        let window = b.window();
+        let out = read_records(&window, WAL_SEGMENT_SIZE, None).unwrap();
+        assert_eq!(out.records.len(), 2);
+        assert!(!out.records[0].carries_image().unwrap());
+        assert!(out.records[1].carries_image().unwrap());
+        // The image payload does not confuse the block walk: both the
+        // record's own parse and the range scan still name the block.
+        assert_eq!(out.records[1].block_refs().unwrap(), vec![blk(16384, 1)]);
+        let refs = scan_block_refs(&window, WAL_SEGMENT_SIZE, end).unwrap();
+        assert_eq!(refs, vec![blk(16384, 0), blk(16384, 1)]);
     }
 
     #[test]

@@ -51,7 +51,7 @@ wait_writable() {
 
 PGDATA="$WORK/pgdata"
 say "initdb and bootstrap into $ZOU_TARGET"
-"$PG_BIN/initdb" -D "$PGDATA" --set io_method=sync >"$WORK/initdb.log" 2>&1
+"$PG_BIN/initdb" -D "$PGDATA" --set io_method=sync --set full_page_writes=off >"$WORK/initdb.log" 2>&1
 REDO=$("$PG_BIN/pg_controldata" -D "$PGDATA" | grep "REDO location" | awk '{print $NF}')
 "$ZOU_BIN/zou-bootstrap" "$ZOU_TARGET" "$PGDATA" --redo "$REDO"
 

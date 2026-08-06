@@ -47,7 +47,7 @@ jobs:
         run: |
           export ZOU_TARGET=/tmp/zou-pg-store
           mkdir -p "$ZOU_TARGET"
-          build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync
+          build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync --set full_page_writes=off
           test "$(find $ZOU_TARGET/tenants/local/pg -type f | wc -l)" -gt 1000
           REDO=$(build/pg/bin/pg_controldata -D /tmp/zou-pgdata | grep "REDO location" | awk '{print $NF}')
           target/release/zou-bootstrap "$ZOU_TARGET" /tmp/zou-pgdata --redo "$REDO"
@@ -167,7 +167,7 @@ jobs:
           export ZOU_S3_ENDPOINT=http://127.0.0.1:9000
           export AWS_ACCESS_KEY_ID=zou
           export AWS_SECRET_ACCESS_KEY=zou-secret-key
-          build/pg/bin/initdb -D /tmp/minio-pgdata --set io_method=sync
+          build/pg/bin/initdb -D /tmp/minio-pgdata --set io_method=sync --set full_page_writes=off
           REDO=$(build/pg/bin/pg_controldata -D /tmp/minio-pgdata | grep "REDO location" | awk '{print $NF}')
           target/release/zou-bootstrap "$ZOU_TARGET" /tmp/minio-pgdata --redo "$REDO"
           build/pg/bin/pg_ctl -D /tmp/minio-pgdata -l /tmp/minio-pg.log start
@@ -188,7 +188,7 @@ jobs:
         run: |
           export ZOU_TARGET=/tmp/zou-ext-store
           mkdir -p "$ZOU_TARGET"
-          build/pg/bin/initdb -D /tmp/zou-ext-pgdata --set io_method=sync
+          build/pg/bin/initdb -D /tmp/zou-ext-pgdata --set io_method=sync --set full_page_writes=off
           REDO=$(build/pg/bin/pg_controldata -D /tmp/zou-ext-pgdata | grep "REDO location" | awk '{print $NF}')
           target/release/zou-bootstrap "$ZOU_TARGET" /tmp/zou-ext-pgdata --redo "$REDO"
           build/pg/bin/pg_ctl -D /tmp/zou-ext-pgdata -l /tmp/zou-ext.log -o "-c shared_preload_libraries=pg_stat_statements" start

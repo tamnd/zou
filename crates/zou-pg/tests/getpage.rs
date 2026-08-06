@@ -175,7 +175,8 @@ fn getpage_serves_what_redo_builds() {
     std::fs::create_dir(&sock).expect("socket dir");
 
     run(Command::new(bin("initdb"))
-        .args(["--no-sync", "-k", "-A", "trust", "-U", "zou", "-D"])
+        .args(["--no-sync", "-k", "-A", "trust", "-U", "zou"])
+        .args(["--set", "full_page_writes=off", "-D"])
         .arg(&datadir));
     run(Command::new(bin("pg_ctl"))
         .arg("-D")
@@ -197,7 +198,8 @@ fn getpage_serves_what_redo_builds() {
 
     // The same workload shape as the redo pool test: inserts across
     // several pages, then updates, deletes and a vacuum so early pages
-    // collect long record chains on top of their first touch images.
+    // collect long record chains on top of their birth records, with
+    // no first touch images anywhere, full_page_writes is off.
     let wal_start = {
         let lsn = psql("SELECT pg_current_wal_lsn()");
         let (hi, lo) = lsn.split_once('/').expect("lsn format");
@@ -242,6 +244,27 @@ fn getpage_serves_what_redo_builds() {
     // the last byte that ever existed on the wire.
     let wal_end = out.records.last().expect("records exist").end_lsn;
     let raw = &buf[(wal_start - base) as usize..(wal_end - base) as usize];
+
+    // full_page_writes is off, so nothing in this corpus carries an
+    // image as torn page protection. The images that remain are the
+    // records whose redo is the image itself, the index build's
+    // log_newpage under the xlog rmgr, and none of them reference the
+    // heap: every heap page served below is reconstructed from its
+    // birth record and deltas alone.
+    let mut xlog_images = 0;
+    for r in &out.records {
+        if r.carries_image().expect("record parses") {
+            assert_eq!(r.rmid, 0, "image outside the xlog rmgr at {:#X}", r.lsn);
+            let refs = r.block_refs().expect("record parses");
+            assert!(
+                refs.iter().all(|b| b.rel != heap_rel),
+                "a heap block got an image at {:#X}",
+                r.lsn
+            );
+            xlog_images += 1;
+        }
+    }
+    assert!(xlog_images > 0, "the index build still writes real images");
 
     let pool = RedoPool::new(RedoPoolConfig {
         postgres: bin("postgres"),

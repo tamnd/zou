@@ -394,6 +394,13 @@ pub fn run(args: &Args) -> Result<(), String> {
             .arg("-D")
             .arg(&pgdata)
             .args(["--set", "io_method=sync"])
+            // Pages live as store objects and a put is atomic on every
+            // backend, so the torn write full page protection guards
+            // against cannot be observed here. The whole argument is
+            // in docs/storage-engine.md. Set at initdb time so
+            // restarts, restores and branches inherit it through the
+            // captured config.
+            .args(["--set", "full_page_writes=off"])
             .env("ZOU_TARGET", &args.target)
             .env("ZOU_PAGE_CACHE", &pagecache)
             .output()
