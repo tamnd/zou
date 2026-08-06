@@ -1273,7 +1273,7 @@ fn close_wal_pipe(pipe: &mut WalPipe) -> i32 {
         if rc == ZOU_OK {
             // Best effort: fold the landing chain into a sealed round so
             // the next start probes a short tail. Failure costs nothing,
-            // the next fold poll runs the same pass.
+            // the next fold thread runs the same pass.
             if let Err(e) = consolidate(&pipe.media, WAL_SHARD) {
                 log::info!("zou_wal_close: consolidate: {e}");
             }
@@ -1427,32 +1427,49 @@ pub unsafe extern "C" fn zou_wal_durable(out_pg_lsn: *mut u64) -> i32 {
     })
 }
 
+/// How a fold thread ended: published, fenced out, or failed. The
+/// thread carries the whole lifecycle, capture, publish, and the
+/// shared log consolidation, so the pusher loop never runs a store
+/// call on a fold's behalf.
+enum FoldEnd {
+    Done {
+        kind: zou_store::manifest::CheckpointKind,
+        dropped: u32,
+    },
+    LeaseLost,
+    Failed(String),
+}
+
 /// The fold in flight, at most one per process. The thread runs
-/// [`fold::prepare`] against the store alone, never the group commit,
-/// so the pusher keeps appending and publishing while it works and a
-/// shutdown can abandon it without a join: an unpublished capture left
-/// no manifest edit and its objects are gc food.
+/// [`fold::prepare`] and then [`fold::publish`] on its own, never on
+/// the pusher loop, so appending and folding overlap end to end and a
+/// shutdown can abandon it without a join: the capture is idempotent
+/// per redo and the publish is one CAS swap that either landed whole
+/// or left no manifest edit, so a retry at the same redo is safe and
+/// abandoned objects are gc food.
 struct FoldTask {
     redo: u64,
-    handle: std::thread::JoinHandle<Result<fold::FoldOutcome, String>>,
+    handle: std::thread::JoinHandle<FoldEnd>,
 }
 
 static FOLD_TASK: Mutex<Option<FoldTask>> = Mutex::new(None);
 
-/// Start folding the completed checkpoint at `redo` on a background
-/// thread, see [`fold::prepare`]. Called by the pusher from the data
-/// directory once its pushed position covers `redo`, so relative paths
-/// resolve inside PGDATA and the checkpoint record the capture names
-/// is already durable in the stream. Returns `ZOU_FOLD_RUNNING`
-/// without starting anything while an earlier fold is still in
-/// flight, its result must be polled first.
+/// Start the whole fold lifecycle for the completed checkpoint at
+/// `redo` on a background thread: capture with [`fold::prepare`],
+/// publish with [`fold::publish`], then consolidate the shared log.
+/// Called by the pusher from the data directory once its pushed
+/// position covers `redo`, so relative paths resolve inside PGDATA and
+/// the checkpoint record the capture names is already durable in the
+/// stream. Returns `ZOU_FOLD_RUNNING` without starting anything while
+/// an earlier fold is still in flight, its result must be polled
+/// first.
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
     wrap(|| {
         let Some(pipe) = WAL.get() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
-        let (store, layout, media, tenant) = {
+        let (store, layout, media, tenant, held) = {
             let pipe = pipe.lock().expect("wal pipe mutex poisoned");
             if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
                 return ZOU_ERR_LEASE_LOST;
@@ -1465,6 +1482,7 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
                 pipe.layout.clone(),
                 Arc::clone(&pipe.media),
                 pipe.tenant,
+                Arc::clone(&pipe.held),
             )
         };
         let mut slot = FOLD_TASK.lock().expect("fold slot mutex poisoned");
@@ -1473,7 +1491,49 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
         }
         let handle = std::thread::Builder::new()
             .name("zou-fold".into())
-            .spawn(move || fold::prepare(&*store, &layout, &media, tenant, Path::new("."), redo));
+            .spawn(move || {
+                let outcome =
+                    match fold::prepare(&*store, &layout, &media, tenant, Path::new("."), redo) {
+                        Ok(outcome) => outcome,
+                        Err(e) => return FoldEnd::Failed(format!("capture: {e}")),
+                    };
+                {
+                    let mut held = held.lock().expect("lease mutex poisoned");
+                    match fold::publish(
+                        &*store,
+                        &layout,
+                        &mut held,
+                        &outcome.checkpoint,
+                        redo,
+                        now_unix(),
+                    ) {
+                        Ok(()) => {}
+                        Err(lease::LeaseError::Lost { .. }) => return FoldEnd::LeaseLost,
+                        Err(e) => return FoldEnd::Failed(format!("publish: {e}")),
+                    }
+                }
+                // A fold marks the natural moment to fold the shared
+                // log too: landing segments consolidate into a sealed
+                // round and old landing objects past the safety window
+                // drop.
+                let dropped = match consolidate(&media, WAL_SHARD) {
+                    Ok(_) => match gc_landing(&media, WAL_SHARD, Duration::from_secs(600)) {
+                        Ok(dropped) => dropped,
+                        Err(e) => {
+                            log::info!("zou fold: gc landing: {e}");
+                            0
+                        }
+                    },
+                    Err(e) => {
+                        log::info!("zou fold: consolidate: {e}");
+                        0
+                    }
+                };
+                FoldEnd::Done {
+                    kind: outcome.stats.kind,
+                    dropped: dropped as u32,
+                }
+            });
         match handle {
             Ok(handle) => {
                 *slot = Some(FoldTask { redo, handle });
@@ -1487,15 +1547,16 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
     })
 }
 
-/// Collect the fold the pusher started, publishing it when it is done.
-/// Returns `ZOU_FOLD_IDLE` when nothing is in flight, `ZOU_FOLD_RUNNING`
-/// while the capture works, and on completion publishes the checkpoint
-/// and tail truncation through the group commit, writes the fold's redo
-/// and the count of dropped sealed segments through the out pointers,
-/// and answers `ZOU_FOLD_DONE_DELTA` or `ZOU_FOLD_DONE_FULL`. Negative
-/// means the fold failed or the publish did; either way the slot is
-/// clear, the error is in the log, and a retry at the same redo is safe
-/// because the fold is idempotent.
+/// Collect the fold the pusher started. Returns `ZOU_FOLD_IDLE` when
+/// nothing is in flight, `ZOU_FOLD_RUNNING` while the thread works, and
+/// once the thread has published its checkpoint and consolidated the
+/// shared log on its own, writes the fold's redo and the count of
+/// dropped landing objects through the out pointers and answers
+/// `ZOU_FOLD_DONE_DELTA` or `ZOU_FOLD_DONE_FULL`. Negative means the
+/// fold failed or the publish did; either way the slot is clear, the
+/// error is in the log, and a retry at the same redo is safe because
+/// the fold is idempotent. The poll itself never touches the store, so
+/// calling it between appends costs a mutex peek and nothing more.
 ///
 /// # Safety
 /// `out_redo` and `out_dropped` must be valid pointers.
@@ -1514,62 +1575,22 @@ pub unsafe extern "C" fn zou_wal_fold_poll(out_redo: *mut u64, out_dropped: *mut
             }
         };
         unsafe { *out_redo = task.redo };
-        let outcome = match task.handle.join() {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(e)) => {
-                log::error!("zou_wal_fold_poll: fold at {:#X}: {e}", task.redo);
-                return ZOU_ERR_STORE;
-            }
+        let end = match task.handle.join() {
+            Ok(end) => end,
             Err(_) => {
                 log::error!("zou_wal_fold_poll: fold thread panicked");
                 return ZOU_ERR_STORE;
             }
         };
-        let Some(pipe) = WAL.get() else {
-            return ZOU_ERR_NOT_INITIALIZED;
-        };
-        let pipe = pipe.lock().expect("wal pipe mutex poisoned");
-        if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
-            return ZOU_ERR_LEASE_LOST;
-        }
-        let kind = outcome.stats.kind;
-        let checkpoint = outcome.checkpoint;
-        let redo = task.redo;
-        {
-            let mut held = pipe.held.lock().expect("lease mutex poisoned");
-            match fold::publish(
-                &*pipe.store,
-                &pipe.layout,
-                &mut held,
-                &checkpoint,
-                redo,
-                now_unix(),
-            ) {
-                Ok(()) => {}
-                Err(lease::LeaseError::Lost { .. }) => return ZOU_ERR_LEASE_LOST,
-                Err(e) => {
-                    log::error!("zou_wal_fold_poll: publish: {e}");
-                    return ZOU_ERR_STORE;
-                }
-            }
-        }
-        // A fold marks the natural moment to fold the shared log too:
-        // landing segments consolidate into a sealed round and old
-        // landing objects past the safety window drop.
-        let dropped = match consolidate(&pipe.media, WAL_SHARD) {
-            Ok(_) => match gc_landing(&pipe.media, WAL_SHARD, Duration::from_secs(600)) {
-                Ok(dropped) => dropped,
-                Err(e) => {
-                    log::info!("zou_wal_fold_poll: gc landing: {e}");
-                    0
-                }
-            },
-            Err(e) => {
-                log::info!("zou_wal_fold_poll: consolidate: {e}");
-                0
+        let (kind, dropped) = match end {
+            FoldEnd::Done { kind, dropped } => (kind, dropped),
+            FoldEnd::LeaseLost => return ZOU_ERR_LEASE_LOST,
+            FoldEnd::Failed(e) => {
+                log::error!("zou_wal_fold_poll: fold at {:#X}: {e}", task.redo);
+                return ZOU_ERR_STORE;
             }
         };
-        unsafe { *out_dropped = dropped as u32 };
+        unsafe { *out_dropped = dropped };
         match kind {
             zou_store::manifest::CheckpointKind::Full => ZOU_FOLD_DONE_FULL,
             zou_store::manifest::CheckpointKind::Delta => ZOU_FOLD_DONE_DELTA,
@@ -1584,10 +1605,11 @@ pub unsafe extern "C" fn zou_wal_fold_poll(out_redo: *mut u64, out_dropped: *mut
 pub extern "C" fn zou_wal_close() -> i32 {
     wrap(|| {
         // A fold still in flight is abandoned, not joined: it holds its
-        // own store handle, its capture published nothing, and waiting
+        // own store handle and lease clone, its publish is one CAS swap
+        // that either landed whole or left no manifest edit, and waiting
         // out a full capture here would hold up shutdown for minutes.
         if FOLD_TASK.lock().map(|s| s.is_some()).unwrap_or(false) {
-            log::info!("zou_wal_close: a fold is still running, abandoning it unpublished");
+            log::info!("zou_wal_close: a fold is still running, abandoning it mid flight");
         }
         let Some(pipe) = WAL.get() else {
             return ZOU_ERR_NOT_INITIALIZED;

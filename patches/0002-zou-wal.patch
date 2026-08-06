@@ -41,7 +41,7 @@ new file mode 100644
 index 0000000..23bc879
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,489 @@
+@@ -0,0 +1,490 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -320,11 +320,11 @@ index 0000000..23bc879
 +		XLogRecPtr	flush = GetFlushRecPtr(&tli);
 +
 +		/*
-+		 * The fold runs on a thread inside the shim, so pushing and
-+		 * folding overlap and commit acks never wait out a capture.
-+		 * Poll every iteration, a finished fold publishes its
-+		 * checkpoint from here between appends, and a fold that ends
-+		 * during the shutdown drain still gets published before exit.
++		 * The whole fold lifecycle, capture, publish, and shared log
++		 * consolidation, runs on a thread inside the shim, so this
++		 * loop never spends a store call on a fold's behalf and commit
++		 * acks never wait one out. The poll is a mutex peek that
++		 * harvests the verdict once the thread is done.
 +		 */
 +		if (fold_running)
 +		{
@@ -430,8 +430,9 @@ index 0000000..23bc879
 +			 * Fully drained, fully durable, and asked to stop.
 +			 * proc_exit runs zou_wal_on_exit, which seals the tail and
 +			 * releases the lease cleanly. A fold still in flight is
-+			 * abandoned, the shim logs it, its unpublished capture is
-+			 * gc food, and the next start refolds the same redo.
++			 * abandoned, the shim logs it, its publish either landed
++			 * whole or left no manifest edit, leftover capture objects
++			 * are gc food, and the next start refolds the same redo.
 +			 */
 +			ereport(LOG,
 +					(errmsg("zou wal pusher drained through %X/%X, shutting down",
