@@ -27,6 +27,38 @@ pub fn key(role: &str, secret: &str) -> String {
     jwt::mint(&jwt::key_claims(role), secret.as_bytes())
 }
 
+/// An access token for the person a suite seeded, carrying the claims
+/// GoTrue puts in one.
+///
+/// Not a project key with a `sub` bolted on: the endpoints that read a
+/// token read more of it than the role. `session_id` is what the
+/// endpoints that can end a session look the session up by, `aal` and
+/// `amr` are what a factor check compares against, and `aud` is
+/// checked before any of them.
+pub fn user_key(user: &crate::suite::User, secret: &str) -> String {
+    let iat = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let claims = serde_json::json!({
+        "iss": "zou",
+        "sub": user.id,
+        "aud": "authenticated",
+        "role": "authenticated",
+        "email": user.email,
+        "phone": "",
+        "session_id": user.session_id,
+        "is_anonymous": false,
+        "aal": "aal1",
+        "amr": [{"method": "password", "timestamp": iat}],
+        "app_metadata": {"provider": "email", "providers": ["email"]},
+        "user_metadata": {},
+        "iat": iat,
+        "exp": iat + 3600,
+    });
+    jwt::mint(&claims, secret.as_bytes())
+}
+
 /// Start zou against `dsn` on a free port and wait until it answers.
 ///
 /// `schemas` and `anon` come from the suite, because a suite derived

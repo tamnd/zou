@@ -1,7 +1,8 @@
 //! Something that answers requests, and how to get a suite's schema
 //! into the database behind it.
 //!
-//! A target is a url and two keys. Hosted Supabase, `supabase start`,
+//! A target is a url and the keys to ask it with. Hosted Supabase,
+//! `supabase start`,
 //! a bare PostgREST, and zou are all the same thing from here, which is
 //! the point: the runner has no idea which it is talking to, so it
 //! cannot accidentally be kinder to one of them.
@@ -16,14 +17,30 @@ use std::time::Duration;
 
 use crate::suite::{Answer, Case, Key};
 
+/// What a case can be asked as.
+///
+/// One struct rather than four arguments because they are chosen
+/// together and always all four: a target is given every key the suite
+/// might name, and which one a request goes out with is the case's
+/// decision rather than the target's.
+#[derive(Default)]
+pub struct Keys {
+    pub anon: Option<String>,
+    pub authenticated: Option<String>,
+    pub service: Option<String>,
+    /// An access token for the person the suite seeded, which is how a
+    /// case reaches an endpoint that wants one without signing in
+    /// first. Signing in would answer with a token, and a case cannot
+    /// read the answer to the case before it.
+    pub user: Option<String>,
+}
+
 pub struct Target {
     /// What the report calls it.
     pub name: String,
     /// No trailing slash.
     pub url: String,
-    pub anon_key: Option<String>,
-    pub authenticated_key: Option<String>,
-    pub service_key: Option<String>,
+    pub keys: Keys,
     /// The database behind it, when the suite's schema can be applied
     /// from here. A target with no dsn has to be set up by hand, which
     /// is the hosted case.
@@ -60,9 +77,7 @@ impl Target {
     pub fn new(
         name: &str,
         url: &str,
-        anon_key: Option<String>,
-        authenticated_key: Option<String>,
-        service_key: Option<String>,
+        keys: Keys,
         dsn: Option<String>,
         strip: Option<String>,
     ) -> Target {
@@ -82,9 +97,7 @@ impl Target {
         Target {
             name: name.to_string(),
             url: url.trim_end_matches('/').to_string(),
-            anon_key,
-            authenticated_key,
-            service_key,
+            keys,
             dsn,
             strip: strip.filter(|s| !s.is_empty()),
             agent,
@@ -93,9 +106,10 @@ impl Target {
 
     fn key_for(&self, key: Key) -> Option<&str> {
         match key {
-            Key::Anon => self.anon_key.as_deref(),
-            Key::Authenticated => self.authenticated_key.as_deref(),
-            Key::Service => self.service_key.as_deref(),
+            Key::Anon => self.keys.anon.as_deref(),
+            Key::Authenticated => self.keys.authenticated.as_deref(),
+            Key::Service => self.keys.service.as_deref(),
+            Key::User => self.keys.user.as_deref(),
             Key::None => None,
         }
     }
@@ -131,13 +145,26 @@ impl Target {
                 .header("apikey", key)
                 .header("authorization", format!("Bearer {key}"));
         }
-        for (name, value) in &case.headers {
-            request = request.header(name, value);
-        }
         let body = case.body.clone().unwrap_or_default();
-        let request = request
+        let mut request = request
             .body(body)
             .map_err(|e| format!("{}: building {} {}: {e}", self.name, case.method, url))?;
+        // Replacing rather than adding, so that a case that writes its
+        // own authorization is asked with that one and not with two.
+        // The apikey the key put on stays, which is the point: a case
+        // about a missing or malformed token has to get past the
+        // gateway to be a case about the token at all, and the hosted
+        // gateway is in front of the reference too even though the
+        // reference here is a bare binary with nothing in front of it.
+        for (name, value) in &case.headers {
+            let name: ureq::http::HeaderName = name
+                .parse()
+                .map_err(|e| format!("{}: {}: header {name}: {e}", self.name, case.name))?;
+            let value: ureq::http::HeaderValue = value
+                .parse()
+                .map_err(|e| format!("{}: {}: header {name}: {e}", self.name, case.name))?;
+            request.headers_mut().insert(name, value);
+        }
         let response = self
             .agent
             .run(request)
@@ -156,7 +183,16 @@ impl Target {
             .into_body()
             .read_to_string()
             .map_err(|e| format!("{}: reading the body of {url}: {e}", self.name))?;
-        Ok(answer(&case.name, status, headers, &raw))
+        let mut answer = answer(&case.name, status, headers, &raw);
+        if !case.volatile.is_empty() {
+            crate::volatile::redact(&mut answer.body, &case.volatile);
+            // The kept bytes are the bytes the volatile values were in,
+            // so there is nothing left in them to compare: a case that
+            // names a token gives up the byte for byte verdict on that
+            // answer and keeps the json one.
+            answer.raw = None;
+        }
+        Ok(answer)
     }
 
     /// The suite's schema, applied to whatever database this target
@@ -372,6 +408,7 @@ mod tests {
             body: None,
             note: None,
             writes: false,
+            volatile: Vec::new(),
         }
     }
 
@@ -379,9 +416,7 @@ mod tests {
         Target::new(
             "n",
             "http://127.0.0.1:3000",
-            None,
-            None,
-            None,
+            Keys::default(),
             None,
             strip.map(str::to_string),
         )

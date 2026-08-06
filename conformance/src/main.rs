@@ -42,6 +42,7 @@ mod report;
 mod scoreboard;
 mod suite;
 mod target;
+mod volatile;
 mod zou;
 
 use std::process::ExitCode;
@@ -49,7 +50,7 @@ use std::process::ExitCode;
 use diff::compare;
 use report::{Report, Result as CaseResult};
 use suite::Suite;
-use target::Target;
+use target::{Keys, Target};
 
 const USAGE: &str = "\
 usage: zou-conformance <mode> --suite <name> [options]
@@ -378,6 +379,14 @@ fn run(args: Args) -> Result<bool, String> {
             .service
             .clone()
             .unwrap_or_else(|| zou::key("service_role", &args.jwt_secret));
+        // Only when the suite seeded somebody. A suite with no user has
+        // no case asking as one, so a token for nobody would go out on
+        // no request at all.
+        let user = suite
+            .cases
+            .user
+            .as_ref()
+            .map(|user| zou::user_key(user, &args.jwt_secret));
         // Started before anything is asked so that a target that cannot
         // come up is one message rather than a suite's worth of them.
         let served = match &args.zou_dsn {
@@ -400,9 +409,12 @@ fn run(args: Args) -> Result<bool, String> {
         let target = Target::new(
             &name,
             &url,
-            Some(anon.clone()),
-            Some(authenticated.clone()),
-            Some(service.clone()),
+            Keys {
+                anon: Some(anon.clone()),
+                authenticated: Some(authenticated.clone()),
+                service: Some(service.clone()),
+                user: user.clone(),
+            },
             dsn,
             args.strip.clone(),
         );
@@ -411,13 +423,16 @@ fn run(args: Args) -> Result<bool, String> {
             Target::new(
                 &name,
                 url,
-                Some(args.reference_anon.clone().unwrap_or_else(|| anon.clone())),
-                Some(authenticated.clone()),
-                Some(
-                    args.reference_service
-                        .clone()
-                        .unwrap_or_else(|| service.clone()),
-                ),
+                Keys {
+                    anon: Some(args.reference_anon.clone().unwrap_or_else(|| anon.clone())),
+                    authenticated: Some(authenticated.clone()),
+                    service: Some(
+                        args.reference_service
+                            .clone()
+                            .unwrap_or_else(|| service.clone()),
+                    ),
+                    user: user.clone(),
+                },
                 args.reference_dsn.clone(),
                 args.reference_strip.clone(),
             )

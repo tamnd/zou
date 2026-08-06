@@ -1,0 +1,260 @@
+//! The values nobody can predict, replaced by what they looked like.
+//!
+//! `diff` compares exactly and is meant to. A suite over a table keeps
+//! that honest by pinning its rows down in setup.sql, so the same
+//! question really does have the same answer twice. A suite over an
+//! auth server has no such option: a sign in answers with a token that
+//! was signed a moment ago and a session row that was made a moment
+//! ago, and the only two choices are to name those values or to stop
+//! comparing the answer.
+//!
+//! So they are named, in the case, and replaced here before the answer
+//! reaches the recording or the comparison. What replaces them is not a
+//! blank: it is the name of the shape the value had. A `<uuid>` that
+//! comes back as a `<number>` is still a difference, and so is a token
+//! with two segments where the reference sent three. What is given up
+//! is the value itself, which is the only thing that could not have
+//! been kept.
+//!
+//! Both sides are redacted by the same case, so this cannot make one
+//! target look better than another: a path that is volatile is
+//! volatile for the reference too.
+
+use serde_json::Value;
+
+/// Replace every value `paths` names with the name of its shape.
+///
+/// A path that matches nothing is left alone rather than reported. The
+/// answer to a request that failed does not carry the keys the answer
+/// to one that worked does, and a case that names both is a case that
+/// asks one question rather than two.
+pub fn redact(body: &mut Value, paths: &[String]) {
+    for path in paths {
+        walk(body, &steps(path));
+    }
+}
+
+/// A pointer split into its steps. Written with slashes, leading one
+/// optional, and `*` for every element of an array or every value of an
+/// object, which is what `identities` and `amr` need.
+fn steps(path: &str) -> Vec<&str> {
+    path.trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn walk(value: &mut Value, steps: &[&str]) {
+    let Some((step, rest)) = steps.split_first() else {
+        *value = Value::String(shape(value));
+        return;
+    };
+    match value {
+        Value::Object(map) if *step == "*" => {
+            for (_, child) in map.iter_mut() {
+                walk(child, rest);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(child) = map.get_mut(*step) {
+                walk(child, rest);
+            }
+        }
+        Value::Array(items) if *step == "*" => {
+            for child in items.iter_mut() {
+                walk(child, rest);
+            }
+        }
+        Value::Array(items) => {
+            if let Ok(at) = step.parse::<usize>()
+                && let Some(child) = items.get_mut(at)
+            {
+                walk(child, rest);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What a value looked like, in as much detail as can be checked
+/// without knowing what it was.
+///
+/// The three string shapes are the three things an auth answer carries
+/// that move: the id of a row, the time it was made, and a token. Each
+/// is told apart by its own spelling rather than by the key it sat
+/// under, so a uuid that arrives where a timestamp belongs says so.
+fn shape(value: &Value) -> String {
+    match value {
+        Value::Null => "<null>".to_string(),
+        Value::Bool(_) => "<bool>".to_string(),
+        Value::Number(_) => "<number>".to_string(),
+        Value::Array(items) => format!("<array of {}>", items.len()),
+        Value::Object(_) => "<object>".to_string(),
+        Value::String(text) => string_shape(text).to_string(),
+    }
+}
+
+fn string_shape(text: &str) -> &'static str {
+    if is_uuid(text) {
+        return "<uuid>";
+    }
+    if is_jwt(text) {
+        return "<jwt>";
+    }
+    if is_timestamp(text) {
+        return "<timestamp>";
+    }
+    "<string>"
+}
+
+/// 8-4-4-4-12 hex, which is the one spelling postgres and Go both use.
+fn is_uuid(text: &str) -> bool {
+    let groups = [8, 4, 4, 4, 12];
+    let mut parts = text.split('-');
+    for want in groups {
+        match parts.next() {
+            Some(part) if part.len() == want && part.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+            _ => return false,
+        }
+    }
+    parts.next().is_none()
+}
+
+/// Three base64url segments, which is enough to tell a signed token
+/// from a random string without verifying it. Verifying it here would
+/// mean holding the secret, and a recording is compared on a machine
+/// that has no reason to.
+fn is_jwt(text: &str) -> bool {
+    let parts: Vec<&str> = text.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        })
+}
+
+/// A date and a time, in either of the two spellings the two servers
+/// send: postgres writes a space and Go writes a `T`.
+fn is_timestamp(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return false;
+    }
+    let digits = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
+    let dashes = [4, 7];
+    let colons = [13, 16];
+    digits.iter().all(|at| bytes[*at].is_ascii_digit())
+        && dashes.iter().all(|at| bytes[*at] == b'-')
+        && colons.iter().all(|at| bytes[*at] == b':')
+        && (bytes[10] == b'T' || bytes[10] == b' ')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn redacted(mut body: Value, paths: &[&str]) -> Value {
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        redact(&mut body, &paths);
+        body
+    }
+
+    #[test]
+    fn a_named_value_becomes_the_name_of_its_shape() {
+        let body = json!({
+            "access_token": "aaa.bbb.ccc",
+            "user": {"id": "e7b3f6b0-1c2d-4e5f-8a9b-0c1d2e3f4a5b"},
+            "token_type": "bearer"
+        });
+        assert_eq!(
+            redacted(body, &["/access_token", "/user/id"]),
+            json!({
+                "access_token": "<jwt>",
+                "user": {"id": "<uuid>"},
+                "token_type": "bearer"
+            })
+        );
+    }
+
+    /// The point of naming the shape rather than blanking the value.
+    #[test]
+    fn a_value_of_the_wrong_shape_is_still_a_difference() {
+        let want = redacted(
+            json!({"id": "e7b3f6b0-1c2d-4e5f-8a9b-0c1d2e3f4a5b"}),
+            &["/id"],
+        );
+        let got = redacted(json!({"id": 7}), &["/id"]);
+        assert_ne!(want, got);
+        assert_eq!(got["id"], "<number>");
+    }
+
+    #[test]
+    fn a_star_reaches_every_element_of_a_list() {
+        let body = json!({"identities": [
+            {"id": "1", "created_at": "2026-08-06T04:18:47Z"},
+            {"id": "2", "created_at": "2026-08-06 04:18:47+00"}
+        ]});
+        assert_eq!(
+            redacted(body, &["/identities/*/created_at"]),
+            json!({"identities": [
+                {"id": "1", "created_at": "<timestamp>"},
+                {"id": "2", "created_at": "<timestamp>"}
+            ]})
+        );
+    }
+
+    #[test]
+    fn a_star_reaches_every_value_of_an_object_too() {
+        let body = json!({"claims": {"session_id": "a", "sub": "b"}});
+        assert_eq!(
+            redacted(body, &["/claims/*"]),
+            json!({"claims": {"session_id": "<string>", "sub": "<string>"}})
+        );
+    }
+
+    /// An error body does not carry the keys a success body does, and a
+    /// case that names both is one case rather than two.
+    #[test]
+    fn a_path_that_matches_nothing_changes_nothing() {
+        let body = json!({"msg": "no"});
+        assert_eq!(redacted(body.clone(), &["/access_token"]), body);
+    }
+
+    #[test]
+    fn a_whole_list_can_be_named_by_its_length() {
+        let body = json!({"factors": [{"id": "a"}, {"id": "b"}]});
+        assert_eq!(
+            redacted(body, &["/factors"]),
+            json!({"factors": "<array of 2>"})
+        );
+    }
+
+    #[test]
+    fn the_spellings_are_told_apart() {
+        assert_eq!(
+            string_shape("e7b3f6b0-1c2d-4e5f-8a9b-0c1d2e3f4a5b"),
+            "<uuid>"
+        );
+        assert_eq!(string_shape("e7b3f6b01c2d4e5f8a9b0c1d2e3f4a5b"), "<string>");
+        assert_eq!(string_shape("aaa.bbb.ccc"), "<jwt>");
+        assert_eq!(string_shape("aaa.bbb"), "<string>");
+        assert_eq!(string_shape("2026-08-06T04:18:47Z"), "<timestamp>");
+        assert_eq!(string_shape("2026-08-06 04:18:47.123+00"), "<timestamp>");
+        assert_eq!(string_shape("2026-08-06"), "<string>");
+        assert_eq!(string_shape("bearer"), "<string>");
+    }
+
+    /// An index reaches one element, which is what an answer with a
+    /// list of exactly one thing in it wants.
+    #[test]
+    fn an_index_reaches_the_element_it_names() {
+        let body = json!([{"id": "a"}, {"id": "b"}]);
+        assert_eq!(
+            redacted(body, &["/1/id"]),
+            json!([{"id": "a"}, {"id": "<string>"}])
+        );
+    }
+}
