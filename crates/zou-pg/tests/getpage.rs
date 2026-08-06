@@ -9,8 +9,11 @@
 //! Gated on ZOU_PG_PREFIX exactly like the redo pool test: without the
 //! patched build the test prints a skip note and passes.
 //!
-//! Three scenarios share one cluster:
+//! Four scenarios share one cluster:
 //! - everything flushed: pages come purely from the layer store
+//! - the same reads through the local file cache, twice: once to fill
+//!   it, once from a fresh cache instance over a store stripped of
+//!   every layer, the restart story
 //! - a partial flush: the tail of the WAL still sits in the memtable,
 //!   so reconstruction stitches layer records and memtable records
 //! - per block read lsns from the last written lsn cache serve the same
@@ -24,6 +27,8 @@ use zou_pg::getpage::{LastWrittenLsn, MAX_GETPAGE_BATCH, PageService};
 use zou_pg::ingest::{IngestConfig, ShardIngest};
 use zou_pg::redo::{RedoPool, RedoPoolConfig, RedoRequest, page_checksum};
 use zou_pg::walscan::{BlockRef, WalRecord, WalWindow, read_records};
+use zou_store::cas::CasStore;
+use zou_store::filecache::FileCache;
 use zou_store::frame::Frame2;
 use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
@@ -271,7 +276,7 @@ fn getpage_serves_what_redo_builds() {
     assert!(frames.len() > 2, "the stream split into several frames");
     let layout = TenantLayout::new("t");
 
-    let serve = |ingest: &ShardIngest, store: &MemStore, blocks: &[BlockRef], at: u64| {
+    let serve = |ingest: &ShardIngest, store: &dyn CasStore, blocks: &[BlockRef], at: u64| {
         let map = match PageShardManifest::load(store, &layout.shard_manifest(0))
             .expect("manifest loads")
         {
@@ -309,6 +314,40 @@ fn getpage_serves_what_redo_builds() {
         serve(&ingest, &store, &index_blocks, wal_end),
         index_want,
         "index from layers differs from direct redo"
+    );
+
+    // The same reads through the local file cache: the first pass
+    // fills it, then a fresh cache instance over a store holding
+    // nothing but the shard manifest serves identical pages, which is
+    // the restart story, layer bytes from NVMe, only the mutable
+    // manifest from the store.
+    let cache_root = tmp.path().join("layer-cache");
+    let manifest_key = layout.shard_manifest(0);
+    let manifest_bytes = store
+        .get(&manifest_key)
+        .expect("store get")
+        .expect("manifest exists")
+        .0;
+    let cached = FileCache::new(Box::new(store), &cache_root, 1 << 30).expect("cache opens");
+    assert_eq!(
+        serve(&ingest, &cached, &heap_blocks, wal_end),
+        heap_want,
+        "heap through a cold cache differs"
+    );
+    assert!(cached.stats().fills > 0, "the pass filled the cache");
+    let survivors = MemStore::default();
+    survivors
+        .put_if_absent(&manifest_key, &manifest_bytes)
+        .expect("manifest survives");
+    let warm = FileCache::new(Box::new(survivors), &cache_root, 1 << 30).expect("cache reopens");
+    assert_eq!(
+        serve(&ingest, &warm, &heap_blocks, wal_end),
+        heap_want,
+        "heap after a restart with no layers in the store differs"
+    );
+    assert!(
+        warm.stats().hits > 0 && warm.stats().misses == 0,
+        "every layer read came from disk"
     );
 
     // Scenario two: flush halfway, leave the tail in the memtable, so
