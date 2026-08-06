@@ -5,15 +5,18 @@
 //! surfaces are wired to the paths a Supabase client already calls,
 //! which is a different claim and one nothing else makes. A client
 //! configured with a zou url and no other changes reaches /rest/v1 for
-//! data, /auth/v1 for sessions, and gets an honest 501 rather than a
-//! confusing 404 at /storage/v1 and /realtime/v1, which are the two
-//! surfaces later milestones fill in.
+//! data, /auth/v1 for sessions, /storage/v1/bucket for buckets, and
+//! gets an honest 501 rather than a confusing 404 everywhere a later
+//! milestone still has to fill in.
 //!
 //! Which side of the apikey gate each route sits on is part of the
-//! wiring and is tested here too. Four routes are deliberately outside
-//! it, and every one of them is outside it because the caller cannot
-//! reasonably be holding a key: a token verifier, a link in an email,
-//! and the two halves of a social sign in.
+//! wiring and is tested here too. Four auth routes are deliberately
+//! outside it, and every one of them is outside it because the caller
+//! cannot reasonably be holding a key: a token verifier, a link in an
+//! email, and the two halves of a social sign in. The bucket routes are
+//! outside it for a different reason, which is that storage-api answers
+//! a keyless request itself rather than letting the gateway do it, and
+//! zou is both of those at once.
 //!
 //! No database. Nothing here gets far enough to need one.
 
@@ -108,7 +111,8 @@ async fn all_four_prefixes_are_routed() {
         "/rest/v1/rpc/whatever",
         "/auth/v1/health",
         "/auth/v1/settings",
-        "/storage/v1/bucket/object",
+        "/storage/v1/bucket",
+        "/storage/v1/object/pics",
         "/realtime/v1/websocket",
     ] {
         let answer = keyed(&app, "GET", path).await;
@@ -210,6 +214,53 @@ async fn the_four_open_routes_need_no_apikey() {
         );
         assert_ne!(answer.message(), "No API key found in request");
     }
+}
+
+#[tokio::test]
+async fn the_bucket_surface_refuses_in_its_own_words_rather_than_the_gates() {
+    let app = app();
+    // The bucket routes are outside the gate for a reason none of the
+    // four above share. storage-api runs behind the same hosted gateway
+    // everything else does, and a request to it with no key is still
+    // answered by storage-api rather than by the gateway, because the
+    // gateway is not what reads the token there. zou is both ends at
+    // once, so the only way to answer that request in the recorded
+    // words is to let it past the gate and refuse it in the handler.
+    for (method, path) in [
+        ("GET", "/storage/v1/bucket"),
+        ("POST", "/storage/v1/bucket"),
+        ("GET", "/storage/v1/bucket/photos"),
+        ("PUT", "/storage/v1/bucket/photos"),
+        ("DELETE", "/storage/v1/bucket/photos"),
+        ("POST", "/storage/v1/bucket/photos/empty"),
+    ] {
+        let answer = bare(&app, method, path).await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{method} {path}");
+        assert_eq!(answer.message(), "Invalid Compact JWS", "{method} {path}");
+        // The status a caller acts on is in the body and it is a
+        // string, which is the shape of every storage-api failure.
+        assert_eq!(answer.body["statusCode"], "403", "{method} {path}");
+        assert_eq!(answer.body["code"], "AccessDenied", "{method} {path}");
+        // Charset and all. The conformance differ compares this header,
+        // so a bucket answer sending zou's usual bare json would be a
+        // difference against the recording.
+        assert_eq!(
+            answer.content_type, "application/json; charset=utf-8",
+            "{method} {path}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_path_under_storage_that_is_not_a_bucket_is_still_stubbed() {
+    let app = app();
+    // A literal segment beats a wildcard one, so the bucket routes take
+    // what they name and the catch all keeps the rest. Worth a test
+    // because the two live in different routers and are merged, and a
+    // merge that shadowed the catch all would leave every unbuilt
+    // storage path answering about a token instead.
+    let answer = keyed(&app, "GET", "/storage/v1/object/public/pics/cat.png").await;
+    assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
 }
 
 #[tokio::test]

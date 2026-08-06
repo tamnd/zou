@@ -420,18 +420,20 @@ It only ever reads. There is a test that runs the whole command against a databa
 
 ## What answers where
 
-A Supabase client is pointed at one url and reaches four surfaces under it. All four are routed today and two of them are built.
+A Supabase client is pointed at one url and reaches four surfaces under it. All four are routed today, two of them are built, and the third has its bucket half.
 
 | prefix | today |
 | --- | --- |
 | `/rest/v1` | PostgREST's grammar, the OpenAPI document at `/rest/v1/`, and `/rest/v1/rpc/<function>` |
 | `/auth/v1` | the GoTrue endpoints this guide describes |
-| `/storage/v1` | 501 with a sentence saying the surface is not built yet |
+| `/storage/v1` | buckets under `/storage/v1/bucket`, and 501 for the object surface |
 | `/realtime/v1` | 501 with a sentence saying the surface is not built yet |
 
-The two stubs answer 501 rather than 404 on purpose, for any method and for every path under the prefix including the prefix itself, because a 404 reads as a wrong url and sends somebody looking for a typo they did not make. An endpoint under `/auth/v1` that is not served yet answers the same way. Anything outside all four prefixes is a 404 in the words the hosted gateway uses, `no Route matched with those values`, so a client that gets one is looking at the same sentence it would get from Supabase.
+What is not built yet answers 501 rather than 404 on purpose, for any method and for every path under the prefix including the prefix itself, because a 404 reads as a wrong url and sends somebody looking for a typo they did not make. An endpoint under `/auth/v1` that is not served yet answers the same way. Anything outside all four prefixes is a 404 in the words the hosted gateway uses, `no Route matched with those values`, so a client that gets one is looking at the same sentence it would get from Supabase.
 
-Four routes sit outside the apikey check, and every one of them is outside it because whoever calls it cannot be holding a key: `/auth/v1/.well-known/jwks.json` is fetched by whatever verifies a token, `/auth/v1/verify` is the link in a confirmation email opened in a mail client, and `/auth/v1/authorize` and `/auth/v1/callback` are the two halves of a social sign in, which are browser navigations rather than fetches. Everything else, the two stubs included, wants an `apikey`.
+Four auth routes sit outside the apikey check, and every one of them is outside it because whoever calls it cannot be holding a key: `/auth/v1/.well-known/jwks.json` is fetched by whatever verifies a token, `/auth/v1/verify` is the link in a confirmation email opened in a mail client, and `/auth/v1/authorize` and `/auth/v1/callback` are the two halves of a social sign in, which are browser navigations rather than fetches.
+
+The bucket routes are outside it too, for a reason of their own. Storage reads its token from the `Authorization` header alone and answers a request that has none in its own words, and it does that behind the same gateway everything else sits behind. zou is the gateway as well as the server, so the only way to give that request the answer a Supabase project gives it is to let it past the check and refuse it in the handler. Everything else, the stubs included, wants an `apikey`.
 
 ## Where to go next
 

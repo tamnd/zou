@@ -2,7 +2,7 @@
 
 zou claims to be Supabase compatible, and a claim like that is only worth what it is measured against.
 So the suites this harness runs are not assertions about what zou should do.
-They are questions, and the answers they are compared with were recorded from the real PostgREST and GoTrue binaries at the versions pinned in `versions.json`.
+They are questions, and the answers they are compared with were recorded from the real PostgREST and GoTrue binaries and the real storage-api image, at the versions pinned in `versions.json`.
 A case that fails is a case where zou and upstream answered the same question differently, and nobody had to decide which of them was right for the difference to show up.
 
 ## Where the suites are
@@ -22,7 +22,7 @@ Point the harness at a checkout with `--suites <dir>`, or with `ZOU_CONFORMANCE_
 Everything except supabase-js comes from the image list the Supabase CLI builds its local stack from, which is what `supabase start` gives people, so the reference is the stack a user actually runs and not a version chosen here.
 Bumping a version means re-recording the suites it covers, and the re-recording is the point: a diff in a recording is upstream changing its mind, and it should be read rather than merged.
 
-Today that is PostgREST 14.15, GoTrue 2.194.0, postgres-meta 0.96.6, supabase-js 2.111.0, and the Supabase CLI 2.111.0.
+Today that is PostgREST 14.15, GoTrue 2.194.0, storage-api 1.67.20, postgres-meta 0.96.6, supabase-js 2.111.0, and the Supabase CLI 2.111.0.
 The one line where zou is deliberately ahead is Postgres: the Supabase local stack is on 17 and zou vendors 18, and a suite that depends on the difference is a suite that is testing Postgres rather than the API in front of it.
 
 ## Six modes
@@ -239,6 +239,28 @@ The token for the seeded person is minted by the harness from the same secret bo
 A case about a missing or malformed token still names a key, so that the apikey goes out and the answer is about the token rather than about the gateway, and the case's own `authorization` header replaces the key's rather than being sent next to it.
 That distinction has to be made here because zou is the gateway as well as the server, and a bare GoTrue has no apikey gate at all.
 
+## The suite recorded from an image
+
+The `storage` suite is 25 cases over the bucket endpoints: listing, fetching, creating, updating, emptying and deleting, each asked with a service key, an anon key, and in a few cases with no key at all.
+The reference is storage-api at the version in `versions.json`, and it is the one reference that cannot be downloaded and run on a flag line.
+storage-api ships as an image and nothing else, so the recording comes from `supabase start` rather than from a binary, which is what the record workflow in this repository brings up.
+
+```
+cargo run -p zou-conformance -- check --suite storage \
+  --suites /tmp/zou-conformance/suites \
+  --zou-dsn postgresql://postgres@127.0.0.1:5432/postgres
+```
+
+That is why this suite has no diff step in CI while the other three do.
+What the diff steps buy is the guarantee that a recording cannot sit in the file being believed after upstream changes its mind, and here that is paid for at the other end: bumping the pinned version means running the record workflow again and reading the diff it produces in `recorded.json`.
+
+The fixture is rows and nothing else.
+storage-api makes the storage schema with its own migrations, zou makes it on the first connection it takes out of the pool, and a `setup.sql` that made a third one would be measuring itself rather than either of them.
+It does have to open one door to write those rows: the storage schema refuses a delete that did not come through the API, from a statement trigger reading a setting, and the fixture sets the same setting storage-api itself sets rather than dropping the trigger and putting it back.
+
+Buckets only, for now.
+An object is bytes, a case in this harness carries none, and a target would need somewhere to put them.
+
 ## The suite compared with the stack rather than the binary
 
 Everything above compares zou with a binary the job downloaded and configured on a flag line.
@@ -319,6 +341,8 @@ The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
 
 The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 74 of them, 96%, with 3 known differences.
 All three are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
+
+The `storage` suite is 25 cases against the storage-api a local Supabase project runs, and zou passes all 25, byte for byte, with no known differences.
 
 supabase-js 2.111.0 runs 16 of its integration tests against zou and all 16 pass.
 

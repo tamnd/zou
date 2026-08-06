@@ -43,7 +43,9 @@ Three answers differ on purpose. They are checked in as `known.json` in the conf
 
 ## What is not served yet
 
-`/storage/v1` and `/realtime/v1` are routes in the router and nothing behind them. Both answer 501 with a body saying so and naming the milestone, rather than 404, so a client gets told the surface exists and is not finished instead of being told the url is wrong. Storage is M3 and Realtime is M4.
+`/storage/v1` is half served. The bucket surface is built and measured, `/realtime/v1` and everything under `/storage/v1` that carries bytes are routes in the router with nothing behind them. Those answer 501 with a body saying so and naming the milestone, rather than 404, so a client gets told the surface exists and is not finished instead of being told the url is wrong. Storage is M3 and Realtime is M4.
+
+The object half is not late, it is waiting on the thing under it. A bucket is a row and zou already has somewhere to keep rows; an object is bytes, and where those bytes go is the storage engine question the rest of this project is about. Uploads, downloads, signed urls and the S3 protocol arrive together with it.
 
 This is also why the supabase-js run skips 18 of its cases. They are skipped rather than deleted so the count keeps saying how much of the file is not being asked.
 
