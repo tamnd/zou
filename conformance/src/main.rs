@@ -690,7 +690,7 @@ fn ask(target: &Target, suite: &Suite, setup: Option<&str>) -> Result<Asked, Str
         false => None,
     };
     for case in &suite.cases.cases {
-        if case.writes
+        if resets_first(case)
             && let Some(reset) = reset
         {
             target.set_up(reset)?;
@@ -701,6 +701,17 @@ fn ask(target: &Target, suite: &Suite, setup: Option<&str>) -> Result<Asked, Str
         }
     }
     Ok(asked)
+}
+
+/// Whether the rows go back in front of this case.
+///
+/// Only the cases that change rows need it, and a chained case is one
+/// that has asked not to have it: it is written to follow the case
+/// before it and putting the fixture back would take away the thing it
+/// is asking about. Everything else in a suite stays order independent,
+/// which is what makes a failure readable.
+fn resets_first(case: &suite::Case) -> bool {
+    case.writes && !case.chained
 }
 
 struct Asked {
@@ -816,6 +827,32 @@ mod tests {
     #[test]
     fn a_run_without_a_target_is_an_error_and_not_a_default() {
         assert!(parse(&argv(&["check", "--suite", "rest"])).is_err());
+    }
+
+    fn case(writes: bool, chained: bool) -> suite::Case {
+        suite::Case {
+            name: "n".to_string(),
+            feature: "f".to_string(),
+            method: "POST".to_string(),
+            path: "/storage/v1/object/notes/hello.txt".to_string(),
+            key: suite::Key::Service,
+            headers: Default::default(),
+            body: None,
+            note: None,
+            writes,
+            chained,
+            volatile: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_rows_go_back_in_front_of_a_write_and_not_in_front_of_a_chain() {
+        assert!(resets_first(&case(true, false)));
+        assert!(!resets_first(&case(false, false)));
+        // The one that matters: a chained case writes and still does
+        // not want the fixture back, because what it is asking about is
+        // what the case before it left.
+        assert!(!resets_first(&case(true, true)));
     }
 
     #[test]

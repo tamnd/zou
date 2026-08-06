@@ -62,6 +62,24 @@ pub struct Case {
     /// rather than against whatever the case before it left.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub writes: bool,
+    /// Asked against what the case before it left, rather than against
+    /// the fixture. Only means anything on a case that writes, since
+    /// the rows only go back in front of those.
+    ///
+    /// Almost nothing needs this and the ones that do could not exist
+    /// without it. A fixture writes rows, and the object surface is
+    /// about bytes that live somewhere no fixture can reach: the only
+    /// way to ask what a copy does is to upload something and then copy
+    /// it, and the only way to ask what a download of a real object
+    /// answers is to have uploaded it first. Both of those are two
+    /// cases where the second one has to see what the first one did.
+    ///
+    /// The cost is that a chain is order dependent in a way the rest of
+    /// a suite is not, so a chain should be short, should sit together
+    /// in the file, and should start with a case that resets like any
+    /// other.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub chained: bool,
     /// The values in this answer that no two runs agree on, as json
     /// pointers into the body. Each one is replaced by the name of what
     /// it looked like before anything is compared, so a token still has
@@ -336,6 +354,19 @@ mod tests {
         assert_eq!(case.method, "GET");
         assert_eq!(case.key, Key::Anon);
         assert!(case.headers.is_empty());
+    }
+
+    #[test]
+    fn a_case_is_asked_against_the_fixture_unless_it_chains() {
+        let plain: Case =
+            serde_json::from_str(r#"{"name": "n", "feature": "f", "path": "/p", "writes": true}"#)
+                .expect("parses");
+        assert!(!plain.chained);
+        let chained: Case = serde_json::from_str(
+            r#"{"name": "n", "feature": "f", "path": "/p", "writes": true, "chained": true}"#,
+        )
+        .expect("parses");
+        assert!(chained.chained);
     }
 
     /// The two tests below read the suites, and the suites are a
