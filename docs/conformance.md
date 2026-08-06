@@ -269,6 +269,20 @@ So `serve` makes zou answer a request that has to reach Postgres before it says 
 The other 18 are Realtime and Storage, which zou does not serve on this URL yet.
 They are skipped behind an environment flag rather than deleted, so the day the feature lands the test runs exactly as upstream wrote it.
 
+## The app
+
+A suite passing says every answer matched a recording. An app working says the answers were enough to build something on, and the second does not follow from the first.
+
+So one of Supabase's own example apps is run against zou with nothing changed in it, in a real browser: `examples/todo-list/sveltejs-todo-list`, in `demo/` in the conformance repository.
+The diff against upstream is one file upstream does not ship, the `.env` its own `.env.example` asks for, and the url and key in it are the ones the Supabase CLI prints for a local project.
+No test hook, no id added to a button, no module replaced.
+
+Four things get driven, each of them something a person does: signing up and adding a todo that is still there after a reload, two accounts that cannot see each other's rows, the anon key on its own reading nothing, and signing in with Github twice landing on the same account rather than on a second one that looks like it.
+
+The Github login is the reason `ZOU_EXTERNAL_GITHUB_URL` exists.
+There is no account to sign in as on github.com and no consent anybody can give in CI, so a stub stands where github does, reached the way a GitHub Enterprise install is reached.
+Everything on zou's side of that is the real path: the code exchange, the two profile calls that find the address github keeps out of the profile document, the identity row, the session in the url fragment, and supabase-js parsing it out.
+
 ## Where zou stands
 
 The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes all of them, with no known differences.

@@ -29,6 +29,8 @@ The Postgres line is the one place zou is deliberately ahead. A suite that depen
 
 A known difference still counts as a failure in every number above. It is excused from the exit code and from nothing else, so the score cannot be improved by writing an explanation down.
 
+Next to those four there is a fifth thing that has no number, because it either works or it does not: one of Supabase's own example apps, unedited, driven through a browser on every push. Signing up, signing in, a row level security policy holding between two accounts, and a Github login that goes all the way through the code exchange and comes back as a session. The app is `examples/todo-list/sveltejs-todo-list` and the only file it gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints. Details in [demo/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo/README.md).
+
 ## What a project will notice
 
 Three answers differ on purpose. They are checked in as `known.json` in the conformance repository, which means a case that starts matching upstream fails the run too, and the day one of these stops being true is a day CI complains.
