@@ -1430,21 +1430,70 @@ fn insert_payload(
 /// empty one leaves no columns to set at all.
 ///
 /// The one object case is the body itself, for the reason
-/// [`insert_payload`] gives. An array is read down here rather than
-/// in SQL, so the element that survives is the parse of it.
+/// [`insert_payload`] gives, and so is the element an array is read
+/// down to: it is cut out of the text rather than taken out of the
+/// parse, so that a duplicate key and the spelling of a number survive
+/// a PATCH the same way they survive a POST.
 fn update_payload(
     content: &Content,
     bytes: &[u8],
     columns: Option<&[String]>,
 ) -> Result<(Vec<String>, String), RestError> {
     let body = body_rows(content, bytes, columns)?;
-    if let Some(raw) = body.raw.filter(|raw| !sent_an_array(raw)) {
-        return Ok((body.cols, raw.to_string()));
+    if let Some(raw) = body.raw {
+        if !sent_an_array(raw) {
+            return Ok((body.cols, raw.to_string()));
+        }
+        return match first_element(raw) {
+            Some(first) => Ok((body.cols, first.to_string())),
+            None => Ok((Vec::new(), "null".to_string())),
+        };
     }
+    // A csv or a form, which zou built out of text of its own, so
+    // there is no arrival to preserve.
     let Some(first) = body.rows.into_iter().next() else {
         return Ok((Vec::new(), "null".to_string()));
     };
     Ok((body.cols, first.to_string()))
+}
+
+/// The text of the first element of a json array, or nothing when the
+/// array is empty.
+///
+/// Cut rather than re-encoded. A parse and a re-encode drops one of
+/// `{"a": 1, "a": 2}`'s two keys and can respell a number, and both are
+/// visible in the answer when the column is `json`, which keeps what it
+/// was sent. The scan is a depth count that knows about strings and
+/// their escapes, which is all it takes to find where one element ends:
+/// the text has already parsed, so it does not have to be validated
+/// again on the way past.
+fn first_element(raw: &str) -> Option<&str> {
+    const BLANK: [char; 4] = [' ', '\t', '\n', '\r'];
+    let inside = raw.trim_start_matches(BLANK).strip_prefix('[')?;
+    let start = inside.len() - inside.trim_start_matches(BLANK).len();
+    let bytes = inside.as_bytes();
+    let mut at = start;
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    while at < bytes.len() {
+        match (in_string, escaped, bytes[at]) {
+            (true, true, _) => escaped = false,
+            (true, false, b'\\') => escaped = true,
+            (true, false, b'"') => in_string = false,
+            (true, false, _) => {}
+            (false, _, b'"') => in_string = true,
+            (false, _, b'[' | b'{') => depth += 1,
+            // The end of this element, whether it is the end of the
+            // array or only the comma before the next one.
+            (false, _, b']' | b'}' | b',') if depth == 0 => break,
+            (false, _, b']' | b'}') => depth -= 1,
+            (false, _, _) => {}
+        }
+        at += 1;
+    }
+    let element = inside[start..at].trim_end_matches(BLANK);
+    (!element.is_empty()).then_some(element)
 }
 
 /// The Range header as a root limit and offset, only when the query
@@ -4186,6 +4235,45 @@ mod tests {
             "\"we\"\"ird\"",
             "a quote in the name doubles instead of escaping the list"
         );
+    }
+
+    /// An update writes one row, so an array is read down to its first
+    /// element. What survives is the text of it, which is the only way a
+    /// duplicate key or the spelling of a number reaches a json column
+    /// the way it was sent.
+    #[test]
+    fn an_update_takes_the_first_element_out_of_the_text() {
+        let (cols, payload) =
+            update_payload(&Content::Json, br#"[{"a":1.0,"a":2}]"#, None).unwrap();
+        assert_eq!(cols, vec!["a"]);
+        assert_eq!(payload, r#"{"a":1.0,"a":2}"#);
+
+        let (_, payload) =
+            update_payload(&Content::Json, br#" [ {"a": 1e2} , {"a": 3} ] "#, None).unwrap();
+        assert_eq!(payload, r#"{"a": 1e2}"#);
+
+        // A lone object is the body, and always was.
+        let (_, payload) = update_payload(&Content::Json, br#"{"a":1.0}"#, None).unwrap();
+        assert_eq!(payload, r#"{"a":1.0}"#);
+
+        // An empty array leaves no columns to set at all.
+        let (cols, payload) = update_payload(&Content::Json, b"[]", None).unwrap();
+        assert!(cols.is_empty());
+        assert_eq!(payload, "null");
+    }
+
+    /// The scan has to know where a string ends, because a bracket or a
+    /// comma inside one ends nothing.
+    #[test]
+    fn a_bracket_inside_a_string_is_not_the_end_of_an_element() {
+        assert_eq!(
+            first_element(r#"[{"a":"],[","b":[1,2]},{"c":3}]"#),
+            Some(r#"{"a":"],[","b":[1,2]}"#)
+        );
+        assert_eq!(first_element(r#"["a\"],b","c"]"#), Some(r#""a\"],b""#));
+        assert_eq!(first_element("[1,2]"), Some("1"));
+        assert_eq!(first_element("[  ]"), None);
+        assert_eq!(first_element("{}"), None);
     }
 
     #[test]
