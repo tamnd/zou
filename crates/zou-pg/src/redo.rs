@@ -150,7 +150,7 @@ impl RedoPool {
     }
 
     /// Run one batch and return the requested pages in `gets` order,
-    /// each [`BLCKSZ`] bytes. Blocks the pushed images and records do
+    /// each `BLCKSZ` bytes. Blocks the pushed images and records do
     /// not explain come back as all zeros. On error the worker involved
     /// is gone and the pool recovers by itself, so retrying is safe,
     /// but a batch that failed on a bad record will fail again. The
