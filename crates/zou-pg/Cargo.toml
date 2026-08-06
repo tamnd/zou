@@ -19,6 +19,7 @@ zou-log = { path = "../zou-log" }
 crc32c = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

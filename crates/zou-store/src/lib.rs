@@ -26,6 +26,7 @@ pub mod open;
 pub mod pageread;
 #[cfg(feature = "s3")]
 pub mod s3;
+pub mod shardmanifest;
 pub mod sim;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
@@ -53,6 +54,7 @@ pub use mem::MemStore;
 pub use open::{PrefixStore, open_store};
 #[cfg(feature = "s3")]
 pub use s3::{Dialect, S3Config, S3Store};
+pub use shardmanifest::{LayerEntry, PAGE_SHARD_FORMAT, PageShardManifest, publish_layer};
 pub use sim::{BUILTIN_PROFILES, OpDist, SimConfig, SimProfile, SimStore};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;
