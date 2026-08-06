@@ -269,7 +269,8 @@ fn pool_pages_match_postgres() {
     std::fs::create_dir(&sock).expect("socket dir");
 
     run(Command::new(bin("initdb"))
-        .args(["--no-sync", "-k", "-A", "trust", "-U", "zou", "-D"])
+        .args(["--no-sync", "-k", "-A", "trust", "-U", "zou"])
+        .args(["--set", "full_page_writes=off", "-D"])
         .arg(&datadir));
     let start = |datadir: &Path| {
         run(Command::new(bin("pg_ctl"))
@@ -298,7 +299,8 @@ fn pool_pages_match_postgres() {
     };
 
     // Several pages of inserts, then updates and deletes so early pages
-    // collect plain records on top of their first touch images, and a
+    // collect plain records on top of their birth records, no first
+    // touch images with full_page_writes off, and a
     // vacuum for pruning, freezing and visibility records. The wal scan
     // starts here rather than at the segment start, initdb's template
     // database copies are megabytes of records that prove nothing.

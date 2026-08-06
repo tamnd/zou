@@ -28,7 +28,7 @@ stop() { "$PG"/pg_ctl -D "$DATADIR" stop -m fast >/dev/null 2>&1 || true; }
 trap stop EXIT
 
 export ZOU_TARGET=$TARGET
-"$PG"/initdb -D "$DATADIR" --set io_method=sync >/dev/null
+"$PG"/initdb -D "$DATADIR" --set io_method=sync --set full_page_writes=off >/dev/null
 REDO=$("$PG"/pg_controldata -D "$DATADIR" | grep "REDO location" | awk '{print $NF}')
 "$BOOTSTRAP" "$TARGET" "$DATADIR" --redo "$REDO" >/dev/null
 "$PG"/pg_ctl -D "$DATADIR" -l "$LOG" -o "-p $PORT -k $SOCK" start >/dev/null

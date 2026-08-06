@@ -5,7 +5,7 @@ Run any leg yourself with `scripts/zou-bench.sh <target> [scale] [seconds]`, whi
 
 ## Method
 
-- Postgres 18.4 with the zou patches, stock initdb settings plus `io_method=sync`, the same configuration the CI smoke uses, so the table measures zou and not tuning.
+- Postgres 18.4 with the zou patches, stock initdb settings plus `io_method=sync` and `full_page_writes=off`, the same configuration the CI smoke uses, so the table measures zou and not tuning.
 - pgbench scale 100, about 1.3 GB of data across 10 million accounts rows.
 - 8 clients, 8 threads, 60 seconds per workload.
 - Every commit is durable on the object store before pgbench sees it acknowledged, there is no local WAL fallback to hide behind.

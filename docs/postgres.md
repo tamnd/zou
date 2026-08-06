@@ -40,7 +40,8 @@ build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
 ## The zou storage manager
 
 Patch `0001-zou-smgr.patch` adds a second entry to the smgr table that routes relation pages to zou-store through the C ABI of the `zou-pg` crate, linked into the backend as a static library.
-Set `ZOU_TARGET` to a store root before running `initdb --set io_method=sync` and every non temp relation lives as one object per block under `tenants/local/pg/<spc>/<db>/<rel>/<fork>/`, with a `SIZE` marker per fork and absent blocks reading as zeros.
+Set `ZOU_TARGET` to a store root before running `initdb --set io_method=sync --set full_page_writes=off` and every non temp relation lives as one object per block under `tenants/local/pg/<spc>/<db>/<rel>/<fork>/`, with a `SIZE` marker per fork and absent blocks reading as zeros.
+Full page writes are off because a store object put is atomic on every backend, so the torn local write that setting guards against cannot be observed; docs/storage-engine.md carries the whole argument, and setting it at initdb time means restores and branches inherit it through the captured config.
 Without `ZOU_TARGET` the binary behaves exactly like stock Postgres on md.
 The target is a local directory or an object store URL: `s3://bucket/prefix` speaks the S3 wire API against AWS, MinIO, or R2, and `gs://bucket/prefix` speaks the same client in the GCS dialect, with the prefix scoping every key so stores can share a bucket.
 URL targets read `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the environment, `ZOU_S3_ENDPOINT` to point at a non AWS endpoint like a local MinIO, and `ZOU_S3_REGION` falling back to `AWS_REGION` then us-east-1, and the same forms work for `zou-bootstrap`, `zou-restore`, and `zou-gc`.
@@ -138,7 +139,7 @@ CI proves the path end to end by deleting a `pg/` block object after a clean shu
 
 ```sh
 mkdir -p /tmp/zou-pg-store
-ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync
+ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync --set full_page_writes=off
 ZOU_TARGET=/tmp/zou-pg-store build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
 build/pg/bin/psql -h /tmp -d postgres -c 'create table t(id int)'
 find /tmp/zou-pg-store/tenants/local/pg -type f | head
