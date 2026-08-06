@@ -555,6 +555,7 @@ jobs:
           # applies it again over the reference dsn before it asks
           # anything, which is what it does for every target, and the
           # file is written to be applied twice.
+          mkdir -p supabase/migrations
           cp /tmp/zou-conformance/suites/rest/setup.sql \
             supabase/migrations/20200101000000_conformance.sql
           supabase start -x studio,imgproxy,edge-runtime,logflare,vector
