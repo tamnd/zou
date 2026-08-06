@@ -1,0 +1,103 @@
+name: Record
+
+# Recording is not a check, so it is not on a push. It is run by hand,
+# it writes files rather than passing or failing, and what it writes is
+# read by somebody before it is committed. A recording that appeared on
+# its own would be a recording nobody had compared with the last one.
+#
+# It exists because one reference cannot be downloaded. PostgREST and
+# GoTrue ship static binaries, so the jobs that diff against them fetch
+# a release asset and run it. storage-api ships as an image, and the
+# only supported way to get the image list a project runs is the CLI,
+# so the reference for anything under /storage/v1 is the stack itself.
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: the suite to record, which must exist in the conformance repository
+        required: true
+        default: storage
+      ref:
+        description: the conformance commit to record from, a branch or a sha
+        required: true
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    name: record ${{ inputs.suite }} from supabase start
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      ZOU_CONFORMANCE_SUITES: /tmp/zou-conformance/suites
+      CLI_URL: http://127.0.0.1:54321
+      CLI_DSN: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # At the ref that was asked for rather than at the pin, because
+      # the questions being recorded are usually the ones that are not
+      # pinned yet.
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "${{ inputs.ref }}"
+          git -C /tmp/zou-conformance log --oneline -1
+      - name: Install the pinned supabase CLI
+        run: |
+          version=$(jq -r .supabase_cli.version /tmp/zou-conformance/versions.json)
+          npm i -g "supabase@$version"
+          supabase --version
+      - name: Bring up a local supabase project
+        run: |
+          mkdir -p /tmp/project
+          cd /tmp/project
+          supabase init --with-vscode-settings=false --with-intellij-settings=false
+          supabase start -x studio,imgproxy,edge-runtime,logflare,vector
+          supabase status
+      # The schema the reference brought with it, kept next to the
+      # recording, because a suite that writes rows into a table has to
+      # be written against the columns that table has. zou's own
+      # bootstrap is read against this rather than against a memory of
+      # what Supabase's migrations do.
+      - name: Keep the schema the reference made
+        run: |
+          for schema in storage auth; do
+            docker exec supabase_db_project pg_dump -U postgres \
+              --schema-only --schema="$schema" --no-owner --no-privileges postgres \
+              > "/tmp/$schema-schema.sql" || true
+            wc -l "/tmp/$schema-schema.sql"
+          done
+      - name: Record the suite
+        run: |
+          cargo run -p zou-conformance -- record \
+            --suite "${{ inputs.suite }}" \
+            --url "$CLI_URL" \
+            --dsn "$CLI_DSN" \
+            --name "supabase start" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET"
+          head -40 "/tmp/zou-conformance/suites/${{ inputs.suite }}/recorded.json"
+      # The whole output of the run, because the point of it is a file
+      # somebody reads and commits rather than a green tick.
+      - name: Keep what it wrote
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recording
+          path: |
+            /tmp/zou-conformance/suites/${{ inputs.suite }}/recorded.json
+            /tmp/storage-schema.sql
+            /tmp/auth-schema.sql
+          if-no-files-found: warn
+      - name: Keep what the stack was saying
+        if: failure()
+        run: |
+          docker ps -a || true
+          docker logs supabase_storage_project 2>&1 | tail -80 || true
