@@ -131,6 +131,13 @@ impl TenantLayout {
         format!("{}/shards/{shard:04x}/", self.prefix)
     }
 
+    /// The shard's manifest: the live layer list and the flush
+    /// watermark, the one mutable object in the shard prefix. CAS
+    /// swapped on every flush and compaction publish.
+    pub fn shard_manifest(&self, shard: u16) -> String {
+        format!("{}SHARD", self.shard_prefix(shard))
+    }
+
     /// A delta layer object. The name is the coverage: the key range
     /// and lsn range the layer holds, so a listing alone rebuilds the
     /// layer map without opening anything.
@@ -170,10 +177,13 @@ impl TenantLayout {
         )
     }
 
-    /// Whether a key must never be overwritten. The manifest is the only
-    /// mutable object in the prefix.
+    /// Whether a key must never be overwritten. The tenant manifest
+    /// and the per shard manifests are the only mutable objects in the
+    /// prefix.
     pub fn is_immutable(&self, key: &str) -> bool {
-        key.starts_with(&self.prefix) && key != self.manifest()
+        key.starts_with(&self.prefix)
+            && key != self.manifest()
+            && !(key.ends_with("/SHARD") && key.starts_with(&format!("{}/shards/", self.prefix)))
     }
 }
 
@@ -203,6 +213,7 @@ mod tests {
             "tenants/acme-prod/files/avatars/u1/pic.png"
         );
         assert_eq!(t.shard_prefix(3), "tenants/acme-prod/shards/0003/");
+        assert_eq!(t.shard_manifest(3), "tenants/acme-prod/shards/0003/SHARD");
         let lo = LayerKey::page(1663, 5, 16384, 0, 0);
         let hi = LayerKey::page(1663, 5, 16384, 0, 8191);
         assert_eq!(
@@ -227,9 +238,10 @@ mod tests {
     }
 
     #[test]
-    fn only_the_manifest_is_mutable() {
+    fn only_the_manifests_are_mutable() {
         let t = TenantLayout::new("acme");
         assert!(!t.is_immutable(&t.manifest()));
+        assert!(!t.is_immutable(&t.shard_manifest(7)));
         assert!(t.is_immutable(&t.checkpoint_page_index("chk-1")));
         assert!(t.is_immutable(&t.manifest_history(1, 1000)));
         let k = LayerKey::page(1, 1, 1, 0, 0);

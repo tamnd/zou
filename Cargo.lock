@@ -2018,6 +2018,7 @@ dependencies = [
  "env_logger",
  "log",
  "tempfile",
+ "thiserror",
  "zou-log",
  "zou-store",
 ]
