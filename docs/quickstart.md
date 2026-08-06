@@ -426,6 +426,7 @@ Four routes sit outside the apikey check, and every one of them is outside it be
 
 ## Where to go next
 
+- docs/compatibility.md for what a project moving off Supabase will notice, and what is still missing
 - docs/architecture.md for the shape of the whole system
 - docs/storage-engine.md for the manifest, lease, WAL, checkpoint, and branching design
 - docs/postgres.md for the patch series and the storage manager shim
