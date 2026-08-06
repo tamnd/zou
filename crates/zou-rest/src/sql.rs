@@ -422,15 +422,24 @@ pub(crate) fn field_expr(
     path: &[JsonStep],
     to_json: bool,
 ) -> String {
+    let mut base = String::new();
+    if let Some(q) = qualifier {
+        base.push_str(&quote_ident(q));
+        base.push('.');
+    }
+    base.push_str(&quote_ident(column));
+    path_expr(&base, path, to_json)
+}
+
+/// The same json path over an expression the caller wrote itself,
+/// for the places where what is being stepped into is a call rather
+/// than a column reference.
+pub(crate) fn path_expr(base: &str, path: &[JsonStep], to_json: bool) -> String {
     let mut out = String::new();
     if to_json && !path.is_empty() {
         out.push_str("to_jsonb(");
     }
-    if let Some(q) = qualifier {
-        out.push_str(&quote_ident(q));
-        out.push('.');
-    }
-    out.push_str(&quote_ident(column));
+    out.push_str(base);
     if to_json && !path.is_empty() {
         out.push(')');
     }

@@ -52,7 +52,9 @@ use crate::catalog::{Catalog, Column, Details, EmbedError, Kind, Rel, Relation};
 use crate::filter::{Node, Op, Value};
 use crate::order::{Direction, Nulls, Term};
 use crate::select::{Col, Embed, Item, Join};
-use crate::sql::{CompileError, EmbedTest, Sql, field_expr, quote_ident, where_clause_over};
+use crate::sql::{
+    CompileError, EmbedTest, Sql, field_expr, path_expr, quote_ident, where_clause_over,
+};
 
 /// Why a query cannot plan: a relationship problem with its PGRST
 /// code, a filter that cannot compile, or a shape the planner
@@ -474,6 +476,10 @@ impl Planner<'_> {
         let mut embeds: Vec<Embedded> = Vec::new();
 
         let rel = self.catalog.relation(table);
+        // Whether this level reads a mutation or an rpc CTE instead
+        // of its own table, which is what decides how a name the
+        // relation has no column for is written out.
+        let source = self.q.source.is_some() && path.is_empty();
         for item in items {
             match item {
                 // A relation with a column that is written out
@@ -501,7 +507,7 @@ impl Planner<'_> {
                         keys: Vec::new(),
                     }),
                 },
-                Item::Col(c) => cols.push(self.col(alias, rel, c)?),
+                Item::Col(c) => cols.push(self.col(table, alias, rel, source, c)?),
                 Item::Embed(e) => self.embed(
                     table,
                     alias,
@@ -783,16 +789,24 @@ impl Planner<'_> {
     /// postgres for the key `0::int` and hand back the text it found
     /// there. Upstream writes `CAST( ... AS ... )` around the whole
     /// field for the same reason.
-    fn col(&self, alias: &str, rel: Option<&Relation>, c: &Col) -> Result<OutCol, PlanError> {
+    fn col(
+        &self,
+        table: &str,
+        alias: &str,
+        rel: Option<&Relation>,
+        source: bool,
+        c: &Col,
+    ) -> Result<OutCol, PlanError> {
         let mut expr = match &c.field {
             Some(f) => {
                 let json = rel.is_none_or(|r| r.steps_as_json(&f.name));
-                let mut e = match rel.filter(|_| c.agg.is_none() && f.path.is_empty()) {
-                    Some(rel) => match rel.column(&f.name) {
-                        Some(col) => represented(alias, col),
-                        None => field_expr(Some(alias), &f.name, &f.path, json),
-                    },
-                    None => field_expr(Some(alias), &f.name, &f.path, json),
+                let known = rel.and_then(|r| r.column(&f.name));
+                let mut e = match known {
+                    Some(col) if c.agg.is_none() && f.path.is_empty() => represented(alias, col),
+                    None if source && rel.is_some() => {
+                        path_expr(&computed(table, alias, &f.name), &f.path, json)
+                    }
+                    _ => field_expr(Some(alias), &f.name, &f.path, json),
                 };
                 if let Some(cast) = &f.cast {
                     if !f.path.is_empty() {
@@ -1010,6 +1024,27 @@ fn represented(alias: &str, col: &Column) -> String {
         Some(func) => format!("{func}({plain})"),
         None => plain,
     }
+}
+
+/// A name a level reads off a source that the relation has no column
+/// for: a computed column, written as the call it is, with the row
+/// cast to the relation the function was declared over.
+///
+/// Over a real table `z0.name` means that same call and postgres
+/// resolves it. Over a mutation or an rpc CTE the row is an anonymous
+/// record, and attribute notation on one of those resolves only while
+/// exactly one function of the name exists: with two overloads
+/// postgres reports the column as missing rather than pick one. The
+/// cast is what `link_sql` writes for a computed relationship, for
+/// the same reason. Only the select list is written this way, since
+/// that is where a computed column is asked for by name.
+fn computed(table: &str, alias: &str, name: &str) -> String {
+    format!(
+        "{}({}::{})",
+        quote_ident(name),
+        quote_ident(alias),
+        quote_ident(table)
+    )
 }
 
 /// What a level reads from: its table, the source relation when the
@@ -1332,6 +1367,28 @@ mod tests {
     fn painted_text(table: &str, sel: &str) -> String {
         let q = query(table, sel);
         plan(&painted(), &q).unwrap_or_else(|e| panic!("{e}")).text
+    }
+
+    /// A name the relation has no column for is a computed column,
+    /// and over a source it has to be written as the call it means,
+    /// because the row it would otherwise be read off has no type of
+    /// its own for postgres to look the name up on.
+    #[test]
+    fn a_computed_column_over_a_source_is_called_on_the_row_cast_back() {
+        let mut q = query("todos", "id,priority");
+        q.source = Some("_zou_mut".into());
+        let sql = plan(&painted(), &q).unwrap_or_else(|e| panic!("{e}")).text;
+        assert_eq!(
+            sql,
+            r#"select "z0"."id" as "id", "priority"("z0"::"todos") as "priority" from "_zou_mut" as "z0""#
+        );
+        // Over its own table it stays attribute notation, which is
+        // the same call written the shorter way.
+        assert!(
+            painted_text("todos", "id,priority").contains(r#""todos"."priority" as "priority""#),
+            "{}",
+            painted_text("todos", "id,priority")
+        );
     }
 
     #[test]
