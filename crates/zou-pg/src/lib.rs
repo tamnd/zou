@@ -106,7 +106,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use zou_log::{
     AppendError, AppendTicket, MediaSink, Sequencer, WalMedia, consolidate, gc_landing, stream_end,
@@ -115,6 +115,7 @@ use zou_log::{
 use zou_store::heartbeat::Heartbeat;
 use zou_store::layout::TenantLayout;
 use zou_store::lease;
+use zou_store::stats;
 use zou_store::{CasStore, Frame2, HeldLease, Lsn, Manifest, open_store, tenant_id};
 
 /// Postgres BLCKSZ. The patch checks this against its own BLCKSZ at init.
@@ -515,6 +516,13 @@ pub unsafe extern "C" fn zou_smgr_nblocks(
     })
 }
 
+/// One page served by one tier: the page count and the call sample
+/// together, the single block read shape.
+fn note_read(tier: stats::ReadTier, pages: u64, started: Instant) {
+    stats::note_read_pages(tier, pages);
+    stats::note_read_call(tier, started.elapsed());
+}
+
 /// Read one page into `buf`. An absent block object reads as zeros,
 /// matching md's file hole semantics for blocks extended but not yet
 /// written. `durable_lsn` is the wal pusher's published durable LSN at
@@ -539,14 +547,18 @@ pub unsafe extern "C" fn zou_smgr_read(
             return ZOU_ERR_BAD_ARGUMENT;
         }
         let out = unsafe { std::slice::from_raw_parts_mut(buf, ZOU_PAGE_SIZE) };
+        let started = Instant::now();
+        let ops_before = stats::thread_ops();
         if let Some(page) = pending_page(shim, (spc, db, rel, fork), blk) {
             out.copy_from_slice(&page);
+            note_read(stats::ReadTier::Cache, 1, started);
             return ZOU_OK;
         }
         if let Some(cache) = &shim.cache
             && let Some(page) = cache.load((spc, db, rel, fork), blk)
         {
             out.copy_from_slice(&page);
+            note_read(stats::ReadTier::Cache, 1, started);
             return ZOU_OK;
         }
         let r = walscan::BlockRef {
@@ -562,6 +574,15 @@ pub unsafe extern "C" fn zou_smgr_read(
                 if let Some(cache) = &shim.cache {
                     cache.save((spc, db, rel, fork), blk, &page);
                 }
+                // Slab misses and barrier probes both leave the
+                // process, the op delta is what tells a local
+                // reconstruction from one that paid a round trip.
+                let tier = if stats::thread_ops() > ops_before {
+                    stats::ReadTier::Store
+                } else {
+                    stats::ReadTier::Local
+                };
+                note_read(tier, 1, started);
                 return ZOU_OK;
             }
             Ok(None) => {}
@@ -576,6 +597,7 @@ pub unsafe extern "C" fn zou_smgr_read(
                 if let Some(cache) = &shim.cache {
                     cache.save((spc, db, rel, fork), blk, &data);
                 }
+                note_read(stats::ReadTier::Store, 1, started);
                 ZOU_OK
             }
             Ok(Some(_)) => ZOU_ERR_STORE,
@@ -585,6 +607,7 @@ pub unsafe extern "C" fn zou_smgr_read(
                 // is known and zeros cached across a truncate and
                 // re-extend would need their own invalidation.
                 out.fill(0);
+                note_read(stats::ReadTier::Store, 1, started);
                 ZOU_OK
             }
             Err(_) => ZOU_ERR_STORE,
@@ -619,18 +642,24 @@ pub unsafe extern "C" fn zou_smgr_readv(
         if ptrs.iter().any(|p| p.is_null()) {
             return ZOU_ERR_BAD_ARGUMENT;
         }
+        let started = Instant::now();
+        let ops_before = stats::thread_ops();
+        let mut cache_pages = 0u64;
+        let mut chain_pages = 0u64;
         let mut misses: Vec<(usize, u32)> = Vec::new();
         for (i, ptr) in ptrs.iter().enumerate() {
             let out = unsafe { std::slice::from_raw_parts_mut(*ptr, ZOU_PAGE_SIZE) };
             let b = blk + i as u32;
             if let Some(page) = pending_page(shim, (spc, db, rel, fork), b) {
                 out.copy_from_slice(&page);
+                cache_pages += 1;
                 continue;
             }
             if let Some(cache) = &shim.cache
                 && let Some(page) = cache.load((spc, db, rel, fork), b)
             {
                 out.copy_from_slice(&page);
+                cache_pages += 1;
                 continue;
             }
             let r = walscan::BlockRef {
@@ -646,6 +675,7 @@ pub unsafe extern "C" fn zou_smgr_readv(
                     if let Some(cache) = &shim.cache {
                         cache.save((spc, db, rel, fork), b, &page);
                     }
+                    chain_pages += 1;
                 }
                 Ok(None) => misses.push((i, b)),
                 Err(()) => return ZOU_ERR_STORE,
@@ -679,7 +709,25 @@ pub unsafe extern "C" fn zou_smgr_readv(
                 }
             }
         });
-        if ok { ZOU_OK } else { ZOU_ERR_STORE }
+        if !ok {
+            return ZOU_ERR_STORE;
+        }
+        // Pages count where they were served, the call lands once
+        // under the slowest tier it touched. The parallel gets run on
+        // pool threads the op delta cannot see, but a nonempty miss
+        // list is a store trip by construction.
+        stats::note_read_pages(stats::ReadTier::Cache, cache_pages);
+        stats::note_read_pages(stats::ReadTier::Local, chain_pages);
+        stats::note_read_pages(stats::ReadTier::Store, misses.len() as u64);
+        let tier = if !misses.is_empty() || stats::thread_ops() > ops_before {
+            stats::ReadTier::Store
+        } else if chain_pages > 0 {
+            stats::ReadTier::Local
+        } else {
+            stats::ReadTier::Cache
+        };
+        stats::note_read_call(tier, started.elapsed());
+        ZOU_OK
     })
 }
 
