@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize};
 
 /// Which key a request is sent with. `anon` and `service` are the two
 /// keys a Supabase project hands out, `authenticated` is a key signed
-/// with the same secret carrying the role a signed in person gets, and
-/// `none` sends neither, which is how the gate itself gets tested.
+/// with the same secret carrying the role a signed in person gets,
+/// `user` is an access token for the person a suite seeded, and `none`
+/// sends neither, which is how the gate itself gets tested.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Key {
@@ -29,6 +30,7 @@ pub enum Key {
     Anon,
     Authenticated,
     Service,
+    User,
     None,
 }
 
@@ -60,6 +62,18 @@ pub struct Case {
     /// rather than against whatever the case before it left.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub writes: bool,
+    /// The values in this answer that no two runs agree on, as json
+    /// pointers into the body. Each one is replaced by the name of what
+    /// it looked like before anything is compared, so a token still has
+    /// to be a token and an id still has to be an id.
+    ///
+    /// A suite over a table can pin its answers down in setup.sql and
+    /// none of these are needed. A suite over an auth server cannot: it
+    /// answers with a token it just signed and a row it just made, and
+    /// the alternative to naming those values is not comparing the
+    /// answer at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volatile: Vec<String>,
 }
 
 fn get() -> String {
@@ -81,7 +95,28 @@ pub struct Cases {
     /// that name rather than under Supabase's.
     #[serde(default = "anon")]
     pub anon_role: String,
+    /// The person the suite seeded, when it seeded one. The `user` key
+    /// is an access token for them, minted from the same secret every
+    /// target is configured with, so a case can ask an endpoint that
+    /// wants a signed in caller without a case before it having signed
+    /// anybody in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<User>,
     pub cases: Vec<Case>,
+}
+
+/// Enough of a seeded person to sign a token for them. Every field is
+/// a row setup.sql wrote, so what the token claims and what the
+/// database holds are the same thing by construction.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct User {
+    pub id: String,
+    pub email: String,
+    /// The session the token belongs to. GoTrue writes one on every
+    /// sign in and reads it back on the endpoints that can end a
+    /// session, so a token without one is a token half the surface
+    /// refuses.
+    pub session_id: String,
 }
 
 fn conformance_schemas() -> Vec<String> {

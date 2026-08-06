@@ -149,6 +149,10 @@ pub fn derive(from: &Path, suite: &str) -> Result<Derived, String> {
             note: note(&skipped, guessed),
             schemas: vec!["test".to_string()],
             anon_role: "postgrest_test_anonymous".to_string(),
+            // Upstream's fixtures pin every row down, so nothing a
+            // derived case reads moves and there is nobody to sign a
+            // token for.
+            user: None,
             cases,
         },
         skipped,
@@ -715,6 +719,7 @@ fn request(bytes: &[char], at: usize, method: &str, spec: &Spec, it: &str) -> Re
         body,
         note: None,
         writes,
+        volatile: Vec::new(),
     })
 }
 
