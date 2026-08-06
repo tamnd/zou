@@ -145,13 +145,26 @@ impl Target {
                 .header("apikey", key)
                 .header("authorization", format!("Bearer {key}"));
         }
-        for (name, value) in &case.headers {
-            request = request.header(name, value);
-        }
         let body = case.body.clone().unwrap_or_default();
-        let request = request
+        let mut request = request
             .body(body)
             .map_err(|e| format!("{}: building {} {}: {e}", self.name, case.method, url))?;
+        // Replacing rather than adding, so that a case that writes its
+        // own authorization is asked with that one and not with two.
+        // The apikey the key put on stays, which is the point: a case
+        // about a missing or malformed token has to get past the
+        // gateway to be a case about the token at all, and the hosted
+        // gateway is in front of the reference too even though the
+        // reference here is a bare binary with nothing in front of it.
+        for (name, value) in &case.headers {
+            let name: ureq::http::HeaderName = name
+                .parse()
+                .map_err(|e| format!("{}: {}: header {name}: {e}", self.name, case.name))?;
+            let value: ureq::http::HeaderValue = value
+                .parse()
+                .map_err(|e| format!("{}: {}: header {name}: {e}", self.name, case.name))?;
+            request.headers_mut().insert(name, value);
+        }
         let response = self
             .agent
             .run(request)
