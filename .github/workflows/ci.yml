@@ -548,6 +548,15 @@ jobs:
           open(path, "w").write("".join(out))
           PY
           grep -A 8 '^\[api\]' supabase/config.toml
+          # The fixture goes in as a migration rather than being applied
+          # afterwards, because PostgREST refuses to become healthy while
+          # a schema it was told to serve does not exist, and the CLI
+          # will not finish starting until it is healthy. The harness
+          # applies it again over the reference dsn before it asks
+          # anything, which is what it does for every target, and the
+          # file is written to be applied twice.
+          cp /tmp/zou-conformance/suites/rest/setup.sql \
+            supabase/migrations/20200101000000_conformance.sql
           supabase start -x studio,imgproxy,edge-runtime,logflare,vector
           supabase status
       - name: Diff the rest suite against the stack a person gets
