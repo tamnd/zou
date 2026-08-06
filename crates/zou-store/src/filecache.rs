@@ -342,12 +342,16 @@ fn scan(
         if meta.is_dir() {
             scan(root, &entry.path(), found)?;
         } else if meta.is_file() {
+            // Keys always use forward slashes, whatever the platform's
+            // separator is.
             let rel = entry
                 .path()
                 .strip_prefix(root)
                 .expect("under the root")
-                .to_string_lossy()
-                .into_owned();
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             // Temp files from a crashed fill are garbage, not entries.
             if cacheable(&rel) {
                 found.push((rel, meta.len(), meta.modified()?));
