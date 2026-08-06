@@ -96,6 +96,8 @@ cargo run -p zou-conformance -- check --suite rest \
 
 Point it at `supabase start`, at a hosted project, or at `zou dev`, and it asks the same questions of each. A target that does not serve under `/rest/v1`, a bare PostgREST for instance, takes `--strip-prefix /rest/v1`, and `diff` asks two targets and compares them with each other rather than with a recording.
 
+CI does the first of those on every push: `supabase start` at the pinned CLI version, the rest suite asked of it and of zou, and the two answers compared with each other rather than with a file. It is a stronger question than the PostgREST binary the job next to it downloads, because a stack has a gateway in front of it and serves `/rest/v1` because something put it there. The hosted target is the one CI cannot have, since it is somebody's account and somebody's key.
+
 That is the whole design: the recordings belong to upstream, they live in their own repository pinned to a commit here, and bumping the pin is a diff somebody reads.
 
 ## How this page stays true

@@ -239,6 +239,33 @@ The token for the seeded person is minted by the harness from the same secret bo
 A case about a missing or malformed token still names a key, so that the apikey goes out and the answer is about the token rather than about the gateway, and the case's own `authorization` header replaces the key's rather than being sent next to it.
 That distinction has to be made here because zou is the gateway as well as the server, and a bare GoTrue has no apikey gate at all.
 
+## The suite compared with the stack rather than the binary
+
+Everything above compares zou with a binary the job downloaded and configured on a flag line.
+That is the same code a local Supabase project runs and it is not the same thing.
+A project gets a gateway in front, the image list the CLI pins, and the api under `/rest/v1` because something put it there rather than because a suite asked for it.
+
+So the `rest` suite is also diffed against `supabase start` itself, at the CLI version pinned in `versions.json` next to the images it brings.
+The generated config is used with one line changed, the schema list, because PostgREST only serves the schemas it was told about and the suite keeps its tables in a schema of its own.
+
+```
+supabase init
+supabase start
+
+cargo run -p zou-conformance -- diff --suite rest \
+  --zou-dsn postgresql://postgres@127.0.0.1:5432/postgres \
+  --reference-url http://127.0.0.1:54321 \
+  --reference-name "supabase start" \
+  --reference-dsn postgresql://postgres:postgres@127.0.0.1:54322/postgres
+```
+
+The fixture goes into `supabase/migrations` rather than being applied afterwards.
+PostgREST will not report itself healthy while a schema it was told to serve does not exist, and `supabase start` does not finish until every container is healthy, so a fixture applied after the stack is up never gets a stack that is up.
+The harness applies it again over the reference dsn before it asks anything, the same as it does for every target, and the file drops what it creates first.
+
+A hosted project is the third target the harness takes and the one CI cannot have, because it is somebody's account and somebody's key.
+The command is the same with the url and the keys of that project, and it is worth saying out loud that `setup.sql` drops and creates schemas, so it wants a project made for the purpose rather than one with anything in it.
+
 ## The suite asked from somewhere else
 
 Every suite above is asked by this harness, over an HTTP client written here.
