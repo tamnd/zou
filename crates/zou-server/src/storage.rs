@@ -174,6 +174,20 @@ impl StorageError {
         }
     }
 
+    /// Not recorded. A cursor that does not read as one is a cursor
+    /// from somewhere else, and this is the shape upstream refuses it
+    /// in. The sentence is built the same way, out of the name of the
+    /// parameter, and the error name is the code because nothing set a
+    /// friendlier one.
+    pub(crate) fn invalid_cursor() -> Self {
+        StorageError {
+            status: 400,
+            error: "InvalidParameter",
+            message: "Invalid Parameter continuation token".to_string(),
+            code: "InvalidParameter",
+        }
+    }
+
     pub(crate) fn internal(message: String) -> Self {
         StorageError {
             status: 500,

@@ -800,6 +800,13 @@ pub fn router(cfg: Config) -> Result<Router, String> {
             "/storage/v1/object/{bucket}",
             axum::routing::delete(object::remove_many),
         )
+        // The two listings, which are both posts because what they ask
+        // for is a body rather than a path. They are literal segments
+        // ahead of the bucket placeholder for the same reason `public`
+        // is, so a bucket called `list` is another bucket nobody can
+        // name here.
+        .route("/storage/v1/object/list/{bucket}", post(object::list))
+        .route("/storage/v1/object/list-v2/{bucket}", post(object::list_v2))
         .route(
             "/storage/v1/object/{bucket}/{*name}",
             get(object::download)

@@ -242,6 +242,12 @@ async fn the_storage_surface_refuses_in_its_own_words_rather_than_the_gates() {
         ("PUT", "/storage/v1/object/photos/cat.png"),
         ("DELETE", "/storage/v1/object/photos/cat.png"),
         ("DELETE", "/storage/v1/object/photos"),
+        // And both listings, which read theirs before they read the
+        // body. A bucket called `list` would land here rather than on
+        // the route that carries bytes, which is upstream's arrangement
+        // too and the reason these two paths are worth naming.
+        ("POST", "/storage/v1/object/list/photos"),
+        ("POST", "/storage/v1/object/list-v2/photos"),
     ] {
         let answer = bare(&app, method, path).await;
         assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{method} {path}");
