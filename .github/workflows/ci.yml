@@ -305,6 +305,12 @@ jobs:
       # number leaves no diff and there is no commit. The skip marker
       # keeps the one that does from starting the whole workflow again
       # to measure what it just measured.
+      #
+      # A merge landing while this job measures moves main under it and
+      # the push comes back rejected. The retry rebases, and gives way
+      # if the file has been written in the meantime, because whoever
+      # wrote it did so for a later commit than this one and the older
+      # numbers are the ones worth losing.
       - name: Commit it if a number moved
         run: |
           git config user.name "github-actions[bot]"
@@ -315,7 +321,24 @@ jobs:
           fi
           git add docs/scoreboard.md
           git commit -m "Scoreboard for ${GITHUB_SHA:0:12} [skip ci]"
-          git push origin HEAD:main
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "main moved, attempt $attempt"
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort
+              echo "a later run wrote the scoreboard first, leaving it"
+              exit 0
+            fi
+            if git diff --quiet origin/main -- docs/scoreboard.md; then
+              echo "a later run wrote the same numbers, nothing to push"
+              exit 0
+            fi
+          done
+          echo "main kept moving, the next merge will measure this again"
+          exit 1
 
   s3-contract:
     name: s3 contract (minio)
