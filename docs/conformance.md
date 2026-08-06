@@ -168,6 +168,10 @@ A suite may also carry a `reset.sql`, which the `postgrest` suite does.
 It is applied before every case that writes, so that a case is asked against the rows it was written against rather than against what the twenty cases before it left behind.
 Upstream gets that for free by rolling every transaction back; here the answers are recorded, so the rows go back the hard way, and identically for both targets.
 
+A case may say `chained`, which means it is asked against what the case before it left rather than against the fixture.
+Almost nothing needs it, and the things that do could not be asked without it: a fixture writes rows, and there is no way to write bytes into the object store behind a reference from SQL, so the only way to ask what a copy of an object does is to upload one and then copy it.
+The cost is that a chain is order dependent in a way the rest of a suite is not, so a chain should be short, should sit together in the file, and should start with a case that resets like any other.
+
 ## The suite derived from upstream
 
 The `rest` suite is hand written, 82 cases about the surface a Supabase project actually uses.

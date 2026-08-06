@@ -408,6 +408,7 @@ mod tests {
             body: None,
             note: None,
             writes: false,
+            chained: false,
             volatile: Vec::new(),
         }
     }

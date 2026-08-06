@@ -719,6 +719,7 @@ fn request(bytes: &[char], at: usize, method: &str, spec: &Spec, it: &str) -> Re
         body,
         note: None,
         writes,
+        chained: false,
         volatile: Vec::new(),
     })
 }
