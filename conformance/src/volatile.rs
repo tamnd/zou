@@ -79,10 +79,11 @@ fn walk(value: &mut Value, steps: &[&str]) {
 /// What a value looked like, in as much detail as can be checked
 /// without knowing what it was.
 ///
-/// The three string shapes are the three things an auth answer carries
-/// that move: the id of a row, the time it was made, and a token. Each
-/// is told apart by its own spelling rather than by the key it sat
-/// under, so a uuid that arrives where a timestamp belongs says so.
+/// The string shapes are the things an answer carries that move: the id
+/// of a row, the time it was made, a token, and a url with a token on
+/// the end. Each is told apart by its own spelling rather than by the
+/// key it sat under, so a uuid that arrives where a timestamp belongs
+/// says so.
 fn shape(value: &Value) -> String {
     match value {
         Value::Null => "<null>".to_string(),
@@ -90,21 +91,32 @@ fn shape(value: &Value) -> String {
         Value::Number(_) => "<number>".to_string(),
         Value::Array(items) => format!("<array of {}>", items.len()),
         Value::Object(_) => "<object>".to_string(),
-        Value::String(text) => string_shape(text).to_string(),
+        Value::String(text) => string_shape(text),
     }
 }
 
-fn string_shape(text: &str) -> &'static str {
+fn string_shape(text: &str) -> String {
     if is_uuid(text) {
-        return "<uuid>";
+        return "<uuid>".to_string();
     }
     if is_jwt(text) {
-        return "<jwt>";
+        return "<jwt>".to_string();
     }
     if is_timestamp(text) {
-        return "<timestamp>";
+        return "<timestamp>".to_string();
     }
-    "<string>"
+    // A signed url is a path with a token on the end, and only the
+    // token moves. Naming the whole of it `<string>` would give up the
+    // route it points at, the bucket, and the name, which is most of
+    // what the answer was for. So the token is named and the rest is
+    // compared, and a url that starts pointing somewhere else is a
+    // difference again.
+    if let Some((path, token)) = text.split_once("?token=")
+        && is_jwt(token)
+    {
+        return format!("{path}?token=<jwt>");
+    }
+    "<string>".to_string()
 }
 
 /// 8-4-4-4-12 hex, which is the one spelling postgres and Go both use.
@@ -245,6 +257,21 @@ mod tests {
         assert_eq!(string_shape("2026-08-06 04:18:47.123+00"), "<timestamp>");
         assert_eq!(string_shape("2026-08-06"), "<string>");
         assert_eq!(string_shape("bearer"), "<string>");
+    }
+
+    /// The path a signed url points at is not volatile and is most of
+    /// what the answer said.
+    #[test]
+    fn a_signed_url_keeps_everything_but_its_token() {
+        assert_eq!(
+            string_shape("/object/sign/notes/hello.txt?token=aaa.bbb.ccc"),
+            "/object/sign/notes/hello.txt?token=<jwt>"
+        );
+        // Not a token, so not a signed url, so nothing to keep.
+        assert_eq!(
+            string_shape("/object/sign/notes/hello.txt?token="),
+            "<string>"
+        );
     }
 
     /// An index reaches one element, which is what an answer with a

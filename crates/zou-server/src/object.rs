@@ -254,6 +254,21 @@ async fn refuse<T>(sess: Session, why: StorageError) -> Result<T, StorageError> 
     done(sess, Err(why)).await
 }
 
+/// A connection with nobody's policies on it.
+///
+/// Two things want one. A public read is not made on anybody's behalf,
+/// and the policies on these tables are written about callers who said
+/// who they were. A signed url has already said everything it is going
+/// to say: the token names the object, and asking the policies again
+/// would refuse the one caller the url was signed for.
+async fn superuser(app: &App) -> Result<Session, StorageError> {
+    let pool = app
+        .pool
+        .as_ref()
+        .ok_or_else(|| StorageError::internal("zou is running without a database".to_string()))?;
+    pool.admin().await.map_err(|e| pg_error(&e))
+}
+
 /// The transaction a read runs in, and who it runs as.
 ///
 /// Everything about the two doors that differs is here. What follows it
@@ -264,15 +279,7 @@ async fn read_session(
     bucket: &str,
     door: Door,
 ) -> Result<Session, StorageError> {
-    let public_read = async || {
-        let pool = app.pool.as_ref().ok_or_else(|| {
-            StorageError::internal("zou is running without a database".to_string())
-        })?;
-        // No role and no claims: a public read is not made on anybody's
-        // behalf, and the policies on these tables are written about
-        // callers who said who they were.
-        pool.admin().await.map_err(|e| pg_error(&e))
-    };
+    let public_read = async || superuser(app).await;
     match door {
         Door::Public => {
             let sess = public_read().await?;
@@ -409,9 +416,24 @@ async fn send(
     name: &str,
     door: Door,
 ) -> Result<Response, StorageError> {
-    let blobs = blobs(app)?;
     let row = read_row(app, parts, bucket, name, door).await?;
+    deliver(app, parts, &row, None).await
+}
 
+/// The bytes of a row that has already been found and allowed.
+///
+/// `until` is the moment a signed url stops working, and it is the one
+/// thing this answer has that a plain download does not: upstream sends
+/// `Expires` instead of `Cache-Control` when a request arrived on a
+/// token, because what a shared cache may keep is decided by the url's
+/// own lifetime rather than by what the upload said about caching.
+async fn deliver(
+    app: &App,
+    parts: &Parts,
+    row: &ObjectRow,
+    until: Option<String>,
+) -> Result<Response, StorageError> {
+    let blobs = blobs(app)?;
     let mime = row.meta("mimetype");
     let mime = mime.as_str().unwrap_or_default();
     let cache = row.meta("cacheControl");
@@ -456,8 +478,11 @@ async fn send(
     let mut answer = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, served_type(mime))
-        .header(header::CACHE_CONTROL, cache)
         .header(header::ACCEPT_RANGES, "bytes");
+    answer = match &until {
+        Some(when) => answer.header(header::EXPIRES, when),
+        None => answer.header(header::CACHE_CONTROL, cache),
+    };
     if let Some(range) = content_range {
         answer = answer.header(header::CONTENT_RANGE, range);
     }
@@ -1187,7 +1212,6 @@ async fn store(
     replace: bool,
 ) -> Result<Response, StorageError> {
     let (ctx, verified) = caller(app, &parts)?;
-    let blobs = blobs(app)?;
     let upload = read_upload(&parts, body).await?;
     // An upload with no header on it still writes an empty object
     // rather than a null. Upstream does it by spreading a value that is
@@ -1205,14 +1229,57 @@ async fn store(
         .to_string();
 
     let sess = begin(app, &ctx, false).await?;
+    let id = write(
+        app,
+        sess,
+        Some(&ctx.role),
+        bucket,
+        name,
+        upload,
+        attached,
+        &sub,
+        replace,
+    )
+    .await?;
+    let answer = format!(
+        "{{\"Id\":{},\"Key\":{}}}",
+        Value::from(id),
+        Value::from(format!("{bucket}/{name}"))
+    );
+    Ok(ok(answer))
+}
+
+/// The row and the bytes, on a connection somebody else opened.
+///
+/// Both doors into an upload end here and write the same two things.
+/// What differs is whose policies the connection is under: a request
+/// carrying a token is under the caller's, and one carrying a signed
+/// url is under nobody's, because the url was checked instead. `role`
+/// is what says which of the two this is.
+///
+/// Returns the id of the row it wrote, having committed it and dropped
+/// whatever bytes it replaced.
+#[allow(clippy::too_many_arguments)]
+async fn write(
+    app: &App,
+    sess: Session,
+    role: Option<&str>,
+    bucket: &str,
+    name: &str,
+    upload: Upload,
+    attached: Option<String>,
+    sub: &str,
+    replace: bool,
+) -> Result<String, StorageError> {
+    let blobs = blobs(app)?;
     // With the policies out of the way, because a caller who may not
     // write into a bucket still hears that the bucket is there. The
     // refusal about the policies comes from the insert, in postgres's
     // own words.
-    let there = unpoliced(&sess, &ctx.role, async || {
-        bucket_public(&sess, bucket).await
-    })
-    .await?;
+    let there = match role {
+        Some(role) => unpoliced(&sess, role, async || bucket_public(&sess, bucket).await).await?,
+        None => bucket_public(&sess, bucket).await?,
+    };
     if there.is_none() {
         return refuse(sess, StorageError::no_such_bucket()).await;
     }
@@ -1249,7 +1316,10 @@ async fn store(
          returning id::text, version"
     );
     let rows = sess
-        .query(&sql, &[&bucket, &name, &sub, &written, &attached])
+        .query(
+            &sql,
+            &[&bucket, &name, &sub.to_string(), &written, &attached],
+        )
         .await
         .map_err(|e| duplicate_is_a_key(&e))?;
     let Some(row) = rows.first() else {
@@ -1271,11 +1341,6 @@ async fn store(
         let _ = sess.rollback().await;
         return Err(StorageError::internal(e.to_string()));
     }
-    let answer = format!(
-        "{{\"Id\":{},\"Key\":{}}}",
-        Value::from(id),
-        Value::from(format!("{bucket}/{name}"))
-    );
     done(sess, Ok(())).await?;
 
     // The version that was replaced, now that nothing points at it. A
@@ -1287,7 +1352,7 @@ async fn store(
     {
         let _ = blobs.delete(old.key()).await;
     }
-    Ok(ok(answer))
+    Ok(id)
 }
 
 /// Postgres's clock, so that the time in the metadata is the same clock
@@ -1379,7 +1444,7 @@ pub async fn move_object(
     let (ctx, _) = caller(&app, &parts)?;
     let asked = json_body(body).await?;
     if let Some(field) = missing(&asked, ["bucketId", "sourceKey", "destinationKey"]) {
-        return Err(StorageError::missing_field(field));
+        return Err(StorageError::missing_property("body", field));
     }
     let to = destination(&asked);
 
@@ -1432,7 +1497,7 @@ pub async fn copy_object(
     let blobs = blobs(&app)?;
     let asked = json_body(body).await?;
     if let Some(field) = missing(&asked, ["sourceKey", "bucketId", "destinationKey"]) {
-        return Err(StorageError::missing_field(field));
+        return Err(StorageError::missing_property("body", field));
     }
     let to = destination(&asked);
     let replace = parts
@@ -1552,6 +1617,433 @@ pub async fn copy_object(
     .to_string();
     done(sess, Ok(())).await?;
     Ok(ok(answer))
+}
+
+/// How long an upload url lasts, in seconds.
+///
+/// Nobody asks for this one and nothing in the request carries it:
+/// upstream reads `UPLOAD_SIGNED_URL_EXPIRATION_TIME` and the local
+/// stack sets nothing, so a minute is what every client gets.
+const UPLOAD_URL_SECONDS: i64 = 60;
+
+/// The last second a token may claim to be good until.
+///
+/// Upstream's ceiling is absolute rather than relative: javascript
+/// counts milliseconds in a double, so the last moment it can name is
+/// `Number.MAX_SAFE_INTEGER` of them, and a token asked to last past
+/// that is refused. What a request may ask for therefore shrinks by one
+/// second every second, which is copied rather than rounded off because
+/// the refusal at the edge is what a recording would show.
+const LAST_SECOND: i64 = 9_007_199_254_740;
+
+/// The seconds a signing request asked for, as far as the shape of the
+/// body can tell.
+///
+/// The ceiling is not checked here, and the split is not tidiness. Two
+/// refusals live in two different places upstream: everything about the
+/// shape is the route's schema and runs before the handler does, and the
+/// ceiling is the signer's and runs inside it. A body that is missing
+/// its paths and asks for an impossible lifetime hears about the paths,
+/// because the schema had its say first.
+fn expires_in(asked: &Value) -> Result<i64, StorageError> {
+    let Some(given) = asked.get("expiresIn") else {
+        return Err(StorageError::missing_property("body", "expiresIn"));
+    };
+    let Some(seconds) = given.as_i64() else {
+        return Err(StorageError::not_valid(
+            "body/expiresIn must be integer".to_string(),
+        ));
+    };
+    if seconds < 1 {
+        return Err(StorageError::not_valid(
+            "body/expiresIn must be >= 1".to_string(),
+        ));
+    }
+    Ok(seconds)
+}
+
+/// The other half: a lifetime that ends before the last moment a token
+/// may name. A parameter rather than a body, because the signer is
+/// where it is asked and the signer was handed a number rather than a
+/// request.
+fn within_reach(seconds: i64) -> Result<i64, StorageError> {
+    match seconds > LAST_SECOND - crate::auth::now() {
+        true => Err(StorageError::invalid_parameter("expiresIn")),
+        false => Ok(seconds),
+    }
+}
+
+/// The paths a list signing was asked about, or what their shape earns.
+///
+/// A thousand is the cap, and it is the same thousand a batch delete
+/// has: it is one number upstream keeps for how many objects a single
+/// request may name.
+fn asked_paths(asked: &Value) -> Result<Vec<String>, StorageError> {
+    let Some(paths) = asked.get("paths") else {
+        return Err(StorageError::missing_property("body", "paths"));
+    };
+    let Some(paths) = paths.as_array() else {
+        return Err(StorageError::not_valid(
+            "body/paths must be array".to_string(),
+        ));
+    };
+    for (at, path) in paths.iter().enumerate() {
+        if !path.is_string() {
+            return Err(StorageError::not_valid(format!(
+                "body/paths/{at} must be string"
+            )));
+        }
+    }
+    if paths.is_empty() {
+        return Err(StorageError::not_valid(
+            "body/paths must NOT have fewer than 1 items".to_string(),
+        ));
+    }
+    if paths.len() > MOST_OBJECTS {
+        return Err(StorageError::not_valid(format!(
+            "body/paths must NOT have more than {MOST_OBJECTS} items"
+        )));
+    }
+    Ok(paths
+        .iter()
+        .map(|path| path.as_str().unwrap_or_default().to_string())
+        .collect())
+}
+
+/// How many objects one request may name.
+const MOST_OBJECTS: usize = 1000;
+
+/// The token a download url carries.
+///
+/// `scope` is the newer half of this claim set and the reason a url can
+/// only do what it was signed for. Before it existed the two kinds of
+/// token were told apart by whether they carried `upsert`, which meant
+/// a read url handed to a browser was also an upload url if the browser
+/// thought to try one. Tokens without a scope are still read, as
+/// downloads when they carry no `upsert` and as uploads when they do,
+/// because upstream still reads them and a client's url should not stop
+/// working on the day this server replaces that one.
+fn download_token(app: &App, url: &str, seconds: i64) -> String {
+    let iat = crate::auth::now();
+    crate::jwt::mint(
+        &json!({"url": url, "scope": "download", "iat": iat, "exp": iat + seconds}),
+        &app.cfg.jwt_secret,
+    )
+}
+
+/// The token an upload url carries: who signed it, whether the upload
+/// it allows may replace what is there, and the same two bounds.
+fn upload_token(app: &App, url: &str, owner: &str, replace: bool) -> String {
+    let iat = crate::auth::now();
+    let mut claims = json!({
+        "url": url, "upsert": replace, "scope": "upload",
+        "iat": iat, "exp": iat + UPLOAD_URL_SECONDS,
+    });
+    // Absent rather than empty when the token was signed by something
+    // with no `sub`, which is what a service key is. `undefined` is not
+    // a value javascript writes into json either.
+    if !owner.is_empty()
+        && let Some(map) = claims.as_object_mut()
+    {
+        map.insert("owner".to_string(), Value::from(owner));
+    }
+    crate::jwt::mint(&claims, &app.cfg.jwt_secret)
+}
+
+/// A token read back, checked against what is being asked of it.
+///
+/// The order is upstream's and it is the order that keeps a refusal
+/// from saying more than it should. The signature first, so a token
+/// this server did not write is refused before a word of it is
+/// believed. Then the scope, so a read url cannot be spent on the
+/// upload route. Then the object it names, which is what stops one
+/// signed url from being a signed url for everything in the bucket. The
+/// clock is checked by the verifier, one step earlier than upstream
+/// checks it, and answers the same way because jose checks `exp` on the
+/// way in too.
+fn signed_claims(
+    app: &App,
+    token: &str,
+    url: &str,
+    scope: &str,
+) -> Result<serde_json::Value, StorageError> {
+    let verified = crate::jwt::verify(token, &app.cfg.jwt_secret)
+        .map_err(|why| StorageError::invalid_jwt(crate::storage::jose_words(&why).to_string()))?;
+    let claims = verified.claims;
+    let said = claims.get("scope").and_then(Value::as_str);
+    let legacy = claims.get("upsert").is_some();
+    let allowed = match scope {
+        "upload" => said == Some("upload") || (said.is_none() && legacy),
+        _ => said == Some("download") || (said.is_none() && !legacy),
+    };
+    if !allowed {
+        return Err(StorageError::invalid_signature(format!(
+            "Token is not scoped for {scope}"
+        )));
+    }
+    if claims.get("url").and_then(Value::as_str) != Some(url) {
+        return Err(StorageError::invalid_signature(
+            "Invalid signature".to_string(),
+        ));
+    }
+    Ok(claims)
+}
+
+/// One query string parameter, decoded.
+///
+/// No extractor, because these handlers already take the parts to read
+/// the authorization header out of them, and because two of the three
+/// parameters this surface has are optional.
+fn asked_for(parts: &Parts, name: &str) -> Option<String> {
+    parts.uri.query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (crate::rest::decode(key) == name).then(|| crate::rest::decode(value))
+    })
+}
+
+/// A moment as a browser writes it, which is what `Expires` wants and
+/// what `new Date(..).toUTCString()` produces.
+fn http_date(unix: i64) -> String {
+    const DAY: i64 = 86_400;
+    let days = unix.div_euclid(DAY);
+    let secs = unix.rem_euclid(DAY);
+    let weekday = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"][days.rem_euclid(7) as usize];
+    let (year, month, day) = crate::smtp::civil(days);
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][month as usize - 1];
+    format!(
+        "{weekday}, {day:02} {month} {year} {:02}:{:02}:{:02} GMT",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60
+    )
+}
+
+/// POST /storage/v1/object/sign/{bucket}/{name}
+///
+/// A url anybody can read the object with until it expires. What makes
+/// it safe to hand out is that it names one object and carries the
+/// moment it stops working, both signed with the project's own secret,
+/// so the route that spends it needs no policies and asks none.
+pub async fn sign(
+    State(app): State<Arc<App>>,
+    Path((bucket, name)): Path<(String, String)>,
+    parts: Parts,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let (ctx, _) = caller(&app, &parts)?;
+    let asked = json_body(body).await?;
+    let seconds = within_reach(expires_in(&asked)?)?;
+
+    let sess = begin(&app, &ctx, true).await?;
+    // Under the caller's own policies, and with nothing asked about the
+    // bucket. A bucket that is not there has no rows in it, so both
+    // questions have the same answer, and upstream asks the one.
+    let found = find(&sess, &bucket, &name).await;
+    if done(sess, found).await?.is_none() {
+        return Err(StorageError::no_such_key());
+    }
+    let url = format!("{bucket}/{name}");
+    let token = download_token(&app, &url, seconds);
+    Ok(ok(
+        json!({"signedURL": format!("/object/sign/{url}?token={token}")}).to_string(),
+    ))
+}
+
+/// POST /storage/v1/object/sign/{bucket}
+///
+/// The same thing for a list of names, and the reason it is a separate
+/// route is that the names are in the body rather than the path.
+///
+/// Every path asked about is answered, in the order it was asked, and a
+/// path with no object behind it is a sentence rather than a refusal:
+/// one name a caller cannot read does not spoil the urls for the ones
+/// they can.
+pub async fn sign_many(
+    State(app): State<Arc<App>>,
+    Path(bucket): Path<String>,
+    parts: Parts,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let (ctx, _) = caller(&app, &parts)?;
+    let asked = json_body(body).await?;
+    let seconds = expires_in(&asked)?;
+    let wanted = asked_paths(&asked)?;
+    let seconds = within_reach(seconds)?;
+
+    // One question for the whole list. Upstream asks in batches of a
+    // few hundred because its driver has a parameter limit to respect,
+    // and an array parameter is one parameter however long it is.
+    let sess = begin(&app, &ctx, true).await?;
+    let rows = sess
+        .query(
+            "select name from storage.objects
+             where bucket_id = $1 and name = any($2::text[])",
+            &[&bucket, &wanted],
+        )
+        .await
+        .map_err(|e| pg_error(&e));
+    let rows = done(sess, rows).await?;
+    let there: Vec<String> = rows.iter().map(|row| row.get(0)).collect();
+
+    let answers: Vec<Value> = wanted
+        .iter()
+        .map(|path| match there.iter().any(|name| name == path) {
+            true => {
+                let url = format!("{bucket}/{path}");
+                let token = download_token(&app, &url, seconds);
+                json!({
+                    "error": Value::Null,
+                    "path": path,
+                    "signedURL": format!("/object/sign/{url}?token={token}"),
+                })
+            }
+            false => json!({
+                "error": "Either the object does not exist or you do not have access to it",
+                "path": path,
+                "signedURL": Value::Null,
+            }),
+        })
+        .collect();
+    Ok(ok(Value::Array(answers).to_string()))
+}
+
+/// GET /storage/v1/object/sign/{bucket}/{name}
+///
+/// Spending one. There is no token in a header and no policy on the
+/// connection: the url said which object, this checks that it really
+/// said it, and the bytes go out.
+pub async fn signed_download(
+    State(app): State<Arc<App>>,
+    Path((bucket, name)): Path<(String, String)>,
+    parts: Parts,
+) -> Result<Response, StorageError> {
+    let Some(token) = asked_for(&parts, "token") else {
+        return Err(StorageError::missing_property("querystring", "token"));
+    };
+    let claims = signed_claims(&app, &token, &format!("{bucket}/{name}"), "download")?;
+    let until = claims.get("exp").and_then(Value::as_i64).map(http_date);
+
+    let sess = superuser(&app).await?;
+    let found = find(&sess, &bucket, &name).await;
+    let Some(row) = done(sess, found).await? else {
+        return Err(StorageError::no_such_key());
+    };
+    deliver(&app, &parts, &row, until).await
+}
+
+/// POST /storage/v1/object/upload/sign/{bucket}/{name}
+///
+/// A url somebody else can upload one object with. The lifetime is not
+/// theirs to pick and neither is the object: both are in the token, and
+/// so is whether the upload may replace what is there.
+///
+/// What this has to decide before signing is whether the caller could
+/// have done the upload themselves, which is asked by doing it and
+/// rolling it back. A permission this server cannot check by reading is
+/// checked by writing, because row level security is a rule about rows
+/// going in rather than a list this end holds.
+pub async fn sign_upload(
+    State(app): State<Arc<App>>,
+    Path((bucket, name)): Path<(String, String)>,
+    parts: Parts,
+) -> Result<Response, StorageError> {
+    let (ctx, verified) = caller(&app, &parts)?;
+    let replace = parts
+        .headers
+        .get("x-upsert")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|asked| asked.eq_ignore_ascii_case("true"));
+    let owner = verified
+        .claims
+        .get("sub")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let conflict = match replace {
+        true => {
+            "on conflict (bucket_id, name) do update
+                set version = excluded.version"
+        }
+        false => "",
+    };
+    let sql = format!(
+        "insert into storage.objects
+             (bucket_id, name, owner, owner_id, version)
+         values ($1, $2,
+                 case when $3::text ~*
+                     '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+                     then $3::text::uuid end,
+                 nullif($3::text, ''), '1')
+         {conflict}
+         returning id::text"
+    );
+    let sess = begin(&app, &ctx, false).await?;
+    let rows = sess.query(&sql, &[&bucket, &name, &owner]).await;
+    // Rolled back either way. Nothing here was meant to be kept: the
+    // row was a question about permission and the answer is whether
+    // postgres let it in.
+    let _ = sess.rollback().await;
+    let rows = rows.map_err(|e| match e.as_db_error().map(|db| db.code().code()) {
+        // The bucket in the path is not a bucket. Upstream does not ask
+        // about it either, so what a client hears is postgres noticing
+        // the row had nothing to belong to.
+        Some("23503") => StorageError::related_missing(),
+        _ => duplicate_is_a_key(&e),
+    })?;
+    // An upsert that conflicted with a row the policies hide writes
+    // nothing and says nothing, and upstream signs the url anyway. The
+    // upload itself runs with the policies off, so the url works: what
+    // the caller could not do by hand, the token lets them do. That is
+    // upstream's reading and this is not the place to change it.
+    if rows.is_empty() && !replace {
+        return Err(StorageError::access_denied(
+            "new row violates row-level security policy".to_string(),
+        ));
+    }
+
+    let url = format!("{bucket}/{name}");
+    let token = upload_token(&app, &url, &owner, replace);
+    Ok(ok(json!({
+        "url": format!("/object/upload/sign/{url}?token={token}"),
+        "token": token,
+    })
+    .to_string()))
+}
+
+/// PUT /storage/v1/object/upload/sign/{bucket}/{name}
+///
+/// Spending an upload url. The token is the whole of the permission, so
+/// this runs with the policies off and writes as whoever signed it,
+/// which is why the owner is in the token rather than read from a
+/// header nobody sent.
+pub async fn upload_signed(
+    State(app): State<Arc<App>>,
+    Path((bucket, name)): Path<(String, String)>,
+    parts: Parts,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let Some(token) = asked_for(&parts, "token") else {
+        return Err(StorageError::missing_property("querystring", "token"));
+    };
+    let claims = signed_claims(&app, &token, &format!("{bucket}/{name}"), "upload")?;
+    let owner = claims
+        .get("owner")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let replace = claims.get("upsert").and_then(Value::as_bool) == Some(true);
+
+    let upload = read_upload(&parts, body).await?;
+    let attached = user_metadata(&parts);
+    let sess = superuser(&app).await?;
+    write(
+        &app, sess, None, &bucket, &name, upload, attached, &owner, replace,
+    )
+    .await?;
+    Ok(ok(json!({"Key": format!("{bucket}/{name}")}).to_string()))
 }
 
 /// DELETE /storage/v1/object/{bucket}/{name}

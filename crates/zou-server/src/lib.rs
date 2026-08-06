@@ -812,6 +812,25 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         // id below them.
         .route("/storage/v1/object/move", post(object::move_object))
         .route("/storage/v1/object/copy", post(object::copy_object))
+        // Signing, and spending what was signed. `sign` with a bucket
+        // and a name asks for one url and `sign` with only a bucket
+        // asks for a list of them, which is two routes rather than one
+        // because the names are in the body in the second and in the
+        // path in the first.
+        //
+        // The get and the put are the other end: they carry the token
+        // in the query string and no authorization header at all, which
+        // is why they are the only two paths here that are not read
+        // through `caller`.
+        .route("/storage/v1/object/sign/{bucket}", post(object::sign_many))
+        .route(
+            "/storage/v1/object/sign/{bucket}/{*name}",
+            get(object::signed_download).post(object::sign),
+        )
+        .route(
+            "/storage/v1/object/upload/sign/{bucket}/{*name}",
+            post(object::sign_upload).put(object::upload_signed),
+        )
         .route(
             "/storage/v1/object/{bucket}/{*name}",
             get(object::download)

@@ -19,6 +19,15 @@
 //! writes a second set, because two rows pointing at one key would make
 //! a delete of either a delete of both.
 //!
+//! Signed urls are here because the recording cannot spend one. The
+//! harness compares one request against one answer and has no way to
+//! carry a url out of the first into the second, so what it can ask is
+//! whether the signing answered and in what shape. Whether the url then
+//! works, whether it works for the object it names and for no other,
+//! whether a read url is refused on the write route, and whether a
+//! token this project did not sign is refused at all, are asked here
+//! instead, end to end through the router.
+//!
 //! Every test works on a bucket of its own with a store of its own, so
 //! they can all run at once against one database the way cargo runs
 //! them, and so a leftover directory from a failed run cannot be read as
@@ -82,6 +91,7 @@ fn service() -> String {
 
 struct Answer {
     status: StatusCode,
+    headers: axum::http::HeaderMap,
     bytes: Vec<u8>,
 }
 
@@ -93,13 +103,32 @@ impl Answer {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).to_string()
     }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
 }
 
 async fn call(f: &Fixture, method: &str, path: &str, mime: &str, body: &str) -> Answer {
-    let mut req = Request::builder()
-        .method(method)
-        .uri(path)
-        .header("authorization", format!("Bearer {}", service()));
+    as_whoever(f, Some(&service()), method, path, mime, body).await
+}
+
+/// The same request, with a token of the caller's choosing or with none
+/// at all. A signed url is spent with none: the token is in the query
+/// string and an authorization header would be a second answer to a
+/// question nobody asked.
+async fn as_whoever(
+    f: &Fixture,
+    token: Option<&str>,
+    method: &str,
+    path: &str,
+    mime: &str,
+    body: &str,
+) -> Answer {
+    let mut req = Request::builder().method(method).uri(path);
+    if let Some(token) = token {
+        req = req.header("authorization", format!("Bearer {token}"));
+    }
     if !mime.is_empty() {
         req = req.header("content-type", mime);
     }
@@ -110,9 +139,11 @@ async fn call(f: &Fixture, method: &str, path: &str, mime: &str, body: &str) -> 
         .await
         .expect("router answers");
     let status = res.status();
+    let headers = res.headers().clone();
     let bytes = to_bytes(res.into_body(), 1 << 20).await.expect("body");
     Answer {
         status,
+        headers,
         bytes: bytes.to_vec(),
     }
 }
@@ -527,5 +558,281 @@ async fn a_copy_that_is_refused_writes_no_bytes() {
     assert_eq!(
         bytes_at(&f, &id, &version).await.as_deref(),
         Some(&b"two.txt"[..]),
+    );
+}
+
+/// The url out of a signing answer, with the prefix the client would
+/// have put back on it. What comes back is a path relative to
+/// /storage/v1, because that is where the client's own url ends.
+fn spendable(answer: &Answer, field: &str) -> String {
+    let url = answer.json()[field]
+        .as_str()
+        .unwrap_or_else(|| panic!("no {field} in {}", answer.text()))
+        .to_string();
+    format!("/storage/v1{url}")
+}
+
+#[tokio::test]
+async fn a_signed_url_reads_the_one_object_it_names() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-sign").await;
+
+    for name in ["one.txt", "two.txt"] {
+        let answer = call(
+            &f,
+            "POST",
+            &format!("/storage/v1/object/zou-sign/{name}"),
+            "text/plain",
+            name,
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    }
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/sign/zou-sign/one.txt",
+        "application/json",
+        r#"{"expiresIn":600}"#,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let url = spendable(&answer, "signedURL");
+    assert!(url.starts_with("/storage/v1/object/sign/zou-sign/one.txt?token="));
+
+    // Spent with no token in a header at all, which is the whole point
+    // of it: the person holding this url is not a caller this project
+    // knows anything about.
+    let answer = as_whoever(&f, None, "GET", &url, "", "").await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(answer.text(), "one.txt");
+    // What a shared cache may keep is the url's own lifetime rather
+    // than what the upload said about caching, so this answer carries
+    // the one header a plain download does not and drops the one it
+    // does.
+    assert!(answer.header("expires").is_some(), "no Expires");
+    assert_eq!(answer.header("cache-control"), None);
+
+    // The same token against the other object in the same bucket. The
+    // name is in the token and the token is signed, so moving it is
+    // forging it.
+    let elsewhere = url.replace("one.txt", "two.txt");
+    let answer = as_whoever(&f, None, "GET", &elsewhere, "", "").await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.text());
+    assert_eq!(answer.json()["error"], "InvalidSignature");
+}
+
+#[tokio::test]
+async fn an_upload_url_writes_the_bytes_as_whoever_signed_it() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-sign-upload").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/upload/sign/zou-sign-upload/new.txt",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    // Nothing was written by the asking. The insert that asked whether
+    // the caller could upload was rolled back, so the name is still
+    // free and the url is what takes it.
+    assert_eq!(how_many(&f.pool, "zou-sign-upload").await, 0);
+
+    let url = spendable(&answer, "url");
+    let answer = as_whoever(&f, None, "PUT", &url, "text/plain", "sent by a stranger").await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(answer.json()["Key"], "zou-sign-upload/new.txt");
+
+    let (id, version) = row(&f.pool, "zou-sign-upload", "new.txt")
+        .await
+        .expect("one row");
+    assert_eq!(
+        bytes_at(&f, &id, &version).await.as_deref(),
+        Some(&b"sent by a stranger"[..]),
+    );
+
+    // And once only, because the url was signed without upsert. What
+    // refuses the second one is the same unique index that refuses a
+    // second upload, reached with the policies off.
+    let answer = as_whoever(&f, None, "PUT", &url, "text/plain", "again").await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.text());
+    assert_eq!(answer.json()["error"], "Duplicate");
+    assert_eq!(
+        bytes_at(&f, &id, &version).await.as_deref(),
+        Some(&b"sent by a stranger"[..]),
+    );
+}
+
+#[tokio::test]
+async fn a_url_signed_for_reading_cannot_be_spent_on_writing() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-scope").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-scope/one.txt",
+        "text/plain",
+        "one.txt",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/sign/zou-scope/one.txt",
+        "application/json",
+        r#"{"expiresIn":600}"#,
+    )
+    .await;
+    let reading = spendable(&answer, "signedURL");
+    let token = reading.split_once("token=").expect("a token").1.to_string();
+
+    // The read url pointed at the write route. Before the scope claim
+    // existed the two kinds of token were told apart by whether they
+    // carried upsert, and a read token carries none, so this would
+    // have been read as an upload url.
+    let writing = format!("/storage/v1/object/upload/sign/zou-scope/one.txt?token={token}");
+    let answer = as_whoever(&f, None, "PUT", &writing, "text/plain", "not yours").await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.text());
+    assert_eq!(answer.json()["message"], "Token is not scoped for upload");
+
+    // And the other way, so neither direction is the loose one.
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/upload/sign/zou-scope/two.txt",
+        "",
+        "",
+    )
+    .await;
+    let upload = spendable(&answer, "url");
+    let downward = upload.replace("/object/upload/sign/", "/object/sign/");
+    let answer = as_whoever(&f, None, "GET", &downward, "", "").await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.text());
+    assert_eq!(answer.json()["message"], "Token is not scoped for download");
+}
+
+#[tokio::test]
+async fn signing_a_list_answers_every_path_that_was_asked() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-sign-many").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-sign-many/there.txt",
+        "text/plain",
+        "there.txt",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/sign/zou-sign-many",
+        "application/json",
+        r#"{"expiresIn":600,"paths":["missing.txt","there.txt","there.txt"]}"#,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let answers = answer.json();
+    let answers = answers.as_array().expect("an array");
+
+    // Three answers for three paths, in the order they were asked, and
+    // the same path twice is answered twice. The lookup dedupes and the
+    // answer does not.
+    assert_eq!(answers.len(), 3);
+    assert_eq!(answers[0]["signedURL"], Value::Null);
+    assert_eq!(
+        answers[0]["error"],
+        "Either the object does not exist or you do not have access to it"
+    );
+    for at in [1, 2] {
+        assert_eq!(answers[at]["error"], Value::Null);
+        assert_eq!(answers[at]["path"], "there.txt");
+        let url = format!(
+            "/storage/v1{}",
+            answers[at]["signedURL"].as_str().expect("a url")
+        );
+        let got = as_whoever(&f, None, "GET", &url, "", "").await;
+        assert_eq!(got.status, StatusCode::OK, "{}", got.text());
+        assert_eq!(got.text(), "there.txt");
+    }
+}
+
+#[tokio::test]
+async fn a_token_this_server_did_not_write_reads_nothing() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-forged").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-forged/one.txt",
+        "text/plain",
+        "one.txt",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+
+    // Everything a real token says, signed with a secret that is not
+    // this project's. The claims are right and the signature is not,
+    // and the signature is what is checked first.
+    let forged = jwt::mint(
+        &serde_json::json!({
+            "url": "zou-forged/one.txt", "scope": "download",
+            "iat": 0, "exp": 9_000_000_000i64,
+        }),
+        b"not the secret this project signs with at all",
+    );
+    let answer = as_whoever(
+        &f,
+        None,
+        "GET",
+        &format!("/storage/v1/object/sign/zou-forged/one.txt?token={forged}"),
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.text());
+    assert_eq!(answer.json()["error"], "InvalidJWT");
+    assert_eq!(answer.json()["message"], "signature verification failed");
+
+    // And one that expired while nobody was holding it. The claims are
+    // this server's own, which is what makes the refusal about the
+    // clock rather than about the signature.
+    let stale = jwt::mint(
+        &serde_json::json!({
+            "url": "zou-forged/one.txt", "scope": "download",
+            "iat": 1, "exp": 2,
+        }),
+        SECRET,
+    );
+    let answer = as_whoever(
+        &f,
+        None,
+        "GET",
+        &format!("/storage/v1/object/sign/zou-forged/one.txt?token={stale}"),
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.text());
+    assert_eq!(answer.json()["error"], "InvalidJWT");
+    assert_eq!(
+        answer.json()["message"],
+        "\"exp\" claim timestamp check failed"
     );
 }
