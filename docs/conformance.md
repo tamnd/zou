@@ -245,7 +245,7 @@ That distinction has to be made here because zou is the gateway as well as the s
 
 ## The suite recorded from an image
 
-The `storage` suite is 94 cases: 25 over the bucket endpoints and 69 over the object ones, each asked with a service key, an anon key, and in a good few cases with no key at all.
+The `storage` suite is 129 cases: 25 over the bucket endpoints and 104 over the object ones, each asked with a service key, an anon key, and in a good few cases with no key at all.
 The reference is storage-api at the version in `versions.json`, and it is the one reference that cannot be downloaded and run on a flag line.
 storage-api ships as an image and nothing else, so the recording comes from `supabase start` rather than from a binary, which is what the record workflow in this repository brings up.
 
@@ -266,7 +266,7 @@ The object cases are the reason a case can say `chained`.
 An upload has to be read back, and a fixture cannot put the bytes there for it: a fixture writes rows and an object is bytes in a store no SQL statement can reach.
 So the first case uploads, and the ones under it that write say they are asked against what the case before them left rather than against the fixture.
 
-What the object cases do not ask about yet: signed urls, resumable uploads, image transforms, the S3 protocol, and what a bucket's size and mime type limits refuse.
+What the object cases do not ask about yet: resumable uploads, image transforms, the S3 protocol, and what a bucket's size and mime type limits refuse.
 The last of those needs a fixture with limits on a bucket, which is a change to the recording rather than a change to zou.
 
 ## The suite compared with the stack rather than the binary
@@ -350,7 +350,7 @@ The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
 The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 74 of them, 96%, with 3 known differences.
 All three are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
 
-The `storage` suite is 94 cases against the storage-api a local Supabase project runs, and zou passes all 94, byte for byte, with no known differences.
+The `storage` suite is 129 cases against the storage-api a local Supabase project runs, and zou passes all 129, byte for byte, with no known differences.
 
 supabase-js 2.111.0 runs 16 of its integration tests against zou and all 16 pass.
 

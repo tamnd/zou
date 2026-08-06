@@ -468,11 +468,16 @@ async fn deliver(
             (StatusCode::OK, bytes, None)
         }
     };
-    // A row with no bytes behind it is an object that is not there. It
-    // happens to a row whose upload half failed, and it is what the
-    // fixture's own object is.
+    // A row with no bytes behind it is not an object that is not
+    // there, it is a store that disagrees with the table, and that is
+    // answered as a failure rather than as a miss. Upstream reaches it
+    // by asking the file for its size before reading it and letting the
+    // missing-file error out of the backend uncaught, so what the
+    // caller is told is the generic sentence. Recorded: a signed url
+    // spent on the row the fixture inserted without ever writing bytes
+    // for answers 500 and not 404.
     let Some(bytes) = bytes else {
-        return Err(StorageError::no_such_key());
+        return Err(StorageError::internal("Internal Server Error".to_string()));
     };
 
     // In the order upstream's renderer writes them, which costs nothing
@@ -1784,11 +1789,24 @@ fn asked_paths(asked: &Value) -> Result<Vec<String>, StorageError> {
             "body/paths must be array".to_string(),
         ));
     };
+    // A path that is not a string is made into one rather than
+    // refused, which is the validator coercing a scalar to the type the
+    // schema asked for. Recorded: a list with the number seven in it
+    // answers an entry for the name "7", not a refusal. Nothing is
+    // coerced out of an array or an object, so those are still refused,
+    // and a null becomes the empty string the way the same table says.
+    let mut wanted = Vec::with_capacity(paths.len());
     for (at, path) in paths.iter().enumerate() {
-        if !path.is_string() {
-            return Err(StorageError::not_valid(format!(
-                "body/paths/{at} must be string"
-            )));
+        match path {
+            Value::String(text) => wanted.push(text.clone()),
+            Value::Number(number) => wanted.push(number.to_string()),
+            Value::Bool(yes) => wanted.push(yes.to_string()),
+            Value::Null => wanted.push(String::new()),
+            _ => {
+                return Err(StorageError::not_valid(format!(
+                    "body/paths/{at} must be string"
+                )));
+            }
         }
     }
     if paths.is_empty() {
@@ -1801,10 +1819,7 @@ fn asked_paths(asked: &Value) -> Result<Vec<String>, StorageError> {
             "body/paths must NOT have more than {MOST_OBJECTS} items"
         )));
     }
-    Ok(paths
-        .iter()
-        .map(|path| path.as_str().unwrap_or_default().to_string())
-        .collect())
+    Ok(wanted)
 }
 
 /// How many objects one request may name.
