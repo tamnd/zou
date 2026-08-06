@@ -270,8 +270,8 @@ They are skipped behind an environment flag rather than deleted, so the day the 
 
 ## Where zou stands
 
-The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes 1215 of them, 99%, with 2 known differences.
-The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, and the two left are tracked in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125) with everything else.
+The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes all of them, with no known differences.
+That suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, and what it took to get there is written down in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125).
 
 The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
 
