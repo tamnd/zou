@@ -737,9 +737,11 @@ async fn reauthenticating_writes_its_own_action() {
     let app = instant(&dsn);
 
     let session = signed_up(&app, &email).await;
+    // A GET, because that is what upstream routes and what the client
+    // sends. A POST here answers 405 with Allow: GET.
     let answer = as_user(
         &app,
-        "POST",
+        "GET",
         "/auth/v1/reauthenticate",
         &session.access,
         serde_json::json!({}),

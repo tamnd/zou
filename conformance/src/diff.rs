@@ -75,15 +75,21 @@ pub fn compare(expected: &Answer, found: &Answer) -> Difference {
     }
     // Same status, same headers, same json. The bytes are all that is
     // left, and they are worth a line but not a failure.
-    let want = expected.raw.as_deref();
-    let got = found.raw.as_deref();
+    //
+    // Through text() rather than off raw, because raw is only kept when
+    // it differs from re-serializing the body and a side that has none
+    // is a side whose bytes were the re-serialization. Saying "absent"
+    // there would name the recording's storage instead of what went
+    // over the wire.
+    let want = expected.text();
+    let got = found.text();
     if want != got {
         return Difference {
             verdict: Verdict::Written,
             lines: vec![format!(
-                "the same json, written as {} not {}",
-                shown(got.map(cut).as_deref()),
-                shown(want.map(cut).as_deref())
+                "the same json, written as {:?} not {:?}",
+                cut(&got),
+                cut(&want)
             )],
         };
     }
@@ -237,6 +243,19 @@ mod tests {
         let difference = compare(&a, &b);
         assert_eq!(difference.verdict, Verdict::Written);
         assert_eq!(difference.lines.len(), 1);
+    }
+
+    /// A side with no raw is a side whose bytes were the
+    /// re-serialization, so the line has to say what it sent rather
+    /// than say that nothing was kept for it.
+    #[test]
+    fn a_side_that_kept_no_bytes_still_says_what_it_wrote() {
+        let a = answer(200, &[], json());
+        let mut b = answer(200, &[], json());
+        b.raw = Some("[ {\"id\": 1, \"title\": \"walk\"} ]".to_string());
+        let line = &compare(&b, &a).lines[0];
+        assert!(line.contains(r#"written as "[{\"id\":1"#), "{line}");
+        assert!(!line.contains("absent"), "{line}");
     }
 
     /// numeric is not a double. A column holding 1200.50 that comes

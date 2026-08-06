@@ -62,6 +62,21 @@ Numbers are compared twice, once parsed and once as they were written.
 A parsed body cannot tell 1200.50 and 1200.5 apart, because a double cannot, and a client reading a price can, so the literals are scanned out of the raw text and compared as a sorted multiset.
 Sorted, because key order is already allowed to differ and this must not be the one thing that turns that back into a failure.
 
+## The values that cannot be the same twice
+
+A suite over a table keeps a recording honest by pinning its rows down in `setup.sql`, and the same question really does have the same answer tomorrow.
+A suite over an auth server has no such option.
+A sign in answers with a token that was signed a moment ago, a session row that was made a moment ago, and an expiry that is now plus an hour, and the choice is to name those values or to stop comparing the answer.
+
+So a case names them, as json pointers in `volatile`, and they are replaced before the answer reaches the recording or the comparison.
+What replaces a value is not a blank, it is the name of the shape it had: `<uuid>`, `<jwt>`, `<number>`, `<timestamp>`.
+A uuid that comes back as a number is still a difference, and so is a token with two segments where the reference sent three.
+What is given up is the value itself, which is the only thing that could not have been kept.
+
+A pointer is written with slashes and takes `*` for every element of an array or every value of an object, which is what `identities` and `amr` need.
+A pointer that matches nothing is left alone rather than reported, because the answer to a request that failed does not carry the keys the answer to one that worked does.
+Both sides are redacted by the same case, so this cannot make one target look better than another: a path that is volatile is volatile for the reference too.
+
 ## The same answer twice
 
 A recording is only worth comparing against if the same question gets the same answer tomorrow, and one thing in postgres makes that untrue on its own: the planner.
@@ -193,6 +208,36 @@ db-anon-role = "postgrest_test_anonymous"
 db-extra-search-path = ""
 ```
 
+## The suite compared with GoTrue
+
+The `auth` suite is 77 cases over the endpoints a sign in flow uses: signup, the three token grants, the user endpoints, verify, recover, magiclink, otp, resend, logout, reauthenticate, the MFA listing, the admin endpoints, settings, health, jwks and authorize.
+The reference is GoTrue 2.194.0 configured the way `supabase start` configures it for a project that has changed nothing, with the mail rate limits raised out of the way.
+A rate limit is a configured number and a clock rather than a compatibility surface, and at the default of thirty an hour which case got the 429 would depend on how long the run before it took.
+
+```
+GOTRUE_MAILER_AUTOCONFIRM=true
+GOTRUE_DISABLE_SIGNUP=false
+GOTRUE_JWT_SECRET=super-secret-jwt-token-with-at-least-32-characters-long
+GOTRUE_RATE_LIMIT_EMAIL_SENT=100000
+```
+
+```
+cargo run -p zou-conformance -- diff --suite auth \
+  --suites /tmp/zou-conformance/suites \
+  --zou-dsn postgresql://postgres@127.0.0.1:5432/postgres \
+  --reference-url http://127.0.0.1:54331 \
+  --reference-dsn postgresql://postgres@127.0.0.1:5432/gotrue_ref \
+  --reference-strip-prefix /auth/v1
+```
+
+The reference keeps its rows in a database of its own, which is the one place this suite differs from the others.
+GoTrue brings its own migrations and runs them at boot, zou installs the auth schema on its first connection, and a run that let both land in the same database would be measuring whichever of the two wrote the schema last.
+
+Nothing in the suite signs in and then uses the answer, because a case is one request.
+The token for the seeded person is minted by the harness from the same secret both servers are configured with, and a case asks for it with `"key": "user"`.
+A case about a missing or malformed token still names a key, so that the apikey goes out and the answer is about the token rather than about the gateway, and the case's own `authorization` header replaces the key's rather than being sent next to it.
+That distinction has to be made here because zou is the gateway as well as the server, and a bare GoTrue has no apikey gate at all.
+
 ## The suite asked from somewhere else
 
 Every suite above is asked by this harness, over an HTTP client written here.
@@ -225,37 +270,38 @@ They are skipped behind an environment flag rather than deleted, so the day the 
 
 ## Where zou stands
 
-The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes 927 of them, 76%, with 290 known differences.
-That number is the honest one, and it is meant to be uncomfortable.
-The suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, so 76% against it and 93% against the hand written suite are both true and they measure different things.
-The gap is a checklist in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125), grouped by what has to be built rather than by the endpoint it shows up on, and it is a small number of missing features rather than 290 separate bugs: computed relationships, function overload resolution, the parts of the query parser that answer `PGRST100`, the media type handlers, and `explain`.
+The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes all of them, with no known differences.
+That suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, and what it took to get there is written down in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125).
+
+The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
+
+The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 71 of them, 92%, with 6 known differences.
+Three of the six are the same thing: Go's json decoder puts the parser's own detail on the end of the message when a body is not json, `invalid character 'o' in literal null`, and zou stops at the sentence in front of it.
+The other three are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
 
 supabase-js 2.111.0 runs 16 of its integration tests against zou and all 16 pass.
 
-The REST suite is 82 cases against PostgREST 14.15, and zou passes 77 of them, 93%, with 5 known differences.
-Every difference left is a message, a code, or a header, not a wrong answer to a question about data: two error messages that name an internal alias instead of the table, two wordings of a hint or a detail, and an upsert that answers 201 where upstream answers 200 on a merge that updated.
-They are tracked in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125) with everything else.
-
-The 49 cases that pass "written differently" are all the same two things: zou puts a space after each colon where PostgREST puts a newline between rows, and a `select=*` comes back with the columns in a different order.
-Neither is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.
+The cases that pass "written differently" are all the same three things: zou puts a space after each colon where PostgREST puts a newline between rows, a `select=*` comes back with the columns in a different order, and two auth answers carry their keys in a different order than Go wrote them.
+None of them is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.
 
 ## The scoreboard
 
 Those paragraphs are prose, and prose goes stale.
-[docs/scoreboard.md](scoreboard.md) is the same numbers generated out of the run, and CI rewrites it on every merge to main, out of the json the two conformance jobs uploaded rather than out of a run of its own.
+[docs/scoreboard.md](scoreboard.md) is the same numbers generated out of the run, and CI rewrites it on every merge to main, out of the json the conformance jobs uploaded rather than out of a run of its own.
 Rendering it from a fresh run would publish a number nobody had failed a build over.
 
 ```
 cargo run -p zou-conformance -- scoreboard \
   --report /tmp/conformance.json \
+  --report /tmp/auth.json \
   --js /tmp/js.json \
   --pin "$(jq -r .ref conformance/suites.json)" \
   --out docs/scoreboard.md
 ```
 
 Two cuts through the same run, and the second one is the useful one.
-A feature says what somebody was testing, which is how the suite is organised, and it is upstream's vocabulary: `upsert` is at 52% and that is not a piece of work.
-An endpoint says what the server had to implement, with the fixture's table and function names taken out, and `PATCH /rest/v1/{table}` at 28% is.
+A feature says what somebody was testing, which is how the suite is organised, and it is upstream's vocabulary: "upsert is at 52%" names a chapter of somebody else's test file rather than a piece of work.
+An endpoint says what the server had to implement, with the fixture's table and function names taken out, and "PATCH /rest/v1/{table} is at 28%" is a piece of work.
 
 There is no date and no run number in the file, so a merge that moved no number leaves no diff and makes no commit.
 The commit it does make carries `[skip ci]`, so the workflow does not start again to measure what it has just measured.

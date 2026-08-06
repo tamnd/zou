@@ -499,15 +499,22 @@ async fn an_admin_makes_an_account_somebody_else_will_sign_in_to() {
     assert_eq!(user["app_metadata"]["providers"][0], "email");
     assert_eq!(user["app_metadata"]["plan"], "team");
     assert!(user["email_confirmed_at"].is_string(), "{user}");
-    assert!(user["confirmed_at"].is_string(), "{user}");
+    // And no confirmed_at, because upstream answers a create with the
+    // struct it just built and that column is generated, so it is not
+    // in the answer here and is in the answer to a fetch of the same
+    // account a moment later.
+    assert!(user.get("confirmed_at").is_none(), "{user}");
 
-    // One email identity, verified, because the admin asserted the
-    // address and email_confirm is that assertion.
+    // One email identity, and it still says the address is unproven.
+    // The admin asserted it, not the provider, and upstream writes the
+    // identity unverified and never goes back, so a client reading
+    // identity_data here sees what it has always seen. The account
+    // itself is confirmed, which is what email_confirm was about.
     let identities = user["identities"].as_array().expect("identities");
     assert_eq!(identities.len(), 1, "{user}");
     assert_eq!(identities[0]["provider"], "email");
     assert_eq!(identities[0]["identity_data"]["email"], email.as_str());
-    assert_eq!(identities[0]["identity_data"]["email_verified"], true);
+    assert_eq!(identities[0]["identity_data"]["email_verified"], false);
 
     // And the account works: the password the admin set signs in.
     let session = signs_in(&app, &email, "correct horse").await;

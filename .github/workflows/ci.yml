@@ -130,9 +130,13 @@ jobs:
           /tmp/postgrest --version
       - name: Test the harness against the suites it reads
         run: cargo test -p zou-conformance
+      # Named rather than left to default, because the default is every
+      # suite in the directory and the auth one is compared against a
+      # different binary in a job of its own.
       - name: Check zou against the recording
         run: |
           cargo run -p zou-conformance -- check \
+            --suite rest --suite postgrest \
             --zou-dsn "$ZOU_CONFORMANCE_DSN" \
             --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
             --json /tmp/conformance.json
@@ -198,6 +202,121 @@ jobs:
         with:
           name: conformance
           path: /tmp/conformance.json
+          if-no-files-found: ignore
+
+  auth-conformance:
+    name: conformance (auth)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      ZOU_CONFORMANCE_SUITES: /tmp/zou-conformance/suites
+      GOTRUE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/gotrue_ref
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      - name: Fetch the GoTrue the suite was recorded from
+        run: |
+          version=$(jq -r .gotrue.version /tmp/zou-conformance/versions.json)
+          mkdir -p /tmp/gotrue
+          curl -sSfL -o /tmp/gotrue.tar.xz \
+            "https://github.com/supabase/auth/releases/download/v$version/auth-v$version-amd64.tar.xz"
+          tar -xJf /tmp/gotrue.tar.xz -C /tmp/gotrue
+          /tmp/gotrue/auth version
+      # The reference keeps its rows in a database of its own, because it
+      # brings its own migrations and runs them at boot, and a suite that
+      # let them land next to zou's would be measuring whichever of the
+      # two wrote the auth schema last.
+      #
+      # Everything here is what a project that has changed nothing gets
+      # from supabase start, except the rate limits. Those are a
+      # configured number and a clock rather than a compatibility
+      # surface, and at the default the case that got the 429 would
+      # depend on how long the run before it took.
+      - name: Start the reference
+        run: |
+          psql "$ZOU_CONFORMANCE_DSN" -v ON_ERROR_STOP=1 -c 'create database gotrue_ref'
+          # The first migration creates tables in auth without creating
+          # auth, and the queries after it name no schema at all,
+          # because upstream runs against the supabase image where the
+          # schema is already there and the role it connects as has a
+          # search_path pointing at it.
+          psql "$GOTRUE_DSN" -v ON_ERROR_STOP=1 -c 'create schema auth'
+          psql "$GOTRUE_DSN" -v ON_ERROR_STOP=1 \
+            -c "alter role postgres in database gotrue_ref set search_path to auth, public"
+          cat > /tmp/gotrue/.env <<'CONF'
+          GOTRUE_API_HOST=127.0.0.1
+          GOTRUE_API_PORT=54331
+          API_EXTERNAL_URL=http://127.0.0.1:54331
+          GOTRUE_DB_DRIVER=postgres
+          GOTRUE_DB_NAMESPACE=auth
+          GOTRUE_DB_MIGRATIONS_PATH=/tmp/gotrue/migrations
+          GOTRUE_SITE_URL=http://localhost:3000
+          GOTRUE_JWT_SECRET=super-secret-jwt-token-with-at-least-32-characters-long
+          GOTRUE_JWT_EXP=3600
+          GOTRUE_JWT_AUD=authenticated
+          GOTRUE_JWT_DEFAULT_GROUP_NAME=authenticated
+          GOTRUE_DISABLE_SIGNUP=false
+          GOTRUE_MAILER_AUTOCONFIRM=true
+          GOTRUE_LOG_LEVEL=warn
+          GOTRUE_RATE_LIMIT_EMAIL_SENT=100000
+          GOTRUE_RATE_LIMIT_VERIFY=100000
+          GOTRUE_RATE_LIMIT_TOKEN_REFRESH=100000
+          GOTRUE_RATE_LIMIT_OTP=100000
+          CONF
+          echo "DATABASE_URL=$GOTRUE_DSN?sslmode=disable" >> /tmp/gotrue/.env
+          (cd /tmp/gotrue && ./auth > /tmp/gotrue.log 2>&1 &)
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:54331/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:54331/health
+      - name: Check zou against the recording
+        run: |
+          cargo run -p zou-conformance -- check --suite auth \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --json /tmp/auth.json
+      # A bare GoTrue answers on / where a project answers on /auth/v1,
+      # so the reference is asked with the prefix taken back off and the
+      # cases stay the paths a client types.
+      - name: Diff the auth suite against a live GoTrue
+        run: |
+          cargo run -p zou-conformance -- diff --suite auth \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --reference-url http://127.0.0.1:54331 \
+            --reference-name "gotrue live" \
+            --reference-dsn "$GOTRUE_DSN" \
+            --reference-strip-prefix /auth/v1 \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET"
+      - name: Keep the reference log
+        if: always()
+        run: cat /tmp/gotrue.log
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth
+          path: /tmp/auth.json
           if-no-files-found: ignore
 
   supabase-js:
@@ -278,7 +397,7 @@ jobs:
   scoreboard:
     name: scoreboard
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [conformance, supabase-js]
+    needs: [conformance, auth-conformance, supabase-js]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -292,12 +411,17 @@ jobs:
           path: /tmp/reports
       - uses: actions/download-artifact@v4
         with:
+          name: auth
+          path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
           name: supabase-js
           path: /tmp/reports
       - name: Render it
         run: |
           cargo run -p zou-conformance -- scoreboard \
             --report /tmp/reports/conformance.json \
+            --report /tmp/reports/auth.json \
             --js /tmp/reports/js.json \
             --pin "$(jq -r .ref conformance/suites.json)" \
             --out docs/scoreboard.md

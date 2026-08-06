@@ -190,15 +190,19 @@ async fn a_confirmed_signup_writes_a_user_an_identity_and_a_session() {
     );
 
     // The identity is what says this user belongs to the email
-    // provider, and email_verified there is what the provider
-    // asserted, which is nothing.
+    // provider, and email_verified there is what the provider has
+    // asserted. Autoconfirm runs the same confirmation a link would
+    // have run, so the provider has asserted it. An account an admin
+    // makes with email_confirm is the other way round: the admin
+    // asserted the address, the provider never did, and the identity
+    // there still says false.
     let identity = &body["user"]["identities"][0];
     assert_eq!(identity["provider"], "email");
     assert_eq!(identity["id"], user_id.as_str());
     assert_eq!(identity["user_id"], user_id.as_str());
     assert_eq!(identity["identity_data"]["sub"], user_id.as_str());
     assert_eq!(identity["identity_data"]["email"], email.as_str());
-    assert_eq!(identity["identity_data"]["email_verified"], false);
+    assert_eq!(identity["identity_data"]["email_verified"], true);
     assert_eq!(identity["identity_data"]["phone_verified"], false);
 
     let sess = pool.unscoped().await.expect("connect");

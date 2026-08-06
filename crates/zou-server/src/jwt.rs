@@ -33,7 +33,9 @@ pub struct Verified {
 #[derive(Debug, PartialEq)]
 pub enum Reject {
     Malformed,
-    WrongAlgorithm,
+    /// Carrying the algorithm the header named, because the message a
+    /// caller of the auth surface gets quotes it back.
+    WrongAlgorithm(String),
     BadSignature,
     Expired,
     UnknownKey,
@@ -43,11 +45,40 @@ impl Reject {
     pub fn as_str(&self) -> &'static str {
         match self {
             Reject::Malformed => "malformed JWT",
-            Reject::WrongAlgorithm => "unsupported JWT algorithm",
+            Reject::WrongAlgorithm(_) => "unsupported JWT algorithm",
             Reject::BadSignature => "invalid JWT signature",
             Reject::Expired => "JWT expired",
             Reject::UnknownKey => "no JWKS key matches this token",
         }
+    }
+
+    /// The same refusal in the words GoTrue uses, which is golang-jwt's
+    /// error chain with a sentence of GoTrue's own in front of it.
+    ///
+    /// The auth surface answers with this and the rest of zou does not,
+    /// because a client talking to /auth/v1 is talking to something
+    /// that has always been GoTrue, and one talking to /rest/v1 has
+    /// always been talking to PostgREST.
+    ///
+    /// Two of these are broader than upstream's. A token that has three
+    /// segments but does not decode is a malformed token here and
+    /// upstream says which part failed to decode, and an unknown kid is
+    /// a bad signature here, which is what it amounts to: nothing this
+    /// project trusts signed it.
+    pub fn gotrue(&self) -> String {
+        let why = match self {
+            Reject::Malformed => {
+                "token is malformed: token contains an invalid number of segments".to_string()
+            }
+            Reject::WrongAlgorithm(alg) => {
+                format!("token signature is invalid: signing method {alg} is invalid")
+            }
+            Reject::BadSignature | Reject::UnknownKey => {
+                "token signature is invalid: signature is invalid".to_string()
+            }
+            Reject::Expired => "token has invalid claims: token is expired".to_string(),
+        };
+        format!("invalid JWT: unable to parse or verify signature, {why}")
     }
 }
 
@@ -443,8 +474,9 @@ fn verify_es256(parts: &Parts, jwks: &Jwks) -> Result<(), Reject> {
 /// path, the legacy key format is the only JWT shaped apikey there is.
 pub fn verify(token: &str, secret: &[u8]) -> Result<Verified, Reject> {
     let parts = split(token)?;
-    if parts.header.get("alg").and_then(|a| a.as_str()) != Some("HS256") {
-        return Err(Reject::WrongAlgorithm);
+    let alg = parts.header.get("alg").and_then(|a| a.as_str());
+    if alg != Some("HS256") {
+        return Err(Reject::WrongAlgorithm(alg.unwrap_or_default().to_string()));
     }
     verify_hs256(&parts, secret)?;
     accept(parts.payload)
@@ -456,7 +488,8 @@ pub fn verify(token: &str, secret: &[u8]) -> Result<Verified, Reject> {
 /// on either format depending on the project's signing key migration.
 pub fn verify_any(token: &str, secret: &[u8], jwks: Option<&Jwks>) -> Result<Verified, Reject> {
     let parts = split(token)?;
-    match parts.header.get("alg").and_then(|a| a.as_str()) {
+    let alg = parts.header.get("alg").and_then(|a| a.as_str());
+    match alg {
         Some("HS256") => {
             // A kid naming a symmetric key in the set wins, and the
             // project secret is what a token carrying no kid, or one
@@ -468,9 +501,9 @@ pub fn verify_any(token: &str, secret: &[u8], jwks: Option<&Jwks>) -> Result<Ver
         }
         Some("ES256") => match jwks {
             Some(jwks) => verify_es256(&parts, jwks)?,
-            None => return Err(Reject::WrongAlgorithm),
+            None => return Err(Reject::WrongAlgorithm("ES256".to_string())),
         },
-        _ => return Err(Reject::WrongAlgorithm),
+        _ => return Err(Reject::WrongAlgorithm(alg.unwrap_or_default().to_string())),
     }
     accept(parts.payload)
 }
@@ -548,11 +581,9 @@ mod tests {
         let header = Base64UrlUnpadded::encode_string(br#"{"alg":"none","typ":"JWT"}"#);
         let payload = Base64UrlUnpadded::encode_string(br#"{"role":"service_role"}"#);
         let token = format!("{header}.{payload}.");
-        assert_eq!(verify(&token, SECRET).unwrap_err(), Reject::WrongAlgorithm);
-        assert_eq!(
-            verify_any(&token, SECRET, None).unwrap_err(),
-            Reject::WrongAlgorithm
-        );
+        let named = Reject::WrongAlgorithm("none".to_string());
+        assert_eq!(verify(&token, SECRET).unwrap_err(), named);
+        assert_eq!(verify_any(&token, SECRET, None).unwrap_err(), named);
     }
 
     #[test]
@@ -560,7 +591,7 @@ mod tests {
         for bad in ["", "a", "a.b", "a.b.c.d", "ยง.!!.??", "a.b.c"] {
             assert!(matches!(
                 verify(bad, SECRET),
-                Err(Reject::Malformed | Reject::WrongAlgorithm | Reject::BadSignature)
+                Err(Reject::Malformed | Reject::WrongAlgorithm(_) | Reject::BadSignature)
             ));
         }
     }
@@ -644,7 +675,7 @@ mod tests {
         let token = mint_es256(&serde_json::json!({"role": "anon"}), &sk, "key-2026");
         assert_eq!(
             verify_any(&token, SECRET, None).unwrap_err(),
-            Reject::WrongAlgorithm
+            Reject::WrongAlgorithm("ES256".to_string())
         );
     }
 
@@ -656,7 +687,10 @@ mod tests {
             &sk,
             "key-2026",
         );
-        assert_eq!(verify(&token, SECRET).unwrap_err(), Reject::WrongAlgorithm);
+        assert_eq!(
+            verify(&token, SECRET).unwrap_err(),
+            Reject::WrongAlgorithm("ES256".to_string())
+        );
     }
 
     #[test]
@@ -864,7 +898,7 @@ mod tests {
         assert!(verify(&by_secret, SECRET).is_ok(), "still plain HS256");
         assert_eq!(
             verify(&by_key, SECRET).unwrap_err(),
-            Reject::WrongAlgorithm,
+            Reject::WrongAlgorithm("ES256".to_string()),
             "the apikey path never takes an ES256 token"
         );
         assert!(verify_any(&by_key, SECRET, Some(&keys.verifiers())).is_ok());

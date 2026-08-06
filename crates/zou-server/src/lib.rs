@@ -414,6 +414,14 @@ async fn gate(
     let identity = match bearer {
         Some(token) => match jwt::verify_any(&token, &app.cfg.jwt_secret, app.jwks.as_ref()) {
             Ok(v) => v,
+            // The auth surface is told about a bad token in GoTrue's
+            // words and everything else in the edge's, because that is
+            // who a client thinks it is talking to. Upstream's gateway
+            // never looks at the bearer token at all, so the refusal a
+            // client sees for /auth/v1 is the one GoTrue itself wrote.
+            Err(why) if req.uri().path().starts_with("/auth/v1/") => {
+                return auth::error_body(StatusCode::FORBIDDEN, "bad_jwt", &why.gotrue());
+            }
             Err(why) => {
                 return json_body(
                     StatusCode::UNAUTHORIZED,
@@ -642,7 +650,10 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/auth/v1/recover", post(auth::recover))
         .route("/auth/v1/magiclink", post(auth::magiclink))
         .route("/auth/v1/otp", post(auth::otp))
-        .route("/auth/v1/reauthenticate", post(auth::reauthenticate))
+        .route(
+            "/auth/v1/reauthenticate",
+            get(auth::reauthenticate).post(auth::reauthenticate_posted),
+        )
         .route("/auth/v1/resend", post(auth::resend))
         // Throwing a session away is a fetch carrying the token being
         // thrown away, so it lives inside the gate with the rest.

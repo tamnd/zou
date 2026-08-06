@@ -1341,9 +1341,11 @@ async fn reauthentication_texts_the_code_when_the_account_has_only_a_number() {
         )
     );
 
+    // A GET, because that is what upstream routes and what the client
+    // sends. A POST here answers 405 with Allow: GET.
     let asked = as_user(
         &app,
-        "POST",
+        "GET",
         "/auth/v1/reauthenticate",
         &token,
         serde_json::json!({}),
@@ -1469,7 +1471,7 @@ async fn an_unproved_number_is_not_something_to_reauthenticate_against() {
     assert_eq!(
         as_user(
             &app,
-            "POST",
+            "GET",
             "/auth/v1/reauthenticate",
             &token,
             serde_json::json!({}),
@@ -1541,9 +1543,11 @@ async fn an_account_with_both_is_asked_at_the_address() {
         &[&email],
     )
     .await;
+    // A GET, because that is what upstream routes and what the client
+    // sends. A POST here answers 405 with Allow: GET.
     let asked = as_user(
         &app,
-        "POST",
+        "GET",
         "/auth/v1/reauthenticate",
         &token,
         serde_json::json!({}),
