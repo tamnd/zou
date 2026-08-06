@@ -30,6 +30,7 @@ pub mod gc;
 pub mod pagecache;
 pub mod pending;
 pub mod reader;
+pub mod redo;
 pub mod restore;
 pub mod walscan;
 

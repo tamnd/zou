@@ -48,7 +48,7 @@ const SMGR_TRUNCATE_HEAP: u32 = 0x0001;
 
 /// A block a WAL record references. Orders by relation then block,
 /// which is the page run order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockRef {
     pub spc: u32,
     pub db: u32,
@@ -92,6 +92,19 @@ pub struct WalWindow {
     pub(crate) base: u64,
     pub(crate) buf: Vec<u8>,
     pub covered_from: u64,
+}
+
+impl WalWindow {
+    /// Wrap raw stream bytes starting at `base`, for callers that
+    /// already hold a contiguous run, like a test reading pg_wal
+    /// segments straight off disk.
+    pub fn from_raw(base: u64, buf: Vec<u8>) -> WalWindow {
+        WalWindow {
+            base,
+            buf,
+            covered_from: base,
+        }
+    }
 }
 
 /// Lay the frames of one tenant's shared log stream that intersect
@@ -451,6 +464,122 @@ pub fn scan_range(window: &WalWindow, start: u64, end: u64) -> Result<ScanOut, S
 /// record cannot have pages in the store yet.
 pub fn scan_available(window: &WalWindow, start: u64) -> Result<ScanOut, String> {
     scan(window, start, None)
+}
+
+/// One complete record pulled out of a window: the raw bytes with page
+/// headers stripped, which is exactly the contiguous form xlogreader
+/// hands a redo routine and what the redo pool ships to its workers.
+pub struct WalRecord {
+    /// Where the record starts, past any page header.
+    pub lsn: u64,
+    /// The aligned end, which is the next record's start.
+    pub end_lsn: u64,
+    pub rmid: u8,
+    pub info: u8,
+    pub xid: u32,
+    /// The full record, fixed header included, `xl_tot_len` long.
+    pub bytes: Vec<u8>,
+}
+
+impl WalRecord {
+    /// The blocks this record references, parsed from its header items.
+    pub fn block_refs(&self) -> Result<Vec<BlockRef>, String> {
+        let mut refs = Vec::new();
+        let mut rels = Vec::new();
+        let mut truncs = Vec::new();
+        record_block_refs(
+            &self.bytes[RECORD_HEADER as usize..],
+            self.bytes.len() as u64,
+            self.info,
+            self.rmid,
+            &mut refs,
+            &mut rels,
+            &mut truncs,
+        )
+        .map_err(|err| match err {
+            ScanErr::Corrupt(msg) => msg,
+            ScanErr::Truncated => "record header items overrun".to_string(),
+        })?;
+        Ok(refs)
+    }
+}
+
+/// What [`read_records`] produced: the records and where the next call
+/// should resume, the end of the last complete record.
+pub struct RecordsOut {
+    pub records: Vec<WalRecord>,
+    pub resume: u64,
+}
+
+/// Walk complete records from `start` and return them whole, payloads
+/// included. With `end` set, running out of window before it is an
+/// error, without it the walk stops cleanly at the first record the
+/// window ends inside, like [`scan_available`]. This is the redo pool's
+/// feed: the record bytes go to a worker verbatim.
+pub fn read_records(
+    window: &WalWindow,
+    start: u64,
+    end: Option<u64>,
+) -> Result<RecordsOut, String> {
+    let mut cursor = Cursor { window, pos: start };
+    let limit = end.unwrap_or_else(|| cursor.end());
+    let mut out = RecordsOut {
+        records: Vec::new(),
+        resume: start,
+    };
+    while cursor.pos < limit {
+        let rec_start = cursor.pos;
+        let step = (|cursor: &mut Cursor| -> Result<Option<WalRecord>, ScanErr> {
+            // Zero bytes where a record should begin are xlog switch
+            // padding, see `scan`.
+            if cursor.at(rec_start, 4)? == [0, 0, 0, 0] {
+                cursor.pos = rec_start / WAL_SEGMENT_SIZE * WAL_SEGMENT_SIZE + WAL_SEGMENT_SIZE;
+                return Ok(None);
+            }
+            cursor.skip_page_header()?;
+            if cursor.pos >= limit {
+                return Ok(None);
+            }
+            let lsn = cursor.pos;
+            let mut bytes = Vec::new();
+            cursor.read(RECORD_HEADER, &mut bytes)?;
+            let tot_len = u64::from(u32::from_le_bytes(
+                bytes[..4].try_into().expect("checked length"),
+            ));
+            if tot_len < RECORD_HEADER {
+                return Err(ScanErr::Corrupt(format!(
+                    "bad record length {tot_len} at {lsn:#X}"
+                )));
+            }
+            let xid = u32::from_le_bytes(bytes[4..8].try_into().expect("checked length"));
+            let info = bytes[16];
+            let rmid = bytes[17];
+            cursor.read(tot_len - RECORD_HEADER, &mut bytes)?;
+            cursor.pos = (cursor.pos + MAXALIGN - 1) & !(MAXALIGN - 1);
+            Ok(Some(WalRecord {
+                lsn,
+                end_lsn: cursor.pos,
+                rmid,
+                info,
+                xid,
+                bytes,
+            }))
+        })(&mut cursor);
+        match step {
+            Ok(record) => {
+                out.resume = cursor.pos;
+                if let Some(record) = record {
+                    out.records.push(record);
+                }
+            }
+            Err(ScanErr::Truncated) if end.is_none() => break,
+            Err(ScanErr::Truncated) => {
+                return Err(format!("wal window ends inside record at {rec_start:#X}"));
+            }
+            Err(ScanErr::Corrupt(msg)) => return Err(msg),
+        }
+    }
+    Ok(out)
 }
 
 /// Synthetic WAL for tests, shared with the fold tests: real page

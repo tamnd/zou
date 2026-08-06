@@ -1,0 +1,1304 @@
+Add a WAL redo worker mode to postgres.
+
+Materializing a page at some LSN means replaying WAL records onto an
+older page image. Reimplementing every rmgr redo routine outside
+postgres is a losing game, the heap and btree routines alone encode
+years of subtle decisions, so instead the page service runs the real
+routines inside postgres itself. This is the approach Neon proved
+out with their walredo process. A worker starts as
+"postgres --zou-redo <scratchdir> [checksum_version]" and speaks a
+small binary protocol on stdin and stdout: push base page images,
+push WAL records, ask for pages back. Pages live in a private
+in-memory smgr wired in as a third smgrsw entry, so nothing ever
+touches a data directory, and a fabricated control file replaces
+pg_control. On Linux the worker locks itself down with seccomp
+before reading the first message, since it processes page bytes that
+ultimately come from tenants.
+
+Records carry an explicit end LSN instead of letting the worker
+compute lsn plus the aligned record length. Redo routines stamp
+EndRecPtr into pages as the page LSN, and when a record crosses a
+WAL page boundary the true end includes the next page's header, so
+the computed value would be short and materialized pages would
+disagree with the primary by exactly a page header size.
+
+The checksum_version argument must match the origin cluster. Redo
+behavior branches on XLogHintBitIsNeeded, heap_xlog_visible for one
+only advances the page LSN when checksums are on, and with a nonzero
+version the worker verifies checksums on every page it is handed, so
+base images pushed to it must carry valid ones. The pool recomputes
+checksums on pages it serves out, since replay legitimately changes
+page contents without updating pd_checksum.
+
+Records from custom rmgrs error out for now. Supporting extensions
+that install their own rmgrs means loading their libraries into the
+worker, which is future work.
+
+The zou_smgr.h include in ipci.c rides along here. The zou shmem
+calls were picked up through an implicit declaration before, which
+newer clang treats as an error.
+
+--- a/src/backend/access/transam/meson.build
++++ b/src/backend/access/transam/meson.build
+@@ -16,6 +16,7 @@ backend_sources += files(
+   'varsup.c',
+   'xact.c',
+   'zou_wal.c',
++  'zou_walredo.c',
+   'xlog.c',
+   'xlogarchive.c',
+   'xlogbackup.c',
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -62,6 +62,7 @@
+ #include "access/xlogreader.h"
+ #include "access/xlogrecovery.h"
+ #include "access/xlogutils.h"
++#include "access/zou_walredo.h"
+ #include "backup/basebackup.h"
+ #include "catalog/catversion.h"
+ #include "catalog/pg_control.h"
+@@ -4888,6 +4889,43 @@ LocalProcessControlFile(bool reset)
+ 	ReadControlFile();
+ }
+ 
++/*
++ * Install a fabricated control file for the zou WAL redo worker, which has
++ * no real data directory to read one from.  ControlFile is static in this
++ * file, so the worker cannot build it itself.  Only fields consulted at
++ * redo time matter.  data_checksum_version must match the cluster whose WAL
++ * the worker replays: several redo routines behave differently under
++ * XLogHintBitIsNeeded(), for example heap_xlog_visible only advances the
++ * heap page LSN when checksums or wal_log_hints are on, and page reads
++ * verify checksums when the version is nonzero.  The zeroed
++ * minRecoveryPoint also disables minRecoveryPoint updates, so nothing ever
++ * tries to write this fake back to disk.  Must run before
++ * CreateSharedMemoryAndSemaphores so XLOGShmemInit copies it into the
++ * private shared memory copy.
++ */
++void
++ZouRedoInstallFakeControlFile(uint32 data_checksum_version)
++{
++	Assert(ControlFile == NULL);
++	ControlFile = (ControlFileData *) palloc0(sizeof(ControlFileData));
++	ControlFile->pg_control_version = PG_CONTROL_VERSION;
++	ControlFile->catalog_version_no = CATALOG_VERSION_NO;
++	ControlFile->state = DB_IN_ARCHIVE_RECOVERY;
++	ControlFile->wal_level = WAL_LEVEL_REPLICA;
++	ControlFile->maxAlign = MAXIMUM_ALIGNOF;
++	ControlFile->floatFormat = FLOATFORMAT_VALUE;
++	ControlFile->blcksz = BLCKSZ;
++	ControlFile->relseg_size = RELSEG_SIZE;
++	ControlFile->xlog_blcksz = XLOG_BLCKSZ;
++	ControlFile->xlog_seg_size = wal_segment_size;
++	ControlFile->nameDataLen = NAMEDATALEN;
++	ControlFile->indexMaxKeys = INDEX_MAX_KEYS;
++	ControlFile->toast_max_chunk_size = TOAST_MAX_CHUNK_SIZE;
++	ControlFile->loblksize = LOBLKSIZE;
++	ControlFile->float8ByVal = FLOAT8PASSBYVAL;
++	ControlFile->data_checksum_version = data_checksum_version;
++}
++
+ /*
+  * Get the wal_level from the control file. For a standby, this value should be
+  * considered as its active wal_level, because it may be different from what
+--- /dev/null
++++ b/src/backend/access/transam/zou_walredo.c
+@@ -0,0 +1,1019 @@
++/*-------------------------------------------------------------------------
++ *
++ * zou_walredo.c
++ *	  Sandboxed WAL redo worker for the zou page service.
++ *
++ * Started as "postgres --zou-redo <scratchdir>".  The page service keeps a
++ * pool of these workers and materializes page versions by shipping a base
++ * page image plus the chain of WAL records that touch it, then reading the
++ * result back.  The worker runs the real rmgr redo routines against a
++ * purely in-memory smgr, so it needs no data directory contents beyond an
++ * empty scratch directory (used for the sysv shmem interlock key and a
++ * per-process scratch file that feeds the AIO read path).
++ *
++ * Protocol, little endian, on stdin/stdout.  Requests are a tag byte
++ * followed by a u32 payload length and the payload:
++ *
++ *	 'R' len=0
++ *		 Reset.  Drops every page and buffer left over from the previous
++ *		 batch.  Every batch must start with this.
++ *	 'P' spc u32, db u32, rel u32, fork u8, blk u32, page image (BLCKSZ)
++ *		 Push a base page image into the in-memory store.
++ *	 'A' lsn u64, end lsn u64, WAL record bytes (header included,
++ *	     xl_tot_len long); the end lsn is where the next record starts in
++ *	     the real stream, page headers included, since redo routines stamp
++ *	     it into pages as the page LSN
++ *		 Apply one record through its rmgr redo routine.
++ *	 'G' spc u32, db u32, rel u32, fork u8, blk u32
++ *		 Read a page.  Answered with 'O', len u32 = BLCKSZ, page image.
++ *
++ * Any malformed message or redo failure exits the process; the pool
++ * restarts workers on EOF.  WAL records arrive over a trusted local pipe
++ * from the page service, which already CRC-checked them at ingest, so the
++ * worker validates lengths but not record checksums.
++ *
++ * The worker deliberately skips the normal control file, lock file and
++ * catalog machinery: redo routines operate below the relcache and only
++ * need shared memory, the buffer manager and the rmgrs.  A fabricated
++ * in-memory control file (see ZouRedoInstallFakeControlFile in xlog.c)
++ * reports checksums off, so materialized pages carry stale checksums and
++ * the page service must recompute them before serving tenants that have
++ * checksums enabled.
++ *
++ * On Linux the worker installs a seccomp allowlist before touching the
++ * first request, so a compromised redo routine cannot open files, connect
++ * sockets or spawn processes.  Set ZOU_REDO_NO_SANDBOX=1 to skip it for
++ * debugging.  Other platforms run unsandboxed and are for development
++ * only.
++ *
++ * Custom WAL resource managers are not registered here, so records from
++ * extensions with custom rmgrs fail the batch.  Wiring those up is left
++ * until a tenant actually needs it.
++ *
++ *-------------------------------------------------------------------------
++ */
++
++#include "postgres.h"
++
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#ifdef __linux__
++#include <linux/audit.h>
++#include <linux/filter.h>
++#include <linux/seccomp.h>
++#include <sys/prctl.h>
++#include <sys/syscall.h>
++#endif
++
++#include "access/xlog.h"
++#include "access/xlog_internal.h"
++#include "access/xlogreader.h"
++#include "access/xlogutils.h"
++#include "access/zou_walredo.h"
++#include "common/file_perm.h"
++#include "libpq/pqsignal.h"
++#include "miscadmin.h"
++#include "port/pg_iovec.h"
++#include "postmaster/postmaster.h"
++#include "storage/aio.h"
++#include "storage/bufmgr.h"
++#include "storage/fd.h"
++#include "storage/ipc.h"
++#include "storage/proc.h"
++#include "storage/smgr.h"
++#include "utils/guc.h"
++#include "utils/hsearch.h"
++#include "utils/memutils.h"
++#include "utils/resowner.h"
++#include "utils/timestamp.h"
++
++bool		zou_redo_active = false;
++
++/* request tags */
++#define ZREDO_TAG_RESET		'R'
++#define ZREDO_TAG_PUSH		'P'
++#define ZREDO_TAG_APPLY		'A'
++#define ZREDO_TAG_GET		'G'
++#define ZREDO_TAG_PAGE		'O'
++
++/* spc + db + rel + fork + blk */
++#define ZREDO_TARGET_LEN	17
++
++/* generous bound: one WAL record tops out at 1GB in theory, 64MB for us */
++#define ZREDO_MAX_PAYLOAD	(64 * 1024 * 1024 + 1024)
++
++typedef struct ZRedoPageKey
++{
++	RelFileLocator locator;
++	ForkNumber	fork;
++	BlockNumber block;
++} ZRedoPageKey;
++
++typedef struct ZRedoPage
++{
++	ZRedoPageKey key;
++	char		image[BLCKSZ];
++} ZRedoPage;
++
++typedef struct ZRedoForkKey
++{
++	RelFileLocator locator;
++	ForkNumber	fork;
++} ZRedoForkKey;
++
++typedef struct ZRedoFork
++{
++	ZRedoForkKey key;
++	BlockNumber nblocks;
++} ZRedoFork;
++
++static MemoryContext store_cxt = NULL;
++static MemoryContext scratch_cxt = NULL;
++static HTAB *page_tab = NULL;
++static HTAB *fork_tab = NULL;
++static HTAB *db_tab = NULL;
++
++static XLogReaderState *reader = NULL;
++
++/* backs pgaio reads of in-memory pages, opened before the sandbox */
++static int	zredo_scratch_fd = -1;
++
++static uint8 *msgbuf = NULL;
++static Size msgbuf_size = 0;
++
++static void store_create(void);
++static void store_reset(void);
++static void handle_push(const uint8 *payload, uint32 len);
++static void handle_apply(uint8 *payload, uint32 len);
++static void handle_get(const uint8 *payload, uint32 len);
++static void apply_record(XLogRecPtr lsn, XLogRecPtr end_lsn,
++						 XLogRecord *record, uint32 reclen);
++pg_noreturn static void request_loop(void);
++static void enter_sandbox(void);
++
++/*
++ * Byte order helpers.  The protocol is little endian regardless of host.
++ */
++static inline uint32
++zredo_get_u32(const uint8 *p)
++{
++	return (uint32) p[0] | ((uint32) p[1] << 8) |
++		((uint32) p[2] << 16) | ((uint32) p[3] << 24);
++}
++
++static inline uint64
++zredo_get_u64(const uint8 *p)
++{
++	return (uint64) zredo_get_u32(p) | ((uint64) zredo_get_u32(p + 4) << 32);
++}
++
++static inline void
++zredo_put_u32(uint8 *p, uint32 v)
++{
++	p[0] = (uint8) v;
++	p[1] = (uint8) (v >> 8);
++	p[2] = (uint8) (v >> 16);
++	p[3] = (uint8) (v >> 24);
++}
++
++/*
++ * Parse the 17 byte page address used by 'P' and 'G'.
++ */
++static void
++zredo_get_target(const uint8 *p, RelFileLocator *locator, ForkNumber *fork,
++				 BlockNumber *block)
++{
++	locator->spcOid = zredo_get_u32(p);
++	locator->dbOid = zredo_get_u32(p + 4);
++	locator->relNumber = zredo_get_u32(p + 8);
++	if (p[12] > MAX_FORKNUM)
++		elog(FATAL, "zou redo: bad fork number %d", (int) p[12]);
++	*fork = (ForkNumber) p[12];
++	*block = zredo_get_u32(p + 13);
++}
++
++/*
++ * Exact reads and writes on the request pipe.  A clean EOF at a message
++ * boundary means the pool is done with us.
++ */
++static bool
++read_full(void *dst, size_t len, bool eof_ok)
++{
++	char	   *p = dst;
++	size_t		left = len;
++
++	while (left > 0)
++	{
++		ssize_t		n = read(STDIN_FILENO, p, left);
++
++		if (n == 0)
++		{
++			if (eof_ok && left == len)
++				return false;
++			elog(FATAL, "zou redo: unexpected EOF on request pipe");
++		}
++		if (n < 0)
++		{
++			if (errno == EINTR)
++				continue;
++			elog(FATAL, "zou redo: read from request pipe failed: %m");
++		}
++		p += n;
++		left -= (size_t) n;
++	}
++	return true;
++}
++
++static void
++write_full(const void *src, size_t len)
++{
++	const char *p = src;
++	size_t		left = len;
++
++	while (left > 0)
++	{
++		ssize_t		n = write(STDOUT_FILENO, p, left);
++
++		if (n < 0)
++		{
++			if (errno == EINTR)
++				continue;
++			elog(FATAL, "zou redo: write to response pipe failed: %m");
++		}
++		p += n;
++		left -= (size_t) n;
++	}
++}
++
++/* ----------------------------------------------------------------
++ * In-memory page store
++ *
++ * Base images pushed by the pool and pages spilled from the tiny
++ * shared_buffers pool both land here.  Reads of blocks nobody stored
++ * return zero pages, which is what redo expects for blocks it has not
++ * seen yet.
++ * ----------------------------------------------------------------
++ */
++
++static void
++store_create(void)
++{
++	HASHCTL		ctl;
++
++	ctl.keysize = sizeof(ZRedoPageKey);
++	ctl.entrysize = sizeof(ZRedoPage);
++	ctl.hcxt = store_cxt;
++	page_tab = hash_create("zou redo pages", 64, &ctl,
++						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++
++	ctl.keysize = sizeof(ZRedoForkKey);
++	ctl.entrysize = sizeof(ZRedoFork);
++	ctl.hcxt = store_cxt;
++	fork_tab = hash_create("zou redo fork sizes", 16, &ctl,
++						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++
++	ctl.keysize = sizeof(Oid);
++	ctl.entrysize = sizeof(Oid);
++	ctl.hcxt = store_cxt;
++	db_tab = hash_create("zou redo touched dbs", 4, &ctl,
++						 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++}
++
++/*
++ * Between batches every page must go: the same worker serves unrelated
++ * tenants whose relfilelocators can collide.  Buffers are dropped by
++ * database oid, which zredo_open collected for every relation that went
++ * through the buffer manager, so pages that exist only in shared buffers
++ * (FPI restores that were never evicted) are covered too.
++ */
++static void
++store_reset(void)
++{
++	if (db_tab != NULL)
++	{
++		HASH_SEQ_STATUS it;
++		Oid		   *db;
++
++		hash_seq_init(&it, db_tab);
++		while ((db = (Oid *) hash_seq_search(&it)) != NULL)
++			DropDatabaseBuffers(*db);
++	}
++	smgrdestroyall();
++	page_tab = NULL;
++	fork_tab = NULL;
++	db_tab = NULL;
++	MemoryContextReset(store_cxt);
++	store_create();
++}
++
++static ZRedoFork *
++fork_entry(RelFileLocator locator, ForkNumber fork, bool create)
++{
++	ZRedoForkKey key;
++	ZRedoFork  *entry;
++	bool		found;
++
++	memset(&key, 0, sizeof(key));
++	key.locator = locator;
++	key.fork = fork;
++	if (!create)
++		return (ZRedoFork *) hash_search(fork_tab, &key, HASH_FIND, NULL);
++	entry = (ZRedoFork *) hash_search(fork_tab, &key, HASH_ENTER, &found);
++	if (!found)
++		entry->nblocks = 0;
++	return entry;
++}
++
++static void
++store_page(RelFileLocator locator, ForkNumber fork, BlockNumber block,
++		   const void *image)
++{
++	ZRedoPageKey key;
++	ZRedoPage  *page;
++	ZRedoFork  *fk;
++
++	memset(&key, 0, sizeof(key));
++	key.locator = locator;
++	key.fork = fork;
++	key.block = block;
++	page = (ZRedoPage *) hash_search(page_tab, &key, HASH_ENTER, NULL);
++	memcpy(page->image, image, BLCKSZ);
++	fk = fork_entry(locator, fork, true);
++	fk->nblocks = Max(fk->nblocks, block + 1);
++}
++
++static void
++load_page(RelFileLocator locator, ForkNumber fork, BlockNumber block,
++		  void *image)
++{
++	ZRedoPageKey key;
++	ZRedoPage  *page;
++
++	memset(&key, 0, sizeof(key));
++	key.locator = locator;
++	key.fork = fork;
++	key.block = block;
++	page = (ZRedoPage *) hash_search(page_tab, &key, HASH_FIND, NULL);
++	if (page != NULL)
++		memcpy(image, page->image, BLCKSZ);
++	else
++		memset(image, 0, BLCKSZ);
++}
++
++/* drop stored pages of one relation, optionally only from a block up */
++static void
++forget_pages(RelFileLocator locator, ForkNumber fork, bool all_forks,
++			 BlockNumber from_block)
++{
++	HASH_SEQ_STATUS it;
++	ZRedoPage  *page;
++
++	hash_seq_init(&it, page_tab);
++	while ((page = (ZRedoPage *) hash_seq_search(&it)) != NULL)
++	{
++		if (!RelFileLocatorEquals(page->key.locator, locator))
++			continue;
++		if (!all_forks && page->key.fork != fork)
++			continue;
++		if (page->key.block < from_block)
++			continue;
++		hash_search(page_tab, &page->key, HASH_REMOVE, NULL);
++	}
++}
++
++/* ----------------------------------------------------------------
++ * The in-memory smgr, entry 2 in smgr.c's smgrsw table
++ * ----------------------------------------------------------------
++ */
++
++void
++zredo_open(SMgrRelation reln)
++{
++	Oid			db = reln->smgr_rlocator.locator.dbOid;
++
++	/* remember the database so store_reset can drop its buffers */
++	hash_search(db_tab, &db, HASH_ENTER, NULL);
++}
++
++void
++zredo_close(SMgrRelation reln, ForkNumber forknum)
++{
++}
++
++void
++zredo_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
++{
++	fork_entry(reln->smgr_rlocator.locator, forknum, true);
++}
++
++bool
++zredo_exists(SMgrRelation reln, ForkNumber forknum)
++{
++	return fork_entry(reln->smgr_rlocator.locator, forknum, false) != NULL;
++}
++
++void
++zredo_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
++{
++	ZRedoForkKey key;
++
++	forget_pages(rlocator.locator, forknum, forknum == InvalidForkNumber, 0);
++	if (forknum == InvalidForkNumber)
++	{
++		for (int f = 0; f <= MAX_FORKNUM; f++)
++		{
++			memset(&key, 0, sizeof(key));
++			key.locator = rlocator.locator;
++			key.fork = (ForkNumber) f;
++			hash_search(fork_tab, &key, HASH_REMOVE, NULL);
++		}
++	}
++	else
++	{
++		memset(&key, 0, sizeof(key));
++		key.locator = rlocator.locator;
++		key.fork = forknum;
++		hash_search(fork_tab, &key, HASH_REMOVE, NULL);
++	}
++}
++
++void
++zredo_extend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++			 const void *buffer, bool skipFsync)
++{
++	store_page(reln->smgr_rlocator.locator, forknum, blocknum, buffer);
++}
++
++void
++zredo_zeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++				 int nblocks, bool skipFsync)
++{
++	ZRedoFork  *fk = fork_entry(reln->smgr_rlocator.locator, forknum, true);
++
++	/* no need to materialize zero pages, reads of missing blocks are zero */
++	fk->nblocks = Max(fk->nblocks, blocknum + (BlockNumber) nblocks);
++}
++
++bool
++zredo_prefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++			   int nblocks)
++{
++	return true;
++}
++
++uint32
++zredo_maxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
++{
++	/* one scratch region per IO bounds combining, see zredo_startreadv */
++	return PG_IOV_MAX;
++}
++
++void
++zredo_readv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++			void **buffers, BlockNumber nblocks)
++{
++	for (BlockNumber i = 0; i < nblocks; i++)
++		load_page(reln->smgr_rlocator.locator, forknum, blocknum + i,
++				  buffers[i]);
++}
++
++/*
++ * Same trick as zoustartreadv in zou_smgr.c: pgaio wants an fd to read
++ * from, so stage the pages into this process's scratch file and point the
++ * IO at the staged region.  The scratch fd is opened before the seccomp
++ * filter goes up; the sandbox only needs pread/pwrite on it.
++ */
++void
++zredo_startreadv(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
++				 BlockNumber blocknum, void **buffers, BlockNumber nblocks)
++{
++	off_t		region;
++	struct iovec *iov;
++	int			iovcnt PG_USED_FOR_ASSERTS_ONLY;
++	uint8	   *staged;
++
++	Assert(zredo_scratch_fd >= 0);
++
++	region = (off_t) pgaio_io_get_id(ioh) * PG_IOV_MAX * BLCKSZ;
++	staged = palloc((Size) nblocks * BLCKSZ);
++	for (BlockNumber i = 0; i < nblocks; i++)
++		load_page(reln->smgr_rlocator.locator, forknum, blocknum + i,
++				  staged + (Size) i * BLCKSZ);
++	if (pwrite(zredo_scratch_fd, staged, (size_t) nblocks * BLCKSZ, region) !=
++		(ssize_t) ((size_t) nblocks * BLCKSZ))
++		ereport(ERROR,
++				(errcode_for_file_access(),
++				 errmsg("zou redo could not stage pages: %m")));
++	pfree(staged);
++
++	iovcnt = pgaio_io_get_iovec(ioh, &iov);
++	Assert((int) nblocks <= iovcnt);
++	for (BlockNumber i = 0; i < nblocks; i++)
++	{
++		iov[i].iov_base = buffers[i];
++		iov[i].iov_len = BLCKSZ;
++	}
++
++	pgaio_io_set_flag(ioh, PGAIO_HF_BUFFERED);
++	pgaio_io_set_target_smgr(ioh, reln, forknum, blocknum, nblocks, false);
++	pgaio_io_register_callbacks(ioh, PGAIO_HCB_MD_READV, 0);
++	pgaio_io_start_readv(ioh, zredo_scratch_fd, (int) nblocks, region);
++}
++
++void
++zredo_writev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++			 const void **buffers, BlockNumber nblocks, bool skipFsync)
++{
++	for (BlockNumber i = 0; i < nblocks; i++)
++		store_page(reln->smgr_rlocator.locator, forknum, blocknum + i,
++				   buffers[i]);
++}
++
++void
++zredo_writeback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++				BlockNumber nblocks)
++{
++}
++
++BlockNumber
++zredo_nblocks(SMgrRelation reln, ForkNumber forknum)
++{
++	ZRedoFork  *fk = fork_entry(reln->smgr_rlocator.locator, forknum, false);
++
++	return fk != NULL ? fk->nblocks : 0;
++}
++
++void
++zredo_truncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks,
++			   BlockNumber nblocks)
++{
++	ZRedoFork  *fk = fork_entry(reln->smgr_rlocator.locator, forknum, true);
++
++	fk->nblocks = nblocks;
++	forget_pages(reln->smgr_rlocator.locator, forknum, false, nblocks);
++}
++
++void
++zredo_immedsync(SMgrRelation reln, ForkNumber forknum)
++{
++}
++
++void
++zredo_registersync(SMgrRelation reln, ForkNumber forknum)
++{
++}
++
++int
++zredo_fd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
++		 uint32 *off)
++{
++	elog(ERROR, "zou redo smgr has no file descriptors");
++	return -1;
++}
++
++/* ----------------------------------------------------------------
++ * Record application
++ * ----------------------------------------------------------------
++ */
++
++static int
++zredo_page_read(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr,
++				int reqLen, XLogRecPtr targetRecPtr, char *readBuf)
++{
++	elog(ERROR, "zou redo worker has no WAL to read");
++	return -1;
++}
++
++static void
++zredo_segment_open(XLogReaderState *xlogreader, XLogSegNo nextSegNo,
++				   TimeLineID *tli_p)
++{
++	elog(ERROR, "zou redo worker has no WAL segments");
++}
++
++static void
++zredo_segment_close(XLogReaderState *xlogreader)
++{
++}
++
++/*
++ * Run one record through its redo routine.  The record was never read
++ * from a WAL page, so instead of going through the reader's fetch loop we
++ * decode it in place and install the decoded record directly, the same
++ * shortcut Neon's walredo uses.  DecodeXLogRecord only requires
++ * decoded->oversized to be set when handed an external buffer.
++ *
++ * The end LSN comes from the caller, who read the record out of real WAL
++ * pages and knows how many page headers it crossed.  It cannot be derived
++ * from the length here, and it has to be exact: redo routines stamp it
++ * into the pages they touch as the page LSN.
++ */
++static void
++apply_record(XLogRecPtr lsn, XLogRecPtr end_lsn, XLogRecord *record,
++			 uint32 reclen)
++{
++	DecodedXLogRecord *decoded;
++	char	   *errormsg = NULL;
++
++	if (reclen < SizeOfXLogRecord || record->xl_tot_len != reclen)
++		elog(FATAL, "zou redo: record length %u does not match xl_tot_len %u",
++			 reclen, record->xl_tot_len);
++	if (XLogRecPtrIsInvalid(lsn) || !XRecOffIsValid(lsn))
++		elog(FATAL, "zou redo: bad record LSN %X/%X", LSN_FORMAT_ARGS(lsn));
++	if (end_lsn < lsn + MAXALIGN(record->xl_tot_len))
++		elog(FATAL, "zou redo: bad record end LSN %X/%X for record at %X/%X",
++			 LSN_FORMAT_ARGS(end_lsn), LSN_FORMAT_ARGS(lsn));
++
++	decoded = palloc(DecodeXLogRecordRequiredSpace(record->xl_tot_len));
++	decoded->oversized = true;
++	if (!DecodeXLogRecord(reader, decoded, record, lsn, &errormsg))
++		elog(ERROR, "zou redo: could not decode record at %X/%X: %s",
++			 LSN_FORMAT_ARGS(lsn), errormsg ? errormsg : "unknown error");
++	decoded->next_lsn = end_lsn;
++
++	reader->record = decoded;
++	reader->ReadRecPtr = lsn;
++	reader->EndRecPtr = decoded->next_lsn;
++
++	GetRmgr(XLogRecGetRmid(reader)).rm_redo(reader);
++
++	reader->record = NULL;
++	pfree(decoded);
++}
++
++/* ----------------------------------------------------------------
++ * Request handlers
++ * ----------------------------------------------------------------
++ */
++
++static void
++handle_push(const uint8 *payload, uint32 len)
++{
++	RelFileLocator locator;
++	ForkNumber	fork;
++	BlockNumber block;
++
++	if (len != ZREDO_TARGET_LEN + BLCKSZ)
++		elog(FATAL, "zou redo: bad push length %u", len);
++	zredo_get_target(payload, &locator, &fork, &block);
++	store_page(locator, fork, block, payload + ZREDO_TARGET_LEN);
++}
++
++static void
++handle_apply(uint8 *payload, uint32 len)
++{
++	XLogRecPtr	lsn;
++	XLogRecPtr	end_lsn;
++
++	if (len < 16 + SizeOfXLogRecord)
++		elog(FATAL, "zou redo: bad apply length %u", len);
++	lsn = (XLogRecPtr) zredo_get_u64(payload);
++	end_lsn = (XLogRecPtr) zredo_get_u64(payload + 8);
++
++	/* msgbuf is maxaligned and the record sits 16 bytes in, still aligned */
++	StaticAssertStmt(MAXIMUM_ALIGNOF <= 8, "record alignment");
++	apply_record(lsn, end_lsn, (XLogRecord *) (payload + 16), len - 16);
++}
++
++static void
++handle_get(const uint8 *payload, uint32 len)
++{
++	RelFileLocator locator;
++	ForkNumber	fork;
++	BlockNumber block;
++	Buffer		buf;
++	static uint8 resp[5 + BLCKSZ];
++
++	if (len != ZREDO_TARGET_LEN)
++		elog(FATAL, "zou redo: bad get length %u", len);
++	zredo_get_target(payload, &locator, &fork, &block);
++
++	buf = ReadBufferWithoutRelcache(locator, fork, block, RBM_NORMAL, NULL,
++									true);
++	LockBuffer(buf, BUFFER_LOCK_SHARE);
++	memcpy(resp + 5, BufferGetPage(buf), BLCKSZ);
++	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
++	ReleaseBuffer(buf);
++
++	resp[0] = ZREDO_TAG_PAGE;
++	zredo_put_u32(resp + 1, BLCKSZ);
++	write_full(resp, sizeof(resp));
++}
++
++static void
++request_loop(void)
++{
++	for (;;)
++	{
++		uint8		tag;
++		uint8		lenbuf[4];
++		uint32		len;
++		MemoryContext oldcxt;
++
++		if (!read_full(&tag, 1, true))
++			proc_exit(0);
++		read_full(lenbuf, sizeof(lenbuf), false);
++		len = zredo_get_u32(lenbuf);
++		if (len > ZREDO_MAX_PAYLOAD)
++			elog(FATAL, "zou redo: oversized request of %u bytes", len);
++		if (len > msgbuf_size)
++		{
++			Size		want = Max((Size) len, msgbuf_size * 2);
++
++			msgbuf = repalloc(msgbuf, want);
++			msgbuf_size = want;
++		}
++		if (len > 0)
++			read_full(msgbuf, len, false);
++
++		oldcxt = MemoryContextSwitchTo(scratch_cxt);
++		switch (tag)
++		{
++			case ZREDO_TAG_RESET:
++				if (len != 0)
++					elog(FATAL, "zou redo: bad reset length %u", len);
++				store_reset();
++				break;
++			case ZREDO_TAG_PUSH:
++				handle_push(msgbuf, len);
++				break;
++			case ZREDO_TAG_APPLY:
++				handle_apply(msgbuf, len);
++				break;
++			case ZREDO_TAG_GET:
++				handle_get(msgbuf, len);
++				break;
++			default:
++				elog(FATAL, "zou redo: unknown request tag 0x%02x",
++					 (unsigned) tag);
++		}
++		MemoryContextSwitchTo(oldcxt);
++		MemoryContextReset(scratch_cxt);
++	}
++}
++
++/* ----------------------------------------------------------------
++ * Sandbox
++ * ----------------------------------------------------------------
++ */
++
++#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
++
++#if defined(__x86_64__)
++#define ZREDO_SECCOMP_ARCH AUDIT_ARCH_X86_64
++#else
++#define ZREDO_SECCOMP_ARCH AUDIT_ARCH_AARCH64
++#endif
++
++#ifndef SECCOMP_RET_KILL_PROCESS
++#define SECCOMP_RET_KILL_PROCESS 0x80000000U
++#endif
++
++/*
++ * Raw BPF allowlist.  Everything the steady state needs: pipe IO, memory,
++ * locking, time, signals and clean exit, plus pread/pwrite for the AIO
++ * scratch file and the sysv teardown calls proc_exit runs into.  Anything
++ * else kills the process and the pool restarts it.
++ */
++static void
++enter_sandbox(void)
++{
++	int			allowed[48];
++	int			n = 0;
++	struct sock_filter prog[4 + lengthof(allowed) * 2];
++	int			pc = 0;
++	struct sock_fprog fprog;
++
++	allowed[n++] = __NR_read;
++	allowed[n++] = __NR_write;
++	allowed[n++] = __NR_close;
++	allowed[n++] = __NR_pread64;
++	allowed[n++] = __NR_pwrite64;
++	allowed[n++] = __NR_preadv;
++	allowed[n++] = __NR_pwritev;
++#ifdef __NR_preadv2
++	allowed[n++] = __NR_preadv2;
++#endif
++#ifdef __NR_pwritev2
++	allowed[n++] = __NR_pwritev2;
++#endif
++#ifdef __NR_fstat
++	allowed[n++] = __NR_fstat;
++#endif
++	allowed[n++] = __NR_lseek;
++	allowed[n++] = __NR_ftruncate;
++	allowed[n++] = __NR_fallocate;
++	allowed[n++] = __NR_exit;
++	allowed[n++] = __NR_exit_group;
++	allowed[n++] = __NR_brk;
++	allowed[n++] = __NR_mmap;
++	allowed[n++] = __NR_munmap;
++	allowed[n++] = __NR_mremap;
++	allowed[n++] = __NR_mprotect;
++	allowed[n++] = __NR_madvise;
++	allowed[n++] = __NR_futex;
++	allowed[n++] = __NR_rt_sigreturn;
++	allowed[n++] = __NR_rt_sigprocmask;
++	allowed[n++] = __NR_rt_sigaction;
++	allowed[n++] = __NR_sigaltstack;
++	allowed[n++] = __NR_getpid;
++	allowed[n++] = __NR_gettid;
++	allowed[n++] = __NR_tgkill;
++	allowed[n++] = __NR_kill;
++	allowed[n++] = __NR_clock_gettime;
++	allowed[n++] = __NR_clock_nanosleep;
++	allowed[n++] = __NR_nanosleep;
++	allowed[n++] = __NR_getrandom;
++	allowed[n++] = __NR_sched_yield;
++	allowed[n++] = __NR_restart_syscall;
++	allowed[n++] = __NR_shmdt;
++	allowed[n++] = __NR_shmctl;
++	allowed[n++] = __NR_semtimedop;
++#ifdef __NR_semop
++	allowed[n++] = __NR_semop;
++#endif
++#ifdef __NR_semget
++	allowed[n++] = __NR_semget;
++#endif
++#ifdef __NR_gettimeofday
++	allowed[n++] = __NR_gettimeofday;
++#endif
++
++	prog[pc++] = (struct sock_filter)
++		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++				 offsetof(struct seccomp_data, arch));
++	prog[pc++] = (struct sock_filter)
++		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ZREDO_SECCOMP_ARCH, 1, 0);
++	prog[pc++] = (struct sock_filter)
++		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
++	prog[pc++] = (struct sock_filter)
++		BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
++				 offsetof(struct seccomp_data, nr));
++	for (int i = 0; i < n; i++)
++	{
++		prog[pc++] = (struct sock_filter)
++			BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32) allowed[i], 0, 1);
++		prog[pc++] = (struct sock_filter)
++			BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
++	}
++	prog[pc++] = (struct sock_filter)
++		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
++
++	fprog.len = (unsigned short) pc;
++	fprog.filter = prog;
++
++	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0)
++		elog(FATAL, "zou redo: could not set no_new_privs: %m");
++	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &fprog) != 0)
++		elog(FATAL, "zou redo: could not install seccomp filter: %m");
++}
++
++#else							/* no seccomp on this platform */
++
++static void
++enter_sandbox(void)
++{
++	/* development platforms run unsandboxed */
++}
++
++#endif
++
++/* ----------------------------------------------------------------
++ * Startup
++ * ----------------------------------------------------------------
++ */
++
++void
++ZouRedoMain(int argc, char *argv[])
++{
++	if (argc < 3)
++	{
++		write_stderr("usage: %s --zou-redo <scratchdir> [checksum_version]\n",
++					 argv[0]);
++		proc_exit(1);
++	}
++
++	zou_redo_active = true;
++
++	/* make sure the zou object storage smgr stays inert in this process */
++	unsetenv("ZOU_TARGET");
++
++	InitStandaloneProcess(argv[0]);
++	InitializeGUCOptions();
++
++	/*
++	 * A tiny buffer pool is plenty: it only has to hold the working set of
++	 * one redo batch, and pages evicted from it land in the in-memory
++	 * store.  io_method has to be sync because there are no AIO workers in
++	 * this process.
++	 */
++	SetConfigOption("shared_buffers", "1MB", PGC_POSTMASTER, PGC_S_OVERRIDE);
++	SetConfigOption("io_method", "sync", PGC_POSTMASTER, PGC_S_OVERRIDE);
++	SetConfigOption("max_connections", "4", PGC_POSTMASTER, PGC_S_OVERRIDE);
++	SetConfigOption("max_worker_processes", "2", PGC_POSTMASTER,
++					PGC_S_OVERRIDE);
++	SetConfigOption("max_wal_senders", "0", PGC_POSTMASTER, PGC_S_OVERRIDE);
++
++	/*
++	 * The scratch directory stands in for a data directory: the sysv shmem
++	 * interlock derives its key from it and the AIO scratch file lives in
++	 * it.  No control file, lock file or catalogs are read from it.
++	 */
++	SetDataDir(argv[2]);
++	ChangeToDataDir();
++
++	/*
++	 * A few shared memory init paths scan their on-disk directories even
++	 * though this process never uses them, so give the scratch dir the
++	 * skeleton they expect.
++	 */
++	{
++		static const char *const skeleton[] = {
++			"base", "global", "pg_commit_ts", "pg_multixact",
++			"pg_multixact/members", "pg_multixact/offsets", "pg_notify",
++			"pg_serial", "pg_subtrans", "pg_twophase", "pg_wal", "pg_xact",
++		};
++
++		for (int i = 0; i < (int) lengthof(skeleton); i++)
++		{
++			if (mkdir(skeleton[i], pg_dir_create_mode) != 0 &&
++				errno != EEXIST)
++				ereport(FATAL,
++						(errcode_for_file_access(),
++						 errmsg("zou redo could not create \"%s\": %m",
++								skeleton[i])));
++		}
++	}
++
++	/*
++	 * The worker must mirror the origin cluster's data checksum setting:
++	 * redo routines branch on XLogHintBitIsNeeded, so getting this wrong
++	 * silently produces pages whose LSNs diverge from the primary's.  With
++	 * a nonzero version, pushed base images must carry valid checksums,
++	 * because page reads verify them.
++	 */
++	ZouRedoInstallFakeControlFile(argc > 3 ? (uint32) atoi(argv[3]) : 0);
++
++	InitializeMaxBackends();
++	InitPostmasterChildSlots();
++	InitializeFastPathLocks();
++	InitializeShmemGUCs();
++	InitializeWalConsistencyChecking();
++	CreateSharedMemoryAndSemaphores();
++	set_max_safe_fds();
++	PgStartTime = GetCurrentTimestamp();
++	InitProcess();
++	BaseInit();
++
++	/* buffer pins are tracked per resource owner, aux style suits us */
++	CreateAuxProcessResourceOwner();
++
++	pqsignal(SIGPIPE, SIG_IGN);
++
++	/*
++	 * Redo routines and the machinery under them insist on recovery being
++	 * in progress, which for this process is simply always true.
++	 */
++	InRecovery = true;
++	RmgrStartup();
++
++	reader = XLogReaderAllocate(wal_segment_size, NULL,
++								XL_ROUTINE(.page_read = &zredo_page_read,
++										   .segment_open = &zredo_segment_open,
++										   .segment_close = &zredo_segment_close),
++								NULL);
++	if (reader == NULL)
++		elog(FATAL, "zou redo: out of memory allocating WAL reader");
++
++	{
++		char		path[MAXPGPATH];
++
++		snprintf(path, sizeof(path), "zou-redo-scratch-%d", MyProcPid);
++		zredo_scratch_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
++		if (zredo_scratch_fd < 0)
++			ereport(FATAL,
++					(errcode_for_file_access(),
++					 errmsg("zou redo could not open scratch file \"%s\": %m",
++							path)));
++		/* keep the fd, drop the name */
++		unlink(path);
++	}
++
++	store_cxt = AllocSetContextCreate(TopMemoryContext, "zou redo store",
++									  ALLOCSET_DEFAULT_SIZES);
++	scratch_cxt = AllocSetContextCreate(TopMemoryContext, "zou redo scratch",
++										ALLOCSET_DEFAULT_SIZES);
++	msgbuf_size = 64 * 1024;
++	msgbuf = MemoryContextAlloc(TopMemoryContext, msgbuf_size);
++	store_create();
++
++	/* any elog(ERROR) from here on exits the process instead of longjmping */
++	ExitOnAnyError = true;
++
++	if (getenv("ZOU_REDO_NO_SANDBOX") == NULL)
++		enter_sandbox();
++
++	request_loop();
++}
+--- a/src/backend/main/main.c
++++ b/src/backend/main/main.c
+@@ -30,6 +30,7 @@
+ #include <sys/param.h>
+ #endif
+ 
++#include "access/zou_walredo.h"
+ #include "bootstrap/bootstrap.h"
+ #include "common/username.h"
+ #include "miscadmin.h"
+@@ -52,6 +53,7 @@ static const char *const DispatchOptionNames[] =
+ 	[DISPATCH_FORKCHILD] = "forkchild",
+ 	[DISPATCH_DESCRIBE_CONFIG] = "describe-config",
+ 	[DISPATCH_SINGLE] = "single",
++	[DISPATCH_ZOU_REDO] = "zou-redo",
+ 	/* DISPATCH_POSTMASTER has no name */
+ };
+ 
+@@ -223,6 +225,9 @@ main(int argc, char *argv[])
+ 			PostgresSingleUserMain(argc, argv,
+ 								   strdup(get_user_name_or_exit(progname)));
+ 			break;
++		case DISPATCH_ZOU_REDO:
++			ZouRedoMain(argc, argv);
++			break;
+ 		case DISPATCH_POSTMASTER:
+ 			PostmasterMain(argc, argv);
+ 			break;
+--- a/src/backend/storage/ipc/ipci.c
++++ b/src/backend/storage/ipc/ipci.c
+@@ -50,6 +50,7 @@
+ #include "storage/procarray.h"
+ #include "storage/procsignal.h"
+ #include "storage/sinvaladt.h"
++#include "storage/zou_smgr.h"
+ #include "utils/guc.h"
+ #include "utils/injection_point.h"
+ 
+--- a/src/backend/storage/smgr/smgr.c
++++ b/src/backend/storage/smgr/smgr.c
+@@ -64,6 +64,7 @@
+ #include "postgres.h"
+ 
+ #include "access/xlogutils.h"
++#include "access/zou_walredo.h"
+ #include "lib/ilist.h"
+ #include "miscadmin.h"
+ #include "storage/aio.h"
+@@ -172,6 +173,29 @@ static const f_smgr smgrsw[] = {
+ 		.smgr_immedsync = zouimmedsync,
+ 		.smgr_registersync = zouregistersync,
+ 		.smgr_fd = zoufd,
++	},
++	/* in-memory store for the zou WAL redo worker */
++	{
++		.smgr_init = NULL,
++		.smgr_shutdown = NULL,
++		.smgr_open = zredo_open,
++		.smgr_close = zredo_close,
++		.smgr_create = zredo_create,
++		.smgr_exists = zredo_exists,
++		.smgr_unlink = zredo_unlink,
++		.smgr_extend = zredo_extend,
++		.smgr_zeroextend = zredo_zeroextend,
++		.smgr_prefetch = zredo_prefetch,
++		.smgr_maxcombine = zredo_maxcombine,
++		.smgr_readv = zredo_readv,
++		.smgr_startreadv = zredo_startreadv,
++		.smgr_writev = zredo_writev,
++		.smgr_writeback = zredo_writeback,
++		.smgr_nblocks = zredo_nblocks,
++		.smgr_truncate = zredo_truncate,
++		.smgr_immedsync = zredo_immedsync,
++		.smgr_registersync = zredo_registersync,
++		.smgr_fd = zredo_fd,
+ 	}
+ };
+ 
+@@ -297,7 +321,10 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
+ 		reln->smgr_targblock = InvalidBlockNumber;
+ 		for (int i = 0; i <= MAX_FORKNUM; ++i)
+ 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
+-		reln->smgr_which = zou_smgr_routable(reln) ? 1 : 0;
++		if (zou_redo_active)
++			reln->smgr_which = 2;
++		else
++			reln->smgr_which = zou_smgr_routable(reln) ? 1 : 0;
+ 
+ 		/* it is not pinned yet */
+ 		reln->pincount = 0;
+--- /dev/null
++++ b/src/include/access/zou_walredo.h
+@@ -0,0 +1,75 @@
++/*-------------------------------------------------------------------------
++ *
++ * zou_walredo.h
++ *	  Declarations for the zou WAL redo worker mode.
++ *
++ * The redo worker is a sandboxed postgres process started as
++ * "postgres --zou-redo <scratchdir>".  It speaks a small binary protocol
++ * on stdin/stdout: the pool pushes base page images and WAL records, the
++ * worker applies the records with the real rmgr redo routines against an
++ * in-memory smgr, and returns materialized page images.  See
++ * src/backend/access/transam/zou_walredo.c for the protocol.
++ *
++ *-------------------------------------------------------------------------
++ */
++#ifndef ZOU_WALREDO_H
++#define ZOU_WALREDO_H
++
++#include "storage/block.h"
++#include "storage/relfilelocator.h"
++#include "storage/smgr.h"
++
++/* true when this process is running as a zou redo worker */
++extern PGDLLIMPORT bool zou_redo_active;
++
++/* entry point, dispatched from main() on --zou-redo */
++pg_noreturn extern void ZouRedoMain(int argc, char *argv[]);
++
++/*
++ * Installs a fabricated in-memory control file so the redo worker never
++ * touches a real pg_control.  Defined in xlog.c because ControlFile is
++ * static there.  Must run before CreateSharedMemoryAndSemaphores so that
++ * XLOGShmemInit copies it into the (private) shared memory copy.
++ */
++extern void ZouRedoInstallFakeControlFile(uint32 data_checksum_version);
++
++/*
++ * The in-memory smgr used while zou_redo_active.  Wired up as a third
++ * entry in smgr.c's smgrsw table.
++ */
++extern void zredo_open(SMgrRelation reln);
++extern void zredo_close(SMgrRelation reln, ForkNumber forknum);
++extern void zredo_create(SMgrRelation reln, ForkNumber forknum, bool isRedo);
++extern bool zredo_exists(SMgrRelation reln, ForkNumber forknum);
++extern void zredo_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum,
++						 bool isRedo);
++extern void zredo_extend(SMgrRelation reln, ForkNumber forknum,
++						 BlockNumber blocknum, const void *buffer,
++						 bool skipFsync);
++extern void zredo_zeroextend(SMgrRelation reln, ForkNumber forknum,
++							 BlockNumber blocknum, int nblocks,
++							 bool skipFsync);
++extern bool zredo_prefetch(SMgrRelation reln, ForkNumber forknum,
++						   BlockNumber blocknum, int nblocks);
++extern uint32 zredo_maxcombine(SMgrRelation reln, ForkNumber forknum,
++							   BlockNumber blocknum);
++extern void zredo_readv(SMgrRelation reln, ForkNumber forknum,
++						BlockNumber blocknum, void **buffers,
++						BlockNumber nblocks);
++extern void zredo_startreadv(PgAioHandle *ioh, SMgrRelation reln,
++							 ForkNumber forknum, BlockNumber blocknum,
++							 void **buffers, BlockNumber nblocks);
++extern void zredo_writev(SMgrRelation reln, ForkNumber forknum,
++						 BlockNumber blocknum, const void **buffers,
++						 BlockNumber nblocks, bool skipFsync);
++extern void zredo_writeback(SMgrRelation reln, ForkNumber forknum,
++							BlockNumber blocknum, BlockNumber nblocks);
++extern BlockNumber zredo_nblocks(SMgrRelation reln, ForkNumber forknum);
++extern void zredo_truncate(SMgrRelation reln, ForkNumber forknum,
++						   BlockNumber old_blocks, BlockNumber nblocks);
++extern void zredo_immedsync(SMgrRelation reln, ForkNumber forknum);
++extern void zredo_registersync(SMgrRelation reln, ForkNumber forknum);
++extern int	zredo_fd(SMgrRelation reln, ForkNumber forknum,
++					 BlockNumber blocknum, uint32 *off);
++
++#endif							/* ZOU_WALREDO_H */
+--- a/src/include/postmaster/postmaster.h
++++ b/src/include/postmaster/postmaster.h
+@@ -137,6 +137,7 @@ typedef enum DispatchOption
+ 	DISPATCH_FORKCHILD,
+ 	DISPATCH_DESCRIBE_CONFIG,
+ 	DISPATCH_SINGLE,
++	DISPATCH_ZOU_REDO,
+ 	DISPATCH_POSTMASTER,		/* must be last */
+ } DispatchOption;
+ 
