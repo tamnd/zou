@@ -939,6 +939,13 @@ mod tests {
         "id, name",
         "id, clients (id, name), x",
         "\" name \"",
+        // Json keys that would not read back the way they were
+        // written, so the render has to quote them.
+        "data-> \t ->k",
+        "data-> 9 ->k",
+        "data->\"x.y\"",
+        "data->\"-\"",
+        "data->\"a \t-b\"",
     ];
 
     #[test]

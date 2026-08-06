@@ -12,13 +12,8 @@ libfuzzer-sys = "0.4"
 zou-store = { path = "../crates/zou-store" }
 zou-log = { path = "../crates/zou-log" }
 zou-rest = { path = "../crates/zou-rest" }
-
-[[bin]]
-name = "wal_decode"
-path = "fuzz_targets/wal_decode.rs"
-test = false
-doc = false
-bench = false
+zou-server = { path = "../crates/zou-server" }
+serde_json = "1"
 
 [[bin]]
 name = "frame_v2"
@@ -93,6 +88,20 @@ bench = false
 [[bin]]
 name = "rest_mutate"
 path = "fuzz_targets/rest_mutate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_verify"
+path = "fuzz_targets/jwt_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_keys"
+path = "fuzz_targets/jwt_keys.rs"
 test = false
 doc = false
 bench = false

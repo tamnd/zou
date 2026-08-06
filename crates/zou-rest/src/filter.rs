@@ -1401,6 +1401,14 @@ mod tests {
         ("or", "(arr.cs.{1,2,3},arr.cd.{1})"),
         ("or", "( id.eq.1, and(id.eq.2, id.eq.3) )"),
         ("or", "(and_starting_col.eq.1,\" spaced \".eq.2)"),
+        // A json key that would not read back the way it was written:
+        // nothing left once the spaces come off, digits that would be
+        // an index, a break byte, and a lone dash.
+        ("data-> \t ->k", "eq.1"),
+        ("data-> 9 ->k", "eq.1"),
+        ("data->\"x.y\"", "eq.1"),
+        ("data->\"-\"", "eq.1"),
+        ("data->\"a \t-b\"", "eq.1"),
     ];
 
     #[test]

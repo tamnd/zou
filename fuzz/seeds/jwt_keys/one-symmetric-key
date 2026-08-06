@@ -1,0 +1,1 @@
+[{"alg":"HS256","k":"dGhlLW9sZC1wcm9qZWN0LXNlY3JldA","key_ops":["sign","verify"],"kid":"legacy","kty":"oct"}]
