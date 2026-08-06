@@ -475,10 +475,20 @@ async fn deliver(
         return Err(StorageError::no_such_key());
     };
 
+    // In the order upstream's renderer writes them, which costs nothing
+    // to keep and makes the two answers comparable byte for byte.
     let mut answer = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, served_type(mime))
-        .header(header::ACCEPT_RANGES, "bytes");
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_TYPE, served_type(mime));
+    if let Some(etag) = etag.as_str() {
+        answer = answer.header(header::ETAG, etag);
+    }
+    answer = answer.header("x-robots-tag", ROBOTS);
+    if let Some(when) = row.meta("lastModified").as_str().and_then(iso_to_unix) {
+        answer = answer.header(header::LAST_MODIFIED, http_date(when));
+    }
+    answer = answer.header(header::CONTENT_LENGTH, bytes.len());
     answer = match &until {
         Some(when) => answer.header(header::EXPIRES, when),
         None => answer.header(header::CACHE_CONTROL, cache),
@@ -486,12 +496,99 @@ async fn deliver(
     if let Some(range) = content_range {
         answer = answer.header(header::CONTENT_RANGE, range);
     }
-    if let Some(etag) = etag.as_str() {
-        answer = answer.header(header::ETAG, etag);
+    if let Some(name) = asked_for(parts, "download") {
+        answer = answer.header(header::CONTENT_DISPOSITION, attachment(&name));
     }
     answer
         .body(Body::from(bytes))
         .map_err(|e| StorageError::internal(e.to_string()))
+}
+
+/// What every download says about crawling.
+///
+/// Upstream reads an override out of the object's own `metadata`,
+/// validates it against the whole X-Robots-Tag grammar, and falls back
+/// to this when it is not a rule a crawler would understand. Nothing
+/// writes that field. The metadata column is built by the upload out of
+/// the content type, the cache header and the bytes, the copy route
+/// lets a body change two of those fields and neither of them is this
+/// one, and the client's own metadata goes in the other column
+/// entirely. So the override is reachable only by writing the row by
+/// hand, and the validator behind it is a hundred lines about a grammar
+/// no answer this server can produce would ever use.
+const ROBOTS: &str = "none";
+
+/// The `Content-Disposition` a `?download` asks for.
+///
+/// A bare `?download` is a name the client did not give, and upstream
+/// answers with the header and nothing after it. A name is sent twice,
+/// once plainly and once in the utf-8 form, which is what a browser
+/// reads when the two disagree. Both copies are encoded, so the plain
+/// one is only plain in the sense that it has no charset in front of
+/// it.
+fn attachment(name: &str) -> String {
+    if name.is_empty() {
+        return "attachment;".to_string();
+    }
+    let encoded = component(name);
+    format!("attachment; filename={encoded}; filename*=UTF-8''{encoded}")
+}
+
+/// `encodeURIComponent`, whose unreserved set is the url standard's
+/// letters, digits and `-_.~` plus the four marks javascript kept from
+/// an older standard.
+fn component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(byte as char),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// `2026-08-06T14:25:39.016Z` as the second it names.
+///
+/// The metadata remembers the moment in json's spelling because that is
+/// what the upload wrote, and `Last-Modified` wants a browser's. The
+/// milliseconds are read and dropped: the header has nowhere to put
+/// them, and upstream loses them the same way.
+fn iso_to_unix(text: &str) -> Option<i64> {
+    let (date, clock) = text.split_once('T')?;
+    let mut day = date.split('-');
+    let year: i64 = day.next()?.parse().ok()?;
+    let month: i64 = day.next()?.parse().ok()?;
+    let day: i64 = day.next()?.parse().ok()?;
+    let mut time = clock.split(':');
+    let hour: i64 = time.next()?.parse().ok()?;
+    let minute: i64 = time.next()?.parse().ok()?;
+    let second: i64 = time.next()?.get(..2)?.parse().ok()?;
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// The other direction from `smtp::civil`: a date to the day number it
+/// is, counting from 1970. March is treated as the first month so that
+/// the leap day lands at the end of the year and stops being a special
+/// case anywhere else.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let of_era = year - era * 400;
+    let of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let of_era_days = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    era * 146_097 + of_era_days - 719_468
 }
 
 /// GET /storage/v1/object/info/{bucket}/{name}
@@ -1794,9 +1891,13 @@ fn signed_claims(
 /// No extractor, because these handlers already take the parts to read
 /// the authorization header out of them, and because two of the three
 /// parameters this surface has are optional.
+///
+/// A key with no `=` after it is there with an empty value rather than
+/// absent, which is what the query parser upstream uses does and what
+/// `?download` on its own relies on to mean a download with no name.
 fn asked_for(parts: &Parts, name: &str) -> Option<String> {
     parts.uri.query()?.split('&').find_map(|pair| {
-        let (key, value) = pair.split_once('=')?;
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         (crate::rest::decode(key) == name).then(|| crate::rest::decode(value))
     })
 }
@@ -2251,6 +2352,58 @@ mod tests {
         assert_eq!(wanted_range("bytes=3-1", 11), None);
         assert_eq!(wanted_range("lines=1-2", 11), None);
         assert_eq!(wanted_range("bytes=-", 11), None);
+    }
+
+    /// The two forms upstream writes, and the one it writes when the
+    /// client asked for a download without saying what to call it.
+    #[test]
+    fn a_download_is_named_twice_or_not_at_all() {
+        assert_eq!(attachment(""), "attachment;");
+        assert_eq!(
+            attachment("cat.png"),
+            "attachment; filename=cat.png; filename*=UTF-8''cat.png"
+        );
+        assert_eq!(
+            attachment("my notes.txt"),
+            "attachment; filename=my%20notes.txt; filename*=UTF-8''my%20notes.txt"
+        );
+    }
+
+    /// `encodeURIComponent` keeps four marks the url standard escapes,
+    /// and escapes the separators that would end the header early.
+    #[test]
+    fn the_encoding_is_javascripts_and_not_the_url_standards() {
+        assert_eq!(component("a-b_c.d~e"), "a-b_c.d~e");
+        assert_eq!(component("!*'()"), "!*'()");
+        assert_eq!(component("a;b,c=d"), "a%3Bb%2Cc%3Dd");
+        assert_eq!(component("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn a_moment_in_json_becomes_a_moment_in_a_header() {
+        let when = iso_to_unix("2026-08-06T14:25:39.016Z").unwrap();
+        assert_eq!(http_date(when), "Thu, 06 Aug 2026 14:25:39 GMT");
+        // No milliseconds and no zone letter, which is the other
+        // spelling a timestamp arrives in.
+        let when = iso_to_unix("1970-01-01T00:00:00").unwrap();
+        assert_eq!(when, 0);
+        assert_eq!(http_date(when), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(iso_to_unix("2026-08-06"), None);
+        assert_eq!(iso_to_unix(""), None);
+    }
+
+    /// The day number and the date it is are each other's inverse, and
+    /// the leap day is where a wrong one would show.
+    #[test]
+    fn the_two_directions_of_a_date_agree() {
+        for days in [-719_468, -1, 0, 1, 11_017, 20_671, 25_000] {
+            let (year, month, day) = crate::smtp::civil(days);
+            assert_eq!(days_from_civil(year, month as i64, day as i64), days);
+        }
+        assert_eq!(
+            crate::smtp::civil(days_from_civil(2024, 2, 29)),
+            (2024, 2, 29)
+        );
     }
 
     #[test]

@@ -561,6 +561,78 @@ async fn a_copy_that_is_refused_writes_no_bytes() {
     );
 }
 
+/// Everything a download says about itself, which is more than the
+/// bytes and is where a client library gets the filename it saves under.
+///
+/// The suite cannot see most of this. Its comparison is eight headers
+/// long and none of these four are among them, so the only place they
+/// can be held to anything is here.
+#[tokio::test]
+async fn a_download_carries_what_the_renderer_carries() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-headers").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-headers/report%20card.txt",
+        "text/plain",
+        "eleven byte",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+
+    let answer = call(
+        &f,
+        "GET",
+        "/storage/v1/object/zou-headers/report%20card.txt",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(answer.header("accept-ranges"), Some("bytes"));
+    assert_eq!(
+        answer.header("content-type"),
+        Some("text/plain; charset=UTF-8")
+    );
+    assert_eq!(answer.header("x-robots-tag"), Some("none"));
+    assert_eq!(answer.header("content-length"), Some("11"));
+    // Written by the upload as json and sent as a browser writes it.
+    let modified = answer.header("last-modified").expect("no Last-Modified");
+    assert!(modified.ends_with(" GMT"), "{modified}");
+    // Nobody asked for a download, so there is nothing to say about one.
+    assert_eq!(answer.header("content-disposition"), None);
+
+    // Asked for by name, and the name is encoded twice over.
+    let answer = call(
+        &f,
+        "GET",
+        "/storage/v1/object/zou-headers/report%20card.txt?download=my%20card.txt",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(
+        answer.header("content-disposition"),
+        Some("attachment; filename=my%20card.txt; filename*=UTF-8''my%20card.txt")
+    );
+
+    // Asked for without a name, which is the parameter on its own.
+    let answer = call(
+        &f,
+        "GET",
+        "/storage/v1/object/zou-headers/report%20card.txt?download",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(answer.header("content-disposition"), Some("attachment;"));
+}
+
 /// The url out of a signing answer, with the prefix the client would
 /// have put back on it. What comes back is a path relative to
 /// /storage/v1, because that is where the client's own url ends.
