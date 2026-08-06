@@ -39,6 +39,8 @@ jobs:
           build/pg/bin/psql -h /tmp -d postgres -c 'select version()' | tee /tmp/version.txt
           grep -q "PostgreSQL 18.4" /tmp/version.txt
           build/pg/bin/pg_ctl -D /tmp/md-pgdata stop
+      - name: Redo pool integration test
+        run: ZOU_PG_PREFIX=$PWD/build/pg cargo test -p zou-pg --test redo_pool
       - name: Smoke test on zou storage
         run: |
           export ZOU_TARGET=/tmp/zou-pg-store
