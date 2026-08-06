@@ -115,6 +115,39 @@ impl StorageError {
         }
     }
 
+    /// And the same sentence again, under a third code, which is the
+    /// one a move answers when the name it is moving on to is taken. A
+    /// copy calls that collision a key and a move calls it a resource.
+    /// Nothing distinguishes the two situations except which route the
+    /// request came in on, and both are recorded.
+    pub(crate) fn resource_already_exists() -> Self {
+        StorageError {
+            status: 409,
+            error: "Duplicate",
+            message: "The resource already exists".to_string(),
+            code: "ResourceAlreadyExists",
+        }
+    }
+
+    /// A body that did not satisfy the schema in front of the handler,
+    /// which is refused before anything of the request is read. The
+    /// sentence is the validator's, built out of the name of the field
+    /// it wanted, and the error name is `Error` rather than
+    /// `FastifyError`: a schema failure is serialized by the time the
+    /// error handler sees it and the class it came from is gone.
+    ///
+    /// A body missing more than one required field is only told about
+    /// the first, in the order the schema lists them, so the caller
+    /// passes them in that order.
+    pub(crate) fn missing_field(field: &str) -> Self {
+        StorageError {
+            status: 400,
+            error: "Error",
+            message: format!("body must have required property '{field}'"),
+            code: "InvalidRequest",
+        }
+    }
+
     /// Not recorded. The suite has no case that sends more than the
     /// limit, because a fixture that uploaded fifty megabytes would be
     /// a fixture nobody runs twice. This is the shape storage-api
@@ -521,17 +554,10 @@ pub async fn create(
     let bucket = body_of(body).await?;
 
     let Some(name) = bucket.name.clone() else {
-        // Not recorded. The reference validates the body against a
-        // schema before the handler runs and this is the shape it
-        // answers with, but which sentence goes in the message is a
-        // question for the next recording round rather than something
-        // to invent confidently.
-        return Err(StorageError {
-            status: 400,
-            error: "FastifyError",
-            message: "body must have required property 'name'".to_string(),
-            code: "InvalidRequest",
-        });
+        // Not recorded here, but the same schema failure is recorded on
+        // the move route, so the shape is copied from there rather than
+        // guessed at.
+        return Err(StorageError::missing_field("name"));
     };
     // A create with no id takes the name as one. Recorded, and not
     // something the documentation says.

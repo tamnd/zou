@@ -110,8 +110,12 @@ struct ObjectRow {
     id: String,
     bucket_id: String,
     name: String,
+    owner: String,
+    owner_id: String,
     version: String,
     created_at: String,
+    updated_at: String,
+    last_accessed_at: String,
     metadata: Value,
     user_metadata: Value,
 }
@@ -167,20 +171,28 @@ fn blobs(app: &App) -> Result<&Blobs, StorageError> {
 
 /// The columns every object answer is built from.
 const OBJECT_COLUMNS: &str = "id::text, coalesce(bucket_id, ''), coalesce(name, ''),
+     coalesce(owner::text, ''), coalesce(owner_id, ''),
      coalesce(version, ''),
      to_char(created_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+     to_char(updated_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+     to_char(last_accessed_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
      coalesce(metadata::text, 'null'), coalesce(user_metadata::text, 'null')";
 
 fn object_row(row: &tokio_postgres::Row) -> ObjectRow {
     let parsed = |text: String| serde_json::from_str(&text).unwrap_or(Value::Null);
+    let moment = |at: usize| row.get::<_, Option<String>>(at).unwrap_or_default();
     ObjectRow {
         id: row.get(0),
         bucket_id: row.get(1),
         name: row.get(2),
-        version: row.get(3),
-        created_at: row.get::<_, Option<String>>(4).unwrap_or_default(),
-        metadata: parsed(row.get(5)),
-        user_metadata: parsed(row.get(6)),
+        owner: row.get(3),
+        owner_id: row.get(4),
+        version: row.get(5),
+        created_at: moment(6),
+        updated_at: moment(7),
+        last_accessed_at: moment(8),
+        metadata: parsed(row.get(9)),
+        user_metadata: parsed(row.get(10)),
     }
 }
 
@@ -1177,7 +1189,14 @@ async fn store(
     let (ctx, verified) = caller(app, &parts)?;
     let blobs = blobs(app)?;
     let upload = read_upload(&parts, body).await?;
-    let attached = user_metadata(&parts);
+    // An upload with no header on it still writes an empty object
+    // rather than a null. Upstream does it by spreading a value that is
+    // not there into a fresh object, which is an accident of javascript
+    // and not a decision, and it is visible: a copy answers the column
+    // it inherited, so an object nobody attached anything to is copied
+    // with an empty object where a row a fixture inserted is copied
+    // with a null.
+    let attached = Some(user_metadata(&parts).unwrap_or_else(|| "{}".to_string()));
     let sub = verified
         .claims
         .get("sub")
@@ -1294,6 +1313,15 @@ fn duplicate_is_a_key(e: &tokio_postgres::Error) -> StorageError {
     }
 }
 
+/// The same, for the route that calls the same collision by the other
+/// name.
+fn duplicate_is_a_resource(e: &tokio_postgres::Error) -> StorageError {
+    match e.as_db_error().map(|db| db.code().code()) {
+        Some("23505") => StorageError::resource_already_exists(),
+        _ => pg_error(e),
+    }
+}
+
 /// Where a move or a copy is going, out of the body it was asked in.
 ///
 /// `destinationBucket` is optional and means the bucket the source is
@@ -1304,6 +1332,17 @@ struct Destination {
     source: String,
     into: String,
     target: String,
+}
+
+/// The fields the schema wants, in the order it lists them, since a
+/// body missing two of them is only told about the first.
+///
+/// The two routes list the same three fields and they do not list them
+/// in the same order, which nothing depends on except this sentence.
+fn missing<'a>(asked: &Value, fields: [&'a str; 3]) -> Option<&'a str> {
+    fields
+        .into_iter()
+        .find(|field| asked.get(field).and_then(Value::as_str).is_none())
 }
 
 fn destination(asked: &Value) -> Destination {
@@ -1339,19 +1378,17 @@ pub async fn move_object(
 ) -> Result<Response, StorageError> {
     let (ctx, _) = caller(&app, &parts)?;
     let asked = json_body(body).await?;
+    if let Some(field) = missing(&asked, ["bucketId", "sourceKey", "destinationKey"]) {
+        return Err(StorageError::missing_field(field));
+    }
     let to = destination(&asked);
 
     let sess = begin(&app, &ctx, false).await?;
-    // The bucket first and with the policies aside, the way an upload
-    // asks it: a caller who may not touch these rows still hears that
-    // the bucket is or is not there.
-    let there = unpoliced(&sess, &ctx.role, async || {
-        bucket_public(&sess, &to.bucket).await
-    })
-    .await?;
-    if there.is_none() {
-        return refuse(sess, StorageError::no_such_bucket()).await;
-    }
+    // No question about the bucket, which is a difference from an
+    // upload and a recorded one: a move out of a bucket that is not
+    // there is answered as an object that is not there. Nothing looks
+    // the bucket up, so there is nothing to tell the two apart with.
+    //
     // The row under the caller's own policies, so a row they cannot see
     // is a row that is not there. That is the reference's reading and it
     // is not the one a delete takes, which asks twice on purpose.
@@ -1365,7 +1402,7 @@ pub async fn move_object(
             &[&to.bucket, &to.source, &to.target, &to.into],
         )
         .await
-        .map_err(|e| duplicate_is_a_key(&e))?;
+        .map_err(|e| duplicate_is_a_resource(&e))?;
     // Seen a moment ago and not moved, so what stopped it was the check
     // on the row it was about to become rather than the row it was.
     if moved == 0 {
@@ -1394,6 +1431,9 @@ pub async fn copy_object(
     let (ctx, verified) = caller(&app, &parts)?;
     let blobs = blobs(&app)?;
     let asked = json_body(body).await?;
+    if let Some(field) = missing(&asked, ["sourceKey", "bucketId", "destinationKey"]) {
+        return Err(StorageError::missing_field(field));
+    }
     let to = destination(&asked);
     let replace = parts
         .headers
@@ -1408,13 +1448,8 @@ pub async fn copy_object(
         .to_string();
 
     let sess = begin(&app, &ctx, false).await?;
-    let there = unpoliced(&sess, &ctx.role, async || {
-        bucket_public(&sess, &to.bucket).await
-    })
-    .await?;
-    if there.is_none() {
-        return refuse(sess, StorageError::no_such_bucket()).await;
-    }
+    // No question about the bucket here either, for the reason the move
+    // above gives.
     let Some(from) = find(&sess, &to.bucket, &to.source).await? else {
         return refuse(sess, StorageError::no_such_key()).await;
     };
@@ -1495,15 +1530,24 @@ pub async fn copy_object(
         let _ = sess.rollback().await;
         return Err(StorageError::internal(e.to_string()));
     }
+    // The whole row, and the two names for the same thing in front of
+    // it. `Id` and `Key` are what a move used to answer before it was
+    // reduced to a sentence, and a copy still carries them beside the
+    // `id` and the `name` the row itself has.
     let answer = json!({
         "Id": made.id,
         "Key": format!("{}/{}", to.into, to.target),
+        "id": made.id,
         "name": made.name,
         "bucket_id": made.bucket_id,
+        "owner": made.owner,
+        "owner_id": made.owner_id,
         "version": made.version,
-        "id": made.id,
         "created_at": made.created_at,
+        "updated_at": made.updated_at,
+        "last_accessed_at": made.last_accessed_at,
         "metadata": made.metadata,
+        "user_metadata": made.user_metadata,
     })
     .to_string();
     done(sess, Ok(())).await?;
@@ -1733,13 +1777,52 @@ mod tests {
         assert_eq!(written["cacheControl"], "no-cache");
     }
 
+    /// A body missing two fields is told about one of them, and which
+    /// one is the order the route lists them in rather than the order
+    /// they are missing in.
+    #[test]
+    fn a_body_is_told_about_the_first_field_it_is_missing() {
+        let asked = json!({"sourceKey": "a.txt"});
+        // The move's order and the copy's order, over the same body.
+        assert_eq!(
+            missing(&asked, ["bucketId", "sourceKey", "destinationKey"]),
+            Some("bucketId")
+        );
+        assert_eq!(
+            missing(&asked, ["sourceKey", "bucketId", "destinationKey"]),
+            Some("bucketId")
+        );
+        let named = json!({"bucketId": "notes", "sourceKey": "a.txt"});
+        assert_eq!(
+            missing(&named, ["bucketId", "sourceKey", "destinationKey"]),
+            Some("destinationKey")
+        );
+
+        let whole = json!({"bucketId": "notes", "sourceKey": "a.txt", "destinationKey": "b.txt"});
+        assert_eq!(
+            missing(&whole, ["bucketId", "sourceKey", "destinationKey"]),
+            None
+        );
+        // A field that is there and is not a string is a field that is
+        // not there, which is what a schema wanting a string does.
+        let numbered = json!({"bucketId": "notes", "sourceKey": 7, "destinationKey": "b.txt"});
+        assert_eq!(
+            missing(&numbered, ["bucketId", "sourceKey", "destinationKey"]),
+            Some("sourceKey")
+        );
+    }
+
     fn row(metadata: Value, user_metadata: Value) -> ObjectRow {
         ObjectRow {
             id: "2c0d1e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f".to_string(),
             bucket_id: "notes".to_string(),
             name: "hello.txt".to_string(),
+            owner: String::new(),
+            owner_id: String::new(),
             version: "5877d5bc-0000-4000-8000-000000000000".to_string(),
             created_at: "2026-08-06T14:25:39.016Z".to_string(),
+            updated_at: "2026-08-06T14:25:39.016Z".to_string(),
+            last_accessed_at: "2026-08-06T14:25:39.016Z".to_string(),
             metadata,
             user_metadata,
         }
