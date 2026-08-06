@@ -7,6 +7,13 @@
 //! tenant's rows, a role they were not given, or the database itself
 //! through the query grammar.
 //!
+//! Two tests here pin behaviour that is not a defence: a plain view
+//! reads its table with its owner's rights, and a security definer
+//! function does the same. Both are postgres's rules, both are how a
+//! project ends up handing out a table it thought a policy covered,
+//! and a suite that only asserted the good cases would not notice the
+//! day one of them changed.
+//!
 //! Gated on ZOU_PG_TEST_DSN like the rest of the live suites, and run
 //! in CI against a real postgres.
 //!
@@ -806,4 +813,446 @@ async fn the_role_switch_is_only_as_narrow_as_the_connection() {
         2,
         "the dsn's own role reads past the policy, see #92"
     );
+}
+
+#[tokio::test]
+async fn a_view_reads_past_a_policy_unless_it_was_built_not_to() {
+    let Some(dsn) = dsn() else { return };
+    docs(&dsn, "zou_atk_view").await;
+    seed(
+        &dsn,
+        &[
+            "drop view if exists zou_atk_view_open",
+            "drop view if exists zou_atk_view_safe",
+            "create view zou_atk_view_open as select * from zou_atk_view",
+            "create view zou_atk_view_safe with (security_invoker = true) \
+             as select * from zou_atk_view",
+            "grant select on zou_atk_view_open, zou_atk_view_safe \
+             to anon, authenticated, service_role",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+    let one = user(U1, "acme", SECRET);
+    let rows = |body: &str| {
+        serde_json::from_str::<serde_json::Value>(body)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len()
+    };
+
+    // The table itself, so the policy is known to be working here.
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/zou_atk_view", Some(&one), ""))
+        .await
+        .unwrap();
+    assert_eq!(rows(&body_text(res).await), 1);
+
+    // A view reads its table with the rights of whoever owns the view,
+    // and the owner here also owns the table, and a table's owner is
+    // exempt from its policies unless the table was forced. So the
+    // plain view hands out both rows. That is postgres's rule and not
+    // zou's, and it is the most common way a project leaks a table it
+    // believed was protected, so it is pinned here rather than left as
+    // something everybody is assumed to know.
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/zou_atk_view_open", Some(&one), ""))
+        .await
+        .unwrap();
+    let body = body_text(res).await;
+    assert_eq!(
+        rows(&body),
+        2,
+        "a plain view no longer reads with its owner's rights: {body}"
+    );
+
+    // The same view built with security_invoker reads as the caller,
+    // policies and all, which is the one line that makes the
+    // difference and the one the docs have to say out loud.
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/zou_atk_view_safe", Some(&one), ""))
+        .await
+        .unwrap();
+    let body = body_text(res).await;
+    assert_eq!(rows(&body), 1, "an invoker view leaked: {body}");
+    assert!(!body.contains("two"));
+
+    // A write through the invoker view is the policy's as well, so the
+    // boundary is not a read time one.
+    let res = app
+        .clone()
+        .oneshot(as_user(
+            "PATCH",
+            "/rest/v1/zou_atk_view_safe?id=eq.2",
+            Some(&one),
+            r#"{"body":"stolen"}"#,
+        ))
+        .await
+        .unwrap();
+    assert!(!res.status().is_server_error());
+    assert_eq!(truth(&dsn, "zou_atk_view").await, "1:one,2:two");
+}
+
+#[tokio::test]
+async fn a_definer_function_is_the_way_past_a_policy_and_the_only_one() {
+    let Some(dsn) = dsn() else { return };
+    docs(&dsn, "zou_atk_fn").await;
+    seed(
+        &dsn,
+        &[
+            "drop function if exists zou_atk_fn_open()",
+            "drop function if exists zou_atk_fn_safe()",
+            "drop function if exists zou_atk_fn_whoami()",
+            "create function zou_atk_fn_open() returns setof zou_atk_fn \
+             language sql stable security definer \
+             set search_path = public as $$ select * from zou_atk_fn $$",
+            "create function zou_atk_fn_safe() returns setof zou_atk_fn \
+             language sql stable as $$ select * from zou_atk_fn $$",
+            "create function zou_atk_fn_whoami() returns text \
+             language sql stable security definer set search_path = public \
+             as $$ select current_user || ' ' || coalesce(auth.uid()::text, 'none') $$",
+            "grant execute on function zou_atk_fn_open(), zou_atk_fn_safe(), \
+             zou_atk_fn_whoami() to anon, authenticated",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+    let one = user(U1, "acme", SECRET);
+    let call = |name: &str| as_user("POST", &format!("/rest/v1/rpc/{name}"), Some(&one), "{}");
+
+    // An ordinary function runs as the caller, so the policy is the
+    // caller's and a function is not a way around one.
+    let res = app.clone().oneshot(call("zou_atk_fn_safe")).await.unwrap();
+    let body = body_text(res).await;
+    assert!(
+        body.contains("one") && !body.contains("two"),
+        "an invoker function read past the policy: {body}"
+    );
+
+    // A definer function runs as its owner, which is the deliberate
+    // way past a policy and the reason writing one is a decision. It
+    // is here so that the assertion above means the function was
+    // checked and not that rpc reads nothing.
+    let res = app.clone().oneshot(call("zou_atk_fn_open")).await.unwrap();
+    let body = body_text(res).await;
+    assert!(
+        body.contains("one") && body.contains("two"),
+        "a definer function no longer reads as its owner: {body}"
+    );
+
+    // And the claims survive the role change, so a definer function
+    // can still be written to filter by whoever called it. The GUCs
+    // are transaction local and have nothing to do with the role, and
+    // that is what makes a definer function safe to write at all.
+    let res = app
+        .clone()
+        .oneshot(call("zou_atk_fn_whoami"))
+        .await
+        .unwrap();
+    let who = body_text(res).await;
+    assert!(
+        who.contains(U1),
+        "the caller was lost inside a definer: {who}"
+    );
+    assert!(
+        !who.contains("authenticated"),
+        "a definer function ran as the caller's role: {who}"
+    );
+}
+
+#[tokio::test]
+async fn a_claim_with_sql_in_it_is_a_claim_and_not_sql() {
+    let Some(dsn) = dsn() else { return };
+    docs(&dsn, "zou_atk_guc").await;
+    seed(
+        &dsn,
+        &[
+            "drop function if exists zou_atk_guc_ctx()",
+            "create function zou_atk_guc_ctx() returns json language sql stable as $$ \
+               select json_build_object( \
+                 'user', current_user, \
+                 'tenant', auth.jwt() ->> 'tenant', \
+                 'header', current_setting('request.headers', true)::json ->> 'x-evil', \
+                 'cookie', current_setting('request.cookies', true)::json ->> 'evil') $$",
+            "grant execute on function zou_atk_guc_ctx() to anon, authenticated",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // Every one of these ends a string, a statement and a comment, in
+    // the shape that would matter if any of the seven settings were
+    // spliced into the text of the statement that sets them rather
+    // than bound as a parameter to it.
+    let payload = "acme'); set role postgres; select set_config('role','postgres',false); --";
+    // A semicolon is what separates one cookie from the next, so a
+    // cookie value cannot hold one and this is the same string with
+    // the separators taken out rather than a weaker one.
+    let cookie = "acme') set role postgres --";
+    let token = user(U1, payload, SECRET);
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rest/v1/rpc/zou_atk_guc_ctx")
+                .header("apikey", anon_key())
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-evil", payload)
+                .header("cookie", format!("evil={cookie}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ctx: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(ctx["user"], "authenticated", "the role moved: {ctx}");
+    assert_eq!(ctx["tenant"], payload, "the claim did not arrive whole");
+    assert_eq!(ctx["header"], payload, "the header did not arrive whole");
+    assert_eq!(ctx["cookie"], cookie, "the cookie did not arrive whole");
+    assert_eq!(truth(&dsn, "zou_atk_guc").await, "1:one,2:two");
+
+    // The same string as a role, which is the one setting postgres
+    // reads back as an identifier. It is a role nobody has, so the
+    // session fails before a statement runs.
+    let as_role = jwt::mint(&serde_json::json!({"role": payload, "sub": U1}), SECRET);
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/zou_atk_guc", Some(&as_role), ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(truth(&dsn, "zou_atk_guc").await, "1:one,2:two");
+}
+
+#[tokio::test]
+async fn an_embed_answers_with_the_callers_rows_and_no_others() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_atk_kid cascade",
+            "drop table if exists zou_atk_dad cascade",
+            "create table zou_atk_dad (id int primary key, owner uuid not null, body text)",
+            "create table zou_atk_kid (id int primary key, \
+               dad int not null references zou_atk_dad (id), \
+               owner uuid not null, body text)",
+            "alter table zou_atk_dad enable row level security",
+            "alter table zou_atk_kid enable row level security",
+            "create policy own on zou_atk_dad for all to authenticated \
+             using (owner = auth.uid()) with check (owner = auth.uid())",
+            "create policy own on zou_atk_kid for all to authenticated \
+             using (owner = auth.uid()) with check (owner = auth.uid())",
+            &format!("insert into zou_atk_dad values (1, '{U1}', 'mine'), (2, '{U2}', 'theirs')"),
+            // The second child hangs off a parent the caller can see
+            // and belongs to somebody else, which is the row a join
+            // that forgot the child's own policy would hand over.
+            &format!(
+                "insert into zou_atk_kid values \
+                   (10, 1, '{U1}', 'mine'), (11, 1, '{U2}', 'theirs'), (12, 2, '{U2}', 'theirs')"
+            ),
+            "grant all on zou_atk_dad, zou_atk_kid to anon, authenticated, service_role",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+    let one = user(U1, "acme", SECRET);
+
+    for uri in [
+        "/rest/v1/zou_atk_dad?select=id,zou_atk_kid(id)",
+        "/rest/v1/zou_atk_dad?select=id,zou_atk_kid!inner(id)",
+        "/rest/v1/zou_atk_dad?select=id,...zou_atk_kid(id)",
+        "/rest/v1/zou_atk_kid?select=id,zou_atk_dad(id)",
+        "/rest/v1/zou_atk_kid?select=id,zou_atk_dad!inner(id)",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(as_user("GET", uri, Some(&one), ""))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{uri}");
+        let body = body_text(res).await;
+        assert!(
+            !body.contains("theirs") && !body.contains("11") && !body.contains(U2),
+            "{uri} reached past a policy: {body}"
+        );
+        assert!(
+            body.contains("10") || body.contains("\"id\":1"),
+            "{uri} read nothing: {body}"
+        );
+    }
+
+    // A filter on the embed is not a way to ask about rows the policy
+    // hides either: an inner join on a child nobody can see drops the
+    // parent rather than admitting the child exists.
+    let res = app
+        .clone()
+        .oneshot(as_user(
+            "GET",
+            "/rest/v1/zou_atk_dad?select=id,zou_atk_kid!inner(id)&zou_atk_kid.id=eq.11",
+            Some(&one),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, "[]");
+}
+
+#[tokio::test]
+async fn a_count_counts_only_the_rows_the_caller_can_see() {
+    let Some(dsn) = dsn() else { return };
+    docs(&dsn, "zou_atk_count").await;
+    let app = app(&dsn);
+    let one = user(U1, "acme", SECRET);
+
+    // A total is a number about rows, and a number about rows the
+    // caller cannot read is still something they were not told.
+    for count in ["exact", "planned", "estimated"] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/v1/zou_atk_count")
+                    .header("apikey", anon_key())
+                    .header("authorization", format!("Bearer {one}"))
+                    .header("prefer", format!("count={count}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let range = res
+            .headers()
+            .get("content-range")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        let body = body_text(res).await;
+        assert!(!body.contains("two"), "count={count} handed over a row");
+        // Only the exact count is a count of rows. The other two are
+        // the planner's guess at the same query, which carries the
+        // policy in it, and a guess is not an assertion about anybody.
+        if count == "exact" {
+            assert_eq!(range, "0-0/1", "count=exact counted rows nobody may read");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_auth_schema_is_not_reachable_over_rest() {
+    let Some(dsn) = dsn() else { return };
+    docs(&dsn, "zou_atk_auth").await;
+    let app = app(&dsn);
+    let service = jwt::mint(&jwt::key_claims("service_role"), SECRET);
+
+    // The tables auth writes are in a schema the rest surface does not
+    // expose, so they are not tables it has, whoever is asking. The
+    // service key is used deliberately: it walks past every policy and
+    // still cannot name a schema nobody exposed.
+    for uri in [
+        "/rest/v1/users",
+        "/rest/v1/auth.users",
+        "/rest/v1/refresh_tokens",
+        "/rest/v1/zou_atk_auth?select=*,users(*)",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(as_user("GET", uri, Some(&service), ""))
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = body_text(res).await;
+        assert!(
+            status.is_client_error(),
+            "{uri} was not refused: {status} {body}"
+        );
+        assert!(
+            !body.contains("encrypted_password") && !body.contains("@"),
+            "{uri} said something about a user: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_token_the_clock_has_passed_is_not_a_token() {
+    let Some(dsn) = dsn() else { return };
+    docs(&dsn, "zou_atk_clock").await;
+    let app = app(&dsn);
+
+    let expired = jwt::mint(
+        &serde_json::json!({"sub": U1, "role": "authenticated", "tenant": "acme", "exp": 1}),
+        SECRET,
+    );
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/zou_atk_clock", Some(&expired), ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["message"], "JWT expired");
+
+    // The apikey is a token too, and an expired one is not a key.
+    let stale = jwt::mint(&serde_json::json!({"role": "anon", "exp": 1}), SECRET);
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/rest/v1/zou_atk_clock")
+                .header("apikey", stale)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // And the claims that are not checked, pinned here so that the day
+    // they start being checked is a test edit rather than a surprise.
+    // A token not valid until an hour from now is accepted, and so is
+    // one addressed to somebody else. Both libraries upstream verifies
+    // with do more than this, which is #173.
+    let early = jwt::mint(
+        &serde_json::json!({
+            "sub": U1, "role": "authenticated", "tenant": "acme",
+            "nbf": now() + 3600, "aud": "somebody-else",
+        }),
+        SECRET,
+    );
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/zou_atk_clock", Some(&early), ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "nbf and aud are checked now, so #173 is done and this test is out of date"
+    );
+    // It is still only the signature that decides, so the gap is a
+    // narrower one than it looks: a token nobody could mint is not
+    // reachable by waiting for its nbf either.
+    let forged = jwt::mint(
+        &serde_json::json!({"sub": U1, "role": "authenticated", "nbf": 1}),
+        OTHER,
+    );
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/zou_atk_clock", Some(&forged), ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Seconds since the epoch, for the claims that are about the clock.
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is past 1970")
+        .as_secs()
 }
