@@ -31,6 +31,7 @@ pub mod admin;
 pub mod audit;
 pub mod auth;
 pub mod edge;
+pub mod gojson;
 pub mod hook;
 pub mod jwt;
 pub mod limit;

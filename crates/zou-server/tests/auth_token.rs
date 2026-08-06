@@ -615,6 +615,13 @@ async fn the_grant_refuses_what_it_cannot_serve() {
     let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["error_code"], "bad_json");
+    // Down to the parser detail, which is Go's own sentence about the
+    // byte it stopped on and is what a client shows the person.
+    assert_eq!(
+        body["msg"],
+        "Could not parse request body as JSON: invalid character 'n' \
+         looking for beginning of object key string"
+    );
 
     // And the endpoint is behind the same gate as everything else.
     let req = Request::builder()
