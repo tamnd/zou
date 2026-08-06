@@ -466,6 +466,106 @@ jobs:
           path: /tmp/zou-conformance/demo/test-results
           if-no-files-found: ignore
 
+  # The third target the harness was written for. The recordings come
+  # from the PostgREST binary, which is the same code, but a binary
+  # configured by hand on a flag line is not the stack anybody runs.
+  # `supabase start` is that stack: the images the CLI pins, a gateway
+  # in front of them, and the api under /rest/v1 because something put
+  # it there rather than because a suite asked for it. Asking both and
+  # comparing the answers is a different question from asking one and
+  # comparing it with a file.
+  #
+  # Nothing is recorded here and nothing is checked against a recording.
+  # It is a diff, so the two targets are each other's expected answer,
+  # and a difference is a difference whichever of them is right.
+  cli:
+    name: diff (supabase start)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      ZOU_CONFORMANCE_SUITES: /tmp/zou-conformance/suites
+      # What the CLI serves a local project on, and the database behind
+      # it. Both are the CLI's defaults rather than anything chosen
+      # here, which is the point: a project that has changed nothing.
+      CLI_URL: http://127.0.0.1:54321
+      CLI_DSN: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      # The CLI version is pinned in versions.json next to the images it
+      # brings, because the stack is the reference here and a reference
+      # that moves on its own is not one.
+      - name: Install the pinned supabase CLI
+        run: |
+          version=$(jq -r .supabase_cli.version /tmp/zou-conformance/versions.json)
+          npm i -g "supabase@$version"
+          supabase --version
+      # The generated config, with one line changed. PostgREST only
+      # serves the schemas it was told about, the suite keeps its tables
+      # in a schema of its own, and the recording was taken from a
+      # PostgREST configured with exactly these two in this order, since
+      # the first is what a request that names no schema gets.
+      - name: Bring up a local supabase project
+        run: |
+          mkdir -p /tmp/project
+          cd /tmp/project
+          supabase init --with-vscode-settings=false --with-intellij-settings=false
+          python3 - <<'PY'
+          path = "supabase/config.toml"
+          out, section = [], ""
+          for line in open(path):
+              stripped = line.strip()
+              if stripped.startswith("[") and stripped.endswith("]"):
+                  section = stripped
+              if section == "[api]" and stripped.startswith("schemas"):
+                  line = 'schemas = ["conformance", "public"]\n'
+              if section == "[api]" and stripped.startswith("extra_search_path"):
+                  line = 'extra_search_path = ["public"]\n'
+              out.append(line)
+          open(path, "w").write("".join(out))
+          PY
+          grep -A 8 '^\[api\]' supabase/config.toml
+          supabase start -x studio,imgproxy,edge-runtime,logflare,vector
+          supabase status
+      - name: Diff the rest suite against the stack a person gets
+        run: |
+          cargo run -p zou-conformance -- diff --suite rest \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --reference-url "$CLI_URL" \
+            --reference-name "supabase start" \
+            --reference-dsn "$CLI_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET"
+      - name: Keep what the stack was saying
+        if: failure()
+        run: |
+          cd /tmp/project
+          supabase status || true
+          docker ps -a || true
+          docker logs "$(docker ps -aqf name=supabase_rest)" 2>&1 | tail -60 || true
+
   # The numbers a merge measured, in a file in the repository rather
   # than in a log that expires. Only on main, and only out of the
   # artifacts the two conformance jobs left behind: rendering it here
