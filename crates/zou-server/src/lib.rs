@@ -807,6 +807,11 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         // name here.
         .route("/storage/v1/object/list/{bucket}", post(object::list))
         .route("/storage/v1/object/list-v2/{bucket}", post(object::list_v2))
+        // Move and copy name both ends in the body, so there is no
+        // bucket in either path and nothing to collide with a bucket
+        // id below them.
+        .route("/storage/v1/object/move", post(object::move_object))
+        .route("/storage/v1/object/copy", post(object::copy_object))
         .route(
             "/storage/v1/object/{bucket}/{*name}",
             get(object::download)

@@ -46,10 +46,16 @@
 //! Everything this file adds around them is the shape of the answer and
 //! the cursor.
 //!
-//! What is not here: move, copy, signed urls, resumable uploads, image
-//! transforms and the S3 protocol. None of them are asked by the suite
-//! yet, and the list on the compatibility issue is where they are
-//! tracked.
+//! Moving is the one place this file does less work than upstream
+//! rather than the same work. A name is not part of the key the bytes
+//! are under, so a move is two columns of one row and the store is
+//! never touched. storage-api keys its store by the name, so its move
+//! has to copy the bytes and write a new version. Copying does touch
+//! the store, because a second row cannot share a key with the first.
+//!
+//! What is not here: signed urls, resumable uploads, image transforms
+//! and the S3 protocol. None of them are asked by the suite yet, and
+//! the list on the compatibility issue is where they are tracked.
 
 use std::sync::Arc;
 
@@ -1286,6 +1292,222 @@ fn duplicate_is_a_key(e: &tokio_postgres::Error) -> StorageError {
         Some("23505") => StorageError::key_already_exists(),
         _ => pg_error(e),
     }
+}
+
+/// Where a move or a copy is going, out of the body it was asked in.
+///
+/// `destinationBucket` is optional and means the bucket the source is
+/// in, which is what makes a rename and a move between buckets the same
+/// request.
+struct Destination {
+    bucket: String,
+    source: String,
+    into: String,
+    target: String,
+}
+
+fn destination(asked: &Value) -> Destination {
+    let bucket = text_of(asked, "bucketId");
+    let into = match text_of(asked, "destinationBucket") {
+        named if named.is_empty() => bucket.clone(),
+        named => named,
+    };
+    Destination {
+        source: text_of(asked, "sourceKey"),
+        target: text_of(asked, "destinationKey"),
+        bucket,
+        into,
+    }
+}
+
+/// POST /storage/v1/object/move
+///
+/// A rename, and the bytes do not go anywhere.
+///
+/// They are under the row's id and its version, neither of which a name
+/// decides, so an object that changes its name or its bucket is a row
+/// that changes two columns. storage-api keys its store by the bucket
+/// and the name instead, so its move has to copy the bytes across and
+/// delete the old ones, and it writes a new version while it does. The
+/// answer is a sentence either way. What differs is `version`, which
+/// the info route answers and no recorded case reads after a move, and
+/// zou's reading of it is the truer one: the bytes did not change.
+pub async fn move_object(
+    State(app): State<Arc<App>>,
+    parts: Parts,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let (ctx, _) = caller(&app, &parts)?;
+    let asked = json_body(body).await?;
+    let to = destination(&asked);
+
+    let sess = begin(&app, &ctx, false).await?;
+    // The bucket first and with the policies aside, the way an upload
+    // asks it: a caller who may not touch these rows still hears that
+    // the bucket is or is not there.
+    let there = unpoliced(&sess, &ctx.role, async || {
+        bucket_public(&sess, &to.bucket).await
+    })
+    .await?;
+    if there.is_none() {
+        return refuse(sess, StorageError::no_such_bucket()).await;
+    }
+    // The row under the caller's own policies, so a row they cannot see
+    // is a row that is not there. That is the reference's reading and it
+    // is not the one a delete takes, which asks twice on purpose.
+    if find(&sess, &to.bucket, &to.source).await?.is_none() {
+        return refuse(sess, StorageError::no_such_key()).await;
+    }
+    let moved = sess
+        .execute(
+            "update storage.objects set bucket_id = $4, name = $3, updated_at = now()
+             where bucket_id = $1 and name = $2",
+            &[&to.bucket, &to.source, &to.target, &to.into],
+        )
+        .await
+        .map_err(|e| duplicate_is_a_key(&e))?;
+    // Seen a moment ago and not moved, so what stopped it was the check
+    // on the row it was about to become rather than the row it was.
+    if moved == 0 {
+        return refuse(
+            sess,
+            StorageError::access_denied("Access denied".to_string()),
+        )
+        .await;
+    }
+    done(sess, Ok(())).await?;
+    Ok(message("Successfully moved"))
+}
+
+/// POST /storage/v1/object/copy
+///
+/// A second row and a second set of bytes, which is the whole
+/// difference from a move. The bytes are read and written rather than
+/// referred to twice: two rows pointing at one key would make a delete
+/// of either of them a delete of both, and nothing in the store counts
+/// what points at it.
+pub async fn copy_object(
+    State(app): State<Arc<App>>,
+    parts: Parts,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let (ctx, verified) = caller(&app, &parts)?;
+    let blobs = blobs(&app)?;
+    let asked = json_body(body).await?;
+    let to = destination(&asked);
+    let replace = parts
+        .headers
+        .get("x-upsert")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|asked| asked.eq_ignore_ascii_case("true"));
+    let sub = verified
+        .claims
+        .get("sub")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let sess = begin(&app, &ctx, false).await?;
+    let there = unpoliced(&sess, &ctx.role, async || {
+        bucket_public(&sess, &to.bucket).await
+    })
+    .await?;
+    if there.is_none() {
+        return refuse(sess, StorageError::no_such_bucket()).await;
+    }
+    let Some(from) = find(&sess, &to.bucket, &to.source).await? else {
+        return refuse(sess, StorageError::no_such_key()).await;
+    };
+
+    // What the copy is described by. `copyMetadata` is true unless the
+    // body says otherwise, and when it is false the two fields the body
+    // may name are the two that change: everything else the source said
+    // about its bytes is still true of the copy, which is the
+    // reference's `preserveUnspecifiedFileMetadata`.
+    let keep = asked.get("copyMetadata").and_then(Value::as_bool) != Some(false);
+    let mut written = from.metadata.clone();
+    if !keep && let Some(given) = asked.get("metadata") {
+        for field in ["cacheControl", "mimetype"] {
+            if let Some(value) = given.get(field)
+                && let Some(object) = written.as_object_mut()
+            {
+                object.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    // The client's own metadata comes across with the copy, or is
+    // replaced by the header when the copy was told not to take it.
+    let attached = match keep {
+        true => match &from.user_metadata {
+            Value::Null => None,
+            given => Some(given.to_string()),
+        },
+        false => user_metadata(&parts),
+    };
+
+    let conflict = match replace {
+        true => {
+            "on conflict (bucket_id, name) do update
+                set version = excluded.version,
+                    metadata = excluded.metadata,
+                    user_metadata = excluded.user_metadata,
+                    updated_at = now()"
+        }
+        false => "",
+    };
+    let sql = format!(
+        "insert into storage.objects
+             (bucket_id, name, owner, owner_id, version, metadata, user_metadata)
+         values ($1, $2,
+                 case when $3::text ~*
+                     '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+                     then $3::text::uuid end,
+                 nullif($3::text, ''),
+                 gen_random_uuid()::text, $4::text::jsonb, $5::text::jsonb)
+         {conflict}
+         returning {OBJECT_COLUMNS}"
+    );
+    let rows = sess
+        .query(
+            &sql,
+            &[&to.into, &to.target, &sub, &written.to_string(), &attached],
+        )
+        .await
+        .map_err(|e| duplicate_is_a_key(&e))?;
+    let Some(made) = rows.first().map(object_row) else {
+        return refuse(
+            sess,
+            StorageError::access_denied("new row violates row-level security policy".to_string()),
+        )
+        .await;
+    };
+
+    // The bytes before the commit, for the reason an upload has: a row
+    // pointing at bytes that were never written is the one state a
+    // client can see and cannot explain.
+    let bytes = blobs
+        .get(from.key())
+        .await
+        .map_err(|e| StorageError::internal(e.to_string()))?;
+    if let Some(bytes) = bytes
+        && let Err(e) = blobs.put(made.key(), bytes).await
+    {
+        let _ = sess.rollback().await;
+        return Err(StorageError::internal(e.to_string()));
+    }
+    let answer = json!({
+        "Id": made.id,
+        "Key": format!("{}/{}", to.into, to.target),
+        "name": made.name,
+        "bucket_id": made.bucket_id,
+        "version": made.version,
+        "id": made.id,
+        "created_at": made.created_at,
+        "metadata": made.metadata,
+    })
+    .to_string();
+    done(sess, Ok(())).await?;
+    Ok(ok(answer))
 }
 
 /// DELETE /storage/v1/object/{bucket}/{name}
