@@ -46,10 +46,16 @@
 //! Everything this file adds around them is the shape of the answer and
 //! the cursor.
 //!
-//! What is not here: move, copy, signed urls, resumable uploads, image
-//! transforms and the S3 protocol. None of them are asked by the suite
-//! yet, and the list on the compatibility issue is where they are
-//! tracked.
+//! Moving is the one place this file does less work than upstream
+//! rather than the same work. A name is not part of the key the bytes
+//! are under, so a move is two columns of one row and the store is
+//! never touched. storage-api keys its store by the name, so its move
+//! has to copy the bytes and write a new version. Copying does touch
+//! the store, because a second row cannot share a key with the first.
+//!
+//! What is not here: signed urls, resumable uploads, image transforms
+//! and the S3 protocol. None of them are asked by the suite yet, and
+//! the list on the compatibility issue is where they are tracked.
 
 use std::sync::Arc;
 
@@ -104,8 +110,12 @@ struct ObjectRow {
     id: String,
     bucket_id: String,
     name: String,
+    owner: String,
+    owner_id: String,
     version: String,
     created_at: String,
+    updated_at: String,
+    last_accessed_at: String,
     metadata: Value,
     user_metadata: Value,
 }
@@ -161,20 +171,28 @@ fn blobs(app: &App) -> Result<&Blobs, StorageError> {
 
 /// The columns every object answer is built from.
 const OBJECT_COLUMNS: &str = "id::text, coalesce(bucket_id, ''), coalesce(name, ''),
+     coalesce(owner::text, ''), coalesce(owner_id, ''),
      coalesce(version, ''),
      to_char(created_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+     to_char(updated_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+     to_char(last_accessed_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
      coalesce(metadata::text, 'null'), coalesce(user_metadata::text, 'null')";
 
 fn object_row(row: &tokio_postgres::Row) -> ObjectRow {
     let parsed = |text: String| serde_json::from_str(&text).unwrap_or(Value::Null);
+    let moment = |at: usize| row.get::<_, Option<String>>(at).unwrap_or_default();
     ObjectRow {
         id: row.get(0),
         bucket_id: row.get(1),
         name: row.get(2),
-        version: row.get(3),
-        created_at: row.get::<_, Option<String>>(4).unwrap_or_default(),
-        metadata: parsed(row.get(5)),
-        user_metadata: parsed(row.get(6)),
+        owner: row.get(3),
+        owner_id: row.get(4),
+        version: row.get(5),
+        created_at: moment(6),
+        updated_at: moment(7),
+        last_accessed_at: moment(8),
+        metadata: parsed(row.get(9)),
+        user_metadata: parsed(row.get(10)),
     }
 }
 
@@ -1171,7 +1189,14 @@ async fn store(
     let (ctx, verified) = caller(app, &parts)?;
     let blobs = blobs(app)?;
     let upload = read_upload(&parts, body).await?;
-    let attached = user_metadata(&parts);
+    // An upload with no header on it still writes an empty object
+    // rather than a null. Upstream does it by spreading a value that is
+    // not there into a fresh object, which is an accident of javascript
+    // and not a decision, and it is visible: a copy answers the column
+    // it inherited, so an object nobody attached anything to is copied
+    // with an empty object where a row a fixture inserted is copied
+    // with a null.
+    let attached = Some(user_metadata(&parts).unwrap_or_else(|| "{}".to_string()));
     let sub = verified
         .claims
         .get("sub")
@@ -1286,6 +1311,247 @@ fn duplicate_is_a_key(e: &tokio_postgres::Error) -> StorageError {
         Some("23505") => StorageError::key_already_exists(),
         _ => pg_error(e),
     }
+}
+
+/// The same, for the route that calls the same collision by the other
+/// name.
+fn duplicate_is_a_resource(e: &tokio_postgres::Error) -> StorageError {
+    match e.as_db_error().map(|db| db.code().code()) {
+        Some("23505") => StorageError::resource_already_exists(),
+        _ => pg_error(e),
+    }
+}
+
+/// Where a move or a copy is going, out of the body it was asked in.
+///
+/// `destinationBucket` is optional and means the bucket the source is
+/// in, which is what makes a rename and a move between buckets the same
+/// request.
+struct Destination {
+    bucket: String,
+    source: String,
+    into: String,
+    target: String,
+}
+
+/// The fields the schema wants, in the order it lists them, since a
+/// body missing two of them is only told about the first.
+///
+/// The two routes list the same three fields and they do not list them
+/// in the same order, which nothing depends on except this sentence.
+fn missing<'a>(asked: &Value, fields: [&'a str; 3]) -> Option<&'a str> {
+    fields
+        .into_iter()
+        .find(|field| asked.get(field).and_then(Value::as_str).is_none())
+}
+
+fn destination(asked: &Value) -> Destination {
+    let bucket = text_of(asked, "bucketId");
+    let into = match text_of(asked, "destinationBucket") {
+        named if named.is_empty() => bucket.clone(),
+        named => named,
+    };
+    Destination {
+        source: text_of(asked, "sourceKey"),
+        target: text_of(asked, "destinationKey"),
+        bucket,
+        into,
+    }
+}
+
+/// POST /storage/v1/object/move
+///
+/// A rename, and the bytes do not go anywhere.
+///
+/// They are under the row's id and its version, neither of which a name
+/// decides, so an object that changes its name or its bucket is a row
+/// that changes two columns. storage-api keys its store by the bucket
+/// and the name instead, so its move has to copy the bytes across and
+/// delete the old ones, and it writes a new version while it does. The
+/// answer is a sentence either way. What differs is `version`, which
+/// the info route answers and no recorded case reads after a move, and
+/// zou's reading of it is the truer one: the bytes did not change.
+pub async fn move_object(
+    State(app): State<Arc<App>>,
+    parts: Parts,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let (ctx, _) = caller(&app, &parts)?;
+    let asked = json_body(body).await?;
+    if let Some(field) = missing(&asked, ["bucketId", "sourceKey", "destinationKey"]) {
+        return Err(StorageError::missing_field(field));
+    }
+    let to = destination(&asked);
+
+    let sess = begin(&app, &ctx, false).await?;
+    // No question about the bucket, which is a difference from an
+    // upload and a recorded one: a move out of a bucket that is not
+    // there is answered as an object that is not there. Nothing looks
+    // the bucket up, so there is nothing to tell the two apart with.
+    //
+    // The row under the caller's own policies, so a row they cannot see
+    // is a row that is not there. That is the reference's reading and it
+    // is not the one a delete takes, which asks twice on purpose.
+    if find(&sess, &to.bucket, &to.source).await?.is_none() {
+        return refuse(sess, StorageError::no_such_key()).await;
+    }
+    let moved = sess
+        .execute(
+            "update storage.objects set bucket_id = $4, name = $3, updated_at = now()
+             where bucket_id = $1 and name = $2",
+            &[&to.bucket, &to.source, &to.target, &to.into],
+        )
+        .await
+        .map_err(|e| duplicate_is_a_resource(&e))?;
+    // Seen a moment ago and not moved, so what stopped it was the check
+    // on the row it was about to become rather than the row it was.
+    if moved == 0 {
+        return refuse(
+            sess,
+            StorageError::access_denied("Access denied".to_string()),
+        )
+        .await;
+    }
+    done(sess, Ok(())).await?;
+    Ok(message("Successfully moved"))
+}
+
+/// POST /storage/v1/object/copy
+///
+/// A second row and a second set of bytes, which is the whole
+/// difference from a move. The bytes are read and written rather than
+/// referred to twice: two rows pointing at one key would make a delete
+/// of either of them a delete of both, and nothing in the store counts
+/// what points at it.
+pub async fn copy_object(
+    State(app): State<Arc<App>>,
+    parts: Parts,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let (ctx, verified) = caller(&app, &parts)?;
+    let blobs = blobs(&app)?;
+    let asked = json_body(body).await?;
+    if let Some(field) = missing(&asked, ["sourceKey", "bucketId", "destinationKey"]) {
+        return Err(StorageError::missing_field(field));
+    }
+    let to = destination(&asked);
+    let replace = parts
+        .headers
+        .get("x-upsert")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|asked| asked.eq_ignore_ascii_case("true"));
+    let sub = verified
+        .claims
+        .get("sub")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let sess = begin(&app, &ctx, false).await?;
+    // No question about the bucket here either, for the reason the move
+    // above gives.
+    let Some(from) = find(&sess, &to.bucket, &to.source).await? else {
+        return refuse(sess, StorageError::no_such_key()).await;
+    };
+
+    // What the copy is described by. `copyMetadata` is true unless the
+    // body says otherwise, and when it is false the two fields the body
+    // may name are the two that change: everything else the source said
+    // about its bytes is still true of the copy, which is the
+    // reference's `preserveUnspecifiedFileMetadata`.
+    let keep = asked.get("copyMetadata").and_then(Value::as_bool) != Some(false);
+    let mut written = from.metadata.clone();
+    if !keep && let Some(given) = asked.get("metadata") {
+        for field in ["cacheControl", "mimetype"] {
+            if let Some(value) = given.get(field)
+                && let Some(object) = written.as_object_mut()
+            {
+                object.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    // The client's own metadata comes across with the copy, or is
+    // replaced by the header when the copy was told not to take it.
+    let attached = match keep {
+        true => match &from.user_metadata {
+            Value::Null => None,
+            given => Some(given.to_string()),
+        },
+        false => user_metadata(&parts),
+    };
+
+    let conflict = match replace {
+        true => {
+            "on conflict (bucket_id, name) do update
+                set version = excluded.version,
+                    metadata = excluded.metadata,
+                    user_metadata = excluded.user_metadata,
+                    updated_at = now()"
+        }
+        false => "",
+    };
+    let sql = format!(
+        "insert into storage.objects
+             (bucket_id, name, owner, owner_id, version, metadata, user_metadata)
+         values ($1, $2,
+                 case when $3::text ~*
+                     '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+                     then $3::text::uuid end,
+                 nullif($3::text, ''),
+                 gen_random_uuid()::text, $4::text::jsonb, $5::text::jsonb)
+         {conflict}
+         returning {OBJECT_COLUMNS}"
+    );
+    let rows = sess
+        .query(
+            &sql,
+            &[&to.into, &to.target, &sub, &written.to_string(), &attached],
+        )
+        .await
+        .map_err(|e| duplicate_is_a_key(&e))?;
+    let Some(made) = rows.first().map(object_row) else {
+        return refuse(
+            sess,
+            StorageError::access_denied("new row violates row-level security policy".to_string()),
+        )
+        .await;
+    };
+
+    // The bytes before the commit, for the reason an upload has: a row
+    // pointing at bytes that were never written is the one state a
+    // client can see and cannot explain.
+    let bytes = blobs
+        .get(from.key())
+        .await
+        .map_err(|e| StorageError::internal(e.to_string()))?;
+    if let Some(bytes) = bytes
+        && let Err(e) = blobs.put(made.key(), bytes).await
+    {
+        let _ = sess.rollback().await;
+        return Err(StorageError::internal(e.to_string()));
+    }
+    // The whole row, and the two names for the same thing in front of
+    // it. `Id` and `Key` are what a move used to answer before it was
+    // reduced to a sentence, and a copy still carries them beside the
+    // `id` and the `name` the row itself has.
+    let answer = json!({
+        "Id": made.id,
+        "Key": format!("{}/{}", to.into, to.target),
+        "id": made.id,
+        "name": made.name,
+        "bucket_id": made.bucket_id,
+        "owner": made.owner,
+        "owner_id": made.owner_id,
+        "version": made.version,
+        "created_at": made.created_at,
+        "updated_at": made.updated_at,
+        "last_accessed_at": made.last_accessed_at,
+        "metadata": made.metadata,
+        "user_metadata": made.user_metadata,
+    })
+    .to_string();
+    done(sess, Ok(())).await?;
+    Ok(ok(answer))
 }
 
 /// DELETE /storage/v1/object/{bucket}/{name}
@@ -1511,13 +1777,52 @@ mod tests {
         assert_eq!(written["cacheControl"], "no-cache");
     }
 
+    /// A body missing two fields is told about one of them, and which
+    /// one is the order the route lists them in rather than the order
+    /// they are missing in.
+    #[test]
+    fn a_body_is_told_about_the_first_field_it_is_missing() {
+        let asked = json!({"sourceKey": "a.txt"});
+        // The move's order and the copy's order, over the same body.
+        assert_eq!(
+            missing(&asked, ["bucketId", "sourceKey", "destinationKey"]),
+            Some("bucketId")
+        );
+        assert_eq!(
+            missing(&asked, ["sourceKey", "bucketId", "destinationKey"]),
+            Some("bucketId")
+        );
+        let named = json!({"bucketId": "notes", "sourceKey": "a.txt"});
+        assert_eq!(
+            missing(&named, ["bucketId", "sourceKey", "destinationKey"]),
+            Some("destinationKey")
+        );
+
+        let whole = json!({"bucketId": "notes", "sourceKey": "a.txt", "destinationKey": "b.txt"});
+        assert_eq!(
+            missing(&whole, ["bucketId", "sourceKey", "destinationKey"]),
+            None
+        );
+        // A field that is there and is not a string is a field that is
+        // not there, which is what a schema wanting a string does.
+        let numbered = json!({"bucketId": "notes", "sourceKey": 7, "destinationKey": "b.txt"});
+        assert_eq!(
+            missing(&numbered, ["bucketId", "sourceKey", "destinationKey"]),
+            Some("sourceKey")
+        );
+    }
+
     fn row(metadata: Value, user_metadata: Value) -> ObjectRow {
         ObjectRow {
             id: "2c0d1e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f".to_string(),
             bucket_id: "notes".to_string(),
             name: "hello.txt".to_string(),
+            owner: String::new(),
+            owner_id: String::new(),
             version: "5877d5bc-0000-4000-8000-000000000000".to_string(),
             created_at: "2026-08-06T14:25:39.016Z".to_string(),
+            updated_at: "2026-08-06T14:25:39.016Z".to_string(),
+            last_accessed_at: "2026-08-06T14:25:39.016Z".to_string(),
             metadata,
             user_metadata,
         }

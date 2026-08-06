@@ -248,6 +248,10 @@ async fn the_storage_surface_refuses_in_its_own_words_rather_than_the_gates() {
         // too and the reason these two paths are worth naming.
         ("POST", "/storage/v1/object/list/photos"),
         ("POST", "/storage/v1/object/list-v2/photos"),
+        // And move and copy, which name no bucket in the path at all
+        // and are refused before their body is read.
+        ("POST", "/storage/v1/object/move"),
+        ("POST", "/storage/v1/object/copy"),
     ] {
         let answer = bare(&app, method, path).await;
         assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{method} {path}");

@@ -12,10 +12,17 @@
 //! already taken leaves the bytes of the name it collided with where
 //! they were.
 //!
+//! Move and copy are here for the same reason and for one more: what
+//! they do to the store is the whole of the difference between them. A
+//! move changes two columns and leaves the bytes alone, because the key
+//! is the row's id and its version and a name is in neither. A copy
+//! writes a second set, because two rows pointing at one key would make
+//! a delete of either a delete of both.
+//!
 //! Every test works on a bucket of its own with a store of its own, so
-//! the four of them can run at once against one database the way cargo
-//! runs them, and so a leftover directory from a failed run cannot be
-//! read as a passing one.
+//! they can all run at once against one database the way cargo runs
+//! them, and so a leftover directory from a failed run cannot be read as
+//! a passing one.
 //!
 //! Gated on ZOU_PG_TEST_DSN like the other live suites, skips when
 //! unset.
@@ -370,5 +377,155 @@ async fn an_upload_onto_a_name_already_taken_leaves_the_first_bytes_alone() {
     assert_eq!(
         bytes_at(&f, &id, &version).await.as_deref(),
         Some(&b"the one that got there first"[..]),
+    );
+}
+
+#[tokio::test]
+async fn a_move_leaves_the_bytes_where_they_are() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-move").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-move/here.txt",
+        "text/plain",
+        "the same bytes either way",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let (id, version) = row(&f.pool, "zou-move", "here.txt").await.expect("a row");
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/move",
+        "application/json",
+        r#"{"bucketId":"zou-move","sourceKey":"here.txt","destinationKey":"there/here.txt"}"#,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(answer.json()["message"], "Successfully moved");
+
+    // One row, the same row, under a new name, and the key its bytes are
+    // under has not changed because a name is not part of it. This is
+    // where zou and storage-api differ: upstream keys the store by the
+    // name, so its move copies the bytes across and writes a new
+    // version.
+    assert_eq!(how_many(&f.pool, "zou-move").await, 1);
+    assert_eq!(row(&f.pool, "zou-move", "here.txt").await, None);
+    let (after, still) = row(&f.pool, "zou-move", "there/here.txt")
+        .await
+        .expect("a row");
+    assert_eq!((after, still), (id.clone(), version.clone()));
+    assert_eq!(
+        bytes_at(&f, &id, &version).await.as_deref(),
+        Some(&b"the same bytes either way"[..]),
+    );
+
+    // And the object answers at the name it was moved to.
+    let answer = call(
+        &f,
+        "GET",
+        "/storage/v1/object/zou-move/there/here.txt",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(answer.text(), "the same bytes either way");
+}
+
+#[tokio::test]
+async fn a_copy_writes_a_second_set_of_bytes() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-copy").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-copy/one.txt",
+        "text/plain",
+        "worth having twice",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let (id, version) = row(&f.pool, "zou-copy", "one.txt").await.expect("a row");
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/copy",
+        "application/json",
+        r#"{"bucketId":"zou-copy","sourceKey":"one.txt","destinationKey":"two.txt"}"#,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(answer.json()["Key"], "zou-copy/two.txt");
+
+    // Two rows and two keys. Sharing one key would make deleting either
+    // of them a delete of both, and nothing in the store counts what
+    // points at it.
+    assert_eq!(how_many(&f.pool, "zou-copy").await, 2);
+    let (second, other) = row(&f.pool, "zou-copy", "two.txt").await.expect("a row");
+    assert_ne!(second, id, "the copy is the same row");
+    assert_ne!(key(&second, &other), key(&id, &version), "one key for two");
+    assert_eq!(
+        bytes_at(&f, &second, &other).await.as_deref(),
+        Some(&b"worth having twice"[..]),
+    );
+    // The one it was copied from is still whole, which is the difference
+    // between a copy and a move.
+    assert_eq!(
+        bytes_at(&f, &id, &version).await.as_deref(),
+        Some(&b"worth having twice"[..]),
+    );
+}
+
+#[tokio::test]
+async fn a_copy_that_is_refused_writes_no_bytes() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-copy-onto").await;
+
+    for name in ["one.txt", "two.txt"] {
+        let answer = call(
+            &f,
+            "POST",
+            &format!("/storage/v1/object/zou-copy-onto/{name}"),
+            "text/plain",
+            name,
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    }
+    let (id, version) = row(&f.pool, "zou-copy-onto", "two.txt")
+        .await
+        .expect("a row");
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/copy",
+        "application/json",
+        r#"{"bucketId":"zou-copy-onto","sourceKey":"one.txt","destinationKey":"two.txt"}"#,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.text());
+    assert_eq!(answer.json()["error"], "Duplicate");
+
+    // The row it collided with still has the bytes it had, because the
+    // insert is inside the transaction and the store is only reached
+    // after it.
+    assert_eq!(how_many(&f.pool, "zou-copy-onto").await, 2);
+    let (still, same) = row(&f.pool, "zou-copy-onto", "two.txt")
+        .await
+        .expect("a row");
+    assert_eq!((still, same), (id.clone(), version.clone()));
+    assert_eq!(
+        bytes_at(&f, &id, &version).await.as_deref(),
+        Some(&b"two.txt"[..]),
     );
 }
