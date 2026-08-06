@@ -516,11 +516,11 @@ async fn the_grammar_does_not_carry_sql() {
     for (uri, want) in [
         (
             "/rest/v1/zou_atk_grammar?select=id&id=in.(1,2);drop%20table%20zou_atk_grammar;--",
-            r#"[{"id": 1}]"#,
+            r#"[{"id":1}]"#,
         ),
         (
             "/rest/v1/zou_atk_grammar?select=id,body);drop%20table%20zou_atk_grammar;--",
-            r#"[{"id": 1, "body": "one"}]"#,
+            r#"[{"id":1,"body":"one"}]"#,
         ),
     ] {
         let res = app

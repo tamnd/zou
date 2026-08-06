@@ -123,7 +123,7 @@ async fn the_read_path_speaks_postgrest() {
             .starts_with("application/json")
     );
     assert_eq!(res.headers()["content-range"], "0-1/*");
-    assert_eq!(body_text(res).await, r#"[{"name": "ann"},{"name": "bob"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"ann"},{"name":"bob"}]"#);
 
     // An embedded to many folds to a json array per parent, empty
     // rides as [] and a nested order applies inside the fold.
@@ -137,7 +137,7 @@ async fn the_read_path_speaks_postgrest() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "ann", "zou_rest_books": [{"title": "a2"}, {"title": "a1"}]},{"name": "bob", "zou_rest_books": [{"title": "b1"}]}]"#
+        r#"[{"name":"ann","zou_rest_books":[{"title": "a2"}, {"title": "a1"}]},{"name":"bob","zou_rest_books":[{"title": "b1"}]}]"#
     );
 
     // A filter narrows, limit and offset window, and Content-Range
@@ -147,7 +147,7 @@ async fn the_read_path_speaks_postgrest() {
         .oneshot(get("/rest/v1/zou_rest_authors?select=name&name=eq.ann"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"name": "ann"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"ann"}]"#);
 
     let res = app
         .clone()
@@ -157,7 +157,7 @@ async fn the_read_path_speaks_postgrest() {
         .await
         .unwrap();
     assert_eq!(res.headers()["content-range"], "1-1/*");
-    assert_eq!(body_text(res).await, r#"[{"name": "bob"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"bob"}]"#);
 
     // A window that starts below the first row starts at the first
     // row, and the rows it would have skipped come off the limit.
@@ -169,7 +169,7 @@ async fn the_read_path_speaks_postgrest() {
         .await
         .unwrap();
     assert_eq!(res.headers()["content-range"], "0-1/*");
-    assert_eq!(body_text(res).await, r#"[{"name": "ann"},{"name": "bob"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"ann"},{"name":"bob"}]"#);
 
     // A window that ends before it starts is a range and not a
     // grammar, so it is refused as one.
@@ -193,7 +193,7 @@ async fn the_read_path_speaks_postgrest() {
     req.headers_mut().insert("range", "0-0".parse().unwrap());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.headers()["content-range"], "0-0/*");
-    assert_eq!(body_text(res).await, r#"[{"name": "ann"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"ann"}]"#);
 
     // No rows is an empty array and the unsatisfied range shape.
     let res = app
@@ -248,7 +248,7 @@ async fn the_read_path_speaks_postgrest() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "ann", "zou_rest_msgs": [{"id": 100}]}]"#
+        r#"[{"name":"ann","zou_rest_msgs":[{"id": 100}]}]"#
     );
 
     // Grammar failures never reach the database.
@@ -305,7 +305,7 @@ async fn the_write_path_speaks_postgrest() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"price": 7, "title": "t1"},{"price": 7, "title": "t2"}]"#
+        r#"[{"title":"t1","price":7},{"title":"t2","price":7}]"#
     );
 
     // return=representation answers with the planned select over the
@@ -324,7 +324,7 @@ async fn the_write_path_speaks_postgrest() {
     assert_eq!(res.headers()["preference-applied"], "return=representation");
     assert_eq!(
         body_text(res).await,
-        r#"[{"title": "c1", "zou_rest_wr_authors": {"name": "ann"}}]"#
+        r#"[{"title":"c1","zou_rest_wr_authors":{"name": "ann"}}]"#
     );
 
     // return=headers-only points Location at the new row by its pk.
@@ -382,7 +382,7 @@ async fn the_write_path_speaks_postgrest() {
         .oneshot(get("/rest/v1/zou_rest_wr_books?select=title&id=eq.2"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"title": "t2x"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"title":"t2x"}]"#);
 
     // ignore-duplicates with an explicit on_conflict drops the clash
     // and keeps the fresh row.
@@ -404,10 +404,7 @@ async fn the_write_path_speaks_postgrest() {
         ))
         .await
         .unwrap();
-    assert_eq!(
-        body_text(res).await,
-        r#"[{"title": "t2x"},{"title": "t4"}]"#
-    );
+    assert_eq!(body_text(res).await, r#"[{"title":"t2x"},{"title":"t4"}]"#);
 
     // An upsert with no pk and no on_conflict has no target to name,
     // so there is nothing to resolve and it is a plain insert. The
@@ -439,7 +436,7 @@ async fn the_write_path_speaks_postgrest() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 1, "title": "p1"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1,"title":"p1"}]"#);
 
     // A minimal PATCH is the bare 204.
     let res = app
@@ -458,7 +455,7 @@ async fn the_write_path_speaks_postgrest() {
         .oneshot(get("/rest/v1/zou_rest_wr_books?select=price&id=eq.4"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"price": 9}]"#);
+    assert_eq!(body_text(res).await, r#"[{"price":9}]"#);
 
     // A PATCH with no keys is PostgREST's no-op answer.
     let res = app
@@ -486,7 +483,7 @@ async fn the_write_path_speaks_postgrest() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 42}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":42}]"#);
 
     let res = app
         .clone()
@@ -537,26 +534,26 @@ async fn a_put_replaces_the_row_the_url_names() {
         .oneshot(req(
             "PUT",
             "/rest/v1/zou_rest_put?name=eq.go",
-            r#"[{"name": "go", "rank": 19}]"#,
+            r#"[{"name":"go","rank":19}]"#,
             &["return=representation"],
         ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
-    assert_eq!(body_text(res).await, r#"[{"name": "go", "rank": 19}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"go","rank":19}]"#);
 
     let res = app
         .clone()
         .oneshot(req(
             "PUT",
             "/rest/v1/zou_rest_put?name=eq.go",
-            r#"[{"name": "go", "rank": 20}]"#,
+            r#"[{"name":"go","rank":20}]"#,
             &["return=representation"],
         ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"name": "go", "rank": 20}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"go","rank":20}]"#);
 
     // No Prefer at all is the bare 204, and it carries no window,
     // because the url named the row rather than a range of them.
@@ -577,7 +574,7 @@ async fn a_put_replaces_the_row_the_url_names() {
         .oneshot(get("/rest/v1/zou_rest_put?select=rank&name=eq.java"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"rank": 1}]"#);
+    assert_eq!(body_text(res).await, r#"[{"rank":1}]"#);
 
     // Every element the url does not name is filtered out of the
     // payload, so a body of two rows puts the one that matches.
@@ -592,7 +589,7 @@ async fn a_put_replaces_the_row_the_url_names() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"name": "java", "rank": 2}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"java","rank":2}]"#);
     let res = app
         .clone()
         .oneshot(get("/rest/v1/zou_rest_put?select=name&name=eq.swift"))
@@ -615,7 +612,7 @@ async fn a_put_replaces_the_row_the_url_names() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"last": "roe", "first": "frances", "salary": 70000}]"#
+        r#"[{"first":"frances","last":"roe","salary":70000}]"#
     );
 
     for uri in [
@@ -676,7 +673,7 @@ async fn a_put_replaces_the_row_the_url_names() {
         .oneshot(get("/rest/v1/zou_rest_put?select=name&order=name"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"name": "go"},{"name": "java"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"go"},{"name":"java"}]"#);
 }
 
 #[tokio::test]
@@ -753,7 +750,7 @@ async fn a_write_reads_its_body_the_way_postgrest_reads_it() {
         .oneshot(get("/rest/v1/zou_rest_body?select=name&id=eq.10"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"name": null}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":null}]"#);
 
     // An update writes one row, so an array is read down to its
     // first element rather than refused, and ?columns= narrows what
@@ -772,7 +769,7 @@ async fn a_write_reads_its_body_the_way_postgrest_reads_it() {
     assert_eq!(res.headers()["content-range"], "0-0/*");
     assert_eq!(
         body_text(res).await,
-        r#"[{"id": 1, "name": "java", "rank": 41}]"#
+        r#"[{"id":1,"name":"java","rank":41}]"#
     );
 
     let res = app
@@ -788,7 +785,7 @@ async fn a_write_reads_its_body_the_way_postgrest_reads_it() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"id": 1, "name": "java", "rank": 43}]"#
+        r#"[{"id":1,"name":"java","rank":43}]"#
     );
 
     // A body with nothing in it to set is not an error and not a
@@ -826,7 +823,7 @@ async fn a_write_reads_its_body_the_way_postgrest_reads_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"id": 1, "rank": 43},{"id": 2, "rank": 19},{"id": 8, "rank": 7},{"id": 9, "rank": 7},{"id": 10, "rank": 7},{"id": 11, "rank": 7}]"#
+        r#"[{"id":1,"rank":43},{"id":2,"rank":19},{"id":8,"rank":7},{"id":9,"rank":7},{"id":10,"rank":7},{"id":11,"rank":7}]"#
     );
 }
 
@@ -928,7 +925,7 @@ async fn the_rpc_surface_speaks_postgrest() {
     assert_eq!(res.headers()["content-range"], "0-0/*");
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "drill", "zou_rpc_owners": {"name": "bob"}}]"#
+        r#"[{"name":"drill","zou_rpc_owners":{"name": "bob"}}]"#
     );
 
     // The same function over POST: body args, query string grammar,
@@ -943,7 +940,7 @@ async fn the_rpc_surface_speaks_postgrest() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 2},{"id": 3}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1},{"id":2},{"id":3}]"#);
 
     // returns table(...) rows come out as objects.
     let res = app
@@ -951,7 +948,7 @@ async fn the_rpc_surface_speaks_postgrest() {
         .oneshot(get("/rest/v1/rpc/zou_rpc_pair?a=21"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"x": 21, "y": 42}]"#);
+    assert_eq!(body_text(res).await, r#"[{"x":21,"y":42}]"#);
 
     // A non set function returning a rowtype is one bare object.
     let res = app
@@ -959,7 +956,7 @@ async fn the_rpc_surface_speaks_postgrest() {
         .oneshot(get("/rest/v1/rpc/zou_rpc_one?select=id,name"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"{"id": 1, "name": "hammer"}"#);
+    assert_eq!(body_text(res).await, r#"{"id":1,"name":"hammer"}"#);
 
     // A variadic gathers repeated query params, or a json array.
     let res = app
@@ -1013,7 +1010,7 @@ async fn the_rpc_surface_speaks_postgrest() {
         .oneshot(get("/rest/v1/zou_rpc_items?select=name&id=eq.99"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"name": "tmp"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"tmp"}]"#);
 
     // Overloads a call shape cannot split are PGRST203 at 300.
     let res = app
@@ -1187,7 +1184,7 @@ async fn a_call_answers_with_the_range_a_read_would() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(res.headers()["content-range"], "1-1/3");
-    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":2}]"#);
 
     // A window that starts past the end is the read path's 416, and
     // it needs the total to know that, so it needs the count to
@@ -1216,7 +1213,7 @@ async fn a_call_answers_with_the_range_a_read_would() {
         .unwrap();
     let res = app.clone().oneshot(ranged).await.unwrap();
     assert_eq!(res.headers()["content-range"], "1-1/*");
-    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":2}]"#);
 
     // The same header on a POST is not a page at all.
     let posted = Request::builder()
@@ -1258,7 +1255,7 @@ async fn a_call_answers_with_the_range_a_read_would() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.headers()["content-range"], "0-0/1");
-    assert_eq!(body_text(res).await, r#"{"id": 1}"#);
+    assert_eq!(body_text(res).await, r#"{"id":1}"#);
 }
 
 /// What a call hands back decides how it is asked. A row is
@@ -1313,7 +1310,7 @@ async fn a_call_is_asked_the_way_its_return_type_reads() {
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK, "{name}");
         assert_eq!(res.headers()["content-range"], "0-0/*");
-        assert_eq!(body_text(res).await, r#"{"x": 10, "y": 5}"#, "{name}");
+        assert_eq!(body_text(res).await, r#"{"x":10,"y":5}"#, "{name}");
     }
 
     // A record has no columns to expand, which is what postgres
@@ -1325,7 +1322,7 @@ async fn a_call_is_asked_the_way_its_return_type_reads() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"{"id": 1, "name": "a"}"#);
+    assert_eq!(body_text(res).await, r#"{"id":1,"name":"a"}"#);
 
     // A set of them is as many rows as the set has.
     let res = app
@@ -1336,7 +1333,7 @@ async fn a_call_is_asked_the_way_its_return_type_reads() {
     assert_eq!(res.headers()["content-range"], "0-1/*");
     assert_eq!(
         body_text(res).await,
-        r#"[{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]"#
+        r#"[{"id":1,"name":"a"}, {"id":2,"name":"b"}]"#
     );
 
     // A domain over a table's rowtype is that table, so the select
@@ -1347,7 +1344,7 @@ async fn a_call_is_asked_the_way_its_return_type_reads() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"name": "b"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"b"}]"#);
 
     // One INOUT argument reads as a scalar from the return type
     // alone, and postgres names the output column after it, so the
@@ -1358,7 +1355,7 @@ async fn a_call_is_asked_the_way_its_return_type_reads() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"{"num": 3}"#);
+    assert_eq!(body_text(res).await, r#"{"num":3}"#);
 }
 
 #[tokio::test]
@@ -1389,7 +1386,7 @@ async fn a_filter_takes_the_strings_upstream_takes() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 3}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1},{"id":3}]"#);
 
     // The commas inside an array literal are the array's, not the
     // tree's, and a negation still reaches the condition behind one.
@@ -1401,7 +1398,7 @@ async fn a_filter_takes_the_strings_upstream_takes() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":2}]"#);
 
     // A column named after a keyword is a column, since only the
     // bracket makes the word a group.
@@ -1413,7 +1410,7 @@ async fn a_filter_takes_the_strings_upstream_takes() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1}]"#);
 
     // is takes not_null in any case, and the trileans keep working.
     let res = app
@@ -1422,7 +1419,7 @@ async fn a_filter_takes_the_strings_upstream_takes() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 2}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1},{"id":2}]"#);
 
     // An in list with nothing in it matches nothing, and negated it
     // matches everything, which is what the empty array does.
@@ -1440,7 +1437,7 @@ async fn a_filter_takes_the_strings_upstream_takes() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 2},{"id": 3}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1},{"id":2},{"id":3}]"#);
 
     // A bracket too many is a bracket nobody looks at.
     let res = app
@@ -1451,7 +1448,7 @@ async fn a_filter_takes_the_strings_upstream_takes() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1}]"#);
 }
 
 #[tokio::test]
@@ -1520,7 +1517,7 @@ async fn the_count_preferences_speak_postgrest() {
     assert_eq!(res.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(res.headers()["content-range"], "0-1/7");
     assert_eq!(res.headers()["preference-applied"], "count=exact");
-    assert_eq!(body_text(res).await, r#"[{"id": 1},{"id": 2}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1},{"id":2}]"#);
 
     // Unpaged with the whole table served is a 200 over the full
     // window.
@@ -1754,10 +1751,7 @@ async fn the_response_modes_speak_postgrest() {
         res.headers()["content-type"],
         "application/vnd.pgrst.object+json; charset=utf-8"
     );
-    assert_eq!(
-        body_text(res).await,
-        r#"{"id": 1, "name": "ann", "note": null}"#
-    );
+    assert_eq!(body_text(res).await, r#"{"id":1,"name":"ann","note":null}"#);
 
     let res = app
         .clone()
@@ -1808,7 +1802,7 @@ async fn the_response_modes_speak_postgrest() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"{"id": 1, "name": "ann"}"#);
+    assert_eq!(body_text(res).await, r#"{"id":1,"name":"ann"}"#);
 
     let res = app
         .clone()
@@ -1843,7 +1837,7 @@ async fn the_response_modes_speak_postgrest() {
     );
     assert_eq!(
         body_text(res).await,
-        r#"[{"id": 1},{"id": 2, "note": "hi"},{"id": 3}]"#
+        r#"[{"id":1},{"id":2,"note":"hi"},{"id":3}]"#
     );
 
     // An Accept nothing can produce is the PGRST107 406.
@@ -1897,7 +1891,7 @@ async fn the_response_modes_speak_postgrest() {
     assert_eq!(res.status(), StatusCode::CREATED);
     assert_eq!(
         body_text(res).await,
-        r#"{"id": 10, "name": "yin", "note": null}"#
+        r#"{"id":10,"name":"yin","note":null}"#
     );
 
     // A singular write that lands on the wrong row count is refused
@@ -1942,7 +1936,7 @@ async fn the_response_modes_speak_postgrest() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"note": "hi"}]"#,
+        r#"[{"note":"hi"}]"#,
         "the refused update rolled back"
     );
 
@@ -2043,7 +2037,7 @@ async fn the_context_and_rls_hold_through_the_whole_door() {
     req.headers_mut()
         .insert("authorization", format!("Bearer {bearer}").parse().unwrap());
     let res = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(body_text(res).await, r#"[{"body": "mine"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"body":"mine"}]"#);
 
     let res = app
         .clone()
@@ -2116,7 +2110,7 @@ async fn the_schema_profiles_speak_postgrest() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(res.headers()["content-profile"], "zou_alt");
-    assert_eq!(body_text(res).await, r#"[{"tag": "alt"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"tag":"alt"}]"#);
 
     // No header is the first exposed schema, and with more than one
     // exposed the default still counts as negotiated.
@@ -2126,7 +2120,7 @@ async fn the_schema_profiles_speak_postgrest() {
         .await
         .unwrap();
     assert_eq!(res.headers()["content-profile"], "public");
-    assert_eq!(body_text(res).await, r#"[{"tag": "pub"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"tag":"pub"}]"#);
 
     // A read ignores Content-Profile, that header is the writes'.
     let res = two
@@ -2141,7 +2135,7 @@ async fn the_schema_profiles_speak_postgrest() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"tag": "pub"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"tag":"pub"}]"#);
 
     // An unexposed schema is the PGRST106 406, hint listing what is.
     let res = two
@@ -2200,7 +2194,7 @@ async fn the_schema_profiles_speak_postgrest() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
     assert_eq!(res.headers()["content-profile"], "zou_alt");
-    assert_eq!(body_text(res).await, r#"[{"id": 2, "tag": "alt2"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":2,"tag":"alt2"}]"#);
 
     // It landed in zou_alt and nowhere near public.
     let res = two
@@ -2215,13 +2209,13 @@ async fn the_schema_profiles_speak_postgrest() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"tag": "alt"},{"tag": "alt2"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"tag":"alt"},{"tag":"alt2"}]"#);
     let res = two
         .clone()
         .oneshot(get("/rest/v1/zou_profile_rows?select=tag"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"tag": "pub"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"tag":"pub"}]"#);
 
     // A minimal write answers 204 with no content type, so no
     // Content-Profile rides along either.
@@ -2276,7 +2270,7 @@ async fn the_schema_profiles_speak_postgrest() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert!(res.headers().get("content-profile").is_none());
-    assert_eq!(body_text(res).await, r#"[{"tag": "pub"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"tag":"pub"}]"#);
 
     let res = one
         .clone()
@@ -2629,7 +2623,7 @@ async fn the_catalog_follows_the_ddl_epoch() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     assert_eq!(
-        body, r#"[{"id": 10, "zou_ep_parents": {"name": "ann"}}]"#,
+        body, r#"[{"id":10,"zou_ep_parents":{"name": "ann"}}]"#,
         "the new foreign key reached the cached catalog"
     );
 }
@@ -2695,7 +2689,7 @@ async fn the_schema_cache_answers_for_tables_and_columns_nobody_has() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1}]"#);
 
     // A column a write names and the table does not have, from the
     // body and from ?columns=, and never from postgres.
@@ -2756,7 +2750,7 @@ async fn the_schema_cache_answers_for_tables_and_columns_nobody_has() {
         .oneshot(get("/rest/v1/zou_cache_widgets?id=eq.1"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"id": 1, "name": "renamed"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1,"name":"renamed"}]"#);
 
     // What a table will take, which is the same list for every table
     // and only says the table is there.
@@ -2811,7 +2805,7 @@ async fn a_data_representation_is_what_the_client_sees() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r##"[{"id": 1, "shade": "#ff0000"},{"id": 2, "shade": "#0000ff"}]"##
+        r##"[{"id":1,"shade":"#ff0000"},{"id":2,"shade":"#0000ff"}]"##
     );
 
     // A star has to be spelled out for the call to go anywhere, and
@@ -2824,7 +2818,7 @@ async fn a_data_representation_is_what_the_client_sees() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r##"[{"id": 1, "note": "warm", "shade": "#ff0000"}]"##
+        r##"[{"id":1,"shade":"#ff0000","note":"warm"}]"##
     );
 
     // The url is text, so a filter reads its value through the cast
@@ -2836,7 +2830,7 @@ async fn a_data_representation_is_what_the_client_sees() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"note": "warm"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"note":"warm"}]"#);
 
     // And a write filtered the same way, whose representation comes
     // back through the cast as well.
@@ -2851,7 +2845,7 @@ async fn a_data_representation_is_what_the_client_sees() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r##"[{"id": 2, "shade": "#0000ff"}]"##);
+    assert_eq!(body_text(res).await, r##"[{"id":2,"shade":"#0000ff"}]"##);
 
     // The request's own cast sits on top of the representation
     // rather than instead of it, so this is the text of the hex
@@ -2861,7 +2855,7 @@ async fn a_data_representation_is_what_the_client_sees() {
         .oneshot(get("/rest/v1/zou_rest_paint?select=shade::text&id=eq.1"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, "[{\"shade\": \"\\\"#ff0000\\\"\"}]");
+    assert_eq!(body_text(res).await, "[{\"shade\":\"\\\"#ff0000\\\"\"}]");
 }
 
 #[tokio::test]
@@ -2902,7 +2896,7 @@ async fn a_data_representation_reads_a_written_value_back_in() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
-    assert_eq!(body_text(res).await, r##"[{"id": 1, "shade": "#ff0000"}]"##);
+    assert_eq!(body_text(res).await, r##"[{"id":1,"shade":"#ff0000"}]"##);
 
     // What actually landed is the integer, which is the point of the
     // whole arrangement.
@@ -2921,14 +2915,14 @@ async fn a_data_representation_reads_a_written_value_back_in() {
         .oneshot(req(
             "POST",
             "/rest/v1/zou_rest_wpaint?select=id,shade&order=id",
-            r##"[{"id": 2, "shade": "#0000ff"},{"id": 3, "shade": "#00ff00"}]"##,
+            r##"[{"id":2,"shade":"#0000ff"},{"id":3,"shade":"#00ff00"}]"##,
             &["return=representation"],
         ))
         .await
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r##"[{"id": 2, "shade": "#0000ff"},{"id": 3, "shade": "#00ff00"}]"##
+        r##"[{"id":2,"shade":"#0000ff"},{"id":3,"shade":"#00ff00"}]"##
     );
 
     // And an update, which declares only the column it writes.
@@ -2943,7 +2937,7 @@ async fn a_data_representation_reads_a_written_value_back_in() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r##"[{"id": 1, "shade": "#010203"}]"##);
+    assert_eq!(body_text(res).await, r##"[{"id":1,"shade":"#010203"}]"##);
 
     // A write that touches nothing represented is left on the plain
     // path, and still writes what it was given.
@@ -2957,7 +2951,7 @@ async fn a_data_representation_reads_a_written_value_back_in() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"id": 1, "note": "chilly"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1,"note":"chilly"}]"#);
 }
 
 /// `Prefer: missing=default`, the write that wants what the table
@@ -2994,7 +2988,7 @@ async fn a_column_left_out_of_a_body_can_take_its_default() {
     assert_eq!(res.status(), StatusCode::CREATED);
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "quiet", "tier": null, "seats": null}]"#
+        r#"[{"name":"quiet","tier":null,"seats":null}]"#
     );
 
     // With it, each one is what the table says, and the preference
@@ -3015,7 +3009,7 @@ async fn a_column_left_out_of_a_body_can_take_its_default() {
     );
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "loud", "tier": "free", "seats": 3}]"#
+        r#"[{"name":"loud","tier":"free","seats":3}]"#
     );
 
     // A key the body does carry still wins, so the defaults go under
@@ -3032,7 +3026,7 @@ async fn a_column_left_out_of_a_body_can_take_its_default() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "mixed", "tier": "free", "seats": 9}]"#
+        r#"[{"name":"mixed","tier":"free","seats":9}]"#
     );
 
     // An identity column has no default row in the catalog at all,
@@ -3042,13 +3036,13 @@ async fn a_column_left_out_of_a_body_can_take_its_default() {
         .oneshot(req(
             "POST",
             "/rest/v1/zou_rest_defaults?columns=id,name&select=name",
-            r#"[{"name": "surrogate"}]"#,
+            r#"[{"name":"surrogate"}]"#,
             &["missing=default", "return=representation"],
         ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::CREATED);
-    assert_eq!(body_text(res).await, r#"[{"name": "surrogate"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"surrogate"}]"#);
 
     // An update fills the same way, one object rather than an array.
     let res = app
@@ -3063,7 +3057,7 @@ async fn a_column_left_out_of_a_body_can_take_its_default() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "quiet", "tier": "free", "seats": 1}]"#
+        r#"[{"name":"quiet","tier":"free","seats":1}]"#
     );
 
     // A DELETE reads no body, so the preference is neither applied
@@ -3155,7 +3149,7 @@ async fn a_preference_nobody_has_costs_what_handling_says_it_does() {
     );
     assert_eq!(
         body_text(res).await,
-        r#"[{"t": "2023-10-18T05:37:59.611-07:00"}]"#
+        r#"[{"t":"2023-10-18T05:37:59.611-07:00"}]"#
     );
 
     // One it does not have is refused under strict and ignored
@@ -3257,7 +3251,7 @@ async fn a_write_that_touched_more_rows_than_asked_for_is_taken_back() {
         .oneshot(get("/rest/v1/zou_rest_capped?select=name&id=eq.1"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"name": "row 1"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"row 1"}]"#);
 
     // Under the cap the write lands and says what it held itself to.
     let res = app
@@ -3335,7 +3329,7 @@ async fn an_order_and_a_filter_can_reach_into_an_embed() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"title": "name", "zou_rest_crew": {"name": "maps"}},{"title": "draw", "zou_rest_crew": {"name": "roads"}},{"title": "walk", "zou_rest_crew": null}]"#
+        r#"[{"title":"name","zou_rest_crew":{"name": "maps"}},{"title":"draw","zou_rest_crew":{"name": "roads"}},{"title":"walk","zou_rest_crew":null}]"#
     );
 
     // The embed does not have to be selected for its columns to be
@@ -3350,7 +3344,7 @@ async fn an_order_and_a_filter_can_reach_into_an_embed() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"title": "draw"},{"title": "name"},{"title": "walk"}]"#
+        r#"[{"title":"draw"},{"title":"name"},{"title":"walk"}]"#
     );
 
     // Sorting a parent by a list is refused rather than guessed at.
@@ -3392,7 +3386,7 @@ async fn an_order_and_a_filter_can_reach_into_an_embed() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"title": "draw"},{"title": "name"}]"#
+        r#"[{"title":"draw"},{"title":"name"}]"#
     );
 
     let res = app
@@ -3401,7 +3395,7 @@ async fn an_order_and_a_filter_can_reach_into_an_embed() {
              &zou_rest_crew=is.null"))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"title": "walk"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"title":"walk"}]"#);
 
     // A to many answers the same question about its own filters, and
     // the count that comes back with it is over the same predicate.
@@ -3417,7 +3411,7 @@ async fn an_order_and_a_filter_can_reach_into_an_embed() {
         .await
         .unwrap();
     assert_eq!(res.headers().get("content-range").unwrap(), "0-0/1");
-    assert_eq!(body_text(res).await, r#"[{"name": "roads"}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"roads"}]"#);
 
     // Every other operator reads the name as a column, which is what
     // lets a table carry a column and an embed of the same name.
@@ -3470,7 +3464,7 @@ async fn an_embed_can_be_named_by_the_key_that_makes_it() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "bob", "dept_id": {"name": "roads"}}]"#
+        r#"[{"name":"bob","dept_id":{"name": "roads"}}]"#
     );
 
     // So does the constraint, under whatever name it was given.
@@ -3483,7 +3477,7 @@ async fn an_embed_can_be_named_by_the_key_that_makes_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"dept": {"name": "roads"}, "name": "bob"}]"#
+        r#"[{"name":"bob","dept":{"name": "roads"}}]"#
     );
 
     // A hint may name either end of the pair it joins on, so the
@@ -3498,7 +3492,7 @@ async fn an_embed_can_be_named_by_the_key_that_makes_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "ada", "zou_rest_dept": {"name": "maps"}}]"#
+        r#"[{"name":"ada","zou_rest_dept":{"name": "maps"}}]"#
     );
 
     // The table's own name, on a table that points at itself, is the
@@ -3512,7 +3506,7 @@ async fn an_embed_can_be_named_by_the_key_that_makes_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "ada", "reports": [{"name": "bob"}]}]"#
+        r#"[{"name":"ada","reports":[{"name": "bob"}]}]"#
     );
 
     // And the column's name is the one row it points at.
@@ -3525,7 +3519,7 @@ async fn an_embed_can_be_named_by_the_key_that_makes_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "bob", "boss_id": {"name": "ada"}}]"#
+        r#"[{"name":"bob","boss_id":{"name": "ada"}}]"#
     );
 
     // A hint on the table name says which column the list comes back
@@ -3540,7 +3534,7 @@ async fn an_embed_can_be_named_by_the_key_that_makes_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "ada", "reports": [{"name": "bob"}]}]"#
+        r#"[{"name":"ada","reports":[{"name": "bob"}]}]"#
     );
 
     // A name that is none of those is still nothing, and the details
@@ -3601,7 +3595,7 @@ async fn a_spread_of_a_list_arrives_one_column_at_a_time() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "labs", "players": []},{"name": "maps", "players": ["cy", "ada"]},{"name": "roads", "players": ["bob"]}]"#
+        r#"[{"name":"labs","players":[]},{"name":"maps","players":["cy", "ada"]},{"name":"roads","players":["bob"]}]"#
     );
 
     // An embed inside the spread is a column of the child like any
@@ -3616,7 +3610,7 @@ async fn a_spread_of_a_list_arrives_one_column_at_a_time() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"id": [], "name": "labs", "coach_id": []},{"id": [1, 3], "name": "maps", "coach_id": [null, {"name": "ada"}]},{"id": [2], "name": "roads", "coach_id": [{"name": "ada"}]}]"#
+        r#"[{"name":"labs","id":[],"coach_id":[]},{"name":"maps","id":[1, 3],"coach_id":[null, {"name": "ada"}]},{"name":"roads","id":[2],"coach_id":[{"name": "ada"}]}]"#
     );
 
     // A star spreads every column of the child.
@@ -3629,7 +3623,7 @@ async fn a_spread_of_a_list_arrives_one_column_at_a_time() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"id": [2], "name": ["bob"], "team": "roads", "team_id": [2], "coach_id": [1]}]"#
+        r#"[{"team":"roads","id":[2],"name":["bob"],"team_id":[2],"coach_id":[1]}]"#
     );
 
     // The parent without children is still a parent, unless the embed
@@ -3644,7 +3638,7 @@ async fn a_spread_of_a_list_arrives_one_column_at_a_time() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": ["ada", "cy"], "team": "maps"},{"name": ["bob"], "team": "roads"}]"#
+        r#"[{"team":"maps","name":["ada", "cy"]},{"team":"roads","name":["bob"]}]"#
     );
 
     let res = app
@@ -3655,7 +3649,7 @@ async fn a_spread_of_a_list_arrives_one_column_at_a_time() {
         ))
         .await
         .unwrap();
-    assert_eq!(body_text(res).await, r#"[{"name": "labs", "players": []}]"#);
+    assert_eq!(body_text(res).await, r#"[{"name":"labs","players":[]}]"#);
 }
 
 #[tokio::test]
@@ -3714,7 +3708,7 @@ async fn a_view_embeds_on_the_keys_of_the_tables_under_it() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"title": "a1", "zou_view_authors": {"name": "ann"}},{"title": "b1", "zou_view_authors": {"name": "bob"}}]"#
+        r#"[{"title":"a1","zou_view_authors":{"name": "ann"}},{"title":"b1","zou_view_authors":{"name": "bob"}}]"#
     );
 
     // And the parent of it, which the table on the other end can
@@ -3728,7 +3722,7 @@ async fn a_view_embeds_on_the_keys_of_the_tables_under_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"title": "a1", "zou_view_author_list": {"name": "ann"}},{"title": "b1", "zou_view_author_list": {"name": "bob"}}]"#
+        r#"[{"title":"a1","zou_view_author_list":{"name": "ann"}},{"title":"b1","zou_view_author_list":{"name": "bob"}}]"#
     );
 
     // Two views over the two ends of one key are related to each
@@ -3742,7 +3736,7 @@ async fn a_view_embeds_on_the_keys_of_the_tables_under_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"name": "ann", "zou_view_book_list": [{"title": "a1"}]},{"name": "bob", "zou_view_book_list": [{"title": "b1"}]}]"#
+        r#"[{"name":"ann","zou_view_book_list":[{"title": "a1"}]},{"name":"bob","zou_view_book_list":[{"title": "b1"}]}]"#
     );
 
     // A view over a view keeps the key, and the view in between is
@@ -3756,7 +3750,7 @@ async fn a_view_embeds_on_the_keys_of_the_tables_under_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"title": "a1", "zou_view_author_list": {"name": "ann"}},{"title": "b1", "zou_view_author_list": {"name": "bob"}}]"#
+        r#"[{"title":"a1","zou_view_author_list":{"name": "ann"}},{"title":"b1","zou_view_author_list":{"name": "bob"}}]"#
     );
 
     // Both ends of the junction are the view's, so the many to many
@@ -3770,7 +3764,7 @@ async fn a_view_embeds_on_the_keys_of_the_tables_under_it() {
         .unwrap();
     assert_eq!(
         body_text(res).await,
-        r#"[{"title": "a1", "zou_view_tags": [{"tag": "old"}, {"tag": "new"}]}]"#
+        r#"[{"title":"a1","zou_view_tags":[{"tag": "old"}, {"tag": "new"}]}]"#
     );
 
     // Naming the key by its column reaches the table it is on. The
@@ -3786,7 +3780,7 @@ async fn a_view_embeds_on_the_keys_of_the_tables_under_it() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"title": "a1", "author_id": {"name": "ann"}},{"title": "b1", "author_id": {"name": "bob"}}]"#
+        r#"[{"title":"a1","author_id":{"name": "ann"}},{"title":"b1","author_id":{"name": "bob"}}]"#
     );
 
     // A view that did not select the key column does not have the
@@ -3836,7 +3830,7 @@ async fn a_json_path_reads_whatever_the_column_holds() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"x": "1", "id": 1, "arr": 5},{"x": "2", "id": 2, "arr": 8}]"#
+        r#"[{"id":1,"x":"1","arr":5},{"id":2,"x":"2","arr":8}]"#
     );
 
     // The same path filters and orders, and a negative index counts
@@ -3849,7 +3843,7 @@ async fn a_json_path_reads_whatever_the_column_holds() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":2}]"#);
 
     // A cast over a path takes brackets, since `::` binds tighter
     // than the arrow and would otherwise land on the key.
@@ -3861,10 +3855,7 @@ async fn a_json_path_reads_whatever_the_column_holds() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(
-        body_text(res).await,
-        r#"[{"n": 7, "id": 1},{"n": 8, "id": 2}]"#
-    );
+    assert_eq!(body_text(res).await, r#"[{"id":1,"n":7},{"id":2,"n":8}]"#);
 
     // Only the six bytes the grammar needs end a key, a dash joins
     // two pieces of one, and digits are an index only when nothing
@@ -3879,7 +3870,7 @@ async fn a_json_path_reads_whatever_the_column_holds() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         body_text(res).await,
-        r#"[{"a!@": "1", "0xy1": "3", "23-x-45": "2"}]"#
+        r#"[{"a!@":"1","23-x-45":"2","0xy1":"3"}]"#
     );
 
     // A jsonb column is read as it is, so an index into a list is
@@ -3892,7 +3883,7 @@ async fn a_json_path_reads_whatever_the_column_holds() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":2}]"#);
 }
 
 #[tokio::test]
@@ -3924,7 +3915,7 @@ async fn a_text_search_makes_the_vector_it_needs() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1}]"#);
 
     // The configuration builds the vector as well as the query. The
     // german dictionary stems Arbeiten to arbeit, and the default one
@@ -3937,7 +3928,7 @@ async fn a_text_search_makes_the_vector_it_needs() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 2}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":2}]"#);
 
     // A column that is already a vector faces the operator bare, and
     // a domain over one is still one.
@@ -3947,5 +3938,5 @@ async fn a_text_search_makes_the_vector_it_needs() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
-    assert_eq!(body_text(res).await, r#"[{"id": 1}]"#);
+    assert_eq!(body_text(res).await, r#"[{"id":1}]"#);
 }

@@ -686,12 +686,12 @@ pub fn scalar_wrap(call: Sql, set: bool) -> Sql {
     let col = quote_ident(VALUE);
     let text = if set {
         format!(
-            "with {src} as ({}) select coalesce(jsonb_agg(to_jsonb({src}.{col})), '[]'::jsonb)::text, count(*)::bigint from {src}",
+            "with {src} as ({}) select coalesce(json_agg(to_json({src}.{col})), '[]'::json)::text, count(*)::bigint from {src}",
             call.text
         )
     } else {
         format!(
-            "with {src} as ({}) select to_jsonb({src}.{col})::text, 1::bigint from {src}",
+            "with {src} as ({}) select to_json({src}.{col})::text, 1::bigint from {src}",
             call.text
         )
     };
