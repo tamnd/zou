@@ -1,0 +1,158 @@
+column buckets.allowed_mime_types text[] null
+column buckets.avif_autodetection boolean null default false
+column buckets.created_at timestamp with time zone null default now()
+column buckets.file_size_limit bigint null
+column buckets.id text not null
+column buckets.name text not null
+column buckets.owner uuid null
+column buckets.owner_id text null
+column buckets.public boolean null default false
+column buckets.type storage.buckettype not null default 'STANDARD'::storage.buckettype
+column buckets.updated_at timestamp with time zone null default now()
+column buckets_analytics.created_at timestamp with time zone not null default now()
+column buckets_analytics.deleted_at timestamp with time zone null
+column buckets_analytics.format text not null default 'ICEBERG'::text
+column buckets_analytics.id uuid not null default gen_random_uuid()
+column buckets_analytics.name text not null
+column buckets_analytics.type storage.buckettype not null default 'ANALYTICS'::storage.buckettype
+column buckets_analytics.updated_at timestamp with time zone not null default now()
+column buckets_vectors.created_at timestamp with time zone not null default now()
+column buckets_vectors.id text not null
+column buckets_vectors.type storage.buckettype not null default 'VECTOR'::storage.buckettype
+column buckets_vectors.updated_at timestamp with time zone not null default now()
+column iceberg_namespaces.bucket_name text not null
+column iceberg_namespaces.catalog_id uuid not null
+column iceberg_namespaces.created_at timestamp with time zone not null default now()
+column iceberg_namespaces.id uuid not null default gen_random_uuid()
+column iceberg_namespaces.metadata jsonb not null default '{}'::jsonb
+column iceberg_namespaces.name text not null
+column iceberg_namespaces.updated_at timestamp with time zone not null default now()
+column iceberg_tables.bucket_name text not null
+column iceberg_tables.catalog_id uuid not null
+column iceberg_tables.created_at timestamp with time zone not null default now()
+column iceberg_tables.id uuid not null default gen_random_uuid()
+column iceberg_tables.location text not null
+column iceberg_tables.name text not null
+column iceberg_tables.namespace_id uuid not null
+column iceberg_tables.remote_table_id text null
+column iceberg_tables.shard_id text null
+column iceberg_tables.shard_key text null
+column iceberg_tables.updated_at timestamp with time zone not null default now()
+column migrations.executed_at timestamp without time zone null default CURRENT_TIMESTAMP
+column migrations.hash character varying(40) not null
+column migrations.id integer not null
+column migrations.name character varying(100) not null
+column objects.bucket_id text null
+column objects.created_at timestamp with time zone null default now()
+column objects.id uuid not null default gen_random_uuid()
+column objects.last_accessed_at timestamp with time zone null default now()
+column objects.metadata jsonb null
+column objects.name text null
+column objects.owner uuid null
+column objects.owner_id text null
+column objects.path_tokens text[] null default string_to_array(name, '/'::text) stored
+column objects.updated_at timestamp with time zone null default now()
+column objects.user_metadata jsonb null
+column objects.version text null
+column s3_multipart_uploads.bucket_id text not null
+column s3_multipart_uploads.created_at timestamp with time zone not null default now()
+column s3_multipart_uploads.id text not null
+column s3_multipart_uploads.in_progress_size bigint not null default 0
+column s3_multipart_uploads.key text not null
+column s3_multipart_uploads.metadata jsonb null
+column s3_multipart_uploads.owner_id text null
+column s3_multipart_uploads.upload_signature text not null
+column s3_multipart_uploads.user_metadata jsonb null
+column s3_multipart_uploads.version text not null
+column s3_multipart_uploads_parts.bucket_id text not null
+column s3_multipart_uploads_parts.created_at timestamp with time zone not null default now()
+column s3_multipart_uploads_parts.etag text not null
+column s3_multipart_uploads_parts.id uuid not null default gen_random_uuid()
+column s3_multipart_uploads_parts.key text not null
+column s3_multipart_uploads_parts.owner_id text null
+column s3_multipart_uploads_parts.part_number integer not null
+column s3_multipart_uploads_parts.size bigint not null default 0
+column s3_multipart_uploads_parts.upload_id text not null
+column s3_multipart_uploads_parts.version text not null
+column vector_indexes.bucket_id text not null
+column vector_indexes.created_at timestamp with time zone not null default now()
+column vector_indexes.data_type text not null
+column vector_indexes.dimension integer not null
+column vector_indexes.distance_metric text not null
+column vector_indexes.id text not null default gen_random_uuid()
+column vector_indexes.metadata_configuration jsonb null
+column vector_indexes.name text not null
+column vector_indexes.updated_at timestamp with time zone not null default now()
+constraint buckets.buckets_pkey PRIMARY KEY (id)
+constraint buckets_analytics.buckets_analytics_pkey PRIMARY KEY (id)
+constraint buckets_vectors.buckets_vectors_pkey PRIMARY KEY (id)
+constraint iceberg_namespaces.iceberg_namespaces_catalog_id_fkey FOREIGN KEY (catalog_id) REFERENCES storage.buckets_analytics(id) ON DELETE CASCADE
+constraint iceberg_namespaces.iceberg_namespaces_pkey PRIMARY KEY (id)
+constraint iceberg_tables.iceberg_tables_catalog_id_fkey FOREIGN KEY (catalog_id) REFERENCES storage.buckets_analytics(id) ON DELETE CASCADE
+constraint iceberg_tables.iceberg_tables_namespace_id_fkey FOREIGN KEY (namespace_id) REFERENCES storage.iceberg_namespaces(id) ON DELETE CASCADE
+constraint iceberg_tables.iceberg_tables_pkey PRIMARY KEY (id)
+constraint migrations.migrations_name_key UNIQUE (name)
+constraint migrations.migrations_pkey PRIMARY KEY (id)
+constraint objects.objects_bucketId_fkey FOREIGN KEY (bucket_id) REFERENCES storage.buckets(id)
+constraint objects.objects_pkey PRIMARY KEY (id)
+constraint s3_multipart_uploads.s3_multipart_uploads_bucket_id_fkey FOREIGN KEY (bucket_id) REFERENCES storage.buckets(id)
+constraint s3_multipart_uploads.s3_multipart_uploads_pkey PRIMARY KEY (id)
+constraint s3_multipart_uploads_parts.s3_multipart_uploads_parts_bucket_id_fkey FOREIGN KEY (bucket_id) REFERENCES storage.buckets(id)
+constraint s3_multipart_uploads_parts.s3_multipart_uploads_parts_pkey PRIMARY KEY (id)
+constraint s3_multipart_uploads_parts.s3_multipart_uploads_parts_upload_id_fkey FOREIGN KEY (upload_id) REFERENCES storage.s3_multipart_uploads(id) ON DELETE CASCADE
+constraint vector_indexes.vector_indexes_bucket_id_fkey FOREIGN KEY (bucket_id) REFERENCES storage.buckets_vectors(id)
+constraint vector_indexes.vector_indexes_pkey PRIMARY KEY (id)
+enum buckettype STANDARD,ANALYTICS,VECTOR
+function allow_any_operation(expected_operations text[]) returns boolean s
+function allow_only_operation(expected_operation text) returns boolean s
+function can_insert_object(bucketid text, name text, owner uuid, metadata jsonb) returns void v
+function enforce_bucket_name_length() returns trigger v
+function extension(name text) returns text i
+function filename(name text) returns text v
+function foldername(name text) returns text[] i
+function get_common_prefix(p_key text, p_prefix text, p_delimiter text) returns text i
+function get_size_by_bucket() returns TABLE(size bigint, bucket_id text) s
+function list_multipart_uploads_with_delimiter(bucket_id text, prefix_param text, delimiter_param text, max_keys integer DEFAULT 100, next_key_token text DEFAULT ''::text, next_upload_token text DEFAULT ''::text) returns TABLE(key text, id text, created_at timestamp with time zone) v
+function list_objects_with_delimiter(_bucket_id text, prefix_param text, delimiter_param text, max_keys integer DEFAULT 100, start_after text DEFAULT ''::text, next_token text DEFAULT ''::text, sort_order text DEFAULT 'asc'::text) returns TABLE(name text, id uuid, metadata jsonb, updated_at timestamp with time zone, created_at timestamp with time zone, last_accessed_at timestamp with time zone) s
+function operation() returns text s
+function protect_delete() returns trigger v
+function search(prefix text, bucketname text, limits integer DEFAULT 100, levels integer DEFAULT 1, offsets integer DEFAULT 0, search text DEFAULT ''::text, sortcolumn text DEFAULT 'name'::text, sortorder text DEFAULT 'asc'::text) returns TABLE(name text, id uuid, updated_at timestamp with time zone, created_at timestamp with time zone, last_accessed_at timestamp with time zone, metadata jsonb) s
+function search_by_timestamp(p_prefix text, p_bucket_id text, p_limit integer, p_level integer, p_start_after text, p_sort_order text, p_sort_column text, p_sort_column_after text) returns TABLE(key text, name text, id uuid, updated_at timestamp with time zone, created_at timestamp with time zone, last_accessed_at timestamp with time zone, metadata jsonb) s
+function search_v2(prefix text, bucket_name text, limits integer DEFAULT 100, levels integer DEFAULT 1, start_after text DEFAULT ''::text, sort_order text DEFAULT 'asc'::text, sort_column text DEFAULT 'name'::text, sort_column_after text DEFAULT ''::text) returns TABLE(key text, name text, id uuid, updated_at timestamp with time zone, created_at timestamp with time zone, last_accessed_at timestamp with time zone, metadata jsonb) s
+function update_updated_at_column() returns trigger v
+index CREATE INDEX idx_multipart_uploads_list ON storage.s3_multipart_uploads USING btree (bucket_id, key, created_at)
+index CREATE INDEX idx_objects_bucket_id_name ON storage.objects USING btree (bucket_id, name COLLATE "C")
+index CREATE INDEX idx_objects_bucket_id_name_lower ON storage.objects USING btree (bucket_id, lower(name) COLLATE "C")
+index CREATE INDEX name_prefix_search ON storage.objects USING btree (name text_pattern_ops)
+index CREATE UNIQUE INDEX bname ON storage.buckets USING btree (name)
+index CREATE UNIQUE INDEX bucketid_objname ON storage.objects USING btree (bucket_id, name)
+index CREATE UNIQUE INDEX buckets_analytics_pkey ON storage.buckets_analytics USING btree (id)
+index CREATE UNIQUE INDEX buckets_analytics_unique_name_idx ON storage.buckets_analytics USING btree (name) WHERE (deleted_at IS NULL)
+index CREATE UNIQUE INDEX buckets_pkey ON storage.buckets USING btree (id)
+index CREATE UNIQUE INDEX buckets_vectors_pkey ON storage.buckets_vectors USING btree (id)
+index CREATE UNIQUE INDEX iceberg_namespaces_pkey ON storage.iceberg_namespaces USING btree (id)
+index CREATE UNIQUE INDEX iceberg_tables_pkey ON storage.iceberg_tables USING btree (id)
+index CREATE UNIQUE INDEX idx_iceberg_namespaces_bucket_id ON storage.iceberg_namespaces USING btree (catalog_id, name)
+index CREATE UNIQUE INDEX idx_iceberg_tables_location ON storage.iceberg_tables USING btree (location)
+index CREATE UNIQUE INDEX idx_iceberg_tables_namespace_id ON storage.iceberg_tables USING btree (catalog_id, namespace_id, name)
+index CREATE UNIQUE INDEX migrations_name_key ON storage.migrations USING btree (name)
+index CREATE UNIQUE INDEX migrations_pkey ON storage.migrations USING btree (id)
+index CREATE UNIQUE INDEX objects_pkey ON storage.objects USING btree (id)
+index CREATE UNIQUE INDEX s3_multipart_uploads_parts_pkey ON storage.s3_multipart_uploads_parts USING btree (id)
+index CREATE UNIQUE INDEX s3_multipart_uploads_pkey ON storage.s3_multipart_uploads USING btree (id)
+index CREATE UNIQUE INDEX vector_indexes_name_bucket_id_idx ON storage.vector_indexes USING btree (name, bucket_id)
+index CREATE UNIQUE INDEX vector_indexes_pkey ON storage.vector_indexes USING btree (id)
+rls buckets on
+rls buckets_analytics on
+rls buckets_vectors on
+rls iceberg_namespaces on
+rls iceberg_tables on
+rls migrations on
+rls objects on
+rls s3_multipart_uploads on
+rls s3_multipart_uploads_parts on
+rls vector_indexes on
+trigger CREATE TRIGGER enforce_bucket_name_length_trigger BEFORE INSERT OR UPDATE OF name ON storage.buckets FOR EACH ROW EXECUTE FUNCTION storage.enforce_bucket_name_length()
+trigger CREATE TRIGGER protect_buckets_delete BEFORE DELETE ON storage.buckets FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete()
+trigger CREATE TRIGGER protect_objects_delete BEFORE DELETE ON storage.objects FOR EACH STATEMENT EXECUTE FUNCTION storage.protect_delete()
+trigger CREATE TRIGGER update_objects_updated_at BEFORE UPDATE ON storage.objects FOR EACH ROW EXECUTE FUNCTION storage.update_updated_at_column()

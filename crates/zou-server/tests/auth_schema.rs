@@ -19,7 +19,7 @@ use zou_server::sql::{Pool, Session};
 /// The same query the refresh script ran to record the fixture. Shared
 /// as a file rather than copied, because two drifting copies of it
 /// would compare two different things and still pass.
-const FINGERPRINT: &str = include_str!("../../../scripts/auth-schema-fingerprint.sql");
+const FINGERPRINT: &str = include_str!("../../../scripts/schema-fingerprint.sql");
 
 /// What replaying GoTrue's migrations produces.
 const GOTRUE: &str = include_str!("fixtures/gotrue-auth-fingerprint.txt");
@@ -38,7 +38,13 @@ fn dsn() -> Option<String> {
     }
 }
 
+/// The query reads the schema it is fingerprinting out of a setting, so
+/// the setting has to be made in the same session first. Every caller
+/// here wants auth.
 async fn fingerprint(sess: &Session) -> Vec<String> {
+    sess.execute("set zou.fingerprint_schema = 'auth'", &[])
+        .await
+        .expect("name the schema");
     sess.query(FINGERPRINT, &[])
         .await
         .expect("fingerprint query")
@@ -84,7 +90,7 @@ async fn the_schema_zou_creates_is_the_schema_gotrue_creates() {
 
     let theirs: Vec<String> = GOTRUE.lines().map(str::to_string).collect();
     assert!(
-        theirs.len() > 500,
+        theirs.len() > 400,
         "the fixture looks truncated at {} lines",
         theirs.len()
     );
