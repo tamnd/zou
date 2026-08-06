@@ -181,6 +181,13 @@ async fn a_delete_that_did_not_come_through_the_api_is_refused() {
     sess.execute("set storage.allow_delete_query = 'true'", &[])
         .await
         .expect("the escape hatch");
+    // The objects first, because they point at the buckets. Another
+    // suite in this crate leaves objects behind in the same database on
+    // purpose, and a foreign key failure here would read as the hatch
+    // not working when it is the order that is wrong.
+    sess.execute("delete from storage.objects", &[])
+        .await
+        .expect("clear the objects with the hatch open");
     sess.execute("delete from storage.buckets", &[])
         .await
         .expect("delete with the hatch open");

@@ -122,7 +122,7 @@ fn shared_buffers() -> String {
 /// prints its own, copy them into the client and go. The SQL pool
 /// dials the postmaster this process supervises, lazily, so the order
 /// the two come up in does not matter.
-fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
+fn start_http(port: u16, pg_port: u16, target: String) -> Result<(), String> {
     let secret = match std::env::var("ZOU_JWT_SECRET") {
         Ok(s) if !s.is_empty() => s,
         _ => {
@@ -278,6 +278,11 @@ fn start_http(port: u16, pg_port: u16) -> Result<(), String> {
             // them. With nothing set this is empty and every provider
             // is refused by name.
             oauth,
+            // Object bytes go where the pages go, under a prefix of
+            // their own. On a laptop that is a directory next to the
+            // data and on a deployment it is the same bucket, which
+            // is the whole point of storing both on the same thing.
+            objects: Some(target),
             // Off by default, the same as GoTrue. Set
             // ZOU_SECURITY_MANUAL_LINKING_ENABLED=true and a signed in
             // person can attach a second provider to the account they
@@ -437,7 +442,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     if let Some(http_port) = args.http {
-        start_http(http_port, args.port)?;
+        start_http(http_port, args.port, args.target.clone())?;
     }
 
     let mut failed_starts = 0u32;

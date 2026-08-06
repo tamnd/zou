@@ -5,7 +5,8 @@
 //! surfaces are wired to the paths a Supabase client already calls,
 //! which is a different claim and one nothing else makes. A client
 //! configured with a zou url and no other changes reaches /rest/v1 for
-//! data, /auth/v1 for sessions, /storage/v1/bucket for buckets, and
+//! data, /auth/v1 for sessions, /storage/v1 for buckets and objects,
+//! and
 //! gets an honest 501 rather than a confusing 404 everywhere a later
 //! milestone still has to fill in.
 //!
@@ -13,10 +14,10 @@
 //! wiring and is tested here too. Four auth routes are deliberately
 //! outside it, and every one of them is outside it because the caller
 //! cannot reasonably be holding a key: a token verifier, a link in an
-//! email, and the two halves of a social sign in. The bucket routes are
-//! outside it for a different reason, which is that storage-api answers
-//! a keyless request itself rather than letting the gateway do it, and
-//! zou is both of those at once.
+//! email, and the two halves of a social sign in. The storage routes
+//! are outside it for a different reason, which is that storage-api
+//! answers a keyless request itself rather than letting the gateway do
+//! it, and zou is both of those at once.
 //!
 //! No database. Nothing here gets far enough to need one.
 
@@ -112,7 +113,8 @@ async fn all_four_prefixes_are_routed() {
         "/auth/v1/health",
         "/auth/v1/settings",
         "/storage/v1/bucket",
-        "/storage/v1/object/pics",
+        "/storage/v1/object/pics/cat.png",
+        "/storage/v1/object/public/pics/cat.png",
         "/realtime/v1/websocket",
     ] {
         let answer = keyed(&app, "GET", path).await;
@@ -130,7 +132,7 @@ async fn the_two_stubbed_surfaces_say_so_rather_than_pretending_to_be_missing() 
     // A 404 here would read as a wrong url and send somebody looking
     // for a typo. A 501 that names the surface and says where it is
     // tracked is the difference between a bug report and a wait.
-    let storage = keyed(&app, "GET", "/storage/v1/object/public/pics/cat.png").await;
+    let storage = keyed(&app, "GET", "/storage/v1/render/image/public/pics/cat.png").await;
     assert_eq!(storage.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
         storage.message(),
@@ -152,7 +154,7 @@ async fn a_stub_answers_whatever_method_it_is_asked() {
     // same answer as a read. A method that 405s under a stubbed
     // surface would be a second wrong answer on top of the first.
     for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] {
-        for path in ["/storage/v1/object/pics", "/realtime/v1/websocket"] {
+        for path in ["/storage/v1/upload/resumable", "/realtime/v1/websocket"] {
             let answer = keyed(&app, method, path).await;
             assert_eq!(
                 answer.status,
@@ -217,9 +219,9 @@ async fn the_four_open_routes_need_no_apikey() {
 }
 
 #[tokio::test]
-async fn the_bucket_surface_refuses_in_its_own_words_rather_than_the_gates() {
+async fn the_storage_surface_refuses_in_its_own_words_rather_than_the_gates() {
     let app = app();
-    // The bucket routes are outside the gate for a reason none of the
+    // The storage routes are outside the gate for a reason none of the
     // four above share. storage-api runs behind the same hosted gateway
     // everything else does, and a request to it with no key is still
     // answered by storage-api rather than by the gateway, because the
@@ -233,6 +235,13 @@ async fn the_bucket_surface_refuses_in_its_own_words_rather_than_the_gates() {
         ("PUT", "/storage/v1/bucket/photos"),
         ("DELETE", "/storage/v1/bucket/photos"),
         ("POST", "/storage/v1/bucket/photos/empty"),
+        // Every object route that writes reads its token before it
+        // reads anything else, so the same sentence comes back from
+        // this half of the surface without a database behind it.
+        ("POST", "/storage/v1/object/photos/cat.png"),
+        ("PUT", "/storage/v1/object/photos/cat.png"),
+        ("DELETE", "/storage/v1/object/photos/cat.png"),
+        ("DELETE", "/storage/v1/object/photos"),
     ] {
         let answer = bare(&app, method, path).await;
         assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{method} {path}");
@@ -252,15 +261,21 @@ async fn the_bucket_surface_refuses_in_its_own_words_rather_than_the_gates() {
 }
 
 #[tokio::test]
-async fn a_path_under_storage_that_is_not_a_bucket_is_still_stubbed() {
+async fn a_path_under_storage_that_is_neither_a_bucket_nor_an_object_is_still_stubbed() {
     let app = app();
-    // A literal segment beats a wildcard one, so the bucket routes take
-    // what they name and the catch all keeps the rest. Worth a test
-    // because the two live in different routers and are merged, and a
-    // merge that shadowed the catch all would leave every unbuilt
-    // storage path answering about a token instead.
-    let answer = keyed(&app, "GET", "/storage/v1/object/public/pics/cat.png").await;
-    assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
+    // A literal segment beats a wildcard one, so the bucket and object
+    // routes take what they name and the catch all keeps the rest.
+    // Worth a test because the two live in different routers and are
+    // merged, and a merge that shadowed the catch all would leave every
+    // unbuilt storage path answering about a token instead.
+    for path in [
+        "/storage/v1/render/image/public/pics/cat.png",
+        "/storage/v1/upload/resumable",
+        "/storage/v1/s3/pics",
+    ] {
+        let answer = keyed(&app, "GET", path).await;
+        assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
+    }
 }
 
 #[tokio::test]
@@ -275,7 +290,7 @@ async fn everything_else_is_behind_the_gate() {
         ("GET", "/auth/v1/user"),
         ("GET", "/auth/v1/admin/users"),
         ("POST", "/auth/v1/factors"),
-        ("GET", "/storage/v1/object/pics"),
+        ("GET", "/storage/v1/upload/resumable"),
         ("GET", "/realtime/v1/websocket"),
     ] {
         let answer = bare(&app, method, path).await;
@@ -295,7 +310,7 @@ async fn the_gate_is_reached_before_a_stub_is() {
     // an unkeyed request to an unbuilt surface hears about the key
     // rather than about the surface. A stub outside the gate would be
     // a hole that grows when the surface is built.
-    let answer = bare(&app, "GET", "/storage/v1/object/pics").await;
+    let answer = bare(&app, "GET", "/storage/v1/upload/resumable").await;
     assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
     assert_eq!(answer.message(), "No API key found in request");
 }
@@ -309,7 +324,7 @@ async fn every_answer_carries_a_request_id() {
     // to a log line.
     for (keyed_request, method, path) in [
         (true, "GET", "/auth/v1/health"),
-        (true, "GET", "/storage/v1/object/pics"),
+        (true, "GET", "/storage/v1/bucket"),
         (true, "GET", "/nowhere"),
         (false, "GET", "/rest/v1/todos"),
         (false, "GET", "/auth/v1/.well-known/jwks.json"),

@@ -108,6 +108,17 @@ pub fn start_at(
         schemas: schemas.to_vec(),
         anon_role: anon.to_string(),
         mailer_autoconfirm: true,
+        // Somewhere to put object bytes, under the port it answers on
+        // so that two runs on one machine cannot read each other's.
+        // A directory rather than a bucket: the suite is about what
+        // the api says, and what the store is is the one thing an
+        // answer never mentions.
+        objects: Some(
+            std::env::temp_dir()
+                .join(format!("zou-conformance-objects-{port}"))
+                .to_string_lossy()
+                .to_string(),
+        ),
         ..Config::default()
     };
     std::thread::spawn(move || {
