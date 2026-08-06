@@ -1,0 +1,91 @@
+name: Fuzz
+
+# Every fuzz target, from the seeds committed next to it, on every
+# change and again each night for longer. A short run on a pull request
+# is not a search, it is a regression check: the seeds carry the inputs
+# that once broke something, and a target that cannot survive its own
+# seeds has broken again. The night run is the search.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Off the hour, because everything queued at midnight waits behind
+    # everything else queued at midnight.
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+      # cargo-fuzz needs the sanitizer flags, which are nightly only.
+      # The toolchain file pins the compiler the rest of the workspace
+      # is built with and this steps around it for the fuzz crate.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz || cargo install cargo-fuzz --locked
+      # Only the night run, which is the one that has time to find
+      # anything worth keeping. A pull request starts from the seeds so
+      # that what it checks is the same on every run and on a fork.
+      - name: The corpus the last night left
+        if: github.event_name == 'schedule'
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: How long each target gets
+        run: |
+          if [ "${{ github.event_name }}" = schedule ]; then
+            echo "FUZZ_SECONDS=600" >> "$GITHUB_ENV"
+          else
+            echo "FUZZ_SECONDS=45" >> "$GITHUB_ENV"
+          fi
+      - name: Build every target
+        run: cargo +nightly fuzz build
+      # A target that fails does not stop the ones after it. One run
+      # naming every target that fell over is worth more than one that
+      # names the first and leaves the rest unasked.
+      - name: Run every target from its seeds
+        run: |
+          fail=0
+          for target in $(cargo +nightly fuzz list); do
+            mkdir -p "fuzz/corpus/$target"
+            if [ -d "fuzz/seeds/$target" ]; then
+              cp "fuzz/seeds/$target"/* "fuzz/corpus/$target/"
+            fi
+            echo "::group::$target"
+            cargo +nightly fuzz run "$target" -- \
+              -max_total_time="$FUZZ_SECONDS" -timeout=25 || fail=1
+            echo "::endgroup::"
+          done
+          exit $fail
+      # The input, so that reproducing it is a download rather than a
+      # rerun with a different seed.
+      - name: Keep whatever broke
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore

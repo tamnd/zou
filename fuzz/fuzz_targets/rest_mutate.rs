@@ -10,7 +10,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use zou_rest::filter::{Node, Parsed, parse_pair};
-use zou_rest::mutate::{Conflict, Returning, delete, insert, update};
+use zou_rest::mutate::{Conflict, Missing, Returning, delete, insert, update};
 use zou_rest::sql::Sql;
 
 fn dense(sql: &Sql) {
@@ -67,16 +67,22 @@ fuzz_target!(|data: &str| {
             set: columns.clone(),
         }),
     ];
+    // No relation: the catalog is not fuzzed here, so a builder that
+    // needs one falls back to what it does for a table it was told
+    // nothing about, which is the path an unknown table takes anyway.
     for r in &returnings {
-        for c in &conflicts {
-            if let Ok(s) = insert(table, &columns, payload.clone(), c.as_ref(), r) {
+        for missing in [Missing::Null, Missing::Default] {
+            for c in &conflicts {
+                if let Ok(s) = insert(table, None, &columns, payload.clone(), missing, c.as_ref(), r)
+                {
+                    dense(&s);
+                }
+            }
+            if let Ok(s) = update(table, None, &columns, payload.clone(), missing, &filters, r) {
                 dense(&s);
             }
         }
-        if let Ok(s) = update(table, &columns, payload.clone(), &filters, r) {
-            dense(&s);
-        }
-        if let Ok(s) = delete(table, &filters, r) {
+        if let Ok(s) = delete(table, None, &filters, r) {
             dense(&s);
         }
     }

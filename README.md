@@ -74,6 +74,13 @@ cargo build
 cargo test
 ```
 
+The grammars, the on disk formats and the token parsers are fuzzed. Every target keeps a seed corpus next to it and CI runs all of them from those seeds on every change and for longer each night.
+
+```bash
+cargo install cargo-fuzz
+cargo +nightly fuzz run rest_filter
+```
+
 `make demo` tours the object layer in seconds, and after a one time `make pg-build` it continues into the real Postgres on a store, rows, a branch, and a restart from nothing but the objects. The walkthrough is in [docs/quickstart.md](docs/quickstart.md).
 
 ## Contributing

@@ -489,10 +489,29 @@ fn json_index(cur: &mut Cur) -> Option<i64> {
     Some(n)
 }
 
+/// True when a json path key cannot be written bare, because reading
+/// it back would give something else.
+///
+/// The key grammar is narrow, so the list is short. The break bytes,
+/// the quote and the backslash all end the key early. A key is read a
+/// dash separated piece at a time and every piece is trimmed as it is
+/// taken, so a piece that is empty or wears a space or a tab on an end
+/// would not come back whole, which covers the empty key and a dash on
+/// either end as well. And a key of nothing but digits is an index
+/// rather than a name.
+fn key_needs_quotes(s: &str) -> bool {
+    s.bytes()
+        .any(|b| json_key_break(b) || b == b'"' || b == b'\\')
+        || s.split('-')
+            .any(|p| p.is_empty() || p.trim_matches([' ', '\t']) != p)
+        || s.bytes().all(|b| b.is_ascii_digit())
+}
+
 pub(crate) fn fmt_path(f: &mut fmt::Formatter<'_>, path: &[JsonStep]) -> fmt::Result {
     for step in path {
         write!(f, "->{}", if step.text { ">" } else { "" })?;
         match &step.key {
+            JsonKey::Name(n) if key_needs_quotes(n) => write_escaped(f, n)?,
             JsonKey::Name(n) => write!(f, "{n}")?,
             JsonKey::Index(i) => write!(f, "{i}")?,
         }
