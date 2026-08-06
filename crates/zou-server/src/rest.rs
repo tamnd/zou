@@ -4,7 +4,7 @@
 //! A request's query string becomes a [`zou_rest::plan::Query`], the
 //! relationship catalog loads through INTROSPECT_SQL on the same
 //! transaction the query will run in, the planner emits one
-//! statement, and the rows come back as jsonb text the handler joins
+//! statement, and the rows come back as json text the handler joins
 //! into the response array. Everything runs inside a transaction
 //! carrying the full request context, read only for reads, so RLS
 //! policies see role, request.jwt.claims, request.headers,
@@ -1153,11 +1153,18 @@ fn not_single(rows: usize) -> RestError {
 
 /// The per-row json expression, stripping nulls when the vendored
 /// nulls=stripped parameter asked for it.
+///
+/// json and not jsonb, because jsonb is a parsed value and this is
+/// the last step before the bytes go out: jsonb drops a duplicate
+/// key, sorts the keys by length, and spaces out the colons, so a
+/// row built with it answers a question about the value rather than
+/// about what the caller sent. Embeds stay jsonb one level in, where
+/// grouping needs an equality operator json does not have.
 fn row_json(media: &Media) -> &'static str {
     if media.stripped() {
-        "jsonb_strip_nulls(to_jsonb(\"_zou_row\"))"
+        "json_strip_nulls(to_json(\"_zou_row\"))"
     } else {
-        "to_jsonb(\"_zou_row\")"
+        "to_json(\"_zou_row\")"
     }
 }
 
@@ -1996,7 +2003,7 @@ async fn load_catalog(
     Ok(fresh)
 }
 
-/// Rows of jsonb text joined into the response array by hand, which
+/// Rows of json text joined into the response array by hand, which
 /// hands back the row count for Content-Range for free.
 fn json_array(rows: &[tokio_postgres::Row]) -> String {
     let mut body = String::from("[");
@@ -2519,10 +2526,10 @@ async fn write(
             }
         }
         Ret::HeadersOnly if wants_location && !pk.is_empty() => {
-            // The returned key rides out through a CTE as jsonb text,
+            // The returned key rides out through a CTE as json text,
             // no type juggling, and a single row becomes Location.
             let text = format!(
-                "with \"{src}\" as ({}) select to_jsonb(\"_zou_row\")::text from \"{src}\" as \"_zou_row\"",
+                "with \"{src}\" as ({}) select to_json(\"_zou_row\")::text from \"{src}\" as \"_zou_row\"",
                 m.text,
                 src = mutate::SOURCE,
             );
@@ -3202,7 +3209,7 @@ async fn invoke(
                     )
                 } else {
                     format!(
-                        "with {} select to_jsonb(\"_zou_row\")::text from ({}) as \"_zou_row\"",
+                        "with {} select to_json(\"_zou_row\")::text from ({}) as \"_zou_row\"",
                         r.cte, r.select.text
                     )
                 };
@@ -3263,7 +3270,7 @@ async fn invoke(
                 None => (r.cte, "null::bigint", r.select.params),
             };
             // The array is joined out of the row texts rather than
-            // built by jsonb_agg, which is the same bytes a read
+            // built by json_agg, which is the same bytes a read
             // sends: an aggregate would space the commas out. csv
             // goes through the same aggregate a read uses, one CTE
             // further along so the total can ride out beside it.
@@ -3275,7 +3282,7 @@ async fn invoke(
                 )
             } else {
                 format!(
-                    "with {cte} select '[' || coalesce(string_agg(to_jsonb(\"_zou_row\")::text, ','), '') || ']', \
+                    "with {cte} select '[' || coalesce(string_agg(to_json(\"_zou_row\")::text, ','), '') || ']', \
                      count(*)::bigint, {total_sql} from ({}) as \"_zou_row\"",
                     r.select.text
                 )
