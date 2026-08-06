@@ -1169,12 +1169,15 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             return Err(ZOU_ERR_BAD_ARGUMENT);
         }
     };
-    let layout = TenantLayout::new("local");
+    // The same tenant the smgr shim attaches as: a restored branch
+    // server pushes under its own prefix and stream, not the parent's.
+    let tenant_ref = std::env::var("ZOU_TENANT").unwrap_or_else(|_| "local".to_string());
+    let layout = TenantLayout::new(&tenant_ref);
     let manifest_key = layout.manifest();
     match store.get(&manifest_key) {
         Ok(Some(_)) => {}
         Ok(None) => {
-            let genesis = Manifest::new("local", 18);
+            let genesis = Manifest::new(&tenant_ref, 18);
             // A racing genesis from another process is fine, someone won.
             let _ = store.put_if_match(&manifest_key, &genesis.to_json(), None);
         }

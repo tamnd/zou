@@ -21,7 +21,7 @@ use crate::restore::WAL_SEGMENT_SIZE;
 
 const XLOG_BLCKSZ: u64 = 8192;
 /// XLOG_PAGE_MAGIC for the vendored Postgres 18 WAL format.
-const XLOG_PAGE_MAGIC: u16 = 0xD118;
+pub(crate) const XLOG_PAGE_MAGIC: u16 = 0xD118;
 const SHORT_PHD: u64 = 24;
 const LONG_PHD: u64 = 40;
 const RECORD_HEADER: u64 = 24;

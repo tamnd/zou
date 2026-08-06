@@ -21,8 +21,12 @@ use crate::layermap::{LayerDesc, LayerMap, LayerMapError, LayerNameError};
 use crate::lsn::Lsn;
 
 /// Current shard manifest format. Readers refuse anything newer with a
-/// clear error instead of misreading it.
-pub const PAGE_SHARD_FORMAT: u32 = 1;
+/// clear error instead of misreading it. Format 2 added branch
+/// inheritance, the per entry owner and cut; a branched shard writes
+/// format 2 so a format 1 binary refuses it whole instead of fetching
+/// inherited layers from the wrong prefix, and a plain shard keeps
+/// writing format 1 so nothing changes for tenants that never branch.
+pub const PAGE_SHARD_FORMAT: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PageShardError {
@@ -41,11 +45,27 @@ pub enum PageShardError {
 }
 
 /// One published layer: the name is the coverage, the size lets a
-/// reader plan its footer range reads without a stat call.
+/// reader plan its footer range reads without a stat call. The branch
+/// fields ride along only on inherited entries and stay off the wire
+/// everywhere else, so a plain manifest is byte identical to before
+/// they existed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerEntry {
     pub name: String,
     pub size: u64,
+    /// The tenant that owns the object. A branch copies the parent's
+    /// entries and tags them, the reader fetches tagged layers from
+    /// the owner's shard prefix, and the tag passes through further
+    /// branches untouched so a grandchild still names the tenant whose
+    /// prefix actually holds the bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// The branch cut: records above this lsn are the owner's future,
+    /// not this tenant's history, and must never serve here. Set when
+    /// an inherited delta spans the branch point; a second branch
+    /// tightens it with a min, never widens it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upto: Option<Lsn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,8 +81,11 @@ pub struct PageShardManifest {
 
 impl PageShardManifest {
     pub fn new(shard: u16) -> Self {
+        // Base format on purpose, not the ceiling: a shard that never
+        // branched keeps writing format 1, only branch creation writes
+        // the format 2 that carries inheritance.
         PageShardManifest {
-            format: PAGE_SHARD_FORMAT,
+            format: 1,
             shard,
             disk_consistent_lsn: Lsn(0),
             layers: Vec::new(),
@@ -94,12 +117,20 @@ impl PageShardManifest {
     /// The layer map over the listed layers, names parsed back into
     /// coverage. The parse cannot drift from the objects because flush
     /// derives names from footers and the reader verifies footers
-    /// against names.
+    /// against names. Owner tags and branch cuts ride into the
+    /// descriptors so the map clamps inherited layers and the reader
+    /// fetches them from the owner's prefix.
     pub fn layer_map(&self) -> Result<LayerMap, PageShardError> {
         let descs = self
             .layers
             .iter()
-            .map(|l| LayerDesc::parse(&l.name, l.size))
+            .map(|l| {
+                LayerDesc::parse(&l.name, l.size).map(|mut d| {
+                    d.owner = l.owner.clone();
+                    d.upto = l.upto;
+                    d
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(LayerMap::new(descs)?)
     }
@@ -156,6 +187,8 @@ mod tests {
         LayerEntry {
             name: desc.name(),
             size: bytes.len() as u64,
+            owner: None,
+            upto: None,
         }
     }
 
@@ -171,6 +204,27 @@ mod tests {
         newer.format = PAGE_SHARD_FORMAT + 1;
         let err = PageShardManifest::decode(&newer.encode()).unwrap_err();
         assert!(matches!(err, PageShardError::FormatTooNew { .. }));
+    }
+
+    #[test]
+    fn branch_fields_round_trip_and_stay_off_the_wire_when_absent() {
+        let mut m = PageShardManifest::new(0);
+        m.layers.push(entry_from_built(&[1], &[10]));
+        let wire = String::from_utf8(m.encode()).unwrap();
+        assert!(
+            !wire.contains("owner") && !wire.contains("upto"),
+            "a plain manifest carries no branch noise"
+        );
+        assert_eq!(m.format, 1, "a plain manifest stays format 1");
+
+        m.format = 2;
+        m.layers[0].owner = Some("p".into());
+        m.layers[0].upto = Some(Lsn(0x250));
+        let back = PageShardManifest::decode(&m.encode()).unwrap();
+        assert_eq!(back, m);
+        let map = back.layer_map().unwrap();
+        assert_eq!(map.layers()[0].owner.as_deref(), Some("p"));
+        assert_eq!(map.layers()[0].upto, Some(Lsn(0x250)));
     }
 
     #[test]

@@ -303,6 +303,8 @@ impl ShardIngest {
         let entry = LayerEntry {
             name: desc.name(),
             size: bytes.len() as u64,
+            owner: None,
+            upto: None,
         };
         shardmanifest::publish_layer(
             store,

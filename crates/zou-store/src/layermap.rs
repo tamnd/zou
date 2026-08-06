@@ -37,6 +37,16 @@ pub struct LayerDesc {
     pub max_lsn: Lsn,
     /// Object length in bytes, for suffix range reads of the footer.
     pub size: u64,
+    /// The tenant that owns the object, set on layers a branch
+    /// inherited. The reader fetches these from the owner's shard
+    /// prefix; the name and bounds are the owner's unchanged, which is
+    /// why the tag lives here and not in the name.
+    pub owner: Option<String>,
+    /// The branch cut for an inherited layer: records above this lsn
+    /// belong to the parent's future, not the child's history, and
+    /// must not serve. A delta spanning the cut stays listed and gets
+    /// clamped here; layers entirely below their cut carry no clamp.
+    pub upto: Option<Lsn>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -62,6 +72,8 @@ impl LayerDesc {
             min_lsn,
             max_lsn,
             size: 0,
+            owner: None,
+            upto: None,
         }
     }
 
@@ -73,6 +85,8 @@ impl LayerDesc {
             min_lsn: lsn,
             max_lsn: lsn,
             size: 0,
+            owner: None,
+            upto: None,
         }
     }
 
@@ -86,11 +100,20 @@ impl LayerDesc {
             min_lsn: footer.min_lsn,
             max_lsn: footer.max_lsn,
             size,
+            owner: None,
+            upto: None,
         }
     }
 
     pub fn covers(&self, key: &LayerKey) -> bool {
         self.min_key <= *key && *key <= self.max_key
+    }
+
+    /// The newest lsn this layer may serve for a read at `lsn`: the
+    /// read lsn itself, tightened by the branch cut on an inherited
+    /// layer.
+    pub fn clamp(&self, lsn: Lsn) -> Lsn {
+        self.upto.map_or(lsn, |u| u.min(lsn))
     }
 
     /// The object name, derived from the ranges and format frozen:
@@ -163,6 +186,8 @@ impl LayerDesc {
                 min_lsn: lsn(lmin)?,
                 max_lsn: lsn(lmax)?,
                 size,
+                owner: None,
+                upto: None,
             },
             (LayerKind::Image, [kmin, kmax, l]) => {
                 let at = lsn(l)?;
@@ -173,6 +198,8 @@ impl LayerDesc {
                     min_lsn: at,
                     max_lsn: at,
                     size,
+                    owner: None,
+                    upto: None,
                 }
             }
             _ => return Err(malformed()),
@@ -326,14 +353,17 @@ impl LayerMap {
     /// at or below the lsn is the base; deltas are every covering
     /// layer whose lsn range intersects `(image_lsn, lsn]`, ascending
     /// by (min_lsn, max_lsn) so their records apply in order after a
-    /// merge on the actual record lsns.
+    /// merge on the actual record lsns. An inherited layer plans
+    /// against `min(lsn, upto)`: the branch cut caps what it may
+    /// serve, so an inherited delta whose usable records all sit at or
+    /// below the floor drops out of the plan entirely.
     pub fn plan(&self, key: &LayerKey, lsn: Lsn) -> ReadPlan<'_> {
         let mut hits = Vec::new();
         stab(&self.layers, &self.images, key, &mut hits);
         let image = hits
             .iter()
             .map(|&i| &self.layers[i])
-            .filter(|l| l.min_lsn <= lsn)
+            .filter(|l| l.min_lsn <= l.clamp(lsn))
             .max_by_key(|l| l.min_lsn);
         let floor = image.map(|i| i.min_lsn).unwrap_or(Lsn(0));
 
@@ -342,7 +372,9 @@ impl LayerMap {
         let mut deltas: Vec<&LayerDesc> = hits
             .iter()
             .map(|&i| &self.layers[i])
-            .filter(|l| l.max_lsn > floor && l.min_lsn <= lsn)
+            .filter(|l| {
+                l.max_lsn > floor && l.min_lsn <= l.clamp(lsn) && l.upto.is_none_or(|u| u > floor)
+            })
             .collect();
         deltas.sort_by_key(|l| (l.min_lsn, l.max_lsn));
         ReadPlan { image, deltas }
@@ -504,6 +536,44 @@ mod tests {
                 assert_eq!(plan.deltas, deltas, "deltas for block {block} lsn {lsn}");
             }
         }
+    }
+
+    #[test]
+    fn an_inherited_layer_plans_against_its_branch_cut() {
+        // A child branched at lsn 250: the parent's image and both
+        // parent deltas are inherited, the second delta spans the cut.
+        let mut image = LayerDesc::image(k(0), k(99), Lsn(100));
+        image.owner = Some("p".into());
+        let mut d1 = LayerDesc::delta(k(0), k(99), Lsn(101), Lsn(200));
+        d1.owner = Some("p".into());
+        let mut d2 = LayerDesc::delta(k(0), k(99), Lsn(201), Lsn(400));
+        d2.owner = Some("p".into());
+        d2.upto = Some(Lsn(250));
+        let own = LayerDesc::delta(k(0), k(99), Lsn(251), Lsn(300));
+        let map = LayerMap::new(vec![image, d1, d2, own]).unwrap();
+
+        // A read far past the cut still plans the spanning delta, the
+        // reader clamps its records at 250, and the child's own delta
+        // stacks above it.
+        let plan = map.plan(&k(5), Lsn(1000));
+        assert_eq!(plan.image.unwrap().min_lsn, Lsn(100));
+        let lsns: Vec<Lsn> = plan.deltas.iter().map(|d| d.min_lsn).collect();
+        assert_eq!(lsns, vec![Lsn(101), Lsn(201), Lsn(251)]);
+        assert_eq!(plan.deltas[1].clamp(Lsn(1000)), Lsn(250));
+
+        // A child image above the cut floors the plan past everything
+        // the inherited spanning delta may serve, so it drops out.
+        let child_image = LayerDesc::image(k(0), k(99), Lsn(300));
+        let mut d2 = LayerDesc::delta(k(0), k(99), Lsn(201), Lsn(400));
+        d2.owner = Some("p".into());
+        d2.upto = Some(Lsn(250));
+        let map = LayerMap::new(vec![child_image, d2]).unwrap();
+        let plan = map.plan(&k(5), Lsn(1000));
+        assert_eq!(plan.floor(), Lsn(300));
+        assert!(
+            plan.deltas.is_empty(),
+            "a clamped delta below the floor is never fetched"
+        );
     }
 
     #[test]

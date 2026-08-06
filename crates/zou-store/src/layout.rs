@@ -85,6 +85,14 @@ impl TenantLayout {
         format!("{}/chk/{id}/INDEX", self.prefix)
     }
 
+    /// The WAL slice a fold captures alongside a checkpoint, from the
+    /// redo page boundary through the end of the checkpoint record, so
+    /// an attach with no stream to overlay, a branch child or a time
+    /// travel restore, still finds the record recovery anchors on.
+    pub fn chk_waltail(&self, id: &str) -> String {
+        format!("{}/chk/{id}/WALTAIL", self.prefix)
+    }
+
     /// One relation page. Mutable derived data, the durable truth for
     /// these bytes is WAL plus checkpoints, so pg/ sits outside the
     /// immutable prefixes on purpose.
@@ -129,6 +137,12 @@ impl TenantLayout {
     /// shard's layer map, swept by compaction gc.
     pub fn shard_prefix(&self, shard: u16) -> String {
         format!("{}/shards/{shard:04x}/", self.prefix)
+    }
+
+    /// All shard prefixes at once, for the operations that walk every
+    /// shard the tenant has: branching and gc.
+    pub fn shards_dir(&self) -> String {
+        format!("{}/shards/", self.prefix)
     }
 
     /// The shard's manifest: the live layer list and the flush

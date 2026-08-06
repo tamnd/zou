@@ -91,6 +91,23 @@ impl<'a> PageService<'a> {
         }
     }
 
+    /// A service bound to one tenant's shard, able to follow the owner
+    /// tags on layers a branch inherited. Branched tenants must attach
+    /// this way; [`Self::new`] refuses their inherited layers loudly.
+    pub fn for_shard(
+        store: &'a dyn CasStore,
+        tenant_ref: &str,
+        shard: u16,
+        pool: Option<&'a RedoPool>,
+        data_checksums: bool,
+    ) -> Self {
+        PageService {
+            reader: LayerReader::for_shard(store, tenant_ref, shard),
+            pool,
+            data_checksums,
+        }
+    }
+
     /// Serve one block, [`Self::get_pages`] without the batching.
     pub fn get_page(
         &self,
@@ -298,6 +315,8 @@ mod tests {
         let entry = LayerEntry {
             name: desc.name(),
             size: bytes.len() as u64,
+            owner: None,
+            upto: None,
         };
         publish_layer(store, &layout.shard_manifest(0), 0, &entry, Lsn(lsn)).unwrap();
         entry

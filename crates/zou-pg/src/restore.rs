@@ -45,14 +45,18 @@ use crate::WAL_SHARD;
 pub const WAL_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 
 /// XLOG_BLCKSZ, initdb's default WAL page size.
-const WAL_PAGE_SIZE: u64 = 8192;
+pub(crate) const WAL_PAGE_SIZE: u64 = 8192;
 
 /// pg_control layout facts this tool relies on, checked against the
 /// vendored src/include/catalog/pg_control.h. The state field follows
 /// system_identifier (8 bytes) and two version fields (4 bytes each).
 const CONTROL_STATE_OFFSET: usize = 16;
-/// checkPointCopy.redo: after state comes 4 bytes of alignment padding,
-/// then pg_time_t time (8), XLogRecPtr checkPoint (8), and the CheckPoint
+/// checkPoint, the lsn of the last checkpoint record itself: after state
+/// come 4 bytes of alignment padding and pg_time_t time (8). Recovery
+/// starts by reading this record, so an attach with no live stream must
+/// still hold the bytes it names.
+const CONTROL_CHECKPOINT_OFFSET: usize = 32;
+/// checkPointCopy.redo: right after checkPoint comes the CheckPoint
 /// struct whose first field is the redo location.
 const CONTROL_REDO_OFFSET: usize = 40;
 const DB_SHUTDOWNED: u32 = 1;
@@ -109,6 +113,18 @@ pub fn control_crc_offset(control: &[u8]) -> Result<usize, String> {
 pub fn control_redo(control: &[u8]) -> Result<u64, String> {
     control_crc_offset(control)?;
     let bytes: [u8; 8] = control[CONTROL_REDO_OFFSET..CONTROL_REDO_OFFSET + 8]
+        .try_into()
+        .expect("length checked by control_crc_offset");
+    Ok(u64::from_le_bytes(bytes))
+}
+
+/// The lsn of the last checkpoint record itself, the position recovery
+/// reads first. Sits at or after the redo location: they are equal for
+/// a shutdown checkpoint and the record trails the redo for an online
+/// one.
+pub fn control_checkpoint(control: &[u8]) -> Result<u64, String> {
+    control_crc_offset(control)?;
+    let bytes: [u8; 8] = control[CONTROL_CHECKPOINT_OFFSET..CONTROL_CHECKPOINT_OFFSET + 8]
         .try_into()
         .expect("length checked by control_crc_offset");
     Ok(u64::from_le_bytes(bytes))
@@ -245,6 +261,47 @@ fn overlay_wal_chunk(
     Ok(())
 }
 
+/// XLP_LONG_HEADER: this page holds the long form header that opens
+/// every WAL segment.
+const XLP_LONG_HEADER: u16 = 0x0002;
+
+/// Write the long page header xlog puts at a segment's start, unless
+/// bytes already sit there. Recovery validates a segment's first page
+/// before reading any record in it, even one far past it, so a segment
+/// file created fresh for bytes laid down mid segment needs the header
+/// synthesized: the zeros it holds at offset 0 fail the magic check and
+/// recovery gives up. Every field is known here, the system identifier
+/// comes from the restored pg_control and the rest is layout.
+fn ensure_segment_header(pg_wal: &Path, tli: u32, sysid: u64, seg_lsn: u64) -> Result<(), String> {
+    let path = pg_wal.join(wal_file_name(tli, seg_lsn));
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("open {}: {e}", path.display()))?;
+    let mut magic = [0u8; 2];
+    std::io::Read::read_exact(&mut file, &mut magic)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    if magic != [0, 0] {
+        return Ok(());
+    }
+    let mut header = Vec::with_capacity(40);
+    header.extend_from_slice(&crate::walscan::XLOG_PAGE_MAGIC.to_le_bytes());
+    header.extend_from_slice(&XLP_LONG_HEADER.to_le_bytes());
+    header.extend_from_slice(&tli.to_le_bytes());
+    header.extend_from_slice(&seg_lsn.to_le_bytes());
+    // xlp_rem_len and the alignment padding before xlp_sysid.
+    header.extend_from_slice(&0u64.to_le_bytes());
+    header.extend_from_slice(&sysid.to_le_bytes());
+    header.extend_from_slice(&(WAL_SEGMENT_SIZE as u32).to_le_bytes());
+    header.extend_from_slice(&(WAL_PAGE_SIZE as u32).to_le_bytes());
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek {}: {e}", path.display()))?;
+    file.write_all(&header)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
 /// Replay the tenant's frames into pg_wal. Returns frames written,
 /// chunk bytes, and the LSN right after the last byte.
 fn overlay_frames(frames: &[Frame2], tli: u32, pg_wal: &Path) -> Result<(usize, u64, u64), String> {
@@ -358,6 +415,40 @@ fn restore_manifest(
     let mut wal_end = chain.last().expect("chain is nonempty").lsn.0;
     let tli = manifest.pg.timeline;
     let pg_wal = pgdata.join("pg_wal");
+
+    // The newest checkpoint's WAL tail: the bytes from its redo page
+    // boundary through the end of the checkpoint record pg_control
+    // names. A restore with a live stream gets the same bytes and more
+    // from the frames below, but a branch child and a time travel
+    // restore have no stream, and without the tail the server holds a
+    // pg_control naming a record that exists nowhere. Laid down before
+    // the frames so live bytes land on top. Absent on genesis, whose
+    // capture carried the whole pg_wal, and on stores from before the
+    // tail existed.
+    let newest = chain.last().expect("chain is nonempty");
+    let tail_layout = crate::fold::chk_layout(layout, newest);
+    if let Some((tail, _)) = store
+        .get(&tail_layout.chk_waltail(&newest.id))
+        .map_err(|e| format!("store: {e}"))?
+    {
+        if tail.len() < 8 {
+            return Err(format!("WALTAIL of {} is malformed", newest.id));
+        }
+        let start = u64::from_le_bytes(tail[..8].try_into().expect("checked length"));
+        overlay_wal_chunk(&pg_wal, tli, start, &tail[8..])?;
+        let end = start + (tail.len() - 8) as u64;
+        // Any segment the tail touched without covering its first page
+        // came into being zero filled here and needs the long header
+        // recovery validates before it reads the checkpoint record.
+        let sysid = u64::from_le_bytes(control[..8].try_into().expect("control is 8192 bytes"));
+        let mut seg = start / WAL_SEGMENT_SIZE;
+        while seg * WAL_SEGMENT_SIZE < end {
+            ensure_segment_header(&pg_wal, tli, sysid, seg * WAL_SEGMENT_SIZE)?;
+            seg += 1;
+        }
+        wal_end = wal_end.max(end);
+    }
+
     let (wal_records, wal_bytes, end) = overlay_frames(frames, tli, &pg_wal)?;
     wal_end = wal_end.max(end);
 
@@ -569,6 +660,89 @@ mod tests {
 
         // A second restore refuses to clobber the first.
         assert!(restore(store_root, "local", &pgdata).is_err());
+    }
+
+    #[test]
+    fn a_restore_with_no_stream_lays_the_checkpoints_wal_tail_down() {
+        // The branch child shape: every checkpoint inherited from the
+        // parent, no frames of its own to overlay. Without the WALTAIL
+        // the restored pg_control names a checkpoint record no segment
+        // holds and recovery panics; with it the record's bytes land in
+        // a segment the restore creates.
+        let store_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let parent = TenantLayout::new("parent");
+        let child = TenantLayout::new("child");
+
+        let control = synthetic_control(DB_IN_PRODUCTION);
+        store
+            .put_if_absent(&parent.chk_file("genesis", "global/pg_control"), &control)
+            .unwrap();
+        store
+            .put_if_absent(&parent.chk_file("genesis", "PG_VERSION"), b"18\n")
+            .unwrap();
+        let index = format!(
+            "f PG_VERSION 3\nf global/pg_control {}\nd pg_wal/archive_status\n",
+            control.len()
+        );
+        store
+            .put_if_absent(&parent.chk_index("genesis"), index.as_bytes())
+            .unwrap();
+
+        // The delta the branch point sits on, its tail starting mid
+        // segment at the redo page floor with 0x200 marker bytes through
+        // the record. Mid segment is the shape that matters: the segment
+        // file comes into being here and its first page needs the long
+        // header recovery validates before reading the record.
+        store.put_if_absent(&parent.chk_index("d1"), b"").unwrap();
+        let tail_start = WAL_SEGMENT_SIZE + 0x2000;
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&tail_start.to_le_bytes());
+        tail.extend_from_slice(&[0x77u8; 0x200]);
+        store
+            .put_if_absent(&parent.chk_waltail("d1"), &tail)
+            .unwrap();
+
+        let mut manifest = Manifest::new("child", 18);
+        manifest.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(0x0100_0028),
+            kind: CheckpointKind::Full,
+            owner: Some("parent".into()),
+        });
+        manifest.checkpoints.push(CheckpointRef {
+            id: "d1".into(),
+            lsn: Lsn(tail_start + 0x80),
+            kind: CheckpointKind::Delta,
+            owner: Some("parent".into()),
+        });
+
+        let pgdata = out_dir.path().join("restored");
+        let stats = restore_manifest(&store, &child, &manifest, &[], &pgdata).unwrap();
+        assert_eq!(stats.wal_records, 0, "no live frames overlaid");
+        assert_eq!(stats.wal_end, tail_start + 0x200);
+
+        // The tail landed at its lsn in a segment created for it, the
+        // rest zero filled except the synthesized segment header.
+        let seg = std::fs::read(pgdata.join("pg_wal/000000010000000000000001")).unwrap();
+        assert_eq!(seg.len() as u64, WAL_SEGMENT_SIZE);
+        assert!(seg[0x2000..0x2200].iter().all(|b| *b == 0x77));
+        assert!(seg[0x2200..].iter().all(|b| *b == 0));
+        assert!(seg[40..0x2000].iter().all(|b| *b == 0));
+
+        // The long header at the segment's start, field by field: magic,
+        // the long header flag, the timeline, the page address, rem_len
+        // zero, then the system identifier out of pg_control and the
+        // segment and page sizes.
+        assert_eq!(&seg[0..2], &crate::walscan::XLOG_PAGE_MAGIC.to_le_bytes());
+        assert_eq!(&seg[2..4], &XLP_LONG_HEADER.to_le_bytes());
+        assert_eq!(&seg[4..8], &1u32.to_le_bytes());
+        assert_eq!(&seg[8..16], &WAL_SEGMENT_SIZE.to_le_bytes());
+        assert_eq!(&seg[16..24], &0u64.to_le_bytes());
+        assert_eq!(&seg[24..32], &control[..8]);
+        assert_eq!(&seg[32..36], &(WAL_SEGMENT_SIZE as u32).to_le_bytes());
+        assert_eq!(&seg[36..40], &(WAL_PAGE_SIZE as u32).to_le_bytes());
     }
 
     #[test]
