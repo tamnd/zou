@@ -95,6 +95,13 @@ pub fn start_at(
         jwt_secret: secret.to_vec(),
         pg: Some(dsn.to_string()),
         external_url: Some(url.clone()),
+        // The one piece of configuration that is read from the
+        // environment here, because it is the one a suite cannot carry:
+        // a provider is a client id, a secret and somewhere to send the
+        // browser, and none of the three belong in a file. A run with
+        // nothing set gets no providers, which is what every suite in
+        // this repository is recorded against.
+        oauth: zou_server::oauth::from_env()?,
         // What the reference is configured with, in the same order,
         // since the first is the one a request that names no schema
         // gets.
