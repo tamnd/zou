@@ -54,8 +54,10 @@ pub const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 /// record and its entry framing. A footer claiming more is lying.
 const MAX_BLOCK_RAW_LEN: u32 = LAYER_BLOCK_TARGET as u32 + MAX_RECORD_LEN + ENTRY_FIXED_LEN as u32;
 
-/// magic, version, kind, reserved.
-const HEADER_LEN: usize = 4 + 2 + 1 + 1;
+/// magic, version, kind, reserved. Public so range readers know how
+/// many bytes to fetch at offset zero for [`read_layer_footer_ranges`].
+pub const LAYER_HEADER_LEN: usize = 4 + 2 + 1 + 1;
+const HEADER_LEN: usize = LAYER_HEADER_LEN;
 /// footer body length, crc, footer magic.
 const TAIL_LEN: usize = 4 + 4 + 4;
 /// first key, last key, offset, compressed len, raw len, entry count,
@@ -447,6 +449,27 @@ pub fn build_image(
     ))
 }
 
+fn parse_header(header: &[u8]) -> Result<LayerKind, LayerDecodeError> {
+    if header.len() < HEADER_LEN {
+        return Err(LayerDecodeError::Truncated {
+            have: header.len(),
+            need: HEADER_LEN,
+        });
+    }
+    if header[0..4] != LAYER_MAGIC {
+        return Err(LayerDecodeError::BadMagic);
+    }
+    let version = u16::from_le_bytes(header[4..6].try_into().unwrap());
+    if version != LAYER_VERSION {
+        return Err(LayerDecodeError::UnsupportedVersion { found: version });
+    }
+    match header[6] {
+        0 => Ok(LayerKind::Delta),
+        1 => Ok(LayerKind::Image),
+        _ => Err(LayerDecodeError::Corrupt),
+    }
+}
+
 fn parse_shell(buf: &[u8]) -> Result<(LayerFooter, usize), LayerDecodeError> {
     if buf.len() < HEADER_LEN + TAIL_LEN {
         return Err(LayerDecodeError::Truncated {
@@ -454,18 +477,7 @@ fn parse_shell(buf: &[u8]) -> Result<(LayerFooter, usize), LayerDecodeError> {
             need: HEADER_LEN + TAIL_LEN,
         });
     }
-    if buf[0..4] != LAYER_MAGIC {
-        return Err(LayerDecodeError::BadMagic);
-    }
-    let version = u16::from_le_bytes(buf[4..6].try_into().unwrap());
-    if version != LAYER_VERSION {
-        return Err(LayerDecodeError::UnsupportedVersion { found: version });
-    }
-    let kind = match buf[6] {
-        0 => LayerKind::Delta,
-        1 => LayerKind::Image,
-        _ => return Err(LayerDecodeError::Corrupt),
-    };
+    let kind = parse_header(&buf[..HEADER_LEN])?;
     if buf[buf.len() - 4..] != LAYER_FOOTER_MAGIC {
         return Err(LayerDecodeError::BadMagic);
     }
@@ -481,8 +493,61 @@ fn parse_shell(buf: &[u8]) -> Result<(LayerFooter, usize), LayerDecodeError> {
     if crc != stored_crc {
         return Err(LayerDecodeError::Corrupt);
     }
+    let footer = parse_footer_body(kind, &buf[footer_start..tail_at], footer_start as u64)?;
+    Ok((footer, footer_start))
+}
 
-    let body = &buf[footer_start..tail_at];
+/// Parse the footer from range reads alone: the fixed size header
+/// fetched at offset zero, and a suffix ending at `object_len`. When
+/// the suffix is too short to hold the whole footer the error's `need`
+/// says how many tail bytes to refetch, so a reader guesses once and
+/// refetches exactly at most once. The block index is validated against
+/// `object_len` the same way the full object decode validates it, so a
+/// footer fetched by ranges proves the same claims.
+pub fn read_layer_footer_ranges(
+    header: &[u8],
+    suffix: &[u8],
+    object_len: u64,
+) -> Result<LayerFooter, LayerDecodeError> {
+    let kind = parse_header(header)?;
+    if suffix.len() < TAIL_LEN || (suffix.len() as u64) > object_len {
+        return Err(LayerDecodeError::Truncated {
+            have: suffix.len(),
+            need: TAIL_LEN,
+        });
+    }
+    if suffix[suffix.len() - 4..] != LAYER_FOOTER_MAGIC {
+        return Err(LayerDecodeError::BadMagic);
+    }
+    let tail_at = suffix.len() - TAIL_LEN;
+    let footer_len = u32::from_le_bytes(suffix[tail_at..tail_at + 4].try_into().unwrap()) as usize;
+    let stored_crc = u32::from_le_bytes(suffix[tail_at + 4..tail_at + 8].try_into().unwrap());
+    let need = footer_len
+        .checked_add(TAIL_LEN)
+        .ok_or(LayerDecodeError::Corrupt)?;
+    if (need as u64) > object_len - HEADER_LEN as u64 {
+        return Err(LayerDecodeError::Corrupt);
+    }
+    if suffix.len() < need {
+        return Err(LayerDecodeError::Truncated {
+            have: suffix.len(),
+            need,
+        });
+    }
+    let body = &suffix[suffix.len() - need..tail_at];
+    let mut crc = crc32c::crc32c(&header[..HEADER_LEN]);
+    crc = crc32c::crc32c_append(crc, body);
+    if crc != stored_crc {
+        return Err(LayerDecodeError::Corrupt);
+    }
+    parse_footer_body(kind, body, object_len - need as u64)
+}
+
+fn parse_footer_body(
+    kind: LayerKind,
+    body: &[u8],
+    footer_start: u64,
+) -> Result<LayerFooter, LayerDecodeError> {
     let mut at = 0usize;
     let take = |at: &mut usize, n: usize| -> Result<&[u8], LayerDecodeError> {
         let end = at.checked_add(n).ok_or(LayerDecodeError::Corrupt)?;
@@ -551,7 +616,7 @@ fn parse_shell(buf: &[u8]) -> Result<(LayerFooter, usize), LayerDecodeError> {
         entry_sum += block.entries as u64;
         blocks.push(block);
     }
-    if expect_at != footer_start as u64 || entry_sum != entry_count {
+    if expect_at != footer_start || entry_sum != entry_count {
         return Err(LayerDecodeError::Corrupt);
     }
     if min_key != blocks[0].first_key
@@ -569,19 +634,16 @@ fn parse_shell(buf: &[u8]) -> Result<(LayerFooter, usize), LayerDecodeError> {
     if at != body.len() {
         return Err(LayerDecodeError::Corrupt);
     }
-    Ok((
-        LayerFooter {
-            kind,
-            min_key,
-            max_key,
-            min_lsn,
-            max_lsn,
-            entry_count,
-            blocks,
-            bloom,
-        },
-        footer_start,
-    ))
+    Ok(LayerFooter {
+        kind,
+        min_key,
+        max_key,
+        min_lsn,
+        max_lsn,
+        entry_count,
+        blocks,
+        bloom,
+    })
 }
 
 /// Footer only, for planning and inspection. This is what a reader
@@ -886,6 +948,32 @@ mod tests {
         let (back, full_footer) = decode_delta(&buf).unwrap();
         assert_eq!(footer, full_footer);
         assert_eq!(back.len() as u64, footer.entry_count);
+    }
+
+    #[test]
+    fn the_footer_parses_from_header_and_suffix_ranges_alone() {
+        let entries = delta_entries(120);
+        let (buf, footer) = build_delta(&entries, 4096).unwrap();
+        let header = &buf[..HEADER_LEN];
+        // A generous suffix guess parses in one shot.
+        let from = buf.len().saturating_sub(4096);
+        let got = read_layer_footer_ranges(header, &buf[from..], buf.len() as u64).unwrap();
+        assert_eq!(got, footer);
+        // A guess that only covers the tail names the exact refetch.
+        let tail_only = &buf[buf.len() - TAIL_LEN..];
+        let need = match read_layer_footer_ranges(header, tail_only, buf.len() as u64) {
+            Err(LayerDecodeError::Truncated { need, .. }) => need,
+            other => panic!("expected a truncated error, got {other:?}"),
+        };
+        let exact = &buf[buf.len() - need..];
+        let got = read_layer_footer_ranges(header, exact, buf.len() as u64).unwrap();
+        assert_eq!(got, footer);
+        // A lying object length shifts the block index base and fails.
+        assert!(read_layer_footer_ranges(header, exact, buf.len() as u64 + 8).is_err());
+        // A corrupt suffix byte fails the crc.
+        let mut bad = exact.to_vec();
+        bad[3] ^= 0x41;
+        assert!(read_layer_footer_ranges(header, &bad, buf.len() as u64).is_err());
     }
 
     #[test]

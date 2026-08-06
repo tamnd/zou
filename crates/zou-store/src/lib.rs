@@ -15,12 +15,15 @@ pub mod guard;
 pub mod heartbeat;
 pub mod hedge;
 pub mod layer;
+pub mod layermap;
 pub mod layout;
 pub mod lease;
 pub mod lsn;
 pub mod manifest;
 pub mod mem;
+pub mod memtable;
 pub mod open;
+pub mod pageread;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod sim;
