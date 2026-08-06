@@ -256,9 +256,13 @@ jobs:
         run: |
           psql "$ZOU_CONFORMANCE_DSN" -v ON_ERROR_STOP=1 -c 'create database gotrue_ref'
           # The first migration creates tables in auth without creating
-          # auth, because upstream runs it against the supabase image
-          # where the schema is already there.
+          # auth, and the queries after it name no schema at all,
+          # because upstream runs against the supabase image where the
+          # schema is already there and the role it connects as has a
+          # search_path pointing at it.
           psql "$GOTRUE_DSN" -v ON_ERROR_STOP=1 -c 'create schema auth'
+          psql "$GOTRUE_DSN" -v ON_ERROR_STOP=1 \
+            -c "alter role postgres in database gotrue_ref set search_path to auth, public"
           cat > /tmp/gotrue/.env <<'CONF'
           GOTRUE_API_HOST=127.0.0.1
           GOTRUE_API_PORT=54331
