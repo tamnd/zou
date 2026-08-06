@@ -75,6 +75,22 @@ jobs:
               > "/tmp/$schema-schema.sql" || true
             wc -l "/tmp/$schema-schema.sql"
           done
+      # Both servers keep a table of the migrations they have run, and
+      # both read it on startup to decide whether they have work to do.
+      # zou creates the finished shape in one go, so it has to write
+      # those rows itself or a real storage-api pointed at a zou
+      # database would replay sixty migrations over a schema that
+      # already has them. The rows are worth taking from the reference
+      # rather than derived, because the hash column is a hash of
+      # something, and which something is a detail of a migration
+      # runner nobody documents.
+      - name: Keep the migration rows the reference wrote
+        run: |
+          docker exec supabase_db_project psql -U postgres -qAtF ' ' -c \
+            "select id, name, hash from storage.migrations order by id" \
+            > /tmp/storage-migrations.txt || true
+          wc -l /tmp/storage-migrations.txt
+          head -5 /tmp/storage-migrations.txt
       - name: Record the suite
         run: |
           cargo run -p zou-conformance -- record \
@@ -95,6 +111,7 @@ jobs:
             /tmp/zou-conformance/suites/${{ inputs.suite }}/recorded.json
             /tmp/storage-schema.sql
             /tmp/auth-schema.sql
+            /tmp/storage-migrations.txt
           if-no-files-found: warn
       - name: Keep what the stack was saying
         if: failure()
