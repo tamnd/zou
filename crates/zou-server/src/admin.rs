@@ -22,11 +22,11 @@ use axum::response::Response;
 
 use crate::audit::{self, Action, Actor};
 use crate::auth::{
-    Caller, Code, Error, Outgoing, Post, caller, confirm_address, denied, error_body, field,
-    hash_off_thread, identities_join, is_uuid, keep_token, landing, link_target, merge_metadata,
-    no_database, posting, query_escape, query_object, read_json, refusal, refused, requested_aud,
-    send_code, six_digits, still_there, taken, token_hash, unguessable_password, user_json,
-    user_object, validate_email, validate_password,
+    Caller, Code, Error, Outgoing, Post, caller, confirm_address, confirm_user_row, denied,
+    error_body, field, hash_off_thread, identities_join, is_uuid, keep_token, landing, link_target,
+    merge_metadata, no_database, posting, query_escape, query_object, read_json, refusal, refused,
+    requested_aud, send_code, six_digits, still_there, taken, token_hash, unguessable_password,
+    user_json, user_object, validate_email, validate_password,
 };
 use crate::json_body;
 use crate::sql;
@@ -522,7 +522,7 @@ async fn create(
         merge_metadata(sess, &user_id, "raw_app_meta_data", &app_data).await?;
     }
     if confirm {
-        confirm_address(sess, &user_id, false).await?;
+        confirm_user_row(sess, &user_id, false).await?;
     }
     ban_account(sess, &user_id, ban).await?;
     // An account made by an admin is filed as a signup, which reads
@@ -539,7 +539,7 @@ async fn create(
         Some(traits),
     )
     .await?;
-    Ok(user_json(sess, &user_id).await?)
+    Ok(crate::auth::as_created(user_json(sess, &user_id).await?))
 }
 
 /// The traits every admin entry carries: who it was done to, and the

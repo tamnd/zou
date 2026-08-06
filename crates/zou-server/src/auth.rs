@@ -535,11 +535,38 @@ fn fresh_token() -> String {
     out
 }
 
+/// Whether a string could be a refresh token this end ever handed out:
+/// twelve characters, lowercase letters and digits only.
+///
+/// Upstream checks the same thing before it goes to the database, and
+/// the check is worth keeping rather than letting the lookup answer,
+/// because a token of the wrong shape is a client sending the wrong
+/// field rather than a session that ended, and the two deserve
+/// different words.
+fn could_be_refresh(token: &str) -> bool {
+    token.len() == 12
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
 /// A timestamptz as RFC 3339 in UTC, the format Go marshals time.Time
 /// into and therefore the one every Supabase client has parsed since
 /// the beginning.
+///
+/// Go writes the fraction as RFC3339Nano, which drops trailing zeros
+/// and drops the dot as well when nothing is left of it, so a whole
+/// second is `2026-01-01T00:00:01Z` and half a second is
+/// `2026-01-01T00:00:01.5Z`. Writing `.US` unconditionally is six
+/// characters different from the reference on almost every row, since
+/// almost every row is written on a whole microsecond and most of
+/// those trail in zeros.
 fn ts(col: &str) -> String {
-    format!(r#"to_char({col} at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')"#)
+    let whole = format!(r#"to_char({col} at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS')"#);
+    let fraction = format!(r#"to_char({col} at time zone 'utc', '.US')"#);
+    // rtrim takes the zeros off, and nullif takes the whole thing off
+    // when the zeros were all there was.
+    format!("({whole} || coalesce(nullif(rtrim({fraction}, '0'), '.'), '') || 'Z')")
 }
 
 /// A key that is present only when the column is, which is what Go's
@@ -650,11 +677,17 @@ pub(crate) fn identities_join() -> String {
                         'provider', i.provider,
                         'created_at', {i_created},
                         'updated_at', {i_updated}
-                    ) order by i.created_at) as list
+                    ) || {signed} || {email}
+                    order by i.created_at) as list
              from auth.identities i where i.user_id = u.id
          ) ids on true",
         i_created = ts("i.created_at"),
         i_updated = ts("i.updated_at"),
+        // Both are omitempty on the Go struct, so an identity that has
+        // never signed in and one that carries no email address are a
+        // key short rather than a null.
+        signed = opt_ts("last_sign_in_at", "i.last_sign_in_at"),
+        email = opt_text("email", "i.email"),
     )
 }
 
@@ -884,8 +917,13 @@ pub async fn refresh(pool: &Pool, token: &str, mint: &Mint<'_>) -> Result<Issued
 }
 
 async fn rotate(sess: &sql::Session, token: &str, mint: &Mint<'_>) -> Result<Issued, Error> {
-    if token.is_empty() {
-        return denied("validation_failed", "refresh_token required");
+    // Shape before lookup, which is upstream's order and matters: a
+    // token that could never have been issued is not a token that was
+    // not found, and the two answers are different error codes. An
+    // absent token takes this path too, since nothing is not the shape
+    // either.
+    if !could_be_refresh(token) {
+        return denied("validation_failed", "Refresh token is not valid");
     }
     let rows = sess
         .query(
@@ -1268,17 +1306,28 @@ async fn register(
         None => {
             let rows = sess
                 .query(
-                    "insert into auth.users
+                    // The id is drawn first so that the metadata can
+                    // carry it. Upstream's user_metadata is the data
+                    // the client sent with the same four keys the
+                    // identity carries written over the top, and one
+                    // of those four is the id of the row being
+                    // written.
+                    "with fresh as (select gen_random_uuid() as id)
+                     insert into auth.users
                          (instance_id, id, aud, role, email, encrypted_password,
                           raw_app_meta_data, raw_user_meta_data,
                           confirmation_token, recovery_token,
                           email_change_token_new, email_change,
                           created_at, updated_at, is_anonymous, is_sso_user)
-                     values ('00000000-0000-0000-0000-000000000000', gen_random_uuid(),
-                             $2, 'authenticated', $1, $3,
-                             jsonb_build_object('provider', 'email',
-                                                'providers', jsonb_build_array('email')),
-                             $4::jsonb, '', '', '', '', now(), now(), false, false)
+                     select '00000000-0000-0000-0000-000000000000', fresh.id,
+                            $2::text, 'authenticated', $1::text, $3::text,
+                            jsonb_build_object('provider', 'email',
+                                               'providers', jsonb_build_array('email')),
+                            $4::jsonb || jsonb_build_object(
+                                'sub', fresh.id::text, 'email', $1::text,
+                                'email_verified', false, 'phone_verified', false),
+                            '', '', '', '', now(), now(), false, false
+                       from fresh
                      returning id::text",
                     &[&email, &AUD, &hash, &data],
                 )
@@ -1354,17 +1403,11 @@ async fn register(
         Some(serde_json::json!({ "provider": "email" })),
     )
     .await?;
-    sess.execute(
-        "update auth.users
-            set email_confirmed_at = now(),
-                confirmation_token = '',
-                updated_at = now(),
-                raw_user_meta_data = coalesce(raw_user_meta_data, '{}'::jsonb)
-                                     || jsonb_build_object('email_verified', true)
-          where id = $1::text::uuid",
-        &[&user_id],
-    )
-    .await?;
+    // The same confirmation a link would have done, which is why it is
+    // the same function: an autoconfirmed signup has to leave the row
+    // and its identity in the state a confirmed one leaves them in,
+    // down to what the identity says the provider asserted.
+    confirm_address(sess, &user_id, false).await?;
     sess.execute(
         "delete from auth.one_time_tokens where user_id = $1::text::uuid",
         &[&user_id],
@@ -2169,11 +2212,44 @@ fn resolved(kind: &str, matched: &str) -> String {
     }
 }
 
-/// Confirm the address. `only_unconfirmed` is what the recovery path
-/// wants: following a recovery link proves the address as surely as
-/// following a confirmation link does, but an account that was already
-/// confirmed does not have its confirmation moved to today.
+/// Confirm the address, and say on the identity that the provider has
+/// now asserted it.
 pub(crate) async fn confirm_address(
+    sess: &sql::Session,
+    user_id: &str,
+    only_unconfirmed: bool,
+) -> Result<(), sql::Error> {
+    confirm_user_row(sess, user_id, only_unconfirmed).await?;
+    // The identity says what the provider asserted, and the email
+    // provider has now asserted the address, which is the one thing it
+    // was ever going to assert.
+    sess.execute(
+        "update auth.identities i
+            set identity_data = i.identity_data
+                                || jsonb_build_object('email_verified', true),
+                updated_at = now()
+           from auth.users u
+          where i.user_id = u.id and u.id = $1::text::uuid
+            and i.identity_data->>'email' = u.email",
+        &[&user_id],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Confirm the address on the user row and leave the identity where it
+/// is. `only_unconfirmed` is what the recovery path wants: following a
+/// recovery link proves the address as surely as following a
+/// confirmation link does, but an account that was already confirmed
+/// does not have its confirmation moved to today.
+///
+/// The admin create path is the caller that wants this rather than the
+/// one above it. Upstream writes the identity unverified, confirms the
+/// account, and never goes back, so an account an admin made with
+/// email_confirm carries an identity that still says the address is
+/// unproven, and a client reading identity_data there sees the same
+/// thing it has always seen.
+pub(crate) async fn confirm_user_row(
     sess: &sql::Session,
     user_id: &str,
     only_unconfirmed: bool,
@@ -2193,20 +2269,6 @@ pub(crate) async fn confirm_address(
                                          || jsonb_build_object('email_verified', true)
               where u.id = $1::text::uuid {guard}"
         ),
-        &[&user_id],
-    )
-    .await?;
-    // The identity says what the provider asserted, and the email
-    // provider has now asserted the address, which is the one thing it
-    // was ever going to assert.
-    sess.execute(
-        "update auth.identities i
-            set identity_data = i.identity_data
-                                || jsonb_build_object('email_verified', true),
-                updated_at = now()
-           from auth.users u
-          where i.user_id = u.id and u.id = $1::text::uuid
-            and i.identity_data->>'email' = u.email",
         &[&user_id],
     )
     .await?;
@@ -3988,9 +4050,7 @@ pub async fn signup(
             );
         }
         return match sign_up_by_phone(pool, phone, password, &channel, &data, &mint, &post).await {
-            Ok(SignedUp::Session(issued)) => json_body(StatusCode::OK, issued.json()),
-            Ok(SignedUp::Pending(user)) => json_body(StatusCode::OK, user),
-            Ok(SignedUp::Taken) => already_registered(),
+            Ok(out) => signed_up(out),
             Err(e) => refusal(e, "signup"),
         };
     }
@@ -4012,11 +4072,36 @@ pub async fn signup(
     )
     .await
     {
-        Ok(SignedUp::Session(issued)) => json_body(StatusCode::OK, issued.json()),
-        Ok(SignedUp::Pending(user)) => json_body(StatusCode::OK, user),
-        Ok(SignedUp::Taken) => already_registered(),
+        Ok(out) => signed_up(out),
         Err(e) => refusal(e, "signup"),
     }
+}
+
+/// What a signup answers with, whichever column it went in by.
+fn signed_up(out: SignedUp) -> Response {
+    match out {
+        SignedUp::Session(issued) => {
+            let mut answer = issued.json();
+            answer["user"] = as_created(answer["user"].take());
+            json_body(StatusCode::OK, answer)
+        }
+        SignedUp::Pending(user) => json_body(StatusCode::OK, as_created(user)),
+        SignedUp::Taken => already_registered(),
+    }
+}
+
+/// The user as the answer to the request that made it.
+///
+/// One key short of the user every other endpoint answers with:
+/// confirmed_at is a generated column, upstream builds this object from
+/// the row it just wrote rather than reading it back, so the column it
+/// never selected is a field it never filled in and Go's omitempty
+/// drops. Fetch the same account a moment later and it is there.
+pub(crate) fn as_created(mut user: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = user.as_object_mut() {
+        map.remove("confirmed_at");
+    }
+    user
 }
 
 /// The answer to a signup on an address that is already confirmed, for a
@@ -4211,13 +4296,27 @@ pub(crate) fn encoded(pairs: &[(&str, String)]) -> String {
 
 /// A redirect, or a 500 when the target is not something that fits in
 /// a header, which is the only way building one fails.
+///
+/// The body is the link Go's http.Redirect writes for a GET, and every
+/// redirect this end sends is answering a navigation. Nothing follows
+/// it, since a browser reads the Location header and a client reads
+/// the fragment, but a proxy that logs response sizes and a person
+/// reading a curl both see what upstream showed them.
 fn to(status: StatusCode, location: &str) -> Response {
     match axum::http::HeaderValue::from_str(location) {
         Ok(value) => {
-            let mut res = Response::new(Body::empty());
+            let mut res = Response::new(Body::from(format!(
+                "<a href=\"{}\">{}</a>.\n\n",
+                html_escape(location),
+                status.canonical_reason().unwrap_or_default()
+            )));
             *res.status_mut() = status;
             res.headers_mut()
                 .insert(axum::http::header::LOCATION, value);
+            res.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("text/html; charset=utf-8"),
+            );
             res
         }
         Err(_) => error_body(
@@ -4226,6 +4325,23 @@ fn to(status: StatusCode, location: &str) -> Response {
             "Unexpected failure, please check server logs for more information",
         ),
     }
+}
+
+/// Go's htmlReplacer, the five characters html.EscapeString rewrites
+/// on the way into the link a redirect carries.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&#34;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Go's url.QueryEscape: unreserved characters through, a space as a
@@ -6466,8 +6582,12 @@ async fn log_out(sess: &sql::Session, caller: &Caller, scope: Scope) -> Result<(
     Ok(())
 }
 
-/// POST /auth/v1/reauthenticate, which mails a code that proves the
+/// GET /auth/v1/reauthenticate, which mails a code that proves the
 /// person holding this session still reads the address on it.
+///
+/// A GET that changes something, which is upstream's choice and
+/// supabase-js's: the client sends GET here, so this end has to answer
+/// GET here or the call never lands.
 pub async fn reauthenticate(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     req: Request<Body>,
@@ -6485,6 +6605,27 @@ pub async fn reauthenticate(
         Ok(id) => json_body(StatusCode::OK, serde_json::json!({"message_id": id})),
         Err(e) => refusal(e, "reauthenticate"),
     }
+}
+
+/// POST /auth/v1/reauthenticate, which is not a thing upstream serves.
+///
+/// It is routed anyway rather than left to the router's own 405,
+/// because upstream runs the gate before it looks at the method: a
+/// POST with no token is told it needs one, and only a POST that got
+/// past the gate is told the method is wrong. A client that has the
+/// verb wrong and the token missing should hear about the token
+/// first, since that is the one it will hit again on the retry.
+pub async fn reauthenticate_posted(req: Request<Body>) -> Response {
+    if let Err(res) = caller(&req) {
+        return *res;
+    }
+    let mut res = Response::new(Body::empty());
+    *res.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+    res.headers_mut().insert(
+        axum::http::header::ALLOW,
+        axum::http::HeaderValue::from_static("GET"),
+    );
+    res
 }
 
 /// PUT /auth/v1/user, where the person holding a session changes their
@@ -6657,7 +6798,18 @@ pub async fn token(
     };
 
     match issued {
-        Ok(issued) => json_body(StatusCode::OK, issued.json()),
+        Ok(issued) => {
+            let mut answer = issued.json();
+            if grant == "password" {
+                // Only this grant. Upstream answers the password grant
+                // with a body that carries the weak password report,
+                // and a report nobody filled in is a null key rather
+                // than no key, where the refresh grant leaves the key
+                // out entirely.
+                answer["weak_password"] = serde_json::Value::Null;
+            }
+            json_body(StatusCode::OK, answer)
+        }
         Err(e) => refusal(e, &format!("{grant} grant")),
     }
 }
@@ -6821,6 +6973,39 @@ mod tests {
             "outside base32: {token}"
         );
         assert_ne!(token, fresh_token(), "two draws are not the same token");
+        assert!(could_be_refresh(&token), "what it mints, it accepts");
+    }
+
+    #[test]
+    fn a_refresh_token_of_the_wrong_shape_never_reaches_the_lookup() {
+        for bad in [
+            "",
+            "zouconform0",
+            "zouconform012",
+            "never-issued",
+            "ZOUCONFORM01",
+        ] {
+            assert!(!could_be_refresh(bad), "{bad} should not be a token");
+        }
+    }
+
+    #[test]
+    fn a_redirect_carries_the_link_go_writes() {
+        let res = to(
+            StatusCode::SEE_OTHER,
+            "http://localhost:3000#error=access_denied&sb=",
+        );
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .map(|v| v.to_str().unwrap()),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            html_escape("http://localhost:3000#error=access_denied&sb="),
+            "http://localhost:3000#error=access_denied&amp;sb="
+        );
     }
 
     /// The envelope reads whatever the handler under it wrote, and
