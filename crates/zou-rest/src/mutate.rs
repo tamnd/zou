@@ -30,6 +30,7 @@
 use crate::catalog::{Catalog, Column, Relation};
 use crate::filter::Node;
 use crate::plan::{PlanError, Query, plan_from};
+use crate::select::Item;
 use crate::sql::{CompileError, Sql, quote_ident, where_clause_from};
 
 /// The CTE a representation select reads the returned rows from.
@@ -71,7 +72,8 @@ fn err<T>(message: impl Into<String>) -> Result<T, CompileError> {
 pub enum Returning {
     /// Nothing, the return=minimal shape.
     None,
-    /// Every column, what the representation CTE needs.
+    /// Every column, which a representation asks for only when it
+    /// cannot say which ones it needs.
     Star,
     /// Named columns, headers-only wants the primary key for the
     /// Location header. An empty list returns nothing.
@@ -154,7 +156,7 @@ pub fn insert(
             ));
         }
     }
-    text.push_str(&returning_sql(returning, None));
+    text.push_str(&returning_sql(returning, table));
     Ok(Sql {
         text,
         params: vec![payload],
@@ -239,7 +241,7 @@ pub fn upsert_one(
             sets.join(", ")
         ));
     }
-    text.push_str(&returning_sql(returning, None));
+    text.push_str(&returning_sql(returning, table));
     Ok(Sql { text, params })
 }
 
@@ -294,7 +296,7 @@ pub fn update(
         text.push_str(" where ");
         text.push_str(&compiled.text);
     }
-    text.push_str(&returning_sql(returning, Some(table)));
+    text.push_str(&returning_sql(returning, table));
     Ok(Sql { text, params })
 }
 
@@ -314,7 +316,7 @@ pub fn delete(
         text.push_str(" where ");
         text.push_str(&compiled.text);
     }
-    text.push_str(&returning_sql(returning, None));
+    text.push_str(&returning_sql(returning, table));
     Ok(Sql { text, params })
 }
 
@@ -332,9 +334,72 @@ pub struct Represented {
     pub select: Sql,
 }
 
+/// Which columns a representation has to hand back: the ones the
+/// select list names, the parent side of every relationship it
+/// embeds, and the primary key.
+///
+/// A returning list is not only about what the response carries.
+/// `returning *` reads every column of the table, so a role with
+/// select on two columns of three cannot write a row it is otherwise
+/// allowed to write, which is the whole of what these cases are
+/// about. Naming the columns is what makes the privileges line up
+/// with what was asked for.
+///
+/// The embed columns are what the join needs rather than what the
+/// client asked for: a select of `name,clients(name)` has to bring
+/// `client_id` back or the join over the CTE has nothing to match on.
+/// The primary key rides along because that is what a Location header
+/// is built out of. A computed relationship takes the whole row as
+/// its argument, so there is no column list to name and the star
+/// stays.
+pub fn needed(catalog: &Catalog, table: &str, items: &[Item], pk: &[String]) -> Returning {
+    let mut cols: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            Item::Star => return Returning::Star,
+            Item::Col(c) => {
+                if let Some(f) = &c.field {
+                    push(&mut cols, &f.name);
+                }
+            }
+            Item::Embed(e) | Item::Spread(e) => {
+                match catalog.resolve(table, &e.relation, e.hint.as_deref()) {
+                    Ok(rel) if rel.call.is_none() => {
+                        for (parent, _) in &rel.join {
+                            push(&mut cols, parent);
+                        }
+                    }
+                    // A computed relationship, or a relationship that
+                    // does not resolve at all: the planner is about to
+                    // report the second one, and neither has columns
+                    // to name here.
+                    _ => return Returning::Star,
+                }
+            }
+        }
+    }
+    for c in pk {
+        push(&mut cols, c);
+    }
+    // A select of nothing but aggregates over a table with no primary
+    // key. Upstream returns the constant 1, which is a row and not a
+    // column; the star is the nearest thing zou can return, and the
+    // response names nothing out of it either way.
+    if cols.is_empty() {
+        return Returning::Star;
+    }
+    Returning::Cols(cols)
+}
+
+fn push(cols: &mut Vec<String>, name: &str) {
+    if !cols.iter().any(|c| c == name) {
+        cols.push(name.to_string());
+    }
+}
+
 /// Plan the request's select tree over a mutation's returned rows.
-/// Build the mutation with Returning::Star, the CTE has to carry
-/// every column an embed join might need.
+/// The mutation returns what [`needed`] worked out, which is every
+/// column a select item or an embed join can reach for.
 pub fn representation(
     catalog: &Catalog,
     mutation: Sql,
@@ -349,21 +414,21 @@ pub fn representation(
     })
 }
 
-fn returning_sql(r: &Returning, qualifier: Option<&str>) -> String {
+/// The returning clause, always qualified with the table. The update
+/// shape needs the qualifier because it has the payload relation in
+/// scope too, and every shape needs it for a computed column, which
+/// is a call on the row written as if it were a column and which
+/// postgres resolves only on something that has a type.
+fn returning_sql(r: &Returning, table: &str) -> String {
+    let t = quote_ident(table);
     match r {
         Returning::None => String::new(),
-        Returning::Star => match qualifier {
-            Some(q) => format!(" returning {}.*", quote_ident(q)),
-            None => " returning *".into(),
-        },
+        Returning::Star => format!(" returning {t}.*"),
         Returning::Cols(cols) if cols.is_empty() => String::new(),
         Returning::Cols(cols) => {
             let list: Vec<String> = cols
                 .iter()
-                .map(|c| match qualifier {
-                    Some(q) => format!("{}.{}", quote_ident(q), quote_ident(c)),
-                    None => quote_ident(c),
-                })
+                .map(|c| format!("{t}.{}", quote_ident(c)))
                 .collect();
             format!(" returning {}", list.join(", "))
         }
@@ -566,7 +631,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.text,
-            r#"insert into "books" select from json_populate_recordset(null::"books", $1) as "_zou_src" returning *"#
+            r#"insert into "books" select from json_populate_recordset(null::"books", $1) as "_zou_src" returning "books".*"#
         );
     }
 
@@ -713,7 +778,7 @@ mod tests {
             "{}",
             s.text
         );
-        assert!(s.text.ends_with(" returning *"), "{}", s.text);
+        assert!(s.text.ends_with(" returning \"tiobe_pls\".*"), "{}", s.text);
         assert_eq!(s.params, vec![r#"[{"name":"Go","rank":19}]"#, "Go"]);
     }
 
@@ -1047,7 +1112,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             s.text,
-            r#"delete from "books" where "books"."id" = $1 returning "id""#
+            r#"delete from "books" where "books"."id" = $1 returning "books"."id""#
         );
         assert_eq!(s.params, vec!["4"]);
 
@@ -1109,7 +1174,7 @@ mod tests {
             "{}",
             r.cte
         );
-        assert!(r.cte.ends_with("returning *)"), "{}", r.cte);
+        assert!(r.cte.ends_with("returning \"books\".*)"), "{}", r.cte);
         assert!(
             r.select.text.contains(r#"from "_zou_mut" as "z0""#),
             "the root reads the returned rows: {}",
@@ -1126,5 +1191,49 @@ mod tests {
             r.select.text
         );
         assert_eq!(r.select.params, vec!["[]".to_string(), "1".into()]);
+    }
+
+    /// A representation returns what it can name and no more, since
+    /// returning a column is reading it.
+    #[test]
+    fn a_representation_returns_what_it_names_and_what_a_join_needs() {
+        let catalog = Catalog::new(vec![FkRow {
+            constraint: "books_author_id_fkey".into(),
+            table: "books".into(),
+            columns: vec!["author_id".into()],
+            ref_table: "authors".into(),
+            ref_columns: vec!["id".into()],
+            unique: false,
+            in_pk: false,
+        }]);
+        let pk = cols(&["id"]);
+        let sel = |s: &str| select::parse(s).unwrap();
+
+        assert_eq!(
+            needed(&catalog, "books", &sel("title"), &pk),
+            Returning::Cols(cols(&["title", "id"]))
+        );
+        // The join column comes back whether or not it was asked for,
+        // and comes back once when it was.
+        assert_eq!(
+            needed(&catalog, "books", &sel("title,authors(name)"), &pk),
+            Returning::Cols(cols(&["title", "author_id", "id"]))
+        );
+        assert_eq!(
+            needed(&catalog, "books", &sel("author_id,authors(name)"), &pk),
+            Returning::Cols(cols(&["author_id", "id"]))
+        );
+        // A star anywhere in the list is the whole row anyway.
+        assert_eq!(needed(&catalog, "books", &sel("*"), &pk), Returning::Star);
+        assert_eq!(
+            needed(&catalog, "books", &sel("id,*"), &pk),
+            Returning::Star
+        );
+        // A relationship that does not resolve is the planner's error
+        // to report, not this one's.
+        assert_eq!(
+            needed(&catalog, "books", &sel("id,nowhere(name)"), &pk),
+            Returning::Star
+        );
     }
 }
