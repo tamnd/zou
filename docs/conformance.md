@@ -42,6 +42,7 @@ scoreboard  turn the json those runs wrote into the published markdown
 `derive` is how the second suite got written, and it is described below.
 `serve` asks nothing at all, and is described below too.
 `scoreboard` asks nothing either: it reads the json those runs wrote and renders [the scoreboard](scoreboard.md), which is described at the end.
+[docs/compatibility.md](compatibility.md) is the prose next to those numbers: which differences are deliberate, which surfaces are not served yet, and what the suites do not ask.
 
 ## What counts as the same answer
 
