@@ -319,6 +319,62 @@ jobs:
           path: /tmp/auth.json
           if-no-files-found: ignore
 
+  # The storage suite has no diff step, which is the one thing that
+  # makes it different from the two jobs above. storage-api ships as an
+  # image and nothing else, so the only way to have the reference on a
+  # runner is to bring up the whole local stack, and the recording was
+  # taken from exactly that in the record workflow. Bumping the pinned
+  # version means running that workflow again and reading the diff in
+  # the recording, which is the same discipline the diff steps buy, paid
+  # for at the other end.
+  storage-conformance:
+    name: conformance (storage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+      ZOU_CONFORMANCE_SUITES: /tmp/zou-conformance/suites
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      # The fixture writes rows into storage.buckets and storage.objects,
+      # and zou is what makes those tables, on the first connection it
+      # takes out of the pool. So the target is started before the setup
+      # is applied, which the harness does anyway, and there is nothing
+      # to install here.
+      - name: Check zou against the recording
+        run: |
+          cargo run -p zou-conformance -- check --suite storage \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --json /tmp/storage.json
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage
+          path: /tmp/storage.json
+          if-no-files-found: ignore
+
   supabase-js:
     name: conformance (supabase-js)
     runs-on: ubuntu-latest
@@ -584,7 +640,7 @@ jobs:
   scoreboard:
     name: scoreboard
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [conformance, auth-conformance, supabase-js]
+    needs: [conformance, auth-conformance, storage-conformance, supabase-js]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -602,6 +658,10 @@ jobs:
           path: /tmp/reports
       - uses: actions/download-artifact@v4
         with:
+          name: storage
+          path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
           name: supabase-js
           path: /tmp/reports
       - name: Render it
@@ -609,6 +669,7 @@ jobs:
           cargo run -p zou-conformance -- scoreboard \
             --report /tmp/reports/conformance.json \
             --report /tmp/reports/auth.json \
+            --report /tmp/reports/storage.json \
             --js /tmp/reports/js.json \
             --pin "$(jq -r .ref conformance/suites.json)" \
             --out docs/scoreboard.md

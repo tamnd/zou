@@ -1,0 +1,624 @@
+//! The Supabase Storage surface. Buckets, for now.
+//!
+//! Everything here is written against a recording rather than against
+//! documentation. storage-api ships as an image rather than a binary,
+//! so the reference is the container a local supabase project runs, and
+//! the twenty five answers it gave to the bucket questions live in the
+//! conformance repository next to the PostgREST and GoTrue ones. Four
+//! of those answers are things nobody would have written down from the
+//! docs, and each of them is a line of code here.
+//!
+//! Every failure is HTTP 400. The status a caller is meant to act on is
+//! a string inside the body, so a bucket that is not there is 400 on
+//! the wire carrying `"statusCode": "404"`. Only a 500 goes out as
+//! itself.
+//!
+//! A bucket in a listing carries `type` and the same bucket fetched on
+//! its own does not. Two routes, two column lists, and the column is
+//! not really a column: the listing selects the literal `'STANDARD'`.
+//!
+//! `owner` comes back as the empty string rather than as null, because
+//! the response is serialized against a schema that calls it a string
+//! and the serializer coerces. The column is a nullable uuid.
+//!
+//! A key that row level security hides a bucket from is told the bucket
+//! is not there, not that it may not look. That falls out of asking the
+//! database first and letting the empty result be the answer, which is
+//! also the only way to get it right without keeping a permission model
+//! of our own alongside the policies.
+//!
+//! Two more things worth knowing while reading this. The surface sits
+//! outside zou's apikey gate, because the reference answers a request
+//! carrying no key at all in storage-api's words rather than a
+//! gateway's. And it reads its token from the authorization header
+//! only, never from the apikey, which is what storage-api's jwt plugin
+//! does.
+//!
+//! What is not here yet: objects, uploads, signed urls, the s3
+//! protocol. Those all need somewhere to put bytes, which is the other
+//! half of M3.
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header, request::Parts};
+use axum::response::{IntoResponse, Response};
+
+use crate::sql::{RequestContext, Session};
+use crate::{App, jwt};
+
+/// How much of a bucket call's body is ever worth reading. A bucket is
+/// six fields, so anything approaching this is not one.
+const BODY_LIMIT: usize = 64 * 1024;
+
+/// The content type the reference sends on every answer, failures
+/// included. The charset is part of it and the conformance differ
+/// compares this header, so it is written once here rather than at each
+/// of the six routes.
+const JSON: &str = "application/json; charset=utf-8";
+
+/// The four fields storage-api puts in a failure, and the status on the
+/// wire is not one of them.
+///
+/// `status` is what goes in the body, as a string. What goes on the
+/// wire is 400 unless the body says 500. That is the whole of
+/// storage-api's error handler and it is why a client switching on the
+/// http status sees one number for everything.
+pub struct StorageError {
+    status: u16,
+    error: &'static str,
+    message: String,
+    code: &'static str,
+}
+
+impl StorageError {
+    fn no_such_bucket() -> Self {
+        StorageError {
+            status: 404,
+            error: "Bucket not found",
+            message: "Bucket not found".to_string(),
+            code: "NoSuchBucket",
+        }
+    }
+
+    fn already_exists() -> Self {
+        StorageError {
+            status: 409,
+            error: "Duplicate",
+            message: "The resource already exists".to_string(),
+            code: "BucketAlreadyExists",
+        }
+    }
+
+    fn not_empty() -> Self {
+        StorageError {
+            status: 409,
+            error: "ResourceNotEmpty",
+            message: "The bucket you tried to delete is not empty".to_string(),
+            code: "ResourceNotEmpty",
+        }
+    }
+
+    fn access_denied(message: String) -> Self {
+        StorageError {
+            status: 403,
+            error: "Unauthorized",
+            message,
+            code: "AccessDenied",
+        }
+    }
+
+    /// The body did not parse. The error name is fastify's own, which
+    /// is the reference implementation showing through, and it is
+    /// copied rather than improved on because a client matching on the
+    /// string is matching on that one.
+    fn bad_json() -> Self {
+        StorageError {
+            status: 400,
+            error: "FastifyError",
+            message: "Body is not valid JSON but content-type is set to 'application/json'"
+                .to_string(),
+            code: "InvalidRequest",
+        }
+    }
+
+    fn internal(message: String) -> Self {
+        StorageError {
+            status: 500,
+            error: "Internal",
+            message,
+            code: "InternalError",
+        }
+    }
+}
+
+impl IntoResponse for StorageError {
+    fn into_response(self) -> Response {
+        let wire = if self.status == 500 {
+            StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        // Written out rather than built from a map, because the map
+        // this server has is a sorted one and the field order the
+        // reference writes is not sorted. A caller parsing the body
+        // cannot tell, and a recording compared byte for byte can, and
+        // the second is the whole point of having the recording.
+        let body = format!(
+            "{{\"statusCode\":{},\"error\":{},\"message\":{},\"code\":{}}}",
+            quoted(&self.status.to_string()),
+            quoted(self.error),
+            quoted(&self.message),
+            quoted(self.code),
+        );
+        (wire, [(header::CONTENT_TYPE, JSON)], body).into_response()
+    }
+}
+
+/// One json string, escaped the way json escapes.
+fn quoted(text: &str) -> String {
+    serde_json::Value::from(text).to_string()
+}
+
+/// An answer that worked, always json and always with the charset on
+/// it.
+fn ok(body: String) -> Response {
+    (StatusCode::OK, [(header::CONTENT_TYPE, JSON)], body).into_response()
+}
+
+/// The one line answer three of the six routes give.
+fn message(text: &str) -> Response {
+    ok(serde_json::json!({ "message": text }).to_string())
+}
+
+/// Why a token was refused, in the words the reference uses.
+///
+/// storage-api verifies with jose and hands jose's own message straight
+/// to the client, so these are jose's strings rather than zou's. Only
+/// the first is recorded: a request with no authorization header at all
+/// verifies the empty string, and that is what jose calls anything that
+/// is not three dot separated segments. The rest are read off jose and
+/// are the next thing for the suite to ask about.
+fn jose_words(why: &jwt::Reject) -> &'static str {
+    match why {
+        jwt::Reject::Malformed => "Invalid Compact JWS",
+        jwt::Reject::WrongAlgorithm(_) => "\"alg\" (Algorithm) Header Parameter value not allowed",
+        jwt::Reject::BadSignature => "signature verification failed",
+        jwt::Reject::Expired => "\"exp\" claim timestamp check failed",
+        jwt::Reject::UnknownKey => "no applicable key found in the JSON Web Key Set",
+    }
+}
+
+/// Who is asking, from the authorization header and nothing else.
+///
+/// Not the apikey. storage-api reads `request.headers.authorization`,
+/// strips a leading Bearer if there is one, and verifies whatever is
+/// left, so a request carrying only an apikey is a request carrying no
+/// token at all. That is also why this surface sits outside zou's
+/// apikey gate: inside it, a request with no key would be answered by
+/// the gate in the gateway's words, and the reference answers it in
+/// storage-api's.
+fn caller(app: &App, parts: &Parts) -> Result<(RequestContext, jwt::Verified), StorageError> {
+    let raw = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = match raw.get(..7) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("bearer ") => &raw[7..],
+        _ => raw,
+    };
+    let verified = jwt::verify_any(token, &app.cfg.jwt_secret, app.jwks.as_ref())
+        .map_err(|why| StorageError::access_denied(jose_words(&why).to_string()))?;
+
+    let mut headers = serde_json::Map::new();
+    for (name, value) in &parts.headers {
+        if let Ok(v) = value.to_str() {
+            headers.insert(name.as_str().to_string(), serde_json::Value::from(v));
+        }
+    }
+    let mut cookies = serde_json::Map::new();
+    if let Some(line) = parts
+        .headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+    {
+        for item in line.split(';') {
+            if let Some((name, value)) = item.trim().split_once('=') {
+                cookies.insert(name.to_string(), serde_json::Value::from(value));
+            }
+        }
+    }
+    let ctx = RequestContext {
+        role: verified
+            .role
+            .clone()
+            .unwrap_or_else(|| app.cfg.anon_role.clone()),
+        claims: verified.claims.to_string(),
+        method: parts.method.as_str().to_string(),
+        path: parts.uri.path().to_string(),
+        headers: serde_json::Value::Object(headers).to_string(),
+        cookies: serde_json::Value::Object(cookies).to_string(),
+        // Everything below is schema qualified anyway, so this is a
+        // fence rather than a convenience: a policy body that names a
+        // bare table resolves inside storage and nowhere else.
+        search_path: "\"storage\"".to_string(),
+    };
+    Ok((ctx, verified))
+}
+
+/// A pg failure in the shape storage-api gives it. Only the two codes
+/// the bucket surface can really produce are named. Anything else is
+/// the database saying something we have not seen, and it goes out as
+/// itself rather than dressed up as one of these.
+fn pg_error(e: &tokio_postgres::Error) -> StorageError {
+    let Some(db) = e.as_db_error() else {
+        return StorageError::internal(e.to_string());
+    };
+    match db.code().code() {
+        // storage-api replaces the message rather than passing
+        // postgres's through, which drops the `for table "buckets"`
+        // postgres puts on the end. Copied because a client matching on
+        // the string is matching on the short one.
+        "42501" if db.message().contains("row-level security") => {
+            StorageError::access_denied("new row violates row-level security policy".to_string())
+        }
+        "42501" => StorageError::access_denied(db.message().to_string()),
+        "23505" => StorageError::already_exists(),
+        _ => StorageError::internal(db.message().to_string()),
+    }
+}
+
+/// The columns a bucket answer is made of, rendered by postgres rather
+/// than assembled here.
+///
+/// Two reasons it is json built in sql. The timestamps have to come out
+/// the way a javascript Date prints them, milliseconds and a Z, and
+/// to_char is the shortest honest way to say that. And `owner` is a
+/// nullable uuid that the reference answers as the empty string,
+/// because its response serializer is told the field is a string and
+/// coerces null into one; a cast and a coalesce say the same thing
+/// without pretending it was a deliberate api decision.
+///
+/// `type` is a literal rather than the column of that name. The listing
+/// asks for it and the single bucket route does not, which is the whole
+/// reason this takes a flag.
+fn bucket_columns(with_type: bool) -> String {
+    let bucket_type = if with_type {
+        ", 'STANDARD' as type"
+    } else {
+        ""
+    };
+    format!(
+        "id, name, coalesce(owner::text, '') as owner, public{bucket_type},
+         file_size_limit, allowed_mime_types,
+         to_char(created_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as created_at,
+         to_char(updated_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') as updated_at"
+    )
+}
+
+/// Open the request's transaction, or say there is no database to open
+/// one on.
+async fn begin(app: &App, ctx: &RequestContext, read_only: bool) -> Result<Session, StorageError> {
+    let pool = app
+        .pool
+        .as_ref()
+        .ok_or_else(|| StorageError::internal("zou is running without a database".to_string()))?;
+    pool.session(ctx, read_only).await.map_err(|e| pg_error(&e))
+}
+
+/// Is the bucket there, as far as this caller is concerned?
+///
+/// Which is not the same question as whether it exists. A row that row
+/// level security hides is a row that is not there, and every route
+/// that changes a bucket asks this first, which is why an anon key
+/// hears "not found" rather than "not allowed" from update, empty and
+/// delete alike.
+async fn bucket_exists(sess: &Session, id: &str) -> Result<bool, StorageError> {
+    let rows = sess
+        .query(
+            "select 1 from storage.buckets where id = $1 limit 1",
+            &[&id],
+        )
+        .await
+        .map_err(|e| pg_error(&e))?;
+    Ok(!rows.is_empty())
+}
+
+/// Give the connection back, then answer.
+///
+/// A refusal still owes the pool its connection: the transaction did
+/// nothing worth keeping but it is still open, and a session dropped on
+/// the floor forfeits the connection under it. A failed statement is
+/// the other case and does drop, the same containment the rest surface
+/// gives a query that broke its own transaction.
+async fn done<T>(sess: Session, answer: Result<T, StorageError>) -> Result<T, StorageError> {
+    sess.commit().await.map_err(|e| pg_error(&e))?;
+    answer
+}
+
+/// GET /storage/v1/bucket
+pub async fn list(State(app): State<Arc<App>>, parts: Parts) -> Result<Response, StorageError> {
+    let (ctx, _) = caller(&app, &parts)?;
+    let sess = begin(&app, &ctx, true).await?;
+    // No order by, deliberately. The reference does not write one
+    // either, so both answer in whatever order the scan hands back, and
+    // an order added here would be a difference rather than a fix. The
+    // day upstream grows a sort parameter this grows one too.
+    // Joined by hand rather than through json_agg, which writes a
+    // newline and a space between elements. Both spellings parse to the
+    // same array and only one of them is the bytes the reference sent.
+    let sql = format!(
+        "select coalesce('[' || string_agg(to_json(b)::text, ',') || ']', '[]')
+         from (select {} from storage.buckets) b",
+        bucket_columns(true)
+    );
+    let rows = sess.query(&sql, &[]).await.map_err(|e| pg_error(&e))?;
+    let body = rows
+        .first()
+        .map(|r| r.get::<_, String>(0))
+        .unwrap_or_else(|| "[]".to_string());
+    done(sess, Ok(ok(body))).await
+}
+
+/// GET /storage/v1/bucket/{id}
+pub async fn get(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    parts: Parts,
+) -> Result<Response, StorageError> {
+    let (ctx, _) = caller(&app, &parts)?;
+    let sess = begin(&app, &ctx, true).await?;
+    let sql = format!(
+        "select to_json(b)::text
+         from (select {} from storage.buckets where id = $1 limit 1) b",
+        bucket_columns(false)
+    );
+    let rows = sess.query(&sql, &[&id]).await.map_err(|e| pg_error(&e))?;
+    let found = rows.first().map(|r| r.get::<_, String>(0));
+    done(sess, found.map(ok).ok_or_else(StorageError::no_such_bucket)).await
+}
+
+/// The body of a create or an update, only the fields either of them
+/// reads.
+///
+/// Every field is optional even though a create needs a name, because
+/// what a missing name earns is a validation failure rather than a
+/// null, and that is a different answer with a different shape.
+struct BucketBody {
+    raw: serde_json::Value,
+    name: Option<String>,
+    id: Option<String>,
+    public: Option<bool>,
+    file_size_limit: Option<i64>,
+    allowed_mime_types: Option<Vec<String>>,
+}
+
+impl BucketBody {
+    /// Was the field written down at all? Which is not whether it has a
+    /// value: an update reads a field sent as null as an instruction to
+    /// clear the column, and a field left out as an instruction to
+    /// leave it alone.
+    fn sent(&self, field: &str) -> bool {
+        self.raw.get(field).is_some()
+    }
+}
+
+/// Read the body as json, or say what the reference says about a body
+/// that is not.
+///
+/// Read field by field rather than through a derive, which is how the
+/// rest of this server reads json too. It also happens to be the
+/// forgiving reading: upstream validates against a schema and refuses a
+/// field of the wrong type, and what it says when it does is not
+/// recorded, so a wrong type here is treated as a field that was not
+/// usable rather than answered with a sentence nobody has checked.
+async fn body_of(body: Body) -> Result<BucketBody, StorageError> {
+    let bytes = axum::body::to_bytes(body, BODY_LIMIT)
+        .await
+        .map_err(|_| StorageError::bad_json())?;
+    let raw: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| StorageError::bad_json())?;
+    Ok(BucketBody {
+        name: raw.get("name").and_then(|v| v.as_str()).map(str::to_string),
+        id: raw.get("id").and_then(|v| v.as_str()).map(str::to_string),
+        public: raw.get("public").and_then(|v| v.as_bool()),
+        file_size_limit: raw.get("file_size_limit").and_then(|v| v.as_i64()),
+        allowed_mime_types: raw.get("allowed_mime_types").and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|m| m.as_str().map(str::to_string))
+                    .collect()
+            })
+        }),
+        raw,
+    })
+}
+
+/// POST /storage/v1/bucket
+pub async fn create(
+    State(app): State<Arc<App>>,
+    parts: Parts,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let (ctx, verified) = caller(&app, &parts)?;
+    let bucket = body_of(body).await?;
+
+    let Some(name) = bucket.name.clone() else {
+        // Not recorded. The reference validates the body against a
+        // schema before the handler runs and this is the shape it
+        // answers with, but which sentence goes in the message is a
+        // question for the next recording round rather than something
+        // to invent confidently.
+        return Err(StorageError {
+            status: 400,
+            error: "FastifyError",
+            message: "body must have required property 'name'".to_string(),
+            code: "InvalidRequest",
+        });
+    };
+    // A create with no id takes the name as one. Recorded, and not
+    // something the documentation says.
+    let id = bucket.id.clone().unwrap_or_else(|| name.clone());
+    let sub = verified
+        .claims
+        .get("sub")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let sess = begin(&app, &ctx, false).await?;
+    // owner is a uuid and owner_id is text, and upstream writes the
+    // subject into both while marking the first deprecated. A service
+    // token has no subject at all and a third party one may have a
+    // subject that is not a uuid, so the cast is guarded rather than
+    // attempted. Guarded in sql because postgres is the end holding the
+    // column definition, and because zou carries no uuid type of its
+    // own to parse it with on this side.
+    sess.execute(
+        "insert into storage.buckets
+             (id, name, owner, owner_id, public, file_size_limit, allowed_mime_types, type)
+         values ($1, $2,
+                 case when $3::text ~*
+                     '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                     then $3::text::uuid end,
+                 nullif($3::text, ''),
+                 coalesce($4, false), $5, $6, 'STANDARD')",
+        &[
+            &id,
+            &name,
+            &sub,
+            &bucket.public,
+            &bucket.file_size_limit,
+            &bucket.allowed_mime_types,
+        ],
+    )
+    .await
+    .map_err(|e| pg_error(&e))?;
+    done(
+        sess,
+        Ok(ok(serde_json::json!({ "name": name }).to_string())),
+    )
+    .await
+}
+
+/// PUT /storage/v1/bucket/{id}
+pub async fn update(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    parts: Parts,
+    body: Body,
+) -> Result<Response, StorageError> {
+    let (ctx, _) = caller(&app, &parts)?;
+    let bucket = body_of(body).await?;
+
+    // Present, not non null. The reference filters on undefined, so a
+    // field sent as null clears the column and a field left out leaves
+    // it alone, and those are two different statements rather than one
+    // statement with a coalesce in it.
+    let mut sets: Vec<String> = Vec::new();
+    let mut args: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![&id];
+    if bucket.sent("public") {
+        args.push(&bucket.public);
+        sets.push(format!("public = ${}", args.len()));
+    }
+    if bucket.sent("file_size_limit") {
+        args.push(&bucket.file_size_limit);
+        sets.push(format!("file_size_limit = ${}", args.len()));
+    }
+    if bucket.sent("allowed_mime_types") {
+        args.push(&bucket.allowed_mime_types);
+        sets.push(format!("allowed_mime_types = ${}", args.len()));
+    }
+
+    let sess = begin(&app, &ctx, false).await?;
+    // Asked before the update rather than read off its row count,
+    // because a body with nothing in it still owes the caller an answer
+    // about whether the bucket is there, and reading it off the update
+    // would need this query anyway for that case.
+    if !bucket_exists(&sess, &id).await? {
+        return done(sess, Err(StorageError::no_such_bucket())).await;
+    }
+    if !sets.is_empty() {
+        let sql = format!(
+            "update storage.buckets set {} where id = $1",
+            sets.join(", ")
+        );
+        sess.execute(&sql, &args).await.map_err(|e| pg_error(&e))?;
+    }
+    done(sess, Ok(message("Successfully updated"))).await
+}
+
+/// The setting storage-api's own deletes turn on.
+///
+/// The storage schema refuses a delete that did not come through the
+/// api, from a statement trigger that reads this. Turning it on is not
+/// a way around the guard, it is how the guard is meant to be opened:
+/// its point is that a hand written delete in a psql session does not
+/// silently orphan objects in the store, not that the server cannot
+/// delete anything. Local, so it lasts this transaction and no longer.
+const ALLOW_DELETE: &str = "set local storage.allow_delete_query = 'true'";
+
+/// POST /storage/v1/bucket/{id}/empty
+pub async fn empty(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    parts: Parts,
+) -> Result<Response, StorageError> {
+    let (ctx, _) = caller(&app, &parts)?;
+    let sess = begin(&app, &ctx, false).await?;
+    if !bucket_exists(&sess, &id).await? {
+        return done(sess, Err(StorageError::no_such_bucket())).await;
+    }
+    sess.execute(ALLOW_DELETE, &[])
+        .await
+        .map_err(|e| pg_error(&e))?;
+    sess.execute("delete from storage.objects where bucket_id = $1", &[&id])
+        .await
+        .map_err(|e| pg_error(&e))?;
+    // Queued, says the reference, whether or not anything was in it and
+    // whether or not there is a queue. The sentence is the contract.
+    done(
+        sess,
+        Ok(message(
+            "Empty bucket has been queued. Completion may take up to an hour.",
+        )),
+    )
+    .await
+}
+
+/// DELETE /storage/v1/bucket/{id}
+pub async fn remove(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    parts: Parts,
+) -> Result<Response, StorageError> {
+    let (ctx, _) = caller(&app, &parts)?;
+    let sess = begin(&app, &ctx, false).await?;
+    if !bucket_exists(&sess, &id).await? {
+        return done(sess, Err(StorageError::no_such_bucket())).await;
+    }
+    // Asked rather than left to the foreign key. The reference asks the
+    // same question and answers it in its own words, and a caller who
+    // got the constraint violation instead would be reading about a
+    // column name.
+    let occupied = !sess
+        .query(
+            "select 1 from storage.objects where bucket_id = $1 limit 1",
+            &[&id],
+        )
+        .await
+        .map_err(|e| pg_error(&e))?
+        .is_empty();
+    if occupied {
+        return done(sess, Err(StorageError::not_empty())).await;
+    }
+    sess.execute(ALLOW_DELETE, &[])
+        .await
+        .map_err(|e| pg_error(&e))?;
+    sess.execute("delete from storage.buckets where id = $1", &[&id])
+        .await
+        .map_err(|e| pg_error(&e))?;
+    done(sess, Ok(message("Successfully deleted"))).await
+}

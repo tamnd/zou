@@ -44,6 +44,7 @@ pub mod rest;
 pub mod sms;
 pub mod smtp;
 pub mod sql;
+pub mod storage;
 pub mod totp;
 
 /// What the front door needs to know: the secret every key and token
@@ -744,6 +745,28 @@ pub fn router(cfg: Config) -> Result<Router, String> {
             "/auth/v1/callback",
             get(auth::callback).post(auth::callback_form),
         )
+        // The bucket surface, and outside the gate for a different
+        // reason than the rest of this router. storage-api sits behind
+        // the same hosted gateway everything else does, but it answers
+        // a request carrying no key in its own words rather than the
+        // gateway's, and it reads its token from the authorization
+        // header alone. Behind the gate a missing key would be refused
+        // one layer too early and in the wrong sentence, so the gate is
+        // in front of the surfaces that agree with it and these six
+        // check their own caller. The paths below the buckets still
+        // land on the stub in the gated router, because a wildcard
+        // segment loses to a literal one.
+        .route(
+            "/storage/v1/bucket",
+            get(storage::list).post(storage::create),
+        )
+        .route(
+            "/storage/v1/bucket/{id}",
+            get(storage::get)
+                .put(storage::update)
+                .delete(storage::remove),
+        )
+        .route("/storage/v1/bucket/{id}/empty", post(storage::empty))
         .with_state(Arc::clone(&app));
     Ok(Router::new()
         .merge(open)
