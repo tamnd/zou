@@ -12,9 +12,20 @@
 //! The costs this feeds are per-op: a put is a put whether it carried 8K
 //! or 8M, which is exactly how S3 bills, so counts and bytes are kept
 //! separately and never merged into one number here.
+//!
+//! The same file carries the smgr read tier counters: every page read a
+//! postgres backend makes lands in exactly one tier, cache when the
+//! local page cache answered, local when reconstruction ran entirely
+//! against local bytes, store when the read paid at least one store
+//! round trip. The read path reports through [`note_read_pages`] and
+//! [`note_read_call`], which open the `ZOU_STORE_STATS` file on first
+//! use and no-op when the variable is unset, so a server that nobody is
+//! measuring pays two branches per read and nothing else.
 
+use std::cell::Cell;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -24,20 +35,23 @@ use crate::cas::{CasError, CasStore, Version};
 /// layout so a dump from a stale binary fails loudly instead of reading
 /// garbage.
 const MAGIC: u64 = u64::from_ne_bytes(*b"ZOUSTATS");
-const FORMAT: u64 = 1;
+const FORMAT: u64 = 2;
 
 pub const OP_NAMES: [&str; 6] = ["get", "get_range", "put_if_match", "put", "delete", "list"];
-pub const CLASS_NAMES: [&str; 6] = ["manifest", "wal", "chk", "page", "file", "other"];
+pub const CLASS_NAMES: [&str; 7] = ["manifest", "wal", "chk", "shards", "page", "file", "other"];
+pub const TIER_NAMES: [&str; 3] = ["cache", "local", "store"];
 
 const KINDS: usize = OP_NAMES.len();
 const CLASSES: usize = CLASS_NAMES.len();
+const TIERS: usize = TIER_NAMES.len();
 const BUCKETS: usize = 32;
 
 const HEADER: usize = 2;
 const BUCKET_BASE: usize = HEADER + KINDS * CLASSES * 2;
 const ERROR_BASE: usize = BUCKET_BASE + KINDS * BUCKETS;
 const CONFLICT_SLOT: usize = ERROR_BASE + KINDS;
-const SLOTS: usize = CONFLICT_SLOT + 1;
+const TIER_BASE: usize = CONFLICT_SLOT + 1;
+const SLOTS: usize = TIER_BASE + TIERS * (2 + BUCKETS);
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -53,9 +67,15 @@ const fn count_slot(kind: usize, class: usize) -> usize {
     HEADER + (kind * CLASSES + class) * 2
 }
 
+const fn tier_slot(tier: usize) -> usize {
+    TIER_BASE + tier * (2 + BUCKETS)
+}
+
 /// Which layout region a key belongs to, as an index into
 /// [`CLASS_NAMES`]. Keys arrive with the tenants/ prefix still on, so
 /// substring checks against the layout's directory names are enough.
+/// The SHARD manifests classify with their layer objects, both live
+/// under shards/ and both are page service traffic.
 fn classify(key: &str) -> usize {
     if key.ends_with("MANIFEST") || key.contains("/manifests/") {
         0
@@ -63,12 +83,14 @@ fn classify(key: &str) -> usize {
         1
     } else if key.contains("/chk/") {
         2
-    } else if key.contains("/pg/") {
+    } else if key.contains("/shards/") {
         3
-    } else if key.contains("/files/") {
+    } else if key.contains("/pg/") {
         4
-    } else {
+    } else if key.contains("/files/") {
         5
+    } else {
+        6
     }
 }
 
@@ -114,6 +136,7 @@ impl Counters {
     }
 
     fn op(&self, op: Op, key: &str, bytes: u64, elapsed: Duration, err: Option<&CasError>) {
+        THREAD_OPS.with(|c| c.set(c.get() + 1));
         let kind = op as usize;
         let class = classify(key);
         self.add(count_slot(kind, class), 1);
@@ -126,6 +149,65 @@ impl Counters {
             Some(_) => self.add(ERROR_BASE + kind, 1),
             None => {}
         }
+    }
+}
+
+/// Which tier answered one smgr read, [`TIER_NAMES`] in enum form.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReadTier {
+    /// The local page cache had the page, no reconstruction ran.
+    Cache,
+    /// Reconstruction ran entirely against local bytes, slab cache
+    /// hits and local redo.
+    Local,
+    /// At least one store round trip happened inside the read.
+    Store,
+}
+
+thread_local! {
+    static THREAD_OPS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Store ops this thread has made through any [`StatsStore`], ever.
+/// A read path samples it before and after to learn whether serving a
+/// page left the process. Worker threads a read fans out to are not
+/// covered, callers classify those paths by construction instead.
+pub fn thread_ops() -> u64 {
+    THREAD_OPS.with(|c| c.get())
+}
+
+/// The counter file for direct tier reporting, opened once per process
+/// from `ZOU_STORE_STATS`. None when the variable is unset or the file
+/// cannot be mapped, and every report is then a no-op.
+fn global() -> Option<&'static Counters> {
+    static GLOBAL: OnceLock<Option<Counters>> = OnceLock::new();
+    GLOBAL
+        .get_or_init(|| {
+            let path = std::env::var("ZOU_STORE_STATS")
+                .ok()
+                .filter(|p| !p.is_empty())?;
+            Counters::open(Path::new(&path)).ok()
+        })
+        .as_ref()
+}
+
+/// Count pages served by a tier. Split from the call sample so a
+/// vectored read can attribute every page to the tier that served it
+/// while its latency lands once, under the slowest tier it touched.
+pub fn note_read_pages(tier: ReadTier, pages: u64) {
+    if pages > 0
+        && let Some(c) = global()
+    {
+        c.add(tier_slot(tier as usize) + 1, pages);
+    }
+}
+
+/// Record one smgr read call under the tier that bounded it.
+pub fn note_read_call(tier: ReadTier, elapsed: Duration) {
+    if let Some(c) = global() {
+        let t = tier as usize;
+        c.add(tier_slot(t), 1);
+        c.add(tier_slot(t) + 2 + bucket(elapsed), 1);
     }
 }
 
@@ -247,12 +329,26 @@ pub struct ClassSnapshot {
     pub bytes: u64,
 }
 
+/// One read tier, decoded from the file. Calls are smgr reads, pages
+/// can exceed calls because vectored reads serve many pages per call.
+#[derive(Debug, serde::Serialize)]
+pub struct TierSnapshot {
+    pub tier: &'static str,
+    pub calls: u64,
+    pub pages: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+}
+
 /// The whole counter file, decoded. This reads the file cold rather
 /// than mapping it, so dumping never touches the counters.
 #[derive(Debug, serde::Serialize)]
 pub struct Snapshot {
     pub conflicts: u64,
     pub ops: Vec<OpSnapshot>,
+    pub reads: Vec<TierSnapshot>,
 }
 
 fn percentile(buckets: &[u64], total: u64, q: f64) -> u64 {
@@ -321,9 +417,29 @@ impl Snapshot {
                 by_class,
             });
         }
+        let mut reads = Vec::with_capacity(TIERS);
+        for (tier, name) in TIER_NAMES.iter().copied().enumerate() {
+            let calls = slot(tier_slot(tier));
+            let buckets: Vec<u64> = (0..BUCKETS)
+                .map(|b| slot(tier_slot(tier) + 2 + b))
+                .collect();
+            reads.push(TierSnapshot {
+                tier: name,
+                calls,
+                pages: slot(tier_slot(tier) + 1),
+                p50_us: percentile(&buckets, calls, 0.50),
+                p95_us: percentile(&buckets, calls, 0.95),
+                p99_us: percentile(&buckets, calls, 0.99),
+                max_us: buckets
+                    .iter()
+                    .rposition(|&n| n > 0)
+                    .map_or(0, |b| 1u64 << (b + 1)),
+            });
+        }
         Ok(Self {
             conflicts: slot(CONFLICT_SLOT),
             ops,
+            reads,
         })
     }
 
@@ -347,9 +463,53 @@ mod tests {
         assert_eq!(classify("tenants/a/manifests/0-0.json"), 0);
         assert_eq!(classify("tenants/a/wal/0000000000000001/00.wal"), 1);
         assert_eq!(classify("tenants/a/chk/chk-1/INDEX"), 2);
-        assert_eq!(classify("tenants/a/pg/1663/5/16384/0/00000001"), 3);
-        assert_eq!(classify("tenants/a/files/avatars/pic.png"), 4);
-        assert_eq!(classify("something-else"), 5);
+        assert_eq!(classify("tenants/a/shards/0000/SHARD"), 3);
+        assert_eq!(
+            classify("tenants/a/shards/0000/i-00-ff-0000000000000001.il"),
+            3
+        );
+        assert_eq!(classify("tenants/a/pg/1663/5/16384/0/00000001"), 4);
+        assert_eq!(classify("tenants/a/files/avatars/pic.png"), 5);
+        assert_eq!(classify("something-else"), 6);
+    }
+
+    #[test]
+    fn read_tiers_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Counters::open(&dir.path().join("stats")).unwrap();
+        for _ in 0..3 {
+            counters.add(tier_slot(ReadTier::Cache as usize), 1);
+            counters.add(tier_slot(ReadTier::Cache as usize) + 1, 1);
+            counters.add(
+                tier_slot(ReadTier::Cache as usize) + 2 + bucket(Duration::from_micros(40)),
+                1,
+            );
+        }
+        counters.add(tier_slot(ReadTier::Store as usize), 1);
+        counters.add(tier_slot(ReadTier::Store as usize) + 1, 128);
+        counters.add(
+            tier_slot(ReadTier::Store as usize) + 2 + bucket(Duration::from_millis(30)),
+            1,
+        );
+        let snap = Snapshot::read(&dir.path().join("stats")).unwrap();
+        let tier = |name: &str| snap.reads.iter().find(|t| t.tier == name).unwrap();
+        assert_eq!(tier("cache").calls, 3);
+        assert_eq!(tier("cache").pages, 3);
+        assert!(tier("cache").p50_us >= 40 && tier("cache").p50_us < 128);
+        assert_eq!(tier("local").calls, 0);
+        assert_eq!(tier("store").calls, 1);
+        assert_eq!(tier("store").pages, 128);
+        assert!(tier("store").p50_us >= 30_000);
+    }
+
+    #[test]
+    fn thread_ops_count_every_wrapped_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = wrap(dir.path(), &dir.path().join("stats"));
+        let before = thread_ops();
+        store.put("tenants/a/pg/1/2/3/0/00000000", b"x").unwrap();
+        store.get("tenants/a/pg/1/2/3/0/00000000").unwrap();
+        assert_eq!(thread_ops(), before + 2);
     }
 
     #[test]
