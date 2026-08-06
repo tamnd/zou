@@ -3713,11 +3713,17 @@ pub(crate) async fn read_json(body: Body) -> Result<serde_json::Value, Response>
         )
     })?;
     serde_json::from_slice(&bytes).map_err(|_| {
-        error_body(
-            StatusCode::BAD_REQUEST,
-            "bad_json",
-            "Could not parse request body as JSON",
-        )
+        // Upstream prints what its parser said after the colon, and a
+        // client that shows the message shows that too, so the message
+        // is only the same message with the reason on the end of it.
+        // When Go would have read the body happily the refusal came
+        // from somewhere serde looks and Go does not, and there is no
+        // honest reason to give.
+        let msg = match crate::gojson::syntax(&bytes) {
+            Some(why) => format!("Could not parse request body as JSON: {why}"),
+            None => "Could not parse request body as JSON".to_string(),
+        };
+        error_body(StatusCode::BAD_REQUEST, "bad_json", &msg)
     })
 }
 
