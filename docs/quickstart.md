@@ -124,6 +124,15 @@ The client library needs nothing new. `supabase.auth.signInWithOAuth({ provider:
 
 An address a provider will not vouch for never links to an account that already holds it. Signing in at a provider with somebody else's address gets a new account with no address at all, which is what GoTrue does and the reason it does it.
 
+Github does not have to be github.com. `ZOU_EXTERNAL_GITHUB_URL` points the whole flow at a GitHub Enterprise install, which serves the sign in pages at the host itself and the api under `/api/v3`, and zou works both addresses out from the one variable the way GoTrue does. It is the only provider that reads a url: Google and Apple are found through their issuer, so a url set for either of them is logged and ignored rather than used, which is also what upstream does.
+
+```bash
+ZOU_EXTERNAL_GITHUB_CLIENT_ID=... \
+ZOU_EXTERNAL_GITHUB_SECRET=... \
+ZOU_EXTERNAL_GITHUB_URL=https://git.example.com \
+  zou dev /tmp/mydb --http 54321
+```
+
 Apple is the same three variables and one extra way to configure it. Its client secret is a JWT with a five minute life rather than a string, so a project can either mint one itself and put it in `ZOU_EXTERNAL_APPLE_SECRET` the way GoTrue takes it, or hand over the key and let zou mint one per exchange:
 
 ```bash

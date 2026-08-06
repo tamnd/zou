@@ -247,9 +247,46 @@ pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Providers, Stri
         if let Some(uri) = var(&format!("ZOU_EXTERNAL_{upper}_REDIRECT_URI")) {
             provider.redirect_uri = uri;
         }
+        if let Some(url) = var(&format!("ZOU_EXTERNAL_{upper}_URL")) {
+            elsewhere(&mut provider, &url);
+        }
         out.insert(provider);
     }
     Ok(out)
+}
+
+/// A provider that does not live where it usually does.
+///
+/// `ZOU_EXTERNAL_<NAME>_URL` is GoTrue's variable and GoTrue reads it
+/// for exactly one of the three providers here: github, where it is
+/// how a GitHub Enterprise install is reached. Google and Apple are
+/// found through their issuer's discovery document, so a url means
+/// nothing to them and upstream logs a line saying so rather than
+/// silently using it. This does the same, because the difference
+/// between ignored and honoured is a sign in that goes somewhere
+/// unexpected.
+fn elsewhere(provider: &mut Provider, url: &str) {
+    let base = url.trim_end_matches('/');
+    if base.is_empty() {
+        return;
+    }
+    if provider.name != "github" {
+        log::warn!(
+            "ZOU_EXTERNAL_{}_URL is set and ignored: only github reads it",
+            provider.name.to_ascii_uppercase()
+        );
+        return;
+    }
+    // Enterprise serves the browser half at the host itself and the
+    // api under /api/v3. github.com is the one install where the api
+    // lives on its own hostname, so a url already pointing at that
+    // hostname is taken as the api root and left alone.
+    provider.authorize_url = format!("{base}/login/oauth/authorize");
+    provider.token_url = format!("{base}/login/oauth/access_token");
+    provider.user_url = match base.ends_with("api.github.com") {
+        true => format!("{base}/user"),
+        false => format!("{base}/api/v3/user"),
+    };
 }
 
 /// The signing key for Apple, when there is one. All three parts have
@@ -768,6 +805,60 @@ mod tests {
         );
 
         assert!(from_vars(|_| None).expect("nothing configured").is_empty());
+    }
+
+    #[test]
+    fn github_can_live_somewhere_other_than_github_com() {
+        let providers = from_vars(|name| match name {
+            "ZOU_EXTERNAL_GITHUB_CLIENT_ID" => Some("id".to_string()),
+            "ZOU_EXTERNAL_GITHUB_SECRET" => Some("shh".to_string()),
+            "ZOU_EXTERNAL_GITHUB_URL" => Some("https://git.example.com/".to_string()),
+            _ => None,
+        })
+        .expect("configured");
+        let github = providers.get("github").expect("github");
+        assert_eq!(
+            github.authorize_url, "https://git.example.com/login/oauth/authorize",
+            "the trailing slash on the variable is not a second one in the url"
+        );
+        assert_eq!(
+            github.token_url,
+            "https://git.example.com/login/oauth/access_token"
+        );
+        assert_eq!(
+            github.user_url, "https://git.example.com/api/v3/user",
+            "Enterprise serves the api under /api/v3"
+        );
+
+        // A url that is already the api hostname is the api root, so
+        // the version prefix would be a second one.
+        let providers = from_vars(|name| match name {
+            "ZOU_EXTERNAL_GITHUB_CLIENT_ID" => Some("id".to_string()),
+            "ZOU_EXTERNAL_GITHUB_SECRET" => Some("shh".to_string()),
+            "ZOU_EXTERNAL_GITHUB_URL" => Some("https://api.github.com".to_string()),
+            _ => None,
+        })
+        .expect("configured");
+        assert_eq!(
+            providers.get("github").expect("github").user_url,
+            "https://api.github.com/user"
+        );
+    }
+
+    #[test]
+    fn a_url_for_a_provider_that_does_not_read_one_changes_nothing() {
+        let providers = from_vars(|name| match name {
+            "ZOU_EXTERNAL_GOOGLE_CLIENT_ID" => Some("id".to_string()),
+            "ZOU_EXTERNAL_GOOGLE_SECRET" => Some("shh".to_string()),
+            "ZOU_EXTERNAL_GOOGLE_URL" => Some("https://accounts.example.com".to_string()),
+            _ => None,
+        })
+        .expect("configured");
+        let google = providers.get("google").expect("google");
+        assert_eq!(
+            google.authorize_url, "https://accounts.google.com/o/oauth2/v2/auth",
+            "upstream warns and ignores it, and a sign in that quietly went somewhere else would be worse"
+        );
     }
 
     #[test]
