@@ -255,6 +255,10 @@ jobs:
       - name: Start the reference
         run: |
           psql "$ZOU_CONFORMANCE_DSN" -v ON_ERROR_STOP=1 -c 'create database gotrue_ref'
+          # The first migration creates tables in auth without creating
+          # auth, because upstream runs it against the supabase image
+          # where the schema is already there.
+          psql "$GOTRUE_DSN" -v ON_ERROR_STOP=1 -c 'create schema auth'
           cat > /tmp/gotrue/.env <<'CONF'
           GOTRUE_API_HOST=127.0.0.1
           GOTRUE_API_PORT=54331

@@ -468,9 +468,11 @@ async fn the_reauthentication_code_is_in_the_subject_and_is_the_one_accepted() {
         .to_string();
     backdate(&pool, "sessions", &session, "created_at", "2 days").await;
 
+    // A GET, because that is what upstream routes and what the client
+    // sends. A POST here answers 405 with Allow: GET.
     let asked = as_user(
         &app,
-        "POST",
+        "GET",
         "/auth/v1/reauthenticate",
         &token,
         serde_json::json!({}),

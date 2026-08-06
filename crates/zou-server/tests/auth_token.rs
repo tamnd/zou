@@ -550,10 +550,33 @@ async fn the_grant_refuses_what_it_cannot_serve() {
     let Some(dsn) = dsn() else { return };
     let app = app(&dsn);
 
+    // A refresh token is twelve characters of lowercase and digits,
+    // and the shape is checked before the lookup, so a string that
+    // could not be one never reaches the table. Upstream answers the
+    // same thing to a body with no refresh token at all, because an
+    // empty string is the wrong shape like any other.
     let (status, body) = post_token(
         &app,
         "refresh_token",
         serde_json::json!({"refresh_token": "notatokenatall"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error_code"], "validation_failed");
+    assert_eq!(body["msg"], "Refresh token is not valid");
+
+    let (status, body) = post_token(&app, "refresh_token", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error_code"], "validation_failed");
+    assert_eq!(body["msg"], "Refresh token is not valid");
+
+    // The right shape and no row is the other refusal, and the two are
+    // worth telling apart: this one means the token was issued and is
+    // gone, and a client that sees it has to sign in again.
+    let (status, body) = post_token(
+        &app,
+        "refresh_token",
+        serde_json::json!({"refresh_token": "zz9x0q7m4k1p"}),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -562,11 +585,6 @@ async fn the_grant_refuses_what_it_cannot_serve() {
         body["msg"],
         "Invalid Refresh Token: Refresh Token Not Found"
     );
-
-    let (status, body) = post_token(&app, "refresh_token", serde_json::json!({})).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error_code"], "validation_failed");
-    assert_eq!(body["msg"], "refresh_token required");
 
     // An unknown grant is 400 with GoTrue's own wording, a grant that
     // is coming is 501, and the difference matters to a client that is

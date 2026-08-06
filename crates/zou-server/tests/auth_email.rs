@@ -1077,9 +1077,11 @@ async fn reauthentication_gates_a_password_update_when_the_project_asks() {
         )
     );
 
+    // A GET, because that is what upstream routes and what the client
+    // sends. A POST here answers 405 with Allow: GET.
     let asked = as_user(
         &app,
-        "POST",
+        "GET",
         "/auth/v1/reauthenticate",
         &token,
         serde_json::json!({}),
