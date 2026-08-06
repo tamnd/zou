@@ -466,6 +466,31 @@ pub fn scan_available(window: &WalWindow, start: u64) -> Result<ScanOut, String>
     scan(window, start, None)
 }
 
+/// The aligned end of a record `tot_len` bytes long starting at `lsn`,
+/// the value [`read_records`] reports as `end_lsn`. Page headers the
+/// record crosses count, and the end is maxaligned because that is
+/// where the next record starts. Redo stamps this lsn into pages, and
+/// layers store records keyed by start lsn only, so the page service
+/// recomputes it when it builds a redo batch. It can, because the WAL
+/// geometry is fixed.
+pub fn record_end(lsn: u64, tot_len: u64) -> u64 {
+    let mut pos = lsn;
+    let mut remaining = tot_len;
+    while remaining > 0 {
+        if pos.is_multiple_of(XLOG_BLCKSZ) {
+            pos += if pos.is_multiple_of(WAL_SEGMENT_SIZE) {
+                LONG_PHD
+            } else {
+                SHORT_PHD
+            };
+        }
+        let run = (XLOG_BLCKSZ - pos % XLOG_BLCKSZ).min(remaining);
+        pos += run;
+        remaining -= run;
+    }
+    (pos + MAXALIGN - 1) & !(MAXALIGN - 1)
+}
+
 /// One complete record pulled out of a window: the raw bytes with page
 /// headers stripped, which is exactly the contiguous form xlogreader
 /// hands a redo routine and what the redo pool ships to its workers.
@@ -735,6 +760,35 @@ mod tests {
         assert_eq!(refs.len(), 6);
         assert_eq!(refs[0], blk(20000, 0));
         assert_eq!(refs[5], blk(20005, 5));
+    }
+
+    #[test]
+    fn record_end_recomputes_what_read_records_reported() {
+        let mut b = Builder::new(WAL_SEGMENT_SIZE);
+        // Sizes all over the place so records land inside pages, end
+        // exactly on boundaries, and cross one or several pages.
+        for i in 0..40u32 {
+            let filler = vec![0x77u8; (i * 397 % 6100) as usize];
+            b.record(&[(blk(30000 + i, i), false)], &filler);
+        }
+        let end = b.pos();
+        let window = b.window();
+        let out = read_records(&window, WAL_SEGMENT_SIZE, Some(end)).unwrap();
+        assert_eq!(out.records.len(), 40);
+        assert!(
+            out.records
+                .iter()
+                .any(|r| r.lsn / XLOG_BLCKSZ != (r.end_lsn - 1) / XLOG_BLCKSZ),
+            "some record crosses a page"
+        );
+        for r in &out.records {
+            assert_eq!(
+                record_end(r.lsn, r.bytes.len() as u64),
+                r.end_lsn,
+                "record at {:#x}",
+                r.lsn
+            );
+        }
     }
 
     #[test]
