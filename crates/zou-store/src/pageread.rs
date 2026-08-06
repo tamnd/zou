@@ -49,6 +49,10 @@ pub enum ReadError {
     Mismatched { name: String },
     #[error("layer {name} came back short at {offset}+{len}")]
     ShortRange { name: String, offset: u64, len: u64 },
+    #[error(
+        "layer {name} belongs to {owner} but this reader has no shard context to resolve it, attach with for_shard"
+    )]
+    ForeignLayer { name: String, owner: String },
 }
 
 /// One reconstructed key: what the redo pool needs to materialize it.
@@ -70,6 +74,10 @@ pub struct LayerReader<'a> {
     store: &'a dyn CasStore,
     /// Object key prefix layer names append to.
     prefix: String,
+    /// The shard number, needed to resolve an inherited layer to its
+    /// owner's shard prefix. A reader without it serves only maps with
+    /// no owner tags.
+    shard: Option<u16>,
     footers: Mutex<HashMap<String, Arc<LayerFooter>>>,
 }
 
@@ -78,12 +86,52 @@ impl<'a> LayerReader<'a> {
         Self {
             store,
             prefix: prefix.into(),
+            shard: None,
             footers: Mutex::new(HashMap::new()),
         }
     }
 
-    fn range(&self, name: &str, offset: u64, len: u64) -> Result<Vec<u8>, ReadError> {
-        let object = format!("{}{}", self.prefix, name);
+    /// A reader bound to one tenant's shard, able to follow owner tags
+    /// into ancestor prefixes. Branched tenants must attach this way,
+    /// [`LayerReader::new`] refuses their inherited layers loudly.
+    pub fn for_shard(store: &'a dyn CasStore, tenant_ref: &str, shard: u16) -> Self {
+        Self {
+            store,
+            prefix: crate::layout::TenantLayout::new(tenant_ref).shard_prefix(shard),
+            shard: Some(shard),
+            footers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The object key for a layer: its name under this shard's prefix,
+    /// or under the owner's shard prefix when the layer is inherited.
+    /// The shard number is the same on both sides because a branch
+    /// copies shard manifests one to one.
+    fn object_key(&self, desc: &LayerDesc, name: &str) -> Result<String, ReadError> {
+        match &desc.owner {
+            None => Ok(format!("{}{}", self.prefix, name)),
+            Some(owner) => match self.shard {
+                Some(shard) => Ok(format!(
+                    "{}{}",
+                    crate::layout::TenantLayout::new(owner).shard_prefix(shard),
+                    name
+                )),
+                None => Err(ReadError::ForeignLayer {
+                    name: name.to_string(),
+                    owner: owner.clone(),
+                }),
+            },
+        }
+    }
+
+    fn range(
+        &self,
+        desc: &LayerDesc,
+        name: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, ReadError> {
+        let object = self.object_key(desc, name)?;
         let bytes =
             self.store
                 .get_range(&object, offset, len)?
@@ -113,13 +161,13 @@ impl<'a> LayerReader<'a> {
             name: name.clone(),
             source,
         };
-        let header = self.range(&name, 0, LAYER_HEADER_LEN as u64)?;
+        let header = self.range(desc, &name, 0, LAYER_HEADER_LEN as u64)?;
         let guess = FOOTER_GUESS.min(desc.size);
-        let suffix = self.range(&name, desc.size - guess, guess)?;
+        let suffix = self.range(desc, &name, desc.size - guess, guess)?;
         let footer = match read_layer_footer_ranges(&header, &suffix, desc.size) {
             Ok(footer) => footer,
             Err(LayerDecodeError::Truncated { need, .. }) if (need as u64) > guess => {
-                let exact = self.range(&name, desc.size - need as u64, need as u64)?;
+                let exact = self.range(desc, &name, desc.size - need as u64, need as u64)?;
                 read_layer_footer_ranges(&header, &exact, desc.size).map_err(layer_err)?
             }
             Err(source) => return Err(layer_err(source)),
@@ -158,7 +206,7 @@ impl<'a> LayerReader<'a> {
             let footer = self.footer(desc)?;
             if footer.may_contain(key) {
                 for meta in footer.locate(key) {
-                    let bytes = self.range(&desc.name(), meta.offset, meta.len as u64)?;
+                    let bytes = self.range(desc, &desc.name(), meta.offset, meta.len as u64)?;
                     let entries =
                         decode_image_block(&bytes, meta).map_err(|source| ReadError::Layer {
                             name: desc.name(),
@@ -178,15 +226,19 @@ impl<'a> LayerReader<'a> {
             if !footer.may_contain(key) {
                 continue;
             }
+            // An inherited layer can carry records past the branch cut,
+            // the owner's future; the clamp keeps them out of this
+            // tenant's history.
+            let ceil = desc.clamp(lsn);
             for meta in footer.locate(key) {
-                let bytes = self.range(&desc.name(), meta.offset, meta.len as u64)?;
+                let bytes = self.range(desc, &desc.name(), meta.offset, meta.len as u64)?;
                 let entries =
                     decode_delta_block(&bytes, meta).map_err(|source| ReadError::Layer {
                         name: desc.name(),
                         source,
                     })?;
                 for e in entries {
-                    if e.key == *key && floor < e.lsn && e.lsn <= lsn {
+                    if e.key == *key && floor < e.lsn && e.lsn <= ceil {
                         merged.insert(e.lsn, e.record);
                     }
                 }

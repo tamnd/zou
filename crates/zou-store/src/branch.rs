@@ -1,9 +1,13 @@
 //! Branch creation and point in time materialization.
 //!
-//! A branch is a new tenant prefix whose manifest points into its
-//! parent's immutable objects: checkpoint refs are copied and tagged
-//! with their owning tenant. Nothing else moves, so a branch is one
-//! manifest GET and one conditional PUT whatever the database size.
+//! A branch is a new tenant prefix whose manifests point into its
+//! parent's immutable objects: checkpoint refs and page shard layer
+//! entries are copied and tagged with their owning tenant, and the
+//! shard entries additionally carry the branch cut so an inherited
+//! delta never serves records past the branch point. No data moves,
+//! so a branch costs one manifest GET, one GET and PUT per page shard
+//! the parent has, and one conditional PUT, whatever the database
+//! size.
 //!
 //! Branch points are checkpoint lsns. The tenant's WAL lives in the
 //! shared log, which consolidation rewrites and gc trims on its own
@@ -20,9 +24,11 @@
 //! back exactly that far.
 
 use crate::cas::{CasError, CasStore};
+use crate::layermap::LayerDesc;
 use crate::layout::TenantLayout;
 use crate::lsn::Lsn;
 use crate::manifest::{BranchOf, Manifest, ManifestError};
+use crate::shardmanifest::{PageShardError, PageShardManifest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BranchError {
@@ -40,6 +46,8 @@ pub enum BranchError {
     NoHistory { unix_ts: u64 },
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    #[error("shard manifest: {0}")]
+    Shard(#[from] PageShardError),
     #[error(transparent)]
     Store(#[from] CasError),
 }
@@ -61,6 +69,7 @@ pub fn branch(
     };
     let parent = Manifest::from_json(&data)?;
     let child = child_of(&parent, src_ref, dst_ref, at_lsn, now_unix)?;
+    branch_shards(store, src_ref, dst_ref, branch_point(&child))?;
     publish_child(store, dst_ref, &child)?;
     Ok(child)
 }
@@ -78,8 +87,18 @@ pub fn materialize_at(
 ) -> Result<Manifest, BranchError> {
     let snapshot = snapshot_at(store, src_ref, unix_ts)?;
     let child = child_of(&snapshot, src_ref, dst_ref, None, now_unix)?;
+    branch_shards(store, src_ref, dst_ref, branch_point(&child))?;
     publish_child(store, dst_ref, &child)?;
     Ok(child)
+}
+
+/// The lsn a freshly built child branches at.
+fn branch_point(child: &Manifest) -> Lsn {
+    child
+        .branch_of
+        .as_ref()
+        .expect("child_of always sets branch_of")
+        .at_lsn
 }
 
 /// The newest history snapshot of `src_ref` at or before `unix_ts`,
@@ -158,6 +177,61 @@ fn child_of(
     Ok(child)
 }
 
+/// Copy the parent's page shard manifests under the child, cut at the
+/// branch point. The child must capture the parent's layer list now:
+/// the parent keeps compacting, its manifest stops naming layers the
+/// child still needs, and gc pins layers by walking manifests. Entries
+/// keep their owner when they already carry one, a grandchild still
+/// names the tenant whose prefix holds the bytes, and the branch cut
+/// only ever tightens.
+///
+/// Each child SHARD is a plain put, not a CAS: nothing serves the
+/// child until its tenant manifest lands, so a branch that crashed
+/// here retries by overwriting its own leftovers. The tenant manifest
+/// CAS in [`publish_child`] stays the one commit point.
+fn branch_shards(
+    store: &dyn CasStore,
+    src_ref: &str,
+    dst_ref: &str,
+    at: Lsn,
+) -> Result<(), BranchError> {
+    let src = TenantLayout::new(src_ref);
+    let dst = TenantLayout::new(dst_ref);
+    for key in store.list(&src.shards_dir())? {
+        if !key.ends_with("/SHARD") {
+            continue;
+        }
+        let Some((parent, _)) = PageShardManifest::load(store, &key)? else {
+            continue;
+        };
+        let mut child = PageShardManifest::new(parent.shard);
+        // Inheritance needs format 2: a binary that predates it must
+        // refuse the whole shard instead of quietly fetching inherited
+        // layers from the wrong prefix.
+        child.format = 2;
+        child.disk_consistent_lsn = parent.disk_consistent_lsn.min(at);
+        for l in &parent.layers {
+            let desc = LayerDesc::parse(&l.name, l.size).map_err(PageShardError::from)?;
+            // A layer that starts past the branch point is entirely
+            // the parent's future; images taken after the point drop
+            // out here too.
+            if desc.min_lsn > at {
+                continue;
+            }
+            let mut e = l.clone();
+            if e.owner.is_none() {
+                e.owner = Some(src_ref.to_string());
+            }
+            if desc.max_lsn > at || e.upto.is_some() {
+                e.upto = Some(e.upto.map_or(at, |u| u.min(at)));
+            }
+            child.layers.push(e);
+        }
+        store.put(&dst.shard_manifest(parent.shard), &child.encode())?;
+    }
+    Ok(())
+}
+
 /// Land the child manifest, refusing to clobber an existing tenant.
 fn publish_child(store: &dyn CasStore, dst_ref: &str, child: &Manifest) -> Result<(), BranchError> {
     let dst = TenantLayout::new(dst_ref);
@@ -176,7 +250,9 @@ fn publish_child(store: &dyn CasStore, dst_ref: &str, child: &Manifest) -> Resul
 mod tests {
     use super::*;
     use crate::cas::LocalFsStore;
+    use crate::layer::LayerKey;
     use crate::manifest::{CheckpointKind, CheckpointRef};
+    use crate::shardmanifest::LayerEntry;
 
     fn chk(id: &str, lsn: u64, kind: CheckpointKind) -> CheckpointRef {
         CheckpointRef {
@@ -208,6 +284,137 @@ mod tests {
             )
             .unwrap();
         (dir, store)
+    }
+
+    fn k(block: u32) -> LayerKey {
+        LayerKey::page(1663, 5, 16384, 0, block)
+    }
+
+    fn delta_entry(min: u64, max: u64) -> LayerEntry {
+        LayerEntry {
+            name: LayerDesc::delta(k(0), k(9), Lsn(min), Lsn(max)).name(),
+            size: 1000,
+            owner: None,
+            upto: None,
+        }
+    }
+
+    fn image_entry(lsn: u64) -> LayerEntry {
+        LayerEntry {
+            name: LayerDesc::image(k(0), k(9), Lsn(lsn)).name(),
+            size: 1000,
+            owner: None,
+            upto: None,
+        }
+    }
+
+    /// The parent's shard 0: an image, a delta before the branch
+    /// point, a delta spanning it, and an image past it.
+    fn setup_shard(store: &LocalFsStore) {
+        let mut m = PageShardManifest::new(0);
+        m.disk_consistent_lsn = Lsn(0x300);
+        m.layers = vec![
+            image_entry(0x100),
+            delta_entry(0x101, 0x180),
+            delta_entry(0x0F0, 0x300),
+            image_entry(0x280),
+        ];
+        let p = TenantLayout::new("p");
+        store.put(&p.shard_manifest(0), &m.encode()).unwrap();
+        // A layer object in the prefix must not be mistaken for a
+        // shard manifest.
+        store
+            .put(&format!("{}{}", p.shard_prefix(0), m.layers[0].name), b"x")
+            .unwrap();
+    }
+
+    fn child_shard(store: &LocalFsStore, tenant_ref: &str) -> PageShardManifest {
+        let key = TenantLayout::new(tenant_ref).shard_manifest(0);
+        PageShardManifest::load(store, &key).unwrap().unwrap().0
+    }
+
+    #[test]
+    fn a_branch_cuts_and_tags_the_shard_manifests() {
+        let (_d, store) = setup();
+        setup_shard(&store);
+        branch(&store, "p", "c", Some(Lsn(0x200)), 5000).unwrap();
+
+        let m = child_shard(&store, "c");
+        assert_eq!(m.format, 2, "inheritance needs the format gate");
+        assert_eq!(
+            m.disk_consistent_lsn,
+            Lsn(0x200),
+            "the flush watermark cannot claim past the branch point"
+        );
+        assert_eq!(
+            m.layers.len(),
+            3,
+            "the image past the branch point dropped out"
+        );
+        assert!(
+            m.layers.iter().all(|l| l.owner.as_deref() == Some("p")),
+            "every inherited entry names its owner"
+        );
+        assert_eq!(m.layers[0].upto, None, "an image needs no cut");
+        assert_eq!(
+            m.layers[1].upto, None,
+            "a delta entirely before the point needs no cut"
+        );
+        assert_eq!(
+            m.layers[2].upto,
+            Some(Lsn(0x200)),
+            "the spanning delta is cut at the branch point"
+        );
+        // And the map the child attaches with carries all of it.
+        let map = m.layer_map().unwrap();
+        assert_eq!(map.layers()[2].upto, Some(Lsn(0x200)));
+    }
+
+    #[test]
+    fn branching_a_branch_tightens_the_cut_and_keeps_the_owner() {
+        let (_d, store) = setup();
+        setup_shard(&store);
+        branch(&store, "p", "c", None, 5000).unwrap();
+        branch(&store, "c", "g", Some(Lsn(0x100)), 6000).unwrap();
+
+        let m = child_shard(&store, "g");
+        assert_eq!(
+            m.layers.len(),
+            2,
+            "deltas starting past the earlier point dropped out"
+        );
+        assert!(
+            m.layers.iter().all(|l| l.owner.as_deref() == Some("p")),
+            "the grandchild still names the tenant whose prefix holds the bytes"
+        );
+        assert_eq!(m.layers[0].upto, None);
+        assert_eq!(
+            m.layers[1].upto,
+            Some(Lsn(0x100)),
+            "the cut tightened to the earlier branch point"
+        );
+        assert_eq!(m.disk_consistent_lsn, Lsn(0x100));
+    }
+
+    #[test]
+    fn a_crashed_branch_retry_overwrites_its_leftovers() {
+        let (_d, store) = setup();
+        setup_shard(&store);
+        // A first attempt died after writing the shard manifest but
+        // before the tenant manifest landed.
+        branch_shards(&store, "p", "c", Lsn(0x100)).unwrap();
+        assert!(
+            store
+                .get(&TenantLayout::new("c").manifest())
+                .unwrap()
+                .is_none(),
+            "nothing committed yet"
+        );
+        // The retry picks a different branch point and must win whole.
+        branch(&store, "p", "c", Some(Lsn(0x200)), 5000).unwrap();
+        let m = child_shard(&store, "c");
+        assert_eq!(m.disk_consistent_lsn, Lsn(0x200));
+        assert_eq!(m.layers.len(), 3);
     }
 
     #[test]

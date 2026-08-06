@@ -44,7 +44,7 @@ use zou_store::manifest::{CheckpointKind, CheckpointRef};
 use zou_store::{CasError, CasStore, Lsn, Manifest};
 
 use crate::capture;
-use crate::restore::control_redo;
+use crate::restore::{WAL_PAGE_SIZE, control_checkpoint, control_redo};
 use crate::walscan::{self, BlockRef};
 use crate::{WAL_SHARD, ZOU_PAGE_SIZE};
 
@@ -514,6 +514,51 @@ fn pack_merged_full(
     pack_page_runs(store, layout, id, &refs, &[], &[], &sizes, &mut fetch)
 }
 
+/// The stream bytes from the redo page boundary through the end of the
+/// checkpoint record at `chk_record`, prefixed with their 8 byte little
+/// endian start lsn. The record is written before the fold starts, but
+/// the pusher may not have shipped it yet, so this polls the shared log
+/// for a while; the fold runs on its own thread and can afford to wait.
+fn capture_wal_tail(
+    media: &WalMedia,
+    tenant: u128,
+    redo: u64,
+    chk_record: u64,
+) -> Result<Vec<u8>, String> {
+    if chk_record < redo {
+        return Err(format!(
+            "pg_control names checkpoint record {chk_record:#X} before its redo {redo:#X}"
+        ));
+    }
+    let floor = redo & !(WAL_PAGE_SIZE - 1);
+    for attempt in 0..120u32 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        let frames = catch_up(media, WAL_SHARD, &TeeFilter::Tenant(tenant), Lsn(floor))
+            .map_err(|e| format!("wal catch up: {e}"))?;
+        // Two pages of slack past the record's start cover its length
+        // and a page header it may straddle.
+        let window =
+            walscan::assemble_window_frames(&frames, floor, chk_record + 2 * WAL_PAGE_SIZE);
+        let Ok(out) = walscan::read_records(&window, chk_record, None) else {
+            continue;
+        };
+        let Some(record) = out.records.first() else {
+            continue;
+        };
+        let start = floor.max(window.covered_from);
+        let (lo, hi) = ((start - floor) as usize, (record.end_lsn - floor) as usize);
+        let mut tail = Vec::with_capacity(8 + hi - lo);
+        tail.extend_from_slice(&start.to_le_bytes());
+        tail.extend_from_slice(&window.buf[lo..hi]);
+        return Ok(tail);
+    }
+    Err(format!(
+        "the checkpoint record at {chk_record:#X} never appeared in the shared log"
+    ))
+}
+
 /// Everything [`prepare`] produced and [`publish`] applies: the ref
 /// the manifest gains and the stats. The split exists so the capture
 /// and pack can run on a thread that never touches the lease, the
@@ -577,6 +622,24 @@ pub fn prepare(
         .is_none()
     {
         bytes = capture::upload(store, layout, &id, &files, &paths.dirs, true)?;
+    }
+
+    // The WAL slice recovery anchors on: from the redo page boundary
+    // through the end of the checkpoint record pg_control names. A
+    // restore with a live stream overlays these bytes anyway, but a
+    // branch child and a time travel restore have no stream, and
+    // without the tail they hold a pg_control naming a record that
+    // exists nowhere. Deterministic per redo, so a retried fold that
+    // finds it skips the capture.
+    if store
+        .get(&layout.chk_waltail(&id))
+        .map_err(|e| format!("store: {e}"))?
+        .is_none()
+    {
+        let tail = capture_wal_tail(media, tenant, redo, control_checkpoint(control)?)?;
+        store
+            .put(&layout.chk_waltail(&id), &tail)
+            .map_err(|e| format!("store: {e}"))?;
     }
 
     // The sorted page runs: a delta packs the blocks the WAL dirtied
@@ -697,13 +760,17 @@ mod tests {
 
     fn synthetic_control(redo: u64) -> Vec<u8> {
         // Same shape the restore tests use: state in production at 16,
-        // the redo at 40, junk, the crc over everything before it at 300.
+        // the checkpoint record lsn at 32, the redo at 40, junk, the crc
+        // over everything before it at 300. The tests model a shutdown
+        // style checkpoint whose record sits at the redo itself, so a
+        // record pushed at redo is the one the tail capture must find.
         let mut control = vec![0u8; 8192];
         control[0..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
         control[16..20].copy_from_slice(&6u32.to_le_bytes());
         for (i, b) in control[20..300].iter_mut().enumerate() {
             *b = (i * 7 + 13) as u8;
         }
+        control[32..40].copy_from_slice(&redo.to_le_bytes());
         control[40..48].copy_from_slice(&redo.to_le_bytes());
         let crc = crc32c::crc32c(&control[..300]);
         control[300..304].copy_from_slice(&crc.to_le_bytes());
@@ -848,6 +915,17 @@ mod tests {
         let index = String::from_utf8(index).unwrap();
         assert!(index.contains("f pg_xact/0000 4"));
 
+        // The WAL tail: everything from where coverage starts, the
+        // stream base here since nothing older was ever pushed, through
+        // the end of the record at the checkpoint lsn, which is the
+        // whole synthetic stream because that record is its last. A
+        // restore with no live frames lays exactly these bytes down so
+        // recovery finds the record pg_control names.
+        let (tail, _) = store.get(&layout.chk_waltail(&chk.id)).unwrap().unwrap();
+        let start = u64::from_le_bytes(tail[..8].try_into().unwrap());
+        assert_eq!(start, stream_lsn);
+        assert_eq!(&tail[8..], stream_bytes);
+
         // The page runs: both present blocks packed in block order, the
         // PAGES index describing exactly them.
         let (pages_index, _) = store
@@ -986,6 +1064,12 @@ mod tests {
         let epoch = u32::try_from(held.epoch).unwrap();
         let mut wal2 = V2Wal::open(Arc::clone(&store) as Arc<dyn CasStore>, "local", epoch);
         wal2.push(0x100, b"payload");
+        // The checkpoint record at redo, which the tail capture waits
+        // for before the fold can complete.
+        let mut wal = Builder::new(redo);
+        wal.record(&[], b"checkpoint");
+        let (rec_lsn, rec_bytes) = wal.stream();
+        wal2.push(rec_lsn, rec_bytes);
 
         let stats = fold(
             &*store,
@@ -1133,6 +1217,12 @@ mod tests {
         let epoch = u32::try_from(held.epoch).unwrap();
         let mut wal2 = V2Wal::open(Arc::clone(&store) as Arc<dyn CasStore>, "child", epoch);
         wal2.push(0x100, b"payload");
+        // The checkpoint record at redo, which the tail capture waits
+        // for before the fold can complete.
+        let mut wal = Builder::new(redo);
+        wal.record(&[], b"checkpoint");
+        let (rec_lsn, rec_bytes) = wal.stream();
+        wal2.push(rec_lsn, rec_bytes);
 
         let stats = fold(
             &*store,
