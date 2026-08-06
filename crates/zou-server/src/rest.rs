@@ -2406,7 +2406,10 @@ async fn write(
     let merging = matches!(conflict, Some(Conflict::Merge { .. }));
 
     let returning = match prefer.ret {
-        Ret::Representation => Returning::Star,
+        // Named columns rather than a star, because returning a
+        // column is reading it and a role can be allowed to write a
+        // row it is not allowed to read all of.
+        Ret::Representation => mutate::needed(&catalog, table, &q.select, &pk),
         // Location only makes sense for an insert; headers-only on
         // an update or delete degrades to minimal like PostgREST.
         Ret::HeadersOnly if wants_location => Returning::Cols(pk.clone()),
