@@ -15,6 +15,7 @@ bytes = "1"
 getrandom = { workspace = true }
 hmac = { workspace = true }
 log = { workspace = true }
+md-5 = "0.11"
 p256 = { workspace = true }
 qrcodegen = "1.8"
 rustls = { workspace = true }
@@ -26,11 +27,13 @@ tokio-postgres = { workspace = true }
 ureq = { workspace = true }
 webpki-roots = { workspace = true }
 zou-rest = { path = "../zou-rest" }
+zou-store = { path = "../zou-store", features = ["s3"] }
 
 [dev-dependencies]
 base64ct = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
+tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 
 [lints]

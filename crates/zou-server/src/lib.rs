@@ -30,6 +30,7 @@ use zou_rest::catalog::Catalog;
 pub mod admin;
 pub mod audit;
 pub mod auth;
+pub mod blob;
 pub mod edge;
 pub mod gojson;
 pub mod hook;
@@ -38,6 +39,7 @@ pub mod limit;
 pub mod mail;
 pub mod mfa;
 pub mod oauth;
+pub mod object;
 pub mod openapi;
 pub mod password;
 pub mod rest;
@@ -178,6 +180,14 @@ pub struct Config {
     /// answer as Google can only assert what the code passes to
     /// itself.
     pub http: Option<Arc<dyn oauth::Http>>,
+    /// Where the bytes of a stored object go: a directory, or an
+    /// `s3://bucket/prefix` url. The same targets the engine takes,
+    /// because on a real deployment it is the same bucket with a
+    /// different prefix in it. None and the storage surface answers
+    /// buckets and refuses everything that needs bytes, which is what
+    /// a server started for the auth or rest surfaces alone should do
+    /// rather than quietly writing files somewhere.
+    pub objects: Option<String>,
 }
 
 impl Default for Config {
@@ -211,6 +221,7 @@ impl Default for Config {
             limit: limit::Settings::default(),
             oauth: oauth::Providers::default(),
             http: None,
+            objects: None,
         }
     }
 }
@@ -252,6 +263,8 @@ pub struct App {
     /// The watch starts on the first request that needs a catalog,
     /// because a router can be built outside a runtime.
     pub watching: tokio::sync::OnceCell<()>,
+    /// Where object bytes live, when this server was told.
+    pub blobs: Option<blob::Blobs>,
 }
 
 impl App {
@@ -326,6 +339,10 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         Some(http) => http,
         None => Arc::new(oauth::Web::default()),
     };
+    let blobs = match &cfg.objects {
+        Some(target) => Some(blob::Blobs::open(target).map_err(|e| format!("objects: {e}"))?),
+        None => None,
+    };
     Ok(Arc::new(App {
         cfg,
         pool,
@@ -339,6 +356,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         catalog: tokio::sync::RwLock::new(HashMap::new()),
         epoch: Arc::new(AtomicU64::new(0)),
         watching: tokio::sync::OnceCell::new(),
+        blobs,
     }))
 }
 
@@ -767,6 +785,44 @@ pub fn router(cfg: Config) -> Result<Router, String> {
                 .delete(storage::remove),
         )
         .route("/storage/v1/bucket/{id}/empty", post(storage::empty))
+        // The object surface, on the same side of the gate as the
+        // buckets and for the same reason. Six paths for what is really
+        // three questions, because upstream lets a client say out loud
+        // which audience it is asking as, and a route that says
+        // `public` is asked with no token at all.
+        //
+        // A literal segment beats a placeholder, so `public`, `info`
+        // and `authenticated` reach their own handlers while every
+        // other first segment is read as a bucket id. That is upstream's
+        // arrangement too, and it is why a bucket called `public` is a
+        // bucket nobody can name here.
+        .route(
+            "/storage/v1/object/{bucket}",
+            axum::routing::delete(object::remove_many),
+        )
+        .route(
+            "/storage/v1/object/{bucket}/{*name}",
+            get(object::download)
+                .post(object::upload)
+                .put(object::replace)
+                .delete(object::remove),
+        )
+        .route(
+            "/storage/v1/object/authenticated/{bucket}/{*name}",
+            get(object::download_authenticated),
+        )
+        .route(
+            "/storage/v1/object/public/{bucket}/{*name}",
+            get(object::download_public),
+        )
+        .route(
+            "/storage/v1/object/info/{bucket}/{*name}",
+            get(object::info),
+        )
+        .route(
+            "/storage/v1/object/info/public/{bucket}/{*name}",
+            get(object::info_public),
+        )
         .with_state(Arc::clone(&app));
     Ok(Router::new()
         .merge(open)

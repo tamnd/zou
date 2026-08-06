@@ -73,7 +73,7 @@ pub struct StorageError {
 }
 
 impl StorageError {
-    fn no_such_bucket() -> Self {
+    pub(crate) fn no_such_bucket() -> Self {
         StorageError {
             status: 404,
             error: "Bucket not found",
@@ -91,6 +91,57 @@ impl StorageError {
         }
     }
 
+    /// What a missing object is called, which is not what a missing
+    /// bucket is called. The error name is `not_found` in lower case
+    /// here and `Bucket not found` in a sentence there, and both are
+    /// copied rather than made consistent.
+    pub(crate) fn no_such_key() -> Self {
+        StorageError {
+            status: 404,
+            error: "not_found",
+            message: "Object not found".to_string(),
+            code: "NoSuchKey",
+        }
+    }
+
+    /// The same sentence a duplicate bucket earns, under a different
+    /// code.
+    pub(crate) fn key_already_exists() -> Self {
+        StorageError {
+            status: 409,
+            error: "Duplicate",
+            message: "The resource already exists".to_string(),
+            code: "KeyAlreadyExists",
+        }
+    }
+
+    /// Not recorded. The suite has no case that sends more than the
+    /// limit, because a fixture that uploaded fifty megabytes would be
+    /// a fixture nobody runs twice. This is the shape storage-api
+    /// answers with and the sentence is its own, but which of the two
+    /// limits a given upload trips is a question for the round that
+    /// adds those cases.
+    pub(crate) fn too_large() -> Self {
+        StorageError {
+            status: 413,
+            error: "Payload too large",
+            message: "The object exceeded the maximum allowed size".to_string(),
+            code: "EntityTooLarge",
+        }
+    }
+
+    /// Not recorded either. A multipart body with no file part in it is
+    /// refused by upstream's schema before its handler runs, the same
+    /// way a bucket with no name is.
+    pub(crate) fn no_file_in_form() -> Self {
+        StorageError {
+            status: 400,
+            error: "FastifyError",
+            message: "Multipart body must contain a file".to_string(),
+            code: "InvalidRequest",
+        }
+    }
+
     fn not_empty() -> Self {
         StorageError {
             status: 409,
@@ -100,7 +151,7 @@ impl StorageError {
         }
     }
 
-    fn access_denied(message: String) -> Self {
+    pub(crate) fn access_denied(message: String) -> Self {
         StorageError {
             status: 403,
             error: "Unauthorized",
@@ -113,7 +164,7 @@ impl StorageError {
     /// is the reference implementation showing through, and it is
     /// copied rather than improved on because a client matching on the
     /// string is matching on that one.
-    fn bad_json() -> Self {
+    pub(crate) fn bad_json() -> Self {
         StorageError {
             status: 400,
             error: "FastifyError",
@@ -123,7 +174,7 @@ impl StorageError {
         }
     }
 
-    fn internal(message: String) -> Self {
+    pub(crate) fn internal(message: String) -> Self {
         StorageError {
             status: 500,
             error: "Internal",
@@ -163,12 +214,12 @@ fn quoted(text: &str) -> String {
 
 /// An answer that worked, always json and always with the charset on
 /// it.
-fn ok(body: String) -> Response {
+pub(crate) fn ok(body: String) -> Response {
     (StatusCode::OK, [(header::CONTENT_TYPE, JSON)], body).into_response()
 }
 
 /// The one line answer three of the six routes give.
-fn message(text: &str) -> Response {
+pub(crate) fn message(text: &str) -> Response {
     ok(serde_json::json!({ "message": text }).to_string())
 }
 
@@ -199,7 +250,10 @@ fn jose_words(why: &jwt::Reject) -> &'static str {
 /// apikey gate: inside it, a request with no key would be answered by
 /// the gate in the gateway's words, and the reference answers it in
 /// storage-api's.
-fn caller(app: &App, parts: &Parts) -> Result<(RequestContext, jwt::Verified), StorageError> {
+pub(crate) fn caller(
+    app: &App,
+    parts: &Parts,
+) -> Result<(RequestContext, jwt::Verified), StorageError> {
     let raw = parts
         .headers
         .get(header::AUTHORIZATION)
@@ -252,7 +306,7 @@ fn caller(app: &App, parts: &Parts) -> Result<(RequestContext, jwt::Verified), S
 /// the bucket surface can really produce are named. Anything else is
 /// the database saying something we have not seen, and it goes out as
 /// itself rather than dressed up as one of these.
-fn pg_error(e: &tokio_postgres::Error) -> StorageError {
+pub(crate) fn pg_error(e: &tokio_postgres::Error) -> StorageError {
     let Some(db) = e.as_db_error() else {
         return StorageError::internal(e.to_string());
     };
@@ -300,7 +354,11 @@ fn bucket_columns(with_type: bool) -> String {
 
 /// Open the request's transaction, or say there is no database to open
 /// one on.
-async fn begin(app: &App, ctx: &RequestContext, read_only: bool) -> Result<Session, StorageError> {
+pub(crate) async fn begin(
+    app: &App,
+    ctx: &RequestContext,
+    read_only: bool,
+) -> Result<Session, StorageError> {
     let pool = app
         .pool
         .as_ref()
@@ -333,7 +391,10 @@ async fn bucket_exists(sess: &Session, id: &str) -> Result<bool, StorageError> {
 /// the floor forfeits the connection under it. A failed statement is
 /// the other case and does drop, the same containment the rest surface
 /// gives a query that broke its own transaction.
-async fn done<T>(sess: Session, answer: Result<T, StorageError>) -> Result<T, StorageError> {
+pub(crate) async fn done<T>(
+    sess: Session,
+    answer: Result<T, StorageError>,
+) -> Result<T, StorageError> {
     sess.commit().await.map_err(|e| pg_error(&e))?;
     answer
 }
@@ -558,7 +619,7 @@ pub async fn update(
 /// its point is that a hand written delete in a psql session does not
 /// silently orphan objects in the store, not that the server cannot
 /// delete anything. Local, so it lasts this transaction and no longer.
-const ALLOW_DELETE: &str = "set local storage.allow_delete_query = 'true'";
+pub(crate) const ALLOW_DELETE: &str = "set local storage.allow_delete_query = 'true'";
 
 /// POST /storage/v1/bucket/{id}/empty
 pub async fn empty(

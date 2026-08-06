@@ -1,0 +1,374 @@
+//! The object surface against a live postgres and a real store, for the
+//! things the recording cannot ask about.
+//!
+//! The twenty nine recorded answers in the conformance repository are
+//! the compatibility claim and they are not repeated here. All of them
+//! are about what comes back over http, and none of them can see the
+//! other half of an upload, which is where the bytes went. That half is
+//! what is here: that the key they are under is built out of the row and
+//! not out of anything a client sent, that a replacement leaves the old
+//! bytes alone until it has committed and then takes them away, that a
+//! delete takes them with the row, and that an upload refused for a name
+//! already taken leaves the bytes of the name it collided with where
+//! they were.
+//!
+//! Every test works on a bucket of its own with a store of its own, so
+//! the four of them can run at once against one database the way cargo
+//! runs them, and so a leftover directory from a failed run cannot be
+//! read as a passing one.
+//!
+//! Gated on ZOU_PG_TEST_DSN like the other live suites, skips when
+//! unset.
+//!
+//!   ZOU_PG_TEST_DSN="host=127.0.0.1 port=5432 user=postgres dbname=postgres" \
+//!     cargo test -p zou-server --test storage_objects
+
+use axum::body::{Body, to_bytes};
+use axum::http::{Request, StatusCode};
+use serde_json::Value;
+use tower::ServiceExt;
+use zou_server::blob::{Blobs, key};
+use zou_server::sql::Pool;
+use zou_server::{Config, jwt, router};
+
+const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long";
+
+fn dsn() -> Option<String> {
+    match std::env::var("ZOU_PG_TEST_DSN") {
+        Ok(v) if !v.is_empty() => Some(v),
+        _ => {
+            eprintln!("skipping: ZOU_PG_TEST_DSN not set");
+            None
+        }
+    }
+}
+
+/// A server and the store it writes into, kept together because the
+/// tests read the store directly and the directory has to outlive both.
+struct Fixture {
+    app: axum::Router,
+    pool: Pool,
+    blobs: Blobs,
+    _dir: tempfile::TempDir,
+}
+
+fn fixture(dsn: &str) -> Fixture {
+    let dir = tempfile::tempdir().expect("a directory to write into");
+    let target = dir.path().to_string_lossy().to_string();
+    Fixture {
+        app: router(Config {
+            jwt_secret: SECRET.to_vec(),
+            pg: Some(dsn.to_string()),
+            objects: Some(target.clone()),
+            ..Config::default()
+        })
+        .expect("router builds"),
+        pool: Pool::new(dsn, 4).expect("dsn parses"),
+        blobs: Blobs::open(&target).expect("the store opens"),
+        _dir: dir,
+    }
+}
+
+fn service() -> String {
+    jwt::mint(&jwt::key_claims("service_role"), SECRET)
+}
+
+struct Answer {
+    status: StatusCode,
+    bytes: Vec<u8>,
+}
+
+impl Answer {
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.bytes).unwrap_or(Value::Null)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).to_string()
+    }
+}
+
+async fn call(f: &Fixture, method: &str, path: &str, mime: &str, body: &str) -> Answer {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {}", service()));
+    if !mime.is_empty() {
+        req = req.header("content-type", mime);
+    }
+    let res = f
+        .app
+        .clone()
+        .oneshot(req.body(Body::from(body.to_string())).unwrap())
+        .await
+        .expect("router answers");
+    let status = res.status();
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.expect("body");
+    Answer {
+        status,
+        bytes: bytes.to_vec(),
+    }
+}
+
+/// Take the bucket and everything in it away, whether or not any of it
+/// was there, then make the bucket again. Through the guard the schema
+/// puts in front of a delete rather than around it.
+async fn fresh(pool: &Pool, bucket: &str) {
+    let sess = pool.unscoped().await.expect("unscoped");
+    sess.execute("set storage.allow_delete_query = 'true'", &[])
+        .await
+        .expect("open the guard");
+    sess.execute(
+        "delete from storage.objects where bucket_id = $1",
+        &[&bucket],
+    )
+    .await
+    .expect("clear objects");
+    sess.execute("delete from storage.buckets where id = $1", &[&bucket])
+        .await
+        .expect("clear the bucket");
+    sess.execute(
+        "insert into storage.buckets (id, name, public) values ($1, $1, false)",
+        &[&bucket],
+    )
+    .await
+    .expect("make the bucket");
+    sess.commit().await.expect("finish");
+}
+
+/// The id and the version of one row, which together are the only thing
+/// the key is built out of.
+async fn row(pool: &Pool, bucket: &str, name: &str) -> Option<(String, String)> {
+    let sess = pool.unscoped().await.expect("unscoped");
+    let rows = sess
+        .query(
+            "select id::text, coalesce(version, '') from storage.objects
+             where bucket_id = $1 and name = $2",
+            &[&bucket, &name],
+        )
+        .await
+        .expect("read back");
+    let found = rows.first().map(|r| (r.get(0), r.get(1)));
+    sess.commit().await.expect("finish");
+    found
+}
+
+async fn how_many(pool: &Pool, bucket: &str) -> i64 {
+    let sess = pool.unscoped().await.expect("unscoped");
+    let n: i64 = sess
+        .query(
+            "select count(*) from storage.objects where bucket_id = $1",
+            &[&bucket],
+        )
+        .await
+        .expect("count")[0]
+        .get(0);
+    sess.commit().await.expect("finish");
+    n
+}
+
+async fn bytes_at(f: &Fixture, id: &str, version: &str) -> Option<Vec<u8>> {
+    f.blobs
+        .get(key(id, version))
+        .await
+        .expect("the store answers")
+}
+
+#[tokio::test]
+async fn the_key_is_built_out_of_the_row_and_not_out_of_the_name() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-keys").await;
+
+    // A name that is a path, with a segment that would climb out of the
+    // store if a name were ever a path here. It is one object with one
+    // name, and the bytes are under the id and the version.
+    let name = "a/../b/c d.txt";
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-keys/a/../b/c%20d.txt",
+        "text/plain",
+        "under the name",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(answer.json()["Key"], format!("zou-keys/{name}"));
+
+    let (id, version) = row(&f.pool, "zou-keys", name).await.expect("one row");
+    assert_eq!(
+        bytes_at(&f, &id, &version).await.as_deref(),
+        Some(&b"under the name"[..]),
+    );
+
+    // And the round trip, so the read builds the same key the write did.
+    let answer = call(
+        &f,
+        "GET",
+        "/storage/v1/object/zou-keys/a/../b/c%20d.txt",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK);
+    assert_eq!(answer.text(), "under the name");
+}
+
+#[tokio::test]
+async fn a_replacement_writes_a_new_version_and_takes_the_old_bytes_away() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-replace").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-replace/note.txt",
+        "text/plain",
+        "first",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let (id, first) = row(&f.pool, "zou-replace", "note.txt")
+        .await
+        .expect("a row");
+
+    let answer = call(
+        &f,
+        "PUT",
+        "/storage/v1/object/zou-replace/note.txt",
+        "text/plain",
+        "second",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let (again, second) = row(&f.pool, "zou-replace", "note.txt")
+        .await
+        .expect("a row");
+
+    // One row, still the same row, and a version it did not have before.
+    // The version is what makes a replacement safe to read across: the
+    // bytes are written next to the old ones rather than over them.
+    assert_eq!(how_many(&f.pool, "zou-replace").await, 1);
+    assert_eq!(again, id, "the replacement made a second row");
+    assert_ne!(second, first, "the version did not move");
+
+    assert_eq!(
+        bytes_at(&f, &id, &second).await.as_deref(),
+        Some(&b"second"[..]),
+    );
+    assert!(
+        bytes_at(&f, &id, &first).await.is_none(),
+        "the bytes nothing points at any more are still costing money",
+    );
+    let answer = call(&f, "GET", "/storage/v1/object/zou-replace/note.txt", "", "").await;
+    assert_eq!(answer.text(), "second");
+}
+
+#[tokio::test]
+async fn a_delete_takes_the_bytes_with_the_row() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-delete").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-delete/gone.txt",
+        "text/plain",
+        "here for now",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let (id, version) = row(&f.pool, "zou-delete", "gone.txt").await.expect("a row");
+    assert!(bytes_at(&f, &id, &version).await.is_some());
+
+    let answer = call(
+        &f,
+        "DELETE",
+        "/storage/v1/object/zou-delete/gone.txt",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert!(row(&f.pool, "zou-delete", "gone.txt").await.is_none());
+    assert!(
+        bytes_at(&f, &id, &version).await.is_none(),
+        "the row went and the bytes stayed",
+    );
+
+    // The other delete, which takes a list and is the one a client
+    // library calls. Same claim about the store.
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-delete/one-of-many.txt",
+        "text/plain",
+        "here for now",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let (id, version) = row(&f.pool, "zou-delete", "one-of-many.txt")
+        .await
+        .expect("a row");
+    let answer = call(
+        &f,
+        "DELETE",
+        "/storage/v1/object/zou-delete",
+        "application/json",
+        r#"{"prefixes":["one-of-many.txt","never-existed.txt"]}"#,
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(
+        answer.json().as_array().map(Vec::len),
+        Some(1),
+        "a name that was not there was answered as if it had been",
+    );
+    assert!(bytes_at(&f, &id, &version).await.is_none());
+}
+
+#[tokio::test]
+async fn an_upload_onto_a_name_already_taken_leaves_the_first_bytes_alone() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-collide").await;
+
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-collide/note.txt",
+        "text/plain",
+        "the one that got there first",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let (id, version) = row(&f.pool, "zou-collide", "note.txt")
+        .await
+        .expect("a row");
+
+    // The refusal itself is recorded. What is not is that the refused
+    // upload wrote nothing: the row is inside the transaction and the
+    // bytes come after it, so a conflict never reaches the store.
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-collide/note.txt",
+        "text/plain",
+        "the one that came second",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.text());
+    assert_eq!(answer.json()["error"], "Duplicate");
+
+    assert_eq!(how_many(&f.pool, "zou-collide").await, 1);
+    let (still, same) = row(&f.pool, "zou-collide", "note.txt")
+        .await
+        .expect("a row");
+    assert_eq!((still, same), (id.clone(), version.clone()));
+    assert_eq!(
+        bytes_at(&f, &id, &version).await.as_deref(),
+        Some(&b"the one that got there first"[..]),
+    );
+}
