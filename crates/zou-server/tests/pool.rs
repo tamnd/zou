@@ -322,20 +322,39 @@ async fn a_role_setting_reaches_the_transaction_that_set_role_would_not_get() {
 /// The one setting a role is not allowed to have, because the schema a
 /// request runs against is negotiated per request and a role level
 /// search_path would win over the profile the caller asked for.
+///
+/// A role of its own rather than anon, because every other test in
+/// this file may be bootstrapping a pool while this one runs, and two
+/// alter role statements against one role at the same time is a tuple
+/// concurrently updated rather than a result.
 #[tokio::test]
 async fn a_role_search_path_does_not_beat_the_requested_profile() {
     let Some(pool) = pool_of(1) else { return };
     let admin = pool.unscoped().await.expect("unscoped");
     admin
-        .execute("alter role anon set search_path to pg_catalog", &[])
+        .execute(
+            "do $$ begin \
+               if not exists (select 1 from pg_roles where rolname = 'zou_pool_profiled') then \
+                 create role zou_pool_profiled nologin; \
+               end if; \
+             end $$",
+            &[],
+        )
+        .await
+        .expect("role");
+    admin
+        .execute(
+            "alter role zou_pool_profiled set search_path to pg_catalog",
+            &[],
+        )
         .await
         .expect("alter role");
     admin.commit().await.expect("finish");
 
-    // A pool of its own, because the settings of the one above are
-    // already read and held for a while.
+    // A pool of its own, because the settings the one above read are
+    // held for a while and were read before any of this.
     let fresh = pool_of(1).expect("dsn");
-    let ctx = RequestContext::bare("anon", "{}");
+    let ctx = RequestContext::bare("zou_pool_profiled", "{}");
     let sess = fresh.session(&ctx, false).await.expect("session");
     assert_eq!(
         text(&sess, "select current_setting('search_path')").await,
@@ -345,9 +364,9 @@ async fn a_role_search_path_does_not_beat_the_requested_profile() {
 
     let admin = pool.unscoped().await.expect("unscoped");
     admin
-        .execute("alter role anon reset search_path", &[])
+        .execute("drop role zou_pool_profiled", &[])
         .await
-        .expect("reset");
+        .expect("drop");
     admin.commit().await.expect("finish");
 }
 

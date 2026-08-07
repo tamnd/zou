@@ -133,10 +133,27 @@ $$;
 -- connection time for the role that connected, and every role here is
 -- reached with set role instead. Pool::settings is the half that makes
 -- them real, and an alter role by hand works the same way.
+-- Asked before it is set, because an alter role that changes nothing
+-- still rewrites the row, and two of those at once is a tuple
+-- concurrently updated. The advisory lock above serializes the
+-- bootstraps, so what is left to avoid is anybody else's alter role,
+-- and the cheapest way is to not write when there is nothing to write.
 do $$
 begin
-    alter role anon set statement_timeout to '3s';
-    alter role authenticated set statement_timeout to '8s';
+    if not exists (
+        select 1 from pg_db_role_setting s join pg_roles r on r.oid = s.setrole
+        where r.rolname = 'anon' and s.setdatabase = 0
+          and s.setconfig @> array['statement_timeout=3s']
+    ) then
+        alter role anon set statement_timeout to '3s';
+    end if;
+    if not exists (
+        select 1 from pg_db_role_setting s join pg_roles r on r.oid = s.setrole
+        where r.rolname = 'authenticated' and s.setdatabase = 0
+          and s.setconfig @> array['statement_timeout=8s']
+    ) then
+        alter role authenticated set statement_timeout to '8s';
+    end if;
 exception when insufficient_privilege then
     raise warning 'zou: no statement timeouts: %', sqlerrm;
 end
