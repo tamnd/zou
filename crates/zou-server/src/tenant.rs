@@ -69,6 +69,12 @@ impl Routing {
     /// Host wins over path when both would match, because a host is the
     /// stronger statement and because a server that has both on is one
     /// where paths are the fallback for clients that cannot do hosts.
+    ///
+    /// This is the whole answer only for a server with no custom
+    /// hostnames on it. A project on its own domain is resolved out of
+    /// the registry instead, which is a lookup rather than a parse, so
+    /// the front door calls [`Routing::label`] and [`Routing::segment`]
+    /// with that lookup in between them.
     pub fn resolve(&self, host: Option<&str>, path: &str) -> Option<Found> {
         if let Some(tenant_ref) = host.and_then(|h| self.label(h)) {
             return Some(Found {
@@ -76,14 +82,11 @@ impl Routing {
                 path: path.to_string(),
             });
         }
-        match self.path_prefix {
-            true => self.segment(path),
-            false => None,
-        }
+        self.segment(path)
     }
 
     /// The ref a host names, if any of the serve domains claim it.
-    fn label(&self, host: &str) -> Option<String> {
+    pub fn label(&self, host: &str) -> Option<String> {
         let host = bare_host(host);
         let found = self.domains.iter().find_map(|domain| {
             let domain = domain.trim_start_matches('.').trim_end_matches('.');
@@ -97,8 +100,13 @@ impl Routing {
         Some(found.to_string())
     }
 
-    /// The ref a path names, and the path without it.
-    fn segment(&self, path: &str) -> Option<Found> {
+    /// The ref a path names, and the path without it. None when the
+    /// server does not route by path at all, so a caller can ask this
+    /// without checking first.
+    pub fn segment(&self, path: &str) -> Option<Found> {
+        if !self.path_prefix {
+            return None;
+        }
         let rest = path.strip_prefix('/')?;
         let (first, rest) = match rest.split_once('/') {
             Some((first, rest)) => (first, rest),
@@ -119,7 +127,7 @@ impl Routing {
 /// case. Ports because the header carries the one the client dialled,
 /// trailing dots because a fully qualified name is the same name, and
 /// case because DNS does not have any.
-fn bare_host(host: &str) -> String {
+pub fn bare_host(host: &str) -> String {
     let host = host.trim();
     // An IPv6 literal is bracketed and full of colons, so the port is
     // only ever what follows the last one outside the brackets.
@@ -201,18 +209,49 @@ impl Registry {
     /// lock held across the network, which is the wrong trade for the
     /// thing sitting in front of every request.
     pub async fn get(&self, tenant_ref: &str) -> Result<Option<Tenant>, String> {
+        let wanted = tenant_ref.to_string();
+        self.cached(tenant_ref.to_string(), move |store| {
+            registry::get(store, &wanted).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// The entry a custom hostname points at, which is two GETs cold,
+    /// the alias and then the entry, and one cached read warm. Both
+    /// steps are cached under the host rather than only the second, so
+    /// that a project on its own domain costs the same per request as
+    /// one on a serve domain.
+    pub async fn by_host(&self, host: &str) -> Result<Option<Tenant>, String> {
+        let host = bare_host(host);
+        let wanted = host.clone();
+        self.cached(format!("host:{host}"), move |store| {
+            let Some(tenant_ref) = registry::host_ref(store, &wanted).map_err(|e| e.to_string())?
+            else {
+                return Ok(None);
+            };
+            registry::get(store, &tenant_ref).map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    /// One cache under two key spaces, refs and `host:` names, which
+    /// cannot collide because a ref holds neither a colon nor a dot.
+    /// One map means one bound and one eviction rather than two of each
+    /// that have to be reasoned about together.
+    async fn cached<F>(&self, key: String, fetch: F) -> Result<Option<Tenant>, String>
+    where
+        F: FnOnce(&dyn CasStore) -> Result<Option<Tenant>, String> + Send + 'static,
+    {
         let now = Instant::now();
-        if let Some(cached) = self.seen.read().await.get(tenant_ref)
+        if let Some(cached) = self.seen.read().await.get(&key)
             && cached.until > now
         {
             return Ok(cached.entry.clone());
         }
         let store = self.store.clone();
-        let wanted = tenant_ref.to_string();
-        let entry = tokio::task::spawn_blocking(move || registry::get(store.as_ref(), &wanted))
+        let entry = tokio::task::spawn_blocking(move || fetch(store.as_ref()))
             .await
-            .map_err(|e| format!("registry lookup: {e}"))?
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("registry lookup: {e}"))??;
         let until = Instant::now()
             + match entry.is_some() {
                 true => self.ttl,
@@ -221,7 +260,7 @@ impl Registry {
         let seq = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut seen = self.seen.write().await;
         seen.insert(
-            tenant_ref.to_string(),
+            key,
             Cached {
                 entry: entry.clone(),
                 until,
@@ -238,6 +277,14 @@ impl Registry {
     /// wait out its own ttl.
     pub async fn forget(&self, tenant_ref: &str) {
         self.seen.write().await.remove(tenant_ref);
+    }
+
+    /// Forget one custom hostname.
+    pub async fn forget_host(&self, host: &str) {
+        self.seen
+            .write()
+            .await
+            .remove(&format!("host:{}", bare_host(host)));
     }
 
     #[cfg(test)]

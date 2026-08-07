@@ -19,8 +19,7 @@ use zou_store::layout::TenantLayout;
 use zou_store::registry::{self, Tenant};
 use zou_store::{CasStore, open_store};
 
-pub const USAGE: &str =
-    "usage: zou tenant <target> <list | create <ref> [--secret <s>] | info <ref> | delete <ref>>";
+pub const USAGE: &str = "usage: zou tenant <target> <list | create <ref> [--secret <s>] | info <ref> | delete <ref> | host add <ref> <host> | host remove <ref> <host>>";
 
 /// A fresh project secret: 32 bytes of the os rng as hex, which is the
 /// shape and the strength the dev loop's own generated secret has, and
@@ -61,6 +60,20 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         }
         [verb, tenant_ref] if verb == "info" => info(store.as_ref(), tenant_ref),
         [verb, tenant_ref] if verb == "delete" => delete(store.as_ref(), tenant_ref),
+        [verb, act, tenant_ref, host] if verb == "host" && act == "add" => {
+            registry::add_host(store.as_ref(), tenant_ref, host).map_err(|e| e.to_string())?;
+            println!("{host} routes to {tenant_ref}");
+            // Said because DNS is the half of this that is not on the
+            // store, and a claimed host that resolves nowhere looks
+            // exactly like a claim that did not work.
+            println!("point {host} at this server for it to mean anything");
+            Ok(())
+        }
+        [verb, act, tenant_ref, host] if verb == "host" && act == "remove" => {
+            registry::remove_host(store.as_ref(), tenant_ref, host).map_err(|e| e.to_string())?;
+            println!("{host} no longer routes to {tenant_ref}");
+            Ok(())
+        }
         _ => Err(USAGE.into()),
     }
 }
@@ -184,6 +197,53 @@ mod tests {
     }
 
     #[test]
+    fn a_host_is_claimed_and_given_back() {
+        let (_d, target) = target();
+        run(&argv(&[&target, "create", "acme-prod", "--secret", "sh"])).unwrap();
+        run(&argv(&[
+            &target,
+            "host",
+            "add",
+            "acme-prod",
+            "api.example.com",
+        ]))
+        .unwrap();
+        run(&argv(&[&target, "info", "acme-prod"])).unwrap();
+        run(&argv(&[
+            &target,
+            "host",
+            "remove",
+            "acme-prod",
+            "api.example.com",
+        ]))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_host_cannot_be_claimed_out_from_under_another_tenant() {
+        let (_d, target) = target();
+        run(&argv(&[&target, "create", "acme-prod", "--secret", "sh"])).unwrap();
+        run(&argv(&[&target, "create", "beta-co", "--secret", "sh"])).unwrap();
+        run(&argv(&[
+            &target,
+            "host",
+            "add",
+            "acme-prod",
+            "api.example.com",
+        ]))
+        .unwrap();
+        let err = run(&argv(&[
+            &target,
+            "host",
+            "add",
+            "beta-co",
+            "api.example.com",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("already claimed"), "{err}");
+    }
+
+    #[test]
     fn the_verbs_that_are_not_verbs_are_the_usage() {
         let (_d, target) = target();
         for bad in [
@@ -193,6 +253,8 @@ mod tests {
             argv(&[&target, "list", "acme-prod"]),
             argv(&[&target, "rename", "acme-prod"]),
             argv(&[&target, "create", "acme-prod", "--secret"]),
+            argv(&[&target, "host", "add", "acme-prod"]),
+            argv(&[&target, "host", "rename", "acme-prod", "api.example.com"]),
         ] {
             assert_eq!(run(&bad).unwrap_err(), USAGE, "{bad:?}");
         }
