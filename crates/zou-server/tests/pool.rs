@@ -289,3 +289,49 @@ async fn checkouts_past_the_cap_wait_instead_of_failing() {
         assert_eq!(t.await.expect("join"), i.to_string());
     }
 }
+
+/// The extensions a project's own migrations assume, which are not
+/// zou's own: nothing in this server calls either of them. The
+/// assertion is that `gen_salt` resolves with nothing in front of it,
+/// because that is how a migration copied off the Supabase docs spells
+/// it.
+#[tokio::test]
+async fn bootstrap_left_the_extensions_a_supabase_database_has() {
+    let Some(pool) = pool_of(1) else { return };
+    let sess = pool.unscoped().await.expect("unscoped");
+    assert_eq!(
+        text(
+            &sess,
+            "select count(*)::text from pg_extension e \
+             join pg_namespace n on n.oid = e.extnamespace \
+             where e.extname in ('pgcrypto','uuid-ossp') and n.nspname = 'extensions'"
+        )
+        .await,
+        "2"
+    );
+    assert_eq!(
+        text(
+            &sess,
+            "select setconfig::text from pg_db_role_setting \
+             where setdatabase = (select oid from pg_database where datname = current_database()) \
+               and setrole = 0"
+        )
+        .await,
+        "{\"search_path=\\\"$user\\\", public, extensions\"}"
+    );
+    // A session that started before the alter database landed still
+    // has the old path, so this asks the way a new one would. Not set
+    // local: an unscoped session is not in a transaction.
+    sess.query("set search_path to \"$user\", public, extensions", &[])
+        .await
+        .expect("search path");
+    assert_eq!(
+        text(&sess, "select length(gen_salt('bf'))::text").await,
+        "29"
+    );
+    assert_eq!(
+        text(&sess, "select length(uuid_generate_v4()::text)::text").await,
+        "36"
+    );
+    sess.commit().await.expect("finish");
+}

@@ -178,6 +178,36 @@ begin
 end
 $$;
 
+-- The half of a Supabase database that nobody's server made.
+--
+-- A project's own migrations call gen_salt, crypt, digest and
+-- uuid_generate_v4 without qualifying them, because the database they
+-- were written against has an extensions schema with pgcrypto and
+-- uuid-ossp in it and extensions on the search path. Recorded off
+-- supabase start rather than remembered, and the recording is kept by
+-- the record workflow now, see tamnd/zou#214.
+--
+-- Best effort on purpose. A deployment pointed at a managed postgres
+-- may have neither the privilege to create an extension nor the files
+-- to create it from, and the rest of this batch is worth applying
+-- either way. What is lost is a project's own sql, not zou's: nothing
+-- here calls into either extension.
+do $$
+begin
+    create schema if not exists extensions;
+    grant usage on schema extensions to anon, authenticated, service_role;
+    create extension if not exists pgcrypto with schema extensions;
+    create extension if not exists \"uuid-ossp\" with schema extensions;
+    execute format(
+        'alter database %I set search_path to %s',
+        current_database(),
+        '\"$user\", public, extensions'
+    );
+exception when insufficient_privilege or undefined_file or duplicate_object then
+    raise warning 'zou: no extensions schema: %', sqlerrm;
+end
+$$;
+
 -- The DDL watch behind catalog invalidation. Event triggers are
 -- superuser only, so a deployment that connects as a lesser role
 -- keeps working and falls back to the timed refresh instead.
