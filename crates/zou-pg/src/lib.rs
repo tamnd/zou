@@ -31,6 +31,10 @@ pub mod gc;
 pub mod getpage;
 pub mod ingest;
 pub mod pagecache;
+#[cfg(unix)]
+pub mod pageserve;
+#[cfg(not(unix))]
+#[path = "pageserve_stub.rs"]
 pub mod pageserve;
 mod pagesvc;
 pub mod pending;
