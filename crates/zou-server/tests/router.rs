@@ -398,16 +398,16 @@ async fn the_s3_door_answers_a_request_with_no_key_on_it() {
 #[tokio::test]
 async fn an_s3_call_this_surface_has_no_answer_for_yet_says_so_without_naming_methods() {
     let app = app();
-    // A piece of an upload whose bytes are some other key's, which is a
-    // request the reference answers and this does not yet. It is a put
-    // that names an upload and a source at once, so the three puts on
-    // this route are told apart by a header and a pair of parameters
-    // and not by anything a router could dispatch on. A method router
-    // would have answered 405 and offered the verbs that are written,
-    // which would read as a claim that a copy into a piece is not part
-    // of the protocol.
+    // Every verb this route answers is dispatched inside one handler,
+    // because the puts on it are told apart by a header and a pair of
+    // query parameters and not by anything a router could look at. So
+    // the verbs it does not answer end up in the same handler too, and
+    // what they hear has to be this rather than the 405 with a list of
+    // verbs a method router would have given: a list that named the
+    // ones that are written would read as a claim about the protocol
+    // rather than about how much of it is here.
     let path = "/storage/v1/s3/pics/big?partNumber=1&uploadId=whichever";
-    let answer = carrying(&app, "PUT", path, ("x-amz-copy-source", "pics/small")).await;
+    let answer = carrying(&app, "PATCH", path, ("x-amz-copy-source", "pics/small")).await;
     assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(answer.allow, "");
     assert_eq!(

@@ -157,6 +157,24 @@ impl StorageError {
         }
     }
 
+    /// A range of a source that a copy cannot take.
+    ///
+    /// Only on a copied piece. A range header on a download clamps to
+    /// the end of the object and answers what there is, and this one
+    /// refuses: an end past the last byte, a start past it, a suffix
+    /// range, two ranges in one header and a range with no unit on it
+    /// are all this, and all with the same lower case sentence.
+    /// Recorded either side of the boundary, so the rule is that the
+    /// end has to be a byte the object has rather than a length it has.
+    pub(crate) fn bad_range() -> Self {
+        StorageError {
+            status: 400,
+            error: "InvalidRange",
+            message: "invalid range provided".to_string(),
+            code: "InvalidRange",
+        }
+    }
+
     /// The same sentence a duplicate bucket earns, under a different
     /// code.
     pub(crate) fn key_already_exists() -> Self {
