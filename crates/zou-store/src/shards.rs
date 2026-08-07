@@ -206,6 +206,21 @@ pub fn load_serving_descs(
     let layout = TenantLayout::new(tenant_ref);
     let mut descs = Vec::new();
     let mut own = None;
+    // A manifest that covers its keyspace at some count keeps covering
+    // it at any count at or above, every split since only narrowed the
+    // shard. Skip the lineage entirely then; a merge widens the shard
+    // past the claim and the ancestors are consulted again.
+    if let Some((m, _)) = PageShardManifest::load(store, &layout.shard_manifest(shard))?
+        && m.covers.is_some_and(|c| c <= manifest.shards)
+    {
+        for l in &m.layers {
+            let mut d = LayerDesc::parse(&l.name, l.size).map_err(PageShardError::from)?;
+            d.owner = l.owner.clone();
+            d.upto = l.upto;
+            descs.push(d);
+        }
+        return Ok((descs, m.disk_consistent_lsn));
+    }
     for s in serving_shards(shard, manifest.shards, &manifest.shard_history) {
         let Some((m, _)) = PageShardManifest::load(store, &layout.shard_manifest(s))? else {
             continue;
@@ -224,6 +239,40 @@ pub fn load_serving_descs(
         }
     }
     Ok((descs, resume_floor(manifest, own)))
+}
+
+/// Retire the split lineage once it stopped mattering: when every
+/// shard of the current count covers its keyspace on its own, nobody
+/// consults an ancestor era again, and the history can be cleared so
+/// the serving set math stays trivial and old eras become gc food.
+/// Returns whether the lineage is gone, false when some shard still
+/// leans on its ancestors. One CAS on the tenant manifest, retried
+/// against the heartbeat like a resize.
+pub fn prune_lineage(store: &dyn CasStore, tenant_ref: &str) -> Result<bool, ShardError> {
+    let layout = TenantLayout::new(tenant_ref);
+    let key = layout.manifest();
+    loop {
+        let Some((data, version)) = store.get(&key)? else {
+            return Err(ShardError::NoTenant { key });
+        };
+        let mut manifest = Manifest::from_json(&data)?;
+        if manifest.shard_history.is_empty() {
+            return Ok(true);
+        }
+        for shard in 0..manifest.shards as u16 {
+            let covered = PageShardManifest::load(store, &layout.shard_manifest(shard))?
+                .is_some_and(|(m, _)| m.covers.is_some_and(|c| c <= manifest.shards));
+            if !covered {
+                return Ok(false);
+            }
+        }
+        manifest.shard_history.clear();
+        match store.put_if_match(&key, &manifest.to_json(), Some(&version)) {
+            Ok(_) => return Ok(true),
+            Err(CasError::Conflict { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -467,5 +516,66 @@ mod tests {
         let mem = crate::memtable::Memtable::new();
         let rec = reader.reconstruct(&map, &mem, &right, Lsn(0x200)).unwrap();
         assert_eq!(rec.records, vec![(Lsn(0x100), vec![9; 16])]);
+    }
+
+    #[test]
+    fn a_coverage_claim_skips_the_lineage_and_lets_the_prune_land() {
+        let store = MemStore::default();
+        seed(&store, "t");
+        let layout = TenantLayout::new("t");
+        let entry = |b: u32| {
+            let entries = vec![crate::layer::DeltaEntry {
+                key: LayerKey::page(1663, 5, 16384, 0, b),
+                lsn: Lsn(0x100),
+                record: vec![7; 16],
+            }];
+            let (bytes, footer) = crate::layer::build_delta(&entries, 4096).unwrap();
+            LayerEntry {
+                name: LayerDesc::from_footer(&footer, bytes.len() as u64).name(),
+                size: bytes.len() as u64,
+                owner: None,
+                upto: None,
+            }
+        };
+        publish_layer(&store, &layout.shard_manifest(0), 0, &entry(1), Lsn(0x100)).unwrap();
+        let manifest = split(&store, "t").unwrap();
+
+        // No claims yet: the lineage stays, shard 1 leans on shard 0.
+        assert!(!prune_lineage(&store, "t").unwrap());
+        let (descs, _) = load_serving_descs(&store, "t", &manifest, 1).unwrap();
+        assert_eq!(descs[0].home, Some(0));
+
+        // Shard 1 covers itself. Its serving set is now its own
+        // manifest alone, but the prune still refuses for shard 0.
+        crate::shardmanifest::swap_layers(
+            &store,
+            &layout.shard_manifest(1),
+            1,
+            &[],
+            &[entry(2)],
+            Some(2),
+        )
+        .unwrap();
+        let (descs, _) = load_serving_descs(&store, "t", &manifest, 1).unwrap();
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].home, None);
+        assert!(!prune_lineage(&store, "t").unwrap());
+        assert!(!load(&store, "t").shard_history.is_empty());
+
+        // Shard 0 covers too: the lineage goes, and stays gone on a
+        // rerun.
+        crate::shardmanifest::swap_layers(&store, &layout.shard_manifest(0), 0, &[], &[], Some(2))
+            .unwrap();
+        assert!(prune_lineage(&store, "t").unwrap());
+        assert!(load(&store, "t").shard_history.is_empty());
+        assert!(prune_lineage(&store, "t").unwrap());
+
+        // A merge widens shard 0 past its claim: covers 2 at count 1
+        // no longer holds and the serving math consults the eras
+        // again, which is exactly the safe direction.
+        let manifest = merge(&store, "t").unwrap();
+        let (descs, _) = load_serving_descs(&store, "t", &manifest, 0).unwrap();
+        assert_eq!(descs.len(), 2, "shard 0 reads both halves after the merge");
+        assert!(!prune_lineage(&store, "t").unwrap());
     }
 }

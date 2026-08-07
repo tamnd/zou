@@ -25,6 +25,7 @@
 pub mod bootstrap;
 pub mod cache;
 pub mod capture;
+pub mod compact;
 pub mod fold;
 pub mod gc;
 pub mod getpage;

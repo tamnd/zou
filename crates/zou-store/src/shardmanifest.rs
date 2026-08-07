@@ -77,6 +77,17 @@ pub struct PageShardManifest {
     /// sealed WAL from here, nothing below it is ever needed again.
     pub disk_consistent_lsn: Lsn,
     pub layers: Vec<LayerEntry>,
+    /// The shard count whose keyspace this manifest covers on its own,
+    /// set when compaction rewrites everything the shard serves into
+    /// its own layers. While the tenant's count stays at or above it,
+    /// readers skip the split lineage entirely: every later split only
+    /// narrows the shard's keyspace, so the coverage still holds. A
+    /// merge widens it again, the condition fails, and the lineage is
+    /// consulted as before. Absent until the first full compaction,
+    /// and losing the field (an old binary rewriting the manifest)
+    /// only costs ancestor reads, never data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub covers: Option<u32>,
 }
 
 impl PageShardManifest {
@@ -89,6 +100,7 @@ impl PageShardManifest {
             shard,
             disk_consistent_lsn: Lsn(0),
             layers: Vec::new(),
+            covers: None,
         }
     }
 
@@ -157,6 +169,46 @@ pub fn publish_layer(
             m.layers.push(entry.clone());
         }
         m.disk_consistent_lsn = m.disk_consistent_lsn.max(disk_consistent_lsn);
+        match store.put_if_match(key, &m.encode(), version.as_ref()) {
+            Ok(_) => return Ok(m),
+            Err(CasError::Conflict { .. }) | Err(CasError::AlreadyExists { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Compaction's atomic commit: retire the named input layers, list the
+/// outputs, and optionally stamp the coverage claim, all in one CAS.
+/// Idempotent like [`publish_layer`]: a crash retry that finds its
+/// outputs already listed and its inputs already gone changes nothing,
+/// so a preempted worker can be rerun blindly. Inputs stay as objects,
+/// orphan gc owns their bytes; this only stops them serving.
+pub fn swap_layers(
+    store: &dyn CasStore,
+    key: &str,
+    shard: u16,
+    retire: &[String],
+    add: &[LayerEntry],
+    covers: Option<u32>,
+) -> Result<PageShardManifest, PageShardError> {
+    loop {
+        let (mut m, version) = match PageShardManifest::load(store, key)? {
+            Some((m, v)) => (m, Some(v)),
+            None => (PageShardManifest::new(shard), None),
+        };
+        m.layers.retain(|l| !retire.contains(&l.name));
+        for entry in add {
+            if !m.layers.iter().any(|l| l.name == entry.name) {
+                m.layers.push(entry.clone());
+            }
+        }
+        if let Some(count) = covers {
+            // The latest full rewrite's count, not a max: a rewrite
+            // filters to the keys the shard owns right now, so an
+            // older wider claim stops being true the moment the new
+            // outputs replace the layers that backed it.
+            m.covers = Some(count);
+        }
         match store.put_if_match(key, &m.encode(), version.as_ref()) {
             Ok(_) => return Ok(m),
             Err(CasError::Conflict { .. }) | Err(CasError::AlreadyExists { .. }) => continue,
@@ -246,5 +298,49 @@ mod tests {
         assert_eq!(loaded, m);
         let map = loaded.layer_map().unwrap();
         assert_eq!(map.layers().len(), 2);
+    }
+
+    #[test]
+    fn swapping_spares_a_concurrent_flush_and_reruns_idempotently() {
+        let store = MemStore::default();
+        let key = "tenants/t/shards/0000/SHARD";
+        let a = entry_from_built(&[1], &[10]);
+        let b = entry_from_built(&[2], &[20]);
+        publish_layer(&store, key, 0, &a, Lsn(10)).unwrap();
+        publish_layer(&store, key, 0, &b, Lsn(20)).unwrap();
+
+        // A flush lands after compaction read its inputs. The retire
+        // list names only what the pass merged, so the newcomer rides
+        // through the swap untouched.
+        let fresh = entry_from_built(&[3], &[30]);
+        publish_layer(&store, key, 0, &fresh, Lsn(30)).unwrap();
+        let merged = entry_from_built(&[1, 2], &[10, 20]);
+        let retire = vec![a.name.clone(), b.name.clone()];
+        let m = swap_layers(
+            &store,
+            key,
+            0,
+            &retire,
+            std::slice::from_ref(&merged),
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(m.layers, vec![fresh.clone(), merged.clone()]);
+        assert_eq!(m.covers, Some(2));
+        assert_eq!(
+            m.disk_consistent_lsn,
+            Lsn(30),
+            "the swap never moves the lsn"
+        );
+
+        // A crashed twin rerunning the same swap changes nothing.
+        let again = swap_layers(&store, key, 0, &retire, &[merged], Some(2)).unwrap();
+        assert_eq!(again, m);
+
+        // A later rewrite at a smaller count overwrites the claim
+        // outright: the old wider claim's backing layers are gone, a
+        // max would keep asserting something no longer true.
+        let m = swap_layers(&store, key, 0, &[], &[], Some(1)).unwrap();
+        assert_eq!(m.covers, Some(1));
     }
 }
