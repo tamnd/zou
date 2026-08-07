@@ -147,9 +147,9 @@ pub fn render(runs: &[Run], js: Option<&Js>, pin: Option<&str>) -> String {
         out.push_str("## supabase-js\n\n");
         out.push_str(
             "supabase-js's own integration file, run against zou with the url changed and \
-             not one assertion touched. Skipped tests need Realtime or Storage, which zou \
-             does not serve on that url yet: they are skipped rather than deleted so that \
-             the count keeps saying how much of the file is not being asked.\n\n",
+             not one assertion touched. Skipped tests need Realtime, which zou does not \
+             serve on that url yet: they are skipped rather than deleted so that the \
+             count keeps saying how much of the file is not being asked.\n\n",
         );
         out.push_str("| block | passing | of | skipped |\n");
         out.push_str("| --- | ---: | ---: | ---: |\n");

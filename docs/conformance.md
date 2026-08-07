@@ -325,8 +325,9 @@ It starts zou on 54321, the port the Supabase CLI serves a local project on, pri
 zou installs the auth schema on the first connection it takes out of its pool, the fixture has a foreign key into `auth.users`, and the health endpoint answers without taking a connection.
 So `serve` makes zou answer a request that has to reach Postgres before it says it is ready, and the `url` line it prints last is a readiness check CI can grep for.
 
-16 of the 34 tests run and zou passes all 16: the client constructing, the PostgREST block, the RLS block, the Authentication block, and the timeout configuration block.
-The other 18 are Realtime and Storage, which zou does not serve on this URL yet.
+17 of the 34 tests run and zou passes all 17: the client constructing, the PostgREST block, the RLS block, the Authentication block, the Storage block, and the timeout configuration block.
+The Storage block is the one that says something the recorded storage suite cannot, because it goes through storage-js with the anon key and a policy on `storage.objects` decides rather than a service role going around it.
+The other 17 are Realtime, which zou does not serve on this URL yet.
 They are skipped behind an environment flag rather than deleted, so the day the feature lands the test runs exactly as upstream wrote it.
 
 ## The app
@@ -353,9 +354,9 @@ The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
 The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 74 of them, 96%, with 3 known differences.
 All three are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
 
-The `storage` suite is 163 cases against the storage-api a local Supabase project runs, and zou passes all 163, byte for byte, with no known differences.
+The `storage` suite is 399 cases against the storage-api a local Supabase project runs, and zou passes all 399, byte for byte, with no known differences.
 
-supabase-js 2.111.0 runs 16 of its integration tests against zou and all 16 pass.
+supabase-js 2.111.0 runs 17 of its integration tests against zou and all 17 pass.
 
 The cases that pass "written differently" are all the same three things: zou puts a space after each colon where PostgREST puts a newline between rows, a `select=*` comes back with the columns in a different order, and two auth answers carry their keys in a different order than Go wrote them.
 None of them is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.
