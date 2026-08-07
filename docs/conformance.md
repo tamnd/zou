@@ -354,7 +354,7 @@ The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
 The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 74 of them, 96%, with 3 known differences.
 All three are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
 
-The `storage` suite is 399 cases against the storage-api a local Supabase project runs, and zou passes all 399, byte for byte, with no known differences.
+The `storage` suite is 435 cases against the storage-api a local Supabase project runs, and zou passes all 435, byte for byte, with no known differences.
 
 supabase-js 2.111.0 runs 17 of its integration tests against zou and all 17 pass.
 

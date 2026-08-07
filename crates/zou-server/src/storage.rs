@@ -712,6 +712,126 @@ impl BucketBody {
     }
 }
 
+/// The pattern upstream's schema holds a size limit up against, quoted
+/// into the refusal exactly as it is written there, backslash and all.
+const SIZE_PATTERN: &str = r"^[0-9]+(?:\.[0-9]+)?(?:[gG][bB]|[mM][bB]|[kK][bB]|[bB])$";
+
+/// A size limit that is not one, in the reference's words.
+///
+/// The schema is three branches in an `anyOf` and the message is every
+/// branch's complaint joined up, so the sentence is long and it is the
+/// sentence a client sees. `finite` is the middle branch's own keyword,
+/// and whether it appears is the one thing that moves: a number that is
+/// finite and not whole passes that branch and fails the other two, and
+/// anything else fails all three.
+fn not_a_size(finite: bool) -> StorageError {
+    let mut said = String::from("body/file_size_limit must be integer");
+    if !finite {
+        said.push_str(", body/file_size_limit must pass \"finite\" keyword validation");
+    }
+    said.push_str(&format!(
+        ", body/file_size_limit must match pattern \"{SIZE_PATTERN}\", \
+         body/file_size_limit must match a schema in anyOf"
+    ));
+    StorageError::not_valid(said)
+}
+
+/// What a `file_size_limit` is, which is a number, or a string with a
+/// unit on the end, or a string with no unit that is a number anyway,
+/// or a yes.
+///
+/// storage-js passes whatever it was handed straight through, so a
+/// bucket made with `fileSizeLimit: '20mb'` arrives here as words. The
+/// schema in front of the reference coerces before it validates, which
+/// is where the odder answers come from: a yes is a one, an empty
+/// string is a null, and `'1024'` is a thousand and twenty four. All
+/// recorded.
+fn size_limit(v: &serde_json::Value) -> Result<Option<i64>, StorageError> {
+    match v {
+        serde_json::Value::Null => Ok(None),
+        // Coerced rather than refused, which is what a schema that
+        // takes a number does to a boolean. false is a zero and zero is
+        // a bucket that takes nothing, so this is a foot gun copied on
+        // purpose.
+        serde_json::Value::Bool(yes) => Ok(Some(i64::from(*yes))),
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(most) => Ok(Some(most)),
+            // 20.0 is a whole number where the reference runs, because
+            // there is only one kind of number there, so a size written
+            // with a nought after the point is the size and not a
+            // refusal. A number that is finite and not whole is the one
+            // case that gets the shorter sentence.
+            None => match n.as_f64() {
+                Some(f) if f.is_finite() && f.fract() == 0.0 => Ok(Some(f as i64)),
+                Some(f) if f.is_finite() => Err(not_a_size(true)),
+                _ => Err(not_a_size(false)),
+            },
+        },
+        serde_json::Value::String(said) => spelled_size(said),
+        _ => Err(not_a_size(false)),
+    }
+}
+
+/// A size limit written down rather than counted out.
+fn spelled_size(said: &str) -> Result<Option<i64>, StorageError> {
+    // An empty string is the null branch rather than the number one,
+    // which is how the coercion in front of the reference reads it, so
+    // sending one clears the column instead of being refused.
+    if said.is_empty() {
+        return Ok(None);
+    }
+    // The number branch first, because a size sent as `'1024'` is a
+    // number that happens to be in quotes and lands there rather than
+    // in the pattern, which has no unitless spelling.
+    if let Ok(n) = said.trim().parse::<f64>()
+        && n.is_finite()
+        && n.fract() == 0.0
+        && n >= i64::MIN as f64
+        && n <= i64::MAX as f64
+    {
+        return Ok(Some(n as i64));
+    }
+    let (count, unit) = match said.as_bytes() {
+        [.., a, b] if unit_of(*a, *b).is_some() => {
+            (&said[..said.len() - 2], unit_of(*a, *b).unwrap())
+        }
+        [.., b] if b.eq_ignore_ascii_case(&b'b') => (&said[..said.len() - 1], 1),
+        _ => return Err(not_a_size(false)),
+    };
+    // The pattern by hand: digits, then at most one dot with digits
+    // after it, and nothing else. No sign, no exponent, no space, which
+    // is why a minus and a `20 mb` are both refused.
+    let (whole, fraction) = match count.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (count, ""),
+    };
+    let numbers = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    if !numbers(whole) || (count.contains('.') && !numbers(fraction)) {
+        return Err(not_a_size(false));
+    }
+    let Ok(count) = count.parse::<f64>() else {
+        return Err(not_a_size(false));
+    };
+    // A thousand and not a thousand and twenty four, so a megabyte here
+    // is twenty million and a mebibyte is not a spelling at all. The
+    // rounding down only shows on a fraction of a byte, which nobody
+    // has asked for and nothing has recorded.
+    Ok(Some((count * unit as f64) as i64))
+}
+
+/// The three units with a letter in front of the b, or nothing.
+fn unit_of(a: u8, b: u8) -> Option<i64> {
+    if !b.eq_ignore_ascii_case(&b'b') {
+        return None;
+    }
+    match a.to_ascii_lowercase() {
+        b'g' => Some(1_000_000_000),
+        b'm' => Some(1_000_000),
+        b'k' => Some(1_000),
+        _ => None,
+    }
+}
+
 /// Read the body as json, or say what the reference says about a body
 /// that is not.
 ///
@@ -720,7 +840,9 @@ impl BucketBody {
 /// forgiving reading: upstream validates against a schema and refuses a
 /// field of the wrong type, and what it says when it does is not
 /// recorded, so a wrong type here is treated as a field that was not
-/// usable rather than answered with a sentence nobody has checked.
+/// usable rather than answered with a sentence nobody has checked. The
+/// size limit is the exception, because what upstream says about that
+/// one is recorded.
 async fn body_of(body: Body) -> Result<BucketBody, StorageError> {
     let bytes = axum::body::to_bytes(body, BODY_LIMIT)
         .await
@@ -731,7 +853,10 @@ async fn body_of(body: Body) -> Result<BucketBody, StorageError> {
         name: raw.get("name").and_then(|v| v.as_str()).map(str::to_string),
         id: raw.get("id").and_then(|v| v.as_str()).map(str::to_string),
         public: raw.get("public").and_then(|v| v.as_bool()),
-        file_size_limit: raw.get("file_size_limit").and_then(|v| v.as_i64()),
+        file_size_limit: match raw.get("file_size_limit") {
+            Some(v) => size_limit(v)?,
+            None => None,
+        },
         allowed_mime_types: raw.get("allowed_mime_types").and_then(|v| {
             v.as_array().map(|a| {
                 a.iter()
@@ -948,4 +1073,66 @@ pub async fn remove(
         .await
         .map_err(|e| pg_error(&e))?;
     done(sess, Ok(message("Successfully deleted"))).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn size(json: &str) -> Result<Option<i64>, StorageError> {
+        size_limit(&serde_json::from_str(json).expect("the test wrote json"))
+    }
+
+    #[test]
+    fn a_size_written_in_words_is_counted_in_thousands() {
+        assert_eq!(size(r#""20mb""#).unwrap(), Some(20_000_000));
+        assert_eq!(size(r#""20MB""#).unwrap(), Some(20_000_000));
+        assert_eq!(size(r#""1kb""#).unwrap(), Some(1_000));
+        assert_eq!(size(r#""1gb""#).unwrap(), Some(1_000_000_000));
+        assert_eq!(size(r#""1000b""#).unwrap(), Some(1_000));
+        assert_eq!(size(r#""0.5mb""#).unwrap(), Some(500_000));
+    }
+
+    #[test]
+    fn a_size_that_is_a_number_in_quotes_is_the_number() {
+        assert_eq!(size(r#""1024""#).unwrap(), Some(1024));
+        assert_eq!(size("1024").unwrap(), Some(1024));
+        assert_eq!(size("1024.0").unwrap(), Some(1024));
+    }
+
+    #[test]
+    fn an_empty_size_clears_the_column_and_a_yes_is_a_one() {
+        assert_eq!(size(r#""""#).unwrap(), None);
+        assert_eq!(size("null").unwrap(), None);
+        assert_eq!(size("true").unwrap(), Some(1));
+        assert_eq!(size("false").unwrap(), Some(0));
+        assert_eq!(size(r#""0""#).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn the_units_are_the_four_the_pattern_names_and_no_others() {
+        for said in [
+            r#""20mib""#,
+            r#""1tb""#,
+            r#""20 mb""#,
+            r#""20 bananas""#,
+            r#""abc""#,
+            r#""-1mb""#,
+            r#""b""#,
+            r#""mb""#,
+            r#"".5mb""#,
+        ] {
+            assert!(size(said).is_err(), "{said} is not a size");
+        }
+    }
+
+    #[test]
+    fn only_a_number_that_is_finite_and_not_whole_gets_the_shorter_sentence() {
+        let long = size(r#""abc""#).unwrap_err().message;
+        let short = size("1024.5").unwrap_err().message;
+        assert!(long.contains("must pass \"finite\" keyword validation"));
+        assert!(!short.contains("finite"));
+        assert!(short.starts_with("body/file_size_limit must be integer, body/file_size_limit"));
+        assert!(long.ends_with("must match a schema in anyOf"));
+    }
 }

@@ -25,7 +25,7 @@ The Postgres line is the one place zou is deliberately ahead. A suite that depen
 | rest, the hand written suite | 82 | 82 | 100% | the surface a Supabase project actually uses |
 | postgrest, derived from upstream's spec files | 1217 | 1217 | 100% | upstream's own test corpus turned into questions |
 | auth | 74 | 77 | 96% | three known differences, below |
-| storage | 399 | 399 | 100% | buckets, objects, resumable uploads and the S3 protocol |
+| storage | 435 | 435 | 100% | buckets, objects, resumable uploads and the S3 protocol |
 | supabase-js | 17 | 17 | 100% | upstream's integration file, url changed, no assertion touched |
 
 A known difference still counts as a failure in every number above. It is excused from the exit code and from nothing else, so the score cannot be improved by writing an explanation down.
