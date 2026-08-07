@@ -85,14 +85,14 @@ use crate::storage::{ALLOW_DELETE, StorageError, begin, caller, done, message, o
 pub(crate) const UPLOAD_LIMIT: usize = 50 * 1024 * 1024;
 
 /// What an upload that says nothing about its type is taken to be.
-const OCTET_STREAM: &str = "application/octet-stream";
+pub(crate) const OCTET_STREAM: &str = "application/octet-stream";
 
 /// How much of a batch delete's body is worth reading. A list of names,
 /// so the room a bucket call gets is enough for a few thousand of them.
 const BODY_LIMIT: usize = 1024 * 1024;
 
 /// The cache-control an upload that says nothing about caching gets.
-const NO_CACHE: &str = "no-cache";
+pub(crate) const NO_CACHE: &str = "no-cache";
 
 /// Which door a read came in by, which decides who it is asked as and
 /// what a bucket that is not public is told.
@@ -113,15 +113,15 @@ enum Door {
 /// field: `metadata` is what storage-api wrote when the bytes went in,
 /// and `user_metadata` is whatever the client attached and is never
 /// looked into.
-struct ObjectRow {
+pub(crate) struct ObjectRow {
     id: String,
     bucket_id: String,
-    name: String,
+    pub(crate) name: String,
     owner: String,
     owner_id: String,
     version: String,
     created_at: String,
-    updated_at: String,
+    pub(crate) updated_at: String,
     last_accessed_at: String,
     metadata: Value,
     user_metadata: Value,
@@ -129,12 +129,12 @@ struct ObjectRow {
 
 impl ObjectRow {
     /// A field of the metadata storage-api writes, or null.
-    fn meta(&self, field: &str) -> Value {
+    pub(crate) fn meta(&self, field: &str) -> Value {
         self.metadata.get(field).cloned().unwrap_or(Value::Null)
     }
 
     /// Where the bytes of this version are.
-    fn key(&self) -> String {
+    pub(crate) fn key(&self) -> String {
         blob::key(&self.id, &self.version)
     }
 
@@ -174,7 +174,7 @@ impl ObjectRow {
 
 /// The store, or the sentence a server that was started without one
 /// owes anybody who asks it for bytes.
-fn blobs(app: &App) -> Result<&Blobs, StorageError> {
+pub(crate) fn blobs(app: &App) -> Result<&Blobs, StorageError> {
     app.blobs
         .as_ref()
         .ok_or_else(|| StorageError::internal("zou is running without an object store".to_string()))
@@ -208,7 +208,11 @@ fn object_row(row: &tokio_postgres::Row) -> ObjectRow {
 }
 
 /// The one row, as whoever this session is.
-async fn find(sess: &Session, bucket: &str, name: &str) -> Result<Option<ObjectRow>, StorageError> {
+pub(crate) async fn find(
+    sess: &Session,
+    bucket: &str,
+    name: &str,
+) -> Result<Option<ObjectRow>, StorageError> {
     let sql =
         format!("select {OBJECT_COLUMNS} from storage.objects where bucket_id = $1 and name = $2");
     let rows = sess
@@ -366,7 +370,7 @@ async fn read_row(
 /// reference spells it, capitals and all. Anything else goes back as it
 /// came, and a type that already says what its charset is is left
 /// alone.
-fn served_type(mime: &str) -> String {
+pub(crate) fn served_type(mime: &str) -> String {
     let mime = match mime.trim().is_empty() {
         true => "application/octet-stream",
         false => mime.trim(),
@@ -386,7 +390,7 @@ fn served_type(mime: &str) -> String {
 /// object is a truthful answer to a question about part of one, and
 /// what the reference says about an unsatisfiable range is not
 /// recorded.
-fn wanted_range(header: &str, size: u64) -> Option<(u64, u64)> {
+pub(crate) fn wanted_range(header: &str, size: u64) -> Option<(u64, u64)> {
     let spec = header.trim().strip_prefix("bytes=")?;
     let (first, last) = spec.split_once('-')?;
     let (start, end) = match (first.trim(), last.trim()) {
@@ -746,7 +750,7 @@ pub async fn info(
     parts: Parts,
 ) -> Result<Response, StorageError> {
     let row = read_row(&app, &parts, &bucket, &name, Door::Authenticated).await?;
-    Ok(ok(row.info()))
+    Ok(described(&row))
 }
 
 /// GET /storage/v1/object/info/public/{bucket}/{name}
@@ -756,7 +760,25 @@ pub async fn info_public(
     parts: Parts,
 ) -> Result<Response, StorageError> {
     let row = read_row(&app, &parts, &bucket, &name, Door::Public).await?;
-    Ok(ok(row.info()))
+    Ok(described(&row))
+}
+
+/// What both info routes answer.
+///
+/// The etag is on it, which is a header a json answer has no obvious
+/// business carrying: nothing about this document changes when the
+/// bytes do, and a client that sent it back in `if-none-match` would
+/// be asking about the object rather than about what is written down
+/// for it. It is here because it is recorded, which makes it the
+/// reference's business rather than this one's.
+fn described(row: &ObjectRow) -> Response {
+    let mut answer = ok(row.info());
+    if let Some(etag) = row.meta("eTag").as_str()
+        && let Ok(value) = etag.parse()
+    {
+        answer.headers_mut().insert(header::ETAG, value);
+    }
+    answer
 }
 
 /// A timestamp column, written the way a javascript Date writes one.
@@ -1436,21 +1458,31 @@ fn split_on<'a>(body: &'a [u8], at: &[u8]) -> Vec<&'a [u8]> {
     pieces
 }
 
-/// What the upload writes into `metadata`.
+/// The etag of some bytes, which is their md5 in quotes.
 ///
-/// storage-api fills this in from what its backend said when it took
-/// the bytes, which is why the field names are the S3 ones rather than
-/// the column ones. The info route reads three of them back out, and a
-/// listing will read more.
-fn metadata(upload: &Upload, when: &str) -> String {
+/// The quotes are part of it rather than the header's punctuation. It
+/// is written into the row that way, answered that way by the info
+/// route, sent that way in a header, and put in an S3 listing that way
+/// with the quotes not escaped, which is four places that would have
+/// to agree if this were computed anywhere else.
+pub(crate) fn etag_of(bytes: &[u8]) -> String {
     let mut digest = Md5::new();
-    digest.update(&upload.bytes);
+    digest.update(bytes);
     let sum: String = digest
         .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    let etag = format!("\"{sum}\"");
+    format!("\"{sum}\"")
+}
+
+/// What the upload writes into `metadata`.
+///
+/// storage-api fills this in from what its backend said when it took
+/// the bytes, which is why the field names are the S3 ones rather than
+/// the column ones. The info route reads three of them back out, and a
+/// listing reads more.
+fn metadata(upload: &Upload, when: &str, etag: &str) -> String {
     json!({
         "eTag": etag,
         "size": upload.bytes.len(),
@@ -1535,7 +1567,7 @@ async fn store(
         .to_string();
 
     let sess = begin(app, &ctx, false).await?;
-    let id = write(
+    let written = write(
         app,
         sess,
         Some(&ctx.role),
@@ -1549,7 +1581,7 @@ async fn store(
     .await?;
     let answer = format!(
         "{{\"Id\":{},\"Key\":{}}}",
-        Value::from(id),
+        Value::from(written.id),
         Value::from(format!("{bucket}/{name}"))
     );
     Ok(ok(answer))
@@ -1563,8 +1595,8 @@ async fn store(
 /// url is under nobody's, because the url was checked instead. `role`
 /// is what says which of the two this is.
 ///
-/// Returns the id of the row it wrote, having committed it and dropped
-/// whatever bytes it replaced.
+/// Returns the row it wrote, having committed it and dropped whatever
+/// bytes it replaced.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write(
     app: &App,
@@ -1576,7 +1608,7 @@ pub(crate) async fn write(
     attached: Option<String>,
     sub: &str,
     replace: bool,
-) -> Result<String, StorageError> {
+) -> Result<Written, StorageError> {
     let blobs = blobs(app)?;
     // With the policies out of the way, because a caller who may not
     // write into a bucket still hears that the bucket is there. The
@@ -1599,7 +1631,8 @@ pub(crate) async fn write(
     let before = find(&sess, bucket, name).await?;
 
     let when = now(&sess).await?;
-    let written = metadata(&upload, &when);
+    let etag = etag_of(&upload.bytes);
+    let written = metadata(&upload, &when, &etag);
     let conflict = match replace {
         // Everything the upload decides, and nothing else. owner stays
         // as it was, because a replacement is not a change of hands.
@@ -1661,7 +1694,16 @@ pub(crate) async fn write(
     {
         let _ = blobs.delete(old.key()).await;
     }
-    Ok(id)
+    Ok(Written { id, etag })
+}
+
+/// What an upload left behind, for the two routes that answer
+/// something about it. The json one names the row and the S3 one
+/// answers the etag and nothing else, and neither can be worked out
+/// again afterwards without reading back what was just written.
+pub(crate) struct Written {
+    pub(crate) id: String,
+    pub(crate) etag: String,
 }
 
 /// Postgres's clock, so that the time in the metadata is the same clock
@@ -2746,9 +2788,13 @@ mod tests {
             mime: "text/plain".to_string(),
             cache: NO_CACHE.to_string(),
         };
+        // The one the reference recorded for the same eleven bytes,
+        // worked out here rather than written out, since what the two
+        // together say is that the sum goes in as the sum was made.
+        let etag = etag_of(&upload.bytes);
+        assert_eq!(etag, "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"");
         let written: Value =
-            serde_json::from_str(&metadata(&upload, "2026-08-06T14:25:39.016Z")).unwrap();
-        // The one the reference recorded for the same eleven bytes.
+            serde_json::from_str(&metadata(&upload, "2026-08-06T14:25:39.016Z", &etag)).unwrap();
         assert_eq!(written["eTag"], "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"");
         assert_eq!(written["size"], 11);
         assert_eq!(written["mimetype"], "text/plain");

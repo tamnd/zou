@@ -43,8 +43,10 @@
 //! element that self closes in one library and does not in another is a
 //! difference nobody meant.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{Method, StatusCode, header, request::Parts};
 use axum::response::{IntoResponse, Response};
@@ -52,6 +54,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::App;
+use crate::object;
 use crate::sql::RequestContext;
 use crate::storage::{StorageError, begin, done, pg_error};
 
@@ -67,14 +70,22 @@ use crate::storage::{StorageError, begin, done, pg_error};
 pub struct Credentials {
     pub access: String,
     pub secret: String,
-    /// Part of what is signed, so a client in the wrong region computes
-    /// a different signature and is told the signature does not match.
+    /// Where the project says it is, which is what a bucket answers
+    /// when asked for its location.
+    ///
+    /// Part of what is signed, so it is also half of which signatures
+    /// verify. The other half is [`REGION`]: a signature made in either
+    /// is taken and one made in a third is not, which is recorded three
+    /// times over against a project whose region is `local`. A client
+    /// that was never told where it is signs in the default and works,
+    /// and a client that read the location and signed in that works
+    /// too, and those are the two things a client does.
     pub region: String,
 }
 
 impl Credentials {
-    /// A pair in the region every Supabase project answers in unless it
-    /// was told otherwise.
+    /// A pair for a project that did not say where it is, which puts it
+    /// where every S3 client assumes it is.
     pub fn new(access: &str, secret: &str) -> Credentials {
         Credentials {
             access: access.to_string(),
@@ -82,9 +93,15 @@ impl Credentials {
             region: REGION.to_string(),
         }
     }
+
+    /// Is this a region a signature may have been computed in?
+    fn takes(&self, region: &str) -> bool {
+        region == self.region || region == REGION
+    }
 }
 
-/// Where a project is when nobody said.
+/// Where an S3 client signs when nobody told it otherwise, and where a
+/// project is when nobody told it either.
 pub const REGION: &str = "us-east-1";
 
 /// The only signature version any of this understands, which is also
@@ -129,11 +146,14 @@ fn refused(why: &StorageError, resource: &str) -> Response {
     (wire, [(header::CONTENT_TYPE, XML)], body).into_response()
 }
 
-/// The five characters that cannot be written as themselves inside a
-/// document. Attributes are quoted with double quotes here and nothing
-/// this surface writes puts a value in one, but both quotes are escaped
-/// anyway because the cost is nothing and the day something does put a
-/// bucket name in an attribute is not the day to remember this.
+/// The three characters that cannot be written as themselves inside an
+/// element.
+///
+/// Three rather than five: an etag is a hex sum in double quotes and
+/// the reference writes those quotes as themselves, so a document that
+/// escaped them would carry a different etag from the one it means.
+/// Quotes matter inside an attribute value and nothing this surface
+/// writes puts anything in one.
 fn escaped(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -141,8 +161,6 @@ fn escaped(text: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
             _ => out.push(c),
         }
     }
@@ -157,14 +175,17 @@ fn xml(body: String) -> Response {
 /// What the caller signed, taken apart.
 ///
 /// The scope is kept as its parts rather than as the string, because
-/// only one of them is used: the day, which the signing key is derived
-/// for. The region in it is deliberately ignored and the configured one
-/// used instead, which is what turns a signature computed for another
-/// region into a signature that does not match.
+/// two of them are used and the other two are constants. The day is
+/// taken as the caller wrote it, since nothing checks the date. The
+/// region is taken and then checked against the pair, rather than used
+/// as it stands: a region read straight out of the credential would
+/// always agree with itself, which is the same as not signing the
+/// region at all.
 #[derive(Debug)]
 struct Signed<'a> {
     access: &'a str,
     day: &'a str,
+    region: &'a str,
     headers: Vec<&'a str>,
     signature: &'a str,
 }
@@ -205,7 +226,7 @@ fn parse(raw: &str) -> Result<Signed<'_>, StorageError> {
         ));
     };
     let mut scope = credential.split('/');
-    let (Some(access), Some(day)) = (scope.next(), scope.next()) else {
+    let (Some(access), Some(day), Some(region)) = (scope.next(), scope.next(), scope.next()) else {
         return Err(StorageError::invalid_signature(
             "Invalid signature format".to_string(),
         ));
@@ -213,6 +234,7 @@ fn parse(raw: &str) -> Result<Signed<'_>, StorageError> {
     Ok(Signed {
         access,
         day,
+        region,
         headers: headers.split(';').collect(),
         signature,
     })
@@ -222,8 +244,10 @@ fn parse(raw: &str) -> Result<Signed<'_>, StorageError> {
 ///
 /// The whole check, and it answers nothing about who: a signature that
 /// verifies is the project, and a signature that does not is one of two
-/// refusals depending on which half of the pair was wrong.
-fn verified(app: &App, parts: &Parts) -> Result<(), StorageError> {
+/// refusals depending on which half of the pair was wrong. What comes
+/// back is the pair it verified against, because one answer on this
+/// surface is the region out of it.
+fn verified<'a>(app: &'a App, parts: &Parts) -> Result<&'a Credentials, StorageError> {
     let raw = parts
         .headers
         .get(header::AUTHORIZATION)
@@ -263,21 +287,21 @@ fn verified(app: &App, parts: &Parts) -> Result<(), StorageError> {
     canonical.push('\n');
     canonical.push_str(payload);
 
-    // The day is the caller's and the region is the project's. Taking
-    // the region from the credential too would mean a client could pick
-    // the one it signed for and always match, which is the same as not
-    // signing the region at all.
-    let scope = format!(
-        "{}/{}/{SERVICE}/aws4_request",
-        signed.day, credentials.region
-    );
+    // The day is the caller's and the region is the caller's out of a
+    // set of two. Checking membership and then signing with what the
+    // caller wrote is the same computation as trying both and taking
+    // whichever matched, said once.
+    if !credentials.takes(signed.region) {
+        return Err(StorageError::wrong_signature());
+    }
+    let scope = format!("{}/{}/{SERVICE}/aws4_request", signed.day, signed.region);
     let to_sign = format!(
         "{ALGORITHM}\n{stamp}\n{scope}\n{}",
         hex(&sha256(canonical.as_bytes()))
     );
-    let key = signing_key(&credentials.secret, signed.day, &credentials.region);
+    let key = signing_key(&credentials.secret, signed.day, signed.region);
     match same(&hex(&sign(&key, &to_sign)), signed.signature) {
-        true => Ok(()),
+        true => Ok(credentials),
         false => Err(StorageError::wrong_signature()),
     }
 }
@@ -285,6 +309,54 @@ fn verified(app: &App, parts: &Parts) -> Result<(), StorageError> {
 /// One header, by a name already in lower case.
 fn header_value<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
     parts.headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The query string taken apart, with the values decoded.
+///
+/// Decoded here rather than by an extractor, because the signature is
+/// computed over the string as it arrived and reading it twice for two
+/// purposes is the only way to have both. A parameter with no value is
+/// an empty one, which is what `?location` is and what tells this
+/// surface which of the several documents a get is asking for.
+fn query_of(parts: &Parts) -> BTreeMap<String, String> {
+    let mut asked = BTreeMap::new();
+    for pair in parts.uri.query().unwrap_or("").split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        asked.insert(name.to_string(), decoded(value));
+    }
+    asked
+}
+
+/// A percent encoded value, as itself.
+///
+/// A plus is a space here, which is the html form rule rather than the
+/// url one, and it is the rule every query string parser in this
+/// business applies. A percent that is not followed by two hex digits
+/// is left as a percent rather than refused: this runs before anything
+/// has been checked, and a query nobody can read is a query about an
+/// object nobody has.
+fn decoded(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'+' => out.push(b' '),
+            b'%' if at + 2 < bytes.len() => match u8::from_str_radix(&value[at + 1..at + 3], 16) {
+                Ok(byte) => {
+                    out.push(byte);
+                    at += 2;
+                }
+                Err(_) => out.push(b'%'),
+            },
+            byte => out.push(byte),
+        }
+        at += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The query string as the signature sees it: sorted by name, and a
@@ -421,17 +493,22 @@ async fn listed(app: &App, parts: &Parts) -> Result<Response, StorageError> {
 /// One route with `any` on it, for the reason the resumable routes have
 /// one: what a method this surface has not been taught yet should hear
 /// is a decision rather than a fallback. A method router would answer
-/// 405 with an `Allow` listing the three verbs below, which would tell
-/// an S3 client that listing a bucket is not a thing anybody can do
-/// here, and it is a thing the reference does. So the unwritten ones
-/// say what every unwritten part of this surface says, and the day
-/// objects arrive they arrive as another arm.
+/// 405 with an `Allow` listing the verbs below, and the things this
+/// surface still owes a client are things a method router would be
+/// answering for. So the unwritten ones say what every unwritten part
+/// of this surface says.
+///
+/// A get is four questions rather than one, told apart by the query:
+/// where the bucket is, whether it keeps versions, and the two versions
+/// of the listing. Which is the protocol's own doing, not something
+/// this dispatch invented.
 pub async fn bucket(
     State(app): State<Arc<App>>,
     Path(bucket): Path<String>,
     parts: Parts,
 ) -> Response {
     let answer = match parts.method {
+        Method::GET => asked(&app, &parts, &bucket).await,
         Method::HEAD => headed(&app, &parts, &bucket).await,
         Method::PUT => made(&app, &parts, &bucket).await,
         Method::DELETE => removed(&app, &parts, &bucket).await,
@@ -441,6 +518,282 @@ pub async fn bucket(
         Ok(response) => response,
         Err(why) => refused(&why, &bucket),
     }
+}
+
+/// GET /storage/v1/s3/{bucket}
+///
+/// Four questions on one verb, told apart by which parameter is in the
+/// query. The two that are not listings are answered before the bucket
+/// is looked for at all: whether the reference checks that a bucket
+/// exists before telling a client where it is is not recorded, and
+/// answering out of the configuration is the cheaper of the two guesses
+/// and the one that cannot be wrong about a bucket that does exist.
+async fn asked(app: &App, parts: &Parts, bucket: &str) -> Result<Response, StorageError> {
+    let credentials = verified(app, parts)?;
+    let query = query_of(parts);
+    if query.contains_key("location") {
+        return Ok(xml(format!(
+            "{DECLARATION}<LocationConstraint xmlns=\"{NAMESPACE}\">{}</LocationConstraint>",
+            escaped(&credentials.region)
+        )));
+    }
+    // Suspended rather than Disabled, which is the difference between a
+    // bucket that never kept old versions and one that stopped. Neither
+    // is true of storage, and this is what the reference says.
+    if query.contains_key("versioning") {
+        return Ok(xml(format!(
+            "{DECLARATION}<VersioningConfiguration xmlns=\"{NAMESPACE}\">\
+             <Status>Suspended</Status><MfaDelete>Disabled</MfaDelete>\
+             </VersioningConfiguration>"
+        )));
+    }
+    listing(app, parts, bucket, &query).await
+}
+
+/// The most keys one page can hold, which is also how many it holds
+/// when nobody said.
+const MOST_KEYS: usize = 1000;
+
+/// One row of a listing, which is either an object or a folder that
+/// several objects are under.
+struct Listed {
+    /// The key as the document writes it, which for a folder is the
+    /// common prefix with its delimiter still on.
+    key: String,
+    folder: bool,
+    /// Empty for a row whose metadata has no etag in it, which is what
+    /// a row somebody inserted by hand looks like. The element is left
+    /// out entirely for those rather than written empty.
+    etag: String,
+    size: i64,
+    when: String,
+}
+
+/// ListObjects and ListObjectsV2, which are one query and two
+/// documents.
+///
+/// The two disagree about the order of their fields, about what a page
+/// is asked for with, and about whether the count of what came back is
+/// worth saying. They agree about every row, so the rows are read once
+/// and written twice.
+async fn listing(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    query: &BTreeMap<String, String>,
+) -> Result<Response, StorageError> {
+    let v2 = query.get("list-type").map(String::as_str) == Some("2");
+    let prefix = query.get("prefix").cloned().unwrap_or_default();
+    let delimiter = query.get("delimiter").cloned().unwrap_or_default();
+    let most = query
+        .get("max-keys")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(MOST_KEYS)
+        .min(MOST_KEYS);
+    // The second version pages with a token it minted and the first
+    // with a key the client already had. A token that says nothing this
+    // server would have said is read as starting from nowhere, which is
+    // the same as starting from the beginning: a page after a token
+    // nobody issued is a page nobody can be wrong about.
+    let after = match v2 {
+        true => match query.get("continuation-token") {
+            Some(token) => spent(token),
+            None => query.get("start-after").cloned().unwrap_or_default(),
+        },
+        false => query.get("marker").cloned().unwrap_or_default(),
+    };
+
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, true).await?;
+    if !exists(&sess, bucket).await? {
+        return done(sess, Err(StorageError::no_such_bucket())).await;
+    }
+    // One more than the page, which is how the answer knows whether to
+    // say there is another one.
+    let found = page(&sess, bucket, &prefix, &delimiter, &after, most + 1).await;
+    let mut rows = done(sess, found).await?;
+    let truncated = rows.len() > most;
+    rows.truncate(most);
+
+    let mut contents = String::new();
+    let mut folders = String::new();
+    for row in &rows {
+        match row.folder {
+            true => folders.push_str(&format!(
+                "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+                escaped(&row.key)
+            )),
+            false => contents.push_str(&entry(row)),
+        }
+    }
+    let named = match prefix.is_empty() {
+        true => "<Prefix/>".to_string(),
+        false => format!("<Prefix>{}</Prefix>", escaped(&prefix)),
+    };
+    // The key the next page starts after, which both versions send and
+    // only one of them wraps up. A page that is not truncated sends
+    // neither, including the first version's marker: it names where to
+    // go next rather than echoing where this page began, so there is
+    // nothing to name when there is no next page.
+    let last = rows.last().map(|row| row.key.clone()).unwrap_or_default();
+
+    let body = match v2 {
+        true => {
+            let counted = rows.len();
+            let delimited = match delimiter.is_empty() {
+                true => String::new(),
+                false => format!("<Delimiter>{}</Delimiter>", escaped(&delimiter)),
+            };
+            let token = match truncated {
+                true => format!(
+                    "<NextContinuationToken>{}</NextContinuationToken>",
+                    escaped(&minted(&last))
+                ),
+                false => String::new(),
+            };
+            format!(
+                "{DECLARATION}<ListBucketResult xmlns=\"{NAMESPACE}\">\
+                 <Name>{}</Name>{named}{contents}<IsTruncated>{truncated}</IsTruncated>\
+                 <MaxKeys>{most}</MaxKeys>{delimited}<KeyCount>{counted}</KeyCount>\
+                 {token}{folders}</ListBucketResult>",
+                escaped(bucket)
+            )
+        }
+        false => {
+            let marker = match truncated {
+                true => format!("<Marker>{}</Marker>", escaped(&last)),
+                false => String::new(),
+            };
+            format!(
+                "{DECLARATION}<ListBucketResult xmlns=\"{NAMESPACE}\">\
+                 <Name>{}</Name>{named}{marker}<MaxKeys>{most}</MaxKeys>\
+                 <IsTruncated>{truncated}</IsTruncated>{contents}{folders}\
+                 </ListBucketResult>",
+                escaped(bucket)
+            )
+        }
+    };
+    Ok(xml(body))
+}
+
+/// One object, as both documents write it.
+///
+/// No owner element, which is a thing S3 sends and this does not: there
+/// is no owner in the table for a row a signature wrote. The etag is
+/// left out rather than written empty when the metadata has none, which
+/// is what a row that was inserted rather than uploaded looks like and
+/// what the fixture's four rows are.
+fn entry(row: &Listed) -> String {
+    let etag = match row.etag.is_empty() {
+        true => String::new(),
+        false => format!("<ETag>{}</ETag>", escaped(&row.etag)),
+    };
+    format!(
+        "<Contents><Key>{}</Key><LastModified>{}</LastModified>{etag}\
+         <Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+        escaped(&row.key),
+        escaped(&row.when),
+        row.size,
+    )
+}
+
+/// A page of keys, with folders in it or without.
+///
+/// With a delimiter this is the function storage-api's own listing goes
+/// through, which walks the index skipping whole folders rather than
+/// reading every row under one, and which hands folders back with their
+/// delimiter trimmed off and everything else null. Without one there is
+/// nothing to skip and the rows are the rows.
+///
+/// Both are ordered by the C collation, which is the order S3 promises
+/// and not the order a database in an ordinary locale sorts in.
+async fn page(
+    sess: &crate::sql::Session,
+    bucket: &str,
+    prefix: &str,
+    delimiter: &str,
+    after: &str,
+    most: usize,
+) -> Result<Vec<Listed>, StorageError> {
+    let when = "to_char(updated_at at time zone 'utc', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')";
+    let rows = match delimiter.is_empty() {
+        true => {
+            let sql = format!(
+                "select name, false,
+                        coalesce(metadata->>'eTag', ''),
+                        coalesce((metadata->>'size')::bigint, 0),
+                        coalesce({when}, '')
+                   from storage.objects
+                  where bucket_id = $1
+                    and starts_with(name, $2)
+                    and ($3 = '' or name collate \"C\" > $3)
+                  order by name collate \"C\"
+                  limit $4"
+            );
+            sess.query(&sql, &[&bucket, &prefix, &after, &(most as i64)])
+                .await
+        }
+        false => {
+            let sql = format!(
+                "select name, id is null,
+                        coalesce(metadata->>'eTag', ''),
+                        coalesce((metadata->>'size')::bigint, 0),
+                        coalesce({when}, '')
+                   from storage.list_objects_with_delimiter($1, $2, $3, $4, $5, '', 'asc')"
+            );
+            sess.query(
+                &sql,
+                &[&bucket, &prefix, &delimiter, &(most as i32), &after],
+            )
+            .await
+        }
+    }
+    .map_err(|e| pg_error(&e))?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let name: String = row.get(0);
+            let folder: bool = row.get(1);
+            Listed {
+                // The function trims the delimiter off a folder and the
+                // document wants it on, since a common prefix is the
+                // string a client puts back in the next request as its
+                // prefix.
+                key: match folder {
+                    true => format!("{name}{delimiter}"),
+                    false => name,
+                },
+                folder,
+                etag: row.get(2),
+                size: row.get(3),
+                when: row.get(4),
+            }
+        })
+        .collect())
+}
+
+/// The token a truncated page hands back.
+///
+/// The key it left off at, with a letter in front of it saying that is
+/// what it is, base64ed so that nothing in a key has to be escaped into
+/// a query string. Not a secret and not signed: a client that makes one
+/// up gets a page starting wherever it said, which is a page it could
+/// have asked for with start-after anyway.
+fn minted(key: &str) -> String {
+    use base64ct::{Base64, Encoding};
+    Base64::encode_string(format!("l:{key}").as_bytes())
+}
+
+/// A token, back to the key inside it, or nothing.
+fn spent(token: &str) -> String {
+    use base64ct::{Base64, Encoding};
+    let Ok(bytes) = Base64::decode_vec(token) else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&bytes)
+        .strip_prefix("l:")
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// HEAD /storage/v1/s3/{bucket}
@@ -513,6 +866,234 @@ async fn removed(app: &App, parts: &Parts, bucket: &str) -> Result<Response, Sto
     done(sess, Ok(StatusCode::NO_CONTENT.into_response())).await
 }
 
+/// Everything one object can be asked, dispatched the way the bucket
+/// route dispatches its own.
+///
+/// The key is the whole rest of the path, slashes and all, because a
+/// key with slashes in it is what makes a listing with a delimiter mean
+/// anything. Nothing here treats those slashes as anything but
+/// characters in a name.
+pub async fn object(
+    State(app): State<Arc<App>>,
+    Path((bucket, key)): Path<(String, String)>,
+    parts: Parts,
+    body: Body,
+) -> Response {
+    let answer = match parts.method {
+        Method::GET => fetched(&app, &parts, &bucket, &key).await,
+        Method::HEAD => described(&app, &parts, &bucket, &key).await,
+        Method::PUT => put(&app, &parts, &bucket, &key, body).await,
+        Method::DELETE => dropped(&app, &parts, &bucket, &key).await,
+        _ => return crate::not_yet("the storage surface"),
+    };
+    match answer {
+        Ok(response) => response,
+        // A key on this surface is named as the bucket and the key
+        // together, which is what a client sent and what an S3 error
+        // means by a resource.
+        Err(why) => refused(&why, &format!("{bucket}/{key}")),
+    }
+}
+
+/// GET /storage/v1/s3/{bucket}/{key}
+///
+/// The bytes, whole or in part. Almost the json download route, and not
+/// quite: no cache control, no last-modified, and nothing asked about
+/// what the client already has. The two halves of storage answer bytes
+/// through two different renderers upstream and this is the shorter of
+/// them.
+async fn fetched(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let row = row_of(app, parts, bucket, key).await?;
+    let size = row.meta("size").as_u64().unwrap_or_default();
+    let asked = parts
+        .headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|header| object::wanted_range(header, size));
+
+    let blobs = object::blobs(app)?;
+    let (status, bytes, range) = match asked {
+        Some((first, last)) => {
+            let bytes = blobs
+                .get_range(row.key(), first, last - first + 1)
+                .await
+                .map_err(|e| StorageError::internal(e.to_string()))?;
+            let range = format!("bytes {first}-{last}/{size}");
+            (StatusCode::PARTIAL_CONTENT, bytes, Some(range))
+        }
+        None => {
+            let bytes = blobs
+                .get(row.key())
+                .await
+                .map_err(|e| StorageError::internal(e.to_string()))?;
+            (StatusCode::OK, bytes, None)
+        }
+    };
+    // A row with no bytes behind it is the store disagreeing with the
+    // table, which is a failure rather than a miss, and the same
+    // failure the json route answers. Recorded on both: the fixture's
+    // rows point at bytes nobody ever wrote and asking for one is 500.
+    let Some(bytes) = bytes else {
+        return Err(StorageError::internal("Internal Server Error".to_string()));
+    };
+
+    let mut answer = Response::builder().status(status);
+    answer = typed(answer, &row);
+    if let Some(range) = range {
+        answer = answer.header(header::CONTENT_RANGE, range);
+    }
+    answer
+        .body(Body::from(bytes))
+        .map_err(|e| StorageError::internal(e.to_string()))
+}
+
+/// HEAD /storage/v1/s3/{bucket}/{key}
+///
+/// The same answer with nothing in it, and answered out of the table
+/// alone. That is the difference worth having a second handler for: a
+/// head never opens the store, so a row whose bytes are gone is 200
+/// here and 500 through the get above. Recorded.
+async fn described(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let row = row_of(app, parts, bucket, key).await?;
+    typed(Response::builder().status(StatusCode::OK), &row)
+        .body(Body::empty())
+        .map_err(|e| StorageError::internal(e.to_string()))
+}
+
+/// The two headers both reads carry: what the object is, and what it
+/// was when it was written. A row with no etag in its metadata sends
+/// none, which is a row somebody inserted rather than uploaded.
+fn typed(
+    answer: axum::http::response::Builder,
+    row: &object::ObjectRow,
+) -> axum::http::response::Builder {
+    let mime = row.meta("mimetype");
+    let mut answer = answer.header(
+        header::CONTENT_TYPE,
+        object::served_type(mime.as_str().unwrap_or_default()),
+    );
+    if let Some(etag) = row.meta("eTag").as_str() {
+        answer = answer.header(header::ETAG, etag);
+    }
+    answer
+}
+
+/// The row, or the refusal that there is not one.
+async fn row_of(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+) -> Result<object::ObjectRow, StorageError> {
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, true).await?;
+    let found = object::find(&sess, bucket, key).await;
+    match done(sess, found).await? {
+        Some(row) => Ok(row),
+        None => Err(StorageError::no_such_key()),
+    }
+}
+
+/// PUT /storage/v1/s3/{bucket}/{key}
+///
+/// Which is an upload with no upsert header to argue about. S3 has no
+/// put that refuses to overwrite, so this one always does, and that is
+/// recorded rather than assumed: the same path put twice answers two
+/// etags and reads back as the second.
+async fn put(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+    body: Body,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let mime = header_value(parts, "content-type").unwrap_or_default();
+    let upload = object::Upload {
+        bytes: axum::body::to_bytes(body, object::UPLOAD_LIMIT)
+            .await
+            .map_err(|_| StorageError::too_large())?
+            .to_vec(),
+        // A client that says nothing is sending bytes. The json route
+        // decides the same thing the same way, and what it reads back
+        // as is recorded on both.
+        mime: match mime.is_empty() {
+            true => object::OCTET_STREAM.to_string(),
+            false => mime.to_string(),
+        },
+        cache: header_value(parts, "cache-control")
+            .unwrap_or(object::NO_CACHE)
+            .to_string(),
+    };
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, false).await?;
+    // No role to put aside for the bucket lookup: this connection is
+    // the service role already, so there are no policies in the way of
+    // the question or of the insert.
+    //
+    // An empty object in the metadata column rather than nothing, which
+    // is what an ordinary upload writes and not what a resumable one
+    // does. Recorded: the object this route put with no metadata
+    // headers on it reads back with `{}` on the json side, so an S3 put
+    // and a form upload leave the same row.
+    let attached = Some("{}".to_string());
+    let written = object::write(app, sess, None, bucket, key, upload, attached, "", true).await?;
+    let mut answer = StatusCode::OK.into_response();
+    if let Ok(value) = written.etag.parse() {
+        answer.headers_mut().insert(header::ETAG, value);
+    }
+    Ok(answer)
+}
+
+/// DELETE /storage/v1/s3/{bucket}/{key}
+///
+/// 204 whether or not there was anything there, which is S3's rule and
+/// not the storage api's: the two halves disagree about a key that is
+/// not there and this endpoint can only answer one of them. Recorded,
+/// because guessing which of its two parents this route takes after is
+/// exactly the kind of thing a recording is for.
+async fn dropped(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, false).await?;
+    let Some(row) = object::find(&sess, bucket, key).await? else {
+        return done(sess, Ok(StatusCode::NO_CONTENT.into_response())).await;
+    };
+    sess.execute(crate::storage::ALLOW_DELETE, &[])
+        .await
+        .map_err(|e| pg_error(&e))?;
+    sess.execute(
+        "delete from storage.objects where bucket_id = $1 and name = $2",
+        &[&bucket, &key],
+    )
+    .await
+    .map_err(|e| pg_error(&e))?;
+    done(sess, Ok(())).await?;
+    // After the commit, for the reason a replaced version's bytes go
+    // after one: a reader that started before it is still reading them.
+    if let Ok(blobs) = object::blobs(app) {
+        let _ = blobs.delete(row.key()).await;
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// Is the bucket there? The service role sees every one of them, so
 /// this really is existence rather than the visibility question the
 /// json routes ask.
@@ -566,6 +1147,7 @@ mod tests {
         let signed = parse(raw).expect("a signature");
         assert_eq!(signed.access, "abc");
         assert_eq!(signed.day, "20260807");
+        assert_eq!(signed.region, "us-east-1");
         assert_eq!(signed.headers, vec!["host", "x-amz-date"]);
         assert_eq!(signed.signature, "deadbeef");
     }
@@ -610,8 +1192,15 @@ mod tests {
 
     #[test]
     fn the_characters_a_document_cannot_carry_are_escaped() {
-        assert_eq!(escaped("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(escaped("a&b<c>d"), "a&amp;b&lt;c&gt;d");
         assert_eq!(escaped("photos"), "photos");
+    }
+
+    /// The one thing escaping must not touch, because the quotes are
+    /// part of the value rather than around it.
+    #[test]
+    fn an_etag_keeps_its_quotes() {
+        assert_eq!(escaped("\"5eb63bbb\""), "\"5eb63bbb\"");
     }
 
     /// Length first, so that a signature of another length is not a

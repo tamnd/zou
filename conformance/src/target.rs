@@ -76,11 +76,21 @@ pub struct Target {
 /// capabilities of the endpoint are `tus-version`, `tus-extension` and
 /// `tus-max-size` and nothing else. Comparing bodies alone would say
 /// every one of those cases matched.
-pub const COMPARED: [&str; 17] = [
+///
+/// `etag` is here for the same reason, and it is the one entry that is
+/// not free: it is the whole answer to a put on the S3 surface, which
+/// sends an empty body, and it is a value both targets compute rather
+/// than echo. It is safe to compare because it is the md5 of the bytes
+/// in quotes on both, which is a value a fixture can pin, and it is
+/// not compared as a date is: an object with different bytes has a
+/// different one and an object with the same bytes has the same one on
+/// every run and every machine.
+pub const COMPARED: [&str; 18] = [
     "allow",
     "content-profile",
     "content-range",
     "content-type",
+    "etag",
     "location",
     "preference-applied",
     "retry-after",
@@ -136,7 +146,12 @@ impl Target {
             // Signed rather than carried, and signed after the case's
             // own headers are on the request, so there is nothing to
             // put in front here.
-            Key::S3 | Key::S3WrongSecret | Key::S3WrongId | Key::S3WrongRegion | Key::None => None,
+            Key::S3
+            | Key::S3WrongSecret
+            | Key::S3WrongId
+            | Key::S3WrongRegion
+            | Key::S3ProjectRegion
+            | Key::None => None,
         }
     }
 
@@ -319,6 +334,12 @@ impl Target {
                 stamp: &stamp,
                 region: match case.key {
                     Key::S3WrongRegion => "eu-west-1",
+                    // Where a local project says it is, which is the
+                    // one region other than the default that could be
+                    // taken. Written out here for the same reason the
+                    // wrong one is: a case cannot read it out of the
+                    // answer to the case before it.
+                    Key::S3ProjectRegion => sigv4::PROJECT,
                     _ => sigv4::REGION,
                 },
             },
