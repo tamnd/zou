@@ -47,6 +47,13 @@ pub struct LayerDesc {
     /// must not serve. A delta spanning the cut stays listed and gets
     /// clamped here; layers entirely below their cut carry no clamp.
     pub upto: Option<Lsn>,
+    /// The shard whose prefix holds the object, set on layers served
+    /// across a split or merge: a child reads its ancestors' layers in
+    /// place until compaction separates them. Never stored, stamped at
+    /// load time from which shard manifest listed the layer, and
+    /// composes with `owner` when the ancestor era was itself
+    /// inherited from a branch parent.
+    pub home: Option<u16>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -74,6 +81,7 @@ impl LayerDesc {
             size: 0,
             owner: None,
             upto: None,
+            home: None,
         }
     }
 
@@ -87,6 +95,7 @@ impl LayerDesc {
             size: 0,
             owner: None,
             upto: None,
+            home: None,
         }
     }
 
@@ -102,6 +111,7 @@ impl LayerDesc {
             size,
             owner: None,
             upto: None,
+            home: None,
         }
     }
 
@@ -188,6 +198,7 @@ impl LayerDesc {
                 size,
                 owner: None,
                 upto: None,
+                home: None,
             },
             (LayerKind::Image, [kmin, kmax, l]) => {
                 let at = lsn(l)?;
@@ -200,6 +211,7 @@ impl LayerDesc {
                     size,
                     owner: None,
                     upto: None,
+                    home: None,
                 }
             }
             _ => return Err(malformed()),

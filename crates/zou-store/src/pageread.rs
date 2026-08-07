@@ -74,9 +74,11 @@ pub struct LayerReader<'a> {
     store: &'a dyn CasStore,
     /// Object key prefix layer names append to.
     prefix: String,
-    /// The shard number, needed to resolve an inherited layer to its
-    /// owner's shard prefix. A reader without it serves only maps with
-    /// no owner tags.
+    /// The tenant and shard the reader is bound to, needed to resolve
+    /// an inherited layer to its owner's prefix and a split ancestor's
+    /// layer to its home shard. A reader without them serves only maps
+    /// with no owner or home tags.
+    tenant: Option<String>,
     shard: Option<u16>,
     footers: Mutex<HashMap<String, Arc<LayerFooter>>>,
 }
@@ -86,42 +88,55 @@ impl<'a> LayerReader<'a> {
         Self {
             store,
             prefix: prefix.into(),
+            tenant: None,
             shard: None,
             footers: Mutex::new(HashMap::new()),
         }
     }
 
     /// A reader bound to one tenant's shard, able to follow owner tags
-    /// into ancestor prefixes. Branched tenants must attach this way,
-    /// [`LayerReader::new`] refuses their inherited layers loudly.
+    /// into ancestor prefixes and home tags across a split. Branched
+    /// and split tenants must attach this way, [`LayerReader::new`]
+    /// refuses their tagged layers loudly.
     pub fn for_shard(store: &'a dyn CasStore, tenant_ref: &str, shard: u16) -> Self {
         Self {
             store,
             prefix: crate::layout::TenantLayout::new(tenant_ref).shard_prefix(shard),
+            tenant: Some(tenant_ref.to_string()),
             shard: Some(shard),
             footers: Mutex::new(HashMap::new()),
         }
     }
 
     /// The object key for a layer: its name under this shard's prefix,
-    /// or under the owner's shard prefix when the layer is inherited.
-    /// The shard number is the same on both sides because a branch
-    /// copies shard manifests one to one.
+    /// under the owner's when the layer is inherited from a branch
+    /// parent, under the home shard's when it is served across a split,
+    /// and under both when the ancestor era was itself branched. Owner
+    /// swaps the tenant, home swaps the shard, and each defaults to
+    /// this reader's own.
     fn object_key(&self, desc: &LayerDesc, name: &str) -> Result<String, ReadError> {
-        match &desc.owner {
-            None => Ok(format!("{}{}", self.prefix, name)),
-            Some(owner) => match self.shard {
-                Some(shard) => Ok(format!(
-                    "{}{}",
-                    crate::layout::TenantLayout::new(owner).shard_prefix(shard),
-                    name
-                )),
-                None => Err(ReadError::ForeignLayer {
-                    name: name.to_string(),
-                    owner: owner.clone(),
-                }),
-            },
+        if desc.owner.is_none() && desc.home.is_none() {
+            return Ok(format!("{}{}", self.prefix, name));
         }
+        let foreign = |owner: &Option<String>| ReadError::ForeignLayer {
+            name: name.to_string(),
+            owner: owner.clone().unwrap_or_else(|| "a split ancestor".into()),
+        };
+        let tenant = match (&desc.owner, &self.tenant) {
+            (Some(owner), _) => owner,
+            (None, Some(own)) => own,
+            (None, None) => return Err(foreign(&desc.owner)),
+        };
+        let shard = match (desc.home, self.shard) {
+            (Some(home), _) => home,
+            (None, Some(own)) => own,
+            (None, None) => return Err(foreign(&desc.owner)),
+        };
+        Ok(format!(
+            "{}{}",
+            crate::layout::TenantLayout::new(tenant).shard_prefix(shard),
+            name
+        ))
     }
 
     fn range(

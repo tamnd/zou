@@ -159,6 +159,13 @@ fn child_of(
 
     let mut child = Manifest::new(dst_ref, parent.pg.version);
     child.pg.timeline = parent.pg.timeline;
+    // The shard function is part of what the child inherits: its keys
+    // land where the parent's did, and the lineage is what lets its
+    // shards find the eras the inherited layers were flushed under.
+    // Sharded parents hand down their format 3 with it.
+    child.shards = parent.shards;
+    child.shard_history = parent.shard_history.clone();
+    child.format = child.format.max(parent.format);
     child.checkpoints = parent.checkpoints[..upto]
         .iter()
         .cloned()
@@ -331,6 +338,20 @@ mod tests {
     fn child_shard(store: &LocalFsStore, tenant_ref: &str) -> PageShardManifest {
         let key = TenantLayout::new(tenant_ref).shard_manifest(0);
         PageShardManifest::load(store, &key).unwrap().unwrap().0
+    }
+
+    #[test]
+    fn a_branch_inherits_the_shard_function() {
+        let (_d, store) = setup();
+        setup_shard(&store);
+        crate::shards::split(&store, "p").unwrap();
+        let child = branch(&store, "p", "c", Some(Lsn(0x200)), 5000).unwrap();
+        assert_eq!(
+            child.shards, 2,
+            "the child's keys land where the parent's did"
+        );
+        assert_eq!(child.shard_history.len(), 1);
+        assert_eq!(child.format, 3, "sharding rides the format gate down");
     }
 
     #[test]
