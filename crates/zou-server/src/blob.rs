@@ -89,6 +89,17 @@ pub fn key(id: &str, version: &str) -> String {
     format!("objects/{id}/{version}")
 }
 
+/// Where one request's worth of a resumable upload lives until the
+/// upload finishes.
+///
+/// The upload's own id and the number of the request within it, so the
+/// parts of one upload sort next to each other and two uploads of the
+/// same name cannot collide. The id is base64url of what a client never
+/// sees, so nothing a client sends reaches this key either.
+pub fn part_key(id: &str, part: i32) -> String {
+    format!("uploads/{id}/{part}")
+}
+
 /// Run a store call off the async threads.
 ///
 /// A join error means the pool is going down or the call panicked, and

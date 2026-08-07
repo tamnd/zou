@@ -44,6 +44,14 @@ struct Answer {
     status: StatusCode,
     request_id: String,
     content_type: String,
+    /// What axum offered instead of the method that was asked for, on
+    /// the answers that carry it. Absent is a claim of its own: a route
+    /// that names the methods it does have is naming code somebody has
+    /// to keep true.
+    allow: String,
+    /// The bytes, for the two or three places where the order the
+    /// fields were written in is the thing being tested.
+    written: String,
     body: serde_json::Value,
 }
 
@@ -87,12 +95,20 @@ async fn send(app: &axum::Router, method: &str, path: &str, key: bool) -> Answer
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
+    let allow = res
+        .headers()
+        .get("allow")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
     let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     Answer {
         status,
         request_id,
         content_type,
+        allow,
+        written: String::from_utf8_lossy(&bytes).to_string(),
         body,
     }
 }
@@ -154,7 +170,7 @@ async fn a_stub_answers_whatever_method_it_is_asked() {
     // same answer as a read. A method that 405s under a stubbed
     // surface would be a second wrong answer on top of the first.
     for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] {
-        for path in ["/storage/v1/upload/resumable", "/realtime/v1/websocket"] {
+        for path in ["/storage/v1/s3/pics", "/realtime/v1/websocket"] {
             let answer = keyed(&app, method, path).await;
             assert_eq!(
                 answer.status,
@@ -271,6 +287,52 @@ async fn the_storage_surface_refuses_in_its_own_words_rather_than_the_gates() {
 }
 
 #[tokio::test]
+async fn the_resumable_routes_refuse_in_the_resumable_order() {
+    let app = app();
+    // Same side of the gate as the rest of storage, same sentence, and
+    // the four fields in a different order than the test above them.
+    // Upstream has two serializers for one error object and this door
+    // reaches the second, which nothing but a byte comparison sees.
+    for (method, path) in [
+        ("POST", "/storage/v1/upload/resumable"),
+        ("PATCH", "/storage/v1/upload/resumable/bm90ZXMvYS50eHQ"),
+        ("DELETE", "/storage/v1/upload/resumable/bm90ZXMvYS50eHQ"),
+    ] {
+        let answer = bare(&app, method, path).await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{method} {path}");
+        assert_eq!(
+            answer.written,
+            r#"{"statusCode":"403","code":"AccessDenied","error":"Unauthorized","message":"Invalid Compact JWS"}"#,
+            "{method} {path}",
+        );
+        assert_eq!(
+            answer.content_type, "application/json; charset=utf-8",
+            "{method} {path}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_method_the_resumable_protocol_has_no_use_for_offers_no_others() {
+    let app = app();
+    // Both routes are one `any` that reads the method itself, and this
+    // is the reason. A `MethodRouter` adds an Allow header on a method
+    // it does not have even when the miss goes to a fallback, upstream
+    // sends none, and the recording compares headers.
+    for (method, path) in [
+        ("GET", "/storage/v1/upload/resumable"),
+        ("PUT", "/storage/v1/upload/resumable"),
+        ("GET", "/storage/v1/upload/resumable/bm90ZXMvYS50eHQ"),
+        ("POST", "/storage/v1/upload/resumable/bm90ZXMvYS50eHQ"),
+    ] {
+        let answer = keyed(&app, method, path).await;
+        assert_eq!(answer.status, StatusCode::NOT_FOUND, "{method} {path}");
+        assert_eq!(answer.allow, "", "{method} {path}");
+        assert_eq!(answer.body["error"], "Not Found", "{method} {path}");
+    }
+}
+
+#[tokio::test]
 async fn a_path_under_storage_that_is_neither_a_bucket_nor_an_object_is_still_stubbed() {
     let app = app();
     // A literal segment beats a wildcard one, so the bucket and object
@@ -280,7 +342,6 @@ async fn a_path_under_storage_that_is_neither_a_bucket_nor_an_object_is_still_st
     // unbuilt storage path answering about a token instead.
     for path in [
         "/storage/v1/render/image/public/pics/cat.png",
-        "/storage/v1/upload/resumable",
         "/storage/v1/s3/pics",
     ] {
         let answer = keyed(&app, "GET", path).await;
@@ -300,7 +361,6 @@ async fn everything_else_is_behind_the_gate() {
         ("GET", "/auth/v1/user"),
         ("GET", "/auth/v1/admin/users"),
         ("POST", "/auth/v1/factors"),
-        ("GET", "/storage/v1/upload/resumable"),
         ("GET", "/realtime/v1/websocket"),
     ] {
         let answer = bare(&app, method, path).await;
@@ -320,7 +380,7 @@ async fn the_gate_is_reached_before_a_stub_is() {
     // an unkeyed request to an unbuilt surface hears about the key
     // rather than about the surface. A stub outside the gate would be
     // a hole that grows when the surface is built.
-    let answer = bare(&app, "GET", "/storage/v1/upload/resumable").await;
+    let answer = bare(&app, "GET", "/storage/v1/s3/pics").await;
     assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
     assert_eq!(answer.message(), "No API key found in request");
 }

@@ -689,15 +689,38 @@ fn ask(target: &Target, suite: &Suite, setup: Option<&str>) -> Result<Asked, Str
         true => suite.reset.as_deref(),
         false => None,
     };
+    // The last url any case was pointed at, which only the resumable
+    // cases read. Kept until something else names one, because the
+    // requests in the middle of an upload answer no location of their
+    // own and the case after them still means the upload the creation
+    // named. Cleared by a case that failed, so that a case following it
+    // is told the chain broke rather than sent somewhere stale.
+    let mut pointed_at: Option<String> = None;
     for case in &suite.cases.cases {
         if resets_first(case)
             && let Some(reset) = reset
         {
             target.set_up(reset)?;
         }
-        match target.send(case) {
-            Ok(answer) => asked.answers.push(answer),
-            Err(message) => asked.errors.push((case.name.clone(), message)),
+        let case = match target::following(case, pointed_at.as_deref()) {
+            Ok(case) => case,
+            Err(message) => {
+                pointed_at = None;
+                asked.errors.push((case.name.clone(), message));
+                continue;
+            }
+        };
+        match target.send(&case) {
+            Ok(sent) => {
+                if sent.location.is_some() {
+                    pointed_at = sent.location;
+                }
+                asked.answers.push(sent.answer);
+            }
+            Err(message) => {
+                pointed_at = None;
+                asked.errors.push((case.name.clone(), message));
+            }
         }
     }
     Ok(asked)

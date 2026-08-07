@@ -299,6 +299,16 @@ impl StorageError {
     }
 }
 
+impl StorageError {
+    /// What it says, for the one caller that has to say it in another
+    /// shape. The resumable routes answer a refusal as a status and a
+    /// sentence rather than as a json body, and the sentence is this
+    /// one.
+    pub(crate) fn said(&self) -> &str {
+        &self.message
+    }
+}
+
 impl IntoResponse for StorageError {
     fn into_response(self) -> Response {
         let wire = if self.status == 500 {
@@ -320,6 +330,31 @@ impl IntoResponse for StorageError {
         );
         (wire, [(header::CONTENT_TYPE, JSON)], body).into_response()
     }
+}
+
+/// The same refusal, in the order the resumable routes write it.
+///
+/// Not a different refusal: the same status, the same words and the
+/// same four fields as [`IntoResponse`] above, written statusCode,
+/// code, error, message rather than statusCode, error, message, code.
+/// Upstream has two serializers for one error object and the resumable
+/// door reaches the other one, which nothing but a recording compared
+/// byte for byte would ever notice. It lives here rather than in `tus`
+/// so that the two orders are one line apart and the day a field is
+/// added to one of them the other is looked at.
+pub(crate) fn as_tus(why: &StorageError) -> Response {
+    let wire = match why.status == 500 {
+        true => StatusCode::INTERNAL_SERVER_ERROR,
+        false => StatusCode::BAD_REQUEST,
+    };
+    let body = format!(
+        "{{\"statusCode\":{},\"code\":{},\"error\":{},\"message\":{}}}",
+        quoted(&why.status.to_string()),
+        quoted(why.code),
+        quoted(why.error),
+        quoted(&why.message),
+    );
+    (wire, [(header::CONTENT_TYPE, JSON)], body).into_response()
 }
 
 /// One json string, escaped the way json escapes.

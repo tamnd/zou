@@ -20,7 +20,19 @@
 //! target look better than another: a path that is volatile is
 //! volatile for the reference too.
 
+use std::collections::BTreeMap;
+
 use serde_json::Value;
+
+/// What a volatile path says before the name of a header, when it means
+/// a header rather than a place in the body.
+///
+/// The resumable protocol needs this and nothing else does. A creation
+/// answers 201 with no body at all and puts the url of the upload it
+/// made in `location`, and that url carries the host the request
+/// arrived on and an id that was generated a moment ago. Naming it in
+/// the body would name nothing, because there is no body.
+const HEADER: &str = "header:";
 
 /// Replace every value `paths` names with the name of its shape.
 ///
@@ -30,7 +42,24 @@ use serde_json::Value;
 /// asks one question rather than two.
 pub fn redact(body: &mut Value, paths: &[String]) {
     for path in paths {
+        if path.starts_with(HEADER) {
+            continue;
+        }
         walk(body, &steps(path));
+    }
+}
+
+/// The same, for the headers a case named instead of a place in the
+/// body. Header names are compared lowercased, which is how they are
+/// kept.
+pub fn redact_headers(headers: &mut BTreeMap<String, String>, paths: &[String]) {
+    for path in paths {
+        let Some(name) = path.strip_prefix(HEADER) else {
+            continue;
+        };
+        if let Some(value) = headers.get_mut(&name.trim().to_ascii_lowercase()) {
+            *value = string_shape(value);
+        }
     }
 }
 
@@ -115,6 +144,29 @@ fn string_shape(text: &str) -> String {
         && is_jwt(token)
     {
         return format!("{path}?token=<jwt>");
+    }
+    // A url a server built out of the host the request arrived on and
+    // an id it made a moment ago, which is what a resumable creation
+    // answers with. The host cannot be compared at all: the reference
+    // is asked on one port and zou on another, so an absolute url
+    // differs on every target by construction. What is worth keeping is
+    // the route in the middle, since that is what a client sends the
+    // bytes to, so the host goes, the last segment is named, and
+    // everything between them is compared.
+    //
+    // The whole string has to be the url and it has to carry nothing
+    // but a path. A scheme somewhere in the middle is a scheme inside a
+    // query string, which is what a link with a `redirect_to` on it
+    // looks like, and taking that apart the same way would keep half a
+    // query and name the other half.
+    if let Some(rest) = text
+        .strip_prefix("http://")
+        .or_else(|| text.strip_prefix("https://"))
+        && !text.contains('?')
+        && let Some((_, path)) = rest.split_once('/')
+        && let Some((route, last)) = path.rsplit_once('/')
+    {
+        return format!("/{route}/{}", string_shape(last));
     }
     "<string>".to_string()
 }
@@ -272,6 +324,57 @@ mod tests {
             string_shape("/object/sign/notes/hello.txt?token="),
             "<string>"
         );
+    }
+
+    /// The host an absolute url was built out of differs between
+    /// targets by construction, and the id on the end of it differs
+    /// between runs. The route is neither.
+    #[test]
+    fn a_url_keeps_the_route_and_gives_up_the_host_and_the_id() {
+        assert_eq!(
+            string_shape("http://127.0.0.1:54321/storage/v1/upload/resumable/bm90ZXM"),
+            "/storage/v1/upload/resumable/<string>"
+        );
+        assert_eq!(
+            string_shape("https://project.supabase.co/storage/v1/upload/resumable/bm90ZXM"),
+            "/storage/v1/upload/resumable/<string>"
+        );
+    }
+
+    /// A link with a `redirect_to` on it carries a second url inside
+    /// its query, and the whole thing is one value that moves. Reading
+    /// the scheme in the middle as the start of the url would keep the
+    /// token, which is the part that moves most.
+    #[test]
+    fn a_scheme_inside_a_query_is_not_the_start_of_a_url() {
+        assert_eq!(
+            string_shape("/auth/v1/verify?token=ad7fff13&type=magiclink&redirect_to=http://a/b"),
+            "<string>"
+        );
+        assert_eq!(
+            string_shape("http://h/auth/v1/verify?token=ad7fff13&redirect_to=http://a/b"),
+            "<string>"
+        );
+    }
+
+    #[test]
+    fn a_header_a_case_named_is_named_the_same_way_a_field_is() {
+        let mut headers = BTreeMap::new();
+        headers.insert("location".to_string(), "http://h/upload/x".to_string());
+        headers.insert("tus-resumable".to_string(), "1.0.0".to_string());
+        redact_headers(
+            &mut headers,
+            &["header:location".to_string(), "/id".to_string()],
+        );
+        assert_eq!(headers["location"], "/upload/<string>");
+        assert_eq!(headers["tus-resumable"], "1.0.0", "not named, not touched");
+    }
+
+    /// The two live in one list, so each has to leave the other alone.
+    #[test]
+    fn a_header_path_is_not_read_as_a_path_into_the_body() {
+        let body = json!({"header:location": "keep me"});
+        assert_eq!(redacted(body.clone(), &["header:location"]), body);
     }
 
     /// An index reaches one element, which is what an answer with a
