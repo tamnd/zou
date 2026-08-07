@@ -106,6 +106,57 @@ impl StorageError {
         }
     }
 
+    /// An upload id that names nothing.
+    ///
+    /// Three situations rather than one, and the recording says they
+    /// are all this: an id nobody was ever given, an id whose upload
+    /// was dropped, and an id whose upload was put together. Once the
+    /// object exists the id that made it is spent, so a client that
+    /// retries a completion it never saw the answer to hears that the
+    /// upload is gone rather than that the object is there.
+    ///
+    /// The error name is the code. Nothing on the json routes can earn
+    /// this, so there is no recording of what upstream calls it there
+    /// and nothing to copy.
+    pub(crate) fn no_such_upload() -> Self {
+        StorageError {
+            status: 404,
+            error: "NoSuchUpload",
+            message: "Upload not found".to_string(),
+            code: "NoSuchUpload",
+        }
+    }
+
+    /// A piece the client named and the server has nothing under.
+    ///
+    /// The sentence carries the number and the upload's id, which makes
+    /// it the one refusal on this surface that says which upload it is
+    /// about.
+    pub(crate) fn missing_part(message: String) -> Self {
+        StorageError {
+            status: 400,
+            error: "MissingPart",
+            message,
+            code: "MissingPart",
+        }
+    }
+
+    /// A piece the server does have under that number, whose etag is
+    /// not the one the client named.
+    ///
+    /// Which is a different thing from a piece that is not there, and
+    /// worth telling apart: the first says the upload lost something
+    /// and the second says the client and the server disagree about
+    /// what was sent.
+    pub(crate) fn wrong_part(message: String) -> Self {
+        StorageError {
+            status: 400,
+            error: "InvalidChecksum",
+            message,
+            code: "InvalidChecksum",
+        }
+    }
+
     /// The same sentence a duplicate bucket earns, under a different
     /// code.
     pub(crate) fn key_already_exists() -> Self {

@@ -12,7 +12,7 @@
 //! the requests really are the same requests rather than requests that
 //! happen to mean the same thing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use crate::sigv4::{self, Credentials};
@@ -216,21 +216,29 @@ impl Target {
 
         let status = response.status().as_u16();
         let mut headers = BTreeMap::new();
+        // Every header rather than the compared ones, because a case can
+        // hold a value out of one this suite does not compare and a hold
+        // that silently found nothing is the worst way to learn that.
+        let mut all = BTreeMap::new();
+        for (name, value) in response.headers() {
+            if let Ok(value) = value.to_str() {
+                all.insert(name.as_str().to_ascii_lowercase(), value.to_string());
+            }
+        }
         for name in COMPARED {
-            if let Some(value) = response.headers().get(name)
-                && let Ok(value) = value.to_str()
-            {
-                headers.insert(name.to_string(), value.to_string());
+            if let Some(value) = all.get(name) {
+                headers.insert(name.to_string(), value.clone());
             }
         }
         let raw = response
             .into_body()
             .read_to_string()
             .map_err(|e| format!("{}: reading the body of {url}: {e}", self.name))?;
-        let mut answer = answer(&case.name, status, headers, &raw);
         // Before anything is named, because the case after this one is
-        // sent to this url rather than to the shape of it.
-        let location = answer.headers.get("location").cloned();
+        // sent to the id this one answered rather than to the shape of
+        // it.
+        let held = holding(case, &all, &raw);
+        let mut answer = answer(&case.name, status, headers, &raw);
         if !case.volatile.is_empty() {
             crate::volatile::redact(&mut answer.body, &case.volatile);
             crate::volatile::redact_headers(&mut answer.headers, &case.volatile);
@@ -240,7 +248,7 @@ impl Target {
             // answer and keeps the json one.
             answer.raw = None;
         }
-        Ok(Sent { answer, location })
+        Ok(Sent { answer, held })
     }
 
     /// Sign a request the way an S3 client would, in place.
@@ -416,56 +424,124 @@ impl Target {
 }
 
 /// What one case came back with: the answer as it is recorded, and the
-/// url it named before anything in it was.
+/// values the cases after it were told to read out of it.
 ///
-/// The two are not the same string. A creation answers with a url
-/// carrying an id that was generated a moment ago, so the case naming
-/// it as volatile has that id replaced by the shape of it, and the case
-/// after it still has to be sent to the real one.
+/// The two are not the same string. A creation answers with a url and an
+/// id that were made a moment ago, so the case naming them as volatile
+/// has them replaced by the shape of them, and the case after it still
+/// has to be sent to the real ones.
 pub struct Sent {
     pub answer: Answer,
-    pub location: Option<String>,
+    pub held: BTreeMap<String, String>,
 }
 
-/// What a case means to go to, when it means to go where the answer
-/// before it pointed.
-pub const FOLLOWS: &str = "{location}";
+/// The one value every answer offers whether or not a case asked for it,
+/// which is the url a creation pointed at.
+pub const LOCATION: &str = "location";
 
-/// `case`, with [`FOLLOWS`] in its path replaced by the path of the url
-/// `location` names.
+/// Every name the cases in a suite hold something under, which is every
+/// name a placeholder in one of them can mean.
 ///
-/// The resumable protocol needs this and nothing else in three suites
-/// does. Every request about an upload after the one that made it goes
-/// to a url the server chose, with an id in it no case can know, so a
-/// suite that could not follow a url could ask a creation and nothing
-/// after it. The path is taken and the rest is dropped, because the
-/// reference answers an absolute url built out of the host the request
-/// arrived on and every target is asked on a host of its own.
-///
-/// A case that follows nothing is an error rather than a request to a
-/// url with braces in it, since the case before it having failed is the
-/// usual reason for it and a second failure that says something else
-/// would only hide the first.
-pub fn following(case: &Case, location: Option<&str>) -> Result<Case, String> {
-    if !case.path.contains(FOLLOWS) {
-        return Ok(case.clone());
+/// Collected up front so that a placeholder can be told from a brace
+/// that is part of a body. A json body is full of braces and none of
+/// them are placeholders, and the difference is that a placeholder names
+/// something a case in this suite said it would hold.
+pub fn held_names(cases: &[Case]) -> BTreeSet<String> {
+    let mut names = BTreeSet::from([LOCATION.to_string()]);
+    for case in cases {
+        names.extend(case.holds.keys().cloned());
     }
-    let Some(location) = location else {
-        return Err(format!(
-            "{}: follows {FOLLOWS}, and the case before it answered no location header",
-            case.name
-        ));
-    };
-    let path = match location.split_once("://") {
-        Some((_, rest)) => match rest.split_once('/') {
-            Some((_, path)) => format!("/{path}"),
-            None => "/".to_string(),
-        },
-        None => location.to_string(),
-    };
+    names
+}
+
+/// `case`, with every placeholder in it replaced by what an earlier case
+/// held under that name.
+///
+/// Placeholders are replaced in the path, in the body and in the header
+/// values, because the three requests that need this need all three: a
+/// part goes to a url carrying the upload's id, a completion sends the
+/// parts' etags in a document, and there is nothing about a header that
+/// makes it the exception.
+///
+/// A case naming something nothing held is an error rather than a
+/// request with braces in it, since the case before it having failed is
+/// the usual reason for it and a second failure that says something else
+/// would only hide the first.
+pub fn filled(
+    case: &Case,
+    held: &BTreeMap<String, String>,
+    names: &BTreeSet<String>,
+) -> Result<Case, String> {
     let mut case = case.clone();
-    case.path = case.path.replace(FOLLOWS, &path);
+    for name in names {
+        let named = format!("{{{name}}}");
+        let inside = case.path.contains(&named)
+            || case.body.as_deref().is_some_and(|it| it.contains(&named))
+            || case.headers.values().any(|it| it.contains(&named));
+        if !inside {
+            continue;
+        }
+        let Some(value) = held.get(name) else {
+            return Err(format!(
+                "{}: names {named}, and nothing before it held one",
+                case.name
+            ));
+        };
+        case.path = case.path.replace(&named, value);
+        if let Some(body) = case.body.as_mut() {
+            *body = body.replace(&named, value);
+        }
+        for header in case.headers.values_mut() {
+            *header = header.replace(&named, value);
+        }
+    }
     Ok(case)
+}
+
+/// What this case said to hold, read out of its answer before anything
+/// in it was named as volatile.
+///
+/// The path of a location and not the whole url, because the reference
+/// answers an absolute one built out of the host the request arrived on
+/// and every target is asked on a host of its own.
+fn holding(
+    case: &Case,
+    headers: &BTreeMap<String, String>,
+    body: &str,
+) -> BTreeMap<String, String> {
+    let mut held = BTreeMap::new();
+    if let Some(url) = headers.get(LOCATION) {
+        let path = match url.split_once("://") {
+            Some((_, rest)) => match rest.split_once('/') {
+                Some((_, path)) => format!("/{path}"),
+                None => "/".to_string(),
+            },
+            None => url.to_string(),
+        };
+        held.insert(LOCATION.to_string(), path);
+    }
+    for (name, from) in &case.holds {
+        // A hold that finds nothing is left unheld rather than held
+        // empty, so the case that names it says the chain broke instead
+        // of asking about an id that is the empty string.
+        if let Some(value) = read_out(headers, body, from) {
+            held.insert(name.clone(), value);
+        }
+    }
+    held
+}
+
+/// One value out of an answer, by a name saying which half of it to look
+/// in.
+fn read_out(headers: &BTreeMap<String, String>, body: &str, from: &str) -> Option<String> {
+    if let Some(name) = from.strip_prefix("header:") {
+        return headers.get(&name.trim().to_ascii_lowercase()).cloned();
+    }
+    let name = from.strip_prefix("element:")?.trim();
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let after = &body[body.find(&open)? + open.len()..];
+    Some(after[..after.find(&close)?].to_string())
 }
 
 /// A sql file, applied to a database over one connection.
@@ -626,6 +702,7 @@ mod tests {
             note: None,
             writes: false,
             chained: false,
+            holds: BTreeMap::new(),
             volatile: Vec::new(),
         }
     }
@@ -679,14 +756,21 @@ mod tests {
         assert_eq!(encoded("/p?title=like.%2A"), "/p?title=like.%2A");
     }
 
-    /// The reference answers an absolute url and every target is asked
-    /// on a host of its own, so only the path survives.
+    /// What a location is held as: the path of it. The reference
+    /// answers an absolute url and every target is asked on a host of
+    /// its own, so only the path survives.
     #[test]
     fn a_case_that_follows_a_url_is_sent_to_the_path_of_it() {
-        let case = case("{location}");
         let at = "http://127.0.0.1:54321/storage/v1/upload/resumable/bm90ZXM";
+        let held = holding(
+            &case("n"),
+            &BTreeMap::from([(LOCATION.to_string(), at.to_string())]),
+            "",
+        );
         assert_eq!(
-            following(&case, Some(at)).expect("follows").path,
+            filled(&case("{location}"), &held, &names())
+                .expect("follows")
+                .path,
             "/storage/v1/upload/resumable/bm90ZXM"
         );
     }
@@ -696,23 +780,75 @@ mod tests {
     #[test]
     fn a_location_that_is_already_a_path_is_used_as_it_stands() {
         let at = "/storage/v1/upload/resumable/bm90ZXM";
-        assert_eq!(
-            following(&case("{location}"), Some(at))
-                .expect("follows")
-                .path,
-            at
+        let held = holding(
+            &case("n"),
+            &BTreeMap::from([(LOCATION.to_string(), at.to_string())]),
+            "",
         );
+        assert_eq!(held.get(LOCATION).map(String::as_str), Some(at));
     }
 
     #[test]
-    fn a_case_that_follows_nothing_is_an_error_rather_than_a_request() {
-        assert!(following(&case("{location}"), None).is_err());
+    fn a_case_that_names_something_nothing_held_is_an_error_rather_than_a_request() {
+        let nothing = BTreeMap::new();
+        assert!(filled(&case("{location}"), &nothing, &names()).is_err());
         assert_eq!(
-            following(&case("/storage/v1/bucket"), None)
+            filled(&case("/storage/v1/bucket"), &nothing, &names())
                 .expect("nothing to follow")
                 .path,
             "/storage/v1/bucket"
         );
+    }
+
+    /// A body full of braces is a json body rather than a body full of
+    /// placeholders, so only the names some case said it would hold are
+    /// replaced.
+    #[test]
+    fn a_brace_that_is_not_a_name_a_case_holds_is_left_where_it_is() {
+        let mut asking = case("/storage/v1/s3/notes/big?uploadId={upload}");
+        asking.body = Some("{\"prefix\":\"{unheld}\"} {tag}".to_string());
+        let held = BTreeMap::from([
+            ("upload".to_string(), "abc123".to_string()),
+            ("tag".to_string(), "\"5eb63bbb\"".to_string()),
+        ]);
+        let names = BTreeSet::from(["upload".to_string(), "tag".to_string()]);
+        let filled = filled(&asking, &held, &names).expect("held both");
+        assert_eq!(filled.path, "/storage/v1/s3/notes/big?uploadId=abc123");
+        assert_eq!(
+            filled.body.as_deref(),
+            Some("{\"prefix\":\"{unheld}\"} \"5eb63bbb\"")
+        );
+    }
+
+    /// Where a hold reads from, which is one of two halves of an answer.
+    #[test]
+    fn a_hold_reads_a_header_or_an_element() {
+        let headers = BTreeMap::from([("etag".to_string(), "\"5eb63bbb\"".to_string())]);
+        let body = "<InitiateMultipartUploadResult><UploadId>abc/123</UploadId>\
+                    </InitiateMultipartUploadResult>";
+        assert_eq!(
+            read_out(&headers, body, "header:etag"),
+            Some("\"5eb63bbb\"".to_string())
+        );
+        assert_eq!(
+            read_out(&headers, body, "element:UploadId"),
+            Some("abc/123".to_string())
+        );
+        assert_eq!(read_out(&headers, body, "element:Missing"), None);
+        assert_eq!(read_out(&headers, body, "header:missing"), None);
+    }
+
+    /// A case that holds nothing holds nothing, and a hold that found
+    /// nothing is left unheld rather than held empty.
+    #[test]
+    fn a_hold_that_finds_nothing_holds_nothing() {
+        let mut asking = case("n");
+        asking.holds = BTreeMap::from([("upload".to_string(), "element:UploadId".to_string())]);
+        assert!(holding(&asking, &BTreeMap::new(), "<Error/>").is_empty());
+    }
+
+    fn names() -> BTreeSet<String> {
+        BTreeSet::from([LOCATION.to_string()])
     }
 
     /// Prefixes come off whole. A path that merely starts with the same

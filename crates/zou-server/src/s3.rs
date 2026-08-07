@@ -555,12 +555,81 @@ async fn asked(app: &App, parts: &Parts, bucket: &str) -> Result<Response, Stora
              </VersioningConfiguration>"
         )));
     }
+    if query.contains_key("uploads") {
+        return unfinished(app, parts, bucket).await;
+    }
     listing(app, parts, bucket, &query).await
+}
+
+/// GET /storage/v1/s3/{bucket}?uploads
+///
+/// ListMultipartUploads: what somebody began in this bucket and never
+/// finished. An upload nobody finishes stays in the table until
+/// somebody drops it, so this is the only way to find out that there is
+/// anything to clean up.
+///
+/// No prefix, no delimiter and no paging, which is three of S3's
+/// parameters not read. Every upload the bucket has comes back and the
+/// answer says so. The reference sends `<Prefix/>` whether or not one
+/// was asked for and this sends it too, empty, because it is.
+async fn unfinished(app: &App, parts: &Parts, bucket: &str) -> Result<Response, StorageError> {
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, true).await?;
+    if !exists(&sess, bucket).await? {
+        return done(sess, Err(StorageError::no_such_bucket())).await;
+    }
+    let found = sess
+        .query(
+            "select key, id,
+                    to_char(created_at at time zone 'utc',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+               from storage.s3_multipart_uploads
+              where bucket_id = $1
+              order by key collate \"C\", created_at",
+            &[&bucket],
+        )
+        .await
+        .map_err(|e| pg_error(&e));
+    let rows = done(sess, found).await?;
+    let mut uploads = String::new();
+    for row in &rows {
+        let key: String = row.get(0);
+        let id: String = row.get(1);
+        let when: String = row.get(2);
+        uploads.push_str(&format!(
+            "<Upload><Key>{}</Key><Initiated>{}</Initiated><UploadId>{}</UploadId>\
+             <StorageClass>STANDARD</StorageClass></Upload>",
+            escaped(&key),
+            escaped(&when),
+            escaped(&id),
+        ));
+    }
+    Ok(xml(format!(
+        "{DECLARATION}<ListMultipartUploadsResult xmlns=\"{NAMESPACE}\"><Name>{}</Name>\
+         <Prefix/>{uploads}<IsTruncated>false</IsTruncated><MaxUploads>{MOST_UPLOADS}</MaxUploads>\
+         <KeyCount>{}</KeyCount></ListMultipartUploadsResult>",
+        escaped(bucket),
+        rows.len(),
+    )))
 }
 
 /// The most keys one page can hold, which is also how many it holds
 /// when nobody said.
 const MOST_KEYS: usize = 1000;
+
+/// What the two multipart listings say they would have stopped at.
+///
+/// Neither of them pages: `max-parts`, `part-number-marker`,
+/// `max-uploads` and the two upload markers are all unread, and every
+/// row comes back. The number is in the answers because the reference
+/// puts it there, and an upload with more pieces than this in it is a
+/// thing neither server has been asked about.
+const MOST_PARTS: usize = 1000;
+const MOST_UPLOADS: usize = 1000;
+
+/// The most pieces an upload is allowed, which is S3's own limit and
+/// the one the reference checks the number against.
+const MOST_PIECES: i32 = 10_000;
 
 /// One row of a listing, which is either an object or a folder that
 /// several objects are under.
@@ -1016,15 +1085,44 @@ fn plain(text: &str) -> String {
 /// key with slashes in it is what makes a listing with a delimiter mean
 /// anything. Nothing here treats those slashes as anything but
 /// characters in a name.
+///
+/// Half of these are about an upload in pieces rather than about the
+/// object, and what tells them apart is the query: `uploads` begins one
+/// and `uploadId` names one that was begun. A put needs both `uploadId`
+/// and `partNumber` to be a piece of one, which is recorded rather than
+/// reasoned: a put naming an upload and no number writes an ordinary
+/// object at that key and answers an ordinary object's etag.
 pub async fn object(
     State(app): State<Arc<App>>,
     Path((bucket, key)): Path<(String, String)>,
     parts: Parts,
     body: Body,
 ) -> Response {
+    let query = query_of(&parts);
     let answer = match parts.method {
+        Method::GET if query.contains_key("uploadId") => {
+            pieces(&app, &parts, &bucket, &key, &query).await
+        }
         Method::GET => fetched(&app, &parts, &bucket, &key).await,
         Method::HEAD => described(&app, &parts, &bucket, &key).await,
+        Method::POST if query.contains_key("uploads") => begun(&app, &parts, &bucket, &key).await,
+        Method::POST if query.contains_key("uploadId") => {
+            assembled(&app, &parts, &bucket, &key, &query, body).await
+        }
+        // UploadPartCopy, whose bytes are some other key's rather than
+        // its own. Owed, and named here rather than left to fall into
+        // the piece below, which would take a body that is not there
+        // and write an empty piece with a straight face.
+        Method::PUT
+            if query.contains_key("uploadId")
+                && query.contains_key("partNumber")
+                && header_value(&parts, "x-amz-copy-source").is_some() =>
+        {
+            return crate::not_yet("the storage surface");
+        }
+        Method::PUT if query.contains_key("uploadId") && query.contains_key("partNumber") => {
+            piece(&app, &parts, &bucket, &key, &query, body).await
+        }
         // One verb and two requests, told apart by a header. A put
         // carrying bytes writes them and a put naming somewhere else's
         // reads them from there, and the second answers a document where
@@ -1033,6 +1131,7 @@ pub async fn object(
             Some(source) => copied(&app, &parts, &bucket, &key, source).await,
             None => put(&app, &parts, &bucket, &key, body).await,
         },
+        Method::DELETE if query.contains_key("uploadId") => abandoned(&app, &parts, &query).await,
         Method::DELETE => dropped(&app, &parts, &bucket, &key).await,
         _ => return crate::not_yet("the storage surface"),
     };
@@ -1375,6 +1474,540 @@ async fn dropped(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// POST /storage/v1/s3/{bucket}/{key}?uploads
+///
+/// CreateMultipartUpload, which writes nothing anybody can read and
+/// hands back the id every request after it carries. Nothing is at the
+/// key until the pieces are put together, and the recording says so:
+/// the object is not there and not in a listing while an upload for it
+/// is in progress.
+///
+/// What the request says about the object it is going to make is kept
+/// on the upload, because the requests that carry the bytes say nothing
+/// about it. The shape of that column is nobody's business but this
+/// server's: no route reads it back, so what upstream writes there is
+/// not recorded and cannot be.
+async fn begun(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let mime = match header_value(parts, "content-type").unwrap_or_default() {
+        "" => object::OCTET_STREAM,
+        given => given,
+    };
+    let cache = header_value(parts, "cache-control").unwrap_or(object::NO_CACHE);
+    let held = serde_json::json!({"contentType": mime, "cacheControl": cache}).to_string();
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, false).await?;
+    if !exists(&sess, bucket).await? {
+        return done(sess, Err(StorageError::no_such_bucket())).await;
+    }
+    // `upload_signature` is left empty. Upstream puts a signature over
+    // the upload's own bucket, key and version there and refuses a
+    // request whose path does not match it; the same question is asked
+    // below by comparing the columns, which needs no secret and cannot
+    // be answered differently by a server holding a different one.
+    //
+    // `version` is written and never read. The object's bytes are keyed
+    // by the version the row that ends up in `storage.objects` gets,
+    // and that row is not this one.
+    let found = sess
+        .query(
+            "insert into storage.s3_multipart_uploads
+                 (id, upload_signature, bucket_id, key, version, metadata)
+             values (gen_random_uuid()::text, '', $1, $2,
+                     gen_random_uuid()::text, $3::text::jsonb)
+             returning id",
+            &[&bucket, &key, &held],
+        )
+        .await
+        .map_err(|e| pg_error(&e));
+    let rows = done(sess, found).await?;
+    let id: String = match rows.first() {
+        Some(row) => row.get(0),
+        None => return Err(StorageError::internal("upload was not written".to_string())),
+    };
+    Ok(xml(format!(
+        "{DECLARATION}<InitiateMultipartUploadResult xmlns=\"{NAMESPACE}\"><Bucket>{}</Bucket>\
+         <Key>{}</Key><UploadId>{}</UploadId></InitiateMultipartUploadResult>",
+        escaped(bucket),
+        escaped(key),
+        escaped(&id),
+    )))
+}
+
+/// PUT /storage/v1/s3/{bucket}/{key}?partNumber=N&uploadId=U
+///
+/// UploadPart. The bytes are kept as they arrived and nothing is joined
+/// up until the upload is put together, which is what lets a client
+/// send them at once and in any order.
+///
+/// The etag comes back without the quotes an object's etag has. That is
+/// upstream's inconsistency and it is load bearing: a client that puts
+/// the quotes back when it names the piece in the completion is refused
+/// with `InvalidChecksum`, which is recorded.
+async fn piece(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+    query: &BTreeMap<String, String>,
+    body: Body,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    // Before anything is looked up, which is where the reference checks
+    // it: a number out of range is refused on an upload that exists,
+    // and the sentence names the querystring rather than the upload. A
+    // number that is not a number at all is not recorded, and reads as
+    // zero here, which is the refusal a client that sent one deserves
+    // for the same reason a client that sent zero does.
+    let number = query
+        .get("partNumber")
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or_default();
+    if number < 1 {
+        return Err(StorageError::not_valid(
+            "Querystring, partNumber must be >= 1".to_string(),
+        ));
+    }
+    if number > MOST_PIECES {
+        return Err(StorageError::not_valid(format!(
+            "Querystring, partNumber must be <= {MOST_PIECES}"
+        )));
+    }
+    let upload = query.get("uploadId").cloned().unwrap_or_default();
+    let bytes = axum::body::to_bytes(body, object::UPLOAD_LIMIT)
+        .await
+        .map_err(|_| StorageError::too_large())?
+        .to_vec();
+    let size = bytes.len() as i64;
+    let etag = object::etag_of(&bytes).trim_matches('"').to_string();
+    let blobs = object::blobs(app)?;
+
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, false).await?;
+    let Some(going) = upload_of(&sess, &upload).await? else {
+        return done(sess, Err(StorageError::no_such_upload())).await;
+    };
+    // A piece sent to an upload that was begun for another key is 500
+    // with `Internal Server Error` on it, which is not a decision
+    // anybody made: upstream compares the path against the signature it
+    // stored and throws where nothing is catching. Copied, because the
+    // alternative is a client that gets a refusal here and a crash
+    // there, and a client cannot tell a deliberate 500 from an
+    // accidental one anyway.
+    if going.bucket != bucket || going.key != key {
+        return done(
+            sess,
+            Err(StorageError::internal("Internal Server Error".to_string())),
+        )
+        .await;
+    }
+    // A row of its own every time, even under a number that already has
+    // one. Both sends are still there afterwards and the listing shows
+    // both, which is recorded, and which is what makes the etag in the
+    // completion a choice between them rather than a check on the
+    // survivor.
+    let rows = sess
+        .query(
+            "insert into storage.s3_multipart_uploads_parts
+                 (upload_id, part_number, bucket_id, key, etag, version, size)
+             values ($1, $2, $3, $4, $5, $6, $7)
+             returning id::text",
+            &[
+                &upload,
+                &number,
+                &bucket,
+                &key,
+                &etag,
+                &going.version,
+                &size,
+            ],
+        )
+        .await
+        .map_err(|e| pg_error(&e))?;
+    let part: String = match rows.first() {
+        Some(row) => row.get(0),
+        None => return Err(StorageError::internal("piece was not written".to_string())),
+    };
+    // What the upload is holding, kept as it goes rather than counted
+    // at the end. Nothing reads it here; it is the column upstream
+    // charges a project's storage against.
+    sess.execute(
+        "update storage.s3_multipart_uploads
+            set in_progress_size = in_progress_size + $2
+          where id = $1",
+        &[&upload, &size],
+    )
+    .await
+    .map_err(|e| pg_error(&e))?;
+
+    // The bytes before the commit, for the reason an upload has one: a
+    // row saying a piece is there is a row a completion will look for.
+    if let Err(e) = blobs
+        .put(crate::blob::piece_key(&upload, &part), bytes)
+        .await
+    {
+        let _ = sess.rollback().await;
+        return Err(StorageError::internal(e.to_string()));
+    }
+    done(sess, Ok(())).await?;
+
+    let mut answer = StatusCode::OK.into_response();
+    if let Ok(value) = etag.parse() {
+        answer.headers_mut().insert(header::ETAG, value);
+    }
+    Ok(answer)
+}
+
+/// GET /storage/v1/s3/{bucket}/{key}?uploadId=U
+///
+/// ListParts, which a client that lost its place asks before sending
+/// the rest.
+///
+/// The bucket and the key in the answer are the ones in the path rather
+/// than the upload's own, and the pieces are every piece the id has
+/// whatever key they were sent under. Both are recorded, by asking for
+/// an upload under a key that is not its.
+///
+/// In order of the number on them, not in the order they arrived. Two
+/// pieces sent under one number are two rows and both are listed, the
+/// earlier send first.
+async fn pieces(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+    query: &BTreeMap<String, String>,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let upload = query.get("uploadId").cloned().unwrap_or_default();
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, true).await?;
+    if upload_of(&sess, &upload).await?.is_none() {
+        return done(sess, Err(StorageError::no_such_upload())).await;
+    }
+    let found = sess
+        .query(
+            "select part_number, etag,
+                    to_char(created_at at time zone 'utc',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
+               from storage.s3_multipart_uploads_parts
+              where upload_id = $1
+              order by part_number, created_at",
+            &[&upload],
+        )
+        .await
+        .map_err(|e| pg_error(&e));
+    let rows = done(sess, found).await?;
+    let mut listed = String::new();
+    for row in &rows {
+        let number: i32 = row.get(0);
+        let etag: String = row.get(1);
+        let when: String = row.get(2);
+        listed.push_str(&format!(
+            "<Part><PartNumber>{number}</PartNumber><LastModified>{}</LastModified>\
+             <ETag>{}</ETag></Part>",
+            escaped(&when),
+            escaped(&etag),
+        ));
+    }
+    Ok(xml(format!(
+        "{DECLARATION}<ListPartsResult xmlns=\"{NAMESPACE}\"><Bucket>{}</Bucket><Key>{}</Key>\
+         <UploadId>{}</UploadId><MaxParts>{MOST_PARTS}</MaxParts>\
+         <IsTruncated>false</IsTruncated>{listed}</ListPartsResult>",
+        escaped(bucket),
+        escaped(key),
+        escaped(&upload),
+    )))
+}
+
+/// DELETE /storage/v1/s3/{bucket}/{key}?uploadId=U
+///
+/// AbortMultipartUpload. The client gave up, and the pieces it sent are
+/// not going to be an object, so they are nobody's.
+///
+/// 200 with no body and no content type, which is S3's 204 answered
+/// differently and recorded.
+async fn abandoned(
+    app: &App,
+    parts: &Parts,
+    query: &BTreeMap<String, String>,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let upload = query.get("uploadId").cloned().unwrap_or_default();
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, false).await?;
+    if upload_of(&sess, &upload).await?.is_none() {
+        return done(sess, Err(StorageError::no_such_upload())).await;
+    }
+    let kept = held_pieces(&sess, &upload).await?;
+    // The parts rows go with the upload, which is the foreign key's
+    // doing rather than this statement's.
+    let gone = sess
+        .execute(
+            "delete from storage.s3_multipart_uploads where id = $1",
+            &[&upload],
+        )
+        .await
+        .map_err(|e| pg_error(&e));
+    done(sess, gone.map(|_| ())).await?;
+    if let Ok(blobs) = object::blobs(app) {
+        for part in &kept {
+            let _ = blobs
+                .delete(crate::blob::piece_key(&upload, &part.id))
+                .await;
+        }
+    }
+    Ok(StatusCode::OK.into_response())
+}
+
+/// POST /storage/v1/s3/{bucket}/{key}?uploadId=U
+///
+/// CompleteMultipartUpload: the pieces the body names, joined up in the
+/// order the body names them and written as an ordinary object.
+///
+/// The order is the body's rather than the numbers' and that is
+/// recorded: a completion naming piece two before piece one makes an
+/// object with the second piece at the front of it. So is the way a
+/// piece is named, which is by its number and its etag together, so
+/// that a number with two sends under it is a choice rather than an
+/// ambiguity.
+///
+/// The upload is gone afterwards, whether or not the object is any
+/// good, which is why a completion sent twice is `NoSuchUpload` rather
+/// than a second object.
+async fn assembled(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+    query: &BTreeMap<String, String>,
+    body: Body,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let upload = query.get("uploadId").cloned().unwrap_or_default();
+    let raw = axum::body::to_bytes(body, object::UPLOAD_LIMIT)
+        .await
+        .map_err(|_| StorageError::too_large())?;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    // Before the upload is looked for, which is where the delete route
+    // reads its own body and the same sentence a schema failure earns
+    // there.
+    let Some(named) = parts_in(&text) else {
+        return Err(StorageError::not_valid(
+            "Body, CompleteMultipartUpload must be object".to_string(),
+        ));
+    };
+    let blobs = object::blobs(app)?;
+
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, false).await?;
+    let Some(going) = upload_of(&sess, &upload).await? else {
+        return done(sess, Err(StorageError::no_such_upload())).await;
+    };
+    let kept = held_pieces(&sess, &upload).await?;
+    let mut wanted = Vec::new();
+    for (number, etag) in &named {
+        let under: Vec<&Held> = kept.iter().filter(|held| held.number == *number).collect();
+        if under.is_empty() {
+            let why = StorageError::missing_part(format!(
+                "Part {number} is missing for upload id {upload}"
+            ));
+            return done(sess, Err(why)).await;
+        }
+        // A piece is named by its etag, and the etag a piece answered
+        // with had no quotes on it. Compared as it arrived: a client
+        // that adds them is naming a piece nobody has.
+        let Some(held) = under.iter().find(|held| &held.etag == etag) else {
+            let why = StorageError::wrong_part(format!("Invalid ETag for part {number}"));
+            return done(sess, Err(why)).await;
+        };
+        wanted.push(held.id.clone());
+    }
+
+    let mut bytes = Vec::new();
+    for part in &wanted {
+        match blobs.get(crate::blob::piece_key(&upload, part)).await {
+            Ok(Some(mut some)) => bytes.append(&mut some),
+            Ok(None) => {}
+            Err(e) => {
+                let _ = sess.rollback().await;
+                return Err(StorageError::internal(e.to_string()));
+            }
+        }
+    }
+
+    // The upload before the object, in the transaction the object is
+    // written in, so that an object that could not be written leaves
+    // the upload where it was.
+    sess.execute(
+        "delete from storage.s3_multipart_uploads where id = $1",
+        &[&upload],
+    )
+    .await
+    .map_err(|e| pg_error(&e))?;
+
+    // Through the same code an ordinary put ends in, so that the two of
+    // them leave the same row behind for the same bytes, including the
+    // empty object in the metadata column that says an S3 put wrote it.
+    let joined = object::Upload {
+        bytes,
+        mime: going.mime,
+        cache: going.cache,
+    };
+    let attached = Some("{}".to_string());
+    let written = object::write(app, sess, None, bucket, key, joined, attached, "", true).await?;
+
+    // The pieces are the object now and their own bytes are nobody's.
+    // After the commit, for the reason a replaced version's bytes go
+    // after one.
+    for part in &kept {
+        let _ = blobs
+            .delete(crate::blob::piece_key(&upload, &part.id))
+            .await;
+    }
+
+    // Location is the bucket and the key rather than a url, which is
+    // recorded and is not what S3 sends.
+    Ok(xml(format!(
+        "{DECLARATION}<CompleteMultipartUploadResult xmlns=\"{NAMESPACE}\">\
+         <Location>{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag>\
+         </CompleteMultipartUploadResult>",
+        escaped(bucket),
+        escaped(key),
+        escaped(bucket),
+        escaped(key),
+        escaped(&written.etag),
+    )))
+}
+
+/// An upload in progress, as much of it as the five requests need.
+struct InPieces {
+    bucket: String,
+    key: String,
+    version: String,
+    mime: String,
+    cache: String,
+}
+
+/// One piece of one, by the row rather than by the number on it.
+struct Held {
+    id: String,
+    number: i32,
+    etag: String,
+}
+
+/// The upload an id names, or nothing.
+///
+/// By the id alone. The bucket and the key in the path are not part of
+/// the question: an upload asked for under the wrong key is found and
+/// then answered about differently by each of the routes that ask, and
+/// both of those answers are recorded.
+async fn upload_of(sess: &crate::sql::Session, id: &str) -> Result<Option<InPieces>, StorageError> {
+    let rows = sess
+        .query(
+            "select bucket_id, key, version,
+                    coalesce(metadata->>'contentType', ''),
+                    coalesce(metadata->>'cacheControl', '')
+               from storage.s3_multipart_uploads where id = $1",
+            &[&id],
+        )
+        .await
+        .map_err(|e| pg_error(&e))?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let mime: String = row.get(3);
+    let cache: String = row.get(4);
+    Ok(Some(InPieces {
+        bucket: row.get(0),
+        key: row.get(1),
+        version: row.get(2),
+        mime: match mime.is_empty() {
+            true => object::OCTET_STREAM.to_string(),
+            false => mime,
+        },
+        cache: match cache.is_empty() {
+            true => object::NO_CACHE.to_string(),
+            false => cache,
+        },
+    }))
+}
+
+/// Every piece an upload is holding, in the order a listing wants them.
+async fn held_pieces(sess: &crate::sql::Session, upload: &str) -> Result<Vec<Held>, StorageError> {
+    let rows = sess
+        .query(
+            "select id::text, part_number, etag
+               from storage.s3_multipart_uploads_parts
+              where upload_id = $1
+              order by part_number, created_at",
+            &[&upload],
+        )
+        .await
+        .map_err(|e| pg_error(&e))?;
+    Ok(rows
+        .iter()
+        .map(|row| Held {
+            id: row.get(0),
+            number: row.get(1),
+            etag: row.get(2),
+        })
+        .collect())
+}
+
+/// The pieces a completion's body names, in the order it named them, or
+/// nothing when there is no `CompleteMultipartUpload` object in it.
+///
+/// Read by finding the tags, for the reason the delete route reads its
+/// own body that way: everything that has to come out of this document
+/// is two elements deep and in document order, and a parser would bring
+/// a set of decisions about namespaces and entities that nothing here
+/// needs.
+///
+/// A `Part` naming no number or no etag is skipped rather than refused.
+/// Nothing recorded says what the reference does with one, and a
+/// completion that names nothing at all is the case that is recorded.
+fn parts_in(body: &str) -> Option<Vec<(i32, String)>> {
+    let at = body.find("<CompleteMultipartUpload")?;
+    let rest = &body[at..];
+    let end = rest.find("</CompleteMultipartUpload>")?;
+    let inside = &rest[rest[..end].find('>')? + 1..end];
+    // An element holding no element is a string rather than an object
+    // as far as the schema upstream is concerned, and that is the
+    // sentence a client hears.
+    if !inside.contains('<') {
+        return None;
+    }
+    let mut named = Vec::new();
+    for chunk in inside.split("<Part>").skip(1) {
+        let Some(number) = inside_of(chunk, "PartNumber") else {
+            continue;
+        };
+        let Ok(number) = number.trim().parse::<i32>() else {
+            continue;
+        };
+        let Some(etag) = inside_of(chunk, "ETag") else {
+            continue;
+        };
+        named.push((number, plain(etag)));
+    }
+    Some(named)
+}
+
+/// What the first `<name>` in some text holds.
+fn inside_of<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let at = text.find(&open)? + open.len();
+    let rest = &text[at..];
+    Some(&rest[..rest.find(&close)?])
+}
+
 /// Is the bucket there? The service role sees every one of them, so
 /// this really is existence rather than the visibility question the
 /// json routes ask.
@@ -1535,6 +2168,48 @@ mod tests {
     fn a_key_written_as_escapes_is_read_as_itself() {
         let body = "<Delete><Object><Key>a&amp;b&lt;c</Key></Object></Delete>";
         assert_eq!(keys_in(body), Some(vec!["a&b<c".into()]));
+    }
+
+    /// In the order the body wrote them, because that is the order the
+    /// object is joined up in. A completion naming the second piece
+    /// first makes an object with the second piece at the front of it,
+    /// which is recorded.
+    #[test]
+    fn a_completion_is_read_as_the_pieces_it_names_in_that_order() {
+        let body = "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                    <Part><PartNumber>2</PartNumber><ETag>bbb</ETag></Part>\
+                    <Part><PartNumber>1</PartNumber><ETag>aaa</ETag></Part>\
+                    </CompleteMultipartUpload>";
+        assert_eq!(
+            parts_in(body),
+            Some(vec![(2, "bbb".to_string()), (1, "aaa".to_string())])
+        );
+    }
+
+    /// The same rule the delete body follows: an element holding no
+    /// element is a string rather than an object, and that is what
+    /// earns the sentence about a schema.
+    #[test]
+    fn a_completion_with_nothing_in_it_is_not_one() {
+        assert_eq!(
+            parts_in("<CompleteMultipartUpload></CompleteMultipartUpload>"),
+            None
+        );
+        assert_eq!(parts_in("<CompleteMultipartUpload/>"), None);
+        assert_eq!(parts_in(""), None);
+    }
+
+    /// A piece that names half of itself names nothing. Nothing
+    /// recorded says what the reference does with one, and the pieces
+    /// that are named are still named.
+    #[test]
+    fn a_piece_missing_its_number_or_its_etag_is_left_out() {
+        let body = "<CompleteMultipartUpload><Part><ETag>bbb</ETag></Part>\
+                    <Part><PartNumber>x</PartNumber><ETag>ccc</ETag></Part>\
+                    <Part><PartNumber>3</PartNumber></Part>\
+                    <Part><PartNumber>1</PartNumber><ETag>aaa</ETag></Part>\
+                    </CompleteMultipartUpload>";
+        assert_eq!(parts_in(body), Some(vec![(1, "aaa".to_string())]));
     }
 
     /// Length first, so that a signature of another length is not a

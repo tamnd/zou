@@ -720,6 +720,7 @@ fn request(bytes: &[char], at: usize, method: &str, spec: &Spec, it: &str) -> Re
         note: None,
         writes,
         chained: false,
+        holds: std::collections::BTreeMap::new(),
         volatile: Vec::new(),
     })
 }

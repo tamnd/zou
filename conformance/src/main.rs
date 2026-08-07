@@ -46,6 +46,7 @@ mod target;
 mod volatile;
 mod zou;
 
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use diff::compare;
@@ -734,36 +735,36 @@ fn ask(target: &Target, suite: &Suite, setup: Option<&str>) -> Result<Asked, Str
         true => suite.reset.as_deref(),
         false => None,
     };
-    // The last url any case was pointed at, which only the resumable
-    // cases read. Kept until something else names one, because the
-    // requests in the middle of an upload answer no location of their
-    // own and the case after them still means the upload the creation
-    // named. Cleared by a case that failed, so that a case following it
-    // is told the chain broke rather than sent somewhere stale.
-    let mut pointed_at: Option<String> = None;
+    // What the cases so far were told to hold on to: the url a creation
+    // pointed at, the id a multipart upload was given, the etag a part
+    // came back with. Each name is kept until something else answers
+    // under it, because the requests in the middle of an upload say
+    // nothing about the upload and the case after them still means it.
+    // Cleared by a case that failed, so that a case naming one is told
+    // the chain broke rather than sent somewhere stale.
+    let mut held: BTreeMap<String, String> = BTreeMap::new();
+    let names = target::held_names(&suite.cases.cases);
     for case in &suite.cases.cases {
         if resets_first(case)
             && let Some(reset) = reset
         {
             target.set_up(reset)?;
         }
-        let case = match target::following(case, pointed_at.as_deref()) {
+        let case = match target::filled(case, &held, &names) {
             Ok(case) => case,
             Err(message) => {
-                pointed_at = None;
+                held.clear();
                 asked.errors.push((case.name.clone(), message));
                 continue;
             }
         };
         match target.send(&case) {
             Ok(sent) => {
-                if sent.location.is_some() {
-                    pointed_at = sent.location;
-                }
+                held.extend(sent.held);
                 asked.answers.push(sent.answer);
             }
             Err(message) => {
-                pointed_at = None;
+                held.clear();
                 asked.errors.push((case.name.clone(), message));
             }
         }
@@ -909,6 +910,7 @@ mod tests {
             note: None,
             writes,
             chained,
+            holds: Default::default(),
             volatile: Vec::new(),
         }
     }
