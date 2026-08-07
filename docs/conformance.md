@@ -245,7 +245,7 @@ That distinction has to be made here because zou is the gateway as well as the s
 
 ## The suite recorded from an image
 
-The `storage` suite is 476 cases: 66 over the bucket endpoints, 236 over the object ones, and 174 over the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
+The `storage` suite is 478 cases: 66 over the bucket endpoints, 238 over the object ones, and 174 over the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
 The reference is storage-api at the version in `versions.json`, and it is the one reference that cannot be downloaded and run on a flag line.
 storage-api ships as an image and nothing else, so the recording comes from `supabase start` rather than from a binary, which is what the record workflow in this repository brings up.
 
@@ -369,8 +369,8 @@ The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
 The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 74 of them, 96%, with 3 known differences.
 All three are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
 
-The `storage` suite is 476 cases against the storage-api a local Supabase project runs, and zou passes all 476, byte for byte, with no known differences.
-Forty one of them are the image transforms, and those are the one place where byte for byte stops at the picture: a case names the dimensions and the format and gives up on the digest, because two jpeg encoders at the same quality do not agree on a single byte.
+The `storage` suite is 478 cases against the storage-api a local Supabase project runs, and zou passes all 478, byte for byte, with no known differences.
+Forty three of them are the image transforms, and those are the one place where byte for byte stops at the picture: a case names the dimensions and the format and gives up on the digest, because two jpeg encoders at the same quality do not agree on a single byte.
 
 supabase-js 2.111.0 runs 17 of its integration tests against zou and all 17 pass.
 
