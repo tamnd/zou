@@ -24,16 +24,23 @@ use serde::{Deserialize, Serialize};
 /// `user` is an access token for the person a suite seeded, and `none`
 /// sends neither, which is how the gate itself gets tested.
 ///
-/// The three `s3` kinds are not keys in the same sense. That surface is
+/// The five `s3` kinds are not keys in the same sense. That surface is
 /// asked with a signature over the request rather than with a token, so
 /// a case naming one of them is signed by the harness on its way out.
-/// `s3` signs with the pair the target was configured with, and the
-/// other three sign every bit as correctly with one field of the
+/// `s3` signs with the pair the target was configured with, and three
+/// of the others sign every bit as correctly with one field of the
 /// signature wrong: a secret that is not it, an access key id nobody
 /// has, or a region the project is not in. Those exist because a case
 /// about a wrong signature cannot be a hand written header, whose date
 /// would have to be today. A case about a malformed header writes its
 /// own `authorization` under `none` instead.
+///
+/// `s3.project-region` is the odd one. Every other signature is made
+/// in `us-east-1`, which is what a client signs in when nobody told it
+/// otherwise, and this one is made in the region the project says it
+/// is in when it is asked where it is. Whether that is a second region
+/// the endpoint takes or the only one and `us-east-1` is the alias is
+/// a question one recording answers and no documentation does.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Key {
@@ -49,6 +56,8 @@ pub enum Key {
     S3WrongId,
     #[serde(rename = "s3.wrong-region")]
     S3WrongRegion,
+    #[serde(rename = "s3.project-region")]
+    S3ProjectRegion,
     None,
 }
 
@@ -58,7 +67,11 @@ impl Key {
     pub fn signs(self) -> bool {
         matches!(
             self,
-            Key::S3 | Key::S3WrongSecret | Key::S3WrongId | Key::S3WrongRegion
+            Key::S3
+                | Key::S3WrongSecret
+                | Key::S3WrongId
+                | Key::S3WrongRegion
+                | Key::S3ProjectRegion
         )
     }
 }

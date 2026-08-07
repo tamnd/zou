@@ -146,7 +146,12 @@ impl Target {
             // Signed rather than carried, and signed after the case's
             // own headers are on the request, so there is nothing to
             // put in front here.
-            Key::S3 | Key::S3WrongSecret | Key::S3WrongId | Key::S3WrongRegion | Key::None => None,
+            Key::S3
+            | Key::S3WrongSecret
+            | Key::S3WrongId
+            | Key::S3WrongRegion
+            | Key::S3ProjectRegion
+            | Key::None => None,
         }
     }
 
@@ -329,6 +334,12 @@ impl Target {
                 stamp: &stamp,
                 region: match case.key {
                     Key::S3WrongRegion => "eu-west-1",
+                    // Where a local project says it is, which is the
+                    // one region other than the default that could be
+                    // taken. Written out here for the same reason the
+                    // wrong one is: a case cannot read it out of the
+                    // answer to the case before it.
+                    Key::S3ProjectRegion => "local",
                     _ => sigv4::REGION,
                 },
             },

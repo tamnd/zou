@@ -43,6 +43,7 @@
 //! element that self closes in one library and does not in another is a
 //! difference nobody meant.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -285,6 +286,56 @@ fn verified(app: &App, parts: &Parts) -> Result<(), StorageError> {
 /// One header, by a name already in lower case.
 fn header_value<'a>(parts: &'a Parts, name: &str) -> Option<&'a str> {
     parts.headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// The query string taken apart, with the values decoded.
+///
+/// Decoded here rather than by an extractor, because the signature is
+/// computed over the string as it arrived and reading it twice for two
+/// purposes is the only way to have both. A parameter with no value is
+/// an empty one, which is what `?location` is and what tells this
+/// surface which of the several documents a get is asking for.
+fn query_of(parts: &Parts) -> BTreeMap<String, String> {
+    let mut asked = BTreeMap::new();
+    for pair in parts.uri.query().unwrap_or("").split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        asked.insert(name.to_string(), decoded(value));
+    }
+    asked
+}
+
+/// A percent encoded value, as itself.
+///
+/// A plus is a space here, which is the html form rule rather than the
+/// url one, and it is the rule every query string parser in this
+/// business applies. A percent that is not followed by two hex digits
+/// is left as a percent rather than refused: this runs before anything
+/// has been checked, and a query nobody can read is a query about an
+/// object nobody has.
+fn decoded(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'+' => out.push(b' '),
+            b'%' if at + 2 < bytes.len() => {
+                match u8::from_str_radix(&value[at + 1..at + 3], 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        at += 2;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            byte => out.push(byte),
+        }
+        at += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The query string as the signature sees it: sorted by name, and a
