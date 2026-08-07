@@ -113,6 +113,31 @@ async fn call(f: &Fixture, method: &str, path: &str, mime: &str, body: &str) -> 
     as_whoever(f, Some(&service()), method, path, mime, body).await
 }
 
+/// A read carrying whatever the client says it already has.
+async fn asking(f: &Fixture, method: &str, path: &str, said: &[(&str, &str)]) -> Answer {
+    let mut req = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", format!("Bearer {}", service()));
+    for (name, value) in said {
+        req = req.header(*name, *value);
+    }
+    let res = f
+        .app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .expect("router answers");
+    let status = res.status();
+    let headers = res.headers().clone();
+    let bytes = to_bytes(res.into_body(), 1 << 20).await.expect("body");
+    Answer {
+        status,
+        headers,
+        bytes: bytes.to_vec(),
+    }
+}
+
 /// The same request, with a token of the caller's choosing or with none
 /// at all. A signed url is spent with none: the token is in the query
 /// string and an authorization header would be a second answer to a
@@ -631,6 +656,80 @@ async fn a_download_carries_what_the_renderer_carries() {
     .await;
     assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
     assert_eq!(answer.header("content-disposition"), Some("attachment;"));
+}
+
+/// A not modified answer carries everything a 200 would have carried
+/// except the bytes, which is what upstream's renderer does: it writes
+/// the headers and then sends whatever it has, and on a 304 it has
+/// nothing.
+///
+/// The suite asks the status and the content type of this and can ask
+/// no more, because the rest of the set is not in the eight headers it
+/// compares.
+#[tokio::test]
+async fn a_not_modified_answer_carries_the_headers_and_no_bytes() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-conditional").await;
+
+    let path = "/storage/v1/object/zou-conditional/etag.txt";
+    let answer = call(&f, "POST", path, "text/plain", "hello world").await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+
+    let answer = asking(&f, "GET", path, &[]).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let etag = answer.header("etag").expect("no ETag").to_string();
+    let modified = answer
+        .header("last-modified")
+        .expect("no Last-Modified")
+        .to_string();
+
+    let answer = asking(&f, "GET", path, &[("if-none-match", &etag)]).await;
+    assert_eq!(answer.status, StatusCode::NOT_MODIFIED, "{}", answer.text());
+    assert!(answer.bytes.is_empty(), "{}", answer.text());
+    assert_eq!(answer.header("accept-ranges"), Some("bytes"));
+    assert_eq!(
+        answer.header("content-type"),
+        Some("text/plain; charset=UTF-8")
+    );
+    assert_eq!(answer.header("etag"), Some(etag.as_str()));
+    assert_eq!(answer.header("x-robots-tag"), Some("none"));
+    assert_eq!(answer.header("last-modified"), Some(modified.as_str()));
+    assert_eq!(answer.header("content-length"), Some("0"));
+
+    // A range next to a condition that is already met is a not modified
+    // answer, because the condition is read before the range is.
+    let answer = asking(
+        &f,
+        "GET",
+        path,
+        &[("if-none-match", &etag), ("range", "bytes=0-3")],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::NOT_MODIFIED, "{}", answer.text());
+    assert_eq!(answer.header("content-range"), None);
+
+    // A HEAD is a different route upstream, answered out of the row by
+    // a renderer that never opens the store, so it has no condition to
+    // read and answers the whole header set with a 200.
+    let answer = asking(&f, "HEAD", path, &[("if-none-match", &etag)]).await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert!(answer.bytes.is_empty());
+    assert_eq!(answer.header("etag"), Some(etag.as_str()));
+
+    // The moment it was written is not after itself, and a moment
+    // before it is a request for the bytes.
+    let answer = asking(&f, "GET", path, &[("if-modified-since", &modified)]).await;
+    assert_eq!(answer.status, StatusCode::NOT_MODIFIED, "{}", answer.text());
+    let answer = asking(
+        &f,
+        "GET",
+        path,
+        &[("if-modified-since", "Wed, 01 Jan 2020 00:00:00 GMT")],
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    assert_eq!(answer.text(), "hello world");
 }
 
 /// The url out of a signing answer, with the prefix the client would

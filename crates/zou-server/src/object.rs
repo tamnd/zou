@@ -61,7 +61,8 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
-use axum::http::{StatusCode, header, request::Parts};
+use axum::http::response::Builder;
+use axum::http::{HeaderName, Method, StatusCode, header, request::Parts};
 use axum::response::Response;
 use md5::{Digest, Md5};
 use serde_json::{Value, json};
@@ -444,6 +445,30 @@ async fn deliver(
     // against, and reading the object to find out how long it is would
     // defeat the point of asking for part of it.
     let size = row.meta("size").as_u64();
+    let changed = row.meta("lastModified").as_str().and_then(iso_to_unix);
+
+    // What the client says it already has, asked before the range and
+    // before the store. Upstream asks it inside the backend, after the
+    // file has been opened far enough to know its size, so a row whose
+    // bytes are gone answers the failure rather than the 304 this does.
+    // Nothing can ask that question honestly: an etag is a thing the
+    // client was given by an answer that had bytes behind it.
+    //
+    // A HEAD is not asked at all. It is a different route upstream and
+    // a different renderer behind it, one that answers out of the row
+    // and never opens the store, so it has nothing to compare and
+    // answers 200 with the same headers a 200 would carry. Recorded.
+    if parts.method != Method::HEAD && already_has(parts, etag.as_str(), changed) {
+        let mut answer = Response::builder().status(StatusCode::NOT_MODIFIED);
+        answer = headers_of(answer, mime, etag.as_str(), changed, 0, cache, &until);
+        if let Some(name) = asked_for(parts, "download") {
+            answer = answer.header(header::CONTENT_DISPOSITION, attachment(&name));
+        }
+        return answer
+            .body(Body::empty())
+            .map_err(|e| StorageError::internal(e.to_string()));
+    }
+
     let asked = parts
         .headers
         .get(header::RANGE)
@@ -480,24 +505,16 @@ async fn deliver(
         return Err(StorageError::internal("Internal Server Error".to_string()));
     };
 
-    // In the order upstream's renderer writes them, which costs nothing
-    // to keep and makes the two answers comparable byte for byte.
-    let mut answer = Response::builder()
-        .status(status)
-        .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_TYPE, served_type(mime));
-    if let Some(etag) = etag.as_str() {
-        answer = answer.header(header::ETAG, etag);
-    }
-    answer = answer.header("x-robots-tag", ROBOTS);
-    if let Some(when) = row.meta("lastModified").as_str().and_then(iso_to_unix) {
-        answer = answer.header(header::LAST_MODIFIED, http_date(when));
-    }
-    answer = answer.header(header::CONTENT_LENGTH, bytes.len());
-    answer = match &until {
-        Some(when) => answer.header(header::EXPIRES, when),
-        None => answer.header(header::CACHE_CONTROL, cache),
-    };
+    let mut answer = Response::builder().status(status);
+    answer = headers_of(
+        answer,
+        mime,
+        etag.as_str(),
+        changed,
+        bytes.len(),
+        cache,
+        &until,
+    );
     if let Some(range) = content_range {
         answer = answer.header(header::CONTENT_RANGE, range);
     }
@@ -507,6 +524,101 @@ async fn deliver(
     answer
         .body(Body::from(bytes))
         .map_err(|e| StorageError::internal(e.to_string()))
+}
+
+/// Everything a download says about itself, in the order upstream's
+/// renderer writes them, which costs nothing to keep and makes the two
+/// answers comparable byte for byte.
+///
+/// A not modified answer carries the whole set with a length of zero,
+/// because upstream writes the headers before it looks at what it is
+/// sending and what it is sending is nothing.
+fn headers_of(
+    answer: Builder,
+    mime: &str,
+    etag: Option<&str>,
+    changed: Option<i64>,
+    length: usize,
+    cache: &str,
+    until: &Option<String>,
+) -> Builder {
+    let mut answer = answer
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_TYPE, served_type(mime));
+    if let Some(etag) = etag {
+        answer = answer.header(header::ETAG, etag);
+    }
+    answer = answer.header("x-robots-tag", ROBOTS);
+    if let Some(when) = changed {
+        answer = answer.header(header::LAST_MODIFIED, http_date(when));
+    }
+    answer = answer.header(header::CONTENT_LENGTH, length);
+    match until {
+        Some(when) => answer.header(header::EXPIRES, when),
+        None => answer.header(header::CACHE_CONTROL, cache),
+    }
+}
+
+/// Whether the client already has what it would be sent.
+///
+/// The two questions are asked in the order upstream asks them and the
+/// first one that says yes wins, which is visible from the outside: an
+/// etag that matches next to a date that says the object is newer is
+/// answered as not modified, because the etag was read first.
+///
+/// `if-none-match` is compared as one string against the other. A star,
+/// a list with the right etag in it, and the right etag without its
+/// quotes are all answers of no, which is not what the header means in
+/// the rfc and is what upstream does. All three are recorded, so this
+/// is a compatibility surface rather than an oversight to fix.
+///
+/// `if-modified-since` is read the way `new Date` reads it, and the one
+/// thing worth knowing about that is what it does with a string that is
+/// not a date: it produces a value that compares false against
+/// everything, so a moment that is not a moment asks for the object.
+/// The comparison is `<=`, so a date equal to the moment the object was
+/// last written is not modified.
+fn already_has(parts: &Parts, etag: Option<&str>, changed: Option<i64>) -> bool {
+    let said = |name: HeaderName| {
+        parts
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+    if let Some(asked) = said(header::IF_NONE_MATCH) {
+        return Some(asked) == etag;
+    }
+    match (
+        said(header::IF_MODIFIED_SINCE).and_then(http_date_to_unix),
+        changed,
+    ) {
+        (Some(since), Some(changed)) => changed <= since,
+        _ => false,
+    }
+}
+
+/// The other direction from [`http_date`], for the one shape a browser
+/// sends. `new Date` reads several more, an iso timestamp among them,
+/// and a client that sends one of those is a client sending something
+/// no browser sends.
+fn http_date_to_unix(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let (_, date) = text.split_once(", ")?;
+    let mut parts = date.split(' ');
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month = parts.next()?;
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|name| *name == month)? as i64
+        + 1;
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut clock = parts.next()?.split(':');
+    let hour: i64 = clock.next()?.parse().ok()?;
+    let minute: i64 = clock.next()?.parse().ok()?;
+    let second: i64 = clock.next()?.parse().ok()?;
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
 /// What every download says about crawling.
@@ -2405,6 +2517,69 @@ mod tests {
         assert_eq!(http_date(when), "Thu, 01 Jan 1970 00:00:00 GMT");
         assert_eq!(iso_to_unix("2026-08-06"), None);
         assert_eq!(iso_to_unix(""), None);
+    }
+
+    /// The header a browser sends back is the header it was given, so
+    /// the two directions have to agree on every moment, and a string
+    /// that is not a moment has to come back as nothing rather than as
+    /// a guess.
+    #[test]
+    fn a_moment_in_a_header_comes_back_out_of_it() {
+        for when in [0, 1_577_836_800, 4_102_444_800, 1_754_490_339] {
+            assert_eq!(http_date_to_unix(&http_date(when)), Some(when));
+        }
+        assert_eq!(
+            http_date_to_unix("Wed, 01 Jan 2020 00:00:00 GMT"),
+            Some(1_577_836_800)
+        );
+        assert_eq!(http_date_to_unix("some time last week"), None);
+        assert_eq!(http_date_to_unix("Wed, 01 Bad 2020 00:00:00 GMT"), None);
+        assert_eq!(http_date_to_unix(""), None);
+    }
+
+    /// The etag is compared as a string, which the three cases that are
+    /// not a match are the point of: a star means any representation at
+    /// all and a list means any of these, and neither is read.
+    #[test]
+    fn what_a_client_already_has_is_one_string_against_another() {
+        let etag = "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"";
+        let changed = 1_754_490_339;
+        let asked = |name: &str, value: &str| {
+            let (parts, _) = axum::http::Request::builder()
+                .header(name, value)
+                .body(())
+                .unwrap()
+                .into_parts();
+            already_has(&parts, Some(etag), Some(changed))
+        };
+        assert!(asked("if-none-match", etag));
+        assert!(!asked("if-none-match", "\"0\""));
+        assert!(!asked("if-none-match", "*"));
+        assert!(!asked(
+            "if-none-match",
+            "\"0\", \"5eb63bbbe01eeed093cb22bb8f5acdc3\""
+        ));
+        assert!(!asked("if-none-match", "5eb63bbbe01eeed093cb22bb8f5acdc3"));
+        // The moment the object was written is not after itself.
+        assert!(asked("if-modified-since", &http_date(changed)));
+        assert!(asked("if-modified-since", &http_date(changed + 1)));
+        assert!(!asked("if-modified-since", &http_date(changed - 1)));
+        assert!(!asked("if-modified-since", "some time last week"));
+    }
+
+    /// An etag that matches next to a date that does not is answered as
+    /// not modified, because the etag is read first and nothing after
+    /// it runs.
+    #[test]
+    fn the_etag_is_read_before_the_date_is() {
+        let etag = "\"5eb63bbbe01eeed093cb22bb8f5acdc3\"";
+        let (parts, _) = axum::http::Request::builder()
+            .header("if-none-match", etag)
+            .header("if-modified-since", "Wed, 01 Jan 2020 00:00:00 GMT")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert!(already_has(&parts, Some(etag), Some(1_754_490_339)));
     }
 
     /// The day number and the date it is are each other's inverse, and
