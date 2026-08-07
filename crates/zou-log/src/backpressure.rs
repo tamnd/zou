@@ -13,8 +13,8 @@
 //!   takeover time and expensive storage growing without limit. That
 //!   one is an alarm, not a steady state.
 //! - Compaction debt is bounded by read amplification, enforced in the
-//!   debt scheduler ([`READ_AMP_BOUND`] in zou-pg's compact module):
-//!   an over bound shard jumps the queue. GetPage never waits on
+//!   debt scheduler (READ_AMP_BOUND in zou-pg's compact module): an
+//!   over bound shard jumps the queue. GetPage never waits on
 //!   compaction, reads just pay the amp until the pass lands.
 //!
 //! This type is the gauge board the roles report into and the
