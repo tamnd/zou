@@ -213,7 +213,40 @@ fn string_shape(text: &str) -> String {
     {
         return format!("/{route}/{}", string_shape(last));
     }
+    // A sentence with an id in the middle of it, which is what a
+    // refusal that names the thing it could not find says: "Part 7 is
+    // missing for upload id 6e125931-...". The same trade as the two
+    // urls above and for the same reason. The id was made a moment ago
+    // and cannot be compared; the words around it are what a client
+    // reads and what a compatible server owes, so they still are.
+    //
+    // Word by word rather than by scanning, so an id has to stand on
+    // its own with spaces around it. A run of hex inside a longer token
+    // is not an id that was named, it is part of a value, and a rule
+    // that reached into one would be redacting halves of things nobody
+    // asked about.
+    if text.split(' ').any(|word| named(word).is_some()) {
+        let words: Vec<String> = text
+            .split(' ')
+            .map(|word| named(word).unwrap_or_else(|| word.to_string()))
+            .collect();
+        return words.join(" ");
+    }
     "<string>".to_string()
+}
+
+/// One word of a sentence with its id named, or nothing if the word is
+/// not one.
+///
+/// What is trimmed off first is whatever cannot be part of an id, so a
+/// sentence that ends in one keeps its full stop.
+fn named(word: &str) -> Option<String> {
+    let core = word.trim_matches(|c: char| !c.is_ascii_hexdigit() && c != '-');
+    if !is_uuid(core) {
+        return None;
+    }
+    let at = word.find(core)?;
+    Some(format!("{}<uuid>{}", &word[..at], &word[at + core.len()..]))
 }
 
 /// 8-4-4-4-12 hex, which is the one spelling postgres and Go both use.
@@ -468,6 +501,36 @@ mod tests {
     fn an_element_path_leaves_a_json_body_alone() {
         let body = json!({"CreationDate": "2026-08-07T03:49:38.782Z"});
         assert_eq!(redacted(body.clone(), &["element:CreationDate"]), body);
+    }
+
+    /// A refusal that names the row it could not find is worth
+    /// comparing except for the name, which is a value the server made
+    /// up a moment ago.
+    #[test]
+    fn a_sentence_keeps_its_words_and_gives_up_its_ids() {
+        let body = Value::String(
+            "<Message>Part 7 is missing for upload id 6e125931-f378-4e33-90e0-dfe3700e4c65</Message>"
+                .to_string(),
+        );
+        assert_eq!(
+            redacted(body, &["element:Message"]),
+            Value::String("<Message>Part 7 is missing for upload id <uuid></Message>".to_string())
+        );
+    }
+
+    /// The id has to be a word of its own. Half of a longer token is
+    /// not something anybody named.
+    #[test]
+    fn a_sentence_with_no_id_in_it_is_a_string() {
+        assert_eq!(string_shape("Object not found"), "<string>");
+        assert_eq!(
+            string_shape("id 6e125931-f378-4e33-90e0-dfe3700e4c65ff"),
+            "<string>"
+        );
+        assert_eq!(
+            string_shape("try 6e125931-f378-4e33-90e0-dfe3700e4c65."),
+            "try <uuid>."
+        );
     }
 
     /// An index reaches one element, which is what an answer with a
