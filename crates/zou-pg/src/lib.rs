@@ -110,8 +110,8 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use zou_log::{
-    AppendError, AppendTicket, MediaSink, Sequencer, WalMedia, consolidate, gc_landing, stream_end,
-    take_over,
+    AppendError, AppendTicket, Backpressure, MediaSink, Sequencer, WalMedia, consolidate,
+    gc_landing, landing_backlog, stream_end, take_over,
 };
 use zou_store::heartbeat::Heartbeat;
 use zou_store::layout::TenantLayout;
@@ -129,6 +129,10 @@ pub const ZOU_ERR_PANIC: i32 = -3;
 pub const ZOU_ERR_BAD_ARGUMENT: i32 = -4;
 pub const ZOU_ERR_LEASE_HELD: i32 = -5;
 pub const ZOU_ERR_LEASE_LOST: i32 = -6;
+/// The backpressure gate refused the append. Not a failure: the caller
+/// naps and retries the same chunk, which is what stops the lag from
+/// growing while consolidation catches up.
+pub const ZOU_ERR_THROTTLED: i32 = -7;
 
 /// [`zou_wal_fold_poll`] answers, and [`zou_wal_fold_start`] borrows
 /// RUNNING for a refused second start. Errors stay negative.
@@ -1154,6 +1158,9 @@ impl WalWaiter {
 struct WalPipe {
     seq: Option<Sequencer>,
     media: Arc<WalMedia>,
+    /// The lag gauge board the sequencer admits against. The fold thread
+    /// reports the consolidation backlog here after every fold.
+    gate: Arc<Backpressure>,
     heartbeat: Option<Heartbeat>,
     held: Arc<Mutex<HeldLease>>,
     store: Arc<dyn CasStore>,
@@ -1209,6 +1216,49 @@ fn sequencer_config_from_env() -> zou_log::SequencerConfig {
     config
 }
 
+/// The writer identity behind the lease. Stable across pusher and
+/// postmaster restarts so a comeback on the same data directory
+/// reacquires its own lease instantly instead of waiting out the TTL,
+/// and distinct across nodes and across instances on one node so rivals
+/// still contend. ZOU_NODE_ID wins for deployments with real node names;
+/// the fallback hashes the host name and the working directory, which is
+/// the data directory because the postmaster chdirs into it at start.
+fn wal_holder() -> String {
+    if let Ok(id) = std::env::var("ZOU_NODE_ID")
+        && !id.is_empty()
+    {
+        return format!("pg-wal-{id}");
+    }
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .ok()
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "host".to_string());
+    let dir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut digest: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in dir.bytes() {
+        digest ^= u64::from(b);
+        digest = digest.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("pg-wal-{host}-{digest:016x}")
+}
+
+/// Whether the supervisor asked for a deliberate lease steal. Set only
+/// when the previous holder is known dead; see [`zou_store::lease::steal`]
+/// for why a wrong call fences a live writer instead of corrupting it.
+fn lease_steal_requested() -> bool {
+    std::env::var("ZOU_LEASE_STEAL").is_ok_and(|v| v == "1" || v == "on")
+}
+
 fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     init_logging();
     let store: Arc<dyn CasStore> = match open_store(target) {
@@ -1232,9 +1282,26 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         }
         Err(_) => return Err(ZOU_ERR_STORE),
     }
-    let holder = format!("pg-wal-{}", std::process::id());
+    let holder = wal_holder();
     let held = match lease::acquire(&*store, &layout, &holder, WAL_LEASE_TTL_SECS, now_unix()) {
         Ok(held) => held,
+        Err(lease::LeaseError::Held { holder: other, .. }) if lease_steal_requested() => {
+            // The supervisor set ZOU_LEASE_STEAL because it knows the
+            // holder is dead. Epoch fencing keeps this safe if it is
+            // wrong; the log line keeps it auditable.
+            log::warn!("zou_wal_open: stealing the writer lease from {other}");
+            let mut races = 0;
+            loop {
+                match lease::steal(&*store, &layout, &holder, WAL_LEASE_TTL_SECS, now_unix()) {
+                    Ok(held) => break held,
+                    Err(lease::LeaseError::Raced) if races < 8 => races += 1,
+                    Err(e) => {
+                        log::error!("zou_wal_open: steal: {e}");
+                        return Err(ZOU_ERR_STORE);
+                    }
+                }
+            }
+        }
         Err(lease::LeaseError::Held { .. }) => return Err(ZOU_ERR_LEASE_HELD),
         Err(_) => return Err(ZOU_ERR_STORE),
     };
@@ -1282,10 +1349,16 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         }
     };
     let sink = Arc::new(MediaSink::new(Arc::clone(&media), WAL_SHARD));
+    // The spec 08 lag bounds guard admission from day one: with no
+    // reports the gate admits everything, and the fold thread's backlog
+    // reports are what arm the consolidation alarm.
+    let gate = Arc::new(Backpressure::default());
+    let mut config = sequencer_config_from_env();
+    config.gate = Some(Arc::clone(&gate));
     let seq = Sequencer::resume(
         WAL_SHARD,
         sink,
-        sequencer_config_from_env(),
+        config,
         takeover.next_seq,
         takeover.prev_digest,
     );
@@ -1293,6 +1366,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         WalPipe {
             seq: Some(seq),
             media,
+            gate,
             heartbeat: Some(heartbeat),
             held,
             store,
@@ -1438,6 +1512,7 @@ pub unsafe extern "C" fn zou_wal_append(
         let ticket = match seq.append(vec![frame]) {
             Ok(ticket) => ticket,
             Err(AppendError::WrongEpoch { .. }) => return ZOU_ERR_LEASE_LOST,
+            Err(AppendError::Throttled { .. }) => return ZOU_ERR_THROTTLED,
             Err(_) => return ZOU_ERR_STORE,
         };
         pipe.first_appended = true;
@@ -1521,7 +1596,7 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
         let Some(pipe) = WAL.get() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
-        let (store, layout, media, tenant, held) = {
+        let (store, layout, media, tenant, held, gate) = {
             let pipe = pipe.lock().expect("wal pipe mutex poisoned");
             if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
                 return ZOU_ERR_LEASE_LOST;
@@ -1535,6 +1610,7 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
                 Arc::clone(&pipe.media),
                 pipe.tenant,
                 Arc::clone(&pipe.held),
+                Arc::clone(&pipe.gate),
             )
         };
         let mut slot = FOLD_TASK.lock().expect("fold slot mutex poisoned");
@@ -1581,6 +1657,14 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
                         0
                     }
                 };
+                // Refresh the consolidation gauge while we are here.
+                // After a clean fold the backlog is near zero and the
+                // report lifts any standing alarm; after a failed one it
+                // is the growing number that arms the cell throttle.
+                match landing_backlog(&media, WAL_SHARD) {
+                    Ok(backlog) => gate.report_consolidation(WAL_SHARD, backlog),
+                    Err(e) => log::info!("zou fold: landing backlog: {e}"),
+                }
                 FoldEnd::Done {
                     kind: outcome.stats.kind,
                     dropped: dropped as u32,

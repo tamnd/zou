@@ -14,11 +14,11 @@
 
 use std::sync::atomic::AtomicBool;
 
-use zou_pg::compact::{debts, run_queue};
+use zou_pg::compact::{READ_AMP_BOUND, debts, run_queue};
 use zou_store::open_store;
 use zou_store::shards::prune_lineage;
 
-pub const USAGE: &str = "usage: zou compact <target> <ref> [--workers <n>]";
+pub const USAGE: &str = "usage: zou compact <target> <ref> [--workers <n> | --status]";
 
 pub fn run(argv: &[String]) -> Result<(), String> {
     let (target, tenant_ref, rest) = match argv {
@@ -27,6 +27,24 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     };
     let workers = match rest {
         [] => 4,
+        [flag] if flag == "--status" => {
+            // Read only: the debt table as JSON, one row per shard, so a
+            // harness can watch the read amp bound during a run without
+            // triggering work. The queue order is the scheduler's.
+            let store = open_store(target)?;
+            let jobs = debts(&*store, tenant_ref).map_err(|e| e.to_string())?;
+            let rows: Vec<String> = jobs
+                .iter()
+                .map(|job| {
+                    format!(
+                        "{{\"shard\":{},\"debt\":{},\"amp\":{},\"bound\":{}}}",
+                        job.shard, job.debt, job.amp, READ_AMP_BOUND
+                    )
+                })
+                .collect();
+            println!("[{}]", rows.join(","));
+            return Ok(());
+        }
         [flag, n] if flag == "--workers" => n.parse().map_err(|_| USAGE.to_string())?,
         _ => return Err(USAGE.into()),
     };

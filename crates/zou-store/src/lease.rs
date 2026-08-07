@@ -76,13 +76,43 @@ pub fn acquire(
     ttl_secs: u64,
     now_unix: u64,
 ) -> Result<HeldLease, LeaseError> {
+    take(store, layout, holder, ttl_secs, now_unix, false)
+}
+
+/// Deliberate failover: become the writer even though the manifest shows
+/// a live lease. This is for a caller that knows the holder is dead, a
+/// control plane whose heartbeat timed out or an operator staring at a
+/// powered off node, when waiting out the TTL would cost availability.
+///
+/// Safety never rested on the TTL. The epoch bump fences the old holder:
+/// its next renewal or manifest publish fails with `Lost`, and its
+/// landing uploads sit in an epoch the chain takeover seals off. A wrong
+/// call therefore costs a live writer its session, never an acked commit.
+pub fn steal(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    holder: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+) -> Result<HeldLease, LeaseError> {
+    take(store, layout, holder, ttl_secs, now_unix, true)
+}
+
+fn take(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    holder: &str,
+    ttl_secs: u64,
+    now_unix: u64,
+    force: bool,
+) -> Result<HeldLease, LeaseError> {
     let key = layout.manifest();
     let Some((data, version)) = store.get(&key)? else {
         return Err(LeaseError::NoManifest { key });
     };
     let mut manifest = Manifest::from_json(&data)?;
 
-    if let Some(lease) = &manifest.lease {
+    if !force && let Some(lease) = &manifest.lease {
         let expired = lease.expires_unix <= now_unix;
         if !expired && lease.holder != holder {
             return Err(LeaseError::Held {
@@ -305,6 +335,20 @@ mod tests {
         // node-a goes quiet past the TTL and node-b steals.
         acquire(&store, &layout, "node-b", 15, 1020).unwrap();
         let err = renew(&store, &layout, &mut a, 15, 1021).unwrap_err();
+        assert!(matches!(err, LeaseError::Lost { ref holder, epoch: 2 } if holder == "node-b"));
+    }
+
+    #[test]
+    fn steal_takes_a_live_lease_and_fences_the_holder() {
+        let (_d, store, layout) = setup();
+        let mut a = acquire(&store, &layout, "node-a", 15, 1000).unwrap();
+
+        // node-b knows node-a is dead and does not wait for 1015.
+        let b = steal(&store, &layout, "node-b", 15, 1005).unwrap();
+        assert_eq!((b.epoch, b.fence, b.expires_unix), (2, 2, 1020));
+
+        // If node-a was alive after all, its next renewal fences it.
+        let err = renew(&store, &layout, &mut a, 15, 1006).unwrap_err();
         assert!(matches!(err, LeaseError::Lost { ref holder, epoch: 2 } if holder == "node-b"));
     }
 

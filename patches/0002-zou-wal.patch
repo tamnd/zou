@@ -41,7 +41,7 @@ new file mode 100644
 index 0000000..23bc879
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,490 @@
+@@ -0,0 +1,518 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -95,6 +95,7 @@ index 0000000..23bc879
 +extern int	zou_wal_close(void);
 +
 +#define ZOU_ERR_LEASE_HELD (-5)
++#define ZOU_ERR_THROTTLED (-7)
 +
 +/* zou_wal_fold_poll answers, mirroring the ZOU_FOLD_* consts in the crate. */
 +#define ZOU_FOLD_IDLE 0
@@ -160,7 +161,8 @@ index 0000000..23bc879
 +	memset(&bgw, 0, sizeof(bgw));
 +	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
 +	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
-+	bgw.bgw_restart_time = 1;
++	/* Come back immediately: every second here is commit stall. */
++	bgw.bgw_restart_time = 0;
 +	snprintf(bgw.bgw_library_name, sizeof(bgw.bgw_library_name), "postgres");
 +	snprintf(bgw.bgw_function_name, sizeof(bgw.bgw_function_name),
 +			 "ZouWalPusherMain");
@@ -232,6 +234,7 @@ index 0000000..23bc879
 +	XLogRecPtr	folded;
 +	TimeLineID	foldtli;
 +	bool		fold_running = false;
++	bool		throttled = false;
 +	int			fold_backoff = 0;
 +	uint64		resume = 0;
 +	char	   *buf;
@@ -402,10 +405,35 @@ index 0000000..23bc879
 +			 */
 +			zou_wal_read_range(pushed, n, tli, buf);
 +			rc = zou_wal_append((const uint8 *) buf, n, (uint64) pushed, &durable);
-+			if (rc != 0)
++			if (rc == ZOU_ERR_THROTTLED)
++			{
++				/*
++				 * The lag bounds refused admission, consolidation is
++				 * too far behind. Nap and retry the same chunk: staged
++				 * WAL stops growing, the commit gate stalls honestly,
++				 * and the fold thread's next backlog report lifts the
++				 * throttle. Log once per streak, not per retry.
++				 */
++				if (!throttled)
++					ereport(LOG,
++							(errmsg("zou wal pusher throttled, consolidation is behind")));
++				throttled = true;
++				(void) WaitLatch(MyLatch,
++								 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
++								 100, PG_WAIT_EXTENSION);
++				ResetLatch(MyLatch);
++			}
++			else if (rc != 0)
 +				ereport(FATAL,
 +						(errmsg("zou wal pusher append failed: %d", rc)));
-+			pushed += n;
++			else
++			{
++				if (throttled)
++					ereport(LOG,
++							(errmsg("zou wal pusher throttle lifted")));
++				throttled = false;
++				pushed += n;
++			}
 +		}
 +		else if (ShutdownRequestPending && published == pushed)
 +		{
