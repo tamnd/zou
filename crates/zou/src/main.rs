@@ -10,6 +10,7 @@ mod inspect;
 mod map;
 mod shard;
 mod stats;
+mod tenant;
 
 use std::process::ExitCode;
 
@@ -31,6 +32,7 @@ fn usage() -> ExitCode {
     eprintln!("       {}", map::USAGE);
     eprintln!("       {}", shard::USAGE);
     eprintln!("       {}", stats::USAGE);
+    eprintln!("       {}", tenant::USAGE);
     eprintln!("       zou --version");
     ExitCode::from(2)
 }
@@ -87,6 +89,7 @@ fn main() -> ExitCode {
         Some("map") => simple(map::run(&argv[1..])),
         Some("shard") => simple(shard::run(&argv[1..])),
         Some("stats") => simple(stats::run(&argv[1..])),
+        Some("tenant") => simple(tenant::run(&argv[1..])),
         _ => usage(),
     }
 }

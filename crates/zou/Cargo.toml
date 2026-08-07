@@ -12,13 +12,16 @@ zou-log = { path = "../zou-log" }
 zou-pg = { path = "../zou-pg" }
 zou-store = { path = "../zou-store" }
 env_logger = { workspace = true }
+getrandom = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
-getrandom = { workspace = true }
 libc = { workspace = true }
 zou-server = { path = "../zou-server" }
 
