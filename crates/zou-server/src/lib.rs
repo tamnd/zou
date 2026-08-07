@@ -28,10 +28,12 @@ use axum::{Router, middleware};
 use zou_rest::catalog::Catalog;
 
 pub mod admin;
+pub mod attach;
 pub mod audit;
 pub mod auth;
 pub mod blob;
 pub mod edge;
+pub mod gateway;
 pub mod gojson;
 pub mod hook;
 pub mod jwt;
