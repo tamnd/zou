@@ -129,25 +129,6 @@ impl StorageError {
         }
     }
 
-    /// A body that did not satisfy the schema in front of the handler,
-    /// which is refused before anything of the request is read. The
-    /// sentence is the validator's, built out of the name of the field
-    /// it wanted, and the error name is `Error` rather than
-    /// `FastifyError`: a schema failure is serialized by the time the
-    /// error handler sees it and the class it came from is gone.
-    ///
-    /// A body missing more than one required field is only told about
-    /// the first, in the order the schema lists them, so the caller
-    /// passes them in that order.
-    pub(crate) fn missing_field(field: &str) -> Self {
-        StorageError {
-            status: 400,
-            error: "Error",
-            message: format!("body must have required property '{field}'"),
-            code: "InvalidRequest",
-        }
-    }
-
     /// Not recorded. The suite has no case that sends more than the
     /// limit, because a fixture that uploaded fifty megabytes would be
     /// a fixture nobody runs twice. This is the shape storage-api
@@ -207,17 +188,90 @@ impl StorageError {
         }
     }
 
-    /// Not recorded. A cursor that does not read as one is a cursor
-    /// from somewhere else, and this is the shape upstream refuses it
-    /// in. The sentence is built the same way, out of the name of the
-    /// parameter, and the error name is the code because nothing set a
-    /// friendlier one.
-    pub(crate) fn invalid_cursor() -> Self {
+    /// A parameter that arrived and is not usable. The sentence is
+    /// built out of the parameter's name, and the error name is the
+    /// code because nothing set a friendlier one.
+    pub(crate) fn invalid_parameter(name: &str) -> Self {
         StorageError {
             status: 400,
             error: "InvalidParameter",
-            message: "Invalid Parameter continuation token".to_string(),
+            message: format!("Invalid Parameter {name}"),
             code: "InvalidParameter",
+        }
+    }
+
+    /// Not recorded. A cursor that does not read as one is a cursor
+    /// from somewhere else, and this is the shape upstream refuses it
+    /// in.
+    pub(crate) fn invalid_cursor() -> Self {
+        StorageError::invalid_parameter("continuation token")
+    }
+
+    /// A field the reference's schema requires and the request did not
+    /// send. `place` is `body` or `querystring`, which is what fastify
+    /// calls the two halves of a request it validates.
+    ///
+    /// A request missing more than one required field is only told
+    /// about the first, in the order the schema lists them, so the
+    /// caller passes them in that order.
+    pub(crate) fn missing_property(place: &str, name: &str) -> Self {
+        StorageError::not_valid(format!("{place} must have required property '{name}'"))
+    }
+
+    /// The other half of the same refusal: a field that is there and is
+    /// not what the schema said it would be.
+    ///
+    /// The error name is `Error` and not `FastifyError`, which is the
+    /// name a body that did not parse at all earns. Both are recorded.
+    /// A parse failure is thrown by fastify and reaches the handler
+    /// with its class on it, and a schema failure is a validation
+    /// result that has been turned into an error somewhere in between,
+    /// so by the time it is serialized there is nothing left saying
+    /// where it came from.
+    pub(crate) fn not_valid(message: String) -> Self {
+        StorageError {
+            status: 400,
+            error: "Error",
+            message,
+            code: "InvalidRequest",
+        }
+    }
+
+    /// A token that does not verify, in the words the library upstream
+    /// verifies with uses. What is wrong with it is said out loud
+    /// because upstream says it out loud: the message is jose's, passed
+    /// through two layers of wrapping and out to the client.
+    pub(crate) fn invalid_jwt(message: String) -> Self {
+        StorageError {
+            status: 400,
+            error: "InvalidJWT",
+            message,
+            code: "InvalidJWT",
+        }
+    }
+
+    /// A token that verifies and is about something else. The signature
+    /// was good, so this is not a forgery, it is a url being spent on
+    /// an object or an action it was not signed for.
+    pub(crate) fn invalid_signature(message: String) -> Self {
+        StorageError {
+            status: 400,
+            error: "InvalidSignature",
+            message,
+            code: "InvalidSignature",
+        }
+    }
+
+    /// What a foreign key violation is called. The row that would not
+    /// go in named a bucket that is not there, and upstream's mapping
+    /// of postgres's codes says so in the general rather than about
+    /// buckets.
+    pub(crate) fn related_missing() -> Self {
+        StorageError {
+            status: 404,
+            error: "InvalidRequest",
+            message: "The related resource does not exist".to_string(),
+            code: "InvalidRequest",
         }
     }
 
@@ -278,7 +332,7 @@ pub(crate) fn message(text: &str) -> Response {
 /// verifies the empty string, and that is what jose calls anything that
 /// is not three dot separated segments. The rest are read off jose and
 /// are the next thing for the suite to ask about.
-fn jose_words(why: &jwt::Reject) -> &'static str {
+pub(crate) fn jose_words(why: &jwt::Reject) -> &'static str {
     match why {
         jwt::Reject::Malformed => "Invalid Compact JWS",
         jwt::Reject::WrongAlgorithm(_) => "\"alg\" (Algorithm) Header Parameter value not allowed",
@@ -555,9 +609,9 @@ pub async fn create(
 
     let Some(name) = bucket.name.clone() else {
         // Not recorded here, but the same schema failure is recorded on
-        // the move route, so the shape is copied from there rather than
-        // guessed at.
-        return Err(StorageError::missing_field("name"));
+        // the move route and on three of the signed url ones, so the
+        // shape is copied rather than guessed at.
+        return Err(StorageError::missing_property("body", "name"));
     };
     // A create with no id takes the name as one. Recorded, and not
     // something the documentation says.
