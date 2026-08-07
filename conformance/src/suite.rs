@@ -122,6 +122,21 @@ pub struct Case {
     /// other.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chained: bool,
+    /// Values out of this case's answer that the cases after it name,
+    /// keyed by the name they write in braces.
+    ///
+    /// Each one says where to read it: `header:etag` or
+    /// `element:UploadId`. A multipart upload is the reason this exists.
+    /// The server mints an id nobody can know, every request after the
+    /// creation carries it, and the id is in the body rather than in a
+    /// header, so a suite that could not hold one could ask a creation
+    /// and nothing after it.
+    ///
+    /// `location` is held out of every answer that has one without any
+    /// case asking, which is what the resumable cases were written
+    /// against and still name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub holds: BTreeMap<String, String>,
     /// The values in this answer that no two runs agree on, as json
     /// pointers into the body. Each one is replaced by the name of what
     /// it looked like before anything is compared, so a token still has
