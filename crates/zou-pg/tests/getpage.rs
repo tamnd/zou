@@ -423,4 +423,67 @@ fn getpage_serves_what_redo_builds() {
             "block {index} at its last written lsn {at:#x} differs"
         );
     }
+
+    // Scenario four: compaction with the pool folds the two runs into
+    // one merged delta plus a fresh image at the flush point, and no
+    // page a reader gets moves an inch.
+    ingest
+        .flush(&store, &layout)
+        .expect("flush")
+        .expect("layer");
+    store
+        .put_if_absent(
+            &layout.manifest(),
+            &zou_store::manifest::Manifest::new("t", 18).to_json(),
+        )
+        .expect("tenant manifest");
+    let outcome = zou_pg::compact::compact_shard(&store, "t", 0, Some(&pool), true)
+        .expect("compaction succeeds")
+        .expect("two runs are work");
+    assert_eq!(outcome.retired, 2, "both flushed runs retired");
+    assert!(
+        outcome.debt_after < outcome.debt_before,
+        "the image erased delta debt: {} to {}",
+        outcome.debt_before,
+        outcome.debt_after
+    );
+    let manifest = PageShardManifest::load(&store, &layout.shard_manifest(0))
+        .expect("manifest loads")
+        .expect("manifest exists")
+        .0;
+    let map = manifest.layer_map().expect("map builds");
+    use zou_store::layer::LayerKind;
+    assert!(
+        map.layers()
+            .iter()
+            .any(|d| d.kind == LayerKind::Image && d.min_lsn == manifest.disk_consistent_lsn),
+        "an image sits at the flush point"
+    );
+    assert_eq!(
+        map.layers()
+            .iter()
+            .filter(|d| d.kind == LayerKind::Delta)
+            .count(),
+        1,
+        "one merged run"
+    );
+    assert_eq!(
+        serve(&ingest, &store, &heap_blocks, wal_end),
+        heap_want,
+        "heap after compaction differs"
+    );
+    assert_eq!(
+        serve(&ingest, &store, &index_blocks, wal_end),
+        index_want,
+        "index after compaction differs"
+    );
+    // And a current read pays the image alone, the read amp bound the
+    // whole pass exists to buy.
+    for blk in heap_blocks.iter().step_by(11) {
+        let key =
+            zou_store::layer::LayerKey::page(blk.spc, blk.db, blk.rel, blk.fork as u8, blk.blk);
+        let plan = map.plan(&key, Lsn(wal_end));
+        assert!(plan.image.is_some(), "image serves {key:?}");
+        assert_eq!(plan.read_amp(), 1, "no deltas above the image for {key:?}");
+    }
 }
