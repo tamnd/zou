@@ -31,6 +31,7 @@ pub mod gc;
 pub mod getpage;
 pub mod ingest;
 pub mod pagecache;
+mod pagesvc;
 pub mod pending;
 pub mod reader;
 pub mod redo;
@@ -110,7 +111,7 @@ use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
 use zou_log::{
-    AppendError, AppendTicket, Backpressure, MediaSink, Sequencer, WalMedia, consolidate,
+    AppendError, AppendTicket, Backpressure, MediaSink, Sequencer, Tee, WalMedia, consolidate,
     gc_landing, landing_backlog, stream_end, take_over,
 };
 use zou_store::heartbeat::Heartbeat;
@@ -1168,6 +1169,9 @@ struct WalPipe {
     tenant: u128,
     writer_epoch: u32,
     waiter: WalWaiter,
+    /// The page service driver feeding layers from the tee, live for
+    /// the life of the pipe.
+    pagesvc: Option<pagesvc::PageSvc>,
     /// Whether this session has appended yet, so the first frame can
     /// carry `first_of_epoch` and mark the takeover boundary in the
     /// stream.
@@ -1355,12 +1359,28 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     let gate = Arc::new(Backpressure::default());
     let mut config = sequencer_config_from_env();
     config.gate = Some(Arc::clone(&gate));
+    // The tee feeds the page service driver: every durable window fans
+    // out to it, and layers grow beside the v1 page objects.
+    let tee = Arc::new(Tee::new());
+    config.tee = Some(Arc::clone(&tee));
     let seq = Sequencer::resume(
         WAL_SHARD,
         sink,
         config,
         takeover.next_seq,
         takeover.prev_digest,
+    );
+    // The watermark starts at the resume point: everything the
+    // chain already holds is durable by definition.
+    let waiter = WalWaiter::spawn(resume);
+    let pagesvc = pagesvc::spawn(
+        Arc::clone(&store),
+        layout.clone(),
+        tenant,
+        tee,
+        Arc::clone(&media),
+        Arc::clone(&gate),
+        Arc::clone(&waiter.durable),
     );
     Ok((
         WalPipe {
@@ -1373,9 +1393,8 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             layout,
             tenant,
             writer_epoch,
-            // The watermark starts at the resume point: everything the
-            // chain already holds is durable by definition.
-            waiter: WalWaiter::spawn(resume),
+            waiter,
+            pagesvc: Some(pagesvc),
             first_appended: false,
         },
         resume,
@@ -1407,6 +1426,12 @@ fn close_wal_pipe(pipe: &mut WalPipe) -> i32 {
                 log::info!("zou_wal_close: gc landing: {e}");
             }
         }
+    }
+    // After the sequencer closed and the waiter drained, the driver
+    // sees a quiet tee: stop is a drain, a final flush, and a zero on
+    // the lag board.
+    if let Some(mut pagesvc) = pipe.pagesvc.take() {
+        pagesvc.stop();
     }
     if let Some(heartbeat) = pipe.heartbeat.take()
         && heartbeat.detach().is_err()
