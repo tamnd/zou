@@ -25,11 +25,12 @@ The Postgres line is the one place zou is deliberately ahead. A suite that depen
 | rest, the hand written suite | 82 | 82 | 100% | the surface a Supabase project actually uses |
 | postgrest, derived from upstream's spec files | 1217 | 1217 | 100% | upstream's own test corpus turned into questions |
 | auth | 74 | 77 | 96% | three known differences, below |
-| supabase-js | 16 | 16 | 100% | upstream's integration file, url changed, no assertion touched |
+| storage | 399 | 399 | 100% | buckets, objects, resumable uploads and the S3 protocol |
+| supabase-js | 17 | 17 | 100% | upstream's integration file, url changed, no assertion touched |
 
 A known difference still counts as a failure in every number above. It is excused from the exit code and from nothing else, so the score cannot be improved by writing an explanation down.
 
-Next to those four there is a fifth thing that has no number, because it either works or it does not: one of Supabase's own example apps, unedited, driven through a browser on every push. Signing up, signing in, a row level security policy holding between two accounts, and a Github login that goes all the way through the code exchange and comes back as a session. The app is `examples/todo-list/sveltejs-todo-list` and the only file it gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints. Details in [demo/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo/README.md).
+Next to those five there is a sixth thing that has no number, because it either works or it does not: one of Supabase's own example apps, unedited, driven through a browser on every push. Signing up, signing in, a row level security policy holding between two accounts, and a Github login that goes all the way through the code exchange and comes back as a session. The app is `examples/todo-list/sveltejs-todo-list` and the only file it gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints. Details in [demo/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo/README.md).
 
 ## What a project will notice
 
@@ -45,11 +46,11 @@ One more difference is not an answer at all, and so is not in `known.json`. **A 
 
 ## What is not served yet
 
-`/storage/v1` is served as far as buckets and objects go. Making, reading, updating, emptying and deleting a bucket, uploading, downloading, describing, listing, moving, copying and deleting an object, and signing a url for a download or an upload, are built and measured against the reference. What is left under `/storage/v1` is resumable uploads, image transforms and the S3 protocol, and all of `/realtime/v1`. Those are routes in the router with nothing behind them, and they answer 501 with a body saying so and naming the milestone, rather than 404, so a client gets told the surface exists and is not finished instead of being told the url is wrong. Storage is M3 and Realtime is M4.
+`/storage/v1` is served as far as buckets, objects, resumable uploads and the S3 protocol go. Making, reading, updating, emptying and deleting a bucket, uploading, downloading, describing, listing, moving, copying and deleting an object, signing a url for a download or an upload, the whole of the TUS protocol a resumable upload speaks, and the whole of the S3 protocol this endpoint speaks including an upload sent in pieces, are built and measured against the reference. What is left under `/storage/v1` is image transforms and analytics buckets, and what is left elsewhere is all of `/realtime/v1`. Those are routes in the router with nothing behind them, and they answer 501 with a body saying so and naming the milestone, rather than 404, so a client gets told the surface exists and is not finished instead of being told the url is wrong. Storage is M3 and Realtime is M4.
 
 The bytes of an object go to the same place the pages do: a directory on a laptop, a prefix on an object store, opened by the same code the engine opens its own target with. A server built without one answers the bucket surface and refuses the routes that carry bytes, because writing files somewhere nobody asked for would be worse than saying so.
 
-This is also why the supabase-js run skips 18 of its cases. They are skipped rather than deleted so the count keeps saying how much of the file is not being asked.
+This is also why the supabase-js run skips 17 of its cases. They are skipped rather than deleted so the count keeps saying how much of the file is not being asked.
 
 ## What the suites do not ask yet
 
