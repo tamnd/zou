@@ -76,11 +76,21 @@ pub struct Target {
 /// capabilities of the endpoint are `tus-version`, `tus-extension` and
 /// `tus-max-size` and nothing else. Comparing bodies alone would say
 /// every one of those cases matched.
-pub const COMPARED: [&str; 17] = [
+///
+/// `etag` is here for the same reason, and it is the one entry that is
+/// not free: it is the whole answer to a put on the S3 surface, which
+/// sends an empty body, and it is a value both targets compute rather
+/// than echo. It is safe to compare because it is the md5 of the bytes
+/// in quotes on both, which is a value a fixture can pin, and it is
+/// not compared as a date is: an object with different bytes has a
+/// different one and an object with the same bytes has the same one on
+/// every run and every machine.
+pub const COMPARED: [&str; 18] = [
     "allow",
     "content-profile",
     "content-range",
     "content-type",
+    "etag",
     "location",
     "preference-applied",
     "retry-after",
