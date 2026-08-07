@@ -50,7 +50,8 @@ pub struct Request<'a> {
     /// rather than beside them because the signature does not treat it
     /// specially: it is one of the headers a client chose to sign.
     pub headers: Vec<(String, String)>,
-    /// Hex sha256 of the body, or [`UNSIGNED`].
+    /// Hex sha256 of the body, or `UNSIGNED-PAYLOAD` for a client that
+    /// declines to hash what it is about to stream.
     pub payload: &'a str,
     /// `20260807T032800Z`, which is also what `x-amz-date` carries.
     pub stamp: &'a str,
