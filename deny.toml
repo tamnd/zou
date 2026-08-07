@@ -1,6 +1,18 @@
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+  # paste is a proc macro reached only through rav1e, which is the avif
+  # encoder behind the image transform routes. Its author archived the
+  # repository and there is no upgrade, safe or otherwise, so the
+  # choices are to carry it or to answer format=avif with nothing.
+  #
+  # It is a compile time dependency: it expands macros and no part of it
+  # is in the binary. Unmaintained is a real thing to know about a crate
+  # and it is not a vulnerability, and this one cannot become one at
+  # runtime because it is not there at runtime.
+  { id = "RUSTSEC-2024-0436", reason = "paste is a build time proc macro under rav1e, archived upstream with no successor in the avif encoder's tree" },
+]
 
 [licenses]
 version = 2
@@ -16,6 +28,16 @@ allow = [
   "Unicode-3.0",
   "Zlib",
 ]
+
+# NCSA is allowed for this one crate and no other. libfuzzer-sys is
+# rav1e's fuzzing harness, behind a feature nothing here turns on: it is
+# absent from the build graph entirely and only appears because this
+# check is run with --all-features, which reaches features no build
+# reaches. Allowing the licence outright would be a claim about every
+# future dependency rather than about this one.
+[[licenses.exceptions]]
+name = "libfuzzer-sys"
+allow = ["NCSA"]
 
 [sources]
 unknown-registry = "deny"

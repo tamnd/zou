@@ -150,6 +150,9 @@ async fn all_four_prefixes_are_routed() {
         "/storage/v1/bucket",
         "/storage/v1/object/pics/cat.png",
         "/storage/v1/object/public/pics/cat.png",
+        "/storage/v1/render/image/authenticated/pics/cat.png",
+        "/storage/v1/render/image/public/pics/cat.png",
+        "/storage/v1/render/image/sign/pics/cat.png",
         "/realtime/v1/websocket",
     ] {
         let answer = keyed(&app, "GET", path).await;
@@ -167,7 +170,7 @@ async fn the_two_stubbed_surfaces_say_so_rather_than_pretending_to_be_missing() 
     // A 404 here would read as a wrong url and send somebody looking
     // for a typo. A 501 that names the surface and says where it is
     // tracked is the difference between a bug report and a wait.
-    let storage = keyed(&app, "GET", "/storage/v1/render/image/public/pics/cat.png").await;
+    let storage = keyed(&app, "GET", "/storage/v1/analytics/pics/whichever").await;
     assert_eq!(storage.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
         storage.message(),
@@ -190,7 +193,7 @@ async fn a_stub_answers_whatever_method_it_is_asked() {
     // surface would be a second wrong answer on top of the first.
     for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] {
         for path in [
-            "/storage/v1/render/image/public/pics/cat.png",
+            "/storage/v1/analytics/pics/whichever",
             "/realtime/v1/websocket",
         ] {
             let answer = keyed(&app, method, path).await;
@@ -362,7 +365,7 @@ async fn a_path_under_storage_that_is_neither_a_bucket_nor_an_object_is_still_st
     // Worth a test because the two live in different routers and are
     // merged, and a merge that shadowed the catch all would leave every
     // unbuilt storage path answering about a token instead.
-    let answer = keyed(&app, "GET", "/storage/v1/render/image/public/pics/cat.png").await;
+    let answer = keyed(&app, "GET", "/storage/v1/analytics/pics/whichever").await;
     assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
 }
 
@@ -447,7 +450,7 @@ async fn the_gate_is_reached_before_a_stub_is() {
     // an unkeyed request to an unbuilt surface hears about the key
     // rather than about the surface. A stub outside the gate would be
     // a hole that grows when the surface is built.
-    let answer = bare(&app, "GET", "/storage/v1/render/image/public/pics/cat.png").await;
+    let answer = bare(&app, "GET", "/storage/v1/analytics/pics/whichever").await;
     assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
     assert_eq!(answer.message(), "No API key found in request");
 }
