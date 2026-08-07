@@ -136,7 +136,7 @@ impl Target {
             // Signed rather than carried, and signed after the case's
             // own headers are on the request, so there is nothing to
             // put in front here.
-            Key::S3 | Key::S3WrongSecret | Key::S3WrongKey | Key::S3WrongRegion | Key::None => None,
+            Key::S3 | Key::S3WrongSecret | Key::S3WrongId | Key::S3WrongRegion | Key::None => None,
         }
     }
 
@@ -249,7 +249,7 @@ impl Target {
         // nobody has is a lookup that finds nothing, and a secret that
         // is not the right one is a signature that does not match.
         let credentials = match case.key {
-            Key::S3WrongKey => &Credentials {
+            Key::S3WrongId => &Credentials {
                 access: "0000000000000000000000000000000a".to_string(),
                 ..credentials.clone()
             },

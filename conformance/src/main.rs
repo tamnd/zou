@@ -420,6 +420,7 @@ fn run(args: Args) -> Result<bool, String> {
                 args.jwt_secret.as_bytes(),
                 &suite.cases.schemas,
                 &suite.cases.anon_role,
+                zou_server::s3::Credentials::new(&args.s3_key, &args.s3_secret),
             )?),
             None => None,
         };
@@ -562,6 +563,7 @@ fn holding(args: &Args) -> Result<bool, String> {
         args.jwt_secret.as_bytes(),
         &args.schemas,
         &args.anon_role,
+        zou_server::s3::Credentials::new(&args.s3_key, &args.s3_secret),
     )?;
     if let Some(path) = &args.setup_sql {
         let sql = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;

@@ -46,7 +46,7 @@ pub enum Key {
     #[serde(rename = "s3.wrong-secret")]
     S3WrongSecret,
     #[serde(rename = "s3.wrong-key")]
-    S3WrongKey,
+    S3WrongId,
     #[serde(rename = "s3.wrong-region")]
     S3WrongRegion,
     None,
@@ -58,7 +58,7 @@ impl Key {
     pub fn signs(self) -> bool {
         matches!(
             self,
-            Key::S3 | Key::S3WrongSecret | Key::S3WrongKey | Key::S3WrongRegion
+            Key::S3 | Key::S3WrongSecret | Key::S3WrongId | Key::S3WrongRegion
         )
     }
 }
