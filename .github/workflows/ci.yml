@@ -445,6 +445,74 @@ jobs:
           path: /tmp/js.json
           if-no-files-found: ignore
 
+  # The same idea as the job above, for the client that owns the surface
+  # M3 is about. storage-js ships its own tests against the storage api,
+  # so they are run unchanged rather than paraphrased into questions,
+  # and a failure here is zou answering differently from the server
+  # upstream wrote them against.
+  storage-js:
+    name: conformance (storage-js)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      # The fixture writes rows into storage.buckets, storage.objects
+      # and auth.users, and zou makes all three on its first connection,
+      # which is why serve applies it rather than a psql step here.
+      - name: Start zou on the port a local supabase project uses
+        run: |
+          cargo run -p zou-conformance -- serve \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --setup /tmp/zou-conformance/js-storage/setup.sql \
+            > /tmp/serve.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q '^url ' /tmp/serve.log && break
+            sleep 1
+          done
+          cat /tmp/serve.log
+          grep -q '^url ' /tmp/serve.log
+      - name: Run storage-js's own integration suite against it
+        working-directory: /tmp/zou-conformance/js-storage
+        run: |
+          npm ci
+          npm test -- --json --outputFile=/tmp/js-storage.json
+      - name: Keep the server log
+        if: always()
+        run: cat /tmp/serve.log
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-js
+          path: /tmp/js-storage.json
+          if-no-files-found: ignore
+
   # One of Supabase's own example apps, unedited, driven through a real
   # browser. The suites ask a server questions and this asks an
   # application, which is a different claim: an app goes through the
@@ -640,7 +708,7 @@ jobs:
   scoreboard:
     name: scoreboard
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [conformance, auth-conformance, storage-conformance, supabase-js]
+    needs: [conformance, auth-conformance, storage-conformance, supabase-js, storage-js]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -664,13 +732,18 @@ jobs:
         with:
           name: supabase-js
           path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
+          name: storage-js
+          path: /tmp/reports
       - name: Render it
         run: |
           cargo run -p zou-conformance -- scoreboard \
             --report /tmp/reports/conformance.json \
             --report /tmp/reports/auth.json \
             --report /tmp/reports/storage.json \
-            --js /tmp/reports/js.json \
+            --js supabase-js=/tmp/reports/js.json \
+            --js storage-js=/tmp/reports/js-storage.json \
             --pin "$(jq -r .ref conformance/suites.json)" \
             --out docs/scoreboard.md
       # Nothing in the file moves on its own, so a merge that changed no

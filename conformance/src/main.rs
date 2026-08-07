@@ -63,12 +63,13 @@ modes
   diff      ask two targets and compare them with each other
   derive    read a PostgREST checkout and write a suite out of it, no target
   serve     start zou on a port and wait, for a suite that is not asked
-            from here: the supabase-js one, or a browser
+            from here: a client's own tests, or a browser
   scoreboard  turn the json those runs wrote into markdown, no target
 
 the scoreboard
   --report <path>          a report json a check wrote with --json, repeatable
-  --js <path>              vitest's json from the supabase-js run
+  --js <name>=<path>       a client's own run, as the json jest writes,
+                           repeatable: --js supabase-js=/tmp/js.json
   --pin <sha>              the zou-conformance commit the suites came from
   --out <path>             where to write it, stdout when absent
 
@@ -162,7 +163,7 @@ struct Args {
     anon_role: String,
     setup_sql: Option<String>,
     reports: Vec<String>,
-    js: Option<String>,
+    js: Vec<String>,
     pin: Option<String>,
     out: Option<String>,
 }
@@ -198,7 +199,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         anon_role: "anon".to_string(),
         setup_sql: None,
         reports: Vec::new(),
-        js: None,
+        js: Vec::new(),
         pin: None,
         out: None,
     };
@@ -247,7 +248,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--suites" => args.suites_dir = Some(need("--suites")?),
             "--setup" => args.setup_sql = Some(need("--setup")?),
             "--report" => args.reports.push(need("--report")?),
-            "--js" => args.js = Some(need("--js")?),
+            "--js" => args.js.push(need("--js")?),
             "--pin" => args.pin = Some(need("--pin")?),
             "--out" => args.out = Some(need("--out")?),
             "--port" => {
@@ -280,7 +281,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         }
         return Ok(args);
     }
-    if !args.reports.is_empty() || args.js.is_some() || args.pin.is_some() || args.out.is_some() {
+    if !args.reports.is_empty() || !args.js.is_empty() || args.pin.is_some() || args.out.is_some() {
         return Err(format!(
             "--report, --js, --pin and --out are for scoreboard, not {}",
             args.mode
@@ -524,11 +525,17 @@ fn run(args: Args) -> Result<bool, String> {
 /// then there is no commit at all.
 fn published(args: &Args) -> Result<bool, String> {
     let runs = scoreboard::read(&args.reports)?;
-    let js = match &args.js {
-        Some(path) => Some(scoreboard::read_js(path)?),
-        None => None,
-    };
-    let text = scoreboard::render(&runs, js.as_ref(), args.pin.as_deref());
+    let mut js = Vec::new();
+    for arg in &args.js {
+        // The client is named on the command line rather than guessed
+        // from the file, because the file is a test runner's report and
+        // has no idea what it was pointed at.
+        let (name, path) = arg
+            .split_once('=')
+            .ok_or_else(|| format!("--js takes <name>=<path>, not {arg:?}"))?;
+        js.push((name.to_string(), scoreboard::read_js(path)?));
+    }
+    let text = scoreboard::render(&runs, &js, args.pin.as_deref());
     match &args.out {
         Some(path) => {
             std::fs::write(path, &text).map_err(|e| format!("{path}: {e}"))?;
@@ -1013,6 +1020,29 @@ mod tests {
         assert_eq!(args.out.as_deref(), Some("docs/scoreboard.md"));
         assert!(parse(&argv(&["scoreboard", "--out", "docs/scoreboard.md"])).is_err());
         assert!(parse(&argv(&["scoreboard", "--report", "r.json", "--url", "u"])).is_err());
+    }
+
+    /// One client per run of its own tests, and there is more than one
+    /// client, so the flag that names them repeats like --report does.
+    #[test]
+    fn a_client_run_is_named_where_it_is_given() {
+        let args = parse(&argv(&[
+            "scoreboard",
+            "--report",
+            "rest.json",
+            "--js",
+            "supabase-js=/tmp/js.json",
+            "--js",
+            "storage-js=/tmp/js-storage.json",
+        ]))
+        .expect("parses");
+        assert_eq!(
+            args.js,
+            [
+                "supabase-js=/tmp/js.json",
+                "storage-js=/tmp/js-storage.json"
+            ]
+        );
     }
 
     /// A scoreboard rendered from a run that is happening right now is
