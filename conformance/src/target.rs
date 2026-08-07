@@ -554,7 +554,9 @@ mod tests {
     fn a_location_that_is_already_a_path_is_used_as_it_stands() {
         let at = "/storage/v1/upload/resumable/bm90ZXM";
         assert_eq!(
-            following(&case("{location}"), Some(at)).expect("follows").path,
+            following(&case("{location}"), Some(at))
+                .expect("follows")
+                .path,
             at
         );
     }
