@@ -170,7 +170,10 @@ async fn a_stub_answers_whatever_method_it_is_asked() {
     // same answer as a read. A method that 405s under a stubbed
     // surface would be a second wrong answer on top of the first.
     for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] {
-        for path in ["/storage/v1/s3/pics", "/realtime/v1/websocket"] {
+        for path in [
+            "/storage/v1/render/image/public/pics/cat.png",
+            "/realtime/v1/websocket",
+        ] {
             let answer = keyed(&app, method, path).await;
             assert_eq!(
                 answer.status,
@@ -340,13 +343,53 @@ async fn a_path_under_storage_that_is_neither_a_bucket_nor_an_object_is_still_st
     // Worth a test because the two live in different routers and are
     // merged, and a merge that shadowed the catch all would leave every
     // unbuilt storage path answering about a token instead.
-    for path in [
-        "/storage/v1/render/image/public/pics/cat.png",
-        "/storage/v1/s3/pics",
-    ] {
-        let answer = keyed(&app, "GET", path).await;
-        assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
+    let answer = keyed(&app, "GET", "/storage/v1/render/image/public/pics/cat.png").await;
+    assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test]
+async fn the_s3_door_answers_a_request_with_no_key_on_it() {
+    let app = app();
+    // Outside the gate, like the rest of storage and for a stronger
+    // reason: a client speaking this protocol signs the request and
+    // sends no apikey at all, so a gate in front of it would refuse
+    // every correct client. What it hears instead is the surface's own
+    // refusal, in xml, about the authorization header it did send.
+    for path in ["/storage/v1/s3", "/storage/v1/s3/", "/storage/v1/s3/pics"] {
+        let answer = bare(&app, "GET", path).await;
+        assert_ne!(answer.status, StatusCode::UNAUTHORIZED, "{path}");
     }
+    let answer = bare(&app, "GET", "/storage/v1/s3").await;
+    assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer.content_type, "application/xml; charset=utf-8");
+    assert!(
+        answer.written.contains("<Code>InvalidSignature</Code>"),
+        "{}",
+        answer.written
+    );
+    assert!(
+        answer
+            .written
+            .contains("<Message>Unsupported authorization type</Message>"),
+        "{}",
+        answer.written
+    );
+}
+
+#[tokio::test]
+async fn an_s3_call_this_surface_has_no_answer_for_yet_says_so_without_naming_methods() {
+    let app = app();
+    // Listing a bucket is a thing the reference does and this does not
+    // yet. A method router would have answered 405 and offered the
+    // three verbs that are written, which would read as a claim that
+    // listing is not part of the protocol.
+    let answer = bare(&app, "GET", "/storage/v1/s3/pics").await;
+    assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(answer.allow, "");
+    assert_eq!(
+        answer.message(),
+        "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
+    );
 }
 
 #[tokio::test]
@@ -380,7 +423,7 @@ async fn the_gate_is_reached_before_a_stub_is() {
     // an unkeyed request to an unbuilt surface hears about the key
     // rather than about the surface. A stub outside the gate would be
     // a hole that grows when the surface is built.
-    let answer = bare(&app, "GET", "/storage/v1/s3/pics").await;
+    let answer = bare(&app, "GET", "/storage/v1/render/image/public/pics/cat.png").await;
     assert_eq!(answer.status, StatusCode::UNAUTHORIZED);
     assert_eq!(answer.message(), "No API key found in request");
 }

@@ -23,6 +23,17 @@ use serde::{Deserialize, Serialize};
 /// with the same secret carrying the role a signed in person gets,
 /// `user` is an access token for the person a suite seeded, and `none`
 /// sends neither, which is how the gate itself gets tested.
+///
+/// The three `s3` kinds are not keys in the same sense. That surface is
+/// asked with a signature over the request rather than with a token, so
+/// a case naming one of them is signed by the harness on its way out.
+/// `s3` signs with the pair the target was configured with, and the
+/// other three sign every bit as correctly with one field of the
+/// signature wrong: a secret that is not it, an access key id nobody
+/// has, or a region the project is not in. Those exist because a case
+/// about a wrong signature cannot be a hand written header, whose date
+/// would have to be today. A case about a malformed header writes its
+/// own `authorization` under `none` instead.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Key {
@@ -31,7 +42,25 @@ pub enum Key {
     Authenticated,
     Service,
     User,
+    S3,
+    #[serde(rename = "s3.wrong-secret")]
+    S3WrongSecret,
+    #[serde(rename = "s3.wrong-key")]
+    S3WrongId,
+    #[serde(rename = "s3.wrong-region")]
+    S3WrongRegion,
     None,
+}
+
+impl Key {
+    /// Whether the harness signs this request rather than putting a
+    /// token on it.
+    pub fn signs(self) -> bool {
+        matches!(
+            self,
+            Key::S3 | Key::S3WrongSecret | Key::S3WrongId | Key::S3WrongRegion
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

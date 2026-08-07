@@ -13,6 +13,7 @@
 use std::net::TcpListener;
 use std::time::Duration;
 
+use zou_server::s3::Credentials;
 use zou_server::{Config, jwt, serve_blocking};
 
 pub struct Served {
@@ -65,8 +66,19 @@ pub fn user_key(user: &crate::suite::User, secret: &str) -> String {
 /// from upstream's fixtures keeps its tables where upstream keeps them
 /// and calls its unauthenticated role what upstream calls it, and the
 /// reference is configured to match both.
-pub fn start(dsn: &str, secret: &[u8], schemas: &[String], anon: &str) -> Result<Served, String> {
-    start_at(0, dsn, secret, schemas, anon)
+///
+/// `s3` is the pair the S3 surface is asked with. It is the one piece
+/// of configuration that is not derived from the secret: a signature is
+/// checked against a key pair rather than minted from a JWT secret, so
+/// both targets in a diff have to be told the same pair by hand.
+pub fn start(
+    dsn: &str,
+    secret: &[u8],
+    schemas: &[String],
+    anon: &str,
+    s3: Credentials,
+) -> Result<Served, String> {
+    start_at(0, dsn, secret, schemas, anon, s3)
 }
 
 /// The same, on a port somebody has to know in advance.
@@ -81,6 +93,7 @@ pub fn start_at(
     secret: &[u8],
     schemas: &[String],
     anon: &str,
+    s3: Credentials,
 ) -> Result<Served, String> {
     // Bound here rather than inside the thread, so a port that cannot
     // be had is an error the caller sees instead of a run that hangs.
@@ -119,6 +132,7 @@ pub fn start_at(
                 .to_string_lossy()
                 .to_string(),
         ),
+        s3: Some(s3),
         ..Config::default()
     };
     std::thread::spawn(move || {

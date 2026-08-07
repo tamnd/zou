@@ -34,9 +34,10 @@
 //! only, never from the apikey, which is what storage-api's jwt plugin
 //! does.
 //!
-//! What is not here yet: objects, uploads, signed urls, the s3
-//! protocol. Those all need somewhere to put bytes, which is the other
-//! half of M3.
+//! The rest of the surface reads this one. Objects are in `object`,
+//! resumable uploads in `tus`, and the S3 protocol in `s3`, and all
+//! three carry their answers back in the [`StorageError`] below even
+//! though none of the three writes it out the way these routes do.
 
 use std::sync::Arc;
 
@@ -65,6 +66,7 @@ const JSON: &str = "application/json; charset=utf-8";
 /// wire is 400 unless the body says 500. That is the whole of
 /// storage-api's error handler and it is why a client switching on the
 /// http status sees one number for everything.
+#[derive(Debug)]
 pub struct StorageError {
     status: u16,
     error: &'static str,
@@ -82,7 +84,7 @@ impl StorageError {
         }
     }
 
-    fn already_exists() -> Self {
+    pub(crate) fn already_exists() -> Self {
         StorageError {
             status: 409,
             error: "Duplicate",
@@ -170,7 +172,7 @@ impl StorageError {
         }
     }
 
-    fn not_empty() -> Self {
+    pub(crate) fn not_empty() -> Self {
         StorageError {
             status: 409,
             error: "ResourceNotEmpty",
@@ -289,6 +291,23 @@ impl StorageError {
         }
     }
 
+    /// The one refusal only the S3 surface can earn: the request was
+    /// signed, the access key id is one this project has, and the
+    /// signature is not the one the secret would have produced. The
+    /// sentence is Amazon's own, word for word, because the reference
+    /// sends Amazon's own and a client matching on it is matching on
+    /// that string.
+    pub(crate) fn wrong_signature() -> Self {
+        StorageError {
+            status: 403,
+            error: "SignatureDoesNotMatch",
+            message: "The request signature we calculated does not match the signature you \
+                      provided. Check your key and signing method."
+                .to_string(),
+            code: "SignatureDoesNotMatch",
+        }
+    }
+
     pub(crate) fn internal(message: String) -> Self {
         StorageError {
             status: 500,
@@ -306,6 +325,14 @@ impl StorageError {
     /// one.
     pub(crate) fn said(&self) -> &str {
         &self.message
+    }
+
+    /// The status it names, which on these routes is a string in the
+    /// body and on the S3 routes is the status on the wire. Two
+    /// surfaces, one error, and only one of them tells the truth in the
+    /// place http keeps it.
+    pub(crate) fn status(&self) -> u16 {
+        self.status
     }
 }
 

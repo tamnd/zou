@@ -43,6 +43,7 @@ pub mod object;
 pub mod openapi;
 pub mod password;
 pub mod rest;
+pub mod s3;
 pub mod sms;
 pub mod smtp;
 pub mod sql;
@@ -189,6 +190,11 @@ pub struct Config {
     /// a server started for the auth or rest surfaces alone should do
     /// rather than quietly writing files somewhere.
     pub objects: Option<String>,
+    /// The key pair the S3 surface is asked with. None and every signed
+    /// request is told the access key it named is not one this project
+    /// has, which is the honest thing to say about a project that has
+    /// no pair at all.
+    pub s3: Option<s3::Credentials>,
 }
 
 impl Default for Config {
@@ -223,6 +229,7 @@ impl Default for Config {
             oauth: oauth::Providers::default(),
             http: None,
             objects: None,
+            s3: None,
         }
     }
 }
@@ -868,6 +875,19 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         // else and sends none of its own headers on it.
         .route("/storage/v1/upload/resumable", any(tus::endpoint))
         .route("/storage/v1/upload/resumable/{id}", any(tus::upload))
+        // The S3 protocol, on this side of the gate for a third reason
+        // again: it is not asked with a key at all. The authorization
+        // header carries a signature over the request, so a gate that
+        // wanted an apikey in front of it would refuse every client
+        // that speaks this protocol correctly.
+        //
+        // Both spellings of the endpoint, because a client that lists
+        // buckets sends the trailing slash and a client that was handed
+        // the endpoint url does not, and the two are signed as the two
+        // different paths they are.
+        .route("/storage/v1/s3", get(s3::list_buckets))
+        .route("/storage/v1/s3/", get(s3::list_buckets))
+        .route("/storage/v1/s3/{bucket}", any(s3::bucket))
         .with_state(Arc::clone(&app));
     Ok(Router::new()
         .merge(open)

@@ -40,6 +40,7 @@ mod derive;
 mod diff;
 mod report;
 mod scoreboard;
+mod sigv4;
 mod suite;
 mod target;
 mod volatile;
@@ -109,6 +110,8 @@ everything else
                            as ZOU_CONFORMANCE_SUITES
   --suite <name>           which suite, or all of them when repeated or absent
   --jwt-secret <secret>    the hs256 secret both ends sign with
+  --s3-key <id>            the S3 access key id the s3 cases sign with
+  --s3-secret <secret>     its secret, which both ends have to agree on
   --json <path>            write the report as json as well
   --no-setup               do not apply setup.sql, the database is ready
   --write-known            write the run's differences to known.json rather
@@ -119,6 +122,14 @@ everything else
 /// worth hiding: every target in a conformance run has to sign with the
 /// same one or the keys are not the same keys.
 const DEMO_SECRET: &str = "super-secret-jwt-token-with-at-least-32-characters-long";
+
+/// The S3 key pair a local Supabase project answers to, which the CLI
+/// prints on every `supabase status` and which is the same on every
+/// machine. Same reasoning as the secret above: it is a fixture rather
+/// than a credential, and every target in a run has to be asked with
+/// the same pair or the signatures are signatures of different things.
+const DEMO_S3_KEY: &str = "625729a08b95bf1b7ff351a663f3a23c";
+const DEMO_S3_SECRET: &str = "850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907";
 
 struct Args {
     mode: String,
@@ -138,6 +149,8 @@ struct Args {
     reference_name: Option<String>,
     reference_strip: Option<String>,
     jwt_secret: String,
+    s3_key: String,
+    s3_secret: String,
     json: Option<String>,
     setup: bool,
     from: Option<String>,
@@ -172,6 +185,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         reference_name: None,
         reference_strip: None,
         jwt_secret: DEMO_SECRET.to_string(),
+        s3_key: DEMO_S3_KEY.to_string(),
+        s3_secret: DEMO_S3_SECRET.to_string(),
         json: None,
         setup: true,
         from: None,
@@ -222,6 +237,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 args.reference_strip = Some(need("--reference-strip-prefix")?)
             }
             "--jwt-secret" => args.jwt_secret = need("--jwt-secret")?,
+            "--s3-key" => args.s3_key = need("--s3-key")?,
+            "--s3-secret" => args.s3_secret = need("--s3-secret")?,
             "--json" => args.json = Some(need("--json")?),
             "--no-setup" => args.setup = false,
             "--from" => args.from = Some(need("--from")?),
@@ -387,6 +404,14 @@ fn run(args: Args) -> Result<bool, String> {
             .user
             .as_ref()
             .map(|user| zou::user_key(user, &args.jwt_secret));
+        // Not derived from anything, unlike the four above. The S3
+        // surface checks a signature rather than a token, so the pair
+        // is whatever the target was configured with and both targets
+        // in a diff have to be configured with the same one.
+        let s3 = sigv4::Credentials {
+            access: args.s3_key.clone(),
+            secret: args.s3_secret.clone(),
+        };
         // Started before anything is asked so that a target that cannot
         // come up is one message rather than a suite's worth of them.
         let served = match &args.zou_dsn {
@@ -395,6 +420,7 @@ fn run(args: Args) -> Result<bool, String> {
                 args.jwt_secret.as_bytes(),
                 &suite.cases.schemas,
                 &suite.cases.anon_role,
+                zou_server::s3::Credentials::new(&args.s3_key, &args.s3_secret),
             )?),
             None => None,
         };
@@ -414,6 +440,7 @@ fn run(args: Args) -> Result<bool, String> {
                 authenticated: Some(authenticated.clone()),
                 service: Some(service.clone()),
                 user: user.clone(),
+                s3: Some(s3.clone()),
             },
             dsn,
             args.strip.clone(),
@@ -432,6 +459,7 @@ fn run(args: Args) -> Result<bool, String> {
                             .unwrap_or_else(|| service.clone()),
                     ),
                     user: user.clone(),
+                    s3: Some(s3.clone()),
                 },
                 args.reference_dsn.clone(),
                 args.reference_strip.clone(),
@@ -535,6 +563,7 @@ fn holding(args: &Args) -> Result<bool, String> {
         args.jwt_secret.as_bytes(),
         &args.schemas,
         &args.anon_role,
+        zou_server::s3::Credentials::new(&args.s3_key, &args.s3_secret),
     )?;
     if let Some(path) = &args.setup_sql {
         let sql = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
