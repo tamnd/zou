@@ -15,6 +15,25 @@
 //! it happens, and it is also why deleting a row has to delete the
 //! bytes it named rather than a path built out of the object's name.
 //!
+//! All of it sits under the tenant, at `tenants/<ref>/files/`, next to
+//! the pages and the layers of the same tenant's database. One prefix
+//! per tenant is what makes a shared bucket safe: a key built here can
+//! only ever name bytes belonging to the tenant the server was started
+//! for, whatever a handler above it got wrong, and dropping a tenant is
+//! dropping a prefix rather than a query.
+//!
+//! A branch inherits its parent's bytes by reading through. The rows
+//! come across because the rows are in the database and the database
+//! was branched, so they name ids and versions the child's own prefix
+//! has never held, and a read that misses at home tries the parent, and
+//! its parent, in order. Writes never do that: an upload into a branch
+//! lands in the branch, and a delete in a branch removes the branch's
+//! own bytes and nothing else, because the parent is a live database
+//! somebody else is using and a child cannot be allowed to empty it.
+//! The cost of that is bytes a branch has stopped referencing but
+//! cannot remove, which is the same cost branching already pays for
+//! pages.
+//!
 //! The store is a blocking interface, deliberately: it is the same
 //! trait the page reader uses, and a page reader that had to be async
 //! would be an async postgres. So every call here goes through
@@ -23,39 +42,76 @@
 
 use std::sync::Arc;
 
-use zou_store::{CasError, CasStore, open_store};
+use zou_store::{CasError, CasStore, layout::TenantLayout, lineage, open_store};
+
+/// The tenant a server serves when nothing named one. The same ref the
+/// engine defaults to, because a single tenant deployment is one
+/// database and its files rather than two things that happen to share a
+/// bucket.
+pub const LOCAL: &str = "local";
 
 /// The bytes behind the object rows.
 #[derive(Clone)]
 pub struct Blobs {
     store: Arc<dyn CasStore>,
+    /// Where this tenant's own bytes go. Every put and every delete is
+    /// under it, and it is the first place a read looks.
+    home: String,
+    /// The prefixes a read falls back to when home has nothing, parent
+    /// first. Empty for a tenant that is not a branch, which is every
+    /// tenant until somebody branches one.
+    inherited: Vec<String>,
 }
 
 impl Blobs {
-    /// Open the store a target string names: a directory, or an
-    /// `s3://bucket/prefix` url. The same strings the engine takes,
-    /// because on a real deployment it is the same bucket.
-    pub fn open(target: &str) -> Result<Blobs, String> {
-        Ok(Blobs {
-            store: Arc::from(open_store(target)?),
-        })
+    /// Open the store a target string names, for one tenant: a
+    /// directory, or an `s3://bucket/prefix` url. The same strings the
+    /// engine takes, because on a real deployment it is the same
+    /// bucket.
+    ///
+    /// The branch chain is read here, once, rather than per request.
+    /// It is a property of the tenant and a tenant does not become a
+    /// branch of something else while it is being served: branching
+    /// writes the child, and the child is what a later server is
+    /// started for.
+    pub fn open(target: &str, tenant_ref: &str) -> Result<Blobs, String> {
+        let store: Arc<dyn CasStore> = Arc::from(open_store(target)?);
+        let chain = lineage(store.as_ref(), tenant_ref).map_err(|e| e.to_string())?;
+        Ok(Blobs::over(store, &chain))
     }
 
-    /// A store made from something already open, which is how a test
-    /// puts bytes in memory and how a multi tenant server will hand
-    /// out one store per tenant prefix.
+    /// A store made from something already open, for a tenant with no
+    /// parents. This is how a test puts bytes in memory.
     pub fn from_store(store: Arc<dyn CasStore>) -> Blobs {
-        Blobs { store }
+        Blobs::over(store, &[LOCAL.to_string()])
+    }
+
+    /// The chain as prefixes: the first is home and the rest are read
+    /// through, in the order they were given.
+    fn over(store: Arc<dyn CasStore>, chain: &[String]) -> Blobs {
+        let mut prefixes = chain.iter().map(|r| TenantLayout::new(r).files_prefix());
+        Blobs {
+            home: prefixes.next().expect("a chain is never empty"),
+            inherited: prefixes.collect(),
+            store,
+        }
     }
 
     pub async fn put(&self, key: String, bytes: Vec<u8>) -> Result<(), CasError> {
         let store = self.store.clone();
+        let key = format!("{}{key}", self.home);
         blocking(move || store.put(&key, &bytes).map(|_| ())).await
     }
 
     pub async fn get(&self, key: String) -> Result<Option<Vec<u8>>, CasError> {
-        let store = self.store.clone();
-        blocking(move || store.get(&key).map(|found| found.map(|(bytes, _)| bytes))).await
+        for at in self.everywhere(&key) {
+            let store = self.store.clone();
+            let found = blocking(move || store.get(&at)).await?;
+            if let Some((bytes, _)) = found {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
     }
 
     /// `len` bytes from `offset`, clamped to the end of the object, so
@@ -67,16 +123,35 @@ impl Blobs {
         offset: u64,
         len: u64,
     ) -> Result<Option<Vec<u8>>, CasError> {
-        let store = self.store.clone();
-        blocking(move || store.get_range(&key, offset, len)).await
+        for at in self.everywhere(&key) {
+            let store = self.store.clone();
+            let found = blocking(move || store.get_range(&at, offset, len)).await?;
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
     }
 
     /// Deleting bytes that are not there succeeds. A row whose upload
     /// failed halfway is a row with no bytes behind it, and removing it
     /// should answer the same as removing one with bytes.
+    ///
+    /// Only home is touched. A branch that deletes an object it
+    /// inherited is deleting the row, which is its own, and leaving the
+    /// bytes, which are not.
     pub async fn delete(&self, key: String) -> Result<(), CasError> {
         let store = self.store.clone();
+        let key = format!("{}{key}", self.home);
         blocking(move || store.delete(&key)).await
+    }
+
+    /// Every place a read looks, home first.
+    fn everywhere(&self, key: &str) -> Vec<String> {
+        std::iter::once(&self.home)
+            .chain(&self.inherited)
+            .map(|prefix| format!("{prefix}{key}"))
+            .collect()
     }
 }
 
@@ -212,5 +287,86 @@ mod tests {
     #[tokio::test]
     async fn deleting_what_was_never_there_is_fine() {
         blobs().delete(key("nobody", "nothing")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_bytes_land_under_the_tenant() {
+        let store = Arc::new(MemStore::new());
+        let blobs = Blobs::over(store.clone(), &["acme-prod".to_string()]);
+        blobs.put(key("an-id", "1"), b"x".to_vec()).await.unwrap();
+        assert_eq!(
+            store.list("").unwrap(),
+            vec!["tenants/acme-prod/files/objects/an-id/1"],
+            "one prefix per tenant is the whole reason a shared bucket is safe"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_reads_what_it_inherited_and_writes_its_own() {
+        let store = Arc::new(MemStore::new());
+        let parent = Blobs::over(store.clone(), &["prod".to_string()]);
+        let child = Blobs::over(store.clone(), &["pr-14".to_string(), "prod".to_string()]);
+        let inherited = key("an-id", "1");
+        parent
+            .put(inherited.clone(), b"from prod".to_vec())
+            .await
+            .unwrap();
+
+        // The row came across with the database, so the branch asks for
+        // a key its own prefix has never held.
+        assert_eq!(
+            child.get(inherited.clone()).await.unwrap().as_deref(),
+            Some(&b"from prod"[..])
+        );
+        assert_eq!(
+            child.get_range(inherited.clone(), 5, 4).await.unwrap(),
+            Some(b"prod".to_vec()),
+            "a range reads through too, and stops at the first prefix that has it"
+        );
+
+        let own = key("another-id", "1");
+        child
+            .put(own.clone(), b"from the branch".to_vec())
+            .await
+            .unwrap();
+        assert!(
+            parent.get(own).await.unwrap().is_none(),
+            "an upload into a branch is not an upload into what it branched from"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_cannot_delete_what_it_inherited() {
+        let store = Arc::new(MemStore::new());
+        let parent = Blobs::over(store.clone(), &["prod".to_string()]);
+        let child = Blobs::over(store.clone(), &["pr-14".to_string(), "prod".to_string()]);
+        let at = key("an-id", "1");
+        parent.put(at.clone(), b"from prod".to_vec()).await.unwrap();
+
+        // Removing the object in the branch removes the row, which is
+        // the branch's, and asks for the bytes, which are not.
+        child.delete(at.clone()).await.unwrap();
+        assert_eq!(
+            parent.get(at).await.unwrap().as_deref(),
+            Some(&b"from prod"[..]),
+            "the parent is a live database somebody else is using"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_that_replaced_an_object_reads_its_own_copy() {
+        let store = Arc::new(MemStore::new());
+        let parent = Blobs::over(store.clone(), &["prod".to_string()]);
+        let child = Blobs::over(store.clone(), &["pr-14".to_string(), "prod".to_string()]);
+        // Upsert keeps the row and writes a new version, so this is the
+        // one case where the same key exists in both prefixes at once.
+        let at = key("an-id", "1");
+        parent.put(at.clone(), b"from prod".to_vec()).await.unwrap();
+        child.put(at.clone(), b"replaced".to_vec()).await.unwrap();
+        assert_eq!(
+            child.get(at).await.unwrap().as_deref(),
+            Some(&b"replaced"[..]),
+            "home comes first, or a branch could never change anything"
+        );
     }
 }

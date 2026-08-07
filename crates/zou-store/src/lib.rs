@@ -37,7 +37,7 @@ pub mod stats;
 pub mod zoufile;
 
 pub use bloom::Bloom;
-pub use branch::{BranchError, branch, materialize_at, snapshot_at};
+pub use branch::{BranchError, branch, lineage, materialize_at, snapshot_at};
 pub use cas::{CasError, CasStore, LocalFsStore, Version};
 pub use delay::{DelayConfig, DelayStore};
 pub use filecache::{CacheStats, FileCache, cacheable};

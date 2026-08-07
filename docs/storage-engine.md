@@ -13,8 +13,14 @@ s3://<bucket>/tenants/<ref>/
   wal/<epoch>/<start-lsn>.wal   sealed WAL segments, immutable
   chk/<chk-id>/index            page location index for one checkpoint
   chk/<chk-id>/<n>.pages        sorted page images, 64 to 256 MB objects
-  files/<bucket>/<key>          Storage API user files
+  files/objects/<id>/<version>  Storage API object bytes
+  files/renders/…               image transforms of those, cached
+  files/uploads/<id>/<part>     pieces of an upload that has not finished
 ```
+
+The `files/` prefix is the Storage API's, and what goes under it is not the engine's business: the row for an object is in the database, in `storage.objects`, and the bytes are keyed by the id and version that row carries, so nothing a client ever sends reaches a key. What the layout owns is that they are under the tenant. One prefix per tenant is what makes a shared bucket safe, and it makes removing a tenant a prefix delete rather than a query. gc does not walk it: gc collects unpinned checkpoints and expired manifest history, and a file is removed by the request that removed its row.
+
+A branch reads through. Its rows arrive with the database it was branched from, so they name ids the child's own prefix has never held, and a read that misses at home tries the parent and then the parent's parent. Writes never do: an upload into a branch lands in the branch, and deleting an object in a branch deletes the row and leaves inherited bytes alone, because the parent is a live database somebody else is using. That leaves bytes a branch has stopped referencing and cannot remove, which is the cost branching already pays for pages.
 
 Everything under wal/ and chk/ is immutable once written. Only MANIFEST is mutated, and only through conditional PUT (If-Match on S3 and R2, preconditions on GCS, atomic rename plus lock on the local backend). That gives atomicity without any external coordination service.
 

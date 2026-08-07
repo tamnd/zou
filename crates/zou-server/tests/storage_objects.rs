@@ -80,7 +80,7 @@ fn fixture(dsn: &str) -> Fixture {
         })
         .expect("router builds"),
         pool: Pool::new(dsn, 4).expect("dsn parses"),
-        blobs: Blobs::open(&target).expect("the store opens"),
+        blobs: Blobs::open(&target, zou_server::blob::LOCAL).expect("the store opens"),
         _dir: dir,
     }
 }

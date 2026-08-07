@@ -92,6 +92,44 @@ pub fn materialize_at(
     Ok(child)
 }
 
+/// The tenants a read falls back through, `tenant_ref` first and then
+/// its parent, its parent's parent, and so on to the root.
+///
+/// Pages and layers do not need this: a branch copies the parent's
+/// layer entries into the child's own shard manifest and tags each one
+/// with the tenant that owns its bytes, so a reader already holds the
+/// whole chain flattened in front of it. Storage API files have no such
+/// list, since nothing writes an entry per file anywhere, so the chain
+/// has to be walked and the walk is what this is.
+///
+/// A tenant with no manifest is a chain of one. That is not an error:
+/// a server pointed at a directory that only ever held object bytes is
+/// a legitimate way to run the storage surface on its own, and it is
+/// what every conformance run does.
+///
+/// The walk stops on a ref it has already seen. A cycle cannot be
+/// built through [`branch`], which refuses an existing destination, but
+/// this is a read of somebody else's mutable objects and a loop here
+/// would be an unkillable process rather than a wrong answer.
+pub fn lineage(store: &dyn CasStore, tenant_ref: &str) -> Result<Vec<String>, BranchError> {
+    let mut chain = vec![tenant_ref.to_string()];
+    let mut at = tenant_ref.to_string();
+    loop {
+        let key = TenantLayout::new(&at).manifest();
+        let Some((data, _)) = store.get(&key)? else {
+            return Ok(chain);
+        };
+        let Some(parent) = Manifest::from_json(&data)?.branch_of else {
+            return Ok(chain);
+        };
+        if chain.contains(&parent.tenant_ref) {
+            return Ok(chain);
+        }
+        chain.push(parent.tenant_ref.clone());
+        at = parent.tenant_ref;
+    }
+}
+
 /// The lsn a freshly built child branches at.
 fn branch_point(child: &Manifest) -> Lsn {
     child
@@ -506,6 +544,47 @@ mod tests {
             "owner tags survive a second hop untouched"
         );
         assert_eq!(g.branch_of.unwrap().tenant_ref, "c");
+    }
+
+    #[test]
+    fn the_lineage_is_the_chain_of_parents_child_first() {
+        let (_d, store) = setup();
+        branch(&store, "p", "c", None, 5000).unwrap();
+        branch(&store, "c", "g", None, 6000).unwrap();
+        assert_eq!(lineage(&store, "g").unwrap(), ["g", "c", "p"]);
+        assert_eq!(lineage(&store, "c").unwrap(), ["c", "p"]);
+        assert_eq!(lineage(&store, "p").unwrap(), ["p"]);
+    }
+
+    #[test]
+    fn a_tenant_with_no_manifest_is_a_chain_of_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        // A store that only ever held object bytes is a legitimate way
+        // to run the storage surface on its own, and it is what every
+        // conformance run does.
+        assert_eq!(lineage(&store, "local").unwrap(), ["local"]);
+    }
+
+    #[test]
+    fn a_cycle_in_the_manifests_stops_rather_than_spins() {
+        let (_d, store) = setup();
+        branch(&store, "p", "c", None, 5000).unwrap();
+        // branch() refuses an existing destination, so this cannot be
+        // built through the api. It is a read of somebody else's
+        // mutable objects, and a loop here would be a process that
+        // never comes back rather than a wrong answer.
+        let key = TenantLayout::new("p").manifest();
+        let (data, version) = store.get(&key).unwrap().unwrap();
+        let mut parent = Manifest::from_json(&data).unwrap();
+        parent.branch_of = Some(BranchOf {
+            tenant_ref: "c".to_string(),
+            at_lsn: Lsn(0x100),
+        });
+        store
+            .put_if_match(&key, &parent.to_json(), Some(&version))
+            .unwrap();
+        assert_eq!(lineage(&store, "c").unwrap(), ["c", "p"]);
     }
 
     #[test]

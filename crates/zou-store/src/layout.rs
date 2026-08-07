@@ -10,7 +10,7 @@
 //!   chk/<chk-id>/<n>.pages        sorted page images
 //!   shards/<shard>/d-….dl         delta layers, WAL records by key
 //!   shards/<shard>/i-….il         image layers, pages at one lsn
-//!   files/<bucket>/<key>          Storage API user files
+//!   files/…                       Storage API object bytes
 //! ```
 //!
 //! Everything except `MANIFEST` is immutable once written.
@@ -128,9 +128,20 @@ impl TenantLayout {
         format!("{}/chk/{chk_id}/{n:08}.pages", self.prefix)
     }
 
-    /// A Storage API user file.
-    pub fn file(&self, bucket: &str, key: &str) -> String {
-        format!("{}/files/{bucket}/{key}", self.prefix)
+    /// Where the Storage API's object bytes go.
+    ///
+    /// A prefix rather than a key builder, because what goes under it
+    /// is not this crate's business: the storage api keys bytes by the
+    /// row id and version it wrote next to them, and none of that means
+    /// anything here. What the layout owns is that they are under the
+    /// tenant, so one tenant's bytes are not reachable from another's
+    /// even by a bug, and so removing a tenant is removing a prefix.
+    ///
+    /// Note that gc does not walk this. It collects unpinned
+    /// checkpoints and expired history and nothing else, so a file is
+    /// only ever removed by the request that removed its row.
+    pub fn files_prefix(&self) -> String {
+        format!("{}/files/", self.prefix)
     }
 
     /// One shard of the layer store. Listed on attach to load the
@@ -222,10 +233,7 @@ mod tests {
             t.checkpoint_pages("chk-000121", 3),
             "tenants/acme-prod/chk/chk-000121/00000003.pages"
         );
-        assert_eq!(
-            t.file("avatars", "u1/pic.png"),
-            "tenants/acme-prod/files/avatars/u1/pic.png"
-        );
+        assert_eq!(t.files_prefix(), "tenants/acme-prod/files/");
         assert_eq!(t.shard_prefix(3), "tenants/acme-prod/shards/0003/");
         assert_eq!(t.shard_manifest(3), "tenants/acme-prod/shards/0003/SHARD");
         let lo = LayerKey::page(1663, 5, 16384, 0, 0);
