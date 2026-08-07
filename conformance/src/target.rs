@@ -85,7 +85,13 @@ pub struct Target {
 /// not compared as a date is: an object with different bytes has a
 /// different one and an object with the same bytes has the same one on
 /// every run and every machine.
-pub const COMPARED: [&str; 18] = [
+/// `x-transformations` is here because it is the only place a render
+/// answer says what it did. The picture is compared as dimensions and a
+/// format rather than as bytes, since two encoders never agree, so this
+/// header is what turns a resize that happened to come out the right
+/// size into a resize that was asked for the right way. storage-js has
+/// a test that reads it, which is how it was noticed at all.
+pub const COMPARED: [&str; 19] = [
     "allow",
     "content-profile",
     "content-range",
@@ -95,6 +101,7 @@ pub const COMPARED: [&str; 18] = [
     "preference-applied",
     "retry-after",
     "www-authenticate",
+    "x-transformations",
     "tus-extension",
     "tus-max-size",
     "tus-resumable",
