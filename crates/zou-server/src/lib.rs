@@ -191,6 +191,11 @@ pub struct Config {
     /// a server started for the auth or rest surfaces alone should do
     /// rather than quietly writing files somewhere.
     pub objects: Option<String>,
+    /// Which tenant's prefix on that store the bytes go under. None is
+    /// `local`, the ref the engine uses for a store with one database
+    /// on it, so a single tenant deployment names nothing and the
+    /// files land beside the pages of the database they belong to.
+    pub tenant: Option<String>,
     /// The key pair the S3 surface is asked with. None and every signed
     /// request is told the access key it named is not one this project
     /// has, which is the honest thing to say about a project that has
@@ -230,6 +235,7 @@ impl Default for Config {
             oauth: oauth::Providers::default(),
             http: None,
             objects: None,
+            tenant: None,
             s3: None,
         }
     }
@@ -348,8 +354,11 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         Some(http) => http,
         None => Arc::new(oauth::Web::default()),
     };
+    let tenant = cfg.tenant.as_deref().unwrap_or(blob::LOCAL);
     let blobs = match &cfg.objects {
-        Some(target) => Some(blob::Blobs::open(target).map_err(|e| format!("objects: {e}"))?),
+        Some(target) => {
+            Some(blob::Blobs::open(target, tenant).map_err(|e| format!("objects: {e}"))?)
+        }
         None => None,
     };
     Ok(Arc::new(App {

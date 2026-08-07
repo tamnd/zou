@@ -278,10 +278,13 @@ fn start_http(port: u16, pg_port: u16, target: String) -> Result<(), String> {
             // them. With nothing set this is empty and every provider
             // is refused by name.
             oauth,
-            // Object bytes go where the pages go, under a prefix of
-            // their own. On a laptop that is a directory next to the
-            // data and on a deployment it is the same bucket, which
-            // is the whole point of storing both on the same thing.
+            // Object bytes go where the pages go: the same store, the
+            // same tenant prefix, under files/. On a laptop that is a
+            // directory next to the data and on a deployment it is the
+            // same bucket, which is the whole point of storing both on
+            // the same thing. The tenant is left unset, so it is
+            // `local`, which is the ref the dev loop restores and
+            // serves under.
             objects: Some(target),
             // Off by default, the same as GoTrue. Set
             // ZOU_SECURITY_MANUAL_LINKING_ENABLED=true and a signed in
