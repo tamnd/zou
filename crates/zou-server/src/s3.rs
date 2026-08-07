@@ -506,12 +506,20 @@ pub async fn bucket(
     State(app): State<Arc<App>>,
     Path(bucket): Path<String>,
     parts: Parts,
+    body: Body,
 ) -> Response {
     let answer = match parts.method {
         Method::GET => asked(&app, &parts, &bucket).await,
         Method::HEAD => headed(&app, &parts, &bucket).await,
         Method::PUT => made(&app, &parts, &bucket).await,
         Method::DELETE => removed(&app, &parts, &bucket).await,
+        // The one post a bucket answers, told from the ones it does not
+        // by a parameter with no value on it. A post carrying anything
+        // else is a multipart upload being started or finished, which is
+        // still owed.
+        Method::POST if query_of(&parts).contains_key("delete") => {
+            dropped_many(&app, &parts, &bucket, body).await
+        }
         _ => return crate::not_yet("the storage surface"),
     };
     match answer {
@@ -866,6 +874,141 @@ async fn removed(app: &App, parts: &Parts, bucket: &str) -> Result<Response, Sto
     done(sess, Ok(StatusCode::NO_CONTENT.into_response())).await
 }
 
+/// POST /storage/v1/s3/{bucket}?delete
+///
+/// DeleteObjects, which is the only request on this surface whose body
+/// is a document the server reads rather than one it writes.
+///
+/// Every key the body named comes back as deleted, in the order the body
+/// named them rather than sorted, and one that nothing was under comes
+/// back as deleted too. Both are recorded, and both are S3's rule rather
+/// than the storage api's: the state the caller asked for is the state
+/// afterwards, so there is nothing to report about a key that was
+/// already in it.
+async fn dropped_many(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    body: Body,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let raw = axum::body::to_bytes(body, object::UPLOAD_LIMIT)
+        .await
+        .map_err(|_| StorageError::too_large())?;
+    // Read before the bucket is looked for, because upstream validates a
+    // body against its schema before its handler runs. A body with
+    // nothing in it earns the same sentence whether or not the bucket in
+    // the path is there.
+    let Some(keys) = keys_in(&String::from_utf8_lossy(&raw)) else {
+        return Err(StorageError::not_valid(
+            "Body, Delete must be object".to_string(),
+        ));
+    };
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, false).await?;
+    if !exists(&sess, bucket).await? {
+        return done(sess, Err(StorageError::no_such_bucket())).await;
+    }
+    // The versions about to lose the rows that point at them, read
+    // before the delete so that their bytes can go after the commit.
+    let rows = sess
+        .query(
+            "select id::text, coalesce(version, '') from storage.objects
+              where bucket_id = $1 and name = any($2)",
+            &[&bucket, &keys],
+        )
+        .await
+        .map_err(|e| pg_error(&e))?;
+    // A row with no version in it points at nothing, which is what a row
+    // somebody inserted rather than uploaded looks like. There are no
+    // bytes under it to go and looking for them would be asking the
+    // store about a key it was never given.
+    let orphaned: Vec<String> = rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .filter(|(_, version)| !version.is_empty())
+        .map(|(id, version)| crate::blob::key(&id, &version))
+        .collect();
+    sess.execute(crate::storage::ALLOW_DELETE, &[])
+        .await
+        .map_err(|e| pg_error(&e))?;
+    sess.execute(
+        "delete from storage.objects where bucket_id = $1 and name = any($2)",
+        &[&bucket, &keys],
+    )
+    .await
+    .map_err(|e| pg_error(&e))?;
+    done(sess, Ok(())).await?;
+    if let Ok(blobs) = object::blobs(app) {
+        for key in orphaned {
+            let _ = blobs.delete(key).await;
+        }
+    }
+
+    let mut deleted = String::new();
+    for key in &keys {
+        deleted.push_str(&format!(
+            "<Deleted><Key>{}</Key></Deleted>",
+            escaped(key.as_str())
+        ));
+    }
+    Ok(xml(format!(
+        "{DECLARATION}<DeleteResult xmlns=\"{NAMESPACE}\">{deleted}</DeleteResult>"
+    )))
+}
+
+/// The keys a delete's body names, in the order it named them, or
+/// nothing when there is no `Delete` object in it at all.
+///
+/// Read by finding the tags rather than by parsing the document, for the
+/// reason the answers are written out rather than serialized: a parser
+/// would bring its own idea of what a document means, and everything
+/// that has to be read out of this one is one element deep.
+///
+/// `Quiet` is not looked for. It asks the server to say nothing about
+/// the keys that worked, which is what a client deleting a thousand of
+/// them sends, and the reference answers all thousand anyway. Recorded,
+/// and copied rather than improved on, because a client that reads the
+/// answer expecting silence reads it wrong against both.
+fn keys_in(body: &str) -> Option<Vec<String>> {
+    let at = body.find("<Delete")?;
+    let rest = &body[at + "<Delete".len()..];
+    // Attributes are allowed on the tag and every client sends one, so
+    // the name ends at a space as well as at the bracket. Anything else
+    // after it is a different element whose name merely starts the same
+    // way.
+    if !rest.starts_with('>') && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut inside = &rest[rest.find('>')? + 1..];
+    // An element that closes itself or holds nothing but text is not an
+    // object, which is the word the refusal uses: the reference reads
+    // this body into a value and its schema says that value is an
+    // object, and an empty element reads as a string.
+    inside = &inside[..inside.find("</Delete>")?];
+    if !inside.contains('<') {
+        return None;
+    }
+    let mut keys = Vec::new();
+    while let Some(at) = inside.find("<Key>") {
+        let value = &inside[at + "<Key>".len()..];
+        let Some(end) = value.find("</Key>") else {
+            break;
+        };
+        keys.push(plain(&value[..end]));
+        inside = &value[end + "</Key>".len()..];
+    }
+    Some(keys)
+}
+
+/// The three escapes [`escaped`] writes, read back. A key really can
+/// hold an ampersand, and a client that sent one wrote it this way.
+fn plain(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
 /// Everything one object can be asked, dispatched the way the bucket
 /// route dispatches its own.
 ///
@@ -882,7 +1025,14 @@ pub async fn object(
     let answer = match parts.method {
         Method::GET => fetched(&app, &parts, &bucket, &key).await,
         Method::HEAD => described(&app, &parts, &bucket, &key).await,
-        Method::PUT => put(&app, &parts, &bucket, &key, body).await,
+        // One verb and two requests, told apart by a header. A put
+        // carrying bytes writes them and a put naming somewhere else's
+        // reads them from there, and the second answers a document where
+        // the first answers nothing.
+        Method::PUT => match header_value(&parts, "x-amz-copy-source") {
+            Some(source) => copied(&app, &parts, &bucket, &key, source).await,
+            None => put(&app, &parts, &bucket, &key, body).await,
+        },
         Method::DELETE => dropped(&app, &parts, &bucket, &key).await,
         _ => return crate::not_yet("the storage surface"),
     };
@@ -1057,6 +1207,137 @@ async fn put(
     Ok(answer)
 }
 
+/// PUT /storage/v1/s3/{bucket}/{key} with `x-amz-copy-source` on it.
+///
+/// A second row and a second set of bytes, which is what the json copy
+/// route writes too and for the same reason: two rows pointing at one
+/// key would make a delete of either of them a delete of both, and
+/// nothing in the store counts what points at it.
+///
+/// A copy onto a key that is already there replaces it, including the
+/// key it came from. S3 refuses a copy onto itself unless the request
+/// changes something, because that is how metadata is rewritten there;
+/// this endpoint has no such rule and answers the same document it
+/// answers for any other copy. Recorded, because a client that rewrites
+/// metadata that way is a client that would have got an error.
+async fn copied(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+    source: &str,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let (from_bucket, from_key) = named(source);
+    let blobs = object::blobs(app)?;
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, false).await?;
+    // A source that is not there and a source in a bucket that is not
+    // there are the same refusal, because one query asks both questions
+    // and nothing asks a second. The resource it names is the
+    // destination rather than the source, which is the path the request
+    // was made to and not the key that is missing. Recorded twice over,
+    // and not something anybody would write on purpose.
+    let Some(from) = object::find(&sess, from_bucket, from_key).await? else {
+        return done(sess, Err(StorageError::no_such_key())).await;
+    };
+    // Copied by the statement that writes it rather than read out here
+    // and sent back in. Everything the source said about its bytes is
+    // still true of the copy, so the only columns that are the copy's
+    // own are where it is and which version its bytes are stored under.
+    let rows = sess
+        .query(
+            "insert into storage.objects (bucket_id, name, version, metadata, user_metadata)
+             select $3, $4, gen_random_uuid()::text, metadata, user_metadata
+               from storage.objects where bucket_id = $1 and name = $2
+             on conflict (bucket_id, name) do update
+                set version = excluded.version,
+                    metadata = excluded.metadata,
+                    user_metadata = excluded.user_metadata,
+                    updated_at = now()
+             returning id::text, version, coalesce(metadata->>'eTag', ''),
+                       to_char(updated_at at time zone 'utc',
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')",
+            &[&from_bucket, &from_key, &bucket, &key],
+        )
+        .await
+        .map_err(|e| missing_parent(&e))?;
+    let Some(made) = rows.first() else {
+        // Nothing on this surface can earn this: the connection is the
+        // service role, so there are no policies for a row to fall foul
+        // of. It is the answer the json copy route gives when one does.
+        return done(
+            sess,
+            Err(StorageError::access_denied(
+                "new row violates row-level security policy".to_string(),
+            )),
+        )
+        .await;
+    };
+    let id: String = made.get(0);
+    let version: String = made.get(1);
+    let etag: String = made.get(2);
+    let when: String = made.get(3);
+
+    // The bytes before the commit, for the reason an upload has: a row
+    // pointing at bytes that were never written is the one state a
+    // client can see and cannot explain. A source whose bytes are not
+    // there leaves the copy in that state anyway, which is what the json
+    // route does and what the fixture's four rows are already in.
+    let bytes = blobs
+        .get(from.key())
+        .await
+        .map_err(|e| StorageError::internal(e.to_string()))?;
+    if let Some(bytes) = bytes
+        && let Err(e) = blobs.put(crate::blob::key(&id, &version), bytes).await
+    {
+        let _ = sess.rollback().await;
+        return Err(StorageError::internal(e.to_string()));
+    }
+    done(sess, Ok(())).await?;
+
+    // The etag is left out when the source had none rather than written
+    // empty, which is the rule a listing follows and for the same
+    // reason: a row somebody inserted by hand has nothing to say here.
+    let tag = match etag.is_empty() {
+        true => String::new(),
+        false => format!("<ETag>{}</ETag>", escaped(&etag)),
+    };
+    Ok(xml(format!(
+        "{DECLARATION}<CopyObjectResult xmlns=\"{NAMESPACE}\">{tag}\
+         <LastModified>{}</LastModified></CopyObjectResult>",
+        escaped(&when)
+    )))
+}
+
+/// The bucket and the key a copy's source header names.
+///
+/// The leading slash is optional. Amazon's own documentation writes one
+/// and several clients do not, and both spellings are recorded as
+/// working, which is the sort of thing a client's choice of library
+/// otherwise decides for it.
+///
+/// Nothing is decoded. A source with a percent in it is not recorded
+/// either way, and a key really can hold one, so guessing here would be
+/// guessing about the one case that would tell.
+fn named(source: &str) -> (&str, &str) {
+    let source = source.strip_prefix('/').unwrap_or(source);
+    source.split_once('/').unwrap_or((source, ""))
+}
+
+/// A row that named a bucket nobody has.
+///
+/// Postgres refuses it as a foreign key and this surface answers in the
+/// general rather than about buckets, which is recorded: a copy into a
+/// bucket that is not there is not `NoSuchBucket`, because nothing
+/// looked the bucket up to be able to say that.
+fn missing_parent(e: &tokio_postgres::Error) -> StorageError {
+    match e.as_db_error().map(|db| db.code().code()) {
+        Some("23503") => StorageError::related_missing(),
+        _ => pg_error(e),
+    }
+}
+
 /// DELETE /storage/v1/s3/{bucket}/{key}
 ///
 /// 204 whether or not there was anything there, which is S3's rule and
@@ -1201,6 +1482,59 @@ mod tests {
     #[test]
     fn an_etag_keeps_its_quotes() {
         assert_eq!(escaped("\"5eb63bbb\""), "\"5eb63bbb\"");
+    }
+
+    /// Both spellings of a source are recorded, and a source naming no
+    /// key at all is a key nobody has rather than a panic.
+    #[test]
+    fn a_copy_source_is_read_with_or_without_its_leading_slash() {
+        assert_eq!(named("/notes/original.txt"), ("notes", "original.txt"));
+        assert_eq!(named("notes/original.txt"), ("notes", "original.txt"));
+        assert_eq!(
+            named("notes/holiday/beach.txt"),
+            ("notes", "holiday/beach.txt")
+        );
+        assert_eq!(named("/notes"), ("notes", ""));
+    }
+
+    /// In the order the body wrote them, which is the order the answer
+    /// reports them in, and with the attribute every client puts on the
+    /// tag ignored.
+    #[test]
+    fn a_delete_body_is_read_as_the_keys_it_names() {
+        let body = "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                    <Object><Key>zebra.txt</Key></Object>\
+                    <Object><Key>apples.txt</Key></Object></Delete>";
+        assert_eq!(
+            keys_in(body),
+            Some(vec!["zebra.txt".into(), "apples.txt".into()])
+        );
+    }
+
+    /// Quiet mode is read as one more element nobody looks at, because
+    /// the reference answers as though it had not been sent.
+    #[test]
+    fn asking_for_quiet_takes_nothing_out_of_the_answer() {
+        let body = "<Delete><Quiet>true</Quiet><Object><Key>apples.txt</Key></Object></Delete>";
+        assert_eq!(keys_in(body), Some(vec!["apples.txt".into()]));
+    }
+
+    /// An empty element is not an object, and neither is a document
+    /// with no delete in it at all.
+    #[test]
+    fn a_delete_body_with_nothing_in_it_is_not_one() {
+        assert_eq!(keys_in("<Delete></Delete>"), None);
+        assert_eq!(keys_in("<Delete/>"), None);
+        assert_eq!(keys_in("<DeleteObjects><Key>a</Key></DeleteObjects>"), None);
+        assert_eq!(keys_in(""), None);
+    }
+
+    /// A key can hold the characters a document cannot, and it went out
+    /// escaped, so it comes back the same way.
+    #[test]
+    fn a_key_written_as_escapes_is_read_as_itself() {
+        let body = "<Delete><Object><Key>a&amp;b&lt;c</Key></Object></Delete>";
+        assert_eq!(keys_in(body), Some(vec!["a&b<c".into()]));
     }
 
     /// Length first, so that a signature of another length is not a
