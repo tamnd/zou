@@ -60,7 +60,22 @@ jobs:
           mkdir -p /tmp/project
           cd /tmp/project
           supabase init --with-vscode-settings=false --with-intellij-settings=false
-          supabase start -x studio,imgproxy,edge-runtime,logflare,vector
+          # imgproxy is in the list now, because it is the reference for
+          # the render routes. storage-api does not transform anything
+          # itself: it checks the request, hands the object to imgproxy
+          # and hands back what imgproxy answered, so a stack without it
+          # answers every render case the same way and the recording
+          # would be a recording of the wiring being off.
+          # And said out loud in the config rather than left to the
+          # template's default, since the default is a line in a version
+          # of the CLI rather than a thing this run decided.
+          if grep -q '\[storage.image_transformation\]' supabase/config.toml; then
+            perl -0pi -e 's/(\[storage\.image_transformation\]\s*\nenabled\s*=\s*)false/${1}true/' \
+              supabase/config.toml
+          else
+            printf '\n[storage.image_transformation]\nenabled = true\n' >> supabase/config.toml
+          fi
+          supabase start -x studio,edge-runtime,logflare,vector
           supabase status
       # The schema the reference brought with it, kept next to the
       # recording, because a suite that writes rows into a table has to
@@ -138,3 +153,4 @@ jobs:
         run: |
           docker ps -a || true
           docker logs supabase_storage_project 2>&1 | tail -80 || true
+          docker logs supabase_imgproxy_project 2>&1 | tail -40 || true

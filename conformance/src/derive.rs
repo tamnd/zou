@@ -717,6 +717,8 @@ fn request(bytes: &[char], at: usize, method: &str, spec: &Spec, it: &str) -> Re
         key: crate::suite::Key::Anon,
         headers,
         body,
+        file: None,
+        bytes: None,
         note: None,
         writes,
         chained: false,
