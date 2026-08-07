@@ -1,5 +1,6 @@
 mod branch;
 mod codegen;
+mod compact;
 #[cfg(unix)]
 mod dev;
 #[cfg(unix)]
@@ -22,6 +23,7 @@ fn usage() -> ExitCode {
     eprintln!("{DEV_USAGE}");
     eprintln!("       {}", branch::USAGE);
     eprintln!("       {}", codegen::USAGE);
+    eprintln!("       {}", compact::USAGE);
     eprintln!("       {}", info::USAGE);
     eprintln!("       {}", inspect::USAGE);
     #[cfg(unix)]
@@ -76,6 +78,7 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Some("branch") => simple(branch::run(&argv[1..])),
+        Some("compact") => simple(compact::run(&argv[1..])),
         Some("gen") => simple(codegen::run(&argv[1..])),
         #[cfg(unix)]
         Some("inbox") => simple(inbox::run(&argv[1..])),

@@ -33,6 +33,7 @@ const XLR_BLOCK_ID_ORIGIN: u8 = 253;
 const XLR_BLOCK_ID_TOPLEVEL_XID: u8 = 252;
 const XLR_MAX_BLOCK_ID: u8 = 32;
 const BKPBLOCK_HAS_IMAGE: u8 = 0x10;
+const BKPBLOCK_WILL_INIT: u8 = 0x40;
 const BKPBLOCK_SAME_REL: u8 = 0x80;
 const BKPBLOCK_FORK_MASK: u8 = 0x0F;
 const BKPIMAGE_HAS_HOLE: u8 = 0x01;
@@ -236,7 +237,7 @@ fn record_block_refs(
     tot_len: u64,
     info: u8,
     rmid: u8,
-    out: &mut Vec<BlockRef>,
+    out: &mut Vec<(BlockRef, bool)>,
     rels: &mut Vec<RelTag>,
     truncs: &mut Vec<(RelTag, u32)>,
 ) -> Result<bool, ScanErr> {
@@ -306,13 +307,16 @@ fn record_block_refs(
                 })?;
                 let blk = u32::from_le_bytes(take(&mut p, 4)?.try_into().expect("checked length"));
                 remaining = remaining.saturating_sub(4);
-                out.push(BlockRef {
-                    spc,
-                    db,
-                    rel: relnum,
-                    fork: (fork_flags & BKPBLOCK_FORK_MASK) as u32,
-                    blk,
-                });
+                out.push((
+                    BlockRef {
+                        spc,
+                        db,
+                        rel: relnum,
+                        fork: (fork_flags & BKPBLOCK_FORK_MASK) as u32,
+                        blk,
+                    },
+                    fork_flags & (BKPBLOCK_WILL_INIT | BKPBLOCK_HAS_IMAGE) != 0,
+                ));
             }
             _ => {
                 return Err(ScanErr::Corrupt(format!(
@@ -378,6 +382,7 @@ fn scan(window: &WalWindow, start: u64, end: Option<u64>) -> Result<ScanOut, Str
         resume: start,
     };
     let mut header = Vec::new();
+    let mut pairs = Vec::new();
     while cursor.pos < limit {
         let rec_start = cursor.pos;
         let step = (|cursor: &mut Cursor| -> Result<(), ScanErr> {
@@ -411,15 +416,17 @@ fn scan(window: &WalWindow, start: u64, end: Option<u64>) -> Result<ScanOut, Str
             let head = body.min(4096);
             header.clear();
             cursor.read(head, &mut header)?;
+            pairs.clear();
             record_block_refs(
                 &header,
                 tot_len,
                 info,
                 rmid,
-                &mut out.refs,
+                &mut pairs,
                 &mut out.rels,
                 &mut out.truncs,
             )?;
+            out.refs.extend(pairs.drain(..).map(|(r, _)| r));
             cursor.skip(body - head)?;
             cursor.pos = (cursor.pos + MAXALIGN - 1) & !(MAXALIGN - 1);
             Ok(())
@@ -509,7 +516,7 @@ pub struct WalRecord {
 }
 
 impl WalRecord {
-    fn parse_refs(&self) -> Result<(Vec<BlockRef>, bool), String> {
+    fn parse_refs(&self) -> Result<(Vec<(BlockRef, bool)>, bool), String> {
         let mut refs = Vec::new();
         let mut rels = Vec::new();
         let mut truncs = Vec::new();
@@ -531,7 +538,8 @@ impl WalRecord {
 
     /// The blocks this record references, parsed from its header items.
     pub fn block_refs(&self) -> Result<Vec<BlockRef>, String> {
-        self.parse_refs().map(|(refs, _)| refs)
+        self.parse_refs()
+            .map(|(refs, _)| refs.into_iter().map(|(r, _)| r).collect())
     }
 
     /// Whether any block reference in this record carries a full page
@@ -543,6 +551,35 @@ impl WalRecord {
     pub fn carries_image(&self) -> Result<bool, String> {
         self.parse_refs().map(|(_, image)| image)
     }
+}
+
+/// The blocks a raw record references, each with whether redo can
+/// build the page without a base: the record initializes the page or
+/// carries a full image of it. For callers holding record bytes
+/// outside a scan, like the records in a delta layer; compaction
+/// consults this before materializing a page whose stored history
+/// starts mid chain.
+pub fn record_init_refs(bytes: &[u8]) -> Result<Vec<(BlockRef, bool)>, String> {
+    if bytes.len() < RECORD_HEADER as usize {
+        return Err("record shorter than its fixed header".to_string());
+    }
+    let mut refs = Vec::new();
+    let mut rels = Vec::new();
+    let mut truncs = Vec::new();
+    record_block_refs(
+        &bytes[RECORD_HEADER as usize..],
+        bytes.len() as u64,
+        bytes[16],
+        bytes[17],
+        &mut refs,
+        &mut rels,
+        &mut truncs,
+    )
+    .map_err(|err| match err {
+        ScanErr::Corrupt(msg) => msg,
+        ScanErr::Truncated => "record header items overrun".to_string(),
+    })?;
+    Ok(refs)
 }
 
 /// What [`read_records`] produced: the records and where the next call

@@ -139,6 +139,20 @@ impl<'a> LayerReader<'a> {
         ))
     }
 
+    /// The whole layer object, resolved through the owner and home
+    /// tags like any read. Compaction uses this to pull its inputs
+    /// wherever they live; the serving path never does, it reads
+    /// blocks by range.
+    pub fn fetch(&self, desc: &LayerDesc) -> Result<Vec<u8>, ReadError> {
+        let name = desc.name();
+        let object = self.object_key(desc, &name)?;
+        Ok(self
+            .store
+            .get(&object)?
+            .ok_or(ReadError::Missing { name })?
+            .0)
+    }
+
     fn range(
         &self,
         desc: &LayerDesc,
