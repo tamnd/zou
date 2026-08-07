@@ -34,6 +34,17 @@ use serde_json::Value;
 /// the body would name nothing, because there is no body.
 const HEADER: &str = "header:";
 
+/// What a volatile path says before the name of an xml element, when
+/// the body is not json and a place in it cannot be pointed at.
+///
+/// The S3 surface answers xml, and a listing of buckets carries the day
+/// each one was made on. Two of them were made by setup.sql and are
+/// pinned there; the one the suite just made was made a moment ago. A
+/// body like that is one string as far as everything else here is
+/// concerned, so naming it by a path would name the whole listing and
+/// give up the names, the order and the shape of the document with it.
+const ELEMENT: &str = "element:";
+
 /// Replace every value `paths` names with the name of its shape.
 ///
 /// A path that matches nothing is left alone rather than reported. The
@@ -42,11 +53,45 @@ const HEADER: &str = "header:";
 /// asks one question rather than two.
 pub fn redact(body: &mut Value, paths: &[String]) {
     for path in paths {
+        if let Some(name) = path.strip_prefix(ELEMENT) {
+            if let Value::String(text) = body {
+                *text = elements(text, name.trim());
+            }
+            continue;
+        }
         if path.starts_with(HEADER) {
             continue;
         }
         walk(body, &steps(path));
     }
+}
+
+/// What every `<name>...</name>` holds, replaced by the name of its
+/// shape, with the tags and everything around them left as they are.
+///
+/// Read by finding the tags rather than by parsing the document,
+/// because the comparison is on the bytes and a parse that rewrote them
+/// would be comparing this crate's idea of the document instead. An
+/// element with attributes on it is not matched, and nothing the S3
+/// surface answers has any.
+fn elements(text: &str, name: &str) -> String {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(&open) {
+        let (before, after) = rest.split_at(at + open.len());
+        out.push_str(before);
+        let Some(end) = after.find(&close) else {
+            rest = after;
+            break;
+        };
+        out.push_str(&string_shape(&after[..end]));
+        out.push_str(&close);
+        rest = &after[end + close.len()..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The same, for the headers a case named instead of a place in the
@@ -375,6 +420,54 @@ mod tests {
     fn a_header_path_is_not_read_as_a_path_into_the_body() {
         let body = json!({"header:location": "keep me"});
         assert_eq!(redacted(body.clone(), &["header:location"]), body);
+    }
+
+    /// The names and the order of a listing are what the case was for,
+    /// and only the day one of them was made on moves.
+    #[test]
+    fn an_element_of_an_xml_body_is_named_and_the_document_is_not() {
+        let body = Value::String(
+            "<Buckets><Bucket><Name>photos</Name>\
+             <CreationDate>2024-01-02T03:04:05.000Z</CreationDate></Bucket>\
+             <Bucket><Name>made</Name>\
+             <CreationDate>2026-08-07T03:49:38.782Z</CreationDate></Bucket></Buckets>"
+                .to_string(),
+        );
+        assert_eq!(
+            redacted(body, &["element:CreationDate"]),
+            Value::String(
+                "<Buckets><Bucket><Name>photos</Name>\
+                 <CreationDate><timestamp></CreationDate></Bucket>\
+                 <Bucket><Name>made</Name>\
+                 <CreationDate><timestamp></CreationDate></Bucket></Buckets>"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A tag whose name merely starts the same way is a different tag,
+    /// and an element nothing closed is left where it was rather than
+    /// swallowing the rest of the document.
+    #[test]
+    fn an_element_is_matched_whole_and_a_broken_one_is_left_alone() {
+        let body = Value::String("<Buckets><Bucket>a</Bucket></Buckets>".to_string());
+        assert_eq!(
+            redacted(body.clone(), &["element:Bucket"]),
+            Value::String("<Buckets><Bucket><string></Bucket></Buckets>".to_string())
+        );
+        assert_eq!(redacted(body.clone(), &["element:Name"]), body);
+        assert_eq!(
+            redacted(Value::String("<Name>a".to_string()), &["element:Name"]),
+            Value::String("<Name>a".to_string())
+        );
+    }
+
+    /// A json body has places that can be pointed at, so an element
+    /// path has nothing to say about one.
+    #[test]
+    fn an_element_path_leaves_a_json_body_alone() {
+        let body = json!({"CreationDate": "2026-08-07T03:49:38.782Z"});
+        assert_eq!(redacted(body.clone(), &["element:CreationDate"]), body);
     }
 
     /// An index reaches one element, which is what an answer with a
