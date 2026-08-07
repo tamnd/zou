@@ -14,6 +14,7 @@ bcrypt = { version = "0.19", default-features = false, features = ["std", "zeroi
 bytes = "1"
 getrandom = { workspace = true }
 hmac = { workspace = true }
+image = { workspace = true }
 log = { workspace = true }
 md-5 = "0.11"
 p256 = { workspace = true }
@@ -25,6 +26,7 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 ureq = { workspace = true }
+webp = { workspace = true }
 webpki-roots = { workspace = true }
 zou-rest = { path = "../zou-rest" }
 zou-store = { path = "../zou-store", features = ["s3"] }

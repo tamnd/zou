@@ -947,7 +947,10 @@ mod tests {
         );
         // A number is held as it is written rather than not at all, and
         // a string is held unquoted, so a url is a url.
-        assert_eq!(read_out(&headers, body, "body:/size"), Some("7".to_string()));
+        assert_eq!(
+            read_out(&headers, body, "body:/size"),
+            Some("7".to_string())
+        );
         assert_eq!(read_out(&headers, body, "body:/missing"), None);
         assert_eq!(read_out(&headers, body, "body:/signedURL/0"), None);
         assert_eq!(read_out(&headers, "not json", "body:/signedURL"), None);
