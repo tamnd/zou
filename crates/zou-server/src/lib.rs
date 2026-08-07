@@ -49,6 +49,7 @@ pub mod sms;
 pub mod smtp;
 pub mod sql;
 pub mod storage;
+pub mod tenant;
 pub mod totp;
 pub mod tus;
 
