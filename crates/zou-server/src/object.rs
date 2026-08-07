@@ -77,9 +77,15 @@ use crate::storage::{ALLOW_DELETE, StorageError, begin, caller, done, message, o
 /// storage-api's own global limit on a fresh project, which the CLI
 /// sets to fifty megabytes. It is a limit on the request rather than on
 /// a bucket: the per bucket `file_size_limit` is a second, smaller
-/// number, and enforcing that one needs answers this suite has not
-/// asked for yet.
-const UPLOAD_LIMIT: usize = 50 * 1024 * 1024;
+/// number, and it is enforced next to this one in [`refused_by`].
+///
+/// It is also a ceiling on that second number. A bucket asking to be
+/// made with a limit above this one, or updated to one, is refused with
+/// the same words an upload over the limit is refused with.
+pub(crate) const UPLOAD_LIMIT: usize = 50 * 1024 * 1024;
+
+/// What an upload that says nothing about its type is taken to be.
+const OCTET_STREAM: &str = "application/octet-stream";
 
 /// How much of a batch delete's body is worth reading. A list of names,
 /// so the room a bucket call gets is enough for a few thousand of them.
@@ -238,15 +244,36 @@ async fn set_role(sess: &Session, role: &str) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// Is there a bucket of this name at all, and is it public?
-async fn bucket_public(sess: &Session, id: &str) -> Result<Option<bool>, StorageError> {
+/// What a bucket says about what may be read from it and written into
+/// it. The three columns every path that touches a bucket wants, read
+/// in the one lookup that was already being made for the first of them.
+struct Bucket {
+    public: bool,
+    size_limit: Option<i64>,
+    mime_types: Option<Vec<String>>,
+}
+
+/// Is there a bucket of this name at all, and what does it say?
+async fn bucket_facts(sess: &Session, id: &str) -> Result<Option<Bucket>, StorageError> {
     let rows = sess
-        .query("select public from storage.buckets where id = $1", &[&id])
+        .query(
+            "select public, file_size_limit, allowed_mime_types
+               from storage.buckets where id = $1",
+            &[&id],
+        )
         .await
         .map_err(|e| pg_error(&e))?;
-    Ok(rows
-        .first()
-        .map(|row| row.get::<_, Option<bool>>(0) == Some(true)))
+    Ok(rows.first().map(|row| Bucket {
+        public: row.get::<_, Option<bool>>(0) == Some(true),
+        size_limit: row.get(1),
+        mime_types: row.get(2),
+    }))
+}
+
+/// Is there a bucket of this name at all, and is it public? The one
+/// question the read paths ask, which is the same lookup.
+async fn bucket_public(sess: &Session, id: &str) -> Result<Option<bool>, StorageError> {
+    Ok(bucket_facts(sess, id).await?.map(|bucket| bucket.public))
 }
 
 /// Commit, then fail. The transaction did nothing worth keeping and the
@@ -1197,6 +1224,57 @@ struct Upload {
     cache: String,
 }
 
+/// What the bucket says about an upload, or nothing if it takes it.
+///
+/// The type is asked before the length. One request can trip both and
+/// the recording says which of the two it is told about.
+fn refused_by(bucket: &Bucket, upload: &Upload) -> Option<StorageError> {
+    if let Some(allowed) = &bucket.mime_types
+        && !allowed.is_empty()
+        && !allowed
+            .iter()
+            .any(|pattern| mime_matches(pattern, &upload.mime))
+    {
+        return Some(StorageError::bad_mime(&upload.mime));
+    }
+    // The bytes of the file, not the bytes of the request. A multipart
+    // form carries its own delimiters and a part header, which is over
+    // a hundred bytes before the file starts, and a form of two hundred
+    // and forty five bytes carrying eleven goes into a bucket that
+    // takes twenty. Recorded.
+    if let Some(most) = bucket.size_limit
+        && most >= 0
+        && upload.bytes.len() as u64 > most as u64
+    {
+        return Some(StorageError::too_large());
+    }
+    None
+}
+
+/// Does one entry of a bucket's list cover this type?
+///
+/// An entry is either a whole type or a family with a star for the
+/// subtype, and `text/*` covers `text/csv`. Parameters are not part of
+/// the comparison: a browser that says `text/plain; charset=utf-8` is
+/// sending text/plain.
+fn mime_matches(pattern: &str, mime: &str) -> bool {
+    let bare = |text: &str| {
+        text.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+    };
+    let (pattern, mime) = (bare(pattern), bare(mime));
+    if pattern == mime {
+        return true;
+    }
+    match (pattern.split_once('/'), mime.split_once('/')) {
+        (Some((family, "*")), Some((theirs, _))) => family == theirs,
+        _ => false,
+    }
+}
+
 /// Read an upload, whichever of the two ways it was sent.
 ///
 /// A browser form and a raw body carry the same three things in
@@ -1216,7 +1294,17 @@ async fn read_upload(parts: &Parts, body: Body) -> Result<Upload, StorageError> 
     let Some(boundary) = form_boundary(&content_type) else {
         return Ok(Upload {
             bytes,
-            mime: content_type,
+            // A request that says nothing about what it is sending is
+            // sending bytes, and that is written down as the type
+            // rather than left empty. Recorded twice over: an upload
+            // with no content-type into a bucket with a list is refused
+            // by a sentence naming a type nobody sent, and the same
+            // upload into a bucket with no list answers
+            // application/octet-stream when the row is read back.
+            mime: match content_type.is_empty() {
+                true => OCTET_STREAM.to_string(),
+                false => content_type,
+            },
             cache: parts
                 .headers
                 .get(header::CACHE_CONTROL)
@@ -1491,11 +1579,14 @@ async fn write(
     // refusal about the policies comes from the insert, in postgres's
     // own words.
     let there = match role {
-        Some(role) => unpoliced(&sess, role, async || bucket_public(&sess, bucket).await).await?,
-        None => bucket_public(&sess, bucket).await?,
+        Some(role) => unpoliced(&sess, role, async || bucket_facts(&sess, bucket).await).await?,
+        None => bucket_facts(&sess, bucket).await?,
     };
-    if there.is_none() {
+    let Some(limits) = there else {
         return refuse(sess, StorageError::no_such_bucket()).await;
+    };
+    if let Some(why) = refused_by(&limits, &upload) {
+        return refuse(sess, why).await;
     }
     // What is there now, so that its bytes can go once the new ones are
     // safely in. Under the caller's policies: a row this caller cannot
@@ -2410,6 +2501,54 @@ mod tests {
          Content-Type: text/plain\r\n\r\n\
          sent as a form\r\n\
          --zouconformanceboundary--\r\n";
+
+    fn sent(mime: &str, bytes: usize) -> Upload {
+        Upload {
+            bytes: vec![b'x'; bytes],
+            mime: mime.to_string(),
+            cache: NO_CACHE.to_string(),
+        }
+    }
+
+    fn takes(types: Option<&[&str]>, most: Option<i64>) -> Bucket {
+        Bucket {
+            public: false,
+            size_limit: most,
+            mime_types: types.map(|list| list.iter().map(|t| t.to_string()).collect()),
+        }
+    }
+
+    #[test]
+    fn a_list_of_types_covers_a_family_and_ignores_the_parameters() {
+        assert!(mime_matches("text/plain", "text/plain"));
+        assert!(mime_matches("text/plain", "text/plain; charset=utf-8"));
+        assert!(mime_matches("TEXT/PLAIN", "text/plain"));
+        assert!(mime_matches("text/*", "text/csv"));
+        assert!(!mime_matches("text/*", "application/json"));
+        assert!(!mime_matches("text/plain", "text/csv"));
+        // A star for the type rather than for the subtype is not a
+        // shape the reference reads, so it covers nothing but itself.
+        assert!(!mime_matches("*/*", "text/plain"));
+    }
+
+    #[test]
+    fn a_bucket_reads_the_type_before_it_reads_the_length() {
+        let bucket = takes(Some(&["text/plain"]), Some(20));
+        assert!(refused_by(&bucket, &sent("text/plain", 11)).is_none());
+        assert_eq!(
+            refused_by(&bucket, &sent("text/plain", 40)).map(|e| e.code),
+            Some("EntityTooLarge")
+        );
+        // Both wrong, and the type is the one that gets answered.
+        assert_eq!(
+            refused_by(&bucket, &sent("application/json", 40)).map(|e| e.code),
+            Some("InvalidMimeType")
+        );
+        // A bucket that says nothing takes anything.
+        assert!(refused_by(&takes(None, None), &sent("application/json", 40)).is_none());
+        // Exactly the limit is not over it.
+        assert!(refused_by(&takes(None, Some(20)), &sent("text/plain", 20)).is_none());
+    }
 
     #[test]
     fn a_form_is_read_the_way_a_browser_writes_one() {
