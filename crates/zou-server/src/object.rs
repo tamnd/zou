@@ -145,8 +145,15 @@ impl ObjectRow {
     /// `content_type`, `cacheControl` as `cache_control`, `eTag` as
     /// `etag`. The renaming is upstream's and so is the choice of which
     /// of the two metadata columns is called `metadata` here: it is the
-    /// client's, and a client that attached none is answered with an
-    /// empty object rather than a null.
+    /// client's, answered as it stands.
+    ///
+    /// Which is not the same as answering an empty object for a client
+    /// that attached nothing, and the difference is recorded. An
+    /// ordinary upload writes an empty object into the column whether
+    /// or not anything was attached, so it reads back as one; a
+    /// resumable upload writes nothing at all, so it reads back as
+    /// null. If this route decided that for itself, one of those two
+    /// would be wrong.
     fn info(&self) -> String {
         json!({
             "id": self.id,
@@ -159,10 +166,7 @@ impl ObjectRow {
             "content_type": self.meta("mimetype"),
             "etag": self.meta("eTag"),
             "size": self.meta("size"),
-            "metadata": match &self.user_metadata {
-                Value::Null => json!({}),
-                given => given.clone(),
-            },
+            "metadata": self.user_metadata,
         })
         .to_string()
     }
@@ -226,7 +230,7 @@ async fn find(sess: &Session, bucket: &str, name: &str) -> Result<Option<ObjectR
 /// or not the question was answered, because a session that came back
 /// with the policies off would be a session the rest of the request
 /// trusts wrongly.
-async fn unpoliced<T>(
+pub(crate) async fn unpoliced<T>(
     sess: &Session,
     role: &str,
     work: impl AsyncFnOnce() -> Result<T, StorageError>,
@@ -247,14 +251,14 @@ async fn set_role(sess: &Session, role: &str) -> Result<(), StorageError> {
 /// What a bucket says about what may be read from it and written into
 /// it. The three columns every path that touches a bucket wants, read
 /// in the one lookup that was already being made for the first of them.
-struct Bucket {
-    public: bool,
-    size_limit: Option<i64>,
-    mime_types: Option<Vec<String>>,
+pub(crate) struct Bucket {
+    pub(crate) public: bool,
+    pub(crate) size_limit: Option<i64>,
+    pub(crate) mime_types: Option<Vec<String>>,
 }
 
 /// Is there a bucket of this name at all, and what does it say?
-async fn bucket_facts(sess: &Session, id: &str) -> Result<Option<Bucket>, StorageError> {
+pub(crate) async fn bucket_facts(sess: &Session, id: &str) -> Result<Option<Bucket>, StorageError> {
     let rows = sess
         .query(
             "select public, file_size_limit, allowed_mime_types
@@ -1218,10 +1222,10 @@ pub async fn list_v2(
 }
 
 /// The bytes of an upload and what the request said about them.
-struct Upload {
-    bytes: Vec<u8>,
-    mime: String,
-    cache: String,
+pub(crate) struct Upload {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) mime: String,
+    pub(crate) cache: String,
 }
 
 /// What the bucket says about an upload, or nothing if it takes it.
@@ -1257,7 +1261,7 @@ fn refused_by(bucket: &Bucket, upload: &Upload) -> Option<StorageError> {
 /// subtype, and `text/*` covers `text/csv`. Parameters are not part of
 /// the comparison: a browser that says `text/plain; charset=utf-8` is
 /// sending text/plain.
-fn mime_matches(pattern: &str, mime: &str) -> bool {
+pub(crate) fn mime_matches(pattern: &str, mime: &str) -> bool {
     let bare = |text: &str| {
         text.split(';')
             .next()
@@ -1562,7 +1566,7 @@ async fn store(
 /// Returns the id of the row it wrote, having committed it and dropped
 /// whatever bytes it replaced.
 #[allow(clippy::too_many_arguments)]
-async fn write(
+pub(crate) async fn write(
     app: &App,
     sess: Session,
     role: Option<&str>,

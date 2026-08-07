@@ -48,6 +48,7 @@ pub mod smtp;
 pub mod sql;
 pub mod storage;
 pub mod totp;
+pub mod tus;
 
 /// What the front door needs to know: the secret every key and token
 /// must verify against, and where postgres lives when there is one to
@@ -854,6 +855,19 @@ pub fn router(cfg: Config) -> Result<Router, String> {
             "/storage/v1/object/info/public/{bucket}/{*name}",
             get(object::info_public),
         )
+        // Resumable uploads, which are their own protocol rather than
+        // another shape of the object routes above: the answers are
+        // headers, the refusals carry real statuses, and the bucket and
+        // the name are metadata rather than path. Both paths carry a
+        // fallback, because a method the protocol does not define is
+        // answered by upstream's router rather than by axum's, and the
+        // two say different things.
+        //
+        // The options is the one route on this surface asked with no
+        // token at all. A browser sends it before it sends anything
+        // else and sends none of its own headers on it.
+        .route("/storage/v1/upload/resumable", any(tus::endpoint))
+        .route("/storage/v1/upload/resumable/{id}", any(tus::upload))
         .with_state(Arc::clone(&app));
     Ok(Router::new()
         .merge(open)
