@@ -75,6 +75,25 @@ jobs:
               > "/tmp/$schema-schema.sql" || true
             wc -l "/tmp/$schema-schema.sql"
           done
+      # What the database came with, which is not in either schema dump
+      # and is the half of a Supabase database somebody's own migrations
+      # run against. A seed that calls gen_salt or uuid_generate_v4 is
+      # calling something the project installed rather than something
+      # Postgres ships turned on.
+      - name: Keep the extensions and the schemas the reference has
+        run: |
+          docker exec supabase_db_project psql -U postgres -qAtF ' ' -c \
+            "select extname, extnamespace::regnamespace, extversion from pg_extension order by 1" \
+            > /tmp/extensions.txt || true
+          docker exec supabase_db_project psql -U postgres -qAtF ' ' -c \
+            "select nspname from pg_namespace order by 1" \
+            >> /tmp/extensions.txt || true
+          docker exec supabase_db_project psql -U postgres -qAtF ' ' -c \
+            "show search_path" >> /tmp/extensions.txt || true
+          docker exec supabase_db_project psql -U postgres -qAtF ' ' -c \
+            "select rolname, rolconfig from pg_roles where rolconfig is not null order by 1" \
+            >> /tmp/extensions.txt || true
+          cat /tmp/extensions.txt
       # Both servers keep a table of the migrations they have run, and
       # both read it on startup to decide whether they have work to do.
       # zou creates the finished shape in one go, so it has to write
@@ -112,6 +131,7 @@ jobs:
             /tmp/storage-schema.sql
             /tmp/auth-schema.sql
             /tmp/storage-migrations.txt
+            /tmp/extensions.txt
           if-no-files-found: warn
       - name: Keep what the stack was saying
         if: failure()
