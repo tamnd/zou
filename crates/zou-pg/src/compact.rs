@@ -87,6 +87,19 @@ pub enum CompactError {
     Store(#[from] CasError),
 }
 
+/// The read amplification bound (spec 08 section 4): one image plus
+/// four delta runs per shard. GetPage never waits on compaction, so
+/// the bound is enforced by scheduling, a shard past it jumps the
+/// queue no matter whose byte debt is bigger.
+pub const READ_AMP_BOUND: usize = 5;
+
+/// Worst case objects a read on this shard touches: every serving
+/// delta run plus the image, the number the bound caps.
+pub fn read_amp(descs: &[LayerDesc]) -> usize {
+    let image = descs.iter().any(|d| d.kind == LayerKind::Image);
+    descs.iter().filter(|d| d.kind == LayerKind::Delta).count() + usize::from(image)
+}
+
 /// The debt of one shard: bytes of delta above the newest image, what
 /// reads pay for on every lookup until compaction erases it. The
 /// scheduler orders shards by this.
@@ -347,16 +360,29 @@ pub fn compact_shard(
     }))
 }
 
-/// One queue entry: a shard and the debt that ranks it.
+/// One queue entry: a shard, the debt that ranks it, and its read amp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub tenant: String,
     pub shard: u16,
     pub debt: u64,
+    pub amp: usize,
 }
 
-/// Every shard of a tenant with its current debt, worst first: the
-/// queue the scheduler feeds from.
+impl Job {
+    /// Queue order: shards past [`READ_AMP_BOUND`] first, they are
+    /// blown bounds and not mere cost, then the deepest byte debt.
+    fn rank(&self) -> (bool, std::cmp::Reverse<u64>, u16) {
+        (
+            self.amp <= READ_AMP_BOUND,
+            std::cmp::Reverse(self.debt),
+            self.shard,
+        )
+    }
+}
+
+/// Every shard of a tenant ranked worst first: the queue the scheduler
+/// feeds from.
 pub fn debts(store: &dyn CasStore, tenant_ref: &str) -> Result<Vec<Job>, CompactError> {
     let layout = TenantLayout::new(tenant_ref);
     let key = layout.manifest();
@@ -371,9 +397,10 @@ pub fn debts(store: &dyn CasStore, tenant_ref: &str) -> Result<Vec<Job>, Compact
             tenant: tenant_ref.to_string(),
             shard,
             debt: debt(&descs),
+            amp: read_amp(&descs),
         });
     }
-    jobs.sort_by(|a, b| b.debt.cmp(&a.debt).then(a.shard.cmp(&b.shard)));
+    jobs.sort_by_key(Job::rank);
     Ok(jobs)
 }
 
@@ -411,7 +438,7 @@ pub fn run_queue(
         }
     });
     let mut out = results.into_inner().unwrap();
-    out.sort_by(|a, b| b.0.debt.cmp(&a.0.debt).then(a.0.shard.cmp(&b.0.shard)));
+    out.sort_by_key(|(job, _)| job.rank());
     out
 }
 
@@ -671,6 +698,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(m.layers.len(), 1);
+    }
+
+    #[test]
+    fn a_blown_amp_bound_outranks_deeper_byte_debt() {
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        split(&store, "t").unwrap();
+        let (b0, b1) = split_blocks(90);
+        // Settle the split first so each child serves only its own
+        // runs and the amp counts below are not muddied by lineage.
+        for (shard, block) in [(0, b0), (1, b1)] {
+            let mut batch = vec![rec(90, block, 0x100)];
+            put_delta(&store, &layout, shard, &mut batch, 0x100);
+            compact_shard(&store, "t", shard, None, false).unwrap();
+        }
+        assert!(prune_lineage(&store, "t").unwrap());
+
+        // Shard 0 takes one fat run, the deepest byte debt by far.
+        // Shard 1 takes five more tiny runs, blowing the amp bound on
+        // a fraction of the bytes.
+        let mut fat: Vec<DeltaEntry> = (0..200u64).map(|i| rec(90, b0, 0x200 + i)).collect();
+        put_delta(&store, &layout, 0, &mut fat, 0x200 + 199);
+        for i in 0..5u64 {
+            let mut batch = vec![rec(90, b1, 0x200 + i)];
+            put_delta(&store, &layout, 1, &mut batch, 0x200 + i);
+        }
+
+        let jobs = debts(&store, "t").unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(
+            jobs[1].debt > jobs[0].debt,
+            "the byte debt points the other way"
+        );
+        assert_eq!(jobs[0].shard, 1, "the blown bound jumps the queue");
+        assert!(jobs[0].amp > READ_AMP_BOUND, "amp {}", jobs[0].amp);
+
+        // One pass puts the shard back under the bound, and byte debt
+        // ranks the queue again.
+        compact_shard(&store, "t", 1, None, false).unwrap().unwrap();
+        let jobs = debts(&store, "t").unwrap();
+        assert!(jobs.iter().all(|j| j.amp <= READ_AMP_BOUND));
+        assert_eq!(jobs[0].shard, 0);
     }
 
     #[test]

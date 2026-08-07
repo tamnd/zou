@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use zou_log::{
     ConsolidateError, MediaSink, RoundIndex, Sequencer, SequencerConfig, ShardManifest, WalMedia,
-    consolidate, decode_sealed, gc_landing, read_chain_linked, read_round_tenant, round_key,
-    take_over,
+    consolidate, decode_sealed, gc_landing, landing_backlog, read_chain_linked, read_round_tenant,
+    round_key, take_over,
 };
 use zou_store::{CasError, CasStore, Frame2, LocalFsStore, Lsn, Version};
 
@@ -405,4 +405,35 @@ fn gc_honors_the_grace_window_and_the_chain_survives_the_deletions() {
     let got = read_round_tenant(standard.as_ref(), &index, 1).unwrap();
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].payload, b"after failover");
+}
+
+#[test]
+fn the_backlog_gauge_tracks_unconsolidated_bytes_down_to_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, media) = store_in(&dir);
+    let shard = 5;
+    assert_eq!(
+        landing_backlog(&media, shard).unwrap(),
+        0,
+        "a shard that never landed anything owes nothing"
+    );
+
+    let t = take_over(&media, shard, "node-a").unwrap();
+    let seq = resume(&media, shard, t);
+    commit(&seq, vec![vec![frame(1, 100, b"first window")]]);
+    let small = landing_backlog(&media, shard).unwrap();
+    assert!(small > 0, "landed bytes count until a round folds them");
+
+    commit(&seq, vec![vec![frame(1, 112, b"second window")]]);
+    seq.close().unwrap();
+    let grown = landing_backlog(&media, shard).unwrap();
+    assert!(grown > small, "the gauge grows with the chain");
+
+    consolidate(&media, shard).unwrap().unwrap();
+    assert_eq!(
+        landing_backlog(&media, shard).unwrap(),
+        0,
+        "a published round moves the boundary and clears the gauge"
+    );
+    let _ = store;
 }

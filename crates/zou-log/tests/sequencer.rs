@@ -8,8 +8,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use zou_log::{
-    AppendError, MediaSink, SegmentSink, Sequencer, SequencerConfig, WalMedia, decode_segment,
-    read_footer, tenants_digest,
+    AppendError, Backpressure, IngestLag, LagBounds, MediaSink, SegmentSink, Sequencer,
+    SequencerConfig, Throttle, WalMedia, decode_segment, read_footer, tenants_digest,
 };
 use zou_store::{CasError, CasStore, Frame2, LocalFsStore, Lsn};
 
@@ -526,4 +526,79 @@ fn the_media_sink_lands_fenced_objects_on_a_real_store() {
         .wait();
     assert!(matches!(outcome, Err(AppendError::Store { .. })));
     seq2.close().unwrap();
+}
+
+#[test]
+fn the_gate_sheds_the_lagging_tenant_and_only_that_tenant() {
+    let gate = Arc::new(Backpressure::new(LagBounds {
+        ingest_bytes: 1000,
+        ingest_secs: 10,
+        consolidation_bytes: 5000,
+    }));
+    let sink = Arc::new(RecordingSink::default());
+    let config = SequencerConfig {
+        window: Duration::from_millis(5),
+        gate: Some(Arc::clone(&gate)),
+        ..SequencerConfig::default()
+    };
+    let seq = Sequencer::start(0, Arc::clone(&sink) as _, config);
+
+    // Tenant 1's page service reports itself over the ingest bound:
+    // its appends are refused, its neighbor's commit right through.
+    gate.report_ingest(
+        1,
+        IngestLag {
+            bytes: 2000,
+            secs: 0,
+        },
+    );
+    let Err(err) = seq.append(vec![frame(1, 1, 0, b"lagging")]) else {
+        panic!("a throttled tenant got through");
+    };
+    assert!(
+        matches!(
+            err,
+            AppendError::Throttled {
+                tenant: 1,
+                reason: Throttle::IngestBytes { .. }
+            }
+        ),
+        "{err}"
+    );
+    seq.append(vec![frame(2, 1, 0, b"healthy")])
+        .unwrap()
+        .wait()
+        .unwrap();
+
+    // A WAL shard past the consolidation bound is the cell alarm and
+    // refuses everyone, healthy tenants included.
+    gate.report_consolidation(0, 9000);
+    let Err(err) = seq.append(vec![frame(2, 1, 100, b"held")]) else {
+        panic!("the cell alarm let a healthy tenant through");
+    };
+    assert!(
+        matches!(
+            err,
+            AppendError::Throttled {
+                tenant: 2,
+                reason: Throttle::Consolidation { .. }
+            }
+        ),
+        "{err}"
+    );
+
+    // Reports replace, so recovery lifts both throttles and the
+    // delayed commits land: delayed, never lost.
+    gate.report_consolidation(0, 0);
+    gate.report_ingest(1, IngestLag::default());
+    seq.append(vec![frame(1, 1, 100, b"caught up")])
+        .unwrap()
+        .wait()
+        .unwrap();
+    seq.append(vec![frame(2, 1, 200, b"resumed")])
+        .unwrap()
+        .wait()
+        .unwrap();
+    seq.close().unwrap();
+    assert!(!sink.puts.lock().unwrap().is_empty());
 }
