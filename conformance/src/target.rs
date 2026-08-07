@@ -136,7 +136,7 @@ impl Target {
             // Signed rather than carried, and signed after the case's
             // own headers are on the request, so there is nothing to
             // put in front here.
-            Key::S3 | Key::S3WrongSecret | Key::S3WrongKey | Key::None => None,
+            Key::S3 | Key::S3WrongSecret | Key::S3WrongKey | Key::S3WrongRegion | Key::None => None,
         }
     }
 
@@ -317,7 +317,10 @@ impl Target {
                 headers,
                 payload: &payload,
                 stamp: &stamp,
-                region: sigv4::REGION,
+                region: match case.key {
+                    Key::S3WrongRegion => "eu-west-1",
+                    _ => sigv4::REGION,
+                },
             },
             credentials,
         );

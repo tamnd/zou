@@ -28,11 +28,12 @@ use serde::{Deserialize, Serialize};
 /// asked with a signature over the request rather than with a token, so
 /// a case naming one of them is signed by the harness on its way out.
 /// `s3` signs with the pair the target was configured with, and the
-/// other two sign every bit as correctly with a secret or an access key
-/// id that is not it, which is the only way to ask what a wrong
-/// signature earns without hand writing a header whose date has to be
-/// today. A case about a malformed header writes its own
-/// `authorization` under `none` instead.
+/// other three sign every bit as correctly with one field of the
+/// signature wrong: a secret that is not it, an access key id nobody
+/// has, or a region the project is not in. Those exist because a case
+/// about a wrong signature cannot be a hand written header, whose date
+/// would have to be today. A case about a malformed header writes its
+/// own `authorization` under `none` instead.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Key {
@@ -46,6 +47,8 @@ pub enum Key {
     S3WrongSecret,
     #[serde(rename = "s3.wrong-key")]
     S3WrongKey,
+    #[serde(rename = "s3.wrong-region")]
+    S3WrongRegion,
     None,
 }
 
@@ -53,7 +56,10 @@ impl Key {
     /// Whether the harness signs this request rather than putting a
     /// token on it.
     pub fn signs(self) -> bool {
-        matches!(self, Key::S3 | Key::S3WrongSecret | Key::S3WrongKey)
+        matches!(
+            self,
+            Key::S3 | Key::S3WrongSecret | Key::S3WrongKey | Key::S3WrongRegion
+        )
     }
 }
 
