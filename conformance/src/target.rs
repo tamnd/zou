@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use crate::sigv4::{self, Credentials};
 use crate::suite::{Answer, Case, Key};
 
 /// What a case can be asked as.
@@ -33,6 +34,11 @@ pub struct Keys {
     /// first. Signing in would answer with a token, and a case cannot
     /// read the answer to the case before it.
     pub user: Option<String>,
+    /// The pair the S3 surface is asked with, which is not a token and
+    /// is not interchangeable with one. A target without it cannot be
+    /// asked the S3 cases at all, which is the hosted case until
+    /// somebody makes a pair on a throwaway project.
+    pub s3: Option<Credentials>,
 }
 
 pub struct Target {
@@ -127,7 +133,10 @@ impl Target {
             Key::Authenticated => self.keys.authenticated.as_deref(),
             Key::Service => self.keys.service.as_deref(),
             Key::User => self.keys.user.as_deref(),
-            Key::None => None,
+            // Signed rather than carried, and signed after the case's
+            // own headers are on the request, so there is nothing to
+            // put in front here.
+            Key::S3 | Key::S3WrongSecret | Key::S3WrongKey | Key::None => None,
         }
     }
 
@@ -182,6 +191,9 @@ impl Target {
                 .map_err(|e| format!("{}: {}: header {name}: {e}", self.name, case.name))?;
             request.headers_mut().insert(name, value);
         }
+        if case.key.signs() {
+            self.sign(&mut request, case)?;
+        }
         let response = self
             .agent
             .run(request)
@@ -214,6 +226,102 @@ impl Target {
             answer.raw = None;
         }
         Ok(Sent { answer, location })
+    }
+
+    /// Sign a request the way an S3 client would, in place.
+    ///
+    /// After the case's own headers rather than before, for two
+    /// reasons. A case that sets an `x-amz-` header means it to be
+    /// covered by the signature, since that is what a client would do.
+    /// And a case that writes its own `authorization` is a case about a
+    /// signature that is wrong on purpose, so there is nothing to sign.
+    fn sign(&self, request: &mut ureq::http::Request<String>, case: &Case) -> Result<(), String> {
+        let credentials = self.keys.s3.as_ref().ok_or_else(|| {
+            format!(
+                "{}: {}: asked to be signed and this target has no S3 key pair",
+                self.name, case.name
+            )
+        })?;
+        // A wrong pair is the target's own with one field replaced, so
+        // the request is correct in every other way and the answer is
+        // about the credential rather than about the shape of the
+        // header. Which field is replaced is the question: an id
+        // nobody has is a lookup that finds nothing, and a secret that
+        // is not the right one is a signature that does not match.
+        let credentials = match case.key {
+            Key::S3WrongKey => &Credentials {
+                access: "0000000000000000000000000000000a".to_string(),
+                ..credentials.clone()
+            },
+            Key::S3WrongSecret => &Credentials {
+                secret: "0".repeat(credentials.secret.len()),
+                ..credentials.clone()
+            },
+            _ => credentials,
+        };
+        if request.headers().contains_key("authorization") {
+            return Ok(());
+        }
+        let host = self
+            .url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&self.url)
+            .trim_end_matches('/')
+            .to_string();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("{}: reading the clock: {e}", self.name))?
+            .as_secs();
+        let stamp = match request
+            .headers()
+            .get("x-amz-date")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(given) => given.to_string(),
+            None => sigv4::stamp(now),
+        };
+        let payload = match request
+            .headers()
+            .get("x-amz-content-sha256")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(given) => given.to_string(),
+            None => sigv4::hex(&sigv4::sha256(request.body().as_bytes())),
+        };
+        put(request, "x-amz-date", &stamp)?;
+        put(request, "x-amz-content-sha256", &payload)?;
+        let (path, query) = match self.path_of(case).split_once('?') {
+            Some((path, query)) => (encoded(path), query.to_string()),
+            None => (encoded(&self.path_of(case)), String::new()),
+        };
+        // Host and every x-amz- header on the request, which is the set
+        // an unadorned client signs. Lowercased and sorted, because the
+        // server rebuilds this list from what arrived and compares the
+        // two strings.
+        let mut headers = vec![("host".to_string(), host)];
+        for (name, value) in request.headers() {
+            let name = name.as_str().to_ascii_lowercase();
+            if name.starts_with("x-amz-")
+                && let Ok(value) = value.to_str()
+            {
+                headers.push((name, value.to_string()));
+            }
+        }
+        headers.sort();
+        let signed = sigv4::authorization(
+            &sigv4::Request {
+                method: case.method.as_str(),
+                path: &path,
+                query: &query,
+                headers,
+                payload: &payload,
+                stamp: &stamp,
+                region: sigv4::REGION,
+            },
+            credentials,
+        );
+        put(request, "authorization", &signed)
     }
 
     /// The suite's schema, applied to whatever database this target
@@ -389,6 +497,17 @@ fn because(error: &dyn std::error::Error) -> String {
 /// documentation and encoded on the way out, which is what every client
 /// does and what makes the cases readable. Percent signs are left alone,
 /// so a case that means to send an escape can.
+/// One header onto a request that is already built, by the two names
+/// the http crate wants it under.
+fn put(request: &mut ureq::http::Request<String>, name: &str, value: &str) -> Result<(), String> {
+    let name: ureq::http::HeaderName = name.parse().map_err(|e| format!("header {name}: {e}"))?;
+    let value: ureq::http::HeaderValue = value
+        .parse()
+        .map_err(|e| format!("header {name} value: {e}"))?;
+    request.headers_mut().insert(name, value);
+    Ok(())
+}
+
 fn encoded(path: &str) -> String {
     const ESCAPED: &str = " \"<>{}|\\^`";
     let mut out = String::with_capacity(path.len());
