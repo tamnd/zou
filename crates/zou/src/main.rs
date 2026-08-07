@@ -6,6 +6,7 @@ mod dev;
 mod inbox;
 mod info;
 mod inspect;
+mod map;
 mod shard;
 mod stats;
 
@@ -25,6 +26,7 @@ fn usage() -> ExitCode {
     eprintln!("       {}", inspect::USAGE);
     #[cfg(unix)]
     eprintln!("       {}", inbox::USAGE);
+    eprintln!("       {}", map::USAGE);
     eprintln!("       {}", shard::USAGE);
     eprintln!("       {}", stats::USAGE);
     eprintln!("       zou --version");
@@ -79,6 +81,7 @@ fn main() -> ExitCode {
         Some("inbox") => simple(inbox::run(&argv[1..])),
         Some("info") => simple(info::run(&argv[1..])),
         Some("inspect") => simple(inspect::run(&argv[1..])),
+        Some("map") => simple(map::run(&argv[1..])),
         Some("shard") => simple(shard::run(&argv[1..])),
         Some("stats") => simple(stats::run(&argv[1..])),
         _ => usage(),

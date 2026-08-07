@@ -419,6 +419,92 @@ mod tests {
     }
 
     #[test]
+    fn a_getpage_follows_the_map_through_a_wrong_shard_redirect() {
+        use zou_store::placement::{self, MapClient, MapServer, Pin, PlacementError};
+
+        let store = MemStore::default();
+        let layout = TenantLayout::new("t");
+        let images = vec![ImageEntry {
+            key: LayerKey::page(1663, 5, 90, 0, 7),
+            page: page_with(0xD7),
+        }];
+        let (bytes, footer) = build_image(&images, Lsn(100), 4096).unwrap();
+        publish(&store, &layout, &bytes, &footer, 100);
+        let (manifest, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let map = manifest.layer_map().unwrap();
+
+        // Two page nodes, each with its own admission gate in front of
+        // the same shard's service, the way a fleet would stand them
+        // up. The rpc is get_page, the envelope is the map version.
+        placement::publish(&store, |m| {
+            m.nodes = ["a", "b"]
+                .map(|id| zou_store::Node {
+                    id: id.into(),
+                    addr: format!("{id}.cell:6400"),
+                })
+                .to_vec()
+        })
+        .unwrap();
+        let mut client = MapClient::new(&store).unwrap();
+        let owner = client.route("t", 0).unwrap().id.clone();
+        let other = if owner == "a" { "b" } else { "a" }.to_string();
+        let mut gates = [
+            (
+                owner.clone(),
+                MapServer::new(&store, owner.clone()).unwrap(),
+            ),
+            (
+                other.clone(),
+                MapServer::new(&store, other.clone()).unwrap(),
+            ),
+        ];
+        let svc = PageService::for_shard(&store, "t", 0, None, false);
+        let serve = |gates: &mut [(String, MapServer)], node: &str, version: u64| {
+            let gate = &mut gates.iter_mut().find(|(id, _)| id == node).unwrap().1;
+            gate.admit("t", 0, version).map(|v| {
+                let page = svc
+                    .get_page(&map, &Memtable::new(), blk(90, 7), 200)
+                    .unwrap();
+                (v, page)
+            })
+        };
+
+        // Steady state serves through the owner.
+        let (v, page) = serve(&mut gates, &owner, client.version()).unwrap();
+        assert_eq!((v, page[100]), (1, 0xD7));
+
+        // Heat balancing moves the shard. The client is stale, routes
+        // to the old owner, and the redirect alone gets it home: no
+        // coordinator, one extra round trip, same page.
+        placement::publish(&store, |m| {
+            m.pins = vec![Pin {
+                tenant: "t".into(),
+                shard: 0,
+                node: other.clone(),
+            }]
+        })
+        .unwrap();
+        assert_eq!(client.route("t", 0).unwrap().id, owner);
+        // Until the old owner hears about the publish, both sides are
+        // stale and it keeps serving, which is safe: layers are
+        // immutable, the map only decides reroute speed.
+        let (v, page) = serve(&mut gates, &owner, client.version()).unwrap();
+        assert_eq!((v, page[100]), (1, 0xD7));
+        let stale = &mut gates.iter_mut().find(|(id, _)| id == &owner).unwrap().1;
+        stale.refresh().unwrap();
+        let err = serve(&mut gates, &owner, client.version()).unwrap_err();
+        let PlacementError::WrongShard { map_version } = err else {
+            panic!("expected a redirect, got {err}");
+        };
+        client.absorb(map_version).unwrap();
+        assert_eq!(client.route("t", 0).unwrap().id, other);
+        let (v, page) = serve(&mut gates, &other, client.version()).unwrap();
+        assert_eq!((v, page[100]), (2, 0xD7));
+    }
+
+    #[test]
     fn a_chain_without_a_pool_refuses_and_names_the_block() {
         let store = MemStore::default();
         let layout = TenantLayout::new("t");

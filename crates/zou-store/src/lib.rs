@@ -25,6 +25,7 @@ pub mod mem;
 pub mod memtable;
 pub mod open;
 pub mod pageread;
+pub mod placement;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod shardmanifest;
@@ -55,6 +56,7 @@ pub use lsn::Lsn;
 pub use manifest::{MANIFEST_FORMAT, Manifest, ShardChange};
 pub use mem::MemStore;
 pub use open::{PrefixStore, open_store};
+pub use placement::{MAP_FORMAT, MapClient, MapServer, Node, Pin, PlacementError, ShardMap};
 #[cfg(feature = "s3")]
 pub use s3::{Dialect, S3Config, S3Store};
 pub use shardmanifest::{LayerEntry, PAGE_SHARD_FORMAT, PageShardManifest, publish_layer};
