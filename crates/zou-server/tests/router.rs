@@ -379,14 +379,14 @@ async fn the_s3_door_answers_a_request_with_no_key_on_it() {
 #[tokio::test]
 async fn an_s3_call_this_surface_has_no_answer_for_yet_says_so_without_naming_methods() {
     let app = app();
-    // Deleting several keys in one request and starting a multipart
-    // upload are both posts, and both are things the reference does and
-    // this does not yet. A method router would have answered 405 and
-    // offered the verbs that are written, which would read as a claim
-    // that neither is part of the protocol.
+    // Starting a multipart upload and finishing one are both posts, and
+    // both are things the reference does and this does not yet. A method
+    // router would have answered 405 and offered the verbs that are
+    // written, which would read as a claim that neither is part of the
+    // protocol.
     for path in [
-        "/storage/v1/s3/pics?delete",
         "/storage/v1/s3/pics/big?uploads",
+        "/storage/v1/s3/pics/big?uploadId=whichever",
     ] {
         let answer = bare(&app, "POST", path).await;
         assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
