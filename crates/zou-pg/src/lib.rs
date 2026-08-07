@@ -868,7 +868,15 @@ fn local_write(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, blk: u32, da
 /// One durable page put plus its local copies, the v1 write path.
 /// Extends use it even with the page service on: the image a fork
 /// grows with is the base later reconstructions start from.
-fn put_page_eager(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, blk: u32, data: &[u8]) -> i32 {
+fn put_page_eager(
+    shim: &Shim,
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+    blk: u32,
+    data: &[u8],
+) -> i32 {
     match shim
         .store
         .put(&shim.layout.pg_block(spc, db, rel, fork, blk), data)
@@ -1768,17 +1776,12 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
                     log::info!("zou fold: skipped under the page service, redo {redo:#x}");
                     zou_store::manifest::CheckpointKind::Delta
                 } else {
-                    let outcome = match fold::prepare(
-                        &*store,
-                        &layout,
-                        &media,
-                        tenant,
-                        Path::new("."),
-                        redo,
-                    ) {
-                        Ok(outcome) => outcome,
-                        Err(e) => return FoldEnd::Failed(format!("capture: {e}")),
-                    };
+                    let outcome =
+                        match fold::prepare(&*store, &layout, &media, tenant, Path::new("."), redo)
+                        {
+                            Ok(outcome) => outcome,
+                            Err(e) => return FoldEnd::Failed(format!("capture: {e}")),
+                        };
                     {
                         let mut held = held.lock().expect("lease mutex poisoned");
                         match fold::publish(

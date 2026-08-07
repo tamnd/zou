@@ -26,9 +26,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use zou_log::{TeeFilter, WalMedia, catch_up, stream_end};
@@ -137,7 +137,8 @@ impl PageClient {
         let sock = UnixStream::connect(&self.path)
             .map_err(|e| format!("page service at {:?}: connect: {e}", self.path))?;
         let cap = WAIT_CAP + Duration::from_secs(10);
-        sock.set_read_timeout(Some(cap)).map_err(|e| e.to_string())?;
+        sock.set_read_timeout(Some(cap))
+            .map_err(|e| e.to_string())?;
         sock.set_write_timeout(Some(Duration::from_secs(10)))
             .map_err(|e| e.to_string())?;
         Ok(sock)
@@ -171,7 +172,9 @@ fn round_trip(
         let len = u32::from_le_bytes(len).min(64 << 10) as usize;
         let mut msg = vec![0u8; len];
         sock.read_exact(&mut msg)?;
-        return Err(std::io::Error::other(String::from_utf8_lossy(&msg).to_string()));
+        return Err(std::io::Error::other(
+            String::from_utf8_lossy(&msg).to_string(),
+        ));
     }
     let mut pages = Vec::with_capacity(blks.len());
     for _ in blks {
