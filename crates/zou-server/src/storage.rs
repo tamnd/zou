@@ -69,7 +69,7 @@ pub struct StorageError {
     status: u16,
     error: &'static str,
     message: String,
-    code: &'static str,
+    pub(crate) code: &'static str,
 }
 
 impl StorageError {
@@ -129,18 +129,32 @@ impl StorageError {
         }
     }
 
-    /// Not recorded. The suite has no case that sends more than the
-    /// limit, because a fixture that uploaded fifty megabytes would be
-    /// a fixture nobody runs twice. This is the shape storage-api
-    /// answers with and the sentence is its own, but which of the two
-    /// limits a given upload trips is a question for the round that
-    /// adds those cases.
+    /// Recorded, for the smaller of the two limits. A bucket's
+    /// `file_size_limit` earns this, and so does a bucket asking to be
+    /// made with a limit above the one the whole server carries. The
+    /// larger limit, the fifty megabytes a request may weigh at all,
+    /// still has no case: a fixture that uploaded fifty megabytes would
+    /// be a fixture nobody runs twice.
     pub(crate) fn too_large() -> Self {
         StorageError {
             status: 413,
             error: "Payload too large",
             message: "The object exceeded the maximum allowed size".to_string(),
             code: "EntityTooLarge",
+        }
+    }
+
+    /// A type the bucket's list does not cover, named back to the
+    /// caller. The type is the one that was read rather than the one
+    /// that was sent, which shows on an upload carrying no content-type
+    /// at all: nobody said application/octet-stream and that is the
+    /// name in the sentence.
+    pub(crate) fn bad_mime(mime: &str) -> Self {
+        StorageError {
+            status: 415,
+            error: "invalid_mime_type",
+            message: format!("mime type {mime} is not supported"),
+            code: "InvalidMimeType",
         }
     }
 
@@ -616,6 +630,9 @@ pub async fn create(
     // A create with no id takes the name as one. Recorded, and not
     // something the documentation says.
     let id = bucket.id.clone().unwrap_or_else(|| name.clone());
+    if let Some(why) = over_the_ceiling(bucket.file_size_limit) {
+        return Err(why);
+    }
     let sub = verified
         .claims
         .get("sub")
@@ -687,6 +704,16 @@ pub async fn update(
         sets.push(format!("allowed_mime_types = ${}", args.len()));
     }
 
+    // Before the bucket is looked for, which is a guess: the bucket in
+    // the recorded case is there, so nothing says whether a bucket that
+    // is not there and a limit that is too big answers the one or the
+    // other.
+    if bucket.sent("file_size_limit")
+        && let Some(why) = over_the_ceiling(bucket.file_size_limit)
+    {
+        return Err(why);
+    }
+
     let sess = begin(&app, &ctx, false).await?;
     // Asked before the update rather than read off its row count,
     // because a body with nothing in it still owes the caller an answer
@@ -703,6 +730,20 @@ pub async fn update(
         sess.execute(&sql, &args).await.map_err(|e| pg_error(&e))?;
     }
     done(sess, Ok(message("Successfully updated"))).await
+}
+
+/// A bucket may not ask to take more than the server will take at all.
+///
+/// Both routes that write the column check it, because a bucket that
+/// could be made small and then widened to a terabyte would have a
+/// limit only until somebody sent a second request. Recorded on each of
+/// them, and answered with the words an upload over the limit gets
+/// rather than with words about a bucket.
+fn over_the_ceiling(asked: Option<i64>) -> Option<StorageError> {
+    match asked {
+        Some(most) if most > crate::object::UPLOAD_LIMIT as i64 => Some(StorageError::too_large()),
+        _ => None,
+    }
 }
 
 /// The setting storage-api's own deletes turn on.

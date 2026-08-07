@@ -436,6 +436,66 @@ async fn an_upload_onto_a_name_already_taken_leaves_the_first_bytes_alone() {
     );
 }
 
+/// Put limits on a bucket [`fresh`] has already made.
+async fn limited(pool: &Pool, bucket: &str, most: i64, types: &[&str]) {
+    let sess = pool.unscoped().await.expect("unscoped");
+    let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
+    sess.execute(
+        "update storage.buckets
+            set file_size_limit = $2, allowed_mime_types = $3 where id = $1",
+        &[&bucket, &most, &types],
+    )
+    .await
+    .expect("set the limits");
+    sess.commit().await.expect("finish");
+}
+
+#[tokio::test]
+async fn an_upload_a_bucket_refuses_leaves_nothing_behind() {
+    let Some(dsn) = dsn() else { return };
+    let f = fixture(&dsn);
+    fresh(&f.pool, "zou-limits").await;
+    limited(&f.pool, "zou-limits", 20, &["text/plain"]).await;
+
+    // The two refusals are recorded. What is not is what they leave: an
+    // upload is a row and then bytes, and a refusal that happened after
+    // the row would leave a row with nothing behind it, which is the
+    // one state this surface answers 500 for.
+    for (mime, body, code) in [
+        ("application/json", "{\"a\":1}", "InvalidMimeType"),
+        ("text/plain", "x".repeat(40).as_str(), "EntityTooLarge"),
+    ] {
+        let answer = call(
+            &f,
+            "POST",
+            "/storage/v1/object/zou-limits/refused.txt",
+            mime,
+            body,
+        )
+        .await;
+        assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.text());
+        assert_eq!(answer.json()["code"], code);
+        assert_eq!(how_many(&f.pool, "zou-limits").await, 0);
+    }
+
+    // And the one that fits goes in, so the refusals above are the
+    // limits doing their job rather than the bucket refusing everything.
+    let answer = call(
+        &f,
+        "POST",
+        "/storage/v1/object/zou-limits/fits.txt",
+        "text/plain",
+        "hello world",
+    )
+    .await;
+    assert_eq!(answer.status, StatusCode::OK, "{}", answer.text());
+    let (id, version) = row(&f.pool, "zou-limits", "fits.txt").await.expect("a row");
+    assert_eq!(
+        bytes_at(&f, &id, &version).await.as_deref(),
+        Some(&b"hello world"[..]),
+    );
+}
+
 #[tokio::test]
 async fn a_move_leaves_the_bytes_where_they_are() {
     let Some(dsn) = dsn() else { return };
