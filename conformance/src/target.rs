@@ -149,7 +149,7 @@ impl Target {
     /// One case, once. Transport failures come back as an error rather
     /// than as a status, because a target that did not answer is not a
     /// target that answered differently.
-    pub fn send(&self, case: &Case) -> Result<Answer, String> {
+    pub fn send(&self, case: &Case) -> Result<Sent, String> {
         let url = format!("{}{}", self.url, encoded(&self.path_of(case)));
         let mut request = ureq::http::Request::builder()
             .method(case.method.as_str())
@@ -201,6 +201,9 @@ impl Target {
             .read_to_string()
             .map_err(|e| format!("{}: reading the body of {url}: {e}", self.name))?;
         let mut answer = answer(&case.name, status, headers, &raw);
+        // Before anything is named, because the case after this one is
+        // sent to this url rather than to the shape of it.
+        let location = answer.headers.get("location").cloned();
         if !case.volatile.is_empty() {
             crate::volatile::redact(&mut answer.body, &case.volatile);
             crate::volatile::redact_headers(&mut answer.headers, &case.volatile);
@@ -210,7 +213,7 @@ impl Target {
             // answer and keeps the json one.
             answer.raw = None;
         }
-        Ok(answer)
+        Ok(Sent { answer, location })
     }
 
     /// The suite's schema, applied to whatever database this target
@@ -278,6 +281,59 @@ impl Target {
             }
         })
     }
+}
+
+/// What one case came back with: the answer as it is recorded, and the
+/// url it named before anything in it was.
+///
+/// The two are not the same string. A creation answers with a url
+/// carrying an id that was generated a moment ago, so the case naming
+/// it as volatile has that id replaced by the shape of it, and the case
+/// after it still has to be sent to the real one.
+pub struct Sent {
+    pub answer: Answer,
+    pub location: Option<String>,
+}
+
+/// What a case means to go to, when it means to go where the answer
+/// before it pointed.
+pub const FOLLOWS: &str = "{location}";
+
+/// `case`, with [`FOLLOWS`] in its path replaced by the path of the url
+/// `location` names.
+///
+/// The resumable protocol needs this and nothing else in three suites
+/// does. Every request about an upload after the one that made it goes
+/// to a url the server chose, with an id in it no case can know, so a
+/// suite that could not follow a url could ask a creation and nothing
+/// after it. The path is taken and the rest is dropped, because the
+/// reference answers an absolute url built out of the host the request
+/// arrived on and every target is asked on a host of its own.
+///
+/// A case that follows nothing is an error rather than a request to a
+/// url with braces in it, since the case before it having failed is the
+/// usual reason for it and a second failure that says something else
+/// would only hide the first.
+pub fn following(case: &Case, location: Option<&str>) -> Result<Case, String> {
+    if !case.path.contains(FOLLOWS) {
+        return Ok(case.clone());
+    }
+    let Some(location) = location else {
+        return Err(format!(
+            "{}: follows {FOLLOWS}, and the case before it answered no location header",
+            case.name
+        ));
+    };
+    let path = match location.split_once("://") {
+        Some((_, rest)) => match rest.split_once('/') {
+            Some((_, path)) => format!("/{path}"),
+            None => "/".to_string(),
+        },
+        None => location.to_string(),
+    };
+    let mut case = case.clone();
+    case.path = case.path.replace(FOLLOWS, &path);
+    Ok(case)
 }
 
 /// A sql file, applied to a database over one connection.
@@ -478,6 +534,40 @@ mod tests {
     #[test]
     fn a_percent_that_is_already_there_is_left_alone() {
         assert_eq!(encoded("/p?title=like.%2A"), "/p?title=like.%2A");
+    }
+
+    /// The reference answers an absolute url and every target is asked
+    /// on a host of its own, so only the path survives.
+    #[test]
+    fn a_case_that_follows_a_url_is_sent_to_the_path_of_it() {
+        let case = case("{location}");
+        let at = "http://127.0.0.1:54321/storage/v1/upload/resumable/bm90ZXM";
+        assert_eq!(
+            following(&case, Some(at)).expect("follows").path,
+            "/storage/v1/upload/resumable/bm90ZXM"
+        );
+    }
+
+    /// A location that is already a path is one, since nothing says a
+    /// server has to send the other kind.
+    #[test]
+    fn a_location_that_is_already_a_path_is_used_as_it_stands() {
+        let at = "/storage/v1/upload/resumable/bm90ZXM";
+        assert_eq!(
+            following(&case("{location}"), Some(at)).expect("follows").path,
+            at
+        );
+    }
+
+    #[test]
+    fn a_case_that_follows_nothing_is_an_error_rather_than_a_request() {
+        assert!(following(&case("{location}"), None).is_err());
+        assert_eq!(
+            following(&case("/storage/v1/bucket"), None)
+                .expect("nothing to follow")
+                .path,
+            "/storage/v1/bucket"
+        );
     }
 
     /// Prefixes come off whole. A path that merely starts with the same
