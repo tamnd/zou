@@ -59,8 +59,16 @@ pub enum RegistryError {
         "{tenant_ref:?} is not a usable ref: {why}. A ref is a hostname label, so it is 1 to {REF_MAX} of a to z, 0 to 9 and hyphen, starting and ending with a letter or a digit"
     )]
     BadRef { tenant_ref: String, why: String },
+    #[error(
+        "{host:?} is not a usable hostname: {why}. It is a DNS name, so it is labels of a to z, 0 to 9 and hyphen joined by dots"
+    )]
+    BadHost { host: String, why: String },
     #[error("tenant {tenant_ref} is already registered")]
     Exists { tenant_ref: String },
+    #[error("{host} is already claimed by another tenant")]
+    HostTaken { host: String },
+    #[error("{host} belongs to {tenant_ref}, not to the tenant asking")]
+    HostElsewhere { host: String, tenant_ref: String },
     #[error("no tenant {tenant_ref} on this store")]
     Missing { tenant_ref: String },
     #[error("invalid registry json for {tenant_ref}: {source}")]
@@ -211,6 +219,158 @@ pub fn list(store: &dyn CasStore) -> Result<Vec<String>, RegistryError> {
     Ok(refs)
 }
 
+/// The longest a hostname may be, the DNS limit.
+pub const HOST_MAX: usize = 253;
+
+/// One custom hostname, pointing at the tenant that claimed it.
+///
+/// A separate object rather than a scan of every entry's `hosts` list,
+/// for the same reason the entries are one per tenant: resolving a host
+/// is on the request path and has to be one GET, and claiming one has
+/// to be a conditional write so that two projects cannot both end up
+/// owning `api.example.com`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Alias {
+    pub format: u32,
+    pub host: String,
+    #[serde(rename = "ref")]
+    pub tenant_ref: String,
+}
+
+/// Where one custom hostname lives. Not under `registry/`, so that
+/// listing the tenants cannot ever turn a hostname into something that
+/// looks like a ref.
+pub fn host_key(host: &str) -> String {
+    format!("hosts/{host}.json")
+}
+
+/// A hostname is checked the way a ref is, and for the same reason: a
+/// name that DNS cannot carry is a name a project can claim and never
+/// be reached on.
+///
+/// It must have a dot in it. A bare label under no domain would be
+/// ambiguous with the labels a wildcard domain already routes, and
+/// nothing good comes of a custom host that shadows a ref.
+pub fn check_host(host: &str) -> Result<(), RegistryError> {
+    let bad = |why: &str| RegistryError::BadHost {
+        host: host.to_string(),
+        why: why.to_string(),
+    };
+    if host.is_empty() || host.len() > HOST_MAX {
+        return Err(bad("it is empty or longer than a hostname may be"));
+    }
+    if !host.contains('.') {
+        return Err(bad("it has no dot in it, so it is a label and not a host"));
+    }
+    for label in host.split('.') {
+        if label.is_empty() || label.len() > REF_MAX {
+            return Err(bad("one of its labels is empty or too long"));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(bad("one of its labels starts or ends with a hyphen"));
+        }
+        if let Some(c) = label
+            .chars()
+            .find(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && *c != '-')
+        {
+            return Err(bad(&format!("{c:?} is not allowed in a hostname")));
+        }
+    }
+    Ok(())
+}
+
+/// Point a hostname at a tenant.
+///
+/// Conditional on the hostname being unclaimed, so the first project to
+/// ask for `api.example.com` is the one that has it, and a second is
+/// told rather than quietly taking it over. Asking twice for a host a
+/// tenant already owns is not an error, because an operator rerunning a
+/// script should not have to care.
+///
+/// The alias is written before the entry is updated. Both orders leave
+/// something behind on a crash and this is the harmless one: an alias
+/// with no mention in the entry still routes, while an entry claiming a
+/// host with no alias would route nowhere and read as a bug.
+pub fn add_host(store: &dyn CasStore, tenant_ref: &str, host: &str) -> Result<(), RegistryError> {
+    check_host(host)?;
+    let Some(mut entry) = get(store, tenant_ref)? else {
+        return Err(RegistryError::Missing {
+            tenant_ref: tenant_ref.to_string(),
+        });
+    };
+    let alias = Alias {
+        format: REGISTRY_FORMAT,
+        host: host.to_string(),
+        tenant_ref: tenant_ref.to_string(),
+    };
+    let mut body = serde_json::to_vec_pretty(&alias).expect("an alias serializes");
+    body.push(b'\n');
+    match store.put_if_absent(&host_key(host), &body) {
+        Ok(_) => {}
+        Err(CasError::Conflict { .. }) | Err(CasError::AlreadyExists { .. }) => {
+            match host_ref(store, host)? {
+                Some(owner) if owner == tenant_ref => {}
+                _ => {
+                    return Err(RegistryError::HostTaken {
+                        host: host.to_string(),
+                    });
+                }
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    if !entry.hosts.iter().any(|h| h == host) {
+        entry.hosts.push(host.to_string());
+        entry.hosts.sort();
+        store.put(&entry_key(tenant_ref), &entry.to_json())?;
+    }
+    Ok(())
+}
+
+/// Stop a hostname routing anywhere, refusing to take one off a tenant
+/// that does not own it.
+pub fn remove_host(
+    store: &dyn CasStore,
+    tenant_ref: &str,
+    host: &str,
+) -> Result<(), RegistryError> {
+    match host_ref(store, host)? {
+        Some(owner) if owner == tenant_ref => store.delete(&host_key(host))?,
+        Some(owner) => {
+            return Err(RegistryError::HostElsewhere {
+                host: host.to_string(),
+                tenant_ref: owner,
+            });
+        }
+        None => {}
+    }
+    if let Some(mut entry) = get(store, tenant_ref)?
+        && entry.hosts.iter().any(|h| h == host)
+    {
+        entry.hosts.retain(|h| h != host);
+        store.put(&entry_key(tenant_ref), &entry.to_json())?;
+    }
+    Ok(())
+}
+
+/// Which tenant a hostname belongs to, in one GET. This is the routing
+/// path for every project on its own domain.
+pub fn host_ref(store: &dyn CasStore, host: &str) -> Result<Option<String>, RegistryError> {
+    let Some((data, _)) = store.get(&host_key(host))? else {
+        return Ok(None);
+    };
+    let alias: Alias = serde_json::from_slice(&data).map_err(|source| RegistryError::Json {
+        tenant_ref: host.to_string(),
+        source,
+    })?;
+    match alias.format > REGISTRY_FORMAT {
+        true => Err(RegistryError::FormatTooNew {
+            found: alias.format,
+        }),
+        false => Ok(Some(alias.tenant_ref)),
+    }
+}
+
 /// Take a tenant off the registry.
 ///
 /// This removes the entry and nothing else. The database and the files
@@ -224,6 +384,17 @@ pub fn delete(store: &dyn CasStore, tenant_ref: &str) -> Result<(), RegistryErro
         return Err(RegistryError::Missing {
             tenant_ref: tenant_ref.to_string(),
         });
+    }
+    // The aliases go with it. They are not the project's data, they
+    // are pointers at a pointer, and one left behind is a hostname
+    // nobody can reclaim because the tenant that owned it is gone.
+    for host in get(store, tenant_ref)?
+        .map(|entry| entry.hosts)
+        .unwrap_or_default()
+    {
+        if host_ref(store, &host)?.as_deref() == Some(tenant_ref) {
+            store.delete(&host_key(&host))?;
+        }
     }
     store.delete(&entry_key(tenant_ref))?;
     Ok(())
@@ -333,5 +504,112 @@ mod tests {
             .unwrap();
         let err = get(&store, "acme-prod").unwrap_err();
         assert!(matches!(err, RegistryError::FormatTooNew { .. }));
+    }
+
+    #[test]
+    fn a_host_points_at_the_tenant_that_claimed_it() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        add_host(&store, "acme-prod", "api.example.com").unwrap();
+        assert_eq!(
+            host_ref(&store, "api.example.com").unwrap().as_deref(),
+            Some("acme-prod")
+        );
+        assert_eq!(
+            get(&store, "acme-prod").unwrap().unwrap().hosts,
+            vec!["api.example.com".to_string()],
+            "and the entry says which hosts it has, so they can be cleaned up"
+        );
+    }
+
+    #[test]
+    fn the_first_tenant_to_ask_for_a_host_keeps_it() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        create(&store, &tenant("beta-co")).unwrap();
+        add_host(&store, "acme-prod", "api.example.com").unwrap();
+        let err = add_host(&store, "beta-co", "api.example.com").unwrap_err();
+        assert!(matches!(err, RegistryError::HostTaken { .. }), "{err}");
+        assert_eq!(
+            host_ref(&store, "api.example.com").unwrap().as_deref(),
+            Some("acme-prod"),
+            "and it still points where it did"
+        );
+    }
+
+    #[test]
+    fn claiming_a_host_twice_is_not_an_error_for_the_tenant_that_has_it() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        add_host(&store, "acme-prod", "api.example.com").unwrap();
+        add_host(&store, "acme-prod", "api.example.com").unwrap();
+        assert_eq!(
+            get(&store, "acme-prod").unwrap().unwrap().hosts.len(),
+            1,
+            "an operator rerunning a script should not have to care"
+        );
+    }
+
+    #[test]
+    fn a_host_can_be_taken_back_only_by_its_owner() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        create(&store, &tenant("beta-co")).unwrap();
+        add_host(&store, "acme-prod", "api.example.com").unwrap();
+        let err = remove_host(&store, "beta-co", "api.example.com").unwrap_err();
+        assert!(matches!(err, RegistryError::HostElsewhere { .. }), "{err}");
+        remove_host(&store, "acme-prod", "api.example.com").unwrap();
+        assert!(host_ref(&store, "api.example.com").unwrap().is_none());
+        assert!(get(&store, "acme-prod").unwrap().unwrap().hosts.is_empty());
+    }
+
+    #[test]
+    fn unregistering_a_tenant_frees_its_hosts() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        add_host(&store, "acme-prod", "api.example.com").unwrap();
+        delete(&store, "acme-prod").unwrap();
+        assert!(
+            host_ref(&store, "api.example.com").unwrap().is_none(),
+            "or the name is claimed forever by a tenant that is not there"
+        );
+        create(&store, &tenant("beta-co")).unwrap();
+        add_host(&store, "beta-co", "api.example.com").unwrap();
+    }
+
+    #[test]
+    fn a_host_that_dns_could_not_carry_is_refused() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        for host in [
+            "",
+            "nodot",
+            "UPPER.example.com",
+            "-lead.example.com",
+            "trail-.example.com",
+            "two..dots.com",
+            "under_score.example.com",
+        ] {
+            let err = add_host(&store, "acme-prod", host).unwrap_err();
+            assert!(
+                matches!(err, RegistryError::BadHost { .. }),
+                "{host}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_cannot_be_claimed_for_a_tenant_that_is_not_registered() {
+        let store = MemStore::new();
+        let err = add_host(&store, "acme-prod", "api.example.com").unwrap_err();
+        assert!(matches!(err, RegistryError::Missing { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_hostname_is_not_a_ref_when_the_tenants_are_listed() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        add_host(&store, "acme-prod", "api.example.com").unwrap();
+        assert_eq!(list(&store).unwrap(), vec!["acme-prod".to_string()]);
     }
 }

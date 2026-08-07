@@ -27,9 +27,10 @@ use axum::http::{Request, StatusCode, Uri, header};
 use axum::response::Response;
 use axum::routing::any;
 use tower::ServiceExt as _;
+use zou_store::registry::Tenant;
 
 use crate::attach::Attached;
-use crate::tenant::{Registry, Routing};
+use crate::tenant::{Found, Registry, Routing};
 
 struct Front {
     routing: Routing,
@@ -58,17 +59,11 @@ async fn dispatch(State(front): State<Arc<Front>>, mut req: Request<Body>) -> Re
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
         .map(|h| h.to_string());
-    let Some(found) = front.routing.resolve(host.as_deref(), req.uri().path()) else {
-        return crate::kong_no_route();
-    };
-    // A registered ref that will not answer and a ref that was never
-    // registered are different failures and are told apart: one is the
-    // caller's mistake and the other is ours.
-    let entry = match front.registry.get(&found.tenant_ref).await {
-        Ok(Some(entry)) => entry,
+    let (entry, found) = match tenant(&front, host.as_deref(), req.uri().path()).await {
+        Ok(Some(both)) => both,
         Ok(None) => return crate::kong_no_route(),
         Err(e) => {
-            log::warn!("registry lookup for {}: {e}", found.tenant_ref);
+            log::warn!("registry lookup: {e}");
             return unavailable("the tenant registry could not be read");
         }
     };
@@ -89,6 +84,51 @@ async fn dispatch(State(front): State<Arc<Front>>, mut req: Request<Body>) -> Re
         Ok(answer) => answer,
         Err(never) => match never {},
     }
+}
+
+/// Which tenant, in the order the answers get more expensive.
+///
+/// A label under a serve domain is a parse and costs nothing, so it is
+/// first. A custom hostname is a lookup, so it is second, and it is
+/// only reached by a host the serve domains did not claim, which means
+/// adding custom domains to a fleet costs its existing tenants nothing.
+/// A path prefix is a parse too, but it is last, because a request that
+/// named a tenant by host has already said which one it means and a
+/// path segment does not get to argue.
+///
+/// None is nobody, and nobody is a 404 without a database being
+/// started for it.
+async fn tenant(
+    front: &Front,
+    host: Option<&str>,
+    path: &str,
+) -> Result<Option<(Tenant, Found)>, String> {
+    if let Some(tenant_ref) = host.and_then(|h| front.routing.label(h)) {
+        let entry = front.registry.get(&tenant_ref).await?;
+        return Ok(entry.map(|entry| {
+            (
+                entry,
+                Found {
+                    tenant_ref,
+                    path: path.to_string(),
+                },
+            )
+        }));
+    }
+    if let Some(host) = host
+        && let Some(entry) = front.registry.by_host(host).await?
+    {
+        let found = Found {
+            tenant_ref: entry.tenant_ref.clone(),
+            path: path.to_string(),
+        };
+        return Ok(Some((entry, found)));
+    }
+    let Some(found) = front.routing.segment(path) else {
+        return Ok(None);
+    };
+    let entry = front.registry.get(&found.tenant_ref).await?;
+    Ok(entry.map(|entry| (entry, found)))
 }
 
 /// The same url with a different path, query kept. None only if the
@@ -247,6 +287,43 @@ mod tests {
             backend.up.lock().unwrap().is_empty(),
             "nothing was started for any of them"
         );
+    }
+
+    #[tokio::test]
+    async fn a_project_on_its_own_domain_is_found_by_lookup() {
+        let (dir, backend, router) = hosted();
+        let store: Arc<dyn CasStore> =
+            Arc::from(open_store(&dir.path().to_string_lossy()).expect("a store opens"));
+        registry::add_host(store.as_ref(), "beta-co", "api.example.com").expect("it claims one");
+        let (status, body) = call(
+            &router,
+            "api.example.com",
+            "/auth/v1/health",
+            Some(&anon("beta-co")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(backend.up.lock().unwrap().clone(), vec!["beta-co"]);
+        let (status, _) = call(
+            &router,
+            "api.example.com",
+            "/auth/v1/health",
+            Some(&anon("acme-prod")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a custom domain is the same tenant with the same secret, not a looser door"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_domain_nobody_claimed_is_still_nobody() {
+        let (_d, backend, router) = hosted();
+        let (status, _) = call(&router, "api.example.com", "/auth/v1/health", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(backend.up.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
