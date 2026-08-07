@@ -72,10 +72,29 @@ async fn bare(app: &axum::Router, method: &str, path: &str) -> Answer {
     send(app, method, path, false).await
 }
 
+/// A request carrying one header and no key, which on the S3 surface is
+/// the difference between two requests that share a verb and a route.
+async fn carrying(app: &axum::Router, method: &str, path: &str, header: (&str, &str)) -> Answer {
+    sent(app, method, path, false, Some(header)).await
+}
+
 async fn send(app: &axum::Router, method: &str, path: &str, key: bool) -> Answer {
+    sent(app, method, path, key, None).await
+}
+
+async fn sent(
+    app: &axum::Router,
+    method: &str,
+    path: &str,
+    key: bool,
+    header: Option<(&str, &str)>,
+) -> Answer {
     let mut req = Request::builder().method(method).uri(path);
     if key {
         req = req.header("apikey", anon_key());
+    }
+    if let Some((name, value)) = header {
+        req = req.header(name, value);
     }
     let res = app
         .clone()
@@ -379,23 +398,22 @@ async fn the_s3_door_answers_a_request_with_no_key_on_it() {
 #[tokio::test]
 async fn an_s3_call_this_surface_has_no_answer_for_yet_says_so_without_naming_methods() {
     let app = app();
-    // Starting a multipart upload and finishing one are both posts, and
-    // both are things the reference does and this does not yet. A method
-    // router would have answered 405 and offered the verbs that are
-    // written, which would read as a claim that neither is part of the
-    // protocol.
-    for path in [
-        "/storage/v1/s3/pics/big?uploads",
-        "/storage/v1/s3/pics/big?uploadId=whichever",
-    ] {
-        let answer = bare(&app, "POST", path).await;
-        assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
-        assert_eq!(answer.allow, "", "{path}");
-        assert_eq!(
-            answer.message(),
-            "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
-        );
-    }
+    // A piece of an upload whose bytes are some other key's, which is a
+    // request the reference answers and this does not yet. It is a put
+    // that names an upload and a source at once, so the three puts on
+    // this route are told apart by a header and a pair of parameters
+    // and not by anything a router could dispatch on. A method router
+    // would have answered 405 and offered the verbs that are written,
+    // which would read as a claim that a copy into a piece is not part
+    // of the protocol.
+    let path = "/storage/v1/s3/pics/big?partNumber=1&uploadId=whichever";
+    let answer = carrying(&app, "PUT", path, ("x-amz-copy-source", "pics/small")).await;
+    assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(answer.allow, "");
+    assert_eq!(
+        answer.message(),
+        "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
+    );
 }
 
 #[tokio::test]

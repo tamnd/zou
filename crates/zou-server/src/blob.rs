@@ -100,6 +100,23 @@ pub fn part_key(id: &str, part: i32) -> String {
     format!("uploads/{id}/{part}")
 }
 
+/// Where one piece of a multipart upload lives until the pieces are put
+/// together.
+///
+/// The same prefix the resumable parts use, since both are bytes an
+/// upload is holding and neither is an object yet. The upload ids
+/// cannot collide: one is a uuid and the other is base64url of what a
+/// client never sees.
+///
+/// Named by the row rather than by the number on it, because a client
+/// that sends the same number twice has sent two pieces and the second
+/// does not replace the first. Which of them the object is made of is
+/// decided later, by the etag the completion names, and both have to
+/// still be there for that to be a decision. Recorded.
+pub fn piece_key(upload: &str, part: &str) -> String {
+    format!("uploads/{upload}/{part}")
+}
+
 /// Run a store call off the async threads.
 ///
 /// A join error means the pool is going down or the call panicked, and
