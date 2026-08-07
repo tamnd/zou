@@ -14,8 +14,11 @@
 //! out to page services and replicas through the [`mod@tee`], with
 //! catch up served from the sealed rounds. Durability itself sits
 //! behind [`SegmentSink`], so the same sequencer runs over the sealed
-//! chain, a plain CAS store, or a test double.
+//! chain, a plain CAS store, or a test double. The lag bounds of spec
+//! 08 section 4 live in [`mod@backpressure`] and are enforced at
+//! append admission.
 
+pub mod backpressure;
 pub mod chain;
 pub mod consolidate;
 pub mod media;
@@ -24,13 +27,17 @@ pub mod segment;
 pub mod sequencer;
 pub mod tee;
 
+pub use backpressure::{
+    Backpressure, CONSOLIDATION_BEHIND_BYTES, INGEST_BEHIND_BYTES, INGEST_BEHIND_SECS, IngestLag,
+    LagBounds, Throttle,
+};
 pub use chain::{
     ChainError, ChainSegment, RoundRange, SHARD_MANIFEST_FORMAT, ShardManifest, Takeover,
     chain_head, manifest_key, read_chain, read_chain_linked, segment_key, take_over,
 };
 pub use consolidate::{
     ConsolidateError, ConsolidateOutcome, ROUND_INDEX_FORMAT, RoundChunk, RoundIndex, RoundTenant,
-    consolidate, gc_landing, read_round_tenant, round_key,
+    consolidate, gc_landing, landing_backlog, read_round_tenant, round_key,
 };
 pub use media::{DEFAULT_HEDGE_AFTER, DurabilityMode, MediaSink, SealOutcome, WalMedia};
 pub use sealed::{

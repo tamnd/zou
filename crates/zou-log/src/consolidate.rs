@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use zou_store::{CasError, CasStore, Frame2, Frame2Stream};
 
 use crate::chain::{
-    ChainError, RoundRange, SHARD_MANIFEST_FORMAT, ShardManifest, digest_of_segment,
+    ChainError, RoundRange, SHARD_MANIFEST_FORMAT, ShardManifest, chain_head, digest_of_segment,
     read_chain_linked,
 };
 use crate::media::WalMedia;
@@ -368,6 +368,30 @@ fn publish(
         Err(CasError::Conflict { .. }) => Err(ConsolidateError::Raced { shard: next.shard }),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Bytes of landing chain sitting past the consolidated boundary, the
+/// consolidation lag gauge of spec 08 section 4. The runner measures
+/// this on its cadence and reports it into
+/// [`Backpressure`](crate::Backpressure), which bumps the worst shard
+/// to the front and, past the bound, throttles the cell's appends.
+/// Fetches every unconsolidated segment to size it, so this belongs on
+/// the runner's clock, never near the commit path; the segments it
+/// reads are the ones the next round reads anyway.
+pub fn landing_backlog(media: &WalMedia, shard: u32) -> Result<u64, ConsolidateError> {
+    let store = media.manifest_store();
+    let Some((manifest, _)) = ShardManifest::load(store.as_ref(), shard)? else {
+        return Ok(0);
+    };
+    let floor = manifest.head.max(manifest.consolidated_upto);
+    let head = chain_head(media, shard, floor)?;
+    let mut backlog = 0u64;
+    for seq in manifest.consolidated_upto + 1..=head {
+        if let Some(bytes) = media.fetch(shard, seq)? {
+            backlog += bytes.len() as u64;
+        }
+    }
+    Ok(backlog)
 }
 
 /// Delete landing segments covered by rounds older than the grace

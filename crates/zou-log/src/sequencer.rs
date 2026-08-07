@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 
 use zou_store::{CasError, Frame2, Lsn};
 
+use crate::backpressure::{Backpressure, Throttle};
 use crate::segment::{SegmentBuilder, SegmentHeader, SegmentKind, tenants_digest};
 use crate::tee::Tee;
 
@@ -74,6 +75,12 @@ pub struct SequencerConfig {
     /// publishing never blocks or fails the flush: durability does not
     /// depend on it.
     pub tee: Option<Arc<Tee>>,
+    /// The cell's lag gauge board (spec 08 section 4). With a gate set,
+    /// an append from a tenant over its ingest bound, or any append
+    /// while a WAL shard is past the consolidation bound, is refused
+    /// with [`AppendError::Throttled`] before anything is staged. None
+    /// admits everything, the mode for tests and single role tools.
+    pub gate: Option<Arc<Backpressure>>,
 }
 
 impl Default for SequencerConfig {
@@ -84,6 +91,7 @@ impl Default for SequencerConfig {
             batch_frames: 4096,
             inflight: 16,
             tee: None,
+            gate: None,
         }
     }
 }
@@ -94,6 +102,11 @@ pub enum AppendError {
     /// nothing from the rejected append was staged.
     #[error("stale writer epoch for tenant {tenant:#x}, current is {current}")]
     WrongEpoch { tenant: u128, current: u32 },
+    /// A lag bound of spec 08 section 4 is blown and admission is
+    /// shedding this tenant's writes. Nothing was staged; the compute
+    /// backs off and retries, so the commit is delayed, never lost.
+    #[error("tenant {tenant:#x} is throttled: {reason}")]
+    Throttled { tenant: u128, reason: Throttle },
     /// The landing PUT for the batch this append was staged in failed.
     /// Nothing was acked; the compute retries on the successor.
     #[error("landing put failed, the shard needs takeover: {source}")]
@@ -300,6 +313,7 @@ fn put_worker(
 /// [`Sequencer::close`] drains every staged window before they exit.
 pub struct Sequencer {
     shared: Arc<Shared>,
+    gate: Option<Arc<Backpressure>>,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -357,13 +371,18 @@ impl Sequencer {
                 put_worker(&rx, &*sink, &shared, &lander)
             }));
         }
+        let gate = config.gate.clone();
         {
             let shared = Arc::clone(&shared);
             handles.push(std::thread::spawn(move || {
                 flusher_loop(&shared, shard, &config, tx, &lander)
             }));
         }
-        Self { shared, handles }
+        Self {
+            shared,
+            gate,
+            handles,
+        }
     }
 
     /// Stage frames for the batch in flight and return the ticket that
@@ -399,6 +418,20 @@ impl Sequencer {
                     tenant: s.frame.tenant,
                     current,
                 });
+            }
+        }
+        // Admission by the lag gauges, after the epoch check so a
+        // fenced writer learns it is stale, not merely slow. One
+        // refused tenant refuses the whole append, and nothing was
+        // staged, matching the atomic admit or reject rule above.
+        if let Some(gate) = &self.gate {
+            for s in &staged {
+                if let Err(reason) = gate.admit(s.frame.tenant) {
+                    return Err(AppendError::Throttled {
+                        tenant: s.frame.tenant,
+                        reason,
+                    });
+                }
             }
         }
         for s in &staged {

@@ -160,6 +160,15 @@ impl ShardIngest {
         self.applied
     }
 
+    /// How far ingest trails the durable end of the tenant's WAL, the
+    /// bytes half of the spec 08 section 4 ingest bound. The driver
+    /// reports the worst shard's lag into the cell's
+    /// [`Backpressure`](zou_log::Backpressure) so the sequencer can
+    /// throttle this tenant, and only this tenant, past 1 GB.
+    pub fn lag(&self, durable_end: u64) -> u64 {
+        durable_end.saturating_sub(self.applied)
+    }
+
     pub fn memtable(&self) -> &Memtable {
         &self.mem
     }
@@ -557,6 +566,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(manifest.layers.len(), 1);
+    }
+
+    #[test]
+    fn lag_measures_bytes_behind_the_durable_end_without_underflow() {
+        let ingest = ShardIngest::new(cfg(0), WAL_BASE);
+        assert_eq!(ingest.lag(WAL_BASE + 500), 500);
+        assert_eq!(ingest.lag(WAL_BASE), 0);
+        assert_eq!(
+            ingest.lag(0),
+            0,
+            "a durable end behind the resume point reads as caught up"
+        );
     }
 
     #[test]
