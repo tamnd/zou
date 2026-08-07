@@ -85,7 +85,13 @@ pub struct Target {
 /// not compared as a date is: an object with different bytes has a
 /// different one and an object with the same bytes has the same one on
 /// every run and every machine.
-pub const COMPARED: [&str; 18] = [
+/// `x-transformations` is here because it is the only place a render
+/// answer says what it did. The picture is compared as dimensions and a
+/// format rather than as bytes, since two encoders never agree, so this
+/// header is what turns a resize that happened to come out the right
+/// size into a resize that was asked for the right way. storage-js has
+/// a test that reads it, which is how it was noticed at all.
+pub const COMPARED: [&str; 19] = [
     "allow",
     "content-profile",
     "content-range",
@@ -95,6 +101,7 @@ pub const COMPARED: [&str; 18] = [
     "preference-applied",
     "retry-after",
     "www-authenticate",
+    "x-transformations",
     "tus-extension",
     "tus-max-size",
     "tus-resumable",
@@ -186,7 +193,16 @@ impl Target {
                 .header("apikey", key)
                 .header("authorization", format!("Bearer {key}"));
         }
-        let body = case.body.clone().unwrap_or_default();
+        // Bytes rather than text, because an upload of an image is a
+        // body that is not a string. A case that names neither sends
+        // nothing, which is not the same as sending an empty string on
+        // a method that carries a body, and ureq spells both the same
+        // way.
+        let body: Vec<u8> = match (&case.bytes, &case.body) {
+            (Some(bytes), _) => bytes.clone(),
+            (None, Some(text)) => text.clone().into_bytes(),
+            (None, None) => Vec::new(),
+        };
         let mut request = request
             .body(body)
             .map_err(|e| format!("{}: building {} {}: {e}", self.name, case.method, url))?;
@@ -230,15 +246,32 @@ impl Target {
                 headers.insert(name.to_string(), value.clone());
             }
         }
-        let raw = response
+        let bytes = response
             .into_body()
-            .read_to_string()
+            .read_to_vec()
             .map_err(|e| format!("{}: reading the body of {url}: {e}", self.name))?;
-        // Before anything is named, because the case after this one is
-        // sent to the id this one answered rather than to the shape of
-        // it.
-        let held = holding(case, &all, &raw);
-        let mut answer = answer(&case.name, status, headers, &raw);
+        // Holding first, because the case after this one is sent to the
+        // id this one answered rather than to the shape of it. A body
+        // that is not text holds from its headers and from nothing
+        // else, which is what the empty string leaves working: the two
+        // things a case can read out of a body are an xml element and a
+        // location, and an image has neither.
+        let (held, mut answer) = match text(&all, &bytes) {
+            Some(raw) => (
+                holding(case, &all, raw),
+                answer(&case.name, status, headers, raw),
+            ),
+            None => (
+                holding(case, &all, ""),
+                Answer {
+                    name: case.name.clone(),
+                    status,
+                    headers,
+                    body: crate::binary::describe(&bytes),
+                    raw: None,
+                },
+            ),
+        };
         if !case.volatile.is_empty() {
             crate::volatile::redact(&mut answer.body, &case.volatile);
             crate::volatile::redact_headers(&mut answer.headers, &case.volatile);
@@ -258,7 +291,7 @@ impl Target {
     /// covered by the signature, since that is what a client would do.
     /// And a case that writes its own `authorization` is a case about a
     /// signature that is wrong on purpose, so there is nothing to sign.
-    fn sign(&self, request: &mut ureq::http::Request<String>, case: &Case) -> Result<(), String> {
+    fn sign(&self, request: &mut ureq::http::Request<Vec<u8>>, case: &Case) -> Result<(), String> {
         let credentials = self.keys.s3.as_ref().ok_or_else(|| {
             format!(
                 "{}: {}: asked to be signed and this target has no S3 key pair",
@@ -310,7 +343,7 @@ impl Target {
             .and_then(|v| v.to_str().ok())
         {
             Some(given) => given.to_string(),
-            None => sigv4::hex(&sigv4::sha256(request.body().as_bytes())),
+            None => sigv4::hex(&sigv4::sha256(request.body())),
         };
         put(request, "x-amz-date", &stamp)?;
         put(request, "x-amz-content-sha256", &payload)?;
@@ -439,6 +472,9 @@ pub struct Sent {
 /// which is the url a creation pointed at.
 pub const LOCATION: &str = "location";
 
+/// The header that decides whether a body is read or described.
+const CONTENT_TYPE: &str = "content-type";
+
 /// Every name the cases in a suite hold something under, which is every
 /// name a placeholder in one of them can mean.
 ///
@@ -537,6 +573,20 @@ fn read_out(headers: &BTreeMap<String, String>, body: &str, from: &str) -> Optio
     if let Some(name) = from.strip_prefix("header:") {
         return headers.get(&name.trim().to_ascii_lowercase()).cloned();
     }
+    // A place in a json body, written the way a volatile path is, since
+    // both of them point at the same kind of thing. The signed urls are
+    // why: a url signed for a transform carries a token nobody can mint
+    // from outside, and the only way to ask what spending one does is
+    // to spend the one that was just answered.
+    if let Some(pointer) = from.strip_prefix("body:") {
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        return match crate::volatile::at(&value, pointer)? {
+            // A string is taken as it is rather than re-serialized, so
+            // a url comes out as a url and not as a quoted one.
+            serde_json::Value::String(text) => Some(text.clone()),
+            other => Some(other.to_string()),
+        };
+    }
     let name = from.strip_prefix("element:")?.trim();
     let open = format!("<{name}>");
     let close = format!("</{name}>");
@@ -599,7 +649,7 @@ fn because(error: &dyn std::error::Error) -> String {
 /// so a case that means to send an escape can.
 /// One header onto a request that is already built, by the two names
 /// the http crate wants it under.
-fn put(request: &mut ureq::http::Request<String>, name: &str, value: &str) -> Result<(), String> {
+fn put(request: &mut ureq::http::Request<Vec<u8>>, name: &str, value: &str) -> Result<(), String> {
     let name: ureq::http::HeaderName = name.parse().map_err(|e| format!("header {name}: {e}"))?;
     let value: ureq::http::HeaderValue = value
         .parse()
@@ -623,6 +673,21 @@ fn encoded(path: &str) -> String {
         }
     }
     out
+}
+
+/// The body as text, when it is text.
+///
+/// Text is what every answer on these surfaces was until the render
+/// routes arrived, and that path is left exactly as it was so that no
+/// recording moves. A body is not text when its bytes are not utf-8,
+/// and also when the server says it is an image: a small enough image
+/// decodes as utf-8 by accident often enough that a recording should
+/// not be resting on the odds.
+fn text<'a>(headers: &BTreeMap<String, String>, bytes: &'a [u8]) -> Option<&'a str> {
+    match headers.get(CONTENT_TYPE) {
+        Some(kind) if kind.starts_with("image/") => None,
+        _ => std::str::from_utf8(bytes).ok(),
+    }
 }
 
 /// A body is parsed when it is json and kept as text when it is not,
@@ -690,6 +755,41 @@ mod tests {
         assert_eq!(answer.body, serde_json::Value::Null);
     }
 
+    fn typed(kind: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([(CONTENT_TYPE.to_string(), kind.to_string())])
+    }
+
+    /// The whole point of leaving the utf-8 path alone: every answer
+    /// recorded before there were images has to read the same way after.
+    #[test]
+    fn text_is_still_text_whatever_it_is_called() {
+        assert_eq!(
+            text(&typed("application/json"), br#"{"message":"ok"}"#),
+            Some(r#"{"message":"ok"}"#)
+        );
+        assert_eq!(
+            text(&typed("application/octet-stream"), b"a downloaded file"),
+            Some("a downloaded file")
+        );
+        assert_eq!(
+            text(&headers(), b"no content type at all"),
+            Some("no content type at all")
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf_8_are_described_instead() {
+        assert_eq!(text(&typed("text/plain"), &[0xff, 0xfe, 0x00]), None);
+    }
+
+    /// A one pixel png is a few dozen bytes and can decode as utf-8 by
+    /// luck, so the server's own word for what it sent is taken first.
+    #[test]
+    fn an_image_is_described_even_when_its_bytes_would_decode() {
+        assert_eq!(text(&typed("image/webp"), b"plain ascii"), None);
+        assert_eq!(text(&typed("image/png"), b"plain ascii"), None);
+    }
+
     fn case(path: &str) -> Case {
         Case {
             name: "n".to_string(),
@@ -699,6 +799,8 @@ mod tests {
             key: Key::Anon,
             headers: BTreeMap::new(),
             body: None,
+            file: None,
+            bytes: None,
             note: None,
             writes: false,
             chained: false,
@@ -836,6 +938,29 @@ mod tests {
         );
         assert_eq!(read_out(&headers, body, "element:Missing"), None);
         assert_eq!(read_out(&headers, body, "header:missing"), None);
+    }
+
+    /// The third half, which is a place in a json body. A signed url is
+    /// the only thing that needs it and it needs it badly: the token in
+    /// it cannot be minted from outside, so a case that spends one has
+    /// to be sent the one the case above it was answered with.
+    #[test]
+    fn a_hold_reads_a_place_in_a_json_body_too() {
+        let headers = BTreeMap::new();
+        let body = r#"{"signedURL":"/render/image/sign/notes/cat.jpg?token=abc","size":7}"#;
+        assert_eq!(
+            read_out(&headers, body, "body:/signedURL"),
+            Some("/render/image/sign/notes/cat.jpg?token=abc".to_string())
+        );
+        // A number is held as it is written rather than not at all, and
+        // a string is held unquoted, so a url is a url.
+        assert_eq!(
+            read_out(&headers, body, "body:/size"),
+            Some("7".to_string())
+        );
+        assert_eq!(read_out(&headers, body, "body:/missing"), None);
+        assert_eq!(read_out(&headers, body, "body:/signedURL/0"), None);
+        assert_eq!(read_out(&headers, "not json", "body:/signedURL"), None);
     }
 
     /// A case that holds nothing holds nothing, and a hold that found

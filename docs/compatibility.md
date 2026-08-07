@@ -26,9 +26,9 @@ The Postgres line is the one place zou is deliberately ahead. A suite that depen
 | rest, the hand written suite | 82 | 82 | 100% | the surface a Supabase project actually uses |
 | postgrest, derived from upstream's spec files | 1217 | 1217 | 100% | upstream's own test corpus turned into questions |
 | auth | 74 | 77 | 96% | three known differences, below |
-| storage | 435 | 435 | 100% | buckets, objects, resumable uploads and the S3 protocol |
+| storage | 478 | 478 | 100% | buckets, objects, image transforms, resumable uploads and the S3 protocol |
 | supabase-js | 17 | 17 | 100% | upstream's integration file, url changed, no assertion touched |
-| storage-js | 130 | 130 | 100% | upstream's own tests for the storage client, likewise |
+| storage-js | 133 | 133 | 100% | upstream's own tests for the storage client, likewise |
 
 A known difference still counts as a failure in every number above. It is excused from the exit code and from nothing else, so the score cannot be improved by writing an explanation down.
 
@@ -48,7 +48,7 @@ One more difference is not an answer at all, and so is not in `known.json`. **A 
 
 ## What is not served yet
 
-`/storage/v1` is served as far as buckets, objects, resumable uploads and the S3 protocol go. Making, reading, updating, emptying and deleting a bucket, uploading, downloading, describing, listing, moving, copying and deleting an object, signing a url for a download or an upload, the whole of the TUS protocol a resumable upload speaks, and the whole of the S3 protocol this endpoint speaks including an upload sent in pieces, are built and measured against the reference. What is left under `/storage/v1` is image transforms and analytics buckets, and what is left elsewhere is all of `/realtime/v1`. Those are routes in the router with nothing behind them, and they answer 501 with a body saying so and naming the milestone, rather than 404, so a client gets told the surface exists and is not finished instead of being told the url is wrong. Storage is M3 and Realtime is M4.
+`/storage/v1` is served as far as buckets, objects, image transforms, resumable uploads and the S3 protocol go. Making, reading, updating, emptying and deleting a bucket, uploading, downloading, describing, listing, moving, copying and deleting an object, signing a url for a download or an upload, resizing and re-encoding an image on the way out, the whole of the TUS protocol a resumable upload speaks, and the whole of the S3 protocol this endpoint speaks including an upload sent in pieces, are built and measured against the reference. The transforms are the one thing here that is not compared byte for byte: a case names the dimensions, the format and the header saying what was asked for, and gives up on the digest, because two jpeg encoders at one quality do not agree on a single byte. What is left under `/storage/v1` is analytics buckets, and what is left elsewhere is all of `/realtime/v1`. Those are routes in the router with nothing behind them, and they answer 501 with a body saying so and naming the milestone, rather than 404, so a client gets told the surface exists and is not finished instead of being told the url is wrong. Storage is M3 and Realtime is M4.
 
 The bytes of an object go to the same place the pages do: a directory on a laptop, a prefix on an object store, opened by the same code the engine opens its own target with. A server built without one answers the bucket surface and refuses the routes that carry bytes, because writing files somewhere nobody asked for would be worse than saying so.
 

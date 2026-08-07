@@ -245,7 +245,7 @@ That distinction has to be made here because zou is the gateway as well as the s
 
 ## The suite recorded from an image
 
-The `storage` suite is 435 cases: 66 over the bucket endpoints, 195 over the object ones, and 174 over the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
+The `storage` suite is 476 cases: 66 over the bucket endpoints, 236 over the object ones, and 174 over the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
 The reference is storage-api at the version in `versions.json`, and it is the one reference that cannot be downloaded and run on a flag line.
 storage-api ships as an image and nothing else, so the recording comes from `supabase start` rather than from a binary, which is what the record workflow in this repository brings up.
 
@@ -331,15 +331,16 @@ The other 17 are Realtime, which zou does not serve on this URL yet.
 They are skipped behind an environment flag rather than deleted, so the day the feature lands the test runs exactly as upstream wrote it.
 
 The second is storage-js's own tests, in `js-storage/`, and it is the same arrangement pointed at the client that owns the surface M3 is about.
-Four files, 135 tests, 130 of them passing against zou and 5 skipped, and 6 of upstream's snapshots.
+Four files, 135 tests, 133 of them passing against zou and 2 skipped, and 6 of upstream's snapshots.
 storage-js is not released on its own: it lives at `packages/core/storage-js` in the supabase-js repository and ships with it, which is why `versions.json` pins it at the same 2.111.0.
 
 Two things about it are worth writing down.
 It runs under jest where the supabase-js suite runs under vitest, because the snapshot file is jest's and a snapshot is an expectation like any other here, so running it under something that writes the file in a different shape would be editing upstream's assertions rather than checking them.
 And the tests are run out of the published package rather than out of a checkout: `@supabase/storage-js` ships its `src/` next to its `dist/`, so `import { StorageClient } from '../src/index'` is left alone and jest maps `../src` onto the package's own sources, which keeps the diff against upstream readable as a diff.
 
-All 5 skips are image transforms.
-Three are behind `ZOU_IMAGE_TRANSFORMS`, since `/storage/v1/render/image` is the part of the storage api zou does not serve, and upstream skips the other two itself.
+Both skips are image transforms and both are upstream's own, one for webp negotiation and one for `format: 'origin'`.
+Three more were skipped here behind `ZOU_IMAGE_TRANSFORMS` while `/storage/v1/render/image` was the part of the storage api zou did not serve, and they run now.
+One of them is what found `x-transformations`, the header a render carries saying what it was asked to do, which no recording had compared because the harness compares a fixed list of headers and that one was not on it.
 That flag is the whole difference from upstream, and no assertion is edited.
 
 Its fixture is upstream's seed rather than one written here, which is how it found something no suite could: the passwords in it are hashed with `crypt` and `gen_salt` unqualified, and until [tamnd/zou#214](https://github.com/tamnd/zou/issues/214) there was no `extensions` schema on the search path for those to resolve in.
@@ -368,11 +369,12 @@ The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
 The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 74 of them, 96%, with 3 known differences.
 All three are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
 
-The `storage` suite is 435 cases against the storage-api a local Supabase project runs, and zou passes all 435, byte for byte, with no known differences.
+The `storage` suite is 476 cases against the storage-api a local Supabase project runs, and zou passes all 476, byte for byte, with no known differences.
+Forty one of them are the image transforms, and those are the one place where byte for byte stops at the picture: a case names the dimensions and the format and gives up on the digest, because two jpeg encoders at the same quality do not agree on a single byte.
 
 supabase-js 2.111.0 runs 17 of its integration tests against zou and all 17 pass.
 
-storage-js 2.111.0 runs 130 of its 135 against zou and all 130 pass, the 5 it does not run being image transforms.
+storage-js 2.111.0 runs 133 of its 135 against zou and all 133 pass, the 2 it does not run being upstream's own skips.
 
 The cases that pass "written differently" are all the same three things: zou puts a space after each colon where PostgREST puts a newline between rows, a `select=*` comes back with the columns in a different order, and two auth answers carry their keys in a different order than Go wrote them.
 None of them is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.

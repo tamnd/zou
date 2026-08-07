@@ -138,6 +138,11 @@ impl ObjectRow {
         blob::key(&self.id, &self.version)
     }
 
+    /// Where one transform of this version is kept.
+    pub(crate) fn render_key(&self, recipe: &str, format: &str) -> String {
+        blob::render_key(&self.id, &self.version, recipe, format)
+    }
+
     /// What `/object/info` answers.
     ///
     /// Half of it is the row and half is the metadata unpacked into
@@ -280,7 +285,7 @@ pub(crate) async fn bucket_facts(sess: &Session, id: &str) -> Result<Option<Buck
 
 /// Is there a bucket of this name at all, and is it public? The one
 /// question the read paths ask, which is the same lookup.
-async fn bucket_public(sess: &Session, id: &str) -> Result<Option<bool>, StorageError> {
+pub(crate) async fn bucket_public(sess: &Session, id: &str) -> Result<Option<bool>, StorageError> {
     Ok(bucket_facts(sess, id).await?.map(|bucket| bucket.public))
 }
 
@@ -297,7 +302,7 @@ async fn refuse<T>(sess: Session, why: StorageError) -> Result<T, StorageError> 
 /// who they were. A signed url has already said everything it is going
 /// to say: the token names the object, and asking the policies again
 /// would refuse the one caller the url was signed for.
-async fn superuser(app: &App) -> Result<Session, StorageError> {
+pub(crate) async fn superuser(app: &App) -> Result<Session, StorageError> {
     let pool = app
         .pool
         .as_ref()
@@ -613,7 +618,7 @@ fn headers_of(
 /// everything, so a moment that is not a moment asks for the object.
 /// The comparison is `<=`, so a date equal to the moment the object was
 /// last written is not modified.
-fn already_has(parts: &Parts, etag: Option<&str>, changed: Option<i64>) -> bool {
+pub(crate) fn already_has(parts: &Parts, etag: Option<&str>, changed: Option<i64>) -> bool {
     let said = |name: HeaderName| {
         parts
             .headers
@@ -678,7 +683,7 @@ const ROBOTS: &str = "none";
 /// reads when the two disagree. Both copies are encoded, so the plain
 /// one is only plain in the sense that it has no charset in front of
 /// it.
-fn attachment(name: &str) -> String {
+pub(crate) fn attachment(name: &str) -> String {
     if name.is_empty() {
         return "attachment;".to_string();
     }
@@ -717,7 +722,7 @@ fn component(text: &str) -> String {
 /// what the upload wrote, and `Last-Modified` wants a browser's. The
 /// milliseconds are read and dropped: the header has nowhere to put
 /// them, and upstream loses them the same way.
-fn iso_to_unix(text: &str) -> Option<i64> {
+pub(crate) fn iso_to_unix(text: &str) -> Option<i64> {
     let (date, clock) = text.split_once('T')?;
     let mut day = date.split('-');
     let year: i64 = day.next()?.parse().ok()?;
@@ -2084,12 +2089,23 @@ const MOST_OBJECTS: usize = 1000;
 /// downloads when they carry no `upsert` and as uploads when they do,
 /// because upstream still reads them and a client's url should not stop
 /// working on the day this server replaces that one.
-fn download_token(app: &App, url: &str, seconds: i64) -> String {
+pub(crate) fn download_token(
+    app: &App,
+    url: &str,
+    seconds: i64,
+    transform: Option<&str>,
+) -> String {
     let iat = crate::auth::now();
-    crate::jwt::mint(
-        &json!({"url": url, "scope": "download", "iat": iat, "exp": iat + seconds}),
-        &app.cfg.jwt_secret,
-    )
+    let mut claims = json!({"url": url, "scope": "download", "iat": iat, "exp": iat + seconds});
+    // Absent rather than empty when there is no transform, so that a
+    // plain download url is the same token it was before this route
+    // learned to sign a transform.
+    if let Some(query) = transform
+        && let Some(map) = claims.as_object_mut()
+    {
+        map.insert("transform".to_string(), Value::from(query));
+    }
+    crate::jwt::mint(&claims, &app.cfg.jwt_secret)
 }
 
 /// The token an upload url carries: who signed it, whether the upload
@@ -2122,7 +2138,7 @@ fn upload_token(app: &App, url: &str, owner: &str, replace: bool) -> String {
 /// clock is checked by the verifier, one step earlier than upstream
 /// checks it, and answers the same way because jose checks `exp` on the
 /// way in too.
-fn signed_claims(
+pub(crate) fn signed_claims(
     app: &App,
     token: &str,
     url: &str,
@@ -2159,7 +2175,7 @@ fn signed_claims(
 /// A key with no `=` after it is there with an empty value rather than
 /// absent, which is what the query parser upstream uses does and what
 /// `?download` on its own relies on to mean a download with no name.
-fn asked_for(parts: &Parts, name: &str) -> Option<String> {
+pub(crate) fn asked_for(parts: &Parts, name: &str) -> Option<String> {
     parts.uri.query()?.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
         (crate::rest::decode(key) == name).then(|| crate::rest::decode(value))
@@ -2168,7 +2184,7 @@ fn asked_for(parts: &Parts, name: &str) -> Option<String> {
 
 /// A moment as a browser writes it, which is what `Expires` wants and
 /// what `new Date(..).toUTCString()` produces.
-fn http_date(unix: i64) -> String {
+pub(crate) fn http_date(unix: i64) -> String {
     const DAY: i64 = 86_400;
     let days = unix.div_euclid(DAY);
     let secs = unix.rem_euclid(DAY);
@@ -2209,10 +2225,20 @@ pub async fn sign(
     if done(sess, found).await?.is_none() {
         return Err(StorageError::no_such_key());
     }
+    // A transform in the body makes this a url for the render route
+    // rather than for this one, and the transform rides in the token
+    // rather than in the url so that a thumbnail's url cannot be edited
+    // into a url for the whole image. Recorded: what comes back for a
+    // signing that asked for one starts `/render/image/sign/`.
+    let transform = crate::render::signed_transform(&asked)?;
     let url = format!("{bucket}/{name}");
-    let token = download_token(&app, &url, seconds);
+    let token = download_token(&app, &url, seconds, transform.as_deref());
+    let route = match transform.is_some() {
+        true => "render/image/sign",
+        false => "object/sign",
+    };
     Ok(ok(
-        json!({"signedURL": format!("/object/sign/{url}?token={token}")}).to_string(),
+        json!({"signedURL": format!("/{route}/{url}?token={token}")}).to_string(),
     ))
 }
 
@@ -2257,7 +2283,9 @@ pub async fn sign_many(
         .map(|path| match there.iter().any(|name| name == path) {
             true => {
                 let url = format!("{bucket}/{path}");
-                let token = download_token(&app, &url, seconds);
+                // No transform. Signing a list is signing names, and
+                // the body it takes has nowhere to put one.
+                let token = download_token(&app, &url, seconds, None);
                 json!({
                     "error": Value::Null,
                     "path": path,

@@ -95,6 +95,21 @@ pub struct Case {
     /// Sent as is, so a case can test what a malformed body does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// A body that is bytes, named as a file in the suite's directory.
+    ///
+    /// The render routes are why this exists. Transforming an image
+    /// means having uploaded one, an image is not text, and a case is a
+    /// line in a json file. The alternative was base64 in the case,
+    /// which is a body nobody can look at and a diff nobody can read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// What `file` held, read once when the suite was loaded.
+    ///
+    /// Never written back out: it is the contents of a file that is
+    /// already in the repository, and a case carrying its own copy of
+    /// one would be two things to keep in step.
+    #[serde(skip)]
+    pub bytes: Option<Vec<u8>>,
     /// Why this case exists, when that is not obvious from the name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -313,8 +328,27 @@ impl Suite {
             true => Some(read(&path)?),
             false => None,
         };
-        let cases: Cases = serde_json::from_str(&read(&dir.join("cases.json"))?)
+        let mut cases: Cases = serde_json::from_str(&read(&dir.join("cases.json"))?)
             .map_err(|e| format!("{name}/cases.json: {e}"))?;
+        // Now rather than when the case is sent, because a suite that
+        // names a file that is not there should say so before it asks
+        // anything, and because the same case is sent to two targets
+        // and both of them should be sent the same bytes.
+        for case in &mut cases.cases {
+            if let Some(file) = &case.file {
+                if outside(file) {
+                    return Err(format!(
+                        "{name}/cases.json: {:?} names {file:?}, which is outside the suite",
+                        case.name
+                    ));
+                }
+                let path = dir.join(file);
+                case.bytes = Some(
+                    std::fs::read(&path)
+                        .map_err(|e| format!("{name}/cases.json: {}: {e}", path.display()))?,
+                );
+            }
+        }
         if cases.suite != name {
             return Err(format!(
                 "{name}/cases.json says it is the {} suite",
@@ -395,6 +429,17 @@ impl Suite {
     }
 }
 
+/// Whether a named file reaches out of the suite's own directory.
+///
+/// A suite is data, and data that can name /etc/passwd as a request
+/// body is data that reads a machine it was only meant to ask questions
+/// of. The suites are pinned to a commit and read by people, so this is
+/// a guard rather than a defence, but it is the difference between a
+/// mistake that fails at load and one that gets uploaded somewhere.
+fn outside(file: &str) -> bool {
+    file.starts_with('/') || file.split('/').any(|part| part == "..")
+}
+
 fn read(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -411,6 +456,31 @@ mod tests {
         assert_eq!(case.method, "GET");
         assert_eq!(case.key, Key::Anon);
         assert!(case.headers.is_empty());
+    }
+
+    /// The bytes are never written back out, so a case that was loaded
+    /// from a file and re-serialized still names the file and nothing
+    /// else.
+    #[test]
+    fn a_body_that_is_a_file_is_named_rather_than_carried() {
+        let mut case: Case = serde_json::from_str(
+            r#"{"name": "n", "feature": "f", "path": "/p", "file": "fixtures/cat.jpg"}"#,
+        )
+        .expect("parses");
+        assert_eq!(case.file.as_deref(), Some("fixtures/cat.jpg"));
+        case.bytes = Some(vec![0xff, 0xd8, 0xff]);
+        let written = serde_json::to_string(&case).expect("serializes");
+        assert!(written.contains(r#""file":"fixtures/cat.jpg""#));
+        assert!(!written.contains("bytes"));
+    }
+
+    #[test]
+    fn a_file_that_reaches_out_of_the_suite_is_not_read() {
+        assert!(outside("/etc/passwd"));
+        assert!(outside("../../../etc/passwd"));
+        assert!(outside("fixtures/../../secrets"));
+        assert!(!outside("fixtures/cat.jpg"));
+        assert!(!outside("cat.jpg"));
     }
 
     #[test]

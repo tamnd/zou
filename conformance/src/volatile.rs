@@ -118,6 +118,25 @@ fn steps(path: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The value a path points at, read rather than replaced.
+///
+/// The same paths a case names as volatile, used for the other half of
+/// the job: a case holds a value out of an answer so the case after it
+/// can be sent to it. `*` means nothing here, since a hold is one value
+/// and not every value of a shape, so a path that carries one finds
+/// nothing rather than the first of several.
+pub fn at<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut at = value;
+    for step in steps(path) {
+        at = match at {
+            Value::Object(map) => map.get(step)?,
+            Value::Array(items) => items.get(step.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(at)
+}
+
 fn walk(value: &mut Value, steps: &[&str]) {
     let Some((step, rest)) = steps.split_first() else {
         *value = Value::String(shape(value));
@@ -302,6 +321,22 @@ mod tests {
         let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
         redact(&mut body, &paths);
         body
+    }
+
+    /// The read only twin of a redaction, which is what a hold uses.
+    #[test]
+    fn a_path_reads_the_value_it_points_at() {
+        let body = json!({"signedURL": "/object/sign/notes/cat.jpg?token=x", "sizes": [1, 2]});
+        assert_eq!(
+            at(&body, "/signedURL").and_then(|v| v.as_str()),
+            Some("/object/sign/notes/cat.jpg?token=x")
+        );
+        assert_eq!(at(&body, "/sizes/1"), Some(&json!(2)));
+        assert_eq!(at(&body, "/sizes/9"), None);
+        assert_eq!(at(&body, "/nothing"), None);
+        // A whole answer is what an empty path points at, which is what
+        // makes a path with nothing after the slash harmless.
+        assert_eq!(at(&body, "/"), Some(&body));
     }
 
     #[test]

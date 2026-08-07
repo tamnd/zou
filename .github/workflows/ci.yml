@@ -499,6 +499,11 @@ jobs:
           grep -q '^url ' /tmp/serve.log
       - name: Run storage-js's own integration suite against it
         working-directory: /tmp/zou-conformance/js-storage
+        # The flag turns on the three transform tests, which were
+        # skipped while there was nothing at /storage/v1/render/image to
+        # answer them. Two skips are left and both are upstream's own.
+        env:
+          ZOU_IMAGE_TRANSFORMS: "1"
         run: |
           npm ci
           npm test -- --json --outputFile=/tmp/js-storage.json

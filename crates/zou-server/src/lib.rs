@@ -42,6 +42,7 @@ pub mod oauth;
 pub mod object;
 pub mod openapi;
 pub mod password;
+pub mod render;
 pub mod rest;
 pub mod s3;
 pub mod sms;
@@ -853,6 +854,23 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route(
             "/storage/v1/object/public/{bucket}/{*name}",
             get(object::download_public),
+        )
+        // The transforms, which are three doors onto the object routes
+        // above rather than a surface of their own. They are their own
+        // paths and not a query parameter on a download because that is
+        // how the client library builds them, and the `sign` one is
+        // where a url signed with a transform in it lands.
+        .route(
+            "/storage/v1/render/image/authenticated/{bucket}/{*name}",
+            get(render::authenticated),
+        )
+        .route(
+            "/storage/v1/render/image/public/{bucket}/{*name}",
+            get(render::public),
+        )
+        .route(
+            "/storage/v1/render/image/sign/{bucket}/{*name}",
+            get(render::signed),
         )
         .route(
             "/storage/v1/object/info/{bucket}/{*name}",

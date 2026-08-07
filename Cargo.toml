@@ -19,6 +19,12 @@ crc32c = "0.6"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 getrandom = "0.3"
 hmac = "0.13"
+# The decoders the storage suite needs and the avif encoder the render
+# routes need, without the two dozen formats nothing asks for. webp is
+# libwebp rather than image's own, because image-webp writes lossless
+# only and a lossless webp of a photograph is larger than the jpeg it
+# was made from, which is the opposite of what the route is for.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "avif"] }
 libc = "0.2"
 log = "0.4"
 p256 = "0.14"
@@ -37,6 +43,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tower = "0.5"
 ureq = "3.3"
+webp = "0.3"
 webpki-roots = "1"
 
 [workspace.lints.clippy]

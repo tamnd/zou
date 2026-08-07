@@ -360,6 +360,23 @@ impl StorageError {
         }
     }
 
+    /// Bytes a transform cannot read. The row is there and so are the
+    /// bytes, and they are not an image any decoder here has, which is
+    /// the one failure the render routes have that the download routes
+    /// cannot: a download hands back whatever it was given.
+    ///
+    /// The error name is the code again, the way it is for a foreign
+    /// key violation above, rather than the `Error` a schema failure
+    /// earns. Recorded, from a text file asked for at a width.
+    pub(crate) fn not_an_image() -> Self {
+        StorageError {
+            status: 400,
+            error: "InvalidRequest",
+            message: "The source image is invalid or unsupported for rendering".to_string(),
+            code: "InvalidRequest",
+        }
+    }
+
     /// The one refusal only the S3 surface can earn: the request was
     /// signed, the access key id is one this project has, and the
     /// signature is not the one the secret would have produced. The

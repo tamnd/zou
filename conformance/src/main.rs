@@ -36,6 +36,7 @@
 //! json a run wrote into the markdown CI commits, so that the numbers
 //! are in the repository rather than in a log that expires.
 
+mod binary;
 mod derive;
 mod diff;
 mod report;
@@ -914,6 +915,8 @@ mod tests {
             key: suite::Key::Service,
             headers: Default::default(),
             body: None,
+            file: None,
+            bytes: None,
             note: None,
             writes,
             chained,

@@ -89,6 +89,19 @@ pub fn key(id: &str, version: &str) -> String {
     format!("objects/{id}/{version}")
 }
 
+/// Where a rendered copy of an object is kept.
+///
+/// Its own prefix rather than a path under the object, because the
+/// object's key names bytes and bytes have no room underneath them: on
+/// a directory store the parent is a file, and everything asked for
+/// below it comes back `Not a directory`. The id and version are the
+/// same pair the source is under, so an object that was replaced never
+/// reads a transform of what it replaced, and the recipe is what the
+/// caller asked for boiled down to a hash by the renderer.
+pub fn render_key(id: &str, version: &str, recipe: &str, format: &str) -> String {
+    format!("renders/{id}/{version}.{recipe}.{format}")
+}
+
 /// Where one request's worth of a resumable upload lives until the
 /// upload finishes.
 ///

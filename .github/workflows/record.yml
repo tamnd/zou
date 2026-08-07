@@ -60,8 +60,37 @@ jobs:
           mkdir -p /tmp/project
           cd /tmp/project
           supabase init --with-vscode-settings=false --with-intellij-settings=false
-          supabase start -x studio,imgproxy,edge-runtime,logflare,vector
+          # imgproxy is in the list now, because it is the reference for
+          # the render routes. storage-api does not transform anything
+          # itself: it checks the request, hands the object to imgproxy
+          # and hands back what imgproxy answered, so a stack without it
+          # answers every render case the same way and the recording
+          # would be a recording of the wiring being off.
+          # And said out loud in the config rather than left to the
+          # template's default, since the default is a line in a version
+          # of the CLI rather than a thing this run decided.
+          #
+          # The section is anchored at the start of a line because the
+          # template ships it commented out, and a grep that matches the
+          # comment goes on to substitute into a line that is not there.
+          if grep -qE '^[[:space:]]*\[storage\.image_transformation\]' supabase/config.toml; then
+            perl -0pi -e 's/(^[ \t]*\[storage\.image_transformation\][ \t]*\nenabled\s*=\s*)false/${1}true/m' \
+              supabase/config.toml
+          else
+            printf '\n[storage.image_transformation]\nenabled = true\n' >> supabase/config.toml
+          fi
+          grep -nE -A1 '^[[:space:]]*\[storage\.image_transformation\]' supabase/config.toml
+          supabase start -x studio,edge-runtime,logflare,vector
           supabase status
+      # Asked rather than assumed. storage-api only registers the render
+      # routes when it is told a transformer is there, so a stack that
+      # came up without imgproxy answers every one of them with a route
+      # that does not exist, and the recording reads like an upstream
+      # decision instead of a container that is missing.
+      - name: Check the transformer is up
+        run: |
+          docker ps --format '{{.Names}}'
+          docker ps --format '{{.Names}}' | grep -qx supabase_imgproxy_project
       # The schema the reference brought with it, kept next to the
       # recording, because a suite that writes rows into a table has to
       # be written against the columns that table has. zou's own
@@ -138,3 +167,4 @@ jobs:
         run: |
           docker ps -a || true
           docker logs supabase_storage_project 2>&1 | tail -80 || true
+          docker logs supabase_imgproxy_project 2>&1 | tail -40 || true
