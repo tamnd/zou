@@ -66,6 +66,12 @@ use crate::storage::{StorageError, begin, caller, done};
 const WIDEST: u32 = 3000;
 const TALLEST: u32 = 8192;
 
+/// The largest a caller can ask a side to be. Past it the number is
+/// quietly held down rather than refused, which is upstream's own limit
+/// and not imgproxy's: storage-api clamps before it builds the option
+/// list, and the clamped number is what the answer says it did.
+const BIGGEST: u32 = 2000;
+
 /// The lowest and highest quality the schema takes. Twenty is also what
 /// the client library documents, and it is the only one of the two a
 /// client is likely to reach.
@@ -202,10 +208,13 @@ fn wanted(place: &str, said: impl Fn(&str) -> Option<String>) -> Result<Wanted, 
                 "{place}/{name} must be >= 0"
             )));
         }
-        // No ceiling. A width of 2501 is not refused and comes back as
-        // the image was, because nothing is enlarged and the crop it
-        // asks for is bigger than the image. Recorded.
-        Ok(u32::try_from(number).unwrap_or(u32::MAX))
+        // A side past the ceiling is held to it rather than refused,
+        // quietly: a width of 2501 comes back as 2000 in the header the
+        // answer carries. Nothing in the picture shows it while the
+        // fixture is 350 wide, since a crop bigger than the image is a
+        // crop that does nothing either way, and it is here because the
+        // header said so. Recorded.
+        Ok(u32::try_from(number).unwrap_or(u32::MAX).min(BIGGEST))
     };
     let width = side("width")?;
     let height = side("height")?;
@@ -516,6 +525,12 @@ async fn answer(
     if let Some(etag) = etag.as_str() {
         answer = answer.header(header::ETAG, etag);
     }
+    // What was asked for, in imgproxy's own spelling. It is the only
+    // thing an answer says about what it did, since the picture is
+    // compared as dimensions and a format rather than as bytes.
+    if let Some(said) = did(wanted) {
+        answer = answer.header("x-transformations", said);
+    }
     answer = match &until {
         Some(when) => answer.header(header::EXPIRES, when),
         None => answer.header(header::CACHE_CONTROL, cache),
@@ -530,6 +545,52 @@ async fn answer(
     answer
         .body(body)
         .map_err(|e| StorageError::internal(e.to_string()))
+}
+
+/// What the answer says it did, or nothing when it did nothing.
+///
+/// This is the option list storage-api builds for imgproxy, handed back
+/// verbatim in `x-transformations`, so it is the request rather than
+/// the answer: a caller who was negotiated into webp is not told so
+/// here, and a caller who named `origin` is not either. Only `avif`
+/// appears, because only `avif` is a format imgproxy was asked for.
+///
+/// The order is height, width, resizing type, quality, format, which is
+/// the order the fields are read in somewhere upstream and is recorded
+/// rather than chosen. The resizing type is named whenever a side was,
+/// and a request with no side at all has nothing to say and says
+/// nothing: no header rather than an empty one.
+fn did(wanted: &Wanted) -> Option<String> {
+    let mut said: Vec<String> = Vec::new();
+    if wanted.height > 0 {
+        said.push(format!("height:{}", wanted.height));
+    }
+    if wanted.width > 0 {
+        said.push(format!("width:{}", wanted.width));
+    }
+    if wanted.width > 0 || wanted.height > 0 {
+        said.push(format!(
+            "resizing_type:{}",
+            match wanted.resize {
+                // imgproxy's names for the three, which are not the
+                // three names the query takes: what a caller calls
+                // cover is what imgproxy calls fill.
+                Resize::Contain => "fit",
+                Resize::Cover => "fill",
+                Resize::Fill => "force",
+            }
+        ));
+    }
+    if let Some(quality) = wanted.quality {
+        said.push(format!("quality:{quality}"));
+    }
+    if wanted.format == Asked::Avif {
+        said.push("format:avif".to_string());
+    }
+    match said.is_empty() {
+        true => None,
+        false => Some(said.join(",")),
+    }
 }
 
 /// Which format the answer comes back in.
@@ -818,6 +879,68 @@ mod tests {
                 .then(|| "0".to_string()))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_side_past_the_ceiling_is_held_to_it_rather_than_refused() {
+        let read = wanted("querystring", |name| {
+            (name == "width").then(|| "2501".to_string())
+        })
+        .unwrap();
+        assert_eq!(read.width, BIGGEST);
+        let read = wanted("querystring", |name| {
+            (name == "height").then(|| "9000".to_string())
+        })
+        .unwrap();
+        assert_eq!(read.height, BIGGEST);
+    }
+
+    #[test]
+    fn what_the_answer_says_it_did_is_what_was_asked_for() {
+        let said = |width, height, resize, quality, format| {
+            did(&Wanted {
+                width,
+                height,
+                resize,
+                quality,
+                format,
+            })
+        };
+
+        // Height before width, and the resizing type named whenever a
+        // side was. All of these are recorded.
+        assert_eq!(
+            said(100, 100, Resize::Cover, None, Asked::Negotiate).as_deref(),
+            Some("height:100,width:100,resizing_type:fill")
+        );
+        assert_eq!(
+            said(100, 100, Resize::Contain, None, Asked::Negotiate).as_deref(),
+            Some("height:100,width:100,resizing_type:fit")
+        );
+        assert_eq!(
+            said(100, 100, Resize::Fill, None, Asked::Negotiate).as_deref(),
+            Some("height:100,width:100,resizing_type:force")
+        );
+        assert_eq!(
+            said(100, 0, Resize::Cover, Some(20), Asked::Negotiate).as_deref(),
+            Some("width:100,resizing_type:fill,quality:20")
+        );
+        assert_eq!(
+            said(100, 0, Resize::Cover, None, Asked::Avif).as_deref(),
+            Some("width:100,resizing_type:fill,format:avif")
+        );
+
+        // The request rather than the answer: a caller negotiated into
+        // webp is not told so, and one who asked for origin is not
+        // either.
+        assert_eq!(
+            said(100, 0, Resize::Cover, None, Asked::Origin).as_deref(),
+            Some("width:100,resizing_type:fill")
+        );
+
+        // Nothing asked for, so nothing said, and a zero is nothing
+        // asked for.
+        assert_eq!(said(0, 0, Resize::Cover, None, Asked::Negotiate), None);
     }
 
     #[test]
