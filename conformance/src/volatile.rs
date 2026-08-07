@@ -153,7 +153,16 @@ fn string_shape(text: &str) -> String {
     // the route in the middle, since that is what a client sends the
     // bytes to, so the host goes, the last segment is named, and
     // everything between them is compared.
-    if let Some((_, rest)) = text.split_once("://")
+    //
+    // The whole string has to be the url and it has to carry nothing
+    // but a path. A scheme somewhere in the middle is a scheme inside a
+    // query string, which is what a link with a `redirect_to` on it
+    // looks like, and taking that apart the same way would keep half a
+    // query and name the other half.
+    if let Some(rest) = text
+        .strip_prefix("http://")
+        .or_else(|| text.strip_prefix("https://"))
+        && !text.contains('?')
         && let Some((_, path)) = rest.split_once('/')
         && let Some((route, last)) = path.rsplit_once('/')
     {
@@ -329,6 +338,22 @@ mod tests {
         assert_eq!(
             string_shape("https://project.supabase.co/storage/v1/upload/resumable/bm90ZXM"),
             "/storage/v1/upload/resumable/<string>"
+        );
+    }
+
+    /// A link with a `redirect_to` on it carries a second url inside
+    /// its query, and the whole thing is one value that moves. Reading
+    /// the scheme in the middle as the start of the url would keep the
+    /// token, which is the part that moves most.
+    #[test]
+    fn a_scheme_inside_a_query_is_not_the_start_of_a_url() {
+        assert_eq!(
+            string_shape("/auth/v1/verify?token=ad7fff13&type=magiclink&redirect_to=http://a/b"),
+            "<string>"
+        );
+        assert_eq!(
+            string_shape("http://h/auth/v1/verify?token=ad7fff13&redirect_to=http://a/b"),
+            "<string>"
         );
     }
 

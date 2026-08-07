@@ -2817,7 +2817,9 @@ mod tests {
                 "cacheControl": "no-cache",
                 "lastModified": "2026-08-06T14:25:39.016Z",
             }),
-            Value::Null,
+            // What an ordinary upload writes into the column, which is
+            // why the answer below has an object rather than a null.
+            json!({}),
         );
         let answer: Value = serde_json::from_str(&row.info()).unwrap();
         assert_eq!(
@@ -2836,6 +2838,16 @@ mod tests {
                 "version": "5877d5bc-0000-4000-8000-000000000000",
             })
         );
+    }
+
+    /// A row nothing wrote that column on. A resumable upload makes
+    /// one, and the answer is the column as it stands rather than the
+    /// empty object an ordinary upload would have put there.
+    #[test]
+    fn an_object_nobody_attached_anything_to() {
+        let row = row(json!({"size": 1}), Value::Null);
+        let answer: Value = serde_json::from_str(&row.info()).unwrap();
+        assert_eq!(answer["metadata"], Value::Null);
     }
 
     /// What the client attached comes back under `metadata`, which is
