@@ -130,15 +130,23 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = DelayStore::new(
             Box::new(LocalFsStore::new(dir.path())),
-            DelayConfig::parse("put=30").unwrap(),
+            DelayConfig::parse("put=300").unwrap(),
         );
         let start = Instant::now();
         store.put("k", b"v").unwrap();
-        assert!(start.elapsed() >= Duration::from_millis(30));
+        assert!(start.elapsed() >= Duration::from_millis(300));
         // Reads carry no configured delay here and still see the write.
+        //
+        // The bound is most of the configured delay rather than a small
+        // number of milliseconds, because what is being asked is
+        // whether the put's sleep leaked into the get, and a read of a
+        // file in a temporary directory takes as long as the machine
+        // feels like taking. A windows runner sleeping on a 15.6 ms
+        // timer under load failed a 30 ms bound here, which said
+        // nothing about the code.
         let start = Instant::now();
         assert_eq!(store.get("k").unwrap().unwrap().0, b"v");
-        assert!(start.elapsed() < Duration::from_millis(30));
+        assert!(start.elapsed() < Duration::from_millis(250));
         assert_eq!(store.list("").unwrap(), vec!["k"]);
     }
 }
