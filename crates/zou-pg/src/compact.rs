@@ -262,16 +262,38 @@ pub fn compact_shard(
 
     // With a redo pool on hand, cut a fresh image at the flush point
     // so the merged run drops out of the read path for current reads.
-    // Only relation pages materialize; other keys keep living in the
-    // delta run, which one merged layer serves cheaply.
+    // Only relation pages materialize, and only those redo can build
+    // from what the store holds: a base in a source image, or a first
+    // record that initializes the page or carries a full image of it.
+    // A page whose stored history starts mid chain stays in the delta
+    // run; feeding its records a zeroed base would crash the redo
+    // worker, not rebuild the page.
     if let Some(pool) = pool
         && dcl > Lsn(0)
     {
+        let based: BTreeSet<LayerKey> = images.values().flat_map(|at| at.keys().copied()).collect();
+        let mut first: BTreeMap<LayerKey, &[u8]> = BTreeMap::new();
+        for ((key, _), record) in &merged {
+            first.entry(*key).or_insert(record.as_slice());
+        }
+        let rebuildable = |k: &LayerKey| {
+            based.contains(k)
+                || first.get(k).is_some_and(|record| {
+                    crate::walscan::record_init_refs(record)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|(b, init)| {
+                            *init
+                                && (b.spc, b.db, b.rel, b.fork as u8, b.blk)
+                                    == (k.spc, k.db, k.rel, k.fork, k.block)
+                        })
+                })
+        };
         let keys: BTreeSet<LayerKey> = merged
             .keys()
             .map(|(key, _)| *key)
             .chain(images.values().flat_map(|at| at.keys().copied()))
-            .filter(|k| k.kind == KEY_PAGE)
+            .filter(|k| k.kind == KEY_PAGE && rebuildable(k))
             .collect();
         if !keys.is_empty() {
             let map = LayerMap::new(descs.clone()).map_err(PageShardError::from)?;
