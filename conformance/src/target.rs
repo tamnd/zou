@@ -203,6 +203,7 @@ impl Target {
         let mut answer = answer(&case.name, status, headers, &raw);
         if !case.volatile.is_empty() {
             crate::volatile::redact(&mut answer.body, &case.volatile);
+            crate::volatile::redact_headers(&mut answer.headers, &case.volatile);
             // The kept bytes are the bytes the volatile values were in,
             // so there is nothing left in them to compare: a case that
             // names a token gives up the byte for byte verdict on that
