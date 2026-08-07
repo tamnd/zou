@@ -2605,6 +2605,7 @@ dependencies = [
  "libc",
  "log",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-postgres",
  "zou-log",

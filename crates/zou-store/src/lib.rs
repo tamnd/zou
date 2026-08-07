@@ -26,6 +26,7 @@ pub mod memtable;
 pub mod open;
 pub mod pageread;
 pub mod placement;
+pub mod registry;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod shardmanifest;

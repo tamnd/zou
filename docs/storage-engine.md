@@ -7,6 +7,7 @@ zou-store makes object storage the only durable medium while keeping commit and 
 One prefix per logical database:
 
 ```
+s3://<bucket>/registry/<ref>.json  one entry per registered tenant
 s3://<bucket>/tenants/<ref>/
   MANIFEST                      current manifest, swapped with CAS
   manifests/<epoch>-<unix>.json manifest history, enables PITR and branching
@@ -27,6 +28,16 @@ Everything under wal/ and chk/ is immutable once written. Only MANIFEST is mutat
 The same layout lives on any backend that passes the CAS contract. A plain path is a directory tree of one file per object, and a path ending in `.zou` is the single file backend: append only frames holding keys, fixed width metadata, and lz4 compressed payloads column wise, a crc guarded scan that truncates torn tails at open, versions as never reused sequence numbers, and compaction that rewrites live entries and swaps the file in atomically. One process owns a `.zou` file at a time through an OS level lock, which fits every sequential tool today, initdb over the shim, zou-bootstrap, zou info, and zou branch, while attaching the multi process postmaster to one waits on the in process engine. A bootstrapped store that spreads over a few thousand files in a directory lands in one file about a quarter the size.
 
 Builds with the `sqlite` feature add one more single file backend: `sqlite://<path>`, or a bare path ending `.db`, `.sqlite`, or `.sqlite3`, keeps the whole store in one SQLite database, WAL mode with synchronous FULL so an acked put survives power loss, conditional PUT as an UPDATE guarded by the expected version, per key integer versions, and the same lz4 rule as the .zou backend. Where .zou bets on a purpose built format, this one bets on the most deployed storage engine there is, and it brings tooling for free, `sqlite3 store.db` inspects a live store and `.backup` takes a consistent hot copy. `ZOU_SQLITE_SYNC=normal` relaxes durability for benchmark runs only.
+
+## Tenant registry
+
+A server that serves more than one database has to answer, on the request path, which tenant a request is for and whether the caller may have it. That answer is `registry/<ref>.json`, one small object per tenant holding the ref, the second it was registered, the project's JWT secret, and any extra hostnames that route to it.
+
+One object per tenant rather than one index object for all of them, for two reasons that both bite at scale. The lookup is the hot operation, and against a per tenant key it is a point GET the store can cache, while against an index it is a read of every tenant to find one. And creating a tenant against a per tenant key is a conditional PUT that fails if the ref is taken, while against an index it is a read modify write two creates can lose.
+
+The secret lives here because the front door has to verify an apikey before it attaches anything. Verifying against the tenant's own database would mean acquiring its lease, hydrating it, and starting a session for a request that turns out to be unauthenticated, which is a lever anyone on the internet can pull. Reading one small object and checking a signature is not.
+
+`zou tenant <target> create <ref> [--secret <s>]` registers one and prints the generated secret, `list` prints the refs and whether each has a database yet, `info <ref>` prints the entry, and `delete <ref>` removes the entry. Registering is not creating a database and deleting is not destroying one: the data under `tenants/<ref>/` arrives when something bootstraps or branches into it, and stays when the entry goes, because a router's index should not be able to destroy a project as a side effect of forgetting it. None of the four takes a lease or writes into a tenant prefix, so they all run against a live store.
 
 ## Manifest
 
