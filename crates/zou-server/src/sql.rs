@@ -76,7 +76,21 @@ struct Inner {
     permits: Arc<Semaphore>,
     idle: Mutex<Vec<Client>>,
     bootstrapped: tokio::sync::OnceCell<()>,
+    settings: tokio::sync::RwLock<Option<(std::time::Instant, RoleSettings)>>,
 }
+
+/// What `alter role x set y to z` wrote, per role, already filtered
+/// down to what is worth applying.
+type RoleSettings = Arc<std::collections::HashMap<String, Vec<(String, String)>>>;
+
+/// The names zou sets itself, which are never taken from a role.
+///
+/// `search_path` is the interesting one: a request's schema is
+/// negotiated per request from the Accept-Profile header, so a role
+/// level search_path would quietly win over the profile the caller
+/// asked for. Dropping both here makes the two sets disjoint, which
+/// is also why the order they are applied in does not matter.
+const OURS: [&str; 2] = ["role", "search_path"];
 
 /// The pool itself, cheap to clone and share.
 #[derive(Clone)]
@@ -107,6 +121,24 @@ begin
     if not exists (select 1 from pg_roles where rolname = 'service_role') then
         create role service_role nologin bypassrls;
     end if;
+end
+$$;
+
+-- The statement timeouts a Supabase project has, three seconds for
+-- anon and eight for authenticated, so a query nobody is waiting for
+-- any more stops rather than holding a connection. service_role has
+-- none there and gets none here.
+--
+-- These rows do nothing on their own: postgres reads role settings at
+-- connection time for the role that connected, and every role here is
+-- reached with set role instead. Pool::settings is the half that makes
+-- them real, and an alter role by hand works the same way.
+do $$
+begin
+    alter role anon set statement_timeout to '3s';
+    alter role authenticated set statement_timeout to '8s';
+exception when insufficient_privilege then
+    raise warning 'zou: no statement timeouts: %', sqlerrm;
 end
 $$;
 
@@ -333,6 +365,11 @@ const RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 /// keeping the catalog from going stale forever.
 const REFRESH: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a read of the role settings is trusted for. Nothing
+/// notifies on an `alter role`, so this is the whole invalidation
+/// story, and it is the delay between running one and seeing it.
+const SETTLED: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl Pool {
     /// Parse the dsn now, dial nothing. `max` caps the number of live
     /// connections, checkouts past it wait their turn.
@@ -343,6 +380,7 @@ impl Pool {
             permits: Arc::new(Semaphore::new(max)),
             idle: Mutex::new(Vec::new()),
             bootstrapped: tokio::sync::OnceCell::new(),
+            settings: tokio::sync::RwLock::new(None),
         })))
     }
 
@@ -454,11 +492,103 @@ impl Pool {
         }
     }
 
+    /// What every role in this database had `alter role` run against
+    /// it, cached for `SETTLED` because nothing announces a change to
+    /// it.
+    ///
+    /// Postgres reads these rows once, at connection time, for the role
+    /// that connected. A role arrived at through `set role` never gets
+    /// them, and every role zou serves is arrived at that way, so
+    /// `alter role anon set statement_timeout to '3s'` would sit in the
+    /// catalog meaning nothing. PostgREST 10 and later reads them
+    /// itself and applies them per transaction, which is the only
+    /// reason those timeouts are real on Supabase, and this is that.
+    ///
+    /// Rows for the database and rows for every database can both exist
+    /// for one role; the query hands back the general one first and the
+    /// specific one last, and the last one of a name wins, which is the
+    /// order postgres itself resolves them in.
+    ///
+    /// An `alter role` fires no event trigger, so the catalog watch
+    /// cannot see one and there is nothing to invalidate against. A
+    /// short time is the honest answer rather than a cache that would
+    /// be right forever or wrong forever.
+    async fn settings(&self, client: &Client) -> Result<RoleSettings, Error> {
+        if let Some((read, known)) = self.0.settings.read().await.as_ref()
+            && read.elapsed() < SETTLED
+        {
+            return Ok(Arc::clone(known));
+        }
+        let rows = client
+            .query(
+                "select r.rolname, s.setconfig \
+                 from pg_db_role_setting s \
+                 join pg_roles r on r.oid = s.setrole \
+                 where s.setconfig is not null \
+                   and s.setdatabase in \
+                       (0, (select oid from pg_database where datname = current_database())) \
+                 order by (s.setdatabase <> 0)",
+                &[],
+            )
+            .await?;
+        let mut by_role: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for row in &rows {
+            let held = by_role.entry(row.get::<_, String>(0)).or_default();
+            for one in row.get::<_, Vec<String>>(1) {
+                let Some((name, value)) = one.split_once('=') else {
+                    continue;
+                };
+                if OURS.iter().any(|ours| ours.eq_ignore_ascii_case(name)) {
+                    continue;
+                }
+                held.retain(|(had, _)| had != name);
+                held.push((name.to_string(), value.to_string()));
+            }
+        }
+        let fresh: RoleSettings = Arc::new(by_role);
+        *self.0.settings.write().await = Some((std::time::Instant::now(), Arc::clone(&fresh)));
+        Ok(fresh)
+    }
+
     /// A transaction with the request context injected, the unit every
     /// REST and auth request runs in. Commit or roll back explicitly,
     /// a dropped session forfeits its connection.
     pub async fn session(&self, ctx: &RequestContext, read_only: bool) -> Result<Session, Error> {
         let (permit, client) = self.checkout().await?;
+        // Read before the begin, so a database that will not answer
+        // this fails the request rather than poisoning a transaction.
+        let known = self.settings(&client).await?;
+        let theirs: &[(String, String)] = known.get(&ctx.role).map_or(&[], Vec::as_slice);
+        let mut sql = String::from(
+            "select set_config('role', $1, true),
+                    set_config('request.jwt.claims', $2, true),
+                    set_config('request.method', $3, true),
+                    set_config('request.path', $4, true),
+                    set_config('request.headers', $5, true),
+                    set_config('request.cookies', $6, true),
+                    set_config('search_path', $7, true)",
+        );
+        let mut args: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![
+            &ctx.role,
+            &ctx.claims,
+            &ctx.method,
+            &ctx.path,
+            &ctx.headers,
+            &ctx.cookies,
+            &ctx.search_path,
+        ];
+        for (name, value) in theirs {
+            // Both sides parameterised: a setting name is an
+            // identifier out of a catalog somebody else can write to.
+            sql.push_str(&format!(
+                ", set_config(${}, ${}, true)",
+                args.len() + 1,
+                args.len() + 2
+            ));
+            args.push(name);
+            args.push(value);
+        }
         let begin = if read_only {
             "begin read only"
         } else {
@@ -466,26 +596,7 @@ impl Pool {
         };
         let injected = async {
             client.batch_execute(begin).await?;
-            client
-                .query_one(
-                    "select set_config('role', $1, true),
-                            set_config('request.jwt.claims', $2, true),
-                            set_config('request.method', $3, true),
-                            set_config('request.path', $4, true),
-                            set_config('request.headers', $5, true),
-                            set_config('request.cookies', $6, true),
-                            set_config('search_path', $7, true)",
-                    &[
-                        &ctx.role,
-                        &ctx.claims,
-                        &ctx.method,
-                        &ctx.path,
-                        &ctx.headers,
-                        &ctx.cookies,
-                        &ctx.search_path,
-                    ],
-                )
-                .await?;
+            client.query_one(&sql, &args).await?;
             Ok::<(), Error>(())
         };
         match injected.await {

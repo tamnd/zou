@@ -290,6 +290,67 @@ async fn checkouts_past_the_cap_wait_instead_of_failing() {
     }
 }
 
+/// The timeout is on the role, and postgres does not apply a role's
+/// settings to a role that was arrived at with set role, so this is
+/// really a test of the pool reading them and applying them itself.
+#[tokio::test]
+async fn a_role_setting_reaches_the_transaction_that_set_role_would_not_get() {
+    let Some(pool) = pool_of(1) else { return };
+    let ctx = RequestContext::bare("anon", "{}");
+    let sess = pool.session(&ctx, false).await.expect("session");
+    assert_eq!(
+        text(&sess, "select current_setting('statement_timeout')").await,
+        "3s"
+    );
+    let err = sess
+        .query("select pg_sleep(5)", &[])
+        .await
+        .expect_err("a query past the timeout");
+    let msg = err.as_db_error().expect("a db error").message();
+    assert!(msg.contains("statement timeout"), "unexpected error: {msg}");
+    sess.rollback().await.expect("rollback");
+
+    // Local to the transaction, like everything else the pool injects.
+    let clean = pool.unscoped().await.expect("unscoped");
+    assert_ne!(
+        text(&clean, "select current_setting('statement_timeout')").await,
+        "3s"
+    );
+    clean.commit().await.expect("finish");
+}
+
+/// The one setting a role is not allowed to have, because the schema a
+/// request runs against is negotiated per request and a role level
+/// search_path would win over the profile the caller asked for.
+#[tokio::test]
+async fn a_role_search_path_does_not_beat_the_requested_profile() {
+    let Some(pool) = pool_of(1) else { return };
+    let admin = pool.unscoped().await.expect("unscoped");
+    admin
+        .execute("alter role anon set search_path to pg_catalog", &[])
+        .await
+        .expect("alter role");
+    admin.commit().await.expect("finish");
+
+    // A pool of its own, because the settings of the one above are
+    // already read and held for a while.
+    let fresh = pool_of(1).expect("dsn");
+    let ctx = RequestContext::bare("anon", "{}");
+    let sess = fresh.session(&ctx, false).await.expect("session");
+    assert_eq!(
+        text(&sess, "select current_setting('search_path')").await,
+        "\"public\""
+    );
+    sess.rollback().await.expect("rollback");
+
+    let admin = pool.unscoped().await.expect("unscoped");
+    admin
+        .execute("alter role anon reset search_path", &[])
+        .await
+        .expect("reset");
+    admin.commit().await.expect("finish");
+}
+
 /// The extensions a project's own migrations assume, which are not
 /// zou's own: nothing in this server calls either of them. The
 /// assertion is that `gen_salt` resolves with nothing in front of it,
