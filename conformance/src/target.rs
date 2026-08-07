@@ -62,7 +62,15 @@ pub struct Target {
 /// path the request came in on, and a bare PostgREST is asked on a path
 /// with `/rest/v1` taken off it, so it would differ on every case
 /// without anything having differed.
-pub const COMPARED: [&str; 8] = [
+///
+/// The nine at the bottom are the resumable protocol, where the answer
+/// is the headers. A creation answers 201 with an empty body and says
+/// everything in `location`, a head answers 200 with an empty body and
+/// says everything in `upload-offset` and `upload-length`, and the
+/// capabilities of the endpoint are `tus-version`, `tus-extension` and
+/// `tus-max-size` and nothing else. Comparing bodies alone would say
+/// every one of those cases matched.
+pub const COMPARED: [&str; 17] = [
     "allow",
     "content-profile",
     "content-range",
@@ -71,6 +79,15 @@ pub const COMPARED: [&str; 8] = [
     "preference-applied",
     "retry-after",
     "www-authenticate",
+    "tus-extension",
+    "tus-max-size",
+    "tus-resumable",
+    "tus-version",
+    "upload-defer-length",
+    "upload-expires",
+    "upload-length",
+    "upload-metadata",
+    "upload-offset",
 ];
 
 impl Target {
