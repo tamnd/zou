@@ -408,6 +408,10 @@ pub fn run(args: &Args) -> Result<(), String> {
             .args(["--set", "full_page_writes=off"])
             .env("ZOU_TARGET", &args.target)
             .env("ZOU_PAGE_CACHE", &pagecache)
+            // No page service exists during bootstrap, initdb is a
+            // standalone process. Writes stay eager whatever the
+            // caller exported.
+            .env_remove("ZOU_PAGESERVE")
             .output()
             .map_err(|e| format!("initdb: {e}"))?;
         if !out.status.success() {

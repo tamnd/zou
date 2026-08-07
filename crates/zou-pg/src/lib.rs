@@ -31,6 +31,11 @@ pub mod gc;
 pub mod getpage;
 pub mod ingest;
 pub mod pagecache;
+#[cfg(unix)]
+pub mod pageserve;
+#[cfg(not(unix))]
+#[path = "pageserve_stub.rs"]
+pub mod pageserve;
 mod pagesvc;
 pub mod pending;
 pub mod reader;
@@ -169,9 +174,27 @@ struct Shim {
     /// unset. Plain files, no lock, cross process safety comes from
     /// bufmgr never running IO on one block from two processes.
     cache: Option<pagecache::PageCache>,
+    /// GetPage client, `Some` when ZOU_PAGESERVE=1. With it in place
+    /// reads past the local tiers go to the page service socket and
+    /// eager page puts are elided, see the pageserve module.
+    pageserve: Option<pageserve::PageClient>,
 }
 
 static SHIM: OnceLock<Shim> = OnceLock::new();
+
+/// The socket the page service worker binds and every backend's
+/// client dials. Postgres processes run from the data directory, so
+/// the relative default lands in PGDATA and stays under the unix
+/// socket path length cap.
+fn pageserve_socket() -> std::path::PathBuf {
+    std::env::var("ZOU_PAGESERVE_SOCK")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("zou.pagesvc"))
+}
+
+fn pageserve_on() -> bool {
+    std::env::var("ZOU_PAGESERVE").is_ok_and(|v| v == "1")
+}
 
 /// Serve one page from the checkpoint chain, `None` when pg/ must
 /// answer. `ZOU_CHAIN_READER=0` is the escape hatch that pins every
@@ -445,6 +468,7 @@ pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
             reader: Mutex::new(ReaderSlot::Unset),
             pending: Mutex::new(pending::Pending::default()),
             cache: pagecache::PageCache::from_env(),
+            pageserve: pageserve_on().then(|| pageserve::PageClient::new(pageserve_socket())),
         });
         ZOU_OK
     })
@@ -567,6 +591,26 @@ pub unsafe extern "C" fn zou_smgr_read(
             note_read(stats::ReadTier::Cache, 1, started);
             return ZOU_OK;
         }
+        // With the page service on it owns everything past the local
+        // tiers: layers and the memtable since the anchor, frozen pg/
+        // images before it. The v1 chain and pg/ cannot answer, eager
+        // puts are elided so pg/ is stale for any block written since.
+        if let Some(client) = &shim.pageserve {
+            match client.get_pages(spc, db, rel, fork, &[blk], durable_lsn) {
+                Ok(pages) => {
+                    out.copy_from_slice(&pages[0]);
+                    if let Some(cache) = &shim.cache {
+                        cache.save((spc, db, rel, fork), blk, &pages[0]);
+                    }
+                    note_read(stats::ReadTier::Store, 1, started);
+                    return ZOU_OK;
+                }
+                Err(e) => {
+                    log::error!("zou_smgr_read: getpage {spc}/{db}/{rel}.{fork} blk {blk}: {e}");
+                    return ZOU_ERR_STORE;
+                }
+            }
+        }
         let r = walscan::BlockRef {
             spc,
             db,
@@ -668,6 +712,12 @@ pub unsafe extern "C" fn zou_smgr_readv(
                 cache_pages += 1;
                 continue;
             }
+            if shim.pageserve.is_some() {
+                // The page service answers everything past the local
+                // tiers, the chain probe would be wasted work.
+                misses.push((i, b));
+                continue;
+            }
             let r = walscan::BlockRef {
                 spc,
                 db,
@@ -686,6 +736,36 @@ pub unsafe extern "C" fn zou_smgr_readv(
                 Ok(None) => misses.push((i, b)),
                 Err(()) => return ZOU_ERR_STORE,
             }
+        }
+        if let Some(client) = &shim.pageserve {
+            if !misses.is_empty() {
+                let blks: Vec<u32> = misses.iter().map(|(_, b)| *b).collect();
+                match client.get_pages(spc, db, rel, fork, &blks, durable_lsn) {
+                    Ok(pages) => {
+                        for ((i, b), page) in misses.iter().zip(&pages) {
+                            let out =
+                                unsafe { std::slice::from_raw_parts_mut(ptrs[*i], ZOU_PAGE_SIZE) };
+                            out.copy_from_slice(page);
+                            if let Some(cache) = &shim.cache {
+                                cache.save((spc, db, rel, fork), *b, page);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("zou_smgr_readv: getpage {spc}/{db}/{rel}.{fork}: {e}");
+                        return ZOU_ERR_STORE;
+                    }
+                }
+            }
+            stats::note_read_pages(stats::ReadTier::Cache, cache_pages);
+            stats::note_read_pages(stats::ReadTier::Store, misses.len() as u64);
+            let tier = if misses.is_empty() {
+                stats::ReadTier::Cache
+            } else {
+                stats::ReadTier::Store
+            };
+            stats::note_read_call(tier, started.elapsed());
+            return ZOU_OK;
         }
         // The remaining blocks all live under pg/ and their gets are
         // independent, so they fan out across the shim thread pool.
@@ -756,32 +836,61 @@ pub unsafe extern "C" fn zou_smgr_write(
             return ZOU_ERR_BAD_ARGUMENT;
         }
         let data = unsafe { std::slice::from_raw_parts(buf, ZOU_PAGE_SIZE) };
-        match shim
-            .store
-            .put(&shim.layout.pg_block(spc, db, rel, fork, blk), data)
-        {
-            Ok(_) => {
-                if let Ok(mut slot) = shim.pending.lock() {
-                    slot.refresh((spc, db, rel, fork), blk, data);
-                }
-                if let Some(cache) = &shim.cache {
-                    cache.save((spc, db, rel, fork), blk, data);
-                }
-                note_write(
-                    shim,
-                    walscan::BlockRef {
-                        spc,
-                        db,
-                        rel,
-                        fork,
-                        blk,
-                    },
-                );
-                ZOU_OK
-            }
-            Err(_) => ZOU_ERR_STORE,
+        if shim.pageserve.is_some() {
+            // Elided: every change on this page is in WAL the mirror
+            // barrier already settled, and the page service serves it
+            // back from layers. The local copies still land so later
+            // reads stay local.
+            local_write(shim, spc, db, rel, fork, blk, data);
+            return ZOU_OK;
         }
+        put_page_eager(shim, spc, db, rel, fork, blk, data)
     })
+}
+
+/// The local half of a page write: pending refresh, cache copy, and
+/// the dirty note, everything but the store put.
+fn local_write(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, blk: u32, data: &[u8]) {
+    if let Ok(mut slot) = shim.pending.lock() {
+        slot.refresh((spc, db, rel, fork), blk, data);
+    }
+    if let Some(cache) = &shim.cache {
+        cache.save((spc, db, rel, fork), blk, data);
+    }
+    note_write(
+        shim,
+        walscan::BlockRef {
+            spc,
+            db,
+            rel,
+            fork,
+            blk,
+        },
+    );
+}
+
+/// One durable page put plus its local copies, the v1 write path.
+/// Extends use it even with the page service on: the image a fork
+/// grows with is the base later reconstructions start from.
+fn put_page_eager(
+    shim: &Shim,
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+    blk: u32,
+    data: &[u8],
+) -> i32 {
+    match shim
+        .store
+        .put(&shim.layout.pg_block(spc, db, rel, fork, blk), data)
+    {
+        Ok(_) => {
+            local_write(shim, spc, db, rel, fork, blk, data);
+            ZOU_OK
+        }
+        Err(_) => ZOU_ERR_STORE,
+    }
 }
 
 /// Buffer one skipFsync page and drain everything when the buffer
@@ -861,7 +970,13 @@ pub unsafe extern "C" fn zou_smgr_extend(
         }
         // Buffering is disabled, fall through to the eager path.
     }
-    let rc = unsafe { zou_smgr_write(spc, db, rel, fork, blk, buf) };
+    let rc = with_shim(|shim| {
+        if buf.is_null() {
+            return ZOU_ERR_BAD_ARGUMENT;
+        }
+        let data = unsafe { std::slice::from_raw_parts(buf, ZOU_PAGE_SIZE) };
+        put_page_eager(shim, spc, db, rel, fork, blk, data)
+    });
     if rc != ZOU_OK {
         return rc;
     }
@@ -922,22 +1037,28 @@ pub unsafe extern "C" fn zou_smgr_writev(
                 return ZOU_OK;
             }
         }
-        struct Job(u32, *const u8);
-        unsafe impl Send for Job {}
-        unsafe impl Sync for Job {}
-        let jobs: Vec<Job> = ptrs
-            .iter()
-            .enumerate()
-            .map(|(i, p)| Job(blk + i as u32, *p))
-            .collect();
-        let ok = pending::for_each_parallel(&jobs, |Job(b, ptr)| {
-            let page = unsafe { std::slice::from_raw_parts(*ptr, ZOU_PAGE_SIZE) };
-            shim.store
-                .put(&shim.layout.pg_block(spc, db, rel, fork, *b), page)
-                .is_ok()
-        });
-        if !ok {
-            return ZOU_ERR_STORE;
+        // Checkpointer and bgwriter runs are the skip_fsync == 0 case,
+        // fully WAL covered, so under the page service the puts drop
+        // out. skipFsync runs that fell through stay eager, some of
+        // those pages never make it into WAL.
+        if shim.pageserve.is_none() || skip_fsync != 0 {
+            struct Job(u32, *const u8);
+            unsafe impl Send for Job {}
+            unsafe impl Sync for Job {}
+            let jobs: Vec<Job> = ptrs
+                .iter()
+                .enumerate()
+                .map(|(i, p)| Job(blk + i as u32, *p))
+                .collect();
+            let ok = pending::for_each_parallel(&jobs, |Job(b, ptr)| {
+                let page = unsafe { std::slice::from_raw_parts(*ptr, ZOU_PAGE_SIZE) };
+                shim.store
+                    .put(&shim.layout.pg_block(spc, db, rel, fork, *b), page)
+                    .is_ok()
+            });
+            if !ok {
+                return ZOU_ERR_STORE;
+            }
         }
         for (i, ptr) in ptrs.iter().enumerate() {
             let page = unsafe { std::slice::from_raw_parts(*ptr, ZOU_PAGE_SIZE) };
@@ -1360,9 +1481,12 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     let mut config = sequencer_config_from_env();
     config.gate = Some(Arc::clone(&gate));
     // The tee feeds the page service driver: every durable window fans
-    // out to it, and layers grow beside the v1 page objects.
-    let tee = Arc::new(Tee::new());
-    config.tee = Some(Arc::clone(&tee));
+    // out to it, and layers grow beside the v1 page objects. With the
+    // standalone page service worker on it ingests the same stream by
+    // polling the store, a second driver here would only burn the same
+    // work twice, so the tee stands down.
+    let tee = (!pageserve_on()).then(|| Arc::new(Tee::new()));
+    config.tee = tee.clone();
     let seq = Sequencer::resume(
         WAL_SHARD,
         sink,
@@ -1373,15 +1497,17 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     // The watermark starts at the resume point: everything the
     // chain already holds is durable by definition.
     let waiter = WalWaiter::spawn(resume);
-    let pagesvc = pagesvc::spawn(
-        Arc::clone(&store),
-        layout.clone(),
-        tenant,
-        tee,
-        Arc::clone(&media),
-        Arc::clone(&gate),
-        Arc::clone(&waiter.durable),
-    );
+    let pagesvc = tee.map(|tee| {
+        pagesvc::spawn(
+            Arc::clone(&store),
+            layout.clone(),
+            tenant,
+            tee,
+            Arc::clone(&media),
+            Arc::clone(&gate),
+            Arc::clone(&waiter.durable),
+        )
+    });
     Ok((
         WalPipe {
             seq: Some(seq),
@@ -1394,7 +1520,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             tenant,
             writer_epoch,
             waiter,
-            pagesvc: Some(pagesvc),
+            pagesvc,
             first_appended: false,
         },
         resume,
@@ -1645,26 +1771,38 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
         let handle = std::thread::Builder::new()
             .name("zou-fold".into())
             .spawn(move || {
-                let outcome =
-                    match fold::prepare(&*store, &layout, &media, tenant, Path::new("."), redo) {
-                        Ok(outcome) => outcome,
-                        Err(e) => return FoldEnd::Failed(format!("capture: {e}")),
-                    };
-                {
-                    let mut held = held.lock().expect("lease mutex poisoned");
-                    match fold::publish(
-                        &*store,
-                        &layout,
-                        &mut held,
-                        &outcome.checkpoint,
-                        redo,
-                        now_unix(),
-                    ) {
-                        Ok(()) => {}
-                        Err(lease::LeaseError::Lost { .. }) => return FoldEnd::LeaseLost,
-                        Err(e) => return FoldEnd::Failed(format!("publish: {e}")),
+                // With the page service on, pg/ carries stale flag day
+                // images kept only as reconstruction bases, so packing
+                // them into a checkpoint would publish garbage. The
+                // durable checkpoint story lives in the shard manifest
+                // instead. The shared log housekeeping below still runs.
+                let kind = if pageserve_on() {
+                    log::info!("zou fold: skipped under the page service, redo {redo:#x}");
+                    zou_store::manifest::CheckpointKind::Delta
+                } else {
+                    let outcome =
+                        match fold::prepare(&*store, &layout, &media, tenant, Path::new("."), redo)
+                        {
+                            Ok(outcome) => outcome,
+                            Err(e) => return FoldEnd::Failed(format!("capture: {e}")),
+                        };
+                    {
+                        let mut held = held.lock().expect("lease mutex poisoned");
+                        match fold::publish(
+                            &*store,
+                            &layout,
+                            &mut held,
+                            &outcome.checkpoint,
+                            redo,
+                            now_unix(),
+                        ) {
+                            Ok(()) => {}
+                            Err(lease::LeaseError::Lost { .. }) => return FoldEnd::LeaseLost,
+                            Err(e) => return FoldEnd::Failed(format!("publish: {e}")),
+                        }
                     }
-                }
+                    outcome.stats.kind
+                };
                 // A fold marks the natural moment to fold the shared
                 // log too: landing segments consolidate into a sealed
                 // round and old landing objects past the safety window
@@ -1691,7 +1829,7 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
                     Err(e) => log::info!("zou fold: landing backlog: {e}"),
                 }
                 FoldEnd::Done {
-                    kind: outcome.stats.kind,
+                    kind,
                     dropped: dropped as u32,
                 }
             });
@@ -1777,6 +1915,96 @@ pub extern "C" fn zou_wal_close() -> i32 {
         };
         let mut pipe = pipe.lock().expect("wal pipe mutex poisoned");
         close_wal_pipe(&mut pipe)
+    })
+}
+
+/// The standalone page service worker's server, held between
+/// [`zou_pagesvc_start`] and [`zou_pagesvc_stop`].
+static PAGESVC_WORKER: Mutex<Option<pageserve::PageServer>> = Mutex::new(None);
+
+/// Start the GetPage server in this process. The dedicated bgworker
+/// calls it once at postmaster start, before recovery, so the socket
+/// is up before the first redo read. Idempotent while running.
+///
+/// # Safety
+/// `target` must be a valid NUL terminated C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zou_pagesvc_start(target: *const c_char, data_checksums: i32) -> i32 {
+    wrap(|| {
+        init_logging();
+        if target.is_null() {
+            return ZOU_ERR_BAD_ARGUMENT;
+        }
+        let Ok(target) = unsafe { CStr::from_ptr(target) }.to_str() else {
+            return ZOU_ERR_BAD_ARGUMENT;
+        };
+        let mut slot = PAGESVC_WORKER.lock().expect("pagesvc slot mutex poisoned");
+        if slot.is_some() {
+            return ZOU_OK;
+        }
+        let store: Arc<dyn CasStore> = match open_store(target) {
+            Ok(store) => Arc::from(store),
+            Err(e) => {
+                log::error!("zou_pagesvc_start: {e}");
+                return ZOU_ERR_BAD_ARGUMENT;
+            }
+        };
+        let tenant_ref = std::env::var("ZOU_TENANT").unwrap_or_else(|_| "local".to_string());
+        let layout = TenantLayout::new(&tenant_ref);
+        let tenant = tenant_id(layout.tenant_ref());
+        let workers = std::env::var("ZOU_REDO_WORKERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let redo = match std::env::current_exe() {
+            Ok(postgres) => Some(redo::RedoPoolConfig {
+                postgres,
+                // Relative to the process cwd, which is PGDATA for
+                // every postgres process, same trick as the socket.
+                scratch_root: std::path::PathBuf::from("zou-redo"),
+                workers,
+                batch_timeout: Duration::from_secs(30),
+                batches_per_worker: 64,
+                data_checksums: data_checksums != 0,
+            }),
+            Err(e) => {
+                log::warn!("zou_pagesvc_start: current_exe: {e}, serving without redo");
+                None
+            }
+        };
+        match pageserve::spawn(pageserve::ServerConfig {
+            store,
+            layout,
+            tenant,
+            socket: pageserve_socket(),
+            data_checksums: data_checksums != 0,
+            redo,
+        }) {
+            Ok(server) => {
+                *slot = Some(server);
+                ZOU_OK
+            }
+            Err(e) => {
+                log::error!("zou_pagesvc_start: spawn: {e}");
+                ZOU_ERR_STORE
+            }
+        }
+    })
+}
+
+/// Stop the GetPage server: flush the ingest tail into a layer, close
+/// the socket, and join the threads. Safe to call when never started.
+#[unsafe(no_mangle)]
+pub extern "C" fn zou_pagesvc_stop() -> i32 {
+    wrap(|| {
+        let taken = PAGESVC_WORKER
+            .lock()
+            .expect("pagesvc slot mutex poisoned")
+            .take();
+        if let Some(mut server) = taken {
+            server.stop();
+        }
+        ZOU_OK
     })
 }
 

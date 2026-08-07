@@ -55,6 +55,10 @@ pub const MAX_GETPAGE_BATCH: usize = 128;
 
 const BLCKSZ: usize = 8192;
 
+/// A hook resolving base images for keys no image layer covers, see
+/// [`PageService::with_base_fallback`].
+type BaseFallback<'a> = Box<dyn Fn(&BlockRef) -> Option<Vec<u8>> + Send + Sync + 'a>;
+
 #[derive(Debug, thiserror::Error)]
 pub enum GetPageError {
     #[error("get page batch of {got} pages exceeds the limit of {MAX_GETPAGE_BATCH}")]
@@ -75,6 +79,7 @@ pub struct PageService<'a> {
     reader: LayerReader<'a>,
     pool: Option<&'a RedoPool>,
     data_checksums: bool,
+    base_fallback: Option<BaseFallback<'a>>,
 }
 
 impl<'a> PageService<'a> {
@@ -88,7 +93,22 @@ impl<'a> PageService<'a> {
             reader: LayerReader::new(store, prefix),
             pool,
             data_checksums,
+            base_fallback: None,
         }
+    }
+
+    /// Resolve a base image for a key no image layer covers yet,
+    /// typically the pg/ objects frozen at the put elision flag day.
+    /// A frozen image can be older than parts of the record chain and
+    /// that is sound: redo stamps every page with its record's lsn, so
+    /// a record the image already contains sees page lsn at or past
+    /// its own and does not apply twice.
+    pub fn with_base_fallback(
+        mut self,
+        f: impl Fn(&BlockRef) -> Option<Vec<u8>> + Send + Sync + 'a,
+    ) -> Self {
+        self.base_fallback = Some(Box::new(f));
+        self
     }
 
     /// A service bound to one tenant's shard, able to follow the owner
@@ -105,6 +125,7 @@ impl<'a> PageService<'a> {
             reader: LayerReader::for_shard(store, tenant_ref, shard),
             pool,
             data_checksums,
+            base_fallback: None,
         }
     }
 
@@ -137,6 +158,19 @@ impl<'a> PageService<'a> {
         for blk in blocks {
             let key = LayerKey::page(blk.spc, blk.db, blk.rel, blk.fork as u8, blk.blk);
             recons.push(self.reader.reconstruct(map, mem, &key, Lsn(at))?);
+        }
+
+        // A key with no image layer starts from the fallback image
+        // when one exists. This covers both a bare chain, whose first
+        // record would otherwise have to initialize the page, and a
+        // block with no records at all, which without the fallback
+        // would read as a hole.
+        if let Some(fallback) = &self.base_fallback {
+            for (blk, r) in blocks.iter().zip(&mut recons) {
+                if r.base.is_none() {
+                    r.base = fallback(blk);
+                }
+            }
         }
 
         // The union of every block's record chain, deduplicated by
