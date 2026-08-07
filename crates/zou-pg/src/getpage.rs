@@ -362,6 +362,63 @@ mod tests {
     }
 
     #[test]
+    fn a_split_child_serves_pages_flushed_before_the_split() {
+        let store = MemStore::default();
+        let layout = TenantLayout::new("t");
+        store
+            .put_if_absent(
+                &layout.manifest(),
+                &zou_store::Manifest::new("t", 18).to_json(),
+            )
+            .unwrap();
+
+        // Two blocks that land on different children once the tenant
+        // splits, both flushed by shard 0 while the count was one.
+        let (b0, b1) = {
+            let mut on0 = None;
+            let mut on1 = None;
+            for b in 0..200u32 {
+                let block = b * 20_000;
+                match zou_store::shard_of(&LayerKey::page(1663, 5, 90, 0, block), 2) {
+                    0 if on0.is_none() => on0 = Some(block),
+                    1 if on1.is_none() => on1 = Some(block),
+                    _ => {}
+                }
+            }
+            (on0.unwrap(), on1.unwrap())
+        };
+        let mut images = vec![
+            ImageEntry {
+                key: LayerKey::page(1663, 5, 90, 0, b0),
+                page: page_with(0xC0),
+            },
+            ImageEntry {
+                key: LayerKey::page(1663, 5, 90, 0, b1),
+                page: page_with(0xC1),
+            },
+        ];
+        images.sort_by_key(|e| e.key);
+        let (bytes, footer) = build_image(&images, Lsn(100), 4096).unwrap();
+        publish(&store, &layout, &bytes, &footer, 100);
+
+        let manifest = zou_store::split(&store, "t").unwrap();
+
+        // Each child sees exactly its own block, through the parent's
+        // prefix, with no manifest of its own yet.
+        for (shard, block, byte) in [(0u16, b0, 0xC0u8), (1, b1, 0xC1)] {
+            let (descs, floor) =
+                zou_store::load_serving_descs(&store, "t", &manifest, shard).unwrap();
+            assert_eq!(floor, Lsn(100));
+            let map = LayerMap::new(descs).unwrap();
+            let svc = PageService::for_shard(&store, "t", shard, None, false);
+            let got = svc
+                .get_page(&map, &Memtable::new(), blk(90, block), 200)
+                .unwrap();
+            assert_eq!(got[100], byte, "shard {shard} serves its half");
+        }
+    }
+
+    #[test]
     fn a_chain_without_a_pool_refuses_and_names_the_block() {
         let store = MemStore::default();
         let layout = TenantLayout::new("t");

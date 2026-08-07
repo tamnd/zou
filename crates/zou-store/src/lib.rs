@@ -28,6 +28,7 @@ pub mod pageread;
 #[cfg(feature = "s3")]
 pub mod s3;
 pub mod shardmanifest;
+pub mod shards;
 pub mod sim;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
@@ -51,12 +52,16 @@ pub use layer::{
 pub use layout::tenant_id;
 pub use lease::{DEFAULT_TTL_SECS, HeldLease, LeaseError};
 pub use lsn::Lsn;
-pub use manifest::{MANIFEST_FORMAT, Manifest};
+pub use manifest::{MANIFEST_FORMAT, Manifest, ShardChange};
 pub use mem::MemStore;
 pub use open::{PrefixStore, open_store};
 #[cfg(feature = "s3")]
 pub use s3::{Dialect, S3Config, S3Store};
 pub use shardmanifest::{LayerEntry, PAGE_SHARD_FORMAT, PageShardManifest, publish_layer};
+pub use shards::{
+    MAX_PAGE_SHARDS, ShardError, load_serving_descs, merge, resume_floor, serving_shards, shard_of,
+    split,
+};
 pub use sim::{BUILTIN_PROFILES, OpDist, SimConfig, SimProfile, SimStore};
 #[cfg(feature = "sqlite")]
 pub use sqlite::SqliteStore;

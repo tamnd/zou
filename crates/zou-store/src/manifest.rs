@@ -12,7 +12,10 @@ use crate::lsn::Lsn;
 /// Current manifest format. Readers refuse anything newer with a clear
 /// error instead of misreading it, and transparently accept anything older.
 /// Format 2 dropped the per tenant WAL tail in favor of the shared log.
-pub const MANIFEST_FORMAT: u32 = 2;
+/// Format 3 added the page shard count and the split lineage; a tenant
+/// writes it on its first split, so a binary that predates sharding
+/// refuses the whole tenant instead of quietly serving shard zero only.
+pub const MANIFEST_FORMAT: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -48,10 +51,45 @@ pub struct Manifest {
     pub folded_upto: Option<Lsn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_of: Option<BranchOf>,
+    /// Page shard count, a power of two (spec 04 section 1). One until
+    /// the first split, and off the wire then, so a tenant that never
+    /// split keeps its manifest byte identical to before sharding.
+    #[serde(default = "one_shard", skip_serializing_if = "is_one_shard")]
+    pub shards: u32,
+    /// Split lineage, oldest first, a chain: each entry's `from` is the
+    /// previous entry's `to`. A shard the newest change created serves
+    /// its ancestors' layers until compaction physically separates
+    /// them, and this list is how a reader knows which eras to consult
+    /// and where a fresh shard's ingest resumes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shard_history: Vec<ShardChange>,
     /// Unix seconds of the last state changing publish. Rides into the
     /// manifest history copy, which is what PITR picks a snapshot by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published_unix: Option<u64>,
+}
+
+fn one_shard() -> u32 {
+    1
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_one_shard(n: &u32) -> bool {
+    *n == 1
+}
+
+/// One shard count change, the record a split or merge leaves behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardChange {
+    pub from: u32,
+    pub to: u32,
+    /// The safe resume floor for shards this change created: every
+    /// record at or below it, for any key, sits in a published layer
+    /// of the pre change era. A shard with no manifest of its own yet
+    /// starts ingesting here.
+    pub at: Lsn,
+    /// When the change was published, for eyes and audit only.
+    pub unix: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +141,10 @@ impl Manifest {
     /// A fresh manifest for a brand new database.
     pub fn new(tenant_ref: &str, pg_version: u32) -> Self {
         Self {
-            format: MANIFEST_FORMAT,
+            // Base format on purpose, not the ceiling: a tenant that
+            // never splits keeps writing format 2, only the first
+            // split writes the format 3 that carries sharding.
+            format: 2,
             tenant_ref: tenant_ref.to_string(),
             epoch: 0,
             lease: None,
@@ -114,6 +155,8 @@ impl Manifest {
             checkpoints: Vec::new(),
             folded_upto: None,
             branch_of: None,
+            shards: 1,
+            shard_history: Vec::new(),
             published_unix: None,
         }
     }
@@ -154,7 +197,7 @@ mod tests {
 
     fn sample() -> Manifest {
         Manifest {
-            format: MANIFEST_FORMAT,
+            format: 2,
             tenant_ref: "acme-prod".into(),
             epoch: 42,
             lease: Some(Lease {
@@ -182,6 +225,8 @@ mod tests {
             ],
             folded_upto: Some("0/8B000000".parse().unwrap()),
             branch_of: None,
+            shards: 1,
+            shard_history: Vec::new(),
             published_unix: None,
         }
     }
@@ -232,6 +277,33 @@ mod tests {
     }
 
     #[test]
+    fn shard_fields_round_trip_and_stay_off_the_wire_when_unsplit() {
+        let text = String::from_utf8(sample().to_json()).unwrap();
+        for key in ["shards", "shard_history"] {
+            assert!(!text.contains(key), "{key} leaked into an unsplit manifest");
+        }
+
+        let mut m = sample();
+        m.format = 3;
+        m.shards = 4;
+        m.shard_history = vec![
+            ShardChange {
+                from: 1,
+                to: 2,
+                at: Lsn(0x100),
+                unix: 1_767_100_200,
+            },
+            ShardChange {
+                from: 2,
+                to: 4,
+                at: Lsn(0x900),
+                unix: 1_767_100_300,
+            },
+        ];
+        assert_eq!(Manifest::from_json(&m.to_json()).unwrap(), m);
+    }
+
+    #[test]
     fn refuses_a_v1_manifest_with_an_unfolded_wal_tail() {
         let json = r#"{
             "format": 1,
@@ -269,6 +341,12 @@ mod tests {
             r#"{{"format":{MANIFEST_FORMAT},"ref":"t1","epoch":0,"pg":{{"version":18,"timeline":1}}}}"#
         );
         let m = Manifest::from_json(json.as_bytes()).unwrap();
-        assert_eq!(m, Manifest::new("t1", 18));
+        assert_eq!(
+            m,
+            Manifest {
+                format: MANIFEST_FORMAT,
+                ..Manifest::new("t1", 18)
+            }
+        );
     }
 }
