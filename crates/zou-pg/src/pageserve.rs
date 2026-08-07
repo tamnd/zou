@@ -134,8 +134,26 @@ impl PageClient {
     }
 
     fn connect(&self) -> Result<UnixStream, String> {
-        let sock = UnixStream::connect(&self.path)
-            .map_err(|e| format!("page service at {:?}: connect: {e}", self.path))?;
+        // The service worker rides every crash cycle: a SIGKILL'd
+        // sibling makes the postmaster reinitialize, and recovery's
+        // first read can land before the restarted worker rebinds the
+        // socket. Failing that read kills the startup process, so a
+        // missing or refusing socket gets a bounded grace instead.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let sock = loop {
+            match UnixStream::connect(&self.path) {
+                Ok(sock) => break sock,
+                Err(e)
+                    if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::NotFound)
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => {
+                    return Err(format!("page service at {:?}: connect: {e}", self.path));
+                }
+            }
+        };
         let cap = WAIT_CAP + Duration::from_secs(10);
         sock.set_read_timeout(Some(cap))
             .map_err(|e| e.to_string())?;

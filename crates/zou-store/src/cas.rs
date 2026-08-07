@@ -171,7 +171,13 @@ impl KeyLock {
         let deadline = Instant::now() + stale + Duration::from_secs(10);
         loop {
             match fs::create_dir(&dir) {
-                Ok(()) => return Ok(Self { dir }),
+                Ok(()) => {
+                    // Stamp the holder pid so a waiter can tell a crashed
+                    // owner from a slow one. A failed stamp only costs the
+                    // early break, the age rule still applies.
+                    let _ = fs::File::create(dir.join(format!("pid-{}", std::process::id())));
+                    return Ok(Self { dir });
+                }
                 Err(e) if lock_busy(&e) => {
                     // A crash between mkdir and Drop leaves the lock dir
                     // behind forever, and without this check the key would
@@ -179,8 +185,13 @@ impl KeyLock {
                     // the duration of one small file write, so a lock dir
                     // whose mtime is minutes old belongs to a dead process
                     // and gets broken. The mtime of a dir is set at mkdir
-                    // and a crashed owner never touches it again.
-                    if lock_is_stale(&dir, stale) {
+                    // and a crashed owner never touches it again. The pid
+                    // stamp shortcuts the wait: local means same host, so
+                    // a lock whose every stamped owner is gone is a crash
+                    // leftover no matter how fresh, and every second spent
+                    // honoring it is a second of commit stall in a kill
+                    // drill.
+                    if lock_expired(&dir, stale) {
                         break_stale_lock(&dir, stale);
                         continue;
                     }
@@ -224,6 +235,54 @@ fn lock_is_stale(dir: &Path, stale: Duration) -> bool {
     false
 }
 
+/// A lock is expired when it is old enough, or when every process that
+/// stamped it is gone. The second arm never fires for a lock whose
+/// stamp did not land or could not be read: absence of evidence keeps
+/// the conservative age rule.
+fn lock_expired(dir: &Path, stale: Duration) -> bool {
+    lock_is_stale(dir, stale) || lock_owner_dead(dir)
+}
+
+/// Whether the lock dir carries pid stamps and every stamped pid is
+/// dead. Localfs means one host, so a dead pid is proof the holder
+/// crashed mid-write. A recycled pid reads as alive and falls back to
+/// the age rule, which only ever errs toward waiting.
+fn lock_owner_dead(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let mut stamped = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("pid-"))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        stamped = true;
+        if pid_alive(pid) {
+            return false;
+        }
+    }
+    stamped
+}
+
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    // Signal zero probes without sending. EPERM still means the pid
+    // exists, it just belongs to someone we cannot signal.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// No cheap liveness probe here, the age rule alone decides.
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
 /// Remove a stale lock so exactly one waiter does the breaking. A naive
 /// stat then remove races: between one waiter's staleness check and its
 /// remove, another waiter can break the stale lock, win the mkdir, and
@@ -235,7 +294,7 @@ fn break_stale_lock(dir: &Path, stale: Duration) {
     let breaker = dir.with_extension("lock-break");
     match fs::create_dir(&breaker) {
         Ok(()) => {
-            if lock_is_stale(dir, stale) {
+            if lock_expired(dir, stale) {
                 let _ = fs::remove_dir_all(dir);
             }
             let _ = fs::remove_dir(&breaker);
@@ -274,6 +333,10 @@ fn lock_busy(e: &std::io::Error) -> bool {
 
 impl Drop for KeyLock {
     fn drop(&mut self) {
+        // Only our own stamp comes out. If a breaker handed this lock
+        // to a new holder while we were still alive, the remove_dir
+        // fails on their stamp and their lock survives us.
+        let _ = fs::remove_file(self.dir.join(format!("pid-{}", std::process::id())));
         let _ = fs::remove_dir(&self.dir);
     }
 }
@@ -420,5 +483,68 @@ impl CasStore for LocalFsStore {
         }
         out.sort();
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pid that no live process holds: a child that already exited
+    /// and was reaped. Recycling between the wait and the assertion
+    /// would need the kernel to lap its whole pid space in
+    /// microseconds.
+    #[cfg(unix)]
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("wait true");
+        pid
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dead_owner_lock_breaks_without_the_age_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let lock = dir.path().join("wedged.lock");
+        fs::create_dir(&lock).unwrap();
+        fs::File::create(lock.join(format!("pid-{}", dead_pid()))).unwrap();
+        let started = Instant::now();
+        store.put_if_absent("wedged", b"through").unwrap();
+        // The age rule alone would sit on this lock for a minute.
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(store.get("wedged").unwrap().unwrap().0, b"through");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_owner_keeps_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("held.lock");
+        fs::create_dir(&lock).unwrap();
+        fs::File::create(lock.join(format!("pid-{}", std::process::id()))).unwrap();
+        assert!(!lock_owner_dead(&lock));
+        assert!(!lock_expired(&lock, stale_lock_age()));
+    }
+
+    #[test]
+    fn unstamped_lock_falls_back_to_the_age_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("bare.lock");
+        fs::create_dir(&lock).unwrap();
+        assert!(!lock_owner_dead(&lock));
+        assert!(!lock_expired(&lock, Duration::from_secs(60)));
+        assert!(lock_expired(&lock, Duration::ZERO));
+    }
+
+    #[test]
+    fn a_released_lock_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.put_if_absent("clean", b"x").unwrap();
+        assert!(!dir.path().join("clean.lock").exists());
     }
 }
