@@ -1110,15 +1110,16 @@ pub async fn object(
             assembled(&app, &parts, &bucket, &key, &query, body).await
         }
         // UploadPartCopy, whose bytes are some other key's rather than
-        // its own. Owed, and named here rather than left to fall into
-        // the piece below, which would take a body that is not there
-        // and write an empty piece with a straight face.
+        // its own. Told apart from the piece below by the header alone,
+        // and taken first, because a request carrying both a source and
+        // a body is the copy: the body is ignored and the source is
+        // what the piece is made of. Recorded.
         Method::PUT
             if query.contains_key("uploadId")
                 && query.contains_key("partNumber")
-                && header_value(&parts, "x-amz-copy-source").is_some() =>
+                && let Some(source) = header_value(&parts, "x-amz-copy-source") =>
         {
-            return crate::not_yet("the storage surface");
+            piece_copied(&app, &parts, &bucket, &key, &query, source).await
         }
         Method::PUT if query.contains_key("uploadId") && query.contains_key("partNumber") => {
             piece(&app, &parts, &bucket, &key, &query, body).await
@@ -1663,6 +1664,189 @@ async fn piece(
     Ok(answer)
 }
 
+/// PUT /storage/v1/s3/{bucket}/{key}?partNumber=N&uploadId=U with
+/// `x-amz-copy-source` on it.
+///
+/// UploadPartCopy: a piece whose bytes are already on the server, so
+/// that a client joining objects together does not have to move them
+/// through itself. The same put a piece is sent with, told apart by the
+/// header, and answering a document where that one answers a header.
+///
+/// The etag in the document has no quotes on it, the same way the sent
+/// piece's header has none, so a client can hand it straight back to
+/// the completion. That is worth saying because the copy of a whole
+/// object answers the object's own etag, which is quoted everywhere
+/// else it appears. Recorded.
+///
+/// The order of the checks is recorded rather than chosen, and it is
+/// not the order the request reads in: the number first, then the
+/// source, then the range, then the upload. A request with a bad range
+/// and a source that is not there is told about the source, and one
+/// with a bad range and an upload that is not there is told about the
+/// range, which pins the middle two either side of the upload.
+async fn piece_copied(
+    app: &App,
+    parts: &Parts,
+    bucket: &str,
+    key: &str,
+    query: &BTreeMap<String, String>,
+    source: &str,
+) -> Result<Response, StorageError> {
+    verified(app, parts)?;
+    let number = query
+        .get("partNumber")
+        .and_then(|value| value.parse::<i32>().ok())
+        .unwrap_or_default();
+    if number < 1 {
+        return Err(StorageError::not_valid(
+            "Querystring, partNumber must be >= 1".to_string(),
+        ));
+    }
+    if number > MOST_PIECES {
+        return Err(StorageError::not_valid(format!(
+            "Querystring, partNumber must be <= {MOST_PIECES}"
+        )));
+    }
+    let upload = query.get("uploadId").cloned().unwrap_or_default();
+    // The same reading a copy of a whole object gives the header, since
+    // it is the same header: the leading slash is optional and nothing
+    // else is touched, so a name spelled with %20 in it is a name with
+    // a percent in it and a version in a query string is part of the
+    // name. Both recorded here, as `NoSuchKey`.
+    let (from_bucket, from_key) = named(source);
+    let asked = header_value(parts, "x-amz-copy-source-range")
+        .unwrap_or_default()
+        .to_string();
+    let blobs = object::blobs(app)?;
+
+    let ctx = context(parts);
+    let sess = begin(app, &ctx, false).await?;
+    let Some(from) = object::find(&sess, from_bucket, from_key).await? else {
+        return done(sess, Err(StorageError::no_such_key())).await;
+    };
+    let whole = from.meta("size").as_u64().unwrap_or_default();
+    let wanted = match copied_range(&asked, whole) {
+        Ok(wanted) => wanted,
+        Err(why) => return done(sess, Err(why)).await,
+    };
+    let Some(going) = upload_of(&sess, &upload).await? else {
+        return done(sess, Err(StorageError::no_such_upload())).await;
+    };
+    // The same 500 a sent piece earns under another key, and for the
+    // same reason: upstream compares the path against the signature it
+    // stored over the upload and throws. Recorded on this request as
+    // well as on that one, so the copy goes through the check rather
+    // than around it.
+    if going.bucket != bucket || going.key != key {
+        return done(
+            sess,
+            Err(StorageError::internal("Internal Server Error".to_string())),
+        )
+        .await;
+    }
+
+    let bytes = match wanted {
+        Some((first, last)) => blobs.get_range(from.key(), first, last - first + 1).await,
+        None => blobs.get(from.key()).await,
+    }
+    .map_err(|e| StorageError::internal(e.to_string()))?;
+    // A source whose row is there and whose bytes are not is 500, the
+    // same as reading it would be. Recorded against one of the
+    // fixture's four rows, which point at bytes nobody ever wrote.
+    let Some(bytes) = bytes else {
+        let _ = sess.rollback().await;
+        return Err(StorageError::internal("Internal Server Error".to_string()));
+    };
+    let size = bytes.len() as i64;
+    let etag = object::etag_of(&bytes).trim_matches('"').to_string();
+
+    // A row of its own, under a number that already has one as much as
+    // under one that does not, which is the rule a sent piece follows
+    // and is recorded again here.
+    let rows = sess
+        .query(
+            "insert into storage.s3_multipart_uploads_parts
+                 (upload_id, part_number, bucket_id, key, etag, version, size)
+             values ($1, $2, $3, $4, $5, $6, $7)
+             returning id::text,
+                       to_char(created_at at time zone 'utc',
+                               'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')",
+            &[
+                &upload,
+                &number,
+                &bucket,
+                &key,
+                &etag,
+                &going.version,
+                &size,
+            ],
+        )
+        .await
+        .map_err(|e| pg_error(&e))?;
+    let Some(made) = rows.first() else {
+        return Err(StorageError::internal("piece was not written".to_string()));
+    };
+    let part: String = made.get(0);
+    let when: String = made.get(1);
+    sess.execute(
+        "update storage.s3_multipart_uploads
+            set in_progress_size = in_progress_size + $2
+          where id = $1",
+        &[&upload, &size],
+    )
+    .await
+    .map_err(|e| pg_error(&e))?;
+
+    if let Err(e) = blobs
+        .put(crate::blob::piece_key(&upload, &part), bytes)
+        .await
+    {
+        let _ = sess.rollback().await;
+        return Err(StorageError::internal(e.to_string()));
+    }
+    done(sess, Ok(())).await?;
+
+    Ok(xml(format!(
+        "{DECLARATION}<CopyPartResult xmlns=\"{NAMESPACE}\"><ETag>{}</ETag>\
+         <LastModified>{}</LastModified></CopyPartResult>",
+        escaped(&etag),
+        escaped(&when),
+    )))
+}
+
+/// Which bytes of the source a copied piece is made of.
+///
+/// `None` when the header is not there and when it is there and empty,
+/// which are the same request as far as this endpoint is concerned and
+/// both recorded.
+///
+/// Everything else is one spelling: `bytes=` and two numbers, the
+/// second of them a byte the object has. A suffix range, two ranges in
+/// one header, a range with no unit, a range that ends before it starts
+/// and a range that ends one past the last byte are all refused, and
+/// all with the same sentence. This is where the two range headers on
+/// this surface part company: the one on a download clamps to the end
+/// and answers what there is.
+fn copied_range(asked: &str, size: u64) -> Result<Option<(u64, u64)>, StorageError> {
+    let asked = asked.trim();
+    if asked.is_empty() {
+        return Ok(None);
+    }
+    let Some(spans) = asked.strip_prefix("bytes=") else {
+        return Err(StorageError::bad_range());
+    };
+    let Some((first, last)) = spans.split_once('-') else {
+        return Err(StorageError::bad_range());
+    };
+    let (Ok(first), Ok(last)) = (first.trim().parse::<u64>(), last.trim().parse::<u64>()) else {
+        return Err(StorageError::bad_range());
+    };
+    if first > last || last >= size {
+        return Err(StorageError::bad_range());
+    }
+    Ok(Some((first, last)))
+}
+
 /// GET /storage/v1/s3/{bucket}/{key}?uploadId=U
 ///
 /// ListParts, which a client that lost its place asks before sending
@@ -2197,6 +2381,39 @@ mod tests {
         );
         assert_eq!(parts_in("<CompleteMultipartUpload/>"), None);
         assert_eq!(parts_in(""), None);
+    }
+
+    /// The boundary a copied range is refused on, which was recorded a
+    /// byte either side of rather than reasoned about. The end is a
+    /// byte the object has, so the last byte of a sixty six byte object
+    /// is 65 and asking for 66 is refused.
+    #[test]
+    fn a_copied_range_ends_on_a_byte_the_object_has() {
+        assert_eq!(copied_range("bytes=0-65", 66).unwrap(), Some((0, 65)));
+        assert_eq!(copied_range("bytes=65-65", 66).unwrap(), Some((65, 65)));
+        assert!(copied_range("bytes=0-66", 66).is_err());
+        assert!(copied_range("bytes=66-66", 66).is_err());
+        assert!(copied_range("bytes=20-10", 66).is_err());
+    }
+
+    /// A header that is not there and a header that is there and empty
+    /// are the same request, and both mean the whole object. Recorded,
+    /// because an empty one reads like a client that meant something.
+    #[test]
+    fn no_copied_range_and_an_empty_one_are_the_whole_object() {
+        assert_eq!(copied_range("", 66).unwrap(), None);
+        assert_eq!(copied_range("   ", 66).unwrap(), None);
+    }
+
+    /// Every other spelling a range header takes is refused here, which
+    /// is where this parser and the one on a download part company.
+    #[test]
+    fn a_copied_range_takes_one_spelling_and_no_other() {
+        assert!(copied_range("0-9", 66).is_err());
+        assert!(copied_range("bytes=-5", 66).is_err());
+        assert!(copied_range("bytes=5-", 66).is_err());
+        assert!(copied_range("bytes=0-1,3-4", 66).is_err());
+        assert!(copied_range("bytes=", 66).is_err());
     }
 
     /// A piece that names half of itself names nothing. Nothing
