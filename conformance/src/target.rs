@@ -339,7 +339,7 @@ impl Target {
                     // taken. Written out here for the same reason the
                     // wrong one is: a case cannot read it out of the
                     // answer to the case before it.
-                    Key::S3ProjectRegion => "local",
+                    Key::S3ProjectRegion => sigv4::PROJECT,
                     _ => sigv4::REGION,
                 },
             },

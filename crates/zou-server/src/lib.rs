@@ -888,6 +888,7 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/storage/v1/s3", get(s3::list_buckets))
         .route("/storage/v1/s3/", get(s3::list_buckets))
         .route("/storage/v1/s3/{bucket}", any(s3::bucket))
+        .route("/storage/v1/s3/{bucket}/{*key}", any(s3::object))
         .with_state(Arc::clone(&app));
     Ok(Router::new()
         .merge(open)

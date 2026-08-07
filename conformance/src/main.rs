@@ -420,7 +420,7 @@ fn run(args: Args) -> Result<bool, String> {
                 args.jwt_secret.as_bytes(),
                 &suite.cases.schemas,
                 &suite.cases.anon_role,
-                zou_server::s3::Credentials::new(&args.s3_key, &args.s3_secret),
+                s3_pair(&args.s3_key, &args.s3_secret),
             )?),
             None => None,
         };
@@ -538,6 +538,22 @@ fn published(args: &Args) -> Result<bool, String> {
     Ok(true)
 }
 
+/// The pair the zou under test is configured with.
+///
+/// Not [`zou_server::s3::Credentials::new`], which puts a project in
+/// the region a client assumes. The reference these suites are recorded
+/// against is a local project, and a local project says it is in
+/// [`sigv4::PROJECT`] and answers that when a bucket is asked where it
+/// is. A target in the default region would answer a different string
+/// to one case and take the same signatures on all the others.
+fn s3_pair(access: &str, secret: &str) -> zou_server::s3::Credentials {
+    zou_server::s3::Credentials {
+        access: access.to_string(),
+        secret: secret.to_string(),
+        region: sigv4::PROJECT.to_string(),
+    }
+}
+
 /// Serving: zou on a known port, and then nothing.
 ///
 /// Everything else here asks the questions itself. This exists for the
@@ -563,7 +579,7 @@ fn holding(args: &Args) -> Result<bool, String> {
         args.jwt_secret.as_bytes(),
         &args.schemas,
         &args.anon_role,
-        zou_server::s3::Credentials::new(&args.s3_key, &args.s3_secret),
+        s3_pair(&args.s3_key, &args.s3_secret),
     )?;
     if let Some(path) = &args.setup_sql {
         let sql = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;

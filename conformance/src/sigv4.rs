@@ -24,6 +24,16 @@ use sha2::{Digest, Sha256};
 /// own, which is a case rather than a constant.
 pub const REGION: &str = "us-east-1";
 
+/// Where a local Supabase project says it is.
+///
+/// The answer to GetBucketLocation, and the second of the two regions a
+/// signature may be computed in: the endpoint takes one made here and
+/// one made in [`REGION`], which is what a client that never asked
+/// where it was signs in, and refuses a third. All three are recorded.
+/// The target zou is started with is put in this region so that it is
+/// answering the same question the reference was.
+pub const PROJECT: &str = "local";
+
 /// The signature version, which is in three places in every request and
 /// is worth having one name for.
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";

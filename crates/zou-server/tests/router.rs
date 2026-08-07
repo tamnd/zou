@@ -379,17 +379,23 @@ async fn the_s3_door_answers_a_request_with_no_key_on_it() {
 #[tokio::test]
 async fn an_s3_call_this_surface_has_no_answer_for_yet_says_so_without_naming_methods() {
     let app = app();
-    // Listing a bucket is a thing the reference does and this does not
-    // yet. A method router would have answered 405 and offered the
-    // three verbs that are written, which would read as a claim that
-    // listing is not part of the protocol.
-    let answer = bare(&app, "GET", "/storage/v1/s3/pics").await;
-    assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(answer.allow, "");
-    assert_eq!(
-        answer.message(),
-        "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
-    );
+    // Deleting several keys in one request and starting a multipart
+    // upload are both posts, and both are things the reference does and
+    // this does not yet. A method router would have answered 405 and
+    // offered the verbs that are written, which would read as a claim
+    // that neither is part of the protocol.
+    for path in [
+        "/storage/v1/s3/pics?delete",
+        "/storage/v1/s3/pics/big?uploads",
+    ] {
+        let answer = bare(&app, "POST", path).await;
+        assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
+        assert_eq!(answer.allow, "", "{path}");
+        assert_eq!(
+            answer.message(),
+            "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
+        );
+    }
 }
 
 #[tokio::test]
