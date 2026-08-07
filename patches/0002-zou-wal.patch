@@ -1,5 +1,5 @@
 diff --git a/src/backend/access/transam/meson.build b/src/backend/access/transam/meson.build
-index e8ae9b1..b7f28a9 100644
+index e8ae9b13c8..b7f28a9253 100644
 --- a/src/backend/access/transam/meson.build
 +++ b/src/backend/access/transam/meson.build
 @@ -15,6 +15,7 @@ backend_sources += files(
@@ -11,7 +11,7 @@ index e8ae9b1..b7f28a9 100644
    'xlogarchive.c',
    'xlogbackup.c',
 diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
-index b885513..24c245d 100644
+index b885513f76..24c245d2bb 100644
 --- a/src/backend/access/transam/xact.c
 +++ b/src/backend/access/transam/xact.c
 @@ -29,6 +29,7 @@
@@ -38,10 +38,10 @@ index b885513..24c245d 100644
  		 */
 diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
 new file mode 100644
-index 0000000..23bc879
+index 0000000000..9a8012210e
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,518 @@
+@@ -0,0 +1,597 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -93,6 +93,8 @@ index 0000000..23bc879
 +extern int	zou_wal_fold_start(uint64 redo);
 +extern int	zou_wal_fold_poll(uint64 *out_redo, uint32 *out_dropped);
 +extern int	zou_wal_close(void);
++extern int	zou_pagesvc_start(const char *target, int data_checksums);
++extern int	zou_pagesvc_stop(void);
 +
 +#define ZOU_ERR_LEASE_HELD (-5)
 +#define ZOU_ERR_THROTTLED (-7)
@@ -168,6 +170,28 @@ index 0000000..23bc879
 +			 "ZouWalPusherMain");
 +	snprintf(bgw.bgw_name, BGW_MAXLEN, "zou wal pusher");
 +	snprintf(bgw.bgw_type, BGW_MAXLEN, "zou wal pusher");
++	RegisterBackgroundWorker(&bgw);
++
++	/*
++	 * The page service has to be up before recovery starts: with
++	 * ZOU_PAGESERVE=1 eager page puts are elided, so the startup
++	 * process reads pages the local tiers miss over its socket. The
++	 * pusher above cannot host it, RecoveryFinished is too late, hence
++	 * a worker of its own starting with the postmaster.
++	 */
++	if (getenv("ZOU_PAGESERVE") == NULL)
++		return;
++
++	memset(&bgw, 0, sizeof(bgw));
++	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
++	bgw.bgw_start_time = BgWorkerStart_PostmasterStart;
++	/* Reads block on the socket, come back quickly after a crash. */
++	bgw.bgw_restart_time = 1;
++	snprintf(bgw.bgw_library_name, sizeof(bgw.bgw_library_name), "postgres");
++	snprintf(bgw.bgw_function_name, sizeof(bgw.bgw_function_name),
++			 "ZouPageServiceMain");
++	snprintf(bgw.bgw_name, BGW_MAXLEN, "zou page service");
++	snprintf(bgw.bgw_type, BGW_MAXLEN, "zou page service");
 +	RegisterBackgroundWorker(&bgw);
 +}
 +
@@ -560,8 +584,63 @@ index 0000000..23bc879
 +		return InvalidXLogRecPtr;
 +	return (XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn);
 +}
++
++static void
++zou_pagesvc_on_exit(int code, Datum arg)
++{
++	(void) zou_pagesvc_stop();
++}
++
++/*
++ * The zou page service worker: hosts the GetPage server the storage
++ * manager reads from when eager page puts are elided. All the work,
++ * ingest polling, reconstruction, and the socket, runs on threads
++ * inside the shim; this process exists so those threads start with the
++ * postmaster, survive backend churn, and stop cleanly with the
++ * cluster. It ingests by polling the store rather than by the pusher's
++ * tee, which is what lets it serve the startup process while the
++ * pusher is not running yet.
++ */
++void
++ZouPageServiceMain(Datum main_arg)
++{
++	const char *target = getenv("ZOU_TARGET");
++	int			rc;
++
++	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
++	BackgroundWorkerUnblockSignals();
++
++	if (target == NULL)
++		ereport(FATAL,
++				(errmsg("zou page service started without ZOU_TARGET")));
++
++	rc = zou_pagesvc_start(target, DataChecksumsEnabled() ? 1 : 0);
++	if (rc != 0)
++		ereport(FATAL,
++				(errmsg("zou page service failed to start: %d", rc)));
++	on_proc_exit(zou_pagesvc_on_exit, (Datum) 0);
++
++	ereport(LOG,
++			(errmsg("zou page service serving \"%s\"", target)));
++
++	while (!ShutdownRequestPending)
++	{
++		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
++						 1000, PG_WAIT_EXTENSION);
++		ResetLatch(MyLatch);
++	}
++
++	/*
++	 * proc_exit runs zou_pagesvc_on_exit, which flushes the ingest tail
++	 * into a layer and advances the shard manifest, so the next start
++	 * anchors there instead of re-ingesting the whole retained stream.
++	 */
++	ereport(LOG,
++			(errmsg("zou page service shutting down")));
++	proc_exit(0);
++}
 diff --git a/src/backend/postmaster/bgworker.c b/src/backend/postmaster/bgworker.c
-index 1ad65c2..b554337 100644
+index 1ad65c237c..74210359b1 100644
 --- a/src/backend/postmaster/bgworker.c
 +++ b/src/backend/postmaster/bgworker.c
 @@ -18,6 +18,7 @@
@@ -572,18 +651,21 @@ index 1ad65c2..b554337 100644
  #include "postmaster/postmaster.h"
  #include "replication/logicallauncher.h"
  #include "replication/logicalworker.h"
-@@ -124,6 +125,9 @@ static const struct
+@@ -124,6 +125,12 @@ static const struct
  	{
  		"ApplyLauncherMain", ApplyLauncherMain
  	},
 +	{
 +		"ZouWalPusherMain", ZouWalPusherMain
 +	},
++	{
++		"ZouPageServiceMain", ZouPageServiceMain
++	},
  	{
  		"ApplyWorkerMain", ApplyWorkerMain
  	},
 diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
-index 5124d39..2d2046f 100644
+index 5124d39e5c..2d2046f1fd 100644
 --- a/src/backend/postmaster/postmaster.c
 +++ b/src/backend/postmaster/postmaster.c
 @@ -92,6 +92,7 @@
@@ -605,7 +687,7 @@ index 5124d39..2d2046f 100644
  	 * process any libraries that should be preloaded at postmaster start
  	 */
 diff --git a/src/backend/storage/ipc/ipci.c b/src/backend/storage/ipc/ipci.c
-index 8d2b0f1..54a0df1 100644
+index 8d2b0f1193..54a0df12fc 100644
 --- a/src/backend/storage/ipc/ipci.c
 +++ b/src/backend/storage/ipc/ipci.c
 @@ -24,6 +24,7 @@
@@ -634,10 +716,10 @@ index 8d2b0f1..54a0df1 100644
  	/*
 diff --git a/src/include/access/zou_wal.h b/src/include/access/zou_wal.h
 new file mode 100644
-index 0000000..870ecc2
+index 0000000000..ce7e5502a9
 --- /dev/null
 +++ b/src/include/access/zou_wal.h
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,40 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.h
@@ -667,6 +749,9 @@ index 0000000..870ecc2
 +
 +/* Pusher worker entry point. */
 +extern void ZouWalPusherMain(Datum main_arg);
++
++/* Page service worker entry point, see ZOU_PAGESERVE. */
++extern void ZouPageServiceMain(Datum main_arg);
 +
 +/* Backends: block until the store holds WAL through lsn. */
 +extern void ZouWalWaitForLSN(XLogRecPtr lsn);

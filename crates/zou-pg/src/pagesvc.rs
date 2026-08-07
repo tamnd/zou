@@ -68,7 +68,7 @@ const PAGE_SHARD: u32 = 0;
 /// ZOU_INGEST_AGE_SECS bounds how stale a layer view of a trickling
 /// tenant goes. Unset or unparsable falls back to the library
 /// defaults.
-fn ingest_config(tenant: u128) -> IngestConfig {
+pub(crate) fn ingest_config(tenant: u128) -> IngestConfig {
     let mut cfg = IngestConfig::new(tenant, PAGE_SHARD, 1);
     if let Some(mb) = env_u64("ZOU_INGEST_FLUSH_MB") {
         cfg.flush_bytes = (mb << 20) as usize;
