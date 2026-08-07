@@ -299,14 +299,14 @@ The harness applies it again over the reference dsn before it asks anything, the
 A hosted project is the third target the harness takes and the one CI cannot have, because it is somebody's account and somebody's key.
 The command is the same with the url and the keys of that project, and it is worth saying out loud that `setup.sql` drops and creates schemas, so it wants a project made for the purpose rather than one with anything in it.
 
-## The suite asked from somewhere else
+## The suites asked from somewhere else
 
 Every suite above is asked by this harness, over an HTTP client written here.
 That is the right way to compare two servers and the wrong way to answer a different question: whether the client a person actually installs works against zou.
 supabase-js does its own URL building, its own token refresh, its own retries and its own error shapes, and a harness that reimplements them is testing the reimplementation.
 
-So there is a suite that is not asked from here.
-It is supabase-js's own `test/integration.test.ts`, in `js/` in the conformance repository, run against zou with the URL and the keys made pluggable and nothing else touched.
+So there are two suites that are not asked from here.
+The first is supabase-js's own `test/integration.test.ts`, in `js/` in the conformance repository, run against zou with the URL and the keys made pluggable and nothing else touched.
 The assertions are upstream's, which is the one case where copying an assertion proves something: upstream wrote them about upstream's own client, against the stack `supabase start` brings up.
 
 `serve` is what gives it somewhere to point.
@@ -329,6 +329,20 @@ So `serve` makes zou answer a request that has to reach Postgres before it says 
 The Storage block is the one that says something the recorded storage suite cannot, because it goes through storage-js with the anon key and a policy on `storage.objects` decides rather than a service role going around it.
 The other 17 are Realtime, which zou does not serve on this URL yet.
 They are skipped behind an environment flag rather than deleted, so the day the feature lands the test runs exactly as upstream wrote it.
+
+The second is storage-js's own tests, in `js-storage/`, and it is the same arrangement pointed at the client that owns the surface M3 is about.
+Four files, 135 tests, 130 of them passing against zou and 5 skipped, and 6 of upstream's snapshots.
+storage-js is not released on its own: it lives at `packages/core/storage-js` in the supabase-js repository and ships with it, which is why `versions.json` pins it at the same 2.111.0.
+
+Two things about it are worth writing down.
+It runs under jest where the supabase-js suite runs under vitest, because the snapshot file is jest's and a snapshot is an expectation like any other here, so running it under something that writes the file in a different shape would be editing upstream's assertions rather than checking them.
+And the tests are run out of the published package rather than out of a checkout: `@supabase/storage-js` ships its `src/` next to its `dist/`, so `import { StorageClient } from '../src/index'` is left alone and jest maps `../src` onto the package's own sources, which keeps the diff against upstream readable as a diff.
+
+All 5 skips are image transforms.
+Three are behind `ZOU_IMAGE_TRANSFORMS`, since `/storage/v1/render/image` is the part of the storage api zou does not serve, and upstream skips the other two itself.
+That flag is the whole difference from upstream, and no assertion is edited.
+
+Its fixture is upstream's seed rather than one written here, which is how it found something no suite could: the passwords in it are hashed with `crypt` and `gen_salt` unqualified, and until [tamnd/zou#214](https://github.com/tamnd/zou/issues/214) there was no `extensions` schema on the search path for those to resolve in.
 
 ## The app
 
@@ -357,6 +371,8 @@ All three are deliberate: zou answers `/health` with its own version rather than
 The `storage` suite is 435 cases against the storage-api a local Supabase project runs, and zou passes all 435, byte for byte, with no known differences.
 
 supabase-js 2.111.0 runs 17 of its integration tests against zou and all 17 pass.
+
+storage-js 2.111.0 runs 130 of its 135 against zou and all 130 pass, the 5 it does not run being image transforms.
 
 The cases that pass "written differently" are all the same three things: zou puts a space after each colon where PostgREST puts a newline between rows, a `select=*` comes back with the columns in a different order, and two auth answers carry their keys in a different order than Go wrote them.
 None of them is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.

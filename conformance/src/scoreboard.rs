@@ -53,9 +53,9 @@ pub struct Group {
     pub percent: usize,
 }
 
-/// Vitest writes jest's shape, which is what the supabase-js run is
-/// read out of. Only the fields that end up on the scoreboard are named
-/// here, so a reporter that grows a field does not break this.
+/// Jest's shape, which vitest writes too, and which is what a client's
+/// own run is read out of. Only the fields that end up on the scoreboard
+/// are named here, so a reporter that grows a field does not break this.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Js {
@@ -87,8 +87,9 @@ struct Block {
     skipped: usize,
 }
 
-/// The whole document.
-pub fn render(runs: &[Run], js: Option<&Js>, pin: Option<&str>) -> String {
+/// The whole document. The js runs are named on the command line, one
+/// per client whose own tests were pointed at zou.
+pub fn render(runs: &[Run], js: &[(String, Js)], pin: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str(
         "# Compatibility scoreboard\n\n\
@@ -118,12 +119,13 @@ pub fn render(runs: &[Run], js: Option<&Js>, pin: Option<&str>) -> String {
             run.suite, run.compared_with, run.passed, run.total, run.percent, run.known
         ));
     }
-    if let Some(js) = js {
+    for (name, js) in js {
         let blocks = blocks(js);
         let passed: usize = blocks.iter().map(|b| b.passed).sum();
         let failed: usize = blocks.iter().map(|b| b.failed).sum();
         out.push_str(&format!(
-            "| supabase-js | its own integration tests | {} | {} | {}% | 0 |\n",
+            "| {} | its own integration tests | {} | {} | {}% | 0 |\n",
+            name,
             passed,
             passed + failed,
             percent(passed, passed + failed)
@@ -143,14 +145,15 @@ pub fn render(runs: &[Run], js: Option<&Js>, pin: Option<&str>) -> String {
         }
     }
 
-    if let Some(js) = js {
-        out.push_str("## supabase-js\n\n");
-        out.push_str(
-            "supabase-js's own integration file, run against zou with the url changed and \
-             not one assertion touched. Skipped tests need Realtime, which zou does not \
-             serve on that url yet: they are skipped rather than deleted so that the \
-             count keeps saying how much of the file is not being asked.\n\n",
-        );
+    for (name, js) in js {
+        out.push_str(&format!("## {name}\n\n"));
+        out.push_str(&format!(
+            "{name}'s own tests, run against zou with the url changed and not one \
+             assertion touched. A skipped test is one that needs something zou does not \
+             serve on that url yet, Realtime or image transforms: they are skipped rather \
+             than deleted so that the count keeps saying how much of the file is not \
+             being asked.\n\n"
+        ));
         out.push_str("| block | passing | of | skipped |\n");
         out.push_str("| --- | ---: | ---: | ---: |\n");
         for block in blocks(js) {
@@ -260,7 +263,7 @@ mod tests {
 
     #[test]
     fn the_scoreboard_carries_both_cuts_through_the_run() {
-        let out = render(&runs(), None, None);
+        let out = render(&runs(), &[], None);
         assert!(out.contains("| rest | postgrest 14.15 (recorded) | 71 | 82 | 86% | 11 |"));
         assert!(out.contains("| GET /rest/v1/{table} | 30 | 38 | 78% |"));
         assert!(out.contains("| select | 7 | 8 | 87% |"));
@@ -270,14 +273,14 @@ mod tests {
     /// reads, so there is nothing in it that moves on its own.
     #[test]
     fn the_same_run_twice_is_the_same_file() {
-        assert_eq!(render(&runs(), None, None), render(&runs(), None, None));
+        assert_eq!(render(&runs(), &[], None), render(&runs(), &[], None));
     }
 
     #[test]
     fn the_pin_says_which_questions_these_answers_are_to() {
         let out = render(
             &runs(),
-            None,
+            &[],
             Some("55194722663a1cdfcd9eca133fbed9df64d0294c"),
         );
         assert!(out.contains("`55194722663a`"));
@@ -301,10 +304,27 @@ mod tests {
     /// invisible either.
     #[test]
     fn a_skipped_client_test_is_counted_apart() {
-        let out = render(&runs(), Some(&js()), None);
+        let out = render(&runs(), &[("supabase-js".to_string(), js())], None);
         assert!(out.contains("| PostgREST | 2 | 3 | 0 |"));
         assert!(out.contains("| Realtime | 0 | 0 | 1 |"));
         assert!(out.contains("| supabase-js | its own integration tests | 2 | 3 | 66% | 0 |"));
+    }
+
+    /// Two clients are two rows and two sections, and nothing about the
+    /// first of them is written into the renderer.
+    #[test]
+    fn every_client_that_ran_gets_its_own_line() {
+        let out = render(
+            &runs(),
+            &[
+                ("supabase-js".to_string(), js()),
+                ("storage-js".to_string(), js()),
+            ],
+            None,
+        );
+        assert!(out.contains("| storage-js | its own integration tests | 2 | 3 | 66% | 0 |"));
+        assert!(out.contains("## supabase-js\n"));
+        assert!(out.contains("## storage-js\n"));
     }
 
     #[test]

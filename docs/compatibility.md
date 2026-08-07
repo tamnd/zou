@@ -14,6 +14,7 @@ One file answers "compatible with what", [versions.json](https://github.com/tamn
 | GoTrue | 2.194.0 |
 | postgres-meta | 0.96.6 |
 | supabase-js | 2.111.0 |
+| storage-js | 2.111.0, the same release |
 | Postgres | 17.6.1.156 upstream, REL_18_4 in zou |
 
 The Postgres line is the one place zou is deliberately ahead. A suite that depends on the difference is a suite testing Postgres rather than the api in front of it.
@@ -27,10 +28,11 @@ The Postgres line is the one place zou is deliberately ahead. A suite that depen
 | auth | 74 | 77 | 96% | three known differences, below |
 | storage | 435 | 435 | 100% | buckets, objects, resumable uploads and the S3 protocol |
 | supabase-js | 17 | 17 | 100% | upstream's integration file, url changed, no assertion touched |
+| storage-js | 130 | 130 | 100% | upstream's own tests for the storage client, likewise |
 
 A known difference still counts as a failure in every number above. It is excused from the exit code and from nothing else, so the score cannot be improved by writing an explanation down.
 
-Next to those five there is a sixth thing that has no number, because it either works or it does not: one of Supabase's own example apps, unedited, driven through a browser on every push. Signing up, signing in, a row level security policy holding between two accounts, and a Github login that goes all the way through the code exchange and comes back as a session. The app is `examples/todo-list/sveltejs-todo-list` and the only file it gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints. Details in [demo/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo/README.md).
+Next to those six there is a seventh thing that has no number, because it either works or it does not: one of Supabase's own example apps, unedited, driven through a browser on every push. Signing up, signing in, a row level security policy holding between two accounts, and a Github login that goes all the way through the code exchange and comes back as a session. The app is `examples/todo-list/sveltejs-todo-list` and the only file it gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints. Details in [demo/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo/README.md).
 
 ## What a project will notice
 
@@ -50,11 +52,11 @@ One more difference is not an answer at all, and so is not in `known.json`. **A 
 
 The bytes of an object go to the same place the pages do: a directory on a laptop, a prefix on an object store, opened by the same code the engine opens its own target with. A server built without one answers the bucket surface and refuses the routes that carry bytes, because writing files somewhere nobody asked for would be worse than saying so.
 
-This is also why the supabase-js run skips 17 of its cases. They are skipped rather than deleted so the count keeps saying how much of the file is not being asked.
+This is also why the supabase-js run skips 17 of its cases, and why the storage-js run skips three of its five. They are skipped rather than deleted so the count keeps saying how much of the file is not being asked, and the other two of the five are skips upstream carries itself.
 
 ## The database underneath
 
-Two servers can agree on every answer and still be sitting on different databases, and no suite can see it, because a suite asks a server. A Supabase project's database comes with things no server of theirs made and a project's own migrations lean on. The record workflow dumps that list next to every recording, so what follows is the reference's answer rather than a memory of it, and [#214](https://github.com/tamnd/zou/issues/214) is where the difference is being worked off.
+Two servers can agree on every answer and still be sitting on different databases, and no suite can see it, because a suite asks a server. A Supabase project's database comes with things no server of theirs made and a project's own migrations lean on. The record workflow dumps that list next to every recording, so what follows is the reference's answer rather than a memory of it, and [#214](https://github.com/tamnd/zou/issues/214) is where the difference was worked off.
 
 **What zou has.** An `extensions` schema holding pgcrypto and uuid-ossp, `extensions` on the database's search path, and usage on it for the three api roles, so a migration copied off the Supabase docs that calls `gen_salt`, `crypt`, `digest` or `uuid_generate_v4` with nothing in front of it resolves the way it does upstream. `statement_timeout` is three seconds for `anon` and eight for `authenticated`, the same numbers a project gets. Those two are worth a note of their own: Postgres reads a role's settings at connection time for the role that connected, and zou reaches every api role with `set role` on a connection that logged in as somebody else, so the pool reads `pg_db_role_setting` and applies them per transaction the way PostgREST does. An `alter role` a project runs itself works the same way, within ten seconds of running it. The two it will not take from a role are `role` and `search_path`, since the schema a request runs against is negotiated per request from `Accept-Profile`.
 
