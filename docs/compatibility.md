@@ -52,6 +52,14 @@ The bytes of an object go to the same place the pages do: a directory on a lapto
 
 This is also why the supabase-js run skips 17 of its cases. They are skipped rather than deleted so the count keeps saying how much of the file is not being asked.
 
+## The database underneath
+
+Two servers can agree on every answer and still be sitting on different databases, and no suite can see it, because a suite asks a server. A Supabase project's database comes with things no server of theirs made and a project's own migrations lean on. The record workflow dumps that list next to every recording, so what follows is the reference's answer rather than a memory of it, and [#214](https://github.com/tamnd/zou/issues/214) is where the difference is being worked off.
+
+**What zou has.** An `extensions` schema holding pgcrypto and uuid-ossp, `extensions` on the database's search path, and usage on it for the three api roles, so a migration copied off the Supabase docs that calls `gen_salt`, `crypt`, `digest` or `uuid_generate_v4` with nothing in front of it resolves the way it does upstream. `statement_timeout` is three seconds for `anon` and eight for `authenticated`, the same numbers a project gets. Those two are worth a note of their own: Postgres reads a role's settings at connection time for the role that connected, and zou reaches every api role with `set role` on a connection that logged in as somebody else, so the pool reads `pg_db_role_setting` and applies them per transaction the way PostgREST does. An `alter role` a project runs itself works the same way, within ten seconds of running it. The two it will not take from a role are `role` and `search_path`, since the schema a request runs against is negotiated per request from `Accept-Profile`.
+
+**What zou does not have.** pg_net and the `net` schema, supabase_vault and the `vault` schema, pg_graphql and the `graphql` and `graphql_public` schemas, pg_stat_statements, and the `realtime`, `_realtime`, `supabase_functions` and `pgbouncer` schemas. Each of those is a piece of the platform rather than a setting, and none of them is M3. The `supabase_*` roles are absent for a different reason: they exist upstream because auth, storage, realtime and the pooler are separate processes connecting as separate roles, and zou is one process on one pool. A schema dump taken from a hosted project names them in its grants, so restoring one into zou means creating them first or dumping without owners and privileges.
+
 ## What the suites do not ask yet
 
 The honest reading of a 96% is that it is 96% of the questions somebody thought to write down. These are the areas where the number above is a lower bound on the work and an upper bound on the confidence, tracked on [#170](https://github.com/tamnd/zou/issues/170):

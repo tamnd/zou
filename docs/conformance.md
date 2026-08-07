@@ -245,7 +245,7 @@ That distinction has to be made here because zou is the gateway as well as the s
 
 ## The suite recorded from an image
 
-The `storage` suite is 243 cases: 32 over the bucket endpoints, 193 over the object ones, and 18 over the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
+The `storage` suite is 435 cases: 66 over the bucket endpoints, 195 over the object ones, and 174 over the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
 The reference is storage-api at the version in `versions.json`, and it is the one reference that cannot be downloaded and run on a flag line.
 storage-api ships as an image and nothing else, so the recording comes from `supabase start` rather than from a binary, which is what the record workflow in this repository brings up.
 
@@ -266,7 +266,7 @@ The object cases are the reason a case can say `chained`.
 An upload has to be read back, and a fixture cannot put the bytes there for it: a fixture writes rows and an object is bytes in a store no SQL statement can reach.
 So the first case uploads, and the ones under it that write say they are asked against what the case before them left rather than against the fixture.
 
-What the object cases do not ask about yet: image transforms, and the half of the S3 protocol that is about objects rather than about buckets.
+What the object cases do not ask about yet: image transforms, and analytics buckets.
 The S3 cases are the one group here that carries no token at all.
 A client of that surface signs the request itself, so the harness computes the signature the way a client does, from an algorithm written out in `sigv4.rs` rather than borrowed from zou: a harness that signed with the server's own code would agree with the server about anything both of them got wrong.
 Four of the keys a case can name are signatures rather than tokens, three of them correct in every way but one, which is how a case asks what a wrong secret, an unknown access key id or the wrong region is answered with.
