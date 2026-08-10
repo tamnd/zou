@@ -176,8 +176,8 @@ impl Attached {
     /// is exactly the one that should be letting go of leases and is
     /// also the one with no requests to notice on.
     pub async fn sweep(&self) {
-        let idle = match u64::try_from(self.idle.as_millis()) {
-            Ok(ms) => ms,
+        let idle = match u64::try_from(self.idle.as_nanos()) {
+            Ok(ns) => ns,
             Err(_) => return,
         };
         let cutoff = self.now().saturating_sub(idle);
@@ -248,8 +248,12 @@ impl Attached {
         crate::ops::attached(slots.len());
     }
 
+    /// Nanoseconds, not milliseconds: eviction sorts on this, and at
+    /// millisecond resolution a burst of attaches all land on one tick,
+    /// leaving the sort to break the tie by tenant name instead of by
+    /// use. Nanoseconds keep every touch distinct.
     fn now(&self) -> u64 {
-        u64::try_from(self.born.elapsed().as_millis()).unwrap_or(u64::MAX)
+        u64::try_from(self.born.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 }
 
