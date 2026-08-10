@@ -40,7 +40,7 @@ violations=0
 iter=0
 
 say() { echo "[soak $(date '+%H:%M:%S')] $*"; }
-q() { "$PG_BIN/psql" -h 127.0.0.1 -p "$PORT" -d postgres -Atqc "$1"; }
+q() { "$PG_BIN/psql" -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -Atqc "$1"; }
 
 start_dev() {
 	RT="$WORK/rt-$iter"
@@ -157,7 +157,7 @@ load_start() {
 	# -n matters: a plain pgbench run truncates pgbench_history before
 	# starting, which would wipe the very rows the balance invariant
 	# sums. Found the hard way when iteration 2 read as data loss.
-	"$PG_BIN/pgbench" -n -h 127.0.0.1 -p "$PORT" -c 4 -T "$SOAK_SECONDS" postgres \
+	"$PG_BIN/pgbench" -n -h 127.0.0.1 -p "$PORT" -U postgres -c 4 -T "$SOAK_SECONDS" postgres \
 		>>"$WORK/pgbench.log" 2>&1 &
 	LOAD=$!
 	(
@@ -192,7 +192,7 @@ done
 q "create table if not exists ledger(id bigint primary key)"
 q "create table if not exists probe(x int)"
 wait_writable
-"$PG_BIN/pgbench" -h 127.0.0.1 -p "$PORT" -i -q -s "$SOAK_SCALE" postgres \
+"$PG_BIN/pgbench" -h 127.0.0.1 -p "$PORT" -U postgres -i -q -s "$SOAK_SCALE" postgres \
 	>"$WORK/pgbench-init.log" 2>&1
 say "initialized scale $SOAK_SCALE, entering the kill loop"
 
@@ -223,7 +223,7 @@ while [ "$SECONDS" -lt "$SOAK_SECONDS" ] && [ "$violations" -eq 0 ]; do
 		SPID=$!
 		stole=""
 		for _ in $(seq 1 25); do
-			if "$PG_BIN/psql" -h 127.0.0.1 -p $((PORT + 1)) -d postgres -Atqc \
+			if "$PG_BIN/psql" -h 127.0.0.1 -p $((PORT + 1)) -U postgres -d postgres -Atqc \
 				"insert into probe values(2)" >/dev/null 2>&1; then
 				stole=yes
 				break
