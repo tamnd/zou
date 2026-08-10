@@ -107,18 +107,31 @@ impl Attached {
         slot.used.store(self.now(), Ordering::Relaxed);
         let backend = self.backend.clone();
         let entry = entry.clone();
+        let tenant_ref = entry.tenant_ref.clone();
         let router = slot
             .router
             .get_or_try_init(|| async move {
                 // Inside the cell, so what is timed is a cold attach
-                // and a warm request counts nothing at all.
+                // and a warm request counts nothing at all. It is also
+                // the span worth having: the request that pays for a
+                // cold start is slow for a reason no other span shows.
                 let start = Instant::now();
+                let mut span = crate::ops::span("attach");
+                if let Some(span) = span.as_mut() {
+                    span.text("zou.tenant", tenant_ref);
+                }
                 let built = match tokio::task::spawn_blocking(move || backend.up(&entry)).await {
                     Ok(Ok(cfg)) => crate::router(cfg),
                     Ok(Err(e)) => Err(e),
                     Err(e) => Err(format!("attach: {e}")),
                 };
                 crate::ops::attach(built.is_ok(), start);
+                if let Some(mut span) = span {
+                    if let Err(e) = &built {
+                        span.failed(e.clone());
+                    }
+                    crate::ops::record(span);
+                }
                 built
             })
             .await?;

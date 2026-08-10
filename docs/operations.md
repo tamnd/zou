@@ -27,6 +27,25 @@ Logs go to stderr, `RUST_LOG` filters them, and `ZOU_LOG_FORMAT=json` writes the
 An environment variable rather than a flag, because the thing that wants json is a container runtime, which sets environment and does not get to rewrite the command line of what it runs.
 Output meant for scripts stays on stdout either way.
 
+## Traces
+
+`ZOU_OTLP_ENDPOINT=http://localhost:4318` turns traces on and is the whole switch.
+With nothing set there is no exporter thread, no queue and no span built, so a deployment that does not collect traces pays a null pointer load per request.
+The endpoint is a base url and `/v1/traces` is appended, the body is OTLP json over http, and any collector that speaks OTLP http reads it.
+
+Context is W3C trace context, the `traceparent` header.
+A request that arrives with one gets a span that is a child of the caller's, so a trace that started in a browser or at a gateway is one trace and not two, and a request that arrives without one starts a trace here.
+A `traceparent` that cannot be parsed is treated as no header at all rather than as a bad request, since a broken tracing header is not worth costing a caller their answer.
+A caller that sets the sampled flag to zero is believed and nothing is recorded for that request.
+
+Each request is one server span named by method and surface, `GET /rest`, with `url.path`, `http.request.method`, `zou.surface` and `http.response.status_code` on it, and a 5xx marks the span as an error.
+The query string is never exported, because `?apikey=<jwt>` is a spelling this server accepts and a span carrying it would mail credentials to a collector.
+A cold attach is a child span named `attach`, carrying `zou.tenant` and the failure when it failed, which is the span that explains a slow first request to a project that was not up.
+
+Spans leave on a thread of their own through a bounded queue, batched every five seconds or every 512 spans.
+A collector that has stopped reading loses spans rather than slowing the server down, and the ones lost are counted as `zou_trace_spans_dropped_total`, so the gap is visible on the scrape rather than silent.
+With json logs on, every line written while serving a request carries `trace_id` and `span_id`, which is what makes a slow trace open its log lines and a suspicious line open its trace.
+
 ## Writer lease
 
 Exactly one node writes to a tenant at a time.
