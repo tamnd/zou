@@ -7,6 +7,7 @@ mod config;
 mod db;
 #[cfg(unix)]
 mod dev;
+mod gc;
 #[cfg(unix)]
 mod inbox;
 mod info;
@@ -41,6 +42,7 @@ fn usage() -> ExitCode {
     eprintln!("       {}", db::DB_USAGE);
     #[cfg(unix)]
     eprintln!("       {}", db::MIGRATION_USAGE);
+    eprintln!("       {}", gc::USAGE);
     eprintln!("       {}", info::USAGE);
     eprintln!("       {}", inspect::USAGE);
     #[cfg(unix)]
@@ -112,6 +114,7 @@ fn main() -> ExitCode {
         Some("db") => simple(db::run(&argv[1..])),
         #[cfg(unix)]
         Some("migration") => simple(db::migration(&argv[1..])),
+        Some("gc") => simple(gc::run(&argv[1..])),
         Some("gen") => simple(codegen::run(&argv[1..])),
         #[cfg(unix)]
         Some("inbox") => simple(inbox::run(&argv[1..])),

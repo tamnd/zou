@@ -33,12 +33,21 @@
 //! the two runs republishes a reference, so the deleting run drops the
 //! candidate instead of the object. The window must exceed the longest
 //! fold upload and the longest gap between reading a manifest and
-//! publishing a branch from it, and one gc job runs at a time, the
-//! candidates object is swapped without a guard.
+//! publishing a branch from it.
+//!
+//! One job runs at a time, because the candidates object is swapped
+//! without a guard and two runs would each write a view of it that the
+//! other's deletions have already made wrong. [`sweep`] is the front
+//! door that enforces it: a lock object under the same prefix, taken
+//! with the store's own conditional write, held for a TTL and released
+//! at the end, so a node that dies mid sweep blocks the next one for
+//! the TTL and not forever. [`run`] itself takes no lock, which is what
+//! a test wants and not what a deployment does.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use zou_store::CasStore;
+use zou_store::cas::CasError;
 use zou_store::layout::TenantLayout;
 use zou_store::manifest::Manifest;
 
@@ -46,14 +55,83 @@ use zou_store::manifest::Manifest;
 /// root. Lines of `<first-seen-unix> <key>`.
 pub const CANDIDATES_KEY: &str = "gc/CANDIDATES";
 
+/// Where the one at a time guard lives. `<holder> <expires-unix>`.
+pub const LOCK_KEY: &str = "gc/LOCK";
+
+/// The safety window a key waits out between being stamped a candidate
+/// and being deleted. A day, which is longer than any fold upload and
+/// longer than the gap between reading a manifest and publishing a
+/// branch from it.
+pub const DEFAULT_WINDOW_SECS: u64 = 24 * 60 * 60;
+
+/// How far back PITR reaches by default. History snapshots younger than
+/// this pin what they reference, so it is the real retention promise
+/// and the window is only the delay on collecting what fell out of it.
+pub const DEFAULT_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// How long a run's claim on the store is good for.
+///
+/// A sweep of a large store is minutes, not an hour, so this is mostly
+/// the answer to how long a crashed run blocks the next one. A store
+/// big enough that a sweep runs past it should raise it rather than
+/// have a second node start one on top of the first.
+pub const DEFAULT_LOCK_TTL_SECS: u64 = 60 * 60;
+
+/// What a run is asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Policy {
+    /// Seconds a candidate waits before it is deleted.
+    pub window_secs: u64,
+    /// Seconds of PITR history that pins what it references.
+    pub retention_secs: u64,
+    /// Seconds the lock a sweep holds stays valid.
+    pub lock_ttl_secs: u64,
+    /// Scan and report, write nothing and delete nothing.
+    pub dry_run: bool,
+    /// Take the lock even if somebody else holds it. For the case where
+    /// a run died and the operator knows it, since the TTL is the only
+    /// other way out.
+    pub force: bool,
+}
+
+impl Default for Policy {
+    fn default() -> Self {
+        Policy {
+            window_secs: DEFAULT_WINDOW_SECS,
+            retention_secs: DEFAULT_RETENTION_SECS,
+            lock_ttl_secs: DEFAULT_LOCK_TTL_SECS,
+            dry_run: false,
+            force: false,
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct GcStats {
     /// Tenants with a readable manifest.
     pub tenants: usize,
     /// Keys stamped and waiting out the safety window after this run.
     pub candidates: usize,
-    /// Objects deleted by this run.
+    /// Objects deleted by this run, or under a dry run the objects it
+    /// would have deleted.
     pub deleted: usize,
+    /// The keys behind that count, filled in under a dry run only. A
+    /// real run has already deleted them and a list of thousands is not
+    /// what a log wants; a person asking what would go wants every one.
+    pub doomed: Vec<String>,
+}
+
+/// What a [`sweep`] did, since not getting to run is an outcome and not
+/// a failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Sweep {
+    Ran(GcStats),
+    /// Somebody else holds the lock. Try again after `until_unix`, or
+    /// pass `force` if that holder is known to be gone.
+    Busy {
+        holder: String,
+        until_unix: u64,
+    },
 }
 
 /// The stamp encoded in a history key, `<epoch>-<unix>.json`.
@@ -63,17 +141,40 @@ fn history_stamp(key: &str) -> Option<u64> {
     unix.parse().ok()
 }
 
-/// One gc pass over the whole store. `now_unix` is the caller's clock
-/// and `window_secs` the safety window, so a run never deletes a key
-/// it stamped itself and a window of zero still takes two runs.
-/// `retention_secs` is how far back PITR reaches, history snapshots
-/// younger than it pin their references.
+/// One gc pass over the whole store, under the default policy with the
+/// window and retention the caller names. `now_unix` is the caller's
+/// clock, so a run never deletes a key it stamped itself and a window
+/// of zero still takes two runs.
+///
+/// This takes no lock. [`sweep`] is the one a deployment calls.
 pub fn run(
     store: &dyn CasStore,
     now_unix: u64,
     window_secs: u64,
     retention_secs: u64,
 ) -> Result<GcStats, String> {
+    run_with(
+        store,
+        now_unix,
+        Policy {
+            window_secs,
+            retention_secs,
+            ..Policy::default()
+        },
+    )
+}
+
+/// One gc pass over the whole store, told exactly what to do.
+///
+/// Under a dry run nothing is written: no key is deleted, the
+/// candidates object is left as it was, and the stats say what the same
+/// run without the flag would have done. That is worth reading twice,
+/// because a first real run stamps candidates and a dry run does not,
+/// so the two runs after a dry run are still the two runs a deletion
+/// takes.
+pub fn run_with(store: &dyn CasStore, now_unix: u64, policy: Policy) -> Result<GcStats, String> {
+    let window_secs = policy.window_secs;
+    let retention_secs = policy.retention_secs;
     let keys = store.list("tenants/").map_err(|e| format!("store: {e}"))?;
 
     let mut refs = BTreeSet::new();
@@ -182,10 +283,15 @@ pub fn run(
     }
     let mut next: BTreeMap<String, u64> = BTreeMap::new();
     let mut deleted = 0;
+    let mut doomed = Vec::new();
     for key in &garbage {
         match state.get(key) {
             Some(&stamp) if now_unix.saturating_sub(stamp) >= window_secs => {
-                store.delete(key).map_err(|e| format!("store: {e}"))?;
+                if policy.dry_run {
+                    doomed.push(key.clone());
+                } else {
+                    store.delete(key).map_err(|e| format!("store: {e}"))?;
+                }
                 deleted += 1;
             }
             Some(&stamp) => {
@@ -196,18 +302,119 @@ pub fn run(
             }
         }
     }
-    let mut text = String::new();
-    for (key, stamp) in &next {
-        text.push_str(&format!("{stamp} {key}\n"));
+    if !policy.dry_run {
+        let mut text = String::new();
+        for (key, stamp) in &next {
+            text.push_str(&format!("{stamp} {key}\n"));
+        }
+        store
+            .put(CANDIDATES_KEY, text.as_bytes())
+            .map_err(|e| format!("store: {e}"))?;
     }
-    store
-        .put(CANDIDATES_KEY, text.as_bytes())
-        .map_err(|e| format!("store: {e}"))?;
     Ok(GcStats {
         tenants: manifests.len(),
         candidates: next.len(),
         deleted,
+        doomed,
     })
+}
+
+/// A claim on the store, which is the line we wrote and nothing else:
+/// releasing checks the object still says that before deleting it, so a
+/// run whose lock expired and was taken over does not release the new
+/// holder's.
+struct Claim {
+    line: String,
+}
+
+enum Claimed {
+    Ours(Claim),
+    Theirs { holder: String, until_unix: u64 },
+}
+
+/// The one lock line, or `None` if whatever is there is not one.
+fn held(data: &[u8]) -> Option<(String, u64)> {
+    let text = String::from_utf8(data.to_vec()).ok()?;
+    let (holder, until) = text.trim().split_once(' ')?;
+    Some((holder.to_string(), until.parse().ok()?))
+}
+
+/// Take the store wide gc lock, or say who has it.
+///
+/// An expired lock is taken over, which is what makes a crashed run
+/// cost a TTL rather than an operator. A lock body nobody can parse is
+/// treated the same way, since a line no reader understands is a line
+/// no releaser will ever remove.
+fn lock(
+    store: &dyn CasStore,
+    holder: &str,
+    now_unix: u64,
+    policy: Policy,
+) -> Result<Claimed, String> {
+    let current = store.get(LOCK_KEY).map_err(|e| format!("store: {e}"))?;
+    if !policy.force
+        && let Some((data, _)) = &current
+        && let Some((holder, until_unix)) = held(data)
+        && until_unix > now_unix
+    {
+        return Ok(Claimed::Theirs { holder, until_unix });
+    }
+    let until_unix = now_unix.saturating_add(policy.lock_ttl_secs);
+    let line = format!("{holder} {until_unix}\n");
+    match store.put_if_match(LOCK_KEY, line.as_bytes(), current.as_ref().map(|(_, v)| v)) {
+        Ok(_) => Ok(Claimed::Ours(Claim { line })),
+        // Somebody swapped the lock between our read and our write,
+        // which is another run taking it. Theirs, whoever they are.
+        Err(CasError::Conflict { .. }) | Err(CasError::AlreadyExists { .. }) => {
+            Ok(Claimed::Theirs {
+                holder: "another run".to_string(),
+                until_unix,
+            })
+        }
+        Err(e) => Err(format!("store: {e}")),
+    }
+}
+
+/// Give the lock back, if it is still ours to give.
+fn unlock(store: &dyn CasStore, claim: &Claim) -> Result<(), String> {
+    match store.get(LOCK_KEY).map_err(|e| format!("store: {e}"))? {
+        Some((data, _)) if data == claim.line.as_bytes() => {
+            store.delete(LOCK_KEY).map_err(|e| format!("store: {e}"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// One gc pass, with the store wide lock that keeps two of them from
+/// running at once.
+///
+/// `holder` names whoever is asking, and it goes in the lock so the run
+/// that finds it busy can say who has it. A dry run takes no lock: it
+/// writes nothing, and a person asking what would go should not have to
+/// wait out somebody's sweep to find out.
+///
+/// The lock is released whether the pass worked or not, and a release
+/// that itself fails is not turned into the answer, since the TTL
+/// already covers that case and the pass is what the caller asked
+/// about.
+pub fn sweep(
+    store: &dyn CasStore,
+    holder: &str,
+    now_unix: u64,
+    policy: Policy,
+) -> Result<Sweep, String> {
+    if policy.dry_run {
+        return run_with(store, now_unix, policy).map(Sweep::Ran);
+    }
+    let claim = match lock(store, holder, now_unix, policy)? {
+        Claimed::Ours(claim) => claim,
+        Claimed::Theirs { holder, until_unix } => return Ok(Sweep::Busy { holder, until_unix }),
+    };
+    let out = run_with(store, now_unix, policy);
+    if let Err(e) = unlock(store, &claim) {
+        log::warn!("gc: the lock was not released: {e}");
+    }
+    out.map(Sweep::Ran)
 }
 
 #[cfg(test)]
@@ -273,7 +480,8 @@ mod tests {
             GcStats {
                 tenants: 1,
                 candidates: 3,
-                deleted: 0
+                deleted: 0,
+                doomed: vec![]
             },
             "the superseded checkpoint is three stamped keys"
         );
@@ -430,5 +638,161 @@ mod tests {
         assert_eq!(run(&store, 1000, 0, 100_000).unwrap(), GcStats::default());
         assert_eq!(run(&store, 2000, 0, 100_000).unwrap(), GcStats::default());
         assert!(chk_present(&store, "ghost", "aaa"));
+    }
+
+    fn policy(window_secs: u64) -> Policy {
+        Policy {
+            window_secs,
+            retention_secs: 100_000,
+            ..Policy::default()
+        }
+    }
+
+    /// The point of a dry run is that a person can ask the question
+    /// before the answer costs anything, so it has to leave the store
+    /// exactly as it found it, candidates object included.
+    #[test]
+    fn a_dry_run_names_what_would_go_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        put_chk(&store, "p", "aaa");
+        put_chk(&store, "p", "bbb");
+        write_manifest(&store, "p", &[("bbb", 0x100, CheckpointKind::Full)], None);
+
+        // Nothing is a candidate yet, so a dry run before the first
+        // real one has nothing to name, and it does not stamp them.
+        let first = run_with(&store, 1000, policy(100).dry(true)).unwrap();
+        assert_eq!((first.candidates, first.deleted), (3, 0));
+        assert!(first.doomed.is_empty());
+        assert!(
+            store.get(CANDIDATES_KEY).unwrap().is_none(),
+            "a dry run did not create the candidates object"
+        );
+
+        run(&store, 1000, 100, 100_000).unwrap();
+        let (state, _) = store.get(CANDIDATES_KEY).unwrap().expect("stamped");
+
+        let due = run_with(&store, 1100, policy(100).dry(true)).unwrap();
+        assert_eq!(due.deleted, 3);
+        assert_eq!(due.doomed.len(), 3, "each one named: {:?}", due.doomed);
+        assert!(
+            due.doomed
+                .iter()
+                .all(|key| key.starts_with("tenants/p/chk/"))
+        );
+        assert!(chk_present(&store, "p", "aaa"), "and still there");
+        assert_eq!(
+            store.get(CANDIDATES_KEY).unwrap().map(|(data, _)| data),
+            Some(state),
+            "the stamps are untouched, so the real run still deletes"
+        );
+
+        assert_eq!(run(&store, 1100, 100, 100_000).unwrap().deleted, 3);
+        assert!(!chk_present(&store, "p", "aaa"));
+    }
+
+    #[test]
+    fn one_sweep_at_a_time_and_a_dead_holder_costs_a_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        put_chk(&store, "p", "aaa");
+        write_manifest(&store, "p", &[("aaa", 0x100, CheckpointKind::Full)], None);
+        let policy = Policy {
+            lock_ttl_secs: 600,
+            ..policy(100)
+        };
+
+        // A node that stops holding the lock when it is done leaves
+        // nothing behind for the next one to wait on.
+        assert!(matches!(
+            sweep(&store, "node-a", 1000, policy).unwrap(),
+            Sweep::Ran(_)
+        ));
+        assert!(store.get(LOCK_KEY).unwrap().is_none());
+
+        // A node that does not, because it died, holds it until the
+        // TTL, and the run that finds it says who and until when
+        // instead of running on top of it.
+        store.put(LOCK_KEY, b"node-a 1600\n").unwrap();
+        assert_eq!(
+            sweep(&store, "node-b", 1100, policy).unwrap(),
+            Sweep::Busy {
+                holder: "node-a".to_string(),
+                until_unix: 1600
+            }
+        );
+        // Asking what would go is still allowed, since it writes
+        // nothing that the holder's run could disagree with.
+        assert!(matches!(
+            sweep(&store, "node-b", 1100, policy.dry(true)).unwrap(),
+            Sweep::Ran(_)
+        ));
+
+        assert!(matches!(
+            sweep(&store, "node-b", 1601, policy).unwrap(),
+            Sweep::Ran(_),
+        ));
+        assert!(store.get(LOCK_KEY).unwrap().is_none(), "and released");
+
+        // Force is for the operator who knows the holder is gone and is
+        // not waiting out the rest of the TTL to say so.
+        store.put(LOCK_KEY, b"node-a 9000\n").unwrap();
+        assert!(matches!(
+            sweep(&store, "node-b", 1700, policy).unwrap(),
+            Sweep::Busy { .. }
+        ));
+        assert!(matches!(
+            sweep(
+                &store,
+                "node-b",
+                1700,
+                Policy {
+                    force: true,
+                    ..policy
+                }
+            )
+            .unwrap(),
+            Sweep::Ran(_)
+        ));
+    }
+
+    /// A holder that comes back after its lock was taken over must not
+    /// release the lock it no longer has, or the run holding it is
+    /// suddenly running unguarded.
+    #[test]
+    fn releasing_a_lock_somebody_else_took_leaves_it_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let mine = Claim {
+            line: "node-a 1600\n".to_string(),
+        };
+        store.put(LOCK_KEY, b"node-b 2600\n").unwrap();
+
+        unlock(&store, &mine).unwrap();
+        assert_eq!(
+            store.get(LOCK_KEY).unwrap().map(|(data, _)| data),
+            Some(b"node-b 2600\n".to_vec())
+        );
+    }
+
+    /// A lock body nothing can read is a lock nothing will release, so
+    /// it has to be takeable rather than a store that never collects
+    /// again.
+    #[test]
+    fn a_lock_nobody_can_read_is_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        store.put(LOCK_KEY, b"\x00\x01 not a lock line").unwrap();
+
+        assert!(matches!(
+            sweep(&store, "node-a", 1000, Policy::default()).unwrap(),
+            Sweep::Ran(_)
+        ));
+    }
+
+    impl Policy {
+        fn dry(self, dry_run: bool) -> Policy {
+            Policy { dry_run, ..self }
+        }
     }
 }

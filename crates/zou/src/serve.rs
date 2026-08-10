@@ -30,6 +30,7 @@ use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::Duration;
 
 use crate::dev::SUPERUSER;
+use zou_pg::gc::{self, Sweep};
 use zou_pg::{bootstrap, restore};
 use zou_server::Config;
 use zou_server::attach::{Attached, Backend};
@@ -40,7 +41,7 @@ use zou_store::layout::TenantLayout;
 use zou_store::registry::Tenant;
 use zou_store::{CasStore, Manifest, open_store};
 
-pub const USAGE: &str = "usage: zou serve <target> [--http <n>] [--pg <n>] [--pool <n>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>]";
+pub const USAGE: &str = "usage: zou serve <target> [--http <n>] [--pg <n>] [--pool <n>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>]";
 
 /// How long a tenant's postmaster has to say it is accepting
 /// connections. A cold attach is meant to be under half a second and
@@ -99,6 +100,17 @@ pub struct Args {
     /// The smallest object this node hands out a store url for instead
     /// of serving. None, the default, and it serves every byte itself.
     pub passthrough: Option<u64>,
+    /// How often this node sweeps the store, and under what policy.
+    /// None, the default, and collecting is somebody else's cron entry
+    /// running `zou gc`.
+    pub gc: Option<Gc>,
+}
+
+/// A node that collects on a timer.
+#[derive(Debug, Clone, Copy)]
+pub struct Gc {
+    pub every: Duration,
+    pub policy: gc::Policy,
 }
 
 pub fn parse(argv: &[String]) -> Result<Args, String> {
@@ -115,6 +127,8 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut idle = zou_server::attach::IDLE;
     let mut shared_buffers = SHARED_BUFFERS.to_string();
     let mut passthrough = None;
+    let mut gc_every = None;
+    let mut policy = gc::Policy::default();
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -139,6 +153,16 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--shared-buffers" => shared_buffers = need(&mut it, "--shared-buffers")?.clone(),
             "--passthrough" => passthrough = Some(size(need(&mut it, "--passthrough")?)?),
+            "--gc-every" => {
+                gc_every = Some(Duration::from_secs(crate::gc::secs(need(
+                    &mut it,
+                    "--gc-every",
+                )?)?));
+            }
+            "--gc-window" => policy.window_secs = crate::gc::secs(need(&mut it, "--gc-window")?)?,
+            "--gc-retention" => {
+                policy.retention_secs = crate::gc::secs(need(&mut it, "--gc-retention")?)?;
+            }
             other if target.is_none() && !other.starts_with('-') => {
                 target = Some(other.to_string());
             }
@@ -155,6 +179,19 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     if domains.is_empty() && !path_prefix {
         return Err("nothing would route: pass --domain or drop --no-path-prefix".to_string());
     }
+    // A retention window set on a node that never collects is a policy
+    // nobody is applying, and finding that out from a full bucket is
+    // worse than finding it out here.
+    let gc = match gc_every {
+        Some(every) if every.is_zero() => {
+            return Err("--gc-every 0 would sweep without pause, leave it off instead".to_string());
+        }
+        Some(every) => Some(Gc { every, policy }),
+        None if policy != gc::Policy::default() => {
+            return Err("--gc-window and --gc-retention need --gc-every to run under".to_string());
+        }
+        None => None,
+    };
     let pg_bin = pg_bin
         .or_else(|| std::env::var_os("ZOU_PG_BIN").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("build/pg/bin"));
@@ -174,6 +211,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         idle,
         shared_buffers,
         passthrough,
+        gc,
     })
 }
 
@@ -721,6 +759,16 @@ pub fn run(args: &Args) -> Result<(), String> {
         args.max_attached,
         args.idle.as_secs()
     );
+    if let Some(gc) = args.gc {
+        log::info!(
+            "collecting every {}, {} of retention, {} of safety window",
+            crate::gc::span(gc.every.as_secs()),
+            crate::gc::span(gc.policy.retention_secs),
+            crate::gc::span(gc.policy.window_secs)
+        );
+        let store = Arc::clone(&backend.store);
+        std::thread::spawn(move || collect(&*store, gc));
+    }
 
     unsafe {
         let handler = on_signal as extern "C" fn(libc::c_int) as usize;
@@ -781,6 +829,46 @@ pub fn run(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// Sweep the store on a timer until the node is asked to stop.
+///
+/// The first sweep is one interval in rather than at start, because a
+/// node that is being restarted in a loop should not walk the whole
+/// store on every boot, and nothing about collecting is urgent.
+///
+/// Every node in a fleet can be told to do this. The lock in the store
+/// is what makes that safe: whichever node gets there first sweeps, the
+/// rest find it busy and go back to sleep, and no node has to be the
+/// special one that owns the cron entry.
+fn collect(store: &dyn CasStore, gc: Gc) {
+    let holder = crate::gc::holder();
+    let mut due = gc.every;
+    while !SHUTDOWN.load(Ordering::SeqCst) {
+        let tick = Duration::from_millis(200);
+        std::thread::sleep(tick);
+        due = due.saturating_sub(tick);
+        if !due.is_zero() {
+            continue;
+        }
+        due = gc.every;
+        let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(since) => since.as_secs(),
+            Err(_) => continue,
+        };
+        match gc::sweep(store, &holder, now, gc.policy) {
+            Ok(Sweep::Ran(stats)) => log::info!(
+                "gc: {} tenants, {} objects deleted, {} waiting out the window",
+                stats.tenants,
+                stats.deleted,
+                stats.candidates
+            ),
+            Ok(Sweep::Busy { holder, until_unix }) => {
+                log::debug!("gc: {holder} is sweeping until unix {until_unix}, leaving it to them");
+            }
+            Err(e) => log::warn!("gc: {e}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,6 +894,10 @@ mod tests {
         assert_eq!(
             args.passthrough, None,
             "a node serves its own bytes unless it was told not to"
+        );
+        assert!(
+            args.gc.is_none(),
+            "a node does not collect unless it was asked to"
         );
     }
 
@@ -838,6 +930,12 @@ mod tests {
             "64MB",
             "--passthrough",
             "8MB",
+            "--gc-every",
+            "6h",
+            "--gc-window",
+            "2d",
+            "--gc-retention",
+            "30d",
         ]))
         .unwrap();
         assert_eq!(args.target, "./fleet");
@@ -853,6 +951,30 @@ mod tests {
         assert_eq!(args.idle, Duration::from_secs(30));
         assert_eq!(args.shared_buffers, "64MB");
         assert_eq!(args.passthrough, Some(8 * 1024 * 1024));
+        let gc = args.gc.expect("a node that was told to collect");
+        assert_eq!(gc.every, Duration::from_secs(6 * 60 * 60));
+        assert_eq!(gc.policy.window_secs, 2 * 24 * 60 * 60);
+        assert_eq!(gc.policy.retention_secs, 30 * 24 * 60 * 60);
+        assert!(!gc.policy.dry_run, "a node that sweeps for real");
+    }
+
+    /// Retention written on a node that never sweeps is a promise
+    /// nothing keeps, and a bucket that fills up is a slow way to find
+    /// that out.
+    #[test]
+    fn a_retention_policy_with_nothing_to_apply_it_is_refused() {
+        assert!(parse(&argv(&["./fleet", "--gc-retention", "30d"])).is_err());
+        assert!(parse(&argv(&["./fleet", "--gc-window", "2d"])).is_err());
+        assert!(parse(&argv(&["./fleet", "--gc-every", "0"])).is_err());
+        assert!(parse(&argv(&["./fleet", "--gc-every", "soon"])).is_err());
+        assert!(parse(&argv(&["./fleet", "--gc-every"])).is_err());
+        let args = parse(&argv(&["./fleet", "--gc-every", "6h"])).unwrap();
+        let gc = args.gc.expect("asked for");
+        assert_eq!(
+            (gc.policy.window_secs, gc.policy.retention_secs),
+            (24 * 60 * 60, 7 * 24 * 60 * 60),
+            "a day of window and a week of retention, the same as the command"
+        );
     }
 
     /// Sizes the way people write them, and a refusal for the rest,

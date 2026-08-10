@@ -177,6 +177,45 @@ What it gives up is worth knowing before turning it on.
 The url outlives the request that made it, so an object deleted a second later is still readable until it expires, and the caller that follows it is talking to the bucket rather than to a permission check.
 It is also visible: the answer is a 302 where upstream sends 200, which every client library follows and every recorded comparison notices, so the conformance suites run with it off.
 
+## Retention and collecting
+
+A store only grows on its own.
+A checkpoint fold supersedes the chain under it, a fold that failed leaves captures nothing names, a deleted branch leaves whatever only it referenced, and every state change leaves a manifest snapshot behind so point in time recovery has somewhere to land.
+`zou gc <target>` is the sweep that walks the store, pins everything a live manifest or a retained snapshot references, and collects the rest.
+
+    zou gc s3://bucket/fleet --retention 7d --window 24h
+
+Two numbers are the whole policy and they are promises to different people.
+`--retention` is how far back point in time recovery reaches, a week by default: a manifest snapshot younger than it keeps everything it references alive, so it is what a customer asking to be restored to last Tuesday is relying on.
+`--window` is how long a key that looks like garbage waits before it is deleted, a day by default: it is a promise to whoever is mid publish, and it has to be longer than the longest fold upload and the longest gap between reading a manifest and publishing a branch from it.
+
+Deleting anything takes two runs whatever the numbers say.
+The first run stamps a key as a candidate, a later run deletes it only if it was still garbage on that run's own scan, so a branch published between the two takes its objects back off the list instead of losing them.
+That is also why a shorter window is not a faster sweep: `--window 0` still takes two runs.
+
+`--dry-run` names every object that would go and writes nothing at all.
+It is worth reading the second half of that: a dry run does not stamp candidates either, so it is a question and not a first run, and the two runs a deletion takes are still ahead of you.
+
+    zou gc s3://bucket/fleet --dry-run
+
+One sweep runs at a time across the whole deployment, and a lock object in the store enforces it rather than an operator remembering to.
+A second run says who holds it and until when and exits non zero, since a cron entry that never runs and never says so is a slow way to fill a bucket.
+The lock is held for an hour by default, `--lock-ttl` moves it, and it is released at the end of the run, so a node that died mid sweep costs the next one a TTL rather than a person.
+`--force` takes it anyway, for the case where the holder is known to be gone and nobody wants to wait out the rest.
+A dry run takes no lock at all, because it writes nothing anyone else's sweep could disagree with.
+
+A node can do this itself instead:
+
+    zou serve s3://bucket/fleet --domain zou.example --gc-every 6h --retention 7d
+
+`--gc-every` is off by default, and `--gc-window` and `--gc-retention` are the same two numbers under it, refused at the command line if there is no `--gc-every` for them to run under, because a retention window on a node that never sweeps is a policy nothing applies.
+Every node in a fleet can be given the same flag: the lock is what makes that safe, whichever gets there first sweeps and the rest go back to sleep, so no node has to be the special one with the cron entry.
+The first sweep is one interval in rather than at boot, so a node being restarted in a loop does not walk the whole store every time.
+
+What it never collects is worth saying.
+WAL is not this job's problem, a tenant's log is trimmed by its own rules, and a tenant prefix with no readable manifest is left entirely alone rather than treated as an orphan.
+The cost is a full listing of everything under `tenants/`, so this is a daily job on a large fleet and not an hourly one.
+
 ## The postgres port
 
 A node serving many projects listens once on 5432 and proxies each connection to the project's own postgres, because a thousand databases on a node have no thousand ports to be exposed on.
