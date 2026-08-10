@@ -265,6 +265,17 @@ impl CasStore for FileCache {
         Ok(version)
     }
 
+    /// Signing a url is arithmetic against no backend, so there is
+    /// nothing here to cache.
+    fn presigned_get(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+        response: &[(&str, &str)],
+    ) -> Result<Option<String>, CasError> {
+        self.inner.presigned_get(key, ttl, response)
+    }
+
     fn delete(&self, key: &str) -> Result<(), CasError> {
         self.inner.delete(key)?;
         if cacheable(key) {

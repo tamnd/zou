@@ -397,6 +397,17 @@ impl CasStore for SimStore {
         self.inner.put(key, data)
     }
 
+    /// Signing a url is arithmetic against no backend, so there is
+    /// nothing here to fail or slow down.
+    fn presigned_get(
+        &self,
+        key: &str,
+        ttl: Duration,
+        response: &[(&str, &str)],
+    ) -> Result<Option<String>, CasError> {
+        self.inner.presigned_get(key, ttl, response)
+    }
+
     fn delete(&self, key: &str) -> Result<(), CasError> {
         self.op(key, &self.profile.delete)?;
         self.inner.delete(key)

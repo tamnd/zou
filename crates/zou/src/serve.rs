@@ -34,12 +34,13 @@ use zou_pg::{bootstrap, restore};
 use zou_server::Config;
 use zou_server::attach::{Attached, Backend};
 use zou_server::fleet::Doors;
+use zou_server::object::Passthrough;
 use zou_server::tenant::{Registry, Routing};
 use zou_store::layout::TenantLayout;
 use zou_store::registry::Tenant;
 use zou_store::{CasStore, Manifest, open_store};
 
-pub const USAGE: &str = "usage: zou serve <target> [--http <n>] [--pg <n>] [--pool <n>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>]";
+pub const USAGE: &str = "usage: zou serve <target> [--http <n>] [--pg <n>] [--pool <n>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>]";
 
 /// How long a tenant's postmaster has to say it is accepting
 /// connections. A cold attach is meant to be under half a second and
@@ -56,6 +57,13 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// backed page cache is the tier that matters. A node running a few
 /// large projects rather than a thousand small ones should raise it.
 const SHARED_BUFFERS: &str = "16MB";
+
+/// How long a passthrough url works for, when one is handed out.
+///
+/// A quarter of an hour is long enough to start a multi gigabyte
+/// download on a bad line and short enough that a url which leaked into
+/// a proxy log stops being a way in by the time anyone reads it.
+const PASSTHROUGH_TTL: Duration = Duration::from_secs(900);
 
 /// Connections one tenant's postmaster will take. The pooler's own
 /// ceiling is twenty per project and role, so this is that plus room
@@ -88,6 +96,9 @@ pub struct Args {
     pub max_attached: usize,
     pub idle: Duration,
     pub shared_buffers: String,
+    /// The smallest object this node hands out a store url for instead
+    /// of serving. None, the default, and it serves every byte itself.
+    pub passthrough: Option<u64>,
 }
 
 pub fn parse(argv: &[String]) -> Result<Args, String> {
@@ -103,6 +114,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut max_attached = zou_server::attach::MAX_ATTACHED;
     let mut idle = zou_server::attach::IDLE;
     let mut shared_buffers = SHARED_BUFFERS.to_string();
+    let mut passthrough = None;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -126,6 +138,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 idle = Duration::from_secs(secs);
             }
             "--shared-buffers" => shared_buffers = need(&mut it, "--shared-buffers")?.clone(),
+            "--passthrough" => passthrough = Some(size(need(&mut it, "--passthrough")?)?),
             other if target.is_none() && !other.starts_with('-') => {
                 target = Some(other.to_string());
             }
@@ -160,7 +173,29 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         max_attached,
         idle,
         shared_buffers,
+        passthrough,
     })
+}
+
+/// A number of bytes, written the way a person writes one: plain, or
+/// with a K, M or G on it, powers of two because that is what every
+/// other size in a postgres deployment means.
+fn size(raw: &str) -> Result<u64, String> {
+    // The B is optional, so 8M and 8MB are the same number and 8B is
+    // eight bytes.
+    let digits = raw.trim().trim_end_matches(['b', 'B']);
+    let (digits, scale) = match digits.chars().last() {
+        Some('k' | 'K') => (&digits[..digits.len() - 1], 1024u64),
+        Some('m' | 'M') => (&digits[..digits.len() - 1], 1024 * 1024),
+        Some('g' | 'G') => (&digits[..digits.len() - 1], 1024 * 1024 * 1024),
+        _ => (digits, 1),
+    };
+    digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(scale))
+        .ok_or_else(|| format!("bad size {raw:?}, write bytes or something like 8MB"))
 }
 
 fn need<'a>(it: &mut std::slice::Iter<'a, String>, flag: &str) -> Result<&'a String, String> {
@@ -342,6 +377,10 @@ struct Postmasters {
     /// for a node reached by path prefix, where the url depends on how
     /// the caller got here.
     domain: Option<String>,
+    /// What every tenant this node brings up is told about handing out
+    /// store urls instead of bytes. None and every one of them serves
+    /// its own.
+    passthrough: Option<Passthrough>,
     store: Arc<dyn CasStore>,
     state: Arc<State>,
 }
@@ -539,6 +578,7 @@ impl Backend for Postmasters {
             // Objects go where the pages go: the same store, the same
             // tenant prefix, under files/.
             objects: Some(self.target.clone()),
+            passthrough: self.passthrough,
             tenant: Some(tenant_ref.clone()),
             external_url: self
                 .domain
@@ -638,6 +678,10 @@ pub fn run(args: &Args) -> Result<(), String> {
         runtime: args.runtime.clone(),
         shared_buffers: args.shared_buffers.clone(),
         domain: args.domains.first().cloned(),
+        passthrough: args.passthrough.map(|min_bytes| Passthrough {
+            min_bytes,
+            ttl: PASSTHROUGH_TTL,
+        }),
         store,
         state: Arc::new(State {
             dying: Mutex::new(HashMap::new()),
@@ -759,6 +803,10 @@ mod tests {
         );
         assert!(args.domains.is_empty());
         assert_eq!(args.max_attached, zou_server::attach::MAX_ATTACHED);
+        assert_eq!(
+            args.passthrough, None,
+            "a node serves its own bytes unless it was told not to"
+        );
     }
 
     #[test]
@@ -788,6 +836,8 @@ mod tests {
             "30",
             "--shared-buffers",
             "64MB",
+            "--passthrough",
+            "8MB",
         ]))
         .unwrap();
         assert_eq!(args.target, "./fleet");
@@ -802,6 +852,23 @@ mod tests {
         assert_eq!(args.max_attached, 64);
         assert_eq!(args.idle, Duration::from_secs(30));
         assert_eq!(args.shared_buffers, "64MB");
+        assert_eq!(args.passthrough, Some(8 * 1024 * 1024));
+    }
+
+    /// Sizes the way people write them, and a refusal for the rest,
+    /// because a node that read `8 megs` as eight bytes would redirect
+    /// every download it has.
+    #[test]
+    fn sizes_are_read_with_or_without_their_units() {
+        assert_eq!(size("1024"), Ok(1024));
+        assert_eq!(size("8B"), Ok(8));
+        assert_eq!(size(" 8k "), Ok(8 * 1024));
+        assert_eq!(size("8KB"), Ok(8 * 1024));
+        assert_eq!(size("8mb"), Ok(8 * 1024 * 1024));
+        assert_eq!(size("2G"), Ok(2 * 1024 * 1024 * 1024));
+        for bad in ["", "8 megs", "-1", "1.5MB", "MB", "18446744073709551615G"] {
+            assert!(size(bad).is_err(), "{bad} should not parse");
+        }
     }
 
     #[test]
@@ -835,6 +902,7 @@ mod tests {
         assert!(parse(&argv(&["./fleet", "--pg", "eleven"])).is_err());
         assert!(parse(&argv(&["./fleet", "--idle-secs", "soon"])).is_err());
         assert!(parse(&argv(&["./fleet", "--max-attached", "lots"])).is_err());
+        assert!(parse(&argv(&["./fleet", "--passthrough", "big"])).is_err());
         assert!(parse(&argv(&["./fleet", "extra"])).is_err());
         assert!(parse(&argv(&["--bogus", "./fleet"])).is_err());
     }

@@ -120,6 +120,34 @@ pub trait CasStore: Send + Sync {
         }
     }
 
+    /// A url that reads this object from the backend directly, good for
+    /// `ttl`, or `None` from a backend where no such url exists.
+    ///
+    /// This is the one thing in the trait that is not about correctness.
+    /// Nothing zou does needs it: every read here works by reading. It
+    /// is here so a server that would otherwise copy a large object
+    /// through itself can hand the caller a url and step out of the
+    /// egress path, which is a deployment's choice rather than the
+    /// store's, so the store only answers whether it is possible.
+    ///
+    /// `response` are `response-*` parameters the url carries, so the
+    /// answer the backend gives has the content type and the
+    /// disposition the caller asked for rather than whatever the bytes
+    /// were uploaded with. They are part of what is signed, so a url
+    /// cannot be edited into one that says something else.
+    ///
+    /// `None` is the honest answer almost everywhere: a directory on a
+    /// laptop is not reachable by url, and neither is a sqlite file.
+    fn presigned_get(
+        &self,
+        key: &str,
+        ttl: Duration,
+        response: &[(&str, &str)],
+    ) -> Result<Option<String>, CasError> {
+        let _ = (key, ttl, response);
+        Ok(None)
+    }
+
     /// Delete an object. Deleting a missing key succeeds, so retries and
     /// concurrent deleters are harmless. When history must be protected
     /// that is the GC safety window's job, not the store's.

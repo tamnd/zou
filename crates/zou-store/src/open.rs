@@ -75,6 +75,15 @@ impl CasStore for PrefixStore {
         self.inner.put(&self.key(key), data)
     }
 
+    fn presigned_get(
+        &self,
+        key: &str,
+        ttl: std::time::Duration,
+        response: &[(&str, &str)],
+    ) -> Result<Option<String>, CasError> {
+        self.inner.presigned_get(&self.key(key), ttl, response)
+    }
+
     fn delete(&self, key: &str) -> Result<(), CasError> {
         self.inner.delete(&self.key(key))
     }
