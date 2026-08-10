@@ -9,9 +9,9 @@ authors.workspace = true
 
 [dependencies]
 zou-log = { path = "../zou-log" }
+zou-ops = { path = "../zou-ops" }
 zou-pg = { path = "../zou-pg" }
 zou-store = { path = "../zou-store" }
-env_logger = { workspace = true }
 getrandom = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }

@@ -110,10 +110,16 @@ impl Attached {
         let router = slot
             .router
             .get_or_try_init(|| async move {
-                let cfg = tokio::task::spawn_blocking(move || backend.up(&entry))
-                    .await
-                    .map_err(|e| format!("attach: {e}"))??;
-                crate::router(cfg)
+                // Inside the cell, so what is timed is a cold attach
+                // and a warm request counts nothing at all.
+                let start = Instant::now();
+                let built = match tokio::task::spawn_blocking(move || backend.up(&entry)).await {
+                    Ok(Ok(cfg)) => crate::router(cfg),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(format!("attach: {e}")),
+                };
+                crate::ops::attach(built.is_ok(), start);
+                built
             })
             .await?;
         // After, not before: a cold attach that pushed the node over
@@ -144,12 +150,16 @@ impl Attached {
             slots.remove(&tenant_ref);
             self.backend.down(&tenant_ref);
         }
+        crate::ops::attached(slots.len());
     }
 
     /// Let one tenant go now, for a project that was just deleted or a
     /// secret that was just rotated.
     pub async fn detach(&self, tenant_ref: &str) {
-        self.slots.lock().await.remove(tenant_ref);
+        let mut slots = self.slots.lock().await;
+        slots.remove(tenant_ref);
+        crate::ops::attached(slots.len());
+        drop(slots);
         self.backend.down(tenant_ref);
     }
 
@@ -178,6 +188,9 @@ impl Attached {
     /// Back down to the ceiling, oldest use first.
     async fn enforce(&self) {
         let mut slots = self.slots.lock().await;
+        // Reported from here because this runs on every attach and
+        // already holds the lock the count would need.
+        crate::ops::attached(slots.len());
         if slots.len() <= self.max {
             return;
         }
@@ -191,6 +204,7 @@ impl Attached {
             slots.remove(&tenant_ref);
             self.backend.down(&tenant_ref);
         }
+        crate::ops::attached(slots.len());
     }
 
     fn now(&self) -> u64 {

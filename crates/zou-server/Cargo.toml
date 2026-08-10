@@ -29,6 +29,7 @@ tower = { workspace = true, features = ["util"] }
 ureq = { workspace = true }
 webp = { workspace = true }
 webpki-roots = { workspace = true }
+zou-ops = { path = "../zou-ops" }
 zou-rest = { path = "../zou-rest" }
 zou-store = { path = "../zou-store", features = ["s3"] }
 
