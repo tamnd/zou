@@ -20,10 +20,11 @@
 //! A snapshot past retention is ordinary two phase garbage, and
 //! whatever only it referenced follows it out through the same window.
 //!
-//! WAL is not this job's problem. The shared log lives under the
-//! `cellwal/` prefixes outside `tenants/`, consolidation rewrites it
-//! and `gc_landing` in zou-log trims the landing chain by its own
-//! rules, so nothing here ever touches a WAL object.
+//! WAL is not this job's problem. A tenant's log lives under its own
+//! `log/` prefix, consolidation rewrites it and `gc_landing` in zou-log
+//! trims the landing chain by its own rules, so this job only ever
+//! collects under `chk/` and `manifests/` and never touches a WAL
+//! object.
 //!
 //! Deletion is two phase. A run stamps each garbage key into the
 //! candidates object with the current time, and a later run deletes a
@@ -287,6 +288,29 @@ mod tests {
         assert_eq!(due.candidates, 0);
         assert!(!chk_present(&store, "p", "aaa"));
         assert!(chk_present(&store, "p", "bbb"));
+    }
+
+    /// A tenant's WAL chain sits under the same `tenants/<ref>/` prefix
+    /// this job walks, and no manifest names a landing segment, so a job
+    /// that collected everything it could not pin would delete the log
+    /// out from under a running pusher. Only `chk/` and `manifests/` are
+    /// ever collected here.
+    #[test]
+    fn the_log_is_never_garbage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        put_chk(&store, "p", "aaa");
+        write_manifest(&store, "p", &[("aaa", 0x100, CheckpointKind::Full)], None);
+        let landing = "tenants/p/log/cellwal/0000/0000000000000001";
+        store.put_if_absent(landing, b"a window of wal").unwrap();
+
+        run(&store, 1000, 0, 100_000).unwrap();
+        let after = run(&store, 2000, 0, 100_000).unwrap();
+        assert_eq!(after.deleted, 0, "nothing here was ever garbage");
+        assert!(
+            store.get(landing).unwrap().is_some(),
+            "the log is still there"
+        );
     }
 
     #[test]

@@ -54,7 +54,7 @@ jobs:
           test -s "$ZOU_TARGET/tenants/local/chk/genesis/INDEX"
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata -l /tmp/zou-pg.log start
           build/pg/bin/psql -h /tmp -d postgres -c "create table t(id int primary key, v text)" -c "insert into t select g, 'row ' || g from generate_series(1,1000) g"
-          test "$(find $ZOU_TARGET/cellwal -type f ! -name manifest | wc -l)" -ge 2
+          test "$(find $ZOU_TARGET/tenants/local/log/cellwal -type f ! -name manifest | wc -l)" -ge 2
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata restart -l /tmp/zou-pg.log
           build/pg/bin/psql -h /tmp -d postgres -c 'select count(*), sum(id) from t' | tee /tmp/reread.txt
           grep -q 500500 /tmp/reread.txt
