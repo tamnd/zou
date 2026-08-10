@@ -370,6 +370,46 @@ pub fn stale_read(behind: u64) {
         .observe(behind as f64);
 }
 
+/// One postgres wire session opening or closing. A level rather than a
+/// rate, because what a pooler is sized against is how many sessions
+/// are open at once.
+pub fn pg_session(open: bool) {
+    let sessions = registry().gauge("zou_pg_sessions", "postgres sessions open right now", &[]);
+    match open {
+        true => sessions.inc(),
+        false => sessions.dec(),
+    }
+}
+
+/// One login on the pg port. `refused` is a client that was told why in
+/// its own protocol, a wrong key or an unknown project, and `error` is
+/// everything that did not get that far, so the two apart are the
+/// difference between somebody typing a password wrong and a database
+/// that will not answer.
+pub fn pg_login(outcome: &'static str) {
+    registry()
+        .counter(
+            "zou_pg_logins_total",
+            "postgres connections that reached a decision",
+            &[("outcome", outcome)],
+        )
+        .inc();
+}
+
+/// What a finished session moved, in each direction, counted from the
+/// client's point of view.
+pub fn pg_bytes(sent: u64, received: u64) {
+    let bytes = |direction: &'static str| {
+        registry().counter(
+            "zou_pg_bytes_total",
+            "bytes proxied on the postgres port",
+            &[("direction", direction)],
+        )
+    };
+    bytes("sent").add(sent);
+    bytes("received").add(received);
+}
+
 /// One registry lookup, hit or miss, which is the reading that says
 /// whether the cache ttls are doing anything.
 pub fn lookup(hit: bool) {

@@ -54,10 +54,21 @@ pub const MAX_ATTACHED: usize = 1024;
 /// that an abandoned project is not still holding a lease at midnight.
 pub const IDLE: Duration = Duration::from_secs(15 * 60);
 
+/// One tenant, up.
+///
+/// The router is what the http door serves and the dsn is what the pg
+/// wire door proxies to, and they are one thing because they are one
+/// attach: whichever door is asked first pays for the postmaster and
+/// the other one finds it already running.
+struct Up {
+    router: Router,
+    pg: Option<String>,
+}
+
 struct Slot {
     /// Built once. A failed attach leaves this empty, so the next
     /// request tries again rather than inheriting the failure.
-    router: OnceCell<Router>,
+    up: OnceCell<Arc<Up>>,
     /// Milliseconds since the manager was made, so that touching a
     /// tenant on the read path is one relaxed store and not a lock.
     used: AtomicU64,
@@ -103,13 +114,27 @@ impl Attached {
     /// least recently used: a request in flight has just touched its
     /// tenant, so it is the last thing eviction reaches for.
     pub async fn router(&self, entry: &Tenant) -> Result<Router, String> {
+        Ok(self.up(entry).await?.router.clone())
+    }
+
+    /// The dsn of the tenant's database, attaching it if it is not up.
+    ///
+    /// This is the pg wire door's half of the same attach. None is a
+    /// tenant whose backend brought it up without a database to talk
+    /// to, which is a legitimate answer on the http side and nothing a
+    /// postgres client can be given.
+    pub async fn dsn(&self, entry: &Tenant) -> Result<Option<String>, String> {
+        Ok(self.up(entry).await?.pg.clone())
+    }
+
+    async fn up(&self, entry: &Tenant) -> Result<Arc<Up>, String> {
         let slot = self.slot(&entry.tenant_ref).await;
         slot.used.store(self.now(), Ordering::Relaxed);
         let backend = self.backend.clone();
         let entry = entry.clone();
         let tenant_ref = entry.tenant_ref.clone();
-        let router = slot
-            .router
+        let up = slot
+            .up
             .get_or_try_init(|| async move {
                 // Inside the cell, so what is timed is a cold attach
                 // and a warm request counts nothing at all. It is also
@@ -121,7 +146,10 @@ impl Attached {
                     span.text("zou.tenant", tenant_ref);
                 }
                 let built = match tokio::task::spawn_blocking(move || backend.up(&entry)).await {
-                    Ok(Ok(cfg)) => crate::router(cfg),
+                    Ok(Ok(cfg)) => {
+                        let pg = cfg.pg.clone();
+                        crate::router(cfg).map(|router| Arc::new(Up { router, pg }))
+                    }
                     Ok(Err(e)) => Err(e),
                     Err(e) => Err(format!("attach: {e}")),
                 };
@@ -140,7 +168,7 @@ impl Attached {
         // just built, and evicting before would let the ceiling be
         // exceeded by exactly the tenant that is about to be used.
         self.enforce().await;
-        Ok(router.clone())
+        Ok(up.clone())
     }
 
     /// Drop everything untouched for longer than the idle budget. A
@@ -191,7 +219,7 @@ impl Attached {
             .entry(tenant_ref.to_string())
             .or_insert_with(|| {
                 Arc::new(Slot {
-                    router: OnceCell::new(),
+                    up: OnceCell::new(),
                     used: AtomicU64::new(0),
                 })
             })
@@ -230,9 +258,9 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
 
-    /// A backend that starts nothing. `Config::pg` of None is a router
-    /// with no pool behind it, which is enough to prove a tenant is up
-    /// without a postmaster in the test.
+    /// A backend that starts nothing. A dsn is only parsed here, never
+    /// dialled, so a tenant can be up in a test without a postmaster
+    /// behind it.
     #[derive(Default)]
     struct Fake {
         ups: StdMutex<Vec<String>>,
@@ -263,6 +291,10 @@ mod tests {
             self.ups.lock().unwrap().push(entry.tenant_ref.clone());
             Ok(Config {
                 jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
+                pg: Some(format!(
+                    "host=127.0.0.1 port=5432 user=zou dbname={}",
+                    entry.tenant_ref
+                )),
                 ..Config::default()
             })
         }
@@ -292,6 +324,22 @@ mod tests {
         }
         assert_eq!(fake.ups(), vec!["acme-prod"], "one attach, five requests");
         assert_eq!(attached.len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn both_doors_share_one_attach() {
+        let (fake, attached) = manager();
+        let _ = attached.router(&entry("acme-prod")).await.unwrap();
+        let dsn = attached.dsn(&entry("acme-prod")).await.unwrap();
+        assert_eq!(
+            dsn.as_deref(),
+            Some("host=127.0.0.1 port=5432 user=zou dbname=acme-prod")
+        );
+        assert_eq!(
+            fake.ups(),
+            vec!["acme-prod"],
+            "a postgres client arriving after a request does not start a second postmaster"
+        );
     }
 
     #[tokio::test]

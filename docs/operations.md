@@ -116,3 +116,29 @@ A read forwarded is slower; a write served locally is data that never happened.
 
 `zou_forwarded_requests_total{outcome="sent"|"failed"}` counts the hops, `zou_stale_reads_total` counts the answers served locally, and `zou_stale_read_seconds` is how far behind they were.
 Each forwarded request opens a client span whose `traceparent` goes across, so a trace covers both nodes and the hop is a span in it.
+
+## The postgres port
+
+A node serving many projects listens once on 5432 and proxies each connection to the project's own postgres, because a thousand databases on a node have no thousand ports to be exposed on.
+The project is named in the startup packet, in either of the two places a client can put it.
+`dbname=acme-prod` is what a person types at psql, and `user=<role>.acme-prod` is the convention Supabase's pooler already taught every driver that cannot set a database name freely, so both work and the user suffix wins when a client spells it twice.
+The part of the user that is not the ref is the role the session runs as, which is how anon, authenticated and service_role reach SQL as themselves and RLS means the same thing here as it does over http.
+
+The password is the project key.
+It is the same JWT that goes in an `apikey` header, signed with the project's secret, and its `role` claim has to be the role the connection asked for, so a key for anon cannot open a service_role session.
+This server checks it and the tenant's own postgres never sees it: the connection this node then opens carries the dsn's credential, which belongs to the node that started the postmaster and is not something a client should hold.
+The check happens before the attach, so an unauthenticated stranger cannot make a node start a database.
+
+    psql "postgresql://service_role.acme-prod:$SERVICE_ROLE_KEY@zou.example:5432/postgres"
+
+There is no TLS on this port yet, and an `SSLRequest` is declined rather than ignored, which is what makes a client decide instead of guess.
+Until there is, put the port on a private network or behind a terminator, because the key crosses in the clear.
+A database that asks this node for SCRAM is refused with a sentence saying so, since trust, cleartext and md5 are what a postmaster this node started asks for.
+Replication connections are refused too, and a startup packet over 10000 bytes or a login that takes longer than 30 seconds is dropped.
+
+Cancellation works the way it does against postgres directly: the key the client is handed is the key its own backend generated, this node only remembers which database that pair is on so a cancel arriving on a fresh connection has somewhere to go.
+A pair this node has never seen is dropped in silence, because guessing one must not cancel a stranger's query.
+
+`zou_pg_sessions` is how many are open right now, which is the number a pooler is sized against.
+`zou_pg_logins_total{outcome="ok"|"refused"|"error"}` separates a client that was told why in its own protocol, a wrong key or an unknown project, from everything that never got that far.
+`zou_pg_bytes_total{direction}` is what the sessions moved.
