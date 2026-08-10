@@ -2703,6 +2703,7 @@ version = "0.0.1"
 dependencies = [
  "crc32c",
  "hmac",
+ "libc",
  "log",
  "lz4_flex",
  "memmap2",

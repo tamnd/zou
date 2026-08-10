@@ -1,5 +1,5 @@
 diff --git a/src/backend/access/transam/meson.build b/src/backend/access/transam/meson.build
-index e8ae9b13c8..b7f28a9253 100644
+index e8ae9b1..b7f28a9 100644
 --- a/src/backend/access/transam/meson.build
 +++ b/src/backend/access/transam/meson.build
 @@ -15,6 +15,7 @@ backend_sources += files(
@@ -11,7 +11,7 @@ index e8ae9b13c8..b7f28a9253 100644
    'xlogarchive.c',
    'xlogbackup.c',
 diff --git a/src/backend/access/transam/xact.c b/src/backend/access/transam/xact.c
-index b885513f76..24c245d2bb 100644
+index b885513..24c245d 100644
 --- a/src/backend/access/transam/xact.c
 +++ b/src/backend/access/transam/xact.c
 @@ -29,6 +29,7 @@
@@ -38,7 +38,7 @@ index b885513f76..24c245d2bb 100644
  		 */
 diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
 new file mode 100644
-index 0000000000..9a8012210e
+index 0000000..e926a73
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
 @@ -0,0 +1,597 @@
@@ -185,8 +185,8 @@ index 0000000000..9a8012210e
 +	memset(&bgw, 0, sizeof(bgw));
 +	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
 +	bgw.bgw_start_time = BgWorkerStart_PostmasterStart;
-+	/* Reads block on the socket, come back quickly after a crash. */
-+	bgw.bgw_restart_time = 1;
++	/* Reads block on the socket, come back immediately after a crash. */
++	bgw.bgw_restart_time = 0;
 +	snprintf(bgw.bgw_library_name, sizeof(bgw.bgw_library_name), "postgres");
 +	snprintf(bgw.bgw_function_name, sizeof(bgw.bgw_function_name),
 +			 "ZouPageServiceMain");
@@ -640,7 +640,7 @@ index 0000000000..9a8012210e
 +	proc_exit(0);
 +}
 diff --git a/src/backend/postmaster/bgworker.c b/src/backend/postmaster/bgworker.c
-index 1ad65c237c..74210359b1 100644
+index 1ad65c2..7421035 100644
 --- a/src/backend/postmaster/bgworker.c
 +++ b/src/backend/postmaster/bgworker.c
 @@ -18,6 +18,7 @@
@@ -665,7 +665,7 @@ index 1ad65c237c..74210359b1 100644
  		"ApplyWorkerMain", ApplyWorkerMain
  	},
 diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
-index 5124d39e5c..2d2046f1fd 100644
+index 5124d39..1fea708 100644
 --- a/src/backend/postmaster/postmaster.c
 +++ b/src/backend/postmaster/postmaster.c
 @@ -92,6 +92,7 @@
@@ -686,8 +686,42 @@ index 5124d39e5c..2d2046f1fd 100644
  	/*
  	 * process any libraries that should be preloaded at postmaster start
  	 */
+@@ -3214,6 +3218,14 @@ PostmasterStateMachine(void)
+ 
+ 		/* start accepting server socket connection events again */
+ 		ConfigurePostmasterWaitSet(true);
++
++		/*
++		 * Arm the bgworker launcher so workers that start with the
++		 * postmaster come back before recovery begins to read. The gate in
++		 * maybe_start_bgworkers() keeps everything else parked until
++		 * recovery ends.
++		 */
++		StartWorkerNeeded = true;
+ 	}
+ }
+ 
+@@ -4219,9 +4231,16 @@ maybe_start_bgworkers(void)
+ 
+ 	/*
+ 	 * During crash recovery, we have no need to be called until the state
+-	 * transition out of recovery.
++	 * transition out of recovery, with one exception. A worker that starts
++	 * with the postmaster can be needed by crash recovery itself: the zou
++	 * page service feeds reads to the startup process, so recovery cannot
++	 * finish without it. Once the postmaster has reset shared memory and
++	 * relaunched the startup process the world looks exactly like boot,
++	 * and bgworker_should_start_now() only lets
++	 * BgWorkerStart_PostmasterStart workers through in PM_STARTUP, so
++	 * falling through is safe from that point on.
+ 	 */
+-	if (FatalError)
++	if (FatalError && pmState != PM_STARTUP)
+ 	{
+ 		StartWorkerNeeded = false;
+ 		HaveCrashedWorker = false;
 diff --git a/src/backend/storage/ipc/ipci.c b/src/backend/storage/ipc/ipci.c
-index 8d2b0f1193..54a0df12fc 100644
+index 8d2b0f1..54a0df1 100644
 --- a/src/backend/storage/ipc/ipci.c
 +++ b/src/backend/storage/ipc/ipci.c
 @@ -24,6 +24,7 @@
@@ -716,7 +750,7 @@ index 8d2b0f1193..54a0df12fc 100644
  	/*
 diff --git a/src/include/access/zou_wal.h b/src/include/access/zou_wal.h
 new file mode 100644
-index 0000000000..ce7e5502a9
+index 0000000..ce7e550
 --- /dev/null
 +++ b/src/include/access/zou_wal.h
 @@ -0,0 +1,40 @@
