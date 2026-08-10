@@ -15,6 +15,9 @@ on:
       - crates/zou/**
       - crates/zou-pg/**
       - crates/zou-store/**
+      - crates/zou-embed/**
+      - crates/libzou/**
+      - crates/zou-node/**
       - .github/workflows/postgres-build.yml
   workflow_dispatch:
 
@@ -121,6 +124,17 @@ jobs:
       # than assumed to still line up.
       - name: the C ABI end to end
         run: ZOU_PG_BIN=$PWD/build/pg/bin crates/libzou/tests/smoke.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # And supabase-js talking to a database inside the node process,
+      # which is the whole point of the binding: the same client a
+      # browser would use, with no socket under it.
+      - name: the node binding end to end
+        run: |
+          crates/zou-node/build.sh
+          npm --prefix crates/zou-node install
+          ZOU_PG_BIN=$PWD/build/pg/bin npm --prefix crates/zou-node test
       - name: zou dev, branch, and info end to end
         run: |
           cargo build -p zou --release
