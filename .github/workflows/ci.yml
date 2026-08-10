@@ -825,6 +825,13 @@ jobs:
           ZOU_S3_TEST_SECRET_KEY: zou-secret-key
           ZOU_S3_RETRY_BASE_MS: 25
         run: cargo test -p zou-store --features s3 --test s3_chaos -- --nocapture
+      - name: Measure failover against MinIO
+        env:
+          ZOU_S3_TEST_ENDPOINT: http://127.0.0.1:9000
+          ZOU_S3_TEST_BUCKET: zou-test
+          ZOU_S3_TEST_ACCESS_KEY: zou
+          ZOU_S3_TEST_SECRET_KEY: zou-secret-key
+        run: cargo test -p zou-store --features s3 --test failover -- --nocapture
 
   deny:
     name: cargo-deny
