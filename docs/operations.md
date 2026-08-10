@@ -164,6 +164,14 @@ The check happens before the attach, so an unauthenticated stranger cannot make 
 
     psql "postgresql://service_role.acme-prod:$SERVICE_ROLE_KEY@zou.example:5432/postgres"
 
+`postgres` is the fourth role and the one a project's own migrations run as.
+It is the cluster superuser every database is initialised with, so it owns the schemas and can create in them, which is what separates it from service_role: service_role sees every row because it bypasses RLS, and it still cannot create a table, exactly as on Supabase.
+A key for it is minted from the project's secret the same way the other three are, and it is the project owner's credential rather than anything an application should carry.
+
+    psql "postgresql://postgres.acme-prod:$POSTGRES_KEY@zou.example:5432/postgres" -f migration.sql
+
+A database initialised by a build before this one took its superuser from the account that ran the node, and this build asks for `postgres`, so such a store answers `role "postgres" does not exist` and wants recreating.
+
 There is no TLS on this port yet, and an `SSLRequest` is declined rather than ignored, which is what makes a client decide instead of guess.
 Until there is, put the port on a private network or behind a terminator, because the key crosses in the clear.
 A database that asks this node for SCRAM is refused with a sentence saying so, since trust, cleartext and md5 are what a postmaster this node started asks for.

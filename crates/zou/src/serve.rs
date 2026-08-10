@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::time::Duration;
 
+use crate::dev::SUPERUSER;
 use zou_pg::{bootstrap, restore};
 use zou_server::Config;
 use zou_server::attach::{Attached, Backend};
@@ -274,6 +275,12 @@ impl Postmasters {
         let out = Command::new(self.pg_bin.join("initdb"))
             .arg("-D")
             .arg(pgdata)
+            // Named rather than left to the OS user, because the
+            // cluster superuser is the role a project's own migrations
+            // run as, and a Supabase project's is postgres wherever it
+            // is hosted. Taking the OS user would make the owner of a
+            // database depend on which account started the node.
+            .args(["-U", SUPERUSER])
             .args(["--set", "io_method=sync"])
             .args(["--set", "full_page_writes=off"])
             .env("ZOU_TARGET", &self.target)
@@ -403,17 +410,13 @@ impl Backend for Postmasters {
             .expect("the live map")
             .insert(tenant_ref.clone(), Live { pid, dir });
 
-        // initdb ran without -U, so the cluster superuser is the OS
-        // user, and local connections are trust. Nothing but this node
-        // can reach the port either way: it is on loopback and the
-        // client of it is in this process.
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("LOGNAME"))
-            .unwrap_or_else(|_| "postgres".to_string());
+        // Local connections are trust, and nothing but this node can
+        // reach the port either way: it is on loopback in a 0700 socket
+        // directory and the client of it is in this process.
         Ok(Config {
             jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
             pg: Some(format!(
-                "host=127.0.0.1 port={port} user={user} dbname=postgres"
+                "host=127.0.0.1 port={port} user={SUPERUSER} dbname=postgres"
             )),
             // Objects go where the pages go: the same store, the same
             // tenant prefix, under files/.

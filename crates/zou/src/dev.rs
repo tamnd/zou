@@ -22,6 +22,21 @@ use zou_pg::{bootstrap, restore};
 use zou_store::layout::TenantLayout;
 use zou_store::{CasStore, Manifest, open_store};
 
+/// The cluster superuser a database is initialised with, here and in
+/// `zou serve`.
+///
+/// It is the role that owns a project's schemas, so it is the role a
+/// project's own migrations run as, and `postgres.<ref>` over the
+/// postgres port is then the connection string a Supabase project
+/// already has. anon, authenticated and service_role reach SQL through
+/// the same port and are what the api uses, but none of them owns
+/// anything, which is why none of them can create a table.
+///
+/// Named rather than taken from the environment, because the owner of a
+/// database should not depend on which account started the process, and
+/// a store initdb'd by one command has to be openable by the other.
+pub const SUPERUSER: &str = "postgres";
+
 /// How many times in a row the postmaster may die before its first
 /// accepted connection until we stop retrying. A crash after it was up
 /// resets the count, that is the recover-and-continue path.
@@ -255,12 +270,8 @@ fn start_http(port: u16, pg_port: u16, target: String) -> Result<(), String> {
     if disable_signup {
         log::info!("signups are off, invitations are the way in");
     }
-    // initdb ran without -U, so the cluster superuser is the OS user
-    // and local connections are trust, the stock dev loop layout.
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "postgres".to_string());
-    let dsn = format!("host=127.0.0.1 port={pg_port} user={user} dbname=postgres");
+    // Local connections are trust, the stock dev loop layout.
+    let dsn = format!("host=127.0.0.1 port={pg_port} user={SUPERUSER} dbname=postgres");
     std::thread::spawn(move || {
         let cfg = zou_server::Config {
             jwt_secret: secret.into_bytes(),
@@ -424,6 +435,12 @@ pub fn run(args: &Args) -> Result<(), String> {
         let out = Command::new(args.pg_bin.join("initdb"))
             .arg("-D")
             .arg(&pgdata)
+            // The same superuser `zou serve` gives a tenant, so a store
+            // made by one command is one the other can open, and so the
+            // role a project's migrations run as is postgres here as it
+            // is on Supabase rather than whichever account happened to
+            // start the process.
+            .args(["-U", SUPERUSER])
             .args(["--set", "io_method=sync"])
             // Pages live as store objects and a put is atomic on every
             // backend, so the torn write full page protection guards
