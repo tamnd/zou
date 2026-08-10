@@ -4,9 +4,17 @@
 //! vendored walredo mode from patch 0005. It holds pages in memory,
 //! applies WAL records through the real rmgr redo routines, and speaks
 //! a tiny length-prefixed protocol on stdin and stdout. The pool feeds
-//! it batches: a reset, the base images the batch needs, the record
-//! chain in LSN order, then the page reads. One write, then the
-//! responses, so a batch costs a single round trip.
+//! it batches: a reset, the batch's target blocks, the base images the
+//! batch needs, the record chain in LSN order, then the page reads. One
+//! write, then the responses, so a batch costs a single round trip.
+//!
+//! The targets tell the worker which blocks this batch is about. A
+//! multi block record drags other blocks into view, and the worker's
+//! copies of those are either absent or half replayed, because records
+//! touching only them are not in the chain. Redo skips every reference
+//! to a block outside the target set, except an init, which is self
+//! contained; each such block's own batch replays the shared records
+//! against its full history.
 //!
 //! Workers are disposable by design. A malformed message or a redo
 //! failure makes the worker die rather than limp along, and a wedged
@@ -165,6 +173,10 @@ impl RedoPool {
         }
         let mut batch = Vec::new();
         frame(&mut batch, b'R', 0);
+        for blk in req.gets {
+            frame(&mut batch, b'T', 17);
+            target(&mut batch, blk)?;
+        }
         for (blk, page) in req.pages {
             frame(&mut batch, b'P', 17 + BLCKSZ);
             target(&mut batch, blk)?;

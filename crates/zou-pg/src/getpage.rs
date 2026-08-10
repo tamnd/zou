@@ -65,6 +65,10 @@ pub enum GetPageError {
     BatchTooLarge { got: usize },
     #[error("reconstruction of {blk:?} needs redo but the service has no redo pool")]
     NoRedoPool { blk: BlockRef },
+    #[error(
+        "{blk:?} has records from {first_lsn:#x} on but no base image, and the first record cannot build the page alone"
+    )]
+    BareChain { blk: BlockRef, first_lsn: u64 },
     #[error("redo: {0}")]
     Redo(String),
     #[error(transparent)]
@@ -199,6 +203,30 @@ impl<'a> PageService<'a> {
                     .expect("a nonempty chain came from some block");
                 return Err(GetPageError::NoRedoPool { blk: *needy.0 });
             };
+            // A main fork block with record history but no base
+            // anywhere is a hole in the store, not a fresh block: a
+            // fresh block's first record builds the page by itself, an
+            // init or a full image. Redo would grow whatever it can
+            // out of zeros and the rest of the page would be
+            // fabricated, so refuse loudly instead.
+            for (blk, r) in blocks.iter().zip(&recons) {
+                if blk.fork != 0 || r.base.is_some() {
+                    continue;
+                }
+                let Some((first_lsn, bytes)) = r.records.first() else {
+                    continue;
+                };
+                let self_built = walscan::record_init_refs(bytes)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|(rref, init)| *init && rref == blk);
+                if !self_built {
+                    return Err(GetPageError::BareChain {
+                        blk: *blk,
+                        first_lsn: first_lsn.0,
+                    });
+                }
+            }
             let bases: Vec<(BlockRef, &[u8])> = blocks
                 .iter()
                 .zip(&recons)
@@ -560,6 +588,47 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, GetPageError::NoRedoPool { blk: b } if b == blk(90, 4)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_bare_mid_history_chain_refuses_loudly() {
+        // The same missing base fixture, but with a pool present, so
+        // the refusal is about the hole in the store, not the missing
+        // pool. The pool spawns workers lazily and the refusal comes
+        // first, so the bogus binary path is never touched.
+        let store = MemStore::default();
+        let layout = TenantLayout::new("t");
+        let entries = vec![DeltaEntry {
+            key: LayerKey::page(1663, 5, 90, 0, 4),
+            lsn: Lsn(150),
+            record: vec![9; 40],
+        }];
+        let (bytes, footer) = build_delta(&entries, 4096).unwrap();
+        publish(&store, &layout, &bytes, &footer, 150);
+        let (manifest, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let map = manifest.layer_map().unwrap();
+
+        let pool = RedoPool::new(crate::redo::RedoPoolConfig {
+            postgres: "/nonexistent".into(),
+            scratch_root: "/nonexistent".into(),
+            workers: 1,
+            batch_timeout: std::time::Duration::from_secs(1),
+            batches_per_worker: 1,
+            data_checksums: false,
+        });
+        let svc = PageService::new(&store, layout.shard_prefix(0), Some(&pool), false);
+        let err = svc
+            .get_page(&map, &Memtable::new(), blk(90, 4), 200)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                GetPageError::BareChain { blk: b, first_lsn: 150 } if b == blk(90, 4)
+            ),
             "{err}"
         );
     }
