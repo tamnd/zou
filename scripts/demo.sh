@@ -77,7 +77,7 @@ say "what the store holds"
 "$ZOU" info "$STORE"
 
 say "branching the database, one small manifest, no data copied"
-"$ZOU" branch "$STORE" local time-travel
+"$ZOU" branch "$STORE" create local time-travel
 "$ZOU" info "$STORE" time-travel
 
 say "restarting from nothing but the store"

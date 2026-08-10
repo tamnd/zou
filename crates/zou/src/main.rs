@@ -12,6 +12,7 @@ mod map;
 mod serve;
 mod shard;
 mod stats;
+mod sync;
 mod tenant;
 
 use std::process::ExitCode;
@@ -35,6 +36,8 @@ fn usage() -> ExitCode {
     eprintln!("       {}", serve::USAGE);
     eprintln!("       {}", shard::USAGE);
     eprintln!("       {}", stats::USAGE);
+    eprintln!("       {}", sync::PUSH_USAGE);
+    eprintln!("       {}", sync::PULL_USAGE);
     eprintln!("       {}", tenant::USAGE);
     eprintln!("       zou --version");
     ExitCode::from(2)
@@ -112,6 +115,8 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Some("shard") => simple(shard::run(&argv[1..])),
+        Some("push") => simple(sync::push(&argv[1..])),
+        Some("pull") => simple(sync::pull(&argv[1..])),
         Some("stats") => simple(stats::run(&argv[1..])),
         Some("tenant") => simple(tenant::run(&argv[1..])),
         _ => usage(),

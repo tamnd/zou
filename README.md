@@ -56,7 +56,7 @@ zou serve --store s3://mybucket/tenants --domain '*.api.example.com'
 Branch a database for a preview deploy:
 
 ```bash
-zou branch create prod pr-142
+zou branch s3://mybucket/tenants create prod pr-142
 ```
 
 ## Design at a glance
