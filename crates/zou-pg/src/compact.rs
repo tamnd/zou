@@ -44,8 +44,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use zou_store::cas::{CasError, CasStore};
 use zou_store::layer::{
-    DeltaEntry, ImageEntry, KEY_PAGE, LayerBuildError, LayerDecodeError, LayerKey, LayerKind,
-    build_delta, build_image, decode_delta, decode_image,
+    DeltaBuilder, ImageBuilder, KEY_PAGE, LayerBuildError, LayerDecodeError, LayerKey, LayerKind,
+    delta_cursor, image_cursor,
 };
 use zou_store::layermap::{LayerDesc, LayerMap};
 use zou_store::layout::TenantLayout;
@@ -193,36 +193,22 @@ pub fn compact_shard(
         .expect("the current count always exceeds a valid shard number");
     let keep = |key: &LayerKey| shard_of(key, keep_count) == shard;
     let reader = LayerReader::for_shard(store, tenant_ref, shard);
-    let mut merged: BTreeMap<(LayerKey, Lsn), Vec<u8>> = BTreeMap::new();
-    let mut images: BTreeMap<Lsn, BTreeMap<LayerKey, Vec<u8>>> = BTreeMap::new();
+    // Inputs stay compressed in memory and stream out block by block:
+    // the pass holds the fetched objects, one decoded block per input,
+    // and the compressed output it is building, never a decoded copy
+    // of the whole shard. Deltas keep their fetch order so a duplicate
+    // (key, lsn) resolves to the latest source, the same last write
+    // wins the map insert used to give.
+    let mut delta_srcs: Vec<(String, Option<Lsn>, Vec<u8>)> = Vec::new();
+    let mut image_groups: BTreeMap<Lsn, Vec<(String, Vec<u8>)>> = BTreeMap::new();
     for desc in &descs {
         let bytes = reader.fetch(desc)?;
-        let decode_err = |source| CompactError::Decode {
-            name: desc.name(),
-            source,
-        };
         match desc.kind {
-            LayerKind::Delta => {
-                let (entries, _) = decode_delta(&bytes).map_err(decode_err)?;
-                for e in entries {
-                    if !keep(&e.key) {
-                        continue;
-                    }
-                    if desc.upto.is_some_and(|u| e.lsn > u) {
-                        continue;
-                    }
-                    merged.insert((e.key, e.lsn), e.record);
-                }
-            }
-            LayerKind::Image => {
-                let (entries, _) = decode_image(&bytes).map_err(decode_err)?;
-                let at = images.entry(desc.min_lsn).or_default();
-                for e in entries {
-                    if keep(&e.key) {
-                        at.insert(e.key, e.page);
-                    }
-                }
-            }
+            LayerKind::Delta => delta_srcs.push((desc.name(), desc.upto, bytes)),
+            LayerKind::Image => image_groups
+                .entry(desc.min_lsn)
+                .or_default()
+                .push((desc.name(), bytes)),
         }
     }
 
@@ -246,32 +232,136 @@ pub fn compact_shard(
         Ok(())
     };
 
-    for (at, pages) in &images {
-        let entries: Vec<ImageEntry> = pages
-            .iter()
-            .map(|(key, page)| ImageEntry {
-                key: *key,
-                page: page.clone(),
-            })
-            .collect();
-        if entries.is_empty() {
-            continue;
+    // Source images rewritten at their lsn, each group of same lsn
+    // layers merged by key with the latest source winning duplicates.
+    let mut based: BTreeSet<LayerKey> = BTreeSet::new();
+    for (at, group) in &image_groups {
+        let mut cursors = Vec::with_capacity(group.len());
+        let mut expected = 0usize;
+        for (name, bytes) in group {
+            let cursor = image_cursor(bytes).map_err(|source| CompactError::Decode {
+                name: name.clone(),
+                source,
+            })?;
+            expected += cursor.footer().entry_count as usize;
+            cursors.push((name.as_str(), cursor.peekable()));
         }
-        let (bytes, footer) = build_image(&entries, *at, BLOCK_TARGET)?;
+        let mut builder = ImageBuilder::new(expected, *at, BLOCK_TARGET);
+        loop {
+            let mut best: Option<(usize, LayerKey)> = None;
+            for (i, (name, cursor)) in cursors.iter_mut().enumerate() {
+                match cursor.peek() {
+                    None => {}
+                    Some(Err(_)) => {
+                        let source = cursor.next().expect("peeked").unwrap_err();
+                        return Err(CompactError::Decode {
+                            name: name.to_string(),
+                            source,
+                        });
+                    }
+                    // A tie goes to the later source, the last writer.
+                    Some(Ok(e)) if best.is_none_or(|(_, k)| e.key <= k) => {
+                        best = Some((i, e.key));
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+            let Some((take, key)) = best else { break };
+            for (i, (_, cursor)) in cursors.iter_mut().enumerate() {
+                if cursor
+                    .peek()
+                    .is_some_and(|r| r.as_ref().is_ok_and(|e| e.key == key))
+                {
+                    let e = cursor.next().expect("peeked").expect("checked");
+                    if i == take && keep(&e.key) {
+                        builder.push(e.key, &e.page)?;
+                        based.insert(e.key);
+                    }
+                }
+            }
+        }
+        if !builder.is_empty() {
+            let (bytes, footer) = builder.finish()?;
+            publish(bytes, &footer)?;
+        }
+    }
+
+    // The deltas sort merged into one run the same way, and the pass
+    // notes what the fresh image cut below will need: every merged
+    // key, and whether a key's oldest record initializes its page.
+    let mut merged_keys: BTreeSet<LayerKey> = BTreeSet::new();
+    let mut first_init: BTreeMap<LayerKey, bool> = BTreeMap::new();
+    let mut cursors = Vec::with_capacity(delta_srcs.len());
+    let mut expected = 0usize;
+    for (name, upto, bytes) in &delta_srcs {
+        let cursor = delta_cursor(bytes).map_err(|source| CompactError::Decode {
+            name: name.clone(),
+            source,
+        })?;
+        expected += cursor.footer().entry_count as usize;
+        cursors.push((name.as_str(), *upto, cursor.peekable()));
+    }
+    let mut builder = DeltaBuilder::new(expected, BLOCK_TARGET);
+    loop {
+        let mut best: Option<(usize, (LayerKey, Lsn))> = None;
+        for (i, (name, upto, cursor)) in cursors.iter_mut().enumerate() {
+            // An inherited layer's records past its cut never compete,
+            // so a twin inside another source's cut still survives.
+            while cursor
+                .peek()
+                .is_some_and(|r| r.as_ref().is_ok_and(|e| upto.is_some_and(|u| e.lsn > u)))
+            {
+                cursor.next();
+            }
+            match cursor.peek() {
+                None => {}
+                Some(Err(_)) => {
+                    let source = cursor.next().expect("peeked").unwrap_err();
+                    return Err(CompactError::Decode {
+                        name: name.to_string(),
+                        source,
+                    });
+                }
+                Some(Ok(e)) if best.is_none_or(|(_, k)| (e.key, e.lsn) <= k) => {
+                    best = Some((i, (e.key, e.lsn)));
+                }
+                Some(Ok(_)) => {}
+            }
+        }
+        let Some((take, at)) = best else { break };
+        for (i, (_, _, cursor)) in cursors.iter_mut().enumerate() {
+            if cursor
+                .peek()
+                .is_some_and(|r| r.as_ref().is_ok_and(|e| (e.key, e.lsn) == at))
+            {
+                let e = cursor.next().expect("peeked").expect("checked");
+                if i != take || !keep(&e.key) {
+                    continue;
+                }
+                if !based.contains(&e.key) {
+                    first_init.entry(e.key).or_insert_with(|| {
+                        crate::walscan::record_init_refs(&e.record)
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|(b, init)| {
+                                *init
+                                    && (b.spc, b.db, b.rel, b.fork as u8, b.blk)
+                                        == (e.key.spc, e.key.db, e.key.rel, e.key.fork, e.key.block)
+                            })
+                    });
+                }
+                merged_keys.insert(e.key);
+                builder.push(e.key, e.lsn, &e.record)?;
+            }
+        }
+    }
+    if !builder.is_empty() {
+        let (bytes, footer) = builder.finish()?;
         publish(bytes, &footer)?;
     }
-    if !merged.is_empty() {
-        let entries: Vec<DeltaEntry> = merged
-            .iter()
-            .map(|((key, lsn), record)| DeltaEntry {
-                key: *key,
-                lsn: *lsn,
-                record: record.clone(),
-            })
-            .collect();
-        let (bytes, footer) = build_delta(&entries, BLOCK_TARGET)?;
-        publish(bytes, &footer)?;
-    }
+    drop(cursors);
+    drop(delta_srcs);
+    drop(image_groups);
 
     // With a redo pool on hand, cut a fresh image at the flush point
     // so the merged run drops out of the read path for current reads.
@@ -284,36 +374,20 @@ pub fn compact_shard(
     if let Some(pool) = pool
         && dcl > Lsn(0)
     {
-        let based: BTreeSet<LayerKey> = images.values().flat_map(|at| at.keys().copied()).collect();
-        let mut first: BTreeMap<LayerKey, &[u8]> = BTreeMap::new();
-        for ((key, _), record) in &merged {
-            first.entry(*key).or_insert(record.as_slice());
-        }
-        let rebuildable = |k: &LayerKey| {
-            based.contains(k)
-                || first.get(k).is_some_and(|record| {
-                    crate::walscan::record_init_refs(record)
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|(b, init)| {
-                            *init
-                                && (b.spc, b.db, b.rel, b.fork as u8, b.blk)
-                                    == (k.spc, k.db, k.rel, k.fork, k.block)
-                        })
-                })
-        };
-        let keys: BTreeSet<LayerKey> = merged
-            .keys()
-            .map(|(key, _)| *key)
-            .chain(images.values().flat_map(|at| at.keys().copied()))
+        let rebuildable =
+            |k: &LayerKey| based.contains(k) || first_init.get(k).copied().unwrap_or(false);
+        let keys: BTreeSet<LayerKey> = merged_keys
+            .iter()
+            .chain(based.iter())
+            .copied()
             .filter(|k| k.kind == KEY_PAGE && rebuildable(k))
             .collect();
+        let keys: Vec<LayerKey> = keys.into_iter().collect();
         if !keys.is_empty() {
             let map = LayerMap::new(descs.clone()).map_err(PageShardError::from)?;
             let svc = PageService::for_shard(store, tenant_ref, shard, Some(pool), data_checksums);
             let mem = Memtable::new();
-            let mut entries = Vec::with_capacity(keys.len());
-            let keys: Vec<LayerKey> = keys.into_iter().collect();
+            let mut builder = ImageBuilder::new(keys.len(), dcl, BLOCK_TARGET);
             for batch in keys.chunks(MAX_GETPAGE_BATCH) {
                 let blocks: Vec<crate::walscan::BlockRef> = batch
                     .iter()
@@ -327,10 +401,10 @@ pub fn compact_shard(
                     .collect();
                 let pages = svc.get_pages(&map, &mem, &blocks, dcl.0)?;
                 for (key, page) in batch.iter().zip(pages) {
-                    entries.push(ImageEntry { key: *key, page });
+                    builder.push(*key, &page)?;
                 }
             }
-            let (bytes, footer) = build_image(&entries, dcl, BLOCK_TARGET)?;
+            let (bytes, footer) = builder.finish()?;
             publish(bytes, &footer)?;
         }
     }
@@ -447,6 +521,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use zou_store::cas::Version;
+    use zou_store::layer::{DeltaEntry, build_delta};
     use zou_store::mem::MemStore;
     use zou_store::shardmanifest::publish_layer;
     use zou_store::shards::{prune_lineage, split};
