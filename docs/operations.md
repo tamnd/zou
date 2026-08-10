@@ -73,6 +73,28 @@ The group commit pipeline independently discovers loss on its next manifest publ
 Treat `lost()` as a stop sign: keep running and every upload is wasted work in a dead epoch.
 Recovery is a fresh `acquire`, which takes a new epoch and a new fence.
 
+## Failover
+
+A node that dies stops renewing, and that is the whole signal.
+The lease runs out on its own, and the next node asked for the tenant finds an expired lease, takes it with the CAS that bumps the epoch, and attaches.
+`lease::takeover` is the wait: it sleeps until the expiry the manifest names, with a tenth of a second of per node jitter so a rack of standbys does not fire one CAS storm, and it gives up after a caller supplied limit because a holder that is still renewing is alive and the caller deserves to be told who to ask rather than kept waiting.
+It is not `steal`.
+A node that cannot be reached from here may be perfectly alive and serving from somewhere else, and a partition is not a death, so the TTL is the one thing both sides agree on.
+
+Recovery time is what is left of the TTL at the moment of death, plus one CAS, plus the attach.
+Death lands between renewals, which at the TTL/3 cadence leaves between two thirds of a TTL and a full one, so with the default 15 second TTL expect 10 to 15 seconds before another node is the writer, and the attach on top of that.
+Measured on server2, 6 vCPU, against the default 15 second TTL over 10 killed holders: min 12.1 s, p50 13.1 s, max 13.3 s against a local store, and min 12.2 s, p50 13.2 s, max 13.7 s against MinIO over the network.
+The object store adds tens to hundreds of milliseconds to a wait measured in seconds, which is the point: recovery is the TTL and nothing else is hiding in it.
+`cargo test -p zou-store --test failover -- --nocapture` reruns it, with `ZOU_FAILOVER_TTL` and `ZOU_FAILOVER_ROUNDS` to change the shape and the S3 test variables to point it at a real store.
+
+A clean shutdown costs none of that.
+`Heartbeat::detach` clears the lease, so the next node in finds nothing to wait for, measured at 9 to 15 ms.
+Roll restarts through detach and a fleet of a thousand tenants does not spend a TTL per tenant.
+
+RPO stays zero across all of it.
+The holder that comes back finds its next renewal answered with `Lost`, its uploads sit in an epoch the live manifest never references, and no acked commit is lost.
+Shorten the TTL to shorten the RTO, and read the clock skew bound above before you do, since the two are the same budget.
+
 ## Write forwarding
 
 Any node in a fleet answers for any tenant, but only the lease holder writes one, so a node that is asked for a tenant it does not hold sends the request to the node that does.

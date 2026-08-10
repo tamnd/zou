@@ -14,6 +14,8 @@
 //! skew between nodes plus the longest upload pause, and the default of
 //! 15 seconds assumes NTP disciplined hosts.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use crate::cas::{CasError, CasStore, Version};
 use crate::layout::TenantLayout;
 use crate::manifest::{Lease, Manifest, ManifestError};
@@ -178,6 +180,116 @@ pub fn steal(
     now_unix: u64,
 ) -> Result<HeldLease, LeaseError> {
     take(store, layout, holder, None, ttl_secs, now_unix, true)
+}
+
+/// Wait for a dead holder's lease to run out, then take it.
+///
+/// This is what a standby does when a node stops answering: not a
+/// [`steal`], because a node that cannot be reached from here may be
+/// perfectly alive and serving from somewhere else, and a partition is
+/// not a death. Waiting out the TTL is the one signal both sides agree
+/// on, so failover is a wait rather than a decision, and the recovery
+/// time is the remaining TTL plus one CAS plus the attach.
+///
+/// It gives up after `limit` rather than waiting forever, because a
+/// holder that keeps renewing is alive and this node has a caller
+/// waiting on an answer. The `Held` error that comes back names the
+/// current holder, which is what a fleet node forwards to.
+pub fn takeover(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    holder: &str,
+    endpoint: Option<&str>,
+    ttl_secs: u64,
+    limit: Duration,
+) -> Result<HeldLease, LeaseError> {
+    let waiting = Waiting {
+        now: &|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before the unix epoch")
+                .as_secs()
+        },
+        sleep: &std::thread::sleep,
+    };
+    takeover_with(store, layout, holder, endpoint, ttl_secs, limit, &waiting)
+}
+
+/// The clock and the wait, together because they are one decision: a
+/// test that moves the clock has to be the thing that sleeps.
+pub struct Waiting<'a> {
+    pub now: &'a dyn Fn() -> u64,
+    pub sleep: &'a dyn Fn(Duration),
+}
+
+/// [`takeover`] with time passed in, so a test can prove the waiting
+/// without spending it.
+pub fn takeover_with(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    holder: &str,
+    endpoint: Option<&str>,
+    ttl_secs: u64,
+    limit: Duration,
+    waiting: &Waiting<'_>,
+) -> Result<HeldLease, LeaseError> {
+    let (now, sleep) = (waiting.now, waiting.sleep);
+    /// How many lost manifest races a takeover reads through before it
+    /// gives up and says so.
+    const RACES: u32 = 5;
+
+    let deadline = now() + limit.as_secs();
+    let mut races = 0;
+    loop {
+        match take(store, layout, holder, endpoint, ttl_secs, now(), false) {
+            Err(LeaseError::Held {
+                holder: whose,
+                expires_unix,
+            }) => {
+                // Past the deadline is the caller's answer: somebody else
+                // is the writer and is renewing, so say who rather than
+                // keep waiting on a node that is alive.
+                if expires_unix >= deadline {
+                    return Err(LeaseError::Held {
+                        holder: whose,
+                        expires_unix,
+                    });
+                }
+                // Until the expiry and not a second longer, because the
+                // second it names is already expired: `take` compares
+                // with <=, and a clock read truncated to seconds cannot
+                // wake this before that second starts. The jitter on top
+                // is what keeps a rack of standbys from firing their CAS
+                // into the same millisecond, and it is never zero, so a
+                // wait that is already over still makes progress.
+                let wait = expires_unix.saturating_sub(now());
+                sleep(Duration::from_millis(wait * 1000 + spread(holder)));
+            }
+            // Another node swapped the manifest under us, which during a
+            // failover is another standby doing the same thing. Read it
+            // again rather than report the race: either that node took
+            // the lease, and the next pass comes back with its name,
+            // which is what the caller has to forward to, or it published
+            // something else and this pass goes through. Bounded, because
+            // a tenant with a busy publisher must not spin here.
+            Err(e @ LeaseError::Raced) => {
+                races += 1;
+                if races > RACES {
+                    return Err(e);
+                }
+                sleep(Duration::from_millis(spread(holder)));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// A tenth of a second or so, depending on who is asking, so two
+/// standbys waiting on the same lease do not wake together. No rng,
+/// because the only property needed is that different names differ and
+/// that nobody waits zero.
+fn spread(holder: &str) -> u64 {
+    50 + u64::from(holder.bytes().fold(17u8, |acc, b| acc.wrapping_mul(31) ^ b)) % 200
 }
 
 fn take(
@@ -354,7 +466,7 @@ fn swap(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::cas::LocalFsStore;
@@ -443,6 +555,137 @@ mod tests {
     fn nobody_holds_a_lease_that_was_never_taken() {
         let (_d, store, layout) = setup();
         assert!(holder(&store, &layout, 1000).unwrap().is_none());
+    }
+
+    /// A clock a test moves by however long the code decided to sleep,
+    /// so waiting out a TTL costs no wall clock at all.
+    fn stopped(at: u64) -> (Arc<Mutex<u64>>, impl Fn() -> u64, impl Fn(Duration)) {
+        let now = Arc::new(Mutex::new(at));
+        let read = Arc::clone(&now);
+        let ticked = Arc::clone(&now);
+        (
+            now,
+            move || *read.lock().unwrap(),
+            move |d: Duration| {
+                *ticked.lock().unwrap() += d.as_millis().div_ceil(1000) as u64;
+            },
+        )
+    }
+
+    #[test]
+    fn a_standby_waits_out_a_dead_holders_lease_and_takes_it() {
+        let (_d, store, layout) = setup();
+        acquire(&store, &layout, "node-a", 15, 1000).unwrap();
+        // node-a stops renewing here and never comes back.
+        let (clock, now, sleep) = stopped(1002);
+        let held = takeover_with(
+            &store,
+            &layout,
+            "node-b",
+            Some("http://10.0.0.5:8000"),
+            15,
+            Duration::from_secs(60),
+            &Waiting {
+                now: &now,
+                sleep: &sleep,
+            },
+        )
+        .expect("the lease runs out and the standby takes it");
+        assert_eq!(held.holder, "node-b");
+        assert_eq!(held.epoch, 2, "a takeover is an acquisition like any other");
+        assert!(
+            *clock.lock().unwrap() >= 1015,
+            "it waited for the expiry rather than stealing"
+        );
+        assert_eq!(
+            holder(&store, &layout, 1020).unwrap().unwrap().endpoint,
+            Some("http://10.0.0.5:8000".to_string()),
+            "and published where it now answers"
+        );
+    }
+
+    #[test]
+    fn a_holder_that_is_still_renewing_is_not_waited_on() {
+        // Which is the difference between a failover and an outage: this
+        // node has a caller waiting, and the answer is who to ask.
+        let (_d, store, layout) = setup();
+        acquire(&store, &layout, "node-a", 15, 1000).unwrap();
+        let (clock, now, sleep) = stopped(1001);
+        let err = takeover_with(
+            &store,
+            &layout,
+            "node-b",
+            None,
+            15,
+            Duration::from_secs(5),
+            &Waiting {
+                now: &now,
+                sleep: &sleep,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, LeaseError::Held { ref holder, .. } if holder == "node-a"));
+        assert_eq!(
+            *clock.lock().unwrap(),
+            1001,
+            "and it did not wait to say so"
+        );
+    }
+
+    #[test]
+    fn a_takeover_of_a_lease_already_gone_costs_nothing() {
+        // The clean shutdown path: detach cleared the lease, so the next
+        // node in is the next node to ask.
+        let (_d, store, layout) = setup();
+        let held = acquire(&store, &layout, "node-a", 15, 1000).unwrap();
+        release(&store, &layout, held).unwrap();
+        let (clock, now, sleep) = stopped(1001);
+        let held = takeover_with(
+            &store,
+            &layout,
+            "node-b",
+            None,
+            15,
+            Duration::from_secs(60),
+            &Waiting {
+                now: &now,
+                sleep: &sleep,
+            },
+        )
+        .expect("nobody holds it");
+        assert_eq!(held.holder, "node-b");
+        assert_eq!(*clock.lock().unwrap(), 1001, "no wait at all");
+    }
+
+    #[test]
+    fn a_lease_renewed_while_a_standby_waits_is_left_alone() {
+        let (_d, store, layout) = setup();
+        let a = Mutex::new(acquire(&store, &layout, "node-a", 15, 1000).unwrap());
+        let (clock, now, sleep) = stopped(1002);
+        // node-a wakes up on the way and renews, which the standby sees
+        // as a new expiry it will not outlast inside its limit.
+        let renewed = Arc::clone(&clock);
+        let store_ref = &store;
+        let layout_ref = &layout;
+        let sleep = move |d: Duration| {
+            sleep(d);
+            let at = *renewed.lock().unwrap();
+            let _ = renew(store_ref, layout_ref, &mut a.lock().unwrap(), 15, at);
+        };
+        let err = takeover_with(
+            &store,
+            &layout,
+            "node-b",
+            None,
+            15,
+            Duration::from_secs(20),
+            &Waiting {
+                now: &now,
+                sleep: &sleep,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, LeaseError::Held { ref holder, .. } if holder == "node-a"));
     }
 
     #[test]
