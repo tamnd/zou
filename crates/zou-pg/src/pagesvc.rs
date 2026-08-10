@@ -30,11 +30,11 @@
 //! error if the hole is still there.
 //!
 //! The lag gauge is the other half of the spec 08 ingest bound: every
-//! second the driver reports how far applied trails the durable end
-//! into the cell's [`Backpressure`], which is what lets the sequencer
-//! throttle a tenant whose ingest cannot keep up, and only that
-//! tenant. A zero report on shutdown lifts the throttle rather than
-//! pinning a stale lag on the board forever.
+//! second the driver reports how far the received stream end trails
+//! the durable end into the cell's [`Backpressure`], which is what
+//! lets the sequencer throttle a tenant whose ingest cannot keep up,
+//! and only that tenant. A zero report on shutdown lifts the throttle
+//! rather than pinning a stale lag on the board forever.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -123,6 +123,31 @@ pub(crate) fn spawn(
     gate: Arc<Backpressure>,
     durable: Arc<AtomicU64>,
 ) -> PageSvc {
+    spawn_with_budget(
+        store,
+        layout,
+        tenant,
+        tee,
+        media,
+        gate,
+        durable,
+        DEFAULT_TEE_BUFFER,
+    )
+}
+
+/// [`spawn`] with the tee budget explicit, so a test can force a cut
+/// without publishing gigabytes.
+#[allow(clippy::too_many_arguments)]
+fn spawn_with_budget(
+    store: Arc<dyn CasStore>,
+    layout: TenantLayout,
+    tenant: u128,
+    tee: Arc<Tee>,
+    media: Arc<WalMedia>,
+    gate: Arc<Backpressure>,
+    durable: Arc<AtomicU64>,
+    tee_budget: usize,
+) -> PageSvc {
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     let handle = std::thread::Builder::new()
@@ -137,6 +162,7 @@ pub(crate) fn spawn(
                 gate: &gate,
                 durable,
                 stop: thread_stop,
+                tee_budget,
                 ingest: None,
                 last_advance: Instant::now(),
                 last_report: Instant::now() - REPORT_EVERY,
@@ -164,9 +190,12 @@ struct Driver<'a> {
     gate: &'a Backpressure,
     durable: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    tee_budget: usize,
     /// `None` until the anchor rule picks a start lsn.
     ingest: Option<ShardIngest>,
-    /// When `applied` last moved, the seconds half of the lag gauge.
+    /// When the received stream end last moved, the seconds half of
+    /// the lag gauge. Tracks `seen`, not `applied`: a stream parked
+    /// inside a partial record is caught up, not stuck.
     last_advance: Instant,
     last_report: Instant,
 }
@@ -174,7 +203,7 @@ struct Driver<'a> {
 impl Driver<'_> {
     fn run(&mut self) -> Result<(), IngestError> {
         let filter = TeeFilter::Tenant(self.tenant);
-        let sub = self.tee.subscribe(filter, DEFAULT_TEE_BUFFER);
+        let mut sub = self.tee.subscribe(filter, self.tee_budget);
         let anchor = match PageShardManifest::load(&*self.store, &self.layout.shard_manifest(0)) {
             Ok(Some((manifest, _))) => Some(manifest.disk_consistent_lsn.0),
             Ok(None) => None,
@@ -188,14 +217,28 @@ impl Driver<'_> {
             let mut idle = true;
             while let Some(event) = sub.try_recv() {
                 idle = false;
-                self.consume(&event, &filter)?;
+                if let Some(next_seq) = self.consume(&event)? {
+                    // The cut removed this subscription from the tee,
+                    // so resubscribe before replaying: the other order
+                    // leaves a window landed between the replay's end
+                    // and the first delivery, with no later event to
+                    // reveal it. The overlap is harmless, apply skips
+                    // bytes below the stream end.
+                    log::info!("zou pagesvc: cut at seq {next_seq}, catching up");
+                    sub = self.tee.subscribe(filter, self.tee_budget);
+                    if self.ingest.is_some() {
+                        self.catch_up(&filter)?;
+                    }
+                }
             }
             self.flush_and_report()?;
             if self.stop.load(Ordering::Acquire) {
                 // The sequencer is closed by now, nothing else will
                 // publish: drain what raced the flag and finish.
                 while let Some(event) = sub.try_recv() {
-                    self.consume(&event, &filter)?;
+                    if self.consume(&event)?.is_some() && self.ingest.is_some() {
+                        self.catch_up(&filter)?;
+                    }
                 }
                 if let Some(ingest) = &mut self.ingest
                     && let Some(entry) = ingest.flush(&*self.store, &self.layout)?
@@ -209,6 +252,19 @@ impl Driver<'_> {
                 return Ok(());
             }
             if idle {
+                // Nothing in the channel and nothing coming: if the
+                // stream end still trails durable, no future event will
+                // say so, because whatever was missed was missed. Close
+                // the gap ourselves. A stream that merely ends inside a
+                // record reads as caught up and sleeps.
+                let durable = self.durable.load(Ordering::Acquire);
+                if self
+                    .ingest
+                    .as_ref()
+                    .is_some_and(|ingest| ingest.lag(durable) > 0)
+                {
+                    self.catch_up(&filter)?;
+                }
                 std::thread::sleep(TICK);
             }
         }
@@ -217,11 +273,17 @@ impl Driver<'_> {
     /// One tee event into the ingest, anchoring first when this store
     /// has never ingested: the anchor is the start of the first frame
     /// seen, nothing older exists to ingest.
-    fn consume(
-        &mut self,
-        event: &zou_log::TeeEvent,
-        filter: &TeeFilter,
-    ) -> Result<(), IngestError> {
+    ///
+    /// A cut comes back as `Some(next_seq)` instead of being handled
+    /// here, because recovering from one means resubscribing and only
+    /// the run loop holds the subscription. That also keeps a cut that
+    /// races the anchor from vanishing, which it used to: with no
+    /// ingest yet there were no frames to anchor on and the event fell
+    /// through as consumed.
+    fn consume(&mut self, event: &zou_log::TeeEvent) -> Result<Option<u64>, IngestError> {
+        if let zou_log::TeeEvent::Lagged { next_seq } = event {
+            return Ok(Some(*next_seq));
+        }
         let ingest = match &mut self.ingest {
             Some(ingest) => ingest,
             None => match first_start(event, self.tenant) {
@@ -230,23 +292,15 @@ impl Driver<'_> {
                     self.ingest
                         .insert(ShardIngest::new(ingest_config(self.tenant), start))
                 }
-                None => return Ok(()),
+                None => return Ok(None),
             },
         };
-        let before = ingest.applied();
-        match ingest.apply_event(event) {
-            Ok(()) => {
-                if ingest.applied() > before {
-                    self.last_advance = Instant::now();
-                }
-                Ok(())
-            }
-            Err(IngestError::Lagged { next_seq }) => {
-                log::info!("zou pagesvc: cut at seq {next_seq}, catching up");
-                self.catch_up(filter)
-            }
-            Err(e) => Err(e),
+        let before = ingest.seen();
+        ingest.apply_event(event)?;
+        if ingest.seen() > before {
+            self.last_advance = Instant::now();
         }
+        Ok(None)
     }
 
     /// Replay the chain from the applied watermark through the same
@@ -256,9 +310,9 @@ impl Driver<'_> {
         let ingest = self.ingest.as_mut().expect("anchored before catch up");
         let frames = catch_up(&self.media, WAL_SHARD, filter, Lsn(ingest.applied()))
             .map_err(|e| IngestError::Wal(format!("catch up: {e}")))?;
-        let before = ingest.applied();
+        let before = ingest.seen();
         ingest.apply_frames(&frames)?;
-        if ingest.applied() > before {
+        if ingest.seen() > before {
             self.last_advance = Instant::now();
         }
         Ok(())
@@ -433,6 +487,240 @@ mod tests {
                 .expect("store answers")
                 .is_none(),
             "nothing to ingest publishes nothing"
+        );
+    }
+
+    /// Zero bounds so any nonzero lag report refuses admission: the
+    /// gate doubles as the probe for whether the driver thinks it is
+    /// caught up.
+    fn zero_bounds() -> Arc<Backpressure> {
+        Arc::new(Backpressure::new(zou_log::LagBounds {
+            ingest_bytes: 0,
+            ingest_secs: 0,
+            consolidation_bytes: u64::MAX,
+        }))
+    }
+
+    /// Wait past at least one report interval and then for the gate to
+    /// admit, so a pre-report `Ok` cannot pass for caught up.
+    fn wait_caught_up(gate: &Backpressure, why: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let settle = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < settle || gate.admit(TENANT).is_err() {
+            assert!(Instant::now() < deadline, "{why}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The wedge class from the scale 1000 run: a window lands on the
+    /// chain but its publish never reaches the driver, and nothing
+    /// later arrives to reveal it. The idle loop has to notice the
+    /// stream end trailing durable and close the gap from the chain by
+    /// itself.
+    #[test]
+    fn an_unpublished_window_is_healed_from_the_chain() {
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        let tee = Arc::new(Tee::new());
+        let media = Arc::new(WalMedia::single(Arc::clone(&store)));
+        let gate = zero_bounds();
+        let durable = Arc::new(AtomicU64::new(0));
+
+        let (start, raw, end) = test_wal();
+        // The whole stream lands on the chain with no tee attached.
+        let t = zou_log::take_over(&media, WAL_SHARD, "test").expect("take over");
+        let sink = Arc::new(zou_log::MediaSink::new(Arc::clone(&media), WAL_SHARD));
+        let seq = zou_log::Sequencer::resume(
+            WAL_SHARD,
+            sink,
+            zou_log::SequencerConfig::default(),
+            t.next_seq,
+            t.prev_digest,
+        );
+        seq.append(frames_over(start, &raw))
+            .expect("admitted")
+            .wait()
+            .expect("durable");
+        seq.close().expect("sequencer close");
+
+        let mut svc = spawn(
+            Arc::clone(&store),
+            layout.clone(),
+            TENANT,
+            Arc::clone(&tee),
+            Arc::clone(&media),
+            Arc::clone(&gate),
+            Arc::clone(&durable),
+        );
+        wait_subscribed(&tee);
+        // Only the first two frames are published; the rest is the
+        // missed window.
+        tee.publish(1, &frames_over(start, &raw[..2048]));
+        durable.store(end, Ordering::Release);
+
+        wait_caught_up(&gate, "the idle loop never closed the gap from the chain");
+        svc.stop();
+        let (manifest, _) = PageShardManifest::load(&*store, &layout.shard_manifest(0))
+            .expect("manifest loads")
+            .expect("the flush published a manifest");
+        assert_eq!(
+            manifest.disk_consistent_lsn.0, end,
+            "the heal reached the durable end"
+        );
+    }
+
+    /// A subscription cut mid stream: the driver must resubscribe and
+    /// replay the chain, then keep hearing live windows on the new
+    /// subscription. It used to catch up once and stay deaf, and the
+    /// tail here is published but never landed, so only the live path
+    /// can deliver it.
+    #[test]
+    fn a_cut_subscription_rejoins_and_stays_live() {
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        let tee = Arc::new(Tee::new());
+        let media = Arc::new(WalMedia::single(Arc::clone(&store)));
+        let gate = zero_bounds();
+        let durable = Arc::new(AtomicU64::new(0));
+
+        // Split the stream at record boundaries so every piece parses
+        // on its own no matter which publishes the driver hears.
+        let mut b = Builder::new(WAL_BASE);
+        let mut first = 0u64;
+        let mut second = 0u64;
+        for blk in 0..40u32 {
+            let r = BlockRef {
+                spc: 1663,
+                db: 5,
+                rel: 1000,
+                fork: 0,
+                blk,
+            };
+            b.record(&[(r, false)], &[blk as u8; 64]);
+            if blk == 7 {
+                first = b.pos();
+            }
+            if blk == 29 {
+                second = b.pos();
+            }
+        }
+        let end = b.pos();
+        let (start, bytes) = b.stream();
+        let raw = bytes.to_vec();
+        let w1 = &raw[..(first - start) as usize];
+        let w2 = &raw[(first - start) as usize..(second - start) as usize];
+        let w3 = &raw[(second - start) as usize..];
+        assert!(
+            w2.len() > w1.len(),
+            "the cut window must blow the budget alone"
+        );
+
+        let t = zou_log::take_over(&media, WAL_SHARD, "test").expect("take over");
+        let sink = Arc::new(zou_log::MediaSink::new(Arc::clone(&media), WAL_SHARD));
+        let config = zou_log::SequencerConfig {
+            tee: Some(Arc::clone(&tee)),
+            ..Default::default()
+        };
+        let seq = zou_log::Sequencer::resume(WAL_SHARD, sink, config, t.next_seq, t.prev_digest);
+
+        let mut svc = spawn_with_budget(
+            Arc::clone(&store),
+            layout.clone(),
+            TENANT,
+            Arc::clone(&tee),
+            Arc::clone(&media),
+            Arc::clone(&gate),
+            Arc::clone(&durable),
+            w2.len() - 1,
+        );
+        wait_subscribed(&tee);
+        seq.append(frames_over(start, w1))
+            .expect("admitted")
+            .wait()
+            .expect("durable");
+        // Let the driver drain the first window so the budget math
+        // below is about the second window alone.
+        std::thread::sleep(Duration::from_millis(300));
+        // Bigger than the whole budget: this window cuts the
+        // subscription and lands on the chain for the replay.
+        seq.append(frames_over(first, w2))
+            .expect("admitted")
+            .wait()
+            .expect("durable");
+        seq.close().expect("sequencer close");
+        durable.store(end, Ordering::Release);
+
+        // Republish the tail until the new subscription hears it, the
+        // watermark drops the overlap. A driver that never resubscribes
+        // never closes the lag: the tail is not on the chain.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let settle = Instant::now() + Duration::from_secs(2);
+        loop {
+            tee.publish(1000, &frames_over(second, w3));
+            std::thread::sleep(Duration::from_millis(50));
+            if Instant::now() >= settle && gate.admit(TENANT).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the driver never rejoined the live stream after the cut"
+            );
+        }
+        svc.stop();
+        let (manifest, _) = PageShardManifest::load(&*store, &layout.shard_manifest(0))
+            .expect("manifest loads")
+            .expect("the flush published a manifest");
+        assert_eq!(
+            manifest.disk_consistent_lsn.0, end,
+            "live windows on the new subscription reach the layers"
+        );
+    }
+
+    /// A write pause that ends inside a record parks `applied` a few
+    /// bytes short of durable for as long as the pause lasts. Measured
+    /// from the received end that is not lag; the old gauge read it as
+    /// a stuck ingest, throttled the tenant, and the throttle refused
+    /// the very appends that would have completed the record.
+    #[test]
+    fn a_pause_inside_a_record_does_not_throttle() {
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        let tee = Arc::new(Tee::new());
+        let media = Arc::new(WalMedia::single(Arc::clone(&store)));
+        // Any report with nonzero seconds refuses admission, so one
+        // stuck report during the pause fails the test.
+        let gate = Arc::new(Backpressure::new(zou_log::LagBounds {
+            ingest_bytes: 1 << 30,
+            ingest_secs: 0,
+            consolidation_bytes: u64::MAX,
+        }));
+        let durable = Arc::new(AtomicU64::new(0));
+
+        let (start, raw, _end) = test_wal();
+        let mut svc = spawn(
+            Arc::clone(&store),
+            layout.clone(),
+            TENANT,
+            Arc::clone(&tee),
+            Arc::clone(&media),
+            Arc::clone(&gate),
+            Arc::clone(&durable),
+        );
+        wait_subscribed(&tee);
+        let cut = raw.len() - 10;
+        tee.publish(1, &frames_over(start, &raw[..cut]));
+        durable.store(start + cut as u64, Ordering::Release);
+
+        // Long enough for two report intervals with the stream parked.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            gate.admit(TENANT).is_ok(),
+            "a stream parked inside a record is caught up, not stuck"
+        );
+        svc.stop();
+        assert!(
+            gate.admit(TENANT).is_ok(),
+            "the stop leaves the board clean"
         );
     }
 }
