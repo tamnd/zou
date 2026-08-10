@@ -42,6 +42,20 @@ base images pushed to it must carry valid ones. The pool recomputes
 checksums on pages it serves out, since replay legitimately changes
 page contents without updating pd_checksum.
 
+A batch declares its target blocks before anything else, and redo
+skips references to blocks outside that set unless the record
+initializes them. A multi block record, a cross page update say,
+drags a neighbor page into a batch that only carries the record
+history of its own targets, so the worker's copy of that neighbor
+is at best half replayed: an init in the chain may create it, but
+the records that touch only the neighbor never made it into the
+chain. Replaying onto such a page panics on offset numbers as soon
+as a later cross page record lands on it. Inits pass the filter
+because redo routines expect a valid buffer back from an init, and
+the page one builds cannot be read again past the filter, while the
+neighbor's own batch replays the shared records against its full
+history. A pool that declares no targets gets the old behavior.
+
 Records from custom rmgrs error out for now. Supporting extensions
 that install their own rmgrs means loading their libraries into the
 worker, which is future work.
@@ -114,9 +128,43 @@ newer clang treats as an error.
  /*
   * Get the wal_level from the control file. For a standby, this value should be
   * considered as its active wal_level, because it may be different from what
+--- a/src/backend/access/transam/xlogutils.c
++++ b/src/backend/access/transam/xlogutils.c
+@@ -23,6 +23,7 @@
+ #include "access/xlogrecovery.h"
+ #include "access/xlog_internal.h"
+ #include "access/xlogutils.h"
++#include "access/zou_walredo.h"
+ #include "miscadmin.h"
+ #include "storage/fd.h"
+ #include "storage/smgr.h"
+@@ -370,6 +371,23 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
+ 	if (!willinit && zeromode)
+ 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
+ 
++	/*
++	 * A zou redo worker materializes exactly the blocks the pool declared
++	 * as this batch's targets.  A record can reference further blocks, and
++	 * inside the worker those pages are either absent or left over from a
++	 * half replayed init, never the real thing, so redo must not read them
++	 * or write into them; their own requests replay these same records
++	 * against their full history.  Init references pass through, because
++	 * redo routines expect a valid buffer from an init and the page they
++	 * build cannot be read again past this filter.
++	 */
++	if (zou_redo_active && !willinit &&
++		zou_redo_bystander(rlocator, forknum, blkno))
++	{
++		*buf = InvalidBuffer;
++		return BLK_NOTFOUND;
++	}
++
+ 	/* If it has a full-page image and it should be restored, do it. */
+ 	if (XLogRecBlockImageApply(record, block_id))
+ 	{
 --- /dev/null
 +++ b/src/backend/access/transam/zou_walredo.c
-@@ -0,0 +1,1019 @@
+@@ -0,0 +1,1073 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_walredo.c
@@ -212,6 +260,7 @@ newer clang treats as an error.
 +
 +/* request tags */
 +#define ZREDO_TAG_RESET		'R'
++#define ZREDO_TAG_TARGET	'T'
 +#define ZREDO_TAG_PUSH		'P'
 +#define ZREDO_TAG_APPLY		'A'
 +#define ZREDO_TAG_GET		'G'
@@ -253,6 +302,7 @@ newer clang treats as an error.
 +static HTAB *page_tab = NULL;
 +static HTAB *fork_tab = NULL;
 +static HTAB *db_tab = NULL;
++static HTAB *target_tab = NULL;
 +
 +static XLogReaderState *reader = NULL;
 +
@@ -264,6 +314,7 @@ newer clang treats as an error.
 +
 +static void store_create(void);
 +static void store_reset(void);
++static void handle_target(const uint8 *payload, uint32 len);
 +static void handle_push(const uint8 *payload, uint32 len);
 +static void handle_apply(uint8 *payload, uint32 len);
 +static void handle_get(const uint8 *payload, uint32 len);
@@ -398,6 +449,12 @@ newer clang treats as an error.
 +	ctl.hcxt = store_cxt;
 +	db_tab = hash_create("zou redo touched dbs", 4, &ctl,
 +						 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
++
++	ctl.keysize = sizeof(ZRedoPageKey);
++	ctl.entrysize = sizeof(ZRedoPageKey);
++	ctl.hcxt = store_cxt;
++	target_tab = hash_create("zou redo batch targets", 64, &ctl,
++							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 +}
 +
 +/*
@@ -423,8 +480,32 @@ newer clang treats as an error.
 +	page_tab = NULL;
 +	fork_tab = NULL;
 +	db_tab = NULL;
++	target_tab = NULL;
 +	MemoryContextReset(store_cxt);
 +	store_create();
++}
++
++/*
++ * True when redo must not touch this page: the pool declared the batch's
++ * target blocks up front and this is not one of them.  A multi block
++ * record references pages beyond the ones a batch materializes, and
++ * inside the worker those pages are either absent or left over from a
++ * half replayed init, never the real thing.  Each such page has its own
++ * request that replays the shared records against its full history.  A
++ * pool that declared no targets gets the old behavior.
++ */
++bool
++zou_redo_bystander(RelFileLocator locator, ForkNumber fork, BlockNumber block)
++{
++	ZRedoPageKey key;
++
++	if (target_tab == NULL || hash_get_num_entries(target_tab) == 0)
++		return false;
++	memset(&key, 0, sizeof(key));
++	key.locator = locator;
++	key.fork = fork;
++	key.block = block;
++	return hash_search(target_tab, &key, HASH_FIND, NULL) == NULL;
 +}
 +
 +static ZRedoFork *
@@ -768,6 +849,24 @@ newer clang treats as an error.
 + */
 +
 +static void
++handle_target(const uint8 *payload, uint32 len)
++{
++	ZRedoPageKey key;
++	RelFileLocator locator;
++	ForkNumber	fork;
++	BlockNumber block;
++
++	if (len != ZREDO_TARGET_LEN)
++		elog(FATAL, "zou redo: bad target length %u", len);
++	zredo_get_target(payload, &locator, &fork, &block);
++	memset(&key, 0, sizeof(key));
++	key.locator = locator;
++	key.fork = fork;
++	key.block = block;
++	hash_search(target_tab, &key, HASH_ENTER, NULL);
++}
++
++static void
 +handle_push(const uint8 *payload, uint32 len)
 +{
 +	RelFileLocator locator;
@@ -854,6 +953,9 @@ newer clang treats as an error.
 +				if (len != 0)
 +					elog(FATAL, "zou redo: bad reset length %u", len);
 +				store_reset();
++				break;
++			case ZREDO_TAG_TARGET:
++				handle_target(msgbuf, len);
 +				break;
 +			case ZREDO_TAG_PUSH:
 +				handle_push(msgbuf, len);
@@ -1270,7 +1372,7 @@ newer clang treats as an error.
  	 * common enough for that to be a problem. Note that we pass create=false
 --- /dev/null
 +++ b/src/include/access/zou_walredo.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,83 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_walredo.h
@@ -1294,6 +1396,14 @@ newer clang treats as an error.
 +
 +/* true when this process is running as a zou redo worker */
 +extern PGDLLIMPORT bool zou_redo_active;
++
++/*
++ * True when the page is not one of the target blocks the pool declared
++ * for the current batch, meaning redo must leave it alone.  Only
++ * meaningful while zou_redo_active.
++ */
++extern bool zou_redo_bystander(RelFileLocator locator, ForkNumber fork,
++							   BlockNumber block);
 +
 +/* entry point, dispatched from main() on --zou-redo */
 +pg_noreturn extern void ZouRedoMain(int argc, char *argv[]);

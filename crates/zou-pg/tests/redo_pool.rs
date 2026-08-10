@@ -233,6 +233,66 @@ fn check_rel(
     pages
 }
 
+/// Replay every block of the relation alone, the shape the page
+/// service uses: a block's chain is just the records that reference
+/// it, and whatever other blocks those records touch are bystanders
+/// the worker must leave alone. Cross page updates make some chains
+/// init a neighbor page and land tuples on it again later, and before
+/// the batch declared its targets the worker replayed those onto its
+/// half built neighbor copy and panicked on the offset numbers.
+fn check_rel_block_by_block(
+    pool: &RedoPool,
+    records: &[WalRecord],
+    datadir: &Path,
+    spc: u32,
+    db: u32,
+    rel: u32,
+    mask: fn(&mut [u8]),
+) {
+    let disk = std::fs::read(
+        datadir
+            .join("base")
+            .join(db.to_string())
+            .join(rel.to_string()),
+    )
+    .expect("relation file exists");
+    for blk in 0..disk.len() / BLCKSZ {
+        let target = BlockRef {
+            spc,
+            db,
+            rel,
+            fork: 0,
+            blk: blk as u32,
+        };
+        let chain: Vec<(u64, u64, &[u8])> = records
+            .iter()
+            .filter(|record| {
+                record
+                    .block_refs()
+                    .expect("well formed record")
+                    .iter()
+                    .any(|r| *r == target)
+            })
+            .map(|record| (record.lsn, record.end_lsn, record.bytes.as_slice()))
+            .collect();
+        if chain.is_empty() {
+            continue;
+        }
+        let pages = pool
+            .apply(&RedoRequest {
+                pages: &[],
+                records: &chain,
+                gets: &[target],
+            })
+            .unwrap_or_else(|err| panic!("block {blk} of rel {rel} alone: {err}"));
+        let mut want = disk[blk * BLCKSZ..(blk + 1) * BLCKSZ].to_vec();
+        let mut got = pages[0].clone();
+        mask(&mut want);
+        mask(&mut got);
+        assert_eq!(got, want, "block {blk} of rel {rel} replayed alone differs");
+    }
+}
+
 /// Write materialized pages over a relation file with fresh checksums,
 /// what the page service does before postgres gets to read them.
 fn install_pages(datadir: &Path, db: u32, rel: u32, pages: &[Vec<u8>]) {
@@ -312,9 +372,32 @@ fn pool_pages_match_postgres() {
             + u64::from_str_radix(lo, 16).expect("lsn format")
     };
     psql("CREATE TABLE t (id int primary key, v text)");
+    // Plain storage keeps the tuples fat instead of compressing the
+    // repeats away, so the table actually spans pages, and the index
+    // on v makes every update of v a non HOT one that needs a new
+    // slot, usually on another page.
+    psql("ALTER TABLE t ALTER COLUMN v SET STORAGE PLAIN");
+    psql("CREATE INDEX ON t (v)");
     psql("INSERT INTO t SELECT g, repeat('x', 500) FROM generate_series(1, 200) g");
     psql("UPDATE t SET v = repeat('y', 500) WHERE id <= 20");
     psql("UPDATE t SET v = repeat('z', 500) WHERE id % 3 = 0");
+    // Single row updates alternating between two far apart source
+    // pages, so a freshly extended destination page collects tuples
+    // from both in turn. One source page's chain then inits the
+    // destination and later lands another tuple on it at an offset
+    // past what it saw being taken, which is the cross page shape the
+    // worker used to replay onto its half built copy and panic on
+    // before batches declared their target blocks. One session for
+    // all of them, so the target block cache keeps steering the new
+    // versions to that shared destination page.
+    let mut alternating = String::new();
+    for i in 0..24 {
+        let id = if i % 2 == 0 { 1 + i / 2 } else { 150 + i / 2 };
+        alternating.push_str(&format!(
+            "UPDATE t SET v = repeat('w', 700) WHERE id = {id};"
+        ));
+    }
+    psql(&alternating);
     psql("DELETE FROM t WHERE id % 7 = 0");
     psql("VACUUM t");
     let heap = psql("SELECT pg_relation_filepath('t')");
@@ -355,6 +438,16 @@ fn pool_pages_match_postgres() {
     });
     let heap_pages = check_rel(&pool, &out.records, &datadir, spc, db, heap_rel, mask_heap);
     let index_pages = check_rel(
+        &pool,
+        &out.records,
+        &datadir,
+        spc,
+        db,
+        index_rel,
+        mask_btree,
+    );
+    check_rel_block_by_block(&pool, &out.records, &datadir, spc, db, heap_rel, mask_heap);
+    check_rel_block_by_block(
         &pool,
         &out.records,
         &datadir,
