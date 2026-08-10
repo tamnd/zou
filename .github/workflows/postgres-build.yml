@@ -144,7 +144,64 @@ jobs:
           kill -INT "$DEV2"
           wait "$DEV2"
           cat /tmp/zou-dev.log /tmp/zou-dev2.log
+          # A branch reads the pages the source folded into runs, and a
+          # database this young has only the capture it was bootstrapped
+          # with, so the create refuses and leaves nothing behind.
+          ! target/release/zou branch /tmp/zou-dev-store create local dev2 2>/tmp/zou-too-young.txt
+          cat /tmp/zou-too-young.txt
+          grep -q "cannot be branched yet" /tmp/zou-too-young.txt
+          test ! -e /tmp/zou-dev-store/tenants/dev2/MANIFEST
+          # Writes and checkpoints until the fold packs one down, which
+          # is what a database that has been running a while has.
+          target/release/zou dev /tmp/zou-dev-store --pg-bin build/pg/bin --port 5614 --runtime /tmp/zou-dev-run3 >/tmp/zou-dev3.log 2>&1 &
+          DEV3=$!
+          for i in $(seq 1 120); do
+            build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select 1' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          for i in $(seq 1 12); do
+            build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -c "insert into devt select g from generate_series(1,2000) g" -c checkpoint >/dev/null
+            sleep 3
+            # Through a file rather than a pipe, `grep -q` closes the
+            # pipe on its first match and the writer dies of it.
+            target/release/zou info /tmp/zou-dev-store >/tmp/zou-settling.txt
+            grep -qE '^  [0-9a-f]{16} full at ' /tmp/zou-settling.txt && break
+          done
+          ROWS=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select count(*) from devt')
+          kill -INT "$DEV3"
+          wait "$DEV3"
+          target/release/zou info /tmp/zou-dev-store | tee /tmp/zou-folded.txt
+          grep -qE '^  [0-9a-f]{16} full at ' /tmp/zou-folded.txt
           target/release/zou branch /tmp/zou-dev-store create local dev2
+          # And the branch serves, on its own ports, with the rows the
+          # source had at the branch point and none of its own leaking
+          # back the other way.
+          target/release/zou dev /tmp/zou-dev-store --ref dev2 --pg-bin build/pg/bin --port 5615 --runtime /tmp/zou-dev-branch >/tmp/zou-dev-branch.log 2>&1 &
+          BRANCH=$!
+          OUT=""
+          for i in $(seq 1 120); do
+            OUT=$(build/pg/bin/psql -h 127.0.0.1 -p 5615 -U postgres -d postgres -Atc 'select count(*) from devt' 2>/dev/null) && [ "$OUT" = "$ROWS" ] && break
+            sleep 1
+          done
+          [ "$OUT" = "$ROWS" ]
+          build/pg/bin/psql -h 127.0.0.1 -p 5615 -U postgres -d postgres -c "insert into devt values (424242)"
+          kill -INT "$BRANCH"
+          wait "$BRANCH"
+          cat /tmp/zou-dev-branch.log
+          # A ref nobody branched is a typo, not a request for a second
+          # database, and the dev loop says so instead of making one.
+          ! target/release/zou dev /tmp/zou-dev-store --ref nope --pg-bin build/pg/bin --port 5616 --runtime /tmp/zou-dev-nope 2>/tmp/zou-no-ref.txt
+          grep -q "take a branch first" /tmp/zou-no-ref.txt
+          target/release/zou dev /tmp/zou-dev-store --pg-bin build/pg/bin --port 5614 --runtime /tmp/zou-dev-run4 >/tmp/zou-dev4.log 2>&1 &
+          DEV4=$!
+          OUT=""
+          for i in $(seq 1 120); do
+            OUT=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select count(*) from devt where id = 424242' 2>/dev/null) && break
+            sleep 1
+          done
+          [ "$OUT" = 0 ]
+          kill -INT "$DEV4"
+          wait "$DEV4"
           target/release/zou info /tmp/zou-dev-store | tee /tmp/zou-info.txt
           grep -q "ref local" /tmp/zou-info.txt
           target/release/zou info /tmp/zou-dev-store dev2 | tee /tmp/zou-info2.txt

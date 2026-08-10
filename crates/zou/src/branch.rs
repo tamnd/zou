@@ -10,6 +10,9 @@
 //! spelled out for people who would rather say what they mean. Either
 //! way the child only references the parent's objects, nothing is
 //! copied, so the call finishes in the time of two manifest round trips.
+//! What the child would read is checked before the call returns, and a
+//! source whose captures do not cover the whole chain is refused here
+//! instead of an hour later on the first page read.
 //!
 //! `list` reads every manifest on the store and prints the ones that
 //! name a parent, optionally only the children of one ref. `delete`
@@ -105,6 +108,24 @@ fn create(store: &dyn CasStore, src: &str, dst: &str, at: At) -> Result<(), Stri
         At::Ts(ts) => materialize_at(store, src, dst, ts, now),
     }
     .map_err(|e| e.to_string())?;
+    // A child reads inherited pages out of the captures it names and
+    // has no fallback for the ones it cannot, so a source whose
+    // captures do not cover the whole chain yields a database that
+    // looks fine here and fails on the first page read an hour later.
+    // Asking now costs one store round trip per inherited checkpoint,
+    // and a child that would not serve is taken back off the store
+    // rather than left as something only shaped like a database.
+    match zou_pg::reader::why_unservable(store, &TenantLayout::new(dst), &manifest)? {
+        None => {}
+        Some(why) => {
+            discard(store, dst)?;
+            return Err(format!(
+                "{src} cannot be branched yet, {why}. A fold packs one down after a few \
+                 checkpoints of writes, so keep the source running and try again. Nothing of \
+                 {dst} was left on the store"
+            ));
+        }
+    }
     let of = manifest
         .branch_of
         .as_ref()
@@ -172,6 +193,26 @@ fn list(store: &dyn CasStore, parent: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// Everything under a ref's prefix, and the count of what went. The
+/// manifest goes first. Everything else under the prefix is
+/// unreachable once it is gone, so a removal interrupted halfway
+/// leaves objects nobody can read rather than a tenant whose manifest
+/// points at objects that are no longer there.
+fn discard(store: &dyn CasStore, tenant_ref: &str) -> Result<usize, String> {
+    let layout = TenantLayout::new(tenant_ref);
+    store
+        .delete(&layout.manifest())
+        .map_err(|e| format!("store: {e}"))?;
+    let prefix = format!("{}/", layout.prefix());
+    let keys = store.list(&prefix).map_err(|e| format!("store: {e}"))?;
+    let mut deleted = 1;
+    for key in &keys {
+        store.delete(key).map_err(|e| format!("store: {e}"))?;
+        deleted += 1;
+    }
+    Ok(deleted)
+}
+
 fn delete(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
     let manifest = read_manifest(store, tenant_ref)?
         .ok_or_else(|| format!("no database at {}", TenantLayout::new(tenant_ref).prefix()))?;
@@ -207,20 +248,7 @@ fn delete(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
         ));
     }
 
-    // The manifest goes first. Everything else under the prefix is
-    // unreachable once it is gone, so a delete interrupted halfway
-    // leaves objects nobody can read rather than a tenant whose
-    // manifest points at objects that are no longer there.
-    let prefix = format!("{}/", TenantLayout::new(tenant_ref).prefix());
-    store
-        .delete(&TenantLayout::new(tenant_ref).manifest())
-        .map_err(|e| format!("store: {e}"))?;
-    let keys = store.list(&prefix).map_err(|e| format!("store: {e}"))?;
-    let mut deleted = 1;
-    for key in &keys {
-        store.delete(key).map_err(|e| format!("store: {e}"))?;
-        deleted += 1;
-    }
+    let deleted = discard(store, tenant_ref)?;
     match registry::delete(store, tenant_ref) {
         Ok(()) => println!("unregistered {tenant_ref}"),
         // A branch nobody registered is the common case, the registry
@@ -251,6 +279,48 @@ mod tests {
         store
             .put(&TenantLayout::new(tenant_ref).manifest(), &m.to_json())
             .unwrap();
+    }
+
+    /// The same, with the full capture bearing a page run index, which
+    /// is what a database that has run long enough to fold one looks
+    /// like and the only kind a branch can be served from.
+    fn folded_root(store: &dyn CasStore, tenant_ref: &str) {
+        let layout = TenantLayout::new(tenant_ref);
+        let mut m = Manifest::new(tenant_ref, 18);
+        m.checkpoints.push(CheckpointRef {
+            id: "f1".into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        store
+            .put(
+                &layout.checkpoint_page_index("f1"),
+                b"runs 1024\np 1663 5 16384 0 0\n",
+            )
+            .unwrap();
+        store.put(&layout.manifest(), &m.to_json()).unwrap();
+    }
+
+    /// A pull request database that answers nothing is worse than one
+    /// that was never made, because the job that made it went green.
+    #[test]
+    fn create_refuses_a_source_the_child_could_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        root(&store, "prod");
+
+        let err = create(&store, "prod", "pr-1", At::Head).unwrap_err();
+        assert!(err.contains("cannot be branched yet"), "{err}");
+        assert!(err.contains("run bearing full capture"), "{err}");
+        // And nothing of the child is left on the store, so the next
+        // run after the source has folded one is not a name collision.
+        assert!(read_manifest(&store, "pr-1").unwrap().is_none());
+        assert!(store.list("tenants/pr-1/").unwrap().is_empty());
+
+        folded_root(&store, "ready");
+        create(&store, "ready", "pr-1", At::Head).unwrap();
+        assert!(read_manifest(&store, "pr-1").unwrap().is_some());
     }
 
     #[test]

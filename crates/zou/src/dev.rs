@@ -54,8 +54,16 @@ extern "C" fn on_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
+/// The tenant a dev loop serves when nothing names one. A single
+/// database in a store of its own is what a laptop has, and this is the
+/// ref every other command defaults to as well.
+pub const LOCAL: &str = "local";
+
 pub struct Args {
     pub target: String,
+    /// Which tenant in the store to serve. `local` unless `--ref` names
+    /// a branch, which is how a per pull request database is opened.
+    pub tenant: String,
     pub pg_bin: PathBuf,
     /// None until the project file and the defaults have had their
     /// say, which happens in `run` rather than here, so parsing stays a
@@ -75,6 +83,7 @@ use crate::DEV_USAGE as USAGE;
 
 pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut target = None;
+    let mut tenant = None;
     let mut pg_bin = None;
     let mut port = None;
     let mut http = None;
@@ -85,6 +94,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--ref" => tenant = Some(need(&mut it, "--ref")?.to_string()),
             "--pg-bin" => pg_bin = Some(PathBuf::from(need(&mut it, "--pg-bin")?)),
             "--port" => {
                 let raw = need(&mut it, "--port")?;
@@ -115,6 +125,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         .unwrap_or_else(|| std::env::temp_dir().join(format!("zou-dev-{}", std::process::id())));
     Ok(Args {
         target,
+        tenant: tenant.unwrap_or_else(|| LOCAL.to_string()),
         pg_bin,
         port,
         http,
@@ -207,6 +218,7 @@ fn start_http(
     port: u16,
     pg_port: u16,
     target: String,
+    tenant: String,
     project: Option<&Project>,
 ) -> Result<(), String> {
     let secret = match std::env::var("ZOU_JWT_SECRET") {
@@ -381,10 +393,11 @@ fn start_http(
             // same tenant prefix, under files/. On a laptop that is a
             // directory next to the data and on a deployment it is the
             // same bucket, which is the whole point of storing both on
-            // the same thing. The tenant is left unset, so it is
-            // `local`, which is the ref the dev loop restores and
-            // serves under.
+            // the same thing. The tenant is the ref the dev loop
+            // restored, so a branch serves the files its parent had and
+            // writes its own under its own prefix.
             objects: Some(target),
+            tenant: Some(tenant),
             // Off by default, the same as GoTrue. Set
             // ZOU_SECURITY_MANUAL_LINKING_ENABLED=true and a signed in
             // person can attach a second provider to the account they
@@ -503,7 +516,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     let (port, http) = ports(args, project.as_ref());
 
     let store: Arc<dyn CasStore> = Arc::from(open_store(&args.target)?);
-    let layout = TenantLayout::new("local");
+    let layout = TenantLayout::new(&args.tenant);
     let fresh = match store
         .get(&layout.manifest())
         .map_err(|e| format!("store: {e}"))?
@@ -514,6 +527,22 @@ pub fn run(args: &Args) -> Result<(), String> {
             .checkpoints
             .is_empty(),
     };
+    // An empty `local` is a store nobody has used yet and initdb is
+    // what it is waiting for. An empty anything else is a ref that was
+    // named and does not exist, which is a typo far more often than it
+    // is a request for a second database, and quietly making an empty
+    // one under the misspelled name would hide the branch that was
+    // meant.
+    if fresh && args.tenant != LOCAL {
+        return Err(format!(
+            "{} has no database at ref {}, take a branch first: \
+             zou branch {} create {LOCAL} {}",
+            args.target, args.tenant, args.target, args.tenant
+        ));
+    }
+    if args.tenant != LOCAL {
+        log::info!("serving ref {}", args.tenant);
+    }
     if fresh {
         log::info!("{} is empty, running initdb", args.target);
         let out = Command::new(args.pg_bin.join("initdb"))
@@ -534,6 +563,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             // captured config.
             .args(["--set", "full_page_writes=off"])
             .env("ZOU_TARGET", &args.target)
+            .env("ZOU_TENANT", &args.tenant)
             .env("ZOU_PAGE_CACHE", &pagecache)
             // No page service exists during bootstrap, initdb is a
             // standalone process. Writes stay eager whatever the
@@ -557,7 +587,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             stats.bytes
         );
     } else {
-        let stats = restore::restore(&args.target, "local", &pgdata)?;
+        let stats = restore::restore(&args.target, &args.tenant, &pgdata)?;
         log::info!(
             "restored {} files and replayed {} wal records from {}",
             stats.files,
@@ -573,7 +603,13 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     if let Some(http_port) = http {
-        start_http(http_port, port, args.target.clone(), project.as_ref())?;
+        start_http(
+            http_port,
+            port,
+            args.target.clone(),
+            args.tenant.clone(),
+            project.as_ref(),
+        )?;
     }
 
     if let Some(ops_port) = args.ops {
@@ -592,6 +628,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             .args(["-c", "listen_addresses=127.0.0.1"])
             .args(["-c", &format!("shared_buffers={}", shared_buffers())])
             .env("ZOU_TARGET", &args.target)
+            .env("ZOU_TENANT", &args.tenant)
             .env("ZOU_PAGE_CACHE", &pagecache)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -682,6 +719,13 @@ mod tests {
             "nothing is scraped unless a port is asked for"
         );
         assert_eq!(args.pg_bin, PathBuf::from("build/pg/bin"));
+        assert_eq!(args.tenant, LOCAL, "a store with one database in it");
+    }
+
+    #[test]
+    fn parse_takes_the_ref_a_branch_was_created_under() {
+        let args = parse(&argv(&["s3://bucket/x", "--ref", "pr-142"])).unwrap();
+        assert_eq!(args.tenant, "pr-142");
     }
 
     #[test]
@@ -698,6 +742,8 @@ mod tests {
             "9187",
             "--runtime",
             "/tmp/run",
+            "--ref",
+            "pr-9",
         ]))
         .unwrap();
         assert_eq!(args.target, "s3://bucket/x");
@@ -706,6 +752,7 @@ mod tests {
         assert_eq!(args.http, Some(54321));
         assert_eq!(args.ops, Some(9187));
         assert_eq!(args.runtime, PathBuf::from("/tmp/run"));
+        assert_eq!(args.tenant, "pr-9");
     }
 
     #[test]

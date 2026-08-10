@@ -70,6 +70,34 @@ PSQL -c "create table guestbook(id serial primary key, note text)"
 PSQL -c "insert into guestbook(note) values ('hello from zou'), ('pages live on the store'), ('so does the WAL')"
 PSQL -c "table guestbook"
 
+say "writing until the fold packs a page capture a branch can read"
+# A branch reads the pages the source folded into runs and has no
+# fallback for the ones it cannot, and the capture a database is
+# bootstrapped with carries files rather than runs. The fold packs a
+# run bearing one down after a few checkpoints of writes, which a
+# database that has been serving for a while did long ago and one three
+# rows old has not, so the demo does that work here rather than let the
+# branch below refuse.
+SETTLED=""
+PSQL -c "create table settling(id serial primary key, pad text)"
+for _ in $(seq 1 12); do
+    PSQL -c "insert into settling(pad) select repeat('x', 80) from generate_series(1, 2000)"
+    PSQL -c "checkpoint"
+    sleep 2
+    # Through a file rather than a pipe: `grep -q` closes the pipe on
+    # its first match and the writer dies of it.
+    "$ZOU" info "$STORE" >"$DEMO_DIR/settling.txt"
+    if grep -qE '^  [0-9a-f]{16} full at ' "$DEMO_DIR/settling.txt"; then
+        SETTLED=yes
+        break
+    fi
+done
+PSQL -c "drop table settling"
+if [ -z "$SETTLED" ]; then
+    echo "no full capture was folded, the branch below would refuse"
+    exit 1
+fi
+
 say "stopping postgres, the store keeps everything"
 stop_dev
 

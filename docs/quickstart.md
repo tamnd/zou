@@ -27,7 +27,7 @@ make pg-build   # once, this is the slow part
 make demo       # now both acts play
 ```
 
-`make pg-build` fetches the pinned Postgres submodule, applies the zou patch series, and builds it with the storage manager shim linked in, see docs/postgres.md. With that in place `make demo` continues past act one: it starts `zou dev` on a fresh store, writes rows through plain `psql`, stops the server, prints what the store holds with `zou info`, takes a branch with `zou branch` which costs one small manifest and copies no data, and then restarts Postgres from nothing but the store and reads the rows back.
+`make pg-build` fetches the pinned Postgres submodule, applies the zou patch series, and builds it with the storage manager shim linked in, see docs/postgres.md. With that in place `make demo` continues past act one: it starts `zou dev` on a fresh store, writes rows through plain `psql`, writes and checkpoints until the fold packs a page capture down, stops the server, prints what the store holds with `zou info`, takes a branch with `zou branch` which costs one small manifest and copies no data, and then restarts Postgres from nothing but the store and reads the rows back.
 
 ## Your own targets
 
@@ -108,6 +108,36 @@ It compares schemas, enums, tables and their columns, constraints, indexes, view
 It does not compare default privileges, column privileges, ownership, extensions, publications, event triggers, domains, composite types, standalone sequences or foreign tables, and it says so on every run rather than letting "no changes" mean "nothing I looked at".
 Grants on a table it is already creating are left out too, because a new table arrives with whatever the default privileges give it.
 A database nobody has made a request against yet does not have `anon`, `authenticated` or `service_role` in it, because the server creates those on its first request, so on that one the grants to those three roles are left alone and the run says so.
+
+## A database per pull request
+
+A branch is a new prefix holding manifests that point at the parent's objects, so one costs a couple of small writes whatever the database weighs, and `zou dev` serves any ref in the store rather than only the default one.
+
+```bash
+zou branch ./store create local pr-142   # the branch, at the parent's last published state
+zou dev ./store --ref pr-142             # serve it, on its own ports if you like
+zou branch ./store delete pr-142         # and take it back when the work lands
+```
+
+Writes on a branch stay on the branch, the parent never sees them, and `zou branch ./store list` prints what is out there and where each one came from.
+A ref that has no database refuses rather than quietly bootstrapping an empty one under a name that was probably a typo, so `--ref` on a laptop means the branch you took and nothing else.
+
+In CI the composite action in `actions/branch` does the same two calls off the pull request event, taking the branch when one opens and removing it when it closes.
+
+```yaml
+- uses: tamnd/zou/actions/branch@main
+  with:
+    target: s3://mybucket/tenants
+```
+
+It names the branch `pr-<number>` unless `ref:` says otherwise, `source:` is the ref it branches from and defaults to `local`, and `zou:` is the binary if it is not on `PATH`.
+Every push to the pull request runs it again, and a branch that is already there is left alone, because the database from the first run is the one with the test data in it.
+Give the workflow the `closed` type as well as the usual ones and the same step deletes the branch, or set `delete: create` and `delete: delete` to say which half runs where.
+
+One thing to know before wiring it up: a branch can only read pages the parent has already folded into page runs, and the capture a database is bootstrapped with is not one of those.
+A fold packs one down after a few checkpoints of writes, so a project that has been running for a while has one and a store somebody made this morning may not.
+`zou branch create` checks before it returns and refuses a source the child could not read, rather than handing back a database that fails on its first query.
+`ZOU_FOLD_DOWN_FACTOR=0` in the server's environment brings the fold forward, the second one packs a full instead of the fifth, which is how the branch smoke test gets one out of a database that has only just started.
 
 ## Mail on a laptop
 

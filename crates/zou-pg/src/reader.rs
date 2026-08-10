@@ -280,6 +280,58 @@ pub struct AttachError {
     pub why: String,
 }
 
+/// What a branch that inherits no readable pages fails with, in
+/// [`ChainReader::attach`] when it is being served and in
+/// [`why_unservable`] before it is taken.
+const NO_CHAIN: &str = "there is no run bearing full capture to serve inherited pages from, \
+                        fold one in the source first";
+
+/// The rule [`ChainReader::attach`] holds a branch to, asked of a
+/// manifest instead of a running reader: from the newest full capture
+/// up, every checkpoint has to carry a page run index. A branch has no
+/// pg/ fallback, so one that does not is a window of blocks the child
+/// could never read, and the answer is the reason it could not, or
+/// `None` when the manifest would serve.
+///
+/// This only reads the page indexes, no WAL and no runs, so it is
+/// cheap enough to ask before branching. `layout` is the manifest's
+/// own, the checkpoint owners point at whatever prefix holds them.
+pub fn why_unservable(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    manifest: &Manifest,
+) -> Result<Option<String>, String> {
+    let Some(full) = manifest
+        .checkpoints
+        .iter()
+        .rposition(|c| c.kind == CheckpointKind::Full)
+    else {
+        return Ok(Some(NO_CHAIN.to_string()));
+    };
+    let mut bearing = 0;
+    let mut gap = false;
+    for c in manifest.checkpoints[full..].iter().rev() {
+        let lay = crate::fold::chk_layout(layout, c);
+        match store
+            .get(&lay.checkpoint_page_index(&c.id))
+            .map_err(|e| format!("store: {e}"))?
+        {
+            Some(_) if gap => {
+                return Ok(Some(format!(
+                    "checkpoint {} has PAGES but a newer one does not",
+                    c.id
+                )));
+            }
+            Some(_) => bearing += 1,
+            None => gap = true,
+        }
+    }
+    if bearing == 0 || gap {
+        return Ok(Some(NO_CHAIN.to_string()));
+    }
+    Ok(None)
+}
+
 pub struct ChainReader {
     /// Newest first, starting no earlier than the newest full capture.
     chain: Vec<ChkIndex>,
@@ -343,9 +395,7 @@ impl ChainReader {
         };
         let no_chain = || AttachError {
             fatal: true,
-            why: "the branch has no run bearing full capture to serve inherited pages from, \
-                  fold one in the source before branching"
-                .into(),
+            why: NO_CHAIN.into(),
         };
         let Some(full) = manifest
             .checkpoints
@@ -1143,6 +1193,83 @@ mod tests {
             "pg/ fallback would read zeros for inherited pages"
         );
         assert!(err.why.contains("run bearing"));
+    }
+
+    /// [`why_unservable`] is asked before a branch exists and attach is
+    /// asked when one is being served, so the two have to agree about
+    /// every shape a chain can take, or a branch passes the check and
+    /// then fails every read. Each case builds the source, branches it,
+    /// and holds the two answers against each other.
+    #[test]
+    fn the_pre_branch_check_agrees_with_what_attach_would_do() {
+        let bearing = |store: &LocalFsStore, layout: &TenantLayout, id: &str| {
+            put_chk(store, layout, id, &[(blk(16384, 0), 0xAA)], &[]);
+        };
+        /// A name, the checkpoints the source publishes, and which of
+        /// them bear a page run index.
+        type Case = (&'static str, &'static [Chk], &'static [&'static str]);
+        type Chk = (&'static str, u64, CheckpointKind);
+        let cases: [Case; 4] = [
+            // A project nobody has written enough into yet: the
+            // bootstrap capture is full but carries files, not runs.
+            (
+                "genesis alone",
+                &[("genesis", 0x100, CheckpointKind::Full)],
+                &[],
+            ),
+            // The deltas above it bear runs, but blocks only genesis
+            // covers live under the parent's mutable prefix.
+            (
+                "genesis under a bearing delta",
+                &[
+                    ("genesis", 0x100, CheckpointKind::Full),
+                    ("d1", 0x200, CheckpointKind::Delta),
+                ],
+                &["d1"],
+            ),
+            // A folded full with a delta on top, which is what a
+            // database that has been running for a while looks like.
+            (
+                "a folded full and a delta",
+                &[
+                    ("f1", 0x100, CheckpointKind::Full),
+                    ("d2", 0x200, CheckpointKind::Delta),
+                ],
+                &["f1", "d2"],
+            ),
+            // A hole at the top: the newest window's dirtied blocks are
+            // in no index and the WAL under it is gone.
+            (
+                "a newest checkpoint with no index",
+                &[
+                    ("f1", 0x100, CheckpointKind::Full),
+                    ("d2", 0x200, CheckpointKind::Delta),
+                ],
+                &["f1"],
+            ),
+        ];
+        for (name, chks, indexed) in cases {
+            let (_d, store, layout) = setup();
+            for id in indexed {
+                bearing(&store, &layout, id);
+            }
+            put_manifest(&*store, &layout, chks);
+            zou_store::branch(&*store, "local", "child", None, 5000).unwrap();
+            let child = TenantLayout::new("child");
+            let (data, _) = store.get(&child.manifest()).unwrap().unwrap();
+            let manifest = Manifest::from_json(&data).unwrap();
+
+            let ahead = why_unservable(&*store, &child, &manifest).unwrap();
+            let served = ChainReader::attach(&dyn_store(&store), &child);
+            match (&ahead, &served) {
+                (Some(why), Err(e)) => assert_eq!(why, &e.why, "{name}"),
+                (None, Ok(Some(_))) => {}
+                _ => panic!(
+                    "{name}: checked {ahead:?} but attach said {:?}",
+                    served.err()
+                ),
+            }
+        }
     }
 
     #[test]
