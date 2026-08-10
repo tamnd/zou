@@ -226,6 +226,31 @@ jobs:
           "$ZOU_PG_BIN/psql" "$DB_URL" -tAc \
             "select count(*) from pg_namespace where nspname in ('auth','storage','zou')" | grep -qx 3
           ! "$ZOU" db reset --db-url postgresql://postgres@db.example.com:5432/postgres
+          # A database built from the migrations and one built from the
+          # same migrations in a shadow are the same database.
+          "$ZOU" db diff 2>&1 | tee /tmp/zou-diff-clean.txt
+          grep -q "no changes" /tmp/zou-diff-clean.txt
+          # Now change it the way Studio would, and see the difference
+          # come back as a migration that reproduces the change.
+          "$ZOU_PG_BIN/psql" "$DB_URL" -q -v ON_ERROR_STOP=1 <<'SQL'
+          create table public.notes (id bigint generated always as identity primary key, widget bigint references public.widgets (id), body text not null);
+          alter table public.notes enable row level security;
+          create policy "notes are mine" on public.notes for select to authenticated using (body <> '');
+          create index notes_widget_idx on public.notes (widget);
+          create view public.widget_notes as select w.name, n.body from public.widgets w join public.notes n on n.widget = w.id;
+          comment on table public.notes is 'written in studio';
+          SQL
+          "$ZOU" db diff 2>/dev/null | tee /tmp/zou-diff.sql
+          grep -q "create table public.notes" /tmp/zou-diff.sql
+          grep -q 'create policy "notes are mine" on public.notes' /tmp/zou-diff.sql
+          grep -q "create view public.widget_notes" /tmp/zou-diff.sql
+          grep -q "comment on table public.notes is 'written in studio'" /tmp/zou-diff.sql
+          ! grep -q "grant .* on table public.notes" /tmp/zou-diff.sql
+          "$ZOU" db diff -f "studio changes" | tee /tmp/zou-diff-file.txt
+          grep -q "supabase/migrations/[0-9]\{14\}_studio_changes.sql" /tmp/zou-diff-file.txt
+          "$ZOU" db reset | grep -q "2 applied"
+          "$ZOU" db diff 2>&1 | tee /tmp/zou-diff-again.txt
+          grep -q "no changes" /tmp/zou-diff-again.txt
           kill -INT "$DEV"
           wait "$DEV" || true
           ! "$ZOU" status >/dev/null 2>&1

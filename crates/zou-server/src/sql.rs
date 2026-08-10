@@ -341,6 +341,22 @@ alter default privileges in schema storage
 /// bootstrap while another replaces it here, which postgres reports as
 /// a deadlock on pg_proc or as tuple concurrently updated. One lock over
 /// everything that writes these schemas is the whole fix.
+/// Everything a database needs before this server can answer from it:
+/// the three api roles, the auth helper functions and the public
+/// grants, then the auth and storage schemas if nobody has put them
+/// there yet. The pool does this once per process on the connection it
+/// opens first.
+///
+/// Public because it is also what a fresh database looks like, and
+/// `zou db diff` builds one to compare against. Idempotent, so calling
+/// it against a database that has been served from before is a few
+/// cheap catalog reads and nothing else.
+pub async fn bootstrap(client: &Client) -> Result<(), tokio_postgres::Error> {
+    client.batch_execute(BOOTSTRAP).await?;
+    ensure_foreign_schema(client, "auth.users", &[AUTH_SCHEMA]).await?;
+    ensure_foreign_schema(client, "storage.objects", &[STORAGE_SCHEMA, STORAGE_GRANTS]).await
+}
+
 async fn ensure_foreign_schema(
     client: &Client,
     marker: &str,
@@ -422,16 +438,7 @@ impl Pool {
         });
         self.0
             .bootstrapped
-            .get_or_try_init(|| async {
-                client.batch_execute(BOOTSTRAP).await?;
-                ensure_foreign_schema(&client, "auth.users", &[AUTH_SCHEMA]).await?;
-                ensure_foreign_schema(
-                    &client,
-                    "storage.objects",
-                    &[STORAGE_SCHEMA, STORAGE_GRANTS],
-                )
-                .await
-            })
+            .get_or_try_init(|| async { bootstrap(&client).await })
             .await?;
         Ok((permit, client))
     }
