@@ -139,6 +139,24 @@ Replication connections are refused too, and a startup packet over 10000 bytes o
 Cancellation works the way it does against postgres directly: the key the client is handed is the key its own backend generated, this node only remembers which database that pair is on so a cancel arriving on a fresh connection has somewhere to go.
 A pair this node has never seen is dropped in silence, because guessing one must not cancel a stranger's query.
 
+### The transaction pooler on 6543
+
+The same door in transaction mode listens on 6543, and it is the port a serverless function should use.
+Routing, the key and the role are identical to 5432, so the only thing that changes is the connection string's port number.
+What changes underneath is what a connection owns: on 5432 a client holds a backend from login to hangup, and on 6543 it borrows one at the first message of a transaction and hands it back at the ReadyForQuery that ends it, so a hundred idle clients cost a hundred sockets on this node and no backends at all on the database.
+The ceiling is twenty backends per project and role, and a client that arrives when they are all out waits for one rather than being refused, because a queue is what a pooler is for.
+
+There is no backend at login, so the greeting is this server's: the parameter set is the one the project's database announced to the first backend opened for it, replayed to every client after, and the cancel key is this node's own.
+A backend is cleaned with `DISCARD ALL` on the way back rather than the next client paying for what the last one left behind, and one that does not come back clean is closed instead of parked.
+A cancel is translated instead of forwarded, to the backend the session is on at that moment and with that backend's own key, and a cancel for a session that is between transactions does nothing at all, because the backend it used last belongs to somebody else now.
+
+Session state does not survive a transaction here, which is the rule every transaction pooler has.
+`SET`, `LISTEN`, `WITH HOLD` cursors and advisory locks taken outside a transaction all belong on 5432.
+Named prepared statements are the one case refused out loud, at the Parse that names them, with a message saying to turn statement caching off in the driver or use 5432, because the alternative is a failure one transaction later about a statement that does not exist.
+A transaction left open with nothing said by either side for 60 seconds is closed with `25P03`, since a pooler whose backends are all pinned by clients that went to lunch is an outage for everyone else on the project.
+
 `zou_pg_sessions` is how many are open right now, which is the number a pooler is sized against.
 `zou_pg_logins_total{outcome="ok"|"refused"|"error"}` separates a client that was told why in its own protocol, a wrong key or an unknown project, from everything that never got that far.
 `zou_pg_bytes_total{direction}` is what the sessions moved.
+`zou_pg_backends` against `zou_pg_sessions` is the whole claim the pooler makes, many sessions and few backends, and the two being equal means the pooling is not buying anything.
+`zou_pg_transactions_total` counts what ran through it, and `zou_pg_checkout_seconds` is how long clients waited for a backend, which is the number that says the ceiling is too low and is kept apart from query time so it cannot be confused with it.
