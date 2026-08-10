@@ -29,6 +29,9 @@ It is the same router `zou serve` puts on a port, so a call that would be refuse
 Nothing is added on the way in.
 The handle does not sign anything for you and does not raise anybody's privileges, which is why `keys()` hands back the same two keys `zou status` prints and you choose which one a call carries.
 
+Unix only for now, since the postmaster is supervised with signals and its socket directory with unix permissions.
+On Windows the crate is an empty library rather than a build failure, so a workspace that carries it still builds there.
+
 ## Opening
 
 ```rust

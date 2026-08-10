@@ -4,15 +4,7 @@
 //! them: a store, a postmaster over it, and the front door as one axum
 //! router. What a host process wants is the same thing without the
 //! sockets, so this hands back a handle that answers a request by
-//! calling the router directly.
-//!
-//! ```no_run
-//! use zou_embed::{Options, Zou};
-//!
-//! let zou = Zou::open(Options::ephemeral()).unwrap();
-//! let answer = zou.request("GET", "/rest/v1/todos", &[("apikey", zou.keys().anon.as_str())], b"").unwrap();
-//! assert_eq!(answer.status, 200);
-//! ```
+//! calling the router directly. [`Zou`] is that handle.
 //!
 //! Three things are worth knowing before building on it.
 //!
@@ -32,6 +24,11 @@
 //! thread at once. What is not allowed is calling `request` from inside
 //! an async runtime's own thread, because it blocks on this handle's
 //! runtime to get the answer.
+//!
+//! Unix only for now, since the postmaster is supervised with signals
+//! and the socket directory with unix permissions. On Windows this
+//! crate is an empty library rather than a build failure, so a
+//! workspace that carries it still builds there.
 
 #![cfg(unix)]
 
@@ -268,6 +265,17 @@ impl Postmaster {
 }
 
 /// One open project: a store, the postgres over it, and the front door.
+///
+/// ```no_run
+/// use zou_embed::{Options, Zou};
+///
+/// let zou = Zou::open(Options::ephemeral()).unwrap();
+/// let key = zou.keys().anon.clone();
+/// let answer = zou
+///     .request("GET", "/rest/v1/todos", &[("apikey", &key)], b"")
+///     .unwrap();
+/// assert_eq!(answer.status, 200);
+/// ```
 pub struct Zou {
     router: Router,
     rt: tokio::runtime::Runtime,
