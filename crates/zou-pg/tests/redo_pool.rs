@@ -270,8 +270,7 @@ fn check_rel_block_by_block(
                 record
                     .block_refs()
                     .expect("well formed record")
-                    .iter()
-                    .any(|r| *r == target)
+                    .contains(&target)
             })
             .map(|record| (record.lsn, record.end_lsn, record.bytes.as_slice()))
             .collect();
