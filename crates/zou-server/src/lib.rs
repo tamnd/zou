@@ -56,6 +56,7 @@ pub mod storage;
 pub mod tenant;
 pub mod totp;
 pub mod tus;
+pub mod wire;
 
 /// What the front door needs to know: the secret every key and token
 /// must verify against, and where postgres lives when there is one to
