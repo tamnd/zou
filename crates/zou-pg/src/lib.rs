@@ -23,6 +23,7 @@
 //! never unwinds into C. Postgres turns nonzero into ereport(ERROR).
 
 pub mod bootstrap;
+pub mod branching;
 pub mod cache;
 pub mod capture;
 pub mod compact;

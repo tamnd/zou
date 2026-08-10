@@ -1,0 +1,31 @@
+[package]
+name = "zou-embed"
+description = "Zou as a library: a Supabase compatible backend inside a host process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zou-pg = { path = "../zou-pg" }
+zou-server = { path = "../zou-server" }
+zou-store = { path = "../zou-store" }
+axum = { workspace = true }
+getrandom = { workspace = true }
+log = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tower = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+zou-store = { path = "../zou-store" }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+
+[lints]
+workspace = true
