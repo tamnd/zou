@@ -1,0 +1,95 @@
+name: zou branch database
+description: A branch database per pull request, created on open and deleted when the pull request closes
+
+inputs:
+  target:
+    description: The store the database lives in, a directory or an s3://bucket/prefix url
+    required: true
+  source:
+    description: The ref to branch from
+    required: false
+    default: local
+  ref:
+    description: The branch to create or delete, pr-<number> by default
+    required: false
+    default: ""
+  zou:
+    description: The zou binary, on PATH or a path to one
+    required: false
+    default: zou
+  delete:
+    description: create, delete, or auto, which deletes on a closed pull request and creates otherwise
+    required: false
+    default: auto
+
+outputs:
+  ref:
+    description: The branch this run created or deleted
+    value: ${{ steps.branch.outputs.ref }}
+  created:
+    description: true when this run created the branch, false when it was already there or was deleted
+    value: ${{ steps.branch.outputs.created }}
+
+runs:
+  using: composite
+  steps:
+    - id: branch
+      shell: bash
+      env:
+        ZOU_BRANCH_TARGET: ${{ inputs.target }}
+        ZOU_BRANCH_SOURCE: ${{ inputs.source }}
+        ZOU_BRANCH_REF: ${{ inputs.ref }}
+        ZOU_BRANCH_BIN: ${{ inputs.zou }}
+        ZOU_BRANCH_DELETE: ${{ inputs.delete }}
+        ZOU_BRANCH_NUMBER: ${{ github.event.pull_request.number || github.event.number }}
+        ZOU_BRANCH_ACTION: ${{ github.event.action }}
+      run: |
+        set -euo pipefail
+        zou="$ZOU_BRANCH_BIN"
+        target="$ZOU_BRANCH_TARGET"
+        source="$ZOU_BRANCH_SOURCE"
+
+        # A pull request numbered 142 gets pr-142 unless the workflow
+        # named something else. Nothing else is derived from the event,
+        # so the same action runs on a schedule or by hand as long as
+        # the ref is given.
+        name="$ZOU_BRANCH_REF"
+        if [ -z "$name" ]; then
+          if [ -z "${ZOU_BRANCH_NUMBER:-}" ]; then
+            echo "no pull request number in this event, pass ref:" >&2
+            exit 1
+          fi
+          name="pr-$ZOU_BRANCH_NUMBER"
+        fi
+        echo "ref=$name" >>"$GITHUB_OUTPUT"
+
+        case "$ZOU_BRANCH_DELETE" in
+          auto) [ "${ZOU_BRANCH_ACTION:-}" = closed ] && verb=delete || verb=create ;;
+          true|delete) verb=delete ;;
+          false|create) verb=create ;;
+          *) echo "delete: expected create, delete, or auto" >&2; exit 1 ;;
+        esac
+
+        if [ "$verb" = delete ]; then
+          echo "created=false" >>"$GITHUB_OUTPUT"
+          # A pull request can close more than once and a workflow can
+          # be rerun, so a branch that is already gone is the job being
+          # done rather than a failure.
+          if ! "$zou" info "$target" "$name" >/dev/null 2>&1; then
+            echo "no branch $name on $target, nothing to delete"
+            exit 0
+          fi
+          "$zou" branch "$target" delete "$name"
+          exit 0
+        fi
+
+        # Every push to the pull request runs this again, and the
+        # database from the first run is the one with the test data in
+        # it. Branching afresh each time would throw that away.
+        if "$zou" info "$target" "$name" >/dev/null 2>&1; then
+          echo "created=false" >>"$GITHUB_OUTPUT"
+          echo "branch $name is already on $target"
+          exit 0
+        fi
+        "$zou" branch "$target" create "$source" "$name"
+        echo "created=true" >>"$GITHUB_OUTPUT"

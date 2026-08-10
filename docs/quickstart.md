@@ -109,6 +109,35 @@ It does not compare default privileges, column privileges, ownership, extensions
 Grants on a table it is already creating are left out too, because a new table arrives with whatever the default privileges give it.
 A database nobody has made a request against yet does not have `anon`, `authenticated` or `service_role` in it, because the server creates those on its first request, so on that one the grants to those three roles are left alone and the run says so.
 
+## A database per pull request
+
+A branch is a new prefix holding manifests that point at the parent's objects, so one costs a couple of small writes whatever the database weighs, and `zou dev` serves any ref in the store rather than only the default one.
+
+```bash
+zou branch ./store create local pr-142   # the branch, at the parent's last published state
+zou dev ./store --ref pr-142             # serve it, on its own ports if you like
+zou branch ./store delete pr-142         # and take it back when the work lands
+```
+
+Writes on a branch stay on the branch, the parent never sees them, and `zou branch ./store list` prints what is out there and where each one came from.
+A ref that has no database refuses rather than quietly bootstrapping an empty one under a name that was probably a typo, so `--ref` on a laptop means the branch you took and nothing else.
+
+In CI the composite action in `actions/branch` does the same two calls off the pull request event, taking the branch when one opens and removing it when it closes.
+
+```yaml
+- uses: tamnd/zou/actions/branch@main
+  with:
+    target: s3://mybucket/tenants
+```
+
+It names the branch `pr-<number>` unless `ref:` says otherwise, `source:` is the ref it branches from and defaults to `local`, and `zou:` is the binary if it is not on `PATH`.
+Every push to the pull request runs it again, and a branch that is already there is left alone, because the database from the first run is the one with the test data in it.
+Give the workflow the `closed` type as well as the usual ones and the same step deletes the branch, or set `delete: create` and `delete: delete` to say which half runs where.
+
+One thing to know before wiring it up: a branch can only read pages the parent has already folded into page runs, and the capture a database is bootstrapped with is not one of those.
+A fold packs one down after a few checkpoints of writes, so a project that has been running for a while has one and a store somebody made this morning may not.
+`zou branch create` checks before it returns and refuses a source the child could not read, rather than handing back a database that fails on its first query.
+
 ## Mail on a laptop
 
 `zou dev <target> --http 54321` starts the API front door next to the postmaster and logs the anon and service_role keys the way `supabase start` does, so a client is pointed at it by copying two lines.
