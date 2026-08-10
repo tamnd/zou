@@ -208,3 +208,17 @@ A transaction left open with nothing said by either side for 60 seconds is close
 `zou_pg_bytes_total{direction}` is what the sessions moved.
 `zou_pg_backends` against `zou_pg_sessions` is the whole claim the pooler makes, many sessions and few backends, and the two being equal means the pooling is not buying anything.
 `zou_pg_transactions_total` counts what ran through it, and `zou_pg_checkout_seconds` is how long clients waited for a backend, which is the number that says the ceiling is too low and is kept apart from query time so it cannot be confused with it.
+
+## Moving a store
+
+`zou push <dir> <target> [ref]` copies a local store, or one tenant of it, out to a remote prefix, and `zou pull <target> <dir> [ref]` copies the other way.
+Both are the same walk with the ends named, so the direction is in the verb rather than in an argument order somebody has to remember, and `--jobs` sets how many objects are in flight at once, sixteen by default.
+
+The interesting part is what it does not copy.
+Checkpoint objects, manifest history snapshots, and WAL segments never change once written, so a key that already exists on the far side is the same bytes and is skipped without being read.
+That makes the second run cheap and makes an interrupted first run resumable: it picks up where the objects run out.
+Everything else is copied every time, the live manifest above all, because that is the object whose whole job is to change, and a copy that skipped it would hand over a database pointing at a state it no longer has.
+
+A tenant with a live lease is copied with a warning rather than refused.
+The walk is not a snapshot, so a manifest written while it ran can name a checkpoint the walk had already passed, and the fix is to copy a detached tenant or to copy twice.
+Nothing here takes a lease of its own, and nothing is deleted on either side, so a push into a prefix that already has a database updates it rather than replacing it.
