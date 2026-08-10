@@ -82,8 +82,41 @@ Peak RSS across the whole process tree is 15.7 GB over up to 1028 processes, med
 Provisioning costs 36.2 tenants a minute at 8 parallel jobs, almost all of it initdb and the genesis capture, with the registry write itself at 2.7 ms p50.
 The store holds 45.6 GB for the thousand, 45.6 MB a tenant.
 
+## A hundred thousand registered tenants
+
+server3 (8 vCPU, 24 GB, Ubuntu), 2026-08-11, MinIO on the same box on a single drive, `cargo test --release -p zou-store --test registry_scale` and `-p zou-server --test registry_cache_scale`.
+A hundred thousand registered tenants, no databases behind them, which is what a registered tenant is: an entry pointing at a prefix.
+Registered at 32 jobs, then read back at each decade on the way up.
+
+| fleet | lookup p50 | p90 | p99 | max |
+| --- | --- | --- | --- | --- |
+| 1,000 | 3.120 ms | 8.992 ms | 30.405 ms | 71.807 ms |
+| 10,000 | 2.596 ms | 5.651 ms | 14.167 ms | 23.951 ms |
+| 100,000 | 2.138 ms | 4.940 ms | 16.055 ms | 25.456 ms |
+
+A hundred times the fleet and the lookup does not move, which is the whole point of one object per tenant: routing a request is a point GET of one key and never a search.
+A ref nobody registered answers in 1.372 ms p50, so a request naming a project that does not exist costs the same round trip as one that does, and a custom hostname costs 2.545 ms p50 for its two reads.
+Registering ran at 458 to 524 a second at 32 jobs, 61.7 ms p50 per conditional PUT, and `registry list`, which is the one operation that does read every entry, took 5.7 s for the hundred thousand.
+The entries themselves are 145 bytes each, so the fleet is 14.5 MB of logical objects, 145 MB at a million; MinIO's own single drive layout writes 785 MB for them, which is per object overhead on 4 KiB blocks rather than anything zou wrote.
+
+The node half is the bounded cache in front of that store.
+
+| what | p50 | p90 | p99 | max |
+| --- | --- | --- | --- | --- |
+| cold, one round trip each | 4.175 ms | 9.847 ms | 25.239 ms | 61.928 ms |
+| warm, a working set of 500 | 601 ns | 641 ns | 761 ns | 302.886 µs |
+| a ref nobody registered | 2.292 ms | 5.076 ms | 19.878 ms | 38.038 ms |
+
+Resident memory went from 4.1 MiB to 7.2 MiB over 22,500 distinct tenants asked for, of which the cache can hold 4,096, and stayed there while it evicted.
+That is the claim being measured: what a node spends on the registry is the bound and not the fleet, and a tenant nobody has asked for costs a node nothing at all.
+Warm lookups are 601 ns because they never leave the process, which is what puts the apikey check in front of attach instead of behind a round trip.
+
+What this does not measure is a node serving a hundred thousand, because attaching is what serving costs and that is the thousand tenant run above.
+It also runs against MinIO on the same box, so the round trips are a loopback and a real S3 will be slower in the same shape.
+
 ## Pending
 
+- The same registry walk at a million entries and against real S3, which is the NFR-20 number rather than its smoke.
 - Lazy hydrate, then a fleet rerun, since the churn tail above is entirely eager attach.
 - Real S3 and S3 Express One Zone runs from an in region box, plus GCS and R2.
 - Concurrent producer runs to show batching amortization.

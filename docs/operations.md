@@ -121,6 +121,7 @@ Each forwarded request opens a client span whose `traceparent` goes across, so a
 
 `zou serve <target>` is the node.
 `zou dev` serves the one database in a store, which is what a laptop wants; this serves whatever is in `registry/`, which on a real deployment is a few hundred or a few thousand projects that are mostly asleep.
+How many may be registered is a different question from how many may be attached, and the registry has been walked at a hundred thousand: the lookup is a point read that does not move between a thousand entries and a hundred thousand, and a node's own memory follows the cache bound rather than the fleet, see [benchmarks.md](benchmarks.md).
 
     zou serve s3://bucket/fleet --domain zou.example --ops 9187
 
