@@ -1407,8 +1407,15 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     let tenant_ref = std::env::var("ZOU_TENANT").unwrap_or_else(|_| "local".to_string());
     let layout = TenantLayout::new(&tenant_ref);
     let manifest_key = layout.manifest();
+    // Where the captured state ends, which is where the stream has to
+    // begin on a store that holds no WAL yet. See `floor` below.
+    let mut captured = 0u64;
     match store.get(&manifest_key) {
-        Ok(Some(_)) => {}
+        Ok(Some((data, _))) => {
+            if let Ok(manifest) = Manifest::from_json(&data) {
+                captured = manifest.checkpoints.last().map_or(0, |c| c.lsn.0);
+            }
+        }
         Ok(None) => {
             let genesis = Manifest::new(&tenant_ref, 18);
             // A racing genesis from another process is fine, someone won.
@@ -1475,8 +1482,19 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     // treats a gap or an overlap not starting at the watermark as
     // corruption, so the pusher must continue from exactly here.
     let tenant = tenant_id(layout.tenant_ref());
+    // A store with no stream yet resumes at the newest checkpoint
+    // instead, because the capture is where the durable state ends and
+    // the bytes between it and the pusher's first look are in neither.
+    // A postmaster writes its own startup checkpoint before a worker of
+    // its runs at all, so those bytes exist every single time: the
+    // capture stops at the record initdb left, the stream used to open
+    // at the flush pointer past the startup record, and a restore then
+    // replayed nothing at all, because recovery stops at the first byte
+    // nobody wrote. The gap is small and always in local pg_wal, so the
+    // pusher simply reads from further back.
     let resume = match stream_end(&media, WAL_SHARD, tenant) {
-        Ok(end) => end.map_or(0, |lsn| lsn.0),
+        Ok(Some(lsn)) => lsn.0,
+        Ok(None) => captured,
         Err(e) => {
             log::error!("zou_wal_open: stream end: {e}");
             return Err(ZOU_ERR_STORE);
@@ -2243,12 +2261,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = CString::new(dir.path().to_str().unwrap()).unwrap();
         let start = 0x0100_0000_u64;
+        // A captured database with nothing streamed yet, which is every
+        // tenant on its first attach. The capture ends before the flush
+        // pointer the caller offers, because a postmaster writes its own
+        // startup checkpoint on the way up, and the open has to hand
+        // back the capture rather than the flush pointer: bytes in that
+        // gap are in no capture and in no stream, and a restore that
+        // meets one stops replaying there.
+        let captured = start - 0x58;
+        {
+            let store = LocalFsStore::new(dir.path());
+            let mut m = Manifest::new("local", 18);
+            m.checkpoints.push(zou_store::manifest::CheckpointRef {
+                id: "genesis".to_string(),
+                lsn: Lsn(captured),
+                kind: zou_store::manifest::CheckpointKind::Full,
+                owner: None,
+            });
+            store
+                .put_if_absent(&TenantLayout::new("local").manifest(), &m.to_json())
+                .unwrap();
+        }
         let mut resume = u64::MAX;
         assert_eq!(
             unsafe { zou_wal_open(target.as_ptr(), start, &mut resume) },
             ZOU_OK
         );
-        assert_eq!(resume, 0, "an empty store has nothing to resume from");
+        assert_eq!(
+            resume, captured,
+            "a store with no stream resumes at the capture"
+        );
         // A second open in the same process is a bug in the caller.
         assert_eq!(
             unsafe { zou_wal_open(target.as_ptr(), start, &mut resume) },
