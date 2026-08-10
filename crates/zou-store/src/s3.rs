@@ -333,6 +333,66 @@ impl CasStore for S3Store {
         }
     }
 
+    /// A query signed GET, which is the same signature the header
+    /// signer makes over a canonical request that carries the
+    /// credentials in the query string and reads `UNSIGNED-PAYLOAD` for
+    /// its body hash.
+    ///
+    /// Only host is signed. Whoever follows this url is a browser or a
+    /// curl and sends whatever headers it likes, and a url that only
+    /// works from one client is not a url.
+    ///
+    /// No request is made, so this answers for a key that is not there
+    /// too, and the url then produces the backend's own not found when
+    /// it is followed.
+    fn presigned_get(
+        &self,
+        key: &str,
+        ttl: Duration,
+        response: &[(&str, &str)],
+    ) -> Result<Option<String>, CasError> {
+        let (amz_date, datestamp) = amz_timestamp(SystemTime::now());
+        let scope = format!("{datestamp}/{}/s3/aws4_request", self.cfg.region);
+        // A week is the longest S3 signs for, and a zero second url is
+        // one nobody can spend, so both ends are pulled into range
+        // rather than refused: the caller asked for a download, not for
+        // an argument about durations.
+        let seconds = ttl.as_secs().clamp(1, 604_800);
+        let mut params = vec![
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
+            (
+                "X-Amz-Credential",
+                format!("{}/{scope}", self.cfg.access_key),
+            ),
+            ("X-Amz-Date", amz_date.clone()),
+            ("X-Amz-Expires", seconds.to_string()),
+            ("X-Amz-SignedHeaders", "host".to_string()),
+        ];
+        params.extend(response.iter().map(|(k, v)| (*k, v.to_string())));
+        // Canonical order is by encoded name, and every pair is encoded
+        // once, here, so what goes on the wire is what was signed.
+        let mut encoded: Vec<(String, String)> = params
+            .iter()
+            .map(|(k, v)| (uri_encode(k, true), uri_encode(v, true)))
+            .collect();
+        encoded.sort();
+        let query = encoded
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let path = self.object_path(key);
+        let canonical = format!(
+            "GET\n{path}\n{query}\nhost:{}\n\nhost\nUNSIGNED-PAYLOAD",
+            self.host
+        );
+        let signature = signature(&self.cfg, &canonical, &amz_date, &datestamp, &scope);
+        Ok(Some(format!(
+            "{}{path}?{query}&X-Amz-Signature={signature}",
+            self.cfg.endpoint.trim_end_matches('/')
+        )))
+    }
+
     fn put_if_match(
         &self,
         key: &str,
@@ -453,16 +513,31 @@ fn authorization(
     let canonical =
         format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_names}\n{payload_hash}");
     let scope = format!("{datestamp}/{}/s3/aws4_request", cfg.region);
+    let signature = signature(cfg, &canonical, amz_date, datestamp, &scope);
+    format!(
+        "AWS4-HMAC-SHA256 Credential={}/{scope},SignedHeaders={signed_names},Signature={signature}",
+        cfg.access_key
+    )
+}
+
+/// The signature over a canonical request.
+///
+/// The header signer and the query signer build different canonical
+/// requests and write the answer in different places. Everything
+/// between the two is this.
+fn signature(
+    cfg: &S3Config,
+    canonical: &str,
+    amz_date: &str,
+    datestamp: &str,
+    scope: &str,
+) -> String {
     let to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         sha256_hex(canonical.as_bytes())
     );
     let key = signing_key(&cfg.secret_key, datestamp, &cfg.region);
-    let signature = hex(&hmac(&key, to_sign.as_bytes()));
-    format!(
-        "AWS4-HMAC-SHA256 Credential={}/{scope},SignedHeaders={signed_names},Signature={signature}",
-        cfg.access_key
-    )
+    hex(&hmac(&key, to_sign.as_bytes()))
 }
 
 fn signing_key(secret: &str, datestamp: &str, region: &str) -> Vec<u8> {
@@ -655,6 +730,113 @@ mod tests {
         assert!(auth.contains(
             "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-goog-if-generation-match"
         ));
+    }
+
+    /// The query string authentication example from the same
+    /// documentation, asked of the shared signer with the canonical
+    /// request the docs print. Presigning builds that string from a key
+    /// and a ttl, and this pins the arithmetic under it.
+    #[test]
+    fn signer_matches_the_aws_presigned_get_vector() {
+        let canonical = concat!(
+            "GET\n",
+            "/test.txt\n",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256",
+            "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request",
+            "&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host\n",
+            "host:examplebucket.s3.amazonaws.com\n",
+            "\n",
+            "host\n",
+            "UNSIGNED-PAYLOAD"
+        );
+        assert_eq!(
+            signature(
+                &example_cfg(),
+                canonical,
+                "20130524T000000Z",
+                "20130524",
+                "20130524/us-east-1/s3/aws4_request",
+            ),
+            "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
+        );
+    }
+
+    /// What a presigned url is made of, asked of the real one.
+    ///
+    /// The signature itself moves with the clock, so what is pinned
+    /// here is everything else: the five parameters in canonical order,
+    /// the response overrides signed alongside them, and the fact that
+    /// changing one of those changes the answer, which is what stops a
+    /// url from being edited into a different download.
+    #[test]
+    fn a_presigned_url_carries_what_it_signed() {
+        let store = S3Store::new(example_cfg());
+        let plain = store
+            .presigned_get("files/a.png", Duration::from_secs(60), &[])
+            .unwrap()
+            .expect("s3 can presign");
+        assert!(
+            plain.starts_with("https://examplebucket.s3.amazonaws.com/examplebucket/files/a.png?"),
+            "{plain}"
+        );
+        let query = plain.split_once('?').unwrap().1;
+        let names: Vec<&str> = query
+            .split('&')
+            .map(|p| p.split_once('=').unwrap().0)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "X-Amz-Algorithm",
+                "X-Amz-Credential",
+                "X-Amz-Date",
+                "X-Amz-Expires",
+                "X-Amz-SignedHeaders",
+                "X-Amz-Signature",
+            ],
+            "canonical order, with the signature last because it is over the rest"
+        );
+        assert!(query.contains("X-Amz-Expires=60"), "{query}");
+
+        let named = store
+            .presigned_get(
+                "files/a.png",
+                Duration::from_secs(60),
+                &[(
+                    "response-content-disposition",
+                    "attachment; filename=\"a b\"",
+                )],
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            named.contains("response-content-disposition=attachment%3B%20filename%3D%22a%20b%22"),
+            "{named}"
+        );
+        assert_ne!(
+            plain.split("X-Amz-Signature=").nth(1),
+            named.split("X-Amz-Signature=").nth(1),
+            "the override is signed, so it cannot be added to a url afterwards"
+        );
+    }
+
+    /// A week is as long as S3 signs for, and a url nobody can spend is
+    /// not worth refusing a download over.
+    #[test]
+    fn a_ttl_out_of_range_is_pulled_into_it() {
+        let store = S3Store::new(example_cfg());
+        let with = |ttl| {
+            store
+                .presigned_get("k", ttl, &[])
+                .unwrap()
+                .unwrap()
+                .split('&')
+                .find(|p| p.starts_with("X-Amz-Expires="))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(with(Duration::from_secs(0)), "X-Amz-Expires=1");
+        assert_eq!(with(Duration::from_secs(999_999)), "X-Amz-Expires=604800");
     }
 
     #[test]

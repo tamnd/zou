@@ -157,6 +157,25 @@ Lazy hydrate, where a page arrives when it is faulted, is the storage engine's w
 
 `zou serve` needs the patched postgres, `--pg-bin` or `ZOU_PG_BIN` pointing at the install, the same one `zou dev` uses.
 
+### Large downloads out of the way
+
+A node that keeps objects on S3 and serves them itself pays for every byte twice, once out of the bucket and once out of its own network, and holds a request open for as long as the download takes.
+On a large file that is long enough to matter to everything else the node is doing, and none of it is work: the bytes arrive from the bucket and leave unchanged.
+`--passthrough <size>` answers a download of an object at least that big with a 302 at a presigned url to the same object instead, so the bucket serves it and the node steps out of the egress path.
+
+    zou serve s3://bucket/fleet --domain zou.example --passthrough 8MB
+
+The size takes a unit, so `8MB`, `8M` and `8388608` are the same number, and it is off unless it is given.
+It applies to a whole object and nothing else.
+A HEAD is answered here as it always was, since it carries no bytes to save, and so is a range request, because the request that follows a redirect is not the one that asked and a client that wanted part of a file must not be handed all of it.
+A store that cannot name its objects with a url, which is every store but S3, answers the way it always did whatever the flag says.
+
+The url is signed for fifteen minutes, carries the content type and the download name the request asked for so the answer says what a download from the node would have said, and a url signed by `createSignedUrl` caps it further: a passthrough never outlives the url that asked for it.
+
+What it gives up is worth knowing before turning it on.
+The url outlives the request that made it, so an object deleted a second later is still readable until it expires, and the caller that follows it is talking to the bucket rather than to a permission check.
+It is also visible: the answer is a 302 where upstream sends 200, which every client library follows and every recorded comparison notices, so the conformance suites run with it off.
+
 ## The postgres port
 
 A node serving many projects listens once on 5432 and proxies each connection to the project's own postgres, because a thousand databases on a node have no thousand ports to be exposed on.

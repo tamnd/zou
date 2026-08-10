@@ -133,6 +133,59 @@ impl Blobs {
         Ok(None)
     }
 
+    /// A url the caller can read these bytes from without coming back
+    /// here, good for `ttl`, or `None` when the store has no such
+    /// thing, which is every store but S3.
+    ///
+    /// `response` are the headers the answer should carry, passed to
+    /// the store as signed parameters, because the bytes go out without
+    /// this process seeing them and the content type a download
+    /// promised has to come from somewhere.
+    ///
+    /// A tenant that is not a branch presigns its own prefix and makes
+    /// no request at all. A branch has to find out which prefix holds
+    /// the bytes first, since a url is about one key and read through
+    /// is about several, and that costs one one-byte read per prefix it
+    /// misses. `None` when no prefix has them, which leaves the caller
+    /// answering for a row whose bytes are gone the way it always did.
+    pub async fn presigned_get(
+        &self,
+        key: String,
+        ttl: std::time::Duration,
+        response: Vec<(String, String)>,
+    ) -> Result<Option<String>, CasError> {
+        let at = match self.inherited.is_empty() {
+            true => format!("{}{key}", self.home),
+            false => {
+                let mut found = None;
+                for at in self.everywhere(&key) {
+                    let store = self.store.clone();
+                    let probe = at.clone();
+                    if blocking(move || store.get_range(&probe, 0, 1))
+                        .await?
+                        .is_some()
+                    {
+                        found = Some(at);
+                        break;
+                    }
+                }
+                match found {
+                    Some(at) => at,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let store = self.store.clone();
+        blocking(move || {
+            let response: Vec<(&str, &str)> = response
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            store.presigned_get(&at, ttl, &response)
+        })
+        .await
+    }
+
     /// Deleting bytes that are not there succeeds. A row whose upload
     /// failed halfway is a row with no bytes behind it, and removing it
     /// should answer the same as removing one with bytes.
@@ -231,6 +284,54 @@ mod tests {
 
     fn blobs() -> Blobs {
         Blobs::from_store(Arc::new(MemStore::new()))
+    }
+
+    /// A store that can name its objects with a url, which in practice
+    /// is S3 and nothing else, so a test that wants one has to be one.
+    /// It signs nothing: the url says which key it was asked about and
+    /// what it was asked to say about it, which is all this layer
+    /// decides.
+    struct Signing(MemStore);
+
+    impl CasStore for Signing {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, zou_store::Version)>, CasError> {
+            self.0.get(key)
+        }
+
+        fn put_if_match(
+            &self,
+            key: &str,
+            data: &[u8],
+            expected: Option<&zou_store::Version>,
+        ) -> Result<zou_store::Version, CasError> {
+            self.0.put_if_match(key, data, expected)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), CasError> {
+            self.0.delete(key)
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+            self.0.list(prefix)
+        }
+
+        fn presigned_get(
+            &self,
+            key: &str,
+            ttl: std::time::Duration,
+            response: &[(&str, &str)],
+        ) -> Result<Option<String>, CasError> {
+            let said: Vec<String> = response.iter().map(|(k, v)| format!("&{k}={v}")).collect();
+            Ok(Some(format!(
+                "https://bucket.example/{key}?expires={}{}",
+                ttl.as_secs(),
+                said.concat()
+            )))
+        }
+    }
+
+    fn ttl() -> std::time::Duration {
+        std::time::Duration::from_secs(60)
     }
 
     #[tokio::test]
@@ -332,6 +433,106 @@ mod tests {
         assert!(
             parent.get(own).await.unwrap().is_none(),
             "an upload into a branch is not an upload into what it branched from"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_with_no_urls_in_it_says_so() {
+        assert_eq!(
+            blobs()
+                .presigned_get(key("an-id", "1"), ttl(), vec![])
+                .await
+                .unwrap(),
+            None,
+            "a directory on a laptop is not reachable by url and neither is memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_url_names_the_tenants_own_key_and_what_the_answer_should_say() {
+        let store = Arc::new(Signing(MemStore::new()));
+        let blobs = Blobs::over(store, &["acme-prod".to_string()]);
+        let url = blobs
+            .presigned_get(
+                key("an-id", "1"),
+                ttl(),
+                vec![(
+                    "response-content-type".to_string(),
+                    "text/plain".to_string(),
+                )],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            url,
+            "https://bucket.example/tenants/acme-prod/files/objects/an-id/1\
+             ?expires=60&response-content-type=text/plain",
+            "the url is about the key under this tenant and nobody else's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_that_is_not_a_branch_signs_without_asking_the_store_anything() {
+        // The bytes are not there at all, and a url is still handed
+        // back: one prefix means there is nothing to find out, and a
+        // read that finds nothing is the caller's answer to give.
+        let store = Arc::new(Signing(MemStore::new()));
+        let blobs = Blobs::over(store, &["acme-prod".to_string()]);
+        assert!(
+            blobs
+                .presigned_get(key("never-uploaded", "1"), ttl(), vec![])
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_signs_the_prefix_that_holds_the_bytes() {
+        let store = Arc::new(Signing(MemStore::new()));
+        let parent = Blobs::over(store.clone(), &["prod".to_string()]);
+        let child = Blobs::over(store.clone(), &["pr-14".to_string(), "prod".to_string()]);
+        let inherited = key("an-id", "1");
+        parent
+            .put(inherited.clone(), b"from prod".to_vec())
+            .await
+            .unwrap();
+
+        // A url is about one key and read through is about several, so
+        // the branch has to find out which prefix has them before it can
+        // name one.
+        assert_eq!(
+            child
+                .presigned_get(inherited.clone(), ttl(), vec![])
+                .await
+                .unwrap(),
+            Some(
+                "https://bucket.example/tenants/prod/files/objects/an-id/1?expires=60".to_string()
+            )
+        );
+
+        let own = key("another-id", "1");
+        child
+            .put(own.clone(), b"in the branch".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            child.presigned_get(own, ttl(), vec![]).await.unwrap(),
+            Some(
+                "https://bucket.example/tenants/pr-14/files/objects/another-id/1?expires=60"
+                    .to_string()
+            ),
+            "home comes first here as it does everywhere else"
+        );
+
+        assert_eq!(
+            child
+                .presigned_get(key("nobody", "1"), ttl(), vec![])
+                .await
+                .unwrap(),
+            None,
+            "no prefix has the bytes, so there is no url to hand out"
         );
     }
 

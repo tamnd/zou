@@ -289,6 +289,20 @@ impl CasStore for StatsStore {
         out
     }
 
+    /// Not counted, because nothing happened: signing a url is
+    /// arithmetic and the request it enables is made by somebody else,
+    /// against the backend, without passing through here at all. That
+    /// is the whole point of it, and it is also what makes the op
+    /// counters stop being the whole story once passthrough is on.
+    fn presigned_get(
+        &self,
+        key: &str,
+        ttl: Duration,
+        response: &[(&str, &str)],
+    ) -> Result<Option<String>, CasError> {
+        self.inner.presigned_get(key, ttl, response)
+    }
+
     fn delete(&self, key: &str) -> Result<(), CasError> {
         let start = Instant::now();
         let out = self.inner.delete(key);

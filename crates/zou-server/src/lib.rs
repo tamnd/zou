@@ -208,6 +208,11 @@ pub struct Config {
     /// has, which is the honest thing to say about a project that has
     /// no pair at all.
     pub s3: Option<s3::Credentials>,
+    /// When a download is answered with a url to the store instead of
+    /// the bytes. None, the default, and every byte of every object is
+    /// copied through this process, which is what upstream does and
+    /// what the conformance suites measure.
+    pub passthrough: Option<object::Passthrough>,
 }
 
 impl Default for Config {
@@ -244,6 +249,7 @@ impl Default for Config {
             objects: None,
             tenant: None,
             s3: None,
+            passthrough: None,
         }
     }
 }

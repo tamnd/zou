@@ -94,6 +94,39 @@ const BODY_LIMIT: usize = 1024 * 1024;
 /// The cache-control an upload that says nothing about caching gets.
 pub(crate) const NO_CACHE: &str = "no-cache";
 
+/// When a download is answered with a url to the store rather than
+/// with the bytes.
+///
+/// A node that keeps objects on S3 and serves them itself pays for
+/// every byte twice, once out of the bucket and once out of its own
+/// network, and holds a request open for as long as the download takes,
+/// which on a large file is long enough to matter to everything else
+/// the node is doing. Handing back a signed url to the same object
+/// costs a redirect and no bytes at all.
+///
+/// What that gives up is everything on the way out. The url outlives
+/// the request that made it, so an object deleted a second later is
+/// still readable until the url expires, and a caller that follows the
+/// redirect is talking to the bucket rather than to a permission check.
+/// It is also visible: the answer is a 302 where upstream sends 200,
+/// which any client library follows and any recorded comparison
+/// notices.
+///
+/// So it is off unless an operator turns it on, it only applies to a
+/// whole object big enough to be worth a round trip, and the url is
+/// short lived.
+#[derive(Clone, Copy, Debug)]
+pub struct Passthrough {
+    /// The smallest object worth redirecting for. Under it the redirect
+    /// costs the caller more than the bytes would have.
+    pub min_bytes: u64,
+    /// How long the url works for. Long enough to start a large
+    /// download on a slow line, short enough that one copied out of a
+    /// proxy log is not a lasting way in. A signed url's own expiry
+    /// caps it further: a passthrough of one never outlives it.
+    pub ttl: std::time::Duration,
+}
+
 /// Which door a read came in by, which decides who it is asked as and
 /// what a bucket that is not public is told.
 #[derive(Clone, Copy, PartialEq)]
@@ -463,17 +496,20 @@ async fn send(
 
 /// The bytes of a row that has already been found and allowed.
 ///
-/// `until` is the moment a signed url stops working, and it is the one
-/// thing this answer has that a plain download does not: upstream sends
-/// `Expires` instead of `Cache-Control` when a request arrived on a
-/// token, because what a shared cache may keep is decided by the url's
-/// own lifetime rather than by what the upload said about caching.
+/// `until` is the moment a signed url stops working, as the second it
+/// happens at, and it is the one thing this answer has that a plain
+/// download does not: upstream sends `Expires` instead of
+/// `Cache-Control` when a request arrived on a token, because what a
+/// shared cache may keep is decided by the url's own lifetime rather
+/// than by what the upload said about caching. It is also the cap on a
+/// passthrough url, which must not outlive the url that asked for it.
 async fn deliver(
     app: &App,
     parts: &Parts,
     row: &ObjectRow,
-    until: Option<String>,
+    expires_at: Option<i64>,
 ) -> Result<Response, StorageError> {
+    let until = expires_at.map(http_date);
     let blobs = blobs(app)?;
     let mime = row.meta("mimetype");
     let mime = mime.as_str().unwrap_or_default();
@@ -515,6 +551,26 @@ async fn deliver(
         .and_then(|v| v.to_str().ok())
         .zip(size)
         .and_then(|(header, size)| wanted_range(header, size));
+
+    // Out of the way, when an operator asked for that, this is the shape
+    // it applies to, and the store can name the bytes with a url.
+    if let Some(pass) = app
+        .cfg
+        .passthrough
+        .filter(|pass| redirects(*pass, &parts.method, asked, size))
+        && let Some(url) = elsewhere(blobs, row, parts, mime, pass, expires_at).await?
+    {
+        // No caching of the redirect itself. It names a url that stops
+        // working, and a cache holding it past that answers a request
+        // with a failure nobody can explain.
+        return Response::builder()
+            .status(StatusCode::FOUND)
+            .header(header::LOCATION, url)
+            .header(header::CACHE_CONTROL, "no-store")
+            .header(header::CONTENT_LENGTH, 0)
+            .body(Body::empty())
+            .map_err(|e| StorageError::internal(e.to_string()));
+    }
 
     let (status, bytes, content_range) = match asked {
         Some((start, end)) => {
@@ -563,6 +619,75 @@ async fn deliver(
     }
     answer
         .body(Body::from(bytes))
+        .map_err(|e| StorageError::internal(e.to_string()))
+}
+
+/// Whether a passthrough applies to this request, which is a question
+/// about the request rather than about the store.
+///
+/// A HEAD is answered here as it always was, since it carries no bytes
+/// to save and a client asking what an object is should not have to
+/// follow anything to find out. A range is too: the request that
+/// follows a redirect is not this one, and a client that asked for part
+/// of a file and got all of it has been answered wrongly. So is an
+/// object under the threshold, and one whose row does not say how big
+/// it is, where a redirect would cost the caller a round trip to save a
+/// transfer that may be nothing at all.
+fn redirects(
+    pass: Passthrough,
+    method: &Method,
+    asked: Option<(u64, u64)>,
+    size: Option<u64>,
+) -> bool {
+    asked.is_none() && method != Method::HEAD && size.is_some_and(|size| size >= pass.min_bytes)
+}
+
+/// How long a passthrough url may work for.
+///
+/// A signed url with a minute left on it cannot hand out one that works
+/// for an hour, so the ttl an operator configured is capped by what is
+/// left of the url that asked. Spending an expired url never reaches
+/// here, so the remainder is positive, and it is floored at zero anyway
+/// because a clock is a clock.
+fn good_for(ttl: std::time::Duration, expires_at: Option<i64>, now: i64) -> std::time::Duration {
+    match expires_at {
+        Some(exp) => ttl.min(std::time::Duration::from_secs(
+            exp.saturating_sub(now).max(0) as u64,
+        )),
+        None => ttl,
+    }
+}
+
+/// The url a caller should follow instead of being sent the bytes, or
+/// `None` when there is not one: a store with no urls in it, which is
+/// every store but S3, or bytes that no prefix in this tenant's chain
+/// holds.
+///
+/// The two headers a download decides rather than reads are signed into
+/// the url, because after the redirect this process never sees the
+/// answer and the type an object is served as is not something a client
+/// should have to guess. The rest of what a download carries, the etag
+/// and the last modified, is the store's to say about its own object,
+/// and what it says is true.
+async fn elsewhere(
+    blobs: &Blobs,
+    row: &ObjectRow,
+    parts: &Parts,
+    mime: &str,
+    pass: Passthrough,
+    expires_at: Option<i64>,
+) -> Result<Option<String>, StorageError> {
+    let mut response = vec![("response-content-type".to_string(), served_type(mime))];
+    if let Some(name) = asked_for(parts, "download") {
+        response.push((
+            "response-content-disposition".to_string(),
+            attachment(&name),
+        ));
+    }
+    let ttl = good_for(pass.ttl, expires_at, crate::auth::now());
+    blobs
+        .presigned_get(row.key(), ttl, response)
+        .await
         .map_err(|e| StorageError::internal(e.to_string()))
 }
 
@@ -2316,7 +2441,7 @@ pub async fn signed_download(
         return Err(StorageError::missing_property("querystring", "token"));
     };
     let claims = signed_claims(&app, &token, &format!("{bucket}/{name}"), "download")?;
-    let until = claims.get("exp").and_then(Value::as_i64).map(http_date);
+    let until = claims.get("exp").and_then(Value::as_i64);
 
     let sess = superuser(&app).await?;
     let found = find(&sess, &bucket, &name).await;
@@ -2590,6 +2715,64 @@ mod tests {
             size_limit: most,
             mime_types: types.map(|list| list.iter().map(|t| t.to_string()).collect()),
         }
+    }
+
+    fn passthrough() -> Passthrough {
+        Passthrough {
+            min_bytes: 1024,
+            ttl: std::time::Duration::from_secs(900),
+        }
+    }
+
+    #[test]
+    fn a_whole_large_object_is_the_only_shape_that_redirects() {
+        let pass = passthrough();
+        assert!(redirects(pass, &Method::GET, None, Some(1024)));
+        assert!(
+            !redirects(pass, &Method::GET, None, Some(1023)),
+            "under the threshold the redirect costs more than the bytes would have"
+        );
+        assert!(
+            !redirects(pass, &Method::HEAD, None, Some(4096)),
+            "a HEAD carries no bytes to save"
+        );
+        assert!(
+            !redirects(pass, &Method::GET, Some((0, 15)), Some(4096)),
+            "a client that asked for part of a file must not be sent all of it"
+        );
+        assert!(
+            !redirects(pass, &Method::GET, None, Some(0)),
+            "an empty object is not worth a round trip"
+        );
+        assert!(
+            !redirects(pass, &Method::GET, None, None),
+            "a row that does not say how big it is cannot be measured against a threshold"
+        );
+    }
+
+    #[test]
+    fn a_signed_urls_own_expiry_caps_the_one_it_hands_out() {
+        let ttl = std::time::Duration::from_secs(900);
+        assert_eq!(
+            good_for(ttl, None, 1_000),
+            ttl,
+            "a plain download has no expiry to cap it"
+        );
+        assert_eq!(
+            good_for(ttl, Some(1_060), 1_000),
+            std::time::Duration::from_secs(60),
+            "a url with a minute left cannot hand out one that works for an hour"
+        );
+        assert_eq!(
+            good_for(ttl, Some(9_000), 1_000),
+            ttl,
+            "an expiry further out than the ttl leaves the ttl alone"
+        );
+        assert_eq!(
+            good_for(ttl, Some(900), 1_000),
+            std::time::Duration::ZERO,
+            "a clock that went backwards is not a longer url"
+        );
     }
 
     #[test]
