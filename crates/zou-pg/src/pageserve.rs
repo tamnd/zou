@@ -436,13 +436,20 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         }
 
         let applied = ingest.as_ref().map_or(0, ShardIngest::applied);
+        let seen = ingest.as_ref().map_or(0, ShardIngest::seen);
         let mem = ingest.as_ref().map_or(&empty_mem, ShardIngest::memtable);
         let now = Instant::now();
         parked.retain(|req| {
             // Zero asks for the latest durable state; anything else is
             // the durability watermark the reader saw, already safe.
+            // Covered means the stream bytes reached the watermark, not
+            // that `applied` did: the published durable is usually a
+            // WAL page boundary with a record spilling over it, and any
+            // complete record ending at or below the watermark has been
+            // parsed once its bytes are in, so the page state at
+            // `applied` is the page state at the watermark.
             let need = if req.lsn == 0 { durable_seen } else { req.lsn };
-            if applied >= need {
+            if seen >= need {
                 let at = if applied == 0 { u64::MAX } else { applied };
                 serve(&cfg, &*store, pool.as_ref(), &map, mem, req, at);
                 return false;
@@ -451,7 +458,7 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                 let msg = match &frozen {
                     Some(e) => format!("ingest frozen: {e}"),
                     None => format!(
-                        "ingest at {applied:#x} never reached {need:#x} within the wait cap"
+                        "ingest saw {seen:#x} but never reached {need:#x} within the wait cap"
                     ),
                 };
                 let _ = req.reply.send(Err(msg));

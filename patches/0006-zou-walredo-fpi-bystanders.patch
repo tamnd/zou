@@ -1,0 +1,43 @@
+Let bystander block refs with a full page image through the redo filter.
+
+The bystander filter from the walredo patch returns BLK_NOTFOUND for
+any block the request did not ask for, so records touching pages
+outside the batch cannot fault in state the worker does not have.
+That breaks on multi block full page image records. log_newpage_range
+packs up to 32 pages into a single XLOG_FPI record during index
+builds, and with data checksums on by default in 18 the same shape
+shows up as XLOG_FPI_FOR_HINT. The record lands in the chain of every
+page it covers, so a batch asking for one of them replays a record
+carrying images for 31 bystanders, and the FPI redo routine (and the
+gin and hash ones) insist on BLK_RESTORED for every image a record
+carries. Getting BLK_NOTFOUND instead is a FATAL in the worker and a
+failed read for the backend.
+
+Restoring an image is safe for a bystander: RestoreBlockImage
+overwrites the whole page without reading what was there, so no half
+replayed state can leak into a page the worker never materialized.
+So the filter now only swallows bystander refs that carry no
+applyable image.
+
+diff --git a/src/backend/access/transam/xlogutils.c b/src/backend/access/transam/xlogutils.c
+index a4e4f2a..ace70ad 100644
+--- a/src/backend/access/transam/xlogutils.c
++++ b/src/backend/access/transam/xlogutils.c
+@@ -379,9 +379,16 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
+ 	 * or write into them; their own requests replay these same records
+ 	 * against their full history.  Init references pass through, because
+ 	 * redo routines expect a valid buffer from an init and the page they
+-	 * build cannot be read again past this filter.
++	 * build cannot be read again past this filter.  A reference carrying
++	 * an image to apply passes through too: the restore below overwrites
++	 * the whole page without reading it, so no half replayed state can
++	 * leak in, and redo routines like the XLOG_FPI one insist on
++	 * BLK_RESTORED for every image a record carries.  log_newpage_range
++	 * packs up to 32 pages into one such record, so a batch routinely
++	 * sees images for blocks it never asked for.
+ 	 */
+ 	if (zou_redo_active && !willinit &&
++		!XLogRecBlockImageApply(record, block_id) &&
+ 		zou_redo_bystander(rlocator, forknum, blkno))
+ 	{
+ 		*buf = InvalidBuffer;
