@@ -15,6 +15,18 @@ pg_control. On Linux the worker locks itself down with seccomp
 before reading the first message, since it processes page bytes that
 ultimately come from tenants.
 
+The sandbox and the stats system disagree about DSM. Before every
+buffered read AsyncReadBuffers prepares a checksum failure report,
+and preparing one means creating a stats entry ref for the database,
+which can grow the shared stats arena by a fresh segment. dsm_create
+calls shm_open, the seccomp filter kills the worker on the spot, and
+the pool only sees a dead pipe. Whether the entry fits an already
+mapped segment depends on allocator state, so a store that lines up
+the misses fails its recovery every single time while everything
+else sails through. The worker's pages are scratch, their stats mean
+nothing, so both the preparation and the report skip out early under
+zou_redo_active.
+
 Records carry an explicit end LSN instead of letting the worker
 compute lsn plus the aligned record length. Redo routines stamp
 EndRecPtr into pages as the page LSN, and when a record crosses a
@@ -1214,6 +1226,48 @@ newer clang treats as an error.
  
  		/* it is not pinned yet */
  		reln->pincount = 0;
+--- a/src/backend/utils/activity/pgstat_database.c
++++ b/src/backend/utils/activity/pgstat_database.c
+@@ -17,6 +17,7 @@
+ 
+ #include "postgres.h"
+ 
++#include "access/zou_walredo.h"
+ #include "storage/procsignal.h"
+ #include "utils/pgstat_internal.h"
+ #include "utils/timestamp.h"
+@@ -146,6 +147,16 @@ pgstat_prepare_report_checksum_failure(Oid dboid)
+ {
+ 	Assert(!CritSectionCount);
+ 
++	/*
++	 * The zou redo worker runs under a seccomp allowlist that has no way
++	 * to create or map DSM segments, so creating the entry ref here can
++	 * kill the process inside dsm_create().  Its reads are scratch pages
++	 * whose stats mean nothing, skip the preparation entirely.  The
++	 * report function below tolerates the missing entry.
++	 */
++	if (zou_redo_active)
++		return;
++
+ 	/*
+ 	 * Just need to ensure this backend has an entry ref for the database.
+ 	 * That will allows us to report checksum failures without e.g. needing to
+@@ -171,6 +182,14 @@ pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount)
+ 	if (!pgstat_track_counts)
+ 		return;
+ 
++	/*
++	 * Even a create=false lookup can fault in an unmapped DSM segment,
++	 * which the zou redo worker's sandbox forbids.  See the matching
++	 * check in pgstat_prepare_report_checksum_failure().
++	 */
++	if (zou_redo_active)
++		return;
++
+ 	/*
+ 	 * Update the shared stats directly - checksum failures should never be
+ 	 * common enough for that to be a problem. Note that we pass create=false
 --- /dev/null
 +++ b/src/include/access/zou_walredo.h
 @@ -0,0 +1,75 @@
