@@ -1,5 +1,5 @@
-//! `zou db push`, `zou db reset` and `zou migration new`: a project's
-//! own migrations, applied to a zou database.
+//! `zou db push`, `zou db diff`, `zou db reset` and `zou migration
+//! new`: a project's own migrations, applied to a zou database.
 //!
 //! A Supabase project keeps its schema as timestamped files under
 //! `supabase/migrations` and a ledger of what has been applied in
@@ -17,6 +17,11 @@
 //! those come back because a container recreates them, and here they
 //! belong to the running server, so a reset that dropped them would
 //! break the api rather than reset the project.
+//!
+//! `diff` goes the other way. It starts a throwaway postgres, replays
+//! the migrations into it, and reports what the real database has that
+//! the migrations do not account for, which is whatever somebody did by
+//! hand or through Studio since the last one was written.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -25,9 +30,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::{Client, NoTls};
 
 use crate::config::{self, Project};
+use crate::schema::{self, Catalog};
+use crate::shadow::Shadow;
 
-pub const DB_USAGE: &str =
-    "usage: zou db <push [--dry-run] | reset [--force]> [--db-url <url>] [--config <config.toml>]";
+pub const DB_USAGE: &str = "usage: zou db <push [--dry-run] | diff [--file <name>] [--schema <name>] [--pg-bin <dir>] | reset [--force]> [--db-url <url>] [--config <config.toml>]";
 pub const MIGRATION_USAGE: &str = "usage: zou migration new <name> [--config <config.toml>]";
 
 /// The ledger the Supabase CLI reads and writes, so a database pushed
@@ -46,9 +52,11 @@ create table if not exists supabase_migrations.schema_migrations (
 reset client_min_messages;
 ";
 
-/// Schemas a reset leaves alone: postgres's own, and the ones this
-/// server puts there and depends on.
-const MANAGED: &[&str] = &[
+/// Schemas that are not the project's: postgres's own, and the ones
+/// this server puts there and depends on. A reset leaves them alone and
+/// a diff does not look at them, for the same reason either way, which
+/// is that nobody writes a migration for them.
+pub const MANAGED: &[&str] = &[
     "auth",
     "extensions",
     "graphql",
@@ -73,6 +81,22 @@ const MANAGED: &[&str] = &[
 /// about them, so their absence decides whether the grants run.
 const API_ROLES: &[&str] = &["anon", "authenticated", "service_role"];
 
+/// The public schema exactly as initdb leaves one, which is what a
+/// reset is trying to get back to.
+///
+/// A plain `create schema public` is not that: it would be owned by
+/// whoever ran it and it would not let PUBLIC in, where a fresh
+/// database has it owned by `pg_database_owner` and readable by
+/// everyone. The role is taken for the grant so that even the grantor
+/// recorded in the acl is the one initdb records, which is what makes a
+/// reset database and a fresh one compare equal.
+const PUBLIC_SCHEMA: &str = "
+create schema public authorization pg_database_owner;
+set role pg_database_owner;
+grant usage on schema public to public;
+reset role;
+";
+
 /// The grants the server's own bootstrap gives the public schema. A
 /// reset drops that schema, so the same grants go back on afterwards,
 /// otherwise the api roles would find a schema they cannot see.
@@ -89,26 +113,25 @@ alter default privileges in schema public
     grant all on functions to anon, authenticated, service_role;
 ";
 
+#[derive(Default)]
 struct Args {
     url: Option<String>,
     config: Option<PathBuf>,
     dry_run: bool,
     force: bool,
+    file: Option<String>,
+    schemas: Vec<String>,
+    pg_bin: Option<PathBuf>,
 }
 
 fn parse(argv: &[String]) -> Result<(String, Args), String> {
     let [verb, rest @ ..] = argv else {
         return Err(DB_USAGE.into());
     };
-    if verb != "push" && verb != "reset" {
+    if !["push", "diff", "reset"].contains(&verb.as_str()) {
         return Err(format!("no such db command {verb:?}\n{DB_USAGE}"));
     }
-    let mut args = Args {
-        url: None,
-        config: None,
-        dry_run: false,
-        force: false,
-    };
+    let mut args = Args::default();
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
         let mut need = |flag: &str| {
@@ -121,6 +144,20 @@ fn parse(argv: &[String]) -> Result<(String, Args), String> {
             "--config" => args.config = Some(PathBuf::from(need("--config")?)),
             "--dry-run" if verb == "push" => args.dry_run = true,
             "--force" if verb == "reset" => args.force = true,
+            "--file" | "-f" if verb == "diff" => args.file = Some(need("--file")?),
+            // Repeatable, the way the CLI takes it, and one flag with a
+            // comma separated list also works because somebody will
+            // write it that way.
+            "--schema" | "-s" if verb == "diff" => {
+                args.schemas.extend(
+                    need("--schema")?
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
+                );
+            }
+            "--pg-bin" if verb == "diff" => args.pg_bin = Some(PathBuf::from(need("--pg-bin")?)),
             other => return Err(format!("unexpected argument {other:?}\n{DB_USAGE}")),
         }
     }
@@ -367,7 +404,7 @@ async fn reset(client: &Client, project: Option<&Project>, dir: &Path) -> Result
         println!("dropped schema {schema}");
     }
     client
-        .batch_execute("create schema public")
+        .batch_execute(PUBLIC_SCHEMA)
         .await
         .map_err(|e| format!("cannot put the public schema back: {}", why(&e)))?;
     // On a database the server has served from, the api roles are
@@ -423,6 +460,121 @@ async fn seed(client: &Client, project: Option<&Project>) -> Result<(), String> 
     Ok(())
 }
 
+/// Every migration in the directory, replayed into a database that has
+/// seen none of them. Not `push`, which asks the ledger first and says
+/// what it did: here there is nothing in the ledger by construction and
+/// nobody is watching.
+async fn replay(client: &Client, dir: &Path) -> Result<usize, String> {
+    applied(client).await?;
+    let all = migrations(dir)?;
+    for m in &all {
+        apply(client, m).await?;
+    }
+    Ok(all.len())
+}
+
+/// What the real database has that the migrations do not account for.
+///
+/// The shadow gets the same bootstrap the server runs, so `auth.uid()`
+/// in a policy and a foreign key to `auth.users` both resolve, and then
+/// the migrations. What comes back is the statements that would turn
+/// the shadow into the real database, which is the migration nobody
+/// wrote.
+async fn diff(
+    client: &Client,
+    project: Option<&Project>,
+    dir: &Path,
+    args: &Args,
+) -> Result<(), String> {
+    let mut shadow = Shadow::start(&crate::shadow::pg_bin(args.pg_bin.as_deref()))?;
+    let ghost = shadow.connect().await?;
+    // The bootstrap says "already exists, skipping" about half of what
+    // it does, which on a database being made for this one command is
+    // not news.
+    ghost
+        .batch_execute("set client_min_messages = warning")
+        .await
+        .map_err(|e| format!("cannot quiet the shadow database: {}", why(&e)))?;
+    zou_server::sql::bootstrap(&ghost)
+        .await
+        .map_err(|e| format!("cannot bootstrap the shadow database: {}", why(&e)))?;
+    // The bootstrap puts pgcrypto and uuid-ossp in the extensions
+    // schema and puts that schema on the database's search path, which
+    // only a later session would pick up. A migration calling
+    // gen_salt() unqualified has to find it in this one.
+    ghost
+        .batch_execute("set search_path = \"$user\", public, extensions")
+        .await
+        .map_err(|e| format!("cannot set the shadow search path: {}", why(&e)))?;
+    let count = replay(&ghost, dir).await?;
+    eprintln!("replayed {count} migrations into a shadow database");
+
+    let schemas = if args.schemas.is_empty() {
+        // Both sides, because a schema that exists in only one of them
+        // is exactly the kind of thing this is looking for.
+        let mut all: BTreeSet<String> = own_schemas(client).await?.into_iter().collect();
+        all.extend(own_schemas(&ghost).await?);
+        all.into_iter().collect()
+    } else {
+        args.schemas.clone()
+    };
+    // Nothing on the search path while the catalogs are read, so
+    // postgres writes every name in the definitions it hands back in
+    // full. A view whose body says `from widgets` means a different
+    // table depending on who is asking, and a difference in the answer
+    // is not something this should have to guess at.
+    for side in [&ghost, client] {
+        side.batch_execute("set search_path = ''")
+            .await
+            .map_err(|e| format!("cannot clear the search path: {}", why(&e)))?;
+    }
+    let mut before = Catalog::read(&ghost, &schemas).await?;
+    let mut after = Catalog::read(client, &schemas).await?;
+    // The shadow is bootstrapped, so it has the api roles and the
+    // grants that come with them. A database nobody has made a request
+    // against yet has neither, and reporting that as a difference
+    // would be reporting on the server rather than on the project.
+    let api_grants = roles_exist(client).await?;
+    if !api_grants {
+        before.forget_grants_to(API_ROLES);
+        after.forget_grants_to(API_ROLES);
+    }
+    let statements = schema::diff(&before, &after);
+
+    eprintln!(
+        "compared {} in both, not compared: {}",
+        schemas.join(", "),
+        schema::UNREAD.join(", ")
+    );
+    if !api_grants {
+        eprintln!(
+            "the api roles are not there yet, so grants to {} were left alone",
+            API_ROLES.join(", ")
+        );
+    }
+    if statements.is_empty() {
+        eprintln!("no changes");
+        return Ok(());
+    }
+    let sql = format!("{}\n", statements.join("\n\n"));
+    let Some(name) = &args.file else {
+        print!("{sql}");
+        return Ok(());
+    };
+    let dir = project
+        .map(Project::migrations)
+        .unwrap_or_else(|| PathBuf::from("supabase/migrations"));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let path = dir.join(format!("{}_{}.sql", stamp(now), slug(name)));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    std::fs::write(&path, &sql).map_err(|e| format!("write {}: {e}", path.display()))?;
+    println!("{}", path.display());
+    Ok(())
+}
+
 pub fn run(argv: &[String]) -> Result<(), String> {
     let (verb, args) = parse(argv)?;
     let project = config::locate(args.config.as_deref())?;
@@ -444,6 +596,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         let client = connect(&url).await?;
         match verb.as_str() {
             "push" => push(&client, &dir, args.dry_run).await,
+            "diff" => diff(&client, project.as_ref(), &dir, &args).await,
             _ => reset(&client, project.as_ref(), &dir).await,
         }
     })
@@ -552,9 +705,23 @@ mod tests {
         let (verb, args) = parse(&argv(&["reset", "--force"])).unwrap();
         assert_eq!(verb, "reset");
         assert!(args.force);
+        let (verb, args) = parse(&argv(&[
+            "diff",
+            "-f",
+            "widgets",
+            "--schema",
+            "public,shop",
+            "--schema",
+            "audit",
+        ]))
+        .unwrap();
+        assert_eq!(verb, "diff");
+        assert_eq!(args.file.as_deref(), Some("widgets"));
+        assert_eq!(args.schemas, ["public", "shop", "audit"]);
         assert!(parse(&argv(&["push", "--force"])).is_err(), "not this verb");
         assert!(parse(&argv(&["reset", "--dry-run"])).is_err());
-        assert!(parse(&argv(&["diff"])).is_err(), "not written yet");
+        assert!(parse(&argv(&["push", "--file", "x"])).is_err());
+        assert!(parse(&argv(&["hoover"])).is_err());
         assert!(parse(&argv(&[])).is_err());
     }
 

@@ -88,14 +88,26 @@ zou migration new "add users table"    # supabase/migrations/20240102030405_add_
 zou db push --dry-run                  # what would be applied, in name order
 zou db push                            # apply it, and write the ledger
 zou db reset                           # drop the project's schemas, replay everything, seed
+zou db diff                            # what the database has that no migration accounts for
+zou db diff -f "studio changes"        # the same, written as the next migration
 ```
 
 The database is the one `[db] port` names, or `--db-url`, or `ZOU_DB_URL`, in that order.
 Each file is applied as one transaction with its ledger row written inside it, so a file that fails half way leaves neither its tables nor its version behind, and the next `zou db push` starts again from the same place.
 
-A reset drops every schema the project owns and puts `public` back with the grants the api roles need, then replays the migrations and runs the seed that `[db.seed] sql_paths` names, `./seed.sql` by default.
+A reset drops every schema the project owns and puts `public` back the way initdb leaves one, then replays the migrations and runs the seed that `[db.seed] sql_paths` names, `./seed.sql` by default.
 It leaves the schemas this server runs on alone, `auth`, `storage`, `extensions` and `zou` among them, because here those belong to the running server rather than to a container somebody can throw away.
 That is also why it refuses a database that is not on this machine unless you say `--force`.
+
+`zou db diff` answers the other question, which is what somebody changed in Studio or in psql and never wrote down.
+It starts a postgres of its own on a socket in a temporary directory, gives it the same bootstrap a zou database gets so that `auth.uid()` in a policy and a foreign key to `auth.users` both resolve, replays the migrations into it, and prints the statements that would turn that database into the real one.
+Give it `-f <name>` and those statements become the next migration instead, `--schema <name>` to look at some schemas rather than all of them, and `--pg-bin <dir>` if the postgres binaries are not where `zou dev` finds them.
+Read only on the real database, so there is no `--force` to think about.
+
+It compares schemas, enums, tables and their columns, constraints, indexes, views, functions, triggers, row level security and its policies, table and schema grants, and comments.
+It does not compare default privileges, column privileges, ownership, extensions, publications, event triggers, domains, composite types, standalone sequences or foreign tables, and it says so on every run rather than letting "no changes" mean "nothing I looked at".
+Grants on a table it is already creating are left out too, because a new table arrives with whatever the default privileges give it.
+A database nobody has made a request against yet does not have `anon`, `authenticated` or `service_role` in it, because the server creates those on its first request, so on that one the grants to those three roles are left alone and the run says so.
 
 ## Mail on a laptop
 

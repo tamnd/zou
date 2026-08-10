@@ -13,7 +13,11 @@ mod info;
 mod inspect;
 mod map;
 #[cfg(unix)]
+mod schema;
+#[cfg(unix)]
 mod serve;
+#[cfg(unix)]
+mod shadow;
 mod shard;
 mod stats;
 #[cfg(unix)]
