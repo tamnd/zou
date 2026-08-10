@@ -2650,8 +2650,11 @@ name = "zou-ops"
 version = "0.0.1"
 dependencies = [
  "env_logger",
+ "getrandom 0.3.4",
  "log",
  "serde_json",
+ "tokio",
+ "ureq",
 ]
 
 [[package]]

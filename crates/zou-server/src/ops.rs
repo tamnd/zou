@@ -15,6 +15,11 @@
 //! path counts requests. This module owns the names, so that the names
 //! are in one place and a call site is one line.
 //!
+//! Traces are the other half and they do not live on this listener at
+//! all, because a trace is not scraped: it is made on the request path
+//! and posted to a collector. What is here is the naming, again, so
+//! that a span is opened in one line at the place the work happens.
+//!
 //! The store's numbers are not counted here at all. They already exist,
 //! in the shared counter file `ZOU_STORE_STATS` names, which is how
 //! ops made by a postgres backend in another process get counted at
@@ -32,6 +37,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use zou_ops::metrics::{Registry, SECONDS};
 use zou_ops::registry;
+use zou_ops::trace;
 
 /// What Prometheus expects a scrape to be, version and all. A scraper
 /// that gets `application/json` here does not guess.
@@ -175,13 +181,33 @@ const STORE_SECONDS: &[f64] = &[
     0.131_072, 0.524_288, 2.097_152, 8.388_608,
 ];
 
-/// Count a request and how long it took. Layered on the whole router,
-/// so a 404 and a 429 are counted too, which are the two a graph is
-/// most often drawn to explain.
+/// Count a request and how long it took, and trace it. Layered on the
+/// whole router, so a 404 and a 429 are counted too, which are the two
+/// a graph is most often drawn to explain.
+///
+/// The trace context comes from the caller when the caller sent one, so
+/// this server's span is a child of whatever made the call, and a new
+/// trace starts here when it did not. The inner service runs under that
+/// context, which is what puts the trace ids on the log lines a request
+/// writes as well as on the span.
 pub async fn measure(req: Request<Body>, next: Next) -> Response {
     let surface = surface(req.uri().path());
     let start = Instant::now();
-    let answer = next.run(req).await;
+    let mut span = opening(&req, surface);
+    let answer = match span.as_ref().map(|(_, ids)| *ids) {
+        Some(ids) => trace::with(ids, next.run(req)).await,
+        None => next.run(req).await,
+    };
+    if let Some((mut span, _)) = span.take() {
+        span.int(
+            "http.response.status_code",
+            i64::from(answer.status().as_u16()),
+        );
+        if answer.status().is_server_error() {
+            span.failed(answer.status().to_string());
+        }
+        record(span);
+    }
     let status = answer.status().as_u16().to_string();
     registry()
         .counter(
@@ -199,6 +225,65 @@ pub async fn measure(req: Request<Body>, next: Next) -> Response {
         )
         .since(start);
     answer
+}
+
+/// The span a request opens, and the context to run it under, or None
+/// when nothing is collecting traces or the caller asked for this one
+/// not to be recorded.
+///
+/// The name is the method and the surface rather than the path, because
+/// a span name is grouped on the same way a metric label is and a path
+/// carries a tenant ref, an object key and a row filter in it. The path
+/// itself is an attribute, where high cardinality is what a trace is
+/// for. The query string is not, at any cardinality: `?apikey=<jwt>` is
+/// a spelling this server accepts, so exporting the query would mail
+/// credentials to a collector.
+fn opening(req: &Request<Body>, surface: &'static str) -> Option<(trace::Span, trace::Ids)> {
+    trace::tracer()?;
+    let parent = req
+        .headers()
+        .get(trace::HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(trace::Ids::parse);
+    let ids = parent.map_or_else(|| trace::Ids::root(true), |parent| parent.child());
+    if !ids.sampled {
+        return None;
+    }
+    let mut span = trace::Span::start(
+        format!("{} /{surface}", req.method()),
+        trace::Kind::Server,
+        ids,
+        parent.map(|parent| parent.span),
+    );
+    span.text("http.request.method", req.method().as_str())
+        .text("url.path", req.uri().path())
+        .text("zou.surface", surface);
+    Some((span, ids))
+}
+
+/// An internal span under whatever request is being served, or None
+/// when nothing is collecting or this is not happening under a request.
+///
+/// Callers hold an `Option` and do nothing with a `None`, which is the
+/// whole cost of tracing being off: no span is built rather than one
+/// built and thrown away.
+pub fn span(name: &'static str) -> Option<zou_ops::trace::Span> {
+    trace::tracer()?;
+    let parent = trace::current()?;
+    Some(trace::Span::start(
+        name,
+        trace::Kind::Internal,
+        parent.child(),
+        Some(parent.span),
+    ))
+}
+
+/// Stamp a span and queue it. A span that is never passed here is never
+/// exported, which is what should happen on a path that returned early.
+pub fn record(span: zou_ops::trace::Span) {
+    if let Some(tracer) = trace::tracer() {
+        tracer.record(span.end());
+    }
 }
 
 /// Which surface a path belongs to, as a fixed set of names.
@@ -403,5 +488,145 @@ mod tests {
     fn a_counter_file_that_is_not_there_is_a_warning_and_not_a_failed_scrape() {
         let dir = tempfile::tempdir().expect("a directory");
         assert!(store_families(&dir.path().join("nothing")).is_none());
+    }
+
+    #[derive(Default)]
+    struct Collected {
+        spans: std::sync::Mutex<Vec<trace::Span>>,
+    }
+
+    impl trace::Sink for Collected {
+        fn send(&self, batch: &[trace::Span]) {
+            self.spans
+                .lock()
+                .expect("the lock")
+                .extend_from_slice(batch);
+        }
+    }
+
+    /// The process tracer, installed once for this binary, since that is
+    /// what a tracer is. Every test here looks for its own span rather
+    /// than assuming it is the only one in the collection.
+    fn sink() -> &'static std::sync::Arc<Collected> {
+        static SINK: std::sync::OnceLock<std::sync::Arc<Collected>> = std::sync::OnceLock::new();
+        SINK.get_or_init(|| {
+            let sink = std::sync::Arc::new(Collected::default());
+            trace::install_with(sink.clone(), std::time::Duration::from_millis(5));
+            sink
+        })
+    }
+
+    fn traced() -> Router {
+        Router::new()
+            .fallback(|| async { (StatusCode::OK, "ok").into_response() })
+            .layer(axum::middleware::from_fn(measure))
+    }
+
+    async fn ask(url: &str, traceparent: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().uri(url);
+        if let Some(header) = traceparent {
+            req = req.header(trace::HEADER, header);
+        }
+        traced()
+            .oneshot(req.body(Body::empty()).expect("a request"))
+            .await
+            .expect("an answer")
+            .status()
+    }
+
+    /// The span for `path`, waited for, since the exporter thread sends
+    /// on its own window.
+    fn exported(path: &str) -> trace::Span {
+        for _ in 0..200 {
+            let spans = sink().spans.lock().expect("the lock");
+            let mine = spans.iter().find(|span| {
+                span.attrs
+                    .iter()
+                    .any(|(key, at)| *key == "url.path" && *at == trace::At::Text(path.to_string()))
+            });
+            if let Some(span) = mine {
+                return span.clone();
+            }
+            drop(spans);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("no span for {path}");
+    }
+
+    #[tokio::test]
+    async fn a_request_joins_the_trace_it_arrived_in() {
+        sink();
+        let status = ask(
+            "/rest/v1/todos",
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let span = exported("/rest/v1/todos");
+        assert_eq!(span.ids.trace_hex(), "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(
+            span.parent.map(|parent| parent.to_vec()),
+            Some(vec![0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7]),
+            "the caller's span is this one's parent"
+        );
+        // The name is grouped on, so it says the surface and not the
+        // path, which carries a tenant ref and a row filter in it.
+        assert_eq!(span.name, "GET /rest");
+        assert_eq!(span.kind, trace::Kind::Server);
+        assert!(
+            span.attrs
+                .contains(&("http.response.status_code", trace::At::Int(200)))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_string_never_leaves_this_process() {
+        // `?apikey=<jwt>` is a spelling this server accepts, so a span
+        // that carried the query would mail credentials to a collector.
+        sink();
+        let status = ask("/auth/v1/user?apikey=header.payload.signature", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let span = exported("/auth/v1/user");
+        for (key, at) in &span.attrs {
+            if let trace::At::Text(text) = at {
+                assert!(!text.contains("apikey"), "{key} carried the query");
+                assert!(!text.contains("signature"), "{key} carried the query");
+            }
+        }
+        assert!(
+            span.parent.is_none(),
+            "nothing sent a header, so this is a root"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broken_traceparent_costs_the_caller_nothing() {
+        sink();
+        let status = ask("/storage/v1/object/pics/a.png", Some("not-a-traceparent")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a header nobody can read is not worth refusing a request over"
+        );
+        let span = exported("/storage/v1/object/pics/a.png");
+        assert!(span.parent.is_none(), "and the trace starts here instead");
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_said_not_to_record_is_believed() {
+        sink();
+        let status = ask(
+            "/functions/v1/hello",
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // Long enough for the exporter window to have passed twice.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let spans = sink().spans.lock().expect("the lock");
+        assert!(
+            !spans.iter().any(|span| span.name == "GET /functions"),
+            "the sampled flag was zero"
+        );
     }
 }

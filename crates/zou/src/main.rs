@@ -51,6 +51,10 @@ fn main() -> ExitCode {
     // ZOU_LOG_FORMAT=json spells them as json lines for a collector.
     // Results meant for scripts stay on stdout untouched.
     zou_ops::logs::init("info");
+    // And traces, but only when ZOU_OTLP_ENDPOINT names a collector.
+    // Nothing set and there is no thread and no span, which is what a
+    // one shot command like `zou stats` should pay for tracing.
+    zou_ops::trace::from_env("zou");
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
