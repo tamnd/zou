@@ -1,8 +1,8 @@
 # Embedded
 
 A whole Supabase compatible project inside another process, with no daemon to start, no port to pick, and no docker compose file.
-This is the `zou-embed` crate, and `libzou`, which is the same thing behind a C ABI.
-The Node, Python, and Go bindings are built over `libzou` and are not there yet.
+This is the `zou-embed` crate, `libzou`, which is the same thing behind a C ABI, and the node package over it.
+The Python and Go bindings are next and are not there yet.
 
 ## What it is
 
@@ -130,6 +130,50 @@ ZOU_PG_BIN=$PWD/build/pg/bin crates/libzou/tests/smoke.sh
 
 That builds the library, compiles [`crates/libzou/tests/smoke.c`](../crates/libzou/tests/smoke.c) against the header with `-Wall -Wextra -Werror`, and runs it: open, sign somebody up, get refused without a key, take a port, checkpoint, branch or be told why not, close.
 It runs in CI on the job that builds the patched Postgres.
+
+## From node
+
+```js
+import { createZou } from "zou";
+
+const zou = await createZou({ dir: "./data" });
+const supabase = zou.client();
+
+await supabase.from("todos").select("*").eq("done", false);
+await zou.close();
+```
+
+That is a real supabase-js client and there is no socket under it.
+`client()` builds one with a `fetch` that hands the request to the same router in this process, so a `.from()`, a `.rpc()`, an `auth.signUp()`, or a storage upload goes where it would have gone and comes back the way it would have come back.
+`client()` takes the anon key unless you pass `zou.serviceRoleKey`, because a test that means to skip row level security should have to say so in the same place it would against a hosted project.
+
+supabase-js is a peer dependency and an optional one.
+A project that only wants `zou.fetch` or a port does not install it, and a project that calls `client()` without it gets a sentence rather than a stack.
+
+```js
+const zou = await createZou();                     // ephemeral, gone on close
+const zou = await createZou({ url: "s3://bucket/app" });
+const port = await zou.listen(0);                  // 0 asks the kernel
+const preview = await zou.branch("pr-142");
+await zou.checkpoint();
+```
+
+`zou.dsn` is the other door, for a host that wants `pg` or `psql` on the database directly, which is how a test suite creates its own schema before serving it.
+`zou.anonKey`, `zou.serviceRoleKey`, `zou.target`, and `zou.tenant` are the rest of what `zou status` prints.
+`zou.url` is the port once `listen` has been called, and a name that resolves nowhere before that, since before that there is nothing to resolve.
+
+The binding is [napi](https://napi.rs) over `zou-embed` rather than over the C ABI, since it is Rust either way and a Rust crate calling its own C ABI is a longer road to the same place.
+`libzou` is the road for everything that is not Rust.
+Everything that takes time is a task on the thread pool rather than work on the thread node runs javascript on, so opening a project and answering a request do not stop the event loop.
+
+```bash
+crates/zou-node/build.sh
+npm --prefix crates/zou-node install
+ZOU_PG_BIN=$PWD/build/pg/bin npm --prefix crates/zou-node test
+```
+
+`build.sh` is cargo plus a copy: node loads a cdylib under a name ending in `.node` and that is the whole build.
+The tests open real projects and run in CI on the job that builds the patched Postgres.
 
 ## Testing it
 

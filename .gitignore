@@ -15,3 +15,8 @@ fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
 fuzz/Cargo.lock
+
+# the node binding: the addon is built, and node_modules is node_modules
+crates/zou-node/zou.node
+node_modules/
+package-lock.json

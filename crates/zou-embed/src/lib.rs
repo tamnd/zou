@@ -639,7 +639,12 @@ impl Zou {
         self.shutdown()
     }
 
-    fn shutdown(&self) -> Result<(), Error> {
+    /// The same thing through a shared handle, for a binding that hands
+    /// out an `Arc` and cannot consume what it gave away. Calling it
+    /// twice is fine and the second call does nothing, which is what
+    /// makes it safe for a garbage collected language to call it from
+    /// both an explicit close and whatever collects the object later.
+    pub fn shutdown(&self) -> Result<(), Error> {
         let mut closed = self.closed.lock().expect("the close flag");
         if *closed {
             return Ok(());
