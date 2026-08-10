@@ -44,6 +44,39 @@ S3 style targets read `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the e
 The cluster superuser is `postgres`, whatever the account running the node is called, because that is the role a project's own migrations run as on a hosted Supabase project and the owner of a database should not depend on which account started it.
 So connect by naming it, `psql -h 127.0.0.1 -p 5432 -U postgres -d postgres`, and a client that leaves the user out is told there is no role by that name.
 
+## A project that already has a config.toml
+
+A Supabase project keeps its ports, its auth switches and its provider credentials in `supabase/config.toml`, and `zou dev` reads that file rather than asking for the same settings a second time.
+Run it from anywhere inside the project and it finds the file by walking up, takes `[api] port` as the http port and `[db] port` as the postgres port, serves the schemas `[api] schemas` names in that order, and turns the rest into the environment variables this binary already reads.
+
+```bash
+zou dev ./store                        # ports and settings from supabase/config.toml
+zou dev ./store --config other/config.toml
+zou dev ./store --no-config            # read nothing, the flags and the defaults only
+```
+
+A flag beats the file and anything already in the environment beats it too, so pinning `ZOU_MAILER_AUTOCONFIRM` for one run does not mean editing the project's file.
+Nothing is served over http unless the file or a flag asks for a port, which keeps `zou dev` on its own a postmaster and nothing else.
+
+`zou status` prints what a client should be pointed at, in the shape `supabase status` prints it, and exits non zero when nothing is listening, so a script can wait on it.
+
+```bash
+$ zou status
+         API URL: http://127.0.0.1:54321
+  S3 Storage URL: http://127.0.0.1:54321/storage/v1/s3
+          DB URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+      JWT secret: ...
+        anon key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+service_role key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+          config: /home/me/app/supabase/config.toml
+    not read yet: api.max_rows, db.shadow_port, studio.port
+$ eval "$(zou status -o env)"          # API_URL, DB_URL, ANON_KEY, SERVICE_ROLE_KEY
+$ zou status -o json                   # the same, for a tool that parses it
+```
+
+The keys are minted from `ZOU_JWT_SECRET`, so pin one, otherwise `zou dev` generates a secret it logs and no other process can know what it signed.
+The last line is the honest part: every setting in the file that zou has no answer for yet is named rather than ignored in silence.
+
 A path ending `.zou` is the single file backend. Every sequential tool works over it today, `zou info`, `zou branch`, `zou-bootstrap`, `zou-restore`, while `zou dev` needs the multi process postmaster and waits on the in process engine, see the note in docs/storage-engine.md.
 
 ## Mail on a laptop

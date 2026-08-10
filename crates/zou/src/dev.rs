@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::config::{self, Project};
 use zou_pg::{bootstrap, restore};
 use zou_store::layout::TenantLayout;
 use zou_store::{CasStore, Manifest, open_store};
@@ -37,6 +38,10 @@ use zou_store::{CasStore, Manifest, open_store};
 /// a store initdb'd by one command has to be openable by the other.
 pub const SUPERUSER: &str = "postgres";
 
+/// The postgres port with nothing else to go on. Supabase projects
+/// name their own, usually 54322, and the file is read for it.
+const DEFAULT_PORT: u16 = 5432;
+
 /// How many times in a row the postmaster may die before its first
 /// accepted connection until we stop retrying. A crash after it was up
 /// resets the count, that is the recover-and-continue path.
@@ -52,10 +57,18 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 pub struct Args {
     pub target: String,
     pub pg_bin: PathBuf,
-    pub port: u16,
+    /// None until the project file and the defaults have had their
+    /// say, which happens in `run` rather than here, so parsing stays a
+    /// pure function of the command line.
+    pub port: Option<u16>,
     pub http: Option<u16>,
     pub ops: Option<u16>,
     pub runtime: PathBuf,
+    /// A config.toml named on the command line. With nothing named the
+    /// working directory is searched, and `--no-config` searches
+    /// nowhere.
+    pub config: Option<PathBuf>,
+    pub no_config: bool,
 }
 
 use crate::DEV_USAGE as USAGE;
@@ -63,17 +76,19 @@ use crate::DEV_USAGE as USAGE;
 pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut target = None;
     let mut pg_bin = None;
-    let mut port = 5432u16;
+    let mut port = None;
     let mut http = None;
     let mut ops = None;
     let mut runtime = None;
+    let mut config = None;
+    let mut no_config = false;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--pg-bin" => pg_bin = Some(PathBuf::from(need(&mut it, "--pg-bin")?)),
             "--port" => {
                 let raw = need(&mut it, "--port")?;
-                port = raw.parse().map_err(|_| format!("bad port {raw:?}"))?;
+                port = Some(raw.parse().map_err(|_| format!("bad port {raw:?}"))?);
             }
             "--http" => {
                 let raw = need(&mut it, "--http")?;
@@ -84,6 +99,8 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 ops = Some(raw.parse().map_err(|_| format!("bad ops port {raw:?}"))?);
             }
             "--runtime" => runtime = Some(PathBuf::from(need(&mut it, "--runtime")?)),
+            "--config" => config = Some(PathBuf::from(need(&mut it, "--config")?)),
+            "--no-config" => no_config = true,
             other if target.is_none() && !other.starts_with('-') => {
                 target = Some(other.to_string());
             }
@@ -103,7 +120,50 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         http,
         ops,
         runtime,
+        config,
+        no_config,
     })
+}
+
+/// The project file a command run from here belongs to, read and put
+/// into this process's environment. A flag beats the file, the file
+/// beats a plain `zou dev` default, and anything already in the
+/// environment beats the file too, which is what `export` enforces.
+///
+/// A file that cannot be read is an error rather than a shrug: a
+/// project that has a config.toml means it.
+fn project(args: &Args) -> Result<Option<Project>, String> {
+    let path = match (&args.config, args.no_config) {
+        (_, true) => None,
+        (Some(path), _) => Some(path.clone()),
+        (None, _) => config::find(&std::env::current_dir().map_err(|e| format!("cwd: {e}"))?),
+    };
+    let Some(path) = path else { return Ok(None) };
+    let project = Project::read(&path)?;
+    log::info!("reading {}", project.path.display());
+    let set = project.export();
+    if !set.is_empty() {
+        log::info!("the project file sets {}", set.join(", "));
+    }
+    if !project.unread.is_empty() {
+        log::info!(
+            "{} settings in it are not read yet, zou status names them",
+            project.unread.len()
+        );
+    }
+    Ok(Some(project))
+}
+
+/// The two ports this command listens on, once the flags, the project
+/// file and the defaults have all had their say. Nothing is served
+/// over http unless a flag or a project asks for it.
+fn ports(args: &Args, project: Option<&Project>) -> (u16, Option<u16>) {
+    let db = args
+        .port
+        .or_else(|| project.and_then(|p| p.db))
+        .unwrap_or(DEFAULT_PORT);
+    let http = args.http.or_else(|| project.and_then(|p| p.api));
+    (db, http)
 }
 
 fn need<'a>(it: &mut std::slice::Iter<'a, String>, flag: &str) -> Result<&'a String, String> {
@@ -144,7 +204,12 @@ fn shared_buffers() -> String {
 /// prints its own, copy them into the client and go. The SQL pool
 /// dials the postmaster this process supervises, lazily, so the order
 /// the two come up in does not matter.
-fn start_http(port: u16, pg_port: u16, target: String) -> Result<(), String> {
+fn start_http(
+    port: u16,
+    pg_port: u16,
+    target: String,
+    project: Option<&Project>,
+) -> Result<(), String> {
     let secret = match std::env::var("ZOU_JWT_SECRET") {
         Ok(s) if !s.is_empty() => s,
         _ => {
@@ -272,10 +337,27 @@ fn start_http(port: u16, pg_port: u16, target: String) -> Result<(), String> {
     }
     // Local connections are trust, the stock dev loop layout.
     let dsn = format!("host=127.0.0.1 port={pg_port} user={SUPERUSER} dbname=postgres");
+    // What the project's own config.toml says, when it has one. The
+    // schemas matter most: PostgREST serves what it was told to serve
+    // and the first of them is what a request that names no schema
+    // gets, so a project keeping its tables outside public is broken
+    // until this arrives.
+    let schemas = project.map(|p| p.schemas.clone()).unwrap_or_default();
+    let site_url = project.and_then(|p| p.site_url.clone());
     std::thread::spawn(move || {
         let cfg = zou_server::Config {
             jwt_secret: secret.into_bytes(),
             pg: Some(dsn),
+            // A project that named its schemas gets them in its own
+            // order, and one that did not gets the server's default.
+            schemas: if schemas.is_empty() {
+                zou_server::Config::default().schemas
+            } else {
+                schemas
+            },
+            // Where a confirmation link sends a person, which is the
+            // project's own front end and not this server.
+            site_url,
             // The dev loop knows where it answers, so its access tokens
             // say so rather than naming GoTrue's default port, which
             // nothing here listens on.
@@ -418,6 +500,9 @@ pub fn run(args: &Args) -> Result<(), String> {
         .map_err(|e| format!("chmod {}: {e}", sock.display()))?;
     log::info!("runtime directory {}", args.runtime.display());
 
+    let project = project(args)?;
+    let (port, http) = ports(args, project.as_ref());
+
     let store: Arc<dyn CasStore> = Arc::from(open_store(&args.target)?);
     let layout = TenantLayout::new("local");
     let fresh = match store
@@ -488,8 +573,8 @@ pub fn run(args: &Args) -> Result<(), String> {
         libc::signal(libc::SIGTERM, handler);
     }
 
-    if let Some(http_port) = args.http {
-        start_http(http_port, args.port, args.target.clone())?;
+    if let Some(http_port) = http {
+        start_http(http_port, port, args.target.clone(), project.as_ref())?;
     }
 
     if let Some(ops_port) = args.ops {
@@ -502,7 +587,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         let mut child = Command::new(&postgres)
             .arg("-D")
             .arg(&pgdata)
-            .args(["-p", &args.port.to_string()])
+            .args(["-p", &port.to_string()])
             .arg("-k")
             .arg(&sock)
             .args(["-c", "listen_addresses=127.0.0.1"])
@@ -520,7 +605,6 @@ pub fn run(args: &Args) -> Result<(), String> {
         let echo = {
             let stderr = child.stderr.take().ok_or("no stderr pipe")?;
             let ready = Arc::clone(&ready);
-            let port = args.port;
             let sock = sock.clone();
             std::thread::spawn(move || {
                 for line in BufReader::new(stderr).lines() {
@@ -592,7 +676,7 @@ mod tests {
     fn parse_takes_the_target_and_defaults_the_rest() {
         let args = parse(&argv(&["./data"])).unwrap();
         assert_eq!(args.target, "./data");
-        assert_eq!(args.port, 5432);
+        assert_eq!(args.port, None);
         assert_eq!(args.http, None);
         assert_eq!(
             args.ops, None,
@@ -619,7 +703,7 @@ mod tests {
         .unwrap();
         assert_eq!(args.target, "s3://bucket/x");
         assert_eq!(args.pg_bin, PathBuf::from("/opt/pg/bin"));
-        assert_eq!(args.port, 5614);
+        assert_eq!(args.port, Some(5614));
         assert_eq!(args.http, Some(54321));
         assert_eq!(args.ops, Some(9187));
         assert_eq!(args.runtime, PathBuf::from("/tmp/run"));
@@ -634,5 +718,67 @@ mod tests {
         assert!(parse(&argv(&["./data", "--ops", "warm"])).is_err());
         assert!(parse(&argv(&["./data", "extra"])).is_err());
         assert!(parse(&argv(&["--bogus", "./data"])).is_err());
+        assert!(parse(&argv(&["./data", "--config"])).is_err());
+    }
+
+    fn project_with(api: Option<u16>, db: Option<u16>) -> Project {
+        Project {
+            api,
+            db,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_flags_beat_the_file_and_the_file_beats_the_default() {
+        let plain = parse(&argv(&["./data"])).unwrap();
+        assert_eq!(ports(&plain, None), (5432, None), "a dev loop on its own");
+        assert_eq!(
+            ports(&plain, Some(&project_with(Some(54321), Some(54322)))),
+            (54322, Some(54321)),
+            "and a project gets the ports its own tooling already uses"
+        );
+        let flagged = parse(&argv(&["./data", "--port", "5614", "--http", "8000"])).unwrap();
+        assert_eq!(
+            ports(&flagged, Some(&project_with(Some(54321), Some(54322)))),
+            (5614, Some(8000)),
+            "what the command line says wins"
+        );
+        assert_eq!(
+            ports(&plain, Some(&project_with(None, None))),
+            (5432, None),
+            "a project with the api switched off and no db port says nothing"
+        );
+    }
+
+    #[test]
+    fn a_config_is_looked_for_unless_it_is_named_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("supabase")).unwrap();
+        std::fs::write(
+            dir.path().join("supabase/config.toml"),
+            "[api]\nport = 55555\n[db]\nport = 55556\n",
+        )
+        .unwrap();
+        let named = parse(&argv(&[
+            "./data",
+            "--config",
+            dir.path().join("supabase/config.toml").to_str().unwrap(),
+        ]))
+        .unwrap();
+        let read = project(&named)
+            .unwrap()
+            .expect("the file it was pointed at");
+        assert_eq!(ports(&named, Some(&read)), (55556, Some(55555)));
+        let refused = parse(&argv(&["./data", "--no-config"])).unwrap();
+        assert!(
+            project(&refused).unwrap().is_none(),
+            "and nothing is looked for when the flag says not to"
+        );
+        let missing = parse(&argv(&["./data", "--config", "/nowhere/config.toml"])).unwrap();
+        assert!(
+            project(&missing).is_err(),
+            "a file that was named and is not there is an error"
+        );
     }
 }
