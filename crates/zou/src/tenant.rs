@@ -104,7 +104,7 @@ fn create(store: &dyn CasStore, tenant_ref: &str, jwt_secret: String) -> Result<
     println!("jwt secret {jwt_secret}");
     // Said out loud because the next thing somebody does is point a
     // client at it and get told there is no manifest.
-    println!("no database yet, make one with zou branch <target> <src> {tenant_ref}");
+    println!("no database yet, make one with zou branch <target> create <src> {tenant_ref}");
     Ok(())
 }
 

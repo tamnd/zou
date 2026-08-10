@@ -144,12 +144,18 @@ jobs:
           kill -INT "$DEV2"
           wait "$DEV2"
           cat /tmp/zou-dev.log /tmp/zou-dev2.log
-          target/release/zou branch /tmp/zou-dev-store local dev2
+          target/release/zou branch /tmp/zou-dev-store create local dev2
           target/release/zou info /tmp/zou-dev-store | tee /tmp/zou-info.txt
           grep -q "ref local" /tmp/zou-info.txt
           target/release/zou info /tmp/zou-dev-store dev2 | tee /tmp/zou-info2.txt
           grep -q "branch of local" /tmp/zou-info2.txt
           grep -q "owned by local" /tmp/zou-info2.txt
+          target/release/zou branch /tmp/zou-dev-store list | tee /tmp/zou-branches.txt
+          grep -q "dev2.*from local" /tmp/zou-branches.txt
+          ! target/release/zou branch /tmp/zou-dev-store delete local
+          target/release/zou branch /tmp/zou-dev-store delete dev2
+          test ! -e /tmp/zou-dev-store/tenants/dev2/MANIFEST
+          test -e /tmp/zou-dev-store/tenants/local/MANIFEST
       - name: make demo, both acts
         run: make demo 2>&1 | tee /tmp/zou-demo.log && grep -q "restarting from nothing but the store" /tmp/zou-demo.log
       - name: Smoke test on MinIO
