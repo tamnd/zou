@@ -29,13 +29,14 @@
 //! what tells a client to decide rather than to guess.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use bytes::{Bytes, BytesMut};
 use md5::{Digest, Md5};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use zou_store::registry::{Tenant, check_ref};
 
 use crate::attach::Attached;
@@ -69,15 +70,46 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// themselves are unaffected, which is the right way round.
 const MAX_CANCEL_KEYS: usize = 16 << 10;
 
+/// How many backends one project and role may have open at once, and
+/// therefore how many transactions can be in flight for it. A client
+/// past it waits for one rather than being refused, because a queue is
+/// what a pooler is for.
+pub const POOL_PER_BANK: usize = 20;
+
+/// How long a client may hold a backend without either side saying
+/// anything. A transaction left open pins a backend, and a pooler whose
+/// backends are all pinned by clients that went to lunch is an outage
+/// for everyone else on the project.
+const IDLE_IN_TRANSACTION: Duration = Duration::from_secs(60);
+
+/// The cap on a single message in the pooler's own buffer. Everything
+/// the two sides say goes through here one message at a time, so this
+/// is what one session can cost in memory.
+const MAX_MESSAGE: usize = 256 << 20;
+
+/// What a connection on this port gets: its own backend for as long as
+/// it is connected, or one per transaction out of a shared pool.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Mode {
+    Session,
+    Transaction,
+}
+
 /// The wire front door.
 pub struct Wire {
     registry: Arc<Registry>,
     attached: Arc<Attached>,
-    /// Which database each live session is on, keyed by the cancel key
-    /// that session was handed. A cancel arrives on a new connection
-    /// that carries nothing but this pair, so without the map there is
-    /// nowhere to send it.
-    cancels: Mutex<HashMap<(i32, i32), String>>,
+    mode: Mode,
+    /// Where each live session's backend is, keyed by the cancel key
+    /// that session was handed. A cancel arrives on a connection of its
+    /// own that carries nothing but this pair, so without the map there
+    /// is nowhere to send it. It is a cell rather than a value because
+    /// under the pooler the answer changes at every transaction.
+    cancels: Mutex<HashMap<(i32, i32), Held>>,
+    /// One pool per project and role, so a backend a client is handed
+    /// is a backend that was already the right role, and no session ever
+    /// runs as an identity its key did not prove.
+    banks: Mutex<HashMap<(String, String), Arc<Bank>>>,
 }
 
 impl Wire {
@@ -85,8 +117,16 @@ impl Wire {
         Wire {
             registry,
             attached,
+            mode: Mode::Session,
             cancels: Mutex::new(HashMap::new()),
+            banks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The same door in transaction mode, which is 6543.
+    pub fn pooling(mut self) -> Wire {
+        self.mode = Mode::Transaction;
+        self
     }
 
     /// Accept forever. Each connection is a task, and a task that fails
@@ -111,8 +151,8 @@ impl Wire {
     pub async fn session(self: Arc<Self>, mut sock: TcpStream) -> Result<(), String> {
         let _live = Live::new();
         let login = tokio::time::timeout(LOGIN_TIMEOUT, self.login(&mut sock)).await;
-        let upstream = match login {
-            Ok(Ok(Some(upstream))) => upstream,
+        let ready = match login {
+            Ok(Ok(Some(ready))) => ready,
             // A cancel, which is a whole connection that carries one
             // message and expects no answer at all.
             Ok(Ok(None)) => return Ok(()),
@@ -134,13 +174,16 @@ impl Wire {
             }
         };
         crate::ops::pg_login("ok");
-        self.pump(sock, upstream).await
+        match ready {
+            Ready::Direct(upstream) => self.pump(sock, upstream).await,
+            Ready::Pooled(bank) => self.pooled(sock, bank).await,
+        }
     }
 
-    /// Startup to authenticated, answering with the upstream connection
-    /// the session runs on. None is a cancel request, which is finished
-    /// by the time this returns.
-    async fn login(&self, sock: &mut TcpStream) -> Result<Option<TcpStream>, Stop> {
+    /// Startup to authenticated, answering with whatever the session
+    /// runs on. None is a cancel request, which is finished by the time
+    /// this returns.
+    async fn login(&self, sock: &mut TcpStream) -> Result<Option<Ready>, Stop> {
         let params = match hello(sock).await? {
             Hello::Cancel { pid, key } => {
                 self.cancel(pid, key).await;
@@ -186,7 +229,33 @@ impl Wire {
                 });
             }
         };
-        Ok(Some(connect(&dsn, &params, &route).await?))
+        match self.mode {
+            Mode::Session => Ok(Some(Ready::Direct(connect(&dsn, &params, &route).await?))),
+            Mode::Transaction => Ok(Some(Ready::Pooled(self.bank(&dsn, &route).await))),
+        }
+    }
+
+    /// The pool for one project and role, made on first use.
+    ///
+    /// Keyed by the dsn rather than by the ref, so a project that is
+    /// detached and comes back somewhere else gets fresh backends
+    /// instead of a pool of connections to a postmaster that has gone.
+    async fn bank(&self, dsn: &str, route: &Route) -> Arc<Bank> {
+        let key = (dsn.to_string(), route.role.clone());
+        self.banks
+            .lock()
+            .await
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(Bank {
+                    dsn: dsn.to_string(),
+                    role: route.role.clone(),
+                    permits: Arc::new(Semaphore::new(POOL_PER_BANK)),
+                    idle: Mutex::new(Vec::new()),
+                    greeting: Mutex::new(Vec::new()),
+                })
+            })
+            .clone()
     }
 
     /// Everything after login: relay until the session is ready,
@@ -223,15 +292,20 @@ impl Wire {
                 _ => {}
             }
         }
-        if let Some(key) = key {
-            let mut cancels = self.cancels.lock().await;
-            if cancels.len() < MAX_CANCEL_KEYS {
-                cancels.insert(key, addr);
-            }
+        if let Some((pid, secret)) = key {
+            self.remember(
+                (pid, secret),
+                Arc::new(StdMutex::new(Some(Target {
+                    addr,
+                    pid,
+                    key: secret,
+                }))),
+            )
+            .await;
         }
         let moved = tokio::io::copy_bidirectional(&mut sock, &mut upstream).await;
         if let Some(key) = key {
-            self.cancels.lock().await.remove(&key);
+            self.forget(key).await;
         }
         match moved {
             Ok((up, down)) => {
@@ -244,28 +318,507 @@ impl Wire {
         }
     }
 
-    /// Send a cancel to the database the session it names is on.
+    /// A pooled session: no backend of its own, one borrowed for the
+    /// length of each transaction and handed back at the end of it.
     ///
-    /// Passed through rather than translated: the key the client holds
-    /// is the key its backend generated, so a session can only be
-    /// cancelled by whoever was handed its key, which is exactly the
-    /// guarantee postgres itself makes. A pair this node has never seen
-    /// is dropped in silence, because the protocol has no reply here and
-    /// an attacker guessing keys deserves no signal either.
+    /// The greeting is this server's. A client needs its parameter set,
+    /// a cancel key and a ReadyForQuery before it will say anything, and
+    /// under the pooler there is no backend yet to have sent them, so
+    /// the parameters are the ones the project's database announced to
+    /// the first backend opened for it and the key is one of ours.
+    async fn pooled(&self, sock: TcpStream, bank: Arc<Bank>) -> Result<(), String> {
+        let greeting = bank.greeting().await.map_err(|e| e.to_string())?;
+        let mut client = Framed::new(sock);
+        let key = (random_i32(), random_i32());
+        let held: Held = Arc::new(StdMutex::new(None));
+        client
+            .send(&raw(b'R', &0i32.to_be_bytes()))
+            .await
+            .map_err(|e| e.to_string())?;
+        client.send(&greeting).await.map_err(|e| e.to_string())?;
+        let mut backend_key = Vec::with_capacity(8);
+        backend_key.extend_from_slice(&key.0.to_be_bytes());
+        backend_key.extend_from_slice(&key.1.to_be_bytes());
+        client
+            .send(&raw(b'K', &backend_key))
+            .await
+            .map_err(|e| e.to_string())?;
+        client
+            .send(&raw(b'Z', b"I"))
+            .await
+            .map_err(|e| e.to_string())?;
+        self.remember(key, Arc::clone(&held)).await;
+        let out = self.transactions(&mut client, &bank, &held).await;
+        self.forget(key).await;
+        out.map_err(|e| e.to_string())
+    }
+
+    /// The pooled session's whole life: borrow at the first message of
+    /// a transaction, hand back at the ReadyForQuery that says the
+    /// transaction is over.
+    async fn transactions(
+        &self,
+        client: &mut Framed<TcpStream>,
+        bank: &Arc<Bank>,
+        held: &Held,
+    ) -> Result<(), Stop> {
+        let mut lease: Option<Lease> = None;
+        // Set by a message this server refused on the client's behalf.
+        // A backend in that state ignores everything until Sync, and so
+        // does this, or the client and the server disagree about how
+        // many answers are owed.
+        let mut skipping = false;
+        loop {
+            let Some(lease_now) = lease.as_mut() else {
+                let Some(msg) = client.next().await? else {
+                    return Ok(());
+                };
+                match starts(msg[0]) {
+                    Start::Leave => return Ok(()),
+                    // Sync with nothing outstanding is answered here,
+                    // because borrowing a backend to say "ready" would
+                    // be a transaction that never happened.
+                    Start::Sync => {
+                        skipping = false;
+                        client.send(&raw(b'Z', b"I")).await?;
+                    }
+                    Start::Ignore => {}
+                    Start::Work => {
+                        if skipping {
+                            continue;
+                        }
+                        if let Some(why) = unsupported(&msg) {
+                            skipping = true;
+                            client.send(&error("0A000", &why)).await?;
+                            continue;
+                        }
+                        let start = std::time::Instant::now();
+                        let borrowed = bank.checkout().await?;
+                        crate::ops::pg_checkout(start);
+                        *held.lock().expect("the cancel cell") = Some(borrowed.target());
+                        lease = Some(borrowed);
+                        let lease = lease.as_mut().expect("just borrowed");
+                        lease.backend.send(&msg).await?;
+                    }
+                }
+                continue;
+            };
+
+            // Both directions at once, because a client is allowed to
+            // send the next statement before the answer to this one has
+            // arrived, and a read that is thrown away half finished
+            // would lose the bytes it had. Both sides keep their own
+            // buffer for exactly that reason.
+            let turn = tokio::time::timeout(IDLE_IN_TRANSACTION, async {
+                tokio::select! {
+                    from_client = client.next() => Turn::Client(from_client),
+                    from_backend = lease_now.backend.next() => Turn::Backend(from_backend),
+                }
+            })
+            .await;
+            match turn {
+                Ok(Turn::Client(msg)) => {
+                    // A client that hangs up mid transaction takes its
+                    // backend with it rather than handing back one with
+                    // an open transaction on it.
+                    let Some(msg) = msg? else { return Ok(()) };
+                    if starts(msg[0]) == Start::Leave {
+                        return Ok(());
+                    }
+                    if skipping && starts(msg[0]) != Start::Sync {
+                        continue;
+                    }
+                    if let Some(why) = unsupported(&msg) {
+                        skipping = true;
+                        client.send(&error("0A000", &why)).await?;
+                        continue;
+                    }
+                    skipping = false;
+                    lease_now.backend.send(&msg).await?;
+                }
+                Ok(Turn::Backend(msg)) => {
+                    let Some(msg) = msg? else {
+                        return Err(Stop::Quiet("the database hung up mid transaction".into()));
+                    };
+                    client.send(&msg).await?;
+                    // Idle, which means no transaction is open, which
+                    // means this backend belongs to whoever asks next.
+                    if msg[0] == b'Z' && msg.last() == Some(&b'I') {
+                        *held.lock().expect("the cancel cell") = None;
+                        if let Some(lease) = lease.take() {
+                            crate::ops::pg_transaction();
+                            bank.release(lease).await;
+                        }
+                    }
+                }
+                Err(_) => {
+                    client
+                        .send(&error(
+                            "25P03",
+                            "the transaction was idle too long and the connection was closed",
+                        ))
+                        .await?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Send a cancel to the backend the session it names is on.
+    ///
+    /// In session mode the key the client holds is the key its own
+    /// backend generated, so this forwards it as it stands, which means
+    /// a session can only be cancelled by whoever was handed its key,
+    /// exactly the guarantee postgres itself makes. Under the pooler
+    /// the key is this server's, because at login there is no backend
+    /// yet, so the cell says which backend the session is on right now
+    /// and the cancel goes there with that backend's own key. A pair
+    /// this node never issued is dropped in silence, because the
+    /// protocol has no reply here and an attacker guessing keys
+    /// deserves no signal either.
     async fn cancel(&self, pid: i32, key: i32) {
-        let Some(addr) = self.cancels.lock().await.get(&(pid, key)).cloned() else {
+        let held = self.cancels.lock().await.get(&(pid, key)).cloned();
+        let Some(target) = held.and_then(|h| h.lock().expect("the cancel cell").clone()) else {
             return;
         };
         let mut packet = Vec::with_capacity(16);
         packet.extend_from_slice(&16i32.to_be_bytes());
         packet.extend_from_slice(&CANCEL_REQUEST.to_be_bytes());
-        packet.extend_from_slice(&pid.to_be_bytes());
-        packet.extend_from_slice(&key.to_be_bytes());
-        if let Ok(mut up) = TcpStream::connect(&addr).await {
+        packet.extend_from_slice(&target.pid.to_be_bytes());
+        packet.extend_from_slice(&target.key.to_be_bytes());
+        if let Ok(mut up) = TcpStream::connect(&target.addr).await {
             let _ = up.write_all(&packet).await;
             let _ = up.shutdown().await;
         }
     }
+
+    async fn remember(&self, key: (i32, i32), held: Held) {
+        let mut cancels = self.cancels.lock().await;
+        if cancels.len() < MAX_CANCEL_KEYS {
+            cancels.insert(key, held);
+        }
+    }
+
+    async fn forget(&self, key: (i32, i32)) {
+        self.cancels.lock().await.remove(&key);
+    }
+}
+
+/// Which side spoke first.
+enum Turn {
+    Client(Result<Option<Bytes>, Stop>),
+    Backend(Result<Option<Bytes>, Stop>),
+}
+
+/// What the session runs on, once it is allowed to run.
+enum Ready {
+    Direct(TcpStream),
+    Pooled(Arc<Bank>),
+}
+
+/// Where a live session's backend is, and what its key there is. A cell
+/// because under the pooler it changes at every transaction, and shared
+/// because a cancel arrives on somebody else's connection.
+type Held = Arc<StdMutex<Option<Target>>>;
+
+#[derive(Clone)]
+struct Target {
+    addr: String,
+    pid: i32,
+    key: i32,
+}
+
+/// The backends open for one project and role.
+struct Bank {
+    dsn: String,
+    role: String,
+    /// The ceiling, and the queue when it is reached.
+    permits: Arc<Semaphore>,
+    idle: Mutex<Vec<Backend>>,
+    /// The ParameterStatus messages this project's database sent the
+    /// first backend, replayed to every client that logs in. They are
+    /// the database's own values, so a client is told the truth about
+    /// its server version and its encoding without this server having
+    /// opinions about either.
+    greeting: Mutex<Vec<u8>>,
+}
+
+impl Bank {
+    /// What a client is told at login. Opening a backend to learn it is
+    /// the price of the first login on a project, and the backend goes
+    /// into the pool rather than being thrown away.
+    async fn greeting(&self) -> Result<Vec<u8>, Stop> {
+        if let Some(known) = Some(self.greeting.lock().await.clone()).filter(|g| !g.is_empty()) {
+            return Ok(known);
+        }
+        let lease = self.checkout().await?;
+        let greeting = lease.backend.greeting.clone();
+        self.release(lease).await;
+        *self.greeting.lock().await = greeting.clone();
+        Ok(greeting)
+    }
+
+    /// A backend, from the pool if one is parked and a new connection
+    /// otherwise. Waits when every permit is out, because a queue is
+    /// what a pooler is for.
+    async fn checkout(&self) -> Result<Lease, Stop> {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| Stop::Quiet("the pool is closed".into()))?;
+        if let Some(backend) = self.idle.lock().await.pop() {
+            return Ok(Lease {
+                backend,
+                _permit: permit,
+            });
+        }
+        let backend = Backend::open(&self.dsn, &self.role).await?;
+        crate::ops::pg_backend(true);
+        Ok(Lease {
+            backend,
+            _permit: permit,
+        })
+    }
+
+    /// Hand a backend back, cleaned.
+    ///
+    /// `DISCARD ALL` is a round trip this server pays rather than the
+    /// next client paying for what the last one left behind. A pooler
+    /// that skips it is betting every client obeys the rule that
+    /// session state is not allowed here, and one leaked search_path on
+    /// a shared database is not a bet worth a hundred microseconds. A
+    /// backend that does not come back clean is closed instead of
+    /// parked.
+    async fn release(&self, mut lease: Lease) {
+        if lease.backend.discard().await.is_err() {
+            crate::ops::pg_backend(false);
+            return;
+        }
+        self.idle.lock().await.push(lease.backend);
+    }
+}
+
+/// A backend checked out of a bank. Dropping one closes it, which is
+/// what should happen to a connection whose client left mid statement.
+struct Lease {
+    backend: Backend,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Lease {
+    fn target(&self) -> Target {
+        Target {
+            addr: self.backend.addr.clone(),
+            pid: self.backend.pid,
+            key: self.backend.key,
+        }
+    }
+}
+
+/// One connection to a project's database, owned by the pool.
+struct Backend {
+    io: Framed<TcpStream>,
+    addr: String,
+    pid: i32,
+    key: i32,
+    /// This backend's own ParameterStatus messages, kept because the
+    /// first backend's are what every pooled client is greeted with.
+    greeting: Vec<u8>,
+}
+
+impl Backend {
+    /// Open one and read its login sequence, which is where its
+    /// parameters and its cancel key come from.
+    ///
+    /// The startup packet is this server's, not any one client's: a
+    /// backend that several clients will use in turn cannot carry one
+    /// of their application names, so it carries the pooler's.
+    async fn open(dsn: &str, role: &str) -> Result<Backend, Stop> {
+        let params = vec![("application_name".to_string(), "zou pooler".to_string())];
+        let route = Route {
+            tenant: String::new(),
+            role: role.to_string(),
+            user: String::new(),
+        };
+        let io = connect(dsn, &params, &route).await?;
+        let addr = io
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| dsn.to_string());
+        let mut backend = Backend {
+            io: Framed::new(io),
+            addr,
+            pid: 0,
+            key: 0,
+            greeting: Vec::new(),
+        };
+        loop {
+            let Some(msg) = backend.next().await? else {
+                return Err(Stop::Quiet("the database hung up during login".into()));
+            };
+            match msg[0] {
+                b'S' => backend.greeting.extend_from_slice(&msg),
+                b'K' if msg.len() == 13 => {
+                    backend.pid = i32::from_be_bytes([msg[5], msg[6], msg[7], msg[8]]);
+                    backend.key = i32::from_be_bytes([msg[9], msg[10], msg[11], msg[12]]);
+                }
+                b'Z' => return Ok(backend),
+                b'E' => {
+                    return Err(Stop::Say {
+                        code: "08006",
+                        message: field(&msg[5..], b'M')
+                            .unwrap_or_else(|| "the database refused a connection".to_string()),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<Bytes>, Stop> {
+        self.io.next().await
+    }
+
+    async fn send(&mut self, msg: &[u8]) -> Result<(), Stop> {
+        self.io.send(msg).await
+    }
+
+    /// Everything a session could have left on it, gone.
+    async fn discard(&mut self) -> Result<(), Stop> {
+        self.send(&raw(b'Q', b"DISCARD ALL\0")).await?;
+        loop {
+            let Some(msg) = self.next().await? else {
+                return Err(Stop::Quiet(
+                    "the database hung up while being cleaned".into(),
+                ));
+            };
+            match msg[0] {
+                b'Z' => return Ok(()),
+                b'E' => return Err(Stop::Quiet("the database could not be cleaned".into())),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// What a frontend message means for whether a backend is needed.
+#[derive(PartialEq)]
+enum Start {
+    /// Needs a backend, and is the start of a transaction if none is
+    /// open.
+    Work,
+    Sync,
+    Leave,
+    Ignore,
+}
+
+fn starts(tag: u8) -> Start {
+    match tag {
+        b'Q' | b'P' | b'B' | b'E' | b'D' | b'C' | b'F' | b'd' | b'c' | b'f' => Start::Work,
+        b'S' => Start::Sync,
+        b'X' => Start::Leave,
+        // Flush with nothing outstanding, and anything this server does
+        // not know, which the backend would answer for if there were
+        // one. There is not, and inventing an answer is worse than
+        // waiting for the client's next message.
+        _ => Start::Ignore,
+    }
+}
+
+/// The one thing a transaction pooler cannot do, refused where the
+/// client can still see which statement caused it.
+///
+/// A named prepared statement lives on the backend that parsed it, and
+/// under the pooler the next transaction is on a different one. Failing
+/// at the Parse that names it beats failing at the Bind one transaction
+/// later with a message about a statement that does not exist.
+fn unsupported(msg: &Bytes) -> Option<String> {
+    if msg[0] != b'P' || msg.len() < 6 {
+        return None;
+    }
+    let (name, _) = cstr(&msg[5..])?;
+    match name.is_empty() {
+        true => None,
+        false => Some(format!(
+            "prepared statement \"{name}\" cannot be named on the transaction pooler, turn statement caching off in your driver or use port 5432"
+        )),
+    }
+}
+
+/// A stream that hands out whole protocol messages.
+///
+/// The buffer is the point. Reading a message straight off a socket is
+/// not safe to abandon half way, and the pooler abandons a read every
+/// time the other side speaks first, so the bytes that did arrive stay
+/// here until the rest of their message joins them.
+struct Framed<S> {
+    io: S,
+    buf: BytesMut,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Framed<S> {
+    fn new(io: S) -> Framed<S> {
+        Framed {
+            io,
+            buf: BytesMut::with_capacity(8 << 10),
+        }
+    }
+
+    /// The next whole message, or None when the other side is done.
+    /// Safe to drop unfinished.
+    async fn next(&mut self) -> Result<Option<Bytes>, Stop> {
+        loop {
+            if let Some(msg) = frame(&mut self.buf)? {
+                return Ok(Some(msg));
+            }
+            let read = self
+                .io
+                .read_buf(&mut self.buf)
+                .await
+                .map_err(|e| Stop::Quiet(format!("reading: {e}")))?;
+            if read == 0 {
+                return match self.buf.is_empty() {
+                    true => Ok(None),
+                    false => Err(Stop::Quiet("hung up mid message".into())),
+                };
+            }
+        }
+    }
+
+    async fn send(&mut self, msg: &[u8]) -> Result<(), Stop> {
+        self.io
+            .write_all(msg)
+            .await
+            .map_err(|e| Stop::Quiet(format!("writing: {e}")))
+    }
+}
+
+/// One whole message out of a buffer, if there is one in there yet.
+fn frame(buf: &mut BytesMut) -> Result<Option<Bytes>, Stop> {
+    if buf.len() < 5 {
+        return Ok(None);
+    }
+    let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    if len < 4 || len - 4 > MAX_MESSAGE {
+        return Err(Stop::Say {
+            code: "08P01",
+            message: format!("message of {len} bytes is out of bounds"),
+        });
+    }
+    // The length counts itself and the body but not the tag, so the
+    // message on the wire is one byte longer than it says.
+    let whole = len + 1;
+    match buf.len() >= whole {
+        true => Ok(Some(buf.split_to(whole).freeze())),
+        false => Ok(None),
+    }
+}
+
+/// A pid or a cancel key of this server's own making.
+fn random_i32() -> i32 {
+    let mut bytes = [0u8; 4];
+    getrandom::fill(&mut bytes).expect("the system random source");
+    i32::from_be_bytes(bytes)
 }
 
 /// What the first packet on a connection turned out to be.
@@ -731,12 +1284,17 @@ mod tests {
     const SECRET: &str = "super-secret-jwt-token-with-at-least-32-characters-long";
 
     /// A postgres that is not one: it reads the startup packet, says
-    /// the session is ready, and echoes. Enough to prove what arrived
-    /// and that bytes cross in both directions after.
+    /// the session is ready, and answers simple queries with the query
+    /// back. It tracks whether a transaction is open, because that is
+    /// the one thing the pooler reads out of its answers.
     #[derive(Default)]
     struct Fake {
         startups: StdMutex<Vec<Vec<(String, String)>>>,
         cancels: StdMutex<Vec<(i32, i32)>>,
+        queries: StdMutex<Vec<String>>,
+        /// Which connection each query arrived on, so a test can say
+        /// two clients shared a backend or did not.
+        opened: StdMutex<i32>,
     }
 
     impl Fake {
@@ -778,22 +1336,68 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(params(&body[4..]).ok().unwrap_or_default());
+            let pid = {
+                let mut opened = self.opened.lock().unwrap();
+                *opened += 1;
+                4241 + *opened
+            };
             let mut hello = Vec::new();
             hello.extend_from_slice(&raw(b'R', &0i32.to_be_bytes()));
+            hello.extend_from_slice(&raw(b'S', b"server_version\x0018.4\0"));
             let mut key = Vec::new();
-            key.extend_from_slice(&4242i32.to_be_bytes());
+            key.extend_from_slice(&pid.to_be_bytes());
             key.extend_from_slice(&99i32.to_be_bytes());
             hello.extend_from_slice(&raw(b'K', &key));
             hello.extend_from_slice(&raw(b'Z', b"I"));
             if sock.write_all(&hello).await.is_err() {
                 return;
             }
-            let mut buf = [0u8; 1024];
-            while let Ok(n) = sock.read(&mut buf).await {
-                if n == 0 || sock.write_all(&buf[..n]).await.is_err() {
-                    return;
+
+            let mut framed = Framed::new(sock);
+            let mut in_transaction = false;
+            while let Ok(Some(msg)) = framed.next().await {
+                let ready = |in_transaction: bool| match in_transaction {
+                    true => raw(b'Z', b"T"),
+                    false => raw(b'Z', b"I"),
+                };
+                match msg[0] {
+                    b'Q' => {
+                        let (sql, _) = cstr(&msg[5..]).unwrap_or_default();
+                        self.queries.lock().unwrap().push(format!("{pid} {sql}"));
+                        let upper = sql.to_uppercase();
+                        if upper.starts_with("BEGIN") {
+                            in_transaction = true;
+                        }
+                        if upper.starts_with("COMMIT")
+                            || upper.starts_with("ROLLBACK")
+                            || upper.starts_with("DISCARD")
+                        {
+                            in_transaction = false;
+                        }
+                        let mut answer = raw(b'C', format!("{sql}\0").as_bytes());
+                        answer.extend_from_slice(&ready(in_transaction));
+                        if framed.send(&answer).await.is_err() {
+                            return;
+                        }
+                    }
+                    b'S' => {
+                        if framed.send(&ready(in_transaction)).await.is_err() {
+                            return;
+                        }
+                    }
+                    b'X' => return,
+                    _ => {}
                 }
             }
+        }
+
+        fn queries(&self) -> Vec<String> {
+            self.queries.lock().unwrap().clone()
+        }
+
+        /// How many connections this database has been asked for.
+        fn opened(&self) -> i32 {
+            *self.opened.lock().unwrap()
         }
 
         fn startup(&self) -> Vec<(String, String)> {
@@ -827,6 +1431,16 @@ mod tests {
     /// A registry with one project in it, the fake postgres behind it,
     /// and the wire door in front, listening on a real port.
     async fn one_project() -> (tempfile::TempDir, Arc<Fake>, Arc<Point>, String) {
+        project(Mode::Session).await
+    }
+
+    /// The same thing on 6543: one backend per transaction rather than
+    /// one per connection.
+    async fn one_pooled_project() -> (tempfile::TempDir, Arc<Fake>, Arc<Point>, String) {
+        project(Mode::Transaction).await
+    }
+
+    async fn project(mode: Mode) -> (tempfile::TempDir, Arc<Fake>, Arc<Point>, String) {
         let dir = tempfile::tempdir().expect("a directory");
         let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(dir.path()));
         registry::create(&*store, &Tenant::new("acme-prod", SECRET, 1)).expect("a project");
@@ -839,10 +1453,14 @@ mod tests {
             dsn,
             ups: StdMutex::new(Vec::new()),
         });
-        let wire = Arc::new(Wire::new(
+        let door = Wire::new(
             Arc::new(Registry::new(store)),
             Arc::new(Attached::new(backend.clone())),
-        ));
+        );
+        let wire = Arc::new(match mode {
+            Mode::Session => door,
+            Mode::Transaction => door.pooling(),
+        });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
         let addr = listener.local_addr().expect("an address").to_string();
         tokio::spawn(wire.serve(listener));
@@ -906,6 +1524,75 @@ mod tests {
                 .expect("a password");
             self.message().await
         }
+
+        /// Log in and read the rest of the greeting, up to and
+        /// including the ReadyForQuery, and hand back the cancel key
+        /// that came with it.
+        async fn up(&mut self, role: &str) -> (i32, i32) {
+            let user = format!("{role}.acme-prod");
+            assert_eq!(
+                self.login(&[("user", user.as_str())], &key(role)).await.0,
+                b'R',
+                "the session should have been let in"
+            );
+            let mut cancel_key = (0, 0);
+            loop {
+                let (tag, body) = self.message().await;
+                if tag == b'K' {
+                    cancel_key = (
+                        i32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+                        i32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+                    );
+                }
+                if tag == b'Z' {
+                    return cancel_key;
+                }
+            }
+        }
+
+        async fn send(&mut self, msg: &[u8]) {
+            self.sock.write_all(msg).await.expect("a message out");
+        }
+
+        /// A simple query and everything it is answered with, up to the
+        /// ReadyForQuery, whose transaction status is the last thing in
+        /// the last message.
+        async fn query(&mut self, sql: &str) -> Vec<(u8, Vec<u8>)> {
+            self.send(&raw(b'Q', format!("{sql}\0").as_bytes())).await;
+            let mut out = Vec::new();
+            loop {
+                let message = self.message().await;
+                let done = message.0 == b'Z';
+                out.push(message);
+                if done {
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// Ask a fake to cancel whatever the pair names, on a connection of
+    /// its own, the way a real client does.
+    async fn cancel(addr: &str, pid: i32, secret: i32) {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&16i32.to_be_bytes());
+        packet.extend_from_slice(&CANCEL_REQUEST.to_be_bytes());
+        packet.extend_from_slice(&pid.to_be_bytes());
+        packet.extend_from_slice(&secret.to_be_bytes());
+        Client::open(addr).await.send(&packet).await;
+    }
+
+    /// Wait for something a background task does. The pooler hands a
+    /// backend back after the client has already been answered, so a
+    /// test that looks straight away is looking too early.
+    async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        done()
     }
 
     fn says(body: &[u8]) -> (String, String) {
@@ -1049,55 +1736,30 @@ mod tests {
     async fn bytes_cross_in_both_directions_once_the_session_is_up() {
         let (_d, _fake, _backend, addr) = one_project().await;
         let mut client = Client::open(&addr).await;
+        // The rest of the login exchange the database sent, relayed,
+        // its own cancel key included.
         assert_eq!(
-            client
-                .login(&[("user", "anon.acme-prod")], &key("anon"))
-                .await
-                .0,
-            b'R'
+            client.up("anon").await,
+            (4242, 99),
+            "in session mode the key the client holds is the backend's own"
         );
-        // The rest of the login exchange the database sent, relayed.
-        let (tag, body) = client.message().await;
-        assert_eq!(tag, b'K', "the cancel key has to reach the client");
-        assert_eq!(
-            i32::from_be_bytes([body[0], body[1], body[2], body[3]]),
-            4242
-        );
-        assert_eq!(client.message().await.0, b'Z');
 
-        let query = raw(b'Q', b"select 1\0");
-        client.sock.write_all(&query).await.expect("a query");
-        let (tag, body) = client.message().await;
-        assert_eq!((tag, body.as_slice()), (b'Q', &b"select 1\0"[..]));
+        let answer = client.query("select 1").await;
+        assert_eq!(
+            answer.first().map(|(tag, body)| (*tag, body.as_slice())),
+            Some((b'C', &b"select 1\0"[..])),
+            "the query reached the database and its answer came back"
+        );
     }
 
     #[tokio::test]
     async fn a_cancel_reaches_the_database_the_session_is_on() {
         let (_d, fake, _backend, addr) = one_project().await;
         let mut client = Client::open(&addr).await;
-        assert_eq!(
-            client
-                .login(&[("user", "anon.acme-prod")], &key("anon"))
-                .await
-                .0,
-            b'R'
-        );
-        assert_eq!(client.message().await.0, b'K');
-        assert_eq!(client.message().await.0, b'Z');
+        let held = client.up("anon").await;
 
-        let mut cancel = Client::open(&addr).await;
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&16i32.to_be_bytes());
-        packet.extend_from_slice(&CANCEL_REQUEST.to_be_bytes());
-        packet.extend_from_slice(&4242i32.to_be_bytes());
-        packet.extend_from_slice(&99i32.to_be_bytes());
-        cancel.sock.write_all(&packet).await.expect("a cancel");
-        for _ in 0..50 {
-            if !fake.cancels.lock().unwrap().is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        cancel(&addr, held.0, held.1).await;
+        eventually(|| !fake.cancels.lock().unwrap().is_empty()).await;
         assert_eq!(
             fake.cancels.lock().unwrap().as_slice(),
             &[(4242, 99)],
@@ -1108,17 +1770,254 @@ mod tests {
     #[tokio::test]
     async fn a_cancel_for_a_session_this_node_never_had_goes_nowhere() {
         let (_d, fake, _backend, addr) = one_project().await;
-        let mut cancel = Client::open(&addr).await;
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&16i32.to_be_bytes());
-        packet.extend_from_slice(&CANCEL_REQUEST.to_be_bytes());
-        packet.extend_from_slice(&1i32.to_be_bytes());
-        packet.extend_from_slice(&2i32.to_be_bytes());
-        cancel.sock.write_all(&packet).await.expect("a cancel");
+        cancel(&addr, 1, 2).await;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(
             fake.cancels.lock().unwrap().is_empty(),
             "guessing a pair must not cancel somebody else's query"
+        );
+    }
+
+    /// A Parse message: the statement name, the sql, and no parameter
+    /// types.
+    fn parse(name: &str, sql: &str) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(name.as_bytes());
+        body.push(0);
+        body.extend_from_slice(sql.as_bytes());
+        body.push(0);
+        body.extend_from_slice(&0i16.to_be_bytes());
+        raw(b'P', &body)
+    }
+
+    #[tokio::test]
+    async fn the_greeting_under_the_pooler_is_the_databases_own_and_the_key_is_not() {
+        let (_d, _fake, _backend, addr) = one_pooled_project().await;
+        let mut client = Client::open(&addr).await;
+        assert_eq!(
+            client
+                .login(&[("user", "anon.acme-prod")], &key("anon"))
+                .await
+                .0,
+            b'R'
+        );
+        let mut parameters = Vec::new();
+        let mut cancel_key = (0, 0);
+        loop {
+            let (tag, body) = client.message().await;
+            match tag {
+                b'S' => parameters.push(body),
+                b'K' => {
+                    cancel_key = (
+                        i32::from_be_bytes([body[0], body[1], body[2], body[3]]),
+                        i32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+                    );
+                }
+                b'Z' => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            parameters,
+            vec![b"server_version\x0018.4\0".to_vec()],
+            "the settings a client is told are the database's own, not this server's guesses"
+        );
+        assert_ne!(
+            cancel_key,
+            (4242, 99),
+            "the key cannot be a backend's, because at login there is no backend yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_clients_one_after_the_other_are_one_backend() {
+        let (_d, fake, _backend, addr) = one_pooled_project().await;
+        let mut first = Client::open(&addr).await;
+        first.up("service_role").await;
+        first.query("select 1").await;
+        first.send(&raw(b'X', b"")).await;
+        assert!(
+            eventually(|| fake
+                .queries()
+                .iter()
+                .filter(|q| q.ends_with("DISCARD ALL"))
+                .count()
+                >= 2)
+            .await,
+            "the backend should have been handed back: {:?}",
+            fake.queries()
+        );
+
+        let mut second = Client::open(&addr).await;
+        second.up("service_role").await;
+        second.query("select 2").await;
+        assert_eq!(
+            fake.opened(),
+            1,
+            "the second client should have been handed the first one's backend"
+        );
+        let queries = fake.queries();
+        assert!(
+            queries.contains(&"4242 select 1".to_string()),
+            "{queries:?}"
+        );
+        assert!(
+            queries.contains(&"4242 select 2".to_string()),
+            "{queries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_inside_a_transaction_is_nobody_elses() {
+        let (_d, fake, _backend, addr) = one_pooled_project().await;
+        let mut first = Client::open(&addr).await;
+        first.up("service_role").await;
+        let answer = first.query("begin").await;
+        assert_eq!(
+            answer.last().map(|(tag, body)| (*tag, body.as_slice())),
+            Some((b'Z', &b"T"[..])),
+            "the transaction status is what says the backend is still owed"
+        );
+
+        let mut second = Client::open(&addr).await;
+        second.up("service_role").await;
+        second.query("select 2").await;
+        assert_eq!(
+            fake.opened(),
+            2,
+            "a second connection is what an open transaction costs"
+        );
+        let queries = fake.queries();
+        assert!(queries.contains(&"4242 begin".to_string()), "{queries:?}");
+        assert!(
+            queries.contains(&"4243 select 2".to_string()),
+            "{queries:?}"
+        );
+
+        first.query("commit").await;
+        assert!(
+            eventually(|| fake
+                .queries()
+                .iter()
+                .filter(|q| q.ends_with("DISCARD ALL"))
+                .count()
+                >= 3)
+            .await,
+            "commit ends the transaction, and the end of the transaction is the release"
+        );
+        let mut third = Client::open(&addr).await;
+        third.up("service_role").await;
+        third.query("select 3").await;
+        assert_eq!(fake.opened(), 2, "and then there is one to spare");
+    }
+
+    #[tokio::test]
+    async fn what_one_client_left_behind_does_not_reach_the_next() {
+        let (_d, fake, _backend, addr) = one_pooled_project().await;
+        let mut client = Client::open(&addr).await;
+        client.up("service_role").await;
+        client.query("set search_path to mine").await;
+        assert!(
+            eventually(|| {
+                let queries = fake.queries();
+                let Some(at) = queries
+                    .iter()
+                    .position(|q| q.ends_with("set search_path to mine"))
+                else {
+                    return false;
+                };
+                queries[at + 1..].iter().any(|q| q.ends_with("DISCARD ALL"))
+            })
+            .await,
+            "a backend is cleaned on the way back, not on the way out: {:?}",
+            fake.queries()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_named_prepared_statement_is_refused_at_the_statement_that_names_it() {
+        let (_d, fake, _backend, addr) = one_pooled_project().await;
+        let mut client = Client::open(&addr).await;
+        client.up("service_role").await;
+        client.send(&parse("s1", "select 1")).await;
+        let (tag, body) = client.message().await;
+        assert_eq!(tag, b'E');
+        let (code, message) = says(&body);
+        assert_eq!(code, "0A000");
+        assert!(message.contains("s1"), "{message}");
+        assert!(
+            message.contains("5432"),
+            "a refusal should say where the thing it refused does work: {message}"
+        );
+
+        // Everything until Sync is ignored, the way a backend in error
+        // state ignores it, or the two sides disagree about how many
+        // answers are owed.
+        client.send(&raw(b'B', b"\0\0\0\0\0\0\0\0\0\0")).await;
+        client.send(&raw(b'S', b"")).await;
+        let (tag, body) = client.message().await;
+        assert_eq!((tag, body.as_slice()), (b'Z', &b"I"[..]));
+        assert!(
+            !fake.queries().iter().any(|q| q.ends_with("select 1")),
+            "nothing that was refused here should have reached the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sync_with_nothing_outstanding_is_answered_without_a_backend() {
+        let (_d, fake, _backend, addr) = one_pooled_project().await;
+        let mut client = Client::open(&addr).await;
+        client.up("service_role").await;
+        client.send(&raw(b'S', b"")).await;
+        let (tag, body) = client.message().await;
+        assert_eq!((tag, body.as_slice()), (b'Z', &b"I"[..]));
+        assert_eq!(
+            fake.opened(),
+            1,
+            "borrowing a backend to say ready would be a transaction that never happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_under_the_pooler_is_translated_to_the_backend_in_the_middle() {
+        let (_d, fake, _backend, addr) = one_pooled_project().await;
+        let mut client = Client::open(&addr).await;
+        let held = client.up("service_role").await;
+        client.query("begin").await;
+
+        cancel(&addr, held.0, held.1).await;
+        assert!(
+            eventually(|| !fake.cancels.lock().unwrap().is_empty()).await,
+            "a cancel for a session in a transaction has somewhere to go"
+        );
+        assert_eq!(
+            fake.cancels.lock().unwrap().as_slice(),
+            &[(4242, 99)],
+            "the pair the client holds is this server's, and the pair the database gets is its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_between_transactions_cancels_nothing() {
+        let (_d, fake, _backend, addr) = one_pooled_project().await;
+        let mut client = Client::open(&addr).await;
+        let held = client.up("service_role").await;
+        client.query("select 1").await;
+        assert!(
+            eventually(|| fake
+                .queries()
+                .iter()
+                .filter(|q| q.ends_with("DISCARD ALL"))
+                .count()
+                >= 2)
+            .await
+        );
+
+        cancel(&addr, held.0, held.1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            fake.cancels.lock().unwrap().is_empty(),
+            "a session between transactions is on no backend, and the one it used last is somebody else's now"
         );
     }
 

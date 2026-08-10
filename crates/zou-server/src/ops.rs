@@ -396,6 +396,46 @@ pub fn pg_login(outcome: &'static str) {
         .inc();
 }
 
+/// One pooled backend opening or closing. Against `zou_pg_sessions`
+/// this is the whole claim a transaction pooler makes: many sessions,
+/// few backends.
+pub fn pg_backend(open: bool) {
+    let backends = registry().gauge(
+        "zou_pg_backends",
+        "pooled connections to tenant databases open right now",
+        &[],
+    );
+    match open {
+        true => backends.inc(),
+        false => backends.dec(),
+    }
+}
+
+/// One transaction finished on the pooler, and how long its client
+/// waited for a backend to run it on. The wait is the number that says
+/// whether a pool is too small, and it is not the query time, so the
+/// two are not mixed.
+pub fn pg_transaction() {
+    registry()
+        .counter(
+            "zou_pg_transactions_total",
+            "transactions run through the pooler",
+            &[],
+        )
+        .inc();
+}
+
+pub fn pg_checkout(start: Instant) {
+    registry()
+        .histogram(
+            "zou_pg_checkout_seconds",
+            "how long a transaction waited for a backend",
+            SECONDS,
+            &[],
+        )
+        .since(start);
+}
+
 /// What a finished session moved, in each direction, counted from the
 /// client's point of view.
 pub fn pg_bytes(sent: u64, received: u64) {
