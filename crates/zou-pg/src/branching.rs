@@ -1,8 +1,8 @@
 //! What has to be true of a branch before anybody is told it exists.
 //!
-//! [`zou_store::branch`](zou_store::branch) writes a child manifest and
-//! nothing else, which is the whole point: no data is copied and the
-//! call is two round trips. What it cannot know is whether the objects
+//! [`zou_store::branch()`] writes a child manifest and nothing else,
+//! which is the whole point: no data is copied and the call is two
+//! round trips. What it cannot know is whether the objects
 //! that manifest names are enough to serve a database from. A child
 //! reads inherited pages out of the captures it names and has no
 //! fallback for the ones it cannot, so a source that has not folded a
