@@ -2,6 +2,8 @@ mod branch;
 mod codegen;
 mod compact;
 #[cfg(unix)]
+mod config;
+#[cfg(unix)]
 mod dev;
 #[cfg(unix)]
 mod inbox;
@@ -12,6 +14,8 @@ mod map;
 mod serve;
 mod shard;
 mod stats;
+#[cfg(unix)]
+mod status;
 mod sync;
 mod tenant;
 
@@ -19,7 +23,7 @@ use std::process::ExitCode;
 
 /// The postmaster child, unix sockets, and signal forwarding are all
 /// unix machinery, so the dev subcommand only exists there.
-pub const DEV_USAGE: &str = "usage: zou dev <target> [--pg-bin <dir>] [--port <n>] [--http <n>] [--ops <n>] [--runtime <dir>]";
+pub const DEV_USAGE: &str = "usage: zou dev <target> [--pg-bin <dir>] [--port <n>] [--http <n>] [--ops <n>] [--runtime <dir>] [--config <config.toml> | --no-config]";
 
 fn usage() -> ExitCode {
     eprintln!("zou {}", env!("CARGO_PKG_VERSION"));
@@ -36,6 +40,8 @@ fn usage() -> ExitCode {
     eprintln!("       {}", serve::USAGE);
     eprintln!("       {}", shard::USAGE);
     eprintln!("       {}", stats::USAGE);
+    #[cfg(unix)]
+    eprintln!("       {}", status::USAGE);
     eprintln!("       {}", sync::PUSH_USAGE);
     eprintln!("       {}", sync::PULL_USAGE);
     eprintln!("       {}", tenant::USAGE);
@@ -118,6 +124,8 @@ fn main() -> ExitCode {
         Some("push") => simple(sync::push(&argv[1..])),
         Some("pull") => simple(sync::pull(&argv[1..])),
         Some("stats") => simple(stats::run(&argv[1..])),
+        #[cfg(unix)]
+        Some("status") => simple(status::run(&argv[1..])),
         Some("tenant") => simple(tenant::run(&argv[1..])),
         _ => usage(),
     }

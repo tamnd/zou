@@ -156,6 +156,46 @@ jobs:
           target/release/zou branch /tmp/zou-dev-store delete dev2
           test ! -e /tmp/zou-dev-store/tenants/dev2/MANIFEST
           test -e /tmp/zou-dev-store/tenants/local/MANIFEST
+      - name: A project's own config.toml drives the dev loop
+        run: |
+          mkdir -p /tmp/zou-proj/supabase /tmp/zou-proj-store
+          cat > /tmp/zou-proj/supabase/config.toml <<'TOML'
+          project_id = "smoke"
+
+          [api]
+          port = 54325
+          schemas = ["public"]
+          max_rows = 1000
+
+          [db]
+          port = 54326
+
+          [auth]
+          enable_anonymous_sign_ins = true
+          TOML
+          ZOU=$PWD/target/release/zou
+          export ZOU_JWT_SECRET=$(openssl rand -hex 32)
+          export ZOU_PG_BIN=$PWD/build/pg/bin
+          cd /tmp/zou-proj
+          "$ZOU" dev /tmp/zou-proj-store >/tmp/zou-proj.log 2>&1 &
+          DEV=$!
+          for i in $(seq 1 120); do
+            "$ZOU" status >/tmp/zou-status.txt 2>&1 && break
+            sleep 1
+          done
+          cat /tmp/zou-status.txt
+          grep -q "API URL: http://127.0.0.1:54325" /tmp/zou-status.txt
+          grep -q "DB URL: postgresql://postgres:postgres@127.0.0.1:54326/postgres" /tmp/zou-status.txt
+          grep -q "not read yet: api.max_rows" /tmp/zou-status.txt
+          eval "$("$ZOU" status -o env)"
+          test -n "$ANON_KEY"
+          curl -sf "$API_URL/auth/v1/settings" -H "apikey: $ANON_KEY" | tee /tmp/zou-settings.json
+          grep -q '"anonymous_users":true' /tmp/zou-settings.json
+          "$ZOU" status -o json | grep -q '"project_id":"smoke"'
+          kill -INT "$DEV"
+          wait "$DEV" || true
+          ! "$ZOU" status >/dev/null 2>&1
+          cat /tmp/zou-proj.log
       - name: make demo, both acts
         run: make demo 2>&1 | tee /tmp/zou-demo.log && grep -q "restarting from nothing but the store" /tmp/zou-demo.log
       - name: Smoke test on MinIO
