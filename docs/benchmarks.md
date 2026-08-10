@@ -56,8 +56,35 @@ The 30 s buckets show the shape: tpcb did 53 transactions in its first half then
 Moving the fold off the commit path moved the stall, it did not remove it, because in the v1 store the fold has to read the entire wal and checkpoint history back through the object store to produce pages.
 That cost is a property of the v1 layout, so this row stays as the honest v1 number and the fix is the storage v2 redesign rather than another pusher patch.
 
+## A thousand tenants on one node
+
+gamingpc (i9-13900K, 32 GB, Ubuntu 26.04 under WSL2, store on a local directory), 2026-08-10, `zoubench fleet` with the node pinned to cpus 0-7 so the eight cores are the deployment and the traffic generator is not sharing them.
+A thousand registered tenants, a hundred attached at once, 16MB shared buffers each, 16 clients over the REST door, a 300 s measured window capped at 200 rps and a 300 s churn window drawing from all thousand.
+Full write up and the raw shape in tamnd/zou-bench `docs/results/2026-08-11.md`.
+
+| phase | requests | errors | rps | p50 | p99 | max |
+| --- | --- | --- | --- | --- | --- | --- |
+| steady, working set attached | 59999 | 0 | 200 | 0.715 ms | 1.298 ms | 4.251 ms |
+| steady, 30 s warmup | 507 | 64 | 1.69 | 1.389 ms | 10786 ms | 11603 ms |
+| churn, all thousand drawn from | 695 | 2 | 2.32 | 7617 ms | 18240 ms | 21897 ms |
+
+Reading the table: once a project is up, a node holding a thousand of them serves reads in under a millisecond and a half at the tail, and everything else on this page is attach.
+The two steady rows are the same node and the same hundred tenants measured with different warmups.
+Thirty seconds is not long enough to attach a hundred tenants at 16 clients, so that row reports the attach storm, with the node itself confirming all 100 attaches happened inside the measured window at a 6.2 s mean.
+Ten minutes of warmup is, and then the node answers every request the scenario asks for with none dropped.
+
+Churn is the honest cost of eager attach.
+Drawing uniformly from a thousand with room for a hundred, nearly every request pays an attach plus the eviction that makes room for it, and the node turned over 1758 attaches in 300 s at a 7.3 s mean while holding the gauge at 100.
+Attach hydrates before serving the first row rather than faulting pages in on demand, and lazy hydrate belongs to the storage v2 redesign, so until that lands the sizing rule is to keep the attached ceiling above the working set.
+
+Memory holds flat.
+Peak RSS across the whole process tree is 15.7 GB over up to 1028 processes, median 13.6 GB, and across thirty minutes covering warmup, steady, idle and a churn window that attached seventeen hundred times the slope points slightly down, so about 140 MB per attached tenant and no drift.
+Provisioning costs 36.2 tenants a minute at 8 parallel jobs, almost all of it initdb and the genesis capture, with the registry write itself at 2.7 ms p50.
+The store holds 45.6 GB for the thousand, 45.6 MB a tenant.
+
 ## Pending
 
+- Lazy hydrate, then a fleet rerun, since the churn tail above is entirely eager attach.
 - Real S3 and S3 Express One Zone runs from an in region box, plus GCS and R2.
 - Concurrent producer runs to show batching amortization.
 - MinIO rerun on the storage v2 layout once it exists, the v1 rerun above showed the fold cost is structural.
