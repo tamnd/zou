@@ -8,6 +8,8 @@ mod inbox;
 mod info;
 mod inspect;
 mod map;
+#[cfg(unix)]
+mod serve;
 mod shard;
 mod stats;
 mod tenant;
@@ -29,6 +31,8 @@ fn usage() -> ExitCode {
     #[cfg(unix)]
     eprintln!("       {}", inbox::USAGE);
     eprintln!("       {}", map::USAGE);
+    #[cfg(unix)]
+    eprintln!("       {}", serve::USAGE);
     eprintln!("       {}", shard::USAGE);
     eprintln!("       {}", stats::USAGE);
     eprintln!("       {}", tenant::USAGE);
@@ -91,6 +95,22 @@ fn main() -> ExitCode {
         Some("info") => simple(info::run(&argv[1..])),
         Some("inspect") => simple(inspect::run(&argv[1..])),
         Some("map") => simple(map::run(&argv[1..])),
+        #[cfg(unix)]
+        Some("serve") => {
+            let args = match serve::parse(&argv[1..]) {
+                Ok(args) => args,
+                Err(e) => {
+                    eprintln!("zou: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            simple(serve::run(&args))
+        }
+        #[cfg(not(unix))]
+        Some("serve") => {
+            eprintln!("zou: serve needs a unix platform");
+            ExitCode::FAILURE
+        }
         Some("shard") => simple(shard::run(&argv[1..])),
         Some("stats") => simple(stats::run(&argv[1..])),
         Some("tenant") => simple(tenant::run(&argv[1..])),

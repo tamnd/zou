@@ -77,6 +77,8 @@ A branch is a new manifest pointing at the same immutable checkpoint and WAL obj
 
 The same crates ship three ways. Embedded links into a host process like SQLite, with the local filesystem as just another object store backend, so the whole engine works offline. Single server mode is one static binary serving many tenants. Serverless mode runs the same binary on Lambda or Fly machines, attaching a tenant on demand in a few hundred milliseconds because attach only needs the manifest plus lazy page faults.
 
+Single server mode is the `zou serve <target>` command, and the difference between it and the `zou dev <target>` a laptop runs is which store prefix it takes as its subject: one database for dev, the whole registry for serve. It binds the four doors on one runtime, holds the registry and the attach manager behind all of them, and owns the one piece the library cannot own, which is starting a postmaster for a tenant and stopping it again. Cold attach is eager for now, because restoring a tenant writes its whole capture to disk before the postmaster starts, so the few hundred milliseconds in the paragraph above is what lazy page faults will buy and not what is measured today, see [operations.md](operations.md).
+
 ## Embedded execution decision
 
 The M1 gate asked whether embedded zou runs Postgres in process as a single user session linked over the C ABI, or as a managed child postmaster on a unix socket loopback. Both were spiked against a real zou store with the patched build, `scripts/zou-spike-embed.sh` reproduces the run.

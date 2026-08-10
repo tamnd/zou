@@ -117,6 +117,39 @@ A read forwarded is slower; a write served locally is data that never happened.
 `zou_forwarded_requests_total{outcome="sent"|"failed"}` counts the hops, `zou_stale_reads_total` counts the answers served locally, and `zou_stale_read_seconds` is how far behind they were.
 Each forwarded request opens a client span whose `traceparent` goes across, so a trace covers both nodes and the hop is a span in it.
 
+## Serving a fleet
+
+`zou serve <target>` is the node.
+`zou dev` serves the one database in a store, which is what a laptop wants; this serves whatever is in `registry/`, which on a real deployment is a few hundred or a few thousand projects that are mostly asleep.
+
+    zou serve s3://bucket/fleet --domain zou.example --ops 9187
+
+Four listeners come up on one runtime: the http front door on 54321, the postgres port on 5432, the pooler on 6543, and the scrape wherever `--ops` says, off unless it is asked for.
+One runtime rather than one each, because four thread pools on an eight core node compete for eight cores and the density this is built for is a number of tenants and not a number of servers.
+They share the registry and the attach manager, so a project brought up by whichever door was asked first is the project the others find already running.
+Any door except http is turned off by giving it port 0.
+
+Routing is `--domain` and the path prefix, and at least one of them has to be on, which is checked at the command line rather than at the first request.
+`--domain zou.example` makes `acme-prod.zou.example` a project, and it is also where a tenant's own external url comes from, so the links in its confirmation mail point at the project instead of at the node.
+The path prefix is on by default and `--no-path-prefix` turns it off, for a deployment that has a wildcard certificate and does not want a second way in.
+
+Nothing is running until a request names a project.
+The first one for a cold tenant restores its runtime directory out of that tenant's own prefix and starts a postmaster on loopback with a private socket directory, and both are thrown away when it is let go of.
+`--max-attached` is how many are up at once and `--idle-secs` is how long an untouched one stays up, both defaulting to what the attach manager uses, and the sweep that enforces the second runs on a timer at a quarter of it, because a node that has gone quiet is exactly the node with no requests to notice on.
+`--shared-buffers` is per tenant and defaults to 16MB, small on purpose: the ceiling multiplies it, and the store backed page cache is the tier that is supposed to be doing the work.
+A node running a few large projects rather than a thousand small ones should raise it.
+
+A postmaster that dies on its own detaches its tenant, so the next request attaches again instead of being routed at a database that is not there.
+One that was asked to stop does not, because something already did.
+Runtime directories are `<ref>-<n>` and never bare `<ref>`, so a detach followed immediately by an attach does not put a new postmaster in the directory the old one is still shutting down in.
+SIGINT or SIGTERM stops every attached tenant with a fast shutdown and removes the tree; no data waits on that, since an acked write is durable on the store by definition.
+
+Attach is eager today.
+Restoring a tenant writes its whole capture back to disk before the postmaster starts, so cold attach costs the size of the database and not the size of the working set, and a node's density and its p99 on a cold request should be measured with that said rather than assumed away.
+Lazy hydrate, where a page arrives when it is faulted, is the storage engine's work and not this command's.
+
+`zou serve` needs the patched postgres, `--pg-bin` or `ZOU_PG_BIN` pointing at the install, the same one `zou dev` uses.
+
 ## The postgres port
 
 A node serving many projects listens once on 5432 and proxies each connection to the project's own postgres, because a thousand databases on a node have no thousand ports to be exposed on.
