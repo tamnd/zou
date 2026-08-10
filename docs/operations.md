@@ -142,6 +142,13 @@ A node running a few large projects rather than a thousand small ones should rai
 A postmaster that dies on its own detaches its tenant, so the next request attaches again instead of being routed at a database that is not there.
 One that was asked to stop does not, because something already did.
 Runtime directories are `<ref>-<n>` and never bare `<ref>`, so a detach followed immediately by an attach does not put a new postmaster in the directory the old one is still shutting down in.
+
+One project has one postmaster at a time, and the node enforces it rather than assuming it.
+Detaching does not wait for a shutdown, because the attach manager is holding its own lock while it evicts and a request that displaced somebody else's project has no business waiting on that project's shutdown checkpoint.
+The next attach of that same project is what waits, which on a node that is churning is a wait that is already over by the time it is asked for.
+Skipping it is not an option: two postmasters put the same tenant's pages into the same prefix, and a database restored out of that has an index and a heap that disagree, which shows up as `create role anon` failing on the unique index that says the role it could not find is already there.
+A postmaster that has not gone within five seconds is asked for an immediate shutdown, and one that has not gone five seconds after that fails the attach instead of being started alongside.
+
 SIGINT or SIGTERM stops every attached tenant with a fast shutdown and removes the tree; no data waits on that, since an acked write is durable on the store by definition.
 
 Attach is eager today.
