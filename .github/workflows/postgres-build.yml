@@ -111,6 +111,11 @@ jobs:
           cat /tmp/zou-restored.log
       - name: kill -9 loop under pgbench load
         run: scripts/zou-crash-loop.sh 3
+      # The same bring up, branch, and restore the dev loop does, driven
+      # from a library instead of a command line, plus the in process
+      # dispatch that has no command line equivalent.
+      - name: the embedded library end to end
+        run: ZOU_PG_BIN=$PWD/build/pg/bin cargo test -p zou-embed --test embed
       - name: zou dev, branch, and info end to end
         run: |
           cargo build -p zou --release

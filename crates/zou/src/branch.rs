@@ -28,6 +28,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use zou_pg::branching::{discard, refuse_unservable};
 use zou_store::layout::TenantLayout;
 use zou_store::registry;
 use zou_store::{CasStore, Lsn, Manifest, branch, materialize_at, open_store};
@@ -108,24 +109,10 @@ fn create(store: &dyn CasStore, src: &str, dst: &str, at: At) -> Result<(), Stri
         At::Ts(ts) => materialize_at(store, src, dst, ts, now),
     }
     .map_err(|e| e.to_string())?;
-    // A child reads inherited pages out of the captures it names and
-    // has no fallback for the ones it cannot, so a source whose
-    // captures do not cover the whole chain yields a database that
-    // looks fine here and fails on the first page read an hour later.
-    // Asking now costs one store round trip per inherited checkpoint,
-    // and a child that would not serve is taken back off the store
-    // rather than left as something only shaped like a database.
-    match zou_pg::reader::why_unservable(store, &TenantLayout::new(dst), &manifest)? {
-        None => {}
-        Some(why) => {
-            discard(store, dst)?;
-            return Err(format!(
-                "{src} cannot be branched yet, {why}. A fold packs one down after a few \
-                 checkpoints of writes, so keep the source running and try again. Nothing of \
-                 {dst} was left on the store"
-            ));
-        }
-    }
+    // A child that would not serve is taken back off the store rather
+    // than left as something only shaped like a database. The embedded
+    // library does the same, out of the same function.
+    refuse_unservable(store, src, dst, &manifest)?;
     let of = manifest
         .branch_of
         .as_ref()
@@ -191,26 +178,6 @@ fn list(store: &dyn CasStore, parent: Option<&str>) -> Result<(), String> {
         (n, _) => println!("{n} branches"),
     }
     Ok(())
-}
-
-/// Everything under a ref's prefix, and the count of what went. The
-/// manifest goes first. Everything else under the prefix is
-/// unreachable once it is gone, so a removal interrupted halfway
-/// leaves objects nobody can read rather than a tenant whose manifest
-/// points at objects that are no longer there.
-fn discard(store: &dyn CasStore, tenant_ref: &str) -> Result<usize, String> {
-    let layout = TenantLayout::new(tenant_ref);
-    store
-        .delete(&layout.manifest())
-        .map_err(|e| format!("store: {e}"))?;
-    let prefix = format!("{}/", layout.prefix());
-    let keys = store.list(&prefix).map_err(|e| format!("store: {e}"))?;
-    let mut deleted = 1;
-    for key in &keys {
-        store.delete(key).map_err(|e| format!("store: {e}"))?;
-        deleted += 1;
-    }
-    Ok(deleted)
 }
 
 fn delete(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
