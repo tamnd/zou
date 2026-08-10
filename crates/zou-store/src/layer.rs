@@ -339,6 +339,214 @@ fn header(kind: LayerKind) -> Vec<u8> {
     buf
 }
 
+/// Incremental delta layer encoder: entries stream in strictly sorted
+/// by (key, lsn) and compressed blocks land as they fill, so building
+/// a layer never holds more than one raw block of entries. The bloom
+/// filter must be sized up front, so `expected` is an upper bound on
+/// the entry count; a merge passes the sum of its inputs' counts and
+/// overshoots only by the duplicates it drops.
+pub struct DeltaBuilder {
+    buf: Vec<u8>,
+    blocks: Vec<LayerBlock>,
+    bloom: Bloom,
+    raw: Vec<u8>,
+    block_target: usize,
+    first: LayerKey,
+    last: Option<(LayerKey, Lsn)>,
+    count: u32,
+    total: u64,
+    min_lsn: Lsn,
+    max_lsn: Lsn,
+}
+
+impl DeltaBuilder {
+    pub fn new(expected: usize, block_target: usize) -> Self {
+        DeltaBuilder {
+            buf: header(LayerKind::Delta),
+            blocks: Vec::new(),
+            bloom: Bloom::sized_for(expected.max(1)),
+            raw: Vec::new(),
+            block_target,
+            first: LayerKey::page(0, 0, 0, 0, 0),
+            last: None,
+            count: 0,
+            total: 0,
+            min_lsn: Lsn(u64::MAX),
+            max_lsn: Lsn(0),
+        }
+    }
+
+    pub fn push(&mut self, key: LayerKey, lsn: Lsn, record: &[u8]) -> Result<(), LayerBuildError> {
+        if self.last.is_some_and(|p| (key, lsn) <= p) {
+            return Err(LayerBuildError::Unsorted);
+        }
+        if record.len() > MAX_RECORD_LEN as usize {
+            return Err(LayerBuildError::RecordTooLarge);
+        }
+        if self.last.is_none() {
+            self.first = key;
+        }
+        self.bloom.insert(&key.encode());
+        if !self.raw.is_empty()
+            && self.raw.len() + ENTRY_FIXED_LEN + record.len() > self.block_target
+        {
+            let last_key = self.last.expect("a filled block has entries").0;
+            push_block(
+                &mut self.buf,
+                &mut self.blocks,
+                &self.raw,
+                self.first,
+                last_key,
+                self.count,
+            );
+            self.raw.clear();
+            self.count = 0;
+            self.first = key;
+        }
+        self.raw.extend_from_slice(&key.encode());
+        self.raw.extend_from_slice(&lsn.0.to_le_bytes());
+        self.raw
+            .extend_from_slice(&(record.len() as u32).to_le_bytes());
+        self.raw.extend_from_slice(record);
+        self.last = Some((key, lsn));
+        self.count += 1;
+        self.total += 1;
+        self.min_lsn = self.min_lsn.min(lsn);
+        self.max_lsn = self.max_lsn.max(lsn);
+        Ok(())
+    }
+
+    /// How many entries went in so far, zero meaning nothing to write.
+    pub fn len(&self) -> u64 {
+        self.total
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    pub fn finish(mut self) -> Result<(Vec<u8>, LayerFooter), LayerBuildError> {
+        let Some((last_key, _)) = self.last else {
+            return Err(LayerBuildError::Empty);
+        };
+        push_block(
+            &mut self.buf,
+            &mut self.blocks,
+            &self.raw,
+            self.first,
+            last_key,
+            self.count,
+        );
+        Ok(finish(
+            self.buf,
+            LayerKind::Delta,
+            self.blocks,
+            self.bloom,
+            self.min_lsn,
+            self.max_lsn,
+            self.total,
+        ))
+    }
+}
+
+/// Incremental image layer encoder at one lsn, the mirror of
+/// [`DeltaBuilder`] for pages streaming in strictly sorted by key.
+pub struct ImageBuilder {
+    buf: Vec<u8>,
+    blocks: Vec<LayerBlock>,
+    bloom: Bloom,
+    raw: Vec<u8>,
+    block_target: usize,
+    lsn: Lsn,
+    first: LayerKey,
+    last: Option<LayerKey>,
+    count: u32,
+    total: u64,
+}
+
+impl ImageBuilder {
+    pub fn new(expected: usize, lsn: Lsn, block_target: usize) -> Self {
+        ImageBuilder {
+            buf: header(LayerKind::Image),
+            blocks: Vec::new(),
+            bloom: Bloom::sized_for(expected.max(1)),
+            raw: Vec::new(),
+            block_target,
+            lsn,
+            first: LayerKey::page(0, 0, 0, 0, 0),
+            last: None,
+            count: 0,
+            total: 0,
+        }
+    }
+
+    pub fn push(&mut self, key: LayerKey, page: &[u8]) -> Result<(), LayerBuildError> {
+        if self.last.is_some_and(|p| key <= p) {
+            return Err(LayerBuildError::Unsorted);
+        }
+        if page.len() != PAGE_IMAGE_LEN {
+            return Err(LayerBuildError::BadPageLen { len: page.len() });
+        }
+        if self.last.is_none() {
+            self.first = key;
+        }
+        self.bloom.insert(&key.encode());
+        if !self.raw.is_empty()
+            && self.raw.len() + KEY_ENCODED_LEN + PAGE_IMAGE_LEN > self.block_target
+        {
+            let last_key = self.last.expect("a filled block has entries");
+            push_block(
+                &mut self.buf,
+                &mut self.blocks,
+                &self.raw,
+                self.first,
+                last_key,
+                self.count,
+            );
+            self.raw.clear();
+            self.count = 0;
+            self.first = key;
+        }
+        self.raw.extend_from_slice(&key.encode());
+        self.raw.extend_from_slice(page);
+        self.last = Some(key);
+        self.count += 1;
+        self.total += 1;
+        Ok(())
+    }
+
+    pub fn len(&self) -> u64 {
+        self.total
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    pub fn finish(mut self) -> Result<(Vec<u8>, LayerFooter), LayerBuildError> {
+        let Some(last_key) = self.last else {
+            return Err(LayerBuildError::Empty);
+        };
+        push_block(
+            &mut self.buf,
+            &mut self.blocks,
+            &self.raw,
+            self.first,
+            last_key,
+            self.count,
+        );
+        Ok(finish(
+            self.buf,
+            LayerKind::Image,
+            self.blocks,
+            self.bloom,
+            self.lsn,
+            self.lsn,
+            self.total,
+        ))
+    }
+}
+
 /// Encode one delta layer from entries already strictly sorted by
 /// (key, lsn). Returns the object bytes and the footer the shard
 /// manifest will summarize.
@@ -346,57 +554,11 @@ pub fn build_delta(
     entries: &[DeltaEntry],
     block_target: usize,
 ) -> Result<(Vec<u8>, LayerFooter), LayerBuildError> {
-    if entries.is_empty() {
-        return Err(LayerBuildError::Empty);
-    }
-    if entries
-        .windows(2)
-        .any(|w| (w[1].key, w[1].lsn) <= (w[0].key, w[0].lsn))
-    {
-        return Err(LayerBuildError::Unsorted);
-    }
-    if entries
-        .iter()
-        .any(|e| e.record.len() > MAX_RECORD_LEN as usize)
-    {
-        return Err(LayerBuildError::RecordTooLarge);
-    }
-
-    let mut buf = header(LayerKind::Delta);
-    let mut blocks = Vec::new();
-    let mut bloom = Bloom::sized_for(entries.len());
-    let mut raw = Vec::new();
-    let mut first = entries[0].key;
-    let mut last = entries[0].key;
-    let mut count = 0u32;
+    let mut b = DeltaBuilder::new(entries.len(), block_target);
     for e in entries {
-        bloom.insert(&e.key.encode());
-        if !raw.is_empty() && raw.len() + ENTRY_FIXED_LEN + e.record.len() > block_target {
-            push_block(&mut buf, &mut blocks, &raw, first, last, count);
-            raw.clear();
-            count = 0;
-            first = e.key;
-        }
-        raw.extend_from_slice(&e.key.encode());
-        raw.extend_from_slice(&e.lsn.0.to_le_bytes());
-        raw.extend_from_slice(&(e.record.len() as u32).to_le_bytes());
-        raw.extend_from_slice(&e.record);
-        last = e.key;
-        count += 1;
+        b.push(e.key, e.lsn, &e.record)?;
     }
-    push_block(&mut buf, &mut blocks, &raw, first, last, count);
-
-    let min_lsn = entries.iter().map(|e| e.lsn).min().expect("non empty");
-    let max_lsn = entries.iter().map(|e| e.lsn).max().expect("non empty");
-    Ok(finish(
-        buf,
-        LayerKind::Delta,
-        blocks,
-        bloom,
-        min_lsn,
-        max_lsn,
-        entries.len() as u64,
-    ))
+    b.finish()
 }
 
 /// Encode one image layer at `lsn` from entries already strictly
@@ -406,47 +568,11 @@ pub fn build_image(
     lsn: Lsn,
     block_target: usize,
 ) -> Result<(Vec<u8>, LayerFooter), LayerBuildError> {
-    if entries.is_empty() {
-        return Err(LayerBuildError::Empty);
-    }
-    if entries.windows(2).any(|w| w[1].key <= w[0].key) {
-        return Err(LayerBuildError::Unsorted);
-    }
-    if let Some(e) = entries.iter().find(|e| e.page.len() != PAGE_IMAGE_LEN) {
-        return Err(LayerBuildError::BadPageLen { len: e.page.len() });
-    }
-
-    let mut buf = header(LayerKind::Image);
-    let mut blocks = Vec::new();
-    let mut bloom = Bloom::sized_for(entries.len());
-    let mut raw = Vec::new();
-    let mut first = entries[0].key;
-    let mut last = entries[0].key;
-    let mut count = 0u32;
+    let mut b = ImageBuilder::new(entries.len(), lsn, block_target);
     for e in entries {
-        bloom.insert(&e.key.encode());
-        if !raw.is_empty() && raw.len() + KEY_ENCODED_LEN + PAGE_IMAGE_LEN > block_target {
-            push_block(&mut buf, &mut blocks, &raw, first, last, count);
-            raw.clear();
-            count = 0;
-            first = e.key;
-        }
-        raw.extend_from_slice(&e.key.encode());
-        raw.extend_from_slice(&e.page);
-        last = e.key;
-        count += 1;
+        b.push(e.key, &e.page)?;
     }
-    push_block(&mut buf, &mut blocks, &raw, first, last, count);
-
-    Ok(finish(
-        buf,
-        LayerKind::Image,
-        blocks,
-        bloom,
-        lsn,
-        lsn,
-        entries.len() as u64,
-    ))
+    b.finish()
 }
 
 fn parse_header(header: &[u8]) -> Result<LayerKind, LayerDecodeError> {
@@ -778,6 +904,126 @@ pub fn decode_delta(buf: &[u8]) -> Result<(Vec<DeltaEntry>, LayerFooter), LayerD
     Ok((entries, footer))
 }
 
+/// Stream a delta layer's entries in (key, lsn) order holding one
+/// decoded block at a time, the merge reader for compaction. An error
+/// item reports the corrupt block and ends the stream.
+pub struct DeltaCursor<'a> {
+    buf: &'a [u8],
+    footer: LayerFooter,
+    block: usize,
+    entries: std::vec::IntoIter<DeltaEntry>,
+    prev: Option<(LayerKey, Lsn)>,
+    dead: bool,
+}
+
+pub fn delta_cursor(buf: &[u8]) -> Result<DeltaCursor<'_>, LayerDecodeError> {
+    let (footer, _) = parse_shell(buf)?;
+    check_kind(&footer, LayerKind::Delta)?;
+    Ok(DeltaCursor {
+        buf,
+        footer,
+        block: 0,
+        entries: Vec::new().into_iter(),
+        prev: None,
+        dead: false,
+    })
+}
+
+impl DeltaCursor<'_> {
+    pub fn footer(&self) -> &LayerFooter {
+        &self.footer
+    }
+}
+
+impl Iterator for DeltaCursor<'_> {
+    type Item = Result<DeltaEntry, LayerDecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.dead {
+            return None;
+        }
+        loop {
+            if let Some(e) = self.entries.next() {
+                // Per block ordering is checked in the block decode;
+                // across the boundary the order must hold too.
+                if self.prev.is_some_and(|p| (e.key, e.lsn) <= p) {
+                    self.dead = true;
+                    return Some(Err(LayerDecodeError::Block {
+                        index: self.block - 1,
+                    }));
+                }
+                self.prev = Some((e.key, e.lsn));
+                return Some(Ok(e));
+            }
+            let meta = self.footer.blocks.get(self.block)?;
+            let index = self.block;
+            self.block += 1;
+            let bytes = &self.buf[meta.offset as usize..(meta.offset + meta.len as u64) as usize];
+            match decode_delta_block(bytes, meta) {
+                Ok(entries) => self.entries = entries.into_iter(),
+                Err(_) => {
+                    self.dead = true;
+                    return Some(Err(LayerDecodeError::Block { index }));
+                }
+            }
+        }
+    }
+}
+
+/// Stream an image layer's pages in key order, the mirror of
+/// [`DeltaCursor`].
+pub struct ImageCursor<'a> {
+    buf: &'a [u8],
+    footer: LayerFooter,
+    block: usize,
+    entries: std::vec::IntoIter<ImageEntry>,
+    dead: bool,
+}
+
+pub fn image_cursor(buf: &[u8]) -> Result<ImageCursor<'_>, LayerDecodeError> {
+    let (footer, _) = parse_shell(buf)?;
+    check_kind(&footer, LayerKind::Image)?;
+    Ok(ImageCursor {
+        buf,
+        footer,
+        block: 0,
+        entries: Vec::new().into_iter(),
+        dead: false,
+    })
+}
+
+impl ImageCursor<'_> {
+    pub fn footer(&self) -> &LayerFooter {
+        &self.footer
+    }
+}
+
+impl Iterator for ImageCursor<'_> {
+    type Item = Result<ImageEntry, LayerDecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.dead {
+            return None;
+        }
+        loop {
+            if let Some(e) = self.entries.next() {
+                return Some(Ok(e));
+            }
+            let meta = self.footer.blocks.get(self.block)?;
+            let index = self.block;
+            self.block += 1;
+            let bytes = &self.buf[meta.offset as usize..(meta.offset + meta.len as u64) as usize];
+            match decode_image_block(bytes, meta) {
+                Ok(entries) => self.entries = entries.into_iter(),
+                Err(_) => {
+                    self.dead = true;
+                    return Some(Err(LayerDecodeError::Block { index }));
+                }
+            }
+        }
+    }
+}
+
 /// Full decode of an image layer: every entry in key order, plus the
 /// footer.
 pub fn decode_image(buf: &[u8]) -> Result<(Vec<ImageEntry>, LayerFooter), LayerDecodeError> {
@@ -884,6 +1130,45 @@ mod tests {
             collected.extend(decode_delta_block(range, meta).unwrap());
         }
         assert_eq!(collected, entries);
+    }
+
+    #[test]
+    fn cursors_stream_what_the_full_decode_returns() {
+        let entries = delta_entries(200);
+        let (buf, footer) = build_delta(&entries, 2048).unwrap();
+        let cursor = delta_cursor(&buf).unwrap();
+        assert_eq!(cursor.footer(), &footer);
+        let streamed: Vec<_> = cursor.map(|r| r.unwrap()).collect();
+        assert_eq!(streamed, entries);
+        let images = image_entries(30);
+        let (ibuf, ifooter) = build_image(&images, Lsn(7), 3 * PAGE_IMAGE_LEN).unwrap();
+        let cursor = image_cursor(&ibuf).unwrap();
+        assert_eq!(cursor.footer(), &ifooter);
+        let streamed: Vec<_> = cursor.map(|r| r.unwrap()).collect();
+        assert_eq!(streamed, images);
+    }
+
+    #[test]
+    fn a_corrupt_block_ends_the_cursor_with_one_error() {
+        let entries = delta_entries(200);
+        let (mut buf, footer) = build_delta(&entries, 2048).unwrap();
+        let meta = &footer.blocks[2];
+        buf[meta.offset as usize + 4] ^= 0xff;
+        let mut clean = 0;
+        let mut cursor = delta_cursor(&buf).unwrap();
+        for item in &mut cursor {
+            match item {
+                Ok(_) => clean += 1,
+                Err(LayerDecodeError::Block { index }) => {
+                    assert_eq!(index, 2);
+                    break;
+                }
+                Err(other) => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(cursor.next().is_none(), "the stream ends at the error");
+        let before: u32 = footer.blocks[..2].iter().map(|b| b.entries).sum();
+        assert_eq!(clean, before, "every entry before the bad block came out");
     }
 
     #[test]
