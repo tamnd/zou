@@ -385,6 +385,8 @@ const DIRECT: &[&str] = &[
     "api.schemas",
     "auth.site_url",
     "db.port",
+    "db.seed.enabled",
+    "db.seed.sql_paths",
 ];
 
 /// A Supabase project, as far as this server is concerned.
@@ -405,9 +407,28 @@ pub struct Project {
     pub env: Vec<(String, String)>,
     /// Settings the file has and this server has no answer for.
     pub unread: Vec<String>,
+    /// What `zou db reset` runs after the migrations, relative to the
+    /// directory the config lives in, and empty when the file switches
+    /// seeding off.
+    pub seed: Vec<String>,
 }
 
 impl Project {
+    /// The directory the file lives in, which is what a relative path
+    /// inside it is relative to.
+    pub fn dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Where a project keeps its migrations, which is next to the
+    /// config file whatever the file is called.
+    pub fn migrations(&self) -> PathBuf {
+        self.dir().join("migrations")
+    }
+
     /// Read a config.toml, taking `env(NAME)` values from the process
     /// environment.
     pub fn read(path: &Path) -> Result<Project, String> {
@@ -523,6 +544,19 @@ impl Project {
                 .collect(),
             _ => Vec::new(),
         };
+        // Seeding is on unless the file says otherwise, and the CLI's
+        // own default path is the one a project that never touched the
+        // setting has.
+        let seed = match table.get("db.seed.enabled").and_then(Value::as_bool) {
+            Some(false) => Vec::new(),
+            _ => match table.get("db.seed.sql_paths") {
+                Some(Value::List(items)) => items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                _ => vec!["./seed.sql".to_string()],
+            },
+        };
         let unread = table
             .keys()
             .filter(|k| !read.iter().any(|r| r == *k))
@@ -543,6 +577,7 @@ impl Project {
                 .map(str::to_string),
             env,
             unread,
+            seed,
         }
     }
 
@@ -563,6 +598,27 @@ impl Project {
         }
         set
     }
+}
+
+/// The project a command was run inside, or the one it was pointed
+/// at. A file that was named and is not there is an error, a file
+/// nobody named and nobody has is simply None.
+pub fn locate(explicit: Option<&Path>) -> Result<Option<Project>, String> {
+    let path = match explicit {
+        Some(path) => Some(path.to_path_buf()),
+        None => find(&std::env::current_dir().map_err(|e| format!("cwd: {e}"))?),
+    };
+    match path {
+        Some(path) => Project::read(&path).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The url a client on this machine reaches a `zou dev` cluster with.
+/// Local connections are trust, so the password is there for the
+/// clients that insist on one and is not a secret.
+pub fn local_db_url(port: u16) -> String {
+    format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres")
 }
 
 /// Look for a project config, starting at `from` and walking up. Both
@@ -789,6 +845,36 @@ port = 54323
         t.insert("auth.external.github.enabled".into(), Value::Bool(false));
         let p = Project::from_table(&t, &|_| Some("x".into()));
         assert_eq!(env_of(&p, "ZOU_EXTERNAL_GITHUB_CLIENT_ID"), None);
+    }
+
+    #[test]
+    fn a_project_that_never_mentioned_the_seed_still_has_the_one_the_cli_gives_it() {
+        let none = |_: &str| None;
+        let project = Project::from_table(&parse("project_id = \"x\"").unwrap(), &none);
+        assert_eq!(project.seed, ["./seed.sql"]);
+        let table = parse("[db.seed]\nsql_paths = [\"./a.sql\", \"./b.sql\"]").unwrap();
+        assert_eq!(
+            Project::from_table(&table, &none).seed,
+            ["./a.sql", "./b.sql"]
+        );
+        let off = parse("[db.seed]\nenabled = false\nsql_paths = [\"./a.sql\"]").unwrap();
+        assert!(
+            Project::from_table(&off, &none).seed.is_empty(),
+            "switched off means nothing runs, whatever the paths say"
+        );
+    }
+
+    #[test]
+    fn migrations_sit_next_to_the_file_that_names_the_project() {
+        let project = Project {
+            path: PathBuf::from("/home/me/app/supabase/config.toml"),
+            ..Project::from_table(&parse("project_id = \"x\"").unwrap(), &|_: &str| None)
+        };
+        assert_eq!(project.dir(), PathBuf::from("/home/me/app/supabase"));
+        assert_eq!(
+            project.migrations(),
+            PathBuf::from("/home/me/app/supabase/migrations")
+        );
     }
 
     #[test]

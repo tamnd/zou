@@ -111,13 +111,8 @@ impl Status {
         format!("http://127.0.0.1:{}/storage/v1/s3", self.api)
     }
 
-    /// Local connections are trust, so the password is there for the
-    /// clients that insist on one and is not a secret.
     fn db_url(&self) -> String {
-        format!(
-            "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
-            self.db
-        )
+        config::local_db_url(self.db)
     }
 
     fn keys(&self) -> Option<(String, String)> {
@@ -191,14 +186,7 @@ impl Status {
 
 pub fn run(argv: &[String]) -> Result<(), String> {
     let args = parse(argv)?;
-    let path = match &args.config {
-        Some(path) => Some(path.clone()),
-        None => config::find(&std::env::current_dir().map_err(|e| format!("cwd: {e}"))?),
-    };
-    let project = match &path {
-        Some(path) => Some(Project::read(path)?),
-        None => None,
-    };
+    let project = config::locate(args.config.as_deref())?;
     let from_project = |pick: fn(&Project) -> Option<u16>| project.as_ref().and_then(pick);
     let status = Status {
         api: args

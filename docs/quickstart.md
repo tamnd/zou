@@ -79,6 +79,24 @@ The last line is the honest part: every setting in the file that zou has no answ
 
 A path ending `.zou` is the single file backend. Every sequential tool works over it today, `zou info`, `zou branch`, `zou-bootstrap`, `zou-restore`, while `zou dev` needs the multi process postmaster and waits on the in process engine, see the note in docs/storage-engine.md.
 
+## The project's own migrations
+
+The schema lives in `supabase/migrations` as `<timestamp>_<name>.sql`, and what has been applied is recorded in `supabase_migrations.schema_migrations`, which is the table the Supabase CLI reads, so a project can go back and forth between the two while it is deciding.
+
+```bash
+zou migration new "add users table"    # supabase/migrations/20240102030405_add_users_table.sql
+zou db push --dry-run                  # what would be applied, in name order
+zou db push                            # apply it, and write the ledger
+zou db reset                           # drop the project's schemas, replay everything, seed
+```
+
+The database is the one `[db] port` names, or `--db-url`, or `ZOU_DB_URL`, in that order.
+Each file is applied as one transaction with its ledger row written inside it, so a file that fails half way leaves neither its tables nor its version behind, and the next `zou db push` starts again from the same place.
+
+A reset drops every schema the project owns and puts `public` back with the grants the api roles need, then replays the migrations and runs the seed that `[db.seed] sql_paths` names, `./seed.sql` by default.
+It leaves the schemas this server runs on alone, `auth`, `storage`, `extensions` and `zou` among them, because here those belong to the running server rather than to a container somebody can throw away.
+That is also why it refuses a database that is not on this machine unless you say `--force`.
+
 ## Mail on a laptop
 
 `zou dev <target> --http 54321` starts the API front door next to the postmaster and logs the anon and service_role keys the way `supabase start` does, so a client is pointed at it by copying two lines.
