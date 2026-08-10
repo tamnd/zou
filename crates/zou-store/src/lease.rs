@@ -76,7 +76,89 @@ pub fn acquire(
     ttl_secs: u64,
     now_unix: u64,
 ) -> Result<HeldLease, LeaseError> {
-    take(store, layout, holder, ttl_secs, now_unix, false)
+    take(store, layout, holder, None, ttl_secs, now_unix, false)
+}
+
+/// The same, publishing an address other nodes can reach this one at.
+///
+/// A fleet needs it and nothing else does: a node that cannot serve a
+/// request itself has to send it to the node that can, and the manifest
+/// is the only thing both of them read. An embedded build and a one
+/// shot command take the lease without one.
+pub fn acquire_at(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    holder: &str,
+    endpoint: Option<&str>,
+    ttl_secs: u64,
+    now_unix: u64,
+) -> Result<HeldLease, LeaseError> {
+    take(store, layout, holder, endpoint, ttl_secs, now_unix, false)
+}
+
+/// [`steal`] with an address, for the same reason [`acquire_at`] has
+/// one: the node that took over is the node the others must now reach.
+pub fn steal_at(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    holder: &str,
+    endpoint: Option<&str>,
+    ttl_secs: u64,
+    now_unix: u64,
+) -> Result<HeldLease, LeaseError> {
+    take(store, layout, holder, endpoint, ttl_secs, now_unix, true)
+}
+
+/// Who holds the writer lease for this tenant, as of `now_unix`.
+///
+/// None means nobody does: either no lease was ever taken or the one
+/// that was has expired, and in both cases the next node to ask may
+/// take it. The lease is read straight from the manifest rather than
+/// from any registry of nodes, so there is no membership service to be
+/// wrong and nothing to keep in sync with the truth.
+///
+/// An expired lease reads as nobody even though its holder may still be
+/// alive and about to renew. That is the same window the protocol
+/// already has, and it is safe on both sides: the epoch bump fences a
+/// writer that lost the race, so the worst case is a request sent to a
+/// node that has just stopped being the writer, which answers it with
+/// the error the lease protocol already produces.
+pub fn holder(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    now_unix: u64,
+) -> Result<Option<Holder>, LeaseError> {
+    let key = layout.manifest();
+    let Some((data, _)) = store.get(&key)? else {
+        return Err(LeaseError::NoManifest { key });
+    };
+    let manifest = Manifest::from_json(&data)?;
+    let published_unix = manifest.published_unix;
+    let epoch = manifest.epoch;
+    Ok(manifest.lease.and_then(|lease| {
+        (lease.expires_unix > now_unix).then_some(Holder {
+            node: lease.holder,
+            endpoint: lease.endpoint,
+            expires_unix: lease.expires_unix,
+            epoch,
+            published_unix,
+        })
+    }))
+}
+
+/// Who is writing a tenant right now, for a node that is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Holder {
+    /// The holder's id, which is what a node compares against its own
+    /// to learn whether it is the writer.
+    pub node: String,
+    /// Where to reach it, when it published one.
+    pub endpoint: Option<String>,
+    pub expires_unix: u64,
+    pub epoch: u64,
+    /// When the holder last published state, which is the freshest any
+    /// reader of this tenant can possibly be.
+    pub published_unix: Option<u64>,
 }
 
 /// Deliberate failover: become the writer even though the manifest shows
@@ -95,13 +177,14 @@ pub fn steal(
     ttl_secs: u64,
     now_unix: u64,
 ) -> Result<HeldLease, LeaseError> {
-    take(store, layout, holder, ttl_secs, now_unix, true)
+    take(store, layout, holder, None, ttl_secs, now_unix, true)
 }
 
 fn take(
     store: &dyn CasStore,
     layout: &TenantLayout,
     holder: &str,
+    endpoint: Option<&str>,
     ttl_secs: u64,
     now_unix: u64,
     force: bool,
@@ -128,6 +211,7 @@ fn take(
         holder: holder.to_string(),
         expires_unix: now_unix + ttl_secs,
         fence,
+        endpoint: endpoint.map(str::to_string),
     });
 
     let version = swap(store, &key, &manifest, &version)?;
@@ -295,6 +379,70 @@ mod tests {
         let m = Manifest::from_json(&data).unwrap();
         assert_eq!(m.epoch, 1);
         assert_eq!(m.lease.unwrap().holder, "node-a");
+    }
+
+    #[test]
+    fn the_holder_publishes_where_to_reach_it_and_renewal_keeps_it() {
+        // The whole of holder discovery: a node that is not the writer
+        // reads the manifest it already reads and finds an address.
+        let (_d, store, layout) = setup();
+        let mut held = acquire_at(
+            &store,
+            &layout,
+            "node-a",
+            Some("http://10.0.0.4:8000"),
+            15,
+            1000,
+        )
+        .unwrap();
+        let found = holder(&store, &layout, 1001).unwrap().expect("a holder");
+        assert_eq!(found.node, "node-a");
+        assert_eq!(found.endpoint.as_deref(), Some("http://10.0.0.4:8000"));
+        assert_eq!(found.expires_unix, 1015);
+
+        renew(&store, &layout, &mut held, 15, 1005).unwrap();
+        let found = holder(&store, &layout, 1006).unwrap().expect("a holder");
+        assert_eq!(
+            found.endpoint.as_deref(),
+            Some("http://10.0.0.4:8000"),
+            "a renewal is not a move"
+        );
+    }
+
+    #[test]
+    fn an_expired_lease_reads_as_nobody_holding_it() {
+        let (_d, store, layout) = setup();
+        acquire_at(
+            &store,
+            &layout,
+            "node-a",
+            Some("http://10.0.0.4:8000"),
+            15,
+            1000,
+        )
+        .unwrap();
+        assert!(holder(&store, &layout, 1014).unwrap().is_some());
+        assert!(
+            holder(&store, &layout, 1015).unwrap().is_none(),
+            "expiry is when the next node may take it, so it is nobody's now"
+        );
+    }
+
+    #[test]
+    fn a_lease_without_an_address_says_so_rather_than_guessing() {
+        // Single node, embedded and every one shot command. There is
+        // nowhere to forward to and a caller has to be told that.
+        let (_d, store, layout) = setup();
+        acquire(&store, &layout, "node-a", 15, 1000).unwrap();
+        let found = holder(&store, &layout, 1001).unwrap().expect("a holder");
+        assert_eq!(found.node, "node-a");
+        assert!(found.endpoint.is_none());
+    }
+
+    #[test]
+    fn nobody_holds_a_lease_that_was_never_taken() {
+        let (_d, store, layout) = setup();
+        assert!(holder(&store, &layout, 1000).unwrap().is_none());
     }
 
     #[test]

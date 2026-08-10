@@ -30,12 +30,14 @@ use tower::ServiceExt as _;
 use zou_store::registry::Tenant;
 
 use crate::attach::Attached;
+use crate::forward::{Forwarding, Where};
 use crate::tenant::{Found, Registry, Routing};
 
 struct Front {
     routing: Routing,
     registry: Arc<Registry>,
     attached: Arc<Attached>,
+    forwarding: Option<Arc<Forwarding>>,
 }
 
 /// A router that serves every tenant on a store.
@@ -44,12 +46,26 @@ struct Front {
 /// what makes the first segment safe to read as a ref, and it is why
 /// there is a fallback here and nothing else.
 pub fn gateway(routing: Routing, registry: Arc<Registry>, attached: Arc<Attached>) -> Router {
+    fleet(routing, registry, attached, None)
+}
+
+/// The same for a node that is one of several. `forwarding` is what it
+/// does with a tenant another node is writing, and a node without it is
+/// a node that believes every tenant is its own, which is true of every
+/// single node deployment and of nothing else.
+pub fn fleet(
+    routing: Routing,
+    registry: Arc<Registry>,
+    attached: Arc<Attached>,
+    forwarding: Option<Arc<Forwarding>>,
+) -> Router {
     Router::new()
         .fallback(any(dispatch))
         .with_state(Arc::new(Front {
             routing,
             registry,
             attached,
+            forwarding,
         }))
 }
 
@@ -67,6 +83,24 @@ async fn dispatch(State(front): State<Arc<Front>>, mut req: Request<Body>) -> Re
             return unavailable("the tenant registry could not be read");
         }
     };
+    // Before the attach, because an attach takes the lease and the
+    // whole question here is whether this node may have it. The request
+    // that goes to a peer goes as it arrived, path and all, so the peer
+    // resolves the same tenant this node just did.
+    let mut stale = None;
+    if let Some(forwarding) = &front.forwarding {
+        match forwarding
+            .decide(&found.tenant_ref, req.method(), req.headers())
+            .await
+        {
+            Where::Here => {}
+            Where::Stale { behind } => stale = Some(behind),
+            Where::There { endpoint } => return forwarding.relay(&endpoint, req).await,
+            Where::Refuse { why, status } => {
+                return crate::json_body(status, serde_json::json!({"message": why}));
+            }
+        }
+    }
     let router = match front.attached.router(&entry).await {
         Ok(router) => router,
         Err(e) => {
@@ -80,10 +114,15 @@ async fn dispatch(State(front): State<Arc<Front>>, mut req: Request<Body>) -> Re
         };
         *req.uri_mut() = uri;
     }
-    match router.into_service::<Body>().oneshot(req).await {
+    let mut answer = match router.into_service::<Body>().oneshot(req).await {
         Ok(answer) => answer,
         Err(never) => match never {},
+    };
+    if let Some(behind) = stale {
+        crate::ops::stale_read(behind);
+        crate::forward::mark_stale(&mut answer, behind);
     }
+    answer
 }
 
 /// Which tenant, in the order the answers get more expensive.
@@ -212,6 +251,65 @@ mod tests {
         })
     }
 
+    /// A node that holds nothing: every tenant is written by node-b,
+    /// which answers at an address nobody has to be listening on.
+    struct Elsewhere {
+        published_unix: Option<u64>,
+    }
+
+    impl crate::forward::Peers for Elsewhere {
+        fn holder(&self, _tenant_ref: &str) -> Result<Option<zou_store::lease::Holder>, String> {
+            Ok(Some(zou_store::lease::Holder {
+                node: "node-b".to_string(),
+                endpoint: Some("http://10.0.0.4:8000".to_string()),
+                expires_unix: u64::MAX,
+                epoch: 2,
+                published_unix: self.published_unix,
+            }))
+        }
+    }
+
+    struct Peer;
+
+    impl crate::forward::Proxy for Peer {
+        fn send(&self, call: crate::forward::Call) -> Result<crate::forward::Answer, String> {
+            Ok(crate::forward::Answer {
+                status: 200,
+                headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                body: format!("the writer answered {}", call.url).into_bytes(),
+            })
+        }
+    }
+
+    fn one_of_several(
+        stale_reads: bool,
+        published_unix: Option<u64>,
+    ) -> (tempfile::TempDir, Arc<Fake>, Router) {
+        let dir = tempfile::tempdir().expect("a directory to write into");
+        let store: Arc<dyn CasStore> =
+            Arc::from(open_store(&dir.path().to_string_lossy()).expect("a store opens"));
+        registry::create(
+            store.as_ref(),
+            &Tenant::new("acme-prod", &secret("acme-prod"), 1),
+        )
+        .expect("it registers");
+        let backend = Arc::new(Fake::default());
+        let attached = Arc::new(Attached::new(backend.clone()));
+        let registry = Arc::new(Registry::new(store));
+        let holders = crate::forward::Holders::new(Arc::new(Elsewhere { published_unix }));
+        let forwarding = crate::forward::Forwarding::new("node-a", holders, Arc::new(Peer))
+            .with_stale_reads(stale_reads);
+        let routing = Routing {
+            domains: vec!["zou.example".to_string()],
+            path_prefix: false,
+        };
+        (
+            dir,
+            backend,
+            fleet(routing, registry, attached, Some(Arc::new(forwarding))),
+        )
+    }
+
     async fn call(
         router: &Router,
         host: &str,
@@ -234,6 +332,62 @@ mod tests {
 
     fn anon(tenant_ref: &str) -> String {
         jwt::mint(&jwt::key_claims("anon"), secret(tenant_ref).as_bytes())
+    }
+
+    async fn ask(router: &Router, method: &str, url: &str, key: Option<&str>) -> Response {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(url)
+            .header(header::HOST, "acme-prod.zou.example");
+        if let Some(key) = key {
+            req = req.header("apikey", key);
+        }
+        router
+            .clone()
+            .oneshot(req.body(Body::empty()).expect("a request"))
+            .await
+            .expect("an answer")
+    }
+
+    #[tokio::test]
+    async fn a_write_for_a_tenant_another_node_holds_never_starts_a_database_here() {
+        let (_d, backend, router) = one_of_several(false, None);
+        let answer = ask(&router, "POST", "/rest/v1/todos", None).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        let body = to_bytes(answer.into_body(), 1 << 20).await.expect("a body");
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "the writer answered http://10.0.0.4:8000/rest/v1/todos"
+        );
+        assert!(
+            backend.up.lock().unwrap().is_empty(),
+            "the decision comes before the attach, because the attach is what takes the lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_read_is_answered_here_and_carries_its_age() {
+        let published = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_secs()
+            - 3;
+        let (_d, backend, router) = one_of_several(true, Some(published));
+        let answer = ask(&router, "GET", "/auth/v1/health", Some(&anon("acme-prod"))).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert_eq!(
+            answer
+                .headers()
+                .get(crate::forward::STALE_SECONDS)
+                .and_then(|v| v.to_str().ok()),
+            Some("3"),
+            "an answer that did not come from the writer says so"
+        );
+        assert_eq!(
+            backend.up.lock().unwrap().clone(),
+            vec!["acme-prod"],
+            "and it is this node that answered it"
+        );
     }
 
     #[tokio::test]

@@ -100,6 +100,16 @@ pub struct Lease {
     pub expires_unix: u64,
     /// Fence token, stamped into every WAL frame the holder writes.
     pub fence: u64,
+    /// Where another node can reach the holder, scheme and authority,
+    /// `http://10.0.0.4:8000`. This is how a node that is not the writer
+    /// finds the one that is: the manifest is already the only thing
+    /// every node reads, so holder discovery costs nothing new.
+    ///
+    /// Absent when the holder is not reachable, which is an embedded
+    /// build, a one shot command and any single node deployment, and
+    /// absent is what every manifest written before this field says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +214,7 @@ mod tests {
                 holder: "node-7f3a".into(),
                 expires_unix: 1_767_100_000,
                 fence: 1042,
+                endpoint: None,
             }),
             pg: PgInfo {
                 version: 18,
