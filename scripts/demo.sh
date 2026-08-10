@@ -31,7 +31,9 @@ cargo build --quiet --release -p zou
 DEMO_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zou-demo.XXXXXX")"
 STORE="$DEMO_DIR/store"
 ZOU=target/release/zou
-PSQL() { "$PG_BIN/psql" -h 127.0.0.1 -p "$PORT" -d postgres -X -q "$@"; }
+# The cluster superuser is postgres wherever a project is hosted, so
+# the connection names it rather than taking the OS user.
+PSQL() { "$PG_BIN/psql" -h 127.0.0.1 -p "$PORT" -U postgres -d postgres -X -q "$@"; }
 
 DEV_PID=""
 stop_dev() {

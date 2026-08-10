@@ -533,7 +533,7 @@ pub fn run(args: &Args) -> Result<(), String> {
                             "postgres ready on 127.0.0.1:{port} and socket {}",
                             sock.display()
                         );
-                        log::info!("try psql -h 127.0.0.1 -p {port} -d postgres");
+                        log::info!("try psql -h 127.0.0.1 -p {port} -U postgres -d postgres");
                     }
                 }
             })

@@ -118,14 +118,14 @@ jobs:
           target/release/zou dev /tmp/zou-dev-store --pg-bin build/pg/bin --port 5614 --runtime /tmp/zou-dev-run >/tmp/zou-dev.log 2>&1 &
           DEV=$!
           for i in $(seq 1 120); do
-            build/pg/bin/psql -h 127.0.0.1 -p 5614 -d postgres -Atc 'select 1' >/dev/null 2>&1 && break
+            build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select 1' >/dev/null 2>&1 && break
             sleep 1
           done
-          build/pg/bin/psql -h 127.0.0.1 -p 5614 -d postgres -c "create table devt(id int)" -c "insert into devt select g from generate_series(1,100) g"
+          build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -c "create table devt(id int)" -c "insert into devt select g from generate_series(1,100) g"
           kill -9 "$(head -1 /tmp/zou-dev-run/pgdata/postmaster.pid)"
           OUT=""
           for i in $(seq 1 120); do
-            OUT=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -d postgres -Atc 'select count(*) from devt' 2>/dev/null) && [ "$OUT" = 100 ] && break
+            OUT=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select count(*) from devt' 2>/dev/null) && [ "$OUT" = 100 ] && break
             sleep 1
           done
           [ "$OUT" = 100 ]
@@ -136,7 +136,7 @@ jobs:
           DEV2=$!
           OUT=""
           for i in $(seq 1 120); do
-            OUT=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -d postgres -Atc 'select count(*) from devt' 2>/dev/null) && [ "$OUT" = 100 ] && break
+            OUT=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select count(*) from devt' 2>/dev/null) && [ "$OUT" = 100 ] && break
             sleep 1
           done
           [ "$OUT" = 100 ]
