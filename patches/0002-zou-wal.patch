@@ -38,10 +38,10 @@ index b885513..24c245d 100644
  		 */
 diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
 new file mode 100644
-index 0000000..e926a73
+index 0000000..ad24f0b
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,608 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -610,14 +610,25 @@ index 0000000..e926a73
 +	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 +	BackgroundWorkerUnblockSignals();
 +
++	/*
++	 * The restart delay is zero because readers block on the socket, so
++	 * a failure that repeats, a bad socket path say, would respawn this
++	 * worker as fast as the postmaster can fork. Pace the exit instead.
++	 */
 +	if (target == NULL)
++	{
++		pg_usleep(1000 * 1000L);
 +		ereport(FATAL,
 +				(errmsg("zou page service started without ZOU_TARGET")));
++	}
 +
 +	rc = zou_pagesvc_start(target, DataChecksumsEnabled() ? 1 : 0);
 +	if (rc != 0)
++	{
++		pg_usleep(1000 * 1000L);
 +		ereport(FATAL,
 +				(errmsg("zou page service failed to start: %d", rc)));
++	}
 +	on_proc_exit(zou_pagesvc_on_exit, (Datum) 0);
 +
 +	ereport(LOG,

@@ -17,7 +17,7 @@ zouunlink. A full table degrades to uncached rather than erroring.
 
 --- a/src/backend/storage/ipc/ipci.c
 +++ b/src/backend/storage/ipc/ipci.c
-@@ -144,6 +144,7 @@ CalculateShmemSize(int *num_semaphores)
+@@ -144,6 +144,7 @@
  	size = add_size(size, PgArchShmemSize());
  	size = add_size(size, ApplyLauncherShmemSize());
  	size = add_size(size, ZouWalShmemSize());
@@ -25,7 +25,7 @@ zouunlink. A full table degrades to uncached rather than erroring.
  	size = add_size(size, BTreeShmemSize());
  	size = add_size(size, SyncScanShmemSize());
  	size = add_size(size, AsyncShmemSize());
-@@ -336,6 +337,7 @@ CreateOrAttachShmemStructs(void)
+@@ -336,6 +337,7 @@
  	PgArchShmemInit();
  	ApplyLauncherShmemInit();
  	ZouWalShmemInit();
@@ -46,7 +46,7 @@ zouunlink. A full table degrades to uncached rather than erroring.
  
  /* C ABI of the zou-pg crate (crates/zou-pg). */
  extern int	zou_pg_init(const char *target);
-@@ -82,6 +85,137 @@ zou_check(int rc, const char *op, SMgrRelation reln, ForkNumber forknum)
+@@ -82,6 +85,137 @@
  						forknum)));
  }
  
@@ -184,7 +184,7 @@ zouunlink. A full table degrades to uncached rather than erroring.
  bool
  zou_smgr_routable(SMgrRelation reln)
  {
-@@ -119,6 +253,14 @@ zouclose(SMgrRelation reln, ForkNumber forknum)
+@@ -119,6 +253,14 @@
  void
  zoucreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
  {
@@ -199,7 +199,7 @@ zouunlink. A full table degrades to uncached rather than erroring.
  	zou_check(zou_smgr_create(ZOU_LOCATOR(reln), (uint32) forknum),
  			  "create", reln, forknum);
  }
-@@ -143,10 +285,16 @@ zouunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
+@@ -143,10 +285,16 @@
  	if (forknum == InvalidForkNumber)
  	{
  		for (int fork = 0; fork <= MAX_FORKNUM; fork++)
@@ -216,7 +216,7 @@ zouunlink. A full table degrades to uncached rather than erroring.
  	/* like mdunlink, unlink failures are not worth erroring over */
  }
  
-@@ -172,6 +320,8 @@ zouextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+@@ -172,6 +320,8 @@
  							  (uint32) blocknum, (const uint8 *) buffer,
  							  zou_skip_fsync(skipFsync)),
  			  "extend", reln, forknum);
@@ -225,7 +225,7 @@ zouunlink. A full table degrades to uncached rather than erroring.
  }
  
  void
-@@ -181,6 +331,8 @@ zouzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+@@ -181,6 +331,8 @@
  	zou_check(zou_smgr_zeroextend(ZOU_LOCATOR(reln), (uint32) forknum,
  								  (uint32) blocknum, (uint32) nblocks),
  			  "zeroextend", reln, forknum);
@@ -234,7 +234,63 @@ zouunlink. A full table degrades to uncached rather than erroring.
  }
  
  bool
-@@ -326,10 +478,20 @@ zouwriteback(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
+@@ -223,7 +375,14 @@
+ 	int			iovcnt PG_USED_FOR_ASSERTS_ONLY;
+ 	uint8	   *staged;
+ 	uint8	  **pages;
++	int			rc;
+ 
++	/*
++	 * The handle stays merely handed out until pgaio_io_start_readv, and
++	 * an error raised in that window must give it back first. In the
++	 * startup process ERROR is promoted to FATAL, and proc_exit's
++	 * resource owner sweep segfaults on a handle that was never defined.
++	 */
+ 	if (zou_scratch_fd < 0)
+ 	{
+ 		char		path[MAXPGPATH];
+@@ -236,10 +395,13 @@
+ 		snprintf(path, sizeof(path), "zou-scratch-%d", MyProcPid);
+ 		zou_scratch_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+ 		if (zou_scratch_fd < 0)
++		{
++			pgaio_io_release(ioh);
+ 			ereport(ERROR,
+ 					(errcode_for_file_access(),
+ 					 errmsg("zou smgr could not open scratch file \"%s\": %m",
+ 							path)));
++		}
+ 		/* keep the fd, drop the name */
+ 		unlink(path);
+ 	}
+@@ -249,15 +411,22 @@
+ 	pages = palloc(nblocks * sizeof(uint8 *));
+ 	for (BlockNumber i = 0; i < nblocks; i++)
+ 		pages[i] = staged + (Size) i * BLCKSZ;
+-	zou_check(zou_smgr_readv(ZOU_LOCATOR(reln), (uint32) forknum,
+-							 (uint32) blocknum, pages, (uint32) nblocks,
+-							 (uint64) ZouWalDurableLSN()),
+-			  "readv", reln, forknum);
++	rc = zou_smgr_readv(ZOU_LOCATOR(reln), (uint32) forknum,
++						(uint32) blocknum, pages, (uint32) nblocks,
++						(uint64) ZouWalDurableLSN());
++	if (rc != 0)
++	{
++		pgaio_io_release(ioh);
++		zou_check(rc, "readv", reln, forknum);
++	}
+ 	if (pwrite(zou_scratch_fd, staged, (size_t) nblocks * BLCKSZ, region) !=
+ 		(ssize_t) ((size_t) nblocks * BLCKSZ))
++	{
++		pgaio_io_release(ioh);
+ 		ereport(ERROR,
+ 				(errcode_for_file_access(),
+ 				 errmsg("zou smgr could not stage pages: %m")));
++	}
+ 	pfree(pages);
+ 	pfree(staged);
+ 
+@@ -326,10 +495,20 @@
  BlockNumber
  zounblocks(SMgrRelation reln, ForkNumber forknum)
  {
@@ -255,7 +311,7 @@ zouunlink. A full table degrades to uncached rather than erroring.
  	return (BlockNumber) n;
  }
  
-@@ -340,6 +502,8 @@ zoutruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks,
+@@ -340,6 +519,8 @@
  	zou_check(zou_smgr_truncate(ZOU_LOCATOR(reln), (uint32) forknum,
  								(uint32) nblocks),
  			  "truncate", reln, forknum);
@@ -266,7 +322,7 @@ zouunlink. A full table degrades to uncached rather than erroring.
  void
 --- a/src/include/storage/zou_smgr.h
 +++ b/src/include/storage/zou_smgr.h
-@@ -55,4 +55,7 @@ extern void zouregistersync(SMgrRelation reln, ForkNumber forknum);
+@@ -55,4 +55,7 @@
  extern int	zoufd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  				  uint32 *off);
  
