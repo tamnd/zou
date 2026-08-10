@@ -53,5 +53,6 @@ pub use sequencer::{
     AppendError, AppendTicket, MAX_INFLIGHT, SegmentSink, Sequencer, SequencerConfig,
 };
 pub use tee::{
-    DEFAULT_TEE_BUFFER, Tee, TeeEvent, TeeFilter, TeeSubscription, catch_up, stream_end,
+    DEFAULT_TEE_BUFFER, Tee, TeeEvent, TeeFilter, TeeSubscription, catch_up, catch_up_with,
+    stream_end,
 };

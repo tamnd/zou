@@ -575,6 +575,14 @@ pub struct FoldOutcome {
 /// derived from it and every step tolerates a retried run. Errors
 /// leave the manifest unchanged and any objects written are gc food,
 /// the caller retries.
+///
+/// `pack_runs` false skips the page runs and publishes an indexless
+/// checkpoint: filesystem capture, pg_control, and the WAL tail only.
+/// That is the shape the page service wants, where pg/ holds stale
+/// flag day images kept as reconstruction bases and packing them
+/// would publish garbage, but the checkpoint still has to exist so a
+/// restore anchors at the newest redo instead of replaying the whole
+/// history.
 pub fn prepare(
     store: &dyn CasStore,
     layout: &TenantLayout,
@@ -582,6 +590,7 @@ pub fn prepare(
     tenant: u128,
     pgdata: &Path,
     redo: u64,
+    pack_runs: bool,
 ) -> Result<FoldOutcome, String> {
     let (data, _) = store
         .get(&layout.manifest())
@@ -655,6 +664,7 @@ pub fn prepare(
             .map_err(|e| format!("store: {e}"))
     };
     let (pages, runs) = match kind {
+        _ if !pack_runs => (0, 0),
         CheckpointKind::Delta => {
             let out = delta_scan(media, tenant, &manifest, redo)?;
             let sizes = touched_sizes(store, layout, &out)?;
@@ -743,7 +753,7 @@ pub fn fold(
     redo: u64,
     now_unix: u64,
 ) -> Result<FoldStats, String> {
-    let out = prepare(store, layout, media, tenant, pgdata, redo)?;
+    let out = prepare(store, layout, media, tenant, pgdata, redo, true)?;
     publish(store, layout, held, &out.checkpoint, redo, now_unix)
         .map_err(|e| format!("fold publish: {e}"))?;
     Ok(out.stats)
@@ -980,6 +990,111 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("past the fold"));
+
+        wal2.close();
+    }
+
+    #[test]
+    fn a_fold_without_page_runs_publishes_an_anchor_checkpoint() {
+        // The page service shape: pg/ holds stale flag day images, so
+        // the fold skips the runs but still captures the filesystem and
+        // the WAL tail and publishes the ref. A restore then anchors at
+        // this redo and replays only the shared log past it, instead of
+        // the whole history from genesis.
+        let store_dir = tempfile::tempdir().unwrap();
+        let pgdata_dir = tempfile::tempdir().unwrap();
+        let pgdata = pgdata_dir.path();
+        let store = Arc::new(LocalFsStore::new(store_dir.path()));
+        let layout = TenantLayout::new("local");
+
+        let stream_base = 2 * WAL_SEGMENT_SIZE + 8;
+        let block = |rel: u32, blk: u32| BlockRef {
+            spc: 1663,
+            db: 5,
+            rel,
+            fork: 0,
+            blk,
+        };
+        let mut wal = Builder::new(stream_base);
+        wal.record(&[(block(16384, 1), false)], b"first");
+        let redo = wal.pos();
+        wal.record(&[], b"the checkpoint record");
+
+        std::fs::create_dir_all(pgdata.join("global")).unwrap();
+        std::fs::create_dir_all(pgdata.join("pg_xact")).unwrap();
+        let control = synthetic_control(redo);
+        std::fs::write(pgdata.join("global/pg_control"), &control).unwrap();
+        std::fs::write(pgdata.join("pg_xact/0000"), b"clog").unwrap();
+
+        let mut genesis = Manifest::new("local", 18);
+        genesis.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(stream_base),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        store
+            .put_if_absent(&layout.chk_index("genesis"), b"f base/big 1000000\n")
+            .unwrap();
+        store
+            .put_if_absent(&layout.manifest(), &genesis.to_json())
+            .unwrap();
+        let mut held = lease::acquire(&*store, &layout, "test", 15, 1000).unwrap();
+        let epoch = u32::try_from(held.epoch).unwrap();
+        let mut wal2 = V2Wal::open(Arc::clone(&store) as Arc<dyn CasStore>, "local", epoch);
+        let (stream_lsn, stream_bytes) = wal.stream();
+        wal2.push(stream_lsn, stream_bytes);
+
+        let out = prepare(
+            &*store,
+            &layout,
+            &wal2.media,
+            wal2.tenant,
+            pgdata,
+            redo,
+            false,
+        )
+        .unwrap();
+        assert_eq!(out.stats.kind, CheckpointKind::Delta);
+        assert_eq!(out.stats.files, 2);
+        assert_eq!(out.stats.pages, 0, "no runs packed");
+        assert_eq!(out.stats.runs, 0);
+        publish(&*store, &layout, &mut held, &out.checkpoint, redo, 2000).unwrap();
+
+        // The ref landed and the anchor moved to the fold's redo.
+        let m = manifest_of(&*store, &layout);
+        assert_eq!(m.folded_upto, Some(Lsn(redo)));
+        assert_eq!(m.checkpoints.len(), 2);
+        let chk = &m.checkpoints[1];
+        assert_eq!(chk.lsn, Lsn(redo));
+        assert_eq!(chk.id, format!("{redo:016x}"));
+
+        // The capture and the WAL tail are whole, the PAGES index never
+        // came into being: an indexless checkpoint.
+        let (index, _) = store.get(&layout.chk_index(&chk.id)).unwrap().unwrap();
+        assert!(
+            String::from_utf8(index)
+                .unwrap()
+                .contains("f pg_xact/0000 4")
+        );
+        let (tail, _) = store.get(&layout.chk_waltail(&chk.id)).unwrap().unwrap();
+        let start = u64::from_le_bytes(tail[..8].try_into().unwrap());
+        assert_eq!(start, stream_lsn);
+        assert_eq!(&tail[8..], stream_bytes);
+        assert!(
+            store
+                .get(&layout.checkpoint_page_index(&chk.id))
+                .unwrap()
+                .is_none(),
+            "no page index published"
+        );
+        assert!(
+            store
+                .get(&layout.checkpoint_pages(&chk.id, 0))
+                .unwrap()
+                .is_none(),
+            "no run objects published"
+        );
 
         wal2.close();
     }

@@ -1799,37 +1799,41 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
             .name("zou-fold".into())
             .spawn(move || {
                 // With the page service on, pg/ carries stale flag day
-                // images kept only as reconstruction bases, so packing
-                // them into a checkpoint would publish garbage. The
-                // durable checkpoint story lives in the shard manifest
-                // instead. The shared log housekeeping below still runs.
-                let kind = if pageserve_on() {
-                    log::info!("zou fold: skipped under the page service, redo {redo:#x}");
-                    zou_store::manifest::CheckpointKind::Delta
-                } else {
-                    let outcome =
-                        match fold::prepare(&*store, &layout, &media, tenant, Path::new("."), redo)
-                        {
-                            Ok(outcome) => outcome,
-                            Err(e) => return FoldEnd::Failed(format!("capture: {e}")),
-                        };
-                    {
-                        let mut held = held.lock().expect("lease mutex poisoned");
-                        match fold::publish(
-                            &*store,
-                            &layout,
-                            &mut held,
-                            &outcome.checkpoint,
-                            redo,
-                            now_unix(),
-                        ) {
-                            Ok(()) => {}
-                            Err(lease::LeaseError::Lost { .. }) => return FoldEnd::LeaseLost,
-                            Err(e) => return FoldEnd::Failed(format!("publish: {e}")),
-                        }
-                    }
-                    outcome.stats.kind
+                // images kept only as reconstruction bases, so the fold
+                // skips the page runs and publishes an indexless
+                // checkpoint: capture, pg_control, and the WAL tail.
+                // That anchor is what lets a restore lay down only the
+                // tail past the newest redo instead of replaying the
+                // whole shard history from genesis.
+                let pack_runs = !pageserve_on();
+                let outcome = match fold::prepare(
+                    &*store,
+                    &layout,
+                    &media,
+                    tenant,
+                    Path::new("."),
+                    redo,
+                    pack_runs,
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(e) => return FoldEnd::Failed(format!("capture: {e}")),
                 };
+                {
+                    let mut held = held.lock().expect("lease mutex poisoned");
+                    match fold::publish(
+                        &*store,
+                        &layout,
+                        &mut held,
+                        &outcome.checkpoint,
+                        redo,
+                        now_unix(),
+                    ) {
+                        Ok(()) => {}
+                        Err(lease::LeaseError::Lost { .. }) => return FoldEnd::LeaseLost,
+                        Err(e) => return FoldEnd::Failed(format!("publish: {e}")),
+                    }
+                }
+                let kind = outcome.stats.kind;
                 // A fold marks the natural moment to fold the shared
                 // log too: landing segments consolidate into a sealed
                 // round and old landing objects past the safety window

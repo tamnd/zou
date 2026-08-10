@@ -143,6 +143,15 @@ pub enum ConsolidateError {
     Raced { shard: u32 },
 }
 
+/// Lets a caller whose own error type is a plain message, like the
+/// restore path, pass it straight through [`crate::tee::catch_up_with`]
+/// without a wrapper enum.
+impl From<ConsolidateError> for String {
+    fn from(e: ConsolidateError) -> String {
+        e.to_string()
+    }
+}
+
 /// What a round did, for the operator log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsolidateOutcome {

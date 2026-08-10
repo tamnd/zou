@@ -33,10 +33,10 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use zou_log::{TeeFilter, WalMedia, catch_up};
+use zou_log::{TeeFilter, WalMedia, catch_up_with};
 use zou_store::layout::TenantLayout;
 use zou_store::manifest::CheckpointKind;
-use zou_store::{CasStore, Frame2, Lsn, Manifest, open_store, tenant_id};
+use zou_store::{CasStore, Lsn, Manifest, open_store, tenant_id};
 
 use crate::WAL_SHARD;
 
@@ -302,22 +302,6 @@ fn ensure_segment_header(pg_wal: &Path, tli: u32, sysid: u64, seg_lsn: u64) -> R
     Ok(())
 }
 
-/// Replay the tenant's frames into pg_wal. Returns frames written,
-/// chunk bytes, and the LSN right after the last byte.
-fn overlay_frames(frames: &[Frame2], tli: u32, pg_wal: &Path) -> Result<(usize, u64, u64), String> {
-    let mut records = 0usize;
-    let mut total = 0u64;
-    let mut end = 0u64;
-    for frame in frames {
-        let lsn = frame.start_lsn.0;
-        overlay_wal_chunk(pg_wal, tli, lsn, &frame.payload)?;
-        records += 1;
-        total += frame.payload.len() as u64;
-        end = end.max(lsn + frame.payload.len() as u64);
-    }
-    Ok((records, total, end))
-}
-
 /// Restore a tenant's data directory from the store into `pgdata`, which
 /// must not already exist. Returns what was rebuilt; a plain server start
 /// on the result completes the attach.
@@ -330,6 +314,8 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
         .map_err(|e| format!("store: {e}"))?
         .ok_or_else(|| format!("{store_root} has no manifest, nothing to restore"))?;
     let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
+    let mut stats = restore_manifest(&*store, &layout, &manifest, pgdata)?;
+
     // WAL past the newest checkpoint comes straight from the shared log,
     // the same read the barrier and the folder do. The floor is the
     // checkpoint's redo location and usually sits mid WAL page, but
@@ -337,20 +323,32 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
     // header included, lives in frames that end at or before the floor.
     // Catching up from the page boundary pulls those frames back in;
     // anything a checkpoint capture already laid down is simply
-    // overwritten with the same bytes.
+    // overwritten with the same bytes. Streamed frame by frame into
+    // pg_wal after the manifest restore laid the WAL tail, so the live
+    // bytes land on top and a long history never sits whole in memory.
     let floor = manifest
         .checkpoints
         .last()
         .map_or(0, |checkpoint| checkpoint.lsn.0);
     let media = WalMedia::single(crate::log_store(Arc::clone(&store), &layout));
-    let frames = catch_up(
+    let tli = manifest.pg.timeline;
+    let pg_wal = pgdata.join("pg_wal");
+    catch_up_with::<String, _>(
         &media,
         WAL_SHARD,
         &TeeFilter::Tenant(tenant_id(tenant)),
         Lsn(floor & !(WAL_PAGE_SIZE - 1)),
+        |frame| {
+            let lsn = frame.start_lsn.0;
+            overlay_wal_chunk(&pg_wal, tli, lsn, &frame.payload)?;
+            stats.wal_records += 1;
+            stats.wal_bytes += frame.payload.len() as u64;
+            stats.wal_end = stats.wal_end.max(lsn + frame.payload.len() as u64);
+            Ok(())
+        },
     )
     .map_err(|e| format!("wal catch up: {e}"))?;
-    restore_manifest(&*store, &layout, &manifest, &frames, pgdata)
+    Ok(stats)
 }
 
 /// Restore the newest history snapshot of `tenant` at or before
@@ -368,16 +366,17 @@ pub fn restore_at(
     let store: Arc<dyn CasStore> = Arc::from(open_store(store_root)?);
     let layout = TenantLayout::new(tenant);
     let snapshot = zou_store::snapshot_at(&*store, tenant, unix_ts).map_err(|e| e.to_string())?;
-    restore_manifest(&*store, &layout, &snapshot, &[], pgdata)
+    restore_manifest(&*store, &layout, &snapshot, pgdata)
 }
 
 /// Materialize one manifest, live head or history snapshot, into a fresh
-/// `pgdata` and overlay `frames` past its newest checkpoint.
+/// `pgdata`, WAL tail included. Frames past the newest checkpoint are
+/// the caller's to overlay on top, [`restore`] streams them from the
+/// shared log.
 fn restore_manifest(
     store: &dyn CasStore,
     layout: &TenantLayout,
     manifest: &Manifest,
-    frames: &[Frame2],
     pgdata: &Path,
 ) -> Result<RestoreStats, String> {
     if pgdata.exists() {
@@ -449,14 +448,11 @@ fn restore_manifest(
         wal_end = wal_end.max(end);
     }
 
-    let (wal_records, wal_bytes, end) = overlay_frames(frames, tli, &pg_wal)?;
-    wal_end = wal_end.max(end);
-
     Ok(RestoreStats {
         files,
         dirs,
-        wal_records,
-        wal_bytes,
+        wal_records: 0,
+        wal_bytes: 0,
         wal_end,
     })
 }
@@ -719,7 +715,7 @@ mod tests {
         });
 
         let pgdata = out_dir.path().join("restored");
-        let stats = restore_manifest(&store, &child, &manifest, &[], &pgdata).unwrap();
+        let stats = restore_manifest(&store, &child, &manifest, &pgdata).unwrap();
         assert_eq!(stats.wal_records, 0, "no live frames overlaid");
         assert_eq!(stats.wal_end, tail_start + 0x200);
 
