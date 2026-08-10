@@ -50,14 +50,15 @@ fn spread(mut took: Vec<Duration>) -> String {
 /// Resident memory of this process, or `None` where it cannot be read
 /// without a dependency. Linux is where the fleet numbers are taken, so
 /// Linux is what this reads.
+#[cfg(target_os = "linux")]
 fn resident() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        return Some(pages * 4096);
-    }
-    #[cfg(not(target_os = "linux"))]
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resident() -> Option<u64> {
     None
 }
 
