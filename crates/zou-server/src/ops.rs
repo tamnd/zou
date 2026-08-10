@@ -335,6 +335,41 @@ pub fn attach(ok: bool, start: Instant) {
     }
 }
 
+/// One request this node did not answer itself. `outcome` is `sent`
+/// when the writer answered and `failed` when it could not be reached,
+/// which is the difference between a fleet that is working and one that
+/// is partitioned.
+pub fn forwarded(outcome: &'static str) {
+    registry()
+        .counter(
+            "zou_forwarded_requests_total",
+            "requests passed to the tenant's writer",
+            &[("outcome", outcome)],
+        )
+        .inc();
+}
+
+/// One read answered from this node's own copy, and how far behind the
+/// writer it was. Both, because the count says how much of the traffic
+/// is taking the fast path and the seconds say what it cost.
+pub fn stale_read(behind: u64) {
+    registry()
+        .counter(
+            "zou_stale_reads_total",
+            "reads answered without the writer",
+            &[],
+        )
+        .inc();
+    registry()
+        .histogram(
+            "zou_stale_read_seconds",
+            "how far behind the writer a local read was",
+            SECONDS,
+            &[],
+        )
+        .observe(behind as f64);
+}
+
 /// One registry lookup, hit or miss, which is the reading that says
 /// whether the cache ttls are doing anything.
 pub fn lookup(hit: bool) {

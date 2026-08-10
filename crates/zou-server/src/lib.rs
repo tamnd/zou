@@ -33,6 +33,7 @@ pub mod audit;
 pub mod auth;
 pub mod blob;
 pub mod edge;
+pub mod forward;
 pub mod gateway;
 pub mod gojson;
 pub mod hook;

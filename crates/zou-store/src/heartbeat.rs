@@ -282,6 +282,7 @@ mod tests {
             holder: "node-b".into(),
             expires_unix: now_unix() + 60,
             fence: 2,
+            endpoint: None,
         });
         store
             .put_if_match(&key, &m.to_json(), Some(&version))

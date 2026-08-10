@@ -72,3 +72,25 @@ The heartbeat flips `lost()` when the manifest shows another holder or when the 
 The group commit pipeline independently discovers loss on its next manifest publish and stops acking, see the ack ordering notes in commit.rs.
 Treat `lost()` as a stop sign: keep running and every upload is wasted work in a dead epoch.
 Recovery is a fresh `acquire`, which takes a new epoch and a new fence.
+
+## Write forwarding
+
+Any node in a fleet answers for any tenant, but only the lease holder writes one, so a node that is asked for a tenant it does not hold sends the request to the node that does.
+Holder discovery is the manifest: the lease already records the node, and it now records that node's address as well, so finding the writer is a GET of an object every node reads anyway and there is no membership service to run or to be wrong.
+The answer is cached for one second, which is under the renewal cadence and keeps a manifest read off the front of every request.
+A tenant nobody holds is served here, because the attach that follows is what takes the lease, and if two nodes race for it the loser fails its attach rather than writing anything.
+
+The forwarded request is the request that came in, with its method, path, query, headers, and body, `Host` included so the peer resolves the same tenant this node did.
+Hop-by-hop headers are dropped in both directions, the node adds `x-zou-forwarded-by` with its own id, and a request that already carries that header is answered 508 rather than forwarded again, since one hop is a fleet working and two is a loop.
+The body is buffered to forward it, so it is bounded at 64 MiB and a larger one is answered 413 with the advice to talk to the writer directly.
+A peer that cannot be reached is a 502 whose body does not name the address, and a writer whose lease carries no address at all is a 503 that says so.
+
+Stale reads are off by default.
+On, a GET, HEAD, or OPTIONS for a tenant another node holds is answered from this node's own copy instead of being forwarded, and the answer carries `x-zou-stale-seconds` counted from the writer's last publish, which is the freshest state any other node could have.
+That header is on stale answers and on no others, so its absence is the statement that the answer came from the writer.
+A caller sends `x-zou-max-staleness` to override the node's choice for one request: a value the local copy is within is served here, anything else is forwarded, and `0` is how a client reads back what it just wrote.
+POST is never treated as safe, even though `POST /rest/v1/rpc/<fn>` is often a read, because whether it is depends on what the function does.
+A read forwarded is slower; a write served locally is data that never happened.
+
+`zou_forwarded_requests_total{outcome="sent"|"failed"}` counts the hops, `zou_stale_reads_total` counts the answers served locally, and `zou_stale_read_seconds` is how far behind they were.
+Each forwarded request opens a client span whose `traceparent` goes across, so a trace covers both nodes and the hop is a span in it.
