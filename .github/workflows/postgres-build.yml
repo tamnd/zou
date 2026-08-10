@@ -162,7 +162,10 @@ jobs:
           for i in $(seq 1 12); do
             build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -c "insert into devt select g from generate_series(1,2000) g" -c checkpoint >/dev/null
             sleep 3
-            target/release/zou info /tmp/zou-dev-store | grep -qE '^  [0-9a-f]{16} full at ' && break
+            # Through a file rather than a pipe, `grep -q` closes the
+            # pipe on its first match and the writer dies of it.
+            target/release/zou info /tmp/zou-dev-store >/tmp/zou-settling.txt
+            grep -qE '^  [0-9a-f]{16} full at ' /tmp/zou-settling.txt && break
           done
           ROWS=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select count(*) from devt')
           kill -INT "$DEV3"

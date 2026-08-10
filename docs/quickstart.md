@@ -27,7 +27,7 @@ make pg-build   # once, this is the slow part
 make demo       # now both acts play
 ```
 
-`make pg-build` fetches the pinned Postgres submodule, applies the zou patch series, and builds it with the storage manager shim linked in, see docs/postgres.md. With that in place `make demo` continues past act one: it starts `zou dev` on a fresh store, writes rows through plain `psql`, stops the server, prints what the store holds with `zou info`, takes a branch with `zou branch` which costs one small manifest and copies no data, and then restarts Postgres from nothing but the store and reads the rows back.
+`make pg-build` fetches the pinned Postgres submodule, applies the zou patch series, and builds it with the storage manager shim linked in, see docs/postgres.md. With that in place `make demo` continues past act one: it starts `zou dev` on a fresh store, writes rows through plain `psql`, writes and checkpoints until the fold packs a page capture down, stops the server, prints what the store holds with `zou info`, takes a branch with `zou branch` which costs one small manifest and copies no data, and then restarts Postgres from nothing but the store and reads the rows back.
 
 ## Your own targets
 
@@ -137,6 +137,7 @@ Give the workflow the `closed` type as well as the usual ones and the same step 
 One thing to know before wiring it up: a branch can only read pages the parent has already folded into page runs, and the capture a database is bootstrapped with is not one of those.
 A fold packs one down after a few checkpoints of writes, so a project that has been running for a while has one and a store somebody made this morning may not.
 `zou branch create` checks before it returns and refuses a source the child could not read, rather than handing back a database that fails on its first query.
+`ZOU_FOLD_DOWN_FACTOR=0` in the server's environment brings the fold forward, the second one packs a full instead of the fifth, which is how the branch smoke test gets one out of a database that has only just started.
 
 ## Mail on a laptop
 
