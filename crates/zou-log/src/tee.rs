@@ -258,21 +258,47 @@ pub fn catch_up(
     filter: &TeeFilter,
     applied: Lsn,
 ) -> Result<Vec<Frame2>, ConsolidateError> {
+    let mut out = Vec::new();
+    catch_up_with::<ConsolidateError, _>(media, wal_shard, filter, applied, |frame| {
+        out.push(frame);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Streaming form of [`catch_up`]: each frame goes to `sink` as it is
+/// read, in lsn order, so a caller replaying a long history never holds
+/// more than one round in memory. The sink's error type only has to
+/// absorb [`ConsolidateError`], so a caller with its own error can pass
+/// it straight through.
+pub fn catch_up_with<E, F>(
+    media: &WalMedia,
+    wal_shard: u32,
+    filter: &TeeFilter,
+    applied: Lsn,
+    mut sink: F,
+) -> Result<(), E>
+where
+    E: From<ConsolidateError>,
+    F: FnMut(Frame2) -> Result<(), E>,
+{
     let store = media.manifest_store();
-    let Some((manifest, _)) = ShardManifest::load(store.as_ref(), wal_shard)? else {
-        return Ok(Vec::new());
+    let Some((manifest, _)) = ShardManifest::load(store.as_ref(), wal_shard)
+        .map_err(|e| E::from(ConsolidateError::from(e)))?
+    else {
+        return Ok(());
     };
     let tenant = filter.tenant();
-    let mut out = Vec::new();
     if let Some(rounds) = manifest.rounds {
         for round in rounds.first..=rounds.last {
-            let index = RoundIndex::load(store.as_ref(), wal_shard, round)?.ok_or(
-                ConsolidateError::BadRound {
+            let index = RoundIndex::load(store.as_ref(), wal_shard, round)
+                .map_err(E::from)?
+                .ok_or(ConsolidateError::BadRound {
                     shard: wal_shard,
                     round,
                     reason: "a retained round index is missing".to_string(),
-                },
-            )?;
+                })
+                .map_err(E::from)?;
             // The watermark says whether the round holds anything new
             // for this tenant, so stale rounds cost one small GET and
             // no sealed reads.
@@ -283,9 +309,9 @@ pub fn catch_up(
             if !fresh {
                 continue;
             }
-            for frame in read_round_tenant(store.as_ref(), &index, tenant)? {
+            for frame in read_round_tenant(store.as_ref(), &index, tenant).map_err(E::from)? {
                 if frame.end_lsn > applied && filter.matches(&frame) {
-                    out.push(frame);
+                    sink(frame)?;
                 }
             }
         }
@@ -295,13 +321,14 @@ pub fn catch_up(
         wal_shard,
         manifest.consolidated_upto,
         manifest.consolidated_digest,
-    )?;
+    )
+    .map_err(|e| E::from(ConsolidateError::from(e)))?;
     for segment in tail {
         for frame in segment.frames {
             if frame.tenant == tenant && frame.end_lsn > applied && filter.matches(&frame) {
-                out.push(frame);
+                sink(frame)?;
             }
         }
     }
-    Ok(out)
+    Ok(())
 }

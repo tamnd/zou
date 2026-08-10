@@ -173,6 +173,17 @@ impl ShardIngest {
         &self.mem
     }
 
+    /// End of the contiguous stream received so far. Everything below
+    /// this is either indexed or the partial record the stream ends
+    /// inside, so the reconstructed page state at [`Self::applied`]
+    /// equals the page state at any lsn up to here. Readers wait on
+    /// this, not on `applied`: a flush position usually lands on a WAL
+    /// page boundary with a record spilling over it, and `applied`
+    /// stays a few bytes short of it until unrelated new WAL arrives.
+    pub fn seen(&self) -> u64 {
+        self.buf_base + self.buf.len() as u64
+    }
+
     /// One tee event. `Lagged` surfaces as an error telling the driver
     /// to catch up from the sealed WAL and resubscribe; the watermark
     /// makes the replayed overlap harmless.
@@ -441,6 +452,34 @@ mod tests {
         foreign.tenant = TENANT + 1;
         ingest.apply_frames(&[foreign]).unwrap();
         assert_eq!(ingest.applied(), wal.pos());
+    }
+
+    /// A stream cut inside a record leaves `applied` at the last
+    /// complete record but `seen` at the cut: the page service serves
+    /// against `seen`, or an idle stream ending on a WAL page boundary
+    /// would park every read until unrelated new WAL arrives.
+    #[test]
+    fn seen_tracks_the_stream_end_past_a_partial_record() {
+        let mine = rel_on(0);
+        let mut wal = Builder::new(WAL_BASE);
+        wal.record(&[(blk(mine, 1), false)], &[0x11; 100]);
+        wal.record(&[(blk(mine, 2), false)], &[0x22; 100]);
+        wal.record(&[(blk(mine, 3), false)], &[0x33; 100]);
+        let (base, bytes) = wal.stream();
+        let cut = bytes.len() - 10;
+
+        let mut ingest = ShardIngest::new(cfg(0), WAL_BASE);
+        ingest.apply_frames(&[frame(base, &bytes[..cut])]).unwrap();
+        assert_eq!(ingest.memtable().len(), 2, "the third record is partial");
+        assert_eq!(ingest.seen(), base + cut as u64);
+        assert!(ingest.applied() < ingest.seen());
+
+        ingest
+            .apply_frames(&[frame(base + cut as u64, &bytes[cut..])])
+            .unwrap();
+        assert_eq!(ingest.applied(), wal.pos());
+        assert_eq!(ingest.seen(), wal.pos());
+        assert_eq!(ingest.memtable().len(), 3);
     }
 
     #[test]
