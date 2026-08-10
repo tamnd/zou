@@ -383,7 +383,7 @@ fn respond_err(sock: &mut UnixStream, msg: &str) -> std::io::Result<()> {
 /// yet waits in `parked` until ingest advances or its deadline hits.
 fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> Result<(), String> {
     let store = Arc::clone(&cfg.store);
-    let media = WalMedia::single(Arc::clone(&store));
+    let media = WalMedia::single(crate::log_store(Arc::clone(&store), &cfg.layout));
     let filter = TeeFilter::Tenant(cfg.tenant);
     let pool = cfg.redo.take().map(RedoPool::new);
     let empty_mem = Memtable::new();

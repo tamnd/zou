@@ -54,6 +54,20 @@ impl TenantLayout {
         self.prefix.strip_prefix("tenants/").unwrap_or(&self.prefix)
     }
 
+    /// Where this tenant's WAL chain lives.
+    ///
+    /// A chain has one writer and fences everyone else off it, and the
+    /// writer today is the postmaster that has the tenant attached. A
+    /// node serving a fleet runs one of those per project, so a chain
+    /// shared between projects is a chain they take from each other
+    /// forever. Scoping it to the tenant is what makes the one writer
+    /// rule hold on a node with more than one project attached; a cell
+    /// wide log with a sequencer of its own is the later shape, and it
+    /// is a different writer, not a different tenant.
+    pub fn log_prefix(&self) -> String {
+        format!("{}/log", self.prefix)
+    }
+
     /// The single mutable object, the root of truth.
     pub fn manifest(&self) -> String {
         format!("{}/MANIFEST", self.prefix)

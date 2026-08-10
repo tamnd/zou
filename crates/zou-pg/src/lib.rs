@@ -66,7 +66,8 @@ pub(crate) mod testv2 {
 
     impl V2Wal {
         pub fn open(store: Arc<dyn CasStore>, tenant_ref: &str, epoch: u32) -> Self {
-            let media = Arc::new(WalMedia::single(store));
+            let layout = zou_store::layout::TenantLayout::new(tenant_ref);
+            let media = Arc::new(WalMedia::single(crate::log_store(store, &layout)));
             let takeover = take_over(&media, WAL_SHARD, "testv2").unwrap();
             let sink = Arc::new(MediaSink::new(Arc::clone(&media), WAL_SHARD));
             let seq = Sequencer::resume(
@@ -1310,10 +1311,18 @@ fn now_unix() -> u64 {
 
 const WAL_LEASE_TTL_SECS: u64 = 15;
 
-/// The WAL shard the single tenant of a self hosted store pins to. The
-/// pusher hosts this one shard's sequencer, a cell with many shards
-/// spreads tenants across them later.
+/// The WAL shard a tenant pins to inside its own log. The pusher hosts
+/// this one shard's sequencer, a cell with many shards spreads tenants
+/// across them later.
 pub(crate) const WAL_SHARD: u32 = 0;
+
+/// The key space one tenant's WAL chain lives in, see
+/// [`zou_store::layout::TenantLayout::log_prefix`]. Every reader and the
+/// writer scope the store the same way, so the chain a pusher lands into
+/// is the chain a fold, a page service, and a restore read back.
+pub(crate) fn log_store(store: Arc<dyn CasStore>, layout: &TenantLayout) -> Arc<dyn CasStore> {
+    Arc::new(zou_store::PrefixStore::over(store, &layout.log_prefix()))
+}
 
 /// The lease, heartbeat, and pipeline setup behind [`zou_wal_open`],
 /// separated so tests can run several writer sessions in one process.
@@ -1398,8 +1407,15 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     let tenant_ref = std::env::var("ZOU_TENANT").unwrap_or_else(|_| "local".to_string());
     let layout = TenantLayout::new(&tenant_ref);
     let manifest_key = layout.manifest();
+    // Where the captured state ends, which is where the stream has to
+    // begin on a store that holds no WAL yet. See `floor` below.
+    let mut captured = 0u64;
     match store.get(&manifest_key) {
-        Ok(Some(_)) => {}
+        Ok(Some((data, _))) => {
+            if let Ok(manifest) = Manifest::from_json(&data) {
+                captured = manifest.checkpoints.last().map_or(0, |c| c.lsn.0);
+            }
+        }
         Ok(None) => {
             let genesis = Manifest::new(&tenant_ref, 18);
             // A racing genesis from another process is fine, someone won.
@@ -1452,7 +1468,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         Ok("off") => Arc::clone(&store),
         _ => Arc::new(zou_store::HedgedStore::new(Arc::clone(&store))),
     };
-    let media = Arc::new(WalMedia::single(landing));
+    let media = Arc::new(WalMedia::single(log_store(landing, &layout)));
     let takeover = match take_over(&media, WAL_SHARD, &holder) {
         Ok(takeover) => takeover,
         Err(e) => {
@@ -1466,8 +1482,19 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     // treats a gap or an overlap not starting at the watermark as
     // corruption, so the pusher must continue from exactly here.
     let tenant = tenant_id(layout.tenant_ref());
+    // A store with no stream yet resumes at the newest checkpoint
+    // instead, because the capture is where the durable state ends and
+    // the bytes between it and the pusher's first look are in neither.
+    // A postmaster writes its own startup checkpoint before a worker of
+    // its runs at all, so those bytes exist every single time: the
+    // capture stops at the record initdb left, the stream used to open
+    // at the flush pointer past the startup record, and a restore then
+    // replayed nothing at all, because recovery stops at the first byte
+    // nobody wrote. The gap is small and always in local pg_wal, so the
+    // pusher simply reads from further back.
     let resume = match stream_end(&media, WAL_SHARD, tenant) {
-        Ok(end) => end.map_or(0, |lsn| lsn.0),
+        Ok(Some(lsn)) => lsn.0,
+        Ok(None) => captured,
         Err(e) => {
             log::error!("zou_wal_open: stream end: {e}");
             return Err(ZOU_ERR_STORE);
@@ -2234,12 +2261,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = CString::new(dir.path().to_str().unwrap()).unwrap();
         let start = 0x0100_0000_u64;
+        // A captured database with nothing streamed yet, which is every
+        // tenant on its first attach. The capture ends before the flush
+        // pointer the caller offers, because a postmaster writes its own
+        // startup checkpoint on the way up, and the open has to hand
+        // back the capture rather than the flush pointer: bytes in that
+        // gap are in no capture and in no stream, and a restore that
+        // meets one stops replaying there.
+        let captured = start - 0x58;
+        {
+            let store = LocalFsStore::new(dir.path());
+            let mut m = Manifest::new("local", 18);
+            m.checkpoints.push(zou_store::manifest::CheckpointRef {
+                id: "genesis".to_string(),
+                lsn: Lsn(captured),
+                kind: zou_store::manifest::CheckpointKind::Full,
+                owner: None,
+            });
+            store
+                .put_if_absent(&TenantLayout::new("local").manifest(), &m.to_json())
+                .unwrap();
+        }
         let mut resume = u64::MAX;
         assert_eq!(
             unsafe { zou_wal_open(target.as_ptr(), start, &mut resume) },
             ZOU_OK
         );
-        assert_eq!(resume, 0, "an empty store has nothing to resume from");
+        assert_eq!(
+            resume, captured,
+            "a store with no stream resumes at the capture"
+        );
         // A second open in the same process is a bug in the caller.
         assert_eq!(
             unsafe { zou_wal_open(target.as_ptr(), start, &mut resume) },
@@ -2320,7 +2371,7 @@ mod tests {
         }
         assert_eq!(close_wal_pipe(&mut pipe), ZOU_OK);
 
-        // Both sessions chain in the shared log: a catch up read hands
+        // Both sessions chain in the tenant's log: a catch up read hands
         // back every frame in lsn order, byte exact, whether it sits in
         // a sealed round or on the landing tail, and each session's
         // first frame carries the takeover marker.
@@ -2330,7 +2381,10 @@ mod tests {
         let manifest = Manifest::from_json(&data).unwrap();
         assert!(manifest.lease.is_none(), "lease released on close");
 
-        let media = WalMedia::single(Arc::new(LocalFsStore::new(dir.path())) as Arc<dyn CasStore>);
+        let media = WalMedia::single(log_store(
+            Arc::new(LocalFsStore::new(dir.path())) as Arc<dyn CasStore>,
+            &layout,
+        ));
         let frames = zou_log::catch_up(
             &media,
             WAL_SHARD,
@@ -2352,5 +2406,44 @@ mod tests {
         assert_eq!(last.start_lsn.0, resumed);
         assert_eq!(last.payload.len(), 128);
         assert!(last.first_of_epoch, "a new session marks its takeover");
+    }
+
+    /// Two projects attached at once on one node push into one store,
+    /// and a chain fences everyone but its writer, so the two must not
+    /// be looking at the same chain. When they were, opening the second
+    /// project sealed the first one's chain, the first one's next window
+    /// lost its landing PUT to the seal, its pusher stepped down, and
+    /// the postmaster restarted it into the same fight, forever.
+    #[test]
+    fn two_projects_pushing_at_once_do_not_fence_each_other() {
+        use crate::testv2::V2Wal;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(dir.path()));
+        let mut acme = V2Wal::open(Arc::clone(&store), "acme", 1);
+        let mut globex = V2Wal::open(Arc::clone(&store), "globex", 1);
+
+        acme.push(0x1000, &[1u8; 4096]);
+        globex.push(0x1000, &[2u8; 4096]);
+        // The one that used to die: an append after the other project
+        // opened its writer.
+        acme.push(0x2000, &[3u8; 4096]);
+        globex.push(0x2000, &[4u8; 4096]);
+        acme.close();
+        globex.close();
+
+        for (tenant_ref, payloads) in [("acme", [1u8, 3u8]), ("globex", [2u8, 4u8])] {
+            let layout = TenantLayout::new(tenant_ref);
+            let media = WalMedia::single(log_store(Arc::clone(&store), &layout));
+            let frames = zou_log::catch_up(
+                &media,
+                WAL_SHARD,
+                &zou_log::TeeFilter::Tenant(tenant_id(tenant_ref)),
+                Lsn(0),
+            )
+            .unwrap();
+            let got: Vec<u8> = frames.iter().map(|f| f.payload[0]).collect();
+            assert_eq!(got, payloads, "{tenant_ref} holds its own two windows");
+        }
     }
 }

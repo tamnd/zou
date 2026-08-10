@@ -41,6 +41,9 @@ zou dev sqlite:///tmp/mydb.db          # the whole store in one SQLite database
 
 S3 style targets read `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the environment, plus `ZOU_S3_ENDPOINT` for a non AWS endpoint like a local MinIO and `ZOU_S3_REGION` when it matters. `gs://bucket/prefix` speaks the GCS dialect with HMAC interop keys.
 
+The cluster superuser is `postgres`, whatever the account running the node is called, because that is the role a project's own migrations run as on a hosted Supabase project and the owner of a database should not depend on which account started it.
+So connect by naming it, `psql -h 127.0.0.1 -p 5432 -U postgres -d postgres`, and a client that leaves the user out is told there is no role by that name.
+
 A path ending `.zou` is the single file backend. Every sequential tool works over it today, `zou info`, `zou branch`, `zou-bootstrap`, `zou-restore`, while `zou dev` needs the multi process postmaster and waits on the in process engine, see the note in docs/storage-engine.md.
 
 ## Mail on a laptop

@@ -142,6 +142,13 @@ A node running a few large projects rather than a thousand small ones should rai
 A postmaster that dies on its own detaches its tenant, so the next request attaches again instead of being routed at a database that is not there.
 One that was asked to stop does not, because something already did.
 Runtime directories are `<ref>-<n>` and never bare `<ref>`, so a detach followed immediately by an attach does not put a new postmaster in the directory the old one is still shutting down in.
+
+One project has one postmaster at a time, and the node enforces it rather than assuming it.
+Detaching does not wait for a shutdown, because the attach manager is holding its own lock while it evicts and a request that displaced somebody else's project has no business waiting on that project's shutdown checkpoint.
+The next attach of that same project is what waits, which on a node that is churning is a wait that is already over by the time it is asked for.
+Skipping it is not an option: two postmasters put the same tenant's pages into the same prefix, and a database restored out of that has an index and a heap that disagree, which shows up as `create role anon` failing on the unique index that says the role it could not find is already there.
+A postmaster that has not gone within five seconds is asked for an immediate shutdown, and one that has not gone five seconds after that fails the attach instead of being started alongside.
+
 SIGINT or SIGTERM stops every attached tenant with a fast shutdown and removes the tree; no data waits on that, since an acked write is durable on the store by definition.
 
 Attach is eager today.
@@ -163,6 +170,14 @@ This server checks it and the tenant's own postgres never sees it: the connectio
 The check happens before the attach, so an unauthenticated stranger cannot make a node start a database.
 
     psql "postgresql://service_role.acme-prod:$SERVICE_ROLE_KEY@zou.example:5432/postgres"
+
+`postgres` is the fourth role and the one a project's own migrations run as.
+It is the cluster superuser every database is initialised with, so it owns the schemas and can create in them, which is what separates it from service_role: service_role sees every row because it bypasses RLS, and it still cannot create a table, exactly as on Supabase.
+A key for it is minted from the project's secret the same way the other three are, and it is the project owner's credential rather than anything an application should carry.
+
+    psql "postgresql://postgres.acme-prod:$POSTGRES_KEY@zou.example:5432/postgres" -f migration.sql
+
+A database initialised by a build before this one took its superuser from the account that ran the node, and this build asks for `postgres`, so such a store answers `role "postgres" does not exist` and wants recreating.
 
 There is no TLS on this port yet, and an `SSLRequest` is declined rather than ignored, which is what makes a client decide instead of guess.
 Until there is, put the port on a private network or behind a terminator, because the key crosses in the clear.

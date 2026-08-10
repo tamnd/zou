@@ -26,9 +26,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::time::Duration;
 
+use crate::dev::SUPERUSER;
 use zou_pg::{bootstrap, restore};
 use zou_server::Config;
 use zou_server::attach::{Attached, Backend};
@@ -180,11 +181,42 @@ struct Live {
     dir: PathBuf,
 }
 
+/// A postmaster that has been asked to leave and has not gone yet.
+///
+/// Detaching does not wait for one: it is called by the attach manager
+/// while that holds its own lock, so a request that evicted somebody
+/// else's project would be waiting on a shutdown checkpoint it has
+/// nothing to do with.
+///
+/// What must not happen is a second postmaster for the same project
+/// starting while the first is still writing. Both would be putting
+/// that tenant's pages into the same store prefix, and a database
+/// restored out of the result has an index and a heap that disagree:
+/// `create role anon` says the role is not there and then fails on the
+/// unique index that says it is. So the wait is not skipped, it is
+/// moved to the one place that needs it, which is the next attach of
+/// that same project.
+struct Dying {
+    pid: u32,
+    gone: Mutex<bool>,
+    woken: Condvar,
+}
+
+/// How long a postmaster gets to leave before it is asked less politely.
+///
+/// A fast shutdown of a small project is tens of milliseconds, so this
+/// is not a number anything normally reaches. Reaching it means a
+/// backend is not responding to a fast shutdown, and immediate shutdown
+/// is what postgres has for that: the next attach replays the wal,
+/// which is the recovery path a crash takes anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// What the thread supervising a postmaster shares with everything
-/// else: which children are meant to be running, and the attach manager
-/// to tell when one of them is not.
+/// else: which children are meant to be running, which are on their way
+/// out, and the attach manager to tell when one of them is not.
 struct State {
     live: Mutex<HashMap<String, Live>>,
+    dying: Mutex<HashMap<String, Arc<Dying>>>,
     /// Weak because the attach manager owns the backend, so a strong
     /// one here would be a cycle that never frees. Empty until the
     /// server is built, which cannot happen before the backend exists.
@@ -192,6 +224,79 @@ struct State {
 }
 
 impl State {
+    /// Note that a postmaster has been asked to leave, so the next
+    /// attach of this project knows there is something to wait for.
+    fn leaving(&self, tenant_ref: &str, pid: u32) {
+        self.dying.lock().expect("the dying map").insert(
+            tenant_ref.to_string(),
+            Arc::new(Dying {
+                pid,
+                gone: Mutex::new(false),
+                woken: Condvar::new(),
+            }),
+        );
+    }
+
+    /// A postmaster has been reaped. Wake whoever is waiting to start
+    /// its replacement.
+    fn left(&self, tenant_ref: &str, pid: u32) {
+        let dying = {
+            let mut map = self.dying.lock().expect("the dying map");
+            match map.get(tenant_ref) {
+                Some(entry) if entry.pid == pid => map.remove(tenant_ref),
+                _ => None,
+            }
+        };
+        let Some(dying) = dying else { return };
+        *dying.gone.lock().expect("a dying postmaster") = true;
+        dying.woken.notify_all();
+    }
+
+    /// Wait for the last postmaster of this project to be gone.
+    ///
+    /// The error is deliberate rather than a timeout that carries on:
+    /// an attach that could not be sure the previous postmaster is dead
+    /// has to fail, because starting a second one is how a tenant's
+    /// pages get written by two processes at once.
+    fn wait_for_the_last_one(&self, tenant_ref: &str) -> Result<(), String> {
+        let Some(dying) = self
+            .dying
+            .lock()
+            .expect("the dying map")
+            .get(tenant_ref)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let mut gone = dying.gone.lock().expect("a dying postmaster");
+        for asked_harder in [false, true] {
+            if *gone {
+                return Ok(());
+            }
+            let (next, waited) = dying
+                .woken
+                .wait_timeout(gone, SHUTDOWN_GRACE)
+                .expect("a dying postmaster");
+            gone = next;
+            if *gone {
+                return Ok(());
+            }
+            if waited.timed_out() && !asked_harder {
+                log::warn!(
+                    "{tenant_ref}: postmaster {} has not gone, asking for an immediate shutdown",
+                    dying.pid
+                );
+                quit(dying.pid);
+            }
+        }
+        if *gone {
+            return Ok(());
+        }
+        Err(format!(
+            "the previous postmaster for {tenant_ref} is still running, so this one is not started"
+        ))
+    }
+
     /// A postmaster left. If the map still names this exact process,
     /// nothing asked it to, so the tenant is let go of and the next
     /// request for it attaches again rather than being routed at a
@@ -274,6 +379,12 @@ impl Postmasters {
         let out = Command::new(self.pg_bin.join("initdb"))
             .arg("-D")
             .arg(pgdata)
+            // Named rather than left to the OS user, because the
+            // cluster superuser is the role a project's own migrations
+            // run as, and a Supabase project's is postgres wherever it
+            // is hosted. Taking the OS user would make the owner of a
+            // database depend on which account started the node.
+            .args(["-U", SUPERUSER])
             .args(["--set", "io_method=sync"])
             .args(["--set", "full_page_writes=off"])
             .env("ZOU_TARGET", &self.target)
@@ -305,6 +416,9 @@ impl Postmasters {
 impl Backend for Postmasters {
     fn up(&self, entry: &Tenant) -> Result<Config, String> {
         let tenant_ref = entry.tenant_ref.clone();
+        // Before anything is read out of the store for this project,
+        // and long before anything is started that would write to it.
+        self.state.wait_for_the_last_one(&tenant_ref)?;
         let dir = self.runtime.join(format!(
             "{tenant_ref}-{}",
             ATTACHES.fetch_add(1, Ordering::Relaxed)
@@ -384,12 +498,23 @@ impl Backend for Postmasters {
             };
             state.died(&watched, pid, why);
             let _ = fs::remove_dir_all(&cleanup);
+            // Last, because the next attach of this project starts as
+            // soon as this says so, and it should not start while this
+            // one's directory is still on disk.
+            state.left(&watched, pid);
         });
 
         match told.recv_timeout(START_TIMEOUT) {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => {
+                // Noted as leaving before it is asked to, because it is
+                // still running and the retry this failure causes must
+                // not be the second postmaster on this project. Both
+                // orders are wrong the other way round: a child that
+                // dies between the signal and the note leaves a project
+                // waiting for a process that is already gone.
+                self.state.leaving(&tenant_ref, pid);
                 stop(pid);
                 return Err(format!(
                     "postgres for {tenant_ref} was not ready within {}s",
@@ -403,17 +528,13 @@ impl Backend for Postmasters {
             .expect("the live map")
             .insert(tenant_ref.clone(), Live { pid, dir });
 
-        // initdb ran without -U, so the cluster superuser is the OS
-        // user, and local connections are trust. Nothing but this node
-        // can reach the port either way: it is on loopback and the
-        // client of it is in this process.
-        let user = std::env::var("USER")
-            .or_else(|_| std::env::var("LOGNAME"))
-            .unwrap_or_else(|_| "postgres".to_string());
+        // Local connections are trust, and nothing but this node can
+        // reach the port either way: it is on loopback in a 0700 socket
+        // directory and the client of it is in this process.
         Ok(Config {
             jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
             pg: Some(format!(
-                "host=127.0.0.1 port={port} user={user} dbname=postgres"
+                "host=127.0.0.1 port={port} user={SUPERUSER} dbname=postgres"
             )),
             // Objects go where the pages go: the same store, the same
             // tenant prefix, under files/.
@@ -432,7 +553,8 @@ impl Backend for Postmasters {
         // manager while it holds its own lock, and a postmaster's fast
         // shutdown is not something a request path should be inside
         // of: the thread that owns the child reaps it and removes its
-        // directory.
+        // directory. The next attach of this same project is what waits
+        // for that, and it is the only thing that has to.
         let Some(live) = self
             .state
             .live
@@ -443,6 +565,7 @@ impl Backend for Postmasters {
             return;
         };
         log::info!("{tenant_ref}: detaching");
+        self.state.leaving(tenant_ref, live.pid);
         stop(live.pid);
     }
 }
@@ -452,6 +575,16 @@ impl Backend for Postmasters {
 fn stop(pid: u32) {
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGINT);
+    }
+}
+
+/// SIGQUIT, which is postgres' immediate shutdown: every backend is
+/// killed without a shutdown checkpoint and the next start replays the
+/// wal. Asked for only when a fast shutdown did not happen, because the
+/// alternative is holding a project hostage to one stuck backend.
+fn quit(pid: u32) {
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGQUIT);
     }
 }
 
@@ -507,6 +640,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         domain: args.domains.first().cloned(),
         store,
         state: Arc::new(State {
+            dying: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             attached: Mutex::new(Weak::new()),
         }),
@@ -712,6 +846,7 @@ mod tests {
     fn only_an_unexpected_death_detaches() {
         let state = State {
             live: Mutex::new(HashMap::new()),
+            dying: Mutex::new(HashMap::new()),
             attached: Mutex::new(Weak::new()),
         };
         state.live.lock().unwrap().insert(
@@ -733,5 +868,64 @@ mod tests {
         );
         // And a tenant nothing knows about is not an error.
         state.died("gone", 4242, "exited".to_string());
+    }
+
+    fn empty_state() -> Arc<State> {
+        Arc::new(State {
+            live: Mutex::new(HashMap::new()),
+            dying: Mutex::new(HashMap::new()),
+            attached: Mutex::new(Weak::new()),
+        })
+    }
+
+    /// The rule the store depends on: one postmaster per project at a
+    /// time. Two of them write the same tenant's pages into the same
+    /// prefix, and what is restored out of that has an index and a heap
+    /// that disagree.
+    #[test]
+    fn an_attach_waits_for_the_postmaster_it_is_replacing() {
+        let state = empty_state();
+        state.leaving("acme-prod", 4242);
+
+        let waiter = Arc::clone(&state);
+        let handle = std::thread::spawn(move || waiter.wait_for_the_last_one("acme-prod"));
+        // Long enough to be sure the waiter is inside the wait rather
+        // than having missed the notify, short enough not to matter.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!handle.is_finished(), "the attach did not wait");
+
+        state.left("acme-prod", 4242);
+        handle.join().expect("the waiter").expect("it was let go");
+    }
+
+    /// Nothing is waited for when nothing is on its way out, which is
+    /// every attach on a node that is not churning.
+    #[test]
+    fn an_attach_of_a_project_nothing_is_leaving_waits_for_nothing() {
+        let state = empty_state();
+        state
+            .wait_for_the_last_one("acme-prod")
+            .expect("no wait at all");
+
+        // A different project leaving is not this project's business.
+        state.leaving("other", 1);
+        state
+            .wait_for_the_last_one("acme-prod")
+            .expect("no wait at all");
+    }
+
+    /// A postmaster that was replaced before it was reaped does not
+    /// clear the one that replaced it, the same rule `died` follows.
+    #[test]
+    fn only_the_postmaster_that_was_asked_to_leave_clears_the_way() {
+        let state = empty_state();
+        state.leaving("acme-prod", 4242);
+        state.left("acme-prod", 1);
+        assert!(
+            state.dying.lock().unwrap().contains_key("acme-prod"),
+            "another pid's exit cleared the wait"
+        );
+        state.left("acme-prod", 4242);
+        assert!(state.dying.lock().unwrap().is_empty());
     }
 }

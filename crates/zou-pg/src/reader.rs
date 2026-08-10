@@ -403,9 +403,10 @@ impl ChainReader {
         // from the consolidated boundary. Frames the catch up already
         // delivered clip as overlaps when the barrier re-fetches their
         // landing segments.
-        let media = Arc::new(WalMedia::single(Arc::clone(store)));
+        let logs = crate::log_store(Arc::clone(store), layout);
+        let media = Arc::new(WalMedia::single(Arc::clone(&logs)));
         let tenant = tenant_id(layout.tenant_ref());
-        let next_seq = match ShardManifest::load(&**store, WAL_SHARD) {
+        let next_seq = match ShardManifest::load(&*logs, WAL_SHARD) {
             Ok(Some((m, _))) => m.consolidated_upto + 1,
             Ok(None) => 1,
             Err(e) => return Err(fail(format!("shard manifest: {e}"))),
