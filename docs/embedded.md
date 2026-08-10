@@ -1,8 +1,8 @@
 # Embedded
 
 A whole Supabase compatible project inside another process, with no daemon to start, no port to pick, and no docker compose file.
-This is the `zou-embed` crate.
-The Node, Python, and Go bindings are built over it and are not there yet.
+This is the `zou-embed` crate, and `libzou`, which is the same thing behind a C ABI.
+The Node, Python, and Go bindings are built over `libzou` and are not there yet.
 
 ## What it is
 
@@ -86,6 +86,50 @@ Shutdown is fast, then immediate, then the signal nothing catches, because a pos
 A handle is `Send` and `Sync` and requests may be issued from any thread at once.
 What is not allowed is calling `request` from inside an async runtime's own thread: it blocks on this handle's runtime to get the answer, and blocking a runtime thread on another runtime is how a program stops.
 A host that is already async should call it from `spawn_blocking`.
+
+## From C, and from anything that speaks C
+
+`libzou` is the same crate behind a C ABI, built as a shared library, a static library, and an rlib.
+The header is [`crates/libzou/include/zou.h`](../crates/libzou/include/zou.h) and it is written by hand rather than generated, because it is the contract and a contract nobody read is not one.
+
+```c
+#include "zou.h"
+
+zou_options *options = zou_options_new();
+zou_options_set(options, "target", "./data");
+
+zou *handle = NULL;
+if (zou_open(options, &handle) != ZOU_OK) {
+    fprintf(stderr, "%s\n", zou_last_error());
+}
+zou_options_free(options);
+
+zou_header headers[1] = {{"apikey", zou_anon_key(handle)}};
+zou_response *answer = NULL;
+zou_request(handle, "GET", "/rest/v1/todos?select=title", headers, 1, NULL, 0, &answer);
+printf("%d\n", zou_response_status(answer));
+zou_response_free(answer);
+
+zou_close(handle);
+```
+
+Four rules cover all of it.
+Everything that can fail returns `ZOU_OK` or a negative code and none of it unwinds, so a panic anywhere inside becomes `ZOU_ERR_PANIC` rather than an unwind across a boundary that has no idea what one is; on a nonzero code nothing was written to the out parameter and `zou_last_error()` has a sentence about it, on this thread, until the next call.
+Ownership is by name: `zou_options_new`, `zou_open`, `zou_branch`, and `zou_request` hand back something to free, and everything else is borrowed and lives as long as what it came from.
+A handle may be used from any thread and from several at once, which is what makes it worth embedding in a server.
+Strings are UTF-8 and NUL terminated, and a body is bytes with a length, because a body may be an image.
+
+Options are set by name rather than through a `repr(C)` struct.
+A struct is an ABI and every field added to one later is a break, while a function added later is just a function nobody is calling yet.
+
+`ZouError` is `{ kind, message }` in `zou-embed` for this reason: an int and one string is what crosses a C boundary, and the codes are the kinds, one for one.
+
+```bash
+ZOU_PG_BIN=$PWD/build/pg/bin crates/libzou/tests/smoke.sh
+```
+
+That builds the library, compiles [`crates/libzou/tests/smoke.c`](../crates/libzou/tests/smoke.c) against the header with `-Wall -Wextra -Werror`, and runs it: open, sign somebody up, get refused without a key, take a port, checkpoint, branch or be told why not, close.
+It runs in CI on the job that builds the patched Postgres.
 
 ## Testing it
 

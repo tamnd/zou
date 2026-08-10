@@ -116,6 +116,11 @@ jobs:
       # dispatch that has no command line equivalent.
       - name: the embedded library end to end
         run: ZOU_PG_BIN=$PWD/build/pg/bin cargo test -p zou-embed --test embed
+      # And the same thing from C, against the hand written header, so
+      # the shared library a binding loads is compiled and run rather
+      # than assumed to still line up.
+      - name: the C ABI end to end
+        run: ZOU_PG_BIN=$PWD/build/pg/bin crates/libzou/tests/smoke.sh
       - name: zou dev, branch, and info end to end
         run: |
           cargo build -p zou --release

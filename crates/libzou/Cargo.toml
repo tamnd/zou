@@ -1,0 +1,18 @@
+[package]
+name = "libzou"
+description = "The C ABI over zou-embed: a Supabase compatible backend as a shared library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "zou"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+zou-embed = { path = "../zou-embed" }
+
+[lints]
+workspace = true

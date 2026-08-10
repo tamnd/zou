@@ -47,9 +47,10 @@ const supabase = zou.client(); // the supabase-js interface, in process
 await supabase.from("todos").select("*").eq("done", false);
 ```
 
-The Rust half of that is built.
+The Rust half of that is built, and the C ABI over it.
 [`zou-embed`](docs/embedded.md) opens a project inside a host process, answers requests through the same router the server puts on a port, serves it on a port too when something outside wants in, and branches.
-The snippet above is waiting on the C ABI and the Node binding over it.
+`libzou` is the same thing behind `zou.h`, for anything that can load a shared library.
+The snippet above is waiting on the Node binding over that.
 
 A server, where the only durable state is the bucket:
 
