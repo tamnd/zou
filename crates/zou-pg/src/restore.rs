@@ -342,7 +342,7 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
         .checkpoints
         .last()
         .map_or(0, |checkpoint| checkpoint.lsn.0);
-    let media = WalMedia::single(Arc::clone(&store));
+    let media = WalMedia::single(crate::log_store(Arc::clone(&store), &layout));
     let frames = catch_up(
         &media,
         WAL_SHARD,

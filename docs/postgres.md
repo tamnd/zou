@@ -93,7 +93,7 @@ CI runs three cycles on every PR that touches the server.
 One known limit: an in place crash restart replays local WAL the store has not seen yet and can push pages early during recovery, so after a crash a node should reattach with `zou-restore`; the fix, starting the pusher at consistent state, is tracked in the milestone issue.
 
 The mirrored tail would grow without bound, so the shim folds it at every completed Postgres checkpoint.
-The whole fold lifecycle, capture, publish, and shared log consolidation, runs on a thread of its own inside the shim, so the pusher loop never spends a store call on a fold's behalf and commit acks never wait one out; the loop only starts a fold and later harvests its verdict with a mutex peek.
+The whole fold lifecycle, capture, publish, and log consolidation, runs on a thread of its own inside the shim, so the pusher loop never spends a store call on a fold's behalf and commit acks never wait one out; the loop only starts a fold and later harvests its verdict with a mutex peek.
 Once a checkpoint completes, every page change before its redo location is on the page store, and the WAL before redo is only needed for the state that does not flow through the storage manager.
 The fold captures exactly that as a delta checkpoint under `chk/<redo>/`: pg_control, the transaction status SLRUs (pg_xact, pg_multixact, pg_commit_ts), two phase state, the relation maps, and the config files.
 It then drops the sealed stream segments that lie entirely below the 16MB pg_wal segment boundary under redo, in the same manifest swap that records the checkpoint, so no failure between the two steps can lose WAL coverage.

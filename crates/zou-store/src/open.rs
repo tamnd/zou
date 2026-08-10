@@ -19,6 +19,8 @@
 //! counter file, see [`crate::stats`]. SIM and DELAY answer the same
 //! question two ways, so setting both is an error.
 
+use std::sync::Arc;
+
 use crate::cas::{CasError, CasStore, LocalFsStore, Version};
 use crate::delay::{DelayConfig, DelayStore};
 use crate::sim::{SimConfig, SimStore};
@@ -27,13 +29,20 @@ use crate::sim::{SimConfig, SimStore};
 /// hold many stores. Callers see their own key space: keys are prefixed
 /// on the way in and list results come back stripped.
 pub struct PrefixStore {
-    inner: Box<dyn CasStore>,
+    inner: Arc<dyn CasStore>,
     prefix: String,
 }
 
 impl PrefixStore {
     /// Wrap `inner` under `prefix`, with or without a trailing slash.
     pub fn new(inner: Box<dyn CasStore>, prefix: &str) -> Self {
+        Self::over(Arc::from(inner), prefix)
+    }
+
+    /// The same, for a store the caller already shares. Opening one
+    /// backend and scoping it several ways is how one process reaches
+    /// several key spaces without paying for several clients.
+    pub fn over(inner: Arc<dyn CasStore>, prefix: &str) -> Self {
         let mut prefix = prefix.trim_matches('/').to_string();
         prefix.push('/');
         Self { inner, prefix }
