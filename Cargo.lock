@@ -2600,7 +2600,6 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 name = "zou"
 version = "0.0.1"
 dependencies = [
- "env_logger",
  "getrandom 0.3.4",
  "libc",
  "log",
@@ -2609,6 +2608,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "zou-log",
+ "zou-ops",
  "zou-pg",
  "zou-server",
  "zou-store",
@@ -2643,6 +2643,15 @@ dependencies = [
  "tempfile",
  "thiserror",
  "zou-store",
+]
+
+[[package]]
+name = "zou-ops"
+version = "0.0.1"
+dependencies = [
+ "env_logger",
+ "log",
+ "serde_json",
 ]
 
 [[package]]
@@ -2693,6 +2702,7 @@ dependencies = [
  "ureq",
  "webp",
  "webpki-roots",
+ "zou-ops",
  "zou-rest",
  "zou-store",
 ]

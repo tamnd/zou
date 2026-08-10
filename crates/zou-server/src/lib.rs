@@ -43,6 +43,7 @@ pub mod mfa;
 pub mod oauth;
 pub mod object;
 pub mod openapi;
+pub mod ops;
 pub mod password;
 pub mod render;
 pub mod rest;
@@ -937,7 +938,11 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         // answers, because every auth refusal leaves through it.
         .layer(middleware::from_fn(auth::envelope))
         .layer(middleware::from_fn(edge::cors))
-        .layer(middleware::from_fn(edge::request_id)))
+        .layer(middleware::from_fn(edge::request_id))
+        // Outermost, so what is counted is what a caller waited for,
+        // including the refusals: a graph of a rate limit or a 404 is
+        // drawn from the same series as a graph of the answers.
+        .layer(middleware::from_fn(ops::measure)))
 }
 
 /// Serve `router(cfg)` on `listener` forever. Builds a private tokio

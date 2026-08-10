@@ -246,8 +246,10 @@ impl Registry {
         if let Some(cached) = self.seen.read().await.get(&key)
             && cached.until > now
         {
+            crate::ops::lookup(true);
             return Ok(cached.entry.clone());
         }
+        crate::ops::lookup(false);
         let store = self.store.clone();
         let entry = tokio::task::spawn_blocking(move || fetch(store.as_ref()))
             .await

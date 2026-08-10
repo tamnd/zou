@@ -39,6 +39,7 @@ pub struct Args {
     pub pg_bin: PathBuf,
     pub port: u16,
     pub http: Option<u16>,
+    pub ops: Option<u16>,
     pub runtime: PathBuf,
 }
 
@@ -49,6 +50,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut pg_bin = None;
     let mut port = 5432u16;
     let mut http = None;
+    let mut ops = None;
     let mut runtime = None;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
@@ -61,6 +63,10 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--http" => {
                 let raw = need(&mut it, "--http")?;
                 http = Some(raw.parse().map_err(|_| format!("bad http port {raw:?}"))?);
+            }
+            "--ops" => {
+                let raw = need(&mut it, "--ops")?;
+                ops = Some(raw.parse().map_err(|_| format!("bad ops port {raw:?}"))?);
             }
             "--runtime" => runtime = Some(PathBuf::from(need(&mut it, "--runtime")?)),
             other if target.is_none() && !other.starts_with('-') => {
@@ -80,6 +86,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         pg_bin,
         port,
         http,
+        ops,
         runtime,
     })
 }
@@ -343,6 +350,22 @@ fn start_http(port: u16, pg_port: u16, target: String) -> Result<(), String> {
     Ok(())
 }
 
+/// The scrape and the health check, on a port of their own and on
+/// loopback like everything else this command binds. Separate from the
+/// api port because what is on it is for whoever runs the process and
+/// not for whoever is using it.
+fn start_ops(port: u16) -> Result<(), String> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("bind ops on 127.0.0.1:{port}: {e}"))?;
+    log::info!("metrics on http://127.0.0.1:{port}/metrics");
+    std::thread::spawn(move || {
+        if let Err(e) = zou_server::ops::serve_blocking(listener, env!("CARGO_PKG_VERSION")) {
+            log::error!("ops server: {e}");
+        }
+    });
+    Ok(())
+}
+
 pub fn run(args: &Args) -> Result<(), String> {
     let postgres = args.pg_bin.join("postgres");
     if !postgres.is_file() {
@@ -452,6 +475,10 @@ pub fn run(args: &Args) -> Result<(), String> {
         start_http(http_port, args.port, args.target.clone())?;
     }
 
+    if let Some(ops_port) = args.ops {
+        start_ops(ops_port)?;
+    }
+
     let mut failed_starts = 0u32;
     loop {
         let ready = Arc::new(AtomicBool::new(false));
@@ -550,6 +577,10 @@ mod tests {
         assert_eq!(args.target, "./data");
         assert_eq!(args.port, 5432);
         assert_eq!(args.http, None);
+        assert_eq!(
+            args.ops, None,
+            "nothing is scraped unless a port is asked for"
+        );
         assert_eq!(args.pg_bin, PathBuf::from("build/pg/bin"));
     }
 
@@ -563,6 +594,8 @@ mod tests {
             "5614",
             "--http",
             "54321",
+            "--ops",
+            "9187",
             "--runtime",
             "/tmp/run",
         ]))
@@ -571,6 +604,7 @@ mod tests {
         assert_eq!(args.pg_bin, PathBuf::from("/opt/pg/bin"));
         assert_eq!(args.port, 5614);
         assert_eq!(args.http, Some(54321));
+        assert_eq!(args.ops, Some(9187));
         assert_eq!(args.runtime, PathBuf::from("/tmp/run"));
     }
 
@@ -580,6 +614,7 @@ mod tests {
         assert!(parse(&argv(&["./data", "--port"])).is_err());
         assert!(parse(&argv(&["./data", "--port", "hot"])).is_err());
         assert!(parse(&argv(&["./data", "--http", "cold"])).is_err());
+        assert!(parse(&argv(&["./data", "--ops", "warm"])).is_err());
         assert!(parse(&argv(&["./data", "extra"])).is_err());
         assert!(parse(&argv(&["--bogus", "./data"])).is_err());
     }

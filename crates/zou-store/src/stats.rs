@@ -320,6 +320,14 @@ pub struct OpSnapshot {
     pub p99_us: u64,
     pub max_us: u64,
     pub by_class: Vec<ClassSnapshot>,
+    /// The raw latency histogram, one slot per power of two, where slot
+    /// b counted the ops that finished under 2^(b+1) microseconds. Kept
+    /// out of the json because `zou stats` is read by a person and 32
+    /// numbers per op is not, and kept in the struct because a scrape
+    /// wants the buckets rather than percentiles somebody else has
+    /// already averaged for it.
+    #[serde(skip)]
+    pub buckets: Vec<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -415,6 +423,7 @@ impl Snapshot {
                 p99_us: percentile(&buckets, count, 0.99),
                 max_us,
                 by_class,
+                buckets,
             });
         }
         let mut reads = Vec::with_capacity(TIERS);

@@ -16,8 +16,7 @@ use std::process::ExitCode;
 
 /// The postmaster child, unix sockets, and signal forwarding are all
 /// unix machinery, so the dev subcommand only exists there.
-pub const DEV_USAGE: &str =
-    "usage: zou dev <target> [--pg-bin <dir>] [--port <n>] [--http <n>] [--runtime <dir>]";
+pub const DEV_USAGE: &str = "usage: zou dev <target> [--pg-bin <dir>] [--port <n>] [--http <n>] [--ops <n>] [--runtime <dir>]";
 
 fn usage() -> ExitCode {
     eprintln!("zou {}", env!("CARGO_PKG_VERSION"));
@@ -48,9 +47,10 @@ fn simple(result: Result<(), String>) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    // Structured logs on stderr, RUST_LOG filters them, info by default.
+    // Logs on stderr, RUST_LOG filters them, info by default, and
+    // ZOU_LOG_FORMAT=json spells them as json lines for a collector.
     // Results meant for scripts stay on stdout untouched.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    zou_ops::logs::init("info");
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
         Some("--version") | Some("-V") => {

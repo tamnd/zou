@@ -1,0 +1,407 @@
+//! The port an operator points a scraper at.
+//!
+//! Two routes, `/healthz` and `/metrics`, on a listener of their own.
+//! Their own listener and not the front door's, for two reasons that
+//! both come from what the front door is. Under path routing the first
+//! segment of every url is a tenant ref, with nothing reserved, so a
+//! `/metrics` route there would quietly take a name a project could
+//! have had. And a scrape is the operational state of the node, which
+//! is not something to hand to whoever holds an anon key for one of the
+//! projects on it. A second listener is the cheap answer to both, and
+//! it is the one every deployment already knows how to firewall.
+//!
+//! What is instrumented lives where it happens: the attach manager
+//! counts attaches, the tenant registry counts lookups, the request
+//! path counts requests. This module owns the names, so that the names
+//! are in one place and a call site is one line.
+//!
+//! The store's numbers are not counted here at all. They already exist,
+//! in the shared counter file `ZOU_STORE_STATS` names, which is how
+//! ops made by a postgres backend in another process get counted at
+//! all, and a scrape folds that file in as it reads it. Counting them
+//! twice would mean counting the ones this process can see and missing
+//! the rest.
+
+use std::time::Instant;
+
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use zou_ops::metrics::{Registry, SECONDS};
+use zou_ops::registry;
+
+/// What Prometheus expects a scrape to be, version and all. A scraper
+/// that gets `application/json` here does not guess.
+const EXPOSITION: &str = "text/plain; version=0.0.4; charset=utf-8";
+
+/// The ops router. `version` is what the build reports about itself,
+/// which is the one thing a scrape carries that the process cannot
+/// count.
+pub fn ops(version: &'static str) -> Router {
+    // A gauge that is always one, which is the standard way to get a
+    // build's version into a query: join on it and every series can be
+    // grouped by the version that produced it.
+    registry()
+        .gauge(
+            "zou_build_info",
+            "always 1, labelled with the build",
+            &[("version", version)],
+        )
+        .set(1);
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
+        .fallback(missing)
+}
+
+/// Alive, which is all this answers.
+///
+/// It does not touch a store, a lease or a database on purpose. A
+/// liveness check that reads a dependency turns one slow dependency
+/// into a rolling restart of everything that depends on it, and there
+/// is no readiness check here either, because readiness for this
+/// process would have to name a tenant: nothing is attached until a
+/// request asks for one, so a node with nothing attached is not
+/// unready, it is idle.
+async fn healthz() -> Response {
+    (StatusCode::OK, "ok\n").into_response()
+}
+
+async fn metrics() -> Response {
+    let mut out = registry().render();
+    if let Some(store) = store_metrics() {
+        out.push_str(&store);
+    }
+    ([(header::CONTENT_TYPE, EXPOSITION)], out).into_response()
+}
+
+async fn missing() -> Response {
+    (StatusCode::NOT_FOUND, "not found\n").into_response()
+}
+
+/// The store counter file as metric families, or None when nothing set
+/// `ZOU_STORE_STATS` and there is no file to read.
+///
+/// It is rendered through a registry built for this scrape rather than
+/// added into the process one, because the file is the truth and the
+/// numbers in it only go up: adding deltas into counters of our own
+/// would mean keeping a copy of the last scrape and being wrong the
+/// first time the file was reset.
+fn store_metrics() -> Option<String> {
+    let path = std::env::var("ZOU_STORE_STATS")
+        .ok()
+        .filter(|p| !p.is_empty())?;
+    store_families(std::path::Path::new(&path))
+}
+
+/// The counter file at `path` as metric families, or None when it
+/// cannot be read, which is a warning and not a failed scrape: the rest
+/// of the numbers are still worth having.
+fn store_families(path: &std::path::Path) -> Option<String> {
+    let snapshot = match zou_store::Snapshot::read(path) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            log::warn!("store counters: {e}");
+            return None;
+        }
+    };
+    let reg = Registry::new();
+    reg.counter(
+        "zou_store_conflicts_total",
+        "conditional writes that lost a race",
+        &[],
+    )
+    .add(snapshot.conflicts);
+    for op in &snapshot.ops {
+        for class in &op.by_class {
+            reg.counter(
+                "zou_store_ops_total",
+                "store operations",
+                &[("op", op.op), ("class", class.class)],
+            )
+            .add(class.count);
+            reg.counter(
+                "zou_store_bytes_total",
+                "bytes through the store",
+                &[("op", op.op), ("class", class.class)],
+            )
+            .add(class.bytes);
+        }
+        reg.counter(
+            "zou_store_errors_total",
+            "store operations that failed",
+            &[("op", op.op)],
+        )
+        .add(op.errors);
+        let seconds = reg.histogram(
+            "zou_store_op_seconds",
+            "how long store operations took",
+            STORE_SECONDS,
+            &[("op", op.op)],
+        );
+        for (at, count) in op.buckets.iter().enumerate() {
+            // Slot b counted what finished under 2^(b+1) microseconds,
+            // and each is folded in at that bound.
+            seconds.observe_count((1u64 << (at + 1)) as f64 / 1e6, *count);
+        }
+    }
+    for tier in &snapshot.reads {
+        reg.counter(
+            "zou_store_read_calls_total",
+            "smgr reads by tier",
+            &[("tier", tier.tier)],
+        )
+        .add(tier.calls);
+        reg.counter(
+            "zou_store_read_pages_total",
+            "pages read by tier",
+            &[("tier", tier.tier)],
+        )
+        .add(tier.pages);
+    }
+    Some(reg.render())
+}
+
+/// The store's own bucket edges, seconds, which are the powers of two
+/// microseconds its counter file keeps. Only the useful stretch of them
+/// is exposed: under a microsecond is noise on any op that touched a
+/// network, and everything above eight seconds lands in the last
+/// bucket, which is where a scrape wants it anyway.
+const STORE_SECONDS: &[f64] = &[
+    0.000_002, 0.000_008, 0.000_032, 0.000_128, 0.000_512, 0.002_048, 0.008_192, 0.032_768,
+    0.131_072, 0.524_288, 2.097_152, 8.388_608,
+];
+
+/// Count a request and how long it took. Layered on the whole router,
+/// so a 404 and a 429 are counted too, which are the two a graph is
+/// most often drawn to explain.
+pub async fn measure(req: Request<Body>, next: Next) -> Response {
+    let surface = surface(req.uri().path());
+    let start = Instant::now();
+    let answer = next.run(req).await;
+    let status = answer.status().as_u16().to_string();
+    registry()
+        .counter(
+            "zou_http_requests_total",
+            "requests answered",
+            &[("surface", surface), ("status", &status)],
+        )
+        .inc();
+    registry()
+        .histogram(
+            "zou_http_request_seconds",
+            "how long requests took",
+            SECONDS,
+            &[("surface", surface)],
+        )
+        .since(start);
+    answer
+}
+
+/// Which surface a path belongs to, as a fixed set of names.
+///
+/// A label per tenant is what the shape of this server invites and it
+/// is the one label that must not be here: a thousand tenants times the
+/// statuses times the surfaces is a series count no scrape wants to
+/// carry, and per tenant numbers are a billing question, not a
+/// monitoring one. Everything unrecognised is `other`, which keeps a
+/// stranger's url from inventing a series.
+fn surface(path: &str) -> &'static str {
+    match path.split('/').nth(1) {
+        Some("rest") => "rest",
+        Some("auth") => "auth",
+        Some("storage") => "storage",
+        Some("realtime") => "realtime",
+        Some("functions") => "functions",
+        _ => "other",
+    }
+}
+
+/// How many tenants are attached right now.
+pub fn attached(n: usize) {
+    registry()
+        .gauge("zou_tenants_attached", "tenants attached right now", &[])
+        .set(n as u64);
+}
+
+/// One attach, how it went and how long it took. Failures are counted
+/// as attempts too, since an attach that is failing fast is the shape
+/// of an outage and a graph of successes alone hides it.
+pub fn attach(ok: bool, start: Instant) {
+    registry()
+        .counter(
+            "zou_tenant_attaches_total",
+            "tenants started",
+            &[("outcome", if ok { "ok" } else { "error" })],
+        )
+        .inc();
+    if ok {
+        registry()
+            .histogram(
+                "zou_tenant_attach_seconds",
+                "how long a cold attach took",
+                SECONDS,
+                &[],
+            )
+            .since(start);
+    }
+}
+
+/// One registry lookup, hit or miss, which is the reading that says
+/// whether the cache ttls are doing anything.
+pub fn lookup(hit: bool) {
+    registry()
+        .counter(
+            "zou_registry_lookups_total",
+            "tenant registry lookups",
+            &[("result", if hit { "hit" } else { "miss" })],
+        )
+        .inc();
+}
+
+/// Serve the ops router on `listener` forever, on a runtime of its own.
+///
+/// One worker thread, because this answers a scrape every fifteen
+/// seconds and nothing else, and because the reason it is a separate
+/// listener is so that it stays answerable when the front door is
+/// busy.
+pub fn serve_blocking(
+    listener: std::net::TcpListener,
+    version: &'static str,
+) -> Result<(), String> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|e| format!("tokio runtime: {e}"))?;
+    rt.block_on(async move {
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("nonblocking: {e}"))?;
+        let listener =
+            tokio::net::TcpListener::from_std(listener).map_err(|e| format!("listener: {e}"))?;
+        axum::serve(listener, ops(version).into_make_service())
+            .await
+            .map_err(|e| format!("serve: {e}"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use tower::ServiceExt;
+
+    async fn call(router: &Router, url: &str) -> (StatusCode, String, String) {
+        let answer = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(url)
+                    .body(Body::empty())
+                    .expect("a request"),
+            )
+            .await
+            .expect("an answer");
+        let status = answer.status();
+        let kind = answer
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let body = to_bytes(answer.into_body(), 1 << 20).await.expect("a body");
+        (status, kind, String::from_utf8_lossy(&body).to_string())
+    }
+
+    #[tokio::test]
+    async fn healthz_answers_without_touching_anything() {
+        let (status, _, body) = call(&ops("0.0.0-test"), "/healthz").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "ok\n");
+    }
+
+    #[tokio::test]
+    async fn metrics_are_the_exposition_format() {
+        // The process registry is shared with every other test in this
+        // binary, so what is asserted here is which families a scrape
+        // carries, not what they are counting at the moment.
+        attached(3);
+        lookup(true);
+        let (status, kind, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(kind, EXPOSITION);
+        assert!(
+            body.contains("zou_build_info{version=\"0.0.0-test\"} 1\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("# TYPE zou_tenants_attached gauge\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("zou_registry_lookups_total{result=\"hit\"}"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ops_port_has_nothing_else_on_it() {
+        // Whatever else is asked for here is not a tenant's url. This
+        // listener serves an operator and nobody else.
+        let (status, _, _) = call(&ops("0.0.0-test"), "/rest/v1/todos").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_path_is_named_by_its_surface_and_never_by_its_tenant() {
+        assert_eq!(surface("/rest/v1/todos"), "rest");
+        assert_eq!(surface("/auth/v1/token"), "auth");
+        assert_eq!(surface("/storage/v1/object/pics/a.png"), "storage");
+        assert_eq!(surface("/realtime/v1/websocket"), "realtime");
+        assert_eq!(surface("/"), "other");
+        assert_eq!(surface("/acme-prod/rest/v1/todos"), "other");
+        assert_eq!(
+            surface("/../../etc/passwd"),
+            "other",
+            "a stranger does not get to name a series"
+        );
+    }
+
+    #[test]
+    fn the_store_counter_file_is_folded_in_when_there_is_one() {
+        use zou_store::CasStore;
+        let dir = tempfile::tempdir().expect("a directory");
+        let counters = dir.path().join("stats");
+        let store = zou_store::StatsStore::new(
+            Box::new(zou_store::cas::LocalFsStore::new(dir.path().join("store"))),
+            &counters,
+        )
+        .expect("counters open");
+        store
+            .put("tenants/local/MANIFEST", b"{}")
+            .expect("a put lands");
+        let out = store_families(&counters).expect("a snapshot renders");
+        assert!(
+            out.contains("zou_store_ops_total{op=\"put\",class=\"manifest\"} 1\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("zou_store_op_seconds_count{op=\"put\"} 1\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("zou_store_bytes_total{op=\"put\",class=\"manifest\"} 2\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_counter_file_that_is_not_there_is_a_warning_and_not_a_failed_scrape() {
+        let dir = tempfile::tempdir().expect("a directory");
+        assert!(store_families(&dir.path().join("nothing")).is_none());
+    }
+}
