@@ -192,6 +192,40 @@ jobs:
           curl -sf "$API_URL/auth/v1/settings" -H "apikey: $ANON_KEY" | tee /tmp/zou-settings.json
           grep -q '"anonymous_users":true' /tmp/zou-settings.json
           "$ZOU" status -o json | grep -q '"project_id":"smoke"'
+          "$ZOU" migration new "add widgets" | tee /tmp/zou-migration.txt
+          grep -q "supabase/migrations/[0-9]\{14\}_add_widgets.sql" /tmp/zou-migration.txt
+          cat > "$(cat /tmp/zou-migration.txt)" <<'SQL'
+          create table public.widgets (id bigserial primary key, name text not null);
+          SQL
+          cat > /tmp/zou-proj/supabase/seed.sql <<'SQL'
+          insert into public.widgets (name) values ('from the seed');
+          SQL
+          "$ZOU" db push --dry-run | grep -q "would apply"
+          "$ZOU" db push | tee /tmp/zou-push.txt
+          grep -q "1 applied, 0 were already there" /tmp/zou-push.txt
+          "$ZOU" db push | grep -q "nothing to apply"
+          for i in $(seq 1 30); do
+            curl -sf "$API_URL/rest/v1/widgets" -H "apikey: $ANON_KEY" >/tmp/zou-empty.json && break
+            sleep 1
+          done
+          grep -qx '\[\]' /tmp/zou-empty.json
+          curl -sf -X POST "$API_URL/rest/v1/widgets" -H "apikey: $SERVICE_ROLE_KEY" \
+            -H 'Content-Type: application/json' -d '{"name":"typed in by hand"}'
+          "$ZOU" db reset | tee /tmp/zou-reset.txt
+          grep -q "dropped schema public" /tmp/zou-reset.txt
+          grep -q "seeded from" /tmp/zou-reset.txt
+          for i in $(seq 1 30); do
+            curl -sf "$API_URL/rest/v1/widgets?select=name" -H "apikey: $ANON_KEY" \
+              >/tmp/zou-widgets.json && break
+            sleep 1
+          done
+          cat /tmp/zou-widgets.json
+          grep -q "from the seed" /tmp/zou-widgets.json
+          ! grep -q "typed in by hand" /tmp/zou-widgets.json
+          "$ZOU_PG_BIN/psql" "$DB_URL" -tAc "select count(*) from pg_event_trigger" | grep -qx 2
+          "$ZOU_PG_BIN/psql" "$DB_URL" -tAc \
+            "select count(*) from pg_namespace where nspname in ('auth','storage','zou')" | grep -qx 3
+          ! "$ZOU" db reset --db-url postgresql://postgres@db.example.com:5432/postgres
           kill -INT "$DEV"
           wait "$DEV" || true
           ! "$ZOU" status >/dev/null 2>&1

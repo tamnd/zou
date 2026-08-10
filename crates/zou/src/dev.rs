@@ -133,13 +133,12 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
 /// A file that cannot be read is an error rather than a shrug: a
 /// project that has a config.toml means it.
 fn project(args: &Args) -> Result<Option<Project>, String> {
-    let path = match (&args.config, args.no_config) {
-        (_, true) => None,
-        (Some(path), _) => Some(path.clone()),
-        (None, _) => config::find(&std::env::current_dir().map_err(|e| format!("cwd: {e}"))?),
+    if args.no_config {
+        return Ok(None);
+    }
+    let Some(project) = config::locate(args.config.as_deref())? else {
+        return Ok(None);
     };
-    let Some(path) = path else { return Ok(None) };
-    let project = Project::read(&path)?;
     log::info!("reading {}", project.path.display());
     let set = project.export();
     if !set.is_empty() {

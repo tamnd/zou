@@ -4,6 +4,8 @@ mod compact;
 #[cfg(unix)]
 mod config;
 #[cfg(unix)]
+mod db;
+#[cfg(unix)]
 mod dev;
 #[cfg(unix)]
 mod inbox;
@@ -31,6 +33,10 @@ fn usage() -> ExitCode {
     eprintln!("       {}", branch::USAGE);
     eprintln!("       {}", codegen::USAGE);
     eprintln!("       {}", compact::USAGE);
+    #[cfg(unix)]
+    eprintln!("       {}", db::DB_USAGE);
+    #[cfg(unix)]
+    eprintln!("       {}", db::MIGRATION_USAGE);
     eprintln!("       {}", info::USAGE);
     eprintln!("       {}", inspect::USAGE);
     #[cfg(unix)]
@@ -98,6 +104,10 @@ fn main() -> ExitCode {
         }
         Some("branch") => simple(branch::run(&argv[1..])),
         Some("compact") => simple(compact::run(&argv[1..])),
+        #[cfg(unix)]
+        Some("db") => simple(db::run(&argv[1..])),
+        #[cfg(unix)]
+        Some("migration") => simple(db::migration(&argv[1..])),
         Some("gen") => simple(codegen::run(&argv[1..])),
         #[cfg(unix)]
         Some("inbox") => simple(inbox::run(&argv[1..])),
