@@ -55,8 +55,11 @@ impl Default for LagBounds {
 }
 
 /// One tenant's ingest lag as its page service driver measures it:
-/// bytes between the durable end and the applied watermark, and how
-/// long the applied watermark has been stuck behind.
+/// bytes between the durable end and the end of the stream ingest has
+/// received, and how long that end has been stuck behind. Received,
+/// not applied: the last record before a write pause is usually cut
+/// by the flush position, and waiting on the applied watermark would
+/// read every pause as a stuck ingest.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IngestLag {
     pub bytes: u64,

@@ -165,8 +165,15 @@ impl ShardIngest {
     /// reports the worst shard's lag into the cell's
     /// [`Backpressure`](zou_log::Backpressure) so the sequencer can
     /// throttle this tenant, and only this tenant, past 1 GB.
+    ///
+    /// Measured from [`Self::seen`], not [`Self::applied`]: a flush
+    /// position usually ends inside a record, so `applied` parks a few
+    /// bytes short of durable until unrelated WAL completes it. Those
+    /// bytes are received, not lagging, and counting them would report
+    /// a stuck watermark on every write pause until the ten second
+    /// bound throttled the tenant, with nothing left to lift it.
     pub fn lag(&self, durable_end: u64) -> u64 {
-        durable_end.saturating_sub(self.applied)
+        durable_end.saturating_sub(self.seen())
     }
 
     pub fn memtable(&self) -> &Memtable {
@@ -616,6 +623,33 @@ mod tests {
             ingest.lag(0),
             0,
             "a durable end behind the resume point reads as caught up"
+        );
+    }
+
+    /// The wedge the scale 1000 init found: a flush position that ends
+    /// inside a record leaves `applied` a few bytes short of durable
+    /// forever if writes pause there. Those bytes are received, not
+    /// lagging, so the gauge measures from `seen` and a pause reads as
+    /// caught up instead of ten seconds later throttling the tenant
+    /// with nothing left to lift it.
+    #[test]
+    fn a_partial_record_at_the_stream_end_is_not_lag() {
+        let mine = rel_on(0);
+        let mut wal = Builder::new(WAL_BASE);
+        wal.record(&[(blk(mine, 1), false)], &[0x11; 100]);
+        wal.record(&[(blk(mine, 2), false)], &[0x22; 100]);
+        let (base, bytes) = wal.stream();
+        let cut = bytes.len() - 10;
+
+        let mut ingest = ShardIngest::new(cfg(0), WAL_BASE);
+        ingest.apply_frames(&[frame(base, &bytes[..cut])]).unwrap();
+        let durable = base + cut as u64;
+        assert!(ingest.applied() < durable, "the second record is partial");
+        assert_eq!(ingest.lag(durable), 0, "every durable byte is received");
+        assert_eq!(
+            ingest.lag(durable + 64),
+            64,
+            "bytes past the received end still count"
         );
     }
 
