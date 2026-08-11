@@ -239,6 +239,13 @@ fn start_http(
     log::info!("http api on http://127.0.0.1:{port}");
     log::info!("anon key {anon}");
     log::info!("service_role key {service}");
+    // The S3 endpoint is asked with a pair rather than with either of
+    // those keys, so it is printed here next to them, the way a local
+    // project prints all three together.
+    let s3 = crate::config::local_s3();
+    log::info!("s3 access key {}", s3.access);
+    log::info!("s3 secret key {}", s3.secret);
+    log::info!("s3 region {}", s3.region);
     let autoconfirm = !matches!(
         std::env::var("ZOU_MAILER_AUTOCONFIRM").as_deref(),
         Ok("false") | Ok("0")
@@ -396,6 +403,12 @@ fn start_http(
             // writes its own under its own prefix.
             objects: Some(target),
             tenant: Some(tenant),
+            // The S3 protocol surface, asked with the pair logged
+            // above. A dev loop with no pair would answer every signed
+            // request that the key is not one this project has, which
+            // is a working endpoint that says no to the client a
+            // project already has configured.
+            s3: Some(s3),
             // Off by default, the same as GoTrue. Set
             // ZOU_SECURITY_MANUAL_LINKING_ENABLED=true and a signed in
             // person can attach a second provider to the account they

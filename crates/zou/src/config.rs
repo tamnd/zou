@@ -621,6 +621,39 @@ pub fn local_db_url(port: u16) -> String {
     format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres")
 }
 
+/// The S3 pair a `supabase start` project answers to, which is fixed
+/// rather than generated and is the same on every machine.
+///
+/// It is a fixture and not a secret, the same way the local anon key
+/// printed in every Supabase tutorial is: it opens a database on
+/// loopback that a person started themselves. `zou dev` answers to it
+/// so that a project which already has these three in an `.env` keeps
+/// working when the command in front of it changes.
+pub const LOCAL_S3_ACCESS_KEY: &str = "625729a08b95bf1b7ff351a663f3a23c";
+pub const LOCAL_S3_SECRET_KEY: &str =
+    "850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907";
+/// Where a local project says it is, which a client signs into and
+/// which a bucket answers when asked for its location.
+pub const LOCAL_S3_REGION: &str = "local";
+
+/// The pair the dev loop's S3 endpoint is asked with: the local one
+/// above, unless the environment names another.
+///
+/// Overridable because the pair being public is only harmless while the
+/// thing behind it is on loopback, and a `zou dev` reachable from
+/// anywhere else is a `zou dev` that wants its own.
+pub fn local_s3() -> zou_server::s3::Credentials {
+    let var = |name: &str, fallback: &str| match std::env::var(name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => fallback.to_string(),
+    };
+    zou_server::s3::Credentials {
+        access: var("ZOU_S3_ACCESS_KEY", LOCAL_S3_ACCESS_KEY),
+        secret: var("ZOU_S3_SECRET_KEY", LOCAL_S3_SECRET_KEY),
+        region: var("ZOU_S3_REGION", LOCAL_S3_REGION),
+    }
+}
+
 /// Look for a project config, starting at `from` and walking up. Both
 /// the top of a project, which holds `supabase/config.toml`, and the
 /// `supabase` directory itself are places a person runs a command from.

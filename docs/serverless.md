@@ -129,6 +129,8 @@ tofu output -raw api_url
 zou tenant s3://my-bucket/projects keys demo --env
 ```
 
+That prints the project's S3 pair as well, which is what an S3 client is configured with and is generated per project rather than shared by the fleet.
+
 `zou status` prints the same pair for the dev loop, but it mints them from `ZOU_JWT_SECRET` and probes a local port.
 A project on a bucket has neither: its secret was made by `tenant create` and lives in the registry, and the thing serving it may be a function with no port at all.
 So `tenant keys` reads the store, which is where the answer is.
