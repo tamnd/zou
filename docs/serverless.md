@@ -28,8 +28,8 @@ demo is up before the first request, in 118.2 ms
 A project has one writer at a time, held as a lease in its manifest with a 15 second TTL, see [operations.md](operations.md).
 This is the whole of what a serverless deployment has to get right.
 
-Two instances of the same project are safe and pointless: the second one attaches, finds the lease held, and its wal pusher waits for it rather than serving writes.
-So cap the deployment at one instance.
+Two instances of the same project are safe and pointless: the second one attaches, finds the lease held by the first, waits `ZOU_LEASE_WAIT_SECS` for it, and then stops its cluster rather than serve writes it cannot land.
+So cap the deployment at one instance, or a burst of traffic is a second instance that shuts itself down.
 On Cloud Run that is `maxScale: 1`, on Fly it is one machine, and on Lambda it is reserved concurrency of 1.
 
 A deployment that ends cleanly puts the lease back.
@@ -109,6 +109,30 @@ It also installs the auth schema, which the first request that needs it does, on
 Lambda sends SIGTERM before destroying an environment only when the function has an extension registered, so a function with no extension is always killed.
 The cost of that is the paragraph above: reads are unaffected, and the first write in the next environment waits out what is left of the 15 second lease.
 
+### The same thing as a config
+
+Those commands are also four Terraform files, see [deploy/lambda/terraform](../deploy/lambda/terraform).
+`tofu apply -var bucket=my-zou-bucket` makes the bucket, a repository for the image, the role with the prefix scoped policy, the log group, the function at reserved concurrency 1, and an http api whose `$default` route is the function.
+It works with Terraform or OpenTofu.
+
+Two things are not in it, because they are not Terraform's to do.
+One is the image, which has to be built and pushed before a function can point at it, and the other is making the project, which is the initdb above.
+The README next to those files is the five steps in order.
+
+There is no `cors_configuration` on the api on purpose.
+zou answers preflights itself, with the origins `ZOU_CORS_ORIGINS` allows, and a gateway that also answers them is a second policy in front of the first that is easy to get wrong and hard to see.
+
+An app needs the url and the anon key, and neither is in the config:
+
+```bash
+tofu output -raw api_url
+zou tenant s3://my-bucket/projects keys demo --env
+```
+
+`zou status` prints the same pair for the dev loop, but it mints them from `ZOU_JWT_SECRET` and probes a local port.
+A project on a bucket has neither: its secret was made by `tenant create` and lives in the registry, and the thing serving it may be a function with no port at all.
+So `tenant keys` reads the store, which is where the answer is.
+
 ### What it costs
 
 `scripts/zou-lambda-smoke.sh` runs the whole adapter against a fake runtime api on a laptop: it hands out function url events, the real binary answers them, and every answer is checked.
@@ -128,6 +152,47 @@ The rest surface's first request builds the schema cache, and the first signup i
 A project that was warmed once, as above, starts answering in tens of milliseconds.
 
 The cold attach against object storage is the number that matters more and it is measured separately, with the wire latency of S3 simulated, in [benchmarks.md](benchmarks.md).
+
+### What it costs in money
+
+A Lambda bill has two halves.
+One is what AWS charges for the function: GB seconds, requests, and the gateway in front of them, all of which are time.
+The other is what the database does underneath, which is S3 per op, and a put is a put whether it carried 8 KB or 8 MB.
+The second half is the one nobody guesses right, so `scripts/zou-lambda-cost.sh` measures it: it makes a project, hands the real binary a cold start, a first read, twenty reads and twenty writes through a fake runtime api, and reads the store's own op counters at each boundary.
+
+On an M-series laptop, arm64 at 2048 MB, against a store on the local disk:
+
+| | | store ops |
+| --- | --- | --- |
+| cold start, exec to the first answer | 1956 ms | 535 gets, 313 puts |
+| first read of a fresh environment | 110 ms | 381 gets |
+| a read, twenty rows through `/rest/v1/` | 1.4 ms | none |
+| a write, one row through `/rest/v1/` | 10.7 ms | 1 put |
+
+The first read is its own line because it is a different thing from the reads after it.
+A query faults the pages it touches in from the store the first time it is asked and finds them in memory every time after, so a warm read costs no store ops at all, and averaging that warm up over the reads that follow would price every read as if it were the first.
+
+The cold start above is the expensive kind: the environment before it had just written, so this one replays that wal, and the log splits it as 15 ms of restore and 1.8 s of postgres recovery.
+An environment that starts on a project nobody has written to since its last checkpoint is the smoke table's 25 to 57 ms.
+
+At 100,000 reads, 10,000 writes and 96 cold starts a day, which is an app with real users on it, those numbers price out at:
+
+| | |
+| --- | --- |
+| lambda duration | $0.41 |
+| lambda requests | $0.67 |
+| api gateway | $3.35 |
+| s3 puts, 1.2 million | $6.17 |
+| s3 gets, 2.7 million | $1.08 |
+| storage, logs and egress | under $0.01 |
+| total | $11.69 a month |
+
+The gateway costs more than the compute, and the puts cost more than both.
+Most of those puts are the cold starts rather than the writes: 96 environments a day at 313 puts each is three quarters of the line, which is the checkpoint each one writes on its way in and out.
+Idle costs the storage line alone, which for a 43 MB project is a tenth of a cent a month.
+
+Rates move and regions differ, so `--rates rates.json` overrides any of them, and `--reads-per-day`, `--writes-per-day` and `--cold-starts-per-day` are the shape of the traffic.
+For a deployment that already exists the script prints the three `aws cloudwatch` and `aws s3 ls` commands that produce the real numbers, and `--invocations-per-day`, `--avg-duration-ms`, `--log-mb-per-day` and `--store-gb` hand them back in and price those instead.
 
 ## Cloud Run
 
@@ -169,4 +234,8 @@ Add a `[[services]]` block on 5432 to get psql and a connection string, and reme
 
 ## What is not here yet
 
-A Terraform example that stands the whole thing up, and a cost readout against a real bill, are the next two lines of [issue #3](https://github.com/tamnd/zou/issues/3).
+The cost numbers above are measured against a store on a local disk and priced at the published rates.
+Nobody has yet run this against a real bucket for a month and compared the two, which is what `--invocations-per-day` and its friends exist for, and the day someone does the table gets replaced by that.
+
+A Terraform example for Cloud Run and for Fly, rather than for Lambda alone, is also not written.
+Both are a service definition and a bucket and neither is hard, but an example that has never been applied is worse than no example.

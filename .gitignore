@@ -10,6 +10,14 @@
 /mutants.out
 /mutants.out.old
 
+# terraform: the provider it downloads, and the state, which belongs in
+# a backend rather than in a repository
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.backup
+*.tfvars
+
 # cargo-fuzz
 fuzz/target/
 fuzz/corpus/
