@@ -81,6 +81,11 @@ The template store carries a `.zou-scratch` marker, so writes to it are not fsyn
 And whether a branch of the template would serve is checked on the first fixture of a process rather than on every one, because a published template never changes again, so the answer cannot change either.
 Together they are most of the 12 ms the branch used to cost on this laptop, and close to none of the 63 ms a github runner takes, where an fsync on ext4 is a fraction of a millisecond and the create is the restore and the postmaster from start to finish.
 
+Putting the template store in RAM does nothing, which is worth saying because it is the obvious next idea.
+The same 20 rounds on a runner with the template on `/dev/shm`, a tmpfs, came out at 64.8 ms against 64.4 ms on the disk in the same job, with the restore at 20.3 ms against 19.5 and the postmaster at 43.1 against 39.9.
+The medium was never the cost: a template read over and over is in page cache either way, and what is left is postgres starting up and the work of reading pages through the store rather than waiting for a device.
+If you want the template somewhere else anyway, `ZOU_TEMPLATE_CACHE` is that, and a tmpfs is a perfectly good place for it, just not a faster one.
+
 The first fixture on a cold machine builds the template, which is one initdb and one fold, 45 s on this laptop.
 It lands in `$ZOU_TEMPLATE_CACHE`, or `$XDG_CACHE_HOME/zou/templates`, or `~/.cache/zou/templates`, and a CI job that keeps that directory between runs pays for it once.
 Two processes arriving at a cold machine at the same time do not both build one: the loser waits for the winner under a lock, and a lock nobody released within ten minutes is treated as a build that died.
