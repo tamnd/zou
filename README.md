@@ -49,9 +49,8 @@ await supabase.from("todos").select("*").eq("done", false);
 
 That runs today.
 [`zou-embed`](docs/embedded.md) opens a project inside a host process, answers requests through the same router the server puts on a port, serves it on a port too when something outside wants in, and branches.
-`libzou` is the same thing behind `zou.h`, for anything that can load a shared library, the node package is napi over the crate, and the python package is PyO3 over it.
-`client()` is a real supabase-js client with a `fetch` that goes to the router in this process, so there is no socket anywhere under that snippet, and `zou.client()` in python is a real supabase-py client with an httpx transport doing the same thing.
-Go is next.
+`libzou` is the same thing behind `zou.h`, for anything that can load a shared library, the node package is napi over the crate, the python package is PyO3 over it, and the Go package is cgo over `libzou`.
+`client()` is a real supabase-js client with a `fetch` that goes to the router in this process, so there is no socket anywhere under that snippet, `zou.client()` in python is a real supabase-py client with an httpx transport doing the same thing, and in Go a project is an `http.RoundTripper`, so `project.Client()` is an ordinary `*http.Client` that never touches a socket.
 
 `createFixture()` is the same thing for a suite that wants a database per test rather than per run.
 The machine builds one template, once, and every fixture after it is a copy on write branch of that template, which is tens of milliseconds instead of the half minute initdb through a store costs.
