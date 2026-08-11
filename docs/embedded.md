@@ -63,6 +63,7 @@ That is the whole cost of a create, and it is what stops a suite from taking a d
 A fixture does not run initdb.
 One template is built per machine and per Postgres build, and every fixture is a branch of it: a manifest write, no pages copied, and the postmaster start that was always going to be there.
 On this laptop that is 60 ms at p50 over 50 creates, of which 13 ms is the branch, 21 ms the restore, 22 ms the postmaster, and a millisecond the front door.
+A github runner is 63 ms, and a 6 vcpu vps with a slow disk is 1.6 s, which is the same four steps on a machine where all four are twenty times slower.
 
 ```rust
 #[test]

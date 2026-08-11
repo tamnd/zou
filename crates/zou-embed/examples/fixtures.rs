@@ -11,13 +11,23 @@
 //! separately, because it is a different question with a different
 //! answer. Pass `--phases` to break a single create down instead.
 
-#![cfg(unix)]
-
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::time::Instant;
 
+#[cfg(unix)]
 use zou_embed::{Options, Zou};
 
+/// `zou-embed` is an empty library off unix, so there is nothing here to
+/// time, and an example with no `main` is a build failure rather than a
+/// thing that was skipped.
+#[cfg(not(unix))]
+fn main() {
+    println!("the embedded library is unix only for now");
+}
+
+#[cfg(unix)]
 fn main() {
     // `RUST_LOG=zou_embed=debug` breaks a create into the branch, the
     // restore, the postmaster and the front door.
@@ -71,6 +81,7 @@ fn main() {
     println!("  max  {:.1}", took[took.len() - 1]);
 }
 
+#[cfg(unix)]
 fn ms(seconds: f64) -> String {
     format!("{:.1} ms", seconds * 1000.0)
 }
