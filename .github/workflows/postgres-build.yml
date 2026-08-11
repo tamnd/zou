@@ -11,6 +11,7 @@ on:
       - .gitmodules
       - patches/**
       - scripts/pg-apply-patches.sh
+      - scripts/zou-bundle.sh
       - Makefile
       - crates/zou/**
       - crates/zou-pg/**
@@ -419,3 +420,23 @@ jobs:
           grep -qx 1 /tmp/ext.txt
           build/pg/bin/pg_ctl -D /tmp/zou-ext-pgdata stop
           cat /tmp/zou-ext.log
+      # What a download weighs, assembled the way an installer would,
+      # with the 150 MB budget as the exit code. Then started out of the
+      # bundle, because a bundle that is small and cannot run a database
+      # is not a smaller bundle.
+      - name: the release bundle, measured
+        run: |
+          scripts/zou-bundle.sh --tar
+          BUNDLE=$PWD/dist/zou-linux-x64
+          $BUNDLE/pg/bin/initdb -D /tmp/bundle-pgdata
+          $BUNDLE/pg/bin/postgres -D /tmp/bundle-pgdata -k /tmp -p 5617 >/tmp/bundle-pg.log 2>&1 &
+          for i in $(seq 1 60); do
+            $BUNDLE/pg/bin/psql -h /tmp -p 5617 -d postgres -Atc 'select 1' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          $BUNDLE/pg/bin/psql -h /tmp -p 5617 -d postgres -v ON_ERROR_STOP=1 \
+            -c 'select version()' \
+            -c 'create extension vector' \
+            -c 'select count(*) > 0 from pg_timezone_names'
+          kill -INT "$(head -1 /tmp/bundle-pgdata/postmaster.pid)"
+          $BUNDLE/bin/zou --version

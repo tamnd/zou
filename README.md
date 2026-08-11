@@ -92,6 +92,8 @@ cargo +nightly fuzz run rest_filter
 
 `make demo` tours the object layer in seconds, and after a one time `make pg-build` it continues into the real Postgres on a store, rows, a branch, and a restart from nothing but the objects. The walkthrough is in [docs/quickstart.md](docs/quickstart.md).
 
+A release is the binary and the patched Postgres together, since one without the other cannot start a database. `scripts/zou-bundle.sh` assembles the pair the way an installer would and prints what it weighs, 48.6 MB on darwin arm64 and 50.6 MB on linux x64 against a budget of 150 MB, see [docs/packaging.md](docs/packaging.md).
+
 ## Contributing
 
 The project is being built top to bottom against the milestone checklists, one PR per feature. Issues and PRs are welcome, but expect churn while M1 is in progress.
