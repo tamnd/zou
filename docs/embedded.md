@@ -50,6 +50,10 @@ That is the cost of `open` and it is seconds rather than milliseconds, most of t
 By default every handle mints a fresh random JWT secret, which is right for a test and wrong for anything that has to still recognise its own tokens after a restart.
 `Options::jwt_secret` pins it.
 
+The S3 protocol door is shut unless a pair is given.
+`Options::s3(access, secret)` opens it, and then an S3 client signing with that pair reaches the same buckets and objects the storage api serves, which is the same arrangement a Supabase project has.
+Nothing to do with the credentials a store on a bucket reads out of the environment: those are how zou reaches somebody else's S3, and this is how somebody else's S3 client reaches zou.
+
 ## A database per test
 
 ```rust
@@ -221,6 +225,7 @@ await zou.checkpoint();
 
 `zou.dsn` is the other door, for a host that wants `pg` or `psql` on the database directly, which is how a test suite creates its own schema before serving it.
 `zou.anonKey`, `zou.serviceRoleKey`, `zou.target`, and `zou.tenant` are the rest of what `zou status` prints.
+`createZou` takes `jwtSecret`, `schemas`, `anonRole`, and `s3AccessKey` with `s3SecretKey` and `s3Region`, which are the same knobs the Rust options are: what tokens are signed with, what the rest surface serves and what a request that names no schema gets, what role a caller with no key of its own runs as, and the pair an S3 client signs with.
 `zou.url` is the port once `listen` has been called, and a name that resolves nowhere before that, since before that there is nothing to resolve.
 
 A node project still needs the patched Postgres, and the way it gets one without a `ZOU_PG_BIN` in every script is the command line package next door.

@@ -148,6 +148,9 @@ pub struct Options {
     /// The schemas the rest surface serves, first one the default.
     /// Empty for the server's own list.
     pub schemas: Vec<String>,
+    /// The role a request that carries no key of its own runs as.
+    /// Empty for `anon`, which is what a Supabase project calls it.
+    pub anon_role: String,
     /// shared_buffers for the child postmaster.
     pub shared_buffers: Option<String>,
     /// Cut this database out of the machine's template instead of
@@ -156,6 +159,27 @@ pub struct Options {
     /// a tenant of its own and goes away with the handle, so it names
     /// no target and keeps nothing.
     pub fixture: bool,
+    /// The pair the S3 protocol surface is asked with. None and that
+    /// surface tells every request the key it named is not one this
+    /// project has, which is the honest answer for a project that was
+    /// never given a pair.
+    pub s3: Option<S3Keys>,
+}
+
+/// The key pair an S3 client signs with, and where the project says it
+/// is.
+///
+/// Nothing to do with the credentials a store on a bucket reads out of
+/// the environment. Those are how zou reaches somebody else's S3, and
+/// this is how somebody else's S3 client reaches zou.
+#[derive(Debug, Clone)]
+pub struct S3Keys {
+    pub access: String,
+    pub secret: String,
+    /// What a bucket answers when asked where it is, and half of what a
+    /// signature is checked against. `us-east-1` when it is empty,
+    /// where every client that was never told assumes it is.
+    pub region: String,
 }
 
 impl Default for Options {
@@ -167,8 +191,10 @@ impl Default for Options {
             runtime: None,
             jwt_secret: None,
             schemas: Vec::new(),
+            anon_role: String::new(),
             shared_buffers: None,
             fixture: false,
+            s3: None,
         }
     }
 }
@@ -225,6 +251,17 @@ impl Options {
     /// Keys that survive a restart, because the host pinned the secret.
     pub fn jwt_secret(mut self, secret: impl Into<String>) -> Options {
         self.jwt_secret = Some(secret.into());
+        self
+    }
+
+    /// A pair for the S3 protocol surface, which answers nothing
+    /// without one.
+    pub fn s3(mut self, access: impl Into<String>, secret: impl Into<String>) -> Options {
+        self.s3 = Some(S3Keys {
+            access: access.into(),
+            secret: secret.into(),
+            region: String::new(),
+        });
         self
     }
 }
@@ -314,6 +351,9 @@ pub struct Zou {
     pg_bin: PathBuf,
     secret: String,
     keys: Keys,
+    /// Kept so a branch of this database answers the S3 surface the
+    /// same way its parent does.
+    s3: Option<S3Keys>,
     /// Removed on close, always: this is the running copy and the store
     /// is where the data actually is.
     runtime: PathBuf,
@@ -497,6 +537,7 @@ impl Zou {
             pg_bin: pg_bin.to_path_buf(),
             secret,
             keys,
+            s3: options.s3.clone(),
             runtime: runtime.to_path_buf(),
             owned_store: cut.owned_store.clone(),
             owned_tenant: cut.owned_tenant,
@@ -570,6 +611,10 @@ impl Zou {
             } else {
                 options.schemas.clone()
             },
+            anon_role: match options.anon_role.is_empty() {
+                true => zou_server::Config::default().anon_role,
+                false => options.anon_role.clone(),
+            },
             // Objects go where the pages go, the same store under the
             // same tenant prefix.
             objects: Some(target.to_string()),
@@ -578,6 +623,14 @@ impl Zou {
             // host wired one up, so a signup that had to wait for a
             // link would wait forever.
             mailer_autoconfirm: true,
+            s3: options.s3.as_ref().map(|keys| zou_server::s3::Credentials {
+                access: keys.access.clone(),
+                secret: keys.secret.clone(),
+                region: match keys.region.is_empty() {
+                    true => zou_server::s3::REGION.to_string(),
+                    false => keys.region.clone(),
+                },
+            }),
             ..Default::default()
         };
         let router = zou_server::router(cfg).map_err(|e| Error::new(Kind::Options, e))?;
@@ -692,11 +745,13 @@ impl Zou {
             runtime: None,
             jwt_secret: Some(self.secret.clone()),
             schemas: Vec::new(),
+            anon_role: String::new(),
             shared_buffers: None,
             // The child names the store the parent is on, which is the
             // template store when the parent is a fixture, so there is
             // nothing left for the template path to do.
             fixture: false,
+            s3: self.s3.clone(),
         })
     }
 
