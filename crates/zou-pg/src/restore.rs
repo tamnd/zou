@@ -62,7 +62,7 @@ const CONTROL_REDO_OFFSET: usize = 40;
 const DB_SHUTDOWNED: u32 = 1;
 const DB_IN_PRODUCTION: u32 = 6;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RestoreStats {
     pub files: usize,
     pub dirs: usize,
@@ -70,6 +70,9 @@ pub struct RestoreStats {
     pub wal_bytes: u64,
     /// Postgres LSN right after the last restored WAL byte.
     pub wal_end: u64,
+    /// The timeline the restored WAL is on, which is what names its
+    /// segment files. A warm up reads them back, see [`crate::warm`].
+    pub timeline: u32,
 }
 
 /// The WAL file name for a byte position, mirroring XLogFileName.
@@ -454,6 +457,7 @@ fn restore_manifest(
         wal_records: 0,
         wal_bytes: 0,
         wal_end,
+        timeline: tli,
     })
 }
 

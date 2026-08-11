@@ -15,6 +15,8 @@
 //! opens every 16MB segment, the cursor skips them and validates the
 //! page magic as it goes.
 
+use std::collections::BTreeSet;
+
 use zou_store::Frame2;
 
 use crate::restore::WAL_SEGMENT_SIZE;
@@ -372,8 +374,14 @@ fn record_block_refs(
 /// the scan consumes complete records until the window ends inside one
 /// and reports where it stopped, which is how a reader tails a stream
 /// whose last frame can end mid record.
-fn scan(window: &WalWindow, start: u64, end: Option<u64>) -> Result<ScanOut, String> {
+fn scan(
+    window: &WalWindow,
+    start: u64,
+    end: Option<u64>,
+    mut faults: Option<&mut Vec<(BlockRef, bool)>>,
+) -> Result<ScanOut, String> {
     let mut cursor = Cursor { window, pos: start };
+    let mut seen = BTreeSet::new();
     let limit = end.unwrap_or_else(|| cursor.end());
     let mut out = ScanOut {
         refs: Vec::new(),
@@ -426,6 +434,13 @@ fn scan(window: &WalWindow, start: u64, end: Option<u64>) -> Result<ScanOut, Str
                 &mut out.rels,
                 &mut out.truncs,
             )?;
+            if let Some(faults) = faults.as_deref_mut() {
+                for (r, init) in pairs.iter() {
+                    if seen.insert(*r) {
+                        faults.push((*r, *init));
+                    }
+                }
+            }
             out.refs.extend(pairs.drain(..).map(|(r, _)| r));
             cursor.skip(body - head)?;
             cursor.pos = (cursor.pos + MAXALIGN - 1) & !(MAXALIGN - 1);
@@ -462,7 +477,23 @@ pub fn scan_block_refs(window: &WalWindow, start: u64, end: u64) -> Result<Vec<B
 /// fold persists so the read path knows where a truncate or a file
 /// recreation invalidated older checkpoint copies of a relation.
 pub fn scan_range(window: &WalWindow, start: u64, end: u64) -> Result<ScanOut, String> {
-    scan(window, start, Some(end))
+    scan(window, start, Some(end), None)
+}
+
+/// Every block the records reference, in the order redo reaches them,
+/// paired with whether redo will hand the page to the buffer manager
+/// without reading it first, which a full page image and a will init
+/// flag both do. First mention wins: a later plain reference to a
+/// block an earlier record initialized is not a fault either, the page
+/// is in shared buffers by then.
+///
+/// This is what a warm up before recovery prefetches. Tolerant of a
+/// stream that ends mid record, like [`scan_available`], because the
+/// restored pg_wal usually does.
+pub fn scan_faults(window: &WalWindow, start: u64) -> Result<Vec<(BlockRef, bool)>, String> {
+    let mut faults = Vec::new();
+    scan(window, start, None, Some(&mut faults))?;
+    Ok(faults)
 }
 
 /// Walk complete records from `start` to wherever the window stops
@@ -472,7 +503,7 @@ pub fn scan_range(window: &WalWindow, start: u64, end: u64) -> Result<ScanOut, S
 /// writes until their record is fully durable, so a partially mirrored
 /// record cannot have pages in the store yet.
 pub fn scan_available(window: &WalWindow, start: u64) -> Result<ScanOut, String> {
-    scan(window, start, None)
+    scan(window, start, None, None)
 }
 
 /// The aligned end of a record `tot_len` bytes long starting at `lsn`,

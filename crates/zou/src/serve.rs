@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use crate::dev::SUPERUSER;
 use zou_pg::gc::{self, Sweep};
-use zou_pg::{bootstrap, install, restore};
+use zou_pg::{bootstrap, install, restore, warm};
 use zou_server::Config;
 use zou_server::attach::{Attached, Backend};
 use zou_server::fleet::Doors;
@@ -516,6 +516,7 @@ impl Backend for Postmasters {
                 stats.files,
                 stats.wal_records
             );
+            warm_pages(&self.target, &tenant_ref, &pgdata, &pagecache, &stats);
         }
 
         let port = free_port()?;
@@ -643,6 +644,35 @@ impl Backend for Postmasters {
         log::info!("{tenant_ref}: detaching");
         self.state.leaving(tenant_ref, live.pid);
         stop(live.pid);
+    }
+}
+
+/// Pull the pages recovery is about to fault into the page cache the
+/// postmaster will be started with, between the restore and the spawn.
+/// Nothing here is load bearing: a warm up that fails costs the round
+/// trips it would have saved, so it logs and returns.
+pub(crate) fn warm_pages(
+    target: &str,
+    tenant_ref: &str,
+    pgdata: &std::path::Path,
+    pagecache: &std::path::Path,
+    stats: &restore::RestoreStats,
+) {
+    match warm::warm(target, tenant_ref, pgdata, pagecache, stats) {
+        Ok(w) if w.wanted == 0 => {}
+        Ok(w) => log::debug!(
+            "{tenant_ref}: warmed {} of {} pages and {} fork sizes, {} bytes{}",
+            w.fetched,
+            w.wanted,
+            w.forks,
+            w.bytes,
+            if w.capped {
+                ", fault list truncated at ZOU_WARM_BLOCKS"
+            } else {
+                ""
+            }
+        ),
+        Err(e) => log::debug!("{tenant_ref}: warm up skipped, {e}"),
     }
 }
 

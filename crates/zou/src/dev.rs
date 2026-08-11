@@ -592,6 +592,10 @@ pub fn run(args: &Args) -> Result<(), String> {
             stats.wal_records,
             args.target
         );
+        // Only on the restore path. A postgres that crashes and is
+        // restarted by the loop below has its cache already, and its
+        // recovery reads come out of it.
+        crate::serve::warm_pages(&args.target, &args.tenant, &pgdata, &pagecache, &stats);
     }
 
     unsafe {
