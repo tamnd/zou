@@ -491,6 +491,7 @@ impl Postmasters {
 impl Backend for Postmasters {
     fn up(&self, entry: &Tenant) -> Result<Config, String> {
         let tenant_ref = entry.tenant_ref.clone();
+        let mut boot = crate::boot::Boot::now();
         // Before anything is read out of the store for this project,
         // and long before anything is started that would write to it.
         self.state.wait_for_the_last_one(&tenant_ref)?;
@@ -507,16 +508,22 @@ impl Backend for Postmasters {
         fs::set_permissions(&sock, fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("chmod {}: {e}", sock.display()))?;
 
+        boot.lap("wait");
         if self.fresh(&tenant_ref)? {
             self.bootstrap(&tenant_ref, &pgdata, &pagecache)?;
+            boot.lap("initdb");
         } else {
             let stats = restore::restore(&self.target, &tenant_ref, &pgdata)?;
             log::debug!(
-                "{tenant_ref}: restored {} files, replayed {} wal records",
+                "{tenant_ref}: restored {} files in {}, replayed {} wal records in {}",
                 stats.files,
-                stats.wal_records
+                crate::boot::ms(stats.skeleton_took),
+                stats.wal_records,
+                crate::boot::ms(stats.wal_took)
             );
+            boot.lap("restore");
             warm_pages(&self.target, &tenant_ref, &pgdata, &pagecache, &stats);
+            boot.lap("warm");
         }
 
         let port = free_port()?;
@@ -538,6 +545,7 @@ impl Backend for Postmasters {
             .map_err(|e| format!("spawn postgres for {tenant_ref}: {e}"))?;
         let pid = child.id();
         let stderr = child.stderr.take().ok_or("no stderr pipe")?;
+        boot.lap("spawn");
 
         // One thread per attached tenant, which is the cost of knowing
         // when one dies. It echoes the postmaster's log with the ref in
@@ -598,11 +606,17 @@ impl Backend for Postmasters {
                 ));
             }
         }
+        boot.lap("recovery");
         self.state
             .live
             .lock()
             .expect("the live map")
             .insert(tenant_ref.clone(), Live { pid, dir });
+        log::info!(
+            "{tenant_ref}: attached in {}, {}",
+            crate::boot::ms(boot.total()),
+            boot.laps()
+        );
 
         // Local connections are trust, and nothing but this node can
         // reach the port either way: it is on loopback in a 0700 socket
@@ -718,6 +732,10 @@ fn bind(port: u16, what: &str) -> Result<Option<std::net::TcpListener>, String> 
 }
 
 pub fn run(args: &Args) -> Result<(), String> {
+    // Running from the top of main, so what it ends up saying is what
+    // a request arriving at a cold node waits for before it is even
+    // routed, see boot.rs.
+    let mut boot = crate::boot::Boot::from_entry();
     let postgres = args.pg_bin.join("postgres");
     if !postgres.is_file() {
         return Err(format!(
@@ -736,7 +754,9 @@ pub fn run(args: &Args) -> Result<(), String> {
         unsafe { std::env::set_var("ZOU_STORE_STATS", &stats) };
     }
 
+    boot.lap("arguments");
     let store: Arc<dyn CasStore> = Arc::from(open_store(&args.target)?);
+    boot.lap("store");
     let registry = Arc::new(Registry::new(Arc::clone(&store)));
     let backend = Arc::new(Postmasters {
         target: args.target.clone(),
@@ -765,6 +785,10 @@ pub fn run(args: &Args) -> Result<(), String> {
     let pg = bind(args.pg, "the postgres port")?;
     let pool = bind(args.pool, "the pooler")?;
     let ops = bind(args.ops, "ops")?;
+    // Listening is the moment a request stops being refused, so it is
+    // the moment the node counts as up whatever else it does after.
+    boot.lap("doors");
+    log::info!("up in {}, {}", crate::boot::ms(boot.total()), boot.laps());
     log::info!("serving {} from {}", args.target, args.runtime.display());
     for domain in &args.domains {
         log::info!("http://<ref>.{domain}:{} names a project", args.http);

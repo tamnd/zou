@@ -162,6 +162,32 @@ Redo went from 939.76 s to 246.70 s and the attach from 1103.52 s to 417.45 s at
 
 What is left of a cold attach is the writes: recovery dirties every page it changed and the end of recovery checkpoint puts them back one at a time, which is where the rest of those ten minutes goes and is the storage engine's problem rather than this command's.
 
+### Where a cold start went
+
+A node says what it spent starting up, because a total tells nobody which step to go and fix.
+Two lines carry it, both at info level, so a node with no collector pointed at it still has the answer in its log.
+
+    up in 0.3 ms, arguments 0.1 ms, store 0.1 ms, doors 0.1 ms
+    acme-prod: attached in 479.2 ms, wait 0.2 ms, restore 443.1 ms, warm 11.1 ms, spawn 0.9 ms, recovery 24.0 ms
+
+The first is the binary, measured from the top of `main` to the four doors listening, and its laps add up to its total.
+It is small because nothing is opened at start that a request has not asked for, the store lap included, which is a handle and not a read.
+What it cannot see is the exec and the dynamic linker that ran before `main`, so a cold start timed from outside is always a few milliseconds larger, and on this laptop that difference is most of it, six milliseconds against a third of one.
+
+The second is one project being brought up, printed once per attach with the ref in front of it.
+`wait` is the previous postmaster for that same ref shutting down, normally nothing and occasionally the whole line on a node that is churning.
+`restore` is the runtime directory being written back out of the tenant's prefix, `warm` is fetching the pages redo is about to read, `spawn` is the fork, and `recovery` is from the postmaster starting to the first connection it takes.
+`initdb` appears instead of `restore` and `warm` the first time a ref is asked for, since there is nothing in the store to restore yet.
+
+`RUST_LOG=debug` splits the restore in two:
+
+    acme-prod: restored 20 files in 333.7 ms, replayed 1 wal records in 95.9 ms
+
+The two halves fail differently, which is why they are counted apart.
+The first is the skeleton, a fixed set of objects a project's size does not change, fetched in parallel, so a large number there is the store being far away or the objects being fat.
+The second is the shared log read from the newest checkpoint's redo location to the end of the stream, so a large number there is a project that has written a lot since its last fold, and the fold cadence is the knob.
+`scripts/zou-cold-start.sh` is the measurement, an exec to first answered request against a store on a directory or behind `SIM`, with the node's own breakdown printed under each run, see [benchmarks.md](benchmarks.md).
+
 `zou serve` needs the patched postgres, `--pg-bin` or `ZOU_PG_BIN` pointing at the install, the same one `zou dev` uses.
 
 ### Large downloads out of the way

@@ -73,10 +73,25 @@ pub fn read_files(capture: &Capture) -> Result<Vec<(String, Vec<u8>)>, String> {
     Ok(files)
 }
 
+/// Trailing zeros a capture does not have to carry. A restore knows the
+/// file's length from the INDEX and creates the file at that length, and
+/// a file created at a length is zeros past what was written, so storing
+/// the zeros is paying to move bytes the other side would have made
+/// anyway. This is not a compression scheme and it is not guessing, it
+/// is the one shape a data directory reliably has: files sized in whole
+/// blocks with the last block part used, and the wal segment holding the
+/// redo location, which is sixteen megabytes however little of it has
+/// been written into.
+fn without_trailing_zeros(data: &[u8]) -> &[u8] {
+    let end = data.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+    &data[..end]
+}
+
 /// Upload a capture as checkpoint `id` and write its INDEX. Returns the
-/// bytes uploaded. Objects under chk/ are immutable, so an object left by
-/// an earlier attempt of the same checkpoint is kept and its stored
-/// length recorded when `keep_existing` is set, which keeps a retried
+/// bytes uploaded, which is what the store holds and so what a restore
+/// pays to read, not what the files measure on disk. Objects under chk/
+/// are immutable, so an object left by an earlier attempt of the same
+/// checkpoint is kept when `keep_existing` is set, which keeps a retried
 /// fold consistent with what the store already holds. Bootstrap passes
 /// false and fails instead, mixing two initdb runs would corrupt.
 pub fn upload(
@@ -91,8 +106,9 @@ pub fn upload(
     let mut bytes = 0u64;
     for (relpath, data) in files {
         let key = layout.chk_file(id, relpath);
-        let len = match store.put_if_absent(&key, data) {
-            Ok(_) => data.len() as u64,
+        let body = without_trailing_zeros(data);
+        let stored = match store.put_if_absent(&key, body) {
+            Ok(_) => body.len() as u64,
             Err(CasError::AlreadyExists { .. }) if keep_existing => {
                 let (existing, _) = store
                     .get(&key)
@@ -105,8 +121,19 @@ pub fn upload(
             }
             Err(e) => return Err(format!("put {relpath}: {e}")),
         };
-        bytes += len;
-        index.push_str(&format!("f {relpath} {len}\n"));
+        bytes += stored;
+        // An `f` line still means the object is the file. A trimmed one
+        // needs both numbers, the file's length and the object's, and
+        // says them before the path so a path with a space in it still
+        // parses. A kept object from an earlier attempt is described the
+        // same way, by what it holds now and the length the file has
+        // here, which is the honest description of what a restore of
+        // this checkpoint would produce.
+        if stored == data.len() as u64 {
+            index.push_str(&format!("f {relpath} {stored}\n"));
+        } else {
+            index.push_str(&format!("t {} {stored} {relpath}\n", data.len()));
+        }
     }
     for dir in dirs {
         index.push_str(&format!("d {dir}\n"));
@@ -287,12 +314,42 @@ mod tests {
         assert!(err.contains("already exists"));
 
         // With keep_existing the INDEX records the stored length, so the
-        // description always matches the immutable object.
+        // description always matches the immutable object, and the
+        // file's own length beside it.
         upload(&store, &layout, "d1", &files, &[], true).unwrap();
         let (index, _) = store.get(&layout.chk_index("d1")).unwrap().unwrap();
         assert_eq!(
             String::from_utf8(index).unwrap(),
-            format!("f pg_xact/0000 {}\n", b"older bytes".len())
+            format!(
+                "t {} {} pg_xact/0000\n",
+                b"newer".len(),
+                b"older bytes".len()
+            )
+        );
+    }
+
+    #[test]
+    fn a_files_trailing_zeros_stay_out_of_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let layout = TenantLayout::new("local");
+        let mut segment = b"a wal record".to_vec();
+        segment.resize(16 * 1024 * 1024, 0);
+        let files = vec![
+            ("pg_wal/000000010000000000000001".to_string(), segment),
+            ("global/pg_control".to_string(), b"control".to_vec()),
+            // All zeros is a legitimate file and trims to nothing.
+            ("pg_xact/0000".to_string(), vec![0u8; 8192]),
+        ];
+
+        let bytes = upload(&store, &layout, "genesis", &files, &[], false).unwrap();
+        assert_eq!(bytes, (b"a wal record".len() + b"control".len()) as u64);
+        let (index, _) = store.get(&layout.chk_index("genesis")).unwrap().unwrap();
+        assert_eq!(
+            String::from_utf8(index).unwrap(),
+            "t 16777216 12 pg_wal/000000010000000000000001\n\
+             f global/pg_control 7\n\
+             t 8192 0 pg_xact/0000\n"
         );
     }
 }

@@ -136,11 +136,52 @@ What is left is the write half.
 The last row is still ten minutes to ready and 583 s of it is the end of recovery checkpoint putting 10,743 dirtied pages back one at a time, which is why the smaller pool finishes sooner: it evicts during redo instead, where the same puts are partly batched, and its checkpoint writes 2,698 buffers in 145 s.
 That path belongs to the storage redesign and not to attach.
 
+## Cold start, from exec to the first row
+
+Apple silicon laptop, 2026-08-11, `scripts/zou-cold-start.sh`, five runs, each starting from a pristine copy of the same store because an attach appends to the shared log and the next one replays what the last one wrote.
+The project is what `zou tenant create` plus one attach leaves behind, an initdb and a genesis capture and nothing else, which is the small end on purpose: this measures the fixed cost every cold request pays, not a database's size.
+One perl process starts the node and speaks every request over a socket, since a process spawn is ten milliseconds and the budget being measured is a hundred.
+
+Binary init, which is the milestone's under 100 ms line:
+
+| from | to | took |
+| --- | --- | --- |
+| exec | a connection taken on the http port | 5.7 to 6.2 ms |
+| `main` | four doors listening | 0.3 ms |
+
+The node's own breakdown is `up in 0.3 ms, arguments 0.1 ms, store 0.1 ms, doors 0.1 ms`, so nearly all of the six milliseconds is the exec and the dynamic linker, before there is a program to ask.
+Nothing is opened at start that a request has not asked for, which is why the store lap is a tenth of a millisecond against a store that is thirty three milliseconds away: it is a handle and not a read.
+
+Attaching that project with `ZOU_STORE_SIM=s3-standard` in front of the store, so a get costs about 33 ms:
+
+| run | attached | restore | of which skeleton | of which wal catch up | warm | spawn | recovery |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 441.7 ms | 408.0 ms | 284.7 ms | 88.9 ms | 18.2 ms | 0.8 ms | 14.4 ms |
+| 2 | 533.4 ms | 477.6 ms | 323.3 ms | 119.2 ms | 13.1 ms | 1.2 ms | 41.4 ms |
+| 3 | 467.5 ms | 435.8 ms | 313.7 ms | 98.7 ms | 9.1 ms | 1.1 ms | 21.3 ms |
+| 4 | 479.2 ms | 443.1 ms | 333.7 ms | 95.9 ms | 11.1 ms | 0.9 ms | 24.0 ms |
+| 5 | 480.1 ms | 451.2 ms | 271.6 ms | 134.8 ms | 10.0 ms | 0.8 ms | 17.9 ms |
+
+The two halves of the restore are the interesting split, and they are why they are timed apart.
+The skeleton is a fixed set of objects a project's size does not change, twenty files here, fetched in parallel, so it is one round trip plus however long the bytes take.
+The catch up is the shared log read from the newest checkpoint's redo page to the end of the stream, so it grows with how much was written since the last fold and not with the database.
+The restore column is larger than the two of them added up because the same manifest is read twice, once to decide whether the tenant is fresh and once inside the restore, which at 33 ms a get is a round trip nobody needs.
+
+Before and after the capture stopped storing trailing zeros: attach was 985.5, 1019.5, 1125.7, 1282.7 and 1285.9 ms on the same script and the same laptop, against 441.7 to 533.4 ms above.
+A full capture used to PUT the whole 16 MB WAL segment holding redo, of which a fresh cluster has written 12,446,782 bytes, and the restore paid to read all sixteen back.
+The INDEX now carries the file's real length beside the object's, the restore recreates the file at its length with a `set_len`, and the store went from 42M to 38M with the genesis WAL object at 12,446,782 bytes.
+That the saving is four megabytes and the attach halves is the same fact from two sides: a cold attach at this size is bytes on the wire, not round trips.
+
+Against a plain directory, where the bytes are free, the same five runs attach in 75.1, 81.5, 87.7, 157.2 and 173.2 ms.
+The spread is the laptop and not the code, and the trimming is worth nothing here, which is the point of measuring both.
+
 ## Pending
 
 - The same registry walk at a million entries and against real S3, which is the NFR-20 number rather than its smoke.
 - A fleet rerun with a crashed tenant in the mix, since the churn above only ever attaches a cleanly stopped one and never pays for recovery.
 - The write half of a cold attach, since with the pages warmed the end of recovery checkpoint puts them back one at a time.
+- The manifest read twice on the attach path, once for the fresh check and once inside the restore.
+- Capturing only the head of the WAL segment holding redo, since recovery validates page zero and then reads from redo forward.
 - Real S3 and S3 Express One Zone runs from an in region box, plus GCS and R2.
 - Concurrent producer runs to show batching amortization.
 - MinIO rerun on the storage v2 layout once it exists, the v1 rerun above showed the fold cost is structural.
