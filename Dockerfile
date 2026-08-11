@@ -24,9 +24,13 @@ RUN make pg-build && cargo build --release -p zou && scripts/zou-bundle.sh
 
 FROM debian:bookworm-slim
 
-# What the postmaster links against, and nothing that built it.
+# What the postmaster links against, and nothing that built it. The
+# bundle script prints this list and fails on anything outside it, so
+# the two stay together rather than drifting until a container cannot
+# run initdb.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      libicu72 libreadline8 zlib1g libuuid1 ca-certificates \
+      libicu72 libreadline8 zlib1g liblz4-1 libzstd1 libssl3 libuuid1 \
+      libxml2 libxslt1.1 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/dist/zou-linux-x64 /opt/zou

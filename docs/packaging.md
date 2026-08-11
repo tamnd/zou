@@ -53,8 +53,22 @@ So the last thing the script does is rewrite those paths into ones relative to t
 
 A mac build also links homebrew, openssl and lz4 and zstd, and homebrew is not in the bundle and is not even at the same path on an intel mac as on an arm one, so those libraries are copied in and rewritten with everything else.
 Anything under `/usr/lib` or `/System` is the operating system and is left where it is.
-Linux is the other way round: openssl and icu and zlib and readline come from the distribution, so the bundle expects them, which on debian and ubuntu means `libicu`, `libssl3`, `zlib1g` and `libreadline8`.
-The container image installs exactly those.
+Linux is the other way round: openssl and icu and zlib and readline and the compression libraries come from the distribution, so the bundle expects them.
+Which ones it expects is not a thing to be remembered, so the script reads it off the binaries and prints it, and fails on anything outside the set the platform is expected to provide:
+
+```
+  from the machine, and nothing else:
+    libc.so.6
+    libicui18n.so.72
+    libreadline.so.8
+    libssl.so.3
+    ...
+```
+
+That check exists because a dependency nobody chose is still a dependency.
+Most of Postgres' optional libraries default to `auto` in meson, so a builder with `libkrb5-dev` on it produces a postmaster that needs `libgssapi_krb5` and a builder without it produces one that does not, from the same commit, and the first person to hear about the difference is whoever ran the container.
+That is exactly how it went: the image failed with `initdb: error while loading shared libraries: libgssapi_krb5.so.2` and the tarball would have failed the same way on a machine without kerberos.
+So `make pg-build` names the ones zou does not offer, gssapi and ldap and pam and bonjour and systemd and the rest, and turns them off, and the docker image installs the ones that are left and nothing else.
 
 CI proves this rather than asserting it: before starting a database out of a fresh bundle it moves `build/pg` out of the way, so what runs is the bundle standing on its own, the way it will arrive on a machine that never built anything.
 Assembling a linux bundle needs `patchelf` on the machine doing the assembling, and the script says so and stops rather than writing a tarball that only works where it was made.

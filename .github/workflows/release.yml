@@ -34,7 +34,7 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get update
-            sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config uuid-dev patchelf
+            sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev liblz4-dev libzstd-dev libssl-dev libxml2-dev libxslt1-dev pkg-config uuid-dev patchelf
           else
             brew install meson ninja icu4c pkg-config bison flex
             echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig" >> "$GITHUB_ENV"

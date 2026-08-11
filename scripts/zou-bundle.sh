@@ -183,6 +183,49 @@ for file in $(machos); do
   esac
 done
 
+# What is left over: the libraries the bundle expects to find on the
+# machine that unpacks it. This is checked rather than trusted, because
+# an optional postgres dependency is picked up from whatever the build
+# machine happened to have installed, and the first person to hear about
+# a new one is otherwise whoever downloaded the tarball onto a machine
+# without it.
+depends_on() {
+  for file in $(machos); do
+    case "$os" in
+      linux) patchelf --print-needed "$file" ;;
+      darwin) otool -L "$file" | awk 'NR > 1 { print $1 }' ;;
+    esac
+  done | sort -u
+}
+
+needed=""
+unknown=""
+for dep in $(depends_on); do
+  # A relocated mach-o names its own libraries through @rpath, and
+  # /usr/lib and /System are the operating system.
+  case "$dep" in @*|/usr/lib/*|/System/*) continue ;; esac
+  lib="$(basename "$dep")"
+  [ -e "$bundle/pg/$libdir/$lib" ] && continue
+  needed="$needed $lib"
+  case "$lib" in
+    # The c library and the things every binary on the platform links.
+    ld-linux*|libc.so.*|libm.so.*|libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|libgcc_s.so.*|libstdc++.so.*|libcrypt.so.*) ;;
+    # And the ones postgres genuinely wants: collation, a prompt,
+    # compression, tls, uuids, and the xml type. The docker image
+    # installs these and nothing else.
+    libicu*.so.*|libreadline.so.*|libtinfo.so.*|libncurses*.so.*|libz.so.*|liblz4.so.*|libzstd.so.*|libssl.so.*|libcrypto.so.*|libuuid.so.*|libxml2.so.*|libxslt.so.*|libexslt.so.*) ;;
+    *) unknown="$unknown $lib" ;;
+  esac
+done
+
+if [ -n "$unknown" ]; then
+  echo >&2
+  echo "the bundle needs libraries a plain $os is not expected to have:$unknown" >&2
+  echo "either turn that dependency off in the pg-build options, or ship the" >&2
+  echo "library in the bundle and install it in the docker image" >&2
+  exit 1
+fi
+
 kb() { du -sk "$1" | awk '{print $1}'; }
 mb() { awk -v k="$1" 'BEGIN { printf "%.1f", k / 1024 }'; }
 
@@ -201,6 +244,14 @@ if [ "$tar" = yes ]; then
   tarball="$out/$name.tar.gz"
   tar -czf "$tarball" -C "$out" "$name"
   printf '  %-28s %8s MB\n' "the tarball" "$(mb "$(kb "$tarball")")"
+fi
+
+echo
+echo "  from the machine, and nothing else:"
+if [ -z "$needed" ]; then
+  echo "    nothing, everything left is the operating system"
+else
+  for lib in $needed; do echo "    $lib"; done
 fi
 
 budget_kb=$(( budget_mb * 1024 ))

@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config uuid-dev patchelf
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev liblz4-dev libzstd-dev libssl-dev libxml2-dev libxslt1-dev pkg-config uuid-dev patchelf
       - name: Build with the patch series applied
         run: make pg-build
       - name: Smoke test on md
