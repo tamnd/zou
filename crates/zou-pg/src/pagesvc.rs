@@ -529,7 +529,11 @@ mod tests {
         let (start, raw, end) = test_wal();
         // The whole stream lands on the chain with no tee attached.
         let t = zou_log::take_over(&media, WAL_SHARD, "test").expect("take over");
-        let sink = Arc::new(zou_log::MediaSink::new(Arc::clone(&media), WAL_SHARD));
+        let sink = Arc::new(zou_log::MediaSink::new(
+            Arc::clone(&media),
+            WAL_SHARD,
+            t.sealed_seq,
+        ));
         let seq = zou_log::Sequencer::resume(
             WAL_SHARD,
             sink,
@@ -616,7 +620,11 @@ mod tests {
         );
 
         let t = zou_log::take_over(&media, WAL_SHARD, "test").expect("take over");
-        let sink = Arc::new(zou_log::MediaSink::new(Arc::clone(&media), WAL_SHARD));
+        let sink = Arc::new(zou_log::MediaSink::new(
+            Arc::clone(&media),
+            WAL_SHARD,
+            t.sealed_seq,
+        ));
         let config = zou_log::SequencerConfig {
             tee: Some(Arc::clone(&tee)),
             ..Default::default()

@@ -41,7 +41,7 @@ new file mode 100644
 index 0000000..ad24f0b
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,608 @@
+@@ -0,0 +1,655 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -67,6 +67,7 @@ index 0000000..ad24f0b
 +#include "postgres.h"
 +
 +#include <fcntl.h>
++#include <signal.h>
 +#include <unistd.h>
 +
 +#include "access/xlog.h"
@@ -248,6 +249,25 @@ index 0000000..ad24f0b
 +	(void) zou_wal_close();
 +}
 +
++/*
++ * How long a starting pusher keeps waiting for a writer lease somebody
++ * else holds. Four TTLs by default, long enough that a predecessor
++ * winding down or a clock skewed by a second or two is never mistaken
++ * for a successor, short enough that a thawed machine stops before a
++ * client gives up on it. ZOU_LEASE_WAIT_SECS tunes it.
++ */
++static int
++zou_lease_wait_secs(void)
++{
++	const char *setting = getenv("ZOU_LEASE_WAIT_SECS");
++	int			secs;
++
++	if (setting == NULL)
++		return 60;
++	secs = atoi(setting);
++	return secs > 0 ? secs : 60;
++}
++
 +void
 +ZouWalPusherMain(Datum main_arg)
 +{
@@ -260,6 +280,7 @@ index 0000000..ad24f0b
 +	bool		fold_running = false;
 +	bool		throttled = false;
 +	int			fold_backoff = 0;
++	int			waited;
 +	uint64		resume = 0;
 +	char	   *buf;
 +
@@ -284,8 +305,17 @@ index 0000000..ad24f0b
 +	/*
 +	 * Become the writer. After a crash the previous incarnation's lease
 +	 * has to expire first, so retry until the store lets us in.
++	 *
++	 * The retry is bounded, because a lease that never expires is not a
++	 * predecessor winding down, it is a successor renewing. That is what
++	 * a thaw looks like from in here: the machine was frozen past the
++	 * TTL, something else took the store, and this cluster's local WAL
++	 * is a branch nobody will ever read. Waiting on would leave a
++	 * postmaster that accepts connections and hangs every commit in the
++	 * write gate forever, since a backend past its flush has interrupts
++	 * held and cannot even be cancelled.
 +	 */
-+	for (;;)
++	for (waited = 0;; waited++)
 +	{
 +		int			rc = zou_wal_open(target, (uint64) pushed, &resume);
 +
@@ -295,6 +325,23 @@ index 0000000..ad24f0b
 +			ereport(FATAL,
 +					(errmsg("zou wal pusher failed to open store \"%s\": %d",
 +							target, rc)));
++		if (waited >= zou_lease_wait_secs())
++		{
++			/*
++			 * Immediate and not a fast shutdown: a shutdown checkpoint
++			 * would flush WAL into the same write gate and hang there,
++			 * and this cluster has nothing worth writing anywhere. It
++			 * owns no lease, so nothing it holds locally is authoritative
++			 * and none of the commits blocked in the gate was ever
++			 * acked. The exit is what a platform health check sees, and
++			 * how traffic gets to the cluster that does own the store.
++			 */
++			ereport(WARNING,
++					(errmsg("zou wal pusher: the writer lease has been held elsewhere for %d seconds, this cluster has been replaced and is stopping",
++							waited)));
++			kill(PostmasterPid, SIGQUIT);
++			proc_exit(1);
++		}
 +		ereport(LOG,
 +				(errmsg("zou wal pusher waiting for the previous writer lease to expire")));
 +		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

@@ -163,6 +163,10 @@ pub trait CasStore: Send + Sync {
 /// a tenant prefix synced to disk is byte-identical to the S3 one. CAS is
 /// emulated with a per-key lock directory (mkdir is atomic on every
 /// platform we care about) around read, compare, tmp-write, rename.
+///
+/// Create if absent does not use the lock at all, because the lock is
+/// breakable and this one operation must hold against a writer that was
+/// stopped mid put and comes back minutes later; see [`Self::publish`].
 pub struct LocalFsStore {
     root: PathBuf,
 }
@@ -174,6 +178,48 @@ impl LocalFsStore {
 
     fn path_for(&self, key: &str) -> PathBuf {
         self.root.join(key)
+    }
+
+    /// Write `data` into a tmp file and publish it at `path` only if
+    /// nothing is there, atomically and without holding anything.
+    ///
+    /// A rename cannot do this. It replaces whatever it lands on, so an
+    /// absence checked before the write is a promise about the past, and
+    /// the key lock is what usually turns that into a promise about now.
+    /// The lock is breakable by design, since a crashed holder must not
+    /// wedge a key forever, and a writer that was frozen rather than
+    /// killed is a live process holding a lock it will not touch again
+    /// until it thaws. Wait out the stale age, break the lock, write,
+    /// and the thaw's rename lands on top of the winner and quietly
+    /// takes the key from it. On the WAL chain that is a successor's
+    /// seal being replaced by the landing segment it fenced, which
+    /// unlinks every segment the successor wrote after it.
+    ///
+    /// A hard link is the operation that says no. It fails with EEXIST
+    /// against whatever is at the destination when it runs, so a
+    /// creation stopped for a minute mid flight loses to the writer that
+    /// got there first, which is exactly what the object store this
+    /// stands in for does with If-None-Match.
+    fn publish(&self, key: &str, path: &Path, data: &[u8]) -> Result<Version, CasError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| Self::io(key, e))?;
+        }
+        let tmp = unique_tmp(path);
+        let mut f = fs::File::create(&tmp).map_err(|e| Self::io(key, e))?;
+        f.write_all(data).map_err(|e| Self::io(key, e))?;
+        f.sync_all().map_err(|e| Self::io(key, e))?;
+        drop(f);
+        let linked = fs::hard_link(&tmp, path);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok(Version::of(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(CasError::AlreadyExists {
+                    key: key.to_string(),
+                })
+            }
+            Err(e) => Err(Self::io(key, e)),
+        }
     }
 
     fn io(key: &str, source: std::io::Error) -> CasError {
@@ -237,6 +283,16 @@ impl KeyLock {
                 Err(e) => return Err(LocalFsStore::io(key, e)),
             }
         }
+    }
+
+    /// Is this still the lock we took? A breaker removes the whole dir,
+    /// stamp and all, so a holder that was frozen past the stale age
+    /// comes back to a lock that is somebody else's or gone, and knows
+    /// another writer has had the key in the meantime.
+    fn still_mine(&self) -> bool {
+        self.dir
+            .join(format!("pid-{}", std::process::id()))
+            .exists()
     }
 }
 
@@ -408,6 +464,23 @@ impl CasStore for LocalFsStore {
         Ok(Some(data))
     }
 
+    fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
+        let path = self.path_for(key);
+        match self.publish(key, &path, data) {
+            // A filesystem without hard links, exFAT on a usb stick or
+            // some network mounts. Nothing frozen can be fenced there,
+            // so fall back to the lock and say so once.
+            Err(CasError::Io { source, .. }) if source.kind() != std::io::ErrorKind::NotFound => {
+                log::warn!("localfs: {key} cannot be created by link ({source}), using the lock");
+                match self.put_if_match(key, data, None) {
+                    Err(CasError::Conflict { key }) => Err(CasError::AlreadyExists { key }),
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+
     fn put_if_match(
         &self,
         key: &str,
@@ -415,7 +488,7 @@ impl CasStore for LocalFsStore {
         expected: Option<&Version>,
     ) -> Result<Version, CasError> {
         let path = self.path_for(key);
-        let _lock = KeyLock::acquire(&path, key)?;
+        let lock = KeyLock::acquire(&path, key)?;
 
         let current = match fs::read(&path) {
             Ok(existing) => Some(Version::of(&existing)),
@@ -433,6 +506,15 @@ impl CasStore for LocalFsStore {
         f.write_all(data).map_err(|e| Self::io(key, e))?;
         f.sync_all().map_err(|e| Self::io(key, e))?;
         drop(f);
+        // Whoever broke this lock has been through the key since the
+        // read above, so the compare it passed says nothing any more and
+        // the rename below would take the key from them. A holder frozen
+        // past the stale age is the way that happens.
+        if !lock.still_mine() {
+            return Err(CasError::Conflict {
+                key: key.to_string(),
+            });
+        }
         // Windows refuses to rename over an existing file when any handle
         // is open on it, so remove the destination first. Safe because both
         // writers and windows readers hold the key lock here.
@@ -541,7 +623,7 @@ mod tests {
         fs::create_dir(&lock).unwrap();
         fs::File::create(lock.join(format!("pid-{}", dead_pid()))).unwrap();
         let started = Instant::now();
-        store.put_if_absent("wedged", b"through").unwrap();
+        store.put_if_match("wedged", b"through", None).unwrap();
         // The age rule alone would sit on this lock for a minute.
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(store.get("wedged").unwrap().unwrap().0, b"through");
@@ -572,7 +654,44 @@ mod tests {
     fn a_released_lock_leaves_nothing_behind() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
-        store.put_if_absent("clean", b"x").unwrap();
+        store.put_if_match("clean", b"x", None).unwrap();
         assert!(!dir.path().join("clean.lock").exists());
+    }
+
+    /// The freeze case. A writer stopped mid create holds the key lock
+    /// and will not touch it again until it thaws, so the lock has to be
+    /// breakable or the key is wedged, and the creation that goes
+    /// through while it is broken has to survive the thaw.
+    #[test]
+    fn a_creation_beats_a_frozen_writer_that_still_holds_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let frozen = KeyLock::acquire(&dir.path().join("seq"), "seq").expect("hold the lock");
+
+        // The successor creates the object without waiting on a lock it
+        // could only take by breaking.
+        store.put_if_absent("seq", b"the seal").expect("created");
+
+        // And the thaw: the same PUT the frozen writer had in flight,
+        // arriving after. It loses, and takes nothing with it.
+        match store.put_if_absent("seq", b"a fenced landing") {
+            Err(CasError::AlreadyExists { key }) => assert_eq!(key, "seq"),
+            other => panic!("a late creation took the key: {other:?}"),
+        }
+        assert_eq!(store.get("seq").unwrap().unwrap().0, b"the seal");
+        drop(frozen);
+    }
+
+    /// The same freeze against a conditional write, where the compare
+    /// the caller passed was read before the lock was broken and says
+    /// nothing about the key any more.
+    #[test]
+    fn a_conditional_write_whose_lock_was_broken_does_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest");
+        let mine = KeyLock::acquire(&path, "manifest").expect("hold the lock");
+        assert!(mine.still_mine());
+        break_stale_lock(&path.with_extension("lock"), Duration::ZERO);
+        assert!(!mine.still_mine());
     }
 }

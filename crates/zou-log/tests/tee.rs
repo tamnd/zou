@@ -55,7 +55,7 @@ fn resume(
     t: zou_log::Takeover,
     tee: &Arc<Tee>,
 ) -> Sequencer {
-    let sink = Arc::new(MediaSink::new(Arc::clone(media), shard));
+    let sink = Arc::new(MediaSink::new(Arc::clone(media), shard, t.sealed_seq));
     Sequencer::resume(shard, sink as _, config(tee), t.next_seq, t.prev_digest)
 }
 
@@ -100,7 +100,7 @@ fn frames_reach_subscribers_only_after_the_window_is_durable() {
     let (entered_tx, entered) = channel();
     let (release, release_rx) = channel();
     let sink = Arc::new(GatedSink {
-        inner: MediaSink::new(Arc::clone(&media), shard),
+        inner: MediaSink::new(Arc::clone(&media), shard, t.sealed_seq),
         entered: entered_tx,
         release: Mutex::new(release_rx),
     });
@@ -152,7 +152,7 @@ fn a_failed_put_publishes_nothing() {
 
     let t = take_over(&media, shard, "node-a").unwrap();
     let sink = Arc::new(FailOnceSink {
-        inner: MediaSink::new(Arc::clone(&media), shard),
+        inner: MediaSink::new(Arc::clone(&media), shard, t.sealed_seq),
         armed: std::sync::atomic::AtomicBool::new(true),
     });
     let seq = Sequencer::resume(shard, sink as _, config(&tee), t.next_seq, t.prev_digest);

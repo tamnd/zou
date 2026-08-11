@@ -287,6 +287,52 @@ pub fn take_over(media: &WalMedia, shard: u32, node: &str) -> Result<Takeover, C
     })
 }
 
+/// Is the object sitting at `seq` litter from a writer this shard's
+/// owner already fenced, rather than the fence itself?
+///
+/// A taken seq normally means the sequencer that hit it is done: a
+/// successor sealed there and this is how it finds out. A frozen machine
+/// breaks that reading. It is stopped with PUTs issued and unanswered, a
+/// successor seals the chain and sweeps what had landed, and then the
+/// freeze ends and every one of those requests goes out at once, into
+/// seqs the successor was handed and has not written yet.
+///
+/// The shard manifest is what tells the two apart, because it is the
+/// only thing that orders takeovers. A seal recorded there that is still
+/// `sealed_seq`, the caller's own, means nobody has taken the shard
+/// since, and no other lineage can have landed a segment anywhere: a
+/// takeover seals before it writes and CASes the manifest before it
+/// returns. So a landing object the caller did not write is litter, and
+/// it may go. A seal object, or a manifest whose head has moved on, is
+/// the fence it looks like.
+pub(crate) fn straggler_at(
+    media: &WalMedia,
+    shard: u32,
+    seq: u64,
+    sealed_seq: u64,
+) -> Result<bool, ChainError> {
+    if sealed_seq == 0 {
+        // No takeover behind the caller, so it never claimed the shard
+        // and everything it did not write belongs to somebody else.
+        return Ok(false);
+    }
+    let Some(bytes) = media.fetch(shard, seq)? else {
+        // Something is on one medium of a pair and no reader can see
+        // it yet, which is the shape a rival's seal has halfway through
+        // landing. Nothing readable is nothing to identify, and a fence
+        // in the middle of going up is still a fence.
+        return Ok(false);
+    };
+    let (header, _) =
+        read_footer(&bytes).map_err(|source| ChainError::Segment { shard, seq, source })?;
+    if header.kind != SegmentKind::Landing {
+        return Ok(false);
+    }
+    let head =
+        ShardManifest::load(media.manifest_store().as_ref(), shard)?.map_or(0, |(m, _)| m.head);
+    Ok(head == sealed_seq)
+}
+
 /// A crash of a pipelined flusher can leave landing segments past the
 /// first hole in the chain. The digest walk stops at the seal, so they
 /// are unreachable, but they sit exactly where the resumed sequencer
@@ -359,8 +405,41 @@ pub fn read_chain_linked(
     while let Some(bytes) = media.fetch(shard, seq)? {
         let (header, frames, footer) =
             decode_segment(&bytes).map_err(|source| ChainError::Segment { shard, seq, source })?;
-        if header.shard != shard || header.seq != seq || header.prev_digest != prev_digest {
+        if header.shard != shard || header.seq != seq {
             return Err(ChainError::BrokenLink { shard, seq });
+        }
+        if header.prev_digest != prev_digest {
+            // A segment that links somewhere else is not in this chain,
+            // so the chain ended at the seq before it. That is a
+            // straggler: a writer a takeover fenced, whose PUT was in
+            // flight the whole time and landed in a seq its successor
+            // has not reached yet. A frozen machine is the one thing
+            // that produces them in bulk, since a suspend keeps every
+            // request it had issued and lets them all go on the thaw.
+            //
+            // Stopping here loses nothing. Acks go in submission order,
+            // so a straggler's own predecessor lost to the seal and none
+            // of them was ever acknowledged to anybody, and nothing
+            // above one is reachable either way. The owner of the seq
+            // clears the litter the moment it writes there itself.
+            //
+            // Litter only ever lands past the last seal, though, because
+            // a takeover sweeps everything above the seq it sealed
+            // before it returns. A break at or below that seq is the
+            // other thing: the chain lost a link under a segment an
+            // owner has already sealed over, and everything it wrote
+            // after it is orphaned. Nobody may quietly read half a chain
+            // and call it recovery, so that one stays an error.
+            let head = ShardManifest::load(media.manifest_store().as_ref(), shard)?
+                .map_or(0, |(m, _)| m.head);
+            if seq <= head {
+                return Err(ChainError::BrokenLink { shard, seq });
+            }
+            log::warn!(
+                "shard {shard} chain ends at {}, seq {seq} links elsewhere",
+                seq - 1
+            );
+            break;
         }
         prev_digest = tenants_digest(&footer.tenants);
         out.push(ChainSegment {

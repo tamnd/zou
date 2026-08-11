@@ -179,7 +179,7 @@ impl Ledger {
 }
 
 fn sequencer(media: &Arc<WalMedia>, shard: u32, t: zou_log::Takeover) -> Sequencer {
-    let sink = Arc::new(MediaSink::new(Arc::clone(media), shard));
+    let sink = Arc::new(MediaSink::new(Arc::clone(media), shard, t.sealed_seq));
     let config = SequencerConfig {
         window: Duration::ZERO,
         ..SequencerConfig::default()

@@ -42,7 +42,7 @@ fn store_in(dir: &tempfile::TempDir) -> (Arc<dyn CasStore>, Arc<WalMedia>) {
 }
 
 fn resume(media: &Arc<WalMedia>, shard: u32, t: zou_log::Takeover) -> Sequencer {
-    let sink = Arc::new(MediaSink::new(Arc::clone(media), shard));
+    let sink = Arc::new(MediaSink::new(Arc::clone(media), shard, t.sealed_seq));
     Sequencer::resume(shard, sink as _, quick(), t.next_seq, t.prev_digest)
 }
 
@@ -371,7 +371,7 @@ fn the_straggler_sweep_spares_a_rival_seal() {
 }
 
 #[test]
-fn a_segment_that_does_not_link_is_refused_by_the_chain_read() {
+fn a_segment_that_does_not_link_ends_the_chain_read_rather_than_breaking_it() {
     let dir = tempfile::tempdir().unwrap();
     let (store, media) = store_in(&dir);
     let shard = 8;
@@ -385,8 +385,8 @@ fn a_segment_that_does_not_link_is_refused_by_the_chain_read() {
     seq.close().unwrap();
 
     // Plant a well formed segment at the next seq with a digest that
-    // links to nothing, the shape a half landed write from a forgotten
-    // epoch would have.
+    // links to nothing, the shape a fenced writer's late landing put
+    // has when a freeze let it out after the sweep.
     let head = chain_head(&media, shard, 0).unwrap();
     let (bytes, _) = SegmentBuilder::new(SegmentHeader {
         kind: SegmentKind::Landing,
@@ -399,6 +399,29 @@ fn a_segment_that_does_not_link_is_refused_by_the_chain_read() {
         .put_if_absent(&segment_key(shard, head + 1), &bytes)
         .unwrap();
 
+    // The chain is what links, so it ends at the last segment that
+    // does. The plant is not in it, and recovery is not refused over
+    // something nobody was ever told was durable.
+    let chain = read_chain(&media, shard, 0).expect("the chain reads up to the plant");
+    assert_eq!(chain.last().unwrap().seq, head);
+    assert_eq!(chain.last().unwrap().frames[0].payload, b"good");
+
+    // A segment at the wrong key is a different thing: the object under
+    // that seq is not the segment it says it is, and no writer of ours
+    // produces that. It stays an error.
+    let (bytes, _) = SegmentBuilder::new(SegmentHeader {
+        kind: SegmentKind::Landing,
+        shard,
+        seq: head + 9,
+        prev_digest: tenants_digest(&chain.last().unwrap().footer.tenants),
+    })
+    .finish();
+    store
+        .delete(&segment_key(shard, head + 1))
+        .expect("clear the plant");
+    store
+        .put_if_absent(&segment_key(shard, head + 1), &bytes)
+        .unwrap();
     match read_chain(&media, shard, 0) {
         Err(ChainError::BrokenLink { seq, .. }) => assert_eq!(seq, head + 1),
         other => panic!("expected a broken link, got {other:?}"),
