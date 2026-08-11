@@ -124,4 +124,22 @@ One account token rather than a project one, since it publishes two projects.
 
 CI installs both wheels into a venv with no `ZOU_PG_BIN` and no checkout on the path, and runs the python suite against them, because a wheel that nobody has installed is a wheel that does not work.
 
-Still to come in this section: brew and a docker image, both of which want this same tree.
+## From homebrew
+
+```bash
+brew install tamnd/zou/zou
+```
+
+The formula installs the bundle whole into `libexec` and links `bin/zou` at the one inside it, rather than putting the binary in `bin` and the postgres somewhere else.
+That is not tidiness, it is how the binary finds its postmaster: it looks beside itself, follows the link first, and a `zou` in `bin` with a `pg` two directories away is a `zou` that cannot start a database.
+
+Mac only, and on purpose.
+The mac bundle carries the libraries it needs that are not the operating system, so it stands on its own wherever it is unpacked, while the linux one takes icu and readline and openssl from the distribution, which is a thing apt and dnf know about and homebrew on linux does not.
+A formula that installs and then cannot run is worse than no formula, so linux has `install.sh` or the tarball and the formula says `depends_on :macos`.
+
+The formula is generated rather than kept in the tree, by `packaging/brew/formula.sh`, because half of it is a pair of sha256 sums that do not exist until the bundles do, and a checked in formula carrying the last release's sums is a formula that installs the wrong thing.
+A tag writes it out of the checksums the release job just uploaded and pushes it to the tap, `tamnd/homebrew-zou`, when there is a `HOMEBREW_TAP_TOKEN`, which is a second repository and so out of reach of the token a workflow gets for free.
+Without the token it prints the formula into the job log and the release is otherwise unaffected.
+CI runs the generator on every change and hands the result to `ruby -c`, since a formula is only found to be broken at a tag, and a tag does not come round again.
+
+Still to come in this section: a docker image, which wants this same tree.
