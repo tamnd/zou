@@ -18,10 +18,18 @@ export interface CreateZouOptions {
   jwtSecret?: string;
   /** Exposed schemas, the first one the default. */
   schemas?: string[];
+  /** The role a request with no key of its own runs as. Default anon. */
+  anonRole?: string;
   /** shared_buffers for the child postmaster. */
   sharedBuffers?: string;
   /** Branch the machine's template instead of running initdb. */
   fixture?: boolean;
+  /** The key an S3 client signs with. Needs the secret below too. */
+  s3AccessKey?: string;
+  /** Its secret. Without both, the S3 surface has no credentials. */
+  s3SecretKey?: string;
+  /** Where the project says it is. Defaults to us-east-1. */
+  s3Region?: string;
 }
 
 /** One open project: a store, the postgres over it, and the front door. */

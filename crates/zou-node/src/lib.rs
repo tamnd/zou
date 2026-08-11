@@ -45,11 +45,22 @@ pub struct ZouOptions {
     pub runtime: Option<String>,
     pub jwt_secret: Option<String>,
     pub schemas: Option<Vec<String>>,
+    /// The role a request with no key of its own runs as, `anon`
+    /// unless a suite recorded against something else says otherwise.
+    pub anon_role: Option<String>,
     pub shared_buffers: Option<String>,
     /// Cut this database out of the machine's template instead of
     /// making one, which is milliseconds rather than seconds and is
     /// what a fixture per test needs.
     pub fixture: Option<bool>,
+    /// The key an S3 client signs with, with its secret below. Without
+    /// the pair the S3 protocol surface tells every request the key it
+    /// named is not one this project has.
+    pub s3_access_key: Option<String>,
+    pub s3_secret_key: Option<String>,
+    /// Where the project says it is, which a signature is checked
+    /// against. `us-east-1` when it is not given.
+    pub s3_region: Option<String>,
 }
 
 impl From<ZouOptions> for zou_embed::Options {
@@ -67,8 +78,19 @@ impl From<ZouOptions> for zou_embed::Options {
         out.runtime = options.runtime.map(PathBuf::from);
         out.jwt_secret = options.jwt_secret;
         out.schemas = options.schemas.unwrap_or_default();
+        out.anon_role = options.anon_role.unwrap_or_default();
         out.shared_buffers = options.shared_buffers;
         out.fixture = options.fixture.unwrap_or(false);
+        // Half a pair is not a pair, and a project given one half has
+        // said something it meant, so it is left with no credentials
+        // rather than a key signed against an empty secret.
+        if let (Some(access), Some(secret)) = (options.s3_access_key, options.s3_secret_key) {
+            out.s3 = Some(zou_embed::S3Keys {
+                access,
+                secret,
+                region: options.s3_region.unwrap_or_default(),
+            });
+        }
         out
     }
 }

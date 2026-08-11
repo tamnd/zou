@@ -22,6 +22,8 @@ on:
       - crates/libzou/**
       - crates/zou-node/**
       - crates/zou-python/**
+      - conformance/embedded.mjs
+      - conformance/suites.json
       - go/**
       - .github/workflows/postgres-build.yml
   workflow_dispatch:
@@ -149,6 +151,28 @@ jobs:
           crates/zou-node/build.sh
           npm --prefix crates/zou-node install
           ZOU_PG_BIN=$PWD/build/pg/bin npm --prefix crates/zou-node test
+      # And the conformance suites, asked of that same package. Every
+      # other conformance job in this repository runs a zou linked into
+      # the harness against a postgres in a container. This one asks
+      # the thing that ships: the addon starts a postmaster over a
+      # directory, the whole api answers inside the node process, and
+      # nothing anywhere is a container.
+      #
+      # Three suites rather than four, and the fourth is left out
+      # rather than forgotten. The postgrest suite re-applies its rows
+      # before every case that writes, which against a postmaster this
+      # process started is minutes of fixture for the same claim the
+      # three below already make. It takes the same command line.
+      - name: the suites against the node package
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          cargo build -p zou-conformance
+          for suite in rest auth storage; do
+            ZOU_PG_BIN=$PWD/build/pg/bin \
+              node conformance/embedded.mjs "$suite" \
+              --suites /tmp/zou-conformance/suites
+          done
       # And supabase-py talking to a database inside the python
       # process, which is the same claim the node job above makes, in
       # the other language a test suite is likely to be written in.

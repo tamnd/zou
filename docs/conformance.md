@@ -370,6 +370,29 @@ Every upload in that suite sends a `cacheControl` in its metadata, and the refer
 zou keeps one value and says `no-cache` in both places, so it matches the recording of the info route and not the listing.
 The suite now asks nothing about cache control and the question is [#285](https://github.com/tamnd/zou/issues/285), which is a decision about how an object records what was asked for apart from what is served rather than anything about tus.
 
+## The package a project installs, asked the same questions
+
+Everything above runs a zou this harness linked in, against a Postgres somebody else brought up, usually in a container.
+That is one build of the code.
+What a node project installs is another: `npm install zou`, an addon that starts a patched postmaster over a directory, and the whole api answering inside the node process with no socket under it and no container anywhere.
+
+So the suites are asked of that one too, by `conformance/embedded.mjs`:
+
+```
+node conformance/embedded.mjs storage --suites /tmp/zou-conformance/suites
+```
+
+It opens a project through the package, hands the harness the url and the dsn it got back, and closes it again on the way out.
+The suite decides the configuration rather than the script: the schemas a suite names, the role its anon key carries, and the S3 pair every target in a run has to be asked with all come out of `cases.json`, because a suite derived from upstream's fixtures keeps its tables where upstream keeps them and grants to a role of its own.
+
+The `rest`, `auth` and `storage` suites run this way in the postgres build workflow, which is where the patched postgres the addon needs is built.
+The `postgrest` suite is left out by name rather than by accident: it re-applies its rows before every case that writes, which against a postmaster the test process started is minutes of fixture for the same claim the other three make.
+
+What this catches is anything that is true of the harness's zou and not of the shipped one.
+Both are the same crates, so it is the configuration that differs, and configuration is exactly where a library that cannot be told something quietly does without it.
+It found one immediately: the S3 protocol surface takes a key pair, the harness had always set one, and nothing else could.
+`zou dev`, `zou serve` and the embedded library all served an endpoint that answered every signature with a key nobody could have.
+
 ## The app
 
 A suite passing says every answer matched a recording. An app working says the answers were enough to build something on, and the second does not follow from the first.

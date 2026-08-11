@@ -65,8 +65,12 @@ async function createZou(options = {}) {
     runtime: options.runtime,
     jwtSecret: options.jwtSecret,
     schemas: options.schemas,
+    anonRole: options.anonRole,
     sharedBuffers: options.sharedBuffers,
     fixture: options.fixture,
+    s3AccessKey: options.s3AccessKey,
+    s3SecretKey: options.s3SecretKey,
+    s3Region: options.s3Region,
   });
   return new Zou(handle);
 }
