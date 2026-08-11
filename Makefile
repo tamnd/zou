@@ -35,10 +35,22 @@ pg-patch: pg-init
 zou-pg-lib:
 	cargo build -p zou-pg --release
 
+# Most of postgres' optional dependencies default to auto, which means
+# the build takes whatever the machine happens to have installed: a
+# builder with libkrb5-dev on it produces a postmaster that needs
+# libgssapi_krb5 at runtime and one without produces a postmaster that
+# does not, from the same commit. The ones below are authentication
+# methods and integrations zou does not offer, so they are off by name
+# rather than by accident, and the bundle script checks what is left.
+PG_OFF := -Dgssapi=disabled -Dldap=disabled -Dpam=disabled -Dbsd_auth=disabled \
+	-Dbonjour=disabled -Dselinux=disabled -Dsystemd=disabled -Dlibcurl=disabled \
+	-Dlibnuma=disabled -Dliburing=disabled
+PG_OPTS := --prefix=$(PG_PREFIX) -Duuid=e2fs $(PG_OFF) -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg"
+
 # Out of tree build so the submodule stays clean. LDFLAGS pulls in the
 # zou-pg staticlib for the smgr patch, see docs/postgres.md.
 pg-build: pg-patch zou-pg-lib
-	meson setup $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX) -Duuid=e2fs -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg" || meson setup --reconfigure $(PG_BUILD) $(PG_SRC) --prefix=$(PG_PREFIX) -Duuid=e2fs -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg"
+	meson setup $(PG_BUILD) $(PG_SRC) $(PG_OPTS) || meson setup --reconfigure $(PG_BUILD) $(PG_SRC) $(PG_OPTS)
 	ninja -C $(PG_BUILD)
 	ninja -C $(PG_BUILD) install
 	$(MAKE) pg-vector

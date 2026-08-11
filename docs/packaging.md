@@ -44,7 +44,34 @@ The loadable modules come whole, `vector` among them, minus the three language h
 
 Postgres finds its share directory and its modules relative to the postmaster, so the bundle keeps the layout the install had rather than one of its own.
 That matters more than it sounds: a debian meson build puts the modules under `lib/x86_64-linux-gnu/postgresql` and a mac build under `lib/postgresql`, and the script reads `pg_config` rather than assuming either.
-A bundle moved anywhere still runs, which is the whole point of shipping one.
+
+## Why it runs somewhere else
+
+A postgres that has just been built is linked against the tree it was built in, by absolute path: `/src/build/pg/lib/x86_64-linux-gnu` is written into `initdb` and stays there when the file is copied.
+Copy that into an image and the postmaster comes up as `error while loading shared libraries: libpq.so.5`, on a machine where libpq is sitting right next to it.
+So the last thing the script does is rewrite those paths into ones relative to the file holding them, `$ORIGIN/../lib/x86_64-linux-gnu` on linux with `patchelf` and `@loader_path/../lib` on mac with `install_name_tool`, and a mach-o that has been edited is re-signed because an arm64 mac will not run a file whose signature no longer matches it.
+
+A mac build also links homebrew, openssl and lz4 and zstd, and homebrew is not in the bundle and is not even at the same path on an intel mac as on an arm one, so those libraries are copied in and rewritten with everything else.
+Anything under `/usr/lib` or `/System` is the operating system and is left where it is.
+Linux is the other way round: openssl and icu and zlib and readline and the compression libraries come from the distribution, so the bundle expects them.
+Which ones it expects is not a thing to be remembered, so the script reads it off the binaries and prints it, and fails on anything outside the set the platform is expected to provide:
+
+```
+  from the machine, and nothing else:
+    libc.so.6
+    libicui18n.so.72
+    libreadline.so.8
+    libssl.so.3
+    ...
+```
+
+That check exists because a dependency nobody chose is still a dependency.
+Most of Postgres' optional libraries default to `auto` in meson, so a builder with `libkrb5-dev` on it produces a postmaster that needs `libgssapi_krb5` and a builder without it produces one that does not, from the same commit, and the first person to hear about the difference is whoever ran the container.
+That is exactly how it went: the image failed with `initdb: error while loading shared libraries: libgssapi_krb5.so.2` and the tarball would have failed the same way on a machine without kerberos.
+So `make pg-build` names the ones zou does not offer, gssapi and ldap and pam and bonjour and systemd and the rest, and turns them off, and the docker image installs the ones that are left and nothing else.
+
+CI proves this rather than asserting it: before starting a database out of a fresh bundle it moves `build/pg` out of the way, so what runs is the bundle standing on its own, the way it will arrive on a machine that never built anything.
+Assembling a linux bundle needs `patchelf` on the machine doing the assembling, and the script says so and stops rather than writing a tarball that only works where it was made.
 
 ## What it weighs
 
@@ -52,15 +79,16 @@ The budget is 150 MB for the pair, and the script exits non zero over it, so CI 
 
 | | darwin arm64, laptop | linux x64, vps | linux x64, github runner |
 | zou | 17.3 MB | 18.1 MB | 20.0 MB |
-| postgres | 16.7 MB | 19.1 MB | 19.2 MB |
-| the other pg programs | 1.5 MB | 1.8 MB | 1.8 MB |
-| loadable modules | 7.8 MB | 6.3 MB | 6.3 MB |
+| postgres | 16.8 MB | 19.1 MB | 19.2 MB |
+| the other pg programs | 1.6 MB | 1.8 MB | 1.8 MB |
+| modules and the libs they use | 15.5 MB | 6.3 MB | 6.3 MB |
 | share, bki and timezones | 5.3 MB | 5.3 MB | 5.3 MB |
-| the bundle | 48.6 MB | 50.6 MB | 52.6 MB |
-| the tarball | 18.0 MB | 19.4 MB | 20.2 MB |
+| the bundle | 56.5 MB | 50.6 MB | 52.6 MB |
+| the tarball | 21.0 MB | 19.4 MB | 20.2 MB |
 
 Measured on an apple silicon laptop, on a 6 vCPU vps, and on the runner that builds every postgres build, all three against the vendored Postgres 18.4 with the patch series applied.
 The two linux columns are the same commit and the same rustc, and the rust binary is two megabytes apart between them anyway, which is what a bundle size is: a number about a machine rather than about a program.
+The mac column carries seven megabytes the linux ones do not, which is openssl and lz4 and zstd: a mac gets those from homebrew and a linux gets them from the distribution, and only one of those two is a thing a download can rely on.
 The rust binary is stripped by the release profile; the postgres binaries are stripped by the script, which is a third of the postmaster.
 A third of the whole bundle is timezones, catalog templates, and extension sql, none of which compresses badly, which is why the tarball is roughly a third of the tree.
 
@@ -142,4 +170,20 @@ A tag writes it out of the checksums the release job just uploaded and pushes it
 Without the token it prints the formula into the job log and the release is otherwise unaffected.
 CI runs the generator on every change and hands the result to `ruby -c`, since a formula is only found to be broken at a tag, and a tag does not come round again.
 
-Still to come in this section: a docker image, which wants this same tree.
+## In a container
+
+```bash
+docker build -t zou .
+docker run --rm -v zou-data:/data zou tenant /data create demo
+docker run --rm -p 54321:54321 -p 5432:5432 -v zou-data:/data zou
+```
+
+Two stages: one with meson and bison and a rust toolchain that builds the patched Postgres and `zou`, and one with the shared libraries the postmaster links against and nothing else.
+What crosses between them is the bundle, the same one `scripts/zou-bundle.sh` writes for a release, so the image and the tarball are the same tree rather than two definitions of what ships.
+
+The command is `zou serve` rather than `zou dev`, because `serve` binds `0.0.0.0` and `dev` deliberately does not, and a dev loop that could only be reached from inside the container would be a strange thing to ship.
+A registry with nothing in it serves nothing, which is why the tenant is made first; the first request after that attaches it, which runs `initdb` and takes a moment, and every start after that is a restore.
+Postgres refuses to run as root and is right to, so the image has a user of its own and `/data` belongs to them.
+
+CI builds the image on every change to the Dockerfile, makes a tenant, starts it, and asks the front door a question it should refuse, because a 401 from the api is the api being up with a database behind it.
+A tag pushes it to `ghcr.io/tamnd/zou`.

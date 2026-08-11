@@ -1,0 +1,60 @@
+name: Docker
+
+# Builds the image and starts a project out of it. Scoped to the things
+# that change what lands in the image, because the build pays for a
+# whole patched Postgres.
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - scripts/zou-bundle.sh
+      - .github/workflows/docker.yml
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    name: build and run the image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+      - name: Build
+        run: docker build -t zou:ci .
+      - name: A project out of the image
+        run: |
+          # A registry with nothing in it serves nothing, so the tenant
+          # is made first, against the same volume the server will open.
+          docker run --rm -v zou-ci-data:/data zou:ci tenant /data create demo
+          docker run -d --name zou-ci -p 54321:54321 -p 5433:5432 -v zou-ci-data:/data zou:ci
+          for i in $(seq 1 240); do
+            curl -s -o /dev/null http://127.0.0.1:54321/demo/rest/v1/ && break
+            sleep 1
+          done
+          # Unauthenticated, so the answer is a refusal rather than
+          # rows, and a refusal from the api is the api being up with a
+          # database behind it.
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:54321/demo/rest/v1/)
+          echo "the front door said $code"
+          docker logs zou-ci | tail -30
+          test "$code" = 401
+          docker rm -f zou-ci
+      - name: What it weighs
+        run: docker image inspect zou:ci --format '{{.Size}}' | awk '{printf "%.1f MB\n", $1 / 1048576}'
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image=ghcr.io/${{ github.repository }}
+          docker tag zou:ci "$image:${GITHUB_REF_NAME}"
+          docker tag zou:ci "$image:latest"
+          docker push "$image:${GITHUB_REF_NAME}"
+          docker push "$image:latest"

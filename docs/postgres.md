@@ -11,10 +11,14 @@ And a fresh clone of this repo contains everything needed to reproduce the exact
 
 ## Building
 
-Prerequisites: meson, ninja, a C compiler, flex, bison, and the usual Postgres libraries (readline, zlib, icu).
+Prerequisites: meson, ninja, a C compiler, flex, bison, and the Postgres libraries the build wants (readline, zlib, icu, lz4, zstd, openssl, libxml2, libxslt).
 
-- Debian and Ubuntu: `apt-get install meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config`
+- Debian and Ubuntu: `apt-get install meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev liblz4-dev libzstd-dev libssl-dev libxml2-dev libxslt1-dev pkg-config uuid-dev`
 - macOS: `brew install meson ninja icu4c pkg-config`
+
+That list is not advice, it is the dependency set a release is built against.
+Most of Postgres' optional dependencies default to `auto` in meson, so a machine with one more dev package than another builds a postmaster that needs one more shared library, from the same commit, and the person who finds out is whoever unpacked the tarball on a machine without it.
+`make pg-build` turns off the ones zou does not offer by name, gssapi and ldap and pam and the rest, and `scripts/zou-bundle.sh` prints what a bundle still expects from the machine and fails on anything outside that list.
 
 Then:
 

@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config uuid-dev
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev liblz4-dev libzstd-dev libssl-dev libxml2-dev libxslt1-dev pkg-config uuid-dev patchelf
       - name: Build with the patch series applied
         run: make pg-build
       - name: Smoke test on md
@@ -430,6 +430,10 @@ jobs:
         run: |
           scripts/zou-bundle.sh --tar
           BUNDLE=$PWD/dist/zou-linux-x64
+          # Out of the way goes the tree these files were built in, so
+          # what starts below is the bundle on its own, the way it
+          # arrives on a machine that never built anything.
+          mv build/pg /tmp/pg-build-tree
           $BUNDLE/pg/bin/initdb -D /tmp/bundle-pgdata
           $BUNDLE/pg/bin/postgres -D /tmp/bundle-pgdata -k /tmp -p 5617 >/tmp/bundle-pg.log 2>&1 &
           for i in $(seq 1 60); do

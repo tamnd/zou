@@ -1,0 +1,16 @@
+# The build happens in the image, so nothing a build produced belongs
+# in the context. .git does, because the patch series is applied against
+# the pinned submodule commit and that is a git operation.
+target/
+build/
+dist/
+node_modules/
+crates/zou-node/zou.node
+crates/zou-python/python/zou/*.so
+__pycache__/
+mutants.out/
+mutants.out.old/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+.DS_Store

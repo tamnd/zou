@@ -6,7 +6,7 @@ From clone to a Postgres whose every page and WAL byte lives on a store, in abou
 
 A recent stable Rust toolchain for everything, and for the full tour the usual Postgres build tools: meson, ninja, a C compiler, flex, bison, and the readline, zlib, and icu libraries.
 
-- Debian and Ubuntu: `apt-get install meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config uuid-dev`
+- Debian and Ubuntu: `apt-get install meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev liblz4-dev libzstd-dev libssl-dev libxml2-dev libxslt1-dev pkg-config uuid-dev`
 - macOS: `brew install meson ninja icu4c pkg-config`
 
 ## Act one, the object layer
