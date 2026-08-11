@@ -1,0 +1,22 @@
+[package]
+name = "zou-python"
+description = "The Python binding over zou-embed: a Supabase compatible backend inside a python process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+name = "zou_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3 so one build serves every python from 3.9 up, and
+# extension-module so the library does not link libpython, which is what
+# an extension is supposed to do on every platform that has an opinion.
+pyo3 = { version = "0.29", features = ["abi3-py39", "extension-module"] }
+zou-embed = { path = "../zou-embed" }
+
+[lints]
+workspace = true

@@ -20,3 +20,9 @@ fuzz/Cargo.lock
 crates/zou-node/zou.node
 node_modules/
 package-lock.json
+
+# the python binding: the extension is built, and so is everything
+# python leaves behind while running it
+crates/zou-python/python/zou/*.so
+__pycache__/
+*.egg-info/

@@ -18,6 +18,7 @@ on:
       - crates/zou-embed/**
       - crates/libzou/**
       - crates/zou-node/**
+      - crates/zou-python/**
       - .github/workflows/postgres-build.yml
   workflow_dispatch:
 
@@ -141,6 +142,16 @@ jobs:
           crates/zou-node/build.sh
           npm --prefix crates/zou-node install
           ZOU_PG_BIN=$PWD/build/pg/bin npm --prefix crates/zou-node test
+      # And supabase-py talking to a database inside the python
+      # process, which is the same claim the node job above makes, in
+      # the other language a test suite is likely to be written in.
+      - name: the python binding end to end
+        run: |
+          crates/zou-python/build.sh
+          python3 -m venv /tmp/zou-python-venv
+          /tmp/zou-python-venv/bin/pip install --quiet supabase
+          ZOU_PG_BIN=$PWD/build/pg/bin /tmp/zou-python-venv/bin/python -m unittest discover \
+            -s crates/zou-python/test -v
       - name: zou dev, branch, and info end to end
         run: |
           cargo build -p zou --release
