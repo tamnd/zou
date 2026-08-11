@@ -1,5 +1,21 @@
 # Packaging
 
+## Installing it
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tamnd/zou/main/install.sh | sh
+```
+
+That works out the platform, downloads the bundle for it, checks it against the sha256 published next to it, and unpacks it into `~/.zou/versions/<tag>` with `~/.zou/bin/zou` linked at the current one.
+Versions sit side by side, so a second install is a link change rather than a directory that is half one version and half another, and uninstalling is `rm -rf ~/.zou`.
+`ZOU_VERSION` picks a tag other than the latest and `ZOU_HOME` picks somewhere other than `~/.zou`.
+Nothing runs as root and nothing is written outside that directory.
+
+There is no `--pg-bin` to pass afterwards.
+A zou that was installed this way finds the postmaster next to itself, because the install layout puts one there, and the order it asks in is the flag, then `ZOU_PG_BIN`, then the bundle it shipped in, then `build/pg/bin` for somebody working in a checkout.
+
+## What a release is
+
 A zou release is not one binary.
 Postgres is a child process, and it has to be the patched build, so a download that is only `zou` is a download that cannot start a database.
 `scripts/zou-bundle.sh` puts the two together the way an installer would and prints what the result weighs.
@@ -49,3 +65,11 @@ The rust binary is stripped by the release profile; the postgres binaries are st
 A third of the whole bundle is timezones, catalog templates, and extension sql, none of which compresses badly, which is why the tarball is roughly a third of the tree.
 
 CI builds a bundle on every postgres build, starts the postmaster out of it, and creates the vector extension, because a bundle that is small and does not run is not a smaller bundle.
+
+## What a tag builds
+
+The release workflow builds a bundle per unix platform, linux and darwin on both architectures, and each leg builds the patched Postgres from the vendored tree, builds `zou`, assembles, starts a database out of the result, and uploads the tarball with its sha256.
+That is roughly fifteen minutes a platform, which is why it runs on tags and not on pushes.
+Windows gets the binary on its own, the way every target did before, because there is no patched Postgres and no embedded story there yet.
+
+Still to come in this section: npm, PyPI, brew, and a docker image, all of which want this same tree.

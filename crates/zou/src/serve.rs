@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use crate::dev::SUPERUSER;
 use zou_pg::gc::{self, Sweep};
-use zou_pg::{bootstrap, restore};
+use zou_pg::{bootstrap, install, restore};
 use zou_server::Config;
 use zou_server::attach::{Attached, Backend};
 use zou_server::fleet::Doors;
@@ -192,9 +192,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         }
         None => None,
     };
-    let pg_bin = pg_bin
-        .or_else(|| std::env::var_os("ZOU_PG_BIN").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("build/pg/bin"));
+    let pg_bin = install::pg_bin(pg_bin);
     let runtime = runtime
         .unwrap_or_else(|| std::env::temp_dir().join(format!("zou-serve-{}", std::process::id())));
     Ok(Args {

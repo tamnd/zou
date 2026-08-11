@@ -811,15 +811,10 @@ impl Drop for Zou {
 }
 
 /// Where the patched postgres is: what the caller said, else the
-/// environment, else where the build puts it.
+/// environment, else the install this binary shipped in, else where a
+/// checkout builds into.
 fn pg_bin(options: &Options) -> PathBuf {
-    if options.pg_bin.as_os_str().is_empty() {
-        std::env::var_os("ZOU_PG_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("build/pg/bin"))
-    } else {
-        options.pg_bin.clone()
-    }
+    zou_pg::install::pg_bin(Some(options.pg_bin.clone()))
 }
 
 /// Whether the store has no database at this ref yet, which is the one

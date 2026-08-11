@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::{self, Project};
-use zou_pg::{bootstrap, restore};
+use zou_pg::{bootstrap, install, restore};
 use zou_store::layout::TenantLayout;
 use zou_store::{CasStore, Manifest, open_store};
 
@@ -118,9 +118,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         }
     }
     let target = target.ok_or(USAGE)?;
-    let pg_bin = pg_bin
-        .or_else(|| std::env::var_os("ZOU_PG_BIN").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("build/pg/bin"));
+    let pg_bin = install::pg_bin(pg_bin);
     let runtime = runtime
         .unwrap_or_else(|| std::env::temp_dir().join(format!("zou-dev-{}", std::process::id())));
     Ok(Args {

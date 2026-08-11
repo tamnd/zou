@@ -3,25 +3,88 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build:
-    name: build (${{ matrix.target }})
+  # What a person downloads: the zou binary and the patched postgres it
+  # starts, in one tree. Building postgres per target is fifteen minutes
+  # a target, which is why this runs on tags rather than on pushes.
+  bundle:
+    name: bundle (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - name: linux-x64
             os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+          - name: linux-arm64
             os: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
+          - name: darwin-x64
             os: macos-13
-          - target: aarch64-apple-darwin
+          - name: darwin-arm64
             os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config uuid-dev
+          else
+            brew install meson ninja icu4c pkg-config bison flex
+            echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig" >> "$GITHUB_ENV"
+            # The bison and flex in the SDK are older than the ones the
+            # postgres grammar is written against.
+            echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+            echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Build the patched Postgres
+        run: make pg-build
+      - name: Build zou
+        run: cargo build --release -p zou
+      - name: Assemble the bundle
+        run: scripts/zou-bundle.sh --tar
+      - name: Start a database out of it
+        run: |
+          BUNDLE=$PWD/dist/zou-${{ matrix.name }}
+          $BUNDLE/pg/bin/initdb -D "$RUNNER_TEMP/bundle-pgdata"
+          $BUNDLE/pg/bin/postgres -D "$RUNNER_TEMP/bundle-pgdata" -k "$RUNNER_TEMP" -p 5618 >"$RUNNER_TEMP/bundle-pg.log" 2>&1 &
+          for i in $(seq 1 60); do
+            $BUNDLE/pg/bin/psql -h "$RUNNER_TEMP" -p 5618 -d postgres -Atc 'select 1' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          $BUNDLE/pg/bin/psql -h "$RUNNER_TEMP" -p 5618 -d postgres -v ON_ERROR_STOP=1 -c 'select version()' -c 'create extension vector'
+          kill -INT "$(head -1 "$RUNNER_TEMP/bundle-pgdata/postmaster.pid")"
+          $BUNDLE/bin/zou --version
+      - name: Checksum
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum zou-${{ matrix.name }}.tar.gz > zou-${{ matrix.name }}.tar.gz.sha256
+          else
+            shasum -a 256 zou-${{ matrix.name }}.tar.gz > zou-${{ matrix.name }}.tar.gz.sha256
+          fi
+          cat zou-${{ matrix.name }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zou-${{ matrix.name }}
+          path: |
+            dist/zou-${{ matrix.name }}.tar.gz
+            dist/zou-${{ matrix.name }}.tar.gz.sha256
+
+  # Windows has no embedded story and no patched postgres, so it gets
+  # the binary on its own, which is what every target got before.
+  windows:
+    name: windows (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
           - target: aarch64-pc-windows-msvc
@@ -36,7 +99,22 @@ jobs:
         with:
           bin: zou
           target: ${{ matrix.target }}
-          tar: unix
           zip: windows
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish:
+    name: publish the bundles
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/* --clobber --repo "$GITHUB_REPOSITORY"

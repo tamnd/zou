@@ -92,7 +92,13 @@ cargo +nightly fuzz run rest_filter
 
 `make demo` tours the object layer in seconds, and after a one time `make pg-build` it continues into the real Postgres on a store, rows, a branch, and a restart from nothing but the objects. The walkthrough is in [docs/quickstart.md](docs/quickstart.md).
 
-A release is the binary and the patched Postgres together, since one without the other cannot start a database. `scripts/zou-bundle.sh` assembles the pair the way an installer would and prints what it weighs, 48.6 MB on darwin arm64 and 50.6 MB on linux x64 against a budget of 150 MB, see [docs/packaging.md](docs/packaging.md).
+A release is the binary and the patched Postgres together, since one without the other cannot start a database, and installing is a directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tamnd/zou/main/install.sh | sh
+```
+
+That takes the bundle for the platform, checks it against its sha256, and unpacks it into `~/.zou`, and the zou inside it finds the postmaster next to itself with nothing to configure. The bundle is 48.6 MB on darwin arm64 and 50.6 MB on linux x64 against a budget of 150 MB, and `scripts/zou-bundle.sh` builds one from a checkout, see [docs/packaging.md](docs/packaging.md).
 
 ## Contributing
 
