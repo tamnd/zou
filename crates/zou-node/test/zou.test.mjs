@@ -8,8 +8,8 @@
 //
 // These start postgres, so they are not free. Most of them take a
 // fixture, which is a database branched off the machine's template and
-// costs a postmaster start; the two that are about the ordinary path
-// run initdb and are the slow ones.
+// costs a postmaster start; the one that is about the ordinary path
+// runs initdb and is most of the suite's time on its own.
 
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";

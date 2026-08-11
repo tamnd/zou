@@ -51,6 +51,41 @@ That is the cost of `open` and it is seconds rather than milliseconds, most of t
 By default every handle mints a fresh random JWT secret, which is right for a test and wrong for anything that has to still recognise its own tokens after a restart.
 `Options::jwt_secret` pins it.
 
+## A database per test
+
+```rust
+Options::fixture()                // branched off the machine's template
+```
+
+An ephemeral project runs initdb against its new store, and initdb through a store writes about 3800 one page objects: 5.5 s on a github runner, 30 s on a laptop, 150 s on a small vps.
+That is the whole cost of a create, and it is what stops a suite from taking a database per test.
+
+A fixture does not run initdb.
+One template is built per machine and per Postgres build, and every fixture is a branch of it: a manifest write, no pages copied, and the postmaster start that was always going to be there.
+On this laptop that is 60 ms at p50 over 50 creates, of which 13 ms is the branch, 21 ms the restore, 22 ms the postmaster, and a millisecond the front door.
+
+```rust
+#[test]
+fn a_signup_lands_in_auth_users() {
+    let zou = Zou::open(Options::fixture()).unwrap();
+    // Your own schema, over the dsn, the way a host process does it.
+    // Then the surface, in this process, with nobody else's rows in it.
+}
+```
+
+Fixtures share the template store and see nothing of each other, each one is a tenant of its own, and closing one takes that tenant off the store while the captures it read from stay where they are.
+A fixture is branchable the moment it is cut, because the template folded a full page capture down before it was published, so a test that wants a branch of its fixture does not have to write to it first.
+
+The first fixture on a cold machine builds the template, which is one initdb and one fold, 45 s on this laptop.
+It lands in `$ZOU_TEMPLATE_CACHE`, or `$XDG_CACHE_HOME/zou/templates`, or `~/.cache/zou/templates`, and a CI job that keeps that directory between runs pays for it once.
+Two processes arriving at a cold machine at the same time do not both build one: the loser waits for the winner under a lock, and a lock nobody released within ten minutes is treated as a build that died.
+
+The template id is a hash of the Postgres build, the crate version, and the DDL `zou_server::sql::bootstrap` would apply.
+The last one is in there because a fixture skips the bootstrap on the strength of the template having run it, which is 75 ms of the create, so a template built against an older auth schema has to be a different template rather than a stale one.
+
+`Options::fixture()` names no target, since the store is the template's.
+Anything that has to end up in a particular directory is `Options::dir`, which is a real store and pays what a real store costs.
+
 ## Serving it to somebody else as well
 
 ```rust
@@ -149,6 +184,20 @@ That is a real supabase-js client and there is no socket under it.
 
 supabase-js is a peer dependency and an optional one.
 A project that only wants `zou.fetch` or a port does not install it, and a project that calls `client()` without it gets a sentence rather than a stack.
+
+```js
+import { createFixture } from "zou";
+
+test("a signup lands in auth.users", async (t) => {
+  const zou = await createFixture();
+  t.after(() => zou.close());
+  const supabase = zou.client();
+  // A database of this test's own, in tens of milliseconds.
+});
+```
+
+`createFixture` is `Options::fixture()` from javascript, and the section above is the whole story: the machine builds one template and every fixture is a branch of it.
+The node suite in this repo runs on fixtures and went from 232 s to 46 s, of which 39 s is the one test that is still about the ordinary initdb path and is meant to be.
 
 ```js
 const zou = await createZou();                     // ephemeral, gone on close

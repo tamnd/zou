@@ -53,6 +53,10 @@ That runs today.
 `client()` is a real supabase-js client with a `fetch` that goes to the router in this process, so there is no socket anywhere under that snippet.
 Python and Go are next.
 
+`createFixture()` is the same thing for a suite that wants a database per test rather than per run.
+The machine builds one template, once, and every fixture after it is a copy on write branch of that template, which is tens of milliseconds instead of the half minute initdb through a store costs.
+The suites in this repo run on it.
+
 A server, where the only durable state is the bucket:
 
 ```bash
