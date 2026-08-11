@@ -1,0 +1,45 @@
+# The package metadata, and enough of a build to make a wheel out of
+# this directory once the extension is built.
+#
+# maturin is the build backend because the thing being packaged is a
+# rust extension, and it is the one tool that knows how to put a cdylib,
+# the python next to it, and the wheel tags for the platform it was
+# built on into one file. The wheels themselves are the packaging line
+# on the milestone rather than this file's job.
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "zou"
+version = "0.0.1"
+description = "A Supabase compatible backend inside your python process: postgres, rest, auth, and storage, with no daemon and no docker"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [{ name = "Tam Nguyen" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Topic :: Database",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+
+# supabase and httpx are what `client()` needs and nothing else does, so
+# a project that only wants `request()` or `listen()` installs neither
+# and one that wants a client asks for it by name.
+[project.optional-dependencies]
+client = ["supabase>=2", "httpx>=0.27"]
+
+[project.urls]
+Homepage = "https://github.com/tamnd/zou"
+Repository = "https://github.com/tamnd/zou"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "zou._zou"
+python-source = "python"
+features = ["pyo3/extension-module"]

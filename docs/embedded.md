@@ -1,8 +1,8 @@
 # Embedded
 
 A whole Supabase compatible project inside another process, with no daemon to start, no port to pick, and no docker compose file.
-This is the `zou-embed` crate, `libzou`, which is the same thing behind a C ABI, and the node package over it.
-The Python and Go bindings are next and are not there yet.
+This is the `zou-embed` crate, `libzou`, which is the same thing behind a C ABI, and the node and python packages over it.
+The Go binding is next and is not there yet.
 
 ## What it is
 
@@ -224,6 +224,46 @@ ZOU_PG_BIN=$PWD/build/pg/bin npm --prefix crates/zou-node test
 
 `build.sh` is cargo plus a copy: node loads a cdylib under a name ending in `.node` and that is the whole build.
 The tests open real projects and run in CI on the job that builds the patched Postgres.
+
+## From python
+
+```python
+from zou import create_fixture
+
+def test_a_signup_lands_in_auth_users():
+    with create_fixture() as zou:
+        supabase = zou.client()
+        supabase.auth.sign_up({"email": "a@example.com", "password": "correct horse battery"})
+```
+
+`create_zou` and `create_fixture` are the same two doors node has, and `client()` is a real supabase-py client with an httpx transport that hands the request to the router in this process.
+supabase-py takes an `httpx_client` in its options, so nothing is monkeypatched and nothing is subclassed: the client is built the way its own documentation says to build it, with a transport that goes somewhere else.
+
+```python
+zou = create_zou(dir="./data")             # a directory of objects, kept
+zou = create_zou(url="s3://bucket/app")    # a bucket, or sqlite://, or a .zou file
+zou = create_zou()                         # ephemeral, gone on close
+port = zou.listen(0)                       # 0 asks the kernel
+preview = zou.branch("pr-142")
+zou.checkpoint()
+```
+
+`zou.dsn` is the other door, for psycopg or psql on the database directly, which is how a suite creates its own schema before serving it.
+`zou.anon_key`, `zou.service_role_key`, `zou.target`, and `zou.tenant` are the rest of what `zou status` prints, and the handle is a context manager so `with` closes it.
+`zou.request(method, path, headers, body)` is one level down from the client, and `zou.transport()` is the httpx transport on its own for a client somebody else built.
+
+Anything that fails raises `zou.ZouError`, which carries `.code`, one of `ZOU_OPTIONS`, `ZOU_POSTGRES`, `ZOU_STORE`, `ZOU_REQUEST`, or `ZOU_IO`, so a test can branch on the kind rather than on the shape of a sentence.
+supabase-py and httpx are optional: `pip install zou[client]` for `client()`, and neither is needed for `request()` or `listen()`.
+
+The binding is [PyO3](https://pyo3.rs) over `zou-embed`, built abi3 so one extension serves every python from 3.9 up, and every call that takes time releases the GIL while it takes it, so a thread that opens a project does not stop the rest of the process.
+
+```bash
+crates/zou-python/build.sh
+ZOU_PG_BIN=$PWD/build/pg/bin python3 -m unittest discover -s crates/zou-python/test
+```
+
+`build.sh` is cargo plus a copy, the same as node's, and maturin builds the wheel.
+The tests open real projects, skip the supabase-py one when supabase-py is not installed, and run in CI on the job that builds the patched Postgres.
 
 ## Testing it
 
