@@ -783,11 +783,11 @@ jobs:
           grep -i s3 /tmp/zou.env | sort
           grep -i s3 /tmp/zou.env | cut -d= -f1 | sort > /tmp/zou-s3.names
           diff /tmp/cli-s3.names /tmp/zou-s3.names
-          # And whether the file a project keeps its settings in names
-          # the pair at all, since `zou config` warns about every key it
-          # does not read and a key it should read is a bug.
-          grep -in s3 /tmp/project/supabase/config.toml \
-            || echo "the generated config.toml says nothing about s3"
+          # And what the file a project keeps its settings in says about
+          # the endpoint, since `zou status` names every key it does not
+          # read and a key it should read is a bug.
+          awk '/^\[storage/{p=1} /^\[/{if ($0 !~ /^\[storage/) p=0} p' \
+            /tmp/project/supabase/config.toml
       - name: Diff the rest suite against the stack a person gets
         run: |
           cargo run -p zou-conformance -- diff --suite rest \
