@@ -142,4 +142,20 @@ A tag writes it out of the checksums the release job just uploaded and pushes it
 Without the token it prints the formula into the job log and the release is otherwise unaffected.
 CI runs the generator on every change and hands the result to `ruby -c`, since a formula is only found to be broken at a tag, and a tag does not come round again.
 
-Still to come in this section: a docker image, which wants this same tree.
+## In a container
+
+```bash
+docker build -t zou .
+docker run --rm -v zou-data:/data zou tenant /data create demo
+docker run --rm -p 54321:54321 -p 5432:5432 -v zou-data:/data zou
+```
+
+Two stages: one with meson and bison and a rust toolchain that builds the patched Postgres and `zou`, and one with the shared libraries the postmaster links against and nothing else.
+What crosses between them is the bundle, the same one `scripts/zou-bundle.sh` writes for a release, so the image and the tarball are the same tree rather than two definitions of what ships.
+
+The command is `zou serve` rather than `zou dev`, because `serve` binds `0.0.0.0` and `dev` deliberately does not, and a dev loop that could only be reached from inside the container would be a strange thing to ship.
+A registry with nothing in it serves nothing, which is why the tenant is made first; the first request after that attaches it, which runs `initdb` and takes a moment, and every start after that is a restore.
+Postgres refuses to run as root and is right to, so the image has a user of its own and `/data` belongs to them.
+
+CI builds the image on every change to the Dockerfile, makes a tenant, starts it, and asks the front door a question it should refuse, because a 401 from the api is the api being up with a database behind it.
+A tag pushes it to `ghcr.io/tamnd/zou`.
