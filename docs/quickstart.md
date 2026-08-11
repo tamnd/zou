@@ -68,13 +68,18 @@ $ zou status
       JWT secret: ...
         anon key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 service_role key: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+   S3 Access Key: 625729a08b95bf1b7ff351a663f3a23c
+   S3 Secret Key: 850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907
+       S3 Region: local
           config: /home/me/app/supabase/config.toml
     not read yet: api.max_rows, db.shadow_port, studio.port
-$ eval "$(zou status -o env)"          # API_URL, DB_URL, ANON_KEY, SERVICE_ROLE_KEY
+$ eval "$(zou status -o env)"          # API_URL, DB_URL, ANON_KEY, SERVICE_ROLE_KEY, S3_PROTOCOL_ACCESS_KEY_ID
 $ zou status -o json                   # the same, for a tool that parses it
 ```
 
 The keys are minted from `ZOU_JWT_SECRET`, so pin one, otherwise `zou dev` generates a secret it logs and no other process can know what it signed.
+The S3 pair is the fixed one a local Supabase project answers to, so an S3 client that already has it in a `.env` keeps working, and `ZOU_S3_ACCESS_KEY`, `ZOU_S3_SECRET_KEY` and `ZOU_S3_REGION` replace it for a dev loop that is reachable from further away than loopback.
+A project whose file says `[storage.s3_protocol] enabled = false` gets no pair at all, and then the endpoint answers every signature with the access key not being one this project has.
 The last line is the honest part: every setting in the file that zou has no answer for yet is named rather than ignored in silence.
 
 A path ending `.zou` is the single file backend. Every sequential tool works over it today, `zou info`, `zou branch`, `zou-bootstrap`, `zou-restore`, while `zou dev` needs the multi process postmaster and waits on the in process engine, see the note in docs/storage-engine.md.

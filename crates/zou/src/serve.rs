@@ -712,6 +712,15 @@ impl Backend for Postmasters {
                 .domain
                 .as_ref()
                 .map(|domain| format!("https://{tenant_ref}.{domain}")),
+            // The S3 pair is this tenant's own, out of the same entry
+            // the secret came from, and a tenant without one has no S3
+            // endpoint rather than a shared one. Nothing here reads an
+            // environment variable for it on purpose: a pair in the
+            // node's environment would be a pair every project on the
+            // node answers to, which is a key that opens every door.
+            s3: entry
+                .s3()
+                .map(|(access, secret)| zou_server::s3::Credentials::new(access, secret)),
             ..Config::default()
         })
     }

@@ -98,6 +98,22 @@ pub struct Tenant {
     /// the reason this exists, and an empty list is the normal case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<String>,
+    /// The pair this project's S3 protocol endpoint is asked with.
+    ///
+    /// Per tenant rather than per server, for the same reason the JWT
+    /// secret is: a fleet answering one pair for every project on it
+    /// would let whoever holds that pair sign for a project they were
+    /// never given anything for, and the whole point of a key is that
+    /// it opens one thing.
+    ///
+    /// Empty is a project with no pair, which is not a project with an
+    /// open endpoint. A server told no pair says of every signed
+    /// request that the access key it named is not one this project
+    /// has, which is true.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub s3_access_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub s3_secret_key: String,
 }
 
 impl Tenant {
@@ -108,6 +124,19 @@ impl Tenant {
             created_unix,
             jwt_secret: jwt_secret.to_string(),
             hosts: Vec::new(),
+            s3_access_key: String::new(),
+            s3_secret_key: String::new(),
+        }
+    }
+
+    /// The pair, when there is one. Half a pair is not a pair: an entry
+    /// carrying an access key and no secret is answered the same way as
+    /// one carrying neither, because there is nothing to verify a
+    /// signature against either way.
+    pub fn s3(&self) -> Option<(&str, &str)> {
+        match self.s3_access_key.is_empty() || self.s3_secret_key.is_empty() {
+            true => None,
+            false => Some((&self.s3_access_key, &self.s3_secret_key)),
         }
     }
 
@@ -353,6 +382,30 @@ pub fn remove_host(
     Ok(())
 }
 
+/// Give a tenant an S3 pair, or replace the one it has.
+///
+/// Replacing is what rotating is, and it takes effect the next time
+/// something reads the entry rather than at once, because a server that
+/// has the project attached is holding the old pair in its config. That
+/// is the same lag a changed JWT secret has and it is a property of the
+/// registry being the source rather than a cache of one.
+pub fn set_s3(
+    store: &dyn CasStore,
+    tenant_ref: &str,
+    access: &str,
+    secret: &str,
+) -> Result<(), RegistryError> {
+    let Some(mut entry) = get(store, tenant_ref)? else {
+        return Err(RegistryError::Missing {
+            tenant_ref: tenant_ref.to_string(),
+        });
+    };
+    entry.s3_access_key = access.to_string();
+    entry.s3_secret_key = secret.to_string();
+    store.put(&entry_key(tenant_ref), &entry.to_json())?;
+    Ok(())
+}
+
 /// Which tenant a hostname belongs to, in one GET. This is the routing
 /// path for every project on its own domain.
 pub fn host_ref(store: &dyn CasStore, host: &str) -> Result<Option<String>, RegistryError> {
@@ -419,6 +472,37 @@ mod tests {
         create(&store, &tenant("acme-prod")).unwrap();
         assert_eq!(store.list("").unwrap(), vec!["registry/acme-prod.json"]);
         assert_eq!(get(&store, "acme-prod").unwrap(), Some(tenant("acme-prod")));
+    }
+
+    #[test]
+    fn an_entry_written_before_s3_existed_still_reads() {
+        // What an older zou wrote, which is every entry on every store
+        // that already has one. It has no pair, and having no pair is a
+        // thing an entry is allowed to be rather than a parse failure.
+        let store = MemStore::new();
+        let older = br#"{"format":1,"ref":"acme-prod","created_unix":1,"jwt_secret":"s"}"#;
+        store.put(&entry_key("acme-prod"), older).unwrap();
+        let entry = get(&store, "acme-prod").unwrap().expect("it reads");
+        assert_eq!(entry.s3(), None);
+        assert!(
+            !String::from_utf8(entry.to_json()).unwrap().contains("s3"),
+            "and writing it back does not invent one"
+        );
+    }
+
+    #[test]
+    fn half_a_pair_is_not_a_pair() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        set_s3(&store, "acme-prod", "an-access-key", "").unwrap();
+        assert_eq!(get(&store, "acme-prod").unwrap().unwrap().s3(), None);
+        set_s3(&store, "acme-prod", "an-access-key", "a-secret").unwrap();
+        assert_eq!(
+            get(&store, "acme-prod").unwrap().unwrap().s3(),
+            Some(("an-access-key", "a-secret"))
+        );
+        let err = set_s3(&store, "nobody", "a", "b").unwrap_err();
+        assert!(matches!(err, RegistryError::Missing { .. }));
     }
 
     #[test]

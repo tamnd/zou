@@ -99,6 +99,13 @@ struct Status {
     api: u16,
     db: u16,
     secret: Option<String>,
+    /// The pair the S3 endpoint is asked with, which is knowable from
+    /// here even when the JWT secret is not: it is fixed unless the
+    /// environment named another, and both cases are the same rule
+    /// `zou dev` applied when it started. None is a project whose own
+    /// file switched the endpoint off, and printing a pair for that
+    /// would be printing a key to a door that is not there.
+    s3: Option<zou_server::s3::Credentials>,
     project: Option<Project>,
 }
 
@@ -129,7 +136,7 @@ impl Status {
     fn pretty(&self) {
         let (anon, service) = self.keys().unzip();
         let unknown = "unknown, pin ZOU_JWT_SECRET and restart to see it".to_string();
-        for (label, value) in [
+        let mut lines = vec![
             ("API URL", self.api_url()),
             ("S3 Storage URL", self.s3_url()),
             ("DB URL", self.db_url()),
@@ -139,7 +146,19 @@ impl Status {
             ),
             ("anon key", anon.unwrap_or_else(|| unknown.clone())),
             ("service_role key", service.unwrap_or(unknown)),
-        ] {
+        ];
+        match &self.s3 {
+            Some(s3) => lines.extend([
+                ("S3 Access Key", s3.access.clone()),
+                ("S3 Secret Key", s3.secret.clone()),
+                ("S3 Region", s3.region.clone()),
+            ]),
+            None => lines.push((
+                "S3 endpoint",
+                "off, storage.s3_protocol.enabled is false".to_string(),
+            )),
+        }
+        for (label, value) in lines {
             println!("{label:>16}: {value}");
         }
         let Some(project) = &self.project else {
@@ -163,6 +182,14 @@ impl Status {
             println!("ANON_KEY=\"{anon}\"");
             println!("SERVICE_ROLE_KEY=\"{service}\"");
         }
+        // The names are the CLI's, not ours: a project's scripts read
+        // these out of `supabase status -o env` today, and a rename
+        // here would be a script to edit for no reason.
+        if let Some(s3) = &self.s3 {
+            println!("S3_PROTOCOL_ACCESS_KEY_ID=\"{}\"", s3.access);
+            println!("S3_PROTOCOL_ACCESS_KEY_SECRET=\"{}\"", s3.secret);
+            println!("S3_PROTOCOL_REGION=\"{}\"", s3.region);
+        }
     }
 
     fn json(&self) {
@@ -174,6 +201,9 @@ impl Status {
             "jwt_secret": self.secret,
             "anon_key": anon,
             "service_role_key": service,
+            "s3_access_key": self.s3.as_ref().map(|s3| &s3.access),
+            "s3_secret_key": self.s3.as_ref().map(|s3| &s3.secret),
+            "s3_region": self.s3.as_ref().map(|s3| &s3.region),
         });
         if let Some(project) = &self.project {
             out["config"] = serde_json::json!(project.path.display().to_string());
@@ -200,6 +230,9 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         secret: std::env::var("ZOU_JWT_SECRET")
             .ok()
             .filter(|s| !s.is_empty()),
+        // The same rule `zou dev` applied when it started: the project's
+        // own file decides whether there is an endpoint at all.
+        s3: project.as_ref().is_none_or(|p| p.s3).then(config::local_s3),
         project,
     };
     match args.output {
@@ -251,6 +284,7 @@ mod tests {
             api: 54321,
             db: 5432,
             secret: Some("a secret at least thirty two bytes long".into()),
+            s3: Some(config::local_s3()),
             project: None,
         };
         assert_eq!(status.api_url(), "http://127.0.0.1:54321");
@@ -270,9 +304,15 @@ mod tests {
             api: 54321,
             db: 5432,
             secret: None,
+            s3: Some(config::local_s3()),
             project: None,
         };
         assert!(status.keys().is_none());
+        assert_eq!(
+            status.s3.map(|s3| s3.access).as_deref(),
+            Some(config::LOCAL_S3_ACCESS_KEY),
+            "the S3 pair is fixed, so it is printable when the keys are not"
+        );
     }
 
     #[test]

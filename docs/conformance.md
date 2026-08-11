@@ -392,6 +392,7 @@ What this catches is anything that is true of the harness's zou and not of the s
 Both are the same crates, so it is the configuration that differs, and configuration is exactly where a library that cannot be told something quietly does without it.
 It found one immediately: the S3 protocol surface takes a key pair, the harness had always set one, and nothing else could.
 `zou dev`, `zou serve` and the embedded library all served an endpoint that answered every signature with a key nobody could have.
+All four can be told one now, each in the shape that suits it: the library and the package take a pair as an option, `zou dev` answers to the fixed pair a local Supabase project answers to, and a served project's pair is its own, out of the registry entry the JWT secret already came from.
 
 ## The app
 

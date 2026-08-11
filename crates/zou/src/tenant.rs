@@ -19,15 +19,28 @@ use zou_store::layout::TenantLayout;
 use zou_store::registry::{self, Tenant};
 use zou_store::{CasStore, open_store};
 
-pub const USAGE: &str = "usage: zou tenant <target> <list | create <ref> [--secret <s>] | info <ref> | keys <ref> [--env] | delete <ref> | host add <ref> <host> | host remove <ref> <host>>";
+pub const USAGE: &str = "usage: zou tenant <target> <list | create <ref> [--secret <s>] | info <ref> | keys <ref> [--env] | s3 <ref> [--rotate] | delete <ref> | host add <ref> <host> | host remove <ref> <host>>";
 
 /// A fresh project secret: 32 bytes of the os rng as hex, which is the
 /// shape and the strength the dev loop's own generated secret has, and
 /// long enough that HS256 is not the weak part.
 fn secret() -> Result<String, String> {
-    let mut raw = [0u8; 32];
+    random(32)
+}
+
+/// n bytes of the os rng as hex.
+fn random(n: usize) -> Result<String, String> {
+    let mut raw = vec![0u8; n];
     getrandom::fill(&mut raw).map_err(|e| format!("random secret: {e}"))?;
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A fresh S3 pair, in the shape a Supabase project's is: an access key
+/// of 32 hex characters and a secret of 64. The lengths are what a
+/// client's configuration field expects to be given, and both come out
+/// of the same rng the project secret does.
+fn s3_pair() -> Result<(String, String), String> {
+    Ok((random(16)?, random(32)?))
 }
 
 fn now() -> u64 {
@@ -59,6 +72,10 @@ pub fn run(argv: &[String]) -> Result<(), String> {
             create(store.as_ref(), tenant_ref, value.clone())
         }
         [verb, tenant_ref] if verb == "info" => info(store.as_ref(), tenant_ref),
+        [verb, tenant_ref] if verb == "s3" => s3(store.as_ref(), tenant_ref, false),
+        [verb, tenant_ref, flag] if verb == "s3" && flag == "--rotate" => {
+            s3(store.as_ref(), tenant_ref, true)
+        }
         [verb, tenant_ref] if verb == "keys" => keys(store.as_ref(), tenant_ref, false),
         [verb, tenant_ref, flag] if verb == "keys" && flag == "--env" => {
             keys(store.as_ref(), tenant_ref, true)
@@ -102,10 +119,19 @@ fn list(store: &dyn CasStore) -> Result<(), String> {
 }
 
 fn create(store: &dyn CasStore, tenant_ref: &str, jwt_secret: String) -> Result<(), String> {
-    let entry = Tenant::new(tenant_ref, &jwt_secret, now());
+    let mut entry = Tenant::new(tenant_ref, &jwt_secret, now());
+    // Every project gets its own S3 pair at creation, because a project
+    // whose S3 endpoint refuses everything until somebody runs a second
+    // command is a project whose storage clients do not work and no
+    // error says why.
+    let (access, secret) = s3_pair()?;
+    entry.s3_access_key = access.clone();
+    entry.s3_secret_key = secret.clone();
     registry::create(store, &entry).map_err(|e| e.to_string())?;
     println!("registered {tenant_ref}");
     println!("jwt secret {jwt_secret}");
+    println!("s3 access key {access}");
+    println!("s3 secret key {secret}");
     // Said out loud because the next thing somebody does is point a
     // client at it and get told there is no manifest.
     println!("no database yet, make one with zou branch <target> create <src> {tenant_ref}");
@@ -120,6 +146,16 @@ fn info(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
     println!("format {}", entry.format);
     println!("created unix {}", entry.created_unix);
     println!("jwt secret {}", entry.jwt_secret);
+    match entry.s3() {
+        Some((access, secret)) => {
+            println!("s3 access key {access}");
+            println!("s3 secret key {secret}");
+        }
+        // Said out loud rather than left blank, because an S3 client
+        // being told its key is not one this project has looks the same
+        // as a wrong key typed in.
+        None => println!("no s3 pair, make one with zou tenant <target> s3 {tenant_ref}"),
+    }
     match entry.hosts.is_empty() {
         true => println!("hosts: none besides its own label"),
         false => println!("hosts: {}", entry.hosts.join(", ")),
@@ -188,6 +224,59 @@ fn keys(store: &dyn CasStore, tenant_ref: &str, as_env: bool) -> Result<(), Stri
         println!("anon key {anon}");
         println!("service_role key {service}");
     }
+    // The S3 pair is read rather than minted, and it is printed here
+    // because a client configured against a project needs all of these
+    // together. The names are the ones `supabase status -o env` uses.
+    if let Some((access, s3_secret)) = entry.s3() {
+        if as_env {
+            println!("S3_PROTOCOL_ACCESS_KEY_ID=\"{access}\"");
+            println!("S3_PROTOCOL_ACCESS_KEY_SECRET=\"{s3_secret}\"");
+            println!("S3_PROTOCOL_REGION=\"{}\"", zou_server_region());
+        } else {
+            println!("s3 access key {access}");
+            println!("s3 secret key {s3_secret}");
+            println!("s3 region {}", zou_server_region());
+        }
+    }
+    Ok(())
+}
+
+/// Where a served project says it is. One constant rather than a
+/// setting, because nothing on this side of the store knows which
+/// region a bucket is in and every S3 client assumes this one when it
+/// is not told otherwise.
+///
+/// Spelled out here rather than taken from `zou_server::s3::REGION`
+/// because that crate supervises a postmaster and is built on unix
+/// only, while `zou tenant` is a store tool that runs wherever a bucket
+/// does. The test below is what keeps the two the same.
+fn zou_server_region() -> &'static str {
+    "us-east-1"
+}
+
+/// Give a tenant an S3 pair, and refuse to replace one it already has
+/// unless that is what was asked for. Rotating is a thing an operator
+/// means to do, not a thing a rerun of a setup script does.
+fn s3(store: &dyn CasStore, tenant_ref: &str, rotate: bool) -> Result<(), String> {
+    let entry = registry::get(store, tenant_ref)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no tenant {tenant_ref} on this store"))?;
+    if let Some((access, _)) = entry.s3()
+        && !rotate
+    {
+        return Err(format!(
+            "{tenant_ref} already has an s3 pair, access key {access}. Replace it with zou tenant <target> s3 {tenant_ref} --rotate"
+        ));
+    }
+    let (access, secret) = s3_pair()?;
+    registry::set_s3(store, tenant_ref, &access, &secret).map_err(|e| e.to_string())?;
+    println!("s3 access key {access}");
+    println!("s3 secret key {secret}");
+    // Said because the pair a running server holds came out of the
+    // entry when it attached the project, and it goes on holding it.
+    if rotate {
+        println!("the old pair still works until this project is next attached");
+    }
     Ok(())
 }
 
@@ -236,6 +325,31 @@ mod tests {
         assert_eq!(one.len(), 64);
         assert!(one.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(one, secret().unwrap(), "or it is not a secret");
+    }
+
+    #[test]
+    fn a_project_is_created_with_an_s3_pair_and_can_rotate_it() {
+        let (_d, target) = target();
+        run(&argv(&[&target, "create", "acme-prod", "--secret", "sh"])).unwrap();
+        let store = zou_store::open_store(&target).unwrap();
+        let first = registry::get(store.as_ref(), "acme-prod").unwrap().unwrap();
+        let (access, secret) = first.s3().expect("created with a pair");
+        assert_eq!((access.len(), secret.len()), (32, 64));
+        let err = run(&argv(&[&target, "s3", "acme-prod"])).unwrap_err();
+        assert!(err.contains("already has an s3 pair"), "{err}");
+        run(&argv(&[&target, "s3", "acme-prod", "--rotate"])).unwrap();
+        let second = registry::get(store.as_ref(), "acme-prod").unwrap().unwrap();
+        assert_ne!(second.s3(), first.s3(), "rotating rotates");
+        assert!(
+            run(&argv(&[&target, "s3", "nobody"])).is_err(),
+            "a ref that is not registered has nothing to rotate"
+        );
+    }
+
+    #[test]
+    fn the_region_here_is_the_one_the_server_verifies_against() {
+        #[cfg(unix)]
+        assert_eq!(zou_server_region(), zou_server::s3::REGION);
     }
 
     #[test]

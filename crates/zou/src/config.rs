@@ -387,6 +387,7 @@ const DIRECT: &[&str] = &[
     "db.port",
     "db.seed.enabled",
     "db.seed.sql_paths",
+    "storage.s3_protocol.enabled",
 ];
 
 /// A Supabase project, as far as this server is concerned.
@@ -402,6 +403,10 @@ pub struct Project {
     /// the first is what a request that names no schema gets.
     pub schemas: Vec<String>,
     pub site_url: Option<String>,
+    /// Whether the S3 protocol endpoint answers, which the file calls
+    /// `[storage.s3_protocol] enabled`. On unless the file says
+    /// otherwise, the way the CLI generates it.
+    pub s3: bool,
     /// Settings that become environment variables, in the order they
     /// are listed above.
     pub env: Vec<(String, String)>,
@@ -575,6 +580,13 @@ impl Project {
                 .get("auth.site_url")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            // On unless the file switches it off, which is what a file
+            // that never mentions it means and what the generated one
+            // says.
+            s3: table
+                .get("storage.s3_protocol.enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             env,
             unread,
             seed,
@@ -619,6 +631,39 @@ pub fn locate(explicit: Option<&Path>) -> Result<Option<Project>, String> {
 /// clients that insist on one and is not a secret.
 pub fn local_db_url(port: u16) -> String {
     format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres")
+}
+
+/// The S3 pair a `supabase start` project answers to, which is fixed
+/// rather than generated and is the same on every machine.
+///
+/// It is a fixture and not a secret, the same way the local anon key
+/// printed in every Supabase tutorial is: it opens a database on
+/// loopback that a person started themselves. `zou dev` answers to it
+/// so that a project which already has these three in an `.env` keeps
+/// working when the command in front of it changes.
+pub const LOCAL_S3_ACCESS_KEY: &str = "625729a08b95bf1b7ff351a663f3a23c";
+pub const LOCAL_S3_SECRET_KEY: &str =
+    "850181e4652dd023b7a98c58ae0d2d34bd487ee0cc3254aed6eda37307425907";
+/// Where a local project says it is, which a client signs into and
+/// which a bucket answers when asked for its location.
+pub const LOCAL_S3_REGION: &str = "local";
+
+/// The pair the dev loop's S3 endpoint is asked with: the local one
+/// above, unless the environment names another.
+///
+/// Overridable because the pair being public is only harmless while the
+/// thing behind it is on loopback, and a `zou dev` reachable from
+/// anywhere else is a `zou dev` that wants its own.
+pub fn local_s3() -> zou_server::s3::Credentials {
+    let var = |name: &str, fallback: &str| match std::env::var(name) {
+        Ok(v) if !v.is_empty() => v,
+        _ => fallback.to_string(),
+    };
+    zou_server::s3::Credentials {
+        access: var("ZOU_S3_ACCESS_KEY", LOCAL_S3_ACCESS_KEY),
+        secret: var("ZOU_S3_SECRET_KEY", LOCAL_S3_SECRET_KEY),
+        region: var("ZOU_S3_REGION", LOCAL_S3_REGION),
+    }
 }
 
 /// Look for a project config, starting at `from` and walking up. Both
@@ -892,6 +937,30 @@ port = 54323
         for key in ["api.port", "auth.email.enable_signup", "project_id"] {
             assert!(!p.unread.iter().any(|k| k == key), "{key} is read");
         }
+    }
+
+    #[test]
+    fn the_s3_endpoint_is_on_unless_the_file_turns_it_off() {
+        // What `supabase init` writes, which is the section and the one
+        // key under it.
+        let on = Project::from_table(
+            &parse("[storage.s3_protocol]\nenabled = true\n").unwrap(),
+            &|_| None,
+        );
+        assert!(on.s3);
+        assert!(
+            !on.unread.iter().any(|k| k == "storage.s3_protocol.enabled"),
+            "and it is read rather than named as a setting with no answer"
+        );
+        let off = Project::from_table(
+            &parse("[storage.s3_protocol]\nenabled = false\n").unwrap(),
+            &|_| None,
+        );
+        assert!(!off.s3);
+        assert!(
+            Project::from_table(&parse("project_id = \"demo\"\n").unwrap(), &|_| None).s3,
+            "a file that never mentions it has one"
+        );
     }
 
     #[test]

@@ -761,6 +761,36 @@ jobs:
             supabase/migrations/20200101000000_conformance.sql
           supabase start -x studio,imgproxy,edge-runtime,logflare,vector
           supabase status
+      # `zou status` prints what a client should be pointed at in the
+      # shape `supabase status` prints it, which is only true while the
+      # names are the same names. They are read off the CLI here rather
+      # than remembered, so a name that moves upstream fails a build
+      # instead of quietly becoming a variable nobody's script sets.
+      #
+      # The S3 pair is the reason this exists: it arrived in zou after
+      # the rest of the block did, and what the CLI calls it was a
+      # guess until this ran.
+      - name: The names the CLI gives the S3 settings
+        run: |
+          cd /tmp/project
+          supabase status -o env | grep -i s3 | sort | tee /tmp/cli-s3.env
+          supabase status -o env | grep -i s3 | cut -d= -f1 | sort > /tmp/cli-s3.names
+          cd "$GITHUB_WORKSPACE"
+          # A status against ports this job's own containers hold is a
+          # status of somebody else's server, which is fine: the names
+          # are the question and they do not depend on what answers.
+          cargo run -p zou -- status -o env > /tmp/zou.env || true
+          grep -i s3 /tmp/zou.env | sort
+          grep -i s3 /tmp/zou.env | cut -d= -f1 | sort > /tmp/zou-s3.names
+          diff /tmp/cli-s3.names /tmp/zou-s3.names
+          # And the one key the generated file has about the endpoint,
+          # which zou reads: a project that switched the endpoint off
+          # gets no pair from `zou dev` and no pair printed here. It is
+          # asserted rather than printed because `zou status` names
+          # every key it does not read, and this one moving would put it
+          # in that list rather than fail anything.
+          grep -A 1 '^\[storage.s3_protocol\]' /tmp/project/supabase/config.toml \
+            | grep -q '^enabled'
       - name: Diff the rest suite against the stack a person gets
         run: |
           cargo run -p zou-conformance -- diff --suite rest \
