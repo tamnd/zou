@@ -45,10 +45,7 @@ pub struct Shadow {
 
 /// Where the postgres binaries are, asked the same way `zou dev` asks.
 pub fn pg_bin(explicit: Option<&Path>) -> PathBuf {
-    explicit
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("ZOU_PG_BIN").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("build/pg/bin"))
+    zou_pg::install::pg_bin(explicit.map(PathBuf::from))
 }
 
 impl Shadow {

@@ -31,6 +31,7 @@ pub mod fold;
 pub mod gc;
 pub mod getpage;
 pub mod ingest;
+pub mod install;
 pub mod pagecache;
 #[cfg(unix)]
 pub mod pageserve;
