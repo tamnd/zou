@@ -72,4 +72,26 @@ The release workflow builds a bundle per unix platform, linux and darwin on both
 That is roughly fifteen minutes a platform, which is why it runs on tags and not on pushes.
 Windows gets the binary on its own, the way every target did before, because there is no patched Postgres and no embedded story there yet.
 
-Still to come in this section: npm, PyPI, brew, and a docker image, all of which want this same tree.
+## From npm
+
+```bash
+npm install -g zou-cli
+zou dev ./data
+```
+
+`zou` on npm is the embedded binding, so the command line is `zou-cli`, and the two are meant to be installed together as often as separately.
+
+npm cannot carry the bundle as package content: four platforms of a fifty megabyte tree in one tarball is not a package anybody should download to get one of them, and npm has no story for shipping one of four.
+So the package is a `postinstall` that downloads the same tarball `install.sh` does, checks the same sha256, and unpacks it into the package under `vendor/`.
+`bin/zou.js` is a shim onto the binary in there, and it is a shim rather than a wrapper: signals, exit codes, and the terminal belong to the child, because `zou dev` is a process a person leaves running and interrupts with ctrl-c.
+
+The version follows the package rather than the release feed: `zou-cli@0.2.0` downloads from the `v0.2.0` release, because a version number that means whatever was newest at install time is not a version number.
+The tag job publishes the package after it has uploaded the bundles, never before, and it publishes nothing at all when there is no `NPM_TOKEN`, which leaves the tarballs on the release either way.
+`ZOU_VERSION` takes a different tag, `ZOU_SKIP_DOWNLOAD=1` installs the package without the bundle for an image that will mount one in later, and `npm rebuild zou-cli` is the fix when the bundle is missing.
+
+The other half of this is the binding: a node project that installs `zou` and `zou-cli` together gets a patched Postgres without a `ZOU_PG_BIN` anywhere, because the binding looks for `pgBin`, then the environment, then `zou-cli` next door.
+That is the answer to the question the embedded packages have had open since they landed, which is where a project that never built anything is supposed to find a postmaster.
+
+CI proves the postinstall against a bundle it just built, served over localhost with a checksum beside it, since there is no published release to test against yet and a postinstall nobody has run is a postinstall that does not work.
+
+Still to come in this section: PyPI, brew, and a docker image, all of which want this same tree.
