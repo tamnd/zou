@@ -84,13 +84,17 @@ void zou_options_free(zou_options *options);
  *   jwt_secret      what tokens are signed with, random when unset
  *   schemas         comma separated, first one the default
  *   shared_buffers  for the child postmaster
+ *   fixture         "1" for a database cut out of the machine's
+ *                   template rather than made, which is milliseconds
+ *                   instead of seconds and names no target of its own
  *
  * A name nobody has is ZOU_ERR_OPTIONS rather than a shrug. */
 int zou_options_set(zou_options *options, const char *name, const char *value);
 
 /* Open a project. This starts a postmaster, and on a store with no
  * database in it runs initdb first, so it is seconds rather than
- * milliseconds. */
+ * milliseconds. The fixture option is the way out of that: the initdb
+ * happens once per machine and every database after it is a branch. */
 int zou_open(const zou_options *options, zou **out);
 
 /* Stop postgres, remove the running copy, and free the handle. The

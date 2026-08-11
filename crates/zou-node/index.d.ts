@@ -20,6 +20,8 @@ export interface CreateZouOptions {
   schemas?: string[];
   /** shared_buffers for the child postmaster. */
   sharedBuffers?: string;
+  /** Branch the machine's template instead of running initdb. */
+  fixture?: boolean;
 }
 
 /** One open project: a store, the postgres over it, and the front door. */
@@ -55,3 +57,9 @@ export declare class Zou {
 
 /** Open a project. */
 export declare function createZou(options?: CreateZouOptions): Promise<Zou>;
+
+/** A database per test: the same thing, branched off the machine's template. */
+export declare function createFixture(options?: CreateZouOptions): Promise<Zou>;
+
+/** A database per test: the same thing, branched off the machine's template. */
+export declare function createFixture(options?: CreateZouOptions): Promise<Zou>;
