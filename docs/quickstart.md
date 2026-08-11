@@ -539,6 +539,7 @@ The bytes of an object go where the pages go. `zou dev <target>` hands the stora
 - docs/architecture.md for the shape of the whole system
 - docs/storage-engine.md for the manifest, lease, WAL, checkpoint, and branching design
 - docs/postgres.md for the patch series and the storage manager shim
+- docs/branching.md for branches, point in time, and a database per pull request
 - docs/embedded.md for running the whole thing inside another process
 - docs/operations.md for leases, retention, and recovery in operation
 - docs/perf.md and docs/benchmarks.md for how the numbers are measured

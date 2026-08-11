@@ -76,6 +76,8 @@ Branch a database for a preview deploy:
 zou branch s3://mybucket/tenants create prod pr-142
 ```
 
+That is a manifest write and no data movement, so it is the same tens of milliseconds against a 73 GB database as against a 73 MB one, and the branch is served by pointing any command at it with `--ref pr-142`. Point in time, the refusals, the composite action that does it per pull request, and what a branch costs a store over a year are in [docs/branching.md](docs/branching.md).
+
 ## Design at a glance
 
 A tenant is a self-contained prefix on the object store: a manifest, WAL segments, and page checkpoints. The manifest is the root of truth and is swapped atomically with conditional PUTs, which also carries a writer lease with epoch fencing. One writer per database, unlimited stateless readers, no consensus service. Commits are acknowledged only after the WAL batch is durable on the object store.
