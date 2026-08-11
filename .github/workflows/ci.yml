@@ -783,11 +783,14 @@ jobs:
           grep -i s3 /tmp/zou.env | sort
           grep -i s3 /tmp/zou.env | cut -d= -f1 | sort > /tmp/zou-s3.names
           diff /tmp/cli-s3.names /tmp/zou-s3.names
-          # And what the file a project keeps its settings in says about
-          # the endpoint, since `zou status` names every key it does not
-          # read and a key it should read is a bug.
-          awk '/^\[storage/{p=1} /^\[/{if ($0 !~ /^\[storage/) p=0} p' \
-            /tmp/project/supabase/config.toml
+          # And the one key the generated file has about the endpoint,
+          # which zou reads: a project that switched the endpoint off
+          # gets no pair from `zou dev` and no pair printed here. It is
+          # asserted rather than printed because `zou status` names
+          # every key it does not read, and this one moving would put it
+          # in that list rather than fail anything.
+          grep -A 1 '^\[storage.s3_protocol\]' /tmp/project/supabase/config.toml \
+            | grep -q '^enabled'
       - name: Diff the rest suite against the stack a person gets
         run: |
           cargo run -p zou-conformance -- diff --suite rest \

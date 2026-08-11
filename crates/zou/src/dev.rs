@@ -241,11 +241,20 @@ fn start_http(
     log::info!("service_role key {service}");
     // The S3 endpoint is asked with a pair rather than with either of
     // those keys, so it is printed here next to them, the way a local
-    // project prints all three together.
-    let s3 = crate::config::local_s3();
-    log::info!("s3 access key {}", s3.access);
-    log::info!("s3 secret key {}", s3.secret);
-    log::info!("s3 region {}", s3.region);
+    // project prints all three together. A project that switched the
+    // endpoint off in its own file gets no pair, and then it answers
+    // every signature with the key not being one this project has.
+    let s3 = project
+        .is_none_or(|p| p.s3)
+        .then(crate::config::local_s3)
+        .inspect(|s3| {
+            log::info!("s3 access key {}", s3.access);
+            log::info!("s3 secret key {}", s3.secret);
+            log::info!("s3 region {}", s3.region);
+        });
+    if s3.is_none() {
+        log::info!("the s3 endpoint is off, storage.s3_protocol.enabled is false");
+    }
     let autoconfirm = !matches!(
         std::env::var("ZOU_MAILER_AUTOCONFIRM").as_deref(),
         Ok("false") | Ok("0")
@@ -408,7 +417,7 @@ fn start_http(
             // request that the key is not one this project has, which
             // is a working endpoint that says no to the client a
             // project already has configured.
-            s3: Some(s3),
+            s3,
             // Off by default, the same as GoTrue. Set
             // ZOU_SECURITY_MANUAL_LINKING_ENABLED=true and a signed in
             // person can attach a second provider to the account they

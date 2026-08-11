@@ -387,6 +387,7 @@ const DIRECT: &[&str] = &[
     "db.port",
     "db.seed.enabled",
     "db.seed.sql_paths",
+    "storage.s3_protocol.enabled",
 ];
 
 /// A Supabase project, as far as this server is concerned.
@@ -402,6 +403,10 @@ pub struct Project {
     /// the first is what a request that names no schema gets.
     pub schemas: Vec<String>,
     pub site_url: Option<String>,
+    /// Whether the S3 protocol endpoint answers, which the file calls
+    /// `[storage.s3_protocol] enabled`. On unless the file says
+    /// otherwise, the way the CLI generates it.
+    pub s3: bool,
     /// Settings that become environment variables, in the order they
     /// are listed above.
     pub env: Vec<(String, String)>,
@@ -575,6 +580,13 @@ impl Project {
                 .get("auth.site_url")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            // On unless the file switches it off, which is what a file
+            // that never mentions it means and what the generated one
+            // says.
+            s3: table
+                .get("storage.s3_protocol.enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
             env,
             unread,
             seed,
@@ -925,6 +937,30 @@ port = 54323
         for key in ["api.port", "auth.email.enable_signup", "project_id"] {
             assert!(!p.unread.iter().any(|k| k == key), "{key} is read");
         }
+    }
+
+    #[test]
+    fn the_s3_endpoint_is_on_unless_the_file_turns_it_off() {
+        // What `supabase init` writes, which is the section and the one
+        // key under it.
+        let on = Project::from_table(
+            &parse("[storage.s3_protocol]\nenabled = true\n").unwrap(),
+            &|_| None,
+        );
+        assert!(on.s3);
+        assert!(
+            !on.unread.iter().any(|k| k == "storage.s3_protocol.enabled"),
+            "and it is read rather than named as a setting with no answer"
+        );
+        let off = Project::from_table(
+            &parse("[storage.s3_protocol]\nenabled = false\n").unwrap(),
+            &|_| None,
+        );
+        assert!(!off.s3);
+        assert!(
+            Project::from_table(&parse("project_id = \"demo\"\n").unwrap(), &|_| None).s3,
+            "a file that never mentions it has one"
+        );
     }
 
     #[test]
