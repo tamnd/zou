@@ -34,16 +34,17 @@ A bundle moved anywhere still runs, which is the whole point of shipping one.
 
 The budget is 150 MB for the pair, and the script exits non zero over it, so CI notices the day something doubles.
 
-| | darwin arm64 | linux x64 |
-| zou | 17.3 MB | 18.1 MB |
-| postgres | 16.7 MB | 19.1 MB |
-| the other pg programs | 1.5 MB | 1.8 MB |
-| loadable modules | 7.8 MB | 6.3 MB |
-| share, bki and timezones | 5.3 MB | 5.3 MB |
-| the bundle | 48.6 MB | 50.6 MB |
-| the tarball | 18.0 MB | 19.4 MB |
+| | darwin arm64, laptop | linux x64, vps | linux x64, github runner |
+| zou | 17.3 MB | 18.1 MB | 20.0 MB |
+| postgres | 16.7 MB | 19.1 MB | 19.2 MB |
+| the other pg programs | 1.5 MB | 1.8 MB | 1.8 MB |
+| loadable modules | 7.8 MB | 6.3 MB | 6.3 MB |
+| share, bki and timezones | 5.3 MB | 5.3 MB | 5.3 MB |
+| the bundle | 48.6 MB | 50.6 MB | 52.6 MB |
+| the tarball | 18.0 MB | 19.4 MB | 20.2 MB |
 
-Measured on an apple silicon laptop and on a 6 vCPU vps, both against the vendored Postgres 18.4 with the patch series applied.
+Measured on an apple silicon laptop, on a 6 vCPU vps, and on the runner that builds every postgres build, all three against the vendored Postgres 18.4 with the patch series applied.
+The two linux columns are the same commit and the same rustc, and the rust binary is two megabytes apart between them anyway, which is what a bundle size is: a number about a machine rather than about a program.
 The rust binary is stripped by the release profile; the postgres binaries are stripped by the script, which is a third of the postmaster.
 A third of the whole bundle is timezones, catalog templates, and extension sql, none of which compresses badly, which is why the tarball is roughly a third of the tree.
 
