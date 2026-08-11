@@ -50,6 +50,8 @@ use zou_pg::{bootstrap, restore};
 use zou_store::layout::TenantLayout;
 use zou_store::{Manifest, open_store};
 
+mod template;
+
 /// The role initdb makes and everything else here connects as, which is
 /// the one `zou dev` and `zou serve` use so a store made by one is a
 /// store the others can open.
@@ -148,6 +150,12 @@ pub struct Options {
     pub schemas: Vec<String>,
     /// shared_buffers for the child postmaster.
     pub shared_buffers: Option<String>,
+    /// Cut this database out of the machine's template instead of
+    /// running initdb for it, which is what makes a create milliseconds
+    /// rather than seconds. It lives on the shared template store under
+    /// a tenant of its own and goes away with the handle, so it names
+    /// no target and keeps nothing.
+    pub fixture: bool,
 }
 
 impl Default for Options {
@@ -160,6 +168,7 @@ impl Default for Options {
             jwt_secret: None,
             schemas: Vec::new(),
             shared_buffers: None,
+            fixture: false,
         }
     }
 }
@@ -170,6 +179,25 @@ impl Options {
     /// what a test suite wants and what nothing else does.
     pub fn ephemeral() -> Options {
         Options::default()
+    }
+
+    /// The same thing, cut out of the machine's template.
+    ///
+    /// An ephemeral handle runs initdb against its new store, which is
+    /// seconds: 5 on a fast runner, 30 on a laptop, and it is the whole
+    /// cost of opening one. A fixture branches a database that already
+    /// exists instead, so what is left is the postmaster start.
+    ///
+    /// The template is built once per machine and per postgres build,
+    /// cached under `ZOU_TEMPLATE_CACHE` or `~/.cache/zou/templates`,
+    /// and the first caller on a cold machine pays for it. Fixtures are
+    /// tenants on it, they see nothing of each other, and closing one
+    /// takes it off the store.
+    pub fn fixture() -> Options {
+        Options {
+            fixture: true,
+            ..Options::default()
+        }
     }
 
     /// A store on disk, kept.
@@ -292,7 +320,24 @@ pub struct Zou {
     /// Removed on close only when this handle made it, which is the
     /// ephemeral case.
     owned_store: Option<PathBuf>,
+    /// Taken off the store on close, which is the fixture case: the
+    /// tenant is this handle's and the captures under it are the
+    /// template's.
+    owned_tenant: bool,
     closed: Mutex<bool>,
+}
+
+/// What a database is going to be, worked out before anything has been
+/// made that would have to be unmade.
+struct Cut {
+    target: String,
+    tenant: String,
+    owned_store: Option<PathBuf>,
+    owned_tenant: bool,
+    /// Whether the roles and the auth and storage schemas are already
+    /// in there, which is true of a fixture because the template ran
+    /// the bootstrap before it was published.
+    contracted: bool,
 }
 
 impl Zou {
@@ -304,24 +349,6 @@ impl Zou {
     /// has one is restored into the runtime directory and replayed,
     /// which is what every later open does.
     pub fn open(options: Options) -> Result<Zou, Error> {
-        let nth = OPENED.fetch_add(1, Ordering::Relaxed);
-        let runtime = match &options.runtime {
-            Some(dir) => dir.clone(),
-            None => std::env::temp_dir().join(format!("zou-embed-{}-{nth}", std::process::id())),
-        };
-        fs::create_dir_all(&runtime).map_err(io(format!("create {}", runtime.display())))?;
-
-        // An empty target is the ephemeral case: a store of this
-        // handle's own, under the runtime directory so one cleanup
-        // removes both.
-        let (target, owned_store) = if options.target.is_empty() {
-            let store = runtime.join("store");
-            fs::create_dir_all(&store).map_err(io(format!("create {}", store.display())))?;
-            (store.display().to_string(), Some(store))
-        } else {
-            (options.target.clone(), None)
-        };
-
         let pg_bin = pg_bin(&options);
         let postgres = pg_bin.join("postgres");
         if !postgres.is_file() {
@@ -334,6 +361,86 @@ impl Zou {
             ));
         }
 
+        let nth = OPENED.fetch_add(1, Ordering::Relaxed);
+        let runtime = match &options.runtime {
+            Some(dir) => dir.clone(),
+            None => std::env::temp_dir().join(format!("zou-embed-{}-{nth}", std::process::id())),
+        };
+        fs::create_dir_all(&runtime).map_err(io(format!("create {}", runtime.display())))?;
+
+        let at = std::time::Instant::now();
+        let cut = Zou::cut(&options, &pg_bin, &runtime)?;
+        log::debug!("open: the database exists after {:?}", at.elapsed());
+        // From here there is a tenant, and maybe a store, that a
+        // failure has to take back off rather than leave for the next
+        // run to trip over.
+        match Zou::raise(&options, &pg_bin, &runtime, &cut) {
+            Ok(zou) => Ok(zou),
+            Err(e) => {
+                if cut.owned_tenant {
+                    let _ = template::drop_tenant(&cut.target, &cut.tenant);
+                }
+                let _ = fs::remove_dir_all(&runtime);
+                Err(e)
+            }
+        }
+    }
+
+    /// Where this database is going to live, made if it is not there.
+    ///
+    /// Three cases. A named target is somebody else's store and nothing
+    /// here owns it. An empty one is ephemeral: a store of this
+    /// handle's own, under the runtime directory so one cleanup removes
+    /// both. A fixture is a branch of the machine's template, which is
+    /// the only one of the three that costs nothing.
+    fn cut(options: &Options, pg_bin: &Path, runtime: &Path) -> Result<Cut, Error> {
+        if !options.fixture {
+            let (target, owned_store) = if options.target.is_empty() {
+                let store = runtime.join("store");
+                fs::create_dir_all(&store).map_err(io(format!("create {}", store.display())))?;
+                (store.display().to_string(), Some(store))
+            } else {
+                (options.target.clone(), None)
+            };
+            return Ok(Cut {
+                target,
+                tenant: options.tenant.clone(),
+                owned_store,
+                owned_tenant: false,
+                contracted: false,
+            });
+        }
+
+        if !options.target.is_empty() {
+            return Err(Error::new(
+                Kind::Options,
+                "a fixture is cut out of the machine's template, so it cannot name a store of \
+                 its own, drop the target or drop the fixture flag",
+            ));
+        }
+        let target = template::ensure(pg_bin)?.display().to_string();
+        // Fixtures share the template store, so the default name would
+        // be the same name for every one of them.
+        let tenant = if options.tenant == LOCAL {
+            format!("fixture-{}", random_hex(8)?)
+        } else {
+            options.tenant.clone()
+        };
+        template::cut(&target, &tenant)?;
+        Ok(Cut {
+            target,
+            tenant,
+            owned_store: None,
+            owned_tenant: true,
+            contracted: true,
+        })
+    }
+
+    /// Everything from a database that exists to a handle over it.
+    fn raise(options: &Options, pg_bin: &Path, runtime: &Path, cut: &Cut) -> Result<Zou, Error> {
+        let postgres = pg_bin.join("postgres");
+        let target = cut.target.clone();
+        let tenant = cut.tenant.clone();
         let pgdata = runtime.join("pgdata");
         let pagecache = runtime.join("pagecache");
         let sock = runtime.join("sock");
@@ -343,13 +450,16 @@ impl Zou {
         fs::set_permissions(&sock, fs::Permissions::from_mode(0o700))
             .map_err(io(format!("chmod {}", sock.display())))?;
 
-        if fresh(&target, &options.tenant)? {
-            initdb(&pg_bin, &pgdata, &target, &options.tenant, &pagecache)?;
+        let at = std::time::Instant::now();
+        if fresh(&target, &tenant)? {
+            initdb(pg_bin, &pgdata, &target, &tenant, &pagecache)?;
+            log::debug!("open: initdb in {:?}", at.elapsed());
         } else {
-            restore::restore(&target, &options.tenant, &pgdata)
-                .map_err(|e| Error::new(Kind::Store, e))?;
+            restore::restore(&target, &tenant, &pgdata).map_err(|e| Error::new(Kind::Store, e))?;
+            log::debug!("open: restore in {:?}", at.elapsed());
         }
 
+        let at = std::time::Instant::now();
         let port = free_port()?;
         let pg = start(
             &postgres,
@@ -357,15 +467,18 @@ impl Zou {
             &sock,
             port,
             &target,
-            &options.tenant,
+            &tenant,
             &pagecache,
             options.shared_buffers.as_deref(),
         )?;
         let dsn = format!("host=127.0.0.1 port={port} user={SUPERUSER} dbname=postgres");
+        log::debug!("open: the postmaster is up after {:?}", at.elapsed());
 
         // From here on a failure has a postmaster to take down with it,
         // since nothing is holding one yet.
-        let rest = Zou::assemble(&options, &target, &dsn);
+        let at = std::time::Instant::now();
+        let rest = Zou::assemble(options, &target, &tenant, &dsn, cut.contracted);
+        log::debug!("open: the front door is up after {:?}", at.elapsed());
         let (router, rt, secret, keys) = match rest {
             Ok(built) => built,
             Err(e) => {
@@ -380,12 +493,13 @@ impl Zou {
             pg,
             dsn,
             target,
-            tenant: options.tenant.clone(),
-            pg_bin,
+            tenant,
+            pg_bin: pg_bin.to_path_buf(),
             secret,
             keys,
-            runtime,
-            owned_store,
+            runtime: runtime.to_path_buf(),
+            owned_store: cut.owned_store.clone(),
+            owned_tenant: cut.owned_tenant,
             closed: Mutex::new(false),
         })
     }
@@ -396,7 +510,9 @@ impl Zou {
     fn assemble(
         options: &Options,
         target: &str,
+        tenant: &str,
         dsn: &str,
+        contracted: bool,
     ) -> Result<(Router, tokio::runtime::Runtime, String, Keys), Error> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -409,19 +525,31 @@ impl Zou {
         // request that happens to need them. A host process sets its
         // own schema up over `dsn` as its first act, and `grant select
         // to anon` has to work then.
-        let contract = dsn.to_string();
-        rt.block_on(async move {
-            let (client, connection) = tokio_postgres::connect(&contract, tokio_postgres::NoTls)
-                .await
-                .map_err(pg("connect"))?;
-            let pump = tokio::spawn(connection);
-            let out = zou_server::sql::bootstrap(&client)
-                .await
-                .map_err(pg("the tenant contract"));
-            drop(client);
-            let _ = pump.await;
-            out
-        })?;
+        //
+        // Unless the database was cut from a template, which ran this
+        // before it was published and whose id covers the ddl, so the
+        // answer cannot go stale without the template going with it.
+        // Asking anyway costs 75 ms against the 45 the rest of a create
+        // takes, which is the difference between a fixture per test and
+        // a fixture per suite.
+        if !contracted {
+            let at = std::time::Instant::now();
+            let contract = dsn.to_string();
+            rt.block_on(async move {
+                let (client, connection) =
+                    tokio_postgres::connect(&contract, tokio_postgres::NoTls)
+                        .await
+                        .map_err(pg("connect"))?;
+                let pump = tokio::spawn(connection);
+                let out = zou_server::sql::bootstrap(&client)
+                    .await
+                    .map_err(pg("the tenant contract"));
+                drop(client);
+                let _ = pump.await;
+                out
+            })?;
+            log::debug!("open: the tenant contract in {:?}", at.elapsed());
+        }
 
         let secret = match &options.jwt_secret {
             Some(secret) if !secret.is_empty() => secret.clone(),
@@ -445,7 +573,7 @@ impl Zou {
             // Objects go where the pages go, the same store under the
             // same tenant prefix.
             objects: Some(target.to_string()),
-            tenant: Some(options.tenant.clone()),
+            tenant: Some(tenant.to_string()),
             // Nothing carries mail out of a host process unless the
             // host wired one up, so a signup that had to wait for a
             // link would wait forever.
@@ -565,6 +693,10 @@ impl Zou {
             jwt_secret: Some(self.secret.clone()),
             schemas: Vec::new(),
             shared_buffers: None,
+            // The child names the store the parent is on, which is the
+            // template store when the parent is a fixture, so there is
+            // nothing left for the template path to do.
+            fixture: false,
         })
     }
 
@@ -657,6 +789,14 @@ impl Zou {
         let _ = fs::remove_dir_all(&self.runtime);
         if let Some(store) = &self.owned_store {
             let _ = fs::remove_dir_all(store);
+        }
+        // A fixture is a tenant on a store somebody else is also using,
+        // so what goes is the tenant. The captures it read out of are
+        // the template's and stay where they are.
+        if self.owned_tenant
+            && let Err(e) = template::drop_tenant(&self.target, &self.tenant)
+        {
+            log::warn!("dropping the fixture {}: {e}", self.tenant);
         }
         stopped
     }
@@ -826,8 +966,13 @@ fn free_port() -> Result<u16, Error> {
 }
 
 fn random_secret() -> Result<String, Error> {
-    let mut raw = [0u8; 32];
-    getrandom::fill(&mut raw).map_err(|e| Error::new(Kind::Io, format!("random secret: {e}")))?;
+    random_hex(32)
+}
+
+/// `bytes` random bytes, written out as hex.
+fn random_hex(bytes: usize) -> Result<String, Error> {
+    let mut raw = vec![0u8; bytes];
+    getrandom::fill(&mut raw).map_err(|e| Error::new(Kind::Io, format!("random bytes: {e}")))?;
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
 }
 

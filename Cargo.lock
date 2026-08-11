@@ -2792,6 +2792,7 @@ name = "zou-embed"
 version = "0.0.1"
 dependencies = [
  "axum",
+ "env_logger",
  "getrandom 0.3.4",
  "libc",
  "log",

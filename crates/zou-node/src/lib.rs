@@ -46,6 +46,10 @@ pub struct ZouOptions {
     pub jwt_secret: Option<String>,
     pub schemas: Option<Vec<String>>,
     pub shared_buffers: Option<String>,
+    /// Cut this database out of the machine's template instead of
+    /// making one, which is milliseconds rather than seconds and is
+    /// what a fixture per test needs.
+    pub fixture: Option<bool>,
 }
 
 impl From<ZouOptions> for zou_embed::Options {
@@ -64,6 +68,7 @@ impl From<ZouOptions> for zou_embed::Options {
         out.jwt_secret = options.jwt_secret;
         out.schemas = options.schemas.unwrap_or_default();
         out.shared_buffers = options.shared_buffers;
+        out.fixture = options.fixture.unwrap_or(false);
         out
     }
 }

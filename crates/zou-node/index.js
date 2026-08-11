@@ -22,6 +22,8 @@ const ORIGIN = "http://zou.embedded";
  * `{ dir }` is a directory of objects, `{ url }` a bucket or a sqlite
  * file or a .zou file, and nothing at all is ephemeral: a store of this
  * handle's own that goes away when it closes.
+ *
+ * `{ fixture: true }` is the fast one. See `createFixture`.
  */
 async function createZou(options = {}) {
   const target = options.dir ?? options.url ?? options.target ?? "";
@@ -36,8 +38,26 @@ async function createZou(options = {}) {
     jwtSecret: options.jwtSecret,
     schemas: options.schemas,
     sharedBuffers: options.sharedBuffers,
+    fixture: options.fixture,
   });
   return new Zou(handle);
+}
+
+/**
+ * A database per test, in the time a test can afford.
+ *
+ * An ephemeral project runs initdb, which is seconds. This branches a
+ * template the machine already built instead, so what is left is the
+ * postmaster start and it is tens of milliseconds. The first call on a
+ * cold machine builds the template and pays the initdb once, and
+ * `ZOU_TEMPLATE_CACHE` says where it goes if a CI job wants to cache
+ * the directory.
+ *
+ * Fixtures see nothing of each other and closing one takes it off the
+ * store, so a `beforeEach` and an `afterEach` is the whole story.
+ */
+async function createFixture(options = {}) {
+  return createZou({ ...options, fixture: true });
 }
 
 /** One open project. */
@@ -188,4 +208,5 @@ function supabaseJs() {
 }
 
 exports.createZou = createZou;
+exports.createFixture = createFixture;
 exports.Zou = Zou;

@@ -357,6 +357,24 @@ pub async fn bootstrap(client: &Client) -> Result<(), tokio_postgres::Error> {
     ensure_foreign_schema(client, "storage.objects", &[STORAGE_SCHEMA, STORAGE_GRANTS]).await
 }
 
+/// The ddl [`bootstrap`] would apply, as one number.
+///
+/// A database that has been bootstrapped once does not need it again,
+/// and something that caches such a database has to know when the ddl
+/// under it has moved on. The version string will not do: the auth
+/// schema changes between releases more often than the version does.
+/// This is what changed, said cheaply enough to ask on every open.
+pub fn contract_version() -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in [BOOTSTRAP, AUTH_SCHEMA, STORAGE_SCHEMA, STORAGE_GRANTS] {
+        for byte in part.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    hash
+}
+
 async fn ensure_foreign_schema(
     client: &Client,
     marker: &str,

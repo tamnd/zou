@@ -37,6 +37,16 @@ fn options() -> Option<Options> {
     })
 }
 
+/// The same thing branched off the machine's template, for a test that
+/// wants a database rather than a store made from nothing. Seconds
+/// cheaper each, once the template is there.
+fn fixture() -> Option<Options> {
+    pg_bin().map(|pg_bin| Options {
+        pg_bin,
+        ..Options::fixture()
+    })
+}
+
 /// Somewhere for a test that needs a store that outlives one handle.
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zou-embed-{name}-{}", std::process::id()));
@@ -69,7 +79,7 @@ fn body(answer: &zou_embed::Response) -> String {
 
 #[test]
 fn a_project_answers_in_process_and_still_checks_who_is_asking() {
-    let Some(options) = options() else { return };
+    let Some(options) = fixture() else { return };
     let zou = Zou::open(options).expect("open");
     sql(
         &zou,
@@ -108,7 +118,7 @@ fn a_project_answers_in_process_and_still_checks_who_is_asking() {
 
 #[test]
 fn the_same_project_is_reachable_over_a_port_as_well() {
-    let Some(options) = options() else { return };
+    let Some(options) = fixture() else { return };
     let zou = Zou::open(options).expect("open");
     sql(
         &zou,
@@ -287,6 +297,124 @@ fn what_the_parent_committed_is_on_the_store_before_the_branch_is_cut() {
     assert!(body(&answer).contains("\"id\":11"), "{}", body(&answer));
     again.close().expect("close");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_fixture_is_branched_off_the_template_rather_than_made() {
+    let Some(pg_bin) = pg_bin() else { return };
+    // The first one on a cold machine builds the template, which is the
+    // initdb every other one is not paying for.
+    let built = std::time::Instant::now();
+    let first = Zou::open(Options {
+        pg_bin: pg_bin.clone(),
+        ..Options::fixture()
+    })
+    .expect("open a fixture");
+    eprintln!("the first fixture took {:?}", built.elapsed());
+
+    let cut = std::time::Instant::now();
+    let second = Zou::open(Options {
+        pg_bin,
+        ..Options::fixture()
+    })
+    .expect("open a second fixture");
+    eprintln!("the second took {:?}", cut.elapsed());
+
+    // The template folded before it was published, so a fixture starts
+    // life with something a child could read inherited pages out of.
+    // An ephemeral project has to be written to for a while first, and
+    // that difference is the point of the template.
+    assert!(
+        first.branchable().expect("asking is cheap"),
+        "a fixture can be branched the moment it is cut"
+    );
+
+    // Same store, two databases, and neither of them is the template.
+    assert_eq!(first.target(), second.target(), "one template per machine");
+    assert_ne!(first.tenant(), second.tenant());
+    assert!(first.tenant().starts_with("fixture-"), "{}", first.tenant());
+
+    // What says it was branched rather than initdb'd, which is the
+    // whole point and is not a thing a stopwatch can prove on a loaded
+    // machine.
+    let store = zou_store::open_store(first.target()).expect("store");
+    let key = zou_store::layout::TenantLayout::new(first.tenant()).manifest();
+    let (data, _) = store
+        .get(&key)
+        .expect("store")
+        .expect("the fixture is on the store");
+    let manifest = zou_store::Manifest::from_json(&data).expect("manifest");
+    let parent = manifest.branch_of.expect("a fixture has a parent");
+    assert_eq!(parent.tenant_ref, "template");
+
+    // Two databases, not two views of one.
+    sql(
+        &first,
+        "create table public.mine (id int primary key);
+         insert into public.mine values (1);
+         grant select on public.mine to anon;",
+    );
+    let answer = first
+        .request(
+            "GET",
+            "/rest/v1/mine",
+            &[("apikey", first.keys().anon.as_str())],
+            b"",
+        )
+        .expect("request");
+    assert_eq!(answer.status, 200, "{}", body(&answer));
+    assert!(body(&answer).contains("\"id\":1"), "{}", body(&answer));
+    let elsewhere = second
+        .request(
+            "GET",
+            "/rest/v1/mine",
+            &[("apikey", second.keys().anon.as_str())],
+            b"",
+        )
+        .expect("request");
+    assert_eq!(
+        elsewhere.status,
+        404,
+        "the other fixture has no such table, {}",
+        body(&elsewhere)
+    );
+
+    // And closing takes the tenant off the store, leaving the template
+    // it was cut from where it was.
+    let target = first.target().to_string();
+    let tenant = first.tenant().to_string();
+    first.close().expect("close");
+    second.close().expect("close");
+    let store = zou_store::open_store(&target).expect("store");
+    assert!(
+        store
+            .get(&zou_store::layout::TenantLayout::new(&tenant).manifest())
+            .expect("store")
+            .is_none(),
+        "the fixture is gone"
+    );
+    assert!(
+        store
+            .get(&zou_store::layout::TenantLayout::new("template").manifest())
+            .expect("store")
+            .is_some(),
+        "the template is not"
+    );
+}
+
+#[test]
+fn a_fixture_and_a_store_are_two_answers_to_the_same_question() {
+    let Some(pg_bin) = pg_bin() else { return };
+    let opened = Zou::open(Options {
+        pg_bin,
+        target: "/tmp/somewhere".to_string(),
+        ..Options::fixture()
+    });
+    let Err(e) = opened else {
+        panic!("a fixture lives on the template store, it cannot name another");
+    };
+    assert_eq!(e.kind, zou_embed::Kind::Options);
+    assert!(e.message.contains("cannot name a store"), "{}", e.message);
 }
 
 #[test]

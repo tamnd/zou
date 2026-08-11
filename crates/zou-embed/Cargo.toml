@@ -24,6 +24,7 @@ libc = { workspace = true }
 
 [dev-dependencies]
 zou-store = { path = "../zou-store" }
+env_logger = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 

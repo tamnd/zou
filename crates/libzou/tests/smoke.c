@@ -3,7 +3,9 @@
  * Open an ephemeral project, ask it something over the in process door
  * with the anon key, ask again without one, put it on a port too, take
  * a checkpoint, ask about branching and do it or read the refusal, then
- * close. Anything unexpected prints what went wrong and exits nonzero.
+ * close. Then the same thing as a fixture, which is the fast way to a
+ * database. Anything unexpected prints what went wrong and exits
+ * nonzero.
  *
  * Build and run it with crates/libzou/tests/smoke.sh, which needs the
  * patched postgres in ZOU_PG_BIN.
@@ -149,6 +151,32 @@ int main(void) {
     ok(zou_close(NULL) == ZOU_OK, "and closing nothing is nothing");
 
     ok(zou_close(handle) == ZOU_OK, "closing takes postgres with it");
+
+    /* And the fast way to the same thing: a database branched off the
+     * machine's template rather than made. The one above ran initdb and
+     * took seconds; this one is a manifest write and a postmaster. It
+     * is last because the first one on a cold machine builds the
+     * template, and by here everything else has already been said. */
+    {
+        zou_options *fast = zou_options_new();
+        ok(zou_options_set(fast, "fixture", "1") == ZOU_OK, "a fixture is asked for by name");
+        if (pg_bin != NULL) {
+            zou_options_set(fast, "pg_bin", pg_bin);
+        }
+        zou *fixture = NULL;
+        rc = zou_open(fast, &fixture);
+        ok(rc == ZOU_OK, "a fixture opens");
+        if (rc == ZOU_OK) {
+            ok(strncmp(zou_tenant(fixture), "fixture-", 8) == 0, "under a name of its own");
+            int branchable = 0;
+            ok(zou_branchable(fixture, &branchable) == ZOU_OK && branchable == 1,
+               "and branchable already, the template folded");
+        } else {
+            printf("     %s\n", zou_last_error());
+        }
+        ok(zou_close(fixture) == ZOU_OK, "and closes like any other");
+        zou_options_free(fast);
+    }
 
     if (failures > 0) {
         printf("\n%d failed\n", failures);

@@ -173,7 +173,9 @@ pub unsafe extern "C" fn zou_options_free(options: *mut ZouOptions) {
 ///
 /// The names are the fields of `zou_embed::Options`: `target`,
 /// `tenant`, `pg_bin`, `runtime`, `jwt_secret`, `schemas` (comma
-/// separated, first one the default), and `shared_buffers`.
+/// separated, first one the default), `shared_buffers`, and `fixture`
+/// (`1` or `true` for a database cut out of the machine's template
+/// rather than made).
 ///
 /// One setter rather than seven exports, because the set of things
 /// worth configuring will grow and a name is cheaper to add than a
@@ -211,6 +213,7 @@ pub unsafe extern "C" fn zou_options_set(
                     .collect();
             }
             "shared_buffers" => options.0.shared_buffers = Some(value.to_string()),
+            "fixture" => options.0.fixture = matches!(value, "1" | "true" | "yes" | "on"),
             other => {
                 return Err((
                     ZOU_ERR_OPTIONS,
