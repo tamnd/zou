@@ -273,6 +273,15 @@ ZOU_PG_BIN=$PWD/build/pg/bin python3 -m unittest discover -s crates/zou-python/t
 `build.sh` is cargo plus a copy, the same as node's, and maturin builds the wheel.
 The tests open real projects, skip the supabase-py one when supabase-py is not installed, and run in CI on the job that builds the patched Postgres.
 
+A project that never built anything installs the pair instead:
+
+```bash
+pip install zou zou-postgres
+```
+
+`zou` is the extension module and `zou-postgres` is the patched Postgres as a wheel per platform, and the binding looks for a postmaster in `pg_bin`, then `ZOU_PG_BIN`, then that package, so both installed means `create_fixture()` with nothing to configure.
+The details of the two wheels and what their platform tags exclude are in [docs/packaging.md](packaging.md).
+
 ## From Go
 
 ```go

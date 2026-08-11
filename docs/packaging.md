@@ -94,4 +94,34 @@ That is the answer to the question the embedded packages have had open since the
 
 CI proves the postinstall against a bundle it just built, served over localhost with a checksum beside it, since there is no published release to test against yet and a postinstall nobody has run is a postinstall that does not work.
 
-Still to come in this section: PyPI, brew, and a docker image, all of which want this same tree.
+## From PyPI
+
+```bash
+pip install zou zou-postgres
+```
+
+Two wheels, because they are two different things that happen to be needed together.
+
+`zou` is the [embedded binding](embedded.md), a PyO3 extension module and the python next to it, built by maturin.
+It is abi3, so one wheel per platform covers 3.9 and everything after it, and it contains no postgres at all, which is why it builds in a manylinux container and installs anywhere.
+
+`zou-postgres` is the patched Postgres, the same tree the tarball ships, as a wheel per platform.
+That is what `zou-cli` is for node, and the binding asks for `pg_bin`, then `ZOU_PG_BIN`, then this package, so a project that installed both has a database per test with nothing to configure and nothing to point anywhere.
+
+```python
+import zou_postgres
+
+zou_postgres.pg_bin()   # .../site-packages/zou_postgres/pg/bin
+```
+
+It is a wheel of binaries rather than of python, so the tag has to be honest about what they need.
+On linux that is the glibc of the machine that built them, since the bundle takes openssl and icu from the distribution: saying `manylinux_2_28` on something built against 2.39 is a claim pip has no way to check and a user finds out about at import time.
+On mac it is the macos of the machine that built them, because the bundle carries homebrew's openssl and lz4 and zstd and a bottle is built for the release it was poured on.
+Older machines than the ones the release builds on are not served by a wheel, and have the tarball or a checkout.
+
+`packaging/pypi/zou-postgres/build.sh` turns a bundle into that wheel, and a tag builds both wheels for all four unix platforms, uploads them to the release, and pushes them to PyPI when there is a `PYPI_TOKEN`.
+One account token rather than a project one, since it publishes two projects.
+
+CI installs both wheels into a venv with no `ZOU_PG_BIN` and no checkout on the path, and runs the python suite against them, because a wheel that nobody has installed is a wheel that does not work.
+
+Still to come in this section: brew and a docker image, both of which want this same tree.

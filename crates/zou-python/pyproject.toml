@@ -33,6 +33,10 @@ classifiers = [
 # and one that wants a client asks for it by name.
 [project.optional-dependencies]
 client = ["supabase>=2", "httpx>=0.27"]
+# The patched postgres this starts, as a wheel, for a project that has
+# never built anything. `pip install zou[postgres]` and there is nothing
+# to point at anything.
+postgres = ["zou-postgres"]
 
 [project.urls]
 Homepage = "https://github.com/tamnd/zou"
