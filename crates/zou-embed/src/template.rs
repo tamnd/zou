@@ -17,8 +17,10 @@
 //! and checkpoints until a fold has packed a full capture down, and
 //! refuses to publish a template that would not serve.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zou_store::layout::TenantLayout;
@@ -97,7 +99,7 @@ pub(crate) fn ensure(pg_bin: &Path) -> Result<PathBuf, Error> {
     let root = cache_root();
     let dir = root.join(identity(pg_bin)?);
     if dir.join(READY).is_file() {
-        return Ok(dir.join("store"));
+        return Ok(scratch(dir.join("store")));
     }
     fs::create_dir_all(&root).map_err(io(format!("create {}", root.display())))?;
 
@@ -113,14 +115,14 @@ pub(crate) fn ensure(pg_bin: &Path) -> Result<PathBuf, Error> {
                 let built = build(pg_bin, &dir);
                 let _ = fs::remove_file(&lock);
                 built?;
-                return Ok(dir.join("store"));
+                return Ok(scratch(dir.join("store")));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Somebody else is building it, or somebody else died
                 // building it. Both look the same from here, and the
                 // difference is how old the lock is.
                 if dir.join(READY).is_file() {
-                    return Ok(dir.join("store"));
+                    return Ok(scratch(dir.join("store")));
                 }
                 if stale(&lock) {
                     let _ = fs::remove_file(&lock);
@@ -141,6 +143,30 @@ pub(crate) fn ensure(pg_bin: &Path) -> Result<PathBuf, Error> {
             Err(e) => return Err(io(format!("lock {}", lock.display()))(e)),
         }
     }
+}
+
+/// Say once that the template store is disposable, and hand the path
+/// back.
+///
+/// Everything under it is either the template, which is rebuilt from
+/// nothing when it is not there, or a fixture, which is dropped by the
+/// handle that made it. Neither is worth an fsync per put, and the fsync
+/// is about 14 ms of a create. The template's own build is durable: this
+/// runs after the build has been published, never during it, so a
+/// machine that loses power mid build loses a `building-*` directory
+/// rather than a template that is half a database.
+///
+/// A template built by an older version gets the marker the first time
+/// it is opened by this one, which is why this is not only done at build
+/// time.
+fn scratch(store: PathBuf) -> PathBuf {
+    if !store.join(zou_store::cas::SCRATCH_MARKER).exists() {
+        // Best effort. A read only cache directory is somebody else's
+        // decision, and a template that fsyncs is slower rather than
+        // broken.
+        let _ = zou_store::cas::LocalFsStore::mark_scratch(&store);
+    }
+    store
 }
 
 /// A lock older than a build could plausibly be is a lock over a build
@@ -343,6 +369,17 @@ pub(crate) fn servable(target: &str, tenant: &str) -> Result<bool, Error> {
         .map_err(|e| Error::new(Kind::Store, e))
 }
 
+/// Templates this process has already branched once and read back.
+///
+/// A published template never changes again, so whether a branch of it
+/// serves is a fact about the template rather than about the branch, and
+/// checking it costs one store get per checkpoint in the chain: about
+/// 3.5 ms of a create. Checking it on the first cut catches the case the
+/// check is there for, a template somebody else built badly or a cache
+/// directory that has been half deleted, and every fixture after that in
+/// the same process inherits the answer.
+static PROVEN: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
 /// Cut a fixture out of the template.
 ///
 /// This is the whole create: a manifest that names the template's
@@ -355,8 +392,20 @@ pub(crate) fn cut(target: &str, tenant: &str) -> Result<(), Error> {
         .as_secs();
     let manifest = zou_store::branch(&*store, TEMPLATE, tenant, None, now)
         .map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+    let proven = PROVEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(target);
+    if proven {
+        return Ok(());
+    }
     zou_pg::branching::refuse_unservable(&*store, TEMPLATE, tenant, &manifest)
-        .map_err(|e| Error::new(Kind::Store, e))
+        .map_err(|e| Error::new(Kind::Store, e))?;
+    PROVEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(target.to_string());
+    Ok(())
 }
 
 /// Take a fixture off the store again.

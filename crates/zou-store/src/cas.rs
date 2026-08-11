@@ -170,11 +170,60 @@ pub trait CasStore: Send + Sync {
 /// link instead, which fails against whatever is at the key when it runs.
 pub struct LocalFsStore {
     root: PathBuf,
+    /// Whether a write waits for the disk before it says it landed.
+    ///
+    /// True everywhere except a store that carries the scratch marker,
+    /// see [`SCRATCH_MARKER`].
+    durable: bool,
 }
+
+/// A file at the root of a store that says its contents are disposable.
+///
+/// A durable write is a write plus a wait for the platter, which on a
+/// mac is F_FULLFSYNC and is the single most expensive thing in a small
+/// put: about 14 ms of a 47 ms fixture database create. That is the
+/// right price for a database somebody will come back to, and the wrong
+/// price for one that exists for the length of a test run and is deleted
+/// by the handle that made it. A store with this file in it skips the
+/// wait, so a crash can lose or tear its most recent writes.
+///
+/// It is a file rather than an environment variable because durability
+/// is a property of the store, not of the process: one test process can
+/// hold a fixture and a real project at the same time, and only the
+/// fixture is throwaway. Nothing writes this on its own except the
+/// embedded template cache, which writes it after the template is built
+/// and fsynced, so what the marker covers is the fixtures cut from it
+/// rather than the template they read.
+pub const SCRATCH_MARKER: &str = ".zou-scratch";
 
 impl LocalFsStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        let root = root.into();
+        let durable = !root.join(SCRATCH_MARKER).exists();
+        Self { root, durable }
+    }
+
+    /// Say that the store at `root` is scratch. Stores opened on it after
+    /// this stop fsyncing, see [`SCRATCH_MARKER`].
+    pub fn mark_scratch(root: &Path) -> std::io::Result<()> {
+        fs::create_dir_all(root)?;
+        fs::write(
+            root.join(SCRATCH_MARKER),
+            b"This store is disposable, so writes to it are not fsynced.\n",
+        )
+    }
+
+    /// Whether this store waits for the disk. Public for the tests that
+    /// check the marker is read where it is written.
+    pub fn is_durable(&self) -> bool {
+        self.durable
+    }
+
+    fn sync(&self, key: &str, f: &fs::File) -> Result<(), CasError> {
+        if self.durable {
+            f.sync_all().map_err(|e| Self::io(key, e))?;
+        }
+        Ok(())
     }
 
     fn path_for(&self, key: &str) -> PathBuf {
@@ -208,7 +257,7 @@ impl LocalFsStore {
         let tmp = unique_tmp(path);
         let mut f = fs::File::create(&tmp).map_err(|e| Self::io(key, e))?;
         f.write_all(data).map_err(|e| Self::io(key, e))?;
-        f.sync_all().map_err(|e| Self::io(key, e))?;
+        self.sync(key, &f)?;
         drop(f);
         let linked = fs::hard_link(&tmp, path);
         let _ = fs::remove_file(&tmp);
@@ -505,7 +554,7 @@ impl CasStore for LocalFsStore {
         let tmp = unique_tmp(&path);
         let mut f = fs::File::create(&tmp).map_err(|e| Self::io(key, e))?;
         f.write_all(data).map_err(|e| Self::io(key, e))?;
-        f.sync_all().map_err(|e| Self::io(key, e))?;
+        self.sync(key, &f)?;
         drop(f);
         // Whoever broke this lock has been through the key since the
         // read above, so the compare it passed says nothing any more and
@@ -536,7 +585,7 @@ impl CasStore for LocalFsStore {
         let tmp = unique_tmp(&path);
         let mut f = fs::File::create(&tmp).map_err(|e| Self::io(key, e))?;
         f.write_all(data).map_err(|e| Self::io(key, e))?;
-        f.sync_all().map_err(|e| Self::io(key, e))?;
+        self.sync(key, &f)?;
         drop(f);
         #[cfg(windows)]
         if path.exists() {
@@ -579,6 +628,7 @@ impl CasStore for LocalFsStore {
                 if name.ends_with(".lock")
                     || name.ends_with(".lock-break")
                     || name.ends_with(".tmp")
+                    || name == SCRATCH_MARKER
                 {
                     continue;
                 }
@@ -681,6 +731,35 @@ mod tests {
         }
         assert_eq!(store.get("seq").unwrap().unwrap().0, b"the seal");
         drop(frozen);
+    }
+
+    /// The marker is a property of the directory, so a store opened on a
+    /// marked one is scratch and a store opened on the directory next to
+    /// it is not, in the same process.
+    #[test]
+    fn the_scratch_marker_turns_the_fsync_off_for_that_store_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join("throwaway");
+        let kept = dir.path().join("kept");
+        LocalFsStore::mark_scratch(&scratch).expect("mark");
+        fs::create_dir_all(&kept).expect("create");
+
+        let scratch = LocalFsStore::new(&scratch);
+        let kept = LocalFsStore::new(&kept);
+        assert!(!scratch.is_durable());
+        assert!(kept.is_durable());
+
+        // Writes still work and still read back, they just do not wait
+        // for the platter.
+        scratch.put("a/b", b"one").unwrap();
+        scratch.put_if_match("c", b"two", None).unwrap();
+        scratch.put_if_absent("d", b"three").unwrap();
+        assert_eq!(scratch.get("a/b").unwrap().unwrap().0, b"one");
+        assert_eq!(scratch.get("c").unwrap().unwrap().0, b"two");
+        assert_eq!(scratch.get("d").unwrap().unwrap().0, b"three");
+        // And the marker is not an object, so nothing walking the store
+        // has to know about it.
+        assert_eq!(scratch.list("").unwrap(), vec!["a/b", "c", "d"]);
     }
 
     /// The same freeze against a conditional write, where the compare
