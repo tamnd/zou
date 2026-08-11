@@ -120,6 +120,8 @@ A branch reads inherited pages out of the captures it names and has no fallback 
 A database young enough that no fold has packed a full page capture down yet cannot be branched, and `branch` says so and leaves nothing of the child on the store, rather than handing back something only shaped like a database that would fail on its first page read.
 `branchable()` asks the same question in advance, for a host that wants to know whether to offer the button.
 
+The same branches from the command line, from a point in time, and per pull request are in [branching.md](branching.md).
+
 ## Closing
 
 `close` stops Postgres and removes the running copy, and reports whether that went cleanly.

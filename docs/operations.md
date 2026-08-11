@@ -223,7 +223,7 @@ A checkpoint fold supersedes the chain under it, a fold that failed leaves captu
     zou gc s3://bucket/fleet --retention 7d --window 24h
 
 Two numbers are the whole policy and they are promises to different people.
-`--retention` is how far back point in time recovery reaches, a week by default: a manifest snapshot younger than it keeps everything it references alive, so it is what a customer asking to be restored to last Tuesday is relying on.
+`--retention` is how far back point in time recovery reaches, a week by default: a manifest snapshot younger than it keeps everything it references alive, so it is what a customer asking to be restored to last Tuesday is relying on, and it is the same window `zou branch --from-time` can reach into, see [branching.md](branching.md).
 `--window` is how long a key that looks like garbage waits before it is deleted, a day by default: it is a promise to whoever is mid publish, and it has to be longer than the longest fold upload and the longest gap between reading a manifest and publishing a branch from it.
 
 Deleting anything takes two runs whatever the numbers say.
