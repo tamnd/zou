@@ -44,6 +44,7 @@ pub mod reader;
 pub mod redo;
 pub mod restore;
 pub mod walscan;
+pub mod warm;
 
 /// A real shard sequencer over any store for the writer side of tests:
 /// the same take_over plus resume wiring open_wal_pipe does, minus the

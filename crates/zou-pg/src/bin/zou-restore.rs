@@ -16,7 +16,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use zou_pg::restore::{restore, restore_at};
+use zou_pg::restore::{RestoreStats, restore, restore_at};
+use zou_pg::warm;
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().collect();
@@ -59,11 +60,38 @@ fn main() -> ExitCode {
                 "restored {} files and {} empty dirs, overlaid {} WAL chunks ({} bytes) ending at {:#X}",
                 stats.files, stats.dirs, stats.wal_records, stats.wal_bytes, stats.wal_end
             );
+            warm_pages(store_root, tenant, Path::new(pgdata), &stats);
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("zou-restore: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Pull the pages recovery will fault into the page cache the server is
+/// about to be started with, which only makes sense when the caller
+/// named one. Best effort: everything that goes wrong here costs the
+/// round trips it would have saved and nothing else.
+fn warm_pages(store_root: &str, tenant: &str, pgdata: &Path, stats: &RestoreStats) {
+    let Some(cache) = std::env::var_os("ZOU_PAGE_CACHE").filter(|v| !v.is_empty()) else {
+        return;
+    };
+    match warm::warm(store_root, tenant, pgdata, Path::new(&cache), stats) {
+        Ok(w) if w.wanted == 0 => {}
+        Ok(w) => println!(
+            "warmed {} of {} pages and {} fork sizes ({} bytes){}",
+            w.fetched,
+            w.wanted,
+            w.forks,
+            w.bytes,
+            if w.capped {
+                ", fault list truncated at ZOU_WARM_BLOCKS"
+            } else {
+                ""
+            }
+        ),
+        Err(e) => eprintln!("zou-restore: warm up skipped, {e}"),
     }
 }

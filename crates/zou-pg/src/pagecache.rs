@@ -99,7 +99,9 @@ impl PageCache {
         Some(PageCache { dir: dir.into() })
     }
 
-    #[cfg(test)]
+    /// A cache at a directory the caller names, for a process that is
+    /// not the postgres the variable was set for: the warm up runs
+    /// before the postmaster exists and fills the cache it will read.
     pub fn at(dir: &Path) -> PageCache {
         PageCache { dir: dir.into() }
     }

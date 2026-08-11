@@ -73,9 +73,10 @@ The two steady rows are the same node and the same hundred tenants measured with
 Thirty seconds is not long enough to attach a hundred tenants at 16 clients, so that row reports the attach storm, with the node itself confirming all 100 attaches happened inside the measured window at a 6.2 s mean.
 Ten minutes of warmup is, and then the node answers every request the scenario asks for with none dropped.
 
-Churn is the honest cost of eager attach.
+Churn is the honest cost of attach.
 Drawing uniformly from a thousand with room for a hundred, nearly every request pays an attach plus the eviction that makes room for it, and the node turned over 1758 attaches in 300 s at a 7.3 s mean while holding the gauge at 100.
-Attach hydrates before serving the first row rather than faulting pages in on demand, and lazy hydrate belongs to the storage v2 redesign, so until that lands the sizing rule is to keep the attached ceiling above the working set.
+These tenants are idle at eviction, so their attach is a restore and not a recovery, and the warm up added since this run has nothing to fetch on that path.
+The sizing rule is still to keep the attached ceiling above the working set, because an attach is round trips whatever fills them.
 
 Memory holds flat.
 Peak RSS across the whole process tree is 15.7 GB over up to 1028 processes, median 13.6 GB, and across thirty minutes covering warmup, steady, idle and a churn window that attached seventeen hundred times the slope points slightly down, so about 140 MB per attached tenant and no drift.
@@ -114,10 +115,32 @@ Warm lookups are 601 ns because they never leave the process, which is what puts
 What this does not measure is a node serving a hundred thousand, because attaching is what serving costs and that is the thousand tenant run above.
 It also runs against MinIO on the same box, so the round trips are a loopback and a real S3 will be slower in the same shape.
 
+## Attaching a tenant that crashed
+
+Apple silicon laptop, 2026-08-11, `scripts/zou-cold-attach.sh`, a local store with `ZOU_STORE_SIM=s3-standard` in front of it so a get costs about 33 ms.
+pgbench scale 25, a checkpoint, twenty seconds of load at four clients, then the postmaster killed with a nine.
+Every attach starts from a fresh copy of the same store, because an attach is a write and a second one on the same store replays nothing.
+
+| pool | warm up | restore | recovery to ready | attach | redo | pages redo read from the store |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32MB | off | 3.92 s | 1099.60 s | 1103.52 s | 939.76 s | 10,586 |
+| 32MB | on | 25.63 s | 391.82 s | 417.45 s | 246.70 s | 14 |
+| 256MB | off | 3.67 s | 1518.77 s | 1522.44 s | 939.50 s | 10,586 |
+| 256MB | on | 25.41 s | 589.08 s | 614.48 s | 5.09 s | 14 |
+
+Restore is under four seconds because it does not download the database, and everything after it is crash recovery, which reads one page per record it replays and takes each of those round trips alone.
+That is why redo is the same 939 s at either pool size when the warm up is off: it is not a memory problem, it is ten and a half thousand requests with never more than one in flight.
+The warm up reads the WAL tail the restore just wrote, takes the pages redo is about to touch out of it, and fetches them in parallel, 10,584 pages and 17 fork sizes in about twenty one seconds, after which redo reads local files and does 14 store reads for the rest of its run.
+
+What is left is the write half.
+The last row is still ten minutes to ready and 583 s of it is the end of recovery checkpoint putting 10,743 dirtied pages back one at a time, which is why the smaller pool finishes sooner: it evicts during redo instead, where the same puts are partly batched, and its checkpoint writes 2,698 buffers in 145 s.
+That path belongs to the storage redesign and not to attach.
+
 ## Pending
 
 - The same registry walk at a million entries and against real S3, which is the NFR-20 number rather than its smoke.
-- Lazy hydrate, then a fleet rerun, since the churn tail above is entirely eager attach.
+- A fleet rerun with a crashed tenant in the mix, since the churn above only ever attaches a cleanly stopped one and never pays for recovery.
+- The write half of a cold attach, since with the pages warmed the end of recovery checkpoint puts them back one at a time.
 - Real S3 and S3 Express One Zone runs from an in region box, plus GCS and R2.
 - Concurrent producer runs to show batching amortization.
 - MinIO rerun on the storage v2 layout once it exists, the v1 rerun above showed the fold cost is structural.

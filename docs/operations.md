@@ -152,9 +152,15 @@ A postmaster that has not gone within five seconds is asked for an immediate shu
 
 SIGINT or SIGTERM stops every attached tenant with a fast shutdown and removes the tree; no data waits on that, since an acked write is durable on the store by definition.
 
-Attach is eager today.
-Restoring a tenant writes its whole capture back to disk before the postmaster starts, so cold attach costs the size of the database and not the size of the working set, and a node's density and its p99 on a cold request should be measured with that said rather than assumed away.
-Lazy hydrate, where a page arrives when it is faulted, is the storage engine's work and not this command's.
+Attach does not download the database.
+A restore writes back a skeleton, the control file and the configuration and the WAL tail, and every relation page stays a store object until something reads it, so the size of the database is not what a cold attach costs.
+What it costs is crash recovery, and recovery is a single process that reads one page per record it replays, so against a store thirty milliseconds away the bill is round trips.
+That is why a restore is followed by a warm up: the WAL tail names the pages redo is about to change, so they are fetched in parallel into the tenant's page cache before the postmaster is started, and redo then reads them off local disk.
+`scripts/zou-cold-attach.sh` is the measurement, on a simulated S3 with a pgbench database and a killed postmaster.
+Redo went from 939.76 s to 246.70 s and the attach from 1103.52 s to 417.45 s at the 32MB pool a packed node gives a tenant, and with a pool that holds what recovery touches redo is 5.09 s against 939.50 s, because the 10,586 pages redo read one at a time became 14.
+`ZOU_WARM_BLOCKS` caps how many pages it will fetch, 65536 by default, and zero turns it off.
+
+What is left of a cold attach is the writes: recovery dirties every page it changed and the end of recovery checkpoint puts them back one at a time, which is where the rest of those ten minutes goes and is the storage engine's problem rather than this command's.
 
 `zou serve` needs the patched postgres, `--pg-bin` or `ZOU_PG_BIN` pointing at the install, the same one `zou dev` uses.
 
