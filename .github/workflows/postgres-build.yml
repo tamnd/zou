@@ -127,9 +127,12 @@ jobs:
       # What a database per test costs on this machine, against the
       # template the suite above already built. It is printed rather
       # than asserted on, because a shared runner is not a place to fail
-      # a build over a millisecond.
+      # a build over a millisecond. The log level breaks each create
+      # into the branch, the restore, the postmaster and the front door,
+      # which is what says whether a number measured on a laptop moved
+      # anything here.
       - name: a database per test, timed
-        run: ZOU_PG_BIN=$PWD/build/pg/bin cargo run --release -p zou-embed --example fixtures -- 20
+        run: RUST_LOG=zou_embed=debug ZOU_PG_BIN=$PWD/build/pg/bin cargo run --release -p zou-embed --example fixtures -- 20
       # And the same thing from C, against the hand written header, so
       # the shared library a binding loads is compiled and run rather
       # than assumed to still line up.

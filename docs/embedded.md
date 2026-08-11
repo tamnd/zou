@@ -61,8 +61,8 @@ That is the whole cost of a create, and it is what stops a suite from taking a d
 
 A fixture does not run initdb.
 One template is built per machine and per Postgres build, and every fixture is a branch of it: a manifest write, no pages copied, and the postmaster start that was always going to be there.
-On this laptop that is 60 ms at p50 over 50 creates, of which 13 ms is the branch, 21 ms the restore, 22 ms the postmaster, and a millisecond the front door.
-A github runner is 63 ms, and a 6 vcpu vps with a slow disk is 1.6 s, which is the same four steps on a machine where all four are twenty times slower.
+On this laptop that is 36 ms at p50 over 50 creates, of which 1 ms is the branch, 16 ms the restore, 19 ms the postmaster, and a fraction of a millisecond the front door.
+A github runner is 63 ms and a 6 vcpu vps with a slow disk is 1.6 s, which is the same four steps on machines where the store reads are slower.
 
 ```rust
 #[test]
@@ -75,6 +75,11 @@ fn a_signup_lands_in_auth_users() {
 
 Fixtures share the template store and see nothing of each other, each one is a tenant of its own, and closing one takes that tenant off the store while the captures it read from stay where they are.
 A fixture is branchable the moment it is cut, because the template folded a full page capture down before it was published, so a test that wants a branch of its fixture does not have to write to it first.
+
+Two things a real project pays for are not paid here.
+The template store carries a `.zou-scratch` marker, so writes to it are not fsynced: everything under it is either the template, which is rebuilt from nothing when it is missing, or a fixture, which is deleted by the handle that made it, and a full fsync is 4 to 5 ms on APFS.
+And whether a branch of the template would serve is checked on the first fixture of a process rather than on every one, because a published template never changes again, so the answer cannot change either.
+Together they are most of the 12 ms the branch used to cost on this laptop, and close to none of the 63 ms a github runner takes, where an fsync on ext4 is a fraction of a millisecond and the create is the restore and the postmaster from start to finish.
 
 The first fixture on a cold machine builds the template, which is one initdb and one fold, 45 s on this laptop.
 It lands in `$ZOU_TEMPLATE_CACHE`, or `$XDG_CACHE_HOME/zou/templates`, or `~/.cache/zou/templates`, and a CI job that keeps that directory between runs pays for it once.
