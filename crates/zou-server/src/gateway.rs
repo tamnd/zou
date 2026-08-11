@@ -38,6 +38,10 @@ struct Front {
     registry: Arc<Registry>,
     attached: Arc<Attached>,
     forwarding: Option<Arc<Forwarding>>,
+    /// The one project this node serves, when it serves one. Set, and
+    /// nothing is parsed out of a request at all: every path is that
+    /// project's path and every hostname is its hostname.
+    only: Option<String>,
 }
 
 /// A router that serves every tenant on a store.
@@ -66,7 +70,52 @@ pub fn fleet(
             registry,
             attached,
             forwarding,
+            only: None,
         }))
+}
+
+/// A node that serves one project and refuses nothing on the way in,
+/// which is what a function or a container with one database behind it
+/// is.
+///
+/// The routing is gone rather than configured off: there is no hostname
+/// to claim and no path segment to eat, so a url is the same url a
+/// hosted project would answer and the client that speaks to it needs
+/// nothing said about prefixes. What is left of the front door is the
+/// attach, which in this mode has usually already happened.
+pub fn only(tenant_ref: String, registry: Arc<Registry>, attached: Arc<Attached>) -> Router {
+    Router::new()
+        .fallback(any(dispatch))
+        .with_state(Arc::new(Front {
+            routing: Routing::default(),
+            registry,
+            attached,
+            forwarding: None,
+            only: Some(tenant_ref),
+        }))
+}
+
+/// Bring the one project up before anything asks for it.
+///
+/// Worth doing only where the wait is somebody else's: a function's
+/// initialisation, or a container that is not in a load balancer's
+/// rotation until it answers a health check. On the request path this
+/// is what the first request pays for anyway.
+pub async fn preattach(
+    tenant_ref: &str,
+    registry: &Registry,
+    attached: &Attached,
+) -> Result<(), String> {
+    let entry = registry
+        .get(tenant_ref)
+        .await?
+        .ok_or_else(|| format!("{tenant_ref} is not a project on this store"))?;
+    // The router it built is thrown away and the attach it did is not:
+    // what this leaves behind is a postmaster up and a slot filled, and
+    // the request that arrives next asks the same manager for the same
+    // thing and finds it there.
+    let _router = attached.router(&entry).await?;
+    Ok(())
 }
 
 async fn dispatch(State(front): State<Arc<Front>>, mut req: Request<Body>) -> Response {
@@ -142,6 +191,21 @@ async fn tenant(
     host: Option<&str>,
     path: &str,
 ) -> Result<Option<(Tenant, Found)>, String> {
+    // A node that serves one project skips all three questions. The
+    // lookup stays, because the entry is where the secret is and a
+    // project can be deleted out from under a running node.
+    if let Some(tenant_ref) = &front.only {
+        let entry = front.registry.get(tenant_ref).await?;
+        return Ok(entry.map(|entry| {
+            (
+                entry,
+                Found {
+                    tenant_ref: tenant_ref.clone(),
+                    path: path.to_string(),
+                },
+            )
+        }));
+    }
     if let Some(tenant_ref) = host.and_then(|h| front.routing.label(h)) {
         let entry = front.registry.get(&tenant_ref).await?;
         return Ok(entry.map(|entry| {
@@ -505,6 +569,117 @@ mod tests {
             StatusCode::OK,
             "the tenant's own router was asked for /auth/v1/health: {body}"
         );
+    }
+
+    /// The same store, served as one project: no domains, no prefix.
+    fn single(tenant_ref: &str) -> (tempfile::TempDir, Arc<Fake>, Router) {
+        let dir = tempfile::tempdir().expect("a directory to write into");
+        let store: Arc<dyn CasStore> =
+            Arc::from(open_store(&dir.path().to_string_lossy()).expect("a store opens"));
+        for one in ["acme-prod", "beta-co"] {
+            registry::create(store.as_ref(), &Tenant::new(one, &secret(one), 1))
+                .expect("it registers");
+        }
+        let backend = Arc::new(Fake::default());
+        let attached = Arc::new(Attached::new(backend.clone()));
+        let registry = Arc::new(Registry::new(store));
+        (
+            dir,
+            backend,
+            only(tenant_ref.to_string(), registry, attached),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_single_tenant_node_answers_whatever_host_it_was_asked_at() {
+        let (_d, backend, router) = single("acme-prod");
+        for host in ["localhost:54321", "anything.example", "10.0.0.4"] {
+            let (status, body) =
+                call(&router, host, "/auth/v1/health", Some(&anon("acme-prod"))).await;
+            assert_eq!(status, StatusCode::OK, "{host}: {body}");
+        }
+        assert_eq!(
+            backend.up.lock().unwrap().len(),
+            1,
+            "three requests, one attach"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_tenant_node_does_not_read_the_first_path_segment() {
+        let (_d, _backend, router) = single("acme-prod");
+        // Which is exactly the url a path prefix node would have read a
+        // ref out of, and here it is a path that project does not serve.
+        let (status, _) = call(
+            &router,
+            "localhost",
+            "/beta-co/auth/v1/health",
+            Some(&anon("acme-prod")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_single_tenant_node_still_holds_its_own_projects_key() {
+        let (_d, _backend, router) = single("acme-prod");
+        let (status, _) = call(
+            &router,
+            "localhost",
+            "/auth/v1/health",
+            Some(&anon("beta-co")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn preattach_brings_the_project_up_before_a_request_does() {
+        let dir = tempfile::tempdir().expect("a directory to write into");
+        let store: Arc<dyn CasStore> =
+            Arc::from(open_store(&dir.path().to_string_lossy()).expect("a store opens"));
+        registry::create(
+            store.as_ref(),
+            &Tenant::new("acme-prod", &secret("acme-prod"), 1),
+        )
+        .expect("it registers");
+        let backend = Arc::new(Fake::default());
+        let attached = Arc::new(Attached::new(backend.clone()));
+        let registry = Arc::new(Registry::new(store));
+        preattach("acme-prod", &registry, &attached)
+            .await
+            .expect("it comes up");
+        assert_eq!(backend.up.lock().unwrap().clone(), vec!["acme-prod"]);
+
+        let router = only("acme-prod".to_string(), registry, attached);
+        let (status, _) = call(
+            &router,
+            "localhost",
+            "/auth/v1/health",
+            Some(&anon("acme-prod")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            backend.up.lock().unwrap().len(),
+            1,
+            "the request found it already up"
+        );
+    }
+
+    #[tokio::test]
+    async fn preattaching_a_project_nobody_registered_says_so() {
+        let dir = tempfile::tempdir().expect("a directory to write into");
+        let store: Arc<dyn CasStore> =
+            Arc::from(open_store(&dir.path().to_string_lossy()).expect("a store opens"));
+        let backend = Arc::new(Fake::default());
+        let attached = Arc::new(Attached::new(backend.clone()));
+        let registry = Arc::new(Registry::new(store));
+        let why = preattach("acme-prod", &registry, &attached)
+            .await
+            .expect_err("there is nothing to attach");
+        assert!(why.contains("acme-prod"), "{why}");
+        assert!(backend.up.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

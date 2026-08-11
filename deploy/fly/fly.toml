@@ -1,0 +1,48 @@
+# One project on Fly, one app, one machine.
+#
+#   fly launch --no-deploy --copy-config --config deploy/fly/fly.toml
+#   fly secrets set AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+#   fly deploy
+#
+# The store is Tigris or any other S3, and `fly storage create` sets the
+# three variables an S3 bucket needs on the app for you.
+app = "zou-demo"
+primary_region = "iad"
+
+[build]
+  dockerfile = "../../Dockerfile"
+
+[env]
+  ZOU_TARGET = "s3://zou-demo/projects"
+  ZOU_REF = "demo"
+  ZOU_S3_ENDPOINT = "https://fly.storage.tigris.dev"
+  AWS_REGION = "auto"
+
+# Appended to the image's entrypoint, which is the zou binary. The
+# store and the project are in the environment above, so what is left
+# is which doors to open.
+[processes]
+  app = "serve --http 8080 --pg 0 --pool 0"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  # Stopped rather than suspended on purpose. A stop is a signal, and
+  # zou answers it by shutting the postmaster down and putting the
+  # writer lease back, so the next start is an attach and not an attach
+  # behind a lease timeout. A suspend freezes the machine mid lease
+  # instead, which is issue #3's freeze and thaw work and not something
+  # to point a project at yet.
+  auto_stop_machines = "stop"
+  min_machines_running = 0
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 100
+    hard_limit = 200
+
+# One machine, because one project has one writer. Scaling this app to
+# two means the second one waits for a lease the first one holds.
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"

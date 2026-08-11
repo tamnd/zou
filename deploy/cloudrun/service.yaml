@@ -1,0 +1,67 @@
+# One project on Cloud Run, served by one instance.
+#
+#   gcloud run services replace deploy/cloudrun/service.yaml --region europe-west1
+#
+# Fill in the image, the bucket, and the secret before running that.
+# The two annotations are the load bearing ones and the comments say
+# why, see docs/serverless.md.
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: zou-demo
+spec:
+  template:
+    metadata:
+      annotations:
+        # One instance, because one project has one writer. A second
+        # instance would find the lease held and wait for it rather
+        # than serve, which is safe and useless.
+        autoscaling.knative.dev/maxScale: "1"
+        # An instance keeps its cpu between requests. The wal pusher
+        # and the lease heartbeat are threads, not request handlers,
+        # and an instance throttled to nothing between requests stops
+        # renewing a lease it is still holding.
+        run.googleapis.com/cpu-throttling: "false"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - image: REGION-docker.pkg.dev/PROJECT/zou/zou:latest
+          # The store and the project come from the environment, so the
+          # command is only about which doors to open. Cloud Run gives
+          # a container one port, so the postgres port and the pooler
+          # are off and psql goes through a node somewhere else.
+          args: ["serve", "--http", "8080", "--pg", "0", "--pool", "0"]
+          ports:
+            - name: http1
+              containerPort: 8080
+          env:
+            # gs:// is signed with an HMAC key for the service account,
+            # not with the account's own credentials.
+            - name: ZOU_TARGET
+              value: gs://BUCKET/projects
+            - name: ZOU_REF
+              value: demo
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: zou-gcs-hmac-id
+                  key: latest
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: zou-gcs-hmac-secret
+                  key: latest
+          resources:
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          # Cloud Run holds requests until the port is listening, and
+          # the port is listening before the project is attached, so
+          # the probe is about the door and the first request waits out
+          # the attach in the accept queue.
+          startupProbe:
+            tcpSocket:
+              port: 8080
+            failureThreshold: 10
+            periodSeconds: 3

@@ -61,6 +61,9 @@ fn s3_from_env() -> Option<zou_store::S3Config> {
         bucket: var("ZOU_S3_TEST_BUCKET"),
         access_key: var("ZOU_S3_TEST_ACCESS_KEY"),
         secret_key: var("ZOU_S3_TEST_SECRET_KEY"),
+        session: std::env::var("ZOU_S3_TEST_SESSION_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty()),
         dialect: match std::env::var("ZOU_S3_TEST_DIALECT").as_deref() {
             Ok("gcs") => zou_store::Dialect::Gcs,
             _ => zou_store::Dialect::S3,

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
@@ -41,7 +41,9 @@ use zou_store::layout::TenantLayout;
 use zou_store::registry::Tenant;
 use zou_store::{CasStore, Manifest, open_store};
 
-pub const USAGE: &str = "usage: zou serve <target> [--http <n>] [--pg <n>] [--pool <n>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>]";
+pub const USAGE: &str = "usage: zou serve <target> [--ref <ref>] [--http <n>] [--pg <n>] [--pool <n>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>]";
+
+pub const LAMBDA_USAGE: &str = "usage: zou lambda <target> [--ref <ref>] [--pg-bin <dir>] [--runtime <dir>] [--shared-buffers <size>] [--passthrough <size>]";
 
 /// How long a tenant's postmaster has to say it is accepting
 /// connections. A cold attach is meant to be under half a second and
@@ -104,6 +106,15 @@ pub struct Args {
     /// None, the default, and collecting is somebody else's cron entry
     /// running `zou gc`.
     pub gc: Option<Gc>,
+    /// The one project this node serves. None is the registry, which is
+    /// what a fleet node does. Set, and nothing is resolved out of a
+    /// request at all, the project comes up before the doors open, and
+    /// what is served is the url a hosted project serves with no prefix
+    /// in front of it.
+    pub only: Option<String>,
+    /// Whether the door is the lambda runtime api instead of a port,
+    /// which is `zou lambda` and nothing else.
+    pub lambda: bool,
 }
 
 /// A node that collects on a timer.
@@ -114,6 +125,19 @@ pub struct Gc {
 }
 
 pub fn parse(argv: &[String]) -> Result<Args, String> {
+    parse_as(argv, false)
+}
+
+/// The same arguments a node takes, minus the ones a function has no
+/// use for. A function has no listener, so a port on the command line
+/// is a misunderstanding worth saying out loud rather than accepting
+/// and ignoring.
+pub fn parse_lambda(argv: &[String]) -> Result<Args, String> {
+    parse_as(argv, true)
+}
+
+fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
+    let usage = if lambda { LAMBDA_USAGE } else { USAGE };
     let mut target = None;
     let mut pg_bin = None;
     let mut runtime = None;
@@ -129,9 +153,29 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut passthrough = None;
     let mut gc_every = None;
     let mut policy = gc::Policy::default();
+    let mut only = std::env::var("ZOU_REF").ok().filter(|r| !r.is_empty());
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
+        if lambda
+            && matches!(
+                arg.as_str(),
+                "--http"
+                    | "--pg"
+                    | "--pool"
+                    | "--ops"
+                    | "--domain"
+                    | "--no-path-prefix"
+                    | "--max-attached"
+                    | "--idle-secs"
+                    | "--gc-every"
+            )
+        {
+            return Err(format!(
+                "{arg} is for a node with ports and a schedule, and a function has neither\n{usage}"
+            ));
+        }
         match arg.as_str() {
+            "--ref" => only = Some(need(&mut it, "--ref")?.clone()),
             "--pg-bin" => pg_bin = Some(PathBuf::from(need(&mut it, "--pg-bin")?)),
             "--runtime" => runtime = Some(PathBuf::from(need(&mut it, "--runtime")?)),
             "--http" => http = port(&mut it, "--http")?,
@@ -166,18 +210,49 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             other if target.is_none() && !other.starts_with('-') => {
                 target = Some(other.to_string());
             }
-            other => return Err(format!("unexpected argument {other:?}\n{USAGE}")),
+            other => return Err(format!("unexpected argument {other:?}\n{usage}")),
         }
     }
-    let target = target.ok_or(USAGE)?;
-    if http == 0 {
-        return Err("the http door is what this serves, --http 0 turns it off".to_string());
+    // Env as well as argv, because the three places a function or a
+    // container is configured from are environment variables, and an
+    // image whose command has to be rewritten to point at a different
+    // bucket is an image per bucket.
+    let target = target
+        .or_else(|| std::env::var("ZOU_TARGET").ok().filter(|t| !t.is_empty()))
+        .ok_or(format!(
+            "no store to serve: pass a target or set ZOU_TARGET\n{usage}"
+        ))?;
+    if let Some(one) = &only {
+        zou_store::registry::check_ref(one).map_err(|e| format!("--ref {one:?}: {e}"))?;
     }
-    // A node with neither way of naming a tenant resolves every request
-    // to nothing, which is a server that answers 404 forever, and the
-    // time to say so is now rather than at the first request.
-    if domains.is_empty() && !path_prefix {
-        return Err("nothing would route: pass --domain or drop --no-path-prefix".to_string());
+    // A function answers whatever url it is given at whatever hostname
+    // it was deployed under, so there is nothing for a request to name
+    // and the project has to be named here.
+    if lambda && only.is_none() {
+        return Err(format!(
+            "a function serves one project: pass --ref or set ZOU_REF\n{usage}"
+        ));
+    }
+    if !lambda {
+        if http == 0 {
+            return Err("the http door is what this serves, --http 0 turns it off".to_string());
+        }
+        // A node with neither way of naming a tenant resolves every
+        // request to nothing, which is a server that answers 404
+        // forever, and the time to say so is now rather than at the
+        // first request. Unless it serves one project, where there is
+        // nothing to resolve and that is the point.
+        if only.is_none() && domains.is_empty() && !path_prefix {
+            return Err("nothing would route: pass --domain or drop --no-path-prefix".to_string());
+        }
+        // Both would be a node that says a request is for one project
+        // by its hostname and serves a different one, so the two ways
+        // of deciding are not allowed to disagree.
+        if only.is_some() && !domains.is_empty() {
+            return Err(
+                "--ref serves one project, so --domain has nothing left to name".to_string(),
+            );
+        }
     }
     // A retention window set on a node that never collects is a policy
     // nobody is applying, and finding that out from a full bucket is
@@ -210,6 +285,8 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         shared_buffers,
         passthrough,
         gc,
+        only,
+        lambda,
     })
 }
 
@@ -781,6 +858,50 @@ pub fn run(args: &Args) -> Result<(), String> {
     );
     backend.watch(Arc::downgrade(&attached));
 
+    if args.lambda {
+        // No listener to bind, and a freeze is not something this
+        // process is told about: an environment that is done answering
+        // is stopped where it stands and thawed for the next event.
+        // Nothing is lost by that, because an acked write is durable on
+        // the store before it is acked.
+        //
+        // The end of an environment is worth catching, though. A
+        // postmaster killed outright leaves its writer lease held until
+        // it expires, and the next cold start of the project waits the
+        // rest of that out wherever in the world it happens. Lambda
+        // sends SIGTERM before it destroys an environment when there is
+        // an extension registered, Cloud Run and Fly always send one,
+        // and this is what makes it mean something.
+        unsafe {
+            let handler = on_signal as extern "C" fn(libc::c_int) as usize;
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGTERM, handler);
+        }
+        let stopping = Arc::clone(&backend);
+        let tree = args.runtime.clone();
+        std::thread::spawn(move || {
+            while !SHUTDOWN.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            stop_all(&stopping, &tree);
+            // The loop this leaves behind is parked on the runtime
+            // api's long poll for an invocation that is not coming, so
+            // the way out is the process ending and not a return.
+            std::process::exit(0);
+        });
+        boot.lap("runtime api");
+        log::info!("up in {}, {}", crate::boot::ms(boot.total()), boot.laps());
+        let only = args.only.clone().ok_or("a function serves one project")?;
+        log::info!("serving {only} from {} as a function", args.target);
+        let api = zou_server::lambda::Lambda::from_env()?;
+        let served = zou_server::lambda::serve_blocking(&api, &only, registry, attached);
+        // The loop only returns when the runtime api itself stopped
+        // making sense, which is a bad way to end and still no reason to
+        // leave a lease behind for the next environment to wait out.
+        stop_all(&backend, &args.runtime);
+        return served;
+    }
+
     let http = bind(args.http, "http")?.ok_or("the http door needs a port")?;
     let pg = bind(args.pg, "the postgres port")?;
     let pool = bind(args.pool, "the pooler")?;
@@ -790,6 +911,9 @@ pub fn run(args: &Args) -> Result<(), String> {
     boot.lap("doors");
     log::info!("up in {}, {}", crate::boot::ms(boot.total()), boot.laps());
     log::info!("serving {} from {}", args.target, args.runtime.display());
+    if let Some(only) = &args.only {
+        log::info!("one project, {only}, at every url this node answers");
+    }
     for domain in &args.domains {
         log::info!("http://<ref>.{domain}:{} names a project", args.http);
     }
@@ -829,6 +953,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
 
     let doors = Doors {
+        only: args.only.clone(),
         routing: Routing {
             domains: args.domains.clone(),
             path_prefix: args.path_prefix,
@@ -854,6 +979,20 @@ pub fn run(args: &Args) -> Result<(), String> {
     while !SHUTDOWN.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(100));
     }
+    stop_all(&backend, &args.runtime);
+    log::info!("stopped, the store is at {}", args.target);
+    Ok(())
+}
+
+/// Stop every attached postmaster and take the runtime tree with them.
+///
+/// Worth doing on the way out even though no data depends on it. An
+/// acked write is durable on the store before it is acked, so nothing is
+/// lost by a postmaster that is killed outright, but the writer lease it
+/// was holding is the store's and stays held until it expires. Stopping
+/// puts the lease back, and the project's next start, on this node or
+/// any other, is a restore rather than a restore behind a timeout.
+fn stop_all(backend: &Postmasters, runtime: &Path) {
     let live: Vec<Live> = backend
         .state
         .live
@@ -866,19 +1005,15 @@ pub fn run(args: &Args) -> Result<(), String> {
     for one in &live {
         stop(one.pid);
     }
-    // Every acked write is durable on the store by definition, so this
-    // is not waiting for data to be safe. It is waiting for postmasters
-    // to let go of their runtime directories before the tree they are
-    // in goes away.
+    // Waiting for postmasters to let go of their runtime directories
+    // before the tree they are in goes away, not for data to be safe.
     for _ in 0..100 {
         if live.iter().all(|one| !one.dir.exists()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let _ = fs::remove_dir_all(&args.runtime);
-    log::info!("stopped, the store is at {}", args.target);
-    Ok(())
+    let _ = fs::remove_dir_all(runtime);
 }
 
 /// Sweep the store on a timer until the node is asked to stop.
@@ -1066,6 +1201,73 @@ mod tests {
             ]))
             .is_ok()
         );
+    }
+
+    /// One project on a node is the deployment a container platform
+    /// gives you: one url, one database, no registry to route through.
+    #[test]
+    fn one_project_needs_nothing_to_route_by() {
+        let args = parse(&argv(&[
+            "./fleet",
+            "--ref",
+            "acme-prod",
+            "--no-path-prefix",
+        ]))
+        .unwrap();
+        assert_eq!(args.only.as_deref(), Some("acme-prod"));
+        assert!(!args.lambda);
+        // And the path prefix left on is not a contradiction, it is a
+        // flag that has nothing to do: nothing is parsed either way.
+        let args = parse(&argv(&["./fleet", "--ref", "acme-prod"])).unwrap();
+        assert_eq!(args.only.as_deref(), Some("acme-prod"));
+    }
+
+    #[test]
+    fn one_project_and_a_domain_would_disagree() {
+        let stop = parse(&argv(&[
+            "./fleet",
+            "--ref",
+            "acme-prod",
+            "--domain",
+            "zou.example",
+        ]))
+        .unwrap_err();
+        assert!(stop.contains("--domain"), "{stop}");
+    }
+
+    #[test]
+    fn a_ref_that_is_not_a_ref_is_refused_here() {
+        let stop = parse(&argv(&["./fleet", "--ref", "Acme Prod"])).unwrap_err();
+        assert!(stop.contains("Acme Prod"), "{stop}");
+    }
+
+    #[test]
+    fn a_function_serves_one_project_and_has_no_ports() {
+        let args = parse_lambda(&argv(&["s3://bucket/fleet", "--ref", "acme-prod"])).unwrap();
+        assert!(args.lambda);
+        assert_eq!(args.only.as_deref(), Some("acme-prod"));
+        let stop = parse_lambda(&argv(&["s3://bucket/fleet"])).unwrap_err();
+        assert!(stop.contains("--ref"), "{stop}");
+        for flag in [
+            "--http",
+            "--pg",
+            "--pool",
+            "--ops",
+            "--domain",
+            "--max-attached",
+            "--idle-secs",
+            "--gc-every",
+        ] {
+            let stop = parse_lambda(&argv(&[
+                "s3://bucket/fleet",
+                "--ref",
+                "acme-prod",
+                flag,
+                "1",
+            ]))
+            .unwrap_err();
+            assert!(stop.contains(flag), "{flag}: {stop}");
+        }
     }
 
     #[test]
