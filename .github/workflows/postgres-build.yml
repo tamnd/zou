@@ -12,6 +12,7 @@ on:
       - patches/**
       - scripts/pg-apply-patches.sh
       - scripts/zou-bundle.sh
+      - packaging/npm/**
       - Makefile
       - crates/zou/**
       - crates/zou-pg/**
@@ -440,3 +441,18 @@ jobs:
             -c 'select count(*) > 0 from pg_timezone_names'
           kill -INT "$(head -1 /tmp/bundle-pgdata/postmaster.pid)"
           $BUNDLE/bin/zou --version
+      # The npm command line package is a postinstall that downloads a
+      # release, so testing it before there is a release means serving
+      # one. This is the tarball the step above just built, over
+      # localhost, checksum and all.
+      - name: the npm command line package
+        run: |
+          cd dist
+          sha256sum zou-linux-x64.tar.gz > zou-linux-x64.tar.gz.sha256
+          python3 -m http.server 8617 >/dev/null 2>&1 &
+          cd ../packaging/npm
+          ZOU_BASE_URL=http://127.0.0.1:8617 ZOU_VERSION=v0.0.0-ci node install.js
+          ./bin/zou.js --version
+          # And the postgres it brought with it, which is the half of
+          # this package that npm is a strange way to deliver.
+          vendor/zou-linux-x64/pg/bin/postgres --version

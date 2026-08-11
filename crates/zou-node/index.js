@@ -8,6 +8,8 @@
 // a database in this process without a socket under any of it.
 
 const { createRequire } = require("node:module");
+const fs = require("node:fs");
+const path = require("node:path");
 
 const native = require("./zou.node");
 
@@ -15,6 +17,32 @@ const native = require("./zou.node");
 // when nothing is listening. Nothing resolves this name and nothing
 // needs to: the origin is stripped off again on the way in.
 const ORIGIN = "http://zou.embedded";
+
+/**
+ * The patched postgres inside an installed `zou-cli`, if there is one.
+ *
+ * The addon can find a postmaster next to the binary it shipped in, but
+ * a node process is not that binary, so the sibling package is where a
+ * node project's postgres actually is. Nothing here fails: an answer of
+ * undefined leaves the addon to look at ZOU_PG_BIN and then at a
+ * checkout, which is what it did before this existed.
+ */
+function pgFromTheCliPackage() {
+  try {
+    // From here and from the project, because a workspace or a pnpm
+    // store puts this file somewhere that cannot see the project's
+    // node_modules by walking up from itself.
+    const cli = require.resolve("zou-cli/package.json", { paths: [__dirname, process.cwd()] });
+    const vendor = path.join(path.dirname(cli), "vendor");
+    for (const bundle of fs.readdirSync(vendor)) {
+      const bin = path.join(vendor, bundle, "pg", "bin");
+      if (fs.existsSync(path.join(bin, "postgres"))) return bin;
+    }
+  } catch {
+    // Not installed, or installed without its bundle.
+  }
+  return undefined;
+}
 
 /**
  * Open a project.
@@ -33,7 +61,7 @@ async function createZou(options = {}) {
   const handle = await native.open({
     target: options.ephemeral ? "" : target,
     tenant: options.tenant,
-    pgBin: options.pgBin ?? process.env.ZOU_PG_BIN,
+    pgBin: options.pgBin ?? process.env.ZOU_PG_BIN ?? pgFromTheCliPackage(),
     runtime: options.runtime,
     jwtSecret: options.jwtSecret,
     schemas: options.schemas,

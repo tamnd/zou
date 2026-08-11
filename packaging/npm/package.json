@@ -1,0 +1,40 @@
+{
+  "name": "zou-cli",
+  "version": "0.0.1",
+  "description": "The zou command line: a Supabase compatible backend on object storage, with the patched Postgres it starts",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tamnd/zou.git",
+    "directory": "packaging/npm"
+  },
+  "bin": {
+    "zou": "bin/zou.js"
+  },
+  "files": [
+    "bin/zou.js",
+    "install.js",
+    "README.md"
+  ],
+  "keywords": [
+    "supabase",
+    "postgres",
+    "postgresql",
+    "backend",
+    "s3"
+  ],
+  "engines": {
+    "node": ">= 18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "scripts": {
+    "postinstall": "node install.js"
+  }
+}

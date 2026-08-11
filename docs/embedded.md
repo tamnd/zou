@@ -211,6 +211,15 @@ await zou.checkpoint();
 `zou.anonKey`, `zou.serviceRoleKey`, `zou.target`, and `zou.tenant` are the rest of what `zou status` prints.
 `zou.url` is the port once `listen` has been called, and a name that resolves nowhere before that, since before that there is nothing to resolve.
 
+A node project still needs the patched Postgres, and the way it gets one without a `ZOU_PG_BIN` in every script is the command line package next door.
+
+```bash
+npm install --save-dev zou zou-cli
+```
+
+`zou-cli` downloads the release bundle for the platform it is installed on, which is the `zou` binary and the patched Postgres in one tree, and the binding looks in it: `pgBin`, then `ZOU_PG_BIN`, then `zou-cli`.
+So a project that installed both has a database per test and nothing to configure, and a project that has a checkout and a `build/pg` carries on as before.
+
 The binding is [napi](https://napi.rs) over `zou-embed` rather than over the C ABI, since it is Rust either way and a Rust crate calling its own C ABI is a longer road to the same place.
 `libzou` is the road for everything that is not Rust.
 Everything that takes time is a task on the thread pool rather than work on the thread node runs javascript on, so opening a project and answering a request do not stop the event loop.
