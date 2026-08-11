@@ -301,6 +301,15 @@ async fn create(app: &Arc<App>, parts: Parts, body: Body) -> Result<Response, Wr
     if !replace && taken(&sess, &bucket, &key).await? {
         return refuse(sess, Refusal::new(409, "The resource already exists")).await;
     }
+    // And whether this caller may write the object at all is answered
+    // now for the same reason, by writing it and rolling it back. It
+    // has to be asked here, because the rows below are the service's
+    // own bookkeeping and no policy is written about them: without
+    // this, a resumable upload would be the one door on the storage
+    // api that row level security does not stand behind.
+    if let Err(why) = may_write(&sess, &bucket, &key, &sub, replace).await {
+        return commit(sess, Err(why)).await;
+    }
 
     let version = uuid();
     let id = upload_id(&bucket, &key, &version);
@@ -314,14 +323,17 @@ async fn create(app: &Arc<App>, parts: Parts, body: Body) -> Result<Response, Wr
             .collect::<Vec<Value>>(),
     })
     .to_string();
-    sess.query(
-        "insert into storage.s3_multipart_uploads
-             (id, upload_signature, bucket_id, key, version, owner_id, metadata)
-         values ($1, '', $2, $3, $4, nullif($5::text, ''), $6::text::jsonb)",
-        &[&id, &bucket, &key, &version, &sub, &state],
-    )
-    .await
-    .map_err(|e| refused_by_postgres(&e))?;
+    object::unpoliced(&sess, &ctx.role, async || {
+        sess.query(
+            "insert into storage.s3_multipart_uploads
+                 (id, upload_signature, bucket_id, key, version, owner_id, metadata)
+             values ($1, '', $2, $3, $4, nullif($5::text, ''), $6::text::jsonb)",
+            &[&id, &bucket, &key, &version, &sub, &state],
+        )
+        .await
+        .map_err(|e| refused_by_postgres(&e))
+    })
+    .await?;
 
     // A creation carrying bytes is a creation and a patch at nothing in
     // the same request, and one carrying all of them finishes here.
@@ -373,7 +385,7 @@ async fn head(app: &Arc<App>, id: &str, parts: Parts) -> Result<Response, Wrong>
     let id = named(id)?;
 
     let sess = begin(app, &ctx, true).await?;
-    let Some(upload) = look_up(&sess, &id).await? else {
+    let Some(upload) = look_up(&sess, &ctx.role, &id).await? else {
         return refuse(sess, gone()).await;
     };
     commit(sess, Ok(())).await?;
@@ -407,7 +419,7 @@ async fn patch(app: &Arc<App>, id: &str, parts: Parts, body: Body) -> Result<Res
     let bytes = read_body(body).await?;
 
     let sess = begin(app, &ctx, false).await?;
-    let Some(upload) = look_up(&sess, &id).await? else {
+    let Some(upload) = look_up(&sess, &ctx.role, &id).await? else {
         return refuse(sess, gone()).await;
     };
     // An upload that reached its length is an object now, and the
@@ -447,7 +459,7 @@ async fn terminate(app: &Arc<App>, id: &str, parts: Parts) -> Result<Response, W
     let id = named(id)?;
 
     let sess = begin(app, &ctx, false).await?;
-    let Some(upload) = look_up(&sess, &id).await? else {
+    let Some(upload) = look_up(&sess, &ctx.role, &id).await? else {
         return refuse(sess, gone()).await;
     };
     let blobs = blobs(app)?;
@@ -457,19 +469,24 @@ async fn terminate(app: &Arc<App>, id: &str, parts: Parts) -> Result<Response, W
     for part in 0..upload.parts {
         let _ = blobs.delete(blob::part_key(&upload.id, part)).await;
     }
-    sess.query(
-        "delete from storage.s3_multipart_uploads where id = $1",
-        &[&upload.id],
-    )
-    .await
-    .map_err(|e| refused_by_postgres(&e))?;
-    // The parts rows name an upload that is gone, so they go with it.
-    sess.query(
-        "delete from storage.s3_multipart_uploads_parts where upload_id = $1",
-        &[&upload.id],
-    )
-    .await
-    .map_err(|e| refused_by_postgres(&e))?;
+    object::unpoliced(&sess, &ctx.role, async || {
+        sess.query(
+            "delete from storage.s3_multipart_uploads where id = $1",
+            &[&upload.id],
+        )
+        .await
+        .map_err(|e| refused_by_postgres(&e))?;
+        // The parts rows name an upload that is gone, so they go with
+        // it.
+        sess.query(
+            "delete from storage.s3_multipart_uploads_parts where upload_id = $1",
+            &[&upload.id],
+        )
+        .await
+        .map_err(|e| refused_by_postgres(&e))?;
+        Ok::<(), Wrong>(())
+    })
+    .await?;
     commit(sess, Ok(())).await?;
 
     Ok(Response::builder()
@@ -678,6 +695,77 @@ fn beyond(bucket: &object::Bucket, mime: &str, length: Option<u64>) -> Option<Re
 
 /// Is there an object of this name already, as far as this caller is
 /// concerned?
+/// May this caller write that object, asked by writing it and taking
+/// it back?
+///
+/// Row level security is a rule about rows going in rather than a list
+/// this end holds, so the only honest way to ask is to try. The signed
+/// upload url route asks the same question the same way; the difference
+/// here is the savepoint, because this is one step of a longer
+/// transaction rather than a transaction of its own.
+///
+/// Every row a resumable upload writes before the last byte lands is on
+/// the multipart tables, which have row level security on and no policy
+/// written about them, so they are written with the policies off, as
+/// upstream writes them. That is what makes this check load bearing: it
+/// is the only place between the token and the finished object where a
+/// policy gets to say no, and without it the whole endpoint would be
+/// open to anybody holding any key.
+async fn may_write(
+    sess: &Session,
+    bucket: &str,
+    key: &str,
+    sub: &str,
+    replace: bool,
+) -> Result<(), Wrong> {
+    let conflict = match replace {
+        true => {
+            "on conflict (bucket_id, name) do update
+                set version = excluded.version"
+        }
+        false => "",
+    };
+    let sql = format!(
+        "insert into storage.objects
+             (bucket_id, name, owner, owner_id, version)
+         values ($1, $2,
+                 case when $3::text ~*
+                     '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$'
+                     then $3::text::uuid end,
+                 nullif($3::text, ''), '1')
+         {conflict}
+         returning id::text"
+    );
+    sess.query("savepoint before_asking", &[])
+        .await
+        .map_err(|e| refused_by_postgres(&e))?;
+    let rows = sess.query(&sql, &[&bucket, &key, &sub]).await;
+    // Rolled back either way, and to a savepoint rather than the whole
+    // transaction, because the bucket lookup above happened in it and
+    // the upload row below is about to.
+    sess.query("rollback to savepoint before_asking", &[])
+        .await
+        .map_err(|e| refused_by_postgres(&e))?;
+    let rows = rows.map_err(|e| match e.as_db_error().map(|db| db.code().code()) {
+        // Two callers racing for the same name. The one that lost hears
+        // what it would have heard from the check above, which is the
+        // sentence for a name that is taken.
+        Some("23505") => Wrong::Tus(Refusal::new(409, "The resource already exists")),
+        _ => refused_by_postgres(&e),
+    })?;
+    // An upsert that collided with a row the policies hide writes
+    // nothing and says nothing. Upstream signs a url for that caller
+    // anyway; here there is no url to sign, and letting the upload
+    // start would only move the refusal to the last byte.
+    if rows.is_empty() {
+        return Err(Wrong::Tus(Refusal::new(
+            403,
+            "new row violates row-level security policy",
+        )));
+    }
+    Ok(())
+}
+
 async fn taken(sess: &Session, bucket: &str, key: &str) -> Result<bool, Wrong> {
     let rows = sess
         .query(
@@ -740,15 +828,17 @@ fn url_of(parts: &Parts, id: &str) -> String {
     format!("{scheme}://{host}/storage/v1/upload/resumable/{id}")
 }
 
-/// The one upload, as whoever this session is.
+/// The one upload, with the policies off.
 ///
 /// Row level security on this table hides it from every role but the
-/// one that bypasses, which is upstream's arrangement too: the
-/// resumable routes are the service's own bookkeeping and there is no
-/// policy written about them.
-async fn look_up(sess: &Session, id: &str) -> Result<Option<InProgress>, Wrong> {
-    let rows = sess
-        .query(
+/// one that bypasses, and no policy is written about it, which is
+/// upstream's arrangement too: the resumable routes are the service's
+/// own bookkeeping. Whether the caller may write the object is asked
+/// where the upload is created, by [`may_write`], since that is the
+/// question a policy can answer.
+async fn look_up(sess: &Session, role: &str, id: &str) -> Result<Option<InProgress>, Wrong> {
+    let rows = object::unpoliced(sess, role, async || {
+        sess.query(
             "select u.id, u.bucket_id, u.key, u.in_progress_size,
                     coalesce(u.metadata::text, 'null'),
                     (select count(*) from storage.s3_multipart_uploads_parts p
@@ -757,7 +847,9 @@ async fn look_up(sess: &Session, id: &str) -> Result<Option<InProgress>, Wrong> 
             &[&id],
         )
         .await
-        .map_err(|e| refused_by_postgres(&e))?;
+        .map_err(|e| refused_by_postgres(&e))
+    })
+    .await?;
     let Some(row) = rows.first() else {
         return Ok(None);
     };
@@ -823,39 +915,44 @@ async fn accept(
         let _ = sess.rollback().await;
         return Err(Wrong::Gate(StorageError::internal(e.to_string())));
     }
-    sess.query(
-        "insert into storage.s3_multipart_uploads_parts
-             (upload_id, size, part_number, bucket_id, key, etag, version, owner_id)
-         values ($1, $2, $3, $4, $5, '', $6, nullif($7::text, ''))",
-        &[
-            &upload.id,
-            &size,
-            &upload.parts,
-            &upload.bucket,
-            &upload.key,
-            &upload.id,
-            &sub.to_string(),
-        ],
-    )
-    .await
-    .map_err(|e| refused_by_postgres(&e))?;
-    sess.query(
-        "update storage.s3_multipart_uploads
-            set in_progress_size = $2,
-                metadata = jsonb_set(coalesce(metadata, '{}'::jsonb),
-                                     '{length}', $3::text::jsonb)
-          where id = $1",
-        &[
-            &upload.id,
-            &arriving,
-            &match length {
-                Some(length) => length.to_string(),
-                None => "null".to_string(),
-            },
-        ],
-    )
-    .await
-    .map_err(|e| refused_by_postgres(&e))?;
+    // Both of these are the service's bookkeeping, see [`look_up`].
+    object::unpoliced(&sess, role, async || {
+        sess.query(
+            "insert into storage.s3_multipart_uploads_parts
+                 (upload_id, size, part_number, bucket_id, key, etag, version, owner_id)
+             values ($1, $2, $3, $4, $5, '', $6, nullif($7::text, ''))",
+            &[
+                &upload.id,
+                &size,
+                &upload.parts,
+                &upload.bucket,
+                &upload.key,
+                &upload.id,
+                &sub.to_string(),
+            ],
+        )
+        .await
+        .map_err(|e| refused_by_postgres(&e))?;
+        sess.query(
+            "update storage.s3_multipart_uploads
+                set in_progress_size = $2,
+                    metadata = jsonb_set(coalesce(metadata, '{}'::jsonb),
+                                         '{length}', $3::text::jsonb)
+              where id = $1",
+            &[
+                &upload.id,
+                &arriving,
+                &match length {
+                    Some(length) => length.to_string(),
+                    None => "null".to_string(),
+                },
+            ],
+        )
+        .await
+        .map_err(|e| refused_by_postgres(&e))?;
+        Ok::<(), Wrong>(())
+    })
+    .await?;
 
     match length == Some(arriving) {
         true => finish(app, sess, role, sub, &upload, arriving).await?,

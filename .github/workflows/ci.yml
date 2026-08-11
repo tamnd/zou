@@ -526,6 +526,70 @@ jobs:
           path: /tmp/js-storage.json
           if-no-files-found: ignore
 
+  # Resumable uploads, driven by the client Supabase tells people to
+  # use. Every other suite here is a request and a recorded answer or
+  # somebody else's test file run unedited, and this is neither, because
+  # tus-js-client's own tests are about the client and storage-api's are
+  # about the server: nobody upstream points the one at the other. What
+  # it catches that a recorded case cannot is the part of the protocol
+  # that is a conversation rather than an answer, a client picking its
+  # own chunk boundaries and asking where it got to after an
+  # interruption. The same file runs against a real supabase stack in
+  # the diff job below, which is what makes its assertions upstream's
+  # behaviour rather than ours.
+  tus-js:
+    name: conformance (tus-js-client)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      - name: Start zou on the port a local supabase project uses
+        run: |
+          cargo run -p zou-conformance -- serve \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --setup /tmp/zou-conformance/js-tus/setup.sql \
+            > /tmp/serve.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q '^url ' /tmp/serve.log && break
+            sleep 1
+          done
+          cat /tmp/serve.log
+          grep -q '^url ' /tmp/serve.log
+      - name: Upload through tus-js-client, read back through supabase-js
+        working-directory: /tmp/zou-conformance/js-tus
+        run: |
+          npm ci
+          npm test
+      - name: Keep the server log
+        if: always()
+        run: cat /tmp/serve.log
+
   # One of Supabase's own example apps, unedited, driven through a real
   # browser. The suites ask a server questions and this asks an
   # application, which is a different claim: an app goes through the
@@ -705,6 +769,21 @@ jobs:
             --reference-name "supabase start" \
             --reference-dsn "$CLI_DSN" \
             --jwt-secret "$ZOU_CONFORMANCE_SECRET"
+      # The tus suite next to it is ours rather than upstream's, which
+      # means its assertions are only worth something if the reference
+      # passes them too. So the same file, unedited, runs against the
+      # stack a person gets: a failure here is this repository having
+      # written down something storage-api does not do, and it should be
+      # read as the suite being wrong rather than the server.
+      - name: Ask the same stack what tus-js-client gets from it
+        run: |
+          cd /tmp/project
+          eval "$(supabase status -o env | sed 's/^/export /')"
+          psql "$CLI_DSN" -v ON_ERROR_STOP=1 \
+            -f /tmp/zou-conformance/js-tus/setup.sql
+          cd /tmp/zou-conformance/js-tus
+          npm ci
+          ZOU_URL="$CLI_URL" ZOU_ANON_KEY="$ANON_KEY" npm test
       - name: Keep what the stack was saying
         if: failure()
         run: |

@@ -345,6 +345,31 @@ That flag is the whole difference from upstream, and no assertion is edited.
 
 Its fixture is upstream's seed rather than one written here, which is how it found something no suite could: the passwords in it are hashed with `crypt` and `gen_salt` unqualified, and until [tamnd/zou#214](https://github.com/tamnd/zou/issues/214) there was no `extensions` schema on the search path for those to resolve in.
 
+## The suite that is ours, and how it is kept honest
+
+There is a third shape, in `js-tus/`, and it exists because resumable uploads cannot be asked about one request at a time.
+
+The recorded storage suite has 60 cases about `/storage/v1/upload/resumable`, which is more than it has about any other route, and all 60 are one request with one answer.
+That is the half of the protocol a recording can hold.
+The other half is a conversation: a client picks its own chunk boundaries, asks where it got to after an interruption, believes the number it is told, sends the offset it believes in, and gives up if the server contradicts it.
+A second process finishes what the first one started with nothing but a url.
+
+So `js-tus/` drives the real tus-js-client, at the version pinned in `versions.json`, the way Supabase's own documentation writes a resumable upload, and reads every result back through supabase-js: the claim being made is that an object uploaded this way is an ordinary object, so the client that would have called `upload()` downloads it and lists it.
+12 tests, and they cover an upload in one piece, an upload in three chunks, an upload interrupted and picked up by a second client, a terminated upload, and the four refusals.
+
+The questions and the assertions there are both ours, which nothing else in this repository or the conformance one can say.
+What keeps that honest is that the same file, unedited, is run against a real `supabase start` in the same CI job that diffs the rest suite against it.
+A failure on that leg is this repository having written down something storage-api does not do, and it should be read as the suite being wrong rather than the server.
+
+It earned its keep on the day it was written.
+The documented flow uses a signed in user's access token rather than the service key, every recorded tus case had used the service key, and zou refused: the tables a resumable upload keeps its bookkeeping in have row level security on and no policy written about them, so the first insert an ordinary user made was refused before a byte moved.
+The bookkeeping is written with the policies off now, as upstream writes it, and whether the caller may write the object at all is asked once at creation by writing the row and rolling it back, which is the same question the signed upload url route asks the same way.
+
+The `supabase start` leg earned its keep on the same day, by refusing an assertion.
+Every upload in that suite sends a `cacheControl` in its metadata, and the reference answers two different things about the same object: a listing reads `max-age=3600` off the row and the info route reads `no-cache` off the stored file.
+zou keeps one value and says `no-cache` in both places, so it matches the recording of the info route and not the listing.
+The suite now asks nothing about cache control and the question is [#285](https://github.com/tamnd/zou/issues/285), which is a decision about how an object records what was asked for apart from what is served rather than anything about tus.
+
 ## The app
 
 A suite passing says every answer matched a recording. An app working says the answers were enough to build something on, and the second does not follow from the first.

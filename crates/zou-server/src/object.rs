@@ -272,11 +272,15 @@ pub(crate) async fn find(
 /// or not the question was answered, because a session that came back
 /// with the policies off would be a session the rest of the request
 /// trusts wrongly.
-pub(crate) async fn unpoliced<T>(
+///
+/// Generic over what the work can go wrong with, because the resumable
+/// routes answer in a shape of their own and still have to ask a
+/// question or two with the policies off.
+pub(crate) async fn unpoliced<T, E: From<StorageError>>(
     sess: &Session,
     role: &str,
-    work: impl AsyncFnOnce() -> Result<T, StorageError>,
-) -> Result<T, StorageError> {
+    work: impl AsyncFnOnce() -> Result<T, E>,
+) -> Result<T, E> {
     set_role(sess, "none").await?;
     let answer = work().await;
     set_role(sess, role).await?;
