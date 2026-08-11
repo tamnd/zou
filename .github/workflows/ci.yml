@@ -26,6 +26,14 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all --check
+      # The homebrew formula is generated at release time, when nobody
+      # is watching and there is no second chance at a tag, so the
+      # generator is run here against no checksums at all and the result
+      # handed to ruby.
+      - name: The brew formula still parses
+        run: |
+          packaging/brew/formula.sh --version 0.0.0 > /tmp/zou.rb
+          ruby -c /tmp/zou.rb
 
   clippy:
     name: clippy
