@@ -13,6 +13,7 @@ on:
       - scripts/pg-apply-patches.sh
       - scripts/zou-bundle.sh
       - packaging/npm/**
+      - packaging/pypi/**
       - Makefile
       - crates/zou/**
       - crates/zou-pg/**
@@ -456,3 +457,21 @@ jobs:
           # And the postgres it brought with it, which is the half of
           # this package that npm is a strange way to deliver.
           vendor/zou-linux-x64/pg/bin/postgres --version
+      # What pip install zou zou-postgres gets: two wheels, one with the
+      # extension and one with the postgres it starts, installed into a
+      # venv that has no ZOU_PG_BIN and no checkout to fall back on. The
+      # python suite then runs against what a user would have.
+      - name: the wheels, installed and run
+        run: |
+          python3 -m venv /tmp/zou-wheel-venv
+          /tmp/zou-wheel-venv/bin/pip install --quiet maturin supabase
+          PYTHON=/tmp/zou-wheel-venv/bin/python packaging/pypi/zou-postgres/build.sh
+          /tmp/zou-wheel-venv/bin/maturin build --release \
+            --manifest-path crates/zou-python/Cargo.toml --out dist/wheels
+          /tmp/zou-wheel-venv/bin/pip install --quiet --force-reinstall dist/wheels/*.whl
+          ls -l dist/wheels
+          # The extension is in site-packages now, so the test has to
+          # run from somewhere the source tree cannot shadow it.
+          cp -r crates/zou-python/test /tmp/zou-wheel-test
+          cd /tmp/zou-wheel-test
+          env -u ZOU_PG_BIN /tmp/zou-wheel-venv/bin/python -m unittest discover -s . -v

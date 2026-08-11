@@ -100,7 +100,7 @@ curl -fsSL https://raw.githubusercontent.com/tamnd/zou/main/install.sh | sh
 
 That takes the bundle for the platform, checks it against its sha256, and unpacks it into `~/.zou`, and the zou inside it finds the postmaster next to itself with nothing to configure. The bundle is 48.6 MB on darwin arm64 and 50.6 MB on linux x64 against a budget of 150 MB, and `scripts/zou-bundle.sh` builds one from a checkout, see [docs/packaging.md](docs/packaging.md).
 
-`npm install -g zou-cli` is the same tree for anyone who would rather get it from npm, and a node project that installs `zou-cli` next to the `zou` binding has a patched Postgres for its tests with no path to point anywhere.
+`npm install -g zou-cli` is the same tree for anyone who would rather get it from npm, and `pip install zou zou-postgres` is the same tree again for python. Either way a project that installs the binding next to the postgres package has a database per test with no path to point anywhere.
 
 ## Contributing
 

@@ -1,0 +1,37 @@
+# The patched Postgres, as a wheel, so a python project can pip install
+# the thing zou starts rather than build it or find it.
+#
+# There is no code here worth the name: the package is a directory of
+# binaries and one function that says where they are. It is built by
+# build.sh out of a release bundle, which is where the version and the
+# platform tag come from.
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zou-postgres"
+version = "0.0.1"
+description = "The patched PostgreSQL that zou runs, for the platform this wheel was built for"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [{ name = "Tam Nguyen" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Topic :: Database",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/tamnd/zou"
+Repository = "https://github.com/tamnd/zou"
+
+[tool.setuptools]
+packages = ["zou_postgres"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+zou_postgres = ["pg/**/*"]

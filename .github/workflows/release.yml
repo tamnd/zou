@@ -61,6 +61,19 @@ jobs:
           $BUNDLE/pg/bin/psql -h "$RUNNER_TEMP" -p 5618 -d postgres -v ON_ERROR_STOP=1 -c 'select version()' -c 'create extension vector'
           kill -INT "$(head -1 "$RUNNER_TEMP/bundle-pgdata/postmaster.pid")"
           $BUNDLE/bin/zou --version
+      # The same tree again as a wheel, so pip install zou zou-postgres
+      # is a project with a postmaster and nothing to configure. It is
+      # built here rather than in the wheels job because this is the job
+      # that has a bundle.
+      - name: The postgres wheel
+        run: |
+          # A dispatch run has a branch name where a tag would be, and
+          # that is not a version, so it builds one that says 0.0.1 and
+          # is never published.
+          case "$GITHUB_REF" in
+            refs/tags/v*) packaging/pypi/zou-postgres/build.sh --version "${GITHUB_REF_NAME#v}" ;;
+            *) packaging/pypi/zou-postgres/build.sh ;;
+          esac
       - name: Checksum
         run: |
           cd dist
@@ -76,6 +89,10 @@ jobs:
           path: |
             dist/zou-${{ matrix.name }}.tar.gz
             dist/zou-${{ matrix.name }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-postgres-${{ matrix.name }}
+          path: dist/wheels/*.whl
 
   # Windows has no embedded story and no patched postgres, so it gets
   # the binary on its own, which is what every target got before.
@@ -103,9 +120,61 @@ jobs:
           checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  # The python binding, which is an extension module and nothing else:
+  # no postgres in it, so it builds in a manylinux container and runs
+  # anywhere that has a python. One abi3 wheel per platform covers 3.9
+  # and everything after it.
+  wheels:
+    name: wheel (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: auto
+          - name: darwin-x64
+            os: macos-13
+            target: x86_64
+            manylinux: "off"
+          - name: darwin-arm64
+            os: macos-latest
+            target: aarch64
+            manylinux: "off"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      # The wheel is named after the tag, since the version a person
+      # installed is the version they should get. A dispatch run has no
+      # tag and builds one that says 0.0.1 and is never published.
+      - name: The version from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          sed -i.bak "s/^version = \".*\"$/version = \"${GITHUB_REF_NAME#v}\"/" crates/zou-python/pyproject.toml
+          rm crates/zou-python/pyproject.toml.bak
+          grep '^version' crates/zou-python/pyproject.toml
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --manifest-path crates/zou-python/Cargo.toml --out dist/wheels
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+      - run: ls -l dist/wheels
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-zou-${{ matrix.name }}
+          path: dist/wheels/*.whl
+
   publish:
     name: publish the bundles
-    needs: bundle
+    # The wheels as well, because a release page that has the tarballs
+    # and not the wheels is a release that is half there.
+    needs: [bundle, wheels]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -147,3 +216,35 @@ jobs:
           # downloads the release of the same name.
           npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#v}"
           npm publish --access public
+  # Both wheels together, since pip install zou zou-postgres is the
+  # pair: the extension module for every platform, and the patched
+  # postgres for every platform. They carry no assets from the release,
+  # so this waits on the jobs that built them and on nothing else.
+  pypi:
+    name: publish the wheels
+    needs: [bundle, wheels]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist/wheels
+          merge-multiple: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: ls -l dist/wheels
+      - name: Publish
+        env:
+          TWINE_USERNAME: __token__
+          # One token for both projects, which means an account token
+          # rather than a project one.
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          if [ -z "$TWINE_PASSWORD" ]; then
+            echo "no PYPI_TOKEN, so nothing goes to pypi, the wheels are on the release either way"
+            exit 0
+          fi
+          pip install --quiet twine
+          twine upload --non-interactive dist/wheels/*.whl

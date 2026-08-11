@@ -25,6 +25,11 @@ package-lock.json
 # the npm command line package: the bundle it downloads at install time
 packaging/npm/vendor/
 
+# the postgres wheel: the tree it carries is copied in at build time
+packaging/pypi/zou-postgres/zou_postgres/pg/
+packaging/pypi/zou-postgres/build/
+packaging/pypi/zou-postgres/dist/
+
 # the python binding: the extension is built, and so is everything
 # python leaves behind while running it
 crates/zou-python/python/zou/*.so

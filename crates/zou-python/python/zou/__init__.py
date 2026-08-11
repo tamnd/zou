@@ -30,6 +30,25 @@ ORIGIN = "http://zou.embedded"
 __all__ = ["create_zou", "create_fixture", "Zou", "Response", "ZouError", "ORIGIN"]
 
 
+def _pg_bin() -> str | None:
+    """Where the patched postgres is, when nobody has said.
+
+    The environment first, because a checkout points at its own build
+    with it. Then the ``zou-postgres`` wheel, which is how a project
+    that has never built anything gets a postmaster: ``pip install zou
+    zou-postgres`` and there is nothing else to do. None leaves the
+    extension to look in ``build/pg/bin`` and then to say so.
+    """
+    said = os.environ.get("ZOU_PG_BIN")
+    if said:
+        return said
+    try:
+        import zou_postgres
+    except ImportError:
+        return None
+    return zou_postgres.pg_bin()
+
+
 def create_zou(
     dir: str | os.PathLike[str] | None = None,
     *,
@@ -56,7 +75,7 @@ def create_zou(
     handle = _zou.open(
         target=target,
         tenant=tenant,
-        pg_bin=os.fspath(pg_bin) if pg_bin is not None else os.environ.get("ZOU_PG_BIN"),
+        pg_bin=os.fspath(pg_bin) if pg_bin is not None else _pg_bin(),
         runtime=os.fspath(runtime) if runtime is not None else None,
         jwt_secret=jwt_secret,
         schemas=list(schemas) if schemas is not None else None,

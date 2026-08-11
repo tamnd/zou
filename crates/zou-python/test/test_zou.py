@@ -1,10 +1,15 @@
 """A project opened from python, for real.
 
-Gated on ZOU_PG_BIN naming a patched install, same as the rust suite two
-crates over, and on the extension having been built:
+Needs the extension and a patched postgres, either from a checkout:
 
     crates/zou-python/build.sh
     ZOU_PG_BIN=$PWD/build/pg/bin python3 -m unittest discover -s crates/zou-python/test
+
+or from the wheels, which is what a project that never built anything
+has:
+
+    pip install zou zou-postgres
+    python3 -m unittest discover -s <a copy of this directory>
 
 These start postgres, so they are not free. Most of them take a fixture,
 which is a database branched off the machine's template and costs a
@@ -22,16 +27,34 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "python"))
+# In a checkout the extension is built next to the source. From a wheel
+# it is in site-packages and this file has been copied out of the tree
+# to run against it, so the source directory goes on the path only when
+# there is something in it.
+SOURCE = HERE.parent / "python"
+if (SOURCE / "zou" / "_zou.abi3.so").exists():
+    sys.path.insert(0, str(SOURCE))
 
-PG_BIN = os.environ.get("ZOU_PG_BIN", "")
-BUILT = (HERE.parent / "python" / "zou" / "_zou.abi3.so").exists()
-READY = PG_BIN != "" and BUILT
-if not READY:
-    print("skipping: needs ZOU_PG_BIN and crates/zou-python/build.sh")
-
-if BUILT:
+try:
     import zou as zoulib
+except ImportError:
+    zoulib = None
+
+# Where psql is, since these tests set their schema up over the dsn the
+# way a host process would. The environment when a checkout points at
+# its own build, and the zou-postgres wheel when there is no checkout.
+PG_BIN = os.environ.get("ZOU_PG_BIN", "")
+if not PG_BIN:
+    try:
+        import zou_postgres
+
+        PG_BIN = zou_postgres.pg_bin()
+    except ImportError:
+        pass
+
+READY = zoulib is not None and PG_BIN != ""
+if not READY:
+    print("skipping: needs the extension and a patched postgres, see the docstring")
 
 try:
     import supabase  # noqa: F401
@@ -52,7 +75,7 @@ def sql(handle, statements):
     )
 
 
-@unittest.skipUnless(READY, "needs ZOU_PG_BIN and the built extension")
+@unittest.skipUnless(READY, "needs the extension and a patched postgres")
 class Embedded(unittest.TestCase):
     def test_a_request_is_answered_in_this_process(self):
         with zoulib.create_fixture() as zou:
@@ -168,7 +191,7 @@ class Embedded(unittest.TestCase):
         zou.close()
 
 
-@unittest.skipUnless(BUILT, "needs crates/zou-python/build.sh")
+@unittest.skipUnless(zoulib is not None, "needs the extension")
 class Offline(unittest.TestCase):
     """The part that needs no postgres, so it runs anywhere."""
 
