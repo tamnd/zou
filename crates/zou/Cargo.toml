@@ -12,9 +12,12 @@ zou-log = { path = "../zou-log" }
 zou-ops = { path = "../zou-ops" }
 zou-pg = { path = "../zou-pg" }
 zou-store = { path = "../zou-store" }
+base64ct = { workspace = true }
 getrandom = { workspace = true }
+hmac = { workspace = true }
 log = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 

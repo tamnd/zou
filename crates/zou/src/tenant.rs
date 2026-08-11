@@ -131,6 +131,39 @@ fn info(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// One legacy format project key: HS256 over the claim set Supabase
+/// puts in an anon or service_role key, iss, role, iat, and a ten year
+/// exp.
+///
+/// The server has this same twenty lines in `zou_server::jwt`, which is
+/// where tokens are verified and where every other format lives. It is
+/// not called from here because that crate supervises a postmaster and
+/// so is compiled on unix only, while `zou tenant` is a store tool that
+/// works wherever a bucket does. The test below mints with this and
+/// verifies with that one, so a drift between them fails rather than
+/// ships.
+fn mint(role: &str, secret: &[u8]) -> String {
+    use base64ct::{Base64UrlUnpadded, Encoding};
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    let iat = now();
+    let claims = serde_json::json!({
+        "iss": "zou",
+        "role": role,
+        "iat": iat,
+        "exp": iat + 10 * 365 * 24 * 3600,
+    });
+    let header = Base64UrlUnpadded::encode_string(br#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload = Base64UrlUnpadded::encode_string(claims.to_string().as_bytes());
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
+    mac.update(header.as_bytes());
+    mac.update(b".");
+    mac.update(payload.as_bytes());
+    let sig = Base64UrlUnpadded::encode_string(&mac.finalize().into_bytes());
+    format!("{header}.{payload}.{sig}")
+}
+
 /// The two api keys a client is configured with, minted from the
 /// secret the registry holds.
 ///
@@ -146,8 +179,8 @@ fn keys(store: &dyn CasStore, tenant_ref: &str, as_env: bool) -> Result<(), Stri
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("no tenant {tenant_ref} on this store"))?;
     let secret = entry.jwt_secret.as_bytes();
-    let anon = zou_server::jwt::mint(&zou_server::jwt::key_claims("anon"), secret);
-    let service = zou_server::jwt::mint(&zou_server::jwt::key_claims("service_role"), secret);
+    let anon = mint("anon", secret);
+    let service = mint("service_role", secret);
     if as_env {
         println!("ANON_KEY=\"{anon}\"");
         println!("SERVICE_ROLE_KEY=\"{service}\"");
@@ -256,9 +289,19 @@ mod tests {
         run(&argv(&[&target, "create", "acme-prod", "--secret", "sh"])).unwrap();
         run(&argv(&[&target, "keys", "acme-prod"])).unwrap();
         run(&argv(&[&target, "keys", "acme-prod", "--env"])).unwrap();
-        let anon = zou_server::jwt::mint(&zou_server::jwt::key_claims("anon"), b"sh");
-        let verified = zou_server::jwt::verify(&anon, b"sh").expect("the pair verifies against it");
-        assert_eq!(verified.role.as_deref(), Some("anon"));
+        // What the printed keys are worth is whether the server takes
+        // them, so mint one here and verify it there.
+        #[cfg(unix)]
+        {
+            let anon = mint("anon", b"sh");
+            let verified =
+                zou_server::jwt::verify(&anon, b"sh").expect("the server takes what this mints");
+            assert_eq!(verified.role.as_deref(), Some("anon"));
+            assert!(
+                zou_server::jwt::verify(&anon, b"another project's secret").is_err(),
+                "a key is only a key for the project whose secret signed it"
+            );
+        }
         assert!(
             run(&argv(&[&target, "keys", "nobody"])).is_err(),
             "a ref that is not registered has no keys"
