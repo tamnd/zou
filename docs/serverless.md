@@ -234,6 +234,9 @@ Add a `[[services]]` block on 5432 to get psql and a connection string, and reme
 
 ## What is not here yet
 
+The Terraform config validates against the aws provider's own schema and plans as far as credentials allow, and nobody has applied it to a real account yet.
+So treat the first apply as the review it has not had, and the same goes for the S3 leg of the benchmarks.
+
 The cost numbers above are measured against a store on a local disk and priced at the published rates.
 Nobody has yet run this against a real bucket for a month and compared the two, which is what `--invocations-per-day` and its friends exist for, and the day someone does the table gets replaced by that.
 

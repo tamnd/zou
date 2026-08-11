@@ -54,6 +54,14 @@ variable "timeout_seconds" {
   description = "The invocation timeout. It has to cover the first attach of a project that has already been created, not the initdb, which is done from a laptop before the function ever runs."
   type        = number
   default     = 30
+
+  # A function can run for fifteen minutes, but an http api gives up
+  # after thirty seconds and answers 504, so anything past this is a
+  # timeout the caller never sees.
+  validation {
+    condition     = var.timeout_seconds > 0 && var.timeout_seconds <= 30
+    error_message = "timeout_seconds is between 1 and 30, which is what an http api integration allows."
+  }
 }
 
 variable "log_retention_days" {
