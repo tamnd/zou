@@ -1,5 +1,6 @@
 /target
 /build
+/dist
 **/*.rs.bk
 *.pending-snap
 .DS_Store
