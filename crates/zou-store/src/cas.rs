@@ -166,7 +166,8 @@ pub trait CasStore: Send + Sync {
 ///
 /// Create if absent does not use the lock at all, because the lock is
 /// breakable and this one operation must hold against a writer that was
-/// stopped mid put and comes back minutes later; see [`Self::publish`].
+/// stopped mid put and comes back minutes later. It publishes by hard
+/// link instead, which fails against whatever is at the key when it runs.
 pub struct LocalFsStore {
     root: PathBuf,
 }
