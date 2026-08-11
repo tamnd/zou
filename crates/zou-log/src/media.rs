@@ -323,16 +323,53 @@ fn put_quorum(
 pub struct MediaSink {
     media: Arc<WalMedia>,
     shard: u32,
+    /// The seq of the seal this sink's takeover wrote, which is its
+    /// claim on the shard. Zero for a sink with no takeover behind it,
+    /// which owns nothing and treats every taken seq as a fence.
+    sealed_seq: u64,
 }
 
 impl MediaSink {
-    pub fn new(media: Arc<WalMedia>, shard: u32) -> Self {
-        Self { media, shard }
+    pub fn new(media: Arc<WalMedia>, shard: u32, sealed_seq: u64) -> Self {
+        Self {
+            media,
+            shard,
+            sealed_seq,
+        }
     }
 }
 
 impl SegmentSink for MediaSink {
     fn put_segment(&self, seq: u64, segment: &[u8]) -> Result<(), CasError> {
-        self.media.put_segment(self.shard, seq, segment)
+        match self.media.put_segment(self.shard, seq, segment) {
+            // A taken seq is usually the fence and the end of this
+            // sequencer. It is litter instead when a writer this sink's
+            // own takeover fenced was frozen rather than killed, and its
+            // in flight PUTs landed after the sweep. Clearing it is the
+            // owner's job, since nobody else can know it is litter.
+            Err(CasError::AlreadyExists { key }) => {
+                match crate::chain::straggler_at(&self.media, self.shard, seq, self.sealed_seq) {
+                    Ok(true) => {
+                        log::warn!(
+                            "shard {} seq {seq} held by a fenced writer's late put, clearing it",
+                            self.shard
+                        );
+                        self.media.delete_segment(self.shard, seq)?;
+                        self.media.put_segment(self.shard, seq, segment)
+                    }
+                    Ok(false) => Err(CasError::AlreadyExists { key }),
+                    // Unreadable is not ours to clear, so it fences us
+                    // like anything else we did not write.
+                    Err(e) => {
+                        log::warn!(
+                            "shard {} seq {seq} is taken and unreadable: {e}",
+                            self.shard
+                        );
+                        Err(CasError::AlreadyExists { key })
+                    }
+                }
+            }
+            other => other,
+        }
     }
 }

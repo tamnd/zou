@@ -65,7 +65,7 @@ fn dual(c: &Cell, hedge_after: Duration) -> Arc<WalMedia> {
 }
 
 fn sequencer(media: &Arc<WalMedia>, shard: u32, t: zou_log::Takeover) -> Sequencer {
-    let sink = Arc::new(MediaSink::new(Arc::clone(media), shard));
+    let sink = Arc::new(MediaSink::new(Arc::clone(media), shard, t.sealed_seq));
     Sequencer::resume(shard, sink as _, quick(), t.next_seq, t.prev_digest)
 }
 

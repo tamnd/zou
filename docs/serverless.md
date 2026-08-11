@@ -37,6 +37,24 @@ A deployment that ends cleanly puts the lease back.
 A deployment that is killed outright does not, and the next start's first write waits out the rest of the 15 seconds while reads answer normally.
 That is the difference between a stop and a kill, and it is worth setting up the platform so it sends a signal.
 
+## Freeze and thaw
+
+A third thing can happen to a serverless process, and it is neither a stop nor a kill.
+Lambda between invocations and a suspended Fly machine are both a freeze: every thread stops where it stands, the heartbeat included, and the PUTs the wal pusher had in flight are neither sent nor cancelled.
+Minutes later the machine thaws with no idea any time passed, and lets all of them go at once.
+
+Nothing it does then can cost an acked write.
+The lease it was holding expired while it was frozen, so a successor took the store, sealed the chain at the head it found, and swept what was above.
+Every one of those late PUTs lands at a seq that is either taken, in which case it loses the creation race, or free and past the successor's own writes, in which case it is litter the successor clears when it gets there.
+A reader crossing that litter ends the chain rather than choking on it, and a break below the last seal is still an error, because that is corruption rather than a thaw.
+
+What the thawed process itself does is give up.
+Its next append fails, its pusher restarts, and it finds the lease held by a machine that is renewing it.
+After `ZOU_LEASE_WAIT_SECS`, 60 seconds by default and four times the TTL, it stops the cluster instead of waiting on.
+The alternative is worse than it sounds: a postmaster that answers on its port and hangs every commit forever, because a backend past its flush holds interrupts and cannot even be cancelled.
+
+[scripts/zou-freeze-thaw.sh](../scripts/zou-freeze-thaw.sh) is the drill: SIGSTOP a cluster under load, hand the store to a successor, SIGCONT the first one, and check that every acked commit is in a third cluster restored from nothing but the objects.
+
 ## Lambda
 
 `zou lambda <store> --ref demo` is a custom runtime: a loop over `GET /2018-06-01/runtime/invocation/next`, the project's own router, and `POST /2018-06-01/runtime/invocation/<id>/response`.
@@ -141,13 +159,14 @@ fly deploy
 ```
 
 One machine, for the one writer rule, and `auto_stop_machines = "stop"` rather than `"suspend"`.
-A stop is a signal and zou puts the lease back on the way out.
-A suspend freezes the machine mid lease, heartbeat included, and what happens on thaw is the freeze and thaw work in [issue #3](https://github.com/tamnd/zou/issues/3), not something to point a project at yet.
+A stop is a signal and zou puts the lease back on the way out, so the next start has the store to itself immediately.
+A suspend freezes the machine mid lease, heartbeat included, and the thaw is safe but not free: the lease expired while the machine was down, another one may have taken the store, and a machine that comes back to that has been replaced.
+It works out what happened, refuses to write, and stops itself, which costs a start rather than the data.
+A suspend is still the wrong setting for a single machine, because the thing it saves is the start a stop pays and the thing it risks is that stop happening anyway.
 
 The postgres port and the pooler are off in that config because an http app does not need them.
 Add a `[[services]]` block on 5432 to get psql and a connection string, and remember that the same one writer rule covers it.
 
 ## What is not here yet
 
-Freeze and thaw semantics, which is what Lambda between invocations and a suspended Fly machine both are, are specified but not tested under chaos.
 A Terraform example that stands the whole thing up, and a cost readout against a real bill, are the next two lines of [issue #3](https://github.com/tamnd/zou/issues/3).

@@ -72,7 +72,11 @@ pub(crate) mod testv2 {
             let layout = zou_store::layout::TenantLayout::new(tenant_ref);
             let media = Arc::new(WalMedia::single(crate::log_store(store, &layout)));
             let takeover = take_over(&media, WAL_SHARD, "testv2").unwrap();
-            let sink = Arc::new(MediaSink::new(Arc::clone(&media), WAL_SHARD));
+            let sink = Arc::new(MediaSink::new(
+                Arc::clone(&media),
+                WAL_SHARD,
+                takeover.sealed_seq,
+            ));
             let seq = Sequencer::resume(
                 WAL_SHARD,
                 sink,
@@ -1503,7 +1507,11 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             return Err(ZOU_ERR_STORE);
         }
     };
-    let sink = Arc::new(MediaSink::new(Arc::clone(&media), WAL_SHARD));
+    let sink = Arc::new(MediaSink::new(
+        Arc::clone(&media),
+        WAL_SHARD,
+        takeover.sealed_seq,
+    ));
     // The spec 08 lag bounds guard admission from day one: with no
     // reports the gate admits everything, and the fold thread's backlog
     // reports are what arm the consolidation alarm.
