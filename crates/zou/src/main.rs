@@ -1,3 +1,4 @@
+mod boot;
 mod branch;
 mod codegen;
 mod compact;
@@ -72,6 +73,9 @@ fn simple(result: Result<(), String>) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // First, so a cold start is measured from as close to the exec as
+    // a program can see, see boot.rs.
+    boot::entered();
     // Logs on stderr, RUST_LOG filters them, info by default, and
     // ZOU_LOG_FORMAT=json spells them as json lines for a collector.
     // Results meant for scripts stay on stdout untouched.

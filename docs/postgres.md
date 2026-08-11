@@ -69,7 +69,8 @@ target/release/zou-bootstrap /tmp/zou-pg-store /tmp/zou-pgdata --redo "$REDO"
 ```
 
 The `zou-restore` tool closes the loop: it rebuilds a data directory from the store alone.
-It writes the newest full capture back exactly as its INDEX describes it, applies every delta checkpoint after it in manifest order with later files winning, flips the pg_control state from shut down to in production so the server runs crash recovery instead of trusting an old clean shutdown, and overlays every mirrored WAL record into the `pg_wal` segment file it came from.
+It writes the newest full capture back exactly as its INDEX describes it, and the INDEX describes a file's length separately from its object's when the two differ, since a capture drops a file's trailing zeros and a WAL segment is sixteen megabytes however little has been written into it.
+It applies every delta checkpoint after it in manifest order with later files winning, flips the pg_control state from shut down to in production so the server runs crash recovery instead of trusting an old clean shutdown, and overlays every mirrored WAL record into the `pg_wal` segment file it came from.
 A pg_control taken from a running server is already in production and passes through untouched.
 A plain server start then replays from the last checkpoint's redo through the last durable record, and the node attaches with all committed data and no other local state.
 

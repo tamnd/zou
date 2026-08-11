@@ -32,6 +32,7 @@
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use zou_log::{TeeFilter, WalMedia, catch_up_with};
 use zou_store::layout::TenantLayout;
@@ -73,6 +74,12 @@ pub struct RestoreStats {
     /// The timeline the restored WAL is on, which is what names its
     /// segment files. A warm up reads them back, see [`crate::warm`].
     pub timeline: u32,
+    /// How long the skeleton took: the manifest, the checkpoint files,
+    /// pg_control and the WAL tail.
+    pub skeleton_took: Duration,
+    /// How long the WAL catch up took, which is the shared log read from
+    /// the newest checkpoint's redo page to the end of the stream.
+    pub wal_took: Duration,
 }
 
 /// The WAL file name for a byte position, mirroring XLogFileName.
@@ -187,7 +194,9 @@ fn restore_fs(
         .ok_or_else(|| format!("checkpoint {chk_id} has no INDEX object"))?;
     let index = String::from_utf8(index).map_err(|_| "INDEX is not utf8".to_string())?;
 
-    let mut files = 0usize;
+    // Path, the file's length, and the object's, which differ when the
+    // capture dropped a file's trailing zeros.
+    let mut files: Vec<(&str, u64, u64)> = Vec::new();
     let mut dirs = 0usize;
     for line in index.lines() {
         if let Some(rest) = line.strip_prefix("f ") {
@@ -197,24 +206,19 @@ fn restore_fs(
             let size: u64 = size
                 .parse()
                 .map_err(|_| format!("bad INDEX line {line:?}"))?;
-            let (data, _) = store
-                .get(&layout.chk_file(chk_id, relpath))
-                .map_err(|e| format!("store: {e}"))?
-                .ok_or_else(|| format!("checkpoint object for {relpath} is missing"))?;
-            if data.len() as u64 != size {
-                return Err(format!(
-                    "{relpath} is {} bytes in the store, INDEX says {size}",
-                    data.len()
-                ));
-            }
-            let path = pgdata.join(relpath);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
-            }
-            std::fs::write(&path, &data).map_err(|e| format!("write {relpath}: {e}"))?;
-            set_mode(&path, 0o600)?;
-            files += 1;
+            files.push((relpath, size, size));
+        } else if let Some(rest) = line.strip_prefix("t ") {
+            let (size, rest) = rest
+                .split_once(' ')
+                .ok_or_else(|| format!("bad INDEX line {line:?}"))?;
+            let (stored, relpath) = rest
+                .split_once(' ')
+                .ok_or_else(|| format!("bad INDEX line {line:?}"))?;
+            let (size, stored) = (size.parse::<u64>(), stored.parse::<u64>());
+            let (Ok(size), Ok(stored)) = (size, stored) else {
+                return Err(format!("bad INDEX line {line:?}"));
+            };
+            files.push((relpath, size, stored));
         } else if let Some(relpath) = line.strip_prefix("d ") {
             std::fs::create_dir_all(pgdata.join(relpath))
                 .map_err(|e| format!("mkdir {relpath}: {e}"))?;
@@ -223,7 +227,69 @@ fn restore_fs(
             return Err(format!("bad INDEX line {line:?}"));
         }
     }
-    Ok((files, dirs))
+    // The parents first and on one thread. They are local calls, most
+    // of them are the same handful of directories, and a restore that
+    // made them inside the fetch would have every thread making the
+    // same one.
+    for (relpath, _, _) in &files {
+        if let Some(parent) = pgdata.join(relpath).parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+        }
+    }
+    // Then the objects, all at once. A skeleton is a few tens of files
+    // and each one is a round trip, so a serial restore against a store
+    // thirty milliseconds away spends a second on a database that is
+    // otherwise empty. Nothing here depends on anything else here:
+    // distinct keys, distinct paths, and the INDEX is already read.
+    let failed = std::sync::Mutex::new(None::<String>);
+    let note = |e: String| {
+        let mut failed = failed.lock().expect("the first error");
+        failed.get_or_insert(e);
+        false
+    };
+    crate::pending::for_each_parallel(&files, |(relpath, size, stored)| {
+        let data = match store.get(&layout.chk_file(chk_id, relpath)) {
+            Ok(Some((data, _))) => data,
+            Ok(None) => return note(format!("checkpoint object for {relpath} is missing")),
+            Err(e) => return note(format!("store: {e}")),
+        };
+        if data.len() as u64 != *stored {
+            return note(format!(
+                "{relpath} is {} bytes in the store, INDEX says {stored}",
+                data.len()
+            ));
+        }
+        let path = pgdata.join(relpath);
+        // A file whose object is shorter had its trailing zeros dropped
+        // by the capture, so the file is made at its real length and the
+        // tail comes back as the hole a fresh file already is. See
+        // capture::without_trailing_zeros.
+        if let Err(e) = write_at_length(&path, &data, *size) {
+            return note(format!("write {relpath}: {e}"));
+        }
+        match set_mode(&path, 0o600) {
+            Ok(()) => true,
+            Err(e) => note(e),
+        }
+    });
+    if let Some(e) = failed.into_inner().expect("the first error") {
+        return Err(e);
+    }
+    Ok((files.len(), dirs))
+}
+
+/// Write `data` into a fresh file that ends up `size` bytes long. Equal
+/// lengths is an ordinary write; a shorter `data` leaves the rest of the
+/// file as a hole, which reads back as zeros and on a filesystem that
+/// keeps holes costs no disk either.
+fn write_at_length(path: &Path, data: &[u8], size: u64) -> Result<(), String> {
+    let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    file.write_all(data).map_err(|e| e.to_string())?;
+    if data.len() as u64 != size {
+        file.set_len(size).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// Write one chunk of WAL at its Postgres LSN, creating zero filled
@@ -309,6 +375,12 @@ fn ensure_segment_header(pg_wal: &Path, tli: u32, sysid: u64, seg_lsn: u64) -> R
 /// must not already exist. Returns what was rebuilt; a plain server start
 /// on the result completes the attach.
 pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreStats, String> {
+    // The two halves are timed apart because they fail differently: the
+    // skeleton is a fixed number of objects a project's size does not
+    // change, and the catch up grows with how much stream sits past the
+    // newest checkpoint. A caller printing an attach breakdown wants to
+    // know which of the two it is looking at.
+    let started = Instant::now();
     let store: Arc<dyn CasStore> = Arc::from(open_store(store_root)?);
     let layout = TenantLayout::new(tenant);
 
@@ -318,6 +390,8 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
         .ok_or_else(|| format!("{store_root} has no manifest, nothing to restore"))?;
     let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
     let mut stats = restore_manifest(&*store, &layout, &manifest, pgdata)?;
+    stats.skeleton_took = started.elapsed();
+    let caught_up = Instant::now();
 
     // WAL past the newest checkpoint comes straight from the shared log,
     // the same read the barrier and the folder do. The floor is the
@@ -351,6 +425,7 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
         },
     )
     .map_err(|e| format!("wal catch up: {e}"))?;
+    stats.wal_took = caught_up.elapsed();
     Ok(stats)
 }
 
@@ -458,6 +533,7 @@ fn restore_manifest(
         wal_bytes: 0,
         wal_end,
         timeline: tli,
+        ..RestoreStats::default()
     })
 }
 
@@ -660,6 +736,65 @@ mod tests {
 
         // A second restore refuses to clobber the first.
         assert!(restore(store_root, "local", &pgdata).is_err());
+    }
+
+    #[test]
+    fn a_capture_that_dropped_trailing_zeros_restores_the_whole_file() {
+        // What a capture writes and what the file measures are two
+        // numbers, and the restore owes the file the second one. The
+        // sixteen megabyte wal segment a fresh cluster has barely
+        // written into is the case that pays for this.
+        let store_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let layout = TenantLayout::new("local");
+
+        let mut segment = vec![0x11u8; 300];
+        store
+            .put_if_absent(
+                &layout.chk_file("genesis", "pg_wal/000000010000000000000001"),
+                &segment,
+            )
+            .unwrap();
+        store
+            .put_if_absent(&layout.chk_file("genesis", "empty file"), b"")
+            .unwrap();
+        let index = format!(
+            "t {WAL_SEGMENT_SIZE} 300 pg_wal/000000010000000000000001\nt 4096 0 empty file\n"
+        );
+        store
+            .put_if_absent(&layout.chk_index("genesis"), index.as_bytes())
+            .unwrap();
+
+        let pgdata = out_dir.path().join("restored");
+        std::fs::create_dir_all(&pgdata).unwrap();
+        let (files, _) = restore_fs(&store, &layout, "genesis", &pgdata).unwrap();
+        assert_eq!(files, 2);
+
+        segment.resize(WAL_SEGMENT_SIZE as usize, 0);
+        let restored = std::fs::read(pgdata.join("pg_wal/000000010000000000000001")).unwrap();
+        assert_eq!(restored, segment, "the zeros came back");
+        // A path with a space in it, which is why the lengths lead.
+        assert_eq!(std::fs::read(pgdata.join("empty file")).unwrap(), [0; 4096]);
+    }
+
+    #[test]
+    fn a_capture_shorter_than_its_own_index_is_refused() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let layout = TenantLayout::new("local");
+        store
+            .put_if_absent(&layout.chk_file("genesis", "PG_VERSION"), b"18\n")
+            .unwrap();
+        store
+            .put_if_absent(&layout.chk_index("genesis"), b"t 9 8 PG_VERSION\n")
+            .unwrap();
+
+        let pgdata = out_dir.path().join("restored");
+        std::fs::create_dir_all(&pgdata).unwrap();
+        let err = restore_fs(&store, &layout, "genesis", &pgdata).unwrap_err();
+        assert!(err.contains("INDEX says 8"), "{err}");
     }
 
     #[test]

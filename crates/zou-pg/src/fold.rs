@@ -87,7 +87,10 @@ pub(crate) fn chk_layout(own: &TenantLayout, c: &CheckpointRef) -> TenantLayout 
     }
 }
 
-/// Total file bytes a checkpoint describes, summed from its INDEX.
+/// Total stored bytes a checkpoint describes, summed from its INDEX.
+/// A trimmed line carries the file's length and the object's; the
+/// object's is what the store holds and what a fold down would move, so
+/// that is the one the policy weighs.
 fn index_bytes(store: &dyn CasStore, layout: &TenantLayout, id: &str) -> Result<u64, String> {
     let (data, _) = store
         .get(&layout.chk_index(id))
@@ -100,6 +103,13 @@ fn index_bytes(store: &dyn CasStore, layout: &TenantLayout, id: &str) -> Result<
             let len = rest
                 .rsplit(' ')
                 .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or_else(|| format!("bad INDEX line {line:?} in {id}"))?;
+            total += len;
+        } else if let Some(rest) = line.strip_prefix("t ") {
+            let len = rest
+                .split(' ')
+                .nth(1)
                 .and_then(|v| v.parse::<u64>().ok())
                 .ok_or_else(|| format!("bad INDEX line {line:?} in {id}"))?;
             total += len;
@@ -915,15 +925,19 @@ mod tests {
         assert_eq!(chk.kind, CheckpointKind::Delta);
         assert_eq!(chk.id, format!("{redo:016x}"));
 
-        // The capture round trips byte for byte.
+        // The capture round trips byte for byte, minus the trailing
+        // zeros of a control file that is mostly padding, which the
+        // INDEX describes so a restore puts them back.
         let (stored, _) = store
             .get(&layout.chk_file(&chk.id, "global/pg_control"))
             .unwrap()
             .unwrap();
-        assert_eq!(stored, control);
+        let live = control.iter().rposition(|b| *b != 0).unwrap() + 1;
+        assert_eq!(stored, control[..live]);
         let (index, _) = store.get(&layout.chk_index(&chk.id)).unwrap().unwrap();
         let index = String::from_utf8(index).unwrap();
         assert!(index.contains("f pg_xact/0000 4"));
+        assert!(index.contains(&format!("t {} {live} global/pg_control\n", control.len())));
 
         // The WAL tail: everything from where coverage starts, the
         // stream base here since nothing older was ever pushed, through
