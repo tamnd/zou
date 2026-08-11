@@ -11,7 +11,7 @@ FROM rust:1.97-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       meson ninja-build flex bison libreadline-dev zlib1g-dev \
-      libicu-dev pkg-config uuid-dev \
+      libicu-dev pkg-config uuid-dev patchelf \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

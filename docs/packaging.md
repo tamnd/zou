@@ -44,7 +44,20 @@ The loadable modules come whole, `vector` among them, minus the three language h
 
 Postgres finds its share directory and its modules relative to the postmaster, so the bundle keeps the layout the install had rather than one of its own.
 That matters more than it sounds: a debian meson build puts the modules under `lib/x86_64-linux-gnu/postgresql` and a mac build under `lib/postgresql`, and the script reads `pg_config` rather than assuming either.
-A bundle moved anywhere still runs, which is the whole point of shipping one.
+
+## Why it runs somewhere else
+
+A postgres that has just been built is linked against the tree it was built in, by absolute path: `/src/build/pg/lib/x86_64-linux-gnu` is written into `initdb` and stays there when the file is copied.
+Copy that into an image and the postmaster comes up as `error while loading shared libraries: libpq.so.5`, on a machine where libpq is sitting right next to it.
+So the last thing the script does is rewrite those paths into ones relative to the file holding them, `$ORIGIN/../lib/x86_64-linux-gnu` on linux with `patchelf` and `@loader_path/../lib` on mac with `install_name_tool`, and a mach-o that has been edited is re-signed because an arm64 mac will not run a file whose signature no longer matches it.
+
+A mac build also links homebrew, openssl and lz4 and zstd, and homebrew is not in the bundle and is not even at the same path on an intel mac as on an arm one, so those libraries are copied in and rewritten with everything else.
+Anything under `/usr/lib` or `/System` is the operating system and is left where it is.
+Linux is the other way round: openssl and icu and zlib and readline come from the distribution, so the bundle expects them, which on debian and ubuntu means `libicu`, `libssl3`, `zlib1g` and `libreadline8`.
+The container image installs exactly those.
+
+CI proves this rather than asserting it: before starting a database out of a fresh bundle it moves `build/pg` out of the way, so what runs is the bundle standing on its own, the way it will arrive on a machine that never built anything.
+Assembling a linux bundle needs `patchelf` on the machine doing the assembling, and the script says so and stops rather than writing a tarball that only works where it was made.
 
 ## What it weighs
 
@@ -52,15 +65,16 @@ The budget is 150 MB for the pair, and the script exits non zero over it, so CI 
 
 | | darwin arm64, laptop | linux x64, vps | linux x64, github runner |
 | zou | 17.3 MB | 18.1 MB | 20.0 MB |
-| postgres | 16.7 MB | 19.1 MB | 19.2 MB |
-| the other pg programs | 1.5 MB | 1.8 MB | 1.8 MB |
-| loadable modules | 7.8 MB | 6.3 MB | 6.3 MB |
+| postgres | 16.8 MB | 19.1 MB | 19.2 MB |
+| the other pg programs | 1.6 MB | 1.8 MB | 1.8 MB |
+| modules and the libs they use | 15.5 MB | 6.3 MB | 6.3 MB |
 | share, bki and timezones | 5.3 MB | 5.3 MB | 5.3 MB |
-| the bundle | 48.6 MB | 50.6 MB | 52.6 MB |
-| the tarball | 18.0 MB | 19.4 MB | 20.2 MB |
+| the bundle | 56.5 MB | 50.6 MB | 52.6 MB |
+| the tarball | 21.0 MB | 19.4 MB | 20.2 MB |
 
 Measured on an apple silicon laptop, on a 6 vCPU vps, and on the runner that builds every postgres build, all three against the vendored Postgres 18.4 with the patch series applied.
 The two linux columns are the same commit and the same rustc, and the rust binary is two megabytes apart between them anyway, which is what a bundle size is: a number about a machine rather than about a program.
+The mac column carries seven megabytes the linux ones do not, which is openssl and lz4 and zstd: a mac gets those from homebrew and a linux gets them from the distribution, and only one of those two is a thing a download can rely on.
 The rust binary is stripped by the release profile; the postgres binaries are stripped by the script, which is a third of the postmaster.
 A third of the whole bundle is timezones, catalog templates, and extension sql, none of which compresses badly, which is why the tarball is roughly a third of the tree.
 

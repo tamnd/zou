@@ -34,7 +34,7 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
             sudo apt-get update
-            sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config uuid-dev
+            sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev pkg-config uuid-dev patchelf
           else
             brew install meson ninja icu4c pkg-config bison flex
             echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig" >> "$GITHUB_ENV"
@@ -52,6 +52,11 @@ jobs:
       - name: Start a database out of it
         run: |
           BUNDLE=$PWD/dist/zou-${{ matrix.name }}
+          # The build tree is what postgres was linked against, so it
+          # goes out of the way before anything is started: what runs
+          # after this is the bundle standing on its own, which is the
+          # only way it will ever arrive on someone else's machine.
+          mv build/pg "$RUNNER_TEMP/pg-build-tree"
           $BUNDLE/pg/bin/initdb -D "$RUNNER_TEMP/bundle-pgdata"
           $BUNDLE/pg/bin/postgres -D "$RUNNER_TEMP/bundle-pgdata" -k "$RUNNER_TEMP" -p 5618 >"$RUNNER_TEMP/bundle-pg.log" 2>&1 &
           for i in $(seq 1 60); do
