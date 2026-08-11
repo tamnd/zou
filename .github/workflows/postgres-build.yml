@@ -19,6 +19,7 @@ on:
       - crates/libzou/**
       - crates/zou-node/**
       - crates/zou-python/**
+      - go/**
       - .github/workflows/postgres-build.yml
   workflow_dispatch:
 
@@ -152,6 +153,11 @@ jobs:
           /tmp/zou-python-venv/bin/pip install --quiet supabase
           ZOU_PG_BIN=$PWD/build/pg/bin /tmp/zou-python-venv/bin/python -m unittest discover \
             -s crates/zou-python/test -v
+      # And the same project behind an http.Client in a go process,
+      # which is cgo over the same shared library the C program above
+      # linked against.
+      - name: the go binding end to end
+        run: ZOU_PG_BIN=$PWD/build/pg/bin go/test.sh -v
       - name: zou dev, branch, and info end to end
         run: |
           cargo build -p zou --release

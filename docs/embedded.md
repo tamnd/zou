@@ -1,8 +1,7 @@
 # Embedded
 
 A whole Supabase compatible project inside another process, with no daemon to start, no port to pick, and no docker compose file.
-This is the `zou-embed` crate, `libzou`, which is the same thing behind a C ABI, and the node and python packages over it.
-The Go binding is next and is not there yet.
+This is the `zou-embed` crate, `libzou`, which is the same thing behind a C ABI, and the node, python, and Go packages over it.
 
 ## What it is
 
@@ -264,6 +263,37 @@ ZOU_PG_BIN=$PWD/build/pg/bin python3 -m unittest discover -s crates/zou-python/t
 
 `build.sh` is cargo plus a copy, the same as node's, and maturin builds the wheel.
 The tests open real projects, skip the supabase-py one when supabase-py is not installed, and run in CI on the job that builds the patched Postgres.
+
+## From Go
+
+```go
+import zou "github.com/tamnd/zou/go"
+
+project, err := zou.Fixture()
+defer project.Close()
+
+answer, err := project.Client().Get(project.URL() + "/rest/v1/todos?select=title")
+```
+
+The Go binding is cgo over `libzou` rather than a binding of its own, because Go's way into a C library is cgo and there is nothing else to invent.
+The seam into Go is `http.RoundTripper`: a `*Zou` is one, so `Client()` is an ordinary `*http.Client` that answers in this process, and any library that takes a client can be pointed at a database of its own without knowing anything about zou.
+That is the same move `fetch` is in node and an httpx transport is in python, in the shape Go already has.
+
+`Open(zou.Options{...})` and `Fixture()` are the two doors, then `Request`, `Listen`, `Branch`, `Branchable`, `Checkpoint`, `Close`, and `AnonKey`, `ServiceRoleKey`, `DSN`, `Target`, `Tenant`, `URL`.
+A failure is a `*zou.Error` with `Code`, `Kind`, and `Message`, so `errors.As` gets the kind rather than a string to match on.
+`Close` twice is fine, and a handle that goes out of scope without it has a finalizer, because a postmaster that outlives the thing holding it is worse than a leak.
+
+One thing cgo makes true that C does not: `zou_last_error` belongs to the thread that made the call, and a goroutine is not a thread.
+Every call that can fail is therefore paired with its message inside a single cgo call, through a few lines of C in the preamble, since one cgo call is one thread by construction.
+
+```bash
+cargo build -p libzou
+ZOU_PG_BIN=$PWD/build/pg/bin go test ./go/...
+```
+
+`go/test.sh` does both.
+The package names `target/debug` and bakes an rpath to it, so a checkout works with nothing else set, and `CGO_LDFLAGS` names the directory anywhere else.
+The tests open real projects and run in CI on the job that builds the patched Postgres.
 
 ## Testing it
 
