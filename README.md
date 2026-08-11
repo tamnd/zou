@@ -59,8 +59,16 @@ The suites in this repo run on it.
 A server, where the only durable state is the bucket:
 
 ```bash
-zou serve --store s3://mybucket/tenants --domain '*.api.example.com'
+zou serve s3://mybucket/tenants --domain api.example.com
 ```
+
+Or one project on a function, where there is no server to run at all:
+
+```bash
+zou lambda s3://mybucket/tenants --ref demo
+```
+
+`--ref` serves one project at every url it answers and brings it up before the first request rather than because of it, which is what Lambda, Cloud Run and Fly all want. The recipes for the three are in [docs/serverless.md](docs/serverless.md).
 
 Branch a database for a preview deploy:
 

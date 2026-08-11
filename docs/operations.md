@@ -134,6 +134,11 @@ Routing is `--domain` and the path prefix, and at least one of them has to be on
 `--domain zou.example` makes `acme-prod.zou.example` a project, and it is also where a tenant's own external url comes from, so the links in its confirmation mail point at the project instead of at the node.
 The path prefix is on by default and `--no-path-prefix` turns it off, for a deployment that has a wildcard certificate and does not want a second way in.
 
+`--ref demo` is the other shape: one project, at every url the node answers, with the routing taken out rather than configured off.
+Nothing is resolved per request, `--domain` has nothing left to name and is refused alongside it, and the project is attached before the http door starts accepting, so the first request waits in the accept queue for an attach instead of being the reason for it.
+`ZOU_REF` sets it and `ZOU_TARGET` sets the store, for a platform that configures a container with variables rather than a command line.
+That is the shape a function or a container per project wants, and the Lambda, Cloud Run and Fly recipes are in [serverless.md](serverless.md).
+
 Nothing is running until a request names a project.
 The first one for a cold tenant restores its runtime directory out of that tenant's own prefix and starts a postmaster on loopback with a private socket directory, and both are thrown away when it is let go of.
 `--max-attached` is how many are up at once and `--idle-secs` is how long an untouched one stays up, both defaulting to what the attach manager uses, and the sweep that enforces the second runs on a timer at a quarter of it, because a node that has gone quiet is exactly the node with no requests to notice on.

@@ -56,6 +56,12 @@ pub struct S3Config {
     pub bucket: String,
     pub access_key: String,
     pub secret_key: String,
+    /// The third part of a temporary credential, from a role rather
+    /// than a user: an instance profile, an ECS task role, or the
+    /// environment a Lambda function is handed. The key pair alone is
+    /// not enough to sign with, the token has to travel with it, in the
+    /// signature on a request and in the query of a presigned url.
+    pub session: Option<String>,
     pub dialect: Dialect,
 }
 
@@ -109,6 +115,19 @@ impl S3Store {
             key: key.to_string(),
             source: std::io::Error::other(msg),
         }
+    }
+
+    /// The caller's headers plus the session token, when there is one.
+    ///
+    /// A temporary credential's token is a header like any other, so it
+    /// rides along with the conditions and is signed and sent by the
+    /// same code rather than by a special case in every method.
+    fn with_token<'a>(&'a self, extra: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let mut headers = extra.to_vec();
+        if let Some(token) = self.cfg.session.as_deref() {
+            headers.push(("x-amz-security-token", token));
+        }
+        headers
     }
 
     fn object_path(&self, key: &str) -> String {
@@ -203,6 +222,8 @@ impl S3Store {
         payload_hash: &str,
     ) -> Result<(u16, Option<String>, Vec<u8>), String> {
         let (amz_date, datestamp) = amz_timestamp(SystemTime::now());
+        let extra = self.with_token(extra_headers);
+        let extra_headers = &extra[..];
         // The condition headers are signed too. SigV4 allows signing any
         // header, and GCS requires its x-goog-* headers in the signature.
         let mut signed_headers = vec![
@@ -368,6 +389,11 @@ impl CasStore for S3Store {
             ("X-Amz-Expires", seconds.to_string()),
             ("X-Amz-SignedHeaders", "host".to_string()),
         ];
+        // Temporary credentials carry their token in the query here,
+        // since a browser following the url sends no headers of ours.
+        if let Some(token) = self.cfg.session.as_deref() {
+            params.push(("X-Amz-Security-Token", token.to_string()));
+        }
         params.extend(response.iter().map(|(k, v)| (*k, v.to_string())));
         // Canonical order is by encoded name, and every pair is encoded
         // once, here, so what goes on the wire is what was signed.
@@ -653,6 +679,7 @@ mod tests {
             bucket: "examplebucket".into(),
             access_key: "AKIAIOSFODNN7EXAMPLE".into(),
             secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into(),
+            session: None,
             dialect: Dialect::S3,
         }
     }
@@ -730,6 +757,70 @@ mod tests {
         assert!(auth.contains(
             "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-goog-if-generation-match"
         ));
+    }
+
+    /// A role's token has to be in the signature, not just on the wire,
+    /// or S3 answers 403 to every request a function makes.
+    #[test]
+    fn a_session_token_is_signed_along_with_the_condition_headers() {
+        let mut cfg = example_cfg();
+        cfg.session = Some("IQoJb3JpZ2luX2VjEXAMPLE".into());
+        let store = S3Store::new(cfg);
+        let sent = store.with_token(&[("if-none-match", "*")]);
+        assert_eq!(
+            sent,
+            vec![
+                ("if-none-match", "*"),
+                ("x-amz-security-token", "IQoJb3JpZ2luX2VjEXAMPLE"),
+            ]
+        );
+        let auth = authorization(
+            &store.cfg,
+            "PUT",
+            "/obj",
+            "",
+            &signed_headers(&sent),
+            EMPTY_SHA256,
+            "20130524T000000Z",
+            "20130524",
+        );
+        assert!(
+            auth.contains(
+                "SignedHeaders=host;if-none-match;x-amz-content-sha256;x-amz-date;x-amz-security-token"
+            ),
+            "{auth}"
+        );
+    }
+
+    /// A static key pair sends no token at all, which is what every
+    /// MinIO and every laptop is.
+    #[test]
+    fn a_static_key_pair_sends_no_token() {
+        let store = S3Store::new(example_cfg());
+        assert_eq!(store.with_token(&[("range", "bytes=0-9")]).len(), 1);
+        let url = store
+            .presigned_get("a/b", Duration::from_secs(60), &[])
+            .expect("a url")
+            .expect("a url");
+        assert!(!url.contains("X-Amz-Security-Token"), "{url}");
+    }
+
+    /// Whoever follows a presigned url sends none of our headers, so
+    /// the token has to be in the query, and signed there.
+    #[test]
+    fn a_presigned_url_carries_the_session_token() {
+        let mut cfg = example_cfg();
+        cfg.session = Some("IQoJb3JpZ2luX2VjEXAMPLE".into());
+        let store = S3Store::new(cfg);
+        let url = store
+            .presigned_get("a/b", Duration::from_secs(60), &[])
+            .expect("a url")
+            .expect("a url");
+        assert!(
+            url.contains("X-Amz-Security-Token=IQoJb3JpZ2luX2VjEXAMPLE"),
+            "{url}"
+        );
+        assert!(url.contains("X-Amz-Signature="), "{url}");
     }
 
     /// The query string authentication example from the same

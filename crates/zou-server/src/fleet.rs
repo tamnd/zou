@@ -25,6 +25,11 @@ use crate::wire::Wire;
 
 /// The doors, and what is behind them.
 pub struct Doors {
+    /// The one project this node serves, if it serves one. Set, and the
+    /// routing is not consulted at all and the project is brought up
+    /// before the http door starts accepting, so the first request pays
+    /// for nothing it did not ask for.
+    pub only: Option<String>,
     /// How a request names its project. Both ways off is a node that
     /// serves nothing, since every request would resolve to no tenant.
     pub routing: Routing,
@@ -107,7 +112,22 @@ impl Doors {
             }
         });
 
-        let front = crate::gateway::gateway(self.routing, self.registry, self.attached);
+        let front = match self.only {
+            // The listener is already bound, so a request that arrives
+            // during this waits in the accept queue rather than being
+            // refused, and the wait is the attach it would have paid
+            // for itself.
+            Some(only) => {
+                let started = std::time::Instant::now();
+                crate::gateway::preattach(&only, &self.registry, &self.attached).await?;
+                log::info!(
+                    "{only} is up before the first request, in {:.1} ms",
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+                crate::gateway::only(only, self.registry, self.attached)
+            }
+            None => crate::gateway::gateway(self.routing, self.registry, self.attached),
+        };
         axum::serve(
             convert(self.http)?,
             front.into_make_service_with_connect_info::<std::net::SocketAddr>(),

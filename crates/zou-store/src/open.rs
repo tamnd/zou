@@ -221,6 +221,11 @@ fn open_remote(scheme: &str, bucket: &str) -> Result<Box<dyn CasStore>, String> 
         bucket: bucket.to_string(),
         access_key: need("AWS_ACCESS_KEY_ID")?,
         secret_key: need("AWS_SECRET_ACCESS_KEY")?,
+        // Set wherever a role hands out the credentials rather than a
+        // person: a Lambda function, an ECS task, an EC2 instance
+        // profile. Absent for a static key pair, which is most laptops
+        // and every MinIO.
+        session: var("AWS_SESSION_TOKEN"),
         dialect,
     })))
 }

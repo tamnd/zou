@@ -51,6 +51,8 @@ fn usage() -> ExitCode {
     eprintln!("       {}", map::USAGE);
     #[cfg(unix)]
     eprintln!("       {}", serve::USAGE);
+    #[cfg(unix)]
+    eprintln!("       {}", serve::LAMBDA_USAGE);
     eprintln!("       {}", shard::USAGE);
     eprintln!("       {}", stats::USAGE);
     #[cfg(unix)]
@@ -139,6 +141,22 @@ fn main() -> ExitCode {
         #[cfg(not(unix))]
         Some("serve") => {
             eprintln!("zou: serve needs a unix platform");
+            ExitCode::FAILURE
+        }
+        #[cfg(unix)]
+        Some("lambda") => {
+            let args = match serve::parse_lambda(&argv[1..]) {
+                Ok(args) => args,
+                Err(e) => {
+                    eprintln!("zou: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            simple(serve::run(&args))
+        }
+        #[cfg(not(unix))]
+        Some("lambda") => {
+            eprintln!("zou: lambda needs a unix platform");
             ExitCode::FAILURE
         }
         Some("shard") => simple(shard::run(&argv[1..])),

@@ -39,6 +39,7 @@ pub mod gateway;
 pub mod gojson;
 pub mod hook;
 pub mod jwt;
+pub mod lambda;
 pub mod limit;
 pub mod mail;
 pub mod mfa;
