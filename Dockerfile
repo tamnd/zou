@@ -9,9 +9,14 @@
 # release, so there is one definition of what ships.
 FROM rust:1.97-bookworm AS builder
 
+# The same list the release builds against, on purpose: a postgres
+# built without liblz4-dev on the machine is a postgres without lz4,
+# and an image whose features are a subset of the tarball's is a
+# difference nobody wrote down.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       meson ninja-build flex bison libreadline-dev zlib1g-dev \
-      libicu-dev pkg-config uuid-dev patchelf \
+      libicu-dev liblz4-dev libzstd-dev libssl-dev libxml2-dev libxslt1-dev \
+      pkg-config uuid-dev patchelf \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
