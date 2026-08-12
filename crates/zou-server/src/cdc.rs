@@ -141,6 +141,16 @@ impl Tap {
         if !published {
             return Err(Closed::NoPublication(publication.to_string()));
         }
+        // A value arrives as the text its output function produced, and
+        // what that function produces for a date, a time or a timestamp
+        // depends on the session asking. Postgres runs the decoding in
+        // this backend, so these two settings are what a payload's
+        // timestamps end up saying, and a subscriber's payload cannot
+        // depend on what time zone the server happens to be in.
+        client
+            .batch_execute("set datestyle = 'ISO, MDY'; set timezone = 'UTC'")
+            .await
+            .map_err(failed)?;
         let pid: i32 = client
             .query_one("select pg_backend_pid()", &[])
             .await
@@ -208,6 +218,13 @@ impl Tap {
     /// until this is dropped.
     pub fn slot(&self) -> &str {
         &self.slot
+    }
+
+    /// The connection this reads on, which is also the one to ask what
+    /// a type oid is: the catalog a payload needs describes the same
+    /// database the changes came out of.
+    pub fn client(&self) -> &tokio_postgres::Client {
+        &self.client
     }
 }
 
