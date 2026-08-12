@@ -149,8 +149,8 @@ pub fn render(runs: &[Run], js: &[(String, Js)], pin: Option<&str>) -> String {
         out.push_str(&format!("## {name}\n\n"));
         out.push_str(&format!(
             "{name}'s own tests, run against zou with the url changed and not one \
-             assertion touched. A skipped test is one that needs something zou does not \
-             serve on that url yet, Realtime or image transforms: they are skipped rather \
+             assertion touched. A skipped test is one upstream skips itself, or one that \
+             needs something zou does not serve on that url yet: they are skipped rather \
              than deleted so that the count keeps saying how much of the file is not \
              being asked.\n\n"
         ));
