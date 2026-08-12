@@ -100,6 +100,38 @@ The last one is in there because a fixture skips the bootstrap on the strength o
 `Options::fixture()` names no target, since the store is the template's.
 Anything that has to end up in a particular directory is `Options::dir`, which is a real store and pays what a real store costs.
 
+### A branch per test, when the tests need a schema
+
+A fixture is empty, so a suite that opens one per test runs its migrations per test as well, and on most projects the migrations are the expensive half.
+Seed one fixture with them and give every test a branch of that instead, which is the same trick a fixture plays on the machine's template, one level further down.
+
+```rust
+static BASE: OnceLock<Zou> = OnceLock::new();
+
+fn base() -> &'static Zou {
+    BASE.get_or_init(|| {
+        let zou = Zou::open(Options::fixture()).unwrap();
+        migrate(zou.dsn());  // once for the whole suite
+        zou
+    })
+}
+
+#[test]
+fn a_todo_can_be_inserted() {
+    let zou = base().branch("a_todo_can_be_inserted").unwrap();
+    // The schema is already there, and nothing this test writes
+    // is visible to any other test.
+    zou.close().unwrap();
+}
+```
+
+`examples/per_test_branch.rs` is that, runnable, with the assertions the pattern stands on: each test sees the seed, sees nothing another test wrote, and takes its database off the store on the way out.
+On this laptop the seeded base costs 193 to 275 ms, template and schema included, and each test is 130 to 151 ms at p50 over four runs of ten tests, 243 to 337 at p90.
+That is roughly 30 ms of restore, 30 ms of postmaster, and 80 ms of waiting for the parent's checkpoint to be published, and the tenant contract is not in there at all because the branch inherits a database that already ran it.
+The spread between p50 and p90 is that last part: the fold runs on a thread of its own about 100 ms after the checkpoint, so a branch that asks just after one started waits for the next.
+
+A branch per test is worth it when the migrations cost more than that, which is most projects with a real schema, and not worth it when the tests are happy on an empty database, where `Options::fixture()` on its own is 36 ms.
+
 ## Serving it to somebody else as well
 
 ```rust
@@ -117,8 +149,11 @@ let preview = zou.branch("pr-142")?;
 ```
 
 A checkpoint is taken first, on purpose: asking for a branch from inside the process that is writing should carry what that process has written.
+A checkpoint on its own is not enough, though, because it hands the pages to the store and the store publishes them from a thread of its own a moment later, and a cut in that window is a child quietly missing its parent's last writes.
+So `branch` waits for the capture that covers its own checkpoint to be published, 73 to 293 ms on this laptop, and fails rather than handing back a child that is behind.
 Then the child manifest is written, no data is copied, and the child is opened and handed back as a second live handle.
 The two are separate databases from that moment, so a write to one is not visible in the other.
+A branch of a fixture is a fixture: it lives on the same template store and goes off it on close, the way the fixture it came from does.
 
 A branch reads inherited pages out of the captures it names and has no fallback for the ones it cannot.
 A database young enough that no fold has packed a full page capture down yet cannot be branched, and `branch` says so and leaves nothing of the child on the store, rather than handing back something only shaped like a database that would fail on its first page read.

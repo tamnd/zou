@@ -178,6 +178,10 @@ fn a_branch_carries_what_the_parent_had_and_then_goes_its_own_way() {
          grant select on public.rows to anon;",
     );
     settle(&parent);
+    // Written after the last fold and committed before the branch is
+    // asked for, which is the row a branch cut at the previous capture
+    // would quietly leave behind.
+    sql(&parent, "insert into public.rows values (9);");
 
     let child = parent.branch("pr-42").expect("branch");
     assert_eq!(child.tenant(), "pr-42");
@@ -189,6 +193,11 @@ fn a_branch_carries_what_the_parent_had_and_then_goes_its_own_way() {
     assert!(
         body(&answer).contains("\"id\":1"),
         "the parent's row came along, {}",
+        body(&answer)
+    );
+    assert!(
+        body(&answer).contains("\"id\":9"),
+        "and so did the one written since the last fold, {}",
         body(&answer)
     );
 
@@ -228,6 +237,18 @@ fn a_branch_carries_what_the_parent_had_and_then_goes_its_own_way() {
     );
 
     child.close().expect("close the child");
+    // A branch of a project somebody keeps is a project somebody keeps.
+    // Closing the handle stops a postmaster, it does not delete a
+    // database, which is the opposite of what closing a branch of a
+    // fixture does and is the reason the two are told apart at all.
+    let store = zou_store::open_store(&dir.display().to_string()).expect("store");
+    assert!(
+        store
+            .get(&zou_store::layout::TenantLayout::new("pr-42").manifest())
+            .expect("store")
+            .is_some(),
+        "the branch is still on the store"
+    );
     parent.close().expect("close the parent");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -400,6 +421,66 @@ fn a_fixture_is_branched_off_the_template_rather_than_made() {
             .is_some(),
         "the template is not"
     );
+}
+
+/// A suite that wants its own schema in every test applies it once and
+/// branches that, so the pattern the milestone asks for is a branch per
+/// test rather than a fixture per test. The branch has to go off the
+/// store when it closes the way the fixture it came from does: the
+/// template store is the machine's, it is shared by every project on the
+/// box, and a suite that leaves a database behind on every test leaves
+/// thousands there by the end of the week.
+#[test]
+fn a_branch_of_a_fixture_goes_off_the_store_the_way_the_fixture_does() {
+    let Some(pg_bin) = pg_bin() else { return };
+    let base = Zou::open(Options {
+        pg_bin,
+        ..Options::fixture()
+    })
+    .expect("open a fixture");
+    sql(
+        &base,
+        "create table public.seeded (id int primary key);
+         insert into public.seeded values (1);
+         grant select on public.seeded to anon;",
+    );
+
+    let child = base.branch("a-test-of-its-own").expect("branch");
+    let anon = child.keys().anon.clone();
+    let answer = child
+        .request("GET", "/rest/v1/seeded", &[("apikey", &anon)], b"")
+        .expect("request");
+    assert_eq!(answer.status, 200, "{}", body(&answer));
+    assert!(
+        body(&answer).contains("\"id\":1"),
+        "the seed came along, {}",
+        body(&answer)
+    );
+
+    let target = base.target().to_string();
+    let tenant = child.tenant().to_string();
+    child.close().expect("close the child");
+    let store = zou_store::open_store(&target).expect("store");
+    assert!(
+        store
+            .get(&zou_store::layout::TenantLayout::new(&tenant).manifest())
+            .expect("store")
+            .is_none(),
+        "the branch is off the template store"
+    );
+
+    // And the database it was cut from is still serving, because what
+    // went is the child's own prefix and nothing it was reading through.
+    let still = base
+        .request(
+            "GET",
+            "/rest/v1/seeded",
+            &[("apikey", base.keys().anon.as_str())],
+            b"",
+        )
+        .expect("request");
+    assert_eq!(still.status, 200, "{}", body(&still));
+    base.close().expect("close the base");
 }
 
 #[test]
