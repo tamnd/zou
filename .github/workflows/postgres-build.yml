@@ -196,6 +196,11 @@ jobs:
         run: ZOU_PG_BIN=$PWD/build/pg/bin go/test.sh -v
       - name: zou dev, branch, and info end to end
         run: |
+          # Branching reads the page runs a fold packed down, and with
+          # the page service on the fold publishes an indexless
+          # checkpoint instead, so this whole step is the object path
+          # until a branch can be taken off the page layers.
+          export ZOU_PAGESERVE=0
           cargo build -p zou --release
           mkdir -p /tmp/zou-dev-store
           target/release/zou dev /tmp/zou-dev-store --pg-bin build/pg/bin --port 5614 --runtime /tmp/zou-dev-run >/tmp/zou-dev.log 2>&1 &

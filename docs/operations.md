@@ -237,6 +237,11 @@ Off is worth keeping reachable, it is how the two paths get compared, and a comp
 The spellings are `1 0 true false on off yes no` in any case, and anything else is refused at startup rather than read as off, because a value nobody can parse is a mistake and answering it with the slow path is how a month of runs measured the wrong path.
 initdb runs with it off in every command that runs one, since bootstrap is a standalone process with no service to talk to, and the redo workers never see it because they run with no store attached at all.
 
+One thing still wants the other path.
+A branch reads the page runs a checkpoint fold packed into a full capture, and with the service on the fold publishes an indexless checkpoint instead, so `zou branch create` on a store that has only ever served this way refuses with `cannot be branched yet`.
+The embedded library runs its postmasters with the service off for that reason, since templates and fixtures are branches, and a dev node that wants to be branched wants `zou dev --page-service off`.
+Issue #320 is taking a branch off the page layers directly, which is where this ends.
+
 ## Retention and collecting
 
 A store only grows on its own.
