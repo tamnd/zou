@@ -39,6 +39,7 @@ use zou_store::lsn::Lsn;
 use zou_store::memtable::Memtable;
 use zou_store::pageread::ReadError;
 use zou_store::shardmanifest::PageShardManifest;
+use zou_store::stats::{Phase, note_phase};
 
 use crate::WAL_SHARD;
 use crate::getpage::{GetPageError, MAX_GETPAGE_BATCH, PageService};
@@ -72,6 +73,7 @@ struct GetReq {
     fork: u32,
     blks: Vec<u32>,
     lsn: u64,
+    arrived: Instant,
     deadline: Instant,
     reply: SyncSender<Result<Vec<Vec<u8>>, String>>,
 }
@@ -343,6 +345,7 @@ fn connection(mut sock: UnixStream, tx: Sender<GetReq>, stop: Arc<AtomicBool>) {
             fork,
             blks,
             lsn,
+            arrived: Instant::now(),
             deadline: Instant::now() + WAIT_CAP,
             reply: reply_tx,
         };
@@ -411,7 +414,8 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     loop {
         if frozen.is_none() && last_poll.elapsed() >= POLL {
             last_poll = Instant::now();
-            if let Err(e) = poll_ingest(
+            let polled = Instant::now();
+            let outcome = poll_ingest(
                 &store,
                 &cfg.layout,
                 &media,
@@ -421,7 +425,12 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                 &mut ingest,
                 &mut map,
                 &mut durable_seen,
-            ) {
+            );
+            // The serve loop is one thread, so this poll is latency
+            // every request behind it pays. Sample it whether or not
+            // there was anything to apply.
+            note_phase(Phase::Ingest, polled.elapsed());
+            if let Err(e) = outcome {
                 // A hole in the stream would poison every later delta;
                 // freeze and let waits fail loudly instead.
                 log::error!("zou pageserve: ingest frozen: {e}");
@@ -471,7 +480,13 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         parked = still;
         for req in ready {
             let at = if applied == 0 { u64::MAX } else { applied };
+            // Two samples, because they answer different questions:
+            // parked is how long ingest kept the reader waiting, read
+            // is what planning and reading the page actually cost.
+            note_phase(Phase::Park, req.arrived.elapsed());
+            let ran = Instant::now();
             serve_reloading(&cfg, &*store, pool.as_ref(), &mut map, mem, &req, at);
+            note_phase(Phase::Read, ran.elapsed());
         }
 
         if stop.load(Ordering::Acquire) {
@@ -986,6 +1001,7 @@ mod tests {
             fork: 0,
             blks: vec![3],
             lsn: 0,
+            arrived: Instant::now(),
             deadline: Instant::now() + WAIT_CAP,
             reply,
         };

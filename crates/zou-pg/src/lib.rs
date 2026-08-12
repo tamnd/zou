@@ -668,7 +668,7 @@ pub unsafe extern "C" fn zou_smgr_read(
                     if let Some(cache) = &shim.cache {
                         cache.save((spc, db, rel, fork), blk, &pages[0]);
                     }
-                    note_read(stats::ReadTier::Store, 1, started);
+                    note_read(stats::ReadTier::Service, 1, started);
                     return ZOU_OK;
                 }
                 Err(e) => {
@@ -824,11 +824,11 @@ pub unsafe extern "C" fn zou_smgr_readv(
                 }
             }
             stats::note_read_pages(stats::ReadTier::Cache, cache_pages);
-            stats::note_read_pages(stats::ReadTier::Store, misses.len() as u64);
+            stats::note_read_pages(stats::ReadTier::Service, misses.len() as u64);
             let tier = if misses.is_empty() {
                 stats::ReadTier::Cache
             } else {
-                stats::ReadTier::Store
+                stats::ReadTier::Service
             };
             stats::note_read_call(tier, started.elapsed());
             return ZOU_OK;

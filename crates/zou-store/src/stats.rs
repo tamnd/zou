@@ -17,10 +17,20 @@
 //! postgres backend makes lands in exactly one tier, cache when the
 //! local page cache answered, local when reconstruction ran entirely
 //! against local bytes, store when the read paid at least one store
-//! round trip. The read path reports through [`note_read_pages`] and
-//! [`note_read_call`], which open the `ZOU_STORE_STATS` file on first
-//! use and no-op when the variable is unset, so a server that nobody is
-//! measuring pays two branches per read and nothing else.
+//! round trip, service when the page service answered it. The read path
+//! reports through [`note_read_pages`] and [`note_read_call`], which
+//! open the `ZOU_STORE_STATS` file on first use and no-op when the
+//! variable is unset, so a server that nobody is measuring pays two
+//! branches per read and nothing else.
+//!
+//! The service tier is where the read leaves the backend, so it says
+//! nothing about what the wait was made of. The page service reports
+//! its own side through [`note_phase`]: how long a request sat parked
+//! waiting for ingest to reach the LSN it asked for, how long the read
+//! itself took once it ran, and how long the driver spent in ingest
+//! rather than answering anybody. One serve loop does all three, so
+//! ingest time is read latency for every request queued behind it and
+//! the only way to see that is to measure it.
 
 use std::cell::Cell;
 use std::fs::{self, OpenOptions};
@@ -35,15 +45,17 @@ use crate::cas::{CasError, CasStore, Version};
 /// layout so a dump from a stale binary fails loudly instead of reading
 /// garbage.
 const MAGIC: u64 = u64::from_ne_bytes(*b"ZOUSTATS");
-const FORMAT: u64 = 2;
+const FORMAT: u64 = 3;
 
 pub const OP_NAMES: [&str; 6] = ["get", "get_range", "put_if_match", "put", "delete", "list"];
 pub const CLASS_NAMES: [&str; 7] = ["manifest", "wal", "chk", "shards", "page", "file", "other"];
-pub const TIER_NAMES: [&str; 3] = ["cache", "local", "store"];
+pub const TIER_NAMES: [&str; 4] = ["cache", "local", "store", "service"];
+pub const PHASE_NAMES: [&str; 3] = ["park", "read", "ingest"];
 
 const KINDS: usize = OP_NAMES.len();
 const CLASSES: usize = CLASS_NAMES.len();
 const TIERS: usize = TIER_NAMES.len();
+const PHASES: usize = PHASE_NAMES.len();
 const BUCKETS: usize = 32;
 
 const HEADER: usize = 2;
@@ -51,7 +63,8 @@ const BUCKET_BASE: usize = HEADER + KINDS * CLASSES * 2;
 const ERROR_BASE: usize = BUCKET_BASE + KINDS * BUCKETS;
 const CONFLICT_SLOT: usize = ERROR_BASE + KINDS;
 const TIER_BASE: usize = CONFLICT_SLOT + 1;
-const SLOTS: usize = TIER_BASE + TIERS * (2 + BUCKETS);
+const PHASE_BASE: usize = TIER_BASE + TIERS * (2 + BUCKETS);
+const SLOTS: usize = PHASE_BASE + PHASES * (1 + BUCKETS);
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -69,6 +82,10 @@ const fn count_slot(kind: usize, class: usize) -> usize {
 
 const fn tier_slot(tier: usize) -> usize {
     TIER_BASE + tier * (2 + BUCKETS)
+}
+
+const fn phase_slot(phase: usize) -> usize {
+    PHASE_BASE + phase * (1 + BUCKETS)
 }
 
 /// Which layout region a key belongs to, as an index into
@@ -162,6 +179,25 @@ pub enum ReadTier {
     Local,
     /// At least one store round trip happened inside the read.
     Store,
+    /// The page service answered, timed at the backend from the send
+    /// to the reply, so it carries the socket, the queue behind the
+    /// serve loop and the read itself.
+    Service,
+}
+
+/// What the page service driver was doing, [`PHASE_NAMES`] in enum
+/// form. These are the driver's own clock, not any one backend's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Phase {
+    /// A request waited for ingest to reach the LSN it asked for.
+    /// Sampled once, when the request finally goes through.
+    Park,
+    /// One request planned and read, from ready to answered.
+    Read,
+    /// One ingest poll: the durable end, the catch up, any flush.
+    /// The serve loop does this instead of answering, so it is
+    /// somebody's read latency.
+    Ingest,
 }
 
 thread_local! {
@@ -208,6 +244,16 @@ pub fn note_read_call(tier: ReadTier, elapsed: Duration) {
         let t = tier as usize;
         c.add(tier_slot(t), 1);
         c.add(tier_slot(t) + 2 + bucket(elapsed), 1);
+    }
+}
+
+/// Record one page service phase. Called from the driver's own
+/// thread, which maps the same counter file as the backends it serves.
+pub fn note_phase(phase: Phase, elapsed: Duration) {
+    if let Some(c) = global() {
+        let p = phase as usize;
+        c.add(phase_slot(p), 1);
+        c.add(phase_slot(p) + 1 + bucket(elapsed), 1);
     }
 }
 
@@ -364,6 +410,20 @@ pub struct TierSnapshot {
     pub max_us: u64,
 }
 
+/// One page service phase, decoded. Calls are samples, not requests:
+/// a request that never parked is counted under read and not under
+/// park, and an ingest poll is counted whether or not anybody was
+/// waiting on it.
+#[derive(Debug, serde::Serialize)]
+pub struct PhaseSnapshot {
+    pub phase: &'static str,
+    pub calls: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+}
+
 /// The whole counter file, decoded. This reads the file cold rather
 /// than mapping it, so dumping never touches the counters.
 #[derive(Debug, serde::Serialize)]
@@ -371,6 +431,7 @@ pub struct Snapshot {
     pub conflicts: u64,
     pub ops: Vec<OpSnapshot>,
     pub reads: Vec<TierSnapshot>,
+    pub pagesvc: Vec<PhaseSnapshot>,
 }
 
 fn percentile(buckets: &[u64], total: u64, q: f64) -> u64 {
@@ -459,10 +520,29 @@ impl Snapshot {
                     .map_or(0, |b| 1u64 << (b + 1)),
             });
         }
+        let mut pagesvc = Vec::with_capacity(PHASES);
+        for (phase, name) in PHASE_NAMES.iter().copied().enumerate() {
+            let calls = slot(phase_slot(phase));
+            let buckets: Vec<u64> = (0..BUCKETS)
+                .map(|b| slot(phase_slot(phase) + 1 + b))
+                .collect();
+            pagesvc.push(PhaseSnapshot {
+                phase: name,
+                calls,
+                p50_us: percentile(&buckets, calls, 0.50),
+                p95_us: percentile(&buckets, calls, 0.95),
+                p99_us: percentile(&buckets, calls, 0.99),
+                max_us: buckets
+                    .iter()
+                    .rposition(|&n| n > 0)
+                    .map_or(0, |b| 1u64 << (b + 1)),
+            });
+        }
         Ok(Self {
             conflicts: slot(CONFLICT_SLOT),
             ops,
             reads,
+            pagesvc,
         })
     }
 
@@ -523,6 +603,36 @@ mod tests {
         assert_eq!(tier("store").calls, 1);
         assert_eq!(tier("store").pages, 128);
         assert!(tier("store").p50_us >= 30_000);
+    }
+
+    /// The phases are what the driver was doing, and a scrape has to
+    /// be able to tell a request that waited on ingest from one that
+    /// waited on the read, so they land in separate counters and both
+    /// keep their own histogram.
+    #[test]
+    fn page_service_phases_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Counters::open(&dir.path().join("stats")).unwrap();
+        for _ in 0..4 {
+            counters.add(phase_slot(Phase::Read as usize), 1);
+            counters.add(
+                phase_slot(Phase::Read as usize) + 1 + bucket(Duration::from_micros(90)),
+                1,
+            );
+        }
+        counters.add(phase_slot(Phase::Park as usize), 1);
+        counters.add(
+            phase_slot(Phase::Park as usize) + 1 + bucket(Duration::from_millis(200)),
+            1,
+        );
+        let snap = Snapshot::read(&dir.path().join("stats")).unwrap();
+        let phase = |name: &str| snap.pagesvc.iter().find(|p| p.phase == name).unwrap();
+        assert_eq!(phase("read").calls, 4);
+        assert!(phase("read").p50_us >= 90 && phase("read").p50_us < 256);
+        assert_eq!(phase("park").calls, 1);
+        assert!(phase("park").p50_us >= 200_000);
+        assert_eq!(phase("ingest").calls, 0);
+        assert_eq!(phase("ingest").max_us, 0);
     }
 
     #[test]
