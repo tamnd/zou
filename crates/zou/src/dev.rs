@@ -77,6 +77,9 @@ pub struct Args {
     /// nowhere.
     pub config: Option<PathBuf>,
     pub no_config: bool,
+    /// `--page-service on|off`, None to leave the environment alone
+    /// and take the default, which is on.
+    pub page_service: Option<bool>,
 }
 
 use crate::DEV_USAGE as USAGE;
@@ -91,6 +94,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     let mut runtime = None;
     let mut config = None;
     let mut no_config = false;
+    let mut page_service = None;
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -111,6 +115,14 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--runtime" => runtime = Some(PathBuf::from(need(&mut it, "--runtime")?)),
             "--config" => config = Some(PathBuf::from(need(&mut it, "--config")?)),
             "--no-config" => no_config = true,
+            "--page-service" => {
+                let raw = need(&mut it, "--page-service")?;
+                page_service = Some(match raw.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "on" | "yes" => true,
+                    "0" | "false" | "off" | "no" => false,
+                    _ => return Err(format!("bad --page-service {raw:?}, want on or off")),
+                });
+            }
             other if target.is_none() && !other.starts_with('-') => {
                 target = Some(other.to_string());
             }
@@ -131,6 +143,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         runtime,
         config,
         no_config,
+        page_service,
     })
 }
 
@@ -595,8 +608,9 @@ pub fn run(args: &Args) -> Result<(), String> {
             .env("ZOU_PAGE_CACHE", &pagecache)
             // No page service exists during bootstrap, initdb is a
             // standalone process. Writes stay eager whatever the
-            // caller exported.
-            .env_remove("ZOU_PAGESERVE")
+            // caller exported, and the off is explicit because unset
+            // means on.
+            .env("ZOU_PAGESERVE", "0")
             .output()
             .map_err(|e| format!("initdb: {e}"))?;
         if !out.status.success() {
@@ -665,6 +679,10 @@ pub fn run(args: &Args) -> Result<(), String> {
             .env("ZOU_TARGET", &args.target)
             .env("ZOU_TENANT", &args.tenant)
             .env("ZOU_PAGE_CACHE", &pagecache)
+            .envs(
+                args.page_service
+                    .map(|on| ("ZOU_PAGESERVE", if on { "1" } else { "0" })),
+            )
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -779,6 +797,8 @@ mod tests {
             "/tmp/run",
             "--ref",
             "pr-9",
+            "--page-service",
+            "off",
         ]))
         .unwrap();
         assert_eq!(args.target, "s3://bucket/x");
@@ -788,6 +808,25 @@ mod tests {
         assert_eq!(args.ops, Some(9187));
         assert_eq!(args.runtime, PathBuf::from("/tmp/run"));
         assert_eq!(args.tenant, "pr-9");
+        assert_eq!(args.page_service, Some(false));
+    }
+
+    /// The flag is how the two read paths get compared without
+    /// exporting anything, and saying nothing leaves the environment
+    /// alone so the default, which is on, applies.
+    #[test]
+    fn parse_reads_the_page_service_flag_both_ways() {
+        assert_eq!(parse(&argv(&["./data"])).unwrap().page_service, None);
+        for on in ["on", "1", "true", "YES"] {
+            let args = parse(&argv(&["./data", "--page-service", on])).unwrap();
+            assert_eq!(args.page_service, Some(true), "{on:?}");
+        }
+        for off in ["off", "0", "false", "No"] {
+            let args = parse(&argv(&["./data", "--page-service", off])).unwrap();
+            assert_eq!(args.page_service, Some(false), "{off:?}");
+        }
+        assert!(parse(&argv(&["./data", "--page-service", "maybe"])).is_err());
+        assert!(parse(&argv(&["./data", "--page-service"])).is_err());
     }
 
     #[test]

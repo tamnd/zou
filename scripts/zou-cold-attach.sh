@@ -55,6 +55,7 @@ if [ ! -d "$PRISTINE" ]; then
 	# the fork sizes of a fresh cluster in the store. Without it the
 	# store holds a file capture nothing can read a block out of.
 	export ZOU_TARGET="$STORE" ZOU_TENANT=local ZOU_PAGE_CACHE="$WORK/cache0"
+	export ZOU_PAGESERVE=0
 	"$PG_BIN/initdb" -D "$PGDATA" --set io_method=sync --set full_page_writes=off \
 		>"$WORK/initdb.log" 2>&1
 	REDO=$("$PG_BIN/pg_controldata" -D "$PGDATA" | grep "REDO location" | awk '{print $NF}')
@@ -89,6 +90,9 @@ mkdir -p "$CACHE"
 
 export ZOU_TARGET="$STORE"
 export ZOU_TENANT=local
+# This starts postgres itself, with no page service to read through,
+# so the object path is the one being timed here.
+export ZOU_PAGESERVE=0
 export ZOU_PAGE_CACHE="$CACHE"
 export ZOU_STORE_SIM="$SIM"
 export ZOU_STORE_STATS="$WORK/stats-$LABEL"

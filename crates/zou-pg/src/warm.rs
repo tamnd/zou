@@ -117,7 +117,10 @@ fn wal_window(pg_wal: &Path, tli: u32, redo: u64, wal_end: u64) -> Result<WalWin
 /// Prefetch what recovery will fault in. `pgdata` is a data directory
 /// a restore just wrote, `cache` the page cache directory the
 /// postmaster will be started with, and `stats` what the restore
-/// reported, for the timeline and the stream end.
+/// reported, for the timeline and the stream end. `pageserve` is
+/// whether the node about to start will read through the page
+/// service, passed rather than read here so a caller and its warm up
+/// cannot end up with different answers.
 ///
 /// Errors are the caller's to log and ignore: every one of them means
 /// a page arrives the slow way instead of the fast way.
@@ -127,6 +130,7 @@ pub fn warm(
     pgdata: &Path,
     cache: &Path,
     stats: &RestoreStats,
+    pageserve: bool,
 ) -> Result<WarmStats, String> {
     let cap = block_cap();
     if cap == 0 {
@@ -137,7 +141,7 @@ pub fn warm(
     // frozen images, so warming out of pg/ would fill the cache with
     // pages older than the ones recovery must see. Warming the service
     // is its own design and its own patch.
-    if crate::pageserve_on() {
+    if pageserve {
         return Ok(WarmStats::default());
     }
 
@@ -316,8 +320,15 @@ mod tests {
             timeline: 1,
             ..RestoreStats::default()
         };
-        let warmed =
-            warm(target.to_str().expect("utf8"), "t", &pgdata, &cache, &stats).expect("warm");
+        let warmed = warm(
+            target.to_str().expect("utf8"),
+            "t",
+            &pgdata,
+            &cache,
+            &stats,
+            false,
+        )
+        .expect("warm");
         assert_eq!(warmed.wanted, 2);
         assert_eq!(warmed.fetched, 2);
         assert!(!warmed.capped);
@@ -362,8 +373,15 @@ mod tests {
             ..RestoreStats::default()
         };
         unsafe { std::env::set_var("ZOU_WARM_BLOCKS", "3") };
-        let warmed =
-            warm(target.to_str().expect("utf8"), "t", &pgdata, &cache, &stats).expect("warm");
+        let warmed = warm(
+            target.to_str().expect("utf8"),
+            "t",
+            &pgdata,
+            &cache,
+            &stats,
+            false,
+        )
+        .expect("warm");
         unsafe { std::env::remove_var("ZOU_WARM_BLOCKS") };
 
         assert_eq!(warmed.wanted, 3);

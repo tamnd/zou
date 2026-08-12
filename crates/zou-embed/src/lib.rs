@@ -1042,7 +1042,9 @@ fn initdb(
         .env("ZOU_TARGET", target)
         .env("ZOU_TENANT", tenant)
         .env("ZOU_PAGE_CACHE", pagecache)
-        .env_remove("ZOU_PAGESERVE")
+        // initdb is standalone, there is no page service yet, and
+        // unset means on.
+        .env("ZOU_PAGESERVE", "0")
         .output()
         .map_err(|e| Error::new(Kind::Postgres, format!("initdb: {e}")))?;
     if !out.status.success() {
@@ -1093,6 +1095,13 @@ fn start(
         .env("ZOU_TARGET", target)
         .env("ZOU_TENANT", tenant)
         .env("ZOU_PAGE_CACHE", pagecache)
+        // Templates, fixtures and branches all read the page runs a
+        // fold packed down, and with the page service on the fold
+        // publishes an indexless checkpoint instead, so a branch of a
+        // project made this way would be refused. The embedded library
+        // is the branching product surface, so it stays on the object
+        // path until a branch can be taken off the page layers.
+        .env("ZOU_PAGESERVE", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if let Some(size) = shared_buffers {

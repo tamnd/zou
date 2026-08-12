@@ -34,6 +34,9 @@ PORT=${PORT:-5621}
 SOCK="$WORK"
 
 export ZOU_TARGET="$WORK/store"
+# These start postgres themselves, with no page service to read
+# through, so the object path is the one under test here.
+export ZOU_PAGESERVE=0
 # How long a pusher waits for a lease somebody else holds before deciding
 # it has been replaced and stopping the cluster. Well above the 15s TTL,
 # so the successor below still starts on the first try, and low enough

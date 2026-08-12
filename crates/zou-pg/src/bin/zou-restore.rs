@@ -78,7 +78,14 @@ fn warm_pages(store_root: &str, tenant: &str, pgdata: &Path, stats: &RestoreStat
     let Some(cache) = std::env::var_os("ZOU_PAGE_CACHE").filter(|v| !v.is_empty()) else {
         return;
     };
-    match warm::warm(store_root, tenant, pgdata, Path::new(&cache), stats) {
+    match warm::warm(
+        store_root,
+        tenant,
+        pgdata,
+        Path::new(&cache),
+        stats,
+        zou_pg::pageserve_enabled(),
+    ) {
         Ok(w) if w.wanted == 0 => {}
         Ok(w) => println!(
             "warmed {} of {} pages and {} fork sizes ({} bytes){}",

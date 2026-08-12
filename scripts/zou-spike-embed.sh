@@ -21,6 +21,9 @@ PORT=${PORT:-5613}
 SOCK="$WORK"
 
 export ZOU_TARGET="$WORK/store"
+# These start postgres themselves, with no page service to read
+# through, so the object path is the one under test here.
+export ZOU_PAGESERVE=0
 mkdir -p "$ZOU_TARGET"
 
 say() { echo "[spike] $*"; }

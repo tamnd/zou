@@ -20,9 +20,13 @@ fn smgr_reads_land_in_their_tiers() {
     let cache_dir = tempfile::tempdir().unwrap();
     let stats = store_dir.path().join("stats");
     // Safety: nothing else runs in this test process yet.
+    //
+    // This is the object path on purpose, so it says so: the default is
+    // the page service, and there is no service here to answer a read.
     unsafe {
         std::env::set_var("ZOU_STORE_STATS", &stats);
         std::env::set_var("ZOU_PAGE_CACHE", cache_dir.path());
+        std::env::set_var("ZOU_PAGESERVE", "0");
     }
     let target = CString::new(store_dir.path().join("store").to_str().unwrap()).unwrap();
     assert_eq!(unsafe { zou_pg_init(target.as_ptr()) }, ZOU_OK);
