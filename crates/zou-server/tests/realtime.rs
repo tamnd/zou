@@ -489,20 +489,29 @@ async fn a_batch_with_a_bad_message_in_it_is_refused_whole() {
 }
 
 #[tokio::test]
-async fn a_private_broadcast_is_told_what_is_missing_rather_than_forbidden() {
+async fn a_private_join_with_no_database_is_refused_by_name() {
     let at = serving().await;
-    // 403 is what upstream answers when the rls check says no, and
-    // answering it here would send somebody looking for a policy that
-    // is not the problem.
-    let (status, body) = post(
-        at,
-        "/realtime/v1/api/broadcast",
-        "application/json",
-        br#"{"messages":[{"topic":"room","event":"cursor","payload":{},"private":true}]}"#.to_vec(),
+    let mut socket = connect(at, "2.0.0").await;
+    send(
+        &mut socket,
+        r#"["1","1","realtime:room","phx_join",{"config":{"private":true}}]"#,
     )
     .await;
-    assert_eq!(status, 501, "{body}");
-    assert!(body.contains("private"), "{body}");
+    let reply = next_json(&mut socket).await;
+    assert_eq!(reply[4]["status"], "error");
+    let reason = reply[4]["response"]["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("no database"), "{reason}");
+}
+
+#[tokio::test]
+async fn a_private_broadcast_with_no_database_behind_it_says_so() {
+    let at = serving().await;
+    // This server has no database, so there are no policies to check a
+    // private broadcast against. Saying no would read as the caller's
+    // own policies refusing it, which is a thing to go and look at,
+    // and there is nothing there to look at.
+    let mut listener = connect(at, "2.0.0").await;
+    join(&mut listener, "realtime:room").await;
 
     let (status, body) = post(
         at,
@@ -511,8 +520,27 @@ async fn a_private_broadcast_is_told_what_is_missing_rather_than_forbidden() {
         br#"{}"#.to_vec(),
     )
     .await;
-    assert_eq!(status, 501, "{body}");
-    assert!(body.contains("private"), "{body}");
+    assert_eq!(status, 422, "{body}");
+    assert!(body.contains("no database"), "{body}");
+
+    // The batch shape drops what it cannot check and still answers
+    // 202, which is upstream's own answer: a batch is not told which
+    // of its messages the policies refused.
+    let (status, body) = post(
+        at,
+        "/realtime/v1/api/broadcast",
+        "application/json",
+        br#"{"messages":[{"topic":"room","event":"cursor","payload":{},"private":true}]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+
+    let nothing =
+        tokio::time::timeout(std::time::Duration::from_millis(250), listener.next()).await;
+    assert!(
+        nothing.is_err(),
+        "a private broadcast nobody could check was delivered anyway"
+    );
 }
 
 #[tokio::test]

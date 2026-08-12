@@ -391,6 +391,17 @@ The broadcast file next to it is there for a smaller reason: supabase-js's own s
 Two of them need a server new enough to have the single message url, and against one that is not they warn and skip rather than pass, so a run says which questions it did not get to ask.
 The question about a payload of bytes is deliberately loose, since the two servers have not been shown to agree on what an octet-stream body is wrapped in, and tightening it is worth a run against a newer reference.
 
+`js-realtime-private/` is a directory of its own for one reason: it needs a database and the two files above need none.
+
+A private channel is the one part of realtime whose answer is not in the server.
+Whether a room may be read, and whether it may be written to, comes out of row level security policies on `realtime.messages` that the project wrote about its own tables, with the room name in `realtime.topic()` and the person in `auth.uid()`.
+So the suite ships a project rather than a configuration: a membership table, a row per person per room, a flag for whether that membership may send, and two policies that read it, applied to both targets unedited through `serve --setup` on one leg and `psql` on the other.
+9 tests: a join the policies allow, one no policy names, one asked with nothing but the project key behind it, a room named after the person and the same room asked for by somebody else, a broadcast between two members, a send to a room that may only be read, both http shapes, and a batch with one allowed room and one refused one.
+
+One question is deliberately not asked, and it is the only place these two servers are known to differ.
+A push a write policy refused is dropped in silence by Supabase Realtime and answered with an error on the push by zou, and both look identical to a listener, so the suite asks what they agree on, that nothing arrives.
+The difference is written down in [realtime.md](realtime.md) instead, because a suite that asserts a divergence stops being a record of what upstream does.
+
 ## The package a project installs, asked the same questions
 
 Everything above runs a zou this harness linked in, against a Postgres somebody else brought up, usually in a container.

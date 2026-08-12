@@ -295,6 +295,12 @@ const AUTH_SCHEMA: &str = include_str!("auth-schema.sql");
 /// reasons, see scripts/storage-schema-refresh.sh.
 const STORAGE_SCHEMA: &str = include_str!("storage-schema.sql");
 
+/// The realtime schema, or the part of it a private channel is
+/// checked against. Written here rather than generated, because
+/// upstream's migrations are mostly postgres changes and this is the
+/// handful of objects that are not, see the file for what is left out.
+const REALTIME_SCHEMA: &str = include_str!("realtime-schema.sql");
+
 /// The grants the storage schema arrives without.
 ///
 /// Upstream these are inside the migrations, granting to roles the
@@ -354,7 +360,8 @@ alter default privileges in schema storage
 pub async fn bootstrap(client: &Client) -> Result<(), tokio_postgres::Error> {
     client.batch_execute(BOOTSTRAP).await?;
     ensure_foreign_schema(client, "auth.users", &[AUTH_SCHEMA]).await?;
-    ensure_foreign_schema(client, "storage.objects", &[STORAGE_SCHEMA, STORAGE_GRANTS]).await
+    ensure_foreign_schema(client, "storage.objects", &[STORAGE_SCHEMA, STORAGE_GRANTS]).await?;
+    ensure_foreign_schema(client, "realtime.messages", &[REALTIME_SCHEMA]).await
 }
 
 /// The ddl [`bootstrap`] would apply, as one number.
@@ -366,7 +373,13 @@ pub async fn bootstrap(client: &Client) -> Result<(), tokio_postgres::Error> {
 /// This is what changed, said cheaply enough to ask on every open.
 pub fn contract_version() -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in [BOOTSTRAP, AUTH_SCHEMA, STORAGE_SCHEMA, STORAGE_GRANTS] {
+    for part in [
+        BOOTSTRAP,
+        AUTH_SCHEMA,
+        STORAGE_SCHEMA,
+        STORAGE_GRANTS,
+        REALTIME_SCHEMA,
+    ] {
         for byte in part.bytes() {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x1000_0000_01b3);

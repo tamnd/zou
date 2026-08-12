@@ -151,6 +151,91 @@ pub enum Action {
     /// Send this socket everyone who is on the topic right now, which
     /// only the hub knows.
     State(String),
+    /// Go and find out whether this socket is allowed to do this, and
+    /// come back through [`Session::authorized`]. Nothing else this
+    /// socket asked for happens until the answer arrives.
+    Ask(Ask),
+}
+
+/// A question about a private channel that only the project's own
+/// database can answer.
+///
+/// The convention is Supabase's: a private channel is allowed or
+/// refused by the policies the project wrote on `realtime.messages`,
+/// with the room name in `realtime.topic()`. Reading them is io, which
+/// this crate does not do, so the question comes out here and the
+/// answer goes back in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ask {
+    /// The channel topic, `realtime:` and the name, which is what
+    /// everything else here is keyed by. The name on its own is what
+    /// the policies see.
+    pub topic: String,
+    /// What the answer is needed for.
+    pub about: About,
+}
+
+impl Ask {
+    /// The room name the policies are asked about, which is the topic
+    /// without the prefix the socket carries.
+    pub fn name(&self) -> &str {
+        name_of(&self.topic)
+    }
+}
+
+/// What an [`Ask`] is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum About {
+    /// Whether this socket may be on the topic at all, which is the
+    /// read policies and is asked once at the join.
+    Join,
+    /// Whether it may send to the topic, which is the broadcast write
+    /// policy.
+    Broadcast,
+    /// Whether it may be seen on the topic, which is the presence
+    /// write policy.
+    Presence,
+}
+
+/// What the policies said, one answer per extension, which is how
+/// Supabase's own check reports them: a channel can be readable for
+/// presence and not for broadcast, or the other way round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Grant {
+    pub broadcast: bool,
+    pub presence: bool,
+}
+
+/// What the policies have said so far about one private channel.
+#[derive(Debug, Clone, Copy, Default)]
+struct Rights {
+    /// Whether the presence read policy said yes, which decides
+    /// whether this socket is sent the topic's presence at all.
+    presence_read: bool,
+    /// What the write policies said, once anything has needed them.
+    /// Nothing means nobody has asked yet, which is the same laziness
+    /// upstream has: a socket that only listens never costs a write
+    /// check.
+    writes: Option<Grant>,
+}
+
+/// Something held while the transport goes and asks.
+#[derive(Debug)]
+enum Pending {
+    /// A join, waiting to know whether it is allowed to happen.
+    Join(Frame),
+    /// Something the socket asked to do, already turned into the
+    /// actions that would do it, so that an allowed answer is a replay
+    /// rather than a second pass through the same code.
+    Do { asked: Frame, actions: Vec<Action> },
+    /// A recheck after a new token, which nothing is waiting on and
+    /// which only matters if the answer is no.
+    Recheck,
+}
+
+/// The room name inside a channel topic.
+fn name_of(topic: &str) -> &str {
+    topic.strip_prefix("realtime:").unwrap_or(topic)
 }
 
 /// One connection.
@@ -161,6 +246,16 @@ pub struct Session {
     identity: Identity,
     /// The channels this socket is on and what each asked for.
     channels: HashMap<String, Config>,
+    /// The private ones among them, with whatever the policies have
+    /// said so far. A public channel is not in here at all, so this
+    /// map is also how the rest of this knows which channels are
+    /// private.
+    rights: HashMap<String, Rights>,
+    /// What is waiting on an answer, at most one per topic: the
+    /// transport asks one question and comes back with it before it
+    /// reads the socket again, so a second question about the same
+    /// topic cannot arrive in between.
+    pending: HashMap<String, Pending>,
 }
 
 impl Session {
@@ -173,6 +268,8 @@ impl Session {
             vsn,
             identity,
             channels: HashMap::new(),
+            rights: HashMap::new(),
+            pending: HashMap::new(),
         }
     }
 
@@ -180,6 +277,11 @@ impl Session {
     /// a client refreshes its token mid connection.
     pub fn role(&self) -> &str {
         &self.identity.role
+    }
+
+    /// Who the socket is now, which is what a policy check runs as.
+    pub fn identity(&self) -> &Identity {
+        &self.identity
     }
 
     /// Whether this socket is on `topic`.
@@ -239,14 +341,14 @@ impl Session {
             payload: json!({}),
         };
         let mut actions = vec![Action::Fan(Fanout {
-            topic,
+            topic: topic.clone(),
             push,
             to_self,
         })];
         if ack {
             actions.push(self.send(Frame::ok(&asked)));
         }
-        actions
+        self.gated(&topic, About::Broadcast, asked, actions)
     }
 
     /// Everything a decoded frame can be.
@@ -287,20 +389,33 @@ impl Session {
             }
         }
         let config = Config::of(&frame.payload);
-        if config.private {
-            return vec![self.send(Frame::error(
-                &frame,
-                "private channels are not implemented yet, tracked in tamnd/zou#4",
-            ))];
-        }
         if config.postgres_changes > 0 {
             return vec![self.send(Frame::error(
                 &frame,
                 "postgres changes are not implemented yet, tracked in tamnd/zou#4",
             ))];
         }
+        if config.private {
+            // Nothing about this join happens until the project's own
+            // policies have been read, so the whole frame is held and
+            // the question goes out.
+            let topic = frame.topic.clone();
+            self.pending.insert(topic.clone(), Pending::Join(frame));
+            return vec![Action::Ask(Ask {
+                topic,
+                about: About::Join,
+            })];
+        }
+        self.joined(frame)
+    }
+
+    /// The join itself, once there is nothing left to check.
+    fn joined(&mut self, frame: Frame) -> Vec<Action> {
+        let config = Config::of(&frame.payload);
         let topic = frame.topic.clone();
-        let wants_presence = config.presence;
+        // A private channel is sent presence only if the presence read
+        // policy said so, whatever the client asked for.
+        let wants_presence = config.presence && self.readable_presence(&topic);
         self.channels.insert(topic.clone(), config);
         // An ok with nothing in it, and the nothing matters: a reply
         // carrying a postgres_changes list is checked against the
@@ -317,10 +432,138 @@ impl Session {
         actions
     }
 
+    /// Whether the topic's presence may be sent down this socket,
+    /// which is a question only a private channel has.
+    fn readable_presence(&self, topic: &str) -> bool {
+        self.rights
+            .get(topic)
+            .is_none_or(|rights| rights.presence_read)
+    }
+
+    /// The answer to an [`Ask`], and what the socket does now it has
+    /// one.
+    ///
+    /// `granted` is what the policies said, or the reason nobody could
+    /// find out, which the client is told rather than left guessing
+    /// about.
+    pub fn authorized(&mut self, ask: &Ask, granted: Result<Grant, String>) -> Vec<Action> {
+        let Some(pending) = self.pending.remove(&ask.topic) else {
+            log::debug!(
+                "realtime: an answer about {} that nothing was waiting for",
+                ask.topic
+            );
+            return Vec::new();
+        };
+        let granted = match granted {
+            Ok(granted) => granted,
+            Err(why) => return self.refuse(pending, &ask.topic, why),
+        };
+        let name = ask.name().to_string();
+        let rights = self.rights.entry(ask.topic.clone()).or_default();
+        match ask.about {
+            About::Join => {
+                rights.presence_read = granted.presence;
+                if !granted.broadcast && !granted.presence {
+                    let why = format!(
+                        "You do not have permissions to read from this Channel topic: {name}"
+                    );
+                    return self.refuse(pending, &ask.topic, why);
+                }
+                match pending {
+                    Pending::Join(frame) => self.joined(frame),
+                    // A recheck that came back fine, which is the
+                    // quiet case: the socket carries on.
+                    _ => Vec::new(),
+                }
+            }
+            About::Broadcast | About::Presence => {
+                rights.writes = Some(granted);
+                let allowed = match ask.about {
+                    About::Presence => granted.presence,
+                    _ => granted.broadcast,
+                };
+                match (allowed, pending) {
+                    (true, Pending::Do { actions, .. }) => actions,
+                    (true, _) => Vec::new(),
+                    (false, pending) => {
+                        let why = format!(
+                            "You do not have permissions to write to this Channel topic: {name}"
+                        );
+                        self.refuse(pending, &ask.topic, why)
+                    }
+                }
+            }
+        }
+    }
+
+    /// What a no looks like, which depends on what was waiting.
+    fn refuse(&mut self, pending: Pending, topic: &str, why: String) -> Vec<Action> {
+        match pending {
+            Pending::Join(frame) => vec![self.send(Frame::error(&frame, why))],
+            Pending::Do { asked, .. } => vec![self.send(Frame::error(&asked, why))],
+            // A socket that was already on the topic and is not
+            // allowed on it any more. The channel goes down the same
+            // way a refused token takes one down, which is what the
+            // client needs to stop trusting what it has and
+            // resubscribe.
+            Pending::Recheck => {
+                self.channels.remove(topic);
+                self.rights.remove(topic);
+                vec![
+                    self.send(Frame::channel_error(topic)),
+                    Action::Untrack(topic.to_string()),
+                    Action::Drop(topic.to_string()),
+                ]
+            }
+        }
+    }
+
+    /// Everything a private channel does goes through here first.
+    ///
+    /// A public channel goes straight through, a private one whose
+    /// policies have already answered goes through or is refused with
+    /// what it may not do, and one nobody has asked about yet holds
+    /// what it was going to do until somebody has.
+    fn gated(
+        &mut self,
+        topic: &str,
+        about: About,
+        asked: Frame,
+        actions: Vec<Action>,
+    ) -> Vec<Action> {
+        let Some(rights) = self.rights.get(topic) else {
+            return actions;
+        };
+        let known = rights.writes.map(|writes| match about {
+            About::Presence => writes.presence,
+            _ => writes.broadcast,
+        });
+        match known {
+            Some(true) => actions,
+            Some(false) => {
+                let why = format!(
+                    "You do not have permissions to write to this Channel topic: {}",
+                    name_of(topic)
+                );
+                vec![self.send(Frame::error(&asked, why))]
+            }
+            None => {
+                self.pending
+                    .insert(topic.to_string(), Pending::Do { asked, actions });
+                vec![Action::Ask(Ask {
+                    topic: topic.to_string(),
+                    about,
+                })]
+            }
+        }
+    }
+
     fn leave(&mut self, frame: Frame) -> Vec<Action> {
         if self.channels.remove(&frame.topic).is_none() {
             return vec![self.send(Frame::error(&frame, "this socket is not on that topic"))];
         }
+        self.rights.remove(&frame.topic);
+        self.pending.remove(&frame.topic);
         // Untracking before the drop, because the diff has to go out
         // while this socket is still on the topic for the others to be
         // told it left.
@@ -369,7 +612,9 @@ impl Session {
                     key: config.presence_key.clone(),
                     payload,
                 };
-                vec![track, self.send(Frame::ok(&frame))]
+                let actions = vec![track, self.send(Frame::ok(&frame))];
+                let topic = frame.topic.clone();
+                self.gated(&topic, About::Presence, frame, actions)
             }
             "untrack" => vec![
                 Action::Untrack(frame.topic.clone()),
@@ -403,13 +648,31 @@ impl Session {
         match tokens.verify(token) {
             Ok(identity) => {
                 self.identity = identity;
-                vec![self.send(Frame::ok(&frame))]
+                let mut actions = vec![self.send(Frame::ok(&frame))];
+                // Every private channel this socket is on was allowed
+                // on to it as somebody else. What the old token could
+                // read says nothing about what this one can, so the
+                // answers are thrown away and asked again, and a
+                // channel the new token may not read is taken down
+                // rather than left running.
+                let private: Vec<String> = self.rights.keys().cloned().collect();
+                for topic in private {
+                    self.rights.insert(topic.clone(), Rights::default());
+                    self.pending.insert(topic.clone(), Pending::Recheck);
+                    actions.push(Action::Ask(Ask {
+                        topic,
+                        about: About::Join,
+                    }));
+                }
+                actions
             }
             Err(why) => {
                 let topics: Vec<String> = self.channels.keys().cloned().collect();
                 let mut actions = vec![self.send(Frame::error(&frame, why))];
                 for topic in topics {
                     self.channels.remove(&topic);
+                    self.rights.remove(&topic);
+                    self.pending.remove(&topic);
                     actions.push(self.send(Frame::channel_error(&topic)));
                     actions.push(Action::Untrack(topic.clone()));
                     actions.push(Action::Drop(topic));
@@ -445,7 +708,8 @@ impl Session {
         if ack {
             actions.push(self.send(Frame::ok(&frame)));
         }
-        actions
+        let topic = frame.topic.clone();
+        self.gated(&topic, About::Broadcast, frame, actions)
     }
 
     /// Something from the hub, on its way down this socket.
@@ -460,8 +724,13 @@ impl Session {
             Sent::Diff { topic, payload } => {
                 // A socket that did not ask for presence is not sent
                 // any: it is still visible to the rest of the topic,
-                // it just has nothing bound that would read this.
+                // it just has nothing bound that would read this. On a
+                // private channel the presence read policy has the
+                // last word, whatever was asked for.
                 self.channels.get(topic).filter(|c| c.presence)?;
+                if !self.readable_presence(topic) {
+                    return None;
+                }
                 Some(self.send(Frame::push(topic, "presence_diff", payload.clone())))
             }
         }
@@ -579,22 +848,15 @@ mod tests {
 
     #[test]
     fn what_is_not_built_says_so_rather_than_joining_and_going_quiet() {
-        for (config, said) in [
-            (
-                r#"{"config":{"postgres_changes":[{"event":"*"}]}}"#,
-                "postgres changes",
-            ),
-            (r#"{"config":{"private":true}}"#, "private channels"),
-        ] {
-            let mut session = socket();
-            let actions = join(&mut session, config);
-            let reply = text_of(&actions[0]);
-            assert_eq!(reply.payload["status"], "error", "{config}");
-            let reason = reply.payload["response"]["reason"].as_str().unwrap();
-            assert!(reason.starts_with(said), "{reason}");
-            assert!(reason.contains("tamnd/zou#4"), "{reason}");
-            assert!(!session.on("realtime:room"), "{config}");
-        }
+        let config = r#"{"config":{"postgres_changes":[{"event":"*"}]}}"#;
+        let mut session = socket();
+        let actions = join(&mut session, config);
+        let reply = text_of(&actions[0]);
+        assert_eq!(reply.payload["status"], "error");
+        let reason = reply.payload["response"]["reason"].as_str().unwrap();
+        assert!(reason.starts_with("postgres changes"), "{reason}");
+        assert!(reason.contains("tamnd/zou#4"), "{reason}");
+        assert!(!session.on("realtime:room"));
     }
 
     #[test]
@@ -936,5 +1198,217 @@ mod tests {
         let mut session = socket();
         assert!(session.text("{", &OneToken).is_empty());
         assert!(session.binary(&[9, 9, 9]).is_empty());
+    }
+
+    const PRIVATE: &str = r#"{"config":{"private":true}}"#;
+
+    fn asked(actions: &[Action]) -> Ask {
+        match actions.first() {
+            Some(Action::Ask(ask)) => ask.clone(),
+            other => panic!("{other:?} is not a question"),
+        }
+    }
+
+    /// Everything the policies said yes to.
+    fn yes() -> Grant {
+        Grant {
+            broadcast: true,
+            presence: true,
+        }
+    }
+
+    /// A private channel joined with the policies saying yes, which is
+    /// where the pushing tests start from.
+    fn private_socket() -> Session {
+        let mut session = socket();
+        let ask = asked(&join(&mut session, PRIVATE));
+        session.authorized(&ask, Ok(yes()));
+        session
+    }
+
+    #[test]
+    fn a_private_join_waits_for_the_policies_rather_than_deciding_itself() {
+        let mut session = socket();
+        let actions = join(&mut session, PRIVATE);
+        assert_eq!(actions.len(), 1);
+        let ask = asked(&actions);
+        assert_eq!(ask.about, About::Join);
+        assert_eq!(ask.topic, "realtime:room");
+        // The name the policies are asked about is the room, not the
+        // topic the socket carries.
+        assert_eq!(ask.name(), "room");
+        // Nothing has happened yet: no reply, and the socket is not on
+        // the topic.
+        assert!(!session.on("realtime:room"));
+
+        let actions = session.authorized(&ask, Ok(yes()));
+        assert_eq!(actions[0], Action::Carry("realtime:room".into()));
+        assert_eq!(text_of(&actions[1]).payload["status"], "ok");
+        assert!(session.on("realtime:room"));
+    }
+
+    #[test]
+    fn a_private_join_the_policies_refuse_is_told_what_it_may_not_read() {
+        let mut session = socket();
+        let ask = asked(&join(&mut session, PRIVATE));
+        let actions = session.authorized(&ask, Ok(Grant::default()));
+        let reply = text_of(&actions[0]);
+        assert_eq!(reply.payload["status"], "error");
+        assert_eq!(
+            reply.payload["response"]["reason"],
+            "You do not have permissions to read from this Channel topic: room"
+        );
+        assert!(!session.on("realtime:room"));
+    }
+
+    #[test]
+    fn a_join_nobody_could_check_says_why_rather_than_saying_no() {
+        let mut session = socket();
+        let ask = asked(&join(&mut session, PRIVATE));
+        let actions = session.authorized(&ask, Err("the database is not answering".into()));
+        assert_eq!(
+            text_of(&actions[0]).payload["response"]["reason"],
+            "the database is not answering"
+        );
+        assert!(!session.on("realtime:room"));
+    }
+
+    #[test]
+    fn a_push_to_a_private_channel_is_checked_once_and_then_remembered() {
+        let mut session = private_socket();
+        let push = r#"["1","7","realtime:room","broadcast",{"event":"cursor","payload":{"x":1}}]"#;
+        let actions = session.text(push, &OneToken);
+        let ask = asked(&actions);
+        assert_eq!(ask.about, About::Broadcast);
+        // The fan out was held, not sent, and comes back whole.
+        let actions = session.authorized(&ask, Ok(yes()));
+        assert!(matches!(actions[0], Action::Fan(_)));
+        // The second push is the same socket asking the same question,
+        // which has already been answered.
+        let actions = session.text(push, &OneToken);
+        assert!(matches!(actions[0], Action::Fan(_)));
+    }
+
+    #[test]
+    fn a_push_the_write_policies_refuse_is_answered_rather_than_sent() {
+        let mut session = private_socket();
+        let actions = session.text(
+            r#"["1","7","realtime:room","broadcast",{"event":"cursor","payload":{}}]"#,
+            &OneToken,
+        );
+        let ask = asked(&actions);
+        let actions = session.authorized(&ask, Ok(Grant::default()));
+        let reply = text_of(&actions[0]);
+        assert_eq!(reply.payload["status"], "error");
+        assert_eq!(
+            reply.payload["response"]["reason"],
+            "You do not have permissions to write to this Channel topic: room"
+        );
+        assert!(!actions.iter().any(|a| matches!(a, Action::Fan(_))));
+    }
+
+    #[test]
+    fn a_track_on_a_private_channel_asks_about_presence_rather_than_broadcast() {
+        let mut session = private_socket();
+        let actions = session.text(
+            r#"["1","7","realtime:room","presence",{"event":"track","payload":{"typing":true}}]"#,
+            &OneToken,
+        );
+        let ask = asked(&actions);
+        assert_eq!(ask.about, About::Presence);
+        let refused = session.authorized(
+            &ask,
+            Ok(Grant {
+                broadcast: true,
+                presence: false,
+            }),
+        );
+        assert!(!refused.iter().any(|a| matches!(a, Action::Track { .. })));
+        assert_eq!(text_of(&refused[0]).payload["status"], "error");
+    }
+
+    #[test]
+    fn presence_the_read_policy_refused_is_not_sent_down_the_socket() {
+        let mut session = socket();
+        let ask = asked(&join(
+            &mut session,
+            r#"{"config":{"private":true,"presence":{"enabled":true}}}"#,
+        ));
+        let actions = session.authorized(
+            &ask,
+            Ok(Grant {
+                broadcast: true,
+                presence: false,
+            }),
+        );
+        // Joined, because broadcast is readable, but with no state
+        // pushed after the reply and no diffs to follow.
+        assert!(session.on("realtime:room"));
+        assert!(!actions.iter().any(|a| matches!(a, Action::State(_))));
+        let diff = Sent::Diff {
+            topic: "realtime:room".into(),
+            payload: json!({"joins": {}, "leaves": {}}),
+        };
+        assert_eq!(session.deliver(&diff, false), None);
+    }
+
+    #[test]
+    fn a_new_token_puts_the_private_channels_back_to_the_policies() {
+        let mut session = private_socket();
+        let actions = session.text(
+            r#"["1","8",  "phoenix","access_token",{"access_token":"good"}]"#,
+            &OneToken,
+        );
+        assert_eq!(text_of(&actions[0]).payload["status"], "ok");
+        let ask = match &actions[1] {
+            Action::Ask(ask) => ask.clone(),
+            other => panic!("{other:?} is not a question"),
+        };
+        assert_eq!(ask.about, About::Join);
+        // The new token may not read what the old one could, and the
+        // channel goes down rather than carrying on.
+        let actions = session.authorized(&ask, Ok(Grant::default()));
+        assert_eq!(text_of(&actions[0]).event, "phx_error");
+        assert_eq!(actions[1], Action::Untrack("realtime:room".into()));
+        assert_eq!(actions[2], Action::Drop("realtime:room".into()));
+        assert!(!session.on("realtime:room"));
+    }
+
+    #[test]
+    fn a_new_token_that_can_still_read_leaves_the_channel_alone() {
+        let mut session = private_socket();
+        let actions = session.text(
+            r#"["1","8","phoenix","access_token",{"access_token":"good"}]"#,
+            &OneToken,
+        );
+        let ask = match &actions[1] {
+            Action::Ask(ask) => ask.clone(),
+            other => panic!("{other:?} is not a question"),
+        };
+        assert!(session.authorized(&ask, Ok(yes())).is_empty());
+        assert!(session.on("realtime:room"));
+        // The write answer was thrown away with the old token, so the
+        // next push is checked again as the new one.
+        let actions = session.text(
+            r#"["1","9","realtime:room","broadcast",{"event":"cursor","payload":{}}]"#,
+            &OneToken,
+        );
+        assert_eq!(asked(&actions).about, About::Broadcast);
+    }
+
+    #[test]
+    fn a_public_channel_asks_nobody_anything() {
+        let mut session = socket();
+        join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        for push in [
+            r#"["1","7","realtime:room","broadcast",{"event":"cursor","payload":{}}]"#,
+            r#"["1","8","realtime:room","presence",{"event":"track","payload":{}}]"#,
+        ] {
+            let actions = session.text(push, &OneToken);
+            assert!(
+                !actions.iter().any(|a| matches!(a, Action::Ask(_))),
+                "{push}"
+            );
+        }
     }
 }
