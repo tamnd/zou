@@ -399,14 +399,69 @@ pub fn read_chain_linked(
     from: u64,
     prev_digest: u64,
 ) -> Result<Vec<ChainSegment>, ChainError> {
-    let mut prev_digest = prev_digest;
     let mut out = Vec::new();
-    let mut seq = from + 1;
-    while let Some(bytes) = media.fetch(shard, seq)? {
-        let (header, frames, footer) =
-            decode_segment(&bytes).map_err(|source| ChainError::Segment { shard, seq, source })?;
+    walk_chain_linked::<ChainError, _>(
+        media,
+        shard,
+        ChainCursor {
+            seq: from + 1,
+            prev_digest,
+        },
+        |segment| {
+            out.push(segment);
+            Ok(true)
+        },
+    )?;
+    Ok(out)
+}
+
+/// Where a chain walk stopped, so the next one starts there instead of
+/// paying for everything it already read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainCursor {
+    /// The next seq to fetch.
+    pub seq: u64,
+    /// The digest the segment at `seq` has to link back to.
+    pub prev_digest: u64,
+}
+
+/// [`read_chain_linked`] one segment at a time, without holding the
+/// whole tail in memory and without insisting on reading all of it.
+///
+/// A reader that keeps up with a live chain reads the same tail over
+/// and over otherwise, because the entry point is the consolidated
+/// boundary and that only moves when a fold runs. The returned cursor
+/// is the fix: hand it back on the next call and the walk resumes at
+/// the first segment nobody has read yet. It stays valid until a
+/// consolidation folds the tail away underneath it, which the caller
+/// sees as a cursor sitting at or below the manifest's consolidated
+/// point and starts over from there.
+///
+/// The sink says whether to keep going. False stops the walk with the
+/// cursor on the next segment, so a caller with a deadline stops on a
+/// segment boundary and never leaves half a segment behind.
+pub fn walk_chain_linked<E, F>(
+    media: &WalMedia,
+    shard: u32,
+    cursor: ChainCursor,
+    mut sink: F,
+) -> Result<ChainCursor, E>
+where
+    E: From<ChainError>,
+    F: FnMut(ChainSegment) -> Result<bool, E>,
+{
+    let mut prev_digest = cursor.prev_digest;
+    let mut seq = cursor.seq;
+    while let Some(bytes) = media
+        .fetch(shard, seq)
+        .map_err(ChainError::from)
+        .map_err(E::from)?
+    {
+        let (header, frames, footer) = decode_segment(&bytes)
+            .map_err(|source| ChainError::Segment { shard, seq, source })
+            .map_err(E::from)?;
         if header.shard != shard || header.seq != seq {
-            return Err(ChainError::BrokenLink { shard, seq });
+            return Err(E::from(ChainError::BrokenLink { shard, seq }));
         }
         if header.prev_digest != prev_digest {
             // A segment that links somewhere else is not in this chain,
@@ -430,10 +485,11 @@ pub fn read_chain_linked(
             // owner has already sealed over, and everything it wrote
             // after it is orphaned. Nobody may quietly read half a chain
             // and call it recovery, so that one stays an error.
-            let head = ShardManifest::load(media.manifest_store().as_ref(), shard)?
+            let head = ShardManifest::load(media.manifest_store().as_ref(), shard)
+                .map_err(E::from)?
                 .map_or(0, |(m, _)| m.head);
             if seq <= head {
-                return Err(ChainError::BrokenLink { shard, seq });
+                return Err(E::from(ChainError::BrokenLink { shard, seq }));
             }
             log::warn!(
                 "shard {shard} chain ends at {}, seq {seq} links elsewhere",
@@ -442,13 +498,16 @@ pub fn read_chain_linked(
             break;
         }
         prev_digest = tenants_digest(&footer.tenants);
-        out.push(ChainSegment {
+        let keep_going = sink(ChainSegment {
             seq,
             header,
             frames,
             footer,
-        });
+        })?;
         seq += 1;
+        if !keep_going {
+            break;
+        }
     }
-    Ok(out)
+    Ok(ChainCursor { seq, prev_digest })
 }

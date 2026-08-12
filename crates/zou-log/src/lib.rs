@@ -32,8 +32,9 @@ pub use backpressure::{
     LagBounds, Throttle,
 };
 pub use chain::{
-    ChainError, ChainSegment, RoundRange, SHARD_MANIFEST_FORMAT, ShardManifest, Takeover,
-    chain_head, manifest_key, read_chain, read_chain_linked, segment_key, take_over,
+    ChainCursor, ChainError, ChainSegment, RoundRange, SHARD_MANIFEST_FORMAT, ShardManifest,
+    Takeover, chain_head, manifest_key, read_chain, read_chain_linked, segment_key, take_over,
+    walk_chain_linked,
 };
 pub use consolidate::{
     ConsolidateError, ConsolidateOutcome, ROUND_INDEX_FORMAT, RoundChunk, RoundIndex, RoundTenant,
@@ -53,6 +54,6 @@ pub use sequencer::{
     AppendError, AppendTicket, MAX_INFLIGHT, SegmentSink, Sequencer, SequencerConfig,
 };
 pub use tee::{
-    DEFAULT_TEE_BUFFER, Tee, TeeEvent, TeeFilter, TeeSubscription, catch_up, catch_up_with,
-    stream_end,
+    DEFAULT_TEE_BUFFER, Tee, TeeEvent, TeeFilter, TeeSubscription, catch_up, catch_up_resuming,
+    catch_up_with, stream_end,
 };
