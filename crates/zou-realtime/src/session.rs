@@ -238,6 +238,31 @@ fn name_of(topic: &str) -> &str {
     topic.strip_prefix("realtime:").unwrap_or(topic)
 }
 
+/// Which room in the hub a channel is on: its topic, and whether it
+/// was joined as private.
+///
+/// A private channel and a public channel of the same name are two
+/// rooms rather than one, which is upstream's rule and has to be. A
+/// public channel is joined without any policy being read, so if the
+/// two shared a room then anybody could join `room` publicly and hear
+/// everything the policies on the private one were keeping them out
+/// of. Two rooms is also what makes the private flag on a send mean
+/// something: a message sent as private reaches the sockets that were
+/// let in by the policies and nobody else.
+pub fn room(topic: &str, private: bool) -> String {
+    match private {
+        true => format!("private:{topic}"),
+        false => topic.to_string(),
+    }
+}
+
+/// The channel topic a room is for, which is the room itself for a
+/// public one. Unambiguous because a channel topic always starts with
+/// `realtime:`, so nothing public can look private.
+fn topic_of(room: &str) -> &str {
+    room.strip_prefix("private:").unwrap_or(room)
+}
+
 /// One connection.
 pub struct Session {
     vsn: Vsn,
@@ -333,6 +358,7 @@ impl Session {
         };
         let ack = config.broadcast_ack;
         let to_self = config.broadcast_self;
+        let room = room(&topic, config.private);
         let asked = Frame {
             join_ref: Some(push.join_ref.clone()),
             reference: Some(push.reference.clone()),
@@ -341,7 +367,7 @@ impl Session {
             payload: json!({}),
         };
         let mut actions = vec![Action::Fan(Fanout {
-            topic: topic.clone(),
+            topic: room,
             push,
             to_self,
         })];
@@ -416,20 +442,28 @@ impl Session {
         // A private channel is sent presence only if the presence read
         // policy said so, whatever the client asked for.
         let wants_presence = config.presence && self.readable_presence(&topic);
+        let room = room(&topic, config.private);
         self.channels.insert(topic.clone(), config);
         // An ok with nothing in it, and the nothing matters: a reply
         // carrying a postgres_changes list is checked against the
         // client's own bindings, and one carrying none is read as
         // subscribed.
-        let mut actions = vec![Action::Carry(topic.clone()), self.send(Frame::ok(&frame))];
+        let mut actions = vec![Action::Carry(room.clone()), self.send(Frame::ok(&frame))];
         if wants_presence {
             // After the reply and after the topic is being carried, in
             // that order: the state is a snapshot and the diffs that
             // follow it are only complete if the socket was already
             // listening when it was taken.
-            actions.push(Action::State(topic));
+            actions.push(Action::State(room));
         }
         actions
+    }
+
+    /// The room a topic this socket is on is in. A topic it is not on
+    /// is a public room, which is the harmless direction to guess in:
+    /// nothing is delivered to a room this socket is not carrying.
+    fn room(&self, topic: &str) -> String {
+        room(topic, self.channels.get(topic).is_some_and(|c| c.private))
     }
 
     /// Whether the topic's presence may be sent down this socket,
@@ -507,12 +541,13 @@ impl Session {
             // client needs to stop trusting what it has and
             // resubscribe.
             Pending::Recheck => {
+                let room = self.room(topic);
                 self.channels.remove(topic);
                 self.rights.remove(topic);
                 vec![
                     self.send(Frame::channel_error(topic)),
-                    Action::Untrack(topic.to_string()),
-                    Action::Drop(topic.to_string()),
+                    Action::Untrack(room.clone()),
+                    Action::Drop(room),
                 ]
             }
         }
@@ -559,6 +594,7 @@ impl Session {
     }
 
     fn leave(&mut self, frame: Frame) -> Vec<Action> {
+        let room = self.room(&frame.topic);
         if self.channels.remove(&frame.topic).is_none() {
             return vec![self.send(Frame::error(&frame, "this socket is not on that topic"))];
         }
@@ -568,8 +604,8 @@ impl Session {
         // while this socket is still on the topic for the others to be
         // told it left.
         vec![
-            Action::Untrack(frame.topic.clone()),
-            Action::Drop(frame.topic.clone()),
+            Action::Untrack(room.clone()),
+            Action::Drop(room),
             self.send(Frame::ok(&frame)),
         ]
     }
@@ -608,7 +644,7 @@ impl Session {
                     ))];
                 }
                 let track = Action::Track {
-                    topic: frame.topic.clone(),
+                    topic: room(&frame.topic, config.private),
                     key: config.presence_key.clone(),
                     payload,
                 };
@@ -617,7 +653,7 @@ impl Session {
                 self.gated(&topic, About::Presence, frame, actions)
             }
             "untrack" => vec![
-                Action::Untrack(frame.topic.clone()),
+                Action::Untrack(room(&frame.topic, config.private)),
                 self.send(Frame::ok(&frame)),
             ],
             other => vec![self.send(Frame::error(
@@ -630,8 +666,12 @@ impl Session {
     /// The topic's presence as this socket should see it, which the
     /// hub had to be asked for because it is the only thing that knows
     /// who else is here.
-    pub fn state(&self, topic: &str, state: Value) -> Action {
-        self.send(Frame::push(topic, "presence_state", state))
+    ///
+    /// `room` is what the hub was asked about and the frame carries
+    /// the topic, which are the same string for a public channel and
+    /// two for a private one.
+    pub fn state(&self, room: &str, state: Value) -> Action {
+        self.send(Frame::push(topic_of(room), "presence_state", state))
     }
 
     /// A client whose access token was about to expire has a new one.
@@ -670,12 +710,13 @@ impl Session {
                 let topics: Vec<String> = self.channels.keys().cloned().collect();
                 let mut actions = vec![self.send(Frame::error(&frame, why))];
                 for topic in topics {
+                    let room = self.room(&topic);
                     self.channels.remove(&topic);
                     self.rights.remove(&topic);
                     self.pending.remove(&topic);
                     actions.push(self.send(Frame::channel_error(&topic)));
-                    actions.push(Action::Untrack(topic.clone()));
-                    actions.push(Action::Drop(topic));
+                    actions.push(Action::Untrack(room.clone()));
+                    actions.push(Action::Drop(room));
                 }
                 actions
             }
@@ -694,6 +735,7 @@ impl Session {
         };
         let ack = config.broadcast_ack;
         let to_self = config.broadcast_self;
+        let room = room(&frame.topic, config.private);
         let Some(push) = BinaryBroadcast::from_frame(&frame) else {
             return vec![self.send(Frame::error(
                 &frame,
@@ -701,7 +743,7 @@ impl Session {
             ))];
         };
         let mut actions = vec![Action::Fan(Fanout {
-            topic: frame.topic.clone(),
+            topic: room,
             push,
             to_self,
         })];
@@ -722,6 +764,7 @@ impl Session {
         match sent {
             Sent::Broadcast(fan) => self.broadcast_down(fan, mine),
             Sent::Diff { topic, payload } => {
+                let topic = self.on_room(topic)?;
                 // A socket that did not ask for presence is not sent
                 // any: it is still visible to the rest of the topic,
                 // it just has nothing bound that would read this. On a
@@ -736,13 +779,21 @@ impl Session {
         }
     }
 
+    /// The topic this socket is on that `room` is for, or nothing if
+    /// this socket is not on it. A private room and a public room of
+    /// the same name are two rooms, so a socket on one of them is not
+    /// on the other and hears nothing from it.
+    fn on_room<'a>(&self, room: &'a str) -> Option<&'a str> {
+        let topic = topic_of(room);
+        let config = self.channels.get(topic)?;
+        (self::room(topic, config.private) == room).then_some(topic)
+    }
+
     fn broadcast_down(&self, fan: &Fanout, mine: bool) -> Option<Action> {
         if mine && !fan.to_self {
             return None;
         }
-        if !self.channels.contains_key(&fan.topic) {
-            return None;
-        }
+        self.on_room(&fan.topic)?;
         match self.vsn {
             // The binary encoding is the current client's, and it
             // carries bytes as bytes.
@@ -1242,9 +1293,96 @@ mod tests {
         assert!(!session.on("realtime:room"));
 
         let actions = session.authorized(&ask, Ok(yes()));
-        assert_eq!(actions[0], Action::Carry("realtime:room".into()));
+        // The room a private channel is carried on is not the room a
+        // public channel of the same name is on.
+        assert_eq!(actions[0], Action::Carry("private:realtime:room".into()));
         assert_eq!(text_of(&actions[1]).payload["status"], "ok");
         assert!(session.on("realtime:room"));
+    }
+
+    #[test]
+    fn a_private_room_and_a_public_room_of_the_same_name_are_two_rooms() {
+        let mut private = private_socket();
+        let mut public = socket();
+        join(&mut public, r#"{"config":{}}"#);
+
+        let from_private = private.text(
+            r#"["1","5","realtime:room","broadcast",{"type":"broadcast","event":"cursor","payload":{"x":1}}]"#,
+            &OneToken,
+        );
+        // The push is held while the write policy is asked, and the
+        // answer is what turns it into a fan out.
+        let allowed = private.authorized(&asked(&from_private), Ok(yes()));
+        let Action::Fan(fan) = &allowed[0] else {
+            panic!("not a fan out")
+        };
+        assert_eq!(fan.topic, "private:realtime:room");
+        // A public channel of that name is a room the policies were
+        // never asked about, so nothing the private one says reaches
+        // it. Anything else would make the policies decoration: anyone
+        // could join room without them and hear the lot.
+        assert!(
+            public
+                .deliver(&Sent::Broadcast(fan.clone()), false)
+                .is_none()
+        );
+
+        let from_public = public.text(
+            r#"["1","5","realtime:room","broadcast",{"type":"broadcast","event":"cursor","payload":{"x":2}}]"#,
+            &OneToken,
+        );
+        let Action::Fan(fan) = &from_public[0] else {
+            panic!("not a fan out")
+        };
+        assert_eq!(fan.topic, "realtime:room");
+        assert!(
+            private
+                .deliver(&Sent::Broadcast(fan.clone()), false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn presence_on_a_private_room_is_not_presence_on_the_public_one() {
+        let mut session = socket();
+        let ask = asked(&join(
+            &mut session,
+            r#"{"config":{"private":true,"presence":{"enabled":true}}}"#,
+        ));
+        let actions = session.authorized(&ask, Ok(yes()));
+        // The state a private join is sent is the private room's.
+        assert_eq!(actions[2], Action::State("private:realtime:room".into()));
+        // And it is sent down naming the topic the client joined,
+        // which is the same channel whichever room it is on.
+        let state = session.state("private:realtime:room", json!({}));
+        assert_eq!(text_of(&state).topic, "realtime:room");
+
+        let track = session.text(
+            r#"["1","6","realtime:room","presence",{"event":"track","payload":{"typing":true}}]"#,
+            &OneToken,
+        );
+        let allowed = session.authorized(&asked(&track), Ok(yes()));
+        assert_eq!(
+            allowed[0],
+            Action::Track {
+                topic: "private:realtime:room".into(),
+                key: None,
+                payload: json!({"typing": true}),
+            }
+        );
+        // A diff from the public room of that name is not this
+        // socket's, the same way a broadcast from it is not.
+        assert!(
+            session
+                .deliver(
+                    &Sent::Diff {
+                        topic: "realtime:room".into(),
+                        payload: json!({"joins": {}, "leaves": {}}),
+                    },
+                    false,
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -1369,8 +1507,8 @@ mod tests {
         // channel goes down rather than carrying on.
         let actions = session.authorized(&ask, Ok(Grant::default()));
         assert_eq!(text_of(&actions[0]).event, "phx_error");
-        assert_eq!(actions[1], Action::Untrack("realtime:room".into()));
-        assert_eq!(actions[2], Action::Drop("realtime:room".into()));
+        assert_eq!(actions[1], Action::Untrack("private:realtime:room".into()));
+        assert_eq!(actions[2], Action::Drop("private:realtime:room".into()));
         assert!(!session.on("realtime:room"));
     }
 

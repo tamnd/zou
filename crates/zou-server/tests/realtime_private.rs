@@ -170,6 +170,16 @@ async fn join_private(socket: &mut Socket, topic: &str, token: Option<&str>) -> 
     next_json(socket).await
 }
 
+/// Join the ordinary way, which asks nobody anything.
+async fn join_public(socket: &mut Socket, topic: &str) -> serde_json::Value {
+    send(
+        socket,
+        &format!(r#"["1","1","{topic}","phx_join",{{"config":{{}}}}]"#),
+    )
+    .await;
+    next_json(socket).await
+}
+
 fn reason(reply: &serde_json::Value) -> String {
     assert_eq!(reply[4]["status"], "error", "{reply}");
     reply[4]["response"]["reason"]
@@ -384,6 +394,48 @@ async fn a_batch_sends_the_rooms_the_policies_allow_and_drops_the_rest_without_s
     assert_eq!(status, 202);
     heard(&mut allowed, "cursor").await;
     quiet(&mut refused).await;
+}
+
+#[tokio::test]
+async fn a_public_channel_of_the_same_name_is_a_different_room() {
+    let Some(dsn) = dsn() else { return };
+    let at = serving(&dsn).await;
+    let token = user_token();
+
+    // Nobody had to ask the policies anything to be here: a public
+    // channel is joined by name and that is all. So if this socket
+    // heard what the private lobby is saying, the policies would be
+    // decoration.
+    let mut public = connect(at).await;
+    join_public(&mut public, "realtime:lobby").await;
+    let mut private = connect(at).await;
+    join_private(&mut private, "realtime:lobby", Some(&token)).await;
+
+    let (status, _) = post(
+        at,
+        "/realtime/v1/api/broadcast/lobby/events/private-cursor?private=true",
+        anon_key(),
+        Some(token.clone()),
+        r#"{"x":1}"#.to_string(),
+    )
+    .await;
+    assert_eq!(status, 202);
+    heard(&mut private, "private-cursor").await;
+    quiet(&mut public).await;
+
+    // And the other way round, which is the same rule read backwards:
+    // a public send is not smuggled into a private room either.
+    let (status, _) = post(
+        at,
+        "/realtime/v1/api/broadcast/lobby/events/public-cursor",
+        anon_key(),
+        Some(token),
+        r#"{"x":1}"#.to_string(),
+    )
+    .await;
+    assert_eq!(status, 202);
+    heard(&mut public, "public-cursor").await;
+    quiet(&mut private).await;
 }
 
 #[tokio::test]

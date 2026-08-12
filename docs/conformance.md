@@ -396,7 +396,8 @@ The question about a payload of bytes is deliberately loose, since the two serve
 A private channel is the one part of realtime whose answer is not in the server.
 Whether a room may be read, and whether it may be written to, comes out of row level security policies on `realtime.messages` that the project wrote about its own tables, with the room name in `realtime.topic()` and the person in `auth.uid()`.
 So the suite ships a project rather than a configuration: a membership table, a row per person per room, a flag for whether that membership may send, and two policies that read it, applied to both targets unedited through `serve --setup` on one leg and `psql` on the other.
-9 tests: a join the policies allow, one no policy names, one asked with nothing but the project key behind it, a room named after the person and the same room asked for by somebody else, a broadcast between two members, a send to a room that may only be read, both http shapes, and a batch with one allowed room and one refused one.
+10 tests: a join the policies allow, one no policy names, one asked with nothing but the project key behind it, a room named after the person and the same room asked for by somebody else, a broadcast between two members, a send to a room that may only be read, both http shapes, a batch with one allowed room and one refused one, and a public channel of the same name hearing none of it.
+That last one is the question the rest of them rest on: a public channel is joined by name with nothing read, so a private room and a public room of one name have to be two rooms or the policies are decoration.
 
 One question is deliberately not asked, and it is the only place these two servers are known to differ.
 A push a write policy refused is dropped in silence by Supabase Realtime and answered with an error on the push by zou, and both look identical to a listener, so the suite asks what they agree on, that nothing arrives.

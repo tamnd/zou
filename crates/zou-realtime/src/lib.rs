@@ -35,4 +35,6 @@ pub mod session;
 
 pub use frame::{BinaryBroadcast, Encoding, Frame, Vsn};
 pub use hub::{Delivery, Hub, SocketId};
-pub use session::{About, Action, Ask, Config, Fanout, Grant, Identity, Sent, Session, Tokens};
+pub use session::{
+    About, Action, Ask, Config, Fanout, Grant, Identity, Sent, Session, Tokens, room,
+};
