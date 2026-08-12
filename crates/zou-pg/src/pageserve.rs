@@ -37,10 +37,11 @@ use zou_store::layermap::LayerMap;
 use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
 use zou_store::memtable::Memtable;
+use zou_store::pageread::ReadError;
 use zou_store::shardmanifest::PageShardManifest;
 
 use crate::WAL_SHARD;
-use crate::getpage::{MAX_GETPAGE_BATCH, PageService};
+use crate::getpage::{GetPageError, MAX_GETPAGE_BATCH, PageService};
 use crate::ingest::{IngestConfig, ShardIngest};
 use crate::pagesvc::ingest_config;
 use crate::redo::{RedoPool, RedoPoolConfig};
@@ -441,7 +442,9 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         let seen = ingest.as_ref().map_or(0, ShardIngest::seen);
         let mem = ingest.as_ref().map_or(&empty_mem, ShardIngest::memtable);
         let now = Instant::now();
-        parked.retain(|req| {
+        let mut ready: Vec<GetReq> = Vec::new();
+        let mut still: Vec<GetReq> = Vec::new();
+        for req in parked.drain(..) {
             // Zero asks for the latest durable state; anything else is
             // the durability watermark the reader saw, already safe.
             // Covered means the stream bytes reached the watermark, not
@@ -452,11 +455,8 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
             // `applied` is the page state at the watermark.
             let need = if req.lsn == 0 { durable_seen } else { req.lsn };
             if seen >= need {
-                let at = if applied == 0 { u64::MAX } else { applied };
-                serve(&cfg, &*store, pool.as_ref(), &map, mem, req, at);
-                return false;
-            }
-            if now >= req.deadline {
+                ready.push(req);
+            } else if now >= req.deadline {
                 let msg = match &frozen {
                     Some(e) => format!("ingest frozen: {e}"),
                     None => format!(
@@ -464,10 +464,15 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                     ),
                 };
                 let _ = req.reply.send(Err(msg));
-                return false;
+            } else {
+                still.push(req);
             }
-            true
-        });
+        }
+        parked = still;
+        for req in ready {
+            let at = if applied == 0 { u64::MAX } else { applied };
+            serve_reloading(&cfg, &*store, pool.as_ref(), &mut map, mem, &req, at);
+        }
 
         if stop.load(Ordering::Acquire) {
             for req in parked.drain(..) {
@@ -594,21 +599,82 @@ fn flush_if_due(
             entry.size,
             ingest.applied()
         );
-        match PageShardManifest::load(&**store, &layout.shard_manifest(0)) {
-            Ok(Some((manifest, _))) => {
-                *map = manifest.layer_map().map_err(|e| e.to_string())?;
-            }
-            Ok(None) => return Err("flush published no manifest".to_string()),
-            Err(e) => return Err(format!("manifest reload: {e}")),
+        if !reload_map(&**store, layout, map)? {
+            return Err("flush published no manifest".to_string());
         }
     }
     Ok(())
+}
+
+/// Pick the shard manifest up into `map`, which is what serves reads
+/// back. False means there is no manifest yet, a shard that has never
+/// flushed, which is not a failure.
+fn reload_map(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    map: &mut LayerMap,
+) -> Result<bool, String> {
+    match PageShardManifest::load(store, &layout.shard_manifest(0)) {
+        Ok(Some((manifest, _))) => {
+            *map = manifest.layer_map().map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(e) => Err(format!("manifest reload: {e}")),
+    }
+}
+
+/// Serve one request, and if the map named a layer the store no
+/// longer has, pick up the current manifest and serve again.
+///
+/// The driver reloads the map after its own flush and at no other
+/// time, so between flushes it is a snapshot of a manifest that
+/// compaction keeps rewriting. Compaction retires the layers it
+/// merged, gc deletes the objects once the window passes, and the
+/// read then plans against names nothing holds anymore. Every
+/// restored node in the six hour run on server2 logged this around
+/// the death drills, and because the checker reads a failed query as
+/// a failed identity it came back as six of eight drills reporting a
+/// broken balance. The map is a cache, the manifest is the authority:
+/// on a miss, go ask it. A second miss is a real answer, the layer is
+/// named by the current manifest and genuinely gone, and it goes back
+/// to the reader as the error it is.
+fn serve_reloading(
+    cfg: &ServerConfig,
+    store: &dyn CasStore,
+    pool: Option<&RedoPool>,
+    map: &mut LayerMap,
+    mem: &Memtable,
+    req: &GetReq,
+    at: u64,
+) {
+    let Served::Stale { layer } = serve(cfg, store, pool, map, mem, req, at, false) else {
+        return;
+    };
+    log::info!("zou pageserve: layer {layer} is gone, reloading the map and reading again");
+    if let Err(e) = reload_map(store, &cfg.layout, map) {
+        log::warn!("zou pageserve: {e}");
+    }
+    serve(cfg, store, pool, map, mem, req, at, true);
+}
+
+/// What one serve attempt did: replied, or found the map naming a
+/// layer the store does not have and left the request unanswered for
+/// the caller to retry.
+enum Served {
+    Done,
+    Stale { layer: String },
 }
 
 /// Serve one request at `at` and reply on its channel. The service is
 /// rebuilt per call; the footer cache it loses is a few small reads
 /// on a local store, and the borrow it would otherwise pin across
 /// ingest mutation is not worth it yet.
+///
+/// `last` says whether a missing layer is the answer. On the first
+/// attempt it is not, the request goes back unanswered so the caller
+/// can reload the map; on the retry it is.
+#[allow(clippy::too_many_arguments)]
 fn serve(
     cfg: &ServerConfig,
     store: &dyn CasStore,
@@ -617,7 +683,8 @@ fn serve(
     mem: &Memtable,
     req: &GetReq,
     at: u64,
-) {
+    last: bool,
+) -> Served {
     let layout = &cfg.layout;
     let service = PageService::new(store, layout.shard_prefix(0), pool, cfg.data_checksums)
         .with_base_fallback(move |blk: &BlockRef| {
@@ -637,10 +704,15 @@ fn serve(
             blk,
         })
         .collect();
-    let answer = service
-        .get_pages(map, mem, &refs, at)
-        .map_err(|e| e.to_string());
+    let answer = match service.get_pages(map, mem, &refs, at) {
+        Ok(pages) => Ok(pages),
+        Err(GetPageError::Read(ReadError::Missing { name })) if !last => {
+            return Served::Stale { layer: name };
+        }
+        Err(e) => Err(e.to_string()),
+    };
     let _ = req.reply.send(answer);
+    Served::Done
 }
 
 #[cfg(test)]
@@ -835,6 +907,105 @@ mod tests {
             ingest.memtable().bytes() < cfg.flush_bytes,
             "the memtable ended at {} bytes, over its own threshold",
             ingest.memtable().bytes()
+        );
+    }
+
+    /// The read failure every restored node logged in the six hour run
+    /// on server2: compaction retired a layer, gc collected the
+    /// object, and the page service was still holding the map it
+    /// loaded before either happened. The map is a cache and the
+    /// manifest is the authority, so a miss reloads and reads again
+    /// rather than failing the page.
+    #[test]
+    fn a_read_naming_a_collected_layer_reloads_the_map_and_answers() {
+        use zou_store::layer::{DeltaEntry, ImageBuilder, LayerKey, build_delta};
+        use zou_store::layermap::LayerDesc;
+        use zou_store::shardmanifest::{LayerEntry, publish_layer, swap_layers};
+
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        let manifest_key = layout.shard_manifest(0);
+        let key = LayerKey::page(1663, 5, 2000, 0, 3);
+        let page = vec![9u8; BLCKSZ];
+
+        let publish = |bytes: Vec<u8>, footer: &zou_store::layer::LayerFooter| -> String {
+            let desc = LayerDesc::from_footer(footer, bytes.len() as u64);
+            let name = desc.name();
+            store
+                .put(&format!("{}{name}", layout.shard_prefix(0)), &bytes)
+                .expect("layer lands");
+            let entry = LayerEntry {
+                name: name.clone(),
+                size: bytes.len() as u64,
+                owner: None,
+                upto: None,
+            };
+            publish_layer(&*store, &manifest_key, 0, &entry, footer.max_lsn).expect("published");
+            name
+        };
+
+        let mut images = ImageBuilder::new(1, Lsn(100), 8192);
+        images.push(key, &page).expect("image pushes");
+        let (bytes, footer) = images.finish().expect("image layer builds");
+        publish(bytes, &footer);
+
+        // The layer compaction merged away and gc then deleted. It is
+        // in the map the driver holds and in nothing else.
+        let (bytes, footer) = build_delta(
+            &[DeltaEntry {
+                key,
+                lsn: Lsn(150),
+                record: vec![0x5A; 64],
+            }],
+            8192,
+        )
+        .expect("delta layer builds");
+        let gone = publish(bytes, &footer);
+        let (manifest, _) = PageShardManifest::load(&*store, &manifest_key)
+            .expect("manifest reads")
+            .expect("both layers published");
+        let mut map = manifest.layer_map().expect("the map builds");
+        swap_layers(
+            &*store,
+            &manifest_key,
+            0,
+            std::slice::from_ref(&gone),
+            &[],
+            None,
+        )
+        .expect("retired");
+        store
+            .delete(&format!("{}{gone}", layout.shard_prefix(0)))
+            .expect("collected");
+
+        let (reply, answers) = sync_channel(1);
+        let req = GetReq {
+            spc: 1663,
+            db: 5,
+            rel: 2000,
+            fork: 0,
+            blks: vec![3],
+            lsn: 0,
+            deadline: Instant::now() + WAIT_CAP,
+            reply,
+        };
+        let cfg = ServerConfig {
+            store: Arc::clone(&store),
+            layout: layout.clone(),
+            tenant: TENANT,
+            socket: sock_path("stale.sock"),
+            data_checksums: false,
+            redo: None,
+        };
+        serve_reloading(&cfg, &*store, None, &mut map, &Memtable::new(), &req, 200);
+        let pages = answers
+            .recv()
+            .expect("the driver replied")
+            .expect("the read survived the collected layer");
+        assert_eq!(pages[0], page, "the image served the page");
+        assert!(
+            !map.layers().iter().any(|d| d.name() == gone),
+            "the map still names the layer that is gone"
         );
     }
 }
