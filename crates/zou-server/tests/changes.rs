@@ -148,6 +148,24 @@ async fn tapped(dsn: &str) {
     panic!("the server never took a replication slot");
 }
 
+/// Wait until no slot of ours is open anywhere, which is where a test
+/// that counts them has to start.
+///
+/// The count is server wide and cannot be anything else, because a slot
+/// is named after the backend that took it and nothing knows that name
+/// in advance. So a slot another suite in the same run is still letting
+/// go of reads here as this one's own, and waiting it out is cheaper
+/// than a test that fails on a machine with a slow database.
+async fn settled(dsn: &str) {
+    for _ in 0..400 {
+        if slots(dsn).await == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("something else is holding a replication slot of ours");
+}
+
 fn anon_key() -> String {
     jwt::mint(&jwt::key_claims("anon"), SECRET)
 }
@@ -233,6 +251,7 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
     if !logical(&dsn).await {
         return;
     }
+    settled(&dsn).await;
     let at = serving(&dsn).await;
     published(
         &dsn,
@@ -321,6 +340,7 @@ async fn a_row_a_policy_hides_never_reaches_the_socket_it_hides_it_from() {
     if !logical(&dsn).await {
         return;
     }
+    settled(&dsn).await;
     let at = serving(&dsn).await;
     published(
         &dsn,
@@ -367,6 +387,7 @@ async fn nothing_is_read_once_the_last_subscriber_has_gone() {
     if !logical(&dsn).await {
         return;
     }
+    settled(&dsn).await;
     let at = serving(&dsn).await;
     published(
         &dsn,
