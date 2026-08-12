@@ -64,6 +64,7 @@ pub mod storage;
 pub mod tenant;
 pub mod totp;
 pub mod tus;
+pub mod visible;
 pub mod wire;
 
 /// What the front door needs to know: the secret every key and token

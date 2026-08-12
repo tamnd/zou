@@ -310,6 +310,27 @@ If the table publishes its old rows it is filled in from there, and if it does n
 A change larger than a megabyte arrives with every value over sixty four bytes left out and `errors` reading `["Error 413: Payload Too Large"]`.
 The id survives, so a client can go and read the row.
 
+## Who a change is sent to
+
+A subscription is a read, so a subscriber is sent a row only if the database would have shown it to them.
+That is asked of the database rather than decided by this server: it becomes the subscriber's role, puts their claims where `auth.uid()` reads them, and selects the changed row back by its primary key.
+Your policies therefore mean here what they mean through `/rest/v1`, and there is nothing extra to write for realtime beyond turning row level security on.
+
+Column privileges are part of the answer.
+A subscriber holding `grant select (id, title)` gets those columns and no others, in both `record` and `columns`, so a client is never told about a column it may not read.
+
+Three cases are worth knowing before you rely on this.
+
+A delete is sent to every subscriber, because the row is gone and no policy can be asked about it.
+On a table with row level security on, its `old_record` is cut down to the identifying columns, so what a subscriber learns is that a row with that key is gone rather than what was in it.
+
+A table with no primary key cannot be checked, since there is nothing to select the row back by, and its changes arrive carrying `["Error 400: Bad Request, no primary key"]` instead of a record.
+A subscriber who may not select the key columns gets `["Error 401: Unauthorized"]`, which is the same problem from the other side.
+
+The check runs against the table as it is now, not as it was at the moment of the change.
+An update that moves a row out of a policy's view is checked in its new state, and a row deleted immediately afterwards is already gone.
+Upstream behaves the same way, and a project that needs an audit trail of who saw what should write one rather than infer it from this.
+
 ## What is not built
 
 | asked for | what happens |
