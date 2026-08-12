@@ -275,6 +275,41 @@ The slot a tap holds is temporary.
 It lives exactly as long as the connection holding it, so a server nobody is subscribed to retains no write ahead log and leaves nothing behind to clean up, and a tap sees what happened after it opened rather than a replay of what it missed.
 That is upstream's trade too.
 
+## What a change looks like
+
+Still nothing a socket receives, but the payload a change turns into is built and is the one Supabase sends, so it is worth writing down before it is wired:
+
+```json
+{
+  "schema": "public",
+  "table": "todos",
+  "commit_timestamp": "2021-11-05T17:20:51.524Z",
+  "type": "INSERT",
+  "columns": [
+    { "name": "id", "type": "int4" },
+    { "name": "details", "type": "text" }
+  ],
+  "record": { "id": 12, "details": "wash up" },
+  "errors": null
+}
+```
+
+An insert has a `record`, a delete has an `old_record`, and an update has both.
+The client renames them to `new` and `old` before your handler sees them.
+The commit timestamp is when the transaction committed rather than when the row was written, because a row has no time of its own until then, and it is the same on every change in one transaction.
+
+Values are json rather than the text postgres prints: an integer is a number, a boolean is a boolean, a `jsonb` column is the json it holds, an array is an array, and a timestamp is `2021-11-05T17:20:51.524+00:00` rather than the space separated form.
+That is postgres's own `to_jsonb` of the value, which is what upstream calls per column, and it is checked against `to_jsonb` in the tests rather than against a description of it.
+A `bytea` is hex with no `\x` on the front, which is upstream's shape and not postgres's.
+
+Two rules worth knowing before you read a payload.
+
+A column stored out of line that an update did not write is not sent by postgres at all.
+If the table publishes its old rows it is filled in from there, and if it does not the key is simply absent from `record`, which is not the same as null.
+
+A change larger than a megabyte arrives with every value over sixty four bytes left out and `errors` reading `["Error 413: Payload Too Large"]`.
+The id survives, so a client can go and read the row.
+
 ## What is not built
 
 | asked for | what happens |

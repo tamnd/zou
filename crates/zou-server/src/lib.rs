@@ -50,6 +50,7 @@ pub mod object;
 pub mod openapi;
 pub mod ops;
 pub mod password;
+pub mod payload;
 pub mod pgoutput;
 pub mod policy;
 pub mod realtime;
