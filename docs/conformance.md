@@ -370,7 +370,7 @@ Every upload in that suite sends a `cacheControl` in its metadata, and the refer
 zou keeps one value and says `no-cache` in both places, so it matches the recording of the info route and not the listing.
 The suite now asks nothing about cache control and the question is [#285](https://github.com/tamnd/zou/issues/285), which is a decision about how an object records what was asked for apart from what is served rather than anything about tus.
 
-`js-realtime/` is the same shape for the same reason, about presence.
+`js-realtime/` is the same shape for the same reason, about presence and about sending to a room over http.
 
 supabase-js's own suite has broadcast in it and no presence at all, so there is nothing to copy, and presence is the other feature here that cannot be asked about one message at a time.
 The server sends a joining socket the whole state once and a diff for every change after that, and what an application reads is the fold of them, which happens in the client.
@@ -385,6 +385,11 @@ It corrected itself on the day it was written, which is the useful kind of findi
 Half the tests were written without a `presence` listener on the channel, read an empty state and failed.
 That is the client doing exactly what it documents: it sets `config.presence.enabled` for any channel that has a presence binding and for nobody else, and the flag decides whether that client is *sent* presence rather than whether it can be *seen*.
 The tests bind a listener where they read state now, which is what an application does, and one test is left over for the other half of the rule: a channel with no binding tracks, and the watcher sees it.
+
+The broadcast file next to it is there for a smaller reason: supabase-js's own suite sends over a socket and never over http, and a client that cannot push has two different urls to post to.
+8 more tests: the batch endpoint by hand, several messages in one post, a message with no event refused and not delivered, `send()` on a channel with no socket falling back, `httpSend()` putting the names in the url, a payload of bytes, a message reaching one room and not the one next to it, and a post with no key at all.
+Two of them need a server new enough to have the single message url, and against one that is not they warn and skip rather than pass, so a run says which questions it did not get to ask.
+The question about a payload of bytes is deliberately loose, since the two servers have not been shown to agree on what an octet-stream body is wrapped in, and tightening it is worth a run against a newer reference.
 
 ## The package a project installs, asked the same questions
 
