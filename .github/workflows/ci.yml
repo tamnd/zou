@@ -636,6 +636,67 @@ jobs:
         if: always()
         run: cat /tmp/front-door.log
 
+  # Private channels, which are the same client asking a different kind
+  # of question: whether a room is allowed is decided by row level
+  # security policies on realtime.messages that a project wrote about
+  # its own tables. So this one needs a database, which is the whole
+  # reason it is a job of its own rather than another file in the one
+  # above, and the policies it is asked against are the suite's own
+  # setup.sql applied through serve.
+  realtime-private-js:
+    name: conformance (realtime-js, private)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      - name: Start zou on the port a local supabase project uses
+        run: |
+          cargo run -p zou-conformance -- serve \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --setup /tmp/zou-conformance/js-realtime-private/setup.sql \
+            > /tmp/serve.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q '^url ' /tmp/serve.log && break
+            sleep 1
+          done
+          cat /tmp/serve.log
+          grep -q '^url ' /tmp/serve.log
+      - name: Subscribe to rooms the policies allow and refuse
+        working-directory: /tmp/zou-conformance/js-realtime-private
+        run: |
+          npm ci
+          ZOU_ANON_KEY="$(awk '/^anon /{print $2}' /tmp/serve.log)" \
+            ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test
+      - name: Keep the server log
+        if: always()
+        run: cat /tmp/serve.log
+
   # One of Supabase's own example apps, unedited, driven through a real
   # browser. The suites ask a server questions and this asks an
   # application, which is a different claim: an app goes through the
@@ -871,6 +932,22 @@ jobs:
           cd /tmp/zou-conformance/js-realtime
           npm ci
           ZOU_URL="$CLI_URL" ZOU_ANON_KEY="$ANON_KEY" npm test
+      # And the private channel suite, which is the one where the
+      # reference leg matters most: the policies are the whole answer,
+      # and a server that read them differently would be a server whose
+      # own tests all pass and whose users are in rooms they should not
+      # be in. The same setup.sql goes into the stack's database that
+      # went into zou's.
+      - name: Ask the same stack what a private channel does
+        run: |
+          cd /tmp/project
+          eval "$(supabase status -o env | sed 's/^/export /')"
+          psql "$CLI_DSN" -v ON_ERROR_STOP=1 \
+            -f /tmp/zou-conformance/js-realtime-private/setup.sql
+          cd /tmp/zou-conformance/js-realtime-private
+          npm ci
+          ZOU_URL="$CLI_URL" ZOU_ANON_KEY="$ANON_KEY" \
+            ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test
       - name: Keep what the stack was saying
         if: failure()
         run: |

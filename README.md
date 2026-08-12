@@ -83,7 +83,8 @@ room.subscribe(async (status) => {
 
 The socket, the channels on it, tokens refreshed mid connection, broadcast between the members of a topic and presence on it are served today, against the real realtime-js.
 A room can be sent to over http as well, both shapes the client posts, which is how a trigger or a worker talks to one without holding a socket.
-`postgres_changes` and private channels are not, and a join asking for one of them is refused by name rather than joined and left silent, see [docs/realtime.md](docs/realtime.md).
+Private channels are served too, against the project's own row level security policies on `realtime.messages`, so policies written for Supabase Realtime answer the same way here.
+`postgres_changes` is not, and a join asking for it is refused by name rather than joined and left silent, see [docs/realtime.md](docs/realtime.md).
 
 Branch a database for a preview deploy:
 

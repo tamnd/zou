@@ -3,8 +3,8 @@
 A socket at `/realtime/v1/websocket`, channels on it, and broadcast and presence between them.
 
 That is a smaller surface than the one Supabase Realtime serves, and the rest of this page is as much about the line as about what is on this side of it.
-`postgres_changes` and private channels are not built.
-A join asking for one of them is answered with an error naming what is missing, which is the difference between a client that reports a failure and a client that waits forever for rows nobody is sending.
+`postgres_changes` is not built.
+A join asking for it is answered with an error naming what is missing, which is the difference between a client that reports a failure and a client that waits forever for rows nobody is sending.
 
 ## Connecting
 
@@ -102,20 +102,75 @@ The `access_token` event is the same thing sent again on a live connection, whic
 A refresh that does not verify takes the socket's channels down rather than leaving them running on the claims that were about to stop being true.
 The client sees an error on the push and then a `phx_error` on each channel, which is what it needs to resubscribe once it has a token that works.
 
+## Private channels
+
+A private channel is one whose rules are written in sql rather than in the server.
+
+```js
+const room = supabase.channel('room', { config: { private: true } })
+```
+
+```sql
+create policy "read the rooms you are in" on realtime.messages
+for select to authenticated
+using (
+  exists (
+    select 1 from memberships m
+    where m.room = realtime.topic() and m.person = auth.uid()
+  )
+);
+
+create policy "write to the rooms you are in" on realtime.messages
+for insert to authenticated
+with check (
+  exists (
+    select 1 from memberships m
+    where m.room = realtime.topic() and m.person = auth.uid()
+  )
+);
+```
+
+Those are ordinary row level security policies on `realtime.messages`, which is Supabase's convention and is worth reading twice, because nothing in the server knows the word room.
+`realtime.topic()` is the channel's name without the `realtime:` a socket topic carries, and `auth.uid()` is whoever the token on the channel says it is.
+A project that already has policies written for Supabase Realtime does not rewrite them to run here.
+
+The way the server finds out is to ask postgres to try.
+Reading is two rows written into `realtime.messages`, one for `broadcast` and one for `presence`, and then selected back as the user: whatever the select policies let through is what this person may read.
+Writing is an insert tried as the user, where a refusal for insufficient privilege is a no and anything else is a yes.
+Both run in a transaction that is rolled back whatever it found, so nothing is ever kept and the table stays empty.
+That is upstream's own method, down to the two extensions and the rollback, because a check that worked differently would answer differently for the same policies.
+
+Reading is checked at the join, and a refusal names the room.
+
+```
+You do not have permissions to read from this Channel topic: room
+```
+
+Writing is checked the first time the channel sends something and then remembered for as long as the channel is up, which keeps a chatty room to one check rather than one per message.
+A new token puts every private channel on the socket back to the policies, because the person the policies were answered for has just changed.
+A channel that may no longer be read gets a `phx_error`, which is the signal a client resubscribes on.
+
+Over http the same policies apply and the answers are upstream's.
+`POST /realtime/v1/api/broadcast/{topic}/events/{event}?private=true` is 403 with `{"message":"Unauthorized"}` when the write policies say no.
+The batch endpoint drops the private messages that were refused, sends the rest, and still answers 202, which is not much of an answer but it is the one clients are written against.
+A service key is not stopped by any of this, because `service_role` has `bypassrls` and the policies never see it, which is how a project's backend reaches every room without being named in every policy.
+
+Two things here are deliberately not upstream's.
+A push a write policy refused is answered with an error on the push rather than dropped in silence, because silence is indistinguishable from a message that was sent and heard by nobody.
+And `realtime.messages` is created unpartitioned rather than partitioned by day with a janitor keeping tomorrow's partition ready, because no message is ever kept in it and every probe rolls back, so the partitions would be a moving part with nothing in them.
+
+A server running without a database refuses a private channel by saying that, rather than by saying 403.
+403 is an answer about a project's policies, and sending somebody to read policies that were never consulted is worse than telling them what is actually missing.
+
 ## What is not built
 
 | asked for | what happens |
 | --- | --- |
 | `postgres_changes` in a join | the join is refused, naming what is missing |
-| a private channel | the same |
-| a private broadcast over http | 501, naming private channels |
 
-All three are M4, tracked in [tamnd/zou#4](https://github.com/tamnd/zou/issues/4).
+That is M4, tracked in [tamnd/zou#4](https://github.com/tamnd/zou/issues/4).
 
-A private broadcast is 501 rather than the 403 upstream answers when its check says no, on purpose.
-403 is what a caller sees when its own policies refused it, and answering that here would send somebody looking through policies for a problem that is not there.
-
-The refusals are worded rather than silent on purpose.
+The refusal is worded rather than silent on purpose.
 A server can accept any of these joins, reply `SUBSCRIBED` and then send nothing, and every client in the world will sit there waiting, which is the worst answer available: the thing that is missing looks exactly like the thing that is working and idle.
 
 ## On a fleet

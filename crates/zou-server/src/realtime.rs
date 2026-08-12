@@ -23,11 +23,11 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use zou_realtime::{
-    Action, BinaryBroadcast, Delivery, Encoding, Fanout, Hub, Identity, Session, SocketId, Tokens,
-    Vsn,
+    About, Action, Ask, BinaryBroadcast, Delivery, Encoding, Fanout, Grant, Hub, Identity, Session,
+    SocketId, Tokens, Vsn,
 };
 
-use crate::{App, AuthContext, json_body};
+use crate::{App, AuthContext, json_body, policy};
 
 /// What checks a token for a socket: the project's own verifier, the
 /// same one every http request goes through.
@@ -98,12 +98,13 @@ pub async fn websocket(
             app: Arc::clone(&app),
             anon_role,
         };
-        run(socket, Session::new(vsn, identity), &app.hub, &tokens).await;
+        run(socket, Session::new(vsn, identity), &app, &tokens).await;
     })
 }
 
 /// One connection, until it goes.
-async fn run(mut socket: WebSocket, mut session: Session, hub: &Hub, tokens: &dyn Tokens) {
+async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens: &dyn Tokens) {
+    let hub = &app.hub;
     let me = hub.socket();
     // The topics this socket is on, each with the receiver it is
     // hearing them through. A join adds one and a leave drops one,
@@ -150,7 +151,7 @@ async fn run(mut socket: WebSocket, mut session: Session, hub: &Hub, tokens: &dy
                 break;
             }
         };
-        if !act(&mut socket, actions, &session, hub, me, &mut carrying).await {
+        if !act(&mut socket, actions, &mut session, app, me, &mut carrying).await {
             break;
         }
     }
@@ -225,11 +226,12 @@ async fn first_of(
 async fn act(
     socket: &mut WebSocket,
     actions: Vec<Action>,
-    session: &Session,
-    hub: &Hub,
+    session: &mut Session,
+    app: &Arc<App>,
     me: SocketId,
     carrying: &mut HashMap<String, tokio::sync::broadcast::Receiver<Delivery>>,
 ) -> bool {
+    let hub = &app.hub;
     for action in actions {
         match action {
             Action::Text(text) => {
@@ -264,9 +266,39 @@ async fn act(
                     return false;
                 }
             }
+            // The one thing this loop stops for. Nothing else the
+            // socket asked for is done until the project's own
+            // policies have answered, which is what makes a private
+            // channel private.
+            Action::Ask(ask) => {
+                let granted = answer(app, session.identity(), &ask).await;
+                let next = session.authorized(&ask, granted);
+                if !Box::pin(act(socket, next, session, app, me, carrying)).await {
+                    return false;
+                }
+            }
         }
     }
     true
+}
+
+/// Go and find out, which is the io a private channel needs and the
+/// reason the session cannot decide one on its own.
+async fn answer(app: &App, who: &Identity, ask: &Ask) -> Result<Grant, String> {
+    let Some(pool) = app.pool.as_ref() else {
+        return Err(
+            "this server has no database, which is what a private channel is checked against"
+                .into(),
+        );
+    };
+    let who = policy::Who {
+        role: &who.role,
+        claims: &who.claims,
+    };
+    match ask.about {
+        About::Join => policy::reads(pool, &who, ask.name()).await,
+        _ => policy::writes(pool, &who, ask.name()).await,
+    }
 }
 
 /// A batch of broadcasts over http, `POST /realtime/v1/api/broadcast`.
@@ -282,6 +314,7 @@ async fn act(
 /// strongest true thing there is to say.
 pub async fn broadcast(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::Extension(auth): axum::Extension<AuthContext>,
     body: Bytes,
 ) -> Response {
     let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&body) else {
@@ -300,13 +333,33 @@ pub async fn broadcast(
     if faults.iter().any(|fault| fault != &json!({})) {
         return unprocessable(json!({"messages": faults}));
     }
-    if messages.iter().any(private_message) {
-        return not_yet_private();
-    }
+    // One check per topic rather than per message, since the policies
+    // are about the room and a batch is usually one room several
+    // times.
+    let mut asked: HashMap<String, bool> = HashMap::new();
     for message in messages {
         let topic = message["topic"].as_str().unwrap_or_default();
         let event = message["event"].as_str().unwrap_or_default();
         let payload = message.get("payload").cloned().unwrap_or(json!({}));
+        if private_message(message) {
+            let allowed = match asked.get(topic) {
+                Some(allowed) => *allowed,
+                None => {
+                    let allowed = may_write(&app, &auth, topic).await.unwrap_or(false);
+                    asked.insert(topic.to_string(), allowed);
+                    allowed
+                }
+            };
+            if !allowed {
+                // Upstream drops a private message the policies
+                // refused and answers 202 for the batch anyway. A
+                // caller sending a mixed batch cannot be told which
+                // half went without being told what its policies say,
+                // which is a thing the batch shape has no room for.
+                log::debug!("realtime: a private broadcast to {topic} was refused by the policies");
+                continue;
+            }
+        }
         fan(&app.hub, topic, event, json_payload(&payload));
     }
     accepted()
@@ -321,13 +374,24 @@ pub async fn broadcast(
 /// the same as bytes that came in over a socket.
 pub async fn broadcast_one(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
+    axum::Extension(auth): axum::Extension<AuthContext>,
     Path((topic, event)): Path<(String, String)>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if query(&uri, "private").as_deref() == Some("true") {
-        return not_yet_private();
+        match may_write(&app, &auth, &topic).await {
+            Ok(true) => {}
+            // The caller's own policies said no, which is what 403
+            // means here and the one place this surface says it.
+            Ok(false) => {
+                return json_body(StatusCode::FORBIDDEN, json!({"message": "Unauthorized"}));
+            }
+            Err(why) => {
+                return json_body(StatusCode::UNPROCESSABLE_ENTITY, json!({"message": why}));
+            }
+        }
     }
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -416,15 +480,27 @@ fn unprocessable(errors: Value) -> Response {
     json_body(StatusCode::UNPROCESSABLE_ENTITY, json!({"errors": errors}))
 }
 
-/// A private broadcast is an rls check against `realtime.messages`, and
-/// there is nothing here to check it with yet.
+/// Whether this caller may send to this room, which is the same
+/// question a socket on a private channel asks and the same policies
+/// answer it.
 ///
-/// Upstream answers 403 when the check says no, and answering 403 here
-/// would be a lie of the worst kind: a caller would read it as its
-/// policies refusing it and go looking for the policy. 501 naming what
-/// is missing sends it to the milestone instead.
-fn not_yet_private() -> Response {
-    crate::not_yet("a private broadcast, which needs private channels")
+/// The error is the sentence to hand back rather than a no: a caller
+/// told no goes and reads its policies, and it should only do that
+/// when the policies are what refused it.
+async fn may_write(app: &App, auth: &AuthContext, topic: &str) -> Result<bool, String> {
+    let Some(pool) = app.pool.as_ref() else {
+        return Err(
+            "this server has no database, which is what a private broadcast is checked against"
+                .into(),
+        );
+    };
+    let who = policy::Who {
+        role: &auth.role,
+        claims: &auth.claims,
+    };
+    policy::writes(pool, &who, topic)
+        .await
+        .map(|granted| granted.broadcast)
 }
 
 /// One parameter out of the connect url.
