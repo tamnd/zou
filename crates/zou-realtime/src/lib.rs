@@ -23,6 +23,12 @@
 //! and left silent, which is the difference between a client that
 //! reports an error and a client that waits forever.
 //!
+//! What a project is allowed is in [`limit`]: how many sockets, how
+//! many joins a second, how many channels one of them may hold, how
+//! many messages a second, and how big one may be. Two of those a
+//! session can answer alone and the rest belong to the whole server,
+//! so they arrive as counters the transport keeps.
+//!
 //! A private channel is the one thing here that cannot be decided
 //! without leaving the crate, since the answer is in the project's own
 //! database. It is still not decided here: the session asks
@@ -31,10 +37,12 @@
 
 pub mod frame;
 pub mod hub;
+pub mod limit;
 pub mod session;
 
 pub use frame::{BinaryBroadcast, Encoding, Frame, Vsn};
 pub use hub::{Delivery, Hub, SocketId};
+pub use limit::{Counters, Limits, Meter, Sockets, Unlimited};
 pub use session::{
-    About, Action, Ask, Config, Fanout, Grant, Identity, Sent, Session, Tokens, room,
+    About, Action, Ask, Budget, Config, Fanout, Grant, Identity, Sent, Session, Tokens, room,
 };

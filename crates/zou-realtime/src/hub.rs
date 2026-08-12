@@ -111,23 +111,33 @@ impl Hub {
         receiver
     }
 
-    /// Hand a broadcast to everyone on its topic.
+    /// Hand a broadcast to everyone on its topic, and say how many
+    /// sockets that was.
     ///
     /// A topic nobody is on is dropped here rather than sent, and its
     /// entry goes with it, which is how the map stays the size of the
     /// live topics.
-    pub fn fan(&self, from: SocketId, fan: Fanout) {
-        self.send(from, Sent::Broadcast(fan));
+    ///
+    /// The count is what a message costs the project: upstream counts
+    /// a send and every delivery of it against the same budget, so one
+    /// broadcast to a thousand sockets is a thousand events and not
+    /// one.
+    pub fn fan(&self, from: SocketId, fan: Fanout) -> usize {
+        self.send(from, Sent::Broadcast(fan))
     }
 
-    fn send(&self, from: SocketId, sent: Sent) {
+    fn send(&self, from: SocketId, sent: Sent) -> usize {
         let mut topics = self.topics.lock().expect("the hub");
         let Some(sender) = topics.get(sent.topic()) else {
-            return;
+            return 0;
         };
         let topic = sent.topic().to_string();
-        if sender.send(Arc::new((from, sent))).is_err() {
-            topics.remove(&topic);
+        match sender.send(Arc::new((from, sent))) {
+            Ok(reached) => reached,
+            Err(_) => {
+                topics.remove(&topic);
+                0
+            }
         }
     }
 

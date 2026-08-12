@@ -13,10 +13,12 @@
 //! failed.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
 use crate::frame::{BinaryBroadcast, Encoding, Frame, Vsn};
+use crate::limit::{Counters, Limits, Unlimited};
 
 /// Who the socket is, once a token has been read.
 #[derive(Debug, Clone, PartialEq)]
@@ -155,6 +157,11 @@ pub enum Action {
     /// come back through [`Session::authorized`]. Nothing else this
     /// socket asked for happens until the answer arrives.
     Ask(Ask),
+    /// The socket itself is finished, once whatever is in front of
+    /// this has been sent. Upstream reaches this by telling the
+    /// transport to disconnect, and it is one refusal only: a project
+    /// over its joins per second budget.
+    Close,
 }
 
 /// A question about a private channel that only the project's own
@@ -263,6 +270,43 @@ fn topic_of(room: &str) -> &str {
     room.strip_prefix("private:").unwrap_or(room)
 }
 
+/// What this project is allowed and what has been spent of it.
+///
+/// The numbers are the whole project's, so every session on one server
+/// is handed the same one of these: two sockets sharing a project
+/// share its budget, which is what makes a limit about the project
+/// rather than about whoever connected first.
+#[derive(Clone)]
+pub struct Budget {
+    pub limits: Limits,
+    pub counters: Arc<dyn Counters>,
+}
+
+impl Default for Budget {
+    /// The numbers a project takes when nothing set any, with nothing
+    /// counting the two that need the whole server to count them. A
+    /// session built this way still refuses a socket that holds too
+    /// many channels or sends too big a message, since those it can
+    /// answer alone.
+    fn default() -> Budget {
+        Budget {
+            limits: Limits::default(),
+            counters: Arc::new(Unlimited),
+        }
+    }
+}
+
+impl Budget {
+    /// A project with nothing counted at all, which is what a test and
+    /// an embedded server both want.
+    pub fn none() -> Budget {
+        Budget {
+            limits: Limits::none(),
+            counters: Arc::new(Unlimited),
+        }
+    }
+}
+
 /// One connection.
 pub struct Session {
     vsn: Vsn,
@@ -281,6 +325,8 @@ pub struct Session {
     /// reads the socket again, so a second question about the same
     /// topic cannot arrive in between.
     pending: HashMap<String, Pending>,
+    /// What the project is allowed and what is counting it.
+    budget: Budget,
 }
 
 impl Session {
@@ -289,12 +335,18 @@ impl Session {
     /// layer has already checked, since a socket that gets this far
     /// passed the same apikey gate every other request does.
     pub fn new(vsn: Vsn, identity: Identity) -> Session {
+        Session::budgeted(vsn, identity, Budget::default())
+    }
+
+    /// The same, on a project whose limits somebody is counting.
+    pub fn budgeted(vsn: Vsn, identity: Identity, budget: Budget) -> Session {
         Session {
             vsn,
             identity,
             channels: HashMap::new(),
             rights: HashMap::new(),
             pending: HashMap::new(),
+            budget,
         }
     }
 
@@ -366,6 +418,9 @@ impl Session {
             event: "broadcast".into(),
             payload: json!({}),
         };
+        if self.too_big(&push) {
+            return self.oversized(&asked, ack);
+        }
         let mut actions = vec![Action::Fan(Fanout {
             topic: room,
             push,
@@ -403,6 +458,30 @@ impl Session {
                 &frame,
                 "a channel topic is realtime: and then a name",
             ))];
+        }
+        // The two budgets a join spends, before the token is read and
+        // before the policies are asked: a socket that is already
+        // holding too many channels and a project that is joining them
+        // too fast are both refused whoever they turn out to be.
+        let held = self.channels.len() as u64;
+        let allowed = self.budget.limits.channels_per_client;
+        if allowed > 0 && held >= allowed {
+            return vec![self.send(Frame::error(
+                &frame,
+                "ChannelRateLimitReached: Too many channels",
+            ))];
+        }
+        if !self.budget.counters.join() {
+            // Upstream answers this one and then tells the transport
+            // to disconnect, so the client is told why before the
+            // socket goes rather than being dropped in silence.
+            return vec![
+                self.send(Frame::error(
+                    &frame,
+                    "ClientJoinRateLimitReached: Too many joins per second",
+                )),
+                Action::Close,
+            ];
         }
         // A join may carry a token of its own, and usually does: the
         // client puts the user's access token there so the channel
@@ -742,6 +821,9 @@ impl Session {
                 "a broadcast carries an event name and a payload",
             ))];
         };
+        if self.too_big(&push) {
+            return self.oversized(&frame, ack);
+        }
         let mut actions = vec![Action::Fan(Fanout {
             topic: room,
             push,
@@ -754,13 +836,85 @@ impl Session {
         self.gated(&topic, About::Broadcast, frame, actions)
     }
 
+    /// Whether one push is more than the project allows a message to
+    /// be.
+    ///
+    /// Upstream measures the erlang term it is about to hand to the
+    /// pubsub and compares it with `max_payload_size_in_kb` and five
+    /// hundred bytes of slack. There is no erlang term here, so what
+    /// is measured is what will go over the wire: the payload and the
+    /// event name it is sent under.
+    fn too_big(&self, push: &BinaryBroadcast) -> bool {
+        let Some(allowed) = self.budget.limits.payload_bytes() else {
+            return false;
+        };
+        (push.payload.len() + push.event.len()) as u64 > allowed
+    }
+
+    /// What a message too big for the project gets: an error to the
+    /// client that asked to be told, and silence for one that did not,
+    /// which is upstream's answer to both.
+    fn oversized(&mut self, asked: &Frame, ack: bool) -> Vec<Action> {
+        if !ack {
+            log::debug!(
+                "realtime: a push to {} is over the payload budget and was dropped",
+                asked.topic
+            );
+            return Vec::new();
+        }
+        vec![self.send(Frame::reply(asked, "error", json!("payload_size_exceeded")))]
+    }
+
+    /// The project has moved more messages a second than it may, and
+    /// this channel is one that noticed.
+    ///
+    /// Upstream tells the client on the channel's own system event and
+    /// then stops the channel, which the client sees as a close on
+    /// that topic and not on the socket: its other channels carry on
+    /// and this one is resubscribed by the client's own retry.
+    fn overrun(&mut self, topic: &str) -> Vec<Action> {
+        let room = self.room(topic);
+        self.channels.remove(topic);
+        self.rights.remove(topic);
+        self.pending.remove(topic);
+        vec![
+            self.send(Frame::push(
+                topic,
+                "system",
+                json!({
+                    "extension": "system",
+                    "status": "error",
+                    "message": "Too many messages per second",
+                    "channel": name_of(topic),
+                }),
+            )),
+            self.send(Frame::push(topic, "phx_close", json!({}))),
+            Action::Untrack(room.clone()),
+            Action::Drop(room),
+        ]
+    }
+
     /// Something from the hub, on its way down this socket.
     ///
     /// `mine` is whether this socket is the one that caused it, which
     /// is the only thing `broadcast.self` decides. A presence diff
     /// ignores it: the socket that tracked applies its own change out
     /// of the diff like everybody else does.
-    pub fn deliver(&self, sent: &Sent, mine: bool) -> Option<Action> {
+    ///
+    /// This is also where a project that is moving more messages than
+    /// it may is noticed, because it is the only place that sees every
+    /// message: upstream counts on delivery too, and the channel that
+    /// was about to be handed one is the channel it takes down.
+    pub fn deliver(&mut self, sent: &Sent, mine: bool) -> Vec<Action> {
+        if self.budget.counters.over_events()
+            && let Some(topic) = self.on_room(sent.topic()).map(str::to_string)
+        {
+            return self.overrun(&topic);
+        }
+        self.delivered(sent, mine).into_iter().collect()
+    }
+
+    fn delivered(&self, sent: &Sent, mine: bool) -> Option<Action> {
         match sent {
             Sent::Broadcast(fan) => self.broadcast_down(fan, mine),
             Sent::Diff { topic, payload } => {
@@ -839,6 +993,14 @@ mod tests {
                 Err("invalid claim: missing sub claim".into())
             }
         }
+    }
+
+    /// What one delivery came to. Everything but an overrun is a
+    /// single action or nothing at all, so a test that expects a
+    /// delivery says so by taking one.
+    fn only(actions: Vec<Action>) -> Option<Action> {
+        assert!(actions.len() <= 1, "one delivery, {actions:?}");
+        actions.into_iter().next()
     }
 
     fn socket() -> Session {
@@ -1047,14 +1209,14 @@ mod tests {
             panic!("not a fan out")
         };
         let sent = Sent::Broadcast(fan.clone());
-        assert!(sender.deliver(&sent, true).is_none());
+        assert!(only(sender.deliver(&sent, true)).is_none());
         assert!(matches!(
-            other.deliver(&sent, false),
+            only(other.deliver(&sent, false)),
             Some(Action::Binary(_))
         ));
         // A socket that left hears nothing more.
         third.text(r#"["1","6","realtime:room","phx_leave",{}]"#, &OneToken);
-        assert!(third.deliver(&sent, false).is_none());
+        assert!(only(third.deliver(&sent, false)).is_none());
     }
 
     #[test]
@@ -1079,7 +1241,8 @@ mod tests {
         let Action::Fan(fan) = &actions[0] else {
             panic!("not a fan out")
         };
-        let Some(Action::Text(text)) = old.deliver(&Sent::Broadcast(fan.clone()), false) else {
+        let Some(Action::Text(text)) = only(old.deliver(&Sent::Broadcast(fan.clone()), false))
+        else {
             panic!("a 1.0.0 socket takes text")
         };
         let down = Frame::decode(&text).unwrap();
@@ -1155,7 +1318,7 @@ mod tests {
             topic: "realtime:room".into(),
             payload: json!({"joins": {}, "leaves": {}}),
         };
-        assert!(session.deliver(&diff, true).is_none());
+        assert!(only(session.deliver(&diff, true)).is_none());
     }
 
     #[test]
@@ -1166,7 +1329,7 @@ mod tests {
             topic: "realtime:room".into(),
             payload: json!({"joins": {"u1": {"metas": [{"phx_ref": "3"}]}}, "leaves": {}}),
         };
-        let Some(Action::Text(text)) = session.deliver(&diff, true) else {
+        let Some(Action::Text(text)) = only(session.deliver(&diff, true)) else {
             panic!("a socket that asked for presence hears its own track back")
         };
         let down = Frame::decode(&text).unwrap();
@@ -1178,7 +1341,7 @@ mod tests {
             topic: "realtime:lobby".into(),
             payload: json!({}),
         };
-        assert!(session.deliver(&elsewhere, false).is_none());
+        assert!(only(session.deliver(&elsewhere, false)).is_none());
     }
 
     #[test]
@@ -1321,11 +1484,7 @@ mod tests {
         // never asked about, so nothing the private one says reaches
         // it. Anything else would make the policies decoration: anyone
         // could join room without them and hear the lot.
-        assert!(
-            public
-                .deliver(&Sent::Broadcast(fan.clone()), false)
-                .is_none()
-        );
+        assert!(only(public.deliver(&Sent::Broadcast(fan.clone()), false)).is_none());
 
         let from_public = public.text(
             r#"["1","5","realtime:room","broadcast",{"type":"broadcast","event":"cursor","payload":{"x":2}}]"#,
@@ -1335,11 +1494,7 @@ mod tests {
             panic!("not a fan out")
         };
         assert_eq!(fan.topic, "realtime:room");
-        assert!(
-            private
-                .deliver(&Sent::Broadcast(fan.clone()), false)
-                .is_none()
-        );
+        assert!(only(private.deliver(&Sent::Broadcast(fan.clone()), false)).is_none());
     }
 
     #[test]
@@ -1373,15 +1528,14 @@ mod tests {
         // A diff from the public room of that name is not this
         // socket's, the same way a broadcast from it is not.
         assert!(
-            session
-                .deliver(
-                    &Sent::Diff {
-                        topic: "realtime:room".into(),
-                        payload: json!({"joins": {}, "leaves": {}}),
-                    },
-                    false,
-                )
-                .is_none()
+            only(session.deliver(
+                &Sent::Diff {
+                    topic: "realtime:room".into(),
+                    payload: json!({"joins": {}, "leaves": {}}),
+                },
+                false,
+            ))
+            .is_none()
         );
     }
 
@@ -1487,7 +1641,7 @@ mod tests {
             topic: "realtime:room".into(),
             payload: json!({"joins": {}, "leaves": {}}),
         };
-        assert_eq!(session.deliver(&diff, false), None);
+        assert_eq!(only(session.deliver(&diff, false)), None);
     }
 
     #[test]
@@ -1548,5 +1702,189 @@ mod tests {
                 "{push}"
             );
         }
+    }
+
+    /// A project that has no room for another join, which is what the
+    /// transport's counter says when the whole server is joining
+    /// faster than it may.
+    struct NoJoins;
+
+    impl Counters for NoJoins {
+        fn join(&self) -> bool {
+            false
+        }
+
+        fn over_events(&self) -> bool {
+            false
+        }
+    }
+
+    /// A project that is already moving more messages a second than it
+    /// is allowed.
+    struct Overrun;
+
+    impl Counters for Overrun {
+        fn join(&self) -> bool {
+            true
+        }
+
+        fn over_events(&self) -> bool {
+            true
+        }
+    }
+
+    fn on_budget(limits: Limits, counters: Arc<dyn Counters>) -> Session {
+        Session::budgeted(
+            Vsn::V2,
+            Identity {
+                role: "anon".into(),
+                claims: json!({"role": "anon"}),
+            },
+            Budget { limits, counters },
+        )
+    }
+
+    #[test]
+    fn a_socket_holding_every_channel_it_may_is_refused_the_next_one() {
+        let mut session = on_budget(
+            Limits {
+                channels_per_client: 1,
+                ..Limits::none()
+            },
+            Arc::new(Unlimited),
+        );
+        join(&mut session, r#"{"config":{}}"#);
+        let actions = session.text(
+            r#"["1","2","realtime:other","phx_join",{"config":{}}]"#,
+            &OneToken,
+        );
+        assert_eq!(
+            text_of(&actions[0]).payload,
+            json!({
+                "status": "error",
+                "response": {"reason": "ChannelRateLimitReached: Too many channels"},
+            })
+        );
+        assert!(!session.on("realtime:other"));
+        // The channel it already had is untouched, since the refusal
+        // is about the next one and not about the socket.
+        assert!(session.on("realtime:room"));
+    }
+
+    /// Upstream answers the join and then disconnects, which is the
+    /// one refusal here that takes the whole socket with it.
+    #[test]
+    fn a_project_joining_faster_than_it_may_refuses_the_join_and_the_socket() {
+        let mut session = on_budget(Limits::none(), Arc::new(NoJoins));
+        let actions = join(&mut session, r#"{"config":{}}"#);
+        assert_eq!(
+            text_of(&actions[0]).payload,
+            json!({
+                "status": "error",
+                "response": {"reason": "ClientJoinRateLimitReached: Too many joins per second"},
+            })
+        );
+        assert_eq!(actions[1], Action::Close);
+        assert!(!session.on("realtime:room"));
+    }
+
+    #[test]
+    fn a_push_over_the_payload_budget_is_told_so_only_if_it_asked_to_be() {
+        let kb = Limits {
+            payload_size_kb: 1,
+            ..Limits::none()
+        };
+        let big = "x".repeat(2000);
+
+        let mut quiet = on_budget(kb, Arc::new(Unlimited));
+        join(&mut quiet, r#"{"config":{}}"#);
+        let dropped = quiet.text(
+            &format!(
+                r#"["1","5","realtime:room","broadcast",{{"event":"cursor","payload":{{"blob":"{big}"}}}}]"#
+            ),
+            &OneToken,
+        );
+        assert!(dropped.is_empty(), "{dropped:?}");
+
+        let mut acked = on_budget(kb, Arc::new(Unlimited));
+        join(&mut acked, r#"{"config":{"broadcast":{"ack":true}}}"#);
+        let refused = acked.text(
+            &format!(
+                r#"["1","5","realtime:room","broadcast",{{"event":"cursor","payload":{{"blob":"{big}"}}}}]"#
+            ),
+            &OneToken,
+        );
+        assert_eq!(
+            text_of(&refused[0]).payload,
+            json!({"status": "error", "response": "payload_size_exceeded"})
+        );
+
+        // A message under the budget goes as it always did, so this is
+        // a ceiling and not a switch.
+        let small = acked.text(
+            r#"["1","6","realtime:room","broadcast",{"event":"cursor","payload":{"x":1}}]"#,
+            &OneToken,
+        );
+        assert!(matches!(small[0], Action::Fan(_)), "{small:?}");
+    }
+
+    #[test]
+    fn a_binary_push_is_measured_the_same_way() {
+        let mut session = on_budget(
+            Limits {
+                payload_size_kb: 1,
+                ..Limits::none()
+            },
+            Arc::new(Unlimited),
+        );
+        join(&mut session, r#"{"config":{"broadcast":{"ack":true}}}"#);
+        let mut push = vec![3u8, 1, 1, 13, 6, 0, 1];
+        push.extend_from_slice(b"11realtime:roomcursor");
+        push.extend_from_slice(&vec![b'x'; 2000]);
+        let refused = session.binary(&push);
+        assert_eq!(
+            text_of(&refused[0]).payload,
+            json!({"status": "error", "response": "payload_size_exceeded"})
+        );
+    }
+
+    /// The project is over its messages a second, so the channel that
+    /// was about to be handed one is told and taken down, and the
+    /// socket itself carries on.
+    #[test]
+    fn a_channel_on_a_project_over_its_message_budget_is_taken_down() {
+        let mut sender = socket();
+        join(&mut sender, r#"{"config":{}}"#);
+        let actions = sender.text(
+            r#"["1","5","realtime:room","broadcast",{"event":"cursor","payload":{"x":1}}]"#,
+            &OneToken,
+        );
+        let Action::Fan(fan) = &actions[0] else {
+            panic!("not a fan out")
+        };
+        let sent = Sent::Broadcast(fan.clone());
+
+        let mut over = on_budget(Limits::none(), Arc::new(Overrun));
+        join(&mut over, r#"{"config":{}}"#);
+        let told = over.deliver(&sent, false);
+        let system = text_of(&told[0]);
+        assert_eq!(system.event, "system");
+        assert_eq!(
+            system.payload,
+            json!({
+                "extension": "system",
+                "status": "error",
+                "message": "Too many messages per second",
+                "channel": "room",
+            })
+        );
+        assert_eq!(text_of(&told[1]).event, "phx_close");
+        assert_eq!(told[2], Action::Untrack("realtime:room".into()));
+        assert_eq!(told[3], Action::Drop("realtime:room".into()));
+        assert!(!over.on("realtime:room"));
+        // Nothing more is said about a topic this socket has been
+        // taken off, so the channel is told once and not on every
+        // message that follows.
+        assert!(only(over.deliver(&sent, false)).is_none());
     }
 }

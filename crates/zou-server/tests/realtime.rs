@@ -22,8 +22,17 @@ const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long"
 /// The server on a port of the kernel's choosing, left running for the
 /// rest of the test.
 async fn serving() -> SocketAddr {
+    // Realtime's own numbers, which no test here is anywhere near.
+    limited(zou_realtime::Limits::default()).await
+}
+
+/// The same server on a budget of the test's choosing, which is how
+/// the limits are proved without opening two hundred sockets or
+/// sending three megabytes.
+async fn limited(realtime: zou_realtime::Limits) -> SocketAddr {
     let app = router(Config {
         jwt_secret: SECRET.to_vec(),
+        realtime,
         ..Config::default()
     })
     .expect("router builds");
@@ -722,4 +731,176 @@ async fn two_projects_on_one_node_do_not_share_a_room() {
     let crossed =
         tokio::time::timeout(std::time::Duration::from_millis(250), stranger.next()).await;
     assert!(crossed.is_err(), "a broadcast crossed projects");
+}
+
+/// The same post with the rate headers read off it, in the order
+/// upstream's plug writes them: what the project is moving, what it is
+/// allowed, and what is left of that.
+async fn post_rated(at: SocketAddr, path: &str, body: Vec<u8>) -> (u16, Vec<String>, String) {
+    let url = format!("http://{at}{path}");
+    let key = anon_key();
+    tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut answer = agent
+            .post(&url)
+            .header("apikey", &key)
+            .header("content-type", "application/json")
+            .send(&body[..])
+            .expect("the request goes");
+        let status = answer.status().as_u16();
+        let rate = ["x-rate-rolling", "x-rate-limit", "x-rate-limit-remaining"]
+            .iter()
+            .map(|name| {
+                answer
+                    .headers()
+                    .get(*name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        let text = answer.body_mut().read_to_string().expect("a body");
+        (status, rate, text)
+    })
+    .await
+    .expect("the request runs")
+}
+
+/// One socket too many is refused at the handshake, before there is a
+/// socket to say anything down, which is why this is an http answer
+/// and not a channel error.
+#[tokio::test]
+async fn a_socket_over_the_ceiling_is_refused_before_it_opens() {
+    let at = limited(zou_realtime::Limits {
+        concurrent_users: 1,
+        ..zou_realtime::Limits::none()
+    })
+    .await;
+    let _first = connect(at, "2.0.0").await;
+    let url = format!(
+        "ws://{at}/realtime/v1/websocket?apikey={}&vsn=2.0.0",
+        anon_key()
+    );
+    match tokio_tungstenite::connect_async(url).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(answer)) => {
+            assert_eq!(answer.status(), 429);
+            let body = answer.body().clone().unwrap_or_default();
+            let body = String::from_utf8_lossy(&body).to_string();
+            assert!(body.contains("Too many connected users"), "{body}");
+        }
+        other => panic!("{other:?} is not the refusal a full project makes"),
+    }
+
+    // The one that was refused did not take a place in the count, so
+    // the project is full and not overfull: the socket that hung up
+    // makes room for the next one.
+    drop(_first);
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _again = connect(at, "2.0.0").await;
+}
+
+#[tokio::test]
+async fn a_socket_holding_every_channel_it_may_is_refused_the_next_one() {
+    let at = limited(zou_realtime::Limits {
+        channels_per_client: 1,
+        ..zou_realtime::Limits::none()
+    })
+    .await;
+    let mut socket = connect(at, "2.0.0").await;
+    assert_eq!(join(&mut socket, "realtime:room").await[4]["status"], "ok");
+    let refused = join(&mut socket, "realtime:other").await;
+    assert_eq!(refused[4]["status"], "error");
+    assert_eq!(
+        refused[4]["response"]["reason"],
+        "ChannelRateLimitReached: Too many channels"
+    );
+}
+
+/// A project joining faster than it may is told on the join it asked
+/// for and then disconnected, which is upstream's answer and the one
+/// refusal that takes the socket with it.
+#[tokio::test]
+async fn a_project_joining_too_fast_is_told_and_hung_up_on() {
+    let at = limited(zou_realtime::Limits {
+        joins_per_second: 1,
+        ..zou_realtime::Limits::none()
+    })
+    .await;
+    let mut socket = connect(at, "2.0.0").await;
+    // Five joins in the first five second bucket is one a second, the
+    // limit itself, and upstream trips at the limit rather than past
+    // it.
+    for room in ["one", "two", "three", "four", "five"] {
+        let joined = join(&mut socket, &format!("realtime:{room}")).await;
+        assert_eq!(joined[4]["status"], "ok", "{room}");
+    }
+    let refused = join(&mut socket, "realtime:six").await;
+    assert_eq!(refused[4]["status"], "error");
+    assert_eq!(
+        refused[4]["response"]["reason"],
+        "ClientJoinRateLimitReached: Too many joins per second"
+    );
+    let gone = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .expect("the socket closes within five seconds");
+    assert!(
+        matches!(gone, None | Some(Ok(Message::Close(_)))),
+        "{gone:?} is not the disconnect that follows the refusal"
+    );
+}
+
+/// Every answer from the broadcast endpoints says what the project is
+/// spending, and one that is already over it is refused rather than
+/// sent.
+#[tokio::test]
+async fn a_project_over_its_events_budget_is_refused_over_http_and_told_by_how_much() {
+    let at = limited(zou_realtime::Limits {
+        events_per_second: 1,
+        ..zou_realtime::Limits::none()
+    })
+    .await;
+    let body = br#"{"messages":[{"topic":"room","event":"cursor","payload":{"x":1}}]}"#.to_vec();
+    // Nobody is listening, so each of these costs the project the one
+    // send and no deliveries. Five of them in a bucket is one a
+    // second, which is the limit.
+    for round in 0..5 {
+        let (status, rate, body) = post_rated(at, "/realtime/v1/api/broadcast", body.clone()).await;
+        assert_eq!(status, 202, "{body}");
+        assert_eq!(rate[1], "1", "round {round}");
+    }
+    let (status, rate, body) = post_rated(at, "/realtime/v1/api/broadcast", body).await;
+    assert_eq!(status, 429);
+    assert_eq!(rate, vec!["1", "1", "0"], "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).expect("json"),
+        serde_json::json!({"message": "Too many requests"})
+    );
+
+    // The single url is behind the same budget, since upstream runs
+    // the one plug in front of both.
+    let (status, _, body) = post_rated(
+        at,
+        "/realtime/v1/api/broadcast/room/events/cursor",
+        b"{}".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 429, "{body}");
+}
+
+/// A project with nothing counted says nothing about it, since a
+/// header reading zero of zero left would read as refused.
+#[tokio::test]
+async fn a_project_with_no_budget_reports_none() {
+    let at = limited(zou_realtime::Limits::none()).await;
+    let (status, rate, body) = post_rated(
+        at,
+        "/realtime/v1/api/broadcast",
+        br#"{"messages":[{"topic":"room","event":"cursor","payload":{}}]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(rate, vec!["", "", ""]);
 }
