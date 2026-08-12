@@ -58,6 +58,53 @@ const KEPT: usize = 64;
 /// What upstream puts in `errors` when the change was too large.
 const TOO_LARGE: &str = "Error 413: Payload Too Large";
 
+/// What upstream says about a change to a table with no primary key,
+/// which it cannot check against a policy because it has no way to name
+/// the row that changed.
+pub const NO_KEY: &str = "Error 400: Bad Request, no primary key";
+
+/// What upstream says when the subscriber may not select the columns
+/// that identify the row, which is the same problem seen from the other
+/// side.
+pub const UNAUTHORIZED: &str = "Error 401: Unauthorized";
+
+/// What one subscriber may see of one change.
+///
+/// A payload is not the same for everybody. Column privileges decide
+/// which columns are in it, row level security decides whether there is
+/// one at all, and a delete under row level security is published as
+/// the key alone because there is no row left to check a policy
+/// against. All three are the database's answers rather than this
+/// server's, and [`crate::visible`] is where they are asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seen {
+    /// Whether this subscriber is told about the change at all.
+    pub row: bool,
+    /// Which of the relation's columns this subscriber may select, in
+    /// the relation's own order.
+    pub columns: Vec<bool>,
+    /// Whether the old record is cut down to the identifying columns,
+    /// which is what upstream does with a delete on a table that has
+    /// row level security on it.
+    pub keys_only: bool,
+    /// What to say instead of a record, when there is a reason there is
+    /// no record rather than a policy that refused one.
+    pub error: Option<&'static str>,
+}
+
+impl Seen {
+    /// Everything, which is what a table with no row level security on
+    /// it and no column privileges revoked comes to.
+    pub fn all(relation: &Relation) -> Seen {
+        Seen {
+            row: true,
+            columns: vec![true; relation.columns.len()],
+            keys_only: false,
+            error: None,
+        }
+    }
+}
+
 /// How a value of some type turns into json.
 ///
 /// This is `to_jsonb`'s behaviour for that type, grouped: everything
@@ -275,16 +322,40 @@ fn shape(oid: u32) -> Shape {
 /// One change, as the `data` half of a `postgres_changes` payload.
 ///
 /// The other half is the ids of whoever asked for it, which is the
-/// transport's to fill in: this is the same object for every
-/// subscriber and building it once is the point.
-pub fn data(change: &Change, types: &Types) -> Value {
+/// transport's to fill in.
+///
+/// This is per subscriber rather than per change, because `seen` is:
+/// two subscribers on the same row with different column privileges
+/// are owed different payloads, and upstream builds one per role for
+/// the same reason. Where they are owed the same one, which is the
+/// common case of a table nobody has revoked anything on, `seen` is
+/// equal and so is the result, so the caller can build it once.
+pub fn data(change: &Change, types: &Types, seen: &Seen) -> Value {
     let relation = &change.relation;
     let mut data = Map::new();
     data.insert("schema".into(), relation.schema.clone().into());
     data.insert("table".into(), relation.table.clone().into());
-    data.insert("commit_timestamp".into(), stamp(change.commit_ts).into());
     data.insert("type".into(), change.op.event().into());
-    data.insert("columns".into(), columns(relation, types));
+
+    // A change nothing can be said about is still sent, with the
+    // reason in it and nothing else. Upstream builds the same three
+    // keys and lets the rest default, which is how a client comes to
+    // see an empty record next to an error rather than silence.
+    if let Some(why) = seen.error {
+        data.insert("commit_timestamp".into(), Value::Null);
+        data.insert("columns".into(), Value::Array(Vec::new()));
+        if change.op != Op::Delete {
+            data.insert("record".into(), Value::Object(Map::new()));
+        }
+        if change.op != Op::Insert {
+            data.insert("old_record".into(), Value::Object(Map::new()));
+        }
+        data.insert("errors".into(), Value::Array(vec![why.into()]));
+        return Value::Object(data);
+    }
+
+    data.insert("commit_timestamp".into(), stamp(change.commit_ts).into());
+    data.insert("columns".into(), columns(relation, types, seen));
 
     let large = weight(change) > MOST;
     match change.op {
@@ -297,6 +368,7 @@ pub fn data(change: &Change, types: &Types) -> Value {
                     change.old.as_deref(),
                     false,
                     types,
+                    seen,
                     large,
                 ),
             );
@@ -310,13 +382,14 @@ pub fn data(change: &Change, types: &Types) -> Value {
                     change.old.as_deref(),
                     false,
                     types,
+                    seen,
                     large,
                 ),
             );
-            data.insert("old_record".into(), old(change, types, large));
+            data.insert("old_record".into(), old(change, types, seen, large));
         }
         Op::Delete => {
-            data.insert("old_record".into(), old(change, types, large));
+            data.insert("old_record".into(), old(change, types, seen, large));
         }
     }
     data.insert(
@@ -332,12 +405,14 @@ pub fn data(change: &Change, types: &Types) -> Value {
 /// The names and types of the table's columns, in the order postgres
 /// declared them, which is what a client uses to know what it is
 /// looking at.
-fn columns(relation: &Relation, types: &Types) -> Value {
+fn columns(relation: &Relation, types: &Types, seen: &Seen) -> Value {
     Value::Array(
         relation
             .columns
             .iter()
-            .map(|column| {
+            .enumerate()
+            .filter(|(at, _)| seen.columns.get(*at).copied().unwrap_or(false))
+            .map(|(_, column)| {
                 let mut one = Map::new();
                 one.insert("name".into(), column.name.clone().into());
                 one.insert("type".into(), types.name(column.type_oid).into());
@@ -349,9 +424,17 @@ fn columns(relation: &Relation, types: &Types) -> Value {
 
 /// The row before the change, which is only as much of it as the
 /// table's replica identity publishes.
-fn old(change: &Change, types: &Types, large: bool) -> Value {
+fn old(change: &Change, types: &Types, seen: &Seen, large: bool) -> Value {
     match &change.old {
-        Some(cells) => row(&change.relation, cells, None, change.old_key, types, large),
+        Some(cells) => row(
+            &change.relation,
+            cells,
+            None,
+            change.old_key || seen.keys_only,
+            types,
+            seen,
+            large,
+        ),
         // No replica identity, so postgres published nothing about the
         // row that was there. Upstream sends an empty object rather
         // than a null, which is the difference between a client seeing
@@ -372,11 +455,15 @@ fn row(
     fallback: Option<&[Cell]>,
     key: bool,
     types: &Types,
+    seen: &Seen,
     large: bool,
 ) -> Value {
     let mut out = Map::new();
     for (at, column) in relation.columns.iter().enumerate() {
         if key && !column.key {
+            continue;
+        }
+        if !seen.columns.get(at).copied().unwrap_or(false) {
             continue;
         }
         let cell = match cells.get(at) {
@@ -722,7 +809,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            data(&change, &types()),
+            data(&change, &types(), &Seen::all(&change.relation)),
             serde_json::json!({
                 "schema": "public",
                 "table": "todos",
@@ -747,7 +834,7 @@ mod tests {
             Some(vec![text("12"), Cell::Null, Cell::Null]),
             true,
         );
-        let data = data(&change, &types());
+        let data = data(&change, &types(), &Seen::all(&change.relation));
         assert_eq!(data["type"], "DELETE");
         assert_eq!(data.get("record"), None, "a deleted row has no record");
         assert_eq!(
@@ -766,7 +853,7 @@ mod tests {
             Some(vec![text("12"), text("wash up"), text("f")]),
             false,
         );
-        let data = data(&change, &types());
+        let data = data(&change, &types(), &Seen::all(&change.relation));
         assert_eq!(
             data["record"],
             serde_json::json!({"id": 12, "details": "washed up", "done": true})
@@ -786,7 +873,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            data(&with, &types())["record"]["details"],
+            data(&with, &types(), &Seen::all(&with.relation))["record"]["details"],
             "the long one",
             "the value did not change, so the old row is what it still is"
         );
@@ -797,9 +884,93 @@ mod tests {
             None,
             false,
         );
-        let record = &data(&without, &types())["record"];
+        let record = &data(&without, &types(), &Seen::all(&without.relation))["record"];
         assert_eq!(record.get("details"), None, "nothing knows what it is");
         assert_eq!(record["id"], 12);
+    }
+
+    #[test]
+    fn a_column_a_subscriber_may_not_select_is_in_neither_half_of_the_payload() {
+        let change = change(
+            Op::Update,
+            vec![text("12"), text("washed up"), text("t")],
+            Some(vec![text("12"), text("wash up"), text("f")]),
+            false,
+        );
+        let seen = Seen {
+            row: true,
+            columns: vec![true, false, true],
+            keys_only: false,
+            error: None,
+        };
+        let data = data(&change, &types(), &seen);
+        assert_eq!(
+            data["columns"],
+            serde_json::json!([
+                {"name": "id", "type": "int4"},
+                {"name": "done", "type": "bool"},
+            ]),
+            "the metadata says what the payload has in it and not what the table has in it"
+        );
+        assert_eq!(
+            data["record"],
+            serde_json::json!({"id": 12, "done": true}),
+            "a grant of select on some columns is a grant of those columns"
+        );
+        assert_eq!(
+            data["old_record"],
+            serde_json::json!({"id": 12, "done": false}),
+            "the old row is the same row and the same privileges"
+        );
+    }
+
+    #[test]
+    fn a_change_nothing_can_be_checked_against_says_why_and_carries_nothing() {
+        let change = change(
+            Op::Insert,
+            vec![text("12"), text("wash up"), text("f")],
+            None,
+            false,
+        );
+        let mut seen = Seen::all(&change.relation);
+        seen.error = Some(NO_KEY);
+        assert_eq!(
+            data(&change, &types(), &seen),
+            serde_json::json!({
+                "schema": "public",
+                "table": "todos",
+                "type": "INSERT",
+                "commit_timestamp": null,
+                "columns": [],
+                "record": {},
+                "errors": ["Error 400: Bad Request, no primary key"],
+            }),
+            "the containers are empty rather than absent, which is what upstream's own coalesce \
+             leaves behind"
+        );
+    }
+
+    #[test]
+    fn a_delete_under_row_level_security_is_the_key_and_nothing_else() {
+        let change = change(
+            Op::Delete,
+            vec![],
+            Some(vec![text("12"), text("wash up"), text("f")]),
+            false,
+        );
+        let mut seen = Seen::all(&change.relation);
+        seen.keys_only = true;
+        assert_eq!(
+            data(&change, &types(), &seen)["old_record"],
+            serde_json::json!({"id": 12}),
+            "there is no row left to check a policy against, so what a subscriber learns is that a \
+             row with that key is gone"
+        );
+        assert_eq!(
+            data(&change, &types(), &Seen::all(&change.relation))["old_record"],
+            serde_json::json!({"id": 12, "details": "wash up", "done": false}),
+            "and a table with no policies on it publishes what it published"
+        );
     }
 
     #[test]
@@ -890,7 +1061,7 @@ mod tests {
             None,
             false,
         );
-        let data = data(&change, &types());
+        let data = data(&change, &types(), &Seen::all(&change.relation));
         assert_eq!(
             data["errors"],
             serde_json::json!(["Error 413: Payload Too Large"])
@@ -923,7 +1094,7 @@ mod tests {
             None,
             false,
         );
-        let data = data(&change, &types);
+        let data = data(&change, &types, &Seen::all(&change.relation));
         assert_eq!(
             data["record"]["id"], "12",
             "a value of an unknown type is what postgres printed, which is never wrong about what \

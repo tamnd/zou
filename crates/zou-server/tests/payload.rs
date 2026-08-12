@@ -22,7 +22,7 @@
 use serde_json::Value;
 use tokio_postgres::{Client, NoTls};
 use zou_server::cdc::{Closed, PUBLICATION, Tap};
-use zou_server::payload::{Types, data};
+use zou_server::payload::{Seen, Types, data};
 use zou_server::pgoutput::Change;
 
 fn dsn() -> Option<String> {
@@ -117,7 +117,7 @@ async fn payload(tap: &Tap, change: &Change) -> Value {
         .learn(tap.client(), &want)
         .await
         .expect("the types of the columns");
-    data(change, &types)
+    data(change, &types, &Seen::all(&change.relation))
 }
 
 /// What upstream would have sent for the row still sitting in the
