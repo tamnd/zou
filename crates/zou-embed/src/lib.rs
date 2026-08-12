@@ -1082,6 +1082,14 @@ fn start(
         .arg("-k")
         .arg(sock)
         .args(["-c", "listen_addresses=127.0.0.1"])
+        // postgres changes reads the logical decoder, and a postmaster
+        // started below this level wrote nothing for it to read.
+        // Raising it is a restart, so it is on from the first boot
+        // rather than from whenever somebody first subscribes. What it
+        // costs is write ahead log volume on updates and deletes, which
+        // is the standing price of a database that can say what
+        // changed, and is what every Supabase project runs at.
+        .args(["-c", "wal_level=logical"])
         .env("ZOU_TARGET", target)
         .env("ZOU_TENANT", tenant)
         .env("ZOU_PAGE_CACHE", pagecache)

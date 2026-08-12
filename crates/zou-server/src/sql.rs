@@ -309,6 +309,12 @@ const REALTIME_SCHEMA: &str = include_str!("realtime-schema.sql");
 /// it and would never see this otherwise. See the file for the rest.
 const REALTIME_SEND: &str = include_str!("realtime-send.sql");
 
+/// The publication postgres changes reads, which a project adds its
+/// tables to. Applied every boot for the same reason as the send
+/// functions, and a notice rather than a failure when the role cannot
+/// create one, see the file.
+const REALTIME_PUBLICATION: &str = include_str!("realtime-publication.sql");
+
 /// The grants the storage schema arrives without.
 ///
 /// Upstream these are inside the migrations, granting to roles the
@@ -370,7 +376,7 @@ pub async fn bootstrap(client: &Client) -> Result<(), tokio_postgres::Error> {
     ensure_foreign_schema(client, "auth.users", &[AUTH_SCHEMA]).await?;
     ensure_foreign_schema(client, "storage.objects", &[STORAGE_SCHEMA, STORAGE_GRANTS]).await?;
     ensure_foreign_schema(client, "realtime.messages", &[REALTIME_SCHEMA]).await?;
-    ensure_schema(client, &[REALTIME_SEND]).await
+    ensure_schema(client, &[REALTIME_SEND, REALTIME_PUBLICATION]).await
 }
 
 /// Apply ddl that has to run on every boot rather than only on a
@@ -417,6 +423,7 @@ pub fn contract_version() -> u64 {
         STORAGE_GRANTS,
         REALTIME_SCHEMA,
         REALTIME_SEND,
+        REALTIME_PUBLICATION,
     ] {
         for byte in part.bytes() {
             hash ^= u64::from(byte);

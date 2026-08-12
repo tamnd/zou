@@ -32,6 +32,7 @@ pub mod attach;
 pub mod audit;
 pub mod auth;
 pub mod blob;
+pub mod cdc;
 pub mod edge;
 pub mod fleet;
 pub mod forward;
