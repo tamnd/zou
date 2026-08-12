@@ -66,6 +66,8 @@ A meta carries a `phx_ref` the client renames to `presence_ref`, which is how it
 `presence: { enabled: true }` in the join decides whether this socket is *sent* presence, not whether it can be *seen*: a socket that tracks without asking for presence is in everybody else's state and gets no diffs itself.
 That is the client's own rule, and it is the one that matters in practice, because the client sets the flag for you the moment a channel has a presence binding on it.
 
+All of that is asked of zou through the real client rather than only over a raw socket, in the presence suite in [tamnd/zou-conformance](https://github.com/tamnd/zou-conformance), which runs against a real `supabase start` as well so that the questions are the reference's answers rather than ours.
+
 State is per topic and per project, and it is held where the sockets are.
 A socket that goes away, whether it untracks, leaves the channel or just disconnects, leaves the topic, and the last socket off a topic takes the topic's state with it.
 Nothing about presence is written down: it is the set of sockets that are connected now, so a node restart is an empty room and the clients that reconnect fill it back in.
