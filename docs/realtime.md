@@ -140,6 +140,10 @@ Writing is an insert tried as the user, where a refusal for insufficient privile
 Both run in a transaction that is rolled back whatever it found, so nothing is ever kept and the table stays empty.
 That is upstream's own method, down to the two extensions and the rollback, because a check that worked differently would answer differently for the same policies.
 
+A private channel and a public channel of the same name are two rooms rather than one.
+`supabase.channel('room', { config: { private: true } })` and `supabase.channel('room')` do not hear each other, and they have to not: a public channel is joined by name with no policy read, so one room shared between the two would mean anybody could join `room` in a line and hear everything the policies were keeping them out of.
+The same split runs through http, where `?private=true` picks which of the two a send goes to.
+
 Reading is checked at the join, and a refusal names the room.
 
 ```

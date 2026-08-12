@@ -341,7 +341,8 @@ pub async fn broadcast(
         let topic = message["topic"].as_str().unwrap_or_default();
         let event = message["event"].as_str().unwrap_or_default();
         let payload = message.get("payload").cloned().unwrap_or(json!({}));
-        if private_message(message) {
+        let private = private_message(message);
+        if private {
             let allowed = match asked.get(topic) {
                 Some(allowed) => *allowed,
                 None => {
@@ -360,7 +361,7 @@ pub async fn broadcast(
                 continue;
             }
         }
-        fan(&app.hub, topic, event, json_payload(&payload));
+        fan(&app.hub, topic, event, private, json_payload(&payload));
     }
     accepted()
 }
@@ -380,7 +381,8 @@ pub async fn broadcast_one(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if query(&uri, "private").as_deref() == Some("true") {
+    let private = query(&uri, "private").as_deref() == Some("true");
+    if private {
         match may_write(&app, &auth, &topic).await {
             Ok(true) => {}
             // The caller's own policies said no, which is what 403
@@ -413,7 +415,7 @@ pub async fn broadcast_one(
             );
         }
     };
-    fan(&app.hub, &topic, &event, payload);
+    fan(&app.hub, &topic, &event, private, payload);
     accepted()
 }
 
@@ -429,11 +431,22 @@ fn json_payload(payload: &Value) -> (Encoding, Vec<u8>) {
 /// client follows when it joins. The sender is a socket id nobody
 /// holds, so nothing is suppressed as its own echo: an http caller is
 /// not on the topic and has nothing to hear back.
-fn fan(hub: &Hub, topic: &str, event: &str, (encoding, payload): (Encoding, Vec<u8>)) {
+///
+/// `private` picks which of the two rooms of that name it goes to. A
+/// message sent as private reaches the sockets the policies let onto
+/// the private channel, and one sent without it reaches the public
+/// channel, which is the whole point of there being two.
+fn fan(
+    hub: &Hub,
+    topic: &str,
+    event: &str,
+    private: bool,
+    (encoding, payload): (Encoding, Vec<u8>),
+) {
     hub.fan(
         hub.socket(),
         Fanout {
-            topic: format!("realtime:{topic}"),
+            topic: zou_realtime::room(&format!("realtime:{topic}"), private),
             push: BinaryBroadcast {
                 join_ref: String::new(),
                 reference: String::new(),
