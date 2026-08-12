@@ -2,9 +2,8 @@
 
 A socket at `/realtime/v1/websocket`, channels on it, and broadcast and presence between them.
 
+`postgres_changes` is built as well, so a channel can subscribe to a table and be sent the rows that changed in it.
 That is a smaller surface than the one Supabase Realtime serves, and the rest of this page is as much about the line as about what is on this side of it.
-`postgres_changes` is not built.
-A join asking for it is answered with an error naming what is missing, which is the difference between a client that reports a failure and a client that waits forever for rows nobody is sending.
 
 ## Connecting
 
@@ -240,13 +239,34 @@ A project with the events budget off reports none of this, because a header sayi
 
 Presence has two limits of its own upstream, on presence events a second and on how often one client may track, and neither is built here yet.
 
+## Subscribing to a table
+
+Nothing about this is special either:
+
+```js
+supabase
+  .channel('todos')
+  .on('postgres_changes', { event: '*', schema: 'public', table: 'todos' }, (change) => {
+    console.log(change.eventType, change.new)
+  })
+  .subscribe()
+```
+
+A channel can carry several of these, filtered or not, and each callback is run for the subscriptions it belongs to:
+
+```js
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'todos', filter: 'user_id=eq.' + id }, mine)
+```
+
+A filter is one column compared with one value, in the operators PostgREST spells `eq`, `neq`, `lt`, `lte`, `gt`, `gte` and `in`, and it is compared in the column's own type rather than as text.
+A subscription with a filter and no table is refused, because a column of no table in particular is a subscription that would quietly match nothing.
+
+The whole channel is refused when any of its subscriptions cannot be made, which the client reports as `CHANNEL_ERROR` with the reason on it.
+Nothing is half subscribed.
+
 ## What the database has to be for postgres changes
 
-Nothing is delivered to a socket yet, so this section is about the half that exists rather than a feature you can use.
-What is built is the tap: a connection that reads what postgres says changed and decodes it.
-A join asking for `postgres_changes` is still refused by name.
-
-Two things have to be true of a database before any of that reads anything, and both are true of one this server started.
+Two things have to be true of a database before any of this delivers anything, and both are true of one this server started.
 
 `wal_level` must be `logical`.
 It is a postmaster setting and a restart, so `zou dev` and `zou serve` start postgres with it rather than turning it on when somebody first subscribes.
@@ -277,7 +297,7 @@ That is upstream's trade too.
 
 ## What a change looks like
 
-Still nothing a socket receives, but the payload a change turns into is built and is the one Supabase sends, so it is worth writing down before it is wired:
+What arrives is what Supabase sends:
 
 ```json
 {
@@ -335,7 +355,7 @@ Upstream behaves the same way, and a project that needs an audit trail of who sa
 
 | asked for | what happens |
 | --- | --- |
-| `postgres_changes` in a join | the join is refused, naming what is missing |
+| `postgres_changes` on a server with no database | the join is refused, naming what is missing |
 | presence rate limits | presence is not counted separately from the rest |
 
 That is M4, tracked in [tamnd/zou#4](https://github.com/tamnd/zou/issues/4).

@@ -574,8 +574,14 @@ async fn a_posted_broadcast_needs_a_key_like_everything_else_does() {
     assert_eq!(status, 401);
 }
 
+/// A server with no database cannot read changes out of one, and says
+/// so in the join reply rather than subscribing the channel to a feed
+/// that will never carry anything.
+///
+/// The same route against a real database is `tests/changes.rs`, which
+/// writes a row and waits for it to arrive over a socket.
 #[tokio::test]
-async fn a_channel_that_asks_for_postgres_changes_is_told_they_are_not_built() {
+async fn a_channel_asking_for_postgres_changes_on_a_server_with_no_database_is_told_so() {
     let at = serving().await;
     let mut socket = connect(at, "2.0.0").await;
     send(
@@ -586,7 +592,7 @@ async fn a_channel_that_asks_for_postgres_changes_is_told_they_are_not_built() {
     let reply = next_json(&mut socket).await;
     assert_eq!(reply[4]["status"], "error");
     let reason = reply[4]["response"]["reason"].as_str().unwrap();
-    assert!(reason.contains("postgres changes"), "{reason}");
+    assert!(reason.contains("no database"), "{reason}");
 }
 
 #[tokio::test]

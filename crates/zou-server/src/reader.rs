@@ -193,6 +193,32 @@ impl Changes {
         Some(id)
     }
 
+    /// One thing a subscriber is finished with, which is the channel it
+    /// was asked for on going away while the socket stays.
+    pub fn unbind(&self, id: u64) {
+        let mut inner = self.inner.lock().expect("changes");
+        inner.subs.remove(id);
+        if let Some(listener) = inner.owner.remove(&id)
+            && let Some(who) = inner.listeners.get_mut(&listener)
+        {
+            who.bindings.retain(|held| *held != id);
+        }
+    }
+
+    /// This subscriber is somebody else now.
+    ///
+    /// A client refreshes its token on a socket it is keeping, and the
+    /// rows it may see are the new token's rather than the old one's.
+    /// Nothing already in its queue is taken back: those were allowed
+    /// when they were sent, which is the same thing upstream can say and
+    /// the only thing anybody can.
+    pub fn became(&self, listener: u64, asker: Asker) {
+        let mut inner = self.inner.lock().expect("changes");
+        if let Some(who) = inner.listeners.get_mut(&listener) {
+            who.asker = asker;
+        }
+    }
+
     /// A subscriber that is finished, and everything it asked for.
     pub fn hung_up(&self, listener: u64) {
         let mut inner = self.inner.lock().expect("changes");
