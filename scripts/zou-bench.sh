@@ -28,6 +28,9 @@ stop() { "$PG"/pg_ctl -D "$DATADIR" stop -m fast >/dev/null 2>&1 || true; }
 trap stop EXIT
 
 export ZOU_TARGET=$TARGET
+# These start postgres themselves, with no page service to read
+# through, so the object path is the one under test here.
+export ZOU_PAGESERVE=0
 "$PG"/initdb -D "$DATADIR" --set io_method=sync --set full_page_writes=off >/dev/null
 REDO=$("$PG"/pg_controldata -D "$DATADIR" | grep "REDO location" | awk '{print $NF}')
 "$BOOTSTRAP" "$TARGET" "$DATADIR" --redo "$REDO" >/dev/null

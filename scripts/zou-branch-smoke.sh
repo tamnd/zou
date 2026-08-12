@@ -12,6 +12,9 @@ PORT=${PORT:-5641}
 WORK=$(mktemp -d /tmp/zou-branchsmoke.XXXXXX)
 SOCK="$WORK"
 export ZOU_TARGET="$WORK/store"
+# These start postgres themselves, with no page service to read
+# through, so the object path is the one under test here.
+export ZOU_PAGESERVE=0
 # The chain reader serves inherited pages from a run bearing full, so
 # the parent must fold one before branching; factor 0 makes the second
 # fold a full instead of the fifth.

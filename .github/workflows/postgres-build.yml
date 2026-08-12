@@ -57,6 +57,9 @@ jobs:
         run: |
           export ZOU_TARGET=/tmp/zou-pg-store
           mkdir -p "$ZOU_TARGET"
+          # This step runs postgres itself, so there is no page
+          # service to read through and the object path is what it tests.
+          export ZOU_PAGESERVE=0
           build/pg/bin/initdb -D /tmp/zou-pgdata --set io_method=sync --set full_page_writes=off
           test "$(find $ZOU_TARGET/tenants/local/pg -type f | wc -l)" -gt 1000
           REDO=$(build/pg/bin/pg_controldata -D /tmp/zou-pgdata | grep "REDO location" | awk '{print $NF}')
@@ -112,6 +115,9 @@ jobs:
       - name: Restore and attach from the store alone
         run: |
           export ZOU_TARGET=/tmp/zou-pg-store
+          # This step runs postgres itself, so there is no page
+          # service to read through and the object path is what it tests.
+          export ZOU_PAGESERVE=0
           target/release/zou-restore "$ZOU_TARGET" /tmp/zou-restored
           build/pg/bin/pg_controldata -D /tmp/zou-restored | grep -q "in production"
           build/pg/bin/pg_ctl -D /tmp/zou-restored -l /tmp/zou-restored.log start
@@ -403,6 +409,9 @@ jobs:
           docker run --rm --network host --entrypoint sh minio/mc:latest -c \
             "mc alias set local http://127.0.0.1:9000 zou zou-secret-key && mc mb local/zou-pg"
           export ZOU_TARGET=s3://zou-pg/smoke
+          # This step runs postgres itself, so there is no page
+          # service to read through and the object path is what it tests.
+          export ZOU_PAGESERVE=0
           export ZOU_S3_ENDPOINT=http://127.0.0.1:9000
           export AWS_ACCESS_KEY_ID=zou
           export AWS_SECRET_ACCESS_KEY=zou-secret-key
@@ -427,6 +436,9 @@ jobs:
         run: |
           export ZOU_TARGET=/tmp/zou-ext-store
           mkdir -p "$ZOU_TARGET"
+          # This step runs postgres itself, so there is no page
+          # service to read through and the object path is what it tests.
+          export ZOU_PAGESERVE=0
           build/pg/bin/initdb -D /tmp/zou-ext-pgdata --set io_method=sync --set full_page_writes=off
           REDO=$(build/pg/bin/pg_controldata -D /tmp/zou-ext-pgdata | grep "REDO location" | awk '{print $NF}')
           target/release/zou-bootstrap "$ZOU_TARGET" /tmp/zou-ext-pgdata --redo "$REDO"
