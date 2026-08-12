@@ -407,6 +407,124 @@ mod tests {
         assert_eq!(hub.state("realtime:room"), json!({}));
     }
 
+    /// What a client keeps: the state it was sent when it joined, and
+    /// every diff since, folded in the way `@supabase/phoenix` folds
+    /// them. A join replaces the metas whose ref it carries and adds
+    /// the ones it does not, a leave takes metas out by ref, and a key
+    /// with no metas left is gone rather than empty.
+    #[derive(Default)]
+    struct Client {
+        state: Map<String, Value>,
+    }
+
+    impl Client {
+        fn apply(&mut self, diff: &Value) {
+            for (key, entry) in diff["joins"].as_object().expect("an object") {
+                let metas = self.state.entry(key.clone()).or_insert(json!([]));
+                let arriving = refs(entry);
+                let metas = metas.as_array_mut().expect("an array");
+                metas.retain(|meta| !arriving.contains(&as_ref(meta)));
+                metas.extend(entry["metas"].as_array().expect("an array").iter().cloned());
+            }
+            for (key, entry) in diff["leaves"].as_object().expect("an object") {
+                let leaving = refs(entry);
+                let Some(metas) = self.state.get_mut(key).and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                metas.retain(|meta| !leaving.contains(&as_ref(meta)));
+                if metas.is_empty() {
+                    self.state.remove(key);
+                }
+            }
+        }
+
+        /// The same shape the server keeps, so the two can be compared
+        /// as one value rather than field by field.
+        fn state(&self) -> Value {
+            let mut out = Map::new();
+            for (key, metas) in &self.state {
+                out.insert(key.clone(), json!({"metas": sorted(metas)}));
+            }
+            Value::Object(out)
+        }
+    }
+
+    fn as_ref(meta: &Value) -> String {
+        meta["phx_ref"].as_str().expect("a ref").to_string()
+    }
+
+    fn refs(entry: &Value) -> Vec<String> {
+        entry["metas"]
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(as_ref)
+            .collect()
+    }
+
+    /// One key's metas by ref, because the server holds them by socket
+    /// and a client holds them in the order it heard about them, and
+    /// neither order is part of the protocol.
+    fn sorted(metas: &Value) -> Vec<Value> {
+        let mut metas: Vec<Value> = metas.as_array().expect("an array").clone();
+        metas.sort_by_key(|meta| as_ref(meta).parse::<u64>().expect("a number"));
+        metas
+    }
+
+    fn normalised(state: &Value) -> Value {
+        let mut out = Map::new();
+        for (key, entry) in state.as_object().expect("an object") {
+            out.insert(key.clone(), json!({"metas": sorted(&entry["metas"])}));
+        }
+        Value::Object(out)
+    }
+
+    /// splitmix64, so a run that fails is a seed somebody can paste
+    /// back rather than a shrug.
+    fn next(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = *seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        z ^ (z >> 31)
+    }
+
+    #[tokio::test]
+    async fn a_client_that_only_ever_sees_diffs_ends_up_where_the_server_is() {
+        // The property presence rests on: a client is sent the state
+        // once and diffs after that, so if the diffs are wrong its
+        // copy drifts and nothing says so. Six sockets sharing three
+        // keys, tracking, retracking and going, checked after every
+        // single change rather than at the end, so a failure names the
+        // step that caused it.
+        let hub = Hub::new();
+        let topic = "realtime:room";
+        let mut watching = hub.carry(topic);
+        let sockets: Vec<SocketId> = (0..6).map(|_| hub.socket()).collect();
+        let keys = ["u1", "u2", "u3"];
+        let mut client = Client::default();
+        let mut seed = 0x2112;
+        for step in 0..500u64 {
+            let who = sockets[next(&mut seed) as usize % sockets.len()];
+            if next(&mut seed) % 3 == 0 {
+                hub.untrack(who, topic);
+            } else {
+                let key = keys[next(&mut seed) as usize % keys.len()];
+                hub.track(who, topic, Some(key.into()), json!({"at": step}));
+            }
+            while let Ok(delivery) = watching.try_recv() {
+                client.apply(&diff_of(&delivery));
+            }
+            assert_eq!(
+                client.state(),
+                normalised(&hub.state(topic)),
+                "the client drifted at step {step}"
+            );
+        }
+        // And it was not a run of nothing happening.
+        assert!(!hub.state(topic).as_object().expect("an object").is_empty());
+    }
+
     #[tokio::test]
     async fn a_socket_that_stops_reading_is_told_it_missed_some() {
         let hub = Hub::new();

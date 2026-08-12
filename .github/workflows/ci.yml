@@ -590,6 +590,52 @@ jobs:
         if: always()
         run: cat /tmp/serve.log
 
+  # Presence, driven through the client that implements it. supabase-js
+  # ships an integration suite and it has broadcast in it and no
+  # presence at all, so these questions are ours, and they are asked
+  # through the real client because the client is half of the protocol:
+  # the server sends the whole state once and diffs after that, and what
+  # an application reads is the fold of them. The same file runs against
+  # a real supabase stack in the diff job below, which is what makes the
+  # assertions upstream's behaviour rather than ours.
+  #
+  # No database and no harness. Realtime touches no rows, so the server
+  # here is the front door example, which is the router on a port with
+  # nothing behind it.
+  realtime-js:
+    name: conformance (realtime-js)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      - name: Start zou on the port a local supabase project uses
+        run: |
+          cargo run -p zou-server --example front_door > /tmp/front-door.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q '^url ' /tmp/front-door.log && break
+            sleep 1
+          done
+          cat /tmp/front-door.log
+          grep -q '^url ' /tmp/front-door.log
+      - name: Track and untrack through supabase-js
+        working-directory: /tmp/zou-conformance/js-realtime
+        run: |
+          npm ci
+          npm test
+      - name: Keep the server log
+        if: always()
+        run: cat /tmp/front-door.log
+
   # One of Supabase's own example apps, unedited, driven through a real
   # browser. The suites ask a server questions and this asks an
   # application, which is a different claim: an app goes through the
@@ -812,6 +858,17 @@ jobs:
           psql "$CLI_DSN" -v ON_ERROR_STOP=1 \
             -f /tmp/zou-conformance/js-tus/setup.sql
           cd /tmp/zou-conformance/js-tus
+          npm ci
+          ZOU_URL="$CLI_URL" ZOU_ANON_KEY="$ANON_KEY" npm test
+      # And the same for the presence suite, for the same reason. The
+      # questions there are ours too, and the only thing that makes them
+      # a statement about Supabase rather than about zou is that
+      # Supabase Realtime answers them the same way.
+      - name: Ask the same stack what presence looks like
+        run: |
+          cd /tmp/project
+          eval "$(supabase status -o env | sed 's/^/export /')"
+          cd /tmp/zou-conformance/js-realtime
           npm ci
           ZOU_URL="$CLI_URL" ZOU_ANON_KEY="$ANON_KEY" npm test
       - name: Keep what the stack was saying

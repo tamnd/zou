@@ -345,7 +345,7 @@ That flag is the whole difference from upstream, and no assertion is edited.
 
 Its fixture is upstream's seed rather than one written here, which is how it found something no suite could: the passwords in it are hashed with `crypt` and `gen_salt` unqualified, and until [tamnd/zou#214](https://github.com/tamnd/zou/issues/214) there was no `extensions` schema on the search path for those to resolve in.
 
-## The suite that is ours, and how it is kept honest
+## The suites that are ours, and how they are kept honest
 
 There is a third shape, in `js-tus/`, and it exists because resumable uploads cannot be asked about one request at a time.
 
@@ -369,6 +369,22 @@ The `supabase start` leg earned its keep on the same day, by refusing an asserti
 Every upload in that suite sends a `cacheControl` in its metadata, and the reference answers two different things about the same object: a listing reads `max-age=3600` off the row and the info route reads `no-cache` off the stored file.
 zou keeps one value and says `no-cache` in both places, so it matches the recording of the info route and not the listing.
 The suite now asks nothing about cache control and the question is [#285](https://github.com/tamnd/zou/issues/285), which is a decision about how an object records what was asked for apart from what is served rather than anything about tus.
+
+`js-realtime/` is the same shape for the same reason, about presence.
+
+supabase-js's own suite has broadcast in it and no presence at all, so there is nothing to copy, and presence is the other feature here that cannot be asked about one message at a time.
+The server sends a joining socket the whole state once and a diff for every change after that, and what an application reads is the fold of them, which happens in the client.
+A server whose diffs the fold cannot apply is a server whose own socket tests pass and whose users watch a room slowly stop matching reality.
+
+So the suite drives the real client at the pinned version the way the Supabase documentation writes a presence channel, a key in the channel config and `track` after SUBSCRIBED, and reads the state back with `presenceState()`.
+8 tests: a tracker seeing itself, a late joiner being told who is already there, a join and a leave reaching everybody else, a client that disconnects without saying anything, one key in two tabs, a client with no key of its own, and presence and broadcast sharing a channel.
+It needs no database and no fixture, because a channel touches no rows, so CI serves it from the front door example rather than from the harness.
+Like the tus suite, it also runs against a real `supabase start`, and that leg is the only thing that makes it a statement about Supabase rather than about zou.
+
+It corrected itself on the day it was written, which is the useful kind of finding.
+Half the tests were written without a `presence` listener on the channel, read an empty state and failed.
+That is the client doing exactly what it documents: it sets `config.presence.enabled` for any channel that has a presence binding and for nobody else, and the flag decides whether that client is *sent* presence rather than whether it can be *seen*.
+The tests bind a listener where they read state now, which is what an application does, and one test is left over for the other half of the rule: a channel with no binding tracks, and the watcher sees it.
 
 ## The package a project installs, asked the same questions
 
