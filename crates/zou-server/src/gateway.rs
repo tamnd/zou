@@ -143,6 +143,15 @@ async fn dispatch(State(front): State<Arc<Front>>, mut req: Request<Body>) -> Re
             .await
         {
             Where::Here => {}
+            // A socket is not a read, whatever its method says, and it
+            // is not a thing the relay can carry either: forwarding is
+            // a request and an answer, and an upgrade is neither. So a
+            // node that is not the holder says so, and says it to the
+            // one kind of request that would otherwise have been served
+            // here and quietly cut off from the rest of the project.
+            Where::Stale { .. } | Where::There { .. } if upgrading(&req) => {
+                return unavailable("this project's sockets are served by the node holding it");
+            }
             Where::Stale { behind } => stale = Some(behind),
             Where::There { endpoint } => return forwarding.relay(&endpoint, req).await,
             Where::Refuse { why, status } => {
@@ -252,6 +261,16 @@ fn repath(uri: &Uri, path: &str) -> Option<Uri> {
 /// than 500 because both of these are worth retrying, and neither says
 /// which tenant or which store, because the person holding an anon key
 /// for one project is not owed the operational state of the node.
+/// Whether this request is asking to stop being a request, which is
+/// what a websocket handshake is. The header is a list, and a client
+/// that sends `Upgrade: websocket` sends nothing else in it.
+fn upgrading(req: &Request<Body>) -> bool {
+    req.headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+}
+
 fn unavailable(why: &str) -> Response {
     crate::json_body(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -427,6 +446,44 @@ mod tests {
             backend.up.lock().unwrap().is_empty(),
             "the decision comes before the attach, because the attach is what takes the lease"
         );
+    }
+
+    /// A websocket for a project this node does not hold, with stale
+    /// reads on, which is the arrangement where it would otherwise have
+    /// been served: the handshake is a GET, and a GET this node is
+    /// allowed to answer from its own copy. Answering it would put the
+    /// socket on this node's hub and the rest of the project's sockets
+    /// on the holder's, which is two rooms of the same name.
+    #[tokio::test]
+    async fn a_socket_for_a_tenant_another_node_holds_is_refused_rather_than_split_off() {
+        for stale_reads in [true, false] {
+            let (_d, backend, router) = one_of_several(stale_reads, None);
+            let answer = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/realtime/v1/websocket?vsn=2.0.0")
+                        .header(header::HOST, "acme-prod.zou.example")
+                        .header("apikey", anon("acme-prod"))
+                        .header(header::UPGRADE, "websocket")
+                        .header(header::CONNECTION, "Upgrade")
+                        .body(Body::empty())
+                        .expect("a request"),
+                )
+                .await
+                .expect("an answer");
+            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let body = to_bytes(answer.into_body(), 1 << 20).await.expect("a body");
+            assert!(
+                String::from_utf8_lossy(&body).contains("the node holding it"),
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(
+                backend.up.lock().unwrap().is_empty(),
+                "and no database was started to refuse it"
+            );
+        }
     }
 
     #[tokio::test]

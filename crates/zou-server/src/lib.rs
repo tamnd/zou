@@ -48,6 +48,7 @@ pub mod object;
 pub mod openapi;
 pub mod ops;
 pub mod password;
+pub mod realtime;
 pub mod render;
 pub mod rest;
 pub mod s3;
@@ -294,6 +295,11 @@ pub struct App {
     pub watching: tokio::sync::OnceCell<()>,
     /// Where object bytes live, when this server was told.
     pub blobs: Option<blob::Blobs>,
+    /// The realtime topics this server is carrying, and the sockets on
+    /// each. One per server rather than one per connection, which is
+    /// what makes two browser tabs on the same channel hear each
+    /// other.
+    pub hub: zou_realtime::Hub,
 }
 
 impl App {
@@ -389,6 +395,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         epoch: Arc::new(AtomicU64::new(0)),
         watching: tokio::sync::OnceCell::new(),
         blobs,
+        hub: zou_realtime::Hub::new(),
     }))
 }
 
@@ -765,6 +772,9 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/storage/v1", any(storage_stub))
         .route("/storage/v1/", any(storage_stub))
         .route("/storage/v1/{*rest}", any(storage_stub))
+        // The one realtime endpoint there is. Everything else under
+        // the prefix is still the honest 501.
+        .route("/realtime/v1/websocket", any(realtime::websocket))
         .route("/realtime/v1", any(realtime_stub))
         .route("/realtime/v1/", any(realtime_stub))
         .route("/realtime/v1/{*rest}", any(realtime_stub))

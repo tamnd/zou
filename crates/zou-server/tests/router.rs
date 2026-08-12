@@ -177,7 +177,10 @@ async fn the_two_stubbed_surfaces_say_so_rather_than_pretending_to_be_missing() 
         "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
     );
 
-    let realtime = keyed(&app, "GET", "/realtime/v1/websocket").await;
+    // The socket itself is served now, so the surface is asked about
+    // somewhere it is not: the REST broadcast endpoint, which is the
+    // rest of M4.
+    let realtime = keyed(&app, "POST", "/realtime/v1/api/broadcast").await;
     assert_eq!(realtime.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
         realtime.message(),
@@ -194,7 +197,7 @@ async fn a_stub_answers_whatever_method_it_is_asked() {
     for method in ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"] {
         for path in [
             "/storage/v1/analytics/pics/whichever",
-            "/realtime/v1/websocket",
+            "/realtime/v1/api/broadcast",
         ] {
             let answer = keyed(&app, method, path).await;
             assert_eq!(

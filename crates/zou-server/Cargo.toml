@@ -8,7 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-axum = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
 base64ct = { workspace = true }
 bcrypt = { version = "0.19", default-features = false, features = ["std", "zeroize"] }
 bytes = "1"
@@ -30,14 +30,18 @@ ureq = { workspace = true }
 webp = { workspace = true }
 webpki-roots = { workspace = true }
 zou-ops = { path = "../zou-ops" }
+zou-realtime = { path = "../zou-realtime" }
 zou-rest = { path = "../zou-rest" }
 zou-store = { path = "../zou-store", features = ["s3"] }
 
 [dev-dependencies]
 base64ct = { workspace = true }
+env_logger = { workspace = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 tempfile = { workspace = true }
+tokio-tungstenite = "0.29"
 tower = { workspace = true, features = ["util"] }
 
 [lints]
