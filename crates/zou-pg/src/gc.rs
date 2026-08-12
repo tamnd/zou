@@ -20,11 +20,36 @@
 //! A snapshot past retention is ordinary two phase garbage, and
 //! whatever only it referenced follows it out through the same window.
 //!
+//! Page layers pin the same way, off the shard manifests rather than
+//! the tenant one. Compaction commits by retiring its inputs from a
+//! shard manifest and listing its outputs in the same CAS, which makes
+//! every retired input dead the instant the swap lands: the outputs
+//! preserve every record the inputs held, and a pass that died before
+//! the swap left objects the manifest never saw. Neither had a
+//! collector until now, and a whole shard rewrite every couple of
+//! minutes leaves a whole shard behind every couple of minutes. A
+//! fifteen minute soak at scale 10 wrote four rewrites of about 280 MB
+//! and kept all four, 1.8 GB of store for a 188 MB database, while the
+//! amp gauge sat at 2 against a bound of 5, because read amplification
+//! is about the layers a read walks and says nothing about the ones
+//! nothing walks at all.
+//!
+//! Every `SHARD` object in the store pins, not only the ones at the
+//! current shard count. A split serves lazily: a descendant reads
+//! through its ancestors' manifests until it covers its own keyspace,
+//! so an older era's layers are live exactly as long as that era's
+//! manifest is, and pruning the lineage is what releases them. Layers
+//! pin by owner and name, so a branch child pins its parent's layers
+//! under the parent's prefix, the way a checkpoint ref already does.
+//! A layer a flush has uploaded but not yet published looks exactly
+//! like a layer a crash abandoned, and the two phase window is what
+//! tells them apart: the second run reads a manifest that names the
+//! one and still does not name the other.
+//!
 //! WAL is not this job's problem. A tenant's log lives under its own
 //! `log/` prefix, consolidation rewrites it and `gc_landing` in zou-log
-//! trims the landing chain by its own rules, so this job only ever
-//! collects under `chk/` and `manifests/` and never touches a WAL
-//! object.
+//! trims the landing chain by its own rules, so this job never touches
+//! a WAL object.
 //!
 //! Deletion is two phase. A run stamps each garbage key into the
 //! candidates object with the current time, and a later run deletes a
@@ -48,8 +73,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use zou_store::CasStore;
 use zou_store::cas::CasError;
+use zou_store::layermap::LayerDesc;
 use zou_store::layout::TenantLayout;
 use zou_store::manifest::Manifest;
+use zou_store::shardmanifest::PageShardManifest;
 
 /// Where the two phase state lives, next to `tenants/` under the store
 /// root. Lines of `<first-seen-unix> <key>`.
@@ -250,6 +277,44 @@ pub fn run_with(store: &dyn CasStore, now_unix: u64, policy: Policy) -> Result<G
         pin(r, m);
     }
 
+    // The layer pins, read off every shard manifest in the store. Every
+    // one of them counts, including eras below the current shard count,
+    // because a split serves through its ancestors until it has
+    // rewritten past them. An entry with an owner tag names the prefix
+    // its bytes actually live under; an untagged one is this tenant's
+    // own, and pins under the branch parent too for the same reason an
+    // untagged checkpoint ref does.
+    let mut pinned_layer: BTreeSet<(String, String)> = BTreeSet::new();
+    for r in &refs {
+        let layout = TenantLayout::new(r);
+        let shards_dir = layout.shards_dir();
+        let mut owners = vec![r.to_string()];
+        if let Some(b) = manifests.get(r).and_then(|m| m.branch_of.as_ref()) {
+            owners.push(b.tenant_ref.clone());
+        }
+        for key in &keys {
+            if !key.starts_with(&shards_dir) || !key.ends_with("/SHARD") {
+                continue;
+            }
+            let Some((data, _)) = store.get(key).map_err(|e| format!("store: {e}"))? else {
+                continue;
+            };
+            let sm = PageShardManifest::decode(&data).map_err(|e| format!("shard {key}: {e}"))?;
+            for e in &sm.layers {
+                match &e.owner {
+                    Some(o) => {
+                        pinned_layer.insert((o.clone(), e.name.clone()));
+                    }
+                    None => {
+                        for owner in &owners {
+                            pinned_layer.insert((owner.clone(), e.name.clone()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut garbage: BTreeSet<String> = BTreeSet::new();
     garbage.extend(expired_history);
     for r in manifests.keys() {
@@ -258,6 +323,26 @@ pub fn run_with(store: &dyn CasStore, now_unix: u64, policy: Policy) -> Result<G
             if let Some(rest) = key.strip_prefix(&chk_prefix)
                 && let Some((id, _)) = rest.split_once('/')
                 && !pinned_chk.contains(&(r.clone(), id.to_string()))
+            {
+                garbage.insert(key.clone());
+            }
+        }
+    }
+    // Retired layers. Only names that parse as layers are touched, so
+    // the `SHARD` manifest itself and anything else a shard prefix
+    // grows later are left where they are rather than deleted by a job
+    // that does not know what they are.
+    for r in manifests.keys() {
+        let shards_dir = TenantLayout::new(r).shards_dir();
+        for key in &keys {
+            let Some(rest) = key.strip_prefix(&shards_dir) else {
+                continue;
+            };
+            let Some((_, name)) = rest.split_once('/') else {
+                continue;
+            };
+            if LayerDesc::parse(name, 0).is_ok()
+                && !pinned_layer.contains(&(r.clone(), name.to_string()))
             {
                 garbage.insert(key.clone());
             }
@@ -422,7 +507,9 @@ mod tests {
     use super::*;
     use zou_store::LocalFsStore;
     use zou_store::Lsn;
+    use zou_store::layer::LayerKey;
     use zou_store::manifest::{BranchOf, CheckpointKind, CheckpointRef};
+    use zou_store::shardmanifest::LayerEntry;
 
     fn put_chk(store: &dyn CasStore, r: &str, id: &str) {
         let layout = TenantLayout::new(r);
@@ -788,6 +875,140 @@ mod tests {
             sweep(&store, "node-a", 1000, Policy::default()).unwrap(),
             Sweep::Ran(_)
         ));
+    }
+
+    /// A layer object and the name a manifest would list it under. The
+    /// lsn range is the only thing that varies, which is enough to make
+    /// one layer a rewrite of another.
+    fn put_layer(store: &dyn CasStore, r: &str, shard: u16, lo: u64, hi: u64) -> String {
+        let layout = TenantLayout::new(r);
+        let key = layout.delta_layer(
+            shard,
+            &LayerKey::page(1663, 5, 16384, 0, 0),
+            &LayerKey::page(1663, 5, 16384, 0, 999),
+            Lsn(lo),
+            Lsn(hi),
+        );
+        store.put_if_absent(&key, &[0xCD; 32]).unwrap();
+        key.rsplit('/').next().unwrap().to_string()
+    }
+
+    /// The manifest a shard publishes: whichever layers it still serves,
+    /// each with the owner the reader would fetch it from.
+    fn write_shard(store: &dyn CasStore, r: &str, shard: u16, layers: &[(&str, Option<&str>)]) {
+        let mut sm = PageShardManifest::new(shard);
+        sm.disk_consistent_lsn = Lsn(0x400);
+        for (name, owner) in layers {
+            sm.layers.push(LayerEntry {
+                name: (*name).to_string(),
+                size: 32,
+                owner: owner.map(str::to_string),
+                upto: None,
+            });
+        }
+        store
+            .put(&TenantLayout::new(r).shard_manifest(shard), &sm.encode())
+            .unwrap();
+    }
+
+    /// The bug that filled two disks. Compaction retires its inputs from
+    /// the shard manifest in the same CAS that lists its outputs, so the
+    /// inputs are dead the moment the swap lands, and until now nothing
+    /// ever deleted them. A fifteen minute soak kept four whole shard
+    /// rewrites of 280 MB each and reported an amplification of 2.
+    #[test]
+    fn a_layer_compaction_retired_waits_out_the_window_then_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        write_manifest(&store, "p", &[], None);
+        let old = put_layer(&store, "p", 0, 0x100, 0x200);
+        let new = put_layer(&store, "p", 0, 0x100, 0x400);
+        write_shard(&store, "p", 0, &[(&new, None)]);
+        let key = |name: &str| format!("tenants/p/shards/0000/{name}");
+
+        let first = run(&store, 1000, 100, 100_000).unwrap();
+        assert_eq!(first.deleted, 0, "the first run only stamps");
+        assert_eq!(first.candidates, 1, "the retired input and nothing else");
+        assert!(store.get(&key(&old)).unwrap().is_some());
+
+        let due = run(&store, 1100, 100, 100_000).unwrap();
+        assert_eq!(due.deleted, 1);
+        assert!(store.get(&key(&old)).unwrap().is_none());
+        assert!(
+            store.get(&key(&new)).unwrap().is_some(),
+            "the layer the manifest names is what the shard serves"
+        );
+        assert!(
+            store.get("tenants/p/shards/0000/SHARD").unwrap().is_some(),
+            "the manifest is not a layer and is never collectible"
+        );
+    }
+
+    /// A split serves lazily: shard 2 of four reads through shard 0 of
+    /// two until it has rewritten past it, so the older era's manifest
+    /// is live and so are the layers it names. Collecting by current
+    /// shard count alone would take the ground out from under the
+    /// descendant.
+    #[test]
+    fn an_older_era_shard_manifest_still_pins_its_layers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        write_manifest(&store, "p", &[], None);
+        let inherited = put_layer(&store, "p", 0, 0x100, 0x200);
+        let own = put_layer(&store, "p", 2, 0x200, 0x400);
+        write_shard(&store, "p", 0, &[(&inherited, None)]);
+        write_shard(&store, "p", 2, &[(&own, None)]);
+
+        let first = run(&store, 1000, 0, 100_000).unwrap();
+        assert_eq!(first.candidates, 0, "every layer is named by some era");
+        let second = run(&store, 1000, 0, 100_000).unwrap();
+        assert_eq!(second.deleted, 0);
+        assert!(
+            store
+                .get(&format!("tenants/p/shards/0000/{inherited}"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// A branch copies its parent's entries and tags them with the
+    /// tenant whose prefix holds the bytes, so the tag is what has to
+    /// pin, under the owner and not under the child.
+    #[test]
+    fn a_branch_pins_the_parent_layers_it_inherited() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let shared = put_layer(&store, "parent", 0, 0x100, 0x200);
+        write_manifest(&store, "parent", &[], None);
+        write_manifest(&store, "child", &[], Some(("parent", 0x200)));
+        // The parent has moved on and no longer names it, the child
+        // still reads through it.
+        let rewritten = put_layer(&store, "parent", 0, 0x100, 0x400);
+        write_shard(&store, "parent", 0, &[(&rewritten, None)]);
+        write_shard(&store, "child", 0, &[(&shared, Some("parent"))]);
+
+        run(&store, 1000, 0, 100_000).unwrap();
+        let due = run(&store, 1000, 0, 100_000).unwrap();
+        assert_eq!(due.deleted, 0, "the child is still reading it");
+        assert!(
+            store
+                .get(&format!("tenants/parent/shards/0000/{shared}"))
+                .unwrap()
+                .is_some()
+        );
+
+        // Once the child stops naming it, the parent's own manifest is
+        // the only opinion left and it says gone.
+        write_shard(&store, "child", 0, &[]);
+        run(&store, 2000, 0, 100_000).unwrap();
+        let after = run(&store, 2000, 0, 100_000).unwrap();
+        assert_eq!(after.deleted, 1);
+        assert!(
+            store
+                .get(&format!("tenants/parent/shards/0000/{shared}"))
+                .unwrap()
+                .is_none()
+        );
     }
 
     impl Policy {
