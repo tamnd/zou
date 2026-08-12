@@ -40,7 +40,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use zou_log::{Backpressure, DEFAULT_TEE_BUFFER, IngestLag, Tee, TeeFilter, WalMedia, catch_up};
+use zou_log::{
+    Backpressure, DEFAULT_TEE_BUFFER, IngestLag, Tee, TeeFilter, WalMedia, catch_up_with,
+};
 use zou_store::CasStore;
 use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
@@ -306,12 +308,43 @@ impl Driver<'_> {
     /// Replay the chain from the applied watermark through the same
     /// door live frames use. The tee contract makes the overlap with
     /// the subscription exact.
+    /// The replay is streamed and flushes as it goes. A driver that
+    /// rejoins after a cut, or starts against a long chain, has the
+    /// whole backlog to apply, and collecting it first holds it twice
+    /// over: once as frames and once as a memtable nothing checks
+    /// until the last one is in. The serving half died that way at
+    /// scale 1000. Flushing inside the loop keeps the memtable at its
+    /// threshold whatever the backlog is.
     fn catch_up(&mut self, filter: &TeeFilter) -> Result<(), IngestError> {
+        let applied = self
+            .ingest
+            .as_ref()
+            .expect("anchored before catch up")
+            .applied();
+        let before = self
+            .ingest
+            .as_ref()
+            .expect("anchored before catch up")
+            .seen();
+        let store = &self.store;
+        let layout = &self.layout;
+        let durable = &self.durable;
         let ingest = self.ingest.as_mut().expect("anchored before catch up");
-        let frames = catch_up(&self.media, WAL_SHARD, filter, Lsn(ingest.applied()))
-            .map_err(|e| IngestError::Wal(format!("catch up: {e}")))?;
-        let before = ingest.seen();
-        ingest.apply_frames(&frames)?;
+        catch_up_with::<IngestError, _>(&self.media, WAL_SHARD, filter, Lsn(applied), |frame| {
+            ingest.apply_frames(std::slice::from_ref(&frame))?;
+            let durable = durable.load(Ordering::Acquire);
+            if ingest.flush_due(durable).is_some()
+                && let Some(entry) = ingest.flush(&**store, layout)?
+            {
+                log::info!(
+                    "zou pagesvc: flush mid replay, layer {} of {} bytes, applied {:#x}",
+                    entry.name,
+                    entry.size,
+                    ingest.applied()
+                );
+            }
+            Ok(())
+        })?;
         if ingest.seen() > before {
             self.last_advance = Instant::now();
         }
