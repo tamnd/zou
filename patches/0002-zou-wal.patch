@@ -41,7 +41,7 @@ new file mode 100644
 index 0000000..ad24f0b
 --- /dev/null
 +++ b/src/backend/access/transam/zou_wal.c
-@@ -0,0 +1,655 @@
+@@ -0,0 +1,671 @@
 +/*-------------------------------------------------------------------------
 + *
 + * zou_wal.c
@@ -96,6 +96,7 @@ index 0000000..ad24f0b
 +extern int	zou_wal_close(void);
 +extern int	zou_pagesvc_start(const char *target, int data_checksums);
 +extern int	zou_pagesvc_stop(void);
++extern int	zou_pageserve_on(void);
 +
 +#define ZOU_ERR_LEASE_HELD (-5)
 +#define ZOU_ERR_THROTTLED (-7)
@@ -174,14 +175,29 @@ index 0000000..ad24f0b
 +	RegisterBackgroundWorker(&bgw);
 +
 +	/*
-+	 * The page service has to be up before recovery starts: with
-+	 * ZOU_PAGESERVE=1 eager page puts are elided, so the startup
-+	 * process reads pages the local tiers miss over its socket. The
-+	 * pusher above cannot host it, RecoveryFinished is too late, hence
-+	 * a worker of its own starting with the postmaster.
++	 * The page service has to be up before recovery starts: with it on
++	 * eager page puts are elided, so the startup process reads pages
++	 * the local tiers miss over its socket. The pusher above cannot
++	 * host it, RecoveryFinished is too late, hence a worker of its own
++	 * starting with the postmaster.
++	 *
++	 * The crate answers whether it is on rather than us reading the
++	 * variable here, so that the worker this registers and the client
++	 * the backends open cannot disagree. They did: this was "set at
++	 * all" and the backends wanted exactly "1", which made
++	 * ZOU_PAGESERVE=true a running page service nobody dialed.
 +	 */
-+	if (getenv("ZOU_PAGESERVE") == NULL)
-+		return;
++	switch (zou_pageserve_on())
++	{
++		case 0:
++			return;
++		case 1:
++			break;
++		default:
++			ereport(FATAL,
++					(errmsg("ZOU_PAGESERVE=\"%s\" is neither on nor off",
++							getenv("ZOU_PAGESERVE"))));
++	}
 +
 +	memset(&bgw, 0, sizeof(bgw));
 +	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;

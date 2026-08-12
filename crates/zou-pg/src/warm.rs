@@ -137,7 +137,7 @@ pub fn warm(
     // frozen images, so warming out of pg/ would fill the cache with
     // pages older than the ones recovery must see. Warming the service
     // is its own design and its own patch.
-    if std::env::var("ZOU_PAGESERVE").is_ok_and(|v| !v.is_empty()) {
+    if crate::pageserve_on() {
         return Ok(WarmStats::default());
     }
 
