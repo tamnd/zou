@@ -772,9 +772,15 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/storage/v1", any(storage_stub))
         .route("/storage/v1/", any(storage_stub))
         .route("/storage/v1/{*rest}", any(storage_stub))
-        // The one realtime endpoint there is. Everything else under
-        // the prefix is still the honest 501.
+        // The socket and the two ways of sending to a topic without
+        // one. Everything else under the prefix is still the honest
+        // 501.
         .route("/realtime/v1/websocket", any(realtime::websocket))
+        .route("/realtime/v1/api/broadcast", post(realtime::broadcast))
+        .route(
+            "/realtime/v1/api/broadcast/{topic}/events/{event}",
+            post(realtime::broadcast_one),
+        )
         .route("/realtime/v1", any(realtime_stub))
         .route("/realtime/v1/", any(realtime_stub))
         .route("/realtime/v1/{*rest}", any(realtime_stub))

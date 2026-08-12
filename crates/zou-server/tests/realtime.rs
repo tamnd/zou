@@ -336,6 +336,207 @@ async fn an_untrack_and_a_leave_both_take_a_socket_off_the_topic() {
     assert_eq!(left[4]["leaves"]["u2"]["metas"][0]["round"], 2);
 }
 
+/// A post to the realtime surface, with the key on it and the status
+/// and body handed back rather than raised, since a refusal is an
+/// answer these tests want to read.
+async fn post(at: SocketAddr, path: &str, content_type: &str, body: Vec<u8>) -> (u16, String) {
+    let url = format!("http://{at}{path}");
+    let key = anon_key();
+    let content_type = content_type.to_string();
+    tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut answer = agent
+            .post(&url)
+            .header("apikey", &key)
+            .header("content-type", &content_type)
+            .send(&body[..])
+            .expect("the request goes");
+        let status = answer.status().as_u16();
+        let text = answer.body_mut().read_to_string().expect("a body");
+        (status, text)
+    })
+    .await
+    .expect("the request runs")
+}
+
+#[tokio::test]
+async fn a_broadcast_posted_over_http_reaches_the_sockets_on_the_topic() {
+    let at = serving().await;
+    let mut listener = connect(at, "2.0.0").await;
+    let mut elsewhere = connect(at, "2.0.0").await;
+    join(&mut listener, "realtime:room").await;
+    join(&mut elsewhere, "realtime:other").await;
+
+    // The batch shape, which is what `channel.send()` falls back to
+    // when the socket is not up. The topic in it is the channel's own
+    // name, without the prefix the socket topic carries.
+    let (status, body) = post(
+        at,
+        "/realtime/v1/api/broadcast",
+        "application/json",
+        br#"{"messages":[{"topic":"room","event":"cursor","payload":{"x":1},"private":false}]}"#
+            .to_vec(),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body, "", "an accepted broadcast says nothing else");
+
+    let heard = next(&mut listener).await;
+    let Message::Binary(bytes) = heard else {
+        panic!("{heard:?} is not the binary broadcast a 2.0.0 socket takes")
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("realtime:room"), "{text}");
+    assert!(text.contains("cursor"), "{text}");
+    assert!(text.ends_with(r#"{"x":1}"#), "{text}");
+
+    let crossed =
+        tokio::time::timeout(std::time::Duration::from_millis(250), elsewhere.next()).await;
+    assert!(crossed.is_err(), "a posted broadcast crossed topics");
+}
+
+#[tokio::test]
+async fn the_single_url_carries_the_names_in_the_path_and_bytes_as_bytes() {
+    let at = serving().await;
+    let mut listener = connect(at, "2.0.0").await;
+    join(&mut listener, "realtime:room").await;
+
+    // The shape `httpSend` posts, with the payload as the whole body.
+    let (status, body) = post(
+        at,
+        "/realtime/v1/api/broadcast/room/events/cursor",
+        "application/json",
+        br#"{"x":2}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let heard = next(&mut listener).await;
+    let Message::Binary(bytes) = heard else {
+        panic!("{heard:?} is not a broadcast")
+    };
+    // The encoding byte says json, so the client parses the payload
+    // rather than handing it over as an ArrayBuffer.
+    assert_eq!(bytes[4], 1, "the payload encoding says json");
+    assert!(String::from_utf8_lossy(&bytes).ends_with(r#"{"x":2}"#));
+
+    let (status, body) = post(
+        at,
+        "/realtime/v1/api/broadcast/room/events/frame",
+        "application/octet-stream",
+        vec![0, 1, 2, 250],
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let heard = next(&mut listener).await;
+    let Message::Binary(bytes) = heard else {
+        panic!("{heard:?} is not a broadcast")
+    };
+    assert_eq!(bytes[4], 0, "the payload encoding says bytes");
+    assert!(
+        bytes.ends_with(&[0, 1, 2, 250]),
+        "the bytes posted are not the bytes delivered"
+    );
+
+    let (status, body) = post(
+        at,
+        "/realtime/v1/api/broadcast/room/events/cursor",
+        "text/plain",
+        b"whatever".to_vec(),
+    )
+    .await;
+    assert_eq!(status, 415, "{body}");
+}
+
+#[tokio::test]
+async fn a_batch_with_a_bad_message_in_it_is_refused_whole() {
+    let at = serving().await;
+    let mut listener = connect(at, "2.0.0").await;
+    join(&mut listener, "realtime:room").await;
+
+    // The first message is fine and the second has no event on it, so
+    // neither is sent: half a batch delivered and then complained
+    // about is the answer nobody can do anything with.
+    let (status, body) = post(
+        at,
+        "/realtime/v1/api/broadcast",
+        "application/json",
+        br#"{"messages":[{"topic":"room","event":"cursor","payload":{}},{"topic":"room","payload":{}}]}"#
+            .to_vec(),
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    let said: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(said["errors"]["messages"][0], serde_json::json!({}));
+    assert_eq!(said["errors"]["messages"][1]["event"][0], "can't be blank");
+
+    let nothing =
+        tokio::time::timeout(std::time::Duration::from_millis(250), listener.next()).await;
+    assert!(nothing.is_err(), "a refused batch was delivered anyway");
+
+    let (status, body) = post(
+        at,
+        "/realtime/v1/api/broadcast",
+        "application/json",
+        br#"{}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    let said: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(said["errors"]["messages"][0], "can't be blank");
+}
+
+#[tokio::test]
+async fn a_private_broadcast_is_told_what_is_missing_rather_than_forbidden() {
+    let at = serving().await;
+    // 403 is what upstream answers when the rls check says no, and
+    // answering it here would send somebody looking for a policy that
+    // is not the problem.
+    let (status, body) = post(
+        at,
+        "/realtime/v1/api/broadcast",
+        "application/json",
+        br#"{"messages":[{"topic":"room","event":"cursor","payload":{},"private":true}]}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 501, "{body}");
+    assert!(body.contains("private"), "{body}");
+
+    let (status, body) = post(
+        at,
+        "/realtime/v1/api/broadcast/room/events/cursor?private=true",
+        "application/json",
+        br#"{}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 501, "{body}");
+    assert!(body.contains("private"), "{body}");
+}
+
+#[tokio::test]
+async fn a_posted_broadcast_needs_a_key_like_everything_else_does() {
+    let at = serving().await;
+    let url = format!("http://{at}/realtime/v1/api/broadcast");
+    let status = tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        agent
+            .post(&url)
+            .header("content-type", "application/json")
+            .send(r#"{"messages":[]}"#)
+            .expect("the request goes")
+            .status()
+            .as_u16()
+    })
+    .await
+    .expect("the request runs");
+    assert_eq!(status, 401);
+}
+
 #[tokio::test]
 async fn a_channel_that_asks_for_postgres_changes_is_told_they_are_not_built() {
     let at = serving().await;

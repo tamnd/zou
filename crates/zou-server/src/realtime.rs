@@ -15,11 +15,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::body::Bytes;
+use axum::extract::Path;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::Uri;
-use axum::response::Response;
+use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
+use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
-use zou_realtime::{Action, Delivery, Hub, Identity, Session, SocketId, Tokens, Vsn};
+use zou_realtime::{
+    Action, BinaryBroadcast, Delivery, Encoding, Fanout, Hub, Identity, Session, SocketId, Tokens,
+    Vsn,
+};
 
 use crate::{App, AuthContext, json_body};
 
@@ -261,6 +267,164 @@ async fn act(
         }
     }
     true
+}
+
+/// A batch of broadcasts over http, `POST /realtime/v1/api/broadcast`.
+///
+/// This is the endpoint the client falls back to when it has a channel
+/// object and no usable socket, and it is also how anything that is
+/// not a browser sends to a room: a cron job, a trigger, a worker that
+/// has an http client and no websocket in it.
+///
+/// The answer is 202 and an empty body, which says the messages were
+/// taken rather than that anybody heard them. Nobody may be on the
+/// topic at all, and a broadcast is not stored, so accepted is the
+/// strongest true thing there is to say.
+pub async fn broadcast(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    body: Bytes,
+) -> Response {
+    let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&body) else {
+        return unprocessable(json!({"messages": ["is invalid"]}));
+    };
+    let Some(messages) = sent.get("messages") else {
+        return unprocessable(json!({"messages": ["can't be blank"]}));
+    };
+    let Some(messages) = messages.as_array() else {
+        return unprocessable(json!({"messages": ["is invalid"]}));
+    };
+    // Every message is checked before any of them is sent, so a batch
+    // with a bad one in it is refused whole rather than half delivered
+    // and then complained about.
+    let faults: Vec<Value> = messages.iter().map(faults_in).collect();
+    if faults.iter().any(|fault| fault != &json!({})) {
+        return unprocessable(json!({"messages": faults}));
+    }
+    if messages.iter().any(private_message) {
+        return not_yet_private();
+    }
+    for message in messages {
+        let topic = message["topic"].as_str().unwrap_or_default();
+        let event = message["event"].as_str().unwrap_or_default();
+        let payload = message.get("payload").cloned().unwrap_or(json!({}));
+        fan(&app.hub, topic, event, json_payload(&payload));
+    }
+    accepted()
+}
+
+/// One broadcast over http, `POST /realtime/v1/api/broadcast/{topic}/events/{event}`.
+///
+/// The same delivery as the batch above with the names in the url and
+/// the payload as the whole body, which is what `httpSend` on a channel
+/// calls. A body that is `application/octet-stream` is carried as bytes
+/// all the way to the other client, which reads it as an ArrayBuffer,
+/// the same as bytes that came in over a socket.
+pub async fn broadcast_one(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    Path((topic, event)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if query(&uri, "private").as_deref() == Some("true") {
+        return not_yet_private();
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or("").trim().to_string())
+        .unwrap_or_else(|| "application/json".into());
+    let payload = match content_type.as_str() {
+        "application/octet-stream" => (Encoding::Binary, body.to_vec()),
+        "application/json" | "" => match serde_json::from_slice::<Value>(&body) {
+            Ok(payload) => json_payload(&payload),
+            Err(_) => return unprocessable(json!({"payload": ["is invalid"]})),
+        },
+        other => {
+            return json_body(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                json!({
+                    "message": format!("{other} is not a content type this endpoint reads"),
+                }),
+            );
+        }
+    };
+    fan(&app.hub, &topic, &event, payload);
+    accepted()
+}
+
+/// A payload on its way to the sockets, as json.
+fn json_payload(payload: &Value) -> (Encoding, Vec<u8>) {
+    (Encoding::Json, payload.to_string().into_bytes())
+}
+
+/// Hand one message to the topic it names.
+///
+/// The topic in the url is the channel's name and the topic on the
+/// socket is that with `realtime:` in front, which is the same rule the
+/// client follows when it joins. The sender is a socket id nobody
+/// holds, so nothing is suppressed as its own echo: an http caller is
+/// not on the topic and has nothing to hear back.
+fn fan(hub: &Hub, topic: &str, event: &str, (encoding, payload): (Encoding, Vec<u8>)) {
+    hub.fan(
+        hub.socket(),
+        Fanout {
+            topic: format!("realtime:{topic}"),
+            push: BinaryBroadcast {
+                join_ref: String::new(),
+                reference: String::new(),
+                topic: format!("realtime:{topic}"),
+                event: event.to_string(),
+                meta: String::new(),
+                encoding,
+                payload,
+            },
+            to_self: false,
+        },
+    );
+}
+
+/// What is wrong with one message in a batch, in the shape upstream
+/// answers with: a map per message, empty when there is nothing wrong
+/// with it, so the caller can line the answers up with what it sent.
+fn faults_in(message: &Value) -> Value {
+    let mut faults = serde_json::Map::new();
+    for field in ["topic", "event"] {
+        match message.get(field).and_then(Value::as_str) {
+            Some(value) if !value.is_empty() => {}
+            _ => {
+                faults.insert(field.into(), json!(["can't be blank"]));
+            }
+        }
+    }
+    if message.get("payload").is_none() {
+        faults.insert("payload".into(), json!(["can't be blank"]));
+    }
+    Value::Object(faults)
+}
+
+fn private_message(message: &Value) -> bool {
+    message.get("private").and_then(Value::as_bool) == Some(true)
+}
+
+/// Taken, and nothing else said.
+fn accepted() -> Response {
+    (StatusCode::ACCEPTED, ()).into_response()
+}
+
+fn unprocessable(errors: Value) -> Response {
+    json_body(StatusCode::UNPROCESSABLE_ENTITY, json!({"errors": errors}))
+}
+
+/// A private broadcast is an rls check against `realtime.messages`, and
+/// there is nothing here to check it with yet.
+///
+/// Upstream answers 403 when the check says no, and answering 403 here
+/// would be a lie of the worst kind: a caller would read it as its
+/// policies refusing it and go looking for the policy. 501 naming what
+/// is missing sends it to the milestone instead.
+fn not_yet_private() -> Response {
+    crate::not_yet("a private broadcast, which needs private channels")
 }
 
 /// One parameter out of the connect url.

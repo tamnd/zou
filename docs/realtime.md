@@ -67,10 +67,29 @@ A meta carries a `phx_ref` the client renames to `presence_ref`, which is how it
 That is the client's own rule, and it is the one that matters in practice, because the client sets the flag for you the moment a channel has a presence binding on it.
 
 All of that is asked of zou through the real client rather than only over a raw socket, in the presence suite in [tamnd/zou-conformance](https://github.com/tamnd/zou-conformance), which runs against a real `supabase start` as well so that the questions are the reference's answers rather than ours.
+The http broadcast below is asked there the same way, through both of the client's own ways of sending.
 
 State is per topic and per project, and it is held where the sockets are.
 A socket that goes away, whether it untracks, leaves the channel or just disconnects, leaves the topic, and the last socket off a topic takes the topic's state with it.
 Nothing about presence is written down: it is the set of sockets that are connected now, so a node restart is an empty room and the clients that reconnect fill it back in.
+
+## Sending without a socket
+
+A room can be sent to over http, which is what anything that is not a browser does: a trigger, a worker, a cron job, or a client whose socket is not up yet.
+
+```bash
+curl -X POST "$URL/realtime/v1/api/broadcast" \
+  -H "apikey: $ANON_KEY" -H 'content-type: application/json' \
+  -d '{"messages":[{"topic":"room","event":"cursor","payload":{"x":12,"y":40}}]}'
+```
+
+That is the batch shape, and it is what `channel.send()` posts when the channel has no socket to push down.
+The single message shape is `POST /realtime/v1/api/broadcast/{topic}/events/{event}` with the payload as the whole body, which is what `channel.httpSend(event, payload)` calls, and a body sent as `application/octet-stream` is carried as bytes the whole way, so the other client reads it as an ArrayBuffer rather than as text.
+The topic in both is the channel's name, without the `realtime:` the socket topic carries, which is the same name the client passes to `supabase.channel()`.
+
+The answer is 202 with an empty body.
+It says the messages were taken, not that anybody heard them: a broadcast is not stored, nobody may be on the topic, and accepted is the strongest true thing there is to say.
+A message missing its topic, its event or its payload is 422 and a list of what is wrong with each message in the batch, and a batch with one bad message in it sends none of them, because half a batch delivered and then complained about is an answer nobody can act on.
 
 ## Tokens
 
@@ -89,9 +108,12 @@ The client sees an error on the push and then a `phx_error` on each channel, whi
 | --- | --- |
 | `postgres_changes` in a join | the join is refused, naming what is missing |
 | a private channel | the same |
-| `POST /realtime/v1/api/broadcast` | 501 |
+| a private broadcast over http | 501, naming private channels |
 
 All three are M4, tracked in [tamnd/zou#4](https://github.com/tamnd/zou/issues/4).
+
+A private broadcast is 501 rather than the 403 upstream answers when its check says no, on purpose.
+403 is what a caller sees when its own policies refused it, and answering that here would send somebody looking through policies for a problem that is not there.
 
 The refusals are worded rather than silent on purpose.
 A server can accept any of these joins, reply `SUBSCRIBED` and then send nothing, and every client in the world will sit there waiting, which is the worst answer available: the thing that is missing looks exactly like the thing that is working and idle.

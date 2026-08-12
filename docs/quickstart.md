@@ -528,7 +528,7 @@ A Supabase client is pointed at one url and reaches four surfaces under it. All 
 | `/rest/v1` | PostgREST's grammar, the OpenAPI document at `/rest/v1/`, and `/rest/v1/rpc/<function>` |
 | `/auth/v1` | the GoTrue endpoints this guide describes |
 | `/storage/v1` | buckets under `/storage/v1/bucket`, objects under `/storage/v1/object`, and 501 for the rest |
-| `/realtime/v1` | the websocket at `/realtime/v1/websocket`, channels, broadcast and presence on it, and 501 for the rest |
+| `/realtime/v1` | the websocket at `/realtime/v1/websocket`, channels, broadcast and presence on it, the broadcast endpoint at `/realtime/v1/api/broadcast`, and 501 for the rest |
 
 What is not built yet answers 501 rather than 404 on purpose, for any method and for every path under the prefix including the prefix itself, because a 404 reads as a wrong url and sends somebody looking for a typo they did not make. An endpoint under `/auth/v1` that is not served yet answers the same way. Anything outside all four prefixes is a 404 in the words the hosted gateway uses, `no Route matched with those values`, so a client that gets one is looking at the same sentence it would get from Supabase.
 
