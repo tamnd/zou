@@ -119,7 +119,7 @@ pub(crate) mod testv2 {
 use std::ffi::{CStr, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -182,7 +182,7 @@ struct Shim {
     /// unset. Plain files, no lock, cross process safety comes from
     /// bufmgr never running IO on one block from two processes.
     cache: Option<pagecache::PageCache>,
-    /// GetPage client, `Some` when ZOU_PAGESERVE=1. With it in place
+    /// GetPage client, `Some` when ZOU_PAGESERVE is on. With it in place
     /// reads past the local tiers go to the page service socket and
     /// eager page puts are elided, see the pageserve module.
     pageserve: Option<pageserve::PageClient>,
@@ -200,8 +200,66 @@ fn pageserve_socket() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("zou.pagesvc"))
 }
 
+/// Whether the page service is on, `Err` when the value is not an
+/// answer either way.
+///
+/// One parse, because three of them cost us a benchmark. This used to
+/// be `v == "1"` here, "set and not empty" in the warm path, and
+/// "merely set" in the postmaster deciding whether to register the
+/// worker. `ZOU_PAGESERVE=true` therefore started the page service,
+/// skipped recovery warming on the grounds that the service owned the
+/// pages, and then ran the object path anyway with nothing on the
+/// other end of the socket: the slowest configuration we have, with
+/// no warm cache, and not a word about it in the log.
+///
+/// So the spellings an operator would reasonably write all work, and
+/// anything else is refused rather than read as off. `ZouWalRegister`
+/// turns that refusal into a FATAL before the postmaster gets
+/// anywhere, and a process that loads the shim without going through
+/// it says so on stderr rather than picking off in silence.
+fn parse_pageserve(v: Option<&str>) -> Result<bool, String> {
+    let Some(v) = v else { return Ok(false) };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "no" => Ok(false),
+        "1" | "true" | "on" | "yes" => Ok(true),
+        _ => Err(format!(
+            "ZOU_PAGESERVE={v}: expected one of 1 0 true false on off yes no"
+        )),
+    }
+}
+
+fn pageserve_setting() -> Result<bool, String> {
+    parse_pageserve(std::env::var("ZOU_PAGESERVE").ok().as_deref())
+}
+
 fn pageserve_on() -> bool {
-    std::env::var("ZOU_PAGESERVE").is_ok_and(|v| v == "1")
+    match pageserve_setting() {
+        Ok(on) => on,
+        Err(msg) => {
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                eprintln!("zou: {msg}, reading it as off");
+            }
+            false
+        }
+    }
+}
+
+/// `ZOU_PAGESERVE` for the C side, 1 on, 0 off, -1 unreadable. The
+/// postmaster asks this instead of calling getenv itself so that the
+/// worker it registers and the client the backends open are answering
+/// the same question.
+#[unsafe(no_mangle)]
+pub extern "C" fn zou_pageserve_on() -> i32 {
+    pageserve_code(pageserve_setting())
+}
+
+fn pageserve_code(setting: Result<bool, String>) -> i32 {
+    match setting {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => -1,
+    }
 }
 
 /// Serve one page from the checkpoint chain, `None` when pg/ must
@@ -2459,6 +2517,46 @@ mod tests {
             .unwrap();
             let got: Vec<u8> = frames.iter().map(|f| f.payload[0]).collect();
             assert_eq!(got, payloads, "{tenant_ref} holds its own two windows");
+        }
+    }
+
+    /// The spelling that broke a benchmark. `true` used to start the
+    /// page service worker in the postmaster, turn the warm path off,
+    /// and leave the backends on the object path with no client, so
+    /// the run measured the slowest configuration we have and said it
+    /// had the page service on.
+    #[test]
+    fn every_way_of_writing_on_means_on() {
+        for v in ["1", "true", "on", "yes", "TRUE", "On", " 1 "] {
+            assert_eq!(parse_pageserve(Some(v)), Ok(true), "{v:?}");
+        }
+        for v in ["0", "false", "off", "no", "OFF", ""] {
+            assert_eq!(parse_pageserve(Some(v)), Ok(false), "{v:?}");
+        }
+    }
+
+    /// Unset is off, and that is the only silent off there is. A value
+    /// nobody can read is an operator mistake, and answering it with
+    /// the slow path is how this went unnoticed for a month.
+    #[test]
+    fn unset_is_off_and_nonsense_is_refused() {
+        assert_eq!(parse_pageserve(None), Ok(false));
+        assert!(parse_pageserve(Some("maybe")).is_err());
+        assert!(parse_pageserve(Some("2")).is_err());
+    }
+
+    /// The C side asks this rather than calling getenv, so the worker
+    /// the postmaster registers and the client a backend opens cannot
+    /// disagree about what the value meant.
+    #[test]
+    fn the_c_side_gets_the_same_answer() {
+        for (v, want) in [
+            (None, 0),
+            (Some("on"), 1),
+            (Some("off"), 0),
+            (Some("x"), -1),
+        ] {
+            assert_eq!(pageserve_code(parse_pageserve(v)), want, "{v:?}");
         }
     }
 }
