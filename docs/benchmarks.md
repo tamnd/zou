@@ -1,5 +1,9 @@
 # Benchmarks
 
+This page is the write up: what was measured, on what, and what it means.
+Which milestone claims those measurements have actually earned is one generated page in the harness repo, [tamnd/zou-bench `docs/dashboard.md`](https://github.com/tamnd/zou-bench/blob/main/docs/dashboard.md), where every row carries the line it has to beat, the run it was read from, and the milestone box it ticks.
+A claim nothing has measured yet is on that page saying so rather than left off it.
+
 Recorded baselines for the commit latency harness.
 Reproduce with `cargo run --release -p zou-store --features s3,sqlite --example commit_latency -- [target]`.
 Without a target the harness runs on a fresh temp directory, with one it runs on whatever the string names, a directory, `sqlite://`, a `.zou` file, or `s3://`, under a nonce prefix it deletes afterwards.
@@ -80,7 +84,9 @@ The sizing rule is still to keep the attached ceiling above the working set, bec
 
 Memory holds flat.
 Peak RSS across the whole process tree is 15.7 GB over up to 1028 processes, median 13.6 GB, and across thirty minutes covering warmup, steady, idle and a churn window that attached seventeen hundred times the slope points slightly down, so about 140 MB per attached tenant and no drift.
-Provisioning costs 36.2 tenants a minute at 8 parallel jobs, almost all of it initdb and the genesis capture, with the registry write itself at 2.7 ms p50.
+Provisioning is almost all initdb and the genesis capture, with the registry write itself at 2.7 ms p50.
+The 36.2 tenants a minute this run reports is not the rate of building a fleet and this page previously read as though it were: the run made 63 tenants and skipped the 937 that earlier passes had already built, so it times the tail of a job that was nearly done.
+A from empty rate is being measured on the eight hundred tenant fleet and replaces this sentence when it lands.
 The store holds 45.6 GB for the thousand, 45.6 MB a tenant.
 
 ## A hundred thousand registered tenants
