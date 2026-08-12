@@ -70,6 +70,17 @@ zou lambda s3://mybucket/tenants --ref demo
 
 `--ref` serves one project at every url it answers and brings it up before the first request rather than because of it, which is what Lambda, Cloud Run and Fly all want. The recipes for the three are in [docs/serverless.md](docs/serverless.md).
 
+Realtime is on the same url and the same key:
+
+```js
+const room = supabase.channel('room')
+room.on('broadcast', { event: 'cursor' }, ({ payload }) => draw(payload))
+room.subscribe()
+```
+
+The socket, the channels on it, tokens refreshed mid connection and broadcast between the members of a topic are served today, against the real realtime-js.
+Presence, `postgres_changes` and private channels are not, and a join asking for one of them is refused by name rather than joined and left silent, see [docs/realtime.md](docs/realtime.md).
+
 Branch a database for a preview deploy:
 
 ```bash

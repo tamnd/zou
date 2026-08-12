@@ -521,14 +521,14 @@ It only ever reads. There is a test that runs the whole command against a databa
 
 ## What answers where
 
-A Supabase client is pointed at one url and reaches four surfaces under it. All four are routed today, three of them are built, and the third is built as far as buckets and objects go.
+A Supabase client is pointed at one url and reaches four surfaces under it. All four are routed today, rest and auth are built, storage is built as far as buckets and objects go, and realtime is built as far as its socket and broadcast go.
 
 | prefix | today |
 | --- | --- |
 | `/rest/v1` | PostgREST's grammar, the OpenAPI document at `/rest/v1/`, and `/rest/v1/rpc/<function>` |
 | `/auth/v1` | the GoTrue endpoints this guide describes |
 | `/storage/v1` | buckets under `/storage/v1/bucket`, objects under `/storage/v1/object`, and 501 for the rest |
-| `/realtime/v1` | 501 with a sentence saying the surface is not built yet |
+| `/realtime/v1` | the websocket at `/realtime/v1/websocket`, channels and broadcast on it, and 501 for the rest |
 
 What is not built yet answers 501 rather than 404 on purpose, for any method and for every path under the prefix including the prefix itself, because a 404 reads as a wrong url and sends somebody looking for a typo they did not make. An endpoint under `/auth/v1` that is not served yet answers the same way. Anything outside all four prefixes is a 404 in the words the hosted gateway uses, `no Route matched with those values`, so a client that gets one is looking at the same sentence it would get from Supabase.
 
