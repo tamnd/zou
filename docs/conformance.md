@@ -325,10 +325,11 @@ It starts zou on 54321, the port the Supabase CLI serves a local project on, pri
 zou installs the auth schema on the first connection it takes out of its pool, the fixture has a foreign key into `auth.users`, and the health endpoint answers without taking a connection.
 So `serve` makes zou answer a request that has to reach Postgres before it says it is ready, and the `url` line it prints last is a readiness check CI can grep for.
 
-17 of the 34 tests run and zou passes all 17: the client constructing, the PostgREST block, the RLS block, the Authentication block, the Storage block, and the timeout configuration block.
+All 34 tests run and zou passes 33: the client constructing, the PostgREST block, the RLS block, the Authentication block, the Storage block, the timeout configuration block and both Realtime blocks.
+The one that does not pass is skipped by upstream itself, a binary broadcast over the older protocol version.
 The Storage block is the one that says something the recorded storage suite cannot, because it goes through storage-js with the anon key and a policy on `storage.objects` decides rather than a service role going around it.
-The other 17 are Realtime, which zou does not serve on this URL yet.
-They are skipped behind an environment flag rather than deleted, so the day the feature lands the test runs exactly as upstream wrote it.
+The Realtime blocks ran behind an environment flag while zou served no Realtime, which is what the Storage block did before storage was served, and both are upstream's own lines again.
+They are the blocks that cost the most to pass: both protocol versions, every channel private and so decided by policies on `realtime.messages`, a socket that has to stay up while channels come and go and hang up when the last one leaves, and a broadcast posted over http arriving on a socket.
 
 The second is storage-js's own tests, in `js-storage/`, and it is the same arrangement pointed at the client that owns the surface M3 is about.
 Four files, 135 tests, 133 of them passing against zou and 2 skipped, and 6 of upstream's snapshots.
