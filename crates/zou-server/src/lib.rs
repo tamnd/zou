@@ -324,6 +324,16 @@ pub struct App {
     /// second are moving. One per server, like the hub, because the
     /// budget is the project's and not a connection's.
     pub quota: Arc<realtime::Quota>,
+    /// Who is subscribed to postgres changes and what they asked for,
+    /// one per server for the same reason the hub is: the one thing
+    /// reading the database has to be able to find every subscription
+    /// on it.
+    pub changes: Arc<reader::Changes>,
+    /// The loop that does the reading, started by the first socket that
+    /// subscribes to anything. Not at boot, because a replication slot
+    /// nobody is reading from is a database whose write ahead log
+    /// cannot be freed.
+    pub reading: tokio::sync::OnceCell<()>,
 }
 
 impl App {
@@ -423,6 +433,8 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         blobs,
         hub: zou_realtime::Hub::new(),
         quota,
+        changes: Arc::new(reader::Changes::new()),
+        reading: tokio::sync::OnceCell::new(),
     }))
 }
 

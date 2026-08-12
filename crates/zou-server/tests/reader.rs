@@ -323,6 +323,15 @@ async fn nothing_holds_a_slot_open_when_nobody_is_listening() {
     )
     .await;
 
+    // The count below is server wide and cannot be anything else, since
+    // a slot is named after the backend that took it and nothing knows
+    // that name in advance. So a slot another suite in the same run is
+    // still letting go of would read here as this reader's own.
+    assert!(
+        untapped(&client).await,
+        "something else is still holding a replication slot of ours"
+    );
+
     let changes = Arc::new(Changes::new());
     let reader = Reader::new(
         &dsn,

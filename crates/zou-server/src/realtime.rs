@@ -6,11 +6,12 @@
 //! decided without a socket has been decided somewhere a test can
 //! reach without opening one.
 //!
-//! A connection is one task with two things to wait on: the next
-//! message from the client, and the next broadcast from a topic this
-//! socket is on. Whichever arrives first is handled and the loop goes
-//! round again, so a client that is only listening costs a parked
-//! future and a client that is only sending never blocks on a reader.
+//! A connection is one task with three things to wait on: the next
+//! message from the client, the next broadcast from a topic this socket
+//! is on, and the next database change it subscribed to. Whichever
+//! arrives first is handled and the loop goes round again, so a client
+//! that is only listening costs a parked future and a client that is
+//! only sending never blocks on a reader.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -27,6 +28,12 @@ use zou_realtime::{
     Identity, Limits, Meter, Session, SocketId, Sockets, Tokens, Vsn,
 };
 
+use crate::binding::Binding;
+// Two things in scope here are called what a socket heard: the enum
+// this loop selects over and the one the reader sends. The reader's
+// takes the other name, since this file is the loop's.
+use crate::reader::{Heard as Feed, Listening, Reader};
+use crate::visible::Asker;
 use crate::{App, AuthContext, json_body, policy};
 
 /// What checks a token for a socket: the project's own verifier, the
@@ -340,17 +347,29 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
     // which is what stops a channel the client left from being
     // polled.
     let mut carrying: HashMap<String, tokio::sync::broadcast::Receiver<Delivery>> = HashMap::new();
+    // Where this socket's database changes arrive, once it has asked
+    // for any. A socket that never subscribes to a table never has one,
+    // and so costs the reader nothing at all.
+    let mut watching: Option<Listening> = None;
     loop {
-        let heard = if carrying.is_empty() {
-            // Nothing to fan in, so this is just the client's next
-            // message. Waiting on an empty set of receivers would
-            // otherwise be a future that never wakes.
-            Heard::Client(socket.recv().await)
-        } else {
-            tokio::select! {
+        let heard = match (carrying.is_empty(), watching.as_mut()) {
+            // Nothing to fan in and nothing subscribed, so this is just
+            // the client's next message. Waiting on an empty set of
+            // receivers would otherwise be a future that never wakes.
+            (true, None) => Heard::Client(socket.recv().await),
+            (true, Some(changes)) => tokio::select! {
+                message = socket.recv() => Heard::Client(message),
+                change = changes.heard.recv() => Heard::Changed(change),
+            },
+            (false, None) => tokio::select! {
                 message = socket.recv() => Heard::Client(message),
                 fanned = next_delivery(&mut carrying) => fanned,
-            }
+            },
+            (false, Some(changes)) => tokio::select! {
+                message = socket.recv() => Heard::Client(message),
+                fanned = next_delivery(&mut carrying) => fanned,
+                change = changes.heard.recv() => Heard::Changed(change),
+            },
         };
         let actions = match heard {
             Heard::Client(None) => break,
@@ -376,10 +395,39 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
                 log::warn!("realtime: a socket missed {missed} messages on {topic}, closing it");
                 break;
             }
+            Heard::Changed(Some(Feed::Change { ids, data })) => session.changed(&ids, &data),
+            // The same news as a lagging topic and for the same reason:
+            // the tap was reopened or this socket was not reading, so
+            // what it has is not everything and there is no way to say
+            // what is missing. A client that reconnects resubscribes
+            // and reads the table, which is the only honest answer.
+            Heard::Changed(Some(Feed::Gap)) => {
+                log::warn!("realtime: a socket missed database changes, closing it");
+                break;
+            }
+            // The reader dropped this subscriber, which it does to one
+            // that stopped reading rather than to one that is fine.
+            Heard::Changed(None) => break,
         };
-        if !act(&mut socket, actions, &mut session, app, me, &mut carrying).await {
+        if !act(
+            &mut socket,
+            actions,
+            &mut session,
+            app,
+            me,
+            &mut carrying,
+            &mut watching,
+        )
+        .await
+        {
             break;
         }
+    }
+    // Every subscription this socket held, out of the index the reader
+    // walks for each changed row. A socket that went and left its
+    // bindings behind would be a policy check per row for nobody.
+    if let Some(changes) = watching {
+        app.changes.hung_up(changes.id);
     }
     let topics: Vec<String> = carrying.keys().cloned().collect();
     // The presence goes before the receivers do, so the diff saying
@@ -401,6 +449,9 @@ enum Heard {
     Client(Option<Result<Message, axum::Error>>),
     Fanned(Delivery),
     Lagged(String, u64),
+    /// A row this socket subscribed to, or the reader saying it has
+    /// stopped sending them.
+    Changed(Option<Feed>),
 }
 
 /// The next broadcast from any topic this socket is on.
@@ -456,6 +507,7 @@ async fn act(
     app: &Arc<App>,
     me: SocketId,
     carrying: &mut HashMap<String, tokio::sync::broadcast::Receiver<Delivery>>,
+    watching: &mut Option<Listening>,
 ) -> bool {
     let hub = &app.hub;
     for action in actions {
@@ -502,8 +554,31 @@ async fn act(
             Action::Ask(ask) => {
                 let granted = answer(app, session.identity(), &ask).await;
                 let next = session.authorized(&ask, granted);
-                if !Box::pin(act(socket, next, session, app, me, carrying)).await {
+                if !Box::pin(act(socket, next, session, app, me, carrying, watching)).await {
                     return false;
+                }
+            }
+            // The other thing this loop stops for. The join reply
+            // carries an id per subscription and nobody has one until
+            // the reader has been told what to look for.
+            Action::Watch { topic, wants } => {
+                let ids = subscribed(app, session.identity(), watching, &wants).await;
+                let next = session.watching(&topic, ids);
+                if !Box::pin(act(socket, next, session, app, me, carrying, watching)).await {
+                    return false;
+                }
+            }
+            Action::Unwatch(ids) => {
+                for id in ids {
+                    app.changes.unbind(id);
+                }
+            }
+            // The claims a row is checked against are the ones the
+            // socket has now, so a refreshed token is told to the
+            // reader before it reads anything else.
+            Action::Rewatch => {
+                if let Some(listening) = watching.as_ref() {
+                    app.changes.became(listening.id, asker(session.identity()));
                 }
             }
             // Whatever was in front of this has been sent, which is
@@ -519,6 +594,78 @@ async fn act(
         }
     }
     true
+}
+
+/// Who a change is checked against, which is whoever the socket
+/// currently is rather than whoever it was when it subscribed.
+fn asker(who: &Identity) -> Asker {
+    Asker {
+        role: who.role.clone(),
+        claims: who.claims.clone(),
+    }
+}
+
+/// What one client's `postgres_changes` list turns into: the id the
+/// reader gave each entry, in the order the client asked, or the reason
+/// there are none.
+///
+/// This is where a socket becomes a subscriber, on its first
+/// subscription rather than at the handshake, so a client that only
+/// broadcasts is not a queue the reader has to consider for every
+/// changed row.
+async fn subscribed(
+    app: &Arc<App>,
+    who: &Identity,
+    watching: &mut Option<Listening>,
+    wants: &[Value],
+) -> Result<Vec<u64>, String> {
+    if app.pool.is_none() {
+        return Err("this server has no database to read changes out of".into());
+    }
+    // Every entry is read before any of them is asked for, so a list
+    // with a bad binding in it is refused whole rather than half
+    // subscribed and then complained about.
+    let mut bindings = Vec::with_capacity(wants.len());
+    for want in wants {
+        bindings.push(Binding::of(want)?);
+    }
+    let listener = match watching.as_ref() {
+        Some(listening) => {
+            // A second channel on the same socket, which may have
+            // joined with a different token than the first one did.
+            app.changes.became(listening.id, asker(who));
+            listening.id
+        }
+        None => watching.insert(app.changes.listen(asker(who))).id,
+    };
+    // The reader starts here rather than at boot, because a replication
+    // slot exists to be read and one nobody is reading is write ahead
+    // log a database cannot free.
+    app.reading.get_or_init(|| async { reading(app) }).await;
+    let mut ids = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let Some(id) = app.changes.bind(listener, binding) else {
+            // The socket stopped being a subscriber while this was
+            // being set up, which is the reader dropping one that was
+            // not reading. What was bound before it goes back out
+            // rather than being left in the index for nobody.
+            for id in ids {
+                app.changes.unbind(id);
+            }
+            return Err("this socket is no longer subscribed".into());
+        };
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+/// Start the one loop that reads this database's changes.
+fn reading(app: &Arc<App>) {
+    let (Some(dsn), Some(pool)) = (app.cfg.pg.clone(), app.pool.clone()) else {
+        return;
+    };
+    let changes = Arc::clone(&app.changes);
+    tokio::spawn(async move { Reader::new(&dsn, pool, changes).run().await });
 }
 
 /// Go and find out, which is the io a private channel needs and the

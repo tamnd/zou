@@ -6,11 +6,12 @@
 //! it over, and does what comes back: send these bytes, start or stop
 //! carrying a topic, hand this broadcast to the hub, close.
 //!
-//! What this refuses is as much of the point as what it answers. A
-//! join asking for postgres changes is told they are not built rather
-//! than joined quietly and left silent, because a channel that says
-//! SUBSCRIBED and never delivers a row is worse to debug than one that
-//! failed.
+//! Two of those actions are questions rather than instructions: whether
+//! a private channel may be joined, and what ids the database side gave
+//! the subscriptions a join asked for. Both come back in through a
+//! method, and in both cases the join waits, because a reply sent before
+//! the answer would be a client told it is subscribed to something
+//! nobody has arranged yet.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -54,9 +55,17 @@ pub struct Config {
     pub presence_key: Option<String>,
     /// Whether joining is subject to the project's own authorization.
     pub private: bool,
-    /// The postgres changes the client wants, unread beyond its
-    /// length, since this refuses them all.
-    pub postgres_changes: usize,
+    /// The postgres changes the client asked for, exactly as it wrote
+    /// them.
+    ///
+    /// Held as the client's own json rather than as anything parsed,
+    /// because the join reply has to hand each one back the way it
+    /// arrived. realtime-js compares the reply's list with its own
+    /// bindings field by field and unsubscribes the channel when any of
+    /// them differ, so a server that tidied a missing filter into a null
+    /// on the way through would be a server whose subscriptions all
+    /// fail. What the entries mean is somebody else's to work out.
+    pub postgres_changes: Vec<Value>,
 }
 
 impl Config {
@@ -90,8 +99,8 @@ impl Config {
             postgres_changes: config
                 .and_then(|c| c.get("postgres_changes"))
                 .and_then(Value::as_array)
-                .map(Vec::len)
-                .unwrap_or(0),
+                .cloned()
+                .unwrap_or_default(),
         }
     }
 }
@@ -157,6 +166,20 @@ pub enum Action {
     /// come back through [`Session::authorized`]. Nothing else this
     /// socket asked for happens until the answer arrives.
     Ask(Ask),
+    /// Ask whatever is reading the database for these subscriptions,
+    /// and come back through [`Session::watching`] with the id it gave
+    /// each of them. The join is not answered until that arrives,
+    /// because the reply is what carries the ids.
+    Watch { topic: String, wants: Vec<Value> },
+    /// Those subscriptions are finished, because the channel they were
+    /// asked for on has gone.
+    Unwatch(Vec<u64>),
+    /// This socket is somebody else now, so whatever is checking its
+    /// rows against a policy should be checking them against the new
+    /// claims. Sent when a token is refreshed on a socket that is
+    /// watching something, since a row is only allowed to reach whoever
+    /// the client currently is.
+    Rewatch,
     /// The socket itself is finished, once whatever is in front of
     /// this has been sent. Upstream reaches this by telling the
     /// transport to disconnect, and it is one refusal only: a project
@@ -238,6 +261,10 @@ enum Pending {
     /// A recheck after a new token, which nothing is waiting on and
     /// which only matters if the answer is no.
     Recheck,
+    /// A join that is allowed to happen and is waiting for the ids of
+    /// the postgres changes it asked for, because the reply is what
+    /// hands them back.
+    Watch(Frame),
 }
 
 /// The room name inside a channel topic.
@@ -325,6 +352,11 @@ pub struct Session {
     /// reads the socket again, so a second question about the same
     /// topic cannot arrive in between.
     pending: HashMap<String, Pending>,
+    /// The postgres change subscriptions each channel holds, by the ids
+    /// whatever is reading the database gave them. This is both how a
+    /// change that arrives finds the channel to go down and how a
+    /// channel that leaves takes its own subscriptions with it.
+    watched: HashMap<String, Vec<u64>>,
     /// What the project is allowed and what is counting it.
     budget: Budget,
 }
@@ -346,6 +378,7 @@ impl Session {
             channels: HashMap::new(),
             rights: HashMap::new(),
             pending: HashMap::new(),
+            watched: HashMap::new(),
             budget,
         }
     }
@@ -494,12 +527,6 @@ impl Session {
             }
         }
         let config = Config::of(&frame.payload);
-        if config.postgres_changes > 0 {
-            return vec![self.send(Frame::error(
-                &frame,
-                "postgres changes are not implemented yet, tracked in tamnd/zou#4",
-            ))];
-        }
         if config.private {
             // Nothing about this join happens until the project's own
             // policies have been read, so the whole frame is held and
@@ -518,22 +545,154 @@ impl Session {
     fn joined(&mut self, frame: Frame) -> Vec<Action> {
         let config = Config::of(&frame.payload);
         let topic = frame.topic.clone();
-        // A private channel is sent presence only if the presence read
-        // policy said so, whatever the client asked for.
-        let wants_presence = config.presence && self.readable_presence(&topic);
         let room = room(&topic, config.private);
+        let wants = config.postgres_changes.clone();
         self.channels.insert(topic.clone(), config);
-        // An ok with nothing in it, and the nothing matters: a reply
-        // carrying a postgres_changes list is checked against the
-        // client's own bindings, and one carrying none is read as
-        // subscribed.
-        let mut actions = vec![Action::Carry(room.clone()), self.send(Frame::ok(&frame))];
-        if wants_presence {
-            // After the reply and after the topic is being carried, in
-            // that order: the state is a snapshot and the diffs that
-            // follow it are only complete if the socket was already
-            // listening when it was taken.
-            actions.push(Action::State(room));
+        let mut actions = vec![Action::Carry(room)];
+        if !wants.is_empty() {
+            // The reply has to carry an id for every subscription and
+            // nothing here knows one yet, so the frame waits the same
+            // way a private join waits for its policies. Everything the
+            // reply is followed by waits with it.
+            self.pending.insert(topic.clone(), Pending::Watch(frame));
+            actions.push(Action::Watch { topic, wants });
+            return actions;
+        }
+        actions.push(self.send(Frame::ok(&frame)));
+        actions.extend(self.after_reply(&topic));
+        actions
+    }
+
+    /// What follows a join reply, once the reply itself has gone.
+    ///
+    /// The presence state is a snapshot and the diffs after it are only
+    /// complete if the socket was already being sent the topic when it
+    /// was taken, which is why this is after the carry and not before
+    /// it. A private channel is sent presence only if the presence read
+    /// policy said so, whatever the client asked for.
+    fn after_reply(&self, topic: &str) -> Option<Action> {
+        let config = self.channels.get(topic)?;
+        let wanted = config.presence && self.readable_presence(topic);
+        wanted.then(|| Action::State(room(topic, config.private)))
+    }
+
+    /// The ids whatever reads the database gave this channel's
+    /// subscriptions, or why it gave none.
+    ///
+    /// The reply hands each one back to the client with the entry it
+    /// came from, in the order the client asked, because that is what
+    /// realtime-js checks it against: it walks its own bindings and the
+    /// reply's list together, and a channel whose entries do not match
+    /// field for field unsubscribes itself with a mismatch error. So
+    /// what goes back is the client's own json with an id added and
+    /// nothing else touched.
+    pub fn watching(&mut self, topic: &str, ids: Result<Vec<u64>, String>) -> Vec<Action> {
+        let frame = match self.pending.remove(topic) {
+            Some(Pending::Watch(frame)) => frame,
+            // Something else is waiting on this topic, which is not
+            // this answer's to take away.
+            Some(other) => {
+                self.pending.insert(topic.to_string(), other);
+                return Vec::new();
+            }
+            None => {
+                log::debug!("realtime: subscriptions for {topic} that nothing was waiting for");
+                return Vec::new();
+            }
+        };
+        let wants = match self.channels.get(topic) {
+            Some(config) => config.postgres_changes.clone(),
+            None => return Vec::new(),
+        };
+        let ids = match ids {
+            Ok(ids) if ids.len() == wants.len() => ids,
+            Ok(_) => {
+                // Not a client's mistake and not something a client can
+                // do anything about, but a reply that did not line up
+                // would fail on the client as a mismatch, so it is said
+                // plainly here instead.
+                return self.unsubscribed(&frame, "the subscriptions do not match what was asked");
+            }
+            Err(why) => return self.unsubscribed(&frame, why),
+        };
+        let echoed: Vec<Value> = wants
+            .iter()
+            .zip(&ids)
+            .map(|(want, id)| {
+                let mut entry = want.clone();
+                match entry.as_object_mut() {
+                    Some(object) => {
+                        object.insert("id".into(), json!(id));
+                        entry
+                    }
+                    // A client that sent something that is not an object
+                    // gets it back as it sent it, which will not match
+                    // and will be told so by its own comparison.
+                    None => entry,
+                }
+            })
+            .collect();
+        self.watched.insert(topic.to_string(), ids);
+        let mut actions = vec![self.send(Frame::reply(
+            &frame,
+            "ok",
+            json!({"postgres_changes": echoed}),
+        ))];
+        actions.extend(self.after_reply(topic));
+        actions
+    }
+
+    /// A join that got as far as being carried and then could not have
+    /// what it asked for. The topic goes back down with the refusal,
+    /// since a client that is told its join failed is not going to send
+    /// a leave for it.
+    fn unsubscribed(&mut self, frame: &Frame, why: impl Into<String>) -> Vec<Action> {
+        let topic = frame.topic.clone();
+        let room = self.room(&topic);
+        self.channels.remove(&topic);
+        self.rights.remove(&topic);
+        let mut actions = vec![self.send(Frame::error(frame, why.into()))];
+        actions.extend(self.unwatch(&topic));
+        actions.push(Action::Drop(room));
+        actions
+    }
+
+    /// The subscriptions a channel held, on their way out of whatever
+    /// is reading the database.
+    fn unwatch(&mut self, topic: &str) -> Option<Action> {
+        let ids = self.watched.remove(topic)?;
+        (!ids.is_empty()).then_some(Action::Unwatch(ids))
+    }
+
+    /// A row this socket asked about, on its way down the channel that
+    /// asked.
+    ///
+    /// The ids are what says which channel: two channels on one socket
+    /// can be subscribed to the same table, and each is owed the change
+    /// with its own ids on it rather than one message carrying both.
+    /// The project's events budget is spent here for the same reason it
+    /// is spent on a broadcast, since a change delivered down a socket
+    /// costs the project what any other message does.
+    pub fn changed(&mut self, ids: &[u64], data: &Value) -> Vec<Action> {
+        let mine: Vec<(String, Vec<u64>)> = self
+            .watched
+            .iter()
+            .filter_map(|(topic, held)| {
+                let ids: Vec<u64> = held.iter().copied().filter(|id| ids.contains(id)).collect();
+                (!ids.is_empty()).then(|| (topic.clone(), ids))
+            })
+            .collect();
+        let mut actions = Vec::new();
+        for (topic, ids) in mine {
+            if self.budget.counters.over_events() {
+                actions.extend(self.overrun(&topic));
+                continue;
+            }
+            actions.push(self.send(Frame::push(
+                &topic,
+                "postgres_changes",
+                json!({"ids": ids, "data": data}),
+            )));
         }
         actions
     }
@@ -614,6 +773,11 @@ impl Session {
         match pending {
             Pending::Join(frame) => vec![self.send(Frame::error(&frame, why))],
             Pending::Do { asked, .. } => vec![self.send(Frame::error(&asked, why))],
+            // A join that was already allowed and was waiting for its
+            // subscriptions, which cannot happen while the transport
+            // asks one question at a time and is answered here anyway
+            // rather than left as a channel with no reply coming.
+            Pending::Watch(frame) => self.unsubscribed(&frame, why),
             // A socket that was already on the topic and is not
             // allowed on it any more. The channel goes down the same
             // way a refused token takes one down, which is what the
@@ -623,11 +787,11 @@ impl Session {
                 let room = self.room(topic);
                 self.channels.remove(topic);
                 self.rights.remove(topic);
-                vec![
-                    self.send(Frame::channel_error(topic)),
-                    Action::Untrack(room.clone()),
-                    Action::Drop(room),
-                ]
+                let mut actions = vec![self.send(Frame::channel_error(topic))];
+                actions.extend(self.unwatch(topic));
+                actions.push(Action::Untrack(room.clone()));
+                actions.push(Action::Drop(room));
+                actions
             }
         }
     }
@@ -682,11 +846,10 @@ impl Session {
         // Untracking before the drop, because the diff has to go out
         // while this socket is still on the topic for the others to be
         // told it left.
-        vec![
-            Action::Untrack(room.clone()),
-            Action::Drop(room),
-            self.send(Frame::ok(&frame)),
-        ]
+        let mut actions = vec![Action::Untrack(room.clone()), Action::Drop(room)];
+        actions.extend(self.unwatch(&frame.topic));
+        actions.push(self.send(Frame::ok(&frame)));
+        actions
     }
 
     /// `track` and `untrack`, which is a client saying it is here and
@@ -768,6 +931,13 @@ impl Session {
             Ok(identity) => {
                 self.identity = identity;
                 let mut actions = vec![self.send(Frame::ok(&frame))];
+                // A row is only allowed to reach whoever this socket
+                // currently is, and it is somebody else now, so whatever
+                // checks its changes against the policies is told before
+                // the next one is read.
+                if !self.watched.is_empty() {
+                    actions.push(Action::Rewatch);
+                }
                 // Every private channel this socket is on was allowed
                 // on to it as somebody else. What the old token could
                 // read says nothing about what this one can, so the
@@ -794,6 +964,7 @@ impl Session {
                     self.rights.remove(&topic);
                     self.pending.remove(&topic);
                     actions.push(self.send(Frame::channel_error(&topic)));
+                    actions.extend(self.unwatch(&topic));
                     actions.push(Action::Untrack(room.clone()));
                     actions.push(Action::Drop(room));
                 }
@@ -877,7 +1048,7 @@ impl Session {
         self.channels.remove(topic);
         self.rights.remove(topic);
         self.pending.remove(topic);
-        vec![
+        let mut actions = vec![
             self.send(Frame::push(
                 topic,
                 "system",
@@ -889,9 +1060,11 @@ impl Session {
                 }),
             )),
             self.send(Frame::push(topic, "phx_close", json!({}))),
-            Action::Untrack(room.clone()),
-            Action::Drop(room),
-        ]
+        ];
+        actions.extend(self.unwatch(topic));
+        actions.push(Action::Untrack(room.clone()));
+        actions.push(Action::Drop(room));
+        actions
     }
 
     /// Something from the hub, on its way down this socket.
@@ -1059,16 +1232,125 @@ mod tests {
         assert!(!session.on("realtime:room"));
     }
 
+    /// A join with two subscriptions on it, one of them filtered.
+    fn watching_join(session: &mut Session) -> Vec<Action> {
+        join(
+            session,
+            r#"{"config":{"postgres_changes":[
+                 {"event":"*","schema":"public","table":"todos"},
+                 {"event":"INSERT","schema":"public","table":"todos","filter":"id=eq.1"}]}}"#,
+        )
+    }
+
+    /// The reply is what carries the ids, so there is no reply until
+    /// there are ids to carry.
     #[test]
-    fn what_is_not_built_says_so_rather_than_joining_and_going_quiet() {
-        let config = r#"{"config":{"postgres_changes":[{"event":"*"}]}}"#;
+    fn a_join_asking_for_postgres_changes_is_answered_once_it_has_them() {
         let mut session = socket();
-        let actions = join(&mut session, config);
+        let actions = watching_join(&mut session);
+        assert_eq!(actions[0], Action::Carry("realtime:room".into()));
+        let Action::Watch { topic, wants } = &actions[1] else {
+            panic!("{:?} is not a watch", actions[1]);
+        };
+        assert_eq!(topic, "realtime:room");
+        assert_eq!(wants.len(), 2);
+        assert_eq!(
+            actions.len(),
+            2,
+            "nothing was answered, because a client told it is subscribed before anything is \
+             reading the database is a client that will wait forever for its first row"
+        );
+
+        let actions = session.watching("realtime:room", Ok(vec![7, 8]));
+        let reply = text_of(&actions[0]);
+        assert_eq!(reply.payload["status"], "ok");
+        assert_eq!(
+            reply.payload["response"]["postgres_changes"],
+            json!([
+                {"event": "*", "schema": "public", "table": "todos", "id": 7},
+                {"event": "INSERT", "schema": "public", "table": "todos",
+                 "filter": "id=eq.1", "id": 8},
+            ]),
+            "each entry is the client's own, in the order it asked, with an id added: realtime-js \
+             walks its bindings and this list together and unsubscribes the channel when any field \
+             differs, so a filter this server tidied into a null would fail every subscription \
+             that did not have one"
+        );
+    }
+
+    #[test]
+    fn a_change_goes_down_the_channel_that_asked_for_it_with_its_own_ids() {
+        let mut session = socket();
+        watching_join(&mut session);
+        session.watching("realtime:room", Ok(vec![7, 8]));
+
+        let data = json!({"type": "INSERT", "table": "todos", "record": {"id": 1}});
+        let actions = session.changed(&[8], &data);
+        let push = text_of(&actions[0]);
+        assert_eq!(push.topic, "realtime:room");
+        assert_eq!(push.event, "postgres_changes");
+        assert_eq!(
+            push.payload,
+            json!({"ids": [8], "data": data}),
+            "the ids are the client's own, which is how it knows which of its subscriptions this \
+             answers and which callback to run"
+        );
+        assert!(
+            session.changed(&[99], &data).is_empty(),
+            "and an id this socket never asked for goes nowhere"
+        );
+    }
+
+    #[test]
+    fn a_channel_that_leaves_takes_its_subscriptions_with_it() {
+        let mut session = socket();
+        watching_join(&mut session);
+        session.watching("realtime:room", Ok(vec![7, 8]));
+
+        let actions = session.text(r#"["1","2","realtime:room","phx_leave",{}]"#, &OneToken);
+        assert!(
+            actions.contains(&Action::Unwatch(vec![7, 8])),
+            "a subscription nobody is on the other end of is a row checked against a policy for \
+             nothing, {actions:?}"
+        );
+        assert!(
+            session.changed(&[7], &json!({"type": "INSERT"})).is_empty(),
+            "and a change that arrives after the leave has nowhere to go"
+        );
+    }
+
+    /// A row is only allowed to reach whoever the socket currently is,
+    /// so the thing checking the rows has to hear about a new token.
+    #[test]
+    fn a_refreshed_token_is_told_to_whatever_is_checking_the_rows() {
+        let mut session = socket();
+        watching_join(&mut session);
+        session.watching("realtime:room", Ok(vec![7, 8]));
+
+        let actions = session.text(
+            r#"["1","3","realtime:room","access_token",{"access_token":"good"}]"#,
+            &OneToken,
+        );
+        assert!(actions.contains(&Action::Rewatch), "{actions:?}");
+        assert_eq!(session.role(), "authenticated");
+    }
+
+    #[test]
+    fn subscriptions_that_could_not_be_made_take_the_channel_back_down() {
+        let mut session = socket();
+        watching_join(&mut session);
+        let actions = session.watching("realtime:room", Err("a filter needs a table".into()));
         let reply = text_of(&actions[0]);
         assert_eq!(reply.payload["status"], "error");
-        let reason = reply.payload["response"]["reason"].as_str().unwrap();
-        assert!(reason.starts_with("postgres changes"), "{reason}");
-        assert!(reason.contains("tamnd/zou#4"), "{reason}");
+        assert_eq!(
+            reply.payload["response"]["reason"],
+            "a filter needs a table"
+        );
+        assert!(
+            actions.contains(&Action::Drop("realtime:room".into())),
+            "the join was carried before the ids were asked for, so a join that failed after that \
+             is a topic to stop carrying, {actions:?}"
+        );
         assert!(!session.on("realtime:room"));
     }
 
