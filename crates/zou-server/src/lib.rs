@@ -31,6 +31,7 @@ pub mod admin;
 pub mod attach;
 pub mod audit;
 pub mod auth;
+pub mod binding;
 pub mod blob;
 pub mod cdc;
 pub mod edge;
