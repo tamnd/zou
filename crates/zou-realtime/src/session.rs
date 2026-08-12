@@ -42,8 +42,14 @@ pub struct Config {
     pub broadcast_self: bool,
     /// Whether a broadcast push is answered at all.
     pub broadcast_ack: bool,
-    /// Whether presence is being tracked on this channel.
+    /// Whether this socket hears about presence on this channel. It
+    /// does not decide whether this socket can be seen: a client that
+    /// tracks is visible to everyone whatever it asked for, this only
+    /// says whether the state and the diffs come back to it.
     pub presence: bool,
+    /// What this socket asked to be known by on this channel, if it
+    /// asked for anything. Nothing means the socket's own name.
+    pub presence_key: Option<String>,
     /// Whether joining is subject to the project's own authorization.
     pub private: bool,
     /// The postgres changes the client wants, unread beyond its
@@ -69,6 +75,12 @@ impl Config {
             broadcast_self: flag("broadcast", "self"),
             broadcast_ack: flag("broadcast", "ack"),
             presence: flag("presence", "enabled"),
+            presence_key: config
+                .and_then(|c| c.get("presence"))
+                .and_then(|p| p.get("key"))
+                .and_then(Value::as_str)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string),
             private: config
                 .and_then(|c| c.get("private"))
                 .and_then(Value::as_bool)
@@ -93,6 +105,27 @@ pub struct Fanout {
     pub to_self: bool,
 }
 
+/// What goes down a topic to the sockets on it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Sent {
+    /// A broadcast from one socket to the others.
+    Broadcast(Fanout),
+    /// A change to who is on the topic, which everyone on it hears,
+    /// the socket that caused it included: a client applies its own
+    /// track through the same diff everybody else does, so there is
+    /// one code path keeping every copy of the state level.
+    Diff { topic: String, payload: Value },
+}
+
+impl Sent {
+    pub fn topic(&self) -> &str {
+        match self {
+            Sent::Broadcast(fan) => &fan.topic,
+            Sent::Diff { topic, .. } => topic,
+        }
+    }
+}
+
 /// What the transport should do next.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -106,6 +139,18 @@ pub enum Action {
     Drop(String),
     /// Hand this to everyone carrying the topic.
     Fan(Fanout),
+    /// Put this socket on the topic's presence, or move it if it is
+    /// already there, and tell the topic.
+    Track {
+        topic: String,
+        key: Option<String>,
+        payload: Value,
+    },
+    /// Take it off, and tell the topic.
+    Untrack(String),
+    /// Send this socket everyone who is on the topic right now, which
+    /// only the hub knows.
+    State(String),
 }
 
 /// One connection.
@@ -213,10 +258,7 @@ impl Session {
             "phx_leave" => self.leave(frame),
             "access_token" => self.refresh(frame, tokens),
             "broadcast" => self.broadcast(frame),
-            "presence" => vec![self.send(Frame::error(
-                &frame,
-                "presence is not implemented yet, tracked in tamnd/zou#4",
-            ))],
+            "presence" => self.presence(frame),
             other => {
                 log::debug!("realtime: nothing answers {other} on {}", frame.topic);
                 vec![self.send(Frame::error(
@@ -257,29 +299,94 @@ impl Session {
                 "postgres changes are not implemented yet, tracked in tamnd/zou#4",
             ))];
         }
-        if config.presence {
-            return vec![self.send(Frame::error(
-                &frame,
-                "presence is not implemented yet, tracked in tamnd/zou#4",
-            ))];
-        }
         let topic = frame.topic.clone();
+        let wants_presence = config.presence;
         self.channels.insert(topic.clone(), config);
         // An ok with nothing in it, and the nothing matters: a reply
         // carrying a postgres_changes list is checked against the
         // client's own bindings, and one carrying none is read as
         // subscribed.
-        vec![Action::Carry(topic), self.send(Frame::ok(&frame))]
+        let mut actions = vec![Action::Carry(topic.clone()), self.send(Frame::ok(&frame))];
+        if wants_presence {
+            // After the reply and after the topic is being carried, in
+            // that order: the state is a snapshot and the diffs that
+            // follow it are only complete if the socket was already
+            // listening when it was taken.
+            actions.push(Action::State(topic));
+        }
+        actions
     }
 
     fn leave(&mut self, frame: Frame) -> Vec<Action> {
         if self.channels.remove(&frame.topic).is_none() {
             return vec![self.send(Frame::error(&frame, "this socket is not on that topic"))];
         }
+        // Untracking before the drop, because the diff has to go out
+        // while this socket is still on the topic for the others to be
+        // told it left.
         vec![
+            Action::Untrack(frame.topic.clone()),
             Action::Drop(frame.topic.clone()),
             self.send(Frame::ok(&frame)),
         ]
+    }
+
+    /// `track` and `untrack`, which is a client saying it is here and
+    /// then saying it is not.
+    ///
+    /// Both are answered, because the client awaits the reply, and
+    /// both are visible to the whole topic whatever this socket asked
+    /// for in its join: `presence.enabled` decides what comes back to
+    /// this socket, not whether this socket can be seen.
+    fn presence(&mut self, frame: Frame) -> Vec<Action> {
+        let Some(config) = self.channels.get(&frame.topic) else {
+            return vec![self.send(Frame::error(
+                &frame,
+                "this socket has not joined that topic",
+            ))];
+        };
+        let event = frame
+            .payload
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match event.as_str() {
+            "track" => {
+                let payload = frame
+                    .payload
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                if !payload.is_object() {
+                    return vec![self.send(Frame::error(
+                        &frame,
+                        "a presence track carries an object as its payload",
+                    ))];
+                }
+                let track = Action::Track {
+                    topic: frame.topic.clone(),
+                    key: config.presence_key.clone(),
+                    payload,
+                };
+                vec![track, self.send(Frame::ok(&frame))]
+            }
+            "untrack" => vec![
+                Action::Untrack(frame.topic.clone()),
+                self.send(Frame::ok(&frame)),
+            ],
+            other => vec![self.send(Frame::error(
+                &frame,
+                format!("{other} is not a presence event, which is track or untrack"),
+            ))],
+        }
+    }
+
+    /// The topic's presence as this socket should see it, which the
+    /// hub had to be asked for because it is the only thing that knows
+    /// who else is here.
+    pub fn state(&self, topic: &str, state: Value) -> Action {
+        self.send(Frame::push(topic, "presence_state", state))
     }
 
     /// A client whose access token was about to expire has a new one.
@@ -304,6 +411,7 @@ impl Session {
                 for topic in topics {
                     self.channels.remove(&topic);
                     actions.push(self.send(Frame::channel_error(&topic)));
+                    actions.push(Action::Untrack(topic.clone()));
                     actions.push(Action::Drop(topic));
                 }
                 actions
@@ -340,11 +448,26 @@ impl Session {
         actions
     }
 
-    /// A broadcast from the hub, on its way down this socket.
+    /// Something from the hub, on its way down this socket.
     ///
-    /// `mine` is whether this socket is the one that sent it, which is
-    /// the only thing `broadcast.self` decides.
-    pub fn deliver(&self, fan: &Fanout, mine: bool) -> Option<Action> {
+    /// `mine` is whether this socket is the one that caused it, which
+    /// is the only thing `broadcast.self` decides. A presence diff
+    /// ignores it: the socket that tracked applies its own change out
+    /// of the diff like everybody else does.
+    pub fn deliver(&self, sent: &Sent, mine: bool) -> Option<Action> {
+        match sent {
+            Sent::Broadcast(fan) => self.broadcast_down(fan, mine),
+            Sent::Diff { topic, payload } => {
+                // A socket that did not ask for presence is not sent
+                // any: it is still visible to the rest of the topic,
+                // it just has nothing bound that would read this.
+                self.channels.get(topic).filter(|c| c.presence)?;
+                Some(self.send(Frame::push(topic, "presence_diff", payload.clone())))
+            }
+        }
+    }
+
+    fn broadcast_down(&self, fan: &Fanout, mine: bool) -> Option<Action> {
         if mine && !fan.to_self {
             return None;
         }
@@ -462,7 +585,6 @@ mod tests {
                 "postgres changes",
             ),
             (r#"{"config":{"private":true}}"#, "private channels"),
-            (r#"{"config":{"presence":{"enabled":true}}}"#, "presence"),
         ] {
             let mut session = socket();
             let actions = join(&mut session, config);
@@ -498,8 +620,9 @@ mod tests {
         let mut session = socket();
         join(&mut session, r#"{"config":{}}"#);
         let actions = session.text(r#"["1","2","realtime:room","phx_leave",{}]"#, &OneToken);
-        assert_eq!(actions[0], Action::Drop("realtime:room".into()));
-        assert_eq!(text_of(&actions[1]).payload["status"], "ok");
+        assert_eq!(actions[0], Action::Untrack("realtime:room".into()));
+        assert_eq!(actions[1], Action::Drop("realtime:room".into()));
+        assert_eq!(text_of(&actions[2]).payload["status"], "ok");
         assert!(!session.on("realtime:room"));
         // And a second leave has nothing to take off.
         let again = session.text(r#"["1","3","realtime:room","phx_leave",{}]"#, &OneToken);
@@ -529,7 +652,8 @@ mod tests {
         );
         assert_eq!(text_of(&actions[0]).payload["status"], "error");
         assert_eq!(text_of(&actions[1]).event, "phx_error");
-        assert_eq!(actions[2], Action::Drop("realtime:room".into()));
+        assert_eq!(actions[2], Action::Untrack("realtime:room".into()));
+        assert_eq!(actions[3], Action::Drop("realtime:room".into()));
         assert!(!session.on("realtime:room"));
     }
 
@@ -609,11 +733,15 @@ mod tests {
         let Action::Fan(fan) = &actions[0] else {
             panic!("not a fan out")
         };
-        assert!(sender.deliver(fan, true).is_none());
-        assert!(matches!(other.deliver(fan, false), Some(Action::Binary(_))));
+        let sent = Sent::Broadcast(fan.clone());
+        assert!(sender.deliver(&sent, true).is_none());
+        assert!(matches!(
+            other.deliver(&sent, false),
+            Some(Action::Binary(_))
+        ));
         // A socket that left hears nothing more.
         third.text(r#"["1","6","realtime:room","phx_leave",{}]"#, &OneToken);
-        assert!(third.deliver(fan, false).is_none());
+        assert!(third.deliver(&sent, false).is_none());
     }
 
     #[test]
@@ -638,13 +766,155 @@ mod tests {
         let Action::Fan(fan) = &actions[0] else {
             panic!("not a fan out")
         };
-        let Some(Action::Text(text)) = old.deliver(fan, false) else {
+        let Some(Action::Text(text)) = old.deliver(&Sent::Broadcast(fan.clone()), false) else {
             panic!("a 1.0.0 socket takes text")
         };
         let down = Frame::decode(&text).unwrap();
         assert_eq!(down.event, "broadcast");
         assert_eq!(down.payload["event"], "cursor");
         assert_eq!(down.payload["payload"], json!({"x": 1}));
+    }
+
+    #[test]
+    fn a_join_that_wants_presence_asks_for_the_state_and_one_that_does_not_does_not() {
+        let mut session = socket();
+        let actions = join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        assert_eq!(actions[0], Action::Carry("realtime:room".into()));
+        assert_eq!(text_of(&actions[1]).payload["status"], "ok");
+        assert_eq!(actions[2], Action::State("realtime:room".into()));
+
+        let mut quiet = socket();
+        let actions = join(&mut quiet, r#"{"config":{}}"#);
+        assert_eq!(actions.len(), 2);
+    }
+
+    #[test]
+    fn a_track_carries_the_key_the_client_asked_for_and_nothing_when_it_did_not() {
+        let mut named = socket();
+        join(
+            &mut named,
+            r#"{"config":{"presence":{"enabled":true,"key":"u1"}}}"#,
+        );
+        let actions = named.text(
+            r#"["1","5","realtime:room","presence",{"type":"presence","event":"track","payload":{"at":"now"}}]"#,
+            &OneToken,
+        );
+        assert_eq!(
+            actions[0],
+            Action::Track {
+                topic: "realtime:room".into(),
+                key: Some("u1".into()),
+                payload: json!({"at": "now"}),
+            }
+        );
+        assert_eq!(text_of(&actions[1]).payload["status"], "ok");
+
+        // An empty key is what the client sends when nobody set one,
+        // and it means the socket names itself rather than everybody
+        // sharing a key of "".
+        let mut anonymous = socket();
+        join(
+            &mut anonymous,
+            r#"{"config":{"presence":{"enabled":true,"key":""}}}"#,
+        );
+        let actions = anonymous.text(
+            r#"["1","5","realtime:room","presence",{"type":"presence","event":"track","payload":{}}]"#,
+            &OneToken,
+        );
+        assert!(matches!(&actions[0], Action::Track { key: None, .. }));
+    }
+
+    #[test]
+    fn a_socket_can_be_seen_without_asking_to_see() {
+        // presence.enabled is off, which realtime-js sets when the
+        // client has no presence bindings, and track still works: the
+        // flag decides what comes back, not whether this is visible.
+        let mut session = socket();
+        join(&mut session, r#"{"config":{}}"#);
+        let actions = session.text(
+            r#"["1","5","realtime:room","presence",{"type":"presence","event":"track","payload":{"at":"now"}}]"#,
+            &OneToken,
+        );
+        assert!(matches!(&actions[0], Action::Track { .. }));
+        // And the diff that comes of it has nowhere to go on this
+        // socket, since nothing here is bound to presence.
+        let diff = Sent::Diff {
+            topic: "realtime:room".into(),
+            payload: json!({"joins": {}, "leaves": {}}),
+        };
+        assert!(session.deliver(&diff, true).is_none());
+    }
+
+    #[test]
+    fn a_diff_reaches_the_sockets_that_asked_for_presence_including_the_one_that_moved() {
+        let mut session = socket();
+        join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        let diff = Sent::Diff {
+            topic: "realtime:room".into(),
+            payload: json!({"joins": {"u1": {"metas": [{"phx_ref": "3"}]}}, "leaves": {}}),
+        };
+        let Some(Action::Text(text)) = session.deliver(&diff, true) else {
+            panic!("a socket that asked for presence hears its own track back")
+        };
+        let down = Frame::decode(&text).unwrap();
+        assert_eq!(down.event, "presence_diff");
+        assert_eq!(down.topic, "realtime:room");
+        assert_eq!(down.payload["joins"]["u1"]["metas"][0]["phx_ref"], "3");
+        // And a topic this socket is not on is not delivered at all.
+        let elsewhere = Sent::Diff {
+            topic: "realtime:lobby".into(),
+            payload: json!({}),
+        };
+        assert!(session.deliver(&elsewhere, false).is_none());
+    }
+
+    #[test]
+    fn a_presence_push_that_makes_no_sense_is_answered_rather_than_dropped() {
+        let mut session = socket();
+        // A topic this socket never joined.
+        let actions = session.text(
+            r#"["1","5","realtime:room","presence",{"type":"presence","event":"track","payload":{}}]"#,
+            &OneToken,
+        );
+        assert_eq!(text_of(&actions[0]).payload["status"], "error");
+
+        join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        for (push, said) in [
+            (
+                r#"{"type":"presence","event":"wave"}"#,
+                "is not a presence event",
+            ),
+            (
+                r#"{"type":"presence","event":"track","payload":"here"}"#,
+                "carries an object",
+            ),
+        ] {
+            let actions = session.text(
+                &format!(r#"["1","6","realtime:room","presence",{push}]"#),
+                &OneToken,
+            );
+            let reply = text_of(&actions[0]);
+            assert_eq!(reply.payload["status"], "error", "{push}");
+            assert!(
+                reply.payload["response"]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains(said),
+                "{push}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_untrack_is_answered_and_asks_for_the_removal() {
+        let mut session = socket();
+        join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        let actions = session.text(
+            r#"["1","7","realtime:room","presence",{"type":"presence","event":"untrack"}]"#,
+            &OneToken,
+        );
+        assert_eq!(actions[0], Action::Untrack("realtime:room".into()));
+        assert_eq!(text_of(&actions[1]).payload["status"], "ok");
     }
 
     #[test]

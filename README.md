@@ -75,11 +75,14 @@ Realtime is on the same url and the same key:
 ```js
 const room = supabase.channel('room')
 room.on('broadcast', { event: 'cursor' }, ({ payload }) => draw(payload))
-room.subscribe()
+room.on('presence', { event: 'sync' }, () => render(room.presenceState()))
+room.subscribe(async (status) => {
+  if (status === 'SUBSCRIBED') await room.track({ typing: false })
+})
 ```
 
-The socket, the channels on it, tokens refreshed mid connection and broadcast between the members of a topic are served today, against the real realtime-js.
-Presence, `postgres_changes` and private channels are not, and a join asking for one of them is refused by name rather than joined and left silent, see [docs/realtime.md](docs/realtime.md).
+The socket, the channels on it, tokens refreshed mid connection, broadcast between the members of a topic and presence on it are served today, against the real realtime-js.
+`postgres_changes` and private channels are not, and a join asking for one of them is refused by name rather than joined and left silent, see [docs/realtime.md](docs/realtime.md).
 
 Branch a database for a preview deploy:
 

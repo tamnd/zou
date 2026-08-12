@@ -196,6 +196,146 @@ async fn a_socket_on_the_old_version_is_sent_the_shape_it_reads() {
     assert_eq!(heard["payload"]["payload"], serde_json::json!({"x": 1}));
 }
 
+/// Join with presence on under `key`, then read the reply and the
+/// state that follows it, which is what `channel.subscribe()` does for
+/// a channel with a presence binding on it.
+async fn join_present(socket: &mut Socket, topic: &str, key: &str) -> serde_json::Value {
+    send(
+        socket,
+        &format!(
+            r#"["1","1","{topic}","phx_join",{{"config":{{"presence":{{"enabled":true,"key":"{key}"}}}}}}]"#
+        ),
+    )
+    .await;
+    let reply = next_json(socket).await;
+    assert_eq!(reply[4]["status"], "ok", "{reply}");
+    let state = next_json(socket).await;
+    assert_eq!(state[3], "presence_state", "{state}");
+    state[4].clone()
+}
+
+async fn track(socket: &mut Socket, topic: &str, payload: &str) {
+    send(
+        socket,
+        &format!(
+            r#"["1","5","{topic}","presence",{{"type":"presence","event":"track","payload":{payload}}}]"#
+        ),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn presence_says_who_is_here_now_and_who_arrives_after() {
+    let at = serving().await;
+    let mut first = connect(at, "2.0.0").await;
+    assert_eq!(
+        join_present(&mut first, "realtime:room", "u1").await,
+        serde_json::json!({}),
+        "the first socket on a topic is alone on it"
+    );
+
+    track(&mut first, "realtime:room", r#"{"typing":false}"#).await;
+    // Its own track comes back twice: the reply it awaited, and then
+    // the diff everyone on the topic gets, this socket included.
+    assert_eq!(next_json(&mut first).await[4]["status"], "ok");
+    let mine = next_json(&mut first).await;
+    assert_eq!(mine[3], "presence_diff");
+    assert_eq!(mine[4]["joins"]["u1"]["metas"][0]["typing"], false);
+    assert!(
+        mine[4]["joins"]["u1"]["metas"][0]["phx_ref"].is_string(),
+        "a meta the client can tell from another"
+    );
+
+    // A socket that arrives later is told who is already here rather
+    // than left to wait for the next thing to change.
+    let mut second = connect(at, "2.0.0").await;
+    let state = join_present(&mut second, "realtime:room", "u2").await;
+    assert_eq!(state["u1"]["metas"][0]["typing"], false);
+
+    track(&mut second, "realtime:room", r#"{"typing":true}"#).await;
+    let seen = next_json(&mut first).await;
+    assert_eq!(seen[3], "presence_diff");
+    assert_eq!(seen[4]["joins"]["u2"]["metas"][0]["typing"], true);
+    assert_eq!(seen[4]["leaves"], serde_json::json!({}));
+
+    // And a socket that goes takes its presence with it, which is the
+    // case a client cannot announce for itself.
+    drop(second);
+    let left = next_json(&mut first).await;
+    assert_eq!(left[3], "presence_diff");
+    assert_eq!(left[4]["leaves"]["u2"]["metas"][0]["typing"], true);
+    assert_eq!(left[4]["joins"], serde_json::json!({}));
+}
+
+#[tokio::test]
+async fn a_socket_that_asked_for_no_presence_is_still_seen_by_the_ones_that_did() {
+    let at = serving().await;
+    let mut watching = connect(at, "2.0.0").await;
+    join_present(&mut watching, "realtime:room", "u1").await;
+
+    let mut quiet = connect(at, "2.0.0").await;
+    join(&mut quiet, "realtime:room").await;
+    track(&mut quiet, "realtime:room", r#"{"at":"the back"}"#).await;
+    // The reply, and nothing else: this socket has no presence
+    // bindings, so upstream sends it no presence and neither does this.
+    assert_eq!(next_json(&mut quiet).await[4]["status"], "ok");
+
+    let seen = next_json(&mut watching).await;
+    assert_eq!(seen[3], "presence_diff");
+    let joins = seen[4]["joins"].as_object().expect("an object of keys");
+    let (key, entry) = joins.iter().next().expect("somebody joined");
+    assert_eq!(entry["metas"][0]["at"], "the back");
+    assert!(
+        key.parse::<u64>().is_ok(),
+        "a socket that named no key is known by its own name, got {key}"
+    );
+
+    // A broadcast still reaches it, which is the point of the flag
+    // being about presence and not about the channel.
+    send(
+        &mut watching,
+        r#"["1","6","realtime:room","broadcast",{"type":"broadcast","event":"cursor","payload":{"x":1}}]"#,
+    )
+    .await;
+    assert!(matches!(next(&mut quiet).await, Message::Binary(_)));
+}
+
+#[tokio::test]
+async fn an_untrack_and_a_leave_both_take_a_socket_off_the_topic() {
+    let at = serving().await;
+    let mut watching = connect(at, "2.0.0").await;
+    join_present(&mut watching, "realtime:room", "u1").await;
+    let mut coming_and_going = connect(at, "2.0.0").await;
+    join_present(&mut coming_and_going, "realtime:room", "u2").await;
+
+    track(&mut coming_and_going, "realtime:room", r#"{"round":1}"#).await;
+    assert_eq!(next_json(&mut watching).await[3], "presence_diff");
+
+    send(
+        &mut coming_and_going,
+        r#"["1","7","realtime:room","presence",{"type":"presence","event":"untrack"}]"#,
+    )
+    .await;
+    let gone = next_json(&mut watching).await;
+    assert_eq!(gone[4]["leaves"]["u2"]["metas"][0]["round"], 1);
+
+    // Tracking again and then leaving the channel outright, which is a
+    // different path off the topic and has to say the same thing.
+    track(&mut coming_and_going, "realtime:room", r#"{"round":2}"#).await;
+    assert_eq!(
+        next_json(&mut watching).await[4]["joins"]["u2"]["metas"][0]["round"],
+        2
+    );
+    send(
+        &mut coming_and_going,
+        r#"["1","8","realtime:room","phx_leave",{}]"#,
+    )
+    .await;
+    let left = next_json(&mut watching).await;
+    assert_eq!(left[3], "presence_diff");
+    assert_eq!(left[4]["leaves"]["u2"]["metas"][0]["round"], 2);
+}
+
 #[tokio::test]
 async fn a_channel_that_asks_for_postgres_changes_is_told_they_are_not_built() {
     let at = serving().await;

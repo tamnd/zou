@@ -144,14 +144,21 @@ async fn run(mut socket: WebSocket, mut session: Session, hub: &Hub, tokens: &dy
                 break;
             }
         };
-        if !act(&mut socket, actions, hub, me, &mut carrying).await {
+        if !act(&mut socket, actions, &session, hub, me, &mut carrying).await {
             break;
         }
     }
-    for topic in carrying.keys() {
-        // Dropping the receivers is what actually takes this socket
-        // off the topics; this is the bookkeeping that lets the hub
-        // forget a topic nobody is on any more.
+    let topics: Vec<String> = carrying.keys().cloned().collect();
+    // The presence goes before the receivers do, so the diff saying
+    // this socket left is fanned while the topic is still up.
+    for topic in &topics {
+        hub.untrack(me, topic);
+    }
+    // Dropping the receivers is what actually takes this socket off
+    // the topics; releasing after that is the bookkeeping that lets
+    // the hub forget a topic nobody is on any more.
+    drop(carrying);
+    for topic in &topics {
         hub.released(topic);
     }
 }
@@ -212,6 +219,7 @@ async fn first_of(
 async fn act(
     socket: &mut WebSocket,
     actions: Vec<Action>,
+    session: &Session,
     hub: &Hub,
     me: SocketId,
     carrying: &mut HashMap<String, tokio::sync::broadcast::Receiver<Delivery>>,
@@ -236,6 +244,20 @@ async fn act(
                 hub.released(&topic);
             }
             Action::Fan(fan) => hub.fan(me, fan),
+            Action::Track {
+                topic,
+                key,
+                payload,
+            } => hub.track(me, &topic, key, payload),
+            Action::Untrack(topic) => hub.untrack(me, &topic),
+            Action::State(topic) => {
+                let state = session.state(&topic, hub.state(&topic));
+                if let Action::Text(text) = state
+                    && socket.send(Message::Text(text.into())).await.is_err()
+                {
+                    return false;
+                }
+            }
         }
     }
     true
