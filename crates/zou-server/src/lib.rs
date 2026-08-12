@@ -53,6 +53,7 @@ pub mod password;
 pub mod payload;
 pub mod pgoutput;
 pub mod policy;
+pub mod reader;
 pub mod realtime;
 pub mod render;
 pub mod rest;
