@@ -79,6 +79,22 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The cdc suite needs logical decoding, and a service container
+      # takes no arguments, so the setting goes in and the container
+      # comes back. Without this that suite skips itself and the tap is
+      # covered by nothing.
+      - name: Turn logical decoding on
+        env:
+          PGPASSWORD: zou-pool-tests
+        run: |
+          set -e
+          psql -h 127.0.0.1 -U postgres -c "alter system set wal_level = logical"
+          docker restart "$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -1)"
+          for _ in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -U postgres && break
+            sleep 2
+          done
+          test "$(psql -h 127.0.0.1 -U postgres -tAc 'show wal_level')" = logical
       - name: Run the pool leak, rls contract, rls attack, and auth tests
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres

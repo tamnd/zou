@@ -240,6 +240,41 @@ A project with the events budget off reports none of this, because a header sayi
 
 Presence has two limits of its own upstream, on presence events a second and on how often one client may track, and neither is built here yet.
 
+## What the database has to be for postgres changes
+
+Nothing is delivered to a socket yet, so this section is about the half that exists rather than a feature you can use.
+What is built is the tap: a connection that reads what postgres says changed and decodes it.
+A join asking for `postgres_changes` is still refused by name.
+
+Two things have to be true of a database before any of that reads anything, and both are true of one this server started.
+
+`wal_level` must be `logical`.
+It is a postmaster setting and a restart, so `zou dev` and `zou serve` start postgres with it rather than turning it on when somebody first subscribes.
+A database you brought yourself is whatever you set it to, and a tap against one below logical says so rather than reporting that nothing changed.
+
+The table has to be in the `supabase_realtime` publication, which the bootstrap contract creates empty:
+
+```sql
+alter publication supabase_realtime add table todos;
+```
+
+That is the same line a Supabase project runs, and it is what makes changes opt in.
+A publication with nothing in it publishes nothing, and a table nobody added is not read, decoded, or sent.
+
+An update tells you what the row became.
+Whether it also tells you what the row was depends on the table, and by default it does not:
+
+```sql
+alter table todos replica identity full;
+```
+
+Without that, postgres publishes the primary key of a changed row and not the rest of it, which is why `old_record` on a Supabase project is usually a key and a disappointment.
+The cost of `full` is write ahead log volume on every update and delete, which is why it is not the default anywhere.
+
+The slot a tap holds is temporary.
+It lives exactly as long as the connection holding it, so a server nobody is subscribed to retains no write ahead log and leaves nothing behind to clean up, and a tap sees what happened after it opened rather than a replay of what it missed.
+That is upstream's trade too.
+
 ## What is not built
 
 | asked for | what happens |

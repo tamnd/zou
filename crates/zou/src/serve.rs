@@ -611,6 +611,9 @@ impl Backend for Postmasters {
             .arg("-k")
             .arg(&sock)
             .args(["-c", "listen_addresses=127.0.0.1"])
+            // What postgres changes reads. See the same line in
+            // zou-embed for why it is on from the first boot.
+            .args(["-c", "wal_level=logical"])
             .args(["-c", &format!("shared_buffers={}", self.shared_buffers)])
             .args(["-c", &format!("max_connections={MAX_CONNECTIONS}")])
             .env("ZOU_TARGET", &self.target)
