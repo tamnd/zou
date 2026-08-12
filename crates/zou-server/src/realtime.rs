@@ -23,8 +23,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use zou_realtime::{
-    About, Action, Ask, BinaryBroadcast, Delivery, Encoding, Fanout, Grant, Hub, Identity, Session,
-    SocketId, Tokens, Vsn,
+    About, Action, Ask, BinaryBroadcast, Budget, Counters, Delivery, Encoding, Fanout, Grant, Hub,
+    Identity, Limits, Meter, Session, SocketId, Sockets, Tokens, Vsn,
 };
 
 use crate::{App, AuthContext, json_body, policy};
@@ -53,6 +53,197 @@ impl Tokens for ProjectTokens {
             // what a client shows when a channel refuses its token.
             Err(_) => Err("invalid claim: token is expired or malformed".into()),
         }
+    }
+}
+
+/// What this project is allowed and what it has spent.
+///
+/// One of these per server, which is one per project: upstream keeps
+/// the same numbers on the tenant row and counts the same three things
+/// across every node the tenant is on. The two a socket can answer for
+/// itself, how many channels it holds and how big a message is, are
+/// not here, because a session answers those without asking anybody.
+pub struct Quota {
+    pub limits: Limits,
+    /// How many sockets are connected right now.
+    pub sockets: Sockets,
+    /// Channel joins, as a rate.
+    joins: Meter,
+    /// Messages sent and messages delivered, as a rate.
+    events: Meter,
+}
+
+impl Quota {
+    pub fn new(limits: Limits) -> Quota {
+        Quota {
+            limits,
+            sockets: Sockets::default(),
+            joins: Meter::new(),
+            events: Meter::new(),
+        }
+    }
+
+    /// One message went out to `reached` sockets, which costs the
+    /// project the send and every delivery of it.
+    pub fn sent(&self, reached: usize) {
+        self.events.count(1 + reached as u64);
+    }
+
+    /// The messages a second this project is moving, which is what the
+    /// http broadcast endpoints report in their headers.
+    pub fn events_per_second(&self) -> f64 {
+        self.events.per_second()
+    }
+
+    /// Whether another socket would be one too many.
+    fn full(&self) -> bool {
+        self.sockets.full(self.limits.concurrent_users)
+    }
+
+    /// Whether the project is joining channels faster than it may,
+    /// which is asked at the handshake as well as at each join because
+    /// upstream asks it in both places.
+    fn joining_too_fast(&self) -> bool {
+        self.joins.over(self.limits.joins_per_second)
+    }
+}
+
+impl Counters for Quota {
+    fn join(&self) -> bool {
+        if self.joining_too_fast() {
+            return false;
+        }
+        self.joins.count(1);
+        true
+    }
+
+    fn over_events(&self) -> bool {
+        self.events.over(self.limits.events_per_second)
+    }
+}
+
+/// What the environment says the realtime tier is allowed.
+///
+/// The names are upstream's `TENANT_MAX_*` with this server's prefix
+/// on them, since upstream reads those into the tenant it makes and
+/// this has the one project rather than a table of them. Anything left
+/// unset keeps upstream's number, and a zero turns that one off.
+pub fn limits_from_env() -> Result<Limits, String> {
+    limits_configured(&|name| std::env::var(name).unwrap_or_default())
+}
+
+pub fn limits_configured(var: &dyn Fn(&str) -> String) -> Result<Limits, String> {
+    let fallback = Limits::default();
+    Ok(Limits {
+        concurrent_users: count(
+            var,
+            "ZOU_REALTIME_MAX_CONCURRENT_USERS",
+            fallback.concurrent_users,
+        )?,
+        joins_per_second: count(
+            var,
+            "ZOU_REALTIME_MAX_JOINS_PER_SECOND",
+            fallback.joins_per_second,
+        )?,
+        channels_per_client: count(
+            var,
+            "ZOU_REALTIME_MAX_CHANNELS_PER_CLIENT",
+            fallback.channels_per_client,
+        )?,
+        events_per_second: count(
+            var,
+            "ZOU_REALTIME_MAX_EVENTS_PER_SECOND",
+            fallback.events_per_second,
+        )?,
+        payload_size_kb: count(
+            var,
+            "ZOU_REALTIME_MAX_PAYLOAD_SIZE_IN_KB",
+            fallback.payload_size_kb,
+        )?,
+    })
+}
+
+fn count(var: &dyn Fn(&str) -> String, name: &str, fallback: u64) -> Result<u64, String> {
+    let text = var(name);
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(fallback);
+    }
+    match text.parse::<u64>() {
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("{name} is {text:?}, which is not a whole number")),
+    }
+}
+
+/// What the http broadcast endpoints say about the budget.
+///
+/// Upstream runs a plug in front of both of them that puts three
+/// headers on every answer and refuses the request outright when the
+/// project is already over its events budget. The headers are the
+/// interesting half: a caller posting broadcasts on a loop can read
+/// how much room is left without waiting to be refused.
+struct Rate {
+    /// The rolling average, whole messages a second, which is what
+    /// upstream reports after truncating it.
+    rolling: u64,
+    /// What the project is allowed. Zero is no limit, and then none of
+    /// this is reported, because a header saying zero remaining of
+    /// zero would read as refused.
+    limit: u64,
+}
+
+impl Rate {
+    fn of(app: &App) -> Rate {
+        Rate {
+            rolling: app.quota.events_per_second() as u64,
+            limit: app.quota.limits.events_per_second,
+        }
+    }
+
+    /// At the limit is over it, the same comparison the sockets make.
+    fn over(&self) -> bool {
+        self.limit > 0 && self.rolling >= self.limit
+    }
+
+    /// Upstream's three headers, on whatever this answer turned out to
+    /// be. Remaining goes negative when a project is over, which is
+    /// upstream's arithmetic and reads as how far over it is.
+    fn onto(&self, mut answer: Response) -> Response {
+        if self.limit == 0 {
+            return answer;
+        }
+        let remaining = self.limit as i64 - self.rolling as i64;
+        let headers = answer.headers_mut();
+        for (name, value) in [
+            ("x-rate-rolling", self.rolling.to_string()),
+            ("x-rate-limit", self.limit.to_string()),
+            ("x-rate-limit-remaining", remaining.to_string()),
+        ] {
+            if let Ok(value) = header::HeaderValue::from_str(&value) {
+                headers.insert(name, value);
+            }
+        }
+        answer
+    }
+
+    /// The refusal, when there is one to make.
+    fn refused(&self) -> Option<Response> {
+        self.over().then(|| {
+            self.onto(json_body(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"message": "Too many requests"}),
+            ))
+        })
+    }
+}
+
+/// One socket's place in the count, given back whatever the connection
+/// did on its way out.
+struct Connected(Arc<Quota>);
+
+impl Drop for Connected {
+    fn drop(&mut self) {
+        self.0.sockets.left();
     }
 }
 
@@ -88,6 +279,22 @@ pub async fn websocket(
             }),
         );
     };
+    // The two budgets that are spent before there is a socket to say
+    // anything down. Upstream refuses both of these at the handshake
+    // with a 429 and a sentence, which is what a client shows rather
+    // than a connection that closes for no stated reason.
+    if app.quota.full() {
+        return json_body(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "Too many connected users"}),
+        );
+    }
+    if app.quota.joining_too_fast() {
+        return json_body(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error": "Too many joins per second"}),
+        );
+    }
     let identity = Identity {
         role: auth.role.clone(),
         claims: (*auth.claims).clone(),
@@ -104,7 +311,23 @@ pub async fn websocket(
             app: Arc::clone(&app),
             anon_role,
         };
-        run(socket, Session::new(vsn, identity), &app, &tokens).await;
+        // Counted from here to whenever this connection ends, however
+        // it ends: the guard gives the place back on the way out of
+        // this task, so a socket that panicked is not one the project
+        // is still paying for.
+        app.quota.sockets.joined();
+        let _connected = Connected(Arc::clone(&app.quota));
+        let budget = Budget {
+            limits: app.quota.limits,
+            counters: Arc::clone(&app.quota) as Arc<dyn Counters>,
+        };
+        run(
+            socket,
+            Session::budgeted(vsn, identity, budget),
+            &app,
+            &tokens,
+        )
+        .await;
     })
 }
 
@@ -143,10 +366,7 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
             Heard::Client(Some(Ok(_))) => Vec::new(),
             Heard::Fanned(delivery) => {
                 let (from, fan) = &*delivery;
-                match session.deliver(fan, *from == me) {
-                    Some(action) => vec![action],
-                    None => Vec::new(),
-                }
+                session.deliver(fan, *from == me)
             }
             // A socket so far behind that the hub gave up holding its
             // backlog. Carrying on would be a client missing messages
@@ -257,7 +477,10 @@ async fn act(
                 carrying.remove(&topic);
                 hub.released(&topic);
             }
-            Action::Fan(fan) => hub.fan(me, fan),
+            // What the message cost the project is what it reached,
+            // which is only known here: the hub is the one thing that
+            // knows how many sockets were on the topic.
+            Action::Fan(fan) => app.quota.sent(hub.fan(me, fan)),
             Action::Track {
                 topic,
                 key,
@@ -282,6 +505,16 @@ async fn act(
                 if !Box::pin(act(socket, next, session, app, me, carrying)).await {
                     return false;
                 }
+            }
+            // Whatever was in front of this has been sent, which is
+            // the point of it being an action rather than a return:
+            // the client is told why before the socket goes. The close
+            // frame goes first so the client sees a socket that was
+            // hung up on rather than one that broke, which are two
+            // different things to its reconnect.
+            Action::Close => {
+                let _ = socket.send(Message::Close(None)).await;
+                return false;
             }
         }
     }
@@ -323,6 +556,19 @@ pub async fn broadcast(
     axum::Extension(auth): axum::Extension<AuthContext>,
     body: Bytes,
 ) -> Response {
+    // The budget is read once, before the batch is looked at, so the
+    // numbers reported are what this caller was measured against
+    // rather than what its own messages just moved them to. Upstream
+    // reads it in a plug for the same reason, which is also why the
+    // headers are on the answer whatever the answer turned out to be.
+    let rate = Rate::of(&app);
+    match rate.refused() {
+        Some(refused) => refused,
+        None => rate.onto(broadcasting(app, auth, body).await),
+    }
+}
+
+async fn broadcasting(app: Arc<App>, auth: AuthContext, body: Bytes) -> Response {
     let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&body) else {
         return unprocessable(json!({"messages": ["is invalid"]}));
     };
@@ -367,7 +613,7 @@ pub async fn broadcast(
                 continue;
             }
         }
-        fan(&app.hub, topic, event, private, json_payload(&payload));
+        fan(&app, topic, event, private, json_payload(&payload));
     }
     accepted()
 }
@@ -383,6 +629,22 @@ pub async fn broadcast_one(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     axum::Extension(auth): axum::Extension<AuthContext>,
     Path((topic, event)): Path<(String, String)>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let rate = Rate::of(&app);
+    match rate.refused() {
+        Some(refused) => refused,
+        None => rate.onto(broadcasting_one(app, auth, topic, event, uri, headers, body).await),
+    }
+}
+
+async fn broadcasting_one(
+    app: Arc<App>,
+    auth: AuthContext,
+    topic: String,
+    event: String,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
@@ -421,7 +683,7 @@ pub async fn broadcast_one(
             );
         }
     };
-    fan(&app.hub, &topic, &event, private, payload);
+    fan(&app, &topic, &event, private, payload);
     accepted()
 }
 
@@ -443,13 +705,14 @@ fn json_payload(payload: &Value) -> (Encoding, Vec<u8>) {
 /// the private channel, and one sent without it reaches the public
 /// channel, which is the whole point of there being two.
 fn fan(
-    hub: &Hub,
+    app: &App,
     topic: &str,
     event: &str,
     private: bool,
     (encoding, payload): (Encoding, Vec<u8>),
 ) {
-    hub.fan(
+    let hub: &Hub = &app.hub;
+    let reached = hub.fan(
         hub.socket(),
         Fanout {
             topic: zou_realtime::room(&format!("realtime:{topic}"), private),
@@ -465,6 +728,10 @@ fn fan(
             to_self: false,
         },
     );
+    // A message that came in over http costs the project what one
+    // over a socket costs, which is why this is counted in the same
+    // place rather than only on the socket path.
+    app.quota.sent(reached);
 }
 
 /// What is wrong with one message in a batch, in the shape upstream
@@ -598,13 +865,7 @@ async fn deliver_once(app: &App) -> Result<(), crate::sql::Error> {
         };
         let Some(note) = note else { return Ok(()) };
         match sent_message(&client, &note).await {
-            Ok(Some(sent)) => fan(
-                &app.hub,
-                &sent.topic,
-                &sent.event,
-                sent.private,
-                sent.payload,
-            ),
+            Ok(Some(sent)) => fan(app, &sent.topic, &sent.event, sent.private, sent.payload),
             Ok(None) => {}
             Err(e) => log::warn!("realtime: a database send was not delivered: {e}"),
         }

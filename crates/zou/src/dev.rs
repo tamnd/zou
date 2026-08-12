@@ -350,6 +350,7 @@ fn start_http(
             "per endpoint rate limits are off, set ZOU_RATE_LIMIT_HEADER or ZOU_RATE_LIMIT_PEER"
         );
     }
+    let realtime = zou_server::realtime::limits_from_env()?;
     let mfa = zou_server::mfa::from_env()?;
     if !mfa.totp_enroll || !mfa.totp_verify {
         log::info!("authenticator factors are off, /auth/v1/factors refuses by name");
@@ -464,6 +465,13 @@ fn start_http(
             // the mail and the text messages of the whole project
             // whether or not it is.
             limit,
+            // What the sockets are allowed, realtime's own numbers: two
+            // hundred at once, a hundred joins a second, a hundred
+            // channels each, a hundred messages a second, three
+            // megabytes a message. The five ZOU_REALTIME_MAX_ envs move
+            // them, and a zero turns one off, which is what a laptop
+            // running a load test of its own wants.
+            realtime,
             // Everything else is GoTrue's default, including the
             // unlimited edge rate the dev loop wants.
             ..Default::default()

@@ -209,11 +209,43 @@ And `realtime.messages` is created unpartitioned rather than partitioned by day 
 A server running without a database refuses a private channel by saying that, rather than by saying 403.
 403 is an answer about a project's policies, and sending somebody to read policies that were never consulted is worse than telling them what is actually missing.
 
+## What a project is allowed
+
+A project has a budget, the same five numbers upstream keeps on the tenant row, and the defaults are upstream's too.
+
+| what | default | environment | what a client sees over it |
+| --- | --- | --- | --- |
+| sockets at once | 200 | `ZOU_REALTIME_MAX_CONCURRENT_USERS` | 429 at the handshake, `{"error":"Too many connected users"}` |
+| joins a second | 100 | `ZOU_REALTIME_MAX_JOINS_PER_SECOND` | `ClientJoinRateLimitReached: Too many joins per second` on the join, then the socket is closed |
+| channels per socket | 100 | `ZOU_REALTIME_MAX_CHANNELS_PER_CLIENT` | `ChannelRateLimitReached: Too many channels` on the join |
+| messages a second | 100 | `ZOU_REALTIME_MAX_EVENTS_PER_SECOND` | the channel is sent `Too many messages per second` on its system event and closed |
+| bytes in a message | 3000 kb | `ZOU_REALTIME_MAX_PAYLOAD_SIZE_IN_KB` | `payload_size_exceeded` when the channel asked for acks, and nothing when it did not |
+
+Set any of them to `0` and that one is off, which is what a server running its own project usually wants and is not something upstream's tenant row can say.
+
+The three rates are averages and not ceilings on a moment.
+What is counted goes into a bucket per five seconds, twelve of them are kept, and the number compared with the limit is the average per second across that minute, so a burst is forgiven and a sustained rate is not.
+A message costs the send and every delivery of it, so one broadcast to a hundred sockets is a hundred and one messages, which is the arithmetic that makes a hundred a second a real number rather than a generous one.
+
+The http broadcast endpoints report the same budget on every answer.
+
+```
+x-rate-rolling: 12
+x-rate-limit: 100
+x-rate-limit-remaining: 88
+```
+
+A post that arrives when the project is already over its budget is 429 with `{"message":"Too many requests"}` and the same three headers, so a caller posting on a loop can read how much room is left without waiting to be refused.
+A project with the events budget off reports none of this, because a header saying zero of zero left reads as refused.
+
+Presence has two limits of its own upstream, on presence events a second and on how often one client may track, and neither is built here yet.
+
 ## What is not built
 
 | asked for | what happens |
 | --- | --- |
 | `postgres_changes` in a join | the join is refused, naming what is missing |
+| presence rate limits | presence is not counted separately from the rest |
 
 That is M4, tracked in [tamnd/zou#4](https://github.com/tamnd/zou/issues/4).
 

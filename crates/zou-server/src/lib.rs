@@ -216,6 +216,12 @@ pub struct Config {
     /// copied through this process, which is what upstream does and
     /// what the conformance suites measure.
     pub passthrough: Option<object::Passthrough>,
+    /// What the realtime tier is allowed: sockets, joins a second,
+    /// channels per socket, messages a second, and how big one may be.
+    /// Realtime's `TENANT_MAX_*`, whose defaults are the ones a hosted
+    /// project is made with. A zero on any of them is that one off,
+    /// which is what a server running its own project usually wants.
+    pub realtime: zou_realtime::Limits,
 }
 
 impl Default for Config {
@@ -253,6 +259,7 @@ impl Default for Config {
             tenant: None,
             s3: None,
             passthrough: None,
+            realtime: zou_realtime::Limits::default(),
         }
     }
 }
@@ -306,6 +313,11 @@ pub struct App {
     /// what makes two browser tabs on the same channel hear each
     /// other.
     pub hub: zou_realtime::Hub,
+    /// What the sockets have spent of the realtime budget: how many
+    /// are connected, how fast they are joining, how many messages a
+    /// second are moving. One per server, like the hub, because the
+    /// budget is the project's and not a connection's.
+    pub quota: Arc<realtime::Quota>,
 }
 
 impl App {
@@ -387,6 +399,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         }
         None => None,
     };
+    let quota = Arc::new(realtime::Quota::new(cfg.realtime));
     Ok(Arc::new(App {
         cfg,
         pool,
@@ -403,6 +416,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         sending: tokio::sync::OnceCell::new(),
         blobs,
         hub: zou_realtime::Hub::new(),
+        quota,
     }))
 }
 
