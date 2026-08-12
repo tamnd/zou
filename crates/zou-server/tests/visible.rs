@@ -190,6 +190,49 @@ async fn a_policy_decides_who_is_told_about_a_row() {
 }
 
 #[tokio::test]
+async fn an_update_is_checked_against_the_row_it_became() {
+    let Some(dsn) = dsn() else { return };
+    let client = connect(&dsn).await;
+    published(
+        &client,
+        "vis_moved",
+        "create table vis_moved (id int primary key, owner uuid, details text);
+         grant select on vis_moved to anon, authenticated;
+         alter table vis_moved enable row level security;
+         create policy mine on vis_moved for select using (owner = auth.uid());",
+    )
+    .await;
+    let Some(mut tap) = tapping(&dsn).await else {
+        return;
+    };
+    let pool = Pool::new(&dsn, 4).expect("a pool");
+
+    client
+        .batch_execute(&format!(
+            "insert into vis_moved values (1, '{ANA}', 'hers');
+             update vis_moved set owner = '{BEN}' where id = 1"
+        ))
+        .await
+        .expect("a row that changed hands");
+    let changes = of(&until(&mut tap, &[("vis_moved", 2)]).await, "vis_moved");
+    assert_eq!(changes.len(), 2, "an insert and an update");
+
+    let hers = seen(&pool, &user(ANA), &changes[1])
+        .await
+        .expect("an answer");
+    assert!(
+        !hers.row,
+        "the check is a select of the row as it is now, so an update that moves a row out of a \
+         policy's view is not told to the person it moved away from, which is upstream's \
+         behaviour and worth knowing rather than worth relying on"
+    );
+    let his = seen(&pool, &user(BEN), &changes[1])
+        .await
+        .expect("an answer");
+    assert!(his.row, "and it is told to the person it moved to");
+}
+
+#[tokio::test]
 async fn a_table_with_no_policies_is_seen_by_anybody_the_grant_lets_read_it() {
     let Some(dsn) = dsn() else { return };
     let client = connect(&dsn).await;

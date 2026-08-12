@@ -126,7 +126,7 @@ async fn looking(sess: &Session, asker: &Asker, change: &Change) -> Result<Seen,
         return Ok(seen);
     }
 
-    seen.row = allowed(sess, asker, relation, &keys, &change.record).await?;
+    seen.row = allowed(sess, asker, relation, &keys, change).await?;
     Ok(seen)
 }
 
@@ -186,7 +186,7 @@ async fn allowed(
     asker: &Asker,
     relation: &Relation,
     keys: &[usize],
-    record: &[Cell],
+    change: &Change,
 ) -> Result<bool, String> {
     // The type each key is compared as, which has to come from the
     // catalog: a value arrives as text and comparing it as text would
@@ -208,12 +208,18 @@ async fn allowed(
             nth + 1,
             types[nth]
         ));
-        values.push(match record.get(*at) {
+        // A key postgres left out is a key nothing wrote, so the row
+        // still has whatever it had, and the old tuple has it at the
+        // same place. A key nothing at all has is null, and a
+        // comparison against null is null, which is the no that
+        // upstream's generated statement gives as well.
+        let cell = match change.record.get(*at) {
+            Some(Cell::Unchanged) | None => change.old.as_ref().and_then(|old| old.get(*at)),
+            cell => cell,
+        };
+        values.push(match cell {
             Some(Cell::Text(text)) => Some(text.clone()),
             Some(Cell::Bytes(bytes)) => Some(format!("\\x{}", hex(bytes))),
-            // A null or an unchanged key cannot identify a row, and a
-            // comparison against null is null, which is what upstream's
-            // generated statement does too.
             _ => None,
         });
     }
