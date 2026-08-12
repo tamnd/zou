@@ -4,7 +4,7 @@
 //! postmaster start so the socket exists before crash recovery reads
 //! its first page. It cannot lean on the pusher's tee for that reason,
 //! the pusher only starts once recovery finishes; instead it polls the
-//! durable WAL stream out of the store through [`catch_up`], which
+//! durable WAL stream out of the store through [`catch_up_with`], which
 //! reads the same bytes the tee would have carried, just a poll
 //! interval later.
 //!
@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
-use zou_log::{TeeFilter, WalMedia, catch_up, stream_end};
+use zou_log::{ConsolidateError, TeeFilter, WalMedia, catch_up_with, stream_end};
 use zou_store::CasStore;
 use zou_store::layermap::LayerMap;
 use zou_store::layout::TenantLayout;
@@ -41,7 +41,7 @@ use zou_store::shardmanifest::PageShardManifest;
 
 use crate::WAL_SHARD;
 use crate::getpage::{MAX_GETPAGE_BATCH, PageService};
-use crate::ingest::ShardIngest;
+use crate::ingest::{IngestConfig, ShardIngest};
 use crate::pagesvc::ingest_config;
 use crate::redo::{RedoPool, RedoPoolConfig};
 use crate::walscan::BlockRef;
@@ -388,6 +388,7 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     let pool = cfg.redo.take().map(RedoPool::new);
     let empty_mem = Memtable::new();
 
+    let ingest_cfg = ingest_config(cfg.tenant);
     let mut ingest: Option<ShardIngest> = None;
     let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
     let mut durable_seen: u64 = 0;
@@ -400,7 +401,7 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
             map = manifest.layer_map().map_err(|e| e.to_string())?;
             let at = manifest.disk_consistent_lsn.0;
             log::info!("zou pageserve: anchored at {at:#x} from the shard manifest");
-            ingest = Some(ShardIngest::new(ingest_config(cfg.tenant), at));
+            ingest = Some(ShardIngest::new(ingest_cfg.clone(), at));
         }
         Ok(None) => {}
         Err(e) => return Err(format!("shard manifest: {e}")),
@@ -415,6 +416,7 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                 &media,
                 &filter,
                 cfg.tenant,
+                &ingest_cfg,
                 &mut ingest,
                 &mut map,
                 &mut durable_seen,
@@ -488,6 +490,29 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     Ok(())
 }
 
+/// What went wrong inside a replay. The wal read and the applying
+/// have nothing to do with each other; this only exists to carry
+/// either one out of the sink closure, where `?` needs a single type.
+enum ReplayError {
+    Wal(ConsolidateError),
+    Ingest(String),
+}
+
+impl From<ConsolidateError> for ReplayError {
+    fn from(e: ConsolidateError) -> Self {
+        Self::Wal(e)
+    }
+}
+
+impl std::fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wal(e) => write!(f, "{e}"),
+            Self::Ingest(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// One ingest poll: refresh the durable end, anchor a fresh shard at
 /// the oldest retained frame, catch up to the stream, and flush when
 /// a threshold says so.
@@ -498,6 +523,7 @@ fn poll_ingest(
     media: &WalMedia,
     filter: &TeeFilter,
     tenant: u128,
+    ingest_cfg: &IngestConfig,
     ingest: &mut Option<ShardIngest>,
     map: &mut LayerMap,
     durable_seen: &mut u64,
@@ -514,39 +540,66 @@ fn poll_ingest(
     }
     let applied = ingest.as_ref().map_or(0, ShardIngest::applied);
     if applied < *durable_seen {
-        let frames = catch_up(media, WAL_SHARD, filter, Lsn(applied))
-            .map_err(|e| format!("catch up: {e}"))?;
-        if let Some(first) = frames.first()
-            && ingest.is_none()
-        {
-            let start = first.start_lsn.0;
-            log::info!("zou pageserve: anchoring a fresh shard at {start:#x}");
-            *ingest = Some(ShardIngest::new(ingest_config(tenant), start));
-        }
-        if let Some(ingest) = ingest.as_mut() {
-            ingest.apply_frames(&frames).map_err(|e| e.to_string())?;
-        }
-    }
-    if let Some(ingest) = ingest.as_mut()
-        && ingest.flush_due(*durable_seen).is_some()
-    {
-        let entry = ingest
-            .flush(&**store, layout)
-            .map_err(|e| format!("flush: {e}"))?;
-        if let Some(entry) = entry {
-            log::info!(
-                "zou pageserve: flush, layer {} of {} bytes, applied {:#x}",
-                entry.name,
-                entry.size,
-                ingest.applied()
-            );
-            match PageShardManifest::load(&**store, &layout.shard_manifest(0)) {
-                Ok(Some((manifest, _))) => {
-                    *map = manifest.layer_map().map_err(|e| e.to_string())?;
-                }
-                Ok(None) => return Err("flush published no manifest".to_string()),
-                Err(e) => return Err(format!("manifest reload: {e}")),
+        // Streamed rather than collected, and flushed inside the
+        // replay. A service that has fallen behind a bulk load has a
+        // whole index build of wal waiting for it, and reading that
+        // into a Vec before applying any of it holds the backlog
+        // twice: once as frames, once as a memtable that gets no
+        // flush check until the last frame lands. At scale 1000 the
+        // worker went 610 MB, 810 MB, 1.1 GB, 1.5 GB a layer and the
+        // kernel killed it at 6.8 GB resident. Flushing here bounds
+        // the memtable by its own threshold instead of by how far
+        // behind the service happens to be.
+        let seen = *durable_seen;
+        catch_up_with::<ReplayError, _>(media, WAL_SHARD, filter, Lsn(applied), |frame| {
+            if ingest.is_none() {
+                let start = frame.start_lsn.0;
+                log::info!("zou pageserve: anchoring a fresh shard at {start:#x}");
+                *ingest = Some(ShardIngest::new(ingest_cfg.clone(), start));
             }
+            let ingest = ingest.as_mut().expect("anchored on the first frame");
+            ingest
+                .apply_frames(std::slice::from_ref(&frame))
+                .map_err(|e| ReplayError::Ingest(e.to_string()))?;
+            flush_if_due(store, layout, ingest, map, seen).map_err(ReplayError::Ingest)
+        })
+        .map_err(|e| format!("catch up: {e}"))?;
+    }
+    if let Some(ingest) = ingest.as_mut() {
+        flush_if_due(store, layout, ingest, map, *durable_seen)?;
+    }
+    Ok(())
+}
+
+/// Publish the memtable if a threshold says so and pick the new layer
+/// up into `map`, which is what serves it back. Nothing due is not an
+/// error and not a flush.
+fn flush_if_due(
+    store: &Arc<dyn CasStore>,
+    layout: &TenantLayout,
+    ingest: &mut ShardIngest,
+    map: &mut LayerMap,
+    durable_seen: u64,
+) -> Result<(), String> {
+    if ingest.flush_due(durable_seen).is_none() {
+        return Ok(());
+    }
+    let entry = ingest
+        .flush(&**store, layout)
+        .map_err(|e| format!("flush: {e}"))?;
+    if let Some(entry) = entry {
+        log::info!(
+            "zou pageserve: flush, layer {} of {} bytes, applied {:#x}",
+            entry.name,
+            entry.size,
+            ingest.applied()
+        );
+        match PageShardManifest::load(&**store, &layout.shard_manifest(0)) {
+            Ok(Some((manifest, _))) => {
+                *map = manifest.layer_map().map_err(|e| e.to_string())?;
+            }
+            Ok(None) => return Err("flush published no manifest".to_string()),
+            Err(e) => return Err(format!("manifest reload: {e}")),
         }
     }
     Ok(())
@@ -593,9 +646,13 @@ fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::walscan::BlockRef;
+    use crate::walscan::testwal::Builder;
+    use zou_store::frame::Frame2;
     use zou_store::mem::MemStore;
 
     const TENANT: u128 = 7;
+    const WAL_BASE: u64 = 16 << 20;
 
     fn server(store: Arc<dyn CasStore>, sock: PathBuf) -> PageServer {
         spawn(ServerConfig {
@@ -662,6 +719,122 @@ mod tests {
         assert!(
             started.elapsed() < WAIT_CAP,
             "the stop cleared the parked request without the full wait"
+        );
+    }
+
+    /// A backlog on the chain, cut into frames the way the sequencer
+    /// cuts them.
+    fn frames_over(start: u64, raw: &[u8]) -> Vec<Frame2> {
+        let mut frames = Vec::new();
+        let mut at = start;
+        for chunk in raw.chunks(1024) {
+            frames.push(Frame2 {
+                tenant: TENANT,
+                writer_epoch: 1,
+                start_lsn: Lsn(at),
+                end_lsn: Lsn(at + chunk.len() as u64),
+                contains_commit: false,
+                first_of_epoch: false,
+                hints: Vec::new(),
+                payload: chunk.to_vec(),
+            });
+            at += chunk.len() as u64;
+        }
+        frames
+    }
+
+    /// Seal a stream of `records` page writes onto the chain and
+    /// answer where it starts and ends.
+    fn seed_chain(media: &WalMedia, records: u32) -> (u64, u64) {
+        let mut b = Builder::new(WAL_BASE);
+        for i in 0..records {
+            let r = BlockRef {
+                spc: 1663,
+                db: 5,
+                rel: 1000,
+                fork: 0,
+                blk: i,
+            };
+            b.record(&[(r, false)], &[i as u8; 4096]);
+        }
+        let end = b.pos();
+        let (start, bytes) = b.stream();
+        let raw = bytes.to_vec();
+        let t = zou_log::take_over(media, WAL_SHARD, "test").expect("take over");
+        let sink = Arc::new(zou_log::MediaSink::new(
+            Arc::new(WalMedia::single(Arc::clone(media.manifest_store()))),
+            WAL_SHARD,
+            t.sealed_seq,
+        ));
+        let seq = zou_log::Sequencer::resume(
+            WAL_SHARD,
+            sink,
+            zou_log::SequencerConfig::default(),
+            t.next_seq,
+            t.prev_digest,
+        );
+        seq.append(frames_over(start, &raw))
+            .expect("admitted")
+            .wait()
+            .expect("durable");
+        seq.close().expect("sequencer close");
+        (start, end)
+    }
+
+    /// The poll that killed the worker at scale 1000. A service that
+    /// has fallen behind an index build reads the whole backlog, and
+    /// before this it read it into a Vec and applied all of it before
+    /// anything asked whether a flush was due, so the memtable grew
+    /// to the size of the backlog no matter what the threshold said.
+    /// The layers went 610 MB, 810 MB, 1.1 GB, 1.5 GB and the kernel
+    /// took the process at 6.8 GB resident.
+    #[test]
+    fn a_backlog_flushes_as_it_replays_instead_of_all_at_once() {
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        let media = WalMedia::single(Arc::clone(&store));
+        let (_, end) = seed_chain(&media, 64);
+
+        let mut cfg = IngestConfig::new(TENANT, 0, 1);
+        // Far below the backlog, which is the whole point: the poll
+        // has to notice mid replay, not after it.
+        cfg.flush_bytes = 32 << 10;
+        cfg.small_floor = 0;
+
+        let mut ingest = None;
+        let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
+        let mut durable_seen = 0u64;
+        poll_ingest(
+            &store,
+            &layout,
+            &media,
+            &TeeFilter::Tenant(TENANT),
+            TENANT,
+            &cfg,
+            &mut ingest,
+            &mut map,
+            &mut durable_seen,
+        )
+        .expect("the poll replays the chain");
+
+        let ingest = ingest.expect("the poll anchored a shard");
+        assert!(
+            ingest.applied() >= end,
+            "the replay stopped early at {:#x} of {end:#x}",
+            ingest.applied()
+        );
+        let (manifest, _) = PageShardManifest::load(&*store, &layout.shard_manifest(0))
+            .expect("manifest reads")
+            .expect("the replay published one");
+        assert!(
+            manifest.layers.len() > 1,
+            "one poll published {} layer(s), so the backlog was held in memory",
+            manifest.layers.len()
+        );
+        assert!(
+            ingest.memtable().bytes() < cfg.flush_bytes,
+            "the memtable ended at {} bytes, over its own threshold",
+            ingest.memtable().bytes()
         );
     }
 }

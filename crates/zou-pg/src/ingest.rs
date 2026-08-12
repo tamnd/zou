@@ -38,7 +38,7 @@
 
 use std::time::{Duration, Instant};
 
-use zou_log::TeeEvent;
+use zou_log::{ConsolidateError, TeeEvent};
 use zou_store::cas::{CasError, CasStore};
 use zou_store::frame::{BlockRef as StripeRef, Frame2};
 use zou_store::layer::{LayerBuildError, LayerKey, build_delta};
@@ -107,6 +107,8 @@ pub enum IngestError {
     Lagged { next_seq: u64 },
     #[error("wal parse: {0}")]
     Wal(String),
+    #[error("wal catch up: {0}")]
+    CatchUp(#[from] ConsolidateError),
     #[error("building delta layer: {0}")]
     Build(#[from] LayerBuildError),
     #[error(transparent)]
