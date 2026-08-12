@@ -67,6 +67,12 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long it gets to leave before it is asked less politely.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a branch waits for the capture of its parent's checkpoint.
+/// It is a tenth of a second against a local store and the wait is
+/// there for the case where it is not, so this is long enough to be a
+/// real failure rather than a slow bucket having a bad minute.
+const FOLD_WAIT: Duration = Duration::from_secs(30);
+
 /// Runtime directories are numbered, because a process may hold several
 /// handles at once and a branch opens a second one while the first is
 /// still up.
@@ -367,6 +373,18 @@ pub struct Zou {
     closed: Mutex<bool>,
 }
 
+/// What a child gets from the parent it was cut out of, which nothing
+/// in the options can express because a branch and a durable project
+/// name the same two things: a store and a tenant on it.
+#[derive(Clone, Copy, Default)]
+struct Inherited {
+    /// Taken off the store on close, because the parent was.
+    owned_tenant: bool,
+    /// The roles and the auth and storage schemas are in there already,
+    /// because they were in the database this was copied from.
+    contracted: bool,
+}
+
 /// What a database is going to be, worked out before anything has been
 /// made that would have to be unmade.
 struct Cut {
@@ -389,6 +407,18 @@ impl Zou {
     /// has one is restored into the runtime directory and replayed,
     /// which is what every later open does.
     pub fn open(options: Options) -> Result<Zou, Error> {
+        Zou::open_inheriting(options, Inherited::default())
+    }
+
+    /// The same, for a caller that knows things about the database it is
+    /// opening which the options have no way to say.
+    ///
+    /// [`branch`](Zou::branch) is that caller. A branch names a store
+    /// and a tenant on it, which is exactly what a durable project
+    /// looks like, so nothing in the options tells the two apart and
+    /// what the child inherits from its parent has to be handed over
+    /// separately.
+    fn open_inheriting(options: Options, inherited: Inherited) -> Result<Zou, Error> {
         let pg_bin = pg_bin(&options);
         let postgres = pg_bin.join("postgres");
         if !postgres.is_file() {
@@ -409,7 +439,9 @@ impl Zou {
         fs::create_dir_all(&runtime).map_err(io(format!("create {}", runtime.display())))?;
 
         let at = std::time::Instant::now();
-        let cut = Zou::cut(&options, &pg_bin, &runtime)?;
+        let mut cut = Zou::cut(&options, &pg_bin, &runtime)?;
+        cut.owned_tenant |= inherited.owned_tenant;
+        cut.contracted |= inherited.contracted;
         log::debug!("open: the database exists after {:?}", at.elapsed());
         // From here there is a tenant, and maybe a store, that a
         // failure has to take back off rather than leave for the next
@@ -716,11 +748,22 @@ impl Zou {
     /// A copy on write branch of this database, open and ready.
     ///
     /// The child references the parent's objects and copies none of
-    /// them, so this costs a checkpoint and two manifest round trips
-    /// rather than the size of the database. The checkpoint is taken
-    /// here on purpose: a branch is made from what the store has, and
-    /// the point of asking for one from inside the process that is
-    /// writing is that it should carry what that process has written.
+    /// them, so this costs a checkpoint, the fold that checkpoint
+    /// starts, and two manifest round trips, rather than the size of
+    /// the database. The checkpoint is taken here on purpose: a branch
+    /// is made from what the store has, and the point of asking for one
+    /// from inside the process that is writing is that it should carry
+    /// what that process has written.
+    ///
+    /// Waiting for the fold is the other half of that, and it is not
+    /// optional. A branch point is a capture, the capture is packed on
+    /// a background thread perhaps a tenth of a second after the
+    /// checkpoint hands it the data, and a child cut in that gap is a
+    /// database that opens, serves, and is missing everything its
+    /// parent wrote since the last fold, with nothing anywhere saying
+    /// so. A second branch of a parent that has not been written to
+    /// since waits for nothing, because the capture it needs is already
+    /// there.
     ///
     /// A database young enough that no fold has packed a full capture
     /// down yet cannot be branched, and this says so rather than
@@ -728,7 +771,7 @@ impl Zou {
     /// That is the same refusal `zou branch create` gives, out of the
     /// same function, and it leaves nothing of the child behind.
     pub fn branch(&self, name: &str) -> Result<Zou, Error> {
-        self.checkpoint()?;
+        self.settle()?;
         let store = open_store(&self.target).map_err(|e| Error::new(Kind::Store, e))?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -738,21 +781,37 @@ impl Zou {
             .map_err(|e| Error::new(Kind::Store, e.to_string()))?;
         zou_pg::branching::refuse_unservable(&*store, &self.tenant, name, &manifest)
             .map_err(|e| Error::new(Kind::Store, e))?;
-        Zou::open(Options {
-            target: self.target.clone(),
-            tenant: name.to_string(),
-            pg_bin: self.pg_bin.clone(),
-            runtime: None,
-            jwt_secret: Some(self.secret.clone()),
-            schemas: Vec::new(),
-            anon_role: String::new(),
-            shared_buffers: None,
-            // The child names the store the parent is on, which is the
-            // template store when the parent is a fixture, so there is
-            // nothing left for the template path to do.
-            fixture: false,
-            s3: self.s3.clone(),
-        })
+        Zou::open_inheriting(
+            Options {
+                target: self.target.clone(),
+                tenant: name.to_string(),
+                pg_bin: self.pg_bin.clone(),
+                runtime: None,
+                jwt_secret: Some(self.secret.clone()),
+                schemas: Vec::new(),
+                anon_role: String::new(),
+                shared_buffers: None,
+                // The child names the store the parent is on, which is
+                // the template store when the parent is a fixture, so
+                // there is nothing left for the template path to do.
+                fixture: false,
+                s3: self.s3.clone(),
+            },
+            Inherited {
+                // A branch of a project somebody keeps is a project
+                // somebody keeps, and a branch of a throwaway is a
+                // throwaway. The second is a suite giving every test a
+                // branch of one seeded database, and without this the
+                // branches pile up on the machine's template store, one
+                // per test, forever.
+                owned_tenant: self.owned_tenant,
+                // The child is a copy of a database this process is
+                // serving, so the roles and the auth and storage
+                // schemas came with it. Asking again is 75 ms of ddl
+                // that finds everything already there.
+                contracted: true,
+            },
+        )
     }
 
     /// Whether a branch of this database would serve, which is the same
@@ -781,20 +840,94 @@ impl Zou {
     /// Push everything committed so far into the store, so a branch or
     /// a copy of the store made now carries it.
     pub fn checkpoint(&self) -> Result<(), Error> {
+        self.checkpoint_redo().map(|_| ())
+    }
+
+    /// The same checkpoint, and where in the wal it starts replaying
+    /// from, which is the position a capture of it is named after.
+    fn checkpoint_redo(&self) -> Result<u64, Error> {
         let dsn = self.dsn.clone();
         self.rt.block_on(async move {
             let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
                 .await
                 .map_err(pg("connect"))?;
             let pump = tokio::spawn(connection);
-            let out = client
-                .simple_query("checkpoint")
-                .await
-                .map_err(pg("checkpoint"));
+            let out = async {
+                client
+                    .simple_query("checkpoint")
+                    .await
+                    .map_err(pg("checkpoint"))?;
+                // As a plain integer, because that is what the manifest
+                // counts in and the two have to be compared.
+                let rows = client
+                    .simple_query(
+                        "select pg_wal_lsn_diff(redo_lsn, '0/0')::bigint from pg_control_checkpoint()",
+                    )
+                    .await
+                    .map_err(pg("the checkpoint position"))?;
+                let redo = rows
+                    .iter()
+                    .find_map(|row| match row {
+                        tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0),
+                        _ => None,
+                    })
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        Error::new(Kind::Postgres, "pg_control_checkpoint said nothing")
+                    })?;
+                Ok(redo)
+            }
+            .await;
             drop(client);
             let _ = pump.await;
-            out.map(|_| ())
+            out
         })
+    }
+
+    /// Checkpoint, and wait until the capture of it is on the store.
+    ///
+    /// The checkpoint hands the data over and returns. What names it is
+    /// a capture, folded on a background thread and published a moment
+    /// later, and a branch point is a capture, so everything between
+    /// the two is a window where a branch would be cut behind the data.
+    /// A parent that has not been written to since its last fold is
+    /// already past this and pays nothing.
+    fn settle(&self) -> Result<(), Error> {
+        let redo = self.checkpoint_redo()?;
+        let store = open_store(&self.target).map_err(|e| Error::new(Kind::Store, e))?;
+        let layout = TenantLayout::new(&self.tenant);
+        let at = std::time::Instant::now();
+        loop {
+            let Some((data, _)) = store
+                .get(&layout.manifest())
+                .map_err(|e| Error::new(Kind::Store, e.to_string()))?
+            else {
+                return Err(Error::new(
+                    Kind::Store,
+                    format!("{} is not on the store", self.tenant),
+                ));
+            };
+            let manifest =
+                Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+            if manifest.checkpoints.iter().any(|c| c.lsn.0 >= redo) {
+                log::debug!(
+                    "branch: the capture of {redo} landed after {:?}",
+                    at.elapsed()
+                );
+                return Ok(());
+            }
+            if at.elapsed() > FOLD_WAIT {
+                return Err(Error::new(
+                    Kind::Store,
+                    format!(
+                        "the checkpoint at {redo} was not captured within {} seconds, so a branch \
+                         cut now would not carry what this database has written",
+                        FOLD_WAIT.as_secs()
+                    ),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// The keys a client of this handle signs its calls with.

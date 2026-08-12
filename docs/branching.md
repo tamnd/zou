@@ -131,7 +131,7 @@ The embedded API has the same two operations, and hands back an open database ra
 
 ```rust
 let zou = Zou::open(Options::dir("./data"))?;
-let pr = zou.branch("pr-142")?;   // checkpoints the parent first, then cuts and opens
+let pr = zou.branch("pr-142")?;   // checkpoints, waits for the capture, cuts and opens
 assert!(zou.branchable()?);       // whether a branch would serve, without making one
 ```
 
@@ -141,6 +141,10 @@ const pr = await zou.branch('pr-142')
 ```
 
 `branch` checkpoints the parent before it cuts, so what was committed a moment ago is in the child, and it refuses for exactly the same reason the command line does.
+The checkpoint alone does not make that true, which is worth knowing if you are reading the store rather than calling this.
+A branch point is a capture, and a capture is folded on a background thread perhaps a tenth of a second after the checkpoint hands it the data, so `branch` waits for the fold that covers its own checkpoint before it cuts, and gives up with an error rather than handing back a child that is quietly behind its parent.
+A second branch of a parent nothing has written to since waits for nothing.
+That wait is the one thing the command line cannot do for you: it reads the store from outside and has no way to ask a running server for a checkpoint, so `zou branch create` cuts at the newest capture that has been published and prints which lsn that was.
 `branchable()` asks the question without making anything, which is what a test that wants to know whether a fixture is ready should call.
 
 Fixtures are this mechanism used once more: every fixture database is a branch of the machine's template, see [embedded.md](embedded.md).
