@@ -506,7 +506,7 @@ mod tests {
         let mut seed = 0x2112;
         for step in 0..500u64 {
             let who = sockets[next(&mut seed) as usize % sockets.len()];
-            if next(&mut seed) % 3 == 0 {
+            if next(&mut seed).is_multiple_of(3) {
                 hub.untrack(who, topic);
             } else {
                 let key = keys[next(&mut seed) as usize % keys.len()];
