@@ -86,8 +86,39 @@ Memory holds flat.
 Peak RSS across the whole process tree is 15.7 GB over up to 1028 processes, median 13.6 GB, and across thirty minutes covering warmup, steady, idle and a churn window that attached seventeen hundred times the slope points slightly down, so about 140 MB per attached tenant and no drift.
 Provisioning is almost all initdb and the genesis capture, with the registry write itself at 2.7 ms p50.
 The 36.2 tenants a minute this run reports is not the rate of building a fleet and this page previously read as though it were: the run made 63 tenants and skipped the 937 that earlier passes had already built, so it times the tail of a job that was nearly done.
-A from empty rate is being measured on the eight hundred tenant fleet and replaces this sentence when it lands.
+The from empty rate is 5.14 tenants a minute, measured on the eight hundred tenant fleet in the next section.
 The store holds 45.6 GB for the thousand, 45.6 MB a tenant.
+
+## Eight hundred mostly idle tenants, and what they cost asleep
+
+gamingpc (i9-13900K, 32 GB, Ubuntu 26.04 under WSL2, store on a local directory), 2026-08-11, `zoubench fleet` with the node pinned to cpus 0-7, scenario `fleet-800-idle`.
+Eight hundred tenants built from empty, a hundred attached at once, 16MB shared buffers each, 16 clients, then a 300 s window at 200 rps, a 300 s churn window drawing from all eight hundred, and ninety minutes of hold in which nobody sends a request at all.
+The store is a local directory, so the dollars below are the S3 standard and R2 price cards of 2026-08-01 applied to the operations the run counted, not a bill anybody paid.
+Full write up in tamnd/zou-bench `docs/results/2026-08-12.md`.
+
+Building the fleet took 9346.5 s for 800 tenants, 5.14 a minute, with the registry write itself at 10.5 ms p50 and everything else initdb, the genesis capture and the first attach, eight at a time on eight cores.
+That is the honest from empty number and it is three orders of magnitude under the M1b line of a hundred a second.
+Serving them is unchanged from the thousand tenant node: 59999 requests at 200 rps with no errors, 0.692 ms p50 and 1.236 ms p99, and churn over all eight hundred at 1852.7 ms p50 and 11941.1 ms p99 with 4962 attaches at a 2.263 s mean.
+
+The hold window is what the run was for, and it splits in two.
+
+| a project nobody is using | puts an hour | gets an hour | deletes an hour |
+| --- | --- | --- | --- |
+| dormant | 0 | 0 | 0 |
+| attached | 742.9 | 762.9 | 55.6 |
+
+A dormant project is free rather than cheap.
+It does nothing at all to the store, so it costs the bytes it left behind and not one request, which is scale to zero working the way the design says it should.
+An attached project with no traffic puts an object every 4.85 seconds and reads one every 4.72, and that timer is the WAL lease heartbeat: the lease TTL is 15 s and the heartbeat renews at a third of it, a manifest read plus a conditional write each time, which is 720 gets and 720 puts an hour before anything else happens.
+
+That rate is the whole bill.
+Priced for a month the fleet is 294.18 usd on S3 standard, of which 0.76 is the 33 GB of data and 293.42 is 54.2 million puts, 55.7 million gets and 4.1 million deletes; on R2 it is 264.57.
+Per project that is 0.37 a month against the 1.10 Neon models for the same scenario, and as a fleet it misses the M1b line of 90 by more than three times, entirely because an eighth of the fleet stays attached and the attached tenth is the only thing writing.
+A cheaper price card does not fix it.
+Either an idle attached project stops renewing and takes the restore if somebody comes back, or the renewal interval grows with idleness instead of sitting at a third of a fifteen second TTL forever, and that is [tamnd/zou#294](https://github.com/tamnd/zou/issues/294).
+
+Memory across the whole run peaks at 17.5 GB, which is the provisioning phase and its eight concurrent initdbs, and sits at 8.6 GB median with a hundred attached over up to 1016 processes, slope negative across nearly four hours.
+The store holds 35.66 GB for the eight hundred in 3.54 million objects, 44.58 MB a tenant.
 
 ## A hundred thousand registered tenants
 
