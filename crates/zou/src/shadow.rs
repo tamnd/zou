@@ -69,8 +69,12 @@ impl Shadow {
             // Nothing in here is worth an fsync, it is deleted in a
             // moment either way, and this is most of the wall clock.
             .arg("--no-sync")
+            // A shadow cluster is plain postgres on local disk with no
+            // store behind it, so both the shim and the page service
+            // stay out of it. Unset means on now, so the off is said
+            // rather than left off.
             .env_remove("ZOU_TARGET")
-            .env_remove("ZOU_PAGESERVE")
+            .env("ZOU_PAGESERVE", "0")
             .output()
             .map_err(|e| {
                 format!(
@@ -102,8 +106,9 @@ impl Shadow {
             // socket, so a failure can be quoted and a working run is
             // silent.
             .args(["-c", "logging_collector=off"])
+            // Plain postgres, see the initdb above.
             .env_remove("ZOU_TARGET")
-            .env_remove("ZOU_PAGESERVE")
+            .env("ZOU_PAGESERVE", "0")
             .stdout(Stdio::null())
             .stderr(log)
             .spawn()

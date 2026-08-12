@@ -542,7 +542,9 @@ impl Postmasters {
             .env("ZOU_TARGET", &self.target)
             .env("ZOU_TENANT", tenant_ref)
             .env("ZOU_PAGE_CACHE", pagecache)
-            .env_remove("ZOU_PAGESERVE")
+            // Bootstrap has no page service to talk to, and unset
+            // means on, so say off.
+            .env("ZOU_PAGESERVE", "0")
             .output()
             .map_err(|e| format!("initdb: {e}"))?;
         if !out.status.success() {
@@ -761,7 +763,14 @@ pub(crate) fn warm_pages(
     pagecache: &std::path::Path,
     stats: &restore::RestoreStats,
 ) {
-    match warm::warm(target, tenant_ref, pgdata, pagecache, stats) {
+    match warm::warm(
+        target,
+        tenant_ref,
+        pgdata,
+        pagecache,
+        stats,
+        zou_pg::pageserve_enabled(),
+    ) {
         Ok(w) if w.wanted == 0 => {}
         Ok(w) => log::debug!(
             "{tenant_ref}: warmed {} of {} pages and {} fork sizes, {} bytes{}",

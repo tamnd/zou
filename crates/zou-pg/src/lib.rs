@@ -217,8 +217,19 @@ fn pageserve_socket() -> std::path::PathBuf {
 /// turns that refusal into a FATAL before the postmaster gets
 /// anywhere, and a process that loads the shim without going through
 /// it says so on stderr rather than picking off in silence.
+///
+/// Unset is on. The other path writes one 8 KB object per page write,
+/// which is what the storage layer was built to stop doing, and it
+/// loses on every number we measure: same box, same scenario, only
+/// this variable differing, crash recovery went 4.3 s against
+/// 112.2 s, a death drill 82.9 s against 253.6 s, init 54.9 s against
+/// 149.5 s, peak rss 0.9 GB against 1.8 GB, and the run that started
+/// the whole investigation was OOM killed in the end of recovery
+/// checkpoint. A default that only the person who wrote it knows to
+/// turn on is not a default. Off stays reachable, it is how the two
+/// paths get compared.
 fn parse_pageserve(v: Option<&str>) -> Result<bool, String> {
-    let Some(v) = v else { return Ok(false) };
+    let Some(v) = v else { return Ok(true) };
     match v.trim().to_ascii_lowercase().as_str() {
         "" | "0" | "false" | "off" | "no" => Ok(false),
         "1" | "true" | "on" | "yes" => Ok(true),
@@ -230,6 +241,14 @@ fn parse_pageserve(v: Option<&str>) -> Result<bool, String> {
 
 fn pageserve_setting() -> Result<bool, String> {
     parse_pageserve(std::env::var("ZOU_PAGESERVE").ok().as_deref())
+}
+
+/// Whether this process will read through the page service, for the
+/// callers outside the shim that have to know: a restore warms the
+/// page cache out of pg/ and that is the wrong cache to fill when the
+/// service owns the pages.
+pub fn pageserve_enabled() -> bool {
+    pageserve_on()
 }
 
 fn pageserve_on() -> bool {
@@ -2121,9 +2140,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("ZOU_PAGE_CACHE", cache_dir.path()) };
+        // This is the object path on purpose, so it says so: the
+        // default is the page service, and there is no service here to
+        // answer a read.
+        unsafe { std::env::set_var("ZOU_PAGESERVE", "0") };
         let target = CString::new(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(unsafe { zou_pg_init(target.as_ptr()) }, ZOU_OK);
         unsafe { std::env::remove_var("ZOU_PAGE_CACHE") };
+        unsafe { std::env::remove_var("ZOU_PAGESERVE") };
         // Idempotent: a second init from the same process is fine.
         assert_eq!(unsafe { zou_pg_init(target.as_ptr()) }, ZOU_OK);
 
@@ -2535,12 +2559,14 @@ mod tests {
         }
     }
 
-    /// Unset is off, and that is the only silent off there is. A value
-    /// nobody can read is an operator mistake, and answering it with
-    /// the slow path is how this went unnoticed for a month.
+    /// Unset is on. Every sustain run before this measured the object
+    /// path because nothing in the tree set the variable and nothing
+    /// in the docs said it existed. A value nobody can read is an
+    /// operator mistake, and answering it with the slow path is how
+    /// that went unnoticed for a month.
     #[test]
-    fn unset_is_off_and_nonsense_is_refused() {
-        assert_eq!(parse_pageserve(None), Ok(false));
+    fn unset_is_on_and_nonsense_is_refused() {
+        assert_eq!(parse_pageserve(None), Ok(true));
         assert!(parse_pageserve(Some("maybe")).is_err());
         assert!(parse_pageserve(Some("2")).is_err());
     }
@@ -2551,7 +2577,7 @@ mod tests {
     #[test]
     fn the_c_side_gets_the_same_answer() {
         for (v, want) in [
-            (None, 0),
+            (None, 1),
             (Some("on"), 1),
             (Some("off"), 0),
             (Some("x"), -1),

@@ -1042,7 +1042,9 @@ fn initdb(
         .env("ZOU_TARGET", target)
         .env("ZOU_TENANT", tenant)
         .env("ZOU_PAGE_CACHE", pagecache)
-        .env_remove("ZOU_PAGESERVE")
+        // initdb is standalone, there is no page service yet, and
+        // unset means on.
+        .env("ZOU_PAGESERVE", "0")
         .output()
         .map_err(|e| Error::new(Kind::Postgres, format!("initdb: {e}")))?;
     if !out.status.success() {

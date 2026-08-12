@@ -214,6 +214,29 @@ What it gives up is worth knowing before turning it on.
 The url outlives the request that made it, so an object deleted a second later is still readable until it expires, and the caller that follows it is talking to the bucket rather than to a permission check.
 It is also visible: the answer is a 302 where upstream sends 200, which every client library follows and every recorded comparison notices, so the conformance suites run with it off.
 
+## The page service
+
+Reads that miss the local caches go to a page service running as a background worker inside the node, over a unix socket in the data directory, and it answers them out of the page layers it builds by replaying the tenant's durable WAL.
+It is on by default, and the reason it is not a knob anyone should have to find is what happens without it.
+The other path writes one 8 KB object per page write and reads pages back as objects, which is the thing the storage layer exists to stop doing.
+
+Measured on the same box with the same binaries running the same scenario, the variable being the only difference:
+
+| | on | off |
+| --- | --- | --- |
+| crash recovery | 4.3 s | 112.2 s |
+| pusher drill | 3.3 s | 215.2 s |
+| death drill | 82.9 s | 253.6 s |
+| init | 54.9 s | 149.5 s |
+| peak rss | 0.9 GB | 1.8 GB |
+
+The run that started that investigation never finished at all: a backend sat twenty five minutes in the end of recovery checkpoint writing about 291 objects a second and the kernel took it before it was done.
+
+`ZOU_PAGESERVE=0` turns it off, and `zou dev --page-service off` does the same for a dev node without touching the environment.
+Off is worth keeping reachable, it is how the two paths get compared, and a comparison is how the numbers above exist.
+The spellings are `1 0 true false on off yes no` in any case, and anything else is refused at startup rather than read as off, because a value nobody can parse is a mistake and answering it with the slow path is how a month of runs measured the wrong path.
+initdb runs with it off in every command that runs one, since bootstrap is a standalone process with no service to talk to, and the redo workers never see it because they run with no store attached at all.
+
 ## Retention and collecting
 
 A store only grows on its own.
