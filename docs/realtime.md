@@ -91,6 +91,49 @@ The answer is 202 with an empty body.
 It says the messages were taken, not that anybody heard them: a broadcast is not stored, nobody may be on the topic, and accepted is the strongest true thing there is to say.
 A message missing its topic, its event or its payload is 422 and a list of what is wrong with each message in the batch, and a batch with one bad message in it sends none of them, because half a batch delivered and then complained about is an answer nobody can act on.
 
+## Sending from sql
+
+A room can also be sent to from inside the database, which is how a project broadcasts a row it has just written without an http client anywhere in the transaction.
+
+```sql
+select realtime.send(
+  jsonb_build_object('x', 12),  -- payload
+  'cursor',                     -- event
+  'room',                       -- topic
+  true                          -- private
+);
+```
+
+```sql
+create trigger orders_changed after insert or update on public.orders
+for each row execute function public.orders_changed();
+
+create or replace function public.orders_changed() returns trigger
+language plpgsql as $$
+begin
+  perform realtime.broadcast_changes(
+    'orders', tg_op, tg_op, tg_table_name, tg_table_schema, new, old);
+  return null;
+end;
+$$;
+```
+
+Both are upstream's functions with upstream's signatures, down to the argument order, because a trigger somebody already wrote is written against them.
+`realtime.send()` defaults to private, so a send that says nothing about it goes to the private room and a public channel of that name hears nothing.
+`realtime.send_binary()` is the same thing with a `bytea` payload, which the other client reads as an ArrayBuffer.
+`realtime.broadcast_changes()` builds the payload Supabase documents, `record`, `old_record`, `operation`, `table` and `schema`, and hands it to `realtime.send()`.
+
+All three insert a row into `realtime.messages` and swallow whatever goes wrong, upstream included, so a send the policies refused is a warning in the log and a message nobody hears rather than a failed statement.
+That is worth knowing before writing a trigger that relies on one: the insert is checked by the same policies as everything else on that table, and the trigger will not tell you when it was refused.
+
+How the row reaches a socket is not upstream's.
+Upstream reads it out of a logical replication slot, which means a slot, a publication and a decoder held open per project, and that is standing machinery a server whose whole point is to have none while nothing is happening cannot hold.
+So the row announces itself: an after insert trigger calls `pg_notify` and the server listens on one connection.
+The message rides inside the notification when it fits, and anything bigger, or binary, is announced by id and read back on the same connection.
+Notifications are transactional, which is what makes this safe next to the policy probes: a probe rolls back, and a notification from a transaction that rolled back is never delivered, so a join never broadcasts itself.
+
+Rows written this way are kept for three days and then deleted, which is upstream's retention done with a delete instead of by dropping a day's partition.
+
 ## Tokens
 
 Three places a token can arrive, and all three are checked by the same verifier every http request goes through.
@@ -161,7 +204,7 @@ A service key is not stopped by any of this, because `service_role` has `bypassr
 
 Two things here are deliberately not upstream's.
 A push a write policy refused is answered with an error on the push rather than dropped in silence, because silence is indistinguishable from a message that was sent and heard by nobody.
-And `realtime.messages` is created unpartitioned rather than partitioned by day with a janitor keeping tomorrow's partition ready, because no message is ever kept in it and every probe rolls back, so the partitions would be a moving part with nothing in them.
+And `realtime.messages` is created unpartitioned rather than partitioned by day with a janitor keeping tomorrow's partition ready, because the only rows that outlive their statement are the ones `realtime.send()` wrote and they are deleted after three days, which is the same three days upstream keeps and one statement rather than a moving part.
 
 A server running without a database refuses a private channel by saying that, rather than by saying 403.
 403 is an answer about a project's policies, and sending somebody to read policies that were never consulted is worse than telling them what is actually missing.
