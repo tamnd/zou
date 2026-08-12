@@ -294,6 +294,11 @@ pub struct App {
     /// The watch starts on the first request that needs a catalog,
     /// because a router can be built outside a runtime.
     pub watching: tokio::sync::OnceCell<()>,
+    /// The listener that carries what `realtime.send()` writes to the
+    /// sockets, started on the first socket for the same reason: a
+    /// message sent while nothing is connected is heard by nobody
+    /// whether this is running or not.
+    pub sending: tokio::sync::OnceCell<()>,
     /// Where object bytes live, when this server was told.
     pub blobs: Option<blob::Blobs>,
     /// The realtime topics this server is carrying, and the sockets on
@@ -395,6 +400,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         catalog: tokio::sync::RwLock::new(HashMap::new()),
         epoch: Arc::new(AtomicU64::new(0)),
         watching: tokio::sync::OnceCell::new(),
+        sending: tokio::sync::OnceCell::new(),
         blobs,
         hub: zou_realtime::Hub::new(),
     }))

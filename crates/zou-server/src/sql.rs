@@ -301,6 +301,14 @@ const STORAGE_SCHEMA: &str = include_str!("storage-schema.sql");
 /// handful of objects that are not, see the file for what is left out.
 const REALTIME_SCHEMA: &str = include_str!("realtime-schema.sql");
 
+/// Sending to a room from sql: upstream's three functions, and the
+/// trigger that gets what they write out to the sockets.
+///
+/// Applied every boot rather than once on a fresh database, because a
+/// database an older zou has already served has realtime.messages in
+/// it and would never see this otherwise. See the file for the rest.
+const REALTIME_SEND: &str = include_str!("realtime-send.sql");
+
 /// The grants the storage schema arrives without.
 ///
 /// Upstream these are inside the migrations, granting to roles the
@@ -361,7 +369,36 @@ pub async fn bootstrap(client: &Client) -> Result<(), tokio_postgres::Error> {
     client.batch_execute(BOOTSTRAP).await?;
     ensure_foreign_schema(client, "auth.users", &[AUTH_SCHEMA]).await?;
     ensure_foreign_schema(client, "storage.objects", &[STORAGE_SCHEMA, STORAGE_GRANTS]).await?;
-    ensure_foreign_schema(client, "realtime.messages", &[REALTIME_SCHEMA]).await
+    ensure_foreign_schema(client, "realtime.messages", &[REALTIME_SCHEMA]).await?;
+    ensure_schema(client, &[REALTIME_SEND]).await
+}
+
+/// Apply ddl that has to run on every boot rather than only on a
+/// fresh database, under the same lock as everything else here.
+///
+/// `create or replace function` twice at once on one function is
+/// `tuple concurrently updated`, and two servers starting together
+/// against one database is the ordinary case rather than a strange
+/// one, so the lock is the whole reason this is not a bare
+/// `batch_execute`.
+async fn ensure_schema(client: &Client, ddl: &[&str]) -> Result<(), tokio_postgres::Error> {
+    client
+        .batch_execute("begin; select pg_advisory_xact_lock(730501)")
+        .await?;
+    let mut applied = Ok(());
+    for batch in ddl {
+        applied = client.batch_execute(batch).await;
+        if applied.is_err() {
+            break;
+        }
+    }
+    match applied {
+        Ok(()) => client.batch_execute("commit").await,
+        Err(e) => {
+            let _ = client.batch_execute("rollback").await;
+            Err(e)
+        }
+    }
 }
 
 /// The ddl [`bootstrap`] would apply, as one number.
@@ -379,6 +416,7 @@ pub fn contract_version() -> u64 {
         STORAGE_SCHEMA,
         STORAGE_GRANTS,
         REALTIME_SCHEMA,
+        REALTIME_SEND,
     ] {
         for byte in part.bytes() {
             hash ^= u64::from(byte);
@@ -545,6 +583,47 @@ impl Pool {
             }
             epoch.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// A connection of its own that is listening to `channel`, which
+    /// is a literal from this crate rather than anything a request can
+    /// name, and what arrives on it.
+    ///
+    /// Outside the pool's permits, like the catalog watch, because a
+    /// connection held for the life of a task is not a connection a
+    /// request should ever be waiting behind. The client comes back
+    /// with the receiver rather than instead of it: the caller reads
+    /// rows on the same connection it is hearing about them through,
+    /// which is one dialled connection and not two.
+    ///
+    /// The receiver closes when the connection dies, which is the
+    /// caller's cue to dial again. Anything that happened while it was
+    /// down was missed, and a broadcast is a live thing rather than a
+    /// log, so there is nothing to catch up on.
+    pub async fn listening(
+        &self,
+        channel: &str,
+    ) -> Result<(Client, tokio::sync::mpsc::UnboundedReceiver<String>), Error> {
+        let (client, mut conn) = self.0.pg.connect(NoTls).await?;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        // Polling for messages is also what drives the queries the
+        // caller runs, so the pump owns the connection and the client
+        // speaks through it.
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) =
+                std::future::poll_fn(|cx| Pin::new(&mut conn).poll_message(cx)).await
+            {
+                if let AsyncMessage::Notification(note) = msg
+                    && tx.send(note.payload().to_string()).is_err()
+                {
+                    return;
+                }
+            }
+        });
+        // listen takes a name rather than a parameter, and every name
+        // this is called with is a literal in this crate.
+        client.batch_execute(&format!("listen {channel}")).await?;
+        Ok((client, rx))
     }
 
     /// What every role in this database had `alter role` run against

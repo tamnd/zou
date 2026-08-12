@@ -94,6 +94,12 @@ pub async fn websocket(
     };
     let anon_role = app.cfg.anon_role.clone();
     upgrade.on_upgrade(move |socket| async move {
+        // A router can be built outside a runtime, so what listens for
+        // database sends starts on the first socket rather than at
+        // boot.
+        app.sending
+            .get_or_init(|| async { deliver(Arc::clone(&app)) })
+            .await;
         let tokens = ProjectTokens {
             app: Arc::clone(&app),
             anon_role,
@@ -516,6 +522,190 @@ async fn may_write(app: &App, auth: &AuthContext, topic: &str) -> Result<bool, S
         .map(|granted| granted.broadcast)
 }
 
+/// How long a row written by `realtime.send()` is kept, which is
+/// upstream's three days. Upstream drops a day's partition; this table
+/// is one table, so the equivalent is a delete.
+const KEEP: &str = "72 hours";
+
+/// How often that sweep runs. An hour is often enough that the table
+/// never has more than an hour of expired rows in it and rare enough
+/// that a server nobody is using is not doing anything.
+const SWEEP: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How long to wait before dialling again after the listening
+/// connection died.
+const REDIAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Carry what `realtime.send()` writes to the sockets, until the
+/// process ends.
+///
+/// Upstream reads these rows out of a logical replication slot. That
+/// means a slot, a publication and a decoder held open per project,
+/// which is standing machinery a server that scales to zero cannot
+/// have, so the row announces itself instead: the trigger in
+/// `realtime-send.sql` calls `pg_notify` and this is what is listening.
+///
+/// A dropped connection loses whatever was sent while it was down, and
+/// that is the right answer rather than a gap to fill: a broadcast is
+/// something happening now, not a log, and a client that was not there
+/// to hear it was not going to be told either way.
+pub fn deliver(app: Arc<App>) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(e) = deliver_once(&app).await {
+                log::warn!("realtime: the database send listener stopped: {e}");
+            }
+            tokio::time::sleep(REDIAL).await;
+        }
+    });
+}
+
+/// One connection's worth of delivering, until it dies.
+async fn deliver_once(app: &App) -> Result<(), crate::sql::Error> {
+    let Some(pool) = &app.pool else {
+        // Nothing to listen to, and nothing that will ever change
+        // that, so this task is over rather than retrying forever.
+        return Ok(());
+    };
+    let (client, mut notes) = pool.listening("zou_realtime").await?;
+    // The first tick an hour in rather than immediately, since a
+    // server that has just started is not the one with three days of
+    // rows behind it, and a reconnect loop should not mean a delete
+    // loop.
+    let mut sweep = tokio::time::interval_at(tokio::time::Instant::now() + SWEEP, SWEEP);
+    loop {
+        let note = tokio::select! {
+            note = notes.recv() => note,
+            _ = sweep.tick() => {
+                // The rows are only ever read back by the branch below
+                // and only ever moments after they were written, so
+                // what this deletes is what nobody was going to ask
+                // for. A database that will not let this server delete
+                // them says so once an hour and keeps working.
+                if let Err(e) = client
+                    .execute(
+                        &format!(
+                            "delete from realtime.messages where inserted_at < now() - interval '{KEEP}'"
+                        ),
+                        &[],
+                    )
+                    .await
+                {
+                    log::debug!("realtime: the messages table was not swept: {e}");
+                }
+                continue;
+            }
+        };
+        let Some(note) = note else { return Ok(()) };
+        match sent_message(&client, &note).await {
+            Ok(Some(sent)) => fan(
+                &app.hub,
+                &sent.topic,
+                &sent.event,
+                sent.private,
+                sent.payload,
+            ),
+            Ok(None) => {}
+            Err(e) => log::warn!("realtime: a database send was not delivered: {e}"),
+        }
+    }
+}
+
+/// One message on its way from the table to a room.
+struct Sent {
+    topic: String,
+    event: String,
+    private: bool,
+    payload: (Encoding, Vec<u8>),
+}
+
+/// What a notification turned out to be saying.
+enum Announced {
+    /// The whole message, which is the ordinary case and costs no
+    /// round trip.
+    Message(Sent),
+    /// The id of a row to read it out of, which is what arrives for
+    /// anything too big for a notification and anything binary.
+    Row(String),
+    /// Nothing this server can act on, which no version of the trigger
+    /// writes and something else on the same channel might.
+    Nothing,
+}
+
+/// Read one notification.
+fn announced(note: &str) -> Announced {
+    let Ok(Value::Object(note)) = serde_json::from_str::<Value>(note) else {
+        return Announced::Nothing;
+    };
+    if let Some(topic) = note.get("topic").and_then(Value::as_str) {
+        return Announced::Message(Sent {
+            topic: topic.to_string(),
+            event: note
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            // Private unless the row said otherwise, which is the
+            // default on `realtime.send()` itself.
+            private: note.get("private").and_then(Value::as_bool).unwrap_or(true),
+            payload: json_payload(&note.get("payload").cloned().unwrap_or(json!({}))),
+        });
+    }
+    match note.get("id").and_then(Value::as_str) {
+        Some(id) => Announced::Row(id.to_string()),
+        None => Announced::Nothing,
+    }
+}
+
+/// What one notification is about, reading the row back when the
+/// notification was only an id.
+///
+/// The read back happens on the connection the notification arrived
+/// on, which is one the server is already holding, so it costs a round
+/// trip and not a connection.
+async fn sent_message(
+    client: &tokio_postgres::Client,
+    note: &str,
+) -> Result<Option<Sent>, crate::sql::Error> {
+    let id = match announced(note) {
+        Announced::Message(sent) => return Ok(Some(sent)),
+        Announced::Row(id) => id,
+        Announced::Nothing => return Ok(None),
+    };
+    let rows = client
+        .query(
+            // Through text on the way to uuid, because a bare
+            // `$1::uuid` would have postgres decide the parameter is
+            // a uuid and this one is a string.
+            "select topic, event, private, payload::text, binary_payload \
+             from realtime.messages where id = $1::text::uuid",
+            &[&id],
+        )
+        .await?;
+    // The row may be gone already, which a sweep in the same second is
+    // enough to do, and a message nobody can read is a message nobody
+    // hears.
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let event: Option<String> = row.get(1);
+    let private: Option<bool> = row.get(2);
+    let payload: Option<String> = row.get(3);
+    let binary: Option<Vec<u8>> = row.get(4);
+    Ok(Some(Sent {
+        topic: row.get(0),
+        event: event.unwrap_or_default(),
+        private: private.unwrap_or(true),
+        payload: match binary {
+            Some(bytes) => (Encoding::Binary, bytes),
+            None => (
+                Encoding::Json,
+                payload.unwrap_or_else(|| "{}".into()).into_bytes(),
+            ),
+        },
+    }))
+}
+
 /// One parameter out of the connect url.
 fn query(uri: &Uri, name: &str) -> Option<String> {
     uri.query()?.split('&').find_map(|pair| {
@@ -536,5 +726,55 @@ mod tests {
         assert_eq!(query(&uri, "log_level"), None);
         let bare: Uri = "/realtime/v1/websocket".parse().unwrap();
         assert_eq!(query(&bare, "vsn"), None);
+    }
+
+    /// The notification the trigger writes when the message fits in
+    /// one, which is every ordinary send.
+    #[test]
+    fn a_whole_message_in_a_notification_needs_no_row() {
+        let note = r#"{"id":"1","topic":"lobby","event":"greeting","private":true,
+                       "payload":{"hello":"room"}}"#;
+        let Announced::Message(sent) = announced(note) else {
+            panic!("the whole message was there");
+        };
+        assert_eq!(sent.topic, "lobby");
+        assert_eq!(sent.event, "greeting");
+        assert!(sent.private);
+        assert!(matches!(sent.payload.0, Encoding::Json));
+        assert!(String::from_utf8_lossy(&sent.payload.1).contains("hello"));
+    }
+
+    /// A send that said it was not private is for the public room of
+    /// that name, and a notification with nothing to say about it is
+    /// for the private one, because that is what `realtime.send()`
+    /// defaults to.
+    #[test]
+    fn a_send_is_private_unless_the_row_says_otherwise() {
+        let public = r#"{"id":"1","topic":"lobby","event":"e","private":false,"payload":{}}"#;
+        let Announced::Message(sent) = announced(public) else {
+            panic!("a message");
+        };
+        assert!(!sent.private);
+
+        let quiet = r#"{"id":"1","topic":"lobby","event":"e","payload":{}}"#;
+        let Announced::Message(sent) = announced(quiet) else {
+            panic!("a message");
+        };
+        assert!(sent.private);
+    }
+
+    #[test]
+    fn an_id_on_its_own_is_a_row_to_go_and_read() {
+        let Announced::Row(id) = announced(r#"{"id":"a3e1"}"#) else {
+            panic!("an id was all there was");
+        };
+        assert_eq!(id, "a3e1");
+    }
+
+    #[test]
+    fn a_notification_this_server_cannot_read_is_left_alone() {
+        assert!(matches!(announced("not json at all"), Announced::Nothing));
+        assert!(matches!(announced("{}"), Announced::Nothing));
+        assert!(matches!(announced("[1,2,3]"), Announced::Nothing));
     }
 }

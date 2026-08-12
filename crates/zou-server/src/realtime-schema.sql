@@ -12,10 +12,12 @@
 -- written for Supabase reads the same columns here. The one difference
 -- is that this table is not partitioned. Upstream partitions it by day
 -- and has a janitor creating tomorrow's partition and dropping last
--- week's, because upstream keeps messages in it. This server does not
--- keep any: the rows it writes are policy probes inside a transaction
--- that is always rolled back, so there is nothing to expire and
--- nothing to sweep.
+-- week's; here it is one table, and what upstream does by dropping a
+-- partition this server does by deleting rows older than three days,
+-- which is the same three days. Most of what lands in it never needs
+-- either: a policy probe writes its row inside a transaction that is
+-- always rolled back, so the only rows that outlive their statement
+-- are the ones `realtime.send()` wrote on purpose.
 
 create schema if not exists realtime;
 
