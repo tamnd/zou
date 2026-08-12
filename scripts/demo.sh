@@ -46,7 +46,10 @@ stop_dev() {
 trap stop_dev EXIT
 
 start_dev() {
-    "$ZOU" dev "$STORE" --pg-bin "$PG_BIN" --port "$PORT" --runtime "$1" \
+    # The second act branches, and a branch reads the page runs a fold
+    # packed down, which the page service elides. So the demo asks for
+    # the object path until #320 lands.
+    "$ZOU" dev "$STORE" --page-service off --pg-bin "$PG_BIN" --port "$PORT" --runtime "$1" \
         >"$DEMO_DIR/$(basename "$1").log" 2>&1 &
     DEV_PID=$!
     for _ in $(seq 1 60); do
