@@ -1,9 +1,9 @@
 # Realtime
 
-A socket at `/realtime/v1/websocket`, channels on it, and broadcast between them.
+A socket at `/realtime/v1/websocket`, channels on it, and broadcast and presence between them.
 
 That is a smaller surface than the one Supabase Realtime serves, and the rest of this page is as much about the line as about what is on this side of it.
-Presence, `postgres_changes` and private channels are not built.
+`postgres_changes` and private channels are not built.
 A join asking for one of them is answered with an error naming what is missing, which is the difference between a client that reports a failure and a client that waits forever for rows nobody is sending.
 
 ## Connecting
@@ -42,6 +42,34 @@ Both encodings are read, and a delivery goes out in whichever encoding the recei
 A broadcast reaches the sockets on the topic and nothing else.
 Another topic does not hear it, and neither does another project: a node serving a thousand projects gives each one its own router and its own set of topics, so `realtime:room` on one project and `realtime:room` on another are two rooms that share a name.
 
+## Presence
+
+Presence is who is on a topic right now, kept by the server so that a socket arriving late is told rather than left to guess.
+
+```js
+const room = supabase.channel('room', { config: { presence: { key: user.id } } })
+
+room.on('presence', { event: 'sync' }, () => render(room.presenceState()))
+room.subscribe(async (status) => {
+  if (status === 'SUBSCRIBED') await room.track({ typing: false })
+})
+```
+
+`track` puts a payload on the topic under the channel's presence key, `untrack` takes it off, and both are answered so the client can await them.
+A socket that names no key is known by the name the server gave it, which is enough to tell two anonymous sockets apart and nothing more.
+Two tabs signed in as the same person are one key with two metas under it, and one tab closing takes one meta rather than the person.
+
+Every change goes out to the topic as a `presence_diff` carrying `joins` and `leaves`, and a socket that has just joined gets a `presence_state` with the whole topic in it.
+The tracker sees its own change through the same diff everybody else does, so there is one path into a client's state and not two.
+A meta carries a `phx_ref` the client renames to `presence_ref`, which is how it tells one of a key's metas from another.
+
+`presence: { enabled: true }` in the join decides whether this socket is *sent* presence, not whether it can be *seen*: a socket that tracks without asking for presence is in everybody else's state and gets no diffs itself.
+That is the client's own rule, and it is the one that matters in practice, because the client sets the flag for you the moment a channel has a presence binding on it.
+
+State is per topic and per project, and it is held where the sockets are.
+A socket that goes away, whether it untracks, leaves the channel or just disconnects, leaves the topic, and the last socket off a topic takes the topic's state with it.
+Nothing about presence is written down: it is the set of sockets that are connected now, so a node restart is an empty room and the clients that reconnect fill it back in.
+
 ## Tokens
 
 Three places a token can arrive, and all three are checked by the same verifier every http request goes through.
@@ -58,11 +86,10 @@ The client sees an error on the push and then a `phx_error` on each channel, whi
 | asked for | what happens |
 | --- | --- |
 | `postgres_changes` in a join | the join is refused, naming what is missing |
-| `presence` enabled in a join, or a presence event | the same |
 | a private channel | the same |
 | `POST /realtime/v1/api/broadcast` | 501 |
 
-All four are M4, tracked in [tamnd/zou#4](https://github.com/tamnd/zou/issues/4).
+All three are M4, tracked in [tamnd/zou#4](https://github.com/tamnd/zou/issues/4).
 
 The refusals are worded rather than silent on purpose.
 A server can accept any of these joins, reply `SUBSCRIBED` and then send nothing, and every client in the world will sit there waiting, which is the worst answer available: the thing that is missing looks exactly like the thing that is working and idle.

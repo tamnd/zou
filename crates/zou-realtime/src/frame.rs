@@ -86,6 +86,20 @@ impl Frame {
         Frame::reply(to, "error", json!({"reason": reason.into()}))
     }
 
+    /// Something the server is saying on a topic without being asked,
+    /// which is what a presence message is. There is no ref because
+    /// nothing is being replied to, and the client matches it to a
+    /// channel by topic and hands it to whatever is bound to the event.
+    pub fn push(topic: &str, event: &str, payload: Value) -> Frame {
+        Frame {
+            join_ref: None,
+            reference: None,
+            topic: topic.into(),
+            event: event.into(),
+            payload,
+        }
+    }
+
     /// The channel has gone wrong and is not coming back. The client
     /// tears the channel down and retries the join.
     pub fn channel_error(topic: &str) -> Frame {

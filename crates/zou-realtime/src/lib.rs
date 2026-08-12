@@ -18,7 +18,7 @@
 //! the binary one that current clients use for broadcasts.
 //!
 //! What is built so far is the socket, the channels on it, tokens on
-//! connect and mid connection, and broadcast. Presence, postgres
+//! connect and mid connection, broadcast and presence. Postgres
 //! changes and private channels are refused by name rather than
 //! joined and left silent, which is the difference between a client
 //! that reports an error and a client that waits forever.
@@ -29,4 +29,4 @@ pub mod session;
 
 pub use frame::{BinaryBroadcast, Encoding, Frame, Vsn};
 pub use hub::{Delivery, Hub, SocketId};
-pub use session::{Action, Config, Fanout, Identity, Session, Tokens};
+pub use session::{Action, Config, Fanout, Identity, Sent, Session, Tokens};
