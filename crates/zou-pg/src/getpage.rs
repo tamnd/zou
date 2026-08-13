@@ -252,7 +252,12 @@ impl<'a> PageService<'a> {
                 .iter()
                 .any(|(rref, init)| *init && rref == blk);
             if !self_built {
-                bare = bare.or(Some((*blk, first_lsn.0)));
+                // Only a strict caller is owed the complaint. Recording
+                // it either way would refuse the batch below on behalf
+                // of a caller that asked for exactly the opposite.
+                if strict {
+                    bare = bare.or(Some((*blk, first_lsn.0)));
+                }
                 usable[i] = strict;
             }
         }
@@ -805,6 +810,42 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_bare_mid_history_chain_is_a_none_to_the_caller_that_asked_for_one() {
+        // The same fixture again, read the way compaction reads it. A
+        // fold that hears BareChain here dies on the whole shard, and
+        // the answer it wanted was only ever "leave that page in the
+        // delta run". The pool is bogus for the same reason as above,
+        // nothing gets as far as redo.
+        let store = MemStore::default();
+        let layout = TenantLayout::new("t");
+        let entries = vec![DeltaEntry {
+            key: LayerKey::page(1663, 5, 90, 0, 4),
+            lsn: Lsn(150),
+            record: vec![9; 40],
+        }];
+        let (bytes, footer) = build_delta(&entries, 4096).unwrap();
+        publish(&store, &layout, &bytes, &footer, 150);
+        let (manifest, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let map = manifest.layer_map().unwrap();
+
+        let pool = RedoPool::new(crate::redo::RedoPoolConfig {
+            postgres: "/nonexistent".into(),
+            scratch_root: "/nonexistent".into(),
+            workers: 1,
+            batch_timeout: std::time::Duration::from_secs(1),
+            batches_per_worker: 1,
+            data_checksums: false,
+        });
+        let svc = PageService::new(&store, layout.shard_prefix(0), Some(&pool), false);
+        let pages = svc
+            .get_pages_where_possible(&map, &Memtable::new(), &[blk(90, 4)], 200)
+            .expect("the batch is not refused over one unbuildable page");
+        assert_eq!(pages, vec![None]);
     }
 
     #[test]
