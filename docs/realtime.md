@@ -34,6 +34,7 @@ Anything else is refused at the handshake with a sentence saying which two are s
 `broadcast` sends a payload to the other sockets on the topic, and the two options in the join payload are honoured.
 `self` decides whether the sender hears its own message back, and it is off unless asked for, because most of the time the sender already knows what it just sent.
 `ack` decides whether the push is answered at all, and a client that asked for one gets a reply it can await.
+A channel with both gets its own message first and the ack after it, so awaiting the ack is enough to know the message has already been handed to whatever is bound to it.
 
 A push carrying an event name is sent as bytes by the current client rather than as json, which is a detail nobody using the client ever sees and the one thing a server has to get right or it will look like it works and deliver nothing.
 Both encodings are read, and a delivery goes out in whichever encoding the receiving socket can read: bytes to a `2.0.0` socket, json to a `1.0.0` one.
@@ -67,6 +68,7 @@ That is the client's own rule, and it is the one that matters in practice, becau
 
 All of that is asked of zou through the real client rather than only over a raw socket, in the presence suite in [tamnd/zou-conformance](https://github.com/tamnd/zou-conformance), which runs against a real `supabase start` as well so that the questions are the reference's answers rather than ours.
 The http broadcast below is asked there the same way, through both of the client's own ways of sending.
+And under both of those there is a golden: the frames a broadcast channel and a presence channel are sent, recorded off a real `supabase start` and compared frame for frame, which is how a server that gets the client's fold right while sending the wrong frames is caught.
 
 State is per topic and per project, and it is held where the sockets are.
 A socket that goes away, whether it untracks, leaves the channel or just disconnects, leaves the topic, and the last socket off a topic takes the topic's state with it.

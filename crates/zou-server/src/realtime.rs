@@ -983,7 +983,6 @@ fn fan(
                 encoding,
                 payload,
             },
-            to_self: false,
         },
     );
     // A message that came in over http costs the project what one

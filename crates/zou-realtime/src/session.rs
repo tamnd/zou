@@ -66,6 +66,11 @@ pub struct Config {
     /// on the way through would be a server whose subscriptions all
     /// fail. What the entries mean is somebody else's to work out.
     pub postgres_changes: Vec<Value>,
+    /// The ref of the join this channel is, which is not something the
+    /// client asked for but is the one thing about the join that
+    /// outlives the reply: the presence state that follows carries it.
+    /// A config that was read off a payload and never joined has none.
+    pub join_ref: Option<String>,
 }
 
 impl Config {
@@ -101,19 +106,24 @@ impl Config {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default(),
+            join_ref: None,
         }
     }
 }
 
 /// A message a broadcast turns into, on its way to the other members
 /// of a topic.
+///
+/// The other members, and nobody else. A sender that asked for
+/// `broadcast.self` has been written its own copy already, before this
+/// was handed to the hub, so the copy that comes back around is always
+/// dropped. That is not tidiness: upstream sends the sender its message
+/// before it acks the push, and a copy that has to go out to the hub
+/// and come back cannot arrive before a reply written on the spot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fanout {
     pub topic: String,
     pub push: BinaryBroadcast,
-    /// Whether the socket that sent it hears it back, which is the
-    /// sender's `broadcast.self` and nobody else's.
-    pub to_self: bool,
 }
 
 /// What goes down a topic to the sockets on it.
@@ -475,11 +485,12 @@ impl Session {
         if self.too_big(&push) {
             return self.oversized(&asked, ack);
         }
-        let mut actions = vec![Action::Fan(Fanout {
-            topic: room,
-            push,
-            to_self,
-        })];
+        let fan = Fanout { topic: room, push };
+        let mut actions = Vec::new();
+        if to_self {
+            actions.extend(self.broadcast_down(&fan));
+        }
+        actions.push(Action::Fan(fan));
         if ack {
             actions.push(self.send(Frame::ok(&asked)));
         }
@@ -564,7 +575,8 @@ impl Session {
 
     /// The join itself, once there is nothing left to check.
     fn joined(&mut self, frame: Frame) -> Vec<Action> {
-        let config = Config::of(&frame.payload);
+        let mut config = Config::of(&frame.payload);
+        config.join_ref = frame.join_ref.clone();
         let topic = frame.topic.clone();
         let room = room(&topic, config.private);
         let wants = config.postgres_changes.clone();
@@ -579,7 +591,12 @@ impl Session {
             actions.push(Action::Watch { topic, wants });
             return actions;
         }
-        actions.push(self.send(Frame::ok(&frame)));
+        // Empty rather than nothing at all. Upstream answers every join
+        // with a `postgres_changes` list, and a channel that asked for
+        // none is answered with none of them rather than with a reply
+        // that has no such field, which is a difference anything
+        // reading the reply itself can see.
+        actions.push(self.send(Frame::reply(&frame, "ok", json!({"postgres_changes": []}))));
         actions.extend(self.after_reply(&topic));
         actions
     }
@@ -953,8 +970,16 @@ impl Session {
     /// `room` is what the hub was asked about and the frame carries
     /// the topic, which are the same string for a public channel and
     /// two for a private one.
+    ///
+    /// It carries the ref of the join it follows, the way everything a
+    /// channel says to the socket that joined it does. The diffs after
+    /// it carry none, because a diff is the topic talking to everyone
+    /// on it and belongs to no one join.
     pub fn state(&self, room: &str, state: Value) -> Action {
-        self.send(Frame::push(topic_of(room), "presence_state", state))
+        let topic = topic_of(room);
+        let mut frame = Frame::push(topic, "presence_state", state);
+        frame.join_ref = self.channels.get(topic).and_then(|c| c.join_ref.clone());
+        self.send(frame)
     }
 
     /// A client whose access token was about to expire has a new one.
@@ -1036,11 +1061,12 @@ impl Session {
         if self.too_big(&push) {
             return self.oversized(&frame, ack);
         }
-        let mut actions = vec![Action::Fan(Fanout {
-            topic: room,
-            push,
-            to_self,
-        })];
+        let fan = Fanout { topic: room, push };
+        let mut actions = Vec::new();
+        if to_self {
+            actions.extend(self.broadcast_down(&fan));
+        }
+        actions.push(Action::Fan(fan));
         if ack {
             actions.push(self.send(Frame::ok(&frame)));
         }
@@ -1130,7 +1156,10 @@ impl Session {
 
     fn delivered(&self, sent: &Sent, mine: bool) -> Option<Action> {
         match sent {
-            Sent::Broadcast(fan) => self.broadcast_down(fan, mine),
+            // The sender was written its own copy where it sent, if it
+            // asked for one, so what comes back around the hub is a
+            // second copy and is dropped.
+            Sent::Broadcast(fan) => (!mine).then(|| self.broadcast_down(fan)).flatten(),
             Sent::Diff { topic, payload } => {
                 let topic = self.on_room(topic)?;
                 // A socket that did not ask for presence is not sent
@@ -1157,10 +1186,10 @@ impl Session {
         (self::room(topic, config.private) == room).then_some(topic)
     }
 
-    fn broadcast_down(&self, fan: &Fanout, mine: bool) -> Option<Action> {
-        if mine && !fan.to_self {
-            return None;
-        }
+    /// A broadcast on its way down this socket, in whatever encoding
+    /// this socket speaks. Nothing goes down a socket that is not on
+    /// the room it was sent to.
+    fn broadcast_down(&self, fan: &Fanout) -> Option<Action> {
         self.on_room(&fan.topic)?;
         match self.vsn {
             // The binary encoding is the current client's, and it
@@ -1254,7 +1283,10 @@ mod tests {
         assert_eq!(actions[0], Action::Carry("realtime:room".into()));
         let reply = text_of(&actions[1]);
         assert_eq!(reply.event, "phx_reply");
-        assert_eq!(reply.payload, json!({"status": "ok", "response": {}}));
+        assert_eq!(
+            reply.payload,
+            json!({"status": "ok", "response": {"postgres_changes": []}})
+        );
         assert!(session.on("realtime:room"));
     }
 
@@ -1545,11 +1577,15 @@ mod tests {
         };
         assert_eq!(fan.topic, "realtime:room");
         assert_eq!(fan.push.event, "cursor");
-        assert!(!fan.to_self);
     }
 
+    /// A channel that asked for both is sent its own message and then
+    /// the ack, in that order, which is upstream's order and the reason
+    /// the sender's copy is written here rather than taken off the hub.
+    /// An application that awaits the ack has already been handed the
+    /// message it sent.
     #[test]
-    fn an_ack_is_sent_when_the_join_asked_for_one() {
+    fn an_ack_is_sent_when_the_join_asked_for_one_and_the_echo_comes_first() {
         let mut session = socket();
         join(
             &mut session,
@@ -1559,12 +1595,33 @@ mod tests {
             r#"["1","5","realtime:room","broadcast",{"type":"broadcast","event":"cursor","payload":{}}]"#,
             &OneToken,
         );
-        assert_eq!(actions.len(), 2);
-        let Action::Fan(fan) = &actions[0] else {
-            panic!("not a fan out")
+        assert_eq!(actions.len(), 3);
+        let Action::Binary(own) = &actions[0] else {
+            panic!("{:?} is not the sender's own copy", actions[0])
         };
-        assert!(fan.to_self);
-        assert_eq!(text_of(&actions[1]).payload["status"], "ok");
+        assert_eq!(own[0], 4, "a broadcast to a subscriber");
+        assert!(own.ends_with(b"realtime:roomcursor{}"), "{own:?}");
+        assert!(matches!(actions[1], Action::Fan(_)), "{:?}", actions[1]);
+        assert_eq!(text_of(&actions[2]).payload["status"], "ok");
+    }
+
+    /// And the copy that comes back around the hub is dropped, so the
+    /// sender is handed one message rather than two.
+    #[test]
+    fn the_senders_own_copy_does_not_come_back_around_as_well() {
+        let mut session = socket();
+        join(&mut session, r#"{"config":{"broadcast":{"self":true}}}"#);
+        let actions = session.text(
+            r#"["1","5","realtime:room","broadcast",{"type":"broadcast","event":"cursor","payload":{}}]"#,
+            &OneToken,
+        );
+        let Action::Fan(fan) = &actions[1] else {
+            panic!("{:?} is not a fan out", actions[1])
+        };
+        let sent = Sent::Broadcast(fan.clone());
+        assert!(only(session.deliver(&sent, true)).is_none());
+        // And somebody else on the topic is still sent it.
+        assert!(only(session.deliver(&sent, false)).is_some());
     }
 
     #[test]
