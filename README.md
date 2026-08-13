@@ -86,6 +86,17 @@ A room can be sent to over http as well, both shapes the client posts, which is 
 Private channels are served too, against the project's own row level security policies on `realtime.messages`, so policies written for Supabase Realtime answer the same way here.
 `postgres_changes` is served as well, so a channel can subscribe to a table and be sent the rows that changed in it, filtered by the same operators upstream takes and checked against the policies on that table, see [docs/realtime.md](docs/realtime.md).
 
+Database webhooks are served too, which is to say the trigger a dashboard writes:
+
+```sql
+create trigger orders_webhook after insert on public.orders
+    for each row execute function supabase_functions.http_request(
+        'https://example.com/hooks/orders', 'POST', '{"Content-Type":"application/json"}', '{}', '1000'
+    );
+```
+
+The `net` and `supabase_functions` schemas are pg_net's interface and upstream's trigger function, but there is no background worker behind them: the queued row announces itself with a notification and the server makes the call, and a request that could not be delivered is tried again, which upstream never does, see [docs/webhooks.md](docs/webhooks.md).
+
 Branch a database for a preview deploy:
 
 ```bash
