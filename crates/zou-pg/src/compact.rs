@@ -127,19 +127,25 @@ fn image_floor(descs: &[LayerDesc]) -> Lsn {
 }
 
 /// Worst case objects a read at the newest lsn touches: the delta runs
-/// above the image floor plus the image, the number the bound caps.
-/// Older layers are not counted because [`ReadPlan::above`] never hands
-/// them to a current read.
+/// above the image floor, which are the only deltas [`ReadPlan::above`]
+/// ever hands a current read, plus every image, because the read has
+/// to ask each one whether it carries the key.
+///
+/// The images are the part that used to be counted as one. They are
+/// sparse, a fold images the keys it saw, so a key nobody has written
+/// for a while sits in an old one and the read probes the newer ones
+/// first and finds nothing. A shard that folds every two minutes and
+/// never lets an image go has a hundred probes on that path by lunch
+/// time, and the gauge said one.
 ///
 /// [`ReadPlan::above`]: zou_store::layermap::ReadPlan::above
 pub fn read_amp(descs: &[LayerDesc]) -> usize {
     let floor = image_floor(descs);
-    let image = descs.iter().any(|d| d.kind == LayerKind::Image);
     descs
         .iter()
         .filter(|d| d.kind == LayerKind::Delta && d.max_lsn > floor)
         .count()
-        + usize::from(image)
+        + descs.iter().filter(|d| d.kind == LayerKind::Image).count()
 }
 
 /// The debt of one shard: bytes of delta above the newest image, what
@@ -789,14 +795,21 @@ mod tests {
         assert_eq!(debt(&[image(200), delta(10, 100, 7)]), 0);
 
         // The amp bound is about the read path, and the read path is
-        // the newest image plus the runs above it. History a pass left
-        // alone is not amp, so a shard is not scheduled for it.
+        // the images plus the runs above the newest of them. A delta
+        // a pass folded is not amp, so a shard is not scheduled for
+        // it, but an image it left behind is: the read has to ask
+        // that one too.
         assert_eq!(read_amp(&[]), 0);
         assert_eq!(read_amp(&[delta(10, 50, 7), delta(51, 90, 7)]), 2);
         assert_eq!(
             read_amp(&[image(200), delta(10, 100, 7), delta(201, 250, 3)]),
             2
         );
+        // Ten folds worth of images with one live run above them is
+        // eleven objects a miss walks, not two.
+        let mut stacked: Vec<LayerDesc> = (0..10).map(|g| image(100 + g * 10)).collect();
+        stacked.push(delta(201, 250, 3));
+        assert_eq!(read_amp(&stacked), 11);
     }
 
     #[test]

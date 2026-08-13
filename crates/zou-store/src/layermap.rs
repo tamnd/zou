@@ -5,9 +5,11 @@
 //! answers the read algorithm for `(key, lsn)`: the newest image layer
 //! at or below the lsn that covers the key, plus every delta layer
 //! that could hold records for the key in the window between that
-//! image and the read lsn. Compaction keeps the answer small, at most
-//! one image and four deltas per lookup, and the plan reports its own
-//! read amplification so that bound is observable instead of assumed.
+//! image and the read lsn. Compaction is what keeps the answer small,
+//! and the plan reports its own read amplification so that the bound
+//! is observable instead of assumed. Images count one each, not one
+//! in total: they are sparse, so a lookup may walk several before it
+//! finds the base for its key.
 //!
 //! Both layer kinds are indexed by an interval tree over the key
 //! space, the classic centered kind: a stab costs O(log n) plus one
@@ -254,13 +256,21 @@ impl<'a> ReadPlan<'a> {
     }
 
     /// The worst case layer count for this lookup, before the floor
-    /// takes anything off. The compaction invariant keeps a read at
-    /// five layers or less, one image plus four deltas; the map
-    /// reports the bound so it is measured, not assumed, and
+    /// takes anything off. Compaction aims at five layers or less,
+    /// and the map reports the count so the aim is measured rather
+    /// than assumed;
     /// [`super::pageread::Reconstruction::layers_touched`] reports
     /// what the read actually paid.
+    ///
+    /// Every image in the plan counts, not one. Images are sparse:
+    /// a fold images the keys it saw and leaves the rest where they
+    /// are, so a key nobody has written for a while is in none of the
+    /// recent images and [`super::pageread::LayerReader::reconstruct`]
+    /// probes them newest first until one carries it. Counting a
+    /// single image said the amp was one while a read walked twenty,
+    /// which is a gauge that goes green as the store gets slower.
     pub fn read_amp(&self) -> usize {
-        self.deltas.len() + usize::from(!self.images.is_empty())
+        self.deltas.len() + self.images.len()
     }
 }
 
@@ -496,6 +506,27 @@ mod tests {
         let plan = map.plan(&k(5000), Lsn(300));
         assert!(plan.images.is_empty() && plan.above(Lsn(0)).count() == 0);
         assert_eq!(plan.read_amp(), 0);
+    }
+
+    #[test]
+    fn every_image_a_read_may_probe_is_counted() {
+        // Twenty folds over the same key range, each one imaging the
+        // keys it merged. A key none of the recent ones held sends
+        // the reader through all twenty footers before it finds a
+        // base, so the amp for that lookup is twenty, not one.
+        let mut layers = Vec::new();
+        for g in 0..20u64 {
+            layers.push(LayerDesc::image(k(0), k(99), Lsn(100 + g * 10)));
+        }
+        layers.push(LayerDesc::delta(k(0), k(99), Lsn(300), Lsn(400)));
+        let map = LayerMap::new(layers).unwrap();
+        let plan = map.plan(&k(5), Lsn(500));
+        assert_eq!(plan.images.len(), 20);
+        assert_eq!(plan.read_amp(), 21);
+        // Reading below most of them counts only what that read can
+        // reach, so the gauge follows the lsn and not the manifest.
+        let plan = map.plan(&k(5), Lsn(150));
+        assert_eq!(plan.read_amp(), 6);
     }
 
     #[test]
