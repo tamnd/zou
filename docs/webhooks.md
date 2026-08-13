@@ -120,5 +120,5 @@ Two differences that are visible from sql:
 
 ## Scheduled jobs
 
-Not yet.
-`pg_cron`'s interface on zou's scheduler is the other half of this milestone and is not built, so a project that schedules a webhook rather than triggering one has nothing to call here.
+A webhook that fires on a clock rather than on a row is a job, and jobs are the `cron` schema, described in [cron.md](cron.md).
+It is the same dispatcher with a different reason for the row existing, so a job whose command calls `net.http_post()` is a scheduled webhook and needs nothing else.

@@ -868,7 +868,7 @@ pub(crate) fn iso_to_unix(text: &str) -> Option<i64> {
 /// is, counting from 1970. March is treated as the first month so that
 /// the leap day lands at the end of the year and stops being a special
 /// case anywhere else.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = year - i64::from(month <= 2);
     let era = year.div_euclid(400);
     let of_era = year - era * 400;

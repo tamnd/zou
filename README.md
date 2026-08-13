@@ -97,6 +97,14 @@ create trigger orders_webhook after insert on public.orders
 
 The `net` and `supabase_functions` schemas are pg_net's interface and upstream's trigger function, but there is no background worker behind them: the queued row announces itself with a notification and the server makes the call, and a request that could not be delivered is tried again, which upstream never does, see [docs/webhooks.md](docs/webhooks.md).
 
+Scheduled jobs are pg_cron's interface on the same idea:
+
+```sql
+select cron.schedule('nightly-vacuum', '0 3 * * *', 'delete from events where at < now() - interval ''30 days''');
+```
+
+The `cron` schema is upstream's functions and its two tables, and the firing is done by the server rather than by a launcher process, so a deployment that scales to zero comes back to one run of a job it missed rather than to a queue of them, see [docs/cron.md](docs/cron.md).
+
 Branch a database for a preview deploy:
 
 ```bash
