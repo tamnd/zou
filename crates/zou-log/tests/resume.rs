@@ -32,11 +32,17 @@ fn frame(tenant: u128, start: u64, body: &[u8]) -> Frame2 {
 struct CountingStore {
     inner: Arc<dyn CasStore>,
     gets: AtomicUsize,
+    ranges: AtomicUsize,
 }
 
 impl CountingStore {
     fn gets(&self) -> usize {
         self.gets.load(Ordering::SeqCst)
+    }
+
+    /// Range reads, which is what a sealed chunk costs.
+    fn ranges(&self) -> usize {
+        self.ranges.load(Ordering::SeqCst)
     }
 }
 
@@ -54,6 +60,7 @@ impl CasStore for CountingStore {
         self.inner.put_if_match(key, data, expected)
     }
     fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
+        self.ranges.fetch_add(1, Ordering::SeqCst);
         self.inner.get_range(key, offset, len)
     }
     fn delete(&self, key: &str) -> Result<(), CasError> {
@@ -69,6 +76,7 @@ fn counting(dir: &tempfile::TempDir) -> (Arc<CountingStore>, Arc<WalMedia>) {
     let counting = Arc::new(CountingStore {
         inner,
         gets: AtomicUsize::new(0),
+        ranges: AtomicUsize::new(0),
     });
     let media = Arc::new(WalMedia::single(Arc::clone(&counting) as Arc<dyn CasStore>));
     (counting, media)
@@ -308,6 +316,129 @@ fn the_cursor_skips_the_rounds_it_has_already_scanned() {
     assert!(
         cost <= 3,
         "an idle poll cost {cost} gets, it is rereading the round indexes"
+    );
+}
+
+/// A frame body big enough that a round of them is several sealed
+/// chunks, which is the only size at which stopping inside a round
+/// means anything, and noisy enough that the frame codec cannot pack
+/// the round back down into one.
+fn big(seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..(400usize << 10))
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+/// A round is one sealed object and a tenant's frames in it are a list
+/// of byte ranges. Stopping in the middle of a range throws away bytes
+/// that have been paid for, and the cursor has to name the range or the
+/// next call pays for them again. The page service does exactly this:
+/// its sink says stop the moment its slice is spent, and the fetch is
+/// what spends it, so before the chunk cursor every poll read the same
+/// chunk, handed over its first frame, stopped, and came back to read
+/// it again. Ingest never moved (zou #327).
+#[test]
+fn a_stop_inside_a_round_comes_back_to_the_next_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, media) = counting(&dir);
+    let shard = 18;
+    let filter = TeeFilter::Tenant(1);
+
+    let seq = writer(&media, shard);
+    let bodies: Vec<Vec<u8>> = (0..8u64).map(big).collect();
+    let mut at = 100;
+    for body in &bodies {
+        push(&seq, 1, at, body);
+        at += body.len() as u64;
+    }
+    consolidate(&media, shard).unwrap().unwrap();
+    seq.close().unwrap();
+
+    let mut cursor = CatchUpCursor::default();
+    let mut seen: Vec<u64> = Vec::new();
+    let mut chunks = 0;
+    for call in 0..8 {
+        let before = store.ranges();
+        let out = catch_up_resuming::<ConsolidateError, _, _>(
+            &media,
+            shard,
+            &filter,
+            // Applied stays where it is, the way it does for a poll
+            // whose frames are already in the ingest buffer waiting on
+            // a record the next chunk completes.
+            Lsn(0),
+            &mut cursor,
+            |f| {
+                seen.push(f.start_lsn.0);
+                // A spent slice, from the first frame on.
+                Ok(false)
+            },
+            || true,
+        )
+        .unwrap();
+        chunks += out.chunks;
+        let mut once = seen.clone();
+        once.sort_unstable();
+        once.dedup();
+        assert_eq!(
+            once.len(),
+            seen.len(),
+            "call {call} handed over a frame an earlier one already had, \
+             which is the livelock: the fetch spends the slice, the stop \
+             loses the fetch"
+        );
+        assert_eq!(
+            store.ranges() - before,
+            out.chunks as usize,
+            "call {call} fetched a chunk it did not deliver"
+        );
+        if out.caught_up {
+            break;
+        }
+        assert_eq!(out.chunks, 1, "a stop should end the call after its chunk");
+    }
+    assert!(chunks >= 2, "one chunk is not a test of stopping between");
+    assert_eq!(seen.len(), 8, "every frame, once");
+}
+
+/// The lsn bounds are in the round index, so a chunk that ends at or
+/// below what the caller has already applied is a range GET nobody
+/// pays for. A restarted page service asks with applied near the head
+/// of the newest round and used to fetch the whole round to find out.
+#[test]
+fn a_round_scan_skips_the_chunks_below_the_applied_lsn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, media) = counting(&dir);
+    let shard = 19;
+    let filter = TeeFilter::Tenant(1);
+
+    let seq = writer(&media, shard);
+    let bodies: Vec<Vec<u8>> = (0..8u64).map(big).collect();
+    let mut at = 100;
+    let mut last = 100;
+    for body in &bodies {
+        push(&seq, 1, at, body);
+        last = at;
+        at += body.len() as u64;
+    }
+    consolidate(&media, shard).unwrap().unwrap();
+    seq.close().unwrap();
+
+    // Everything but the last frame is behind the caller already.
+    let before = store.ranges();
+    let mut cursor = CatchUpCursor::default();
+    let out = drain(&media, shard, &filter, Lsn(last), &mut cursor);
+    assert_eq!(out, vec![last], "only the frame it has not applied");
+    let fetched = store.ranges() - before;
+    assert!(
+        fetched <= 2,
+        "it fetched {fetched} chunks for one frame at the end of the round"
     );
 }
 

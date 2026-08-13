@@ -452,6 +452,45 @@ pub fn gc_landing(media: &WalMedia, shard: u32, grace: Duration) -> Result<u64, 
     Ok(deleted)
 }
 
+/// The byte ranges one tenant's frames occupy in a round, in lsn
+/// order, empty for a tenant the round never saw. Every entry carries
+/// its lsn bounds, so a reader that only wants what is above a
+/// watermark can drop most of them without a single GET.
+pub fn round_chunks(index: &RoundIndex, tenant: u128) -> &[RoundChunk] {
+    index
+        .tenants
+        .iter()
+        .find(|t| t.tenant == tenant)
+        .map_or(&[], |t| &t.chunks)
+}
+
+/// One chunk of one tenant's frames, one range GET. A reader that
+/// cannot hold a whole round, or cannot afford to fetch one before it
+/// answers anything else, takes them one at a time through this.
+pub fn read_round_chunk(
+    store: &dyn CasStore,
+    index: &RoundIndex,
+    chunk: &RoundChunk,
+) -> Result<Vec<Frame2>, ConsolidateError> {
+    let bytes = store
+        .get_range(&index.sealed, chunk.offset, chunk.len)?
+        .ok_or(ConsolidateError::BadRound {
+            shard: index.shard,
+            round: index.round,
+            reason: format!("sealed object {} is missing", index.sealed),
+        })?;
+    let mut out = Vec::new();
+    for item in Frame2Stream::new(&bytes) {
+        let frame = item.map_err(|source| ConsolidateError::BadRound {
+            shard: index.shard,
+            round: index.round,
+            reason: format!("sealed chunk at {} is corrupt: {source}", chunk.offset),
+        })?;
+        out.push(frame);
+    }
+    Ok(out)
+}
+
 /// Read one tenant's frames out of a round, in lsn order, using only
 /// the round index and range GETs against the sealed object. This is
 /// the catch up read path: no footer fetch, no full object fetch.
@@ -460,26 +499,9 @@ pub fn read_round_tenant(
     index: &RoundIndex,
     tenant: u128,
 ) -> Result<Vec<Frame2>, ConsolidateError> {
-    let Some(t) = index.tenants.iter().find(|t| t.tenant == tenant) else {
-        return Ok(Vec::new());
-    };
     let mut out = Vec::new();
-    for chunk in &t.chunks {
-        let bytes = store
-            .get_range(&index.sealed, chunk.offset, chunk.len)?
-            .ok_or(ConsolidateError::BadRound {
-                shard: index.shard,
-                round: index.round,
-                reason: format!("sealed object {} is missing", index.sealed),
-            })?;
-        for item in Frame2Stream::new(&bytes) {
-            let frame = item.map_err(|source| ConsolidateError::BadRound {
-                shard: index.shard,
-                round: index.round,
-                reason: format!("sealed chunk at {} is corrupt: {source}", chunk.offset),
-            })?;
-            out.push(frame);
-        }
+    for chunk in round_chunks(index, tenant) {
+        out.extend(read_round_chunk(store, index, chunk)?);
     }
     Ok(out)
 }
