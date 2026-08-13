@@ -342,7 +342,8 @@ A subscriber holding `grant select (id, title)` gets those columns and no others
 Three cases are worth knowing before you rely on this.
 
 A delete is sent to every subscriber, because the row is gone and no policy can be asked about it.
-On a table with row level security on, its `old_record` is cut down to the identifying columns, so what a subscriber learns is that a row with that key is gone rather than what was in it.
+On a table with row level security on, its `old_record` is cut down to the primary key, so what a subscriber learns is that a row with that key is gone rather than what was in it.
+That holds on a table with `replica identity full` as well, where postgres publishes every column of the deleted row and marks all of them as part of the identity: the cut is made on the key the catalog has rather than on what the change says about itself, because the other way round is a table publishing its deleted rows to everybody who subscribed.
 
 A table with no primary key cannot be checked, since there is nothing to select the row back by, and its changes arrive carrying `["Error 400: Bad Request, no primary key"]` instead of a record.
 A subscriber who may not select the key columns gets `["Error 401: Unauthorized"]`, which is the same problem from the other side.

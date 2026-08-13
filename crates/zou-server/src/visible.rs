@@ -28,11 +28,20 @@
 //!
 //! And what a delete says. There is no row left to check a policy
 //! against, so upstream publishes deletes to every subscriber and cuts
-//! the old record down to the identifying columns when the table has
-//! row level security on. What a subscriber learns is that a row with
-//! that key is gone, which is the compromise upstream made and one this
-//! server has to make the same way or a project's policies mean
-//! something different here.
+//! the old record down to the primary key when the table has row level
+//! security on. What a subscriber learns is that a row with that key is
+//! gone, which is the compromise upstream made and one this server has
+//! to make the same way or a project's policies mean something
+//! different here.
+//!
+//! The key that cut is made on comes from the catalog and not from the
+//! change, because the two are not the same thing on a table with
+//! `replica identity full`: pgoutput flags every column of such a table
+//! as part of the identity, so a cut made on the flags would keep the
+//! whole deleted row and publish it to subscribers a policy hides it
+//! from. Upstream cuts on `(c).is_pkey` for the same reason, with the
+//! same comment next to it about not being able to secure a delete any
+//! other way.
 //!
 //! Two things this cannot fix, both upstream's too and both worth
 //! knowing. The check reads the table as it is now, so a row an update
@@ -44,7 +53,7 @@
 use serde_json::Value;
 
 use crate::payload::{NO_KEY, Seen, UNAUTHORIZED};
-use crate::pgoutput::{Cell, Change, Op, Relation};
+use crate::pgoutput::{Cell, Change, Op, Relation, Replica};
 use crate::sql::{Error, Pool, Session};
 
 /// Who is asking, which is the role and the claims a policy reads.
@@ -89,10 +98,11 @@ pub async fn seen(pool: &Pool, asker: &Asker, change: &Change) -> Result<Seen, S
 
 async fn looking(sess: &Session, asker: &Asker, change: &Change) -> Result<Seen, String> {
     let relation = &change.relation;
-    let (rls, columns) = privileges(sess, asker, relation).await?;
+    let (rls, columns, keys) = privileges(sess, asker, relation).await?;
     let mut seen = Seen {
         row: true,
         columns,
+        keys: identifying(relation, keys),
         keys_only: false,
         error: None,
     };
@@ -105,11 +115,11 @@ async fn looking(sess: &Session, asker: &Asker, change: &Change) -> Result<Seen,
         return Ok(seen);
     }
 
-    let keys: Vec<usize> = relation
-        .columns
+    let keys: Vec<usize> = seen
+        .keys
         .iter()
         .enumerate()
-        .filter(|(_, column)| column.key)
+        .filter(|(_, key)| **key)
         .map(|(at, _)| at)
         .collect();
     if keys.is_empty() {
@@ -130,11 +140,27 @@ async fn looking(sess: &Session, asker: &Asker, change: &Change) -> Result<Seen,
     Ok(seen)
 }
 
-/// Whether row level security is on, and which columns this role may
-/// select.
+/// Which columns name the row, which is the primary key.
 ///
-/// Both come from the catalog rather than from a check as the user,
-/// which is what `has_column_privilege` taking a role is for: a
+/// The one case where there is no primary key and something still names
+/// the row is a table with `replica identity index`: postgres will not
+/// publish an update or a delete of one without the index's columns, so
+/// they identify a row as exactly as a key would and are what the
+/// change carries. Flags are read for that and only that, because under
+/// `replica identity full` every column carries the flag and none of
+/// them names anything.
+fn identifying(relation: &Relation, keys: Vec<bool>) -> Vec<bool> {
+    if keys.iter().any(|key| *key) || relation.replica == Replica::Full {
+        return keys;
+    }
+    relation.columns.iter().map(|column| column.key).collect()
+}
+
+/// Whether row level security is on, which columns this role may
+/// select, and which of them are the primary key.
+///
+/// All three come from the catalog rather than from a check as the
+/// user, which is what `has_column_privilege` taking a role is for: a
 /// privilege is a fact about a grant and does not need anybody to be
 /// impersonated to be read.
 ///
@@ -145,7 +171,7 @@ async fn privileges(
     sess: &Session,
     asker: &Asker,
     relation: &Relation,
-) -> Result<(bool, Vec<bool>), String> {
+) -> Result<(bool, Vec<bool>, Vec<bool>), String> {
     let names: Vec<String> = relation.columns.iter().map(|c| c.name.clone()).collect();
     let oid = relation.oid as i64;
     // The left join is what keeps a column dropped since the relation
@@ -165,8 +191,21 @@ async fn privileges(
                           on a.attrelid = c.oid and a.attname = n.name
                          and a.attnum > 0 and not a.attisdropped
                         order by n.at
+                    ),
+                    array(
+                        select coalesce(a.attnum = any(k.keys), false)
+                        from unnest($3::text[]) with ordinality as n(name, at)
+                        left join pg_attribute a
+                          on a.attrelid = c.oid and a.attname = n.name
+                         and a.attnum > 0 and not a.attisdropped
+                        order by n.at
                     )
-             from pg_class c where c.oid = $1::int8::oid",
+             from pg_class c
+             left join lateral (
+                 select i.indkey::int2[] as keys from pg_index i
+                  where i.indrelid = c.oid and i.indisprimary limit 1
+             ) k on true
+             where c.oid = $1::int8::oid",
             &[&oid, &asker.role, &names],
         )
         .await
@@ -174,9 +213,10 @@ async fn privileges(
     let Some(row) = rows.first() else {
         // The relation is gone, which is a table dropped between the
         // change and this question. Nobody may see it.
-        return Ok((true, vec![false; relation.columns.len()]));
+        let none = vec![false; relation.columns.len()];
+        return Ok((true, none.clone(), none));
     };
-    Ok((row.get(0), row.get(1)))
+    Ok((row.get(0), row.get(1), row.get(2)))
 }
 
 /// Whether the policies on the table let this asker select the row that
