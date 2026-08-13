@@ -257,7 +257,6 @@ mod tests {
                 encoding: Encoding::Json,
                 payload: b"{}".to_vec(),
             },
-            to_self: false,
         }
     }
 

@@ -134,12 +134,21 @@ async fn a_join_is_answered_and_a_heartbeat_keeps_it_open() {
     let reply = join(&mut socket, "realtime:room").await;
     assert_eq!(reply[3], "phx_reply");
     assert_eq!(reply[4]["status"], "ok");
-    assert_eq!(reply[4]["response"], serde_json::json!({}));
+    // A join is answered with the postgres changes it asked for, and a
+    // join that asked for none is answered with an empty list rather
+    // than with nothing at all, which is what upstream sends.
+    assert_eq!(
+        reply[4]["response"],
+        serde_json::json!({"postgres_changes": []})
+    );
 
+    // The heartbeat is the socket's own and belongs to no channel, so
+    // its reply is the empty one.
     send(&mut socket, r#"[null,"2","phoenix","heartbeat",{}]"#).await;
     let beat = next_json(&mut socket).await;
     assert_eq!(beat[2], "phoenix");
     assert_eq!(beat[4]["status"], "ok");
+    assert_eq!(beat[4]["response"], serde_json::json!({}));
 }
 
 #[tokio::test]
