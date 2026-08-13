@@ -1,0 +1,177 @@
+The wal pusher runs during recovery.
+
+A crash leaves local pg_wal ahead of the stream, because the pusher
+died with everything else before it had drained. Recovery then reads
+pages from the page service at the lsn it is replaying, the service
+can only serve what the store holds, the read parks for the wait cap
+and fails, and the startup process dies with it. Three restarts later
+the postmaster gives up and the node is gone for good.
+
+The pusher already knows how to close that gap: on a store whose
+stream ends behind local flush it re-pushes the difference. It just
+ran too late, registered with BgWorkerStart_RecoveryFinished, waiting
+on the recovery that was waiting on it. It now starts with the
+postmaster, like the page service, and trails replay while recovery
+runs.
+
+Out of recovery its bound is the flush pointer as before. In recovery
+there is no flush pointer, GetFlushRecPtr asserts on that, and the
+bytes known good are the ones replay has read, so the bound is
+lastReplayedEndRecPtr. Recovery reads its pages at that same lsn, so a
+parked read costs one push and one ingest poll instead of the wait
+cap. A store that ends ahead of the replay pointer is the ordinary
+case during recovery rather than the fatal one it is afterwards, and
+folding waits until recovery is done.
+
+Taking the writer lease before recovery instead of after comes with
+this, and it is the right way round. A cluster that has lost the lease
+holds a branch nobody will read, and it should learn that before it
+spends a recovery, not after.
+
+diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -121,7 +121,17 @@
+ 
+ 	memset(&bgw, 0, sizeof(bgw));
+ 	bgw.bgw_flags = BGWORKER_SHMEM_ACCESS;
+-	bgw.bgw_start_time = BgWorkerStart_RecoveryFinished;
++
++	/*
++	 * The pusher comes up with the postmaster rather than once recovery
++	 * has finished. A crash leaves local pg_wal ahead of the stream,
++	 * recovery reads its pages from the page service at the lsn it is
++	 * replaying, and the service can only answer once that WAL is in
++	 * the store. Registered any later, the worker that would push it
++	 * waits for the recovery that is waiting for the push, and the node
++	 * never starts again (zou #334).
++	 */
++	bgw.bgw_start_time = BgWorkerStart_PostmasterStart;
+ 	/* Come back immediately: every second here is commit stall. */
+ 	bgw.bgw_restart_time = 0;
+ 	snprintf(bgw.bgw_library_name, sizeof(bgw.bgw_library_name), "postgres");
+@@ -209,6 +219,24 @@
+ 	}
+ }
+ 
++/*
++ * How far local pg_wal is known good.
++ *
++ * Out of recovery that is the flush pointer. In recovery there is no
++ * flush pointer, GetFlushRecPtr asserts on exactly that, and the bytes
++ * that are known good are the ones replay has read and applied, so the
++ * pusher trails replay. That is also the lsn recovery reads its pages
++ * at, so a read parked ahead of the stream costs one push and one
++ * ingest poll rather than the wait cap and a dead startup process.
++ */
++static XLogRecPtr
++zou_wal_local_end(TimeLineID *tli)
++{
++	if (RecoveryInProgress())
++		return GetXLogReplayRecPtr(tli);
++	return GetFlushRecPtr(tli);
++}
++
+ static void
+ zou_wal_publish(XLogRecPtr durable)
+ {
+@@ -273,8 +301,21 @@
+ 	 * Bytes before the first start are covered by the bootstrap
+ 	 * checkpoint capture.
+ 	 */
+-	pushed = GetFlushRecPtr(&tli);
++	/*
++	 * Recovery publishes where redo starts before it replays anything,
++	 * so a pusher that came up with the postmaster waits for that
++	 * rather than mirroring from a pointer nobody has set yet.
++	 */
++	while (RecoveryInProgress() && !ShutdownRequestPending &&
++		   XLogRecPtrIsInvalid(GetXLogReplayRecPtr(NULL)))
++	{
++		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
++						 100, PG_WAIT_EXTENSION);
++		ResetLatch(MyLatch);
++	}
+ 
++	pushed = zou_wal_local_end(&tli);
++
+ 	/*
+ 	 * Become the writer. After a crash the previous incarnation's lease
+ 	 * has to expire first, so retry until the store lets us in.
+@@ -332,11 +373,22 @@
+ 	 */
+ 	if (resume != 0)
+ 	{
+-		if ((XLogRecPtr) resume > pushed)
++		/*
++		 * A store ahead of the cluster it belongs to is nothing local
++		 * can explain, once the cluster is up. During recovery it is
++		 * the ordinary case: replay starts at the last checkpoint, the
++		 * store already holds what follows, and there is nothing to
++		 * push until replay comes past the end of the stream.
++		 */
++		if ((XLogRecPtr) resume > pushed && !RecoveryInProgress())
+ 			ereport(FATAL,
+ 					(errmsg("zou store holds WAL through %X/%X but local flush is only %X/%X",
+ 							LSN_FORMAT_ARGS((XLogRecPtr) resume),
+ 							LSN_FORMAT_ARGS(pushed))));
++		if ((XLogRecPtr) resume > pushed)
++			ereport(LOG,
++					(errmsg("zou wal pusher waiting for recovery to replay past %X/%X, where the stream ends",
++							LSN_FORMAT_ARGS((XLogRecPtr) resume))));
+ 		if ((XLogRecPtr) resume < pushed)
+ 			ereport(LOG,
+ 					(errmsg("zou wal pusher re-pushing %X/%X to %X/%X missed by the previous session",
+@@ -364,7 +416,7 @@
+ 	buf = palloc(ZOU_WAL_CHUNK);
+ 	for (;;)
+ 	{
+-		XLogRecPtr	flush = GetFlushRecPtr(&tli);
++		XLogRecPtr	flush = zou_wal_local_end(&tli);
+ 
+ 		/*
+ 		 * The whole fold lifecycle, capture, publish, and shared log
+@@ -402,7 +454,7 @@
+ 								LSN_FORMAT_ARGS((XLogRecPtr) fredo), rc)));
+ 			}
+ 		}
+-		else if (!ShutdownRequestPending)
++		else if (!ShutdownRequestPending && !RecoveryInProgress())
+ 		{
+ 			XLogRecPtr	redo;
+ 
+@@ -414,7 +466,11 @@
+ 			 * GetOldestRestartPoint reads the control file, so redo only
+ 			 * moves once a checkpoint has fully completed and flushed
+ 			 * its pages. Nothing new starts once shutdown is requested,
+-			 * a capture the exit would abandon is wasted work.
++			 * a capture the exit would abandon is wasted work, and
++			 * nothing starts during recovery either: the pusher is
++			 * there to get local WAL into the store so replay can read
++			 * its pages, and a fold competing for the same store calls
++			 * only slows that down.
+ 			 */
+ 			GetOldestRestartPoint(&redo, &foldtli);
+ 			if (redo > folded && pushed >= redo && fold_backoff == 0)
+@@ -559,14 +615,13 @@
+ 		return;
+ 
+ 	/*
+-	 * Recovery cannot wait: the pusher only starts once recovery
+-	 * finishes, so waiting here would deadlock the startup process
+-	 * against a worker that cannot run yet. A node attached with
+-	 * zou-restore only replays WAL the store already holds, which makes
+-	 * the skip safe. An in place crash restart replaying local WAL the
+-	 * store has not seen yet can push pages early during recovery; the
+-	 * fix is starting the pusher at consistent state, noted in the
+-	 * milestone issue.
++	 * Recovery does not wait. There is a pusher during recovery now, so
++	 * the wait would end, but the thing that lifts a throttle is a fold
++	 * and recovery runs none, so a throttled store would stall replay
++	 * with nothing able to clear it. Restartpoints can push a page
++	 * ahead of its WAL because of this, which only matters with the
++	 * page service off, since with it on the eager put is elided and
++	 * pages come out of the stream instead.
+ 	 */
+ 	if (RecoveryInProgress())
+ 		return;
