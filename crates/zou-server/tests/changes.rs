@@ -112,6 +112,26 @@ async fn published(dsn: &str, table: &str, ddl: &str) {
     held.abort();
 }
 
+/// A table that exists and that nobody added to the publication,
+/// which is the state a project is in between writing a table and
+/// remembering the `alter publication`.
+async fn unpublished(dsn: &str, table: &str, ddl: &str) {
+    let (client, connection) = dsn
+        .parse::<tokio_postgres::Config>()
+        .expect("a dsn")
+        .connect(tokio_postgres::NoTls)
+        .await
+        .expect("a connection");
+    let held = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!("drop table if exists {table}; {ddl}"))
+        .await
+        .expect("a table outside the publication");
+    held.abort();
+}
+
 async fn serving(dsn: &str) -> SocketAddr {
     let app = router(Config {
         jwt_secret: SECRET.to_vec(),
@@ -427,6 +447,86 @@ async fn a_row_a_policy_hides_never_reaches_the_socket_it_hides_it_from() {
 }
 
 /// A channel that goes takes its subscriptions with it, and the last
+/// A subscription to a table nobody published, which is the most
+/// common way a subscription that reads correctly hears nothing.
+///
+/// The channel joins, the reply carries an id per entry because the
+/// client compares that list with its own bindings before it reads
+/// anything else, and the system frame carries the reason instead of
+/// `Subscribed to PostgreSQL`. Upstream draws it here rather than at
+/// the reply, and one entry it cannot subscribe takes the whole list
+/// with it, so a channel that asked for a published table and an
+/// unpublished one hears about neither.
+#[tokio::test]
+async fn a_table_nobody_published_is_refused_on_the_system_frame() {
+    let Some(dsn) = dsn() else { return };
+    let _one = alone().lock().await;
+    if !logical(&dsn).await {
+        return;
+    }
+    settled(&dsn).await;
+    let at = serving(&dsn).await;
+    published(
+        &dsn,
+        "chg_open",
+        "create table chg_open (id int primary key);
+         grant select on chg_open to anon, authenticated;",
+    )
+    .await;
+    unpublished(
+        &dsn,
+        "chg_shut",
+        "create table chg_shut (id int primary key);
+         grant select on chg_shut to anon, authenticated;",
+    )
+    .await;
+
+    let mut socket = connect(at).await;
+    send(
+        &mut socket,
+        &json!(["1", "1", "realtime:db", "phx_join", {
+            "config": {"postgres_changes": [
+                {"event": "*", "schema": "public", "table": "chg_open"},
+                {"event": "INSERT", "schema": "public", "table": "chg_shut", "filter": "id=eq.7"},
+            ]},
+            "access_token": token(ANA),
+        }])
+        .to_string(),
+    )
+    .await;
+    let reply = next(&mut socket).await;
+    assert_eq!(reply[4]["status"], "ok", "{reply}");
+    let echoed = reply[4]["response"]["postgres_changes"]
+        .as_array()
+        .expect("the reply carries the subscriptions")
+        .clone();
+    assert_eq!(echoed.len(), 2, "{reply}");
+    assert!(echoed[0]["id"].is_number(), "{reply}");
+
+    let system = next(&mut socket).await;
+    assert_eq!(system[3], "system", "{system}");
+    assert_eq!(
+        system[4],
+        json!({
+            "message": "Unable to subscribe to changes with given parameters. Please check \
+                        Realtime is enabled for the given connect parameters: [event: INSERT, \
+                        schema: public, table: chg_shut, filters: [{\"id\", \"eq\", \"7\", \
+                        false}], select: nil]",
+            "status": "error",
+            "extension": "postgres_changes",
+            "channel": "db",
+        }),
+        "upstream's wording, parameters and all, because it is what somebody reads when their \
+         subscription is silent"
+    );
+
+    // The published table in the same list, written to and not heard
+    // about, which is the half of this that is a decision rather than a
+    // message.
+    run(&dsn, "insert into chg_open (id) values (1)").await;
+    quiet(&mut socket).await;
+}
+
 /// socket to go takes the replication slot with it, which is the
 /// property that keeps a quiet server from filling a disk.
 #[tokio::test]

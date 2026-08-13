@@ -269,6 +269,17 @@ After it comes a `system` event reading `Subscribed to PostgreSQL`, which supaba
 It is here because it is on the socket upstream, and the recorded frames in the conformance suite are the proof rather than the claim.
 It is also the frame to write after, rather than the join reply, if you want the guarantee everywhere: this server holds the join until the tap is open, and upstream answers the join first and says `Subscribed to PostgreSQL` when the changes are flowing, which for the first subscriber after it starts is a few seconds later.
 
+And it is where a subscription nobody could make is said:
+
+```
+Unable to subscribe to changes with given parameters. Please check Realtime is enabled for the given connect parameters: [event: *, schema: public, table: todos, filters: [], select: nil]
+```
+
+That is the same frame carrying `status: error`, and it is what a table nobody added to the `supabase_realtime` publication gets.
+One entry that cannot be subscribed takes the rest of the list with it, so a channel asking for a published table and an unpublished one hears about neither, and the reply before it is still `ok` with an id per entry, because the reply is about what the client asked for and the system frame is about what became of it.
+The channel stays joined, so whatever else it was for keeps working.
+A binding with no table is every table in the schema and is not checked, here or upstream, because what it asks for is whatever the publication has.
+
 ## What the database has to be for postgres changes
 
 Two things have to be true of a database before any of this delivers anything, and both are true of one this server started.
