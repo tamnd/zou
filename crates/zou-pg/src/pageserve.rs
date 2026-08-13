@@ -583,6 +583,7 @@ struct Progress {
     applied: u64,
     polls: u64,
     rounds: u64,
+    chunks: u64,
     segments: u64,
     frames: u64,
 }
@@ -592,6 +593,7 @@ impl Progress {
     fn poll(&mut self, out: &CatchUp) {
         self.polls += 1;
         self.rounds += u64::from(out.rounds);
+        self.chunks += u64::from(out.chunks);
         self.segments += u64::from(out.segments);
         self.frames += out.frames;
     }
@@ -605,6 +607,7 @@ impl Progress {
             return;
         }
         let round = cursor.round.unwrap_or(0);
+        let chunk = cursor.chunk;
         let seq = cursor.chain.map_or(0, |c| c.seq);
         // A poll that reads and applies nothing is the healthy idle
         // case. A poll that reads frames without the watermark moving
@@ -615,9 +618,10 @@ impl Progress {
             ""
         };
         log::info!(
-            "zou pageserve: applied {applied:#x} seen {seen:#x} durable {durable:#x}, cursor round {round} seq {seq}, {} polls read {} rounds {} segments {} frames in {:.0}s{stuck}",
+            "zou pageserve: applied {applied:#x} seen {seen:#x} durable {durable:#x}, cursor round {round} chunk {chunk} seq {seq}, {} polls read {} rounds {} chunks {} segments {} frames in {:.0}s{stuck}",
             self.polls,
             self.rounds,
+            self.chunks,
             self.segments,
             self.frames,
             elapsed.as_secs_f64(),
@@ -625,6 +629,7 @@ impl Progress {
         self.applied = applied;
         self.polls = 0;
         self.rounds = 0;
+        self.chunks = 0;
         self.segments = 0;
         self.frames = 0;
         self.last = Some(now);
@@ -1273,6 +1278,124 @@ mod tests {
         assert!(
             ingest.expect("anchored").applied() >= end,
             "the slices never finished the backlog"
+        );
+    }
+
+    /// [`seed_chain`] with a body the frame codec cannot pack down, so
+    /// a fold over it seals more than one chunk for the tenant. A
+    /// constant byte compresses to nothing and puts the whole round in
+    /// one chunk, which is not the shape this is about.
+    fn seed_chain_noisy(media: &WalMedia, records: u32) -> (u64, u64) {
+        let mut b = Builder::new(WAL_BASE);
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for i in 0..records {
+            let r = BlockRef {
+                spc: 1663,
+                db: 5,
+                rel: 1000,
+                fork: 0,
+                blk: i,
+            };
+            let body: Vec<u8> = (0..4096)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            b.record(&[(r, false)], &body);
+        }
+        let end = b.pos();
+        let (start, bytes) = b.stream();
+        let raw = bytes.to_vec();
+        let t = zou_log::take_over(media, WAL_SHARD, "test").expect("take over");
+        let sink = Arc::new(zou_log::MediaSink::new(
+            Arc::new(WalMedia::single(Arc::clone(media.manifest_store()))),
+            WAL_SHARD,
+            t.sealed_seq,
+        ));
+        let seq = zou_log::Sequencer::resume(
+            WAL_SHARD,
+            sink,
+            zou_log::SequencerConfig::default(),
+            t.next_seq,
+            t.prev_digest,
+        );
+        seq.append(frames_over(start, &raw))
+            .expect("admitted")
+            .wait()
+            .expect("durable");
+        seq.close().expect("sequencer close");
+        (start, end)
+    }
+
+    /// The freeze after a kill drill on server2, #327. A restarted
+    /// service comes up behind the sealed rounds rather than behind the
+    /// landing tail, and reading a tenant's frames out of a round is a
+    /// range GET per chunk. A poll whose slice is spent by that GET
+    /// used to hand over the first frame, stop, and leave the cursor on
+    /// the round, so the next poll paid for the same chunk again. The
+    /// frames were ones the ingest buffer already held, waiting on a
+    /// record the next chunk completes, so applied never moved: 40
+    /// minutes of polling, hundreds of megabytes a minute of reads, and
+    /// the watermark exactly where the restart left it. Every poll has
+    /// to end further along than it started.
+    #[test]
+    fn a_poll_over_sealed_rounds_advances_on_every_slice() {
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        let media = WalMedia::single(Arc::clone(&store));
+        let (_, end) = seed_chain_noisy(&media, 400);
+        zou_log::consolidate(&media, WAL_SHARD)
+            .expect("the fold runs")
+            .expect("it had something to fold");
+
+        let cfg = IngestConfig::new(TENANT, 0, 1);
+        let mut ingest = None;
+        let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
+        let mut durable_seen = 0u64;
+        let mut cursor = CatchUpCursor::default();
+        let mut progress = Progress::default();
+        let mut applied = 0;
+        let mut polls = 0;
+        loop {
+            let was = cursor;
+            // Spent before it starts, which is what a poll behind a
+            // fetch always is.
+            let caught_up = poll_ingest(
+                &store,
+                &layout,
+                &media,
+                &TeeFilter::Tenant(TENANT),
+                &cfg,
+                &mut ingest,
+                &mut map,
+                &mut durable_seen,
+                &mut cursor,
+                &mut progress,
+                Instant::now(),
+            )
+            .expect("the poll replays what it can");
+            let now = ingest.as_ref().map_or(0, ShardIngest::applied);
+            // Either the watermark moved or the cursor did. A poll
+            // where neither did is one that read something and threw
+            // it away, and every poll after it does the same thing.
+            assert!(
+                now > applied || cursor != was || caught_up,
+                "poll {polls} ended where it started, at {now:#x}"
+            );
+            applied = now;
+            polls += 1;
+            assert!(polls < 50, "the slices are not making progress");
+            if caught_up {
+                break;
+            }
+        }
+        assert!(polls > 2, "a single chunk round is not a test of this");
+        assert!(
+            applied >= end,
+            "the slices stopped at {applied:#x} of {end:#x}"
         );
     }
 

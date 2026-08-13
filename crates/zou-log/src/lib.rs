@@ -38,7 +38,8 @@ pub use chain::{
 };
 pub use consolidate::{
     ConsolidateError, ConsolidateOutcome, ROUND_INDEX_FORMAT, RoundChunk, RoundIndex, RoundTenant,
-    consolidate, gc_landing, landing_backlog, read_round_tenant, round_key,
+    consolidate, gc_landing, landing_backlog, read_round_chunk, read_round_tenant, round_chunks,
+    round_key,
 };
 pub use media::{DEFAULT_HEDGE_AFTER, DurabilityMode, MediaSink, SealOutcome, WalMedia};
 pub use sealed::{

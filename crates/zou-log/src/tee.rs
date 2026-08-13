@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use zou_store::{Frame2, Lsn};
 
 use crate::chain::{ChainCursor, ChainError, ShardManifest, walk_chain_linked};
-use crate::consolidate::{ConsolidateError, RoundIndex, read_round_tenant};
+use crate::consolidate::{ConsolidateError, RoundIndex, read_round_chunk, round_chunks};
 use crate::media::WalMedia;
 
 /// The default subscription budget from the spec: fall more than this
@@ -324,6 +324,12 @@ pub struct CatchUpCursor {
     /// The next sealed round to scan. None starts at the oldest round
     /// the shard still retains.
     pub round: Option<u64>,
+    /// The next chunk of `round` to read, zero at the top of a round.
+    /// A round is one sealed object and a tenant's frames in it are a
+    /// list of byte ranges, so this is what lets a stop land inside a
+    /// round without the next call paying for the ranges this one
+    /// already read.
+    pub chunk: u32,
     /// Where the landing tail walk stopped.
     pub chain: Option<ChainCursor>,
 }
@@ -339,9 +345,11 @@ pub struct CatchUp {
     /// durable end of the stream when `caught_up`, a lower bound on it
     /// otherwise.
     pub end: Option<Lsn>,
-    /// Round indexes read, tail segments walked, and frames handed to
-    /// the sink, for a caller that wants to log its own progress.
+    /// Round indexes read, sealed chunks fetched out of them, tail
+    /// segments walked, and frames handed to the sink, for a caller
+    /// that wants to log its own progress.
     pub rounds: u32,
+    pub chunks: u32,
     pub segments: u32,
     pub frames: u64,
 }
@@ -360,15 +368,23 @@ pub struct CatchUp {
 /// where the frames it would have missed now live.
 ///
 /// Two ways to stop early. The sink says whether to keep going, and
-/// false stops after the frame it is on. `more` is asked between
-/// rounds and between segments whatever the sink said, which is what
-/// bounds a poll that is reading a long run of rounds and segments
-/// holding nothing for this tenant: the sink never sees those, so a
-/// deadline that only reaches the walk through the sink does not bind
-/// on them at all. `caught_up` false out of this means it stopped with
-/// work left, so a caller sharing the thread with something else, like
-/// a page service answering reads, can bound one poll and come back
-/// for the rest.
+/// false stops after the unit it is in. `more` is asked between
+/// rounds, between the chunks of a round and between segments whatever
+/// the sink said, which is what bounds a poll that is reading a long
+/// run of rounds and segments holding nothing for this tenant: the
+/// sink never sees those, so a deadline that only reaches the walk
+/// through the sink does not bind on them at all. `caught_up` false
+/// out of this means it stopped with work left, so a caller sharing
+/// the thread with something else, like a page service answering
+/// reads, can bound one poll and come back for the rest.
+///
+/// A stop always lands on a unit boundary, never inside one. A chunk
+/// and a segment are each one GET, and stopping halfway through the
+/// frames of one throws away bytes that have been paid for and leaves
+/// the cursor where the next call pays for them again. That is not
+/// just waste: a poll whose slice is spent by the fetch delivers the
+/// first frame, stops, and comes back to the same fetch, so a stream
+/// whose head is a fetch away never advances at all.
 pub fn catch_up_resuming<E, F, G>(
     media: &WalMedia,
     wal_shard: u32,
@@ -399,6 +415,15 @@ where
         // has dropped out from under, so start where the history now
         // starts.
         let mut at = cursor.round.unwrap_or(rounds.first).max(rounds.first);
+        // The chunk cursor belongs to the round it stopped in. A round
+        // retention has dropped starts at the top of the one that
+        // replaced it.
+        let mut skip = if cursor.round == Some(at) {
+            cursor.chunk
+        } else {
+            0
+        };
+        let mut resume_chunk = 0;
         while at <= rounds.last {
             let index = RoundIndex::load(store.as_ref(), wal_shard, at)
                 .map_err(E::from)?
@@ -419,20 +444,37 @@ where
                 .find(|t| t.tenant == tenant)
                 .map(|t| Lsn(t.watermark));
             out.end = out.end.max(watermark);
+            let mut stop_in_round = false;
             if watermark.is_some_and(|w| w > applied) {
-                for frame in read_round_tenant(store.as_ref(), &index, tenant).map_err(E::from)? {
-                    if frame.end_lsn > applied && filter.matches(&frame) {
-                        out.frames += 1;
-                        keep &= sink(frame)?;
+                let chunks = round_chunks(&index, tenant);
+                for (i, chunk) in chunks.iter().enumerate().skip(skip as usize) {
+                    // A chunk that ends at or below what the caller has
+                    // is a range GET nobody has to pay for.
+                    if chunk.max_lsn <= applied.0 {
+                        continue;
+                    }
+                    out.chunks += 1;
+                    for frame in read_round_chunk(store.as_ref(), &index, chunk).map_err(E::from)? {
+                        if frame.end_lsn > applied && filter.matches(&frame) {
+                            out.frames += 1;
+                            keep &= sink(frame)?;
+                        }
+                    }
+                    // Asked after the chunk, so the bytes this call
+                    // fetched are the bytes it delivered, and the next
+                    // one starts past them.
+                    if !keep || !more() {
+                        resume_chunk = i as u32 + 1;
+                        stop_in_round = true;
+                        break;
                     }
                 }
-                // Stopping mid round leaves the cursor on it: the next
-                // call rescans it against a higher `applied` and skips
-                // what it has already handed over.
-                if !keep {
-                    break;
-                }
             }
+            if stop_in_round {
+                stopped = true;
+                break;
+            }
+            skip = 0;
             at += 1;
             // Asked after the round, not before it, so a poll that
             // starts with its slice already spent still does one round
@@ -443,6 +485,7 @@ where
             }
         }
         cursor.round = Some(at);
+        cursor.chunk = resume_chunk;
         if !keep || stopped {
             return Ok(out);
         }
