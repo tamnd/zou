@@ -213,6 +213,27 @@ impl Ask {
     }
 }
 
+/// What a channel's `postgres_changes` list turned into, which is the
+/// answer to an [`Action::Watch`].
+///
+/// The ids are one per entry the client asked for, in the order it
+/// asked, because that is what the reply hands back and what the client
+/// compares against its own bindings.
+///
+/// `refused` is the reason nothing is subscribed, in the wording
+/// upstream uses, and it is a list that had one entry in it that could
+/// not be subscribed rather than a list that failed. Upstream refuses
+/// all of them together and says so once, naming the entry: a channel
+/// that asked for two tables and is missing one hears about neither,
+/// which is the same bargain as a join that cannot be half made. The
+/// ids still go back, because the client checks the reply against its
+/// bindings before it looks at anything else, and they name nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Watched {
+    pub ids: Vec<u64>,
+    pub refused: Option<String>,
+}
+
 /// What an [`Ask`] is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum About {
@@ -586,7 +607,7 @@ impl Session {
     /// field for field unsubscribes itself with a mismatch error. So
     /// what goes back is the client's own json with an id added and
     /// nothing else touched.
-    pub fn watching(&mut self, topic: &str, ids: Result<Vec<u64>, String>) -> Vec<Action> {
+    pub fn watching(&mut self, topic: &str, made: Result<Watched, String>) -> Vec<Action> {
         let frame = match self.pending.remove(topic) {
             Some(Pending::Watch(frame)) => frame,
             // Something else is waiting on this topic, which is not
@@ -604,8 +625,8 @@ impl Session {
             Some(config) => config.postgres_changes.clone(),
             None => return Vec::new(),
         };
-        let ids = match ids {
-            Ok(ids) if ids.len() == wants.len() => ids,
+        let made = match made {
+            Ok(made) if made.ids.len() == wants.len() => made,
             Ok(_) => {
                 // Not a client's mistake and not something a client can
                 // do anything about, but a reply that did not line up
@@ -617,7 +638,7 @@ impl Session {
         };
         let echoed: Vec<Value> = wants
             .iter()
-            .zip(&ids)
+            .zip(&made.ids)
             .map(|(want, id)| {
                 let mut entry = want.clone();
                 match entry.as_object_mut() {
@@ -632,21 +653,32 @@ impl Session {
                 }
             })
             .collect();
-        self.watched.insert(topic.to_string(), ids);
+        // A list with an entry that could not be subscribed leaves this
+        // channel with none, so there is nothing here to take back out
+        // when it goes.
+        if made.refused.is_none() {
+            self.watched.insert(topic.to_string(), made.ids);
+        }
         let mut actions = vec![self.send(Frame::reply(
             &frame,
             "ok",
             json!({"postgres_changes": echoed}),
         ))];
-        // And the line upstream says after it. Nothing in realtime-js
-        // acts on this, but it is on the socket and an application can
-        // bind `system`, so a server that skips it sends a different
-        // conversation than the one that was recorded.
-        actions.push(self.send(Frame::system(
-            &frame,
-            "postgres_changes",
-            "Subscribed to PostgreSQL",
-        )));
+        // And the line upstream says after it, which is where a
+        // subscription that could not be made is said. The reply is ok
+        // either way and the channel stays joined either way, because
+        // the reply is about what the client asked for and this is
+        // about what became of it. Nothing in realtime-js acts on it,
+        // but it is on the socket and an application can bind `system`.
+        actions.push(match &made.refused {
+            Some(why) => self.send(Frame::system(&frame, "postgres_changes", "error", why)),
+            None => self.send(Frame::system(
+                &frame,
+                "postgres_changes",
+                "ok",
+                "Subscribed to PostgreSQL",
+            )),
+        });
         actions.extend(self.after_reply(topic));
         actions
     }
@@ -1209,6 +1241,12 @@ mod tests {
         )
     }
 
+    /// Subscriptions that were made, which is the ordinary answer to a
+    /// watch.
+    fn made(ids: Vec<u64>) -> Watched {
+        Watched { ids, refused: None }
+    }
+
     #[test]
     fn a_join_is_carried_and_answered_in_that_order() {
         let mut session = socket();
@@ -1270,7 +1308,7 @@ mod tests {
              reading the database is a client that will wait forever for its first row"
         );
 
-        let actions = session.watching("realtime:room", Ok(vec![7, 8]));
+        let actions = session.watching("realtime:room", Ok(made(vec![7, 8])));
         let reply = text_of(&actions[0]);
         assert_eq!(reply.payload["status"], "ok");
         assert_eq!(
@@ -1308,7 +1346,7 @@ mod tests {
     fn a_change_goes_down_the_channel_that_asked_for_it_with_its_own_ids() {
         let mut session = socket();
         watching_join(&mut session);
-        session.watching("realtime:room", Ok(vec![7, 8]));
+        session.watching("realtime:room", Ok(made(vec![7, 8])));
 
         let data = json!({"type": "INSERT", "table": "todos", "record": {"id": 1}});
         let actions = session.changed(&[8], &data);
@@ -1331,7 +1369,7 @@ mod tests {
     fn a_channel_that_leaves_takes_its_subscriptions_with_it() {
         let mut session = socket();
         watching_join(&mut session);
-        session.watching("realtime:room", Ok(vec![7, 8]));
+        session.watching("realtime:room", Ok(made(vec![7, 8])));
 
         let actions = session.text(r#"["1","2","realtime:room","phx_leave",{}]"#, &OneToken);
         assert!(
@@ -1351,7 +1389,7 @@ mod tests {
     fn a_refreshed_token_is_told_to_whatever_is_checking_the_rows() {
         let mut session = socket();
         watching_join(&mut session);
-        session.watching("realtime:room", Ok(vec![7, 8]));
+        session.watching("realtime:room", Ok(made(vec![7, 8])));
 
         let actions = session.text(
             r#"["1","3","realtime:room","access_token",{"access_token":"good"}]"#,
@@ -1359,6 +1397,59 @@ mod tests {
         );
         assert!(actions.contains(&Action::Rewatch), "{actions:?}");
         assert_eq!(session.role(), "authenticated");
+    }
+
+    /// A list with a table nobody published in it, which is a joined
+    /// channel with nothing subscribed rather than a failed join.
+    ///
+    /// Upstream draws the line here rather than at the reply: the
+    /// client asked for something well formed and got an answer, and
+    /// what could not be arranged is said on the frame that says what
+    /// became of the subscriptions. A channel that also broadcasts
+    /// keeps working, which it would not if the join had been refused.
+    #[test]
+    fn a_subscription_nobody_could_make_is_said_on_the_system_frame() {
+        let mut session = socket();
+        watching_join(&mut session);
+        let why = "Unable to subscribe to changes with given parameters.";
+        let actions = session.watching(
+            "realtime:room",
+            Ok(Watched {
+                ids: vec![7, 8],
+                refused: Some(why.into()),
+            }),
+        );
+
+        let reply = text_of(&actions[0]);
+        assert_eq!(reply.payload["status"], "ok");
+        assert_eq!(
+            reply.payload["response"]["postgres_changes"][0]["id"], 7,
+            "the ids go back whatever became of them, because realtime-js compares the reply with              its own bindings before it reads anything else and a shorter list is a mismatch"
+        );
+        let system = text_of(&actions[1]);
+        assert_eq!(system.event, "system");
+        assert_eq!(
+            system.payload,
+            json!({
+                "message": why,
+                "status": "error",
+                "extension": "postgres_changes",
+                "channel": "room",
+            })
+        );
+        assert!(
+            session.on("realtime:room"),
+            "the channel is joined, which is what upstream leaves it as"
+        );
+        assert!(
+            session.changed(&[7], &json!({"type": "INSERT"})).is_empty(),
+            "and the ids name nothing, so a change that somehow carried one goes nowhere"
+        );
+        let actions = session.text(r#"["1","2","realtime:room","phx_leave",{}]"#, &OneToken);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Unwatch(_))),
+            "nothing was bound, so there is nothing to take back out, {actions:?}"
+        );
     }
 
     #[test]

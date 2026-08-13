@@ -99,7 +99,11 @@ impl Frame {
     /// It carries the join's own ref and no ref of its own, the same
     /// way phoenix pushes anything on a joined channel, and the channel
     /// name in it is the topic without the prefix.
-    pub fn system(to: &Frame, extension: &str, message: &str) -> Frame {
+    /// The status is the whole of what the frame says: `ok` is the
+    /// subscriptions being live, and `error` is the same frame carrying
+    /// the reason there are none, which is how upstream answers a
+    /// subscription to a table nobody published.
+    pub fn system(to: &Frame, extension: &str, status: &str, message: &str) -> Frame {
         Frame {
             join_ref: to.join_ref.clone(),
             reference: None,
@@ -107,7 +111,7 @@ impl Frame {
             event: "system".into(),
             payload: json!({
                 "message": message,
-                "status": "ok",
+                "status": status,
                 "extension": extension,
                 "channel": to.topic.strip_prefix("realtime:").unwrap_or(&to.topic),
             }),

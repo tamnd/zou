@@ -54,6 +54,17 @@ impl Wants {
         }
     }
 
+    /// The word a client sent for this, which is the word it goes back
+    /// out as when a subscription for it could not be made.
+    pub fn named(&self) -> &'static str {
+        match self {
+            Wants::Insert => "INSERT",
+            Wants::Update => "UPDATE",
+            Wants::Delete => "DELETE",
+            Wants::Any => "*",
+        }
+    }
+
     /// Which of the three lists a binding goes in. `Any` goes in all of
     /// them, so that a change reads one list rather than two.
     fn lists(&self) -> &'static [usize] {
@@ -109,6 +120,21 @@ pub struct Filter {
     /// The value as the client wrote it, compared against the column's
     /// own type at match time.
     pub value: String,
+}
+
+impl Compare {
+    /// The word the client wrote, which a refusal names it by.
+    pub fn named(&self) -> &'static str {
+        match self {
+            Compare::Eq => "eq",
+            Compare::Neq => "neq",
+            Compare::Lt => "lt",
+            Compare::Lte => "lte",
+            Compare::Gt => "gt",
+            Compare::Gte => "gte",
+            Compare::In => "in",
+        }
+    }
 }
 
 impl Filter {

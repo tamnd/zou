@@ -254,6 +254,20 @@ impl Changes {
         Some(id)
     }
 
+    /// An id that names no subscription, which is what the reply hands
+    /// back for a list that could not be subscribed.
+    ///
+    /// The client checks the reply against its own bindings before it
+    /// looks at anything else, so there has to be one per entry, and a
+    /// change can never carry one of these because nothing was bound
+    /// to it. It comes off the same counter as a real one so it can
+    /// never be a real one later.
+    pub fn unnamed(&self) -> u64 {
+        let mut inner = self.inner.lock().expect("changes");
+        inner.next += 1;
+        inner.next
+    }
+
     /// One thing a subscriber is finished with, which is the channel it
     /// was asked for on going away while the socket stays.
     pub fn unbind(&self, id: u64) {

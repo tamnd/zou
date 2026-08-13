@@ -418,7 +418,7 @@ So the last test records the frames off the socket before the client has decoded
 Three things in a frame are true of a run rather than of a server and are replaced rather than dropped: a ref, the subscription ids, and the commit timestamp.
 The ids become the position they held in the join's answer, which keeps the only thing about them that matters, that a change came back naming the subscription the join made.
 
-It caught three things, one from each direction it can be run.
+It caught four things, from each direction it can be run.
 
 Against zou, eight of the eleven failed on their first run, and they are the kind only a real client finds.
 zou answered a join once its subscriptions were registered, and it takes its replication slot when the first subscriber arrives, so a client that subscribed and then wrote was told `SUBSCRIBED` while the slot was still being taken and the row it wrote next was written before there was anything to see it.
@@ -433,7 +433,9 @@ Both are fixed in the server, and the eleven now pass against both.
 The reference had the same shape of race in it as zou did, which is why every test in the file writes after the `system` frame rather than after `SUBSCRIBED`.
 Upstream answers the join first and says `Subscribed to PostgreSQL` when the changes are actually flowing, and for the first subscriber to a project after Supabase Realtime starts that is about three and a half seconds later, so a suite that wrote on the join reply lost its first change on a stack that had just come up and never on one that had been running.
 zou holds the join until the tap is open and then says both, so waiting for the second one costs it nothing.
-What that frame says is not asserted, because a subscription to a table that is not in the publication comes back as `status: error` naming the parameters upstream and as `ok` on zou, which is [#347](https://github.com/tamnd/zou/issues/347).
+And it says one more thing zou did not: a subscription to a table nobody added to the publication comes back on that frame with `status: error` and a message naming every parameter of the binding, where zou said `ok` and then had nothing to send, which is the same silence as a table that never changes.
+Forgetting the `alter publication` is the most common way a subscription that reads correctly hears nothing, so it is worth saying out loud, and it is [#347](https://github.com/tamnd/zou/issues/347).
+The wording is asserted whole now, on both servers, because it is what somebody reads in their console.
 
 And the fixture itself was wrong in a way only the reference could say.
 It granted the reads and left the writes ungranted, on the reasoning that a service key has `bypassrls` and needs no grant, and every write in it failed against `supabase start` with a 403: `bypassrls` is about policies and grants are grants.

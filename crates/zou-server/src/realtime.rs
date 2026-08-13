@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use zou_realtime::{
     About, Action, Ask, BinaryBroadcast, Budget, Counters, Delivery, Encoding, Fanout, Grant, Hub,
-    Identity, Limits, Meter, Session, SocketId, Sockets, Tokens, Vsn,
+    Identity, Limits, Meter, Session, SocketId, Sockets, Tokens, Vsn, Watched,
 };
 
 use crate::binding::Binding;
@@ -35,7 +35,7 @@ use crate::binding::Binding;
 use crate::ops;
 use crate::reader::{Heard as Feed, Listening, Reader};
 use crate::visible::Asker;
-use crate::{App, AuthContext, json_body, policy};
+use crate::{App, AuthContext, cdc, json_body, policy, sql};
 
 /// What checks a token for a socket: the project's own verifier, the
 /// same one every http request goes through.
@@ -634,16 +634,30 @@ async fn subscribed(
     who: &Identity,
     watching: &mut Option<Listening>,
     wants: &[Value],
-) -> Result<Vec<u64>, String> {
-    if app.pool.is_none() {
+) -> Result<Watched, String> {
+    let Some(pool) = app.pool.as_ref() else {
         return Err("this server has no database to read changes out of".into());
-    }
+    };
     // Every entry is read before any of them is asked for, so a list
     // with a bad binding in it is refused whole rather than half
     // subscribed and then complained about.
     let mut bindings = Vec::with_capacity(wants.len());
     for want in wants {
         bindings.push(Binding::of(want)?);
+    }
+    // And every table is looked for before any of them is subscribed,
+    // for the same reason and with a different answer: a table nobody
+    // published is not a client's mistake in the way a filter with no
+    // table is, it is a project that has not run its `alter
+    // publication` yet, and it is the most common way a subscription
+    // that looks right hears nothing. So the channel joins, nothing is
+    // subscribed, and the reason goes out on the system frame, which
+    // is what upstream does down to the wording.
+    if let Some(missing) = unpublished(pool, &bindings).await? {
+        return Ok(Watched {
+            ids: bindings.iter().map(|_| app.changes.unnamed()).collect(),
+            refused: Some(missing),
+        });
     }
     let listener = match watching.as_ref() {
         Some(listening) => {
@@ -689,7 +703,64 @@ async fn subscribed(
     {
         log::warn!("realtime: a subscription was answered before there was a tap to carry it");
     }
-    Ok(ids)
+    Ok(Watched { ids, refused: None })
+}
+
+/// The first entry naming a table that is not in the publication, said
+/// the way upstream says it.
+///
+/// A binding with no table is every table in the schema and is not
+/// checked, here or upstream: what it is asking for is whatever the
+/// publication has, which is a question with no wrong answer.
+///
+/// The message is upstream's, parameters and all, because it is what a
+/// person reads in their console when a subscription is silent and the
+/// thing they will search for. `select: nil` is upstream's own field
+/// for something it does not use.
+async fn unpublished(pool: &sql::Pool, bindings: &[Binding]) -> Result<Option<String>, String> {
+    if bindings.iter().all(|binding| binding.table.is_none()) {
+        return Ok(None);
+    }
+    let sess = pool
+        .admin()
+        .await
+        .map_err(|e| format!("the publication could not be read: {e}"))?;
+    let rows = sess
+        .query(
+            "select schemaname, tablename from pg_publication_tables where pubname = $1",
+            &[&cdc::PUBLICATION],
+        )
+        .await
+        .map_err(|e| format!("the publication could not be read: {e}"))?;
+    let published: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect::<Vec<(String, String)>>();
+    let missing = bindings.iter().find(|binding| match &binding.table {
+        None => false,
+        Some(table) => !published
+            .iter()
+            .any(|(schema, named)| schema == &binding.schema && named == table),
+    });
+    Ok(missing.map(|binding| {
+        let filters = match &binding.filter {
+            Some(filter) => format!(
+                "[{{{:?}, {:?}, {:?}, false}}]",
+                filter.column,
+                filter.compare.named(),
+                filter.value
+            ),
+            None => "[]".to_string(),
+        };
+        format!(
+            "Unable to subscribe to changes with given parameters. \
+             Please check Realtime is enabled for the given connect parameters: \
+             [event: {}, schema: {}, table: {}, filters: {filters}, select: nil]",
+            binding.wants.named(),
+            binding.schema,
+            binding.table.as_deref().unwrap_or("*"),
+        )
+    }))
 }
 
 /// How long a join waits for a tap before being answered without one.

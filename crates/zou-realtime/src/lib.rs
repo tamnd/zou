@@ -44,5 +44,6 @@ pub use frame::{BinaryBroadcast, Encoding, Frame, Vsn};
 pub use hub::{Delivery, Hub, SocketId};
 pub use limit::{Counters, Limits, Meter, Sockets, Unlimited};
 pub use session::{
-    About, Action, Ask, Budget, Config, Fanout, Grant, Identity, Sent, Session, Tokens, room,
+    About, Action, Ask, Budget, Config, Fanout, Grant, Identity, Sent, Session, Tokens, Watched,
+    room,
 };
