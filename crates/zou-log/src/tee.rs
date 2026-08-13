@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use zou_store::{Frame2, Lsn};
 
-use crate::chain::ShardManifest;
+use crate::chain::{ChainCursor, ChainError, ShardManifest, walk_chain_linked};
 use crate::consolidate::{ConsolidateError, RoundIndex, read_round_tenant};
 use crate::media::WalMedia;
 use crate::read_chain_linked;
@@ -282,13 +282,65 @@ where
     E: From<ConsolidateError>,
     F: FnMut(Frame2) -> Result<(), E>,
 {
+    let mut cursor = None;
+    catch_up_resuming(media, wal_shard, filter, applied, &mut cursor, |frame| {
+        sink(frame).map(|()| true)
+    })?;
+    Ok(())
+}
+
+/// A [`ChainError`] on the way out of the walk, or the caller's own
+/// error on the way out of the sink. The walk wants one error type and
+/// the caller only promised to absorb a [`ConsolidateError`], so this
+/// carries both across and unwraps on the other side.
+enum WalkError<E> {
+    Chain(ChainError),
+    Sink(E),
+}
+
+impl<E> From<ChainError> for WalkError<E> {
+    fn from(e: ChainError) -> Self {
+        Self::Chain(e)
+    }
+}
+
+/// [`catch_up_with`] that resumes and can stop early.
+///
+/// Reading the tail starts at the consolidated boundary, and that only
+/// moves when a fold runs, so a service polling a live stream reads
+/// every segment written since the last fold on every poll. On a box
+/// pushing a few thousand segments a minute that is thousands of GETs
+/// per poll for the few segments that are new. `cursor` fixes it: pass
+/// the same one back and the walk picks up at the first segment nobody
+/// has read. A fold that moves the boundary past the cursor invalidates
+/// it, and this notices and starts again from the boundary, which is
+/// where the frames it would have missed now live.
+///
+/// The sink says whether to keep going, and false stops the walk after
+/// the segment it is in. Ok(false) out of this means it stopped with
+/// work left, so a caller that shares the thread with something else,
+/// like a page service answering reads, can bound one poll and come
+/// back for the rest.
+pub fn catch_up_resuming<E, F>(
+    media: &WalMedia,
+    wal_shard: u32,
+    filter: &TeeFilter,
+    applied: Lsn,
+    cursor: &mut Option<ChainCursor>,
+    mut sink: F,
+) -> Result<bool, E>
+where
+    E: From<ConsolidateError>,
+    F: FnMut(Frame2) -> Result<bool, E>,
+{
     let store = media.manifest_store();
     let Some((manifest, _)) = ShardManifest::load(store.as_ref(), wal_shard)
         .map_err(|e| E::from(ConsolidateError::from(e)))?
     else {
-        return Ok(());
+        return Ok(true);
     };
     let tenant = filter.tenant();
+    let mut keep = true;
     if let Some(rounds) = manifest.rounds {
         for round in rounds.first..=rounds.last {
             let index = RoundIndex::load(store.as_ref(), wal_shard, round)
@@ -311,24 +363,37 @@ where
             }
             for frame in read_round_tenant(store.as_ref(), &index, tenant).map_err(E::from)? {
                 if frame.end_lsn > applied && filter.matches(&frame) {
-                    sink(frame)?;
+                    keep &= sink(frame)?;
                 }
             }
-        }
-    }
-    let tail = read_chain_linked(
-        media,
-        wal_shard,
-        manifest.consolidated_upto,
-        manifest.consolidated_digest,
-    )
-    .map_err(|e| E::from(ConsolidateError::from(e)))?;
-    for segment in tail {
-        for frame in segment.frames {
-            if frame.tenant == tenant && frame.end_lsn > applied && filter.matches(&frame) {
-                sink(frame)?;
+            if !keep {
+                return Ok(false);
             }
         }
     }
-    Ok(())
+    // A cursor at or below the boundary is one a fold has read out from
+    // under, and everything under it is in the rounds above by now.
+    let start = match *cursor {
+        Some(c) if c.seq > manifest.consolidated_upto => c,
+        _ => ChainCursor {
+            seq: manifest.consolidated_upto + 1,
+            prev_digest: manifest.consolidated_digest,
+        },
+    };
+    let walked = walk_chain_linked::<WalkError<E>, _>(media, wal_shard, start, |segment| {
+        for frame in segment.frames {
+            if frame.tenant == tenant && frame.end_lsn > applied && filter.matches(&frame) {
+                keep &= sink(frame).map_err(WalkError::Sink)?;
+            }
+        }
+        Ok(keep)
+    });
+    match walked {
+        Ok(end) => {
+            *cursor = Some(end);
+            Ok(keep)
+        }
+        Err(WalkError::Chain(e)) => Err(E::from(ConsolidateError::from(e))),
+        Err(WalkError::Sink(e)) => Err(e),
+    }
 }

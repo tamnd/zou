@@ -4,9 +4,11 @@
 //! postmaster start so the socket exists before crash recovery reads
 //! its first page. It cannot lean on the pusher's tee for that reason,
 //! the pusher only starts once recovery finishes; instead it polls the
-//! durable WAL stream out of the store through [`catch_up_with`], which
-//! reads the same bytes the tee would have carried, just a poll
-//! interval later.
+//! durable WAL stream out of the store through [`catch_up_resuming`],
+//! which reads the same bytes the tee would have carried, just a poll
+//! interval later. That read is cursored and time sliced, because one
+//! thread does ingest and reads both: a poll that walks the whole tail
+//! is a read stall for everything queued behind it.
 //!
 //! Serving follows the reconstruction rule set: published layers and
 //! the live memtable carry every record since the anchor, and blocks
@@ -31,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
-use zou_log::{ConsolidateError, TeeFilter, WalMedia, catch_up_with, stream_end};
+use zou_log::{ChainCursor, ConsolidateError, TeeFilter, WalMedia, catch_up_resuming, stream_end};
 use zou_store::CasStore;
 use zou_store::layermap::LayerMap;
 use zou_store::layout::TenantLayout;
@@ -62,6 +64,13 @@ const WAIT_CAP: Duration = Duration::from_secs(20);
 /// The ingest poll cadence, the freshness cost of reading the stream
 /// out of the store instead of the tee.
 const POLL: Duration = Duration::from_millis(100);
+
+/// How long one poll may spend applying before it hands the thread back
+/// to the readers. A service that has fallen a long way behind still
+/// catches up, one slice per poll, and a read that only needs an lsn
+/// already applied is answered in between instead of waiting for the
+/// whole backlog.
+const INGEST_SLICE: Duration = Duration::from_millis(200);
 
 /// One read request as the driver sees it: a run of blocks of one
 /// fork, the lsn the reader needs covered, and the channel the pages
@@ -353,9 +362,17 @@ fn connection(mut sock: UnixStream, tx: Sender<GetReq>, stop: Arc<AtomicBool>) {
             let _ = respond_err(&mut sock, "page service driver is gone");
             return;
         }
+        // The driver answers a request it cannot serve itself, and says
+        // how far ingest got, so this only fires when the driver never
+        // reached the deadline check at all. Say that, rather than
+        // blaming a request nobody dropped.
         let answer = match reply_rx.recv_timeout(WAIT_CAP + Duration::from_secs(5)) {
             Ok(answer) => answer,
-            Err(_) => Err("page service driver dropped the request".to_string()),
+            Err(RecvTimeoutError::Timeout) => Err(format!(
+                "page service did not answer within {} seconds",
+                (WAIT_CAP + Duration::from_secs(5)).as_secs()
+            )),
+            Err(RecvTimeoutError::Disconnected) => Err("page service driver is gone".to_string()),
         };
         let ok = match answer {
             Ok(pages) => respond_pages(&mut sock, &pages).is_ok(),
@@ -399,6 +416,8 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     let mut frozen: Option<String> = None;
     let mut parked: Vec<GetReq> = Vec::new();
     let mut last_poll = Instant::now() - POLL;
+    let mut cursor: Option<ChainCursor> = None;
+    let mut behind = false;
 
     match PageShardManifest::load(&*store, &cfg.layout.shard_manifest(0)) {
         Ok(Some((manifest, _))) => {
@@ -412,7 +431,10 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     }
 
     loop {
-        if frozen.is_none() && last_poll.elapsed() >= POLL {
+        // A poll that stopped on its slice has more waiting, so go
+        // straight back to it after the readers have had their turn
+        // rather than idling out the rest of the cadence.
+        if frozen.is_none() && (behind || last_poll.elapsed() >= POLL) {
             last_poll = Instant::now();
             let polled = Instant::now();
             let outcome = poll_ingest(
@@ -425,16 +447,21 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                 &mut ingest,
                 &mut map,
                 &mut durable_seen,
+                &mut cursor,
+                polled + INGEST_SLICE,
             );
             // The serve loop is one thread, so this poll is latency
             // every request behind it pays. Sample it whether or not
             // there was anything to apply.
             note_phase(Phase::Ingest, polled.elapsed());
-            if let Err(e) = outcome {
-                // A hole in the stream would poison every later delta;
-                // freeze and let waits fail loudly instead.
-                log::error!("zou pageserve: ingest frozen: {e}");
-                frozen = Some(e);
+            match outcome {
+                Ok(caught_up) => behind = !caught_up,
+                Err(e) => {
+                    // A hole in the stream would poison every later
+                    // delta; freeze and let waits fail loudly instead.
+                    log::error!("zou pageserve: ingest frozen: {e}");
+                    frozen = Some(e);
+                }
             }
         }
 
@@ -547,18 +574,21 @@ fn poll_ingest(
     ingest: &mut Option<ShardIngest>,
     map: &mut LayerMap,
     durable_seen: &mut u64,
-) -> Result<(), String> {
+    cursor: &mut Option<ChainCursor>,
+    deadline: Instant,
+) -> Result<bool, String> {
     match stream_end(media, WAL_SHARD, tenant) {
         Ok(Some(end)) => *durable_seen = end.0.max(*durable_seen),
-        Ok(None) => return Ok(()),
+        Ok(None) => return Ok(true),
         Err(e) => {
             // The store not answering is not a hole in the stream;
             // stay at the old watermark and try again next poll.
             log::warn!("zou pageserve: stream end: {e}");
-            return Ok(());
+            return Ok(true);
         }
     }
     let applied = ingest.as_ref().map_or(0, ShardIngest::applied);
+    let mut caught_up = true;
     if applied < *durable_seen {
         // Streamed rather than collected, and flushed inside the
         // replay. A service that has fallen behind a bulk load has a
@@ -571,24 +601,32 @@ fn poll_ingest(
         // the memtable by its own threshold instead of by how far
         // behind the service happens to be.
         let seen = *durable_seen;
-        catch_up_with::<ReplayError, _>(media, WAL_SHARD, filter, Lsn(applied), |frame| {
-            if ingest.is_none() {
-                let start = frame.start_lsn.0;
-                log::info!("zou pageserve: anchoring a fresh shard at {start:#x}");
-                *ingest = Some(ShardIngest::new(ingest_cfg.clone(), start));
-            }
-            let ingest = ingest.as_mut().expect("anchored on the first frame");
-            ingest
-                .apply_frames(std::slice::from_ref(&frame))
-                .map_err(|e| ReplayError::Ingest(e.to_string()))?;
-            flush_if_due(store, layout, ingest, map, seen).map_err(ReplayError::Ingest)
-        })
+        caught_up = catch_up_resuming::<ReplayError, _>(
+            media,
+            WAL_SHARD,
+            filter,
+            Lsn(applied),
+            cursor,
+            |frame| {
+                if ingest.is_none() {
+                    let start = frame.start_lsn.0;
+                    log::info!("zou pageserve: anchoring a fresh shard at {start:#x}");
+                    *ingest = Some(ShardIngest::new(ingest_cfg.clone(), start));
+                }
+                let ingest = ingest.as_mut().expect("anchored on the first frame");
+                ingest
+                    .apply_frames(std::slice::from_ref(&frame))
+                    .map_err(|e| ReplayError::Ingest(e.to_string()))?;
+                flush_if_due(store, layout, ingest, map, seen).map_err(ReplayError::Ingest)?;
+                Ok(Instant::now() < deadline)
+            },
+        )
         .map_err(|e| format!("catch up: {e}"))?;
     }
     if let Some(ingest) = ingest.as_mut() {
         flush_if_due(store, layout, ingest, map, *durable_seen)?;
     }
-    Ok(())
+    Ok(caught_up)
 }
 
 /// Publish the memtable if a threshold says so and pick the new layer
@@ -868,6 +906,47 @@ mod tests {
         (start, end)
     }
 
+    /// [`seed_chain`], but one append per frame, so the chain is many
+    /// segments instead of one. That is what a live pusher writes, and
+    /// a slice can only stop between segments.
+    fn seed_chain_segments(media: &WalMedia, records: u32) -> (u64, u64) {
+        let mut b = Builder::new(WAL_BASE);
+        for i in 0..records {
+            let r = BlockRef {
+                spc: 1663,
+                db: 5,
+                rel: 1000,
+                fork: 0,
+                blk: i,
+            };
+            b.record(&[(r, false)], &[i as u8; 4096]);
+        }
+        let end = b.pos();
+        let (start, bytes) = b.stream();
+        let raw = bytes.to_vec();
+        let t = zou_log::take_over(media, WAL_SHARD, "test").expect("take over");
+        let sink = Arc::new(zou_log::MediaSink::new(
+            Arc::new(WalMedia::single(Arc::clone(media.manifest_store()))),
+            WAL_SHARD,
+            t.sealed_seq,
+        ));
+        let seq = zou_log::Sequencer::resume(
+            WAL_SHARD,
+            sink,
+            zou_log::SequencerConfig::default(),
+            t.next_seq,
+            t.prev_digest,
+        );
+        for frame in frames_over(start, &raw) {
+            seq.append(vec![frame])
+                .expect("admitted")
+                .wait()
+                .expect("durable");
+        }
+        seq.close().expect("sequencer close");
+        (start, end)
+    }
+
     /// The poll that killed the worker at scale 1000. A service that
     /// has fallen behind an index build reads the whole backlog, and
     /// before this it read it into a Vec and applied all of it before
@@ -891,6 +970,9 @@ mod tests {
         let mut ingest = None;
         let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
         let mut durable_seen = 0u64;
+        let mut cursor = None;
+        // A slice long enough that this poll runs the whole backlog,
+        // the point of the test being where the flushes land.
         poll_ingest(
             &store,
             &layout,
@@ -901,6 +983,8 @@ mod tests {
             &mut ingest,
             &mut map,
             &mut durable_seen,
+            &mut cursor,
+            Instant::now() + Duration::from_secs(600),
         )
         .expect("the poll replays the chain");
 
@@ -922,6 +1006,75 @@ mod tests {
             ingest.memtable().bytes() < cfg.flush_bytes,
             "the memtable ended at {} bytes, over its own threshold",
             ingest.memtable().bytes()
+        );
+    }
+
+    /// The stall behind #322: one thread does ingest and reads, and a
+    /// poll that replays a whole backlog before returning is an outage
+    /// for every read queued behind it. On server2 that came back as
+    /// six balance checks in a row failing after a drill, each one
+    /// giving up 25 seconds in without the driver ever answering. A
+    /// poll takes a slice and comes back for the rest.
+    #[test]
+    fn a_poll_stops_on_its_slice_and_the_next_one_carries_on() {
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        let media = WalMedia::single(Arc::clone(&store));
+        let (_, end) = seed_chain_segments(&media, 24);
+
+        let cfg = IngestConfig::new(TENANT, 0, 1);
+        let mut ingest = None;
+        let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
+        let mut durable_seen = 0u64;
+        let mut cursor = None;
+        let poll = |ingest: &mut _, map: &mut _, seen: &mut _, cursor: &mut _, deadline| {
+            poll_ingest(
+                &store,
+                &layout,
+                &media,
+                &TeeFilter::Tenant(TENANT),
+                TENANT,
+                &cfg,
+                ingest,
+                map,
+                seen,
+                cursor,
+                deadline,
+            )
+        };
+
+        // A deadline already gone stops after the first segment, and
+        // says it is not caught up.
+        let caught_up = poll(
+            &mut ingest,
+            &mut map,
+            &mut durable_seen,
+            &mut cursor,
+            Instant::now(),
+        )
+        .expect("the poll replays what it can");
+        assert!(!caught_up, "a poll out of time is not caught up");
+        let first = ingest.as_ref().expect("anchored").applied();
+        assert!(first > 0 && first < end, "one slice applied {first:#x}");
+
+        // Polling again picks up where it stopped rather than starting
+        // over, and enough of them finish the backlog.
+        let mut rounds = 0;
+        while !poll(
+            &mut ingest,
+            &mut map,
+            &mut durable_seen,
+            &mut cursor,
+            Instant::now(),
+        )
+        .expect("the poll replays what it can")
+        {
+            rounds += 1;
+            assert!(rounds < 200, "the slices are not making progress");
+        }
+        assert!(
+            ingest.expect("anchored").applied() >= end,
+            "the slices never finished the backlog"
         );
     }
 
