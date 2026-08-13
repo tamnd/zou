@@ -319,6 +319,12 @@ const NET_SCHEMA: &str = include_str!("net-schema.sql");
 /// webhook is, and the audit table it writes.
 const FUNCTIONS_SCHEMA: &str = include_str!("functions-schema.sql");
 
+/// The `cron` schema, which on a Supabase project is pg_cron: the job
+/// table, the run log, and the functions that write them. Only applied
+/// to a database that has none of it, so a real pg_cron keeps its own,
+/// see the file.
+const CRON_SCHEMA: &str = include_str!("cron-schema.sql");
+
 /// The publication postgres changes reads, which a project adds its
 /// tables to. Applied every boot for the same reason as the send
 /// functions, and a notice rather than a failure when the role cannot
@@ -388,6 +394,7 @@ pub async fn bootstrap(client: &Client) -> Result<(), tokio_postgres::Error> {
     ensure_foreign_schema(client, "realtime.messages", &[REALTIME_SCHEMA]).await?;
     ensure_foreign_schema(client, "net.http_request_queue", &[NET_SCHEMA]).await?;
     ensure_foreign_schema(client, "supabase_functions.hooks", &[FUNCTIONS_SCHEMA]).await?;
+    ensure_foreign_schema(client, "cron.job", &[CRON_SCHEMA]).await?;
     ensure_schema(client, &[REALTIME_SEND, REALTIME_PUBLICATION]).await
 }
 
@@ -438,6 +445,7 @@ pub fn contract_version() -> u64 {
         REALTIME_PUBLICATION,
         NET_SCHEMA,
         FUNCTIONS_SCHEMA,
+        CRON_SCHEMA,
     ] {
         for byte in part.bytes() {
             hash ^= u64::from(byte);
@@ -838,6 +846,26 @@ impl Session {
         params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
     ) -> Result<u64, Error> {
         self.client().execute(sql, params).await
+    }
+
+    /// Run whatever a project wrote, as one simple query, and say how
+    /// many rows the last statement in it touched.
+    ///
+    /// This is for a scheduled job's command, which is text a person
+    /// typed into `cron.schedule` and may be several statements. The
+    /// simple protocol is the only one that takes several, and the
+    /// count is all it hands back: postgres prints a command tag on
+    /// the wire, and this driver keeps the number out of it and drops
+    /// the word.
+    pub async fn simple(&self, sql: &str) -> Result<u64, Error> {
+        let messages = self.client().simple_query(sql).await?;
+        let mut touched = 0;
+        for message in messages {
+            if let tokio_postgres::SimpleQueryMessage::CommandComplete(rows) = message {
+                touched = rows;
+            }
+        }
+        Ok(touched)
     }
 
     async fn end(mut self, stmt: &str) -> Result<(), Error> {

@@ -34,6 +34,7 @@ pub mod auth;
 pub mod binding;
 pub mod blob;
 pub mod cdc;
+pub mod cron;
 pub mod edge;
 pub mod fleet;
 pub mod forward;
@@ -345,6 +346,10 @@ pub struct App {
     /// fills because a transaction committed, and a transaction only
     /// happens because somebody arrived.
     pub dispatching: tokio::sync::OnceCell<()>,
+    /// The loop that runs the jobs a project scheduled, started by the
+    /// same first request. Only one node ends up firing them, which is
+    /// an advisory lock rather than a decision made here.
+    pub ticking: tokio::sync::OnceCell<()>,
 }
 
 impl App {
@@ -447,6 +452,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         changes: Arc::new(reader::Changes::new()),
         reading: tokio::sync::OnceCell::new(),
         dispatching: tokio::sync::OnceCell::new(),
+        ticking: tokio::sync::OnceCell::new(),
     }))
 }
 
@@ -551,6 +557,9 @@ async fn gate(
     // boot. Nothing queues one without a request having arrived.
     app.dispatching
         .get_or_init(|| async { webhook::dispatch(Arc::clone(&app)) })
+        .await;
+    app.ticking
+        .get_or_init(|| async { cron::tick(Arc::clone(&app)) })
         .await;
     next.run(req).await
 }

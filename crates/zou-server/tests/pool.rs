@@ -389,15 +389,19 @@ async fn bootstrap_left_the_extensions_a_supabase_database_has() {
         .await,
         "2"
     );
+    // Membership rather than the whole array, because the cron
+    // schema puts pg_cron's four settings on the database next to
+    // this one and a project reads them one at a time.
     assert_eq!(
         text(
             &sess,
-            "select setconfig::text from pg_db_role_setting \
-             where setdatabase = (select oid from pg_database where datname = current_database()) \
-               and setrole = 0"
+            "select (setconfig @> array['search_path=\"$user\", public, extensions'])::text \
+               from pg_db_role_setting \
+              where setdatabase = (select oid from pg_database where datname = current_database()) \
+                and setrole = 0"
         )
         .await,
-        "{\"search_path=\\\"$user\\\", public, extensions\"}"
+        "true"
     );
     // A session that started before the alter database landed still
     // has the old path, so this asks the way a new one would. Not set
