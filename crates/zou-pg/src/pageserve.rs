@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::time::{Duration, Instant};
 
-use zou_log::{ChainCursor, ConsolidateError, TeeFilter, WalMedia, catch_up_resuming, stream_end};
+use zou_log::{CatchUp, CatchUpCursor, ConsolidateError, TeeFilter, WalMedia, catch_up_resuming};
 use zou_store::CasStore;
 use zou_store::layermap::LayerMap;
 use zou_store::layout::TenantLayout;
@@ -416,8 +416,9 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     let mut frozen: Option<String> = None;
     let mut parked: Vec<GetReq> = Vec::new();
     let mut last_poll = Instant::now() - POLL;
-    let mut cursor: Option<ChainCursor> = None;
+    let mut cursor = CatchUpCursor::default();
     let mut behind = false;
+    let mut progress = Progress::default();
 
     match PageShardManifest::load(&*store, &cfg.layout.shard_manifest(0)) {
         Ok(Some((manifest, _))) => {
@@ -442,18 +443,24 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                 &cfg.layout,
                 &media,
                 &filter,
-                cfg.tenant,
                 &ingest_cfg,
                 &mut ingest,
                 &mut map,
                 &mut durable_seen,
                 &mut cursor,
+                &mut progress,
                 polled + INGEST_SLICE,
             );
             // The serve loop is one thread, so this poll is latency
             // every request behind it pays. Sample it whether or not
             // there was anything to apply.
             note_phase(Phase::Ingest, polled.elapsed());
+            progress.report(
+                ingest.as_ref().map_or(0, ShardIngest::applied),
+                ingest.as_ref().map_or(0, ShardIngest::seen),
+                durable_seen,
+                &cursor,
+            );
             match outcome {
                 Ok(caught_up) => behind = !caught_up,
                 Err(e) => {
@@ -560,73 +567,138 @@ impl std::fmt::Display for ReplayError {
     }
 }
 
-/// One ingest poll: refresh the durable end, anchor a fresh shard at
-/// the oldest retained frame, catch up to the stream, and flush when
-/// a threshold says so.
+/// How often the driver says where ingest is. Long enough to be quiet
+/// on an idle node, short enough that a service which stops applying
+/// is visible in the log within a minute instead of being reconstructed
+/// afterwards from a store on disk (zou #324).
+const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+
+/// The periodic ingest progress line. Everything chasing #324 needed
+/// and had to get from an offline reader instead: both watermarks,
+/// where the cursor sits, and how much one interval of polling
+/// actually read.
+#[derive(Default)]
+struct Progress {
+    last: Option<Instant>,
+    applied: u64,
+    polls: u64,
+    rounds: u64,
+    segments: u64,
+    frames: u64,
+}
+
+impl Progress {
+    /// Fold in what one catch up covered.
+    fn poll(&mut self, out: &CatchUp) {
+        self.polls += 1;
+        self.rounds += u64::from(out.rounds);
+        self.segments += u64::from(out.segments);
+        self.frames += out.frames;
+    }
+
+    /// Log the interval if it is due, and start a new one.
+    fn report(&mut self, applied: u64, seen: u64, durable: u64, cursor: &CatchUpCursor) {
+        let now = Instant::now();
+        let since = *self.last.get_or_insert(now);
+        let elapsed = now.duration_since(since);
+        if elapsed < PROGRESS_EVERY {
+            return;
+        }
+        let round = cursor.round.unwrap_or(0);
+        let seq = cursor.chain.map_or(0, |c| c.seq);
+        // A poll that reads and applies nothing is the healthy idle
+        // case. A poll that reads frames without the watermark moving
+        // is the bug, so say which one this is.
+        let stuck = if applied == self.applied && self.frames > 0 {
+            ", applied has not moved"
+        } else {
+            ""
+        };
+        log::info!(
+            "zou pageserve: applied {applied:#x} seen {seen:#x} durable {durable:#x}, cursor round {round} seq {seq}, {} polls read {} rounds {} segments {} frames in {:.0}s{stuck}",
+            self.polls,
+            self.rounds,
+            self.segments,
+            self.frames,
+            elapsed.as_secs_f64(),
+        );
+        self.applied = applied;
+        self.polls = 0;
+        self.rounds = 0;
+        self.segments = 0;
+        self.frames = 0;
+        self.last = Some(now);
+    }
+}
+
+/// One ingest poll: catch up to the stream, anchor a fresh shard at
+/// the oldest retained frame, refresh the durable end from what the
+/// walk saw, and flush when a threshold says so.
 #[allow(clippy::too_many_arguments)]
 fn poll_ingest(
     store: &Arc<dyn CasStore>,
     layout: &TenantLayout,
     media: &WalMedia,
     filter: &TeeFilter,
-    tenant: u128,
     ingest_cfg: &IngestConfig,
     ingest: &mut Option<ShardIngest>,
     map: &mut LayerMap,
     durable_seen: &mut u64,
-    cursor: &mut Option<ChainCursor>,
+    cursor: &mut CatchUpCursor,
+    progress: &mut Progress,
     deadline: Instant,
 ) -> Result<bool, String> {
-    match stream_end(media, WAL_SHARD, tenant) {
-        Ok(Some(end)) => *durable_seen = end.0.max(*durable_seen),
-        Ok(None) => return Ok(true),
-        Err(e) => {
-            // The store not answering is not a hole in the stream;
-            // stay at the old watermark and try again next poll.
-            log::warn!("zou pageserve: stream end: {e}");
-            return Ok(true);
-        }
-    }
     let applied = ingest.as_ref().map_or(0, ShardIngest::applied);
-    let mut caught_up = true;
-    if applied < *durable_seen {
-        // Streamed rather than collected, and flushed inside the
-        // replay. A service that has fallen behind a bulk load has a
-        // whole index build of wal waiting for it, and reading that
-        // into a Vec before applying any of it holds the backlog
-        // twice: once as frames, once as a memtable that gets no
-        // flush check until the last frame lands. At scale 1000 the
-        // worker went 610 MB, 810 MB, 1.1 GB, 1.5 GB a layer and the
-        // kernel killed it at 6.8 GB resident. Flushing here bounds
-        // the memtable by its own threshold instead of by how far
-        // behind the service happens to be.
-        let seen = *durable_seen;
-        caught_up = catch_up_resuming::<ReplayError, _>(
-            media,
-            WAL_SHARD,
-            filter,
-            Lsn(applied),
-            cursor,
-            |frame| {
-                if ingest.is_none() {
-                    let start = frame.start_lsn.0;
-                    log::info!("zou pageserve: anchoring a fresh shard at {start:#x}");
-                    *ingest = Some(ShardIngest::new(ingest_cfg.clone(), start));
-                }
-                let ingest = ingest.as_mut().expect("anchored on the first frame");
-                ingest
-                    .apply_frames(std::slice::from_ref(&frame))
-                    .map_err(|e| ReplayError::Ingest(e.to_string()))?;
-                flush_if_due(store, layout, ingest, map, seen).map_err(ReplayError::Ingest)?;
-                Ok(Instant::now() < deadline)
-            },
-        )
-        .map_err(|e| format!("catch up: {e}"))?;
+    // Streamed rather than collected, and flushed inside the replay. A
+    // service that has fallen behind a bulk load has a whole index
+    // build of wal waiting for it, and reading that into a Vec before
+    // applying any of it holds the backlog twice: once as frames, once
+    // as a memtable that gets no flush check until the last frame
+    // lands. At scale 1000 the worker went 610 MB, 810 MB, 1.1 GB,
+    // 1.5 GB a layer and the kernel killed it at 6.8 GB resident.
+    // Flushing here bounds the memtable by its own threshold instead
+    // of by how far behind the service happens to be.
+    let seen = *durable_seen;
+    let out = catch_up_resuming::<ReplayError, _, _>(
+        media,
+        WAL_SHARD,
+        filter,
+        Lsn(applied),
+        cursor,
+        |frame| {
+            if ingest.is_none() {
+                let start = frame.start_lsn.0;
+                log::info!("zou pageserve: anchoring a fresh shard at {start:#x}");
+                *ingest = Some(ShardIngest::new(ingest_cfg.clone(), start));
+            }
+            let ingest = ingest.as_mut().expect("anchored on the first frame");
+            ingest
+                .apply_frames(std::slice::from_ref(&frame))
+                .map_err(|e| ReplayError::Ingest(e.to_string()))?;
+            flush_if_due(store, layout, ingest, map, seen).map_err(ReplayError::Ingest)?;
+            Ok(Instant::now() < deadline)
+        },
+        || Instant::now() < deadline,
+    )
+    .map_err(|e| format!("catch up: {e}"))?;
+    progress.poll(&out);
+    // The walk is the freshness probe, which is why there is no
+    // separate stream end call here any more. That one ran first on
+    // every poll and read the whole landing tail into memory to look
+    // at one number per frame, uncursored and outside the slice: at a
+    // few thousand segments a minute it becomes the poll, and the
+    // watermark stops moving (zou #324). A walk that reached the head
+    // has seen the highest end lsn this tenant has durable, so that is
+    // the durable end. A walk that stopped on its slice only saw a
+    // prefix, and its end is a lower bound, so the watermark from the
+    // last complete walk stands.
+    if let Some(end) = out.end.filter(|_| out.caught_up) {
+        *durable_seen = end.0.max(*durable_seen);
     }
     if let Some(ingest) = ingest.as_mut() {
         flush_if_due(store, layout, ingest, map, *durable_seen)?;
     }
-    Ok(caught_up)
+    Ok(out.caught_up)
 }
 
 /// Publish the memtable if a threshold says so and pick the new layer
@@ -970,7 +1042,8 @@ mod tests {
         let mut ingest = None;
         let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
         let mut durable_seen = 0u64;
-        let mut cursor = None;
+        let mut cursor = CatchUpCursor::default();
+        let mut progress = Progress::default();
         // A slice long enough that this poll runs the whole backlog,
         // the point of the test being where the flushes land.
         poll_ingest(
@@ -978,12 +1051,12 @@ mod tests {
             &layout,
             &media,
             &TeeFilter::Tenant(TENANT),
-            TENANT,
             &cfg,
             &mut ingest,
             &mut map,
             &mut durable_seen,
             &mut cursor,
+            &mut progress,
             Instant::now() + Duration::from_secs(600),
         )
         .expect("the poll replays the chain");
@@ -1009,6 +1082,118 @@ mod tests {
         );
     }
 
+    /// Delegates everything and counts the object reads, because the
+    /// cost of a poll is the whole point here.
+    struct CountingStore {
+        inner: Arc<dyn CasStore>,
+        gets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingStore {
+        fn gets(&self) -> usize {
+            self.gets.load(Ordering::SeqCst)
+        }
+    }
+
+    impl CasStore for CountingStore {
+        fn get(
+            &self,
+            key: &str,
+        ) -> Result<Option<(Vec<u8>, zou_store::Version)>, zou_store::CasError> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key)
+        }
+        fn put_if_match(
+            &self,
+            key: &str,
+            data: &[u8],
+            expected: Option<&zou_store::Version>,
+        ) -> Result<zou_store::Version, zou_store::CasError> {
+            self.inner.put_if_match(key, data, expected)
+        }
+        fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            len: u64,
+        ) -> Result<Option<Vec<u8>>, zou_store::CasError> {
+            self.inner.get_range(key, offset, len)
+        }
+        fn delete(&self, key: &str) -> Result<(), zou_store::CasError> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, zou_store::CasError> {
+            self.inner.list(prefix)
+        }
+    }
+
+    /// The freeze behind #324. Every poll used to ask for the durable
+    /// end of the stream first, and that read the whole landing tail
+    /// from the consolidated boundary, uncursored and outside the
+    /// slice, to look at one number per frame. The tail past a fold is
+    /// everything the pusher has written since, so on a box under a
+    /// bulk load the poll became the tail: on server2 and server3 the
+    /// applied watermark stopped for hours, with the driver still
+    /// polling, no error and no warning, and 56 GB of chain reads to
+    /// show for it. A poll that is caught up should cost a handful of
+    /// gets whatever the tail behind it looks like.
+    #[test]
+    fn a_caught_up_poll_does_not_reread_the_tail() {
+        let inner: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let store = Arc::new(CountingStore {
+            inner,
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let counted: Arc<dyn CasStore> = store.clone();
+        let layout = TenantLayout::new("t");
+        let media = WalMedia::single(Arc::clone(&counted));
+        let (_, end) = seed_chain_segments(&media, 40);
+
+        let cfg = IngestConfig::new(TENANT, 0, 1);
+        let mut ingest = None;
+        let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
+        let mut durable_seen = 0u64;
+        let mut cursor = CatchUpCursor::default();
+        let mut progress = Progress::default();
+        let mut poll = |ingest: &mut _, map: &mut _, seen: &mut _, cursor: &mut _| {
+            poll_ingest(
+                &counted,
+                &layout,
+                &media,
+                &TeeFilter::Tenant(TENANT),
+                &cfg,
+                ingest,
+                map,
+                seen,
+                cursor,
+                &mut progress,
+                Instant::now() + Duration::from_secs(600),
+            )
+            .expect("the poll replays the chain")
+        };
+
+        assert!(
+            poll(&mut ingest, &mut map, &mut durable_seen, &mut cursor),
+            "one long slice catches up"
+        );
+        assert_eq!(
+            ingest.as_ref().expect("anchored").applied(),
+            end,
+            "the whole chain"
+        );
+        assert_eq!(durable_seen, end, "the walk is the freshness probe");
+
+        // Nothing has moved: the manifest, the round check and the one
+        // miss that says the head is where the cursor left it.
+        let before = store.gets();
+        assert!(poll(&mut ingest, &mut map, &mut durable_seen, &mut cursor));
+        let cost = store.gets() - before;
+        assert!(
+            cost <= 4,
+            "a caught up poll cost {cost} gets over a 40 segment tail"
+        );
+    }
+
     /// The stall behind #322: one thread does ingest and reads, and a
     /// poll that replays a whole backlog before returning is an outage
     /// for every read queued behind it. On server2 that came back as
@@ -1026,36 +1211,48 @@ mod tests {
         let mut ingest = None;
         let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
         let mut durable_seen = 0u64;
-        let mut cursor = None;
-        let poll = |ingest: &mut _, map: &mut _, seen: &mut _, cursor: &mut _, deadline| {
+        let mut cursor = CatchUpCursor::default();
+        let mut progress = Progress::default();
+        let poll = |ingest: &mut _,
+                    map: &mut _,
+                    seen: &mut _,
+                    cursor: &mut _,
+                    progress: &mut _,
+                    deadline| {
             poll_ingest(
                 &store,
                 &layout,
                 &media,
                 &TeeFilter::Tenant(TENANT),
-                TENANT,
                 &cfg,
                 ingest,
                 map,
                 seen,
                 cursor,
+                progress,
                 deadline,
             )
         };
 
-        // A deadline already gone stops after the first segment, and
-        // says it is not caught up.
-        let caught_up = poll(
-            &mut ingest,
-            &mut map,
-            &mut durable_seen,
-            &mut cursor,
-            Instant::now(),
-        )
-        .expect("the poll replays what it can");
-        assert!(!caught_up, "a poll out of time is not caught up");
+        // A deadline already gone stops on the segment it is in and
+        // says it is not caught up. The first segment of a fresh chain
+        // carries the epoch marker and no frames, so it takes two of
+        // these to get an applied watermark, and two is still nothing
+        // like the whole backlog.
+        for _ in 0..2 {
+            let caught_up = poll(
+                &mut ingest,
+                &mut map,
+                &mut durable_seen,
+                &mut cursor,
+                &mut progress,
+                Instant::now(),
+            )
+            .expect("the poll replays what it can");
+            assert!(!caught_up, "a poll out of time is not caught up");
+        }
         let first = ingest.as_ref().expect("anchored").applied();
-        assert!(first > 0 && first < end, "one slice applied {first:#x}");
+        assert!(first > 0 && first < end, "two slices applied {first:#x}");
 
         // Polling again picks up where it stopped rather than starting
         // over, and enough of them finish the backlog.
@@ -1065,6 +1262,7 @@ mod tests {
             &mut map,
             &mut durable_seen,
             &mut cursor,
+            &mut progress,
             Instant::now(),
         )
         .expect("the poll replays what it can")

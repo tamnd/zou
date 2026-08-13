@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use zou_log::{
-    ChainCursor, ConsolidateError, MediaSink, Sequencer, SequencerConfig, TeeFilter, WalMedia,
+    CatchUpCursor, ConsolidateError, MediaSink, Sequencer, SequencerConfig, TeeFilter, WalMedia,
     catch_up_resuming, consolidate, take_over,
 };
 use zou_store::{CasError, CasStore, Frame2, LocalFsStore, Lsn, Version};
@@ -103,13 +103,21 @@ fn drain(
     shard: u32,
     filter: &TeeFilter,
     applied: Lsn,
-    cursor: &mut Option<ChainCursor>,
+    cursor: &mut CatchUpCursor,
 ) -> Vec<u64> {
     let mut out = Vec::new();
-    catch_up_resuming::<ConsolidateError, _>(media, shard, filter, applied, cursor, |f| {
-        out.push(f.start_lsn.0);
-        Ok(true)
-    })
+    catch_up_resuming::<ConsolidateError, _, _>(
+        media,
+        shard,
+        filter,
+        applied,
+        cursor,
+        |f| {
+            out.push(f.start_lsn.0);
+            Ok(true)
+        },
+        || true,
+    )
     .unwrap();
     out
 }
@@ -126,11 +134,14 @@ fn the_cursor_reads_the_new_segments_and_not_the_tail_behind_them() {
         push(&seq, 1, 100 + i * 10, b"landing!!!");
     }
 
-    let mut cursor = None;
+    let mut cursor = CatchUpCursor::default();
     let first = drain(&media, shard, &filter, Lsn(0), &mut cursor);
     assert_eq!(first.len(), 8);
     let after_first = store.gets();
-    assert!(cursor.is_some(), "the walk hands back where it stopped");
+    assert!(
+        cursor.chain.is_some(),
+        "the walk hands back where it stopped"
+    );
 
     // Nothing new: the cursor sits one past the head, so this is the
     // manifest read plus the one miss that says the head has not moved.
@@ -169,12 +180,12 @@ fn a_sink_that_stops_early_comes_back_to_the_next_segment() {
     }
     seq.close().unwrap();
 
-    let mut cursor = None;
+    let mut cursor = CatchUpCursor::default();
     let mut seen: Vec<u64> = Vec::new();
     // Stop on the first frame of every call, which is one segment here.
     for _ in 0..5 {
         let mut taken = 0;
-        let caught_up = catch_up_resuming::<ConsolidateError, _>(
+        let out = catch_up_resuming::<ConsolidateError, _, _>(
             &media,
             shard,
             &filter,
@@ -185,24 +196,119 @@ fn a_sink_that_stops_early_comes_back_to_the_next_segment() {
                 taken += 1;
                 Ok(false)
             },
+            || true,
         )
         .unwrap();
         assert_eq!(taken, 1, "a stop should end the walk after its segment");
-        assert!(!caught_up, "stopping early is not caught up");
+        assert!(!out.caught_up, "stopping early is not caught up");
     }
     assert_eq!(seen, vec![100, 110, 120, 130, 140]);
 
-    // The sixth call has nothing left and says so.
-    let caught_up = catch_up_resuming::<ConsolidateError, _>(
+    // The sixth call has nothing left and says so, with the durable
+    // end of the stream it walked to get there.
+    let out = catch_up_resuming::<ConsolidateError, _, _>(
         &media,
         shard,
         &filter,
         Lsn(0),
         &mut cursor,
         |_| Ok(false),
+        || true,
     )
     .unwrap();
-    assert!(caught_up);
+    assert!(out.caught_up);
+    // The end is what this call saw, and this one started past the
+    // tail, so there was nothing to see. The caller keeps the running
+    // maximum across polls.
+    assert_eq!(out.end, None);
+}
+
+#[test]
+fn a_stop_between_segments_binds_without_the_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, media) = counting(&dir);
+    let shard = 16;
+    // Catching up for a tenant that has nothing in this chain, which
+    // is what a long run of segments holding another tenant's frames
+    // looks like from here. The sink is never called, so a caller
+    // whose only way to stop is the sink cannot stop at all: it reads
+    // the whole tail every poll however long the tail is, which is
+    // the page service freeze in zou #324.
+    let seq = writer(&media, shard);
+    for i in 0..20u64 {
+        push(&seq, 2, 100 + i * 10, b"other!!!!!");
+    }
+    seq.close().unwrap();
+
+    let mut cursor = CatchUpCursor::default();
+    let mut asked = 0;
+    let before = store.gets();
+    let out = catch_up_resuming::<ConsolidateError, _, _>(
+        &media,
+        shard,
+        &TeeFilter::Tenant(1),
+        Lsn(0),
+        &mut cursor,
+        |_| panic!("this tenant has no frames here"),
+        || {
+            asked += 1;
+            asked < 3
+        },
+    )
+    .unwrap();
+    assert_eq!(out.segments, 3, "it stopped where it was told to");
+    assert!(!out.caught_up);
+    assert!(store.gets() - before < 10, "it read the tail past the stop");
+
+    // And it comes back to the segment after the one it stopped on.
+    let out = catch_up_resuming::<ConsolidateError, _, _>(
+        &media,
+        shard,
+        &TeeFilter::Tenant(1),
+        Lsn(0),
+        &mut cursor,
+        |_| panic!("this tenant has no frames here"),
+        || true,
+    )
+    .unwrap();
+    assert_eq!(out.segments, 18);
+    assert!(out.caught_up);
+    assert_eq!(out.end, None, "nothing here belongs to this tenant");
+}
+
+#[test]
+fn the_cursor_skips_the_rounds_it_has_already_scanned() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, media) = counting(&dir);
+    let shard = 17;
+    let filter = TeeFilter::Tenant(1);
+
+    // Four folds, so four sealed rounds of history to walk past.
+    let seq = writer(&media, shard);
+    for round in 0..4u64 {
+        for i in 0..3u64 {
+            push(&seq, 1, 100 + (round * 3 + i) * 10, b"sealed!!!!");
+        }
+        consolidate(&media, shard).unwrap().unwrap();
+    }
+    seq.close().unwrap();
+
+    let mut cursor = CatchUpCursor::default();
+    let all = drain(&media, shard, &filter, Lsn(0), &mut cursor);
+    assert_eq!(all.len(), 12, "every sealed frame, out of the rounds");
+    assert_eq!(cursor.round, Some(5), "past the last round it scanned");
+
+    // Caught up and idle: the rounds are behind the cursor and cost
+    // nothing to skip. Without the round cursor this is one index GET
+    // per round on every poll, forever, growing with the history.
+    let before = store.gets();
+    let idle = drain(&media, shard, &filter, Lsn(220), &mut cursor);
+    assert!(idle.is_empty());
+    let cost = store.gets() - before;
+    assert!(
+        cost <= 3,
+        "an idle poll cost {cost} gets, it is rereading the round indexes"
+    );
 }
 
 #[test]
@@ -216,7 +322,7 @@ fn a_fold_under_the_cursor_sends_the_walk_back_to_the_boundary() {
     for i in 0..4u64 {
         push(&seq, 1, 100 + i * 10, b"foldable!!");
     }
-    let mut cursor = None;
+    let mut cursor = CatchUpCursor::default();
     assert_eq!(drain(&media, shard, &filter, Lsn(0), &mut cursor).len(), 4);
     let stale = cursor;
     seq.close().unwrap();

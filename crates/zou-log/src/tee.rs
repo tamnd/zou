@@ -29,7 +29,6 @@ use zou_store::{Frame2, Lsn};
 use crate::chain::{ChainCursor, ChainError, ShardManifest, walk_chain_linked};
 use crate::consolidate::{ConsolidateError, RoundIndex, read_round_tenant};
 use crate::media::WalMedia;
-use crate::read_chain_linked;
 
 /// The default subscription budget from the spec: fall more than this
 /// many frame bytes behind and the tee cuts you to catch up mode.
@@ -236,19 +235,27 @@ pub fn stream_end(
             }
         }
     }
-    let tail = read_chain_linked(
+    // Walked rather than collected: the tail past the boundary is
+    // every segment written since the last fold, which on a box under
+    // a bulk load is tens of thousands of them, and holding all of
+    // that parsed in memory to look at one number per frame is how a
+    // page service poll turns into gigabytes of resident set.
+    walk_chain_linked::<ConsolidateError, _>(
         media,
         wal_shard,
-        manifest.consolidated_upto,
-        manifest.consolidated_digest,
-    )?;
-    for segment in tail {
-        for frame in segment.frames {
-            if frame.tenant == tenant && end.is_none_or(|e| frame.end_lsn > e) {
-                end = Some(frame.end_lsn);
+        ChainCursor {
+            seq: manifest.consolidated_upto + 1,
+            prev_digest: manifest.consolidated_digest,
+        },
+        |segment| {
+            for frame in segment.frames {
+                if frame.tenant == tenant && end.is_none_or(|e| frame.end_lsn > e) {
+                    end = Some(frame.end_lsn);
+                }
             }
-        }
-    }
+            Ok(true)
+        },
+    )?;
     Ok(end)
 }
 
@@ -282,10 +289,16 @@ where
     E: From<ConsolidateError>,
     F: FnMut(Frame2) -> Result<(), E>,
 {
-    let mut cursor = None;
-    catch_up_resuming(media, wal_shard, filter, applied, &mut cursor, |frame| {
-        sink(frame).map(|()| true)
-    })?;
+    let mut cursor = CatchUpCursor::default();
+    catch_up_resuming(
+        media,
+        wal_shard,
+        filter,
+        applied,
+        &mut cursor,
+        |frame| sink(frame).map(|()| true),
+        || true,
+    )?;
     Ok(())
 }
 
@@ -304,76 +317,139 @@ impl<E> From<ChainError> for WalkError<E> {
     }
 }
 
+/// Where a catch up stopped, so the next one starts there instead of
+/// paying again for everything it has already read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CatchUpCursor {
+    /// The next sealed round to scan. None starts at the oldest round
+    /// the shard still retains.
+    pub round: Option<u64>,
+    /// Where the landing tail walk stopped.
+    pub chain: Option<ChainCursor>,
+}
+
+/// What one catch up covered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CatchUp {
+    /// True when the walk reached the head of the chain, so everything
+    /// the tenant had durable at that moment went to the sink.
+    pub caught_up: bool,
+    /// The highest end lsn this call saw for the filter's tenant, over
+    /// the rounds it read indexes for and the tail it walked. The
+    /// durable end of the stream when `caught_up`, a lower bound on it
+    /// otherwise.
+    pub end: Option<Lsn>,
+    /// Round indexes read, tail segments walked, and frames handed to
+    /// the sink, for a caller that wants to log its own progress.
+    pub rounds: u32,
+    pub segments: u32,
+    pub frames: u64,
+}
+
 /// [`catch_up_with`] that resumes and can stop early.
 ///
-/// Reading the tail starts at the consolidated boundary, and that only
-/// moves when a fold runs, so a service polling a live stream reads
-/// every segment written since the last fold on every poll. On a box
-/// pushing a few thousand segments a minute that is thousands of GETs
-/// per poll for the few segments that are new. `cursor` fixes it: pass
-/// the same one back and the walk picks up at the first segment nobody
-/// has read. A fold that moves the boundary past the cursor invalidates
-/// it, and this notices and starts again from the boundary, which is
+/// Reading starts at the oldest retained round and the consolidated
+/// boundary, and neither moves except when a fold runs, so a service
+/// polling a live stream reads every round index and every segment
+/// written since the last fold on every poll. On a box pushing a few
+/// thousand segments a minute that is thousands of GETs per poll for
+/// the few that are new. `cursor` fixes it: pass the same one back and
+/// the scan picks up at the first round and the first segment nobody
+/// has read. A fold that retires a round or moves the boundary past
+/// the cursor invalidates it, and this notices and starts again from
 /// where the frames it would have missed now live.
 ///
-/// The sink says whether to keep going, and false stops the walk after
-/// the segment it is in. Ok(false) out of this means it stopped with
-/// work left, so a caller that shares the thread with something else,
-/// like a page service answering reads, can bound one poll and come
-/// back for the rest.
-pub fn catch_up_resuming<E, F>(
+/// Two ways to stop early. The sink says whether to keep going, and
+/// false stops after the frame it is on. `more` is asked between
+/// rounds and between segments whatever the sink said, which is what
+/// bounds a poll that is reading a long run of rounds and segments
+/// holding nothing for this tenant: the sink never sees those, so a
+/// deadline that only reaches the walk through the sink does not bind
+/// on them at all. `caught_up` false out of this means it stopped with
+/// work left, so a caller sharing the thread with something else, like
+/// a page service answering reads, can bound one poll and come back
+/// for the rest.
+pub fn catch_up_resuming<E, F, G>(
     media: &WalMedia,
     wal_shard: u32,
     filter: &TeeFilter,
     applied: Lsn,
-    cursor: &mut Option<ChainCursor>,
+    cursor: &mut CatchUpCursor,
     mut sink: F,
-) -> Result<bool, E>
+    mut more: G,
+) -> Result<CatchUp, E>
 where
     E: From<ConsolidateError>,
     F: FnMut(Frame2) -> Result<bool, E>,
+    G: FnMut() -> bool,
 {
     let store = media.manifest_store();
+    let mut out = CatchUp::default();
     let Some((manifest, _)) = ShardManifest::load(store.as_ref(), wal_shard)
         .map_err(|e| E::from(ConsolidateError::from(e)))?
     else {
-        return Ok(true);
+        out.caught_up = true;
+        return Ok(out);
     };
     let tenant = filter.tenant();
     let mut keep = true;
+    let mut stopped = false;
     if let Some(rounds) = manifest.rounds {
-        for round in rounds.first..=rounds.last {
-            let index = RoundIndex::load(store.as_ref(), wal_shard, round)
+        // A cursor below the oldest retained round is one retention
+        // has dropped out from under, so start where the history now
+        // starts.
+        let mut at = cursor.round.unwrap_or(rounds.first).max(rounds.first);
+        while at <= rounds.last {
+            let index = RoundIndex::load(store.as_ref(), wal_shard, at)
                 .map_err(E::from)?
                 .ok_or(ConsolidateError::BadRound {
                     shard: wal_shard,
-                    round,
+                    round: at,
                     reason: "a retained round index is missing".to_string(),
                 })
                 .map_err(E::from)?;
-            // The watermark says whether the round holds anything new
-            // for this tenant, so stale rounds cost one small GET and
-            // no sealed reads.
-            let fresh = index
+            out.rounds += 1;
+            // Every round index carries the tenant watermarks forward,
+            // so this is both the freshness test and the sealed half
+            // of the durable end, for one small GET and no sealed
+            // object reads.
+            let watermark = index
                 .tenants
                 .iter()
-                .any(|t| t.tenant == tenant && t.watermark > applied.0);
-            if !fresh {
-                continue;
-            }
-            for frame in read_round_tenant(store.as_ref(), &index, tenant).map_err(E::from)? {
-                if frame.end_lsn > applied && filter.matches(&frame) {
-                    keep &= sink(frame)?;
+                .find(|t| t.tenant == tenant)
+                .map(|t| Lsn(t.watermark));
+            out.end = out.end.max(watermark);
+            if watermark.is_some_and(|w| w > applied) {
+                for frame in read_round_tenant(store.as_ref(), &index, tenant).map_err(E::from)? {
+                    if frame.end_lsn > applied && filter.matches(&frame) {
+                        out.frames += 1;
+                        keep &= sink(frame)?;
+                    }
+                }
+                // Stopping mid round leaves the cursor on it: the next
+                // call rescans it against a higher `applied` and skips
+                // what it has already handed over.
+                if !keep {
+                    break;
                 }
             }
-            if !keep {
-                return Ok(false);
+            at += 1;
+            // Asked after the round, not before it, so a poll that
+            // starts with its slice already spent still does one round
+            // of work rather than none at all.
+            if !more() {
+                stopped = true;
+                break;
             }
+        }
+        cursor.round = Some(at);
+        if !keep || stopped {
+            return Ok(out);
         }
     }
     // A cursor at or below the boundary is one a fold has read out from
     // under, and everything under it is in the rounds above by now.
-    let start = match *cursor {
+    let start = match cursor.chain {
         Some(c) if c.seq > manifest.consolidated_upto => c,
         _ => ChainCursor {
             seq: manifest.consolidated_upto + 1,
@@ -381,17 +457,25 @@ where
         },
     };
     let walked = walk_chain_linked::<WalkError<E>, _>(media, wal_shard, start, |segment| {
+        out.segments += 1;
         for frame in segment.frames {
-            if frame.tenant == tenant && frame.end_lsn > applied && filter.matches(&frame) {
-                keep &= sink(frame).map_err(WalkError::Sink)?;
+            if frame.tenant == tenant {
+                out.end = out.end.max(Some(frame.end_lsn));
+                if frame.end_lsn > applied && filter.matches(&frame) {
+                    out.frames += 1;
+                    keep &= sink(frame).map_err(WalkError::Sink)?;
+                }
             }
         }
-        Ok(keep)
+        let go = keep && more();
+        stopped |= !go;
+        Ok(go)
     });
     match walked {
         Ok(end) => {
-            *cursor = Some(end);
-            Ok(keep)
+            cursor.chain = Some(end);
+            out.caught_up = !stopped;
+            Ok(out)
         }
         Err(WalkError::Chain(e)) => Err(E::from(ConsolidateError::from(e))),
         Err(WalkError::Sink(e)) => Err(e),
