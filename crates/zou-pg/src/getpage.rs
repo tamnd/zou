@@ -165,6 +165,45 @@ impl<'a> PageService<'a> {
         blocks: &[BlockRef],
         at: u64,
     ) -> Result<Vec<Vec<u8>>, GetPageError> {
+        Ok(self
+            .build(map, mem, blocks, at, true)?
+            .into_iter()
+            .map(|page| page.expect("a strict build answers every block"))
+            .collect())
+    }
+
+    /// [`Self::get_pages`] for a caller that would rather hear about a
+    /// block the store cannot build than be refused the batch: `None`
+    /// where [`Self::get_pages`] would return [`GetPageError::BareChain`]
+    /// or fabricate a hole out of zeros.
+    ///
+    /// Compaction reads this way. Whether a key can be imaged at all is
+    /// the same question the reader answers while it builds the page,
+    /// asked one layer deeper than the caller can see: the base may be
+    /// in any image of the plan, in the first record, or in the
+    /// fallback. A key that comes back `None` simply keeps its records
+    /// in the delta run and gets asked again next pass.
+    pub fn get_pages_where_possible(
+        &self,
+        map: &LayerMap,
+        mem: &Memtable,
+        blocks: &[BlockRef],
+        at: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>, GetPageError> {
+        self.build(map, mem, blocks, at, false)
+    }
+
+    /// The read path both entry points share. `strict` is what to do
+    /// with a block no base can be found for: refuse the batch, or drop
+    /// that block from it.
+    fn build(
+        &self,
+        map: &LayerMap,
+        mem: &Memtable,
+        blocks: &[BlockRef],
+        at: u64,
+        strict: bool,
+    ) -> Result<Vec<Option<Vec<u8>>>, GetPageError> {
         if blocks.len() > MAX_GETPAGE_BATCH {
             return Err(GetPageError::BatchTooLarge { got: blocks.len() });
         }
@@ -187,60 +226,77 @@ impl<'a> PageService<'a> {
             }
         }
 
+        // A main fork block with record history but no base anywhere is
+        // a hole in the store, not a fresh block: a fresh block's first
+        // record builds the page by itself, an init or a full image.
+        // Redo would grow whatever it can out of zeros and the rest of
+        // the page would be fabricated. A block with no base and no
+        // records is the other hole, the one that reads as zeros.
+        // Strict callers hear about the first kind and get zeros for
+        // the second; the rest drop both from the batch.
+        let mut bare: Option<(BlockRef, u64)> = None;
+        let mut usable = vec![true; blocks.len()];
+        for (i, (blk, r)) in blocks.iter().zip(&recons).enumerate() {
+            if r.base.is_some() {
+                continue;
+            }
+            let Some((first_lsn, bytes)) = r.records.first() else {
+                usable[i] = strict;
+                continue;
+            };
+            if blk.fork != 0 {
+                continue;
+            }
+            let self_built = walscan::record_init_refs(bytes)
+                .unwrap_or_default()
+                .iter()
+                .any(|(rref, init)| *init && rref == blk);
+            if !self_built {
+                bare = bare.or(Some((*blk, first_lsn.0)));
+                usable[i] = strict;
+            }
+        }
+        let live = |i: usize, r: &Reconstruction| usable[i] && (!r.records.is_empty());
+
         // The union of every block's record chain, deduplicated by
         // lsn: one record is one position in the tenant's single WAL
         // stream, so two chains listing the same lsn carry the same
         // bytes and redo must see the record once.
         let mut chain: BTreeMap<u64, &[u8]> = BTreeMap::new();
-        for r in &recons {
+        for (i, r) in recons.iter().enumerate() {
+            if !usable[i] {
+                continue;
+            }
             for (lsn, bytes) in &r.records {
                 chain.insert(lsn.0, bytes.as_slice());
             }
         }
 
-        let mut pages: Vec<Vec<u8>> = Vec::with_capacity(blocks.len());
+        let mut pages: Vec<Option<Vec<u8>>> = Vec::with_capacity(blocks.len());
         if chain.is_empty() {
             // Every block is exactly its image, or a hole.
-            for r in &recons {
-                pages.push(r.base.clone().unwrap_or_else(|| vec![0; BLCKSZ]));
+            for (i, r) in recons.iter().enumerate() {
+                pages.push(usable[i].then(|| r.base.clone().unwrap_or_else(|| vec![0; BLCKSZ])));
             }
         } else {
             let Some(pool) = self.pool else {
                 let needy = blocks
                     .iter()
                     .zip(&recons)
-                    .find(|(_, r)| !r.records.is_empty())
+                    .enumerate()
+                    .find(|(i, (_, r))| live(*i, r))
                     .expect("a nonempty chain came from some block");
-                return Err(GetPageError::NoRedoPool { blk: *needy.0 });
+                return Err(GetPageError::NoRedoPool { blk: *needy.1.0 });
             };
-            // A main fork block with record history but no base
-            // anywhere is a hole in the store, not a fresh block: a
-            // fresh block's first record builds the page by itself, an
-            // init or a full image. Redo would grow whatever it can
-            // out of zeros and the rest of the page would be
-            // fabricated, so refuse loudly instead.
-            for (blk, r) in blocks.iter().zip(&recons) {
-                if blk.fork != 0 || r.base.is_some() {
-                    continue;
-                }
-                let Some((first_lsn, bytes)) = r.records.first() else {
-                    continue;
-                };
-                let self_built = walscan::record_init_refs(bytes)
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|(rref, init)| *init && rref == blk);
-                if !self_built {
-                    return Err(GetPageError::BareChain {
-                        blk: *blk,
-                        first_lsn: first_lsn.0,
-                    });
-                }
+            if let Some((blk, first_lsn)) = bare {
+                return Err(GetPageError::BareChain { blk, first_lsn });
             }
             let bases: Vec<(BlockRef, &[u8])> = blocks
                 .iter()
                 .zip(&recons)
-                .filter_map(|(blk, r)| r.base.as_deref().map(|page| (*blk, page)))
+                .enumerate()
+                .filter(|(i, _)| usable[*i])
+                .filter_map(|(_, (blk, r))| r.base.as_deref().map(|page| (*blk, page)))
                 .collect();
             let records: Vec<(u64, u64, &[u8])> = chain
                 .iter()
@@ -249,10 +305,15 @@ impl<'a> PageService<'a> {
             // Blocks nothing ever touched stay out of the gets: the
             // redo worker only knows pages it was given something for,
             // holes are answered here with zeros.
+            let wanted: Vec<bool> = recons
+                .iter()
+                .enumerate()
+                .map(|(i, r)| usable[i] && (r.base.is_some() || !r.records.is_empty()))
+                .collect();
             let gets: Vec<BlockRef> = blocks
                 .iter()
-                .zip(&recons)
-                .filter(|(_, r)| r.base.is_some() || !r.records.is_empty())
+                .zip(&wanted)
+                .filter(|(_, want)| **want)
                 .map(|(blk, _)| *blk)
                 .collect();
             let mut applied = match pool.apply(&RedoRequest {
@@ -269,17 +330,18 @@ impl<'a> PageService<'a> {
                     return Err(GetPageError::Redo(format!("{e}, {blamed}")));
                 }
             };
-            for r in &recons {
-                if r.base.is_some() || !r.records.is_empty() {
-                    pages.push(applied.next().expect("one page per get"));
-                } else {
-                    pages.push(vec![0; BLCKSZ]);
-                }
+            for (i, want) in wanted.iter().enumerate() {
+                pages.push(match (want, usable[i]) {
+                    (true, _) => Some(applied.next().expect("one page per get")),
+                    (false, true) => Some(vec![0; BLCKSZ]),
+                    (false, false) => None,
+                });
             }
         }
 
         if self.data_checksums {
             for (blk, page) in blocks.iter().zip(&mut pages) {
+                let Some(page) = page else { continue };
                 if page.iter().any(|b| *b != 0) {
                     let sum = page_checksum(page, blk.blk);
                     page[8..10].copy_from_slice(&sum.to_le_bytes());

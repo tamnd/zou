@@ -90,19 +90,9 @@ const INGEST_SLICE: Duration = Duration::from_millis(200);
 const FOLD_EVERY: Duration = Duration::from_secs(60);
 
 /// The least delta worth folding, two flush thresholds. Under this the
-/// chain a read walks is short enough that rebuilding every page of
-/// the shard costs more than reading through it.
+/// chain a read walks is short enough that rebuilding the pages the
+/// debt touches costs more than reading through it.
 const FOLD_DEBT_FLOOR: u64 = 128 << 20;
-
-/// And the other half of the gate: fold only once the delta above the
-/// newest image is at least this fraction of the image it would
-/// replace. A fold rewrites the whole shard, so a flat threshold is a
-/// trap at scale. The 24 h tenant on server3 carries a 7 GB image and
-/// takes 7 GB of delta an hour, which against a flat 128 MB is a 7 GB
-/// rewrite every minute. Tying the trigger to the image bounds the
-/// write amplification instead: one image rewritten per half image of
-/// delta ingested, whatever the tenant's size.
-const FOLD_DEBT_RATIO: u64 = 2;
 
 /// One read request as the driver sees it: a run of blocks of one
 /// fork, the lsn the reader needs covered, and the channel the pages
@@ -959,7 +949,7 @@ fn fold_loop(
                 continue;
             }
         };
-        if !worth_folding(debt, image) {
+        if !worth_folding(debt) {
             due = Instant::now() + FOLD_EVERY;
             continue;
         }
@@ -1021,11 +1011,15 @@ fn fold_debt(
     Ok((crate::compact::debt(descs), image))
 }
 
-/// Whether a shard owing `debt` bytes of delta over an image of
-/// `image` bytes has earned a rewrite. A shard with no image at all
-/// has to get one, so the floor alone decides there.
-fn worth_folding(debt: u64, image: u64) -> bool {
-    debt >= FOLD_DEBT_FLOOR && debt >= image / FOLD_DEBT_RATIO
+/// Whether a shard owing `debt` bytes of delta has earned a fold. The
+/// debt alone decides it: a pass costs what it reads, and since zou
+/// #356 what it reads is the debt, not the shard. The image underneath
+/// used to be rewritten every pass, so a fat one had to buy itself
+/// patience by demanding a debt half its size before it would move;
+/// now the fold leaves it where it is, and waiting only means reads
+/// keep walking delta for no reason.
+fn worth_folding(debt: u64) -> bool {
+    debt >= FOLD_DEBT_FLOOR
 }
 
 /// The service the driver serves every request through, built once so
@@ -1995,31 +1989,22 @@ mod tests {
         );
     }
 
-    /// The gate that keeps a big tenant from rewriting itself every
-    /// minute: a fold has to be worth the image it replaces, not just
-    /// worth more than a flat number.
+    /// The gate is the debt and nothing else, because the pass reads
+    /// the debt and nothing else. The image it stood on used to be part
+    /// of the bill and no longer is (zou #356).
     #[test]
-    fn a_fold_waits_until_the_delta_is_worth_the_image_it_rewrites() {
-        let gb = 1u64 << 30;
+    fn a_fold_waits_for_the_debt_floor_and_nothing_else() {
         assert!(
-            !worth_folding(FOLD_DEBT_FLOOR - 1, 0),
-            "a shard with no image still waits for the floor"
+            !worth_folding(FOLD_DEBT_FLOOR - 1),
+            "a short chain is the cheaper read"
         );
         assert!(
-            worth_folding(FOLD_DEBT_FLOOR, 0),
-            "and then takes its first image"
+            worth_folding(FOLD_DEBT_FLOOR),
+            "and then the fold has earned its turn"
         );
         assert!(
-            !worth_folding(FOLD_DEBT_FLOOR, 7 * gb),
-            "128 MB of delta does not justify rewriting 7 GB"
-        );
-        assert!(
-            !worth_folding(3 * gb, 7 * gb),
-            "under half the image is still the cheaper read"
-        );
-        assert!(
-            worth_folding(4 * gb, 7 * gb),
-            "past half the image the rewrite pays for itself"
+            worth_folding(4 * (1u64 << 30)),
+            "however big the tenant underneath it is"
         );
     }
 }
