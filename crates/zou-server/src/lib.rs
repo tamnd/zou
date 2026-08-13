@@ -66,6 +66,7 @@ pub mod tenant;
 pub mod totp;
 pub mod tus;
 pub mod visible;
+pub mod webhook;
 pub mod wire;
 
 /// What the front door needs to know: the secret every key and token
@@ -228,6 +229,10 @@ pub struct Config {
     /// project is made with. A zero on any of them is that one off,
     /// which is what a server running its own project usually wants.
     pub realtime: zou_realtime::Limits,
+    /// How hard a database webhook is tried: how many attempts in
+    /// total and how long the first wait between them is. One attempt
+    /// is pg_net's own behaviour.
+    pub webhook: webhook::Retries,
 }
 
 impl Default for Config {
@@ -266,6 +271,7 @@ impl Default for Config {
             s3: None,
             passthrough: None,
             realtime: zou_realtime::Limits::default(),
+            webhook: webhook::Retries::default(),
         }
     }
 }
@@ -334,6 +340,11 @@ pub struct App {
     /// nobody is reading from is a database whose write ahead log
     /// cannot be freed.
     pub reading: tokio::sync::OnceCell<()>,
+    /// The loop that makes the calls a database webhook queued,
+    /// started by the first request through the gate. A queue only
+    /// fills because a transaction committed, and a transaction only
+    /// happens because somebody arrived.
+    pub dispatching: tokio::sync::OnceCell<()>,
 }
 
 impl App {
@@ -435,6 +446,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         quota,
         changes: Arc::new(reader::Changes::new()),
         reading: tokio::sync::OnceCell::new(),
+        dispatching: tokio::sync::OnceCell::new(),
     }))
 }
 
@@ -534,6 +546,12 @@ async fn gate(
         role: identity.role.unwrap_or_else(|| "anon".to_string()),
         claims: Arc::new(identity.claims),
     });
+    // A router can be built outside a runtime, so what makes the calls
+    // a webhook queued starts on the first request rather than at
+    // boot. Nothing queues one without a request having arrived.
+    app.dispatching
+        .get_or_init(|| async { webhook::dispatch(Arc::clone(&app)) })
+        .await;
     next.run(req).await
 }
 

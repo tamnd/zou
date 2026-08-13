@@ -364,6 +364,7 @@ fn start_http(
         );
     }
     let realtime = zou_server::realtime::limits_from_env()?;
+    let webhook = zou_server::webhook::retries_from_env()?;
     let mfa = zou_server::mfa::from_env()?;
     if !mfa.totp_enroll || !mfa.totp_verify {
         log::info!("authenticator factors are off, /auth/v1/factors refuses by name");
@@ -485,6 +486,11 @@ fn start_http(
             // them, and a zero turns one off, which is what a laptop
             // running a load test of its own wants.
             realtime,
+            // How hard a database webhook is tried before its answer
+            // is written down: three times, two seconds apart and then
+            // ten. ZOU_WEBHOOK_ATTEMPTS=1 is pg_net's own behaviour,
+            // which is to try once and record whatever happened.
+            webhook,
             // Everything else is GoTrue's default, including the
             // unlimited edge rate the dev loop wants.
             ..Default::default()

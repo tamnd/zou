@@ -309,6 +309,16 @@ const REALTIME_SCHEMA: &str = include_str!("realtime-schema.sql");
 /// it and would never see this otherwise. See the file for the rest.
 const REALTIME_SEND: &str = include_str!("realtime-send.sql");
 
+/// The `net` schema, which on a Supabase project is pg_net: the queue
+/// a database webhook writes into, and the functions that write it.
+/// Only applied to a database that has neither, so a real pg_net keeps
+/// its own, see the file.
+const NET_SCHEMA: &str = include_str!("net-schema.sql");
+
+/// The `supabase_functions` schema: the trigger function a database
+/// webhook is, and the audit table it writes.
+const FUNCTIONS_SCHEMA: &str = include_str!("functions-schema.sql");
+
 /// The publication postgres changes reads, which a project adds its
 /// tables to. Applied every boot for the same reason as the send
 /// functions, and a notice rather than a failure when the role cannot
@@ -376,6 +386,8 @@ pub async fn bootstrap(client: &Client) -> Result<(), tokio_postgres::Error> {
     ensure_foreign_schema(client, "auth.users", &[AUTH_SCHEMA]).await?;
     ensure_foreign_schema(client, "storage.objects", &[STORAGE_SCHEMA, STORAGE_GRANTS]).await?;
     ensure_foreign_schema(client, "realtime.messages", &[REALTIME_SCHEMA]).await?;
+    ensure_foreign_schema(client, "net.http_request_queue", &[NET_SCHEMA]).await?;
+    ensure_foreign_schema(client, "supabase_functions.hooks", &[FUNCTIONS_SCHEMA]).await?;
     ensure_schema(client, &[REALTIME_SEND, REALTIME_PUBLICATION]).await
 }
 
@@ -424,6 +436,8 @@ pub fn contract_version() -> u64 {
         REALTIME_SCHEMA,
         REALTIME_SEND,
         REALTIME_PUBLICATION,
+        NET_SCHEMA,
+        FUNCTIONS_SCHEMA,
     ] {
         for byte in part.bytes() {
             hash ^= u64::from(byte);
