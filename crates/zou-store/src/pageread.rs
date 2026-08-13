@@ -3,7 +3,7 @@
 //! A lookup plans against the [`LayerMap`], fetches only what the
 //! plan names, and returns the base image plus the ordered record
 //! chain the redo pool needs. Everything is range GETs: a footer is
-//! two small ranges the first time and cached after, a block is one
+//! one suffix range the first time and cached after, a block is one
 //! range verified by the crc in its own index row. The whole layer
 //! object is never fetched.
 //!
@@ -22,21 +22,26 @@
 //! megabytes again on the next read of the same layer.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::cas::{CasError, CasStore};
 use crate::layer::{
-    LAYER_HEADER_LEN, LayerDecodeError, LayerFooter, LayerKey, decode_delta_block,
-    decode_image_block, read_layer_footer_ranges,
+    LayerDecodeError, LayerFooter, LayerKey, decode_delta_block, decode_image_block,
+    read_layer_footer_suffix,
 };
 use crate::layermap::{LayerDesc, LayerMap};
 use crate::lsn::Lsn;
 use crate::memtable::Memtable;
 
-/// First guess for the footer suffix fetch. Wide enough that one
-/// range covers the footer of any healthy layer; a footer bigger than
-/// this costs one exact refetch, not an error.
+/// First guess for the footer suffix fetch, before this reader has
+/// met a layer of its own. A footer bigger than the guess costs one
+/// exact refetch, not an error.
 const FOOTER_GUESS: u64 = 64 * 1024;
+
+/// Ceiling on the learned guess, so one layer with an outsized footer
+/// cannot make every later cold read drag megabytes it does not need.
+const FOOTER_GUESS_CAP: u64 = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
@@ -85,6 +90,11 @@ pub struct LayerReader<'a> {
     tenant: Option<String>,
     shard: Option<u16>,
     footers: Mutex<HashMap<String, Arc<LayerFooter>>>,
+    /// How many tail bytes the next cold footer fetch asks for. The
+    /// layers one shard cuts are all about the same shape, so the
+    /// first layer whose footer overflowed the guess is a good guess
+    /// for the rest, and the reader outlives them all.
+    guess: AtomicU64,
 }
 
 impl<'a> LayerReader<'a> {
@@ -95,6 +105,7 @@ impl<'a> LayerReader<'a> {
             tenant: None,
             shard: None,
             footers: Mutex::new(HashMap::new()),
+            guess: AtomicU64::new(FOOTER_GUESS),
         }
     }
 
@@ -109,6 +120,7 @@ impl<'a> LayerReader<'a> {
             tenant: Some(tenant_ref.to_string()),
             shard: Some(shard),
             footers: Mutex::new(HashMap::new()),
+            guess: AtomicU64::new(FOOTER_GUESS),
         }
     }
 
@@ -194,14 +206,16 @@ impl<'a> LayerReader<'a> {
             name: name.clone(),
             source,
         };
-        let header = self.range(desc, &name, 0, LAYER_HEADER_LEN as u64)?;
-        let guess = FOOTER_GUESS.min(desc.size);
+        let guess = self.guess.load(Ordering::Relaxed).min(desc.size);
         let suffix = self.range(desc, &name, desc.size - guess, guess)?;
-        let footer = match read_layer_footer_ranges(&header, &suffix, desc.size) {
+        let footer = match read_layer_footer_suffix(desc.kind, &suffix, desc.size) {
             Ok(footer) => footer,
             Err(LayerDecodeError::Truncated { need, .. }) if (need as u64) > guess => {
                 let exact = self.range(desc, &name, desc.size - need as u64, need as u64)?;
-                read_layer_footer_ranges(&header, &exact, desc.size).map_err(layer_err)?
+                // Next time, ask for this much up front.
+                self.guess
+                    .fetch_max((need as u64).min(FOOTER_GUESS_CAP), Ordering::Relaxed);
+                read_layer_footer_suffix(desc.kind, &exact, desc.size).map_err(layer_err)?
             }
             Err(source) => return Err(layer_err(source)),
         };
@@ -326,6 +340,7 @@ mod tests {
     use super::*;
     use crate::layer::{DeltaEntry, ImageEntry, PAGE_IMAGE_LEN, build_delta, build_image};
     use crate::mem::MemStore;
+    use std::sync::atomic::AtomicUsize;
 
     fn k(block: u32) -> LayerKey {
         LayerKey::page(1663, 5, 16384, 0, block)
@@ -522,22 +537,45 @@ mod tests {
     #[test]
     fn an_object_that_disagrees_with_its_name_is_refused() {
         let (store, map, _) = history();
-        // Serve the image layer's bytes under a delta layer's name.
-        let image = &map.layers()[0];
-        let bytes = store
-            .get(&format!("layers/{}", image.name()))
-            .unwrap()
-            .unwrap()
-            .0;
-        let mut liar = LayerDesc::delta(image.min_key, image.max_key, Lsn(1), Lsn(9));
-        liar.size = bytes.len() as u64;
-        store
-            .put(&format!("layers/{}", liar.name()), &bytes)
-            .unwrap();
-        let map = LayerMap::new(vec![liar]).unwrap();
-        let reader = LayerReader::new(&store, "layers/");
+        let bytes = |desc: &LayerDesc| {
+            store
+                .get(&format!("layers/{}", desc.name()))
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        let serve_as = |mut liar: LayerDesc, bytes: Vec<u8>| {
+            liar.size = bytes.len() as u64;
+            store
+                .put(&format!("layers/{}", liar.name()), &bytes)
+                .unwrap();
+            let map = LayerMap::new(vec![liar]).unwrap();
+            let reader = LayerReader::new(&store, "layers/");
+            reader.reconstruct(&map, &Memtable::new(), &k(1), Lsn(5))
+        };
+
+        // The image layer's bytes under a delta layer's name. The
+        // footer crc covers the header the reader named, so claiming
+        // the wrong kind fails the crc before anything is parsed.
+        let image = map.layers()[0].clone();
         assert!(matches!(
-            reader.reconstruct(&map, &Memtable::new(), &k(1), Lsn(5)),
+            serve_as(
+                LayerDesc::delta(image.min_key, image.max_key, Lsn(1), Lsn(9)),
+                bytes(&image)
+            ),
+            Err(ReadError::Layer {
+                source: LayerDecodeError::Corrupt,
+                ..
+            })
+        ));
+
+        // The same kind under a name claiming a different lsn parses
+        // fine and is refused on the claim itself.
+        assert!(matches!(
+            serve_as(
+                LayerDesc::image(image.min_key, image.max_key, Lsn(4)),
+                bytes(&image)
+            ),
             Err(ReadError::Mismatched { .. })
         ));
     }
@@ -547,7 +585,7 @@ mod tests {
         // Thousands of tiny blocks blow the footer past the 64 KB
         // guess; the reader must refetch exactly and still serve.
         let store = MemStore::default();
-        let entries: Vec<DeltaEntry> = (0..30_000u32)
+        let entries: Vec<DeltaEntry> = (0..10_000u32)
             .map(|i| DeltaEntry {
                 key: k(i),
                 lsn: Lsn(100 + i as u64),
@@ -556,14 +594,79 @@ mod tests {
             .collect();
         let (buf, footer) = build_delta(&entries, 16).unwrap();
         assert!(footer.blocks.len() > 2000);
-        let mut desc = LayerDesc::delta(k(0), k(29_999), Lsn(100), Lsn(100 + 29_999));
+        let mut desc = LayerDesc::delta(k(0), k(9_999), Lsn(100), Lsn(100 + 9_999));
         desc.size = buf.len() as u64;
         store.put(&format!("layers/{}", desc.name()), &buf).unwrap();
-        let map = LayerMap::new(vec![desc]).unwrap();
+        let map = LayerMap::new(vec![desc.clone()]).unwrap();
+        let store = Counting {
+            inner: store,
+            ranges: AtomicUsize::new(0),
+        };
         let reader = LayerReader::new(&store, "layers/");
         let got = reader
-            .reconstruct(&map, &Memtable::new(), &k(12_345), Lsn(u64::MAX))
+            .reconstruct(&map, &Memtable::new(), &k(5_000), Lsn(u64::MAX))
             .unwrap();
-        assert_eq!(got.records, vec![(Lsn(100 + 12_345), vec![57u8; 4])]);
+        assert_eq!(got.records, vec![(Lsn(100 + 5_000), vec![136u8; 4])]);
+        assert_eq!(
+            store.ranges.load(Ordering::Relaxed),
+            3,
+            "the guess, the exact refetch, and the block"
+        );
+
+        // And the reader learned: the same layer cold in a second
+        // reader would pay three again, this one pays two, because a
+        // footer that big is now what it asks for up front.
+        assert!(reader.guess.load(Ordering::Relaxed) > FOOTER_GUESS);
+        let twin = {
+            let mut twin = LayerDesc::delta(k(0), k(9_999), Lsn(50), Lsn(99));
+            twin.size = buf.len() as u64;
+            store.put(&format!("layers/{}", twin.name()), &buf).unwrap();
+            twin
+        };
+        // The twin is the same bytes under another name, so it fails on
+        // the claim, but only after the footer parsed, which is the
+        // fetch this counts.
+        store.ranges.store(0, Ordering::Relaxed);
+        let map = LayerMap::new(vec![twin]).unwrap();
+        assert!(matches!(
+            reader.reconstruct(&map, &Memtable::new(), &k(5_000), Lsn(u64::MAX)),
+            Err(ReadError::Mismatched { .. })
+        ));
+        assert_eq!(
+            store.ranges.load(Ordering::Relaxed),
+            1,
+            "one fetch, no refetch"
+        );
+    }
+
+    /// A store that counts range reads, so a test can say how many
+    /// round trips a read cost.
+    struct Counting {
+        inner: MemStore,
+        ranges: AtomicUsize,
+    }
+
+    impl CasStore for Counting {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, crate::cas::Version)>, CasError> {
+            self.inner.get(key)
+        }
+        fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
+            self.ranges.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_range(key, offset, len)
+        }
+        fn put_if_match(
+            &self,
+            key: &str,
+            data: &[u8],
+            expected: Option<&crate::cas::Version>,
+        ) -> Result<crate::cas::Version, CasError> {
+            self.inner.put_if_match(key, data, expected)
+        }
+        fn delete(&self, key: &str) -> Result<(), CasError> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+            self.inner.list(prefix)
+        }
     }
 }
