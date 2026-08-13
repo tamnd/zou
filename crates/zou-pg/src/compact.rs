@@ -127,6 +127,31 @@ pub fn debt(descs: &[LayerDesc]) -> u64 {
         .sum()
 }
 
+/// The lsn a fresh image cut at `dcl` is allowed to claim.
+///
+/// The two watermarks either side of an image cut do not mean the same
+/// thing. `disk_consistent_lsn` is the ingest's resume point: the
+/// layers hold every record that starts below it, and the record that
+/// starts at `dcl` itself is still only in the log, waiting for the
+/// next flush. An image lsn is the other way round, inclusive: the
+/// read path floors the delta run at the base image's lsn and applies
+/// only records above it, so an image labelled `dcl` claims to hold
+/// the record at `dcl` that nothing ever put in it.
+///
+/// The record is then lost for good. Every later read of that page
+/// takes the image as its base and skips straight past the record, and
+/// the next one lands on a page that never got the row before it, which
+/// is how a heap insert ends up redoing at an offset the page has no
+/// room for and taking the redo worker down with it (zou #358).
+///
+/// One byte lower and the claim is exactly what the layers hold. The
+/// cut is a bound, not a position, so it does not have to land on a
+/// record boundary, and the record at `dcl` reaches the read path from
+/// the delta layer the next flush writes.
+fn image_cut(dcl: Lsn) -> Lsn {
+    Lsn(dcl.0.saturating_sub(1))
+}
+
 /// What one pass did, for logs and the scoreboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactOutcome {
@@ -388,12 +413,12 @@ pub fn compact_shard(
     drop(delta_srcs);
     drop(image_groups);
 
-    // With a redo pool on hand, cut a fresh image at the flush point
-    // so the merged run drops out of the read path for current reads.
-    // Only relation pages materialize, and only those redo can build
-    // from a base somebody holds: a source image, a first record that
-    // initializes the page or carries a full image of it, or the pg/
-    // object frozen at the put elision flag day, which is the same
+    // With a redo pool on hand, cut a fresh image just under the flush
+    // point so the merged run drops out of the read path for current
+    // reads. Only relation pages materialize, and only those redo can
+    // build from a base somebody holds: a source image, a first record
+    // that initializes the page or carries a full image of it, or the
+    // pg/ object frozen at the put elision flag day, which is the same
     // fallback the live page service reads through. A page with no
     // base anywhere stays in the delta run; feeding its records a
     // zeroed base would crash the redo worker, not rebuild the page.
@@ -402,6 +427,7 @@ pub fn compact_shard(
     if let Some(pool) = pool
         && dcl > Lsn(0)
     {
+        let cut = image_cut(dcl);
         let keys: BTreeSet<LayerKey> = merged_keys
             .iter()
             .chain(based.iter())
@@ -427,7 +453,7 @@ pub fn compact_shard(
                         .cloned()
                 });
             let mem = Memtable::new();
-            let mut builder = ImageBuilder::new(dcl, BLOCK_TARGET);
+            let mut builder = ImageBuilder::new(cut, BLOCK_TARGET);
             for batch in keys.chunks(MAX_GETPAGE_BATCH) {
                 let mut ready: Vec<LayerKey> = Vec::with_capacity(batch.len());
                 {
@@ -462,7 +488,7 @@ pub fn compact_shard(
                         blk: k.block,
                     })
                     .collect();
-                let pages = svc.get_pages(&map, &mem, &blocks, dcl.0)?;
+                let pages = svc.get_pages(&map, &mem, &blocks, cut.0)?;
                 for (key, page) in ready.iter().zip(pages) {
                     builder.push(*key, &page)?;
                     imaged += 1;
@@ -659,6 +685,59 @@ mod tests {
         publish_layer(store, &layout.shard_manifest(shard), shard, &entry, Lsn(at)).unwrap();
     }
 
+    /// The record that starts at the flush point is not in the layers
+    /// the flush left behind, so an image cut there would claim it and
+    /// no read would ever apply it. The lsns are the ones off the
+    /// gamingpc store that took the redo worker down in zou #358.
+    #[test]
+    fn the_record_starting_at_the_flush_point_survives_the_image() {
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        let key = LayerKey::page(1663, 5, 90, 0, 645);
+        // One flush: the last record it drained ends at the dcl, and
+        // the record starting there is still only in the log.
+        let dcl = Lsn(0xcf939b0);
+        put_delta(&store, &layout, 0, &mut [rec(90, 645, 0xcf93200)], dcl.0);
+        // The fold that follows cuts an image over that run.
+        put_image(
+            &store,
+            &layout,
+            0,
+            &[ImageEntry {
+                key,
+                page: vec![7; PAGE_IMAGE_LEN],
+            }],
+            image_cut(dcl).0,
+        );
+        // The next flush brings the record at the dcl, and the one
+        // after it, the insert that lands on the row before it.
+        put_delta(
+            &store,
+            &layout,
+            0,
+            &mut [rec(90, 645, dcl.0), rec(90, 645, 0xcf93f70)],
+            0xf7bb280,
+        );
+
+        let (manifest, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let recon = LayerReader::for_shard(&store, "t", 0)
+            .reconstruct(
+                &manifest.layer_map().unwrap(),
+                &Memtable::new(),
+                &key,
+                Lsn(0x11b4d8c0),
+            )
+            .unwrap();
+        assert!(recon.base.is_some(), "the image is the base");
+        assert_eq!(
+            recon.records.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
+            vec![dcl.0, 0xcf93f70],
+            "the record at the flush point has to reach redo"
+        );
+    }
+
     fn rec(rel: u32, block: u32, lsn: u64) -> DeltaEntry {
         DeltaEntry {
             key: LayerKey::page(1663, 5, rel, 0, block),
@@ -851,7 +930,11 @@ mod tests {
         let mem = Memtable::new();
         let got = reader.reconstruct(&map, &mem, &frozen, Lsn(0x500)).unwrap();
         assert_eq!(got.base, Some(vec![0xAB; BLCKSZ]));
-        assert_eq!(got.base_lsn, Some(Lsn(0x200)), "the image sits at the dcl");
+        assert_eq!(
+            got.base_lsn,
+            Some(image_cut(Lsn(0x200))),
+            "the image sits one byte under the dcl"
+        );
         assert_eq!(
             got.records.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
             vec![0x300, 0x400],
@@ -961,10 +1044,10 @@ mod tests {
             .collect();
         assert_eq!(
             images,
-            vec![Lsn(0x100), Lsn(0x200)],
+            vec![Lsn(0x100), image_cut(Lsn(0x200))],
             "the source image is rewritten where it stood and the fresh one \
-             stands at the lsn the layers reach, not the one the flush moved \
-             the shard to"
+             stands just under the lsn the layers reach, not under the one \
+             the flush moved the shard to"
         );
 
         // The racing record is still there to apply, which is the whole
@@ -974,7 +1057,7 @@ mod tests {
             .reconstruct(&m.layer_map().unwrap(), &Memtable::new(), &key, Lsn(0x500))
             .unwrap();
         assert_eq!(got.base, Some(vec![0xAB; PAGE_IMAGE_LEN]));
-        assert_eq!(got.base_lsn, Some(Lsn(0x200)));
+        assert_eq!(got.base_lsn, Some(image_cut(Lsn(0x200))));
         assert_eq!(
             got.records.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
             vec![0x250]

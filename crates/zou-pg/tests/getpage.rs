@@ -9,7 +9,7 @@
 //! Gated on ZOU_PG_PREFIX exactly like the redo pool test: without the
 //! patched build the test prints a skip note and passes.
 //!
-//! Four scenarios share one cluster:
+//! Six scenarios share one cluster:
 //! - everything flushed: pages come purely from the layer store
 //! - the same reads through the local file cache, twice: once to fill
 //!   it, once from a fresh cache instance over a store stripped of
@@ -18,6 +18,10 @@
 //!   so reconstruction stitches layer records and memtable records
 //! - per block read lsns from the last written lsn cache serve the same
 //!   pages as a read at the very end of the WAL
+//! - a compaction pass folds the runs into one delta plus a fresh image
+//!   and no page a reader gets moves an inch
+//! - a fold in the middle of the stream, on the boundary where the next
+//!   record starts at the flush point, the shape of zou #358
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -454,10 +458,10 @@ fn getpage_serves_what_redo_builds() {
     let map = manifest.layer_map().expect("map builds");
     use zou_store::layer::LayerKind;
     assert!(
-        map.layers()
-            .iter()
-            .any(|d| d.kind == LayerKind::Image && d.min_lsn == manifest.disk_consistent_lsn),
-        "an image sits at the flush point"
+        map.layers().iter().any(
+            |d| d.kind == LayerKind::Image && d.min_lsn.0 + 1 == manifest.disk_consistent_lsn.0
+        ),
+        "an image sits just under the flush point"
     );
     assert_eq!(
         map.layers()
@@ -490,4 +494,68 @@ fn getpage_serves_what_redo_builds() {
             "no deltas above the image for {key:?}"
         );
     }
+
+    // Scenario five: fold in the middle of the stream, on the exact
+    // boundary where the next record starts at the flush point.
+    //
+    // This is zou #358. The flush publishes its resume point as the
+    // disk consistent lsn, so the layers hold every record below it
+    // and the record starting at it is still only in the log. An image
+    // cut at that lsn claims the record anyway, every later read of
+    // the page skips it, and the next insert into the page redoes at
+    // an offset the page has no room for and kills the redo worker.
+    // The cut has to sit one byte under the flush point.
+    let cut = {
+        // A heap record that is not the first for its block, so the
+        // page it touches has a history the fold will image.
+        let mut seen = std::collections::HashSet::new();
+        let mut chosen = None;
+        for record in &out.records {
+            for blk in record.block_refs().expect("well formed") {
+                if blk.rel != heap_rel {
+                    continue;
+                }
+                if !seen.insert((blk.rel, blk.blk)) && chosen.is_none() && record.lsn > wal_start {
+                    chosen = Some(record.lsn);
+                }
+            }
+        }
+        chosen.expect("a heap page gets a second record")
+    };
+    let store = MemStore::default();
+    store
+        .put_if_absent(
+            &layout.manifest(),
+            &zou_store::manifest::Manifest::new("t", 18).to_json(),
+        )
+        .expect("tenant manifest");
+    let mut ingest = ShardIngest::new(IngestConfig::new(TENANT, 0, 1), wal_start);
+    ingest
+        .apply_frames(&frames_over(wal_start, &raw[..(cut - wal_start) as usize]))
+        .expect("head applies");
+    assert_eq!(ingest.applied(), cut, "the flush point is the record start");
+    ingest
+        .flush(&store, &layout)
+        .expect("flush")
+        .expect("layer");
+    zou_pg::compact::compact_shard(&store, "t", 0, Some(&pool), true)
+        .expect("compaction succeeds")
+        .expect("an image is work");
+    ingest
+        .apply_frames(&frames_over(cut, &raw[(cut - wal_start) as usize..]))
+        .expect("tail applies");
+    ingest
+        .flush(&store, &layout)
+        .expect("flush")
+        .expect("layer");
+    assert_eq!(
+        serve(&ingest, &store, &heap_blocks, wal_end),
+        heap_want,
+        "heap folded at a record boundary differs from direct redo"
+    );
+    assert_eq!(
+        serve(&ingest, &store, &index_blocks, wal_end),
+        index_want,
+        "index folded at a record boundary differs from direct redo"
+    );
 }
