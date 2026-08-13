@@ -1,0 +1,156 @@
+Make a blocked syscall in the redo worker say what it was.
+
+The sandbox answered a call outside the allowlist with
+SECCOMP_RET_KILL_PROCESS, which takes the worker out before it can log
+anything. All that is left is an audit line in dmesg with a syscall
+number in it, on a machine where someone thought to look at dmesg.
+That is how zou #332 went unnoticed for two days.
+
+The filter now traps instead. The syscall still never runs, so the
+sandbox is exactly as tight as it was, but a handler gets to write one
+line naming the syscall and the address it came from, plus a backtrace
+where the platform has one, before exiting. The line goes to stderr,
+which is the postgres log the pool inherited.
+
+The handler sticks to async signal safe calls, and does not ask for
+SA_NODEFER: a blocked syscall from inside the handler cannot be
+delivered, so the kernel kills the process, which is where this
+started rather than a loop. The first backtrace of a process can load
+libgcc, so that is done before the filter goes up rather than from
+inside the handler. An unexpected arch still kills outright.
+
+diff --git a/src/backend/access/transam/zou_walredo.c b/src/backend/access/transam/zou_walredo.c
+--- a/src/backend/access/transam/zou_walredo.c
++++ b/src/backend/access/transam/zou_walredo.c
+@@ -42,9 +42,10 @@
+  *
+  * On Linux the worker installs a seccomp allowlist before touching the
+  * first request, so a compromised redo routine cannot open files, connect
+- * sockets or spawn processes.  Set ZOU_REDO_NO_SANDBOX=1 to skip it for
+- * debugging.  Other platforms run unsandboxed and are for development
+- * only.
++ * sockets or spawn processes.  A call the allowlist turns down never runs;
++ * it traps to a handler that names the syscall in the log and exits.  Set
++ * ZOU_REDO_NO_SANDBOX=1 to skip the whole thing for debugging.  Other
++ * platforms run unsandboxed and are for development only.
+  *
+  * Custom WAL resource managers are not registered here, so records from
+  * extensions with custom rmgrs fail the batch.  Wiring those up is left
+@@ -63,8 +64,12 @@
+ #include <linux/audit.h>
+ #include <linux/filter.h>
+ #include <linux/seccomp.h>
++#include <signal.h>
+ #include <sys/prctl.h>
+ #include <sys/syscall.h>
++#ifdef HAVE_EXECINFO_H
++#include <execinfo.h>
++#endif
+ #endif
+ 
+ #include "access/xlog.h"
+@@ -823,13 +828,57 @@
+ 
+ #ifndef SECCOMP_RET_KILL_PROCESS
+ #define SECCOMP_RET_KILL_PROCESS 0x80000000U
++#endif
++
++#ifndef SECCOMP_RET_TRAP
++#define SECCOMP_RET_TRAP 0x00030000U
+ #endif
+ 
+ /*
++ * Say which syscall the filter turned down, then go.
++ *
++ * A killed worker is silent: the process is gone before it can log anything
++ * and the only trace is an audit line in dmesg holding a syscall number.
++ * Trapping instead gets a line in the postgres log naming the syscall and,
++ * where the platform can manage it, the stack that made the call.  The
++ * syscall itself never runs either way, so the sandbox is exactly as tight
++ * as it was.
++ *
++ * Only async signal safe calls belong here.  A blocked syscall inside the
++ * handler cannot be delivered again, SIGSYS is on the mask for the duration,
++ * so the kernel falls back to killing the process, which is where this
++ * started.
++ */
++static void
++zredo_blocked(int sig, siginfo_t *si, void *cxt)
++{
++	char		msg[160];
++	int			len;
++
++	len = snprintf(msg, sizeof(msg),
++				   "zou redo: sandbox blocked syscall %d at %p, worker exiting\n",
++				   si->si_syscall, si->si_call_addr);
++	if (len > 0)
++		(void) write(STDERR_FILENO, msg, Min(len, (int) sizeof(msg) - 1));
++
++#ifdef HAVE_BACKTRACE_SYMBOLS
++	{
++		void	   *frames[32];
++		int			nframes = backtrace(frames, lengthof(frames));
++
++		backtrace_symbols_fd(frames, nframes, STDERR_FILENO);
++	}
++#endif
++
++	_exit(2);
++}
++
++/*
+  * Raw BPF allowlist.  Everything the steady state needs: pipe IO, memory,
+  * locking, time, signals and clean exit, plus pread/pwrite for the AIO
+  * scratch file and the sysv teardown calls proc_exit runs into.  Anything
+- * else kills the process and the pool restarts it.
++ * else traps to the handler above, which reports it and exits, and the pool
++ * spawns a fresh worker.
+  */
+ static void
+ enter_sandbox(void)
+@@ -839,7 +888,28 @@
+ 	struct sock_filter prog[4 + lengthof(allowed) * 2];
+ 	int			pc = 0;
+ 	struct sock_fprog fprog;
++	struct sigaction act;
++
++	memset(&act, 0, sizeof(act));
++	act.sa_sigaction = zredo_blocked;
++	act.sa_flags = SA_SIGINFO;
++	sigemptyset(&act.sa_mask);
++	if (sigaction(SIGSYS, &act, NULL) != 0)
++		elog(FATAL, "zou redo: could not install the blocked syscall handler: %m");
+ 
++#ifdef HAVE_BACKTRACE_SYMBOLS
++	/*
++	 * The first backtrace of a process can load libgcc, which is an open the
++	 * filter would turn down from inside the handler.  Get it over with while
++	 * there is still no filter.
++	 */
++	{
++		void	   *frames[1];
++
++		(void) backtrace(frames, lengthof(frames));
++	}
++#endif
++
+ 	allowed[n++] = __NR_read;
+ 	allowed[n++] = __NR_write;
+ 	allowed[n++] = __NR_close;
+@@ -900,6 +970,7 @@
+ 				 offsetof(struct seccomp_data, arch));
+ 	prog[pc++] = (struct sock_filter)
+ 		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ZREDO_SECCOMP_ARCH, 1, 0);
++	/* an unexpected arch is nothing a handler should get a say in */
+ 	prog[pc++] = (struct sock_filter)
+ 		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+ 	prog[pc++] = (struct sock_filter)
+@@ -913,7 +984,7 @@
+ 			BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+ 	}
+ 	prog[pc++] = (struct sock_filter)
+-		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
++		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+ 
+ 	fprog.len = (unsigned short) pc;
+ 	fprog.filter = prog;
