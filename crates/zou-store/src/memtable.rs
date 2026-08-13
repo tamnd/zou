@@ -19,6 +19,15 @@ use crate::lsn::Lsn;
 pub struct Memtable {
     entries: BTreeMap<(LayerKey, Lsn), Vec<u8>>,
     bytes: usize,
+    /// Inclusive lsn bounds, carried along rather than derived. The
+    /// btree is ordered by key first, so the only way to read the
+    /// bounds back out of it is to walk every entry, and the flush
+    /// check asks for them once per record applied. On a service
+    /// catching up that walk is the catch up: a memtable heading for
+    /// its flush threshold holds hundreds of thousands of entries and
+    /// the apply goes quadratic, from under a millisecond a frame to
+    /// nine of them (zou #336).
+    lsns: Option<(Lsn, Lsn)>,
 }
 
 impl Memtable {
@@ -28,6 +37,10 @@ impl Memtable {
 
     pub fn insert(&mut self, key: LayerKey, lsn: Lsn, record: Vec<u8>) {
         self.bytes += record.len();
+        self.lsns = Some(match self.lsns {
+            Some((lo, hi)) => (lo.min(lsn), hi.max(lsn)),
+            None => (lsn, lsn),
+        });
         if let Some(old) = self.entries.insert((key, lsn), record) {
             self.bytes -= old.len();
         }
@@ -64,10 +77,7 @@ impl Memtable {
 
     /// Inclusive lsn bounds over everything held, None when empty.
     pub fn lsn_range(&self) -> Option<(Lsn, Lsn)> {
-        let mut lsns = self.entries.keys().map(|&(_, lsn)| lsn);
-        let first = lsns.next()?;
-        let (min, max) = lsns.fold((first, first), |(lo, hi), l| (lo.min(l), hi.max(l)));
-        Some((min, max))
+        self.lsns
     }
 
     /// Everything, in the (key, lsn) order [`crate::layer::build_delta`]
@@ -75,6 +85,7 @@ impl Memtable {
     /// delta layer and publishes it in the shard manifest.
     pub fn drain_sorted(&mut self) -> Vec<DeltaEntry> {
         self.bytes = 0;
+        self.lsns = None;
         std::mem::take(&mut self.entries)
             .into_iter()
             .map(|((key, lsn), record)| DeltaEntry { key, lsn, record })
@@ -117,6 +128,13 @@ mod tests {
         mem.insert(k(1), Lsn(10), vec![0; 100]);
         assert_eq!(mem.len(), 1);
         assert_eq!(mem.bytes(), 100);
+        mem.insert(k(1), Lsn(4), vec![0; 10]);
+        mem.insert(k(1), Lsn(10), vec![0; 10]);
+        assert_eq!(
+            mem.lsn_range(),
+            Some((Lsn(4), Lsn(10))),
+            "the carried bounds widen with what lands, replacement and all"
+        );
     }
 
     #[test]
