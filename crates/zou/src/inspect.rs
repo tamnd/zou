@@ -7,6 +7,9 @@
 //! and writes nothing, so it is safe to point at a live store or at a
 //! file copied out of one.
 
+use std::sync::Arc;
+
+use zou_log::{TeeFilter, WalMedia, catch_up};
 use zou_pg::walscan;
 use zou_store::layer::{
     LayerKey, LayerKind, PAGE_IMAGE_LEN, decode_delta, decode_image, read_layer_footer,
@@ -16,16 +19,23 @@ use zou_store::lsn::Lsn;
 use zou_store::memtable::Memtable;
 use zou_store::pageread::LayerReader;
 use zou_store::shardmanifest::PageShardManifest;
-use zou_store::{CasStore, open_store};
+use zou_store::{CasStore, PrefixStore, open_store, tenant_id};
 
 pub const USAGE: &str = "usage: zou inspect <file | target key | \
-     target chain <ref> <shard> <spc/db/rel/fork/block> [at]>";
+     target chain <ref> <shard> <spc/db/rel/fork/block> [at] | \
+     target wal <ref> <from> <to> [spc/db/rel/fork/block]>";
+
+/// The single shard of a tenant's log in this release.
+const WAL_SHARD: u32 = 0;
 
 pub fn run(argv: &[String]) -> Result<(), String> {
     let bytes = match argv {
         [file] => std::fs::read(file).map_err(|e| format!("{file}: {e}"))?,
         [target, verb, tenant_ref, shard, block, rest @ ..] if verb == "chain" => {
             return chain(target, tenant_ref, shard, block, rest);
+        }
+        [target, verb, tenant_ref, from, to, rest @ ..] if verb == "wal" => {
+            return wal(target, tenant_ref, from, to, rest);
         }
         [target, key] => {
             let store: Box<dyn CasStore> = open_store(target)?;
@@ -198,6 +208,101 @@ fn chain(
             record.len()
         );
     }
+    Ok(())
+}
+
+/// `zou inspect <target> wal <ref> <from> <to> [spc/db/rel/fork/block]`:
+/// the records the log itself holds over an lsn window.
+///
+/// The layers are a derived thing. When a page will not rebuild, the
+/// first question is whether the record redo wants is missing from the
+/// layers or was never in the stream at all, and only the log can
+/// answer that. This reads the tenant's log the way an attaching node
+/// reads it, lays the frames into one window, and walks it, so a hole
+/// in the frames shows up as a hole here too. Takes no lease and
+/// writes nothing.
+fn wal(
+    target: &str,
+    tenant_ref: &str,
+    from: &str,
+    to: &str,
+    rest: &[String],
+) -> Result<(), String> {
+    let (from, to) = (parse_lsn(from)?, parse_lsn(to)?);
+    if to <= from {
+        return Err(format!("{to:#x} is not above {from:#x}"));
+    }
+    let want = match rest {
+        [] => None,
+        [block] => {
+            let parts: Vec<&str> = block.split('/').collect();
+            let [spc, db, rel, fork, blk] = parts.as_slice() else {
+                return Err(format!("{block} is not spc/db/rel/fork/block"));
+            };
+            let num = |s: &str| s.parse::<u32>().map_err(|_| format!("{s} is not a number"));
+            Some(walscan::BlockRef {
+                spc: num(spc)?,
+                db: num(db)?,
+                rel: num(rel)?,
+                fork: num(fork)?,
+                blk: num(blk)?,
+            })
+        }
+        _ => return Err(USAGE.into()),
+    };
+
+    let store: Arc<dyn CasStore> = Arc::from(open_store(target)?);
+    let layout = TenantLayout::new(tenant_ref);
+    let logs: Arc<dyn CasStore> =
+        Arc::new(PrefixStore::over(Arc::clone(&store), &layout.log_prefix()));
+    let media = WalMedia::single(logs);
+    let tenant = tenant_id(tenant_ref);
+    let frames = catch_up(&media, WAL_SHARD, &TeeFilter::Tenant(tenant), Lsn(from))
+        .map_err(|e| format!("log: {e}"))?;
+    let window = walscan::assemble_window_frames(&frames, from, to);
+    println!(
+        "{} frames over {from:#x}..{to:#x}, window covered from {:#x}",
+        frames.len(),
+        window.covered_from
+    );
+    if window.covered_from > from {
+        println!(
+            "the log has nothing below {:#x} in this window",
+            window.covered_from
+        );
+    }
+
+    let out = walscan::read_records(&window, window.covered_from.max(from), Some(to))
+        .map_err(|e| format!("wal: {e}"))?;
+    let mut matched = 0;
+    for record in &out.records {
+        let refs = record.block_refs().map_err(|e| format!("wal: {e}"))?;
+        if let Some(want) = &want
+            && !refs.iter().any(|r| r == want)
+        {
+            continue;
+        }
+        matched += 1;
+        let refs = refs
+            .iter()
+            .map(|r| format!("{}/{}/{}.{} blk {}", r.spc, r.db, r.rel, r.fork, r.blk))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "  {:#x}..{:#x} {} bytes, rmgr {} info {:#04x}, xid {}, {refs}",
+            record.lsn,
+            record.end_lsn,
+            record.bytes.len(),
+            record.rmid,
+            record.info,
+            record.xid
+        );
+    }
+    println!(
+        "{} records in the window, {matched} shown, resume {:#x}",
+        out.records.len(),
+        out.resume
+    );
     Ok(())
 }
 
