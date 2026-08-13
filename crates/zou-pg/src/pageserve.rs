@@ -18,7 +18,11 @@
 //! far and then serves at the applied watermark, which is the
 //! freshness barrier the v1 chain reader used to provide. Requests at
 //! lsn zero, reads before the pusher publishes a durability watermark,
-//! are served once ingest has covered the durable end of the stream.
+//! are served once ingest has covered the durable end of the stream,
+//! and a service that has only just anchored does not know where that
+//! end is, so they wait for the first walk that reaches it. Recovery
+//! reads name the replay position instead, since the startup process
+//! knows the lsn it needs better than any watermark does.
 //!
 //! An ingest error freezes the applied watermark. Waiting requests
 //! then time out and read as errors at the smgr, loud and safe: with
@@ -398,6 +402,31 @@ fn respond_err(sock: &mut UnixStream, msg: &str) -> std::io::Result<()> {
     sock.write_all(msg.as_bytes())
 }
 
+/// Whether a request can be served now.
+///
+/// An lsn names the durability watermark the reader already saw, so it
+/// is covered once the stream bytes reached it. Covered means the
+/// bytes, not `applied`: a watermark is usually a WAL page boundary
+/// with a record spilling over it, and any complete record ending at
+/// or below the watermark has been parsed once its bytes are in, so
+/// the page state at `applied` is the page state at the watermark.
+///
+/// Zero asks for the latest durable state instead, which is a question
+/// nobody can answer before a walk has reached the head of the stream.
+/// Answering it anyway hands back whatever ingest happens to hold, and
+/// for a service that has only just anchored that is the anchor. That
+/// is the first read a restarted node makes, from the startup process,
+/// and replaying a record onto a page missing everything since the
+/// anchor is a panic rather than an error (zou #329). So a zero waits
+/// for the probe.
+fn covered(lsn: u64, seen: u64, durable_seen: u64, probed: bool) -> bool {
+    if lsn == 0 {
+        probed && seen >= durable_seen
+    } else {
+        seen >= lsn
+    }
+}
+
 /// The driver: one thread that owns ingest and serves reads, so the
 /// memtable never needs a lock. Ingest polls the store, requests
 /// arrive over the channel, and a request whose lsn is not covered
@@ -418,6 +447,11 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     let mut last_poll = Instant::now() - POLL;
     let mut cursor = CatchUpCursor::default();
     let mut behind = false;
+    // Whether a walk has ever reached the head of the stream. Until
+    // one has, `durable_seen` is not a low estimate of the durable
+    // end, it is no estimate at all, and a request that asks for the
+    // latest durable state has to wait rather than take the anchor.
+    let mut probed = false;
     let mut progress = Progress::default();
 
     match PageShardManifest::load(&*store, &cfg.layout.shard_manifest(0)) {
@@ -462,7 +496,10 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                 &cursor,
             );
             match outcome {
-                Ok(caught_up) => behind = !caught_up,
+                Ok(caught_up) => {
+                    behind = !caught_up;
+                    probed |= caught_up;
+                }
                 Err(e) => {
                     // A hole in the stream would poison every later
                     // delta; freeze and let waits fail loudly instead.
@@ -488,20 +525,16 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         let mut ready: Vec<GetReq> = Vec::new();
         let mut still: Vec<GetReq> = Vec::new();
         for req in parked.drain(..) {
-            // Zero asks for the latest durable state; anything else is
-            // the durability watermark the reader saw, already safe.
-            // Covered means the stream bytes reached the watermark, not
-            // that `applied` did: the published durable is usually a
-            // WAL page boundary with a record spilling over it, and any
-            // complete record ending at or below the watermark has been
-            // parsed once its bytes are in, so the page state at
-            // `applied` is the page state at the watermark.
             let need = if req.lsn == 0 { durable_seen } else { req.lsn };
-            if seen >= need {
+            if covered(req.lsn, seen, durable_seen, probed) {
                 ready.push(req);
             } else if now >= req.deadline {
                 let msg = match &frozen {
                     Some(e) => format!("ingest frozen: {e}"),
+                    None if req.lsn == 0 && !probed => {
+                        "ingest never reached the head of the stream within the wait cap"
+                            .to_string()
+                    }
                     None => format!(
                         "ingest saw {seen:#x} but never reached {need:#x} within the wait cap"
                     ),
@@ -922,6 +955,39 @@ mod tests {
             started.elapsed() < WAIT_CAP,
             "the stop cleared the parked request without the full wait"
         );
+    }
+
+    /// The panic behind #329. A service that has just anchored has no
+    /// idea where the stream ends, and the first read of a restarted
+    /// node asks for the end. Answering that out of the anchor gives
+    /// recovery a page missing 99 MB of WAL, which redo turns into
+    /// "failed to add tuple" and a dead node.
+    #[test]
+    fn a_zero_waits_for_the_probe_and_an_lsn_does_not() {
+        let anchor = 0x69bf_9a58;
+        assert!(
+            !covered(0, anchor, 0, false),
+            "the latest durable state is not the anchor just because that is all there is"
+        );
+        assert!(
+            covered(0, anchor, anchor, true),
+            "a walk that reached the head answers the question"
+        );
+        assert!(
+            !covered(0, anchor, anchor + 1, true),
+            "and a walk that found more still holds the read"
+        );
+
+        // Recovery names the lsn it is replaying, which is a real
+        // barrier on its own and needs no probe behind it: ingest
+        // cannot have passed an lsn without walking to it.
+        let replay = 0x6f65_a108;
+        assert!(
+            !covered(replay, anchor, 0, false),
+            "the anchor is behind it"
+        );
+        assert!(covered(replay, replay, 0, false), "ingest reached it");
+        assert!(covered(replay, replay + 1, 0, false), "and past it");
     }
 
     /// A backlog on the chain, cut into frames the way the sequencer
