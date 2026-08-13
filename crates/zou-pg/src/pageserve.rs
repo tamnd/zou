@@ -60,10 +60,19 @@ const BLCKSZ: usize = 8192;
 const MAGIC: u32 = 0x3147_505A;
 
 /// How long the server holds a request whose lsn ingest has not
-/// reached, and so also how long a client can sit in a read. Past it
-/// the request fails loudly rather than serving a page missing its
-/// own writes.
+/// reached, once ingest has stopped moving. A request fails loudly
+/// rather than serving a page missing its own writes, but only when
+/// waiting longer would not have helped: a service catching up from
+/// the store is on its way to the lsn the reader asked for, and
+/// failing that read kills the recovery that is doing the reading
+/// (zou #336).
 const WAIT_CAP: Duration = Duration::from_secs(20);
+
+/// The backstop on the client side of the socket. The driver decides
+/// when a wait is hopeless and says so, so this only fires when the
+/// driver never got to the decision at all, which is a bug in the
+/// driver rather than a slow catch up.
+const ANSWER_CAP: Duration = Duration::from_secs(300);
 
 /// The ingest poll cadence, the freshness cost of reading the stream
 /// out of the store instead of the tee.
@@ -170,7 +179,10 @@ impl PageClient {
                 }
             }
         };
-        let cap = WAIT_CAP + Duration::from_secs(10);
+        // Long enough to outlast the driver's own backstop, so a read
+        // that is going to fail fails with the driver's reason rather
+        // than with a timeout on this end.
+        let cap = ANSWER_CAP + Duration::from_secs(10);
         sock.set_read_timeout(Some(cap))
             .map_err(|e| e.to_string())?;
         sock.set_write_timeout(Some(Duration::from_secs(10)))
@@ -370,11 +382,11 @@ fn connection(mut sock: UnixStream, tx: Sender<GetReq>, stop: Arc<AtomicBool>) {
         // how far ingest got, so this only fires when the driver never
         // reached the deadline check at all. Say that, rather than
         // blaming a request nobody dropped.
-        let answer = match reply_rx.recv_timeout(WAIT_CAP + Duration::from_secs(5)) {
+        let answer = match reply_rx.recv_timeout(ANSWER_CAP) {
             Ok(answer) => answer,
             Err(RecvTimeoutError::Timeout) => Err(format!(
                 "page service did not answer within {} seconds",
-                (WAIT_CAP + Duration::from_secs(5)).as_secs()
+                ANSWER_CAP.as_secs()
             )),
             Err(RecvTimeoutError::Disconnected) => Err("page service driver is gone".to_string()),
         };
@@ -419,6 +431,22 @@ fn respond_err(sock: &mut UnixStream, msg: &str) -> std::io::Result<()> {
 /// and replaying a record onto a page missing everything since the
 /// anchor is a panic rather than an error (zou #329). So a zero waits
 /// for the probe.
+/// Whether a parked request has waited as long as waiting is worth.
+///
+/// Not the same question as whether it has waited long enough. A
+/// service catching up from the store answers the request the moment
+/// it gets there, and the reader is often the recovery whose page this
+/// is, which dies of the error and takes the node with it. So a
+/// request past its own cap on a watermark that is still moving is
+/// early rather than hopeless, and what fails it is the watermark
+/// going quiet for a cap of its own. The request cap is still the
+/// floor, because an idle service has a watermark that has not moved
+/// in hours and a request arriving into that should not fail on the
+/// spot.
+fn hopeless(past_deadline: bool, stalled: Duration, frozen: bool) -> bool {
+    past_deadline && (frozen || stalled >= WAIT_CAP)
+}
+
 fn covered(lsn: u64, seen: u64, durable_seen: u64, probed: bool) -> bool {
     if lsn == 0 {
         probed && seen >= durable_seen
@@ -453,6 +481,13 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     // latest durable state has to wait rather than take the anchor.
     let mut probed = false;
     let mut progress = Progress::default();
+    // The watermark and the last time it moved. A parked request is
+    // failed on a stalled ingest, not on a slow one: a service that is
+    // still applying frames is on its way to the lsn the request is
+    // waiting for, and the reader is often the recovery that dies of
+    // the error (zou #336).
+    let mut watermark: u64 = 0;
+    let mut advanced = Instant::now();
 
     match PageShardManifest::load(&*store, &cfg.layout.shard_manifest(0)) {
         Ok(Some((manifest, _))) => {
@@ -522,21 +557,30 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         let seen = ingest.as_ref().map_or(0, ShardIngest::seen);
         let mem = ingest.as_ref().map_or(&empty_mem, ShardIngest::memtable);
         let now = Instant::now();
+        if seen > watermark {
+            watermark = seen;
+            advanced = now;
+        }
+        // An idle service has a watermark that has not moved in hours,
+        // so the request's own deadline is the floor: every request
+        // gets its wait cap, and one waiting on a moving watermark
+        // gets as long as the catch up takes.
+        let stalled = now.duration_since(advanced);
         let mut ready: Vec<GetReq> = Vec::new();
         let mut still: Vec<GetReq> = Vec::new();
         for req in parked.drain(..) {
             let need = if req.lsn == 0 { durable_seen } else { req.lsn };
             if covered(req.lsn, seen, durable_seen, probed) {
                 ready.push(req);
-            } else if now >= req.deadline {
+            } else if hopeless(now >= req.deadline, stalled, frozen.is_some()) {
+                let secs = stalled.as_secs();
                 let msg = match &frozen {
                     Some(e) => format!("ingest frozen: {e}"),
                     None if req.lsn == 0 && !probed => {
-                        "ingest never reached the head of the stream within the wait cap"
-                            .to_string()
+                        format!("ingest has not reached the head of the stream in {secs} seconds")
                     }
                     None => format!(
-                        "ingest saw {seen:#x} but never reached {need:#x} within the wait cap"
+                        "ingest saw {seen:#x} but never reached {need:#x}, and has not moved for {secs} seconds"
                     ),
                 };
                 let _ = req.reply.send(Err(msg));
@@ -977,6 +1021,30 @@ mod tests {
         assert!(
             started.elapsed() < WAIT_CAP,
             "the stop cleared the parked request without the full wait"
+        );
+    }
+
+    /// The availability half of #336. A node that comes back with the
+    /// service a memtable behind the stream has recovery reading pages
+    /// at lsns catch up has not got to yet, and failing those reads
+    /// kills the startup process and then the node.
+    #[test]
+    fn a_moving_watermark_holds_a_request_past_its_cap() {
+        assert!(
+            !hopeless(true, Duration::from_secs(1), false),
+            "catching up towards the lsn, the answer is coming"
+        );
+        assert!(
+            hopeless(true, WAIT_CAP, false),
+            "a watermark that has gone quiet is not going to reach it"
+        );
+        assert!(
+            !hopeless(false, WAIT_CAP * 10, false),
+            "an idle service is quiet, a fresh request still gets its own cap"
+        );
+        assert!(
+            hopeless(true, Duration::ZERO, true),
+            "frozen ingest never moves again, so it fails on the deadline"
         );
     }
 
