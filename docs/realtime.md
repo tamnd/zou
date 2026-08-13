@@ -267,6 +267,7 @@ Nothing is half subscribed.
 The join reply hands back the subscriptions the server made, each with the id it was given, in the order they were asked for, and the client checks that list against its own bindings field for field before it routes anything.
 After it comes a `system` event reading `Subscribed to PostgreSQL`, which supabase-js does nothing with and an application binding `system` is handed.
 It is here because it is on the socket upstream, and the recorded frames in the conformance suite are the proof rather than the claim.
+It is also the frame to write after, rather than the join reply, if you want the guarantee everywhere: this server holds the join until the tap is open, and upstream answers the join first and says `Subscribed to PostgreSQL` when the changes are flowing, which for the first subscriber after it starts is a few seconds later.
 
 ## What the database has to be for postgres changes
 

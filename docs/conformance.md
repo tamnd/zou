@@ -407,8 +407,8 @@ The difference is written down in [realtime.md](realtime.md) instead, because a 
 
 `js-realtime-changes/` is a fourth realtime directory, and it needs a database for a different reason than the third: the thing under test is a row nobody sent.
 
-`setup.sql` there is four tables and one realtime line, the `alter publication` a project runs when it turns a table on.
-Three of the tables are in the publication and one is not, which is the only way to ask whether a table nobody opted in is really left alone; one of the three publishes its old rows, which is the single setting that changes what an update and a delete carry; and one has row level security on it with a policy about who owns a row.
+`setup.sql` there is five tables and one realtime line, the `alter publication` a project runs when it turns a table on.
+Four of the tables are in the publication and one is not, which is the only way to ask whether a table nobody opted in is really left alone; one of the four publishes its old rows, which is the single setting that changes what an update and a delete carry; one has row level security on it with a policy about who owns a row; and one is written to by nothing but the frame test.
 Every write in the suite goes through `/rest/v1` as the service key, because a suite holding a connection to the database could set a row up in a way no application could.
 11 tests: an insert, an update, a delete, the same update and delete on a table with `replica identity full`, a subscription for one event, a filter, a table nobody published, a policy withholding somebody else's row, a delete on that table telling everybody the key and nothing else, and two subscriptions on one channel.
 
@@ -429,6 +429,11 @@ Against the reference, the recording had a frame in it that zou did not send: a 
 supabase-js does nothing with it, which is exactly why nothing above the frames could have noticed, and an application binding `system` is handed it.
 The reference also disagreed about an ordinary update: on a table with the default replica identity zou sent `old_record: {}` and Supabase Realtime sent the key, taken from the new row, which is the difference between a client being told which row this was and being told nothing.
 Both are fixed in the server, and the eleven now pass against both.
+
+The reference had the same shape of race in it as zou did, which is why every test in the file writes after the `system` frame rather than after `SUBSCRIBED`.
+Upstream answers the join first and says `Subscribed to PostgreSQL` when the changes are actually flowing, and for the first subscriber to a project after Supabase Realtime starts that is about three and a half seconds later, so a suite that wrote on the join reply lost its first change on a stack that had just come up and never on one that had been running.
+zou holds the join until the tap is open and then says both, so waiting for the second one costs it nothing.
+What that frame says is not asserted, because a subscription to a table that is not in the publication comes back as `status: error` naming the parameters upstream and as `ok` on zou, which is [#347](https://github.com/tamnd/zou/issues/347).
 
 And the fixture itself was wrong in a way only the reference could say.
 It granted the reads and left the writes ungranted, on the reasoning that a service key has `bypassrls` and needs no grant, and every write in it failed against `supabase start` with a 403: `bypassrls` is about policies and grants are grants.
