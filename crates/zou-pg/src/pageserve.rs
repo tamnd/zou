@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use zou_log::{CatchUp, CatchUpCursor, ConsolidateError, TeeFilter, WalMedia, catch_up_resuming};
 use zou_store::CasStore;
+use zou_store::layer::LayerKind;
 use zou_store::layermap::LayerMap;
 use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
@@ -84,6 +85,24 @@ const POLL: Duration = Duration::from_millis(100);
 /// already applied is answered in between instead of waiting for the
 /// whole backlog.
 const INGEST_SLICE: Duration = Duration::from_millis(200);
+
+/// How often the fold looks at what reads are paying.
+const FOLD_EVERY: Duration = Duration::from_secs(60);
+
+/// The least delta worth folding, two flush thresholds. Under this the
+/// chain a read walks is short enough that rebuilding every page of
+/// the shard costs more than reading through it.
+const FOLD_DEBT_FLOOR: u64 = 128 << 20;
+
+/// And the other half of the gate: fold only once the delta above the
+/// newest image is at least this fraction of the image it would
+/// replace. A fold rewrites the whole shard, so a flat threshold is a
+/// trap at scale. The 24 h tenant on server3 carries a 7 GB image and
+/// takes 7 GB of delta an hour, which against a flat 128 MB is a 7 GB
+/// rewrite every minute. Tying the trigger to the image bounds the
+/// write amplification instead: one image rewritten per half image of
+/// delta ingested, whatever the tenant's size.
+const FOLD_DEBT_RATIO: u64 = 2;
 
 /// One read request as the driver sees it: a run of blocks of one
 /// fork, the lsn the reader needs covered, and the channel the pages
@@ -463,7 +482,7 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     let store = Arc::clone(&cfg.store);
     let media = WalMedia::single(crate::log_store(Arc::clone(&store), &cfg.layout));
     let filter = TeeFilter::Tenant(cfg.tenant);
-    let pool = cfg.redo.take().map(RedoPool::new);
+    let pool = cfg.redo.take().map(RedoPool::new).map(Arc::new);
     let empty_mem = Memtable::new();
 
     let ingest_cfg = ingest_config(cfg.tenant);
@@ -500,12 +519,28 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         Err(e) => return Err(format!("shard manifest: {e}")),
     }
 
+    // The fold runs next to the driver rather than in it, and dies
+    // with it whichever way the driver leaves.
+    let folding = Arc::new(AtomicBool::new(false));
+    let _fold_stops = StopOnDrop(Arc::clone(&folding));
+    if let Some(pool) = &pool {
+        let store = Arc::clone(&store);
+        let pool = Arc::clone(pool);
+        let done = Arc::clone(&folding);
+        let layout = cfg.layout.clone();
+        let data_checksums = cfg.data_checksums;
+        std::thread::Builder::new()
+            .name("zou-fold".into())
+            .spawn(move || fold_loop(store, pool, done, layout, data_checksums))
+            .map_err(|e| format!("fold thread: {e}"))?;
+    }
+
     // One service for the life of the driver. Every read plans against
     // layer footers, and a footer is megabytes on a layer of any size,
     // so rebuilding the service per request meant refetching them per
     // request: 34 GB of range reads for 18466 pages in one segment of
     // the gamingpc smoke, 2.4 MB a page (zou #338).
-    let service = page_service(&*store, &cfg.layout, pool.as_ref(), cfg.data_checksums);
+    let service = page_service(&*store, &cfg.layout, pool.as_deref(), cfg.data_checksums);
     let mut footers_held = 0;
 
     loop {
@@ -869,6 +904,126 @@ fn reload_map(
         Ok(None) => Ok(false),
         Err(e) => Err(format!("manifest reload: {e}")),
     }
+}
+
+/// Sets a flag when it goes out of scope, whichever way the scope
+/// ends. The fold thread outlives the driver's loop otherwise. The
+/// driver returns as soon as the server's stop flag is set, so this
+/// one flag ends the fold on both the ordered stop and the abrupt
+/// ones, the channel hanging up and a panic on the way out.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// The half of compaction that needs a redo pool: cut a fresh image
+/// when the delta bytes above the newest image say reads have got
+/// expensive (zou #340).
+///
+/// The sweep a `zou compact` worker runs merges deltas and separates
+/// keyspaces, but it has no pool and no way to know whether the
+/// cluster it is folding for runs with data checksums, so it cannot
+/// materialize a page. The page service has both, which is why this
+/// runs here. It runs on its own thread: a fold is minutes of redo on
+/// a big shard and the driver loop owes its reads a hundred
+/// milliseconds.
+///
+/// Everything it does commits with one CAS, so being killed anywhere
+/// leaves orphan objects for gc and nothing else. A flush that lands
+/// first makes the swap retry.
+fn fold_loop(
+    store: Arc<dyn CasStore>,
+    pool: Arc<RedoPool>,
+    stop: Arc<AtomicBool>,
+    layout: TenantLayout,
+    data_checksums: bool,
+) {
+    let tenant_ref = layout.tenant_ref().to_string();
+    let mut due = Instant::now() + FOLD_EVERY;
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        if Instant::now() < due {
+            continue;
+        }
+        let (debt, image) = match fold_debt(&*store, &layout, 0) {
+            Ok(pair) => pair,
+            Err(e) => {
+                log::warn!("zou pageserve: fold: {e}");
+                due = Instant::now() + FOLD_EVERY;
+                continue;
+            }
+        };
+        if !worth_folding(debt, image) {
+            due = Instant::now() + FOLD_EVERY;
+            continue;
+        }
+        log::info!(
+            "zou pageserve: folding, reads are walking {} MB of delta above a {} MB image",
+            debt >> 20,
+            image >> 20
+        );
+        let started = Instant::now();
+        match crate::compact::compact_shard(&*store, &tenant_ref, 0, Some(&pool), data_checksums) {
+            Ok(Some(out)) => log::info!(
+                "zou pageserve: folded {} layers into {} in {:.0}s, debt {} MB to {} MB",
+                out.retired,
+                out.outputs,
+                started.elapsed().as_secs_f64(),
+                out.debt_before >> 20,
+                out.debt_after >> 20,
+            ),
+            Ok(None) => log::info!("zou pageserve: fold found nothing to do"),
+            Err(e) => log::warn!("zou pageserve: fold: {e}"),
+        }
+        // From the end of the work, not the start of it: a fold that
+        // took longer than the cadence has already had its turn.
+        due = Instant::now() + FOLD_EVERY;
+    }
+}
+
+/// What the fold decides on: the delta bytes piled above the newest
+/// image of `shard`, which is what every read there walks, and the
+/// bytes of that image, which is what a fold would rewrite. A shard
+/// with no manifest of its own has neither yet.
+fn fold_debt(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    shard: u16,
+) -> Result<(u64, u64), String> {
+    let Some((manifest, _)) =
+        PageShardManifest::load(store, &layout.shard_manifest(shard)).map_err(|e| e.to_string())?
+    else {
+        return Ok((0, 0));
+    };
+    let map = manifest.layer_map().map_err(|e| e.to_string())?;
+    let descs = map.layers();
+    let floor = descs
+        .iter()
+        .filter(|d| d.kind == LayerKind::Image)
+        .map(|d| d.min_lsn)
+        .max();
+    let image = match floor {
+        Some(at) => descs
+            .iter()
+            .filter(|d| d.kind == LayerKind::Image && d.min_lsn == at)
+            .map(|d| d.size)
+            .sum(),
+        None => 0,
+    };
+    Ok((crate::compact::debt(descs), image))
+}
+
+/// Whether a shard owing `debt` bytes of delta over an image of
+/// `image` bytes has earned a rewrite. A shard with no image at all
+/// has to get one, so the floor alone decides there.
+fn worth_folding(debt: u64, image: u64) -> bool {
+    debt >= FOLD_DEBT_FLOOR && debt >= image / FOLD_DEBT_RATIO
 }
 
 /// The service the driver serves every request through, built once so
@@ -1765,6 +1920,104 @@ mod tests {
         assert!(
             !map.layers().iter().any(|d| d.name() == gone),
             "the map still names the layer that is gone"
+        );
+    }
+
+    /// What the fold decides on. Deltas piled on top of an image are
+    /// the chain a read walks, so they count; the same deltas under a
+    /// newer image are history nobody reads through, so they do not.
+    /// A shard the tenant manifest does not name owes nothing.
+    #[test]
+    fn the_fold_counts_the_delta_a_read_walks_and_nothing_else() {
+        use zou_store::layer::{DeltaEntry, ImageBuilder, LayerKey, build_delta};
+        use zou_store::layermap::LayerDesc;
+        use zou_store::manifest::Manifest;
+        use zou_store::shardmanifest::{LayerEntry, publish_layer};
+
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        store
+            .put_if_absent(&layout.manifest(), &Manifest::new("t", 18).to_json())
+            .expect("tenant manifest lands");
+        let manifest_key = layout.shard_manifest(0);
+        let key = LayerKey::page(1663, 5, 2000, 0, 3);
+
+        let publish = |bytes: Vec<u8>, footer: &zou_store::layer::LayerFooter| -> u64 {
+            let desc = LayerDesc::from_footer(footer, bytes.len() as u64);
+            let entry = LayerEntry {
+                name: desc.name(),
+                size: bytes.len() as u64,
+                owner: None,
+                upto: None,
+            };
+            store
+                .put(
+                    &format!("{}{}", layout.shard_prefix(0), desc.name()),
+                    &bytes,
+                )
+                .expect("layer lands");
+            publish_layer(&*store, &manifest_key, 0, &entry, footer.max_lsn).expect("published");
+            bytes.len() as u64
+        };
+
+        let mut images = ImageBuilder::new(Lsn(100), 8192);
+        images.push(key, &vec![9u8; BLCKSZ]).expect("image pushes");
+        let (bytes, footer) = images.finish().expect("image layer builds");
+        let image_bytes = publish(bytes, &footer);
+        assert_eq!(
+            fold_debt(&*store, &layout, 0).expect("debt reads"),
+            (0, image_bytes),
+            "an image alone owes nothing and is the thing a fold would rewrite"
+        );
+
+        let (bytes, footer) = build_delta(
+            &[DeltaEntry {
+                key,
+                lsn: Lsn(150),
+                record: vec![0x5A; 4096],
+            }],
+            8192,
+        )
+        .expect("delta layer builds");
+        let delta_bytes = publish(bytes, &footer);
+        assert_eq!(
+            fold_debt(&*store, &layout, 0).expect("debt reads"),
+            (delta_bytes, image_bytes),
+            "the delta above the image is what a read walks"
+        );
+
+        assert_eq!(
+            fold_debt(&*store, &TenantLayout::new("nosuchtenant"), 0).expect("debt reads"),
+            (0, 0),
+            "a store with no shard manifest yet has nothing to fold"
+        );
+    }
+
+    /// The gate that keeps a big tenant from rewriting itself every
+    /// minute: a fold has to be worth the image it replaces, not just
+    /// worth more than a flat number.
+    #[test]
+    fn a_fold_waits_until_the_delta_is_worth_the_image_it_rewrites() {
+        let gb = 1u64 << 30;
+        assert!(
+            !worth_folding(FOLD_DEBT_FLOOR - 1, 0),
+            "a shard with no image still waits for the floor"
+        );
+        assert!(
+            worth_folding(FOLD_DEBT_FLOOR, 0),
+            "and then takes its first image"
+        );
+        assert!(
+            !worth_folding(FOLD_DEBT_FLOOR, 7 * gb),
+            "128 MB of delta does not justify rewriting 7 GB"
+        );
+        assert!(
+            !worth_folding(3 * gb, 7 * gb),
+            "under half the image is still the cheaper read"
+        );
+        assert!(
+            worth_folding(4 * gb, 7 * gb),
+            "past half the image the rewrite pays for itself"
         );
     }
 }
