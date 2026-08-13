@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 
 use zou_log::{CatchUp, CatchUpCursor, ConsolidateError, TeeFilter, WalMedia, catch_up_resuming};
 use zou_store::CasStore;
+use zou_store::layer::LayerKind;
 use zou_store::layermap::LayerMap;
 use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
@@ -85,13 +86,23 @@ const POLL: Duration = Duration::from_millis(100);
 /// whole backlog.
 const INGEST_SLICE: Duration = Duration::from_millis(200);
 
-/// How often the fold looks at what reads are paying, and the debt in
-/// delta bytes above the newest image that makes a fold worth doing.
-/// The threshold is two flush thresholds of delta: below that the
+/// How often the fold looks at what reads are paying.
+const FOLD_EVERY: Duration = Duration::from_secs(60);
+
+/// The least delta worth folding, two flush thresholds. Under this the
 /// chain a read walks is short enough that rebuilding every page of
 /// the shard costs more than reading through it.
-const FOLD_EVERY: Duration = Duration::from_secs(60);
-const FOLD_DEBT: u64 = 128 << 20;
+const FOLD_DEBT_FLOOR: u64 = 128 << 20;
+
+/// And the other half of the gate: fold only once the delta above the
+/// newest image is at least this fraction of the image it would
+/// replace. A fold rewrites the whole shard, so a flat threshold is a
+/// trap at scale. The 24 h tenant on server3 carries a 7 GB image and
+/// takes 7 GB of delta an hour, which against a flat 128 MB is a 7 GB
+/// rewrite every minute. Tying the trigger to the image bounds the
+/// write amplification instead: one image rewritten per half image of
+/// delta ingested, whatever the tenant's size.
+const FOLD_DEBT_RATIO: u64 = 2;
 
 /// One read request as the driver sees it: a run of blocks of one
 /// fork, the lsn the reader needs covered, and the channel the pages
@@ -516,11 +527,11 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         let store = Arc::clone(&store);
         let pool = Arc::clone(pool);
         let done = Arc::clone(&folding);
-        let tenant_ref = cfg.layout.tenant_ref().to_string();
+        let layout = cfg.layout.clone();
         let data_checksums = cfg.data_checksums;
         std::thread::Builder::new()
             .name("zou-fold".into())
-            .spawn(move || fold_loop(store, pool, done, tenant_ref, data_checksums))
+            .spawn(move || fold_loop(store, pool, done, layout, data_checksums))
             .map_err(|e| format!("fold thread: {e}"))?;
     }
 
@@ -927,9 +938,10 @@ fn fold_loop(
     store: Arc<dyn CasStore>,
     pool: Arc<RedoPool>,
     stop: Arc<AtomicBool>,
-    tenant_ref: String,
+    layout: TenantLayout,
     data_checksums: bool,
 ) {
+    let tenant_ref = layout.tenant_ref().to_string();
     let mut due = Instant::now() + FOLD_EVERY;
     loop {
         std::thread::sleep(Duration::from_millis(200));
@@ -939,21 +951,22 @@ fn fold_loop(
         if Instant::now() < due {
             continue;
         }
-        let debt = match fold_debt(&*store, &tenant_ref, 0) {
-            Ok(debt) => debt,
+        let (debt, image) = match fold_debt(&*store, &layout, 0) {
+            Ok(pair) => pair,
             Err(e) => {
                 log::warn!("zou pageserve: fold: {e}");
                 due = Instant::now() + FOLD_EVERY;
                 continue;
             }
         };
-        if debt < FOLD_DEBT {
+        if !worth_folding(debt, image) {
             due = Instant::now() + FOLD_EVERY;
             continue;
         }
         log::info!(
-            "zou pageserve: folding, reads are walking {} MB of delta above the newest image",
-            debt >> 20
+            "zou pageserve: folding, reads are walking {} MB of delta above a {} MB image",
+            debt >> 20,
+            image >> 20
         );
         let started = Instant::now();
         match crate::compact::compact_shard(&*store, &tenant_ref, 0, Some(&pool), data_checksums) {
@@ -974,14 +987,43 @@ fn fold_loop(
     }
 }
 
-/// The delta bytes piled up above the newest image of `shard`: what
-/// every read on that shard walks, and the one number the fold decides
-/// on. A shard the tenant manifest does not name owes nothing, which
-/// is the honest answer for a store whose shard count shrank under a
-/// running service rather than a reason to fold something else.
-fn fold_debt(store: &dyn CasStore, tenant_ref: &str, shard: u16) -> Result<u64, String> {
-    let jobs = crate::compact::debts(store, tenant_ref).map_err(|e| e.to_string())?;
-    Ok(jobs.iter().find(|j| j.shard == shard).map_or(0, |j| j.debt))
+/// What the fold decides on: the delta bytes piled above the newest
+/// image of `shard`, which is what every read there walks, and the
+/// bytes of that image, which is what a fold would rewrite. A shard
+/// with no manifest of its own has neither yet.
+fn fold_debt(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    shard: u16,
+) -> Result<(u64, u64), String> {
+    let Some((manifest, _)) =
+        PageShardManifest::load(store, &layout.shard_manifest(shard)).map_err(|e| e.to_string())?
+    else {
+        return Ok((0, 0));
+    };
+    let map = manifest.layer_map().map_err(|e| e.to_string())?;
+    let descs = map.layers();
+    let floor = descs
+        .iter()
+        .filter(|d| d.kind == LayerKind::Image)
+        .map(|d| d.min_lsn)
+        .max();
+    let image = match floor {
+        Some(at) => descs
+            .iter()
+            .filter(|d| d.kind == LayerKind::Image && d.min_lsn == at)
+            .map(|d| d.size)
+            .sum(),
+        None => 0,
+    };
+    Ok((crate::compact::debt(descs), image))
+}
+
+/// Whether a shard owing `debt` bytes of delta over an image of
+/// `image` bytes has earned a rewrite. A shard with no image at all
+/// has to get one, so the floor alone decides there.
+fn worth_folding(debt: u64, image: u64) -> bool {
+    debt >= FOLD_DEBT_FLOOR && debt >= image / FOLD_DEBT_RATIO
 }
 
 /// The service the driver serves every request through, built once so
@@ -1918,14 +1960,14 @@ mod tests {
             bytes.len() as u64
         };
 
-        let mut images = ImageBuilder::new(1, Lsn(100), 8192);
+        let mut images = ImageBuilder::new(Lsn(100), 8192);
         images.push(key, &vec![9u8; BLCKSZ]).expect("image pushes");
         let (bytes, footer) = images.finish().expect("image layer builds");
-        publish(bytes, &footer);
+        let image_bytes = publish(bytes, &footer);
         assert_eq!(
-            fold_debt(&*store, "t", 0).expect("debt reads"),
-            0,
-            "an image alone is nothing to fold"
+            fold_debt(&*store, &layout, 0).expect("debt reads"),
+            (0, image_bytes),
+            "an image alone owes nothing and is the thing a fold would rewrite"
         );
 
         let (bytes, footer) = build_delta(
@@ -1939,19 +1981,43 @@ mod tests {
         .expect("delta layer builds");
         let delta_bytes = publish(bytes, &footer);
         assert_eq!(
-            fold_debt(&*store, "t", 0).expect("debt reads"),
-            delta_bytes,
+            fold_debt(&*store, &layout, 0).expect("debt reads"),
+            (delta_bytes, image_bytes),
             "the delta above the image is what a read walks"
         );
 
         assert_eq!(
-            fold_debt(&*store, "t", 1).expect("debt reads"),
-            0,
-            "a shard the manifest does not name owes nothing"
+            fold_debt(&*store, &TenantLayout::new("nosuchtenant"), 0).expect("debt reads"),
+            (0, 0),
+            "a store with no shard manifest yet has nothing to fold"
+        );
+    }
+
+    /// The gate that keeps a big tenant from rewriting itself every
+    /// minute: a fold has to be worth the image it replaces, not just
+    /// worth more than a flat number.
+    #[test]
+    fn a_fold_waits_until_the_delta_is_worth_the_image_it_rewrites() {
+        let gb = 1u64 << 30;
+        assert!(
+            !worth_folding(FOLD_DEBT_FLOOR - 1, 0),
+            "a shard with no image still waits for the floor"
         );
         assert!(
-            fold_debt(&*store, "nosuchtenant", 0).is_err(),
-            "a missing tenant is an error to log, not a zero to act on"
+            worth_folding(FOLD_DEBT_FLOOR, 0),
+            "and then takes its first image"
+        );
+        assert!(
+            !worth_folding(FOLD_DEBT_FLOOR, 7 * gb),
+            "128 MB of delta does not justify rewriting 7 GB"
+        );
+        assert!(
+            !worth_folding(3 * gb, 7 * gb),
+            "under half the image is still the cheaper read"
+        );
+        assert!(
+            worth_folding(4 * gb, 7 * gb),
+            "past half the image the rewrite pays for itself"
         );
     }
 }
