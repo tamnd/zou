@@ -272,7 +272,10 @@ fn wal(
         );
     }
 
-    let out = walscan::read_records(&window, window.covered_from.max(from), Some(to))
+    // No explicit end: the window already stops at `to`, and a record
+    // the window ends inside is a window edge, not corruption, so the
+    // scan should stop there rather than call it an error.
+    let out = walscan::read_records(&window, window.covered_from.max(from), None)
         .map_err(|e| format!("wal: {e}"))?;
     let mut matched = 0;
     for record in &out.records {
