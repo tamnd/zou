@@ -133,6 +133,13 @@ impl<'a> PageService<'a> {
         }
     }
 
+    /// Let go of the footers of layers `map` no longer names, and
+    /// answer how many the reader still holds. A service kept across
+    /// reads has to be told when the map moved on.
+    pub fn forget_unnamed(&self, map: &LayerMap) -> usize {
+        self.reader.forget_unnamed(map)
+    }
+
     /// Serve one block, [`Self::get_pages`] without the batching.
     pub fn get_page(
         &self,
