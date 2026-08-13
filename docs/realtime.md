@@ -295,6 +295,9 @@ The slot a tap holds is temporary.
 It lives exactly as long as the connection holding it, so a server nobody is subscribed to retains no write ahead log and leaves nothing behind to clean up, and a tap sees what happened after it opened rather than a replay of what it missed.
 That is upstream's trade too.
 
+How long a change takes to arrive is measured rather than assumed.
+`zou_realtime_commit_to_socket_seconds` on the ops port is counted from the transaction's commit timestamp to the frame going out, `zou_realtime_change_seconds` is the part of it that happened here, and [operations.md](operations.md) says what each is worth relying on.
+
 ## What a change looks like
 
 What arrives is what Supabase sends:

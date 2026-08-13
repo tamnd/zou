@@ -450,6 +450,55 @@ pub fn pg_bytes(sent: u64, received: u64) {
     bytes("received").add(received);
 }
 
+/// One `postgres_changes` frame handed to a socket, and how long the
+/// change took to reach it.
+///
+/// Two numbers, because they answer different questions and one of them
+/// is not entirely this server's. The commit to socket seconds is what
+/// an application feels, counted from the commit timestamp postgres
+/// wrote by its own clock, so on a database that is not on this machine
+/// it carries whatever the two clocks disagree about. It is still the
+/// number somebody asking how live a subscription is means, and it is
+/// the one the milestone puts a target on.
+///
+/// The other is this server's own share of the same interval, from the
+/// tap reading the change out of the slot to the frame going out, on
+/// one clock. That is the one to look at when the first one moves,
+/// since it says whether what moved was here.
+///
+/// A clock behind the database's would make the first one negative,
+/// which is not a duration and would poison the sum. It is counted as
+/// zero, and the two apart are what says that is what happened.
+pub fn change_delivered(commit_ts: i64, read: Instant) {
+    registry()
+        .counter(
+            "zou_realtime_changes_total",
+            "database changes delivered to a socket",
+            &[],
+        )
+        .inc();
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_micros() as i64)
+        .unwrap_or(commit_ts);
+    registry()
+        .histogram(
+            "zou_realtime_commit_to_socket_seconds",
+            "how long a change took to reach a socket, from the transaction's commit",
+            SECONDS,
+            &[],
+        )
+        .observe(micros.saturating_sub(commit_ts).max(0) as f64 / 1_000_000.0);
+    registry()
+        .histogram(
+            "zou_realtime_change_seconds",
+            "how long a change took inside this server, from the tap reading it",
+            SECONDS,
+            &[],
+        )
+        .since(read);
+}
+
 /// One registry lookup, hit or miss, which is the reading that says
 /// whether the cache ttls are doing anything.
 pub fn lookup(hit: bool) {
@@ -545,6 +594,39 @@ mod tests {
         assert!(
             body.contains("zou_registry_lookups_total{result=\"hit\"}"),
             "{body}"
+        );
+    }
+
+    /// A delivery is two intervals and a count, and the one measured
+    /// across two clocks cannot be allowed to report a negative.
+    #[tokio::test]
+    async fn a_change_that_reached_a_socket_is_two_intervals_and_a_count() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock")
+            .as_micros() as i64;
+        change_delivered(now - 250_000, Instant::now());
+        // A commit timestamp from a database whose clock is ahead of
+        // this one, which is an hour that must not land in the sum.
+        change_delivered(now + 3_600_000_000, Instant::now());
+        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        assert!(body.contains("zou_realtime_changes_total 2\n"), "{body}");
+        assert!(
+            body.contains("# TYPE zou_realtime_commit_to_socket_seconds histogram\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("# TYPE zou_realtime_change_seconds histogram\n"),
+            "{body}"
+        );
+        let sum = body
+            .lines()
+            .find_map(|line| line.strip_prefix("zou_realtime_commit_to_socket_seconds_sum "))
+            .and_then(|n| n.parse::<f64>().ok())
+            .expect("a sum");
+        assert!(
+            (0.2..1.0).contains(&sum),
+            "the quarter second is in it and the clock that is an hour ahead is a zero, {sum}"
         );
     }
 
