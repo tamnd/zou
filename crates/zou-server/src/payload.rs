@@ -33,7 +33,9 @@
 //! An old record under the default replica identity is the key and
 //! nothing else. Postgres pads the rest of that tuple with nulls,
 //! which would be a payload saying every other column became null, so
-//! the padding is dropped rather than sent.
+//! the padding is dropped rather than sent. That cut and the one a
+//! delete under row level security gets are different cuts, which
+//! [`keep`] is about.
 //!
 //! A row too large to send is not an error and not a truncation. It is
 //! the payload with every value over sixty four bytes left out and an
@@ -83,9 +85,12 @@ pub struct Seen {
     /// Which of the relation's columns this subscriber may select, in
     /// the relation's own order.
     pub columns: Vec<bool>,
-    /// Whether the old record is cut down to the identifying columns,
-    /// which is what upstream does with a delete on a table that has
-    /// row level security on it.
+    /// Which of the relation's columns are the primary key, in the same
+    /// order, as the catalog has it rather than as the change flags it.
+    pub keys: Vec<bool>,
+    /// Whether the old record is cut down to the key, which is what
+    /// upstream does with a delete on a table that has row level
+    /// security on it.
     pub keys_only: bool,
     /// What to say instead of a record, when there is a reason there is
     /// no record rather than a policy that refused one.
@@ -99,6 +104,7 @@ impl Seen {
         Seen {
             row: true,
             columns: vec![true; relation.columns.len()],
+            keys: relation.columns.iter().map(|column| column.key).collect(),
             keys_only: false,
             error: None,
         }
@@ -366,7 +372,7 @@ pub fn data(change: &Change, types: &Types, seen: &Seen) -> Value {
                     relation,
                     &change.record,
                     change.old.as_deref(),
-                    false,
+                    None,
                     types,
                     seen,
                     large,
@@ -380,7 +386,7 @@ pub fn data(change: &Change, types: &Types, seen: &Seen) -> Value {
                     relation,
                     &change.record,
                     change.old.as_deref(),
-                    false,
+                    None,
                     types,
                     seen,
                     large,
@@ -430,7 +436,7 @@ fn old(change: &Change, types: &Types, seen: &Seen, large: bool) -> Value {
             &change.relation,
             cells,
             None,
-            change.old_key || seen.keys_only,
+            keep(change, seen).as_deref(),
             types,
             seen,
             large,
@@ -443,24 +449,56 @@ fn old(change: &Change, types: &Types, seen: &Seen, large: bool) -> Value {
     }
 }
 
+/// Which columns of an old row are kept, or all of them.
+///
+/// Two cuts land in the same place and they are not the same cut. The
+/// change's own flags say which cells postgres actually sent, so under
+/// the default replica identity everything else in that tuple is null
+/// padding rather than a value. `keys_only` is a security cut, made on
+/// the key the catalog has, and it is the one that decides what a
+/// subscriber learns from a delete they were not allowed to read.
+///
+/// The difference shows on a table with `replica identity full` and row
+/// level security on, where the flags mark every column and the catalog
+/// marks the key: cutting on the flags there would publish the whole
+/// deleted row to everybody.
+fn keep(change: &Change, seen: &Seen) -> Option<Vec<bool>> {
+    if !change.old_key && !seen.keys_only {
+        return None;
+    }
+    Some(
+        change
+            .relation
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(at, column)| {
+                (!change.old_key || column.key)
+                    && (!seen.keys_only || seen.keys.get(at).copied().unwrap_or(false))
+            })
+            .collect(),
+    )
+}
+
 /// A row of cells as the object a client reads.
 ///
 /// `fallback` is the old row, which is where an unchanged toasted
-/// value is found when the table publishes one. `key` says the cells
-/// are the identifying columns and the rest of the tuple is postgres
-/// padding rather than nulls anybody wrote.
+/// value is found when the table publishes one. `keep` is the cut from
+/// [`keep`], and nothing outside it is in the payload.
 fn row(
     relation: &Relation,
     cells: &[Cell],
     fallback: Option<&[Cell]>,
-    key: bool,
+    keep: Option<&[bool]>,
     types: &Types,
     seen: &Seen,
     large: bool,
 ) -> Value {
     let mut out = Map::new();
     for (at, column) in relation.columns.iter().enumerate() {
-        if key && !column.key {
+        if let Some(keep) = keep
+            && !keep.get(at).copied().unwrap_or(false)
+        {
             continue;
         }
         if !seen.columns.get(at).copied().unwrap_or(false) {
@@ -900,6 +938,7 @@ mod tests {
         let seen = Seen {
             row: true,
             columns: vec![true, false, true],
+            keys: vec![true, false, false],
             keys_only: false,
             error: None,
         };
@@ -970,6 +1009,39 @@ mod tests {
             data(&change, &types(), &Seen::all(&change.relation))["old_record"],
             serde_json::json!({"id": 12, "details": "wash up", "done": false}),
             "and a table with no policies on it publishes what it published"
+        );
+    }
+
+    /// The one a table with `replica identity full` gets, which is the
+    /// case where the change's flags and the catalog's key disagree.
+    #[test]
+    fn a_delete_of_a_row_that_published_all_of_itself_is_still_the_key() {
+        let mut relation = Relation::clone(&todos());
+        relation.replica = Replica::Full;
+        for column in &mut relation.columns {
+            column.key = true;
+        }
+        let relation = Arc::new(relation);
+        let change = Change {
+            relation: Arc::clone(&relation),
+            op: Op::Delete,
+            record: vec![],
+            old: Some(vec![text("12"), text("the combination"), text("f")]),
+            // Postgres sent the whole row rather than a key tuple, so
+            // there is no padding to drop and nothing about the flags
+            // says which column names the row.
+            old_key: false,
+            commit_ts: 1_636_132_851_524_060,
+            lsn: 42,
+        };
+        let mut seen = Seen::all(&relation);
+        seen.keys = vec![true, false, false];
+        seen.keys_only = true;
+        assert_eq!(
+            data(&change, &types(), &seen)["old_record"],
+            serde_json::json!({"id": 12}),
+            "the flags mark every column of such a table, so a cut made on them would publish a \
+             deleted row to the subscribers a policy hides it from"
         );
     }
 

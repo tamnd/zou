@@ -190,6 +190,11 @@ impl Changes {
         if let Some(who) = inner.listeners.get_mut(&listener) {
             who.bindings.push(id);
         }
+        drop(inner);
+        // This is what a reader waits for rather than the subscriber
+        // itself, since a subscriber that has asked for nothing is
+        // nothing to read a database for.
+        self.wake.notify_one();
         Some(id)
     }
 
@@ -231,10 +236,22 @@ impl Changes {
         }
     }
 
-    /// How many subscribers there are, which is what decides whether
-    /// there is a tap at all.
+    /// How many subscribers have asked for something, which is what
+    /// decides whether there is a tap at all.
+    ///
+    /// A subscriber with no bindings is not one: a socket that joined
+    /// and has not asked yet, or one whose channels have all gone while
+    /// the socket stays open. Neither is a reason to hold a replication
+    /// slot, and the second is a client that could otherwise pin a
+    /// database's write ahead log by subscribing once and leaving.
     pub fn listening(&self) -> usize {
-        self.inner.lock().expect("changes").listeners.len()
+        self.inner
+            .lock()
+            .expect("changes")
+            .listeners
+            .values()
+            .filter(|who| !who.bindings.is_empty())
+            .count()
     }
 
     /// Wait until somebody is listening. Returns immediately when
@@ -612,11 +629,34 @@ mod tests {
             "nobody is subscribed, so there is nothing to hold a slot open for"
         );
         let listening = std::sync::Arc::clone(&changes);
+        let ana = changes.listen(asker("ana"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), changes.woken())
+                .await
+                .is_err(),
+            "a socket that has joined and asked for nothing is not a subscription either"
+        );
         tokio::spawn(async move {
-            listening.listen(asker("ana"));
+            listening.bind(ana.id, binding("todos"));
         });
         tokio::time::timeout(Duration::from_secs(5), changes.woken())
             .await
-            .expect("the first subscriber wakes the reader");
+            .expect("the first subscription wakes the reader");
+    }
+
+    /// A slot is held for whoever is reading it, and a socket with no
+    /// subscriptions left is not.
+    #[test]
+    fn a_socket_that_gave_up_its_last_subscription_is_not_holding_a_tap_open() {
+        let changes = Changes::new();
+        let ana = changes.listen(asker("ana"));
+        let one = changes.bind(ana.id, binding("todos")).expect("a binding");
+        assert_eq!(changes.listening(), 1);
+        changes.unbind(one);
+        assert_eq!(
+            changes.listening(),
+            0,
+            "the socket is still open and there is nothing on it to read a database for"
+        );
     }
 }
