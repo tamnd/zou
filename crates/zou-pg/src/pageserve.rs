@@ -619,16 +619,23 @@ struct Progress {
     chunks: u64,
     segments: u64,
     frames: u64,
+    bytes: u64,
+    polling: Duration,
+    applying: Duration,
 }
 
 impl Progress {
-    /// Fold in what one catch up covered.
-    fn poll(&mut self, out: &CatchUp) {
+    /// Fold in what one catch up covered, and how its time split
+    /// between the store reads and the apply.
+    fn poll(&mut self, out: &CatchUp, polling: Duration, applying: Duration, bytes: u64) {
         self.polls += 1;
         self.rounds += u64::from(out.rounds);
         self.chunks += u64::from(out.chunks);
         self.segments += u64::from(out.segments);
         self.frames += out.frames;
+        self.bytes += bytes;
+        self.polling += polling;
+        self.applying += applying;
     }
 
     /// Log the interval if it is due, and start a new one.
@@ -651,13 +658,16 @@ impl Progress {
             ""
         };
         log::info!(
-            "zou pageserve: applied {applied:#x} seen {seen:#x} durable {durable:#x}, cursor round {round} chunk {chunk} seq {seq}, {} polls read {} rounds {} chunks {} segments {} frames in {:.0}s{stuck}",
+            "zou pageserve: applied {applied:#x} seen {seen:#x} durable {durable:#x}, cursor round {round} chunk {chunk} seq {seq}, {} polls read {} rounds {} chunks {} segments {} frames {} MB in {:.0}s, {:.1}s polling of which {:.1}s applying{stuck}",
             self.polls,
             self.rounds,
             self.chunks,
             self.segments,
             self.frames,
+            self.bytes >> 20,
             elapsed.as_secs_f64(),
+            self.polling.as_secs_f64(),
+            self.applying.as_secs_f64(),
         );
         self.applied = applied;
         self.polls = 0;
@@ -665,6 +675,9 @@ impl Progress {
         self.chunks = 0;
         self.segments = 0;
         self.frames = 0;
+        self.bytes = 0;
+        self.polling = Duration::ZERO;
+        self.applying = Duration::ZERO;
         self.last = Some(now);
     }
 }
@@ -697,6 +710,13 @@ fn poll_ingest(
     // Flushing here bounds the memtable by its own threshold instead
     // of by how far behind the service happens to be.
     let seen = *durable_seen;
+    // The poll splits in two: the store reads that bring frames in, and
+    // the apply that puts them in the memtable. A catch up that runs at
+    // a megabyte a second is a different bug depending on which half it
+    // spends its time in, and from outside the two are one number.
+    let started = Instant::now();
+    let mut applying = Duration::ZERO;
+    let mut bytes: u64 = 0;
     let out = catch_up_resuming::<ReplayError, _, _>(
         media,
         WAL_SHARD,
@@ -710,16 +730,19 @@ fn poll_ingest(
                 *ingest = Some(ShardIngest::new(ingest_cfg.clone(), start));
             }
             let ingest = ingest.as_mut().expect("anchored on the first frame");
+            bytes += frame.payload.len() as u64;
+            let at = Instant::now();
             ingest
                 .apply_frames(std::slice::from_ref(&frame))
                 .map_err(|e| ReplayError::Ingest(e.to_string()))?;
             flush_if_due(store, layout, ingest, map, seen).map_err(ReplayError::Ingest)?;
+            applying += at.elapsed();
             Ok(Instant::now() < deadline)
         },
         || Instant::now() < deadline,
     )
     .map_err(|e| format!("catch up: {e}"))?;
-    progress.poll(&out);
+    progress.poll(&out, started.elapsed(), applying, bytes);
     // The walk is the freshness probe, which is why there is no
     // separate stream end call here any more. That one ran first on
     // every poll and read the whole landing tail into memory to look
