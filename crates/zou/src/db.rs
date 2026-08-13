@@ -58,6 +58,7 @@ reset client_min_messages;
 /// is that nobody writes a migration for them.
 pub const MANAGED: &[&str] = &[
     "auth",
+    "cron",
     "extensions",
     "graphql",
     "graphql_public",
@@ -788,7 +789,7 @@ mod tests {
 
     #[test]
     fn the_schemas_this_server_lives_in_are_not_the_projects_to_drop() {
-        for ours in ["auth", "storage", "zou", "supabase_migrations"] {
+        for ours in ["auth", "cron", "storage", "zou", "supabase_migrations"] {
             assert!(MANAGED.contains(&ours), "{ours} is not the project's");
         }
         assert!(!MANAGED.contains(&"public"), "public is, and comes back");
