@@ -236,12 +236,18 @@ impl<'a> LayerReader<'a> {
         footers.len()
     }
 
-    /// The read algorithm for `(key, lsn)`: plan on the map, fetch the
-    /// base image from the plan's image layer, collect records from
-    /// the plan's delta layers and the memtable, merge ascending.
-    /// Overlapping unconsolidated layers can hold the same record; the
-    /// merge keys on lsn, so a record applies once no matter how many
-    /// layers carry it.
+    /// The read algorithm for `(key, lsn)`: plan on the map, take the
+    /// base from the newest image layer that holds the key, collect
+    /// records from the delta layers above that image and the
+    /// memtable, merge ascending. Overlapping unconsolidated layers
+    /// can hold the same record; the merge keys on lsn, so a record
+    /// applies once no matter how many layers carry it.
+    ///
+    /// The floor follows the base, not the plan. An image whose key
+    /// range covers the key but which does not carry it leaves the
+    /// floor where it was: compaction cuts images with interior gaps,
+    /// and reading a gap as if it were a hit would drop the records
+    /// below the image lsn and rebuild the page from half a chain.
     pub fn reconstruct(
         &self,
         map: &LayerMap,
@@ -250,29 +256,36 @@ impl<'a> LayerReader<'a> {
         lsn: Lsn,
     ) -> Result<Reconstruction, ReadError> {
         let plan = map.plan(key, lsn);
-        let floor = plan.floor();
 
         let mut base = None;
-        if let Some(desc) = plan.image {
+        let mut floor = Lsn(0);
+        for desc in &plan.images {
             let footer = self.footer(desc)?;
-            if footer.may_contain(key) {
-                for meta in footer.locate(key) {
-                    let bytes = self.range(desc, &desc.name(), meta.offset, meta.len as u64)?;
-                    let entries =
-                        decode_image_block(&bytes, meta).map_err(|source| ReadError::Layer {
-                            name: desc.name(),
-                            source,
-                        })?;
-                    if let Ok(i) = entries.binary_search_by(|e| e.key.cmp(key)) {
-                        base = Some(entries.into_iter().nth(i).expect("index from search").page);
-                        break;
-                    }
+            if !footer.may_contain(key) {
+                continue;
+            }
+            for meta in footer.locate(key) {
+                let bytes = self.range(desc, &desc.name(), meta.offset, meta.len as u64)?;
+                let entries =
+                    decode_image_block(&bytes, meta).map_err(|source| ReadError::Layer {
+                        name: desc.name(),
+                        source,
+                    })?;
+                if let Ok(i) = entries.binary_search_by(|e| e.key.cmp(key)) {
+                    base = Some(entries.into_iter().nth(i).expect("index from search").page);
+                    break;
                 }
+            }
+            if base.is_some() {
+                floor = desc.min_lsn;
+                break;
             }
         }
 
+        let mut touched = usize::from(base.is_some());
         let mut merged: BTreeMap<Lsn, Vec<u8>> = BTreeMap::new();
-        for desc in &plan.deltas {
+        for desc in plan.above(floor) {
+            touched += 1;
             let footer = self.footer(desc)?;
             if !footer.may_contain(key) {
                 continue;
@@ -300,10 +313,10 @@ impl<'a> LayerReader<'a> {
         }
 
         Ok(Reconstruction {
-            base_lsn: plan.image.map(|_| floor),
+            base_lsn: base.as_ref().map(|_| floor),
             base,
             records: merged.into_iter().collect(),
-            layers_touched: plan.read_amp(),
+            layers_touched: touched,
         })
     }
 }
@@ -401,6 +414,46 @@ mod tests {
         assert_eq!(got.base_lsn, None);
         assert!(got.records.is_empty());
         assert_eq!(got.layers_touched, 0);
+    }
+
+    #[test]
+    fn an_image_with_a_gap_does_not_floor_the_key_it_skipped() {
+        // What compaction actually cuts: an image over the pages redo
+        // could rebuild, with a hole where a page's base was not in
+        // the store. The hole sits inside the layer's key range, so
+        // the map offers the layer for the missing key too. Taking
+        // that offer would drop every record below lsn 400 and hand
+        // redo half a chain, which is a corrupt page, not a slow one.
+        let (store, mut map, mem) = history();
+        let mut layers = map.layers().to_vec();
+        let sparse: Vec<ImageEntry> = (0..10u32)
+            .filter(|b| *b != 3)
+            .map(|b| ImageEntry {
+                key: k(b),
+                page: page(0xAA),
+            })
+            .collect();
+        let (buf, footer) = build_image(&sparse, Lsn(400), 3 * PAGE_IMAGE_LEN).unwrap();
+        let desc = LayerDesc::from_footer(&footer, buf.len() as u64);
+        assert!(desc.covers(&k(3)), "the gap is inside the key range");
+        store.put(&format!("layers/{}", desc.name()), &buf).unwrap();
+        layers.push(desc);
+        map = LayerMap::new(layers).unwrap();
+
+        let reader = LayerReader::new(&store, "layers/");
+        let got = reader.reconstruct(&map, &mem, &k(3), Lsn(500)).unwrap();
+        assert_eq!(got.base, Some(page(3)), "the base is the older image");
+        assert_eq!(got.base_lsn, Some(Lsn(100)));
+        let lsns: Vec<u64> = got.records.iter().map(|(l, _)| l.0).collect();
+        assert_eq!(lsns, vec![101, 150, 200, 201, 250, 300, 305, 310]);
+
+        // A key the newer image does hold reads from it, with the
+        // records below it folded away.
+        let got = reader.reconstruct(&map, &mem, &k(1), Lsn(500)).unwrap();
+        assert_eq!(got.base, Some(page(0xAA)));
+        assert_eq!(got.base_lsn, Some(Lsn(400)));
+        assert!(got.records.is_empty());
+        assert_eq!(got.layers_touched, 1);
     }
 
     #[test]

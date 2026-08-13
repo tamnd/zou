@@ -483,7 +483,11 @@ fn getpage_serves_what_redo_builds() {
         let key =
             zou_store::layer::LayerKey::page(blk.spc, blk.db, blk.rel, blk.fork as u8, blk.blk);
         let plan = map.plan(&key, Lsn(wal_end));
-        assert!(plan.image.is_some(), "image serves {key:?}");
-        assert_eq!(plan.read_amp(), 1, "no deltas above the image for {key:?}");
+        let image = plan.images.first().expect("an image serves {key:?}");
+        assert_eq!(
+            plan.above(image.min_lsn).count(),
+            0,
+            "no deltas above the image for {key:?}"
+        );
     }
 }
