@@ -7,6 +7,7 @@
 //! and writes nothing, so it is safe to point at a live store or at a
 //! file copied out of one.
 
+use zou_pg::walscan;
 use zou_store::layer::{
     LayerKey, LayerKind, PAGE_IMAGE_LEN, decode_delta, decode_image, read_layer_footer,
 };
@@ -168,7 +169,34 @@ fn chain(
         recon.layers_touched
     );
     for (lsn, record) in &recon.records {
-        println!("  {:#x} {} bytes", lsn.0, record.len());
+        // rmgr and info come out of the fixed record header, and the
+        // refs say which blocks the record touches and which of them
+        // it can build from nothing. A chain whose first record is
+        // not an init for this block has nowhere to start.
+        let (info, rmid) = (record[16], record[17]);
+        let refs = match walscan::record_init_refs(record) {
+            Ok(refs) => refs
+                .iter()
+                .map(|(r, init)| {
+                    format!(
+                        "{}/{}/{}.{} blk {}{}",
+                        r.spc,
+                        r.db,
+                        r.rel,
+                        r.fork,
+                        r.blk,
+                        if *init { " init" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            Err(e) => format!("refs unreadable: {e}"),
+        };
+        println!(
+            "  {:#x} {} bytes, rmgr {rmid} info {info:#04x}, {refs}",
+            lsn.0,
+            record.len()
+        );
     }
     Ok(())
 }
