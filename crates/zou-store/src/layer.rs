@@ -341,14 +341,19 @@ fn header(kind: LayerKind) -> Vec<u8> {
 
 /// Incremental delta layer encoder: entries stream in strictly sorted
 /// by (key, lsn) and compressed blocks land as they fill, so building
-/// a layer never holds more than one raw block of entries. The bloom
-/// filter must be sized up front, so `expected` is an upper bound on
-/// the entry count; a merge passes the sum of its inputs' counts and
-/// overshoots only by the duplicates it drops.
+/// a layer never holds more than one raw block of entries.
+///
+/// The filter is sized at the end from the distinct keys the layer
+/// actually holds, not from an estimate of the entries. In a delta
+/// layer those numbers are not close: one hot page takes a record per
+/// update, and a layer of 1.6 million records off a pgbench run covers
+/// tens of thousands of keys. Sized for the records the filter came
+/// out at 2 MB, which every reader of that layer then fetched and held
+/// (zou #343).
 pub struct DeltaBuilder {
     buf: Vec<u8>,
     blocks: Vec<LayerBlock>,
-    bloom: Bloom,
+    hashes: Vec<(u64, u64)>,
     raw: Vec<u8>,
     block_target: usize,
     first: LayerKey,
@@ -360,11 +365,11 @@ pub struct DeltaBuilder {
 }
 
 impl DeltaBuilder {
-    pub fn new(expected: usize, block_target: usize) -> Self {
+    pub fn new(block_target: usize) -> Self {
         DeltaBuilder {
             buf: header(LayerKind::Delta),
             blocks: Vec::new(),
-            bloom: Bloom::sized_for(expected.max(1)),
+            hashes: Vec::new(),
             raw: Vec::new(),
             block_target,
             first: LayerKey::page(0, 0, 0, 0, 0),
@@ -386,7 +391,11 @@ impl DeltaBuilder {
         if self.last.is_none() {
             self.first = key;
         }
-        self.bloom.insert(&key.encode());
+        // Sorted input means a key that repeats repeats right here, so
+        // one comparison keeps the filter counting keys, not records.
+        if self.last.is_none_or(|(prev, _)| prev != key) {
+            self.hashes.push(Bloom::hash(&key.encode()));
+        }
         if !self.raw.is_empty()
             && self.raw.len() + ENTRY_FIXED_LEN + record.len() > self.block_target
         {
@@ -441,7 +450,7 @@ impl DeltaBuilder {
             self.buf,
             LayerKind::Delta,
             self.blocks,
-            self.bloom,
+            Bloom::from_hashes(&self.hashes),
             self.min_lsn,
             self.max_lsn,
             self.total,
@@ -454,7 +463,7 @@ impl DeltaBuilder {
 pub struct ImageBuilder {
     buf: Vec<u8>,
     blocks: Vec<LayerBlock>,
-    bloom: Bloom,
+    hashes: Vec<(u64, u64)>,
     raw: Vec<u8>,
     block_target: usize,
     lsn: Lsn,
@@ -465,11 +474,11 @@ pub struct ImageBuilder {
 }
 
 impl ImageBuilder {
-    pub fn new(expected: usize, lsn: Lsn, block_target: usize) -> Self {
+    pub fn new(lsn: Lsn, block_target: usize) -> Self {
         ImageBuilder {
             buf: header(LayerKind::Image),
             blocks: Vec::new(),
-            bloom: Bloom::sized_for(expected.max(1)),
+            hashes: Vec::new(),
             raw: Vec::new(),
             block_target,
             lsn,
@@ -490,7 +499,7 @@ impl ImageBuilder {
         if self.last.is_none() {
             self.first = key;
         }
-        self.bloom.insert(&key.encode());
+        self.hashes.push(Bloom::hash(&key.encode()));
         if !self.raw.is_empty()
             && self.raw.len() + KEY_ENCODED_LEN + PAGE_IMAGE_LEN > self.block_target
         {
@@ -539,7 +548,7 @@ impl ImageBuilder {
             self.buf,
             LayerKind::Image,
             self.blocks,
-            self.bloom,
+            Bloom::from_hashes(&self.hashes),
             self.lsn,
             self.lsn,
             self.total,
@@ -554,7 +563,7 @@ pub fn build_delta(
     entries: &[DeltaEntry],
     block_target: usize,
 ) -> Result<(Vec<u8>, LayerFooter), LayerBuildError> {
-    let mut b = DeltaBuilder::new(entries.len(), block_target);
+    let mut b = DeltaBuilder::new(block_target);
     for e in entries {
         b.push(e.key, e.lsn, &e.record)?;
     }
@@ -568,7 +577,7 @@ pub fn build_image(
     lsn: Lsn,
     block_target: usize,
 ) -> Result<(Vec<u8>, LayerFooter), LayerBuildError> {
-    let mut b = ImageBuilder::new(entries.len(), lsn, block_target);
+    let mut b = ImageBuilder::new(lsn, block_target);
     for e in entries {
         b.push(e.key, &e.page)?;
     }
@@ -1073,6 +1082,45 @@ mod tests {
                 page: lcg_bytes(i as u64, PAGE_IMAGE_LEN),
             })
             .collect()
+    }
+
+    /// The shape of a real delta layer: a page takes a record on every
+    /// update, so records outnumber keys many times over. The filter
+    /// has to follow the keys, and the layer still has to answer for
+    /// every key it holds and mostly say no to the ones it does not.
+    #[test]
+    fn a_layer_of_repeated_keys_carries_a_filter_sized_for_the_keys() {
+        let keys = 500usize;
+        let per_key = 40usize;
+        let entries: Vec<DeltaEntry> = (0..keys * per_key)
+            .map(|i| DeltaEntry {
+                key: LayerKey::page(1663, 5, 16384, 0, (i / per_key) as u32),
+                lsn: Lsn(0x1000 + i as u64 * 8),
+                record: lcg_bytes(i as u64, 64),
+            })
+            .collect();
+        let (_, footer) = build_delta(&entries, LAYER_BLOCK_TARGET).unwrap();
+
+        assert_eq!(footer.entry_count, (keys * per_key) as u64);
+        assert_eq!(
+            footer.bloom.bits().len(),
+            Bloom::sized_for(keys).bits().len(),
+            "the filter is sized for {keys} keys, not {} records",
+            keys * per_key
+        );
+        for i in 0..keys as u32 {
+            assert!(
+                footer.may_contain(&LayerKey::page(1663, 5, 16384, 0, i)),
+                "block {i} is in the layer and the filter has to say so"
+            );
+        }
+        let absent = (keys as u32..keys as u32 * 2)
+            .filter(|&i| !footer.may_contain(&LayerKey::page(1663, 5, 16384, 0, i)))
+            .count();
+        assert!(
+            absent > keys * 9 / 10,
+            "only {absent} of {keys} absent keys missed, the filter is too small"
+        );
     }
 
     #[test]

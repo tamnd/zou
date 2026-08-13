@@ -1612,7 +1612,7 @@ mod tests {
         let layout = TenantLayout::new("t");
         let page = vec![4u8; BLCKSZ];
 
-        let mut images = ImageBuilder::new(1, Lsn(100), 8192);
+        let mut images = ImageBuilder::new(Lsn(100), 8192);
         images
             .push(LayerKey::page(1663, 5, 2000, 0, 3), &page)
             .expect("image pushes");
@@ -1701,7 +1701,7 @@ mod tests {
             name
         };
 
-        let mut images = ImageBuilder::new(1, Lsn(100), 8192);
+        let mut images = ImageBuilder::new(Lsn(100), 8192);
         images.push(key, &page).expect("image pushes");
         let (bytes, footer) = images.finish().expect("image layer builds");
         publish(bytes, &footer);

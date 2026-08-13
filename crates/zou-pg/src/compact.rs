@@ -237,16 +237,14 @@ pub fn compact_shard(
     let mut based: BTreeSet<LayerKey> = BTreeSet::new();
     for (at, group) in &image_groups {
         let mut cursors = Vec::with_capacity(group.len());
-        let mut expected = 0usize;
         for (name, bytes) in group {
             let cursor = image_cursor(bytes).map_err(|source| CompactError::Decode {
                 name: name.clone(),
                 source,
             })?;
-            expected += cursor.footer().entry_count as usize;
             cursors.push((name.as_str(), cursor.peekable()));
         }
-        let mut builder = ImageBuilder::new(expected, *at, BLOCK_TARGET);
+        let mut builder = ImageBuilder::new(*at, BLOCK_TARGET);
         loop {
             let mut best: Option<(usize, LayerKey)> = None;
             for (i, (name, cursor)) in cursors.iter_mut().enumerate() {
@@ -292,16 +290,14 @@ pub fn compact_shard(
     let mut merged_keys: BTreeSet<LayerKey> = BTreeSet::new();
     let mut first_init: BTreeMap<LayerKey, bool> = BTreeMap::new();
     let mut cursors = Vec::with_capacity(delta_srcs.len());
-    let mut expected = 0usize;
     for (name, upto, bytes) in &delta_srcs {
         let cursor = delta_cursor(bytes).map_err(|source| CompactError::Decode {
             name: name.clone(),
             source,
         })?;
-        expected += cursor.footer().entry_count as usize;
         cursors.push((name.as_str(), *upto, cursor.peekable()));
     }
-    let mut builder = DeltaBuilder::new(expected, BLOCK_TARGET);
+    let mut builder = DeltaBuilder::new(BLOCK_TARGET);
     loop {
         let mut best: Option<(usize, (LayerKey, Lsn))> = None;
         for (i, (name, upto, cursor)) in cursors.iter_mut().enumerate() {
@@ -387,7 +383,7 @@ pub fn compact_shard(
             let map = LayerMap::new(descs.clone()).map_err(PageShardError::from)?;
             let svc = PageService::for_shard(store, tenant_ref, shard, Some(pool), data_checksums);
             let mem = Memtable::new();
-            let mut builder = ImageBuilder::new(keys.len(), dcl, BLOCK_TARGET);
+            let mut builder = ImageBuilder::new(dcl, BLOCK_TARGET);
             for batch in keys.chunks(MAX_GETPAGE_BATCH) {
                 let blocks: Vec<crate::walscan::BlockRef> = batch
                     .iter()
