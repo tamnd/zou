@@ -17,7 +17,9 @@ SA_NODEFER: a blocked syscall from inside the handler cannot be
 delivered, so the kernel kills the process, which is where this
 started rather than a loop. The first backtrace of a process can load
 libgcc, so that is done before the filter goes up rather than from
-inside the handler. An unexpected arch still kills outright.
+inside the handler, and backtrace_symbols_fd writes its lines with
+writev, so that joins write on the allowlist. An unexpected arch still
+kills outright.
 
 diff --git a/src/backend/access/transam/zou_walredo.c b/src/backend/access/transam/zou_walredo.c
 --- a/src/backend/access/transam/zou_walredo.c
@@ -108,19 +110,19 @@ diff --git a/src/backend/access/transam/zou_walredo.c b/src/backend/access/trans
   */
  static void
  enter_sandbox(void)
-@@ -839,7 +888,28 @@
+@@ -839,9 +888,32 @@
  	struct sock_filter prog[4 + lengthof(allowed) * 2];
  	int			pc = 0;
  	struct sock_fprog fprog;
 +	struct sigaction act;
-+
+ 
 +	memset(&act, 0, sizeof(act));
 +	act.sa_sigaction = zredo_blocked;
 +	act.sa_flags = SA_SIGINFO;
 +	sigemptyset(&act.sa_mask);
 +	if (sigaction(SIGSYS, &act, NULL) != 0)
 +		elog(FATAL, "zou redo: could not install the blocked syscall handler: %m");
- 
++
 +#ifdef HAVE_BACKTRACE_SYMBOLS
 +	/*
 +	 * The first backtrace of a process can load libgcc, which is an open the
@@ -136,8 +138,12 @@ diff --git a/src/backend/access/transam/zou_walredo.c b/src/backend/access/trans
 +
  	allowed[n++] = __NR_read;
  	allowed[n++] = __NR_write;
++	/* backtrace_symbols_fd builds its lines out of iovecs */
++	allowed[n++] = __NR_writev;
  	allowed[n++] = __NR_close;
-@@ -900,6 +970,7 @@
+ 	allowed[n++] = __NR_pread64;
+ 	allowed[n++] = __NR_pwrite64;
+@@ -900,6 +972,7 @@
  				 offsetof(struct seccomp_data, arch));
  	prog[pc++] = (struct sock_filter)
  		BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ZREDO_SECCOMP_ARCH, 1, 0);
@@ -145,7 +151,7 @@ diff --git a/src/backend/access/transam/zou_walredo.c b/src/backend/access/trans
  	prog[pc++] = (struct sock_filter)
  		BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
  	prog[pc++] = (struct sock_filter)
-@@ -913,7 +984,7 @@
+@@ -913,7 +986,7 @@
  			BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
  	}
  	prog[pc++] = (struct sock_filter)
