@@ -157,17 +157,31 @@ pub fn compact_shard(
         return Err(CompactError::NoTenant { key: manifest_key });
     };
     let manifest = Manifest::from_json(&data)?;
+
+    // The shard manifest first, the layer set second, and the order is
+    // not a style choice. The image this pass cuts is built from the
+    // layers and stamped with the dcl, so the dcl has to be one the
+    // layers already reach. Ingest publishes a fresh layer and the dcl
+    // it reaches in a single CAS, so reading the manifest first can
+    // only leave us with a dcl older than the layers, and an image cut
+    // at an older lsn ignores the layers above it and is still true.
+    // The other order loses: a flush landing between the two reads
+    // hands us a dcl the layers stop short of, and every key written in
+    // that window comes out of the fresh image stale. Nothing catches
+    // it later either, because a read floors at the image lsn and drops
+    // the very records that would have fixed the page.
+    let own = PageShardManifest::load(store, &layout.shard_manifest(shard))?.map(|(m, _)| m);
+    let dcl = own
+        .as_ref()
+        .map(|m| m.disk_consistent_lsn)
+        .unwrap_or(Lsn(0));
+
     let (descs, _) = load_serving_descs(store, tenant_ref, &manifest, shard)?;
     if descs.is_empty() {
         return Ok(None);
     }
     let debt_before = debt(&descs);
 
-    let own = PageShardManifest::load(store, &layout.shard_manifest(shard))?.map(|(m, _)| m);
-    let dcl = own
-        .as_ref()
-        .map(|m| m.disk_consistent_lsn)
-        .unwrap_or(Lsn(0));
     let retire: Vec<String> = own
         .iter()
         .flat_map(|m| &m.layers)
@@ -573,14 +587,13 @@ pub fn run_queue(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redo::RedoPoolConfig;
     use std::sync::atomic::AtomicUsize;
     use zou_store::cas::Version;
-    use zou_store::layer::{DeltaEntry, build_delta};
+    use zou_store::layer::{DeltaEntry, ImageEntry, PAGE_IMAGE_LEN, build_delta, build_image};
     use zou_store::mem::MemStore;
     use zou_store::shardmanifest::publish_layer;
     use zou_store::shards::{prune_lineage, split};
-
-    use crate::redo::RedoPoolConfig;
 
     fn seed(store: &dyn CasStore, tenant_ref: &str) -> TenantLayout {
         let layout = TenantLayout::new(tenant_ref);
@@ -620,6 +633,30 @@ mod tests {
             Lsn(dcl),
         )
         .unwrap();
+    }
+
+    fn put_image(
+        store: &dyn CasStore,
+        layout: &TenantLayout,
+        shard: u16,
+        entries: &[ImageEntry],
+        at: u64,
+    ) {
+        let (bytes, footer) = build_image(entries, Lsn(at), 4096).unwrap();
+        let desc = LayerDesc::from_footer(&footer, bytes.len() as u64);
+        store
+            .put_if_absent(
+                &format!("{}{}", layout.shard_prefix(shard), desc.name()),
+                &bytes,
+            )
+            .unwrap();
+        let entry = LayerEntry {
+            name: desc.name(),
+            size: bytes.len() as u64,
+            owner: None,
+            upto: None,
+        };
+        publish_layer(store, &layout.shard_manifest(shard), shard, &entry, Lsn(at)).unwrap();
     }
 
     fn rec(rel: u32, block: u32, lsn: u64) -> DeltaEntry {
@@ -825,6 +862,123 @@ mod tests {
         let got = reader.reconstruct(&map, &mem, &orphan, Lsn(0x500)).unwrap();
         assert_eq!(got.base, None);
         assert_eq!(got.records.len(), 2);
+    }
+
+    /// A store that lets one flush land in the middle of a pass, right
+    /// between the two reads of the shard manifest.
+    struct RacingStore {
+        inner: MemStore,
+        manifest: String,
+        reads: AtomicUsize,
+    }
+
+    impl CasStore for RacingStore {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, CasError> {
+            // load_serving_descs reads the manifest twice, once for the
+            // coverage claim and once for the layers, so the third read
+            // of the pass is the one that comes after the layer set is
+            // in hand: the exact moment a flush hurts.
+            if key == self.manifest && self.reads.fetch_add(1, Ordering::SeqCst) == 2 {
+                // Ingest publishing a run and the lsn it reaches, in
+                // one CAS, as the pass reads the manifest a second time.
+                let layout = TenantLayout::new("t");
+                put_delta(&self.inner, &layout, 0, &mut [rec(90, 7, 0x250)], 0x500);
+            }
+            self.inner.get(key)
+        }
+        fn put_if_match(
+            &self,
+            key: &str,
+            data: &[u8],
+            expected: Option<&Version>,
+        ) -> Result<Version, CasError> {
+            self.inner.put_if_match(key, data, expected)
+        }
+        fn delete(&self, key: &str) -> Result<(), CasError> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+            self.inner.list(prefix)
+        }
+    }
+
+    /// The pass reads the shard manifest twice, once for the lsn it
+    /// stamps on the fresh image and once, through load_serving_descs,
+    /// for the layers it builds that image from. Take the lsn from the
+    /// later read and a flush landing in between hands the pass an lsn
+    /// its layers do not reach: every key written in that window comes
+    /// out of the image stale, and no later read can fix it because it
+    /// floors at the image lsn and drops those very records (zou #358).
+    #[test]
+    fn a_flush_landing_mid_pass_cannot_lift_the_image_above_its_layers() {
+        let layout = TenantLayout::new("t");
+        let store = RacingStore {
+            inner: MemStore::default(),
+            manifest: layout.shard_manifest(0),
+            reads: AtomicUsize::new(0),
+        };
+        // Seeding goes straight to the inner store so the count the
+        // hook watches is the pass's own reads and nothing else.
+        seed(&store.inner, "t");
+        let key = LayerKey::page(1663, 5, 90, 0, 7);
+        put_image(
+            &store.inner,
+            &layout,
+            0,
+            &[ImageEntry {
+                key,
+                page: vec![0xAB; PAGE_IMAGE_LEN],
+            }],
+            0x100,
+        );
+        // Two runs so the pass has work, holding records for another
+        // block and above the flush point, so the image the pass cuts
+        // is the base alone and never asks the redo pool for anything.
+        put_delta(&store.inner, &layout, 0, &mut [rec(90, 9, 0x600)], 0x200);
+        put_delta(&store.inner, &layout, 0, &mut [rec(90, 9, 0x700)], 0x200);
+
+        let pool = RedoPool::new(RedoPoolConfig {
+            postgres: "/nonexistent/postgres".into(),
+            scratch_root: std::env::temp_dir(),
+            workers: 1,
+            batch_timeout: std::time::Duration::from_secs(5),
+            batches_per_worker: 1,
+            data_checksums: false,
+        });
+        compact_shard(&store, "t", 0, Some(&pool), false)
+            .unwrap()
+            .expect("two runs and a pool mean work");
+
+        let (m, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let images: Vec<Lsn> = m
+            .layers
+            .iter()
+            .filter_map(|l| LayerDesc::parse(&l.name, l.size).ok())
+            .filter(|d| d.kind == LayerKind::Image)
+            .map(|d| d.min_lsn)
+            .collect();
+        assert_eq!(
+            images,
+            vec![Lsn(0x100), Lsn(0x200)],
+            "the source image is rewritten where it stood and the fresh one \
+             stands at the lsn the layers reach, not the one the flush moved \
+             the shard to"
+        );
+
+        // The racing record is still there to apply, which is the whole
+        // point: an image stamped at 0x500 would have swallowed it.
+        let reader = LayerReader::new(&store, layout.shard_prefix(0));
+        let got = reader
+            .reconstruct(&m.layer_map().unwrap(), &Memtable::new(), &key, Lsn(0x500))
+            .unwrap();
+        assert_eq!(got.base, Some(vec![0xAB; PAGE_IMAGE_LEN]));
+        assert_eq!(got.base_lsn, Some(Lsn(0x200)));
+        assert_eq!(
+            got.records.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
+            vec![0x250]
+        );
     }
 
     /// A store that starts refusing writes after a budget, the shape
