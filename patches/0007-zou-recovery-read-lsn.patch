@@ -1,0 +1,101 @@
+Ask for the replay position when recovery reads a page.
+
+The storage manager passes the pusher's published durable LSN with
+every read, and the page service takes zero to mean the latest durable
+state. During recovery there is no pusher, so the value is always
+zero, and a service that has just anchored answers the latest durable
+state with the anchor. The startup process then replays a record onto
+a page missing every change since the anchor. On server2 that came
+back as "will not overwrite a used ItemId" and a PANIC in redo, three
+times in a row, and the node never came up (zou #329).
+
+The startup process knows the LSN it needs, it is replaying it.
+lastReplayedEndRecPtr is the end of the last record applied, so a page
+carrying everything up to it and nothing of the record in hand is
+exactly what redo expects. ZouWalReadLSN returns that during recovery
+and the durable LSN otherwise, and the two read paths ask for it.
+
+A read the service cannot cover now parks and then fails loudly, which
+is also what should happen when the local pg_wal is ahead of the
+stream, the state a SIGKILL'd pusher leaves behind. Today that reads
+as a fresh page and corrupts.
+
+diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -28,6 +28,7 @@
+ 
+ #include "access/xlog.h"
+ #include "access/xlog_internal.h"
++#include "access/xlogrecovery.h"
+ #include "access/zou_wal.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
+@@ -602,6 +603,35 @@
+ 	if (!IsUnderPostmaster || ZouWalShmem == NULL || !ZouWalActive())
+ 		return InvalidXLogRecPtr;
+ 	return (XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn);
++}
++
++/*
++ * The LSN a page read has to be served at.
++ *
++ * Normally that is the published durable LSN, see above. During
++ * recovery there is no pusher and so no publication, and the reader
++ * that matters is the startup process, which knows exactly which LSN
++ * it needs because it is replaying it. lastReplayedEndRecPtr is the
++ * end of the last record applied, so a page carrying everything up to
++ * it and nothing of the record in hand is exactly the page redo
++ * expects.
++ *
++ * Zero here means no barrier at all, and a page service that has just
++ * anchored answers it with the anchor. Redo then applies a record to a
++ * page missing every change since, which is a PANIC rather than an
++ * error (zou #329).
++ */
++XLogRecPtr
++ZouWalReadLSN(void)
++{
++	if (RecoveryInProgress())
++	{
++		XLogRecPtr	replayed = GetXLogReplayRecPtr(NULL);
++
++		if (!XLogRecPtrIsInvalid(replayed))
++			return replayed;
++	}
++	return ZouWalDurableLSN();
+ }
+ 
+ static void
+diff --git a/src/include/access/zou_wal.h b/src/include/access/zou_wal.h
+--- a/src/include/access/zou_wal.h
++++ b/src/include/access/zou_wal.h
+@@ -37,4 +37,7 @@
+ /* The published durable LSN, InvalidXLogRecPtr before the first publish. */
+ extern XLogRecPtr ZouWalDurableLSN(void);
+ 
++/* The LSN a page read must be served at, the replay position in recovery. */
++extern XLogRecPtr ZouWalReadLSN(void);
++
+ #endif							/* ZOU_WAL_H */
+diff --git a/src/backend/storage/smgr/zou_smgr.c b/src/backend/storage/smgr/zou_smgr.c
+--- a/src/backend/storage/smgr/zou_smgr.c
++++ b/src/backend/storage/smgr/zou_smgr.c
+@@ -356,7 +356,7 @@
+ 	zou_check(zou_smgr_readv(ZOU_LOCATOR(reln), (uint32) forknum,
+ 							 (uint32) blocknum, (uint8 **) buffers,
+ 							 (uint32) nblocks,
+-							 (uint64) ZouWalDurableLSN()),
++							 (uint64) ZouWalReadLSN()),
+ 			  "readv", reln, forknum);
+ }
+ 
+@@ -413,7 +413,7 @@
+ 		pages[i] = staged + (Size) i * BLCKSZ;
+ 	rc = zou_smgr_readv(ZOU_LOCATOR(reln), (uint32) forknum,
+ 						(uint32) blocknum, pages, (uint32) nblocks,
+-						(uint64) ZouWalDurableLSN());
++						(uint64) ZouWalReadLSN());
+ 	if (rc != 0)
+ 	{
+ 		pgaio_io_release(ioh);
