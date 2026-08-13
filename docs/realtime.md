@@ -264,6 +264,11 @@ A subscription with a filter and no table is refused, because a column of no tab
 The whole channel is refused when any of its subscriptions cannot be made, which the client reports as `CHANNEL_ERROR` with the reason on it.
 Nothing is half subscribed.
 
+The join reply hands back the subscriptions the server made, each with the id it was given, in the order they were asked for, and the client checks that list against its own bindings field for field before it routes anything.
+After it comes a `system` event reading `Subscribed to PostgreSQL`, which supabase-js does nothing with and an application binding `system` is handed.
+It is here because it is on the socket upstream, and the recorded frames in the conformance suite are the proof rather than the claim.
+It is also the frame to write after, rather than the join reply, if you want the guarantee everywhere: this server holds the join until the tap is open, and upstream answers the join first and says `Subscribed to PostgreSQL` when the changes are flowing, which for the first subscriber after it starts is a few seconds later.
+
 ## What the database has to be for postgres changes
 
 Two things have to be true of a database before any of this delivers anything, and both are true of one this server started.
@@ -289,11 +294,17 @@ alter table todos replica identity full;
 ```
 
 Without that, postgres publishes the primary key of a changed row and not the rest of it, which is why `old_record` on a Supabase project is usually a key and a disappointment.
+An update that left the key alone publishes nothing at all about the old row, and the `old_record` you get is still the key, taken from the new row, which is upstream's answer too: it names which row this was rather than saying there was none.
 The cost of `full` is write ahead log volume on every update and delete, which is why it is not the default anywhere.
 
 The slot a tap holds is temporary.
 It lives exactly as long as the connection holding it, so a server nobody is subscribed to retains no write ahead log and leaves nothing behind to clean up, and a tap sees what happened after it opened rather than a replay of what it missed.
 That is upstream's trade too.
+
+Which is why a join is answered once there is a tap rather than as soon as the subscriptions are registered.
+A slot sees what was written after it existed, so a client told `SUBSCRIBED` while one was still being taken would lose whatever it wrote next, and an application that subscribes and then writes is the ordinary case rather than a corner of one.
+The wait is bounded at five seconds, inside the client's own join timeout: a database this server cannot tap answers the join anyway and the subscriber is told there is a gap, because a join left hanging says less than that.
+Upstream has nothing to wait for here, since its slot is permanent and always being read, which is the same trade in the other direction.
 
 How long a change takes to arrive is measured rather than assumed.
 `zou_realtime_commit_to_socket_seconds` on the ops port is counted from the transaction's commit timestamp to the frame going out, `zou_realtime_change_seconds` is the part of it that happened here, and [operations.md](operations.md) says what each is worth relying on.

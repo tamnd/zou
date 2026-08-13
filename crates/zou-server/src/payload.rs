@@ -441,10 +441,41 @@ fn old(change: &Change, types: &Types, seen: &Seen, large: bool) -> Value {
             seen,
             large,
         ),
-        // No replica identity, so postgres published nothing about the
-        // row that was there. Upstream sends an empty object rather
-        // than a null, which is the difference between a client seeing
-        // nothing and a client seeing that there is nothing.
+        // Postgres published nothing about the row that was there,
+        // which under the default replica identity is what an update
+        // that left the key alone looks like: the key did not move, so
+        // there was no old tuple worth writing down.
+        //
+        // Upstream still says which row it was, and it can, because the
+        // key it would have named is in the new row unchanged. So an
+        // update carries the key here too, taken from the record, and
+        // that is what a client comparing old and new is given to
+        // compare on. A delete is not this case, because a delete
+        // always publishes a tuple.
+        None if change.op == Op::Update && change.relation.columns.iter().any(|c| c.key) => {
+            let keys: Vec<bool> = change
+                .relation
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(at, column)| {
+                    column.key && (!seen.keys_only || seen.keys.get(at).copied().unwrap_or(false))
+                })
+                .collect();
+            row(
+                &change.relation,
+                &change.record,
+                None,
+                Some(&keys),
+                types,
+                seen,
+                large,
+            )
+        }
+        // A table with nothing to name a row by, where upstream sends
+        // an empty object rather than a null, which is the difference
+        // between a client seeing nothing and a client seeing that
+        // there is nothing.
         None => Value::Object(Map::new()),
     }
 }
@@ -899,6 +930,34 @@ mod tests {
         assert_eq!(
             data["old_record"],
             serde_json::json!({"id": 12, "details": "wash up", "done": false})
+        );
+    }
+
+    /// The ordinary update, which is the one most tables get: default
+    /// replica identity, a key nobody touched, and so no old tuple in
+    /// the write ahead log at all.
+    #[test]
+    fn an_update_that_published_no_old_row_still_says_which_row_it_was() {
+        let change = change(
+            Op::Update,
+            vec![text("12"), text("washed up"), text("t")],
+            None,
+            false,
+        );
+        assert_eq!(
+            data(&change, &types(), &Seen::all(&change.relation))["old_record"],
+            serde_json::json!({"id": 12}),
+            "the key did not move, so it is in the new row, and upstream names the row rather \
+             than sending an empty object"
+        );
+
+        let mut seen = Seen::all(&change.relation);
+        seen.keys_only = true;
+        seen.keys = vec![true, false, false];
+        assert_eq!(
+            data(&change, &types(), &seen)["old_record"],
+            serde_json::json!({"id": 12}),
+            "and the cut a policy makes is the same cut, since the key is all there was"
         );
     }
 

@@ -638,6 +638,15 @@ impl Session {
             "ok",
             json!({"postgres_changes": echoed}),
         ))];
+        // And the line upstream says after it. Nothing in realtime-js
+        // acts on this, but it is on the socket and an application can
+        // bind `system`, so a server that skips it sends a different
+        // conversation than the one that was recorded.
+        actions.push(self.send(Frame::system(
+            &frame,
+            "postgres_changes",
+            "Subscribed to PostgreSQL",
+        )));
         actions.extend(self.after_reply(topic));
         actions
     }
@@ -1275,6 +1284,23 @@ mod tests {
              walks its bindings and this list together and unsubscribes the channel when any field \
              differs, so a filter this server tidied into a null would fail every subscription \
              that did not have one"
+        );
+
+        let system = text_of(&actions[1]);
+        assert_eq!(system.event, "system");
+        assert_eq!(system.topic, "realtime:room");
+        assert_eq!(system.join_ref.as_deref(), Some("1"));
+        assert_eq!(system.reference, None);
+        assert_eq!(
+            system.payload,
+            json!({
+                "message": "Subscribed to PostgreSQL",
+                "status": "ok",
+                "extension": "postgres_changes",
+                "channel": "room",
+            }),
+            "the line upstream says after the reply, which is on the socket whether or not the \
+             client's own library does anything with it"
         );
     }
 

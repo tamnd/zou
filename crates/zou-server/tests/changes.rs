@@ -136,16 +136,20 @@ async fn slots(dsn: &str) -> i64 {
     .await
 }
 
-/// Wait until the server has a slot, so that what is written next is
-/// written into it rather than before it.
-async fn tapped(dsn: &str) {
-    for _ in 0..200 {
-        if slots(dsn).await > 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("the server never took a replication slot");
+/// The join has been answered, so there is a slot.
+///
+/// This used to be a wait, because the reply came back before the
+/// reader had taken one and a row written straight afterwards was
+/// written before the slot existed and lost. Now the reply waits for
+/// the tap, so this is the assertion that it still does: what a client
+/// writes the moment it is told it is subscribed is a row it hears
+/// about.
+async fn tapping(dsn: &str) {
+    assert!(
+        slots(dsn).await > 0,
+        "the join was answered before anything was reading the write ahead log, so the next \
+         write would go into a database nobody had a slot on"
+    );
 }
 
 /// Wait until no slot of ours is open anywhere, which is where a test
@@ -233,6 +237,21 @@ async fn subscribe(socket: &mut Socket, sub: &str, wants: Value) -> Value {
     .await;
     let reply = next(socket).await;
     assert_eq!(reply[4]["status"], "ok", "{reply}");
+    // And the line upstream says after it, which is on the socket before
+    // any change is, so it is read here rather than by whoever is
+    // waiting for a row.
+    let system = next(socket).await;
+    assert_eq!(system[3], "system", "{system}");
+    assert_eq!(
+        system[4],
+        json!({
+            "message": "Subscribed to PostgreSQL",
+            "status": "ok",
+            "extension": "postgres_changes",
+            "channel": "db",
+        }),
+        "the frame Supabase Realtime sends once a join's subscriptions exist"
+    );
     reply[4]["response"].clone()
 }
 
@@ -286,7 +305,7 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
     assert!(echoed[0].get("filter").is_none(), "{response}");
     assert!(echoed[0]["id"].is_number(), "{response}");
     let both = vec![echoed[0]["id"].clone(), echoed[1]["id"].clone()];
-    tapped(&dsn).await;
+    tapping(&dsn).await;
 
     run(&dsn, "insert into chg_todos values (1, 'wash up')").await;
     let insert = changed(&mut socket).await;
@@ -387,7 +406,7 @@ async fn a_row_a_policy_hides_never_reaches_the_socket_it_hides_it_from() {
     let mut his = connect(at).await;
     subscribe(&mut hers, ANA, wants.clone()).await;
     subscribe(&mut his, BEN, wants).await;
-    tapped(&dsn).await;
+    tapping(&dsn).await;
 
     run(
         &dsn,
@@ -434,7 +453,7 @@ async fn nothing_is_read_once_the_last_subscriber_has_gone() {
         json!([{"event": "*", "schema": "public", "table": "chg_gone"}]),
     )
     .await;
-    tapped(&dsn).await;
+    tapping(&dsn).await;
 
     // Closing the socket rather than leaving the channel, because that
     // is what a browser tab does and the harder of the two to get

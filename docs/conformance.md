@@ -405,6 +405,40 @@ One question is deliberately not asked, and it is the only place these two serve
 A push a write policy refused is dropped in silence by Supabase Realtime and answered with an error on the push by zou, and both look identical to a listener, so the suite asks what they agree on, that nothing arrives.
 The difference is written down in [realtime.md](realtime.md) instead, because a suite that asserts a divergence stops being a record of what upstream does.
 
+`js-realtime-changes/` is a fourth realtime directory, and it needs a database for a different reason than the third: the thing under test is a row nobody sent.
+
+`setup.sql` there is five tables and one realtime line, the `alter publication` a project runs when it turns a table on.
+Four of the tables are in the publication and one is not, which is the only way to ask whether a table nobody opted in is really left alone; one of the four publishes its old rows, which is the single setting that changes what an update and a delete carry; one has row level security on it with a policy about who owns a row; and one is written to by nothing but the frame test.
+Every write in the suite goes through `/rest/v1` as the service key, because a suite holding a connection to the database could set a row up in a way no application could.
+11 tests: an insert, an update, a delete, the same update and delete on a table with `replica identity full`, a subscription for one event, a filter, a table nobody published, a policy withholding somebody else's row, a delete on that table telling everybody the key and nothing else, and two subscriptions on one channel.
+
+The last one is a different shape of question, and the reason this suite exists rather than being three more tests in the file above.
+Everything else reads what the client handed the application, which is the fold of the frames rather than the frames: the client takes the ids out of the join's answer, routes changes on them, renames `record` to `new` and hands over an object, and a server can get all of that right while sending something upstream never sends.
+So the last test records the frames off the socket before the client has decoded them and compares them with what Supabase Realtime sent for the same three writes, which is `frames.json` in that directory, taken from a real `supabase start`.
+Three things in a frame are true of a run rather than of a server and are replaced rather than dropped: a ref, the subscription ids, and the commit timestamp.
+The ids become the position they held in the join's answer, which keeps the only thing about them that matters, that a change came back naming the subscription the join made.
+
+It caught three things, one from each direction it can be run.
+
+Against zou, eight of the eleven failed on their first run, and they are the kind only a real client finds.
+zou answered a join once its subscriptions were registered, and it takes its replication slot when the first subscriber arrives, so a client that subscribed and then wrote was told `SUBSCRIBED` while the slot was still being taken and the row it wrote next was written before there was anything to see it.
+They passed with a second and a half of sleep in front of every write, which is how it was found.
+The join reply waits for the tap now, and the socket test in `crates/zou-server/tests/changes.rs` that used to wait for a slot before writing asserts there is one instead.
+
+Against the reference, the recording had a frame in it that zou did not send: a `system` event reading `Subscribed to PostgreSQL`, after the join reply and before any change.
+supabase-js does nothing with it, which is exactly why nothing above the frames could have noticed, and an application binding `system` is handed it.
+The reference also disagreed about an ordinary update: on a table with the default replica identity zou sent `old_record: {}` and Supabase Realtime sent the key, taken from the new row, which is the difference between a client being told which row this was and being told nothing.
+Both are fixed in the server, and the eleven now pass against both.
+
+The reference had the same shape of race in it as zou did, which is why every test in the file writes after the `system` frame rather than after `SUBSCRIBED`.
+Upstream answers the join first and says `Subscribed to PostgreSQL` when the changes are actually flowing, and for the first subscriber to a project after Supabase Realtime starts that is about three and a half seconds later, so a suite that wrote on the join reply lost its first change on a stack that had just come up and never on one that had been running.
+zou holds the join until the tap is open and then says both, so waiting for the second one costs it nothing.
+What that frame says is not asserted, because a subscription to a table that is not in the publication comes back as `status: error` naming the parameters upstream and as `ok` on zou, which is [#347](https://github.com/tamnd/zou/issues/347).
+
+And the fixture itself was wrong in a way only the reference could say.
+It granted the reads and left the writes ungranted, on the reasoning that a service key has `bypassrls` and needs no grant, and every write in it failed against `supabase start` with a 403: `bypassrls` is about policies and grants are grants.
+zou took the writes because its bootstrap grants the three api roles everything in `public`, which upstream's default privileges do not, and that difference is [#344](https://github.com/tamnd/zou/issues/344) rather than something to hide in a fixture.
+
 ## The package a project installs, asked the same questions
 
 Everything above runs a zou this harness linked in, against a Postgres somebody else brought up, usually in a container.

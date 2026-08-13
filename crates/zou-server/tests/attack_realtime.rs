@@ -136,16 +136,20 @@ async fn slots(dsn: &str) -> i64 {
     .await
 }
 
-/// Wait until the server has a slot, so that what is written next is
-/// written into it rather than before it.
-async fn tapped(dsn: &str) {
-    for _ in 0..200 {
-        if slots(dsn).await > 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    panic!("the server never took a replication slot");
+/// The join has been answered, so there is a slot.
+///
+/// This used to be a wait, because the reply came back before the
+/// reader had taken one and a row written straight afterwards was
+/// written before the slot existed and lost. Now the reply waits for
+/// the tap, so this is the assertion that it still does: what a client
+/// writes the moment it is told it is subscribed is a row it hears
+/// about.
+async fn tapping(dsn: &str) {
+    assert!(
+        slots(dsn).await > 0,
+        "the join was answered before anything was reading the write ahead log, so the next \
+         write would go into a database nobody had a slot on"
+    );
 }
 
 /// Wait until no slot of ours is open anywhere, which is where a test
@@ -239,6 +243,11 @@ async fn subscribe(socket: &mut Socket, topic: &str, token: &str, wants: Value) 
 async fn subscribed(socket: &mut Socket, topic: &str, sub: &str, wants: Value) -> Value {
     let reply = subscribe(socket, topic, &token(sub), wants).await;
     assert_eq!(reply[4]["status"], "ok", "{reply}");
+    // The line that follows the reply on a join that asked for postgres
+    // changes, taken off the socket here so that a test waiting for a
+    // change does not read it as one.
+    let system = next(socket).await;
+    assert_eq!(system[3], "system", "{system}");
     reply[4]["response"].clone()
 }
 
@@ -301,7 +310,7 @@ async fn no_wording_of_a_subscription_gets_around_the_policy_on_the_table() {
         ]),
     )
     .await;
-    tapped(&dsn).await;
+    tapping(&dsn).await;
 
     run(
         &dsn,
@@ -352,7 +361,7 @@ async fn a_table_the_attacker_may_not_select_gives_them_the_refusal_and_no_value
         json!([{"event": "*", "schema": "public", "table": "atk_ledger"}]),
     )
     .await;
-    tapped(&dsn).await;
+    tapping(&dsn).await;
 
     run(&dsn, "insert into atk_ledger values (1, 900000)").await;
 
@@ -403,7 +412,7 @@ async fn a_column_the_attacker_may_not_select_is_not_in_the_change() {
         json!([{"event": "*", "schema": "public", "table": "atk_people"}]),
     )
     .await;
-    tapped(&dsn).await;
+    tapping(&dsn).await;
 
     run(&dsn, "insert into atk_people values (1, 'ana', 120000)").await;
 
@@ -469,7 +478,7 @@ async fn a_filter_is_not_a_place_to_put_sql() {
         ]),
     )
     .await;
-    tapped(&dsn).await;
+    tapping(&dsn).await;
 
     run(&dsn, "insert into atk_open values (1, 'still here')").await;
     quiet(&mut mine).await;
@@ -520,7 +529,7 @@ async fn a_delete_tells_the_attacker_a_row_went_and_not_what_was_in_it() {
         json!([{"event": "DELETE", "schema": "public", "table": "atk_secrets"}]),
     )
     .await;
-    tapped(&dsn).await;
+    tapping(&dsn).await;
 
     // Replica identity full, which publishes every column of the old
     // row, so what the attacker is not told is a decision here rather
@@ -568,7 +577,7 @@ async fn a_refresh_that_does_not_verify_takes_the_subscription_with_it() {
         json!([{"event": "*", "schema": "public", "table": "atk_feed"}]),
     )
     .await;
-    tapped(&dsn).await;
+    tapping(&dsn).await;
 
     run(&dsn, "insert into atk_feed values (1, 'before')").await;
     let heard = changed(&mut mine).await;

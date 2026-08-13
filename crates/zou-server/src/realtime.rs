@@ -672,8 +672,32 @@ async fn subscribed(
         };
         ids.push(id);
     }
+    // And then wait for the tap, which is the difference between a
+    // client that may write a row the moment it is told it is
+    // subscribed and one that has to guess how long to leave it. A
+    // replication slot sees what was written after it existed, so a
+    // join answered while the reader was still opening one is a client
+    // that will never hear about the row it wrote next.
+    //
+    // Bounded, because the alternative is a join that hangs on a reader
+    // that is not running at all. Over the bound it is answered anyway
+    // and whatever is wrong reaches this subscriber as a gap, which is
+    // what happened before this wait existed.
+    if tokio::time::timeout(TAPPING, app.changes.tapping())
+        .await
+        .is_err()
+    {
+        log::warn!("realtime: a subscription was answered before there was a tap to carry it");
+    }
     Ok(ids)
 }
+
+/// How long a join waits for a tap before being answered without one.
+///
+/// Comfortably inside realtime-js's own ten second join timeout, since
+/// a client that gave up on the join would resubscribe and wait for the
+/// same thing again.
+const TAPPING: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Start the one loop that reads this database's changes.
 fn reading(app: &Arc<App>) {
