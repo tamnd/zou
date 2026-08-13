@@ -17,6 +17,10 @@ The process counts requests as `zou_http_requests_total{surface,status}` and `zo
 The multi tenant path adds `zou_tenants_attached`, `zou_tenant_attaches_total{outcome}` and `zou_tenant_attach_seconds`, which is the cold attach NFR-12 puts a number on, and `zou_registry_lookups_total{result}`, which is whether the registry cache ttls are doing anything.
 `zou_build_info{version}` is always 1 and is there to join on.
 
+A subscription is not a request, so the surface counters say nothing about how live one is, and `zou_realtime_changes_total` counts the database changes that reached a socket with two histograms next to it.
+`zou_realtime_commit_to_socket_seconds` is what an application feels, counted from the commit timestamp postgres wrote, which means it carries whatever a database on another machine disagrees with this one's clock about, and a clock behind the database's is counted as a zero rather than as a negative.
+`zou_realtime_change_seconds` is this server's own share of the same interval, from the tap reading the change out of the slot to the frame going out, on one clock, and it is the one that says whether what moved was here.
+
 Store numbers come from the counter file `ZOU_STORE_STATS` names rather than from counters of this process, and a scrape folds that file in as it reads it.
 That is deliberate: the file is shared memory, so the ops a postgres backend made in another process are in it, and counting in process would count the ones this process can see and miss the rest.
 Set `ZOU_STORE_STATS=/run/zou/stats` and the scrape gains `zou_store_ops_total{op,class}`, `zou_store_bytes_total{op,class}`, `zou_store_errors_total{op}`, `zou_store_conflicts_total`, `zou_store_op_seconds{op}` and the read tier counters.

@@ -32,6 +32,7 @@ use crate::binding::Binding;
 // Two things in scope here are called what a socket heard: the enum
 // this loop selects over and the one the reader sends. The reader's
 // takes the other name, since this file is the loop's.
+use crate::ops;
 use crate::reader::{Heard as Feed, Listening, Reader};
 use crate::visible::Asker;
 use crate::{App, AuthContext, json_body, policy};
@@ -371,6 +372,10 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
                 change = changes.heard.recv() => Heard::Changed(change),
             },
         };
+        // Set when what came in was a change, so that how long it took
+        // to arrive is counted after the frame has gone out rather than
+        // before, which is the moment the client could have read it.
+        let mut delivered = None;
         let actions = match heard {
             Heard::Client(None) => break,
             Heard::Client(Some(Err(e))) => {
@@ -395,7 +400,15 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
                 log::warn!("realtime: a socket missed {missed} messages on {topic}, closing it");
                 break;
             }
-            Heard::Changed(Some(Feed::Change { ids, data })) => session.changed(&ids, &data),
+            Heard::Changed(Some(Feed::Change {
+                ids,
+                data,
+                commit_ts,
+                read,
+            })) => {
+                delivered = Some((commit_ts, read));
+                session.changed(&ids, &data)
+            }
             // The same news as a lagging topic and for the same reason:
             // the tap was reopened or this socket was not reading, so
             // what it has is not everything and there is no way to say
@@ -421,6 +434,9 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
         .await
         {
             break;
+        }
+        if let Some((commit_ts, read)) = delivered {
+            ops::change_delivered(commit_ts, read);
         }
     }
     // Every subscription this socket held, out of the index the reader

@@ -59,7 +59,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
@@ -96,7 +96,18 @@ pub enum Heard {
     /// A change this subscriber asked for, with the ids of the
     /// bindings it matched, which is how a client knows which of its
     /// own subscriptions this is an answer to.
-    Change { ids: Vec<u64>, data: Value },
+    Change {
+        ids: Vec<u64>,
+        data: Value,
+        /// When the transaction that made it committed, by the
+        /// database's clock, in microseconds.
+        commit_ts: i64,
+        /// When the tap read it, by this process's clock. The two
+        /// together are what the delivery latency is measured from,
+        /// and they are two clocks because there is no one clock this
+        /// question has an answer on.
+        read: Instant,
+    },
     /// Changes were missed, because the tap had to be reopened or this
     /// subscriber was not reading. There is no way to say which
     /// changes, which is the whole point of telling somebody.
@@ -406,6 +417,9 @@ impl Reader {
 
     /// Everything one batch is owed, in the order postgres wrote it.
     async fn deliver(&mut self, client: &tokio_postgres::Client, batch: &[Change]) {
+        // When this batch came back, which is where the half of the
+        // delivery latency that is this server's own starts.
+        let read = Instant::now();
         for change in batch {
             self.at = change.lsn;
             let wanted = self.changes.wanted(change);
@@ -438,7 +452,12 @@ impl Reader {
                     }
                 };
                 let Some(data) = data else { continue };
-                match to.try_send(Heard::Change { ids, data }) {
+                match to.try_send(Heard::Change {
+                    ids,
+                    data,
+                    commit_ts: change.commit_ts,
+                    read,
+                }) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         // Not a wait and not a drop of this one

@@ -328,6 +328,36 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
         json!({"id": 1}),
         "the default replica identity publishes the key and the payload says so"
     );
+
+    // The delivery latency is counted here rather than in a test of
+    // its own, because what could be wrong about it is the wiring: a
+    // number observed in a unit test proves the arithmetic and nothing
+    // about whether a change that reached a socket was ever measured.
+    //
+    // Waited for rather than read once, since the count goes up after
+    // the frame has gone out and the client is what read it.
+    let mut scrape = String::new();
+    let mut counted = 0;
+    for _ in 0..200 {
+        scrape = zou_ops::metrics::registry().render();
+        counted = scrape
+            .lines()
+            .find_map(|line| line.strip_prefix("zou_realtime_changes_total "))
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or_default();
+        if counted >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        counted >= 4,
+        "four frames went out on this socket and each of them is a delivery, {counted}"
+    );
+    assert!(
+        scrape.contains("zou_realtime_commit_to_socket_seconds_bucket"),
+        "{scrape}"
+    );
 }
 
 /// The policies decide what a socket is told, not just what it can
