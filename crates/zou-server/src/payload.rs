@@ -34,8 +34,8 @@
 //! nothing else. Postgres pads the rest of that tuple with nulls,
 //! which would be a payload saying every other column became null, so
 //! the padding is dropped rather than sent. That cut and the one a
-//! delete under row level security gets are different cuts, which
-//! [`keep`] is about.
+//! delete under row level security gets are different cuts, which the
+//! `keep` below is about.
 //!
 //! A row too large to send is not an error and not a truncation. It is
 //! the payload with every value over sixty four bytes left out and an
