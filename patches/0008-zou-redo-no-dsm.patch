@@ -1,0 +1,85 @@
+Do not give the redo worker a dynamic shared memory control segment.
+
+A walredo worker gets killed by its own seccomp filter every so often,
+on unlink (zou #332). The caller turns out to be its own exit:
+
+    unlink("/dev/shm/PostgreSQL.554764962")
+     > shm_unlink
+     > dsm_impl_posix
+     > dsm_postmaster_shutdown
+     > shmem_exit
+     > proc_exit
+     > ZouRedoMain
+
+The worker is a standalone process, so CreateSharedMemoryAndSemaphores
+runs dsm_postmaster_startup for it and it ends up owning a control
+segment nobody else can see. Destroying that on the way out is a
+shm_unlink, which glibc implements as unlink on a path under /dev/shm,
+and unlink is not on the sandbox allowlist. It should not be either:
+the worker replays records it did not write, and a process that can
+unlink by name can delete the data directory and the store.
+
+It was rare because the pool kills a retiring worker rather than
+waiting for it, so the SIGKILL usually wins the race with proc_exit.
+Feeding a worker a clean EOF reproduces it every time.
+
+Nothing in the worker has any use for dynamic shared memory: it runs
+no parallel workers and loads no extensions. So it does not create the
+control segment at all, which also stops it leaking one under /dev/shm
+every time the pool kills it. dsm_create says what is going on instead
+of dereferencing the NULL control pointer, in case a future caller
+appears.
+
+diff --git a/src/backend/storage/ipc/ipci.c b/src/backend/storage/ipc/ipci.c
+--- a/src/backend/storage/ipc/ipci.c
++++ b/src/backend/storage/ipc/ipci.c
+@@ -25,6 +25,7 @@
+ #include "access/xlogprefetcher.h"
+ #include "access/xlogrecovery.h"
+ #include "access/zou_wal.h"
++#include "access/zou_walredo.h"
+ #include "commands/async.h"
+ #include "miscadmin.h"
+ #include "pgstat.h"
+@@ -243,8 +244,18 @@
+ 	/* Initialize subsystems */
+ 	CreateOrAttachShmemStructs();
+ 
+-	/* Initialize dynamic shared memory facilities. */
+-	dsm_postmaster_startup(shim);
++	/*
++	 * Initialize dynamic shared memory facilities.
++	 *
++	 * The zou redo worker is skipped.  It is a standalone process, so it
++	 * would create a control segment of its own and destroy it again on the
++	 * way out, and the destroy is a shm_unlink, which is an unlink, which is
++	 * not a syscall the redo sandbox allows.  The worker has no use for
++	 * dynamic shared memory anyway: nothing in it runs parallel workers or
++	 * loads an extension.
++	 */
++	if (!zou_redo_active)
++		dsm_postmaster_startup(shim);
+ 
+ 	/*
+ 	 * Now give loadable modules a chance to set up their shmem allocations
+diff --git a/src/backend/storage/ipc/dsm.c b/src/backend/storage/ipc/dsm.c
+--- a/src/backend/storage/ipc/dsm.c
++++ b/src/backend/storage/ipc/dsm.c
+@@ -533,6 +533,17 @@
+ 	if (!dsm_init_done)
+ 		dsm_backend_startup();
+ 
++	/*
++	 * A process that skipped dsm_postmaster_startup has no control segment to
++	 * record this in.  Only the zou redo worker does that, and it is meant to
++	 * have no dsm user at all, so say so rather than dereferencing NULL a few
++	 * lines down.
++	 */
++	if (dsm_control == NULL)
++		ereport(ERROR,
++				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++				 errmsg("dynamic shared memory is not available in this process")));
++
+ 	/* Create a new segment descriptor. */
+ 	seg = dsm_create_descriptor();
+ 

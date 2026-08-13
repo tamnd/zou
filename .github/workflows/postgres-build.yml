@@ -499,6 +499,13 @@ jobs:
           cd dist
           sha256sum zou-linux-x64.tar.gz > zou-linux-x64.tar.gz.sha256
           python3 -m http.server 8617 >/dev/null 2>&1 &
+          # The server takes a moment to bind and the postinstall does not
+          # retry, so ask for the checksum until it answers rather than
+          # racing it and failing the job with "fetch failed".
+          for _ in $(seq 100); do
+            curl -sfo /dev/null http://127.0.0.1:8617/zou-linux-x64.tar.gz.sha256 && break
+            sleep 0.1
+          done
           cd ../packaging/npm
           ZOU_BASE_URL=http://127.0.0.1:8617 ZOU_VERSION=v0.0.0-ci node install.js
           ./bin/zou.js --version
