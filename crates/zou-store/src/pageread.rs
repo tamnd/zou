@@ -15,7 +15,11 @@
 //! Footers cache by object name. Layers are immutable, so a cached
 //! footer is never stale; a map swap after flush or compaction just
 //! stops naming the layers that went away, and dropping their cache
-//! entries is a bounded memory question, not a correctness one.
+//! entries is a bounded memory question, not a correctness one, which
+//! is what [`LayerReader::forget_unnamed`] is for. The cache is not an
+//! optimization to take or leave: a footer runs to megabytes on a
+//! layer of any size, so a reader that throws it away pays those
+//! megabytes again on the next read of the same layer.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -212,6 +216,24 @@ impl<'a> LayerReader<'a> {
         let footer = Arc::new(footer);
         self.footers.lock().unwrap().insert(name, footer.clone());
         Ok(footer)
+    }
+
+    /// Drop cached footers for layers `map` no longer names, and
+    /// answer how many are still held. Compaction retires layers
+    /// constantly, and a footer is not the small thing the fetch code
+    /// makes it look like: a 350 MB delta layer carries a 2 MB bloom
+    /// plus an index row per block. A reader that lives as long as the
+    /// process has to let go of them or it keeps the whole retired
+    /// history in memory.
+    pub fn forget_unnamed(&self, map: &LayerMap) -> usize {
+        let mut footers = self.footers.lock().unwrap();
+        if footers.is_empty() {
+            return 0;
+        }
+        let named: std::collections::HashSet<String> =
+            map.layers().iter().map(|d| d.name()).collect();
+        footers.retain(|name, _| named.contains(name));
+        footers.len()
     }
 
     /// The read algorithm for `(key, lsn)`: plan on the map, fetch the
@@ -424,6 +446,24 @@ mod tests {
             fresh.reconstruct(&map, &mem, &k(3), Lsn(310)),
             Err(ReadError::Missing { .. })
         ));
+    }
+
+    #[test]
+    fn the_footers_of_retired_layers_are_let_go() {
+        let (store, map, mem) = history();
+        let reader = LayerReader::new(&store, "layers/");
+        reader.reconstruct(&map, &mem, &k(3), Lsn(310)).unwrap();
+        assert_eq!(reader.footers.lock().unwrap().len(), 3);
+
+        // What compaction leaves behind: a map naming one of the three.
+        let kept = LayerMap::new(vec![map.layers()[0].clone()]).unwrap();
+        assert_eq!(reader.forget_unnamed(&kept), 1);
+        assert_eq!(
+            reader.footers.lock().unwrap().keys().next(),
+            Some(&map.layers()[0].name()),
+            "the surviving footer is the one the map still names"
+        );
+        assert_eq!(reader.forget_unnamed(&kept), 1, "a second pass is a no op");
     }
 
     #[test]

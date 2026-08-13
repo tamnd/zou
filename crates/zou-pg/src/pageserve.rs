@@ -500,6 +500,14 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         Err(e) => return Err(format!("shard manifest: {e}")),
     }
 
+    // One service for the life of the driver. Every read plans against
+    // layer footers, and a footer is megabytes on a layer of any size,
+    // so rebuilding the service per request meant refetching them per
+    // request: 34 GB of range reads for 18466 pages in one segment of
+    // the gamingpc smoke, 2.4 MB a page (zou #338).
+    let service = page_service(&*store, &cfg.layout, pool.as_ref(), cfg.data_checksums);
+    let mut footers_held = 0;
+
     loop {
         // A poll that stopped on its slice has more waiting, so go
         // straight back to it after the readers have had their turn
@@ -596,8 +604,17 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
             // is what planning and reading the page actually cost.
             note_phase(Phase::Park, req.arrived.elapsed());
             let ran = Instant::now();
-            serve_reloading(&cfg, &*store, pool.as_ref(), &mut map, mem, &req, at);
+            serve_reloading(&service, &*store, &cfg.layout, &mut map, mem, &req, at);
             note_phase(Phase::Read, ran.elapsed());
+        }
+
+        // Flush and compaction retire layers under the reader. Holding
+        // their footers is holding a bloom filter per retired layer,
+        // so let them go once the map has stopped naming them.
+        let held = service.forget_unnamed(&map);
+        if held != footers_held {
+            footers_held = held;
+            log::debug!("zou pageserve: {held} layer footers cached");
         }
 
         if stop.load(Ordering::Acquire) {
@@ -854,6 +871,27 @@ fn reload_map(
     }
 }
 
+/// The service the driver serves every request through, built once so
+/// the footer cache survives the request that filled it (zou #338).
+///
+/// The fallback reads the pg/ image of a block the layers do not
+/// cover, the objects frozen at the put elision flag day.
+fn page_service<'a>(
+    store: &'a dyn CasStore,
+    layout: &'a TenantLayout,
+    pool: Option<&'a RedoPool>,
+    data_checksums: bool,
+) -> PageService<'a> {
+    PageService::new(store, layout.shard_prefix(0), pool, data_checksums).with_base_fallback(
+        move |blk: &BlockRef| match store
+            .get(&layout.pg_block(blk.spc, blk.db, blk.rel, blk.fork, blk.blk))
+        {
+            Ok(Some((data, _))) if data.len() == BLCKSZ => Some(data),
+            _ => None,
+        },
+    )
+}
+
 /// Serve one request, and if the map named a layer the store no
 /// longer has, pick up the current manifest and serve again.
 ///
@@ -870,22 +908,22 @@ fn reload_map(
 /// named by the current manifest and genuinely gone, and it goes back
 /// to the reader as the error it is.
 fn serve_reloading(
-    cfg: &ServerConfig,
+    service: &PageService,
     store: &dyn CasStore,
-    pool: Option<&RedoPool>,
+    layout: &TenantLayout,
     map: &mut LayerMap,
     mem: &Memtable,
     req: &GetReq,
     at: u64,
 ) {
-    let Served::Stale { layer } = serve(cfg, store, pool, map, mem, req, at, false) else {
+    let Served::Stale { layer } = serve(service, map, mem, req, at, false) else {
         return;
     };
     log::info!("zou pageserve: layer {layer} is gone, reloading the map and reading again");
-    if let Err(e) = reload_map(store, &cfg.layout, map) {
+    if let Err(e) = reload_map(store, layout, map) {
         log::warn!("zou pageserve: {e}");
     }
-    serve(cfg, store, pool, map, mem, req, at, true);
+    serve(service, map, mem, req, at, true);
 }
 
 /// What one serve attempt did: replied, or found the map naming a
@@ -896,33 +934,19 @@ enum Served {
     Stale { layer: String },
 }
 
-/// Serve one request at `at` and reply on its channel. The service is
-/// rebuilt per call; the footer cache it loses is a few small reads
-/// on a local store, and the borrow it would otherwise pin across
-/// ingest mutation is not worth it yet.
+/// Serve one request at `at` and reply on its channel.
 ///
 /// `last` says whether a missing layer is the answer. On the first
 /// attempt it is not, the request goes back unanswered so the caller
 /// can reload the map; on the retry it is.
-#[allow(clippy::too_many_arguments)]
 fn serve(
-    cfg: &ServerConfig,
-    store: &dyn CasStore,
-    pool: Option<&RedoPool>,
+    service: &PageService,
     map: &LayerMap,
     mem: &Memtable,
     req: &GetReq,
     at: u64,
     last: bool,
 ) -> Served {
-    let layout = &cfg.layout;
-    let service = PageService::new(store, layout.shard_prefix(0), pool, cfg.data_checksums)
-        .with_base_fallback(move |blk: &BlockRef| {
-            match store.get(&layout.pg_block(blk.spc, blk.db, blk.rel, blk.fork, blk.blk)) {
-                Ok(Some((data, _))) if data.len() == BLCKSZ => Some(data),
-                _ => None,
-            }
-        });
     let refs: Vec<BlockRef> = req
         .blks
         .iter()
@@ -1249,11 +1273,24 @@ mod tests {
     struct CountingStore {
         inner: Arc<dyn CasStore>,
         gets: std::sync::atomic::AtomicUsize,
+        ranges: std::sync::atomic::AtomicUsize,
     }
 
     impl CountingStore {
+        fn new(inner: Arc<dyn CasStore>) -> Self {
+            Self {
+                inner,
+                gets: std::sync::atomic::AtomicUsize::new(0),
+                ranges: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
         fn gets(&self) -> usize {
             self.gets.load(Ordering::SeqCst)
+        }
+
+        fn ranges(&self) -> usize {
+            self.ranges.load(Ordering::SeqCst)
         }
     }
 
@@ -1279,6 +1316,7 @@ mod tests {
             offset: u64,
             len: u64,
         ) -> Result<Option<Vec<u8>>, zou_store::CasError> {
+            self.ranges.fetch_add(1, Ordering::SeqCst);
             self.inner.get_range(key, offset, len)
         }
         fn delete(&self, key: &str) -> Result<(), zou_store::CasError> {
@@ -1302,10 +1340,7 @@ mod tests {
     #[test]
     fn a_caught_up_poll_does_not_reread_the_tail() {
         let inner: Arc<dyn CasStore> = Arc::new(MemStore::default());
-        let store = Arc::new(CountingStore {
-            inner,
-            gets: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let store = Arc::new(CountingStore::new(inner));
         let counted: Arc<dyn CasStore> = store.clone();
         let layout = TenantLayout::new("t");
         let media = WalMedia::single(Arc::clone(&counted));
@@ -1556,6 +1591,82 @@ mod tests {
         );
     }
 
+    /// The cost behind #338. The driver used to build the page service
+    /// inside the serve call, so the footer cache lived for exactly one
+    /// request and every read planned by refetching the footer of every
+    /// layer it touched. A footer is not small: the 350 MB delta layer
+    /// the gamingpc smoke ended with carries a 2 MB bloom and an index
+    /// row for each of its 3850 blocks, and the segment holding the
+    /// death drill paid 34.5 GB of range reads to serve 18466 pages,
+    /// 2.4 MB a page. The second read of a layer should cost the block
+    /// it wants and nothing else.
+    #[test]
+    fn a_second_read_of_a_layer_does_not_refetch_its_footer() {
+        use zou_store::layer::{ImageBuilder, LayerKey};
+        use zou_store::layermap::LayerDesc;
+        use zou_store::shardmanifest::{LayerEntry, publish_layer};
+
+        let inner: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let counting = Arc::new(CountingStore::new(inner));
+        let store: Arc<dyn CasStore> = counting.clone();
+        let layout = TenantLayout::new("t");
+        let page = vec![4u8; BLCKSZ];
+
+        let mut images = ImageBuilder::new(1, Lsn(100), 8192);
+        images
+            .push(LayerKey::page(1663, 5, 2000, 0, 3), &page)
+            .expect("image pushes");
+        let (bytes, footer) = images.finish().expect("image layer builds");
+        let desc = LayerDesc::from_footer(&footer, bytes.len() as u64);
+        store
+            .put(
+                &format!("{}{}", layout.shard_prefix(0), desc.name()),
+                &bytes,
+            )
+            .expect("layer lands");
+        publish_layer(
+            &*store,
+            &layout.shard_manifest(0),
+            0,
+            &LayerEntry {
+                name: desc.name(),
+                size: bytes.len() as u64,
+                owner: None,
+                upto: None,
+            },
+            footer.max_lsn,
+        )
+        .expect("published");
+
+        let sock = sock_path("footers.sock");
+        let mut srv = server(Arc::clone(&store), sock.clone());
+        let client = PageClient::new(sock);
+
+        assert_eq!(
+            client.get_pages(1663, 5, 2000, 0, &[3], 0).expect("served")[0],
+            page
+        );
+        let first = counting.ranges();
+        assert!(
+            first >= 2,
+            "the first read fetched the footer, {first} range"
+        );
+
+        for _ in 0..4 {
+            assert_eq!(
+                client.get_pages(1663, 5, 2000, 0, &[3], 0).expect("served")[0],
+                page
+            );
+        }
+        srv.stop();
+        assert_eq!(
+            counting.ranges() - first,
+            4,
+            "four more reads of the same layer cost {} ranges, one block each is 4",
+            counting.ranges() - first
+        );
+    }
+
     /// The read failure every restored node logged in the six hour run
     /// on server2: compaction retired a layer, gc collected the
     /// object, and the page service was still holding the map it
@@ -1636,15 +1747,16 @@ mod tests {
             deadline: Instant::now() + WAIT_CAP,
             reply,
         };
-        let cfg = ServerConfig {
-            store: Arc::clone(&store),
-            layout: layout.clone(),
-            tenant: TENANT,
-            socket: sock_path("stale.sock"),
-            data_checksums: false,
-            redo: None,
-        };
-        serve_reloading(&cfg, &*store, None, &mut map, &Memtable::new(), &req, 200);
+        let service = page_service(&*store, &layout, None, false);
+        serve_reloading(
+            &service,
+            &*store,
+            &layout,
+            &mut map,
+            &Memtable::new(),
+            &req,
+            200,
+        );
         let pages = answers
             .recv()
             .expect("the driver replied")
