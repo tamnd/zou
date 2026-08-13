@@ -220,30 +220,47 @@ impl LayerDesc {
     }
 }
 
-/// What one lookup touches, in apply order: the base image if any
-/// image layer covers the key at or below the read lsn, then every
-/// delta layer that can hold records in `(image_lsn, read_lsn]` for
-/// the key, ascending by lsn range. No image means the key's first
-/// record must initialize the page, which Postgres full page images
-/// and init records do.
+/// What one lookup may touch: every image layer covering the key at
+/// or below the read lsn, newest first, then every delta layer that
+/// can hold records for the key at or below the read lsn, ascending
+/// by lsn range. No image at all means the key's first record must
+/// initialize the page, which Postgres full page images and init
+/// records do.
+///
+/// The base is the newest image that actually holds the key, which is
+/// not always the newest image covering it. An image layer's key
+/// range is the span of what it holds, not a claim to hold all of it:
+/// compaction materializes only the pages redo can rebuild from what
+/// the store has, so an image cut over a busy shard has interior gaps
+/// where a page's base lives somewhere else. Only the reader, footer
+/// in hand, can tell a gap from a hit, so the map hands over the
+/// candidates and [`ReadPlan::above`] takes the floor it settled on.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ReadPlan<'a> {
-    pub image: Option<&'a LayerDesc>,
-    pub deltas: Vec<&'a LayerDesc>,
+    pub images: Vec<&'a LayerDesc>,
+    deltas: Vec<&'a LayerDesc>,
 }
 
-impl ReadPlan<'_> {
-    /// Layers this lookup touches. The compaction invariant keeps this
-    /// at five or less, one image plus four deltas; the map reports it
-    /// so the bound is measured, not assumed.
-    pub fn read_amp(&self) -> usize {
-        self.deltas.len() + usize::from(self.image.is_some())
+impl<'a> ReadPlan<'a> {
+    /// The delta layers that can hold records above `floor`, in apply
+    /// order. `floor` is the lsn of the image the base came from, or
+    /// zero when no image held the key: records at or below it are
+    /// already folded into the base and must not be applied again.
+    pub fn above(&self, floor: Lsn) -> impl Iterator<Item = &'a LayerDesc> {
+        self.deltas
+            .iter()
+            .copied()
+            .filter(move |l| l.max_lsn > floor && l.upto.is_none_or(|u| u > floor))
     }
 
-    /// The lsn floor of the plan: records at or below this are already
-    /// folded into the base image and must not be applied again.
-    pub fn floor(&self) -> Lsn {
-        self.image.map(|i| i.min_lsn).unwrap_or(Lsn(0))
+    /// The worst case layer count for this lookup, before the floor
+    /// takes anything off. The compaction invariant keeps a read at
+    /// five layers or less, one image plus four deltas; the map
+    /// reports the bound so it is measured, not assumed, and
+    /// [`super::pageread::Reconstruction::layers_touched`] reports
+    /// what the read actually paid.
+    pub fn read_amp(&self) -> usize {
+        self.deltas.len() + usize::from(!self.images.is_empty())
     }
 }
 
@@ -361,35 +378,33 @@ impl LayerMap {
         &self.layers
     }
 
-    /// The read algorithm for `(key, lsn)`. The newest covering image
-    /// at or below the lsn is the base; deltas are every covering
-    /// layer whose lsn range intersects `(image_lsn, lsn]`, ascending
-    /// by (min_lsn, max_lsn) so their records apply in order after a
-    /// merge on the actual record lsns. An inherited layer plans
-    /// against `min(lsn, upto)`: the branch cut caps what it may
-    /// serve, so an inherited delta whose usable records all sit at or
-    /// below the floor drops out of the plan entirely.
+    /// The read algorithm for `(key, lsn)`. Candidate bases are every
+    /// covering image at or below the lsn, newest first, and the
+    /// reader takes the first that holds the key. Deltas are every
+    /// covering layer at or below the lsn, ascending by (min_lsn,
+    /// max_lsn) so their records apply in order after a merge on the
+    /// actual record lsns; [`ReadPlan::above`] drops the ones the base
+    /// already covers. An inherited layer plans against `min(lsn,
+    /// upto)`: the branch cut caps what it may serve.
     pub fn plan(&self, key: &LayerKey, lsn: Lsn) -> ReadPlan<'_> {
         let mut hits = Vec::new();
         stab(&self.layers, &self.images, key, &mut hits);
-        let image = hits
+        let mut images: Vec<&LayerDesc> = hits
             .iter()
             .map(|&i| &self.layers[i])
             .filter(|l| l.min_lsn <= l.clamp(lsn))
-            .max_by_key(|l| l.min_lsn);
-        let floor = image.map(|i| i.min_lsn).unwrap_or(Lsn(0));
+            .collect();
+        images.sort_by_key(|l| std::cmp::Reverse(l.min_lsn));
 
         hits.clear();
         stab(&self.layers, &self.deltas, key, &mut hits);
         let mut deltas: Vec<&LayerDesc> = hits
             .iter()
             .map(|&i| &self.layers[i])
-            .filter(|l| {
-                l.max_lsn > floor && l.min_lsn <= l.clamp(lsn) && l.upto.is_none_or(|u| u > floor)
-            })
+            .filter(|l| l.min_lsn <= l.clamp(lsn))
             .collect();
         deltas.sort_by_key(|l| (l.min_lsn, l.max_lsn));
-        ReadPlan { image, deltas }
+        ReadPlan { images, deltas }
     }
 }
 
@@ -431,24 +446,30 @@ mod tests {
         ])
         .unwrap();
         let plan = map.plan(&k(5), Lsn(850));
-        assert_eq!(plan.image.unwrap().min_lsn, Lsn(500));
-        assert_eq!(plan.floor(), Lsn(500));
-        let lsns: Vec<Lsn> = plan.deltas.iter().map(|d| d.min_lsn).collect();
+        let images: Vec<Lsn> = plan.images.iter().map(|i| i.min_lsn).collect();
+        assert_eq!(images, vec![Lsn(500), Lsn(100)], "newest candidate first");
+        let lsns: Vec<Lsn> = plan.above(Lsn(500)).map(|d| d.min_lsn).collect();
         assert_eq!(lsns, vec![Lsn(501), Lsn(801)]);
-        assert_eq!(plan.read_amp(), 3);
 
-        // Reading before the newer image picks the older one and the
-        // delta that spans the gap.
+        // A reader that found no base in the newer image, because the
+        // image has a gap where this key would be, keeps the whole
+        // delta run instead of the two layers above the gap.
+        let lsns: Vec<Lsn> = plan.above(Lsn(0)).map(|d| d.min_lsn).collect();
+        assert_eq!(lsns, vec![Lsn(101), Lsn(501), Lsn(801)]);
+
+        // Reading before the newer image sees only the older one and
+        // the delta that spans the gap.
         let plan = map.plan(&k(5), Lsn(300));
-        assert_eq!(plan.image.unwrap().min_lsn, Lsn(100));
-        assert_eq!(plan.deltas.len(), 1);
-        assert_eq!(plan.deltas[0].min_lsn, Lsn(101));
+        let images: Vec<Lsn> = plan.images.iter().map(|i| i.min_lsn).collect();
+        assert_eq!(images, vec![Lsn(100)]);
+        let above: Vec<Lsn> = plan.above(Lsn(100)).map(|d| d.min_lsn).collect();
+        assert_eq!(above, vec![Lsn(101)]);
 
         // Reading below every image has no base and every delta that
         // starts at or below the lsn.
         let plan = map.plan(&k(5), Lsn(99));
-        assert!(plan.image.is_none());
-        assert_eq!(plan.floor(), Lsn(0));
+        assert!(plan.images.is_empty());
+        assert_eq!(plan.above(Lsn(0)).count(), 0);
     }
 
     #[test]
@@ -462,16 +483,18 @@ mod tests {
         ])
         .unwrap();
         let plan = map.plan(&k(120), Lsn(300));
-        assert_eq!(plan.image.unwrap().min_key, k(100));
-        assert_eq!(plan.deltas.len(), 2);
-        assert!(plan.deltas.iter().all(|d| d.covers(&k(120))));
+        assert_eq!(plan.images[0].min_key, k(100));
+        let deltas: Vec<&LayerDesc> = plan.above(Lsn(100)).collect();
+        assert_eq!(deltas.len(), 2);
+        assert!(deltas.iter().all(|d| d.covers(&k(120))));
         let plan = map.plan(&k(10), Lsn(300));
-        assert_eq!(plan.image.unwrap().max_key, k(99));
-        assert_eq!(plan.deltas.len(), 1, "the straddling delta misses key 10");
-        assert_eq!(plan.deltas[0].min_key, k(0));
+        assert_eq!(plan.images[0].max_key, k(99));
+        let deltas: Vec<&LayerDesc> = plan.above(Lsn(100)).collect();
+        assert_eq!(deltas.len(), 1, "the straddling delta misses key 10");
+        assert_eq!(deltas[0].min_key, k(0));
         // A key outside every layer plans nothing.
         let plan = map.plan(&k(5000), Lsn(300));
-        assert!(plan.image.is_none() && plan.deltas.is_empty());
+        assert!(plan.images.is_empty() && plan.above(Lsn(0)).count() == 0);
         assert_eq!(plan.read_amp(), 0);
     }
 
@@ -503,7 +526,7 @@ mod tests {
                     "block {block} at {lsn} touches {}",
                     plan.read_amp()
                 );
-                assert!(plan.image.is_some());
+                assert!(!plan.images.is_empty());
             }
         }
     }
@@ -533,7 +556,11 @@ mod tests {
                         l.kind == LayerKind::Image && l.covers(&k(block)) && l.min_lsn <= Lsn(lsn)
                     })
                     .max_by_key(|l| l.min_lsn);
-                assert_eq!(plan.image, image, "image for block {block} lsn {lsn}");
+                assert_eq!(
+                    plan.images.first().copied(),
+                    image,
+                    "image for block {block} lsn {lsn}"
+                );
                 let floor = image.map(|i| i.min_lsn).unwrap_or(Lsn(0));
                 let mut deltas: Vec<&LayerDesc> = layers
                     .iter()
@@ -545,7 +572,11 @@ mod tests {
                     })
                     .collect();
                 deltas.sort_by_key(|l| (l.min_lsn, l.max_lsn));
-                assert_eq!(plan.deltas, deltas, "deltas for block {block} lsn {lsn}");
+                assert_eq!(
+                    plan.above(floor).collect::<Vec<_>>(),
+                    deltas,
+                    "deltas for block {block} lsn {lsn}"
+                );
             }
         }
     }
@@ -568,10 +599,11 @@ mod tests {
         // reader clamps its records at 250, and the child's own delta
         // stacks above it.
         let plan = map.plan(&k(5), Lsn(1000));
-        assert_eq!(plan.image.unwrap().min_lsn, Lsn(100));
-        let lsns: Vec<Lsn> = plan.deltas.iter().map(|d| d.min_lsn).collect();
+        assert_eq!(plan.images[0].min_lsn, Lsn(100));
+        let above: Vec<&LayerDesc> = plan.above(Lsn(100)).collect();
+        let lsns: Vec<Lsn> = above.iter().map(|d| d.min_lsn).collect();
         assert_eq!(lsns, vec![Lsn(101), Lsn(201), Lsn(251)]);
-        assert_eq!(plan.deltas[1].clamp(Lsn(1000)), Lsn(250));
+        assert_eq!(above[1].clamp(Lsn(1000)), Lsn(250));
 
         // A child image above the cut floors the plan past everything
         // the inherited spanning delta may serve, so it drops out.
@@ -581,9 +613,10 @@ mod tests {
         d2.upto = Some(Lsn(250));
         let map = LayerMap::new(vec![child_image, d2]).unwrap();
         let plan = map.plan(&k(5), Lsn(1000));
-        assert_eq!(plan.floor(), Lsn(300));
-        assert!(
-            plan.deltas.is_empty(),
+        assert_eq!(plan.images[0].min_lsn, Lsn(300));
+        assert_eq!(
+            plan.above(Lsn(300)).count(),
+            0,
             "a clamped delta below the floor is never fetched"
         );
     }
