@@ -50,6 +50,24 @@
 //! permanent slot, which is exactly the disk hazard above with nobody
 //! at all on the other end of it.
 //!
+//! ## Why a join waits for one
+//!
+//! A slot sees what was written after it existed and nothing before, so
+//! a client told it was subscribed while the tap was still opening
+//! would lose every row written in between. That is not a rare window:
+//! an application that subscribes and then writes, which is what a demo
+//! and half the tutorials do, hits it every time on the first
+//! subscription, and what it sees is a change that never arrives rather
+//! than an error.
+//!
+//! So the tap has a state ([`Tapped`]) and a join waits on it. The
+//! reader says `Open` once it has one and `Failed` when it could not
+//! take one, and the join is answered on either, which means the only
+//! thing a subscriber waits for is the answer to the question it just
+//! asked. Upstream has nothing to wait for here because its slot is
+//! permanent and always being read, which is the trade this made in the
+//! other direction.
+//!
 //! Within one tap's life resuming is real, since the tap consumes from
 //! the slot and postgres remembers where it got to. Across a reopen it
 //! is a gap, and a gap is told rather than smoothed over: every
@@ -131,9 +149,32 @@ struct Listener {
     bindings: Vec<u64>,
 }
 
+/// Whether there is a tap on the database right now.
+///
+/// What a join needs to know, and the reason it is three states rather
+/// than a flag: a join that waited for `Open` on a database this server
+/// cannot tap would wait for something that is not coming, so the
+/// reader says which of the two happened and the join stops waiting
+/// either way.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tapped {
+    /// Nobody has asked for one, or the reader is taking one now.
+    #[default]
+    Waiting,
+    /// Open, and reading from a point before this moment, which is what
+    /// makes a row written after this one visible to whoever asked.
+    Open,
+    /// The last attempt did not work, and the reason has already gone
+    /// to the subscribers as a gap.
+    Failed,
+}
+
 #[derive(Default)]
 struct Inner {
     subs: Subscriptions,
+    /// Where the tap is, which is the reader's news and everybody
+    /// else's answer.
+    tap: Tapped,
     listeners: HashMap<u64, Listener>,
     /// Which subscriber a binding belongs to, which is what turns the
     /// matcher's answer into a list of queues.
@@ -153,6 +194,10 @@ pub struct Changes {
     /// nothing to do is parked rather than polling a database nobody is
     /// listening to.
     wake: Notify,
+    /// Woken the other way, when the reader has news about its tap, so
+    /// that a join is answered as soon as there is one rather than on a
+    /// timer.
+    taken: Notify,
 }
 
 impl Changes {
@@ -265,6 +310,41 @@ impl Changes {
             .count()
     }
 
+    /// The reader, saying where its tap is.
+    pub fn tapped(&self, state: Tapped) {
+        self.inner.lock().expect("changes").tap = state;
+        // Everybody rather than one, since every join waiting on this
+        // is waiting for the same tap.
+        self.taken.notify_waiters();
+    }
+
+    /// Where it is, for a test and for the wait below.
+    pub fn tap(&self) -> Tapped {
+        self.inner.lock().expect("changes").tap
+    }
+
+    /// Wait until the reader has taken a tap, or has said it could not.
+    ///
+    /// This is what a join holds for after its bindings are in, and it
+    /// is the whole of the fix for a subscription that is answered
+    /// before there is anything reading the write ahead log: a client
+    /// that has been told it is subscribed can write a row and expect
+    /// to hear about it.
+    ///
+    /// It returns rather than refusing on `Failed`, because what is
+    /// wrong with the database has already gone to this subscriber as a
+    /// gap and a join that hung on it would turn a database missing its
+    /// publication into a client that never gets an answer at all.
+    pub async fn tapping(&self) {
+        loop {
+            let waiting = self.taken.notified();
+            if self.tap() != Tapped::Waiting {
+                return;
+            }
+            waiting.await;
+        }
+    }
+
     /// Wait until somebody is listening. Returns immediately when
     /// somebody already is, because the alternative is a reader that
     /// sleeps through the subscriber who arrived while it was checking.
@@ -371,6 +451,9 @@ impl Reader {
                 // this database's write ahead log.
                 tap = None;
                 told = false;
+                // And the next join waits for the next tap rather than
+                // being answered on the strength of this one.
+                self.changes.tapped(Tapped::Waiting);
                 self.changes.woken().await;
                 continue;
             }
@@ -379,10 +462,15 @@ impl Reader {
                 None => match Tap::open(&self.dsn, PUBLICATION).await {
                     Ok(open) => {
                         told = false;
+                        // Said before the first poll, because what is
+                        // waiting on it is a join that will write as
+                        // soon as it is answered.
+                        self.changes.tapped(Tapped::Open);
                         open
                     }
                     Err(why) => {
                         self.trouble(&mut told, &why.to_string()).await;
+                        self.changes.tapped(Tapped::Failed);
                         tokio::time::sleep(self.every).await;
                         continue;
                     }
@@ -399,6 +487,10 @@ impl Reader {
                     self.gap().await;
                     told = true;
                     tap = None;
+                    // A join that arrives now waits for the tap that
+                    // replaces this one, since the one it would have
+                    // been answered on has gone.
+                    self.changes.tapped(Tapped::Waiting);
                     tokio::time::sleep(self.every).await;
                     continue;
                 }
@@ -661,6 +753,38 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), changes.woken())
             .await
             .expect("the first subscription wakes the reader");
+    }
+
+    /// The other half of the same idea. A slot is taken when the first
+    /// subscriber arrives, and until it has been taken there is nothing
+    /// to answer that subscriber's join on: a row written in the
+    /// meantime is written before the slot existed and is gone.
+    #[tokio::test]
+    async fn a_join_waits_for_the_tap_that_will_carry_what_it_asked_for() {
+        let changes = std::sync::Arc::new(Changes::new());
+        assert_eq!(changes.tap(), Tapped::Waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), changes.tapping())
+                .await
+                .is_err(),
+            "there is no tap yet, so the client is not told it is subscribed yet"
+        );
+
+        let opening = std::sync::Arc::clone(&changes);
+        tokio::spawn(async move { opening.tapped(Tapped::Open) });
+        tokio::time::timeout(Duration::from_secs(5), changes.tapping())
+            .await
+            .expect("the join goes through once there is a tap");
+
+        // And a database this server cannot tap lets the join go as
+        // well, because what is wrong with it has already reached this
+        // subscriber as a gap and waiting longer tells nobody anything.
+        changes.tapped(Tapped::Waiting);
+        let refusing = std::sync::Arc::clone(&changes);
+        tokio::spawn(async move { refusing.tapped(Tapped::Failed) });
+        tokio::time::timeout(Duration::from_secs(5), changes.tapping())
+            .await
+            .expect("a tap that could not be taken is an answer too");
     }
 
     /// A slot is held for whoever is reading it, and a socket with no

@@ -713,6 +713,89 @@ jobs:
         if: always()
         run: cat /tmp/serve.log
 
+  # Rows nobody sent. The two jobs above are about messages a client
+  # pushed, and this one is about a table in the publication being
+  # written to over /rest/v1 and whoever subscribed being told, which
+  # is the other half of realtime and the half an application actually
+  # uses. Every write goes through the api, so the suite never holds a
+  # connection to the database and cannot set a row up in a way no
+  # application could.
+  #
+  # The last test in it is a different question, and it is why the file
+  # is worth having: it records the frames off the socket before the
+  # client has folded them and compares them with a recording taken
+  # from a real supabase start. A server can hand the application the
+  # right object and still be sending frames upstream does not send.
+  realtime-changes-js:
+    name: conformance (realtime-js, changes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # A change is read out of the write ahead log, so this one needs
+      # the database to be able to decode logically. A service container
+      # takes no arguments, so the setting goes in and the container
+      # comes back, the same as the pool job does it.
+      - name: Turn logical decoding on
+        env:
+          PGPASSWORD: zou-conformance
+        run: |
+          set -e
+          psql -h 127.0.0.1 -U postgres -c "alter system set wal_level = logical"
+          docker restart "$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -1)"
+          for _ in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -U postgres && break
+            sleep 2
+          done
+          test "$(psql -h 127.0.0.1 -U postgres -tAc 'show wal_level')" = logical
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      - name: Start zou on the port a local supabase project uses
+        run: |
+          cargo run -p zou-conformance -- serve \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --setup /tmp/zou-conformance/js-realtime-changes/setup.sql \
+            > /tmp/serve.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q '^url ' /tmp/serve.log && break
+            sleep 1
+          done
+          cat /tmp/serve.log
+          grep -q '^url ' /tmp/serve.log
+      - name: Write rows through the api and read them off a subscription
+        working-directory: /tmp/zou-conformance/js-realtime-changes
+        run: |
+          npm ci
+          ZOU_ANON_KEY="$(awk '/^anon /{print $2}' /tmp/serve.log)" \
+            ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test
+      - name: Keep the server log
+        if: always()
+        run: cat /tmp/serve.log
+
   # One of Supabase's own example apps, unedited, driven through a real
   # browser. The suites ask a server questions and this asks an
   # application, which is a different claim: an app goes through the
@@ -961,6 +1044,22 @@ jobs:
           psql "$CLI_DSN" -v ON_ERROR_STOP=1 \
             -f /tmp/zou-conformance/js-realtime-private/setup.sql
           cd /tmp/zou-conformance/js-realtime-private
+          npm ci
+          ZOU_URL="$CLI_URL" ZOU_ANON_KEY="$ANON_KEY" \
+            ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test
+      # And the changes suite, where the reference leg is doing two
+      # jobs. The ten behavioural questions are ours and are only worth
+      # something if Supabase Realtime answers them the same way, and
+      # the eleventh is a recording of that server's frames: running it
+      # here in check mode is what keeps frames.json a statement about
+      # upstream rather than a file that was true once.
+      - name: Ask the same stack what a change looks like
+        run: |
+          cd /tmp/project
+          eval "$(supabase status -o env | sed 's/^/export /')"
+          psql "$CLI_DSN" -v ON_ERROR_STOP=1 \
+            -f /tmp/zou-conformance/js-realtime-changes/setup.sql
+          cd /tmp/zou-conformance/js-realtime-changes
           npm ci
           ZOU_URL="$CLI_URL" ZOU_ANON_KEY="$ANON_KEY" \
             ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test

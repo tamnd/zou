@@ -86,6 +86,34 @@ impl Frame {
         Frame::reply(to, "error", json!({"reason": reason.into()}))
     }
 
+    /// What the server says on a channel about the channel itself, and
+    /// there is one of these: the line that follows a join that asked
+    /// for postgres changes, once the subscriptions behind it exist.
+    ///
+    /// realtime-js reads it and does nothing with it, which is not a
+    /// reason to leave it out. It is on the socket, an application that
+    /// listens for `system` is handed it, and a recording of what
+    /// upstream sends has it in it, so a server without it is a server
+    /// whose frames are not the same frames.
+    ///
+    /// It carries the join's own ref and no ref of its own, the same
+    /// way phoenix pushes anything on a joined channel, and the channel
+    /// name in it is the topic without the prefix.
+    pub fn system(to: &Frame, extension: &str, message: &str) -> Frame {
+        Frame {
+            join_ref: to.join_ref.clone(),
+            reference: None,
+            topic: to.topic.clone(),
+            event: "system".into(),
+            payload: json!({
+                "message": message,
+                "status": "ok",
+                "extension": extension,
+                "channel": to.topic.strip_prefix("realtime:").unwrap_or(&to.topic),
+            }),
+        }
+    }
+
     /// Something the server is saying on a topic without being asked,
     /// which is what a presence message is. There is no ref because
     /// nothing is being replied to, and the client matches it to a
