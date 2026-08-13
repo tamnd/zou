@@ -56,8 +56,14 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     for (job, result) in &results {
         match result {
             Ok(Some(out)) => println!(
-                "shard {}: {} layers into {}, debt {} to {}",
-                job.shard, out.retired, out.outputs, out.debt_before, out.debt_after
+                "shard {}: {} layers into {}, debt {} to {}, imaged {} pages of which {} off the frozen objects",
+                job.shard,
+                out.retired,
+                out.outputs,
+                out.debt_before,
+                out.debt_after,
+                out.imaged,
+                out.frozen
             ),
             Ok(None) => println!("shard {}: nothing to do", job.shard),
             Err(e) => {

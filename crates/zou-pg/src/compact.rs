@@ -10,6 +10,12 @@
 //! is on hand, a fresh image materialized at `disk_consistent_lsn` so
 //! the delta chains above the old images stop being the read path.
 //!
+//! The fresh image reaches for a base wherever the live page service
+//! would, the frozen pg/ objects included. A pass that only looked at
+//! layers left every page whose base predates them in the delta run
+//! forever, which is read amp the fold exists to buy down and delta
+//! bytes every later pass rewrites for nothing.
+//!
 //! The commit is one CAS on the shard manifest that retires the inputs
 //! and lists the outputs, so a worker can die anywhere: outputs are
 //! create only, a half written pass leaves orphans for gc and the
@@ -38,7 +44,7 @@
 //! pool of workers that stop between jobs when asked, the preemption
 //! story again.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -61,6 +67,10 @@ use crate::redo::RedoPool;
 
 /// Compression block size for rebuilt layers, the format's read unit.
 const BLOCK_TARGET: usize = 256 * 1024;
+
+/// Postgres page size, the length a frozen pg/ object has to have to
+/// be a base.
+const BLCKSZ: usize = 8192;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompactError {
@@ -124,6 +134,11 @@ pub struct CompactOutcome {
     pub outputs: usize,
     pub debt_before: u64,
     pub debt_after: u64,
+    /// Pages the pass materialized into the fresh image.
+    pub imaged: usize,
+    /// How many of those stood on a frozen pg/ object because no layer
+    /// held a base for them.
+    pub frozen: usize,
 }
 
 /// One compaction pass over one shard. `Ok(None)` means there was
@@ -362,30 +377,68 @@ pub fn compact_shard(
     // With a redo pool on hand, cut a fresh image at the flush point
     // so the merged run drops out of the read path for current reads.
     // Only relation pages materialize, and only those redo can build
-    // from what the store holds: a base in a source image, or a first
-    // record that initializes the page or carries a full image of it.
-    // A page whose stored history starts mid chain stays in the delta
-    // run; feeding its records a zeroed base would crash the redo
-    // worker, not rebuild the page.
+    // from a base somebody holds: a source image, a first record that
+    // initializes the page or carries a full image of it, or the pg/
+    // object frozen at the put elision flag day, which is the same
+    // fallback the live page service reads through. A page with no
+    // base anywhere stays in the delta run; feeding its records a
+    // zeroed base would crash the redo worker, not rebuild the page.
+    let mut imaged = 0;
+    let mut frozen_bases = 0;
     if let Some(pool) = pool
         && dcl > Lsn(0)
     {
-        let rebuildable =
-            |k: &LayerKey| based.contains(k) || first_init.get(k).copied().unwrap_or(false);
         let keys: BTreeSet<LayerKey> = merged_keys
             .iter()
             .chain(based.iter())
             .copied()
-            .filter(|k| k.kind == KEY_PAGE && rebuildable(k))
+            .filter(|k| k.kind == KEY_PAGE)
             .collect();
         let keys: Vec<LayerKey> = keys.into_iter().collect();
         if !keys.is_empty() {
             let map = LayerMap::new(descs.clone()).map_err(PageShardError::from)?;
-            let svc = PageService::for_shard(store, tenant_ref, shard, Some(pool), data_checksums);
+            // The frozen pages of the batch in hand. Deciding whether a
+            // key can be imaged at all means asking the store for its
+            // pg/ object, and the service asks for the same page again
+            // while it builds it, so the answers are held to keep that
+            // at one GET per key. The batch bounds the memory, so a
+            // shard of any size costs the same megabyte here.
+            let held: Mutex<HashMap<LayerKey, Vec<u8>>> = Mutex::new(HashMap::new());
+            let svc = PageService::for_shard(store, tenant_ref, shard, Some(pool), data_checksums)
+                .with_base_fallback(|blk: &crate::walscan::BlockRef| {
+                    let key = LayerKey::page(blk.spc, blk.db, blk.rel, blk.fork as u8, blk.blk);
+                    held.lock()
+                        .expect("no panics under lock")
+                        .get(&key)
+                        .cloned()
+                });
             let mem = Memtable::new();
             let mut builder = ImageBuilder::new(dcl, BLOCK_TARGET);
             for batch in keys.chunks(MAX_GETPAGE_BATCH) {
-                let blocks: Vec<crate::walscan::BlockRef> = batch
+                let mut ready: Vec<LayerKey> = Vec::with_capacity(batch.len());
+                {
+                    let mut held = held.lock().expect("no panics under lock");
+                    held.clear();
+                    for key in batch {
+                        if based.contains(key) || first_init.get(key).copied().unwrap_or(false) {
+                            ready.push(*key);
+                            continue;
+                        }
+                        let object =
+                            layout.pg_block(key.spc, key.db, key.rel, key.fork as u32, key.block);
+                        if let Some((page, _)) = store.get(&object)?
+                            && page.len() == BLCKSZ
+                        {
+                            held.insert(*key, page);
+                            ready.push(*key);
+                        }
+                    }
+                    frozen_bases += held.len();
+                }
+                if ready.is_empty() {
+                    continue;
+                }
+                let blocks: Vec<crate::walscan::BlockRef> = ready
                     .iter()
                     .map(|k| crate::walscan::BlockRef {
                         spc: k.spc,
@@ -396,12 +449,15 @@ pub fn compact_shard(
                     })
                     .collect();
                 let pages = svc.get_pages(&map, &mem, &blocks, dcl.0)?;
-                for (key, page) in batch.iter().zip(pages) {
+                for (key, page) in ready.iter().zip(pages) {
                     builder.push(*key, &page)?;
+                    imaged += 1;
                 }
             }
-            let (bytes, footer) = builder.finish()?;
-            publish(bytes, &footer)?;
+            if !builder.is_empty() {
+                let (bytes, footer) = builder.finish()?;
+                publish(bytes, &footer)?;
+            }
         }
     }
 
@@ -427,6 +483,8 @@ pub fn compact_shard(
         outputs: add.len(),
         debt_before,
         debt_after: debt(&after),
+        imaged,
+        frozen: frozen_bases,
     }))
 }
 
@@ -521,6 +579,8 @@ mod tests {
     use zou_store::mem::MemStore;
     use zou_store::shardmanifest::publish_layer;
     use zou_store::shards::{prune_lineage, split};
+
+    use crate::redo::RedoPoolConfig;
 
     fn seed(store: &dyn CasStore, tenant_ref: &str) -> TenantLayout {
         let layout = TenantLayout::new(tenant_ref);
@@ -695,6 +755,76 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// A page whose base lives only in the frozen pg/ objects is
+    /// exactly the case compaction used to be blind to (zou #351): no
+    /// source image holds it, no record of it initializes the page, so
+    /// the pass skipped it and its history stayed in the delta run for
+    /// good. The pool here is never asked to redo anything, because
+    /// both keys read at the flush point come back as their base.
+    #[test]
+    fn a_base_only_the_frozen_objects_hold_still_lands_in_the_image() {
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        // Two pages with history, one of them with a frozen base.
+        let frozen = LayerKey::page(1663, 5, 90, 0, 7);
+        let orphan = LayerKey::page(1663, 5, 90, 0, 9);
+        store
+            .put_if_absent(
+                &layout.pg_block(
+                    frozen.spc,
+                    frozen.db,
+                    frozen.rel,
+                    frozen.fork as u32,
+                    frozen.block,
+                ),
+                &vec![0xAB; BLCKSZ],
+            )
+            .unwrap();
+        // The records sit above the flush point, so the read that
+        // builds the image is the base alone.
+        let mut batch = vec![rec(90, 7, 0x300), rec(90, 9, 0x300)];
+        put_delta(&store, &layout, 0, &mut batch, 0x200);
+        let mut batch = vec![rec(90, 7, 0x400), rec(90, 9, 0x400)];
+        put_delta(&store, &layout, 0, &mut batch, 0x200);
+
+        let pool = RedoPool::new(RedoPoolConfig {
+            postgres: "/nonexistent/postgres".into(),
+            scratch_root: std::env::temp_dir(),
+            workers: 1,
+            batch_timeout: std::time::Duration::from_secs(5),
+            batches_per_worker: 1,
+            data_checksums: false,
+        });
+        let out = compact_shard(&store, "t", 0, Some(&pool), false)
+            .unwrap()
+            .expect("two runs and a pool mean work");
+        assert_eq!(
+            (out.imaged, out.frozen),
+            (1, 1),
+            "the frozen page is imaged, the one with no base anywhere is not"
+        );
+
+        let (m, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let map = m.layer_map().unwrap();
+        let reader = LayerReader::new(&store, layout.shard_prefix(0));
+        let mem = Memtable::new();
+        let got = reader.reconstruct(&map, &mem, &frozen, Lsn(0x500)).unwrap();
+        assert_eq!(got.base, Some(vec![0xAB; BLCKSZ]));
+        assert_eq!(got.base_lsn, Some(Lsn(0x200)), "the image sits at the dcl");
+        assert_eq!(
+            got.records.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
+            vec![0x300, 0x400],
+            "the history above the image is still there"
+        );
+        // The other key kept its whole chain and got no image, which is
+        // the right answer: a zeroed base is not its page.
+        let got = reader.reconstruct(&map, &mem, &orphan, Lsn(0x500)).unwrap();
+        assert_eq!(got.base, None);
+        assert_eq!(got.records.len(), 2);
     }
 
     /// A store that starts refusing writes after a budget, the shape
