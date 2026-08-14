@@ -69,10 +69,17 @@ pub async fn cors(req: Request<Body>, next: Next) -> Response {
             header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
             HeaderValue::from_static("true"),
         );
-        h.insert(
-            header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            HeaderValue::from_static(EXPOSE_HEADERS),
-        );
+        // Unless the handler already said which of its headers a
+        // browser may read. The functions surface does: its refusals
+        // carry sb-error-code and say so, the way upstream's runtime
+        // does, and a list written here over the top of that one would
+        // hide the header the client is meant to read.
+        if !h.contains_key(header::ACCESS_CONTROL_EXPOSE_HEADERS) {
+            h.insert(
+                header::ACCESS_CONTROL_EXPOSE_HEADERS,
+                HeaderValue::from_static(EXPOSE_HEADERS),
+            );
+        }
     }
     res
 }
@@ -103,7 +110,7 @@ pub async fn request_id(mut req: Request<Body>, next: Next) -> Response {
     res
 }
 
-fn fresh_id() -> String {
+pub(crate) fn fresh_id() -> String {
     let mut b = [0u8; 16];
     getrandom::fill(&mut b).expect("the os rng never fails");
     b[6] = (b[6] & 0x0f) | 0x40;

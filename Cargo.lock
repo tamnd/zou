@@ -2980,6 +2980,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zou-functions"
+version = "0.0.1"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "zou-log"
 version = "0.0.1"
 dependencies = [
@@ -3082,6 +3089,7 @@ dependencies = [
  "ureq",
  "webp",
  "webpki-roots",
+ "zou-functions",
  "zou-ops",
  "zou-realtime",
  "zou-rest",

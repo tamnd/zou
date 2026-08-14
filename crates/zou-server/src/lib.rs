@@ -38,6 +38,7 @@ pub mod cron;
 pub mod edge;
 pub mod fleet;
 pub mod forward;
+pub mod functions;
 pub mod gateway;
 pub mod gojson;
 pub mod hook;
@@ -234,6 +235,13 @@ pub struct Config {
     /// total and how long the first wait between them is. One attempt
     /// is pg_net's own behaviour.
     pub webhook: webhook::Retries,
+    /// What is deployed under /functions/v1, and what runs it. None is
+    /// a project with no functions, which answers every name the same
+    /// 404 upstream answers a name nobody deployed, rather than
+    /// pretending the surface is missing: a server that serves no
+    /// functions and a server that was never asked to are the same
+    /// thing to a caller.
+    pub functions: Option<Arc<zou_functions::Registry>>,
 }
 
 impl Default for Config {
@@ -273,6 +281,7 @@ impl Default for Config {
             passthrough: None,
             realtime: zou_realtime::Limits::default(),
             webhook: webhook::Retries::default(),
+            functions: None,
         }
     }
 }
@@ -1008,6 +1017,17 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         // buckets sends the trailing slash and a client that was handed
         // the endpoint url does not, and the two are signed as the two
         // different paths they are.
+        // The functions surface, outside the gate for the same reason
+        // the buckets are: the gateway in front of upstream's runtime
+        // has no key check on this route, so a call carrying no key at
+        // all reaches the runtime and is refused in the runtime's own
+        // words. Both spellings of a call are one handler, since the
+        // name and the path after it are read off the url either way,
+        // and `/functions/v1/` with no name at all is upstream's text
+        // 404 rather than the gateway's json one.
+        .route("/functions/v1/", any(functions::unnamed))
+        .route("/functions/v1/{name}", any(functions::call))
+        .route("/functions/v1/{name}/{*rest}", any(functions::call))
         .route("/storage/v1/s3", get(s3::list_buckets))
         .route("/storage/v1/s3/", get(s3::list_buckets))
         .route("/storage/v1/s3/{bucket}", any(s3::bucket))

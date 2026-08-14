@@ -1,0 +1,14 @@
+[package]
+name = "zou-functions"
+description = "The edge functions a Supabase project keeps in supabase/functions, and the seam something runs them through"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

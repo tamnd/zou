@@ -431,6 +431,41 @@ fn split(token: &str) -> Result<Parts<'_>, Reject> {
     })
 }
 
+/// What a token says it was signed with, for a caller that has to
+/// choose its words by the algorithm rather than by the failure.
+///
+/// The functions surface needs it: the reference has one refusal for a
+/// legacy HS256 token that does not verify and another for an
+/// asymmetric one, and both of them arrive here as the same
+/// [`Reject::BadSignature`]. None for anything that is not three
+/// segments with a json header on the front, which is a token that
+/// never got as far as having an algorithm.
+///
+/// This reads the header itself rather than going through `split`,
+/// and the difference is the point: split decodes the signature too, so
+/// a token whose signature is not base64 at all has no parts, while it
+/// very much has an algorithm. The reference reads the header of
+/// `<hs256 header>.<payload>.WRONG` and refuses it as an HS256 token.
+///
+/// An `alg` that is not a string still has a value, and the reference
+/// quotes it back: `{"alg":123}` earns `Unsupported JWT algorithm 123`.
+/// So this renders whatever is there rather than insisting on a string
+/// and calling the rest nothing.
+pub fn algorithm(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let (Some(header), Some(_), Some(_), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    let header = Base64UrlUnpadded::decode_vec(header).ok()?;
+    let header: serde_json::Value = serde_json::from_slice(&header).ok()?;
+    match header.get("alg")? {
+        serde_json::Value::String(alg) => Some(alg.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
 /// Decode the payload and finish: expiry check, role extraction.
 fn accept(payload: &str) -> Result<Verified, Reject> {
     let claims = Base64UrlUnpadded::decode_vec(payload).map_err(|_| Reject::Malformed)?;
