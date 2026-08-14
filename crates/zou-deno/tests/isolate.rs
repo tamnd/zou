@@ -437,6 +437,9 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
             fetch: typeof fetch,
             url: typeof URL,
             params: typeof URLSearchParams,
+            blob: typeof Blob,
+            file: typeof File,
+            form: typeof FormData,
             crypto: typeof crypto,
             timer: typeof setTimeout,
             stream: (() => { try { new ReadableStream(); return "made one"; } catch (e) { return e.message; } })(),
@@ -450,6 +453,9 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
     assert_eq!(said["fetch"], "function");
     assert_eq!(said["url"], "function");
     assert_eq!(said["params"], "function");
+    assert_eq!(said["blob"], "function");
+    assert_eq!(said["file"], "function");
+    assert_eq!(said["form"], "function");
     assert_eq!(said["crypto"], "undefined");
     assert_eq!(said["timer"], "undefined");
     assert_eq!(said["stream"], "ReadableStream is not implemented yet");
@@ -628,6 +634,176 @@ fn a_handler_can_read_its_own_url_with_the_parser() {
     // A Request's url is parsed rather than kept as it was written, the
     // same as Deno, so the empty path is the root.
     assert_eq!(said["normalised"], "https://example.com/");
+}
+
+#[test]
+fn a_blob_is_bytes_with_a_type_on_it() {
+    let answer = answered(
+        r#"
+        const blob = new Blob(["one ", new TextEncoder().encode("two "), new Blob(["three"])], {
+            type: "TEXT/Plain",
+        });
+        Deno.serve(async () => Response.json({
+            size: blob.size,
+            type: blob.type,
+            text: await blob.text(),
+            sliced: await blob.slice(4, 8).text(),
+            slicedType: blob.slice(0, 1, "application/json").type,
+            fromTheEnd: await blob.slice(-5).text(),
+            bytes: Array.from(await new Blob(["ß"]).bytes()),
+            buffer: (await blob.arrayBuffer()).byteLength,
+            empty: new Blob().size,
+            refused: (() => { try { new Blob("one"); return "made one"; } catch (e) { return e.message; } })(),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["size"], 13);
+    // Lowercased, because a media type is compared case insensitively
+    // and this is where that is settled rather than at every reader.
+    assert_eq!(said["type"], "text/plain");
+    assert_eq!(said["text"], "one two three");
+    assert_eq!(said["sliced"], "two ");
+    assert_eq!(said["slicedType"], "application/json");
+    assert_eq!(said["fromTheEnd"], "three");
+    assert_eq!(said["bytes"], serde_json::json!([195, 159]));
+    assert_eq!(said["buffer"], 13);
+    assert_eq!(said["empty"], 0);
+    assert_eq!(said["refused"], "Blob parts must be an iterable of parts");
+}
+
+#[test]
+fn a_file_is_a_blob_that_knows_what_it_is_called() {
+    let answer = answered(
+        r#"
+        const file = new File(["a,b\n1,2\n"], "rows.csv", { type: "text/csv", lastModified: 1700000000000 });
+        Deno.serve(async () => Response.json({
+            name: file.name,
+            type: file.type,
+            size: file.size,
+            when: file.lastModified,
+            text: await file.text(),
+            isBlob: file instanceof Blob,
+            needsAName: (() => { try { new File(["x"]); return "made one"; } catch (e) { return e.message; } })(),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["name"], "rows.csv");
+    assert_eq!(said["type"], "text/csv");
+    assert_eq!(said["size"], 8);
+    assert_eq!(said["when"], 1_700_000_000_000i64);
+    assert_eq!(said["text"], "a,b\n1,2\n");
+    assert_eq!(said["isBlob"], true);
+    assert_eq!(said["needsAName"], "File requires a name");
+}
+
+/// A form written out as multipart and read straight back in, which is
+/// the only test that says the writer and the reader agree. The bytes
+/// in it are not utf-8 on purpose: a part is bytes, and a round trip
+/// through a string would lose them.
+#[test]
+fn a_form_goes_out_as_multipart_and_comes_back_the_same_form() {
+    let answer = answered(
+        r#"
+        const form = new FormData();
+        form.append("who", "ana");
+        form.append("who", "ben");
+        form.append("file", new File([new Uint8Array([0, 159, 146, 255])], "raw.bin", {
+            type: "application/octet-stream",
+        }));
+        const request = new Request("https://example.com/", { method: "POST", body: form });
+        const type = request.headers.get("content-type");
+        const read = await request.formData();
+        const file = read.get("file");
+        Deno.serve(async () => Response.json({
+            type: type.split(";")[0],
+            boundary: type.includes("boundary=") && !type.endsWith("boundary="),
+            who: read.getAll("who"),
+            keys: Array.from(read.keys()),
+            name: file.name,
+            fileType: file.type,
+            bytes: Array.from(await file.bytes()),
+            missing: read.get("nobody"),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["type"], "multipart/form-data");
+    assert_eq!(said["boundary"], true);
+    assert_eq!(said["who"], serde_json::json!(["ana", "ben"]));
+    assert_eq!(said["keys"], serde_json::json!(["who", "who", "file"]));
+    assert_eq!(said["name"], "raw.bin");
+    assert_eq!(said["fileType"], "application/octet-stream");
+    assert_eq!(said["bytes"], serde_json::json!([0, 159, 146, 255]));
+    assert_eq!(said["missing"], serde_json::Value::Null);
+}
+
+/// The other form encoding, which is the one an html form posts and the
+/// one a handler is likelier to be sent.
+#[test]
+fn a_posted_form_is_read_as_a_form() {
+    let answer = called(
+        r#"
+        Deno.serve(async (req) => {
+            const form = await req.formData();
+            return Response.json({
+                who: form.get("who"),
+                said: form.get("said"),
+                has: form.has("who"),
+                afterSet: (() => { form.set("who", "ben"); return form.getAll("who"); })(),
+                afterDelete: (() => { form.delete("said"); return Array.from(form.keys()); })(),
+            });
+        });
+        "#,
+        Call {
+            method: "POST".to_string(),
+            url: "http://localhost:9000/functions/v1/hello".to_string(),
+            headers: vec![(
+                "content-type".to_string(),
+                "application/x-www-form-urlencoded".to_string(),
+            )],
+            body: b"who=ana&said=a+value+%26+a+half".to_vec(),
+            execution_id: "one".to_string(),
+        },
+    )
+    .expect("an answer");
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["who"], "ana");
+    assert_eq!(said["said"], "a value & a half");
+    assert_eq!(said["has"], true);
+    assert_eq!(said["afterSet"], serde_json::json!(["ben"]));
+    assert_eq!(said["afterDelete"], serde_json::json!(["who"]));
+}
+
+/// A blob as a body, and a body as a blob, which is the pair of them a
+/// storage client uses in both directions.
+#[test]
+fn a_blob_can_be_sent_and_a_body_can_be_read_as_one() {
+    let answer = answered(
+        r#"
+        const sent = new Response(new Blob(["{}"], { type: "application/json" }));
+        const read = await new Response("some bytes", { headers: { "content-type": "text/csv" } }).blob();
+        Deno.serve(async () => Response.json({
+            type: sent.headers.get("content-type"),
+            body: await sent.text(),
+            blobType: read.type,
+            blobText: await read.text(),
+            params: await new Response(new URLSearchParams({ a: "1" })).text(),
+            paramsType: new Response(new URLSearchParams({ a: "1" })).headers.get("content-type"),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["type"], "application/json");
+    assert_eq!(said["body"], "{}");
+    assert_eq!(said["blobType"], "text/csv");
+    assert_eq!(said["blobText"], "some bytes");
+    assert_eq!(said["params"], "a=1");
+    assert_eq!(
+        said["paramsType"],
+        "application/x-www-form-urlencoded;charset=UTF-8"
+    );
 }
 
 #[test]

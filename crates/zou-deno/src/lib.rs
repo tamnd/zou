@@ -25,21 +25,26 @@
 //!
 //! - `crypto` is not there, and `crypto.subtle` least of all.
 //! - Streams are not there. A `ReadableStream` body throws by name, and
-//!   `fetch` collects an answer before handing it back.
-//! - `Blob`, `File` and `FormData` are not there.
+//!   `fetch` collects an answer before handing it back, so a blob's
+//!   `stream()` throws too.
+//! - `WebSocket` is not there, which is what a realtime client wants.
 //! - Timers are not there, so a handler that sleeps will not.
 //! - There are no node built ins, so `node:` is refused by name and a
 //!   package that reaches for one will not run.
 //!
 //! What is there is `Headers`, `Request`, `Response`, `URL`,
-//! `URLSearchParams`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`,
-//! `console`, `Deno.serve`, `Deno.env` and `fetch`, which is enough to
-//! run a handler that reads a request, calls something else and
-//! answers.
+//! `URLSearchParams`, `Blob`, `File`, `FormData`, `TextEncoder`,
+//! `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`
+//! and `fetch`, which is enough to run a handler that reads a request,
+//! calls something else and answers.
 //!
 //! `URL` is the `url` crate behind two ops, which is the same parser
 //! Deno's own is built on, rather than a few hundred lines of
 //! javascript that is wrong in the corners.
+//!
+//! `Blob`, `File` and `FormData` are javascript, because a blob is
+//! bytes with a media type on it and a form is a list of pairs and two
+//! wire formats, none of which is work for the host.
 //!
 //! `fetch` is the client `zou-server` calls a database webhook with,
 //! behind an op, rather than a second HTTP stack linked in beside it.

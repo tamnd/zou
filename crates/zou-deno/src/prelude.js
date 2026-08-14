@@ -487,6 +487,342 @@
   }
 
   // ---------------------------------------------------------------
+  // Blob, File and FormData
+  //
+  // A blob is bytes with a media type on it, so that is what this is:
+  // the bytes held whole, a slice that copies, and the same promises a
+  // body is read through. A form is a list of pairs and the two wire
+  // formats it turns into. None of it needs the host, so none of it is
+  // an op.
+
+  const BLOB = Symbol("blob");
+  const TYPE = Symbol("type");
+  const FIELDS = Symbol("fields");
+
+  /// A media type is printable ascii, lowercased, or it is nothing:
+  /// what a blob does with one it cannot use is drop it rather than
+  /// refuse the blob.
+  function mediaType(value) {
+    const type = value === undefined || value === null ? "" : String(value);
+    return /^[\x20-\x7e]*$/.test(type) ? type.toLowerCase() : "";
+  }
+
+  /// One run of bytes out of the pieces something was built from, which
+  /// may themselves be blobs.
+  function joined(parts) {
+    const pieces = [];
+    let size = 0;
+    for (const part of parts) {
+      const bytes = part instanceof Blob ? part[BLOB] : bytesOf(part);
+      pieces.push(bytes);
+      size += bytes.length;
+    }
+    const bytes = new Uint8Array(size);
+    let at = 0;
+    for (const piece of pieces) {
+      bytes.set(piece, at);
+      at += piece.length;
+    }
+    return bytes;
+  }
+
+  /// Where `needle` starts in `bytes`, at or after `from`, or -1.
+  ///
+  /// Multipart is a byte format and a part can hold anything, so this
+  /// searches bytes rather than decoding first: text that is not utf-8
+  /// would not survive the round trip.
+  function indexOfBytes(bytes, needle, from = 0) {
+    for (let at = from; at + needle.length <= bytes.length; at += 1) {
+      let same = true;
+      for (let step = 0; step < needle.length; step += 1) {
+        if (bytes[at + step] !== needle[step]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) {
+        return at;
+      }
+    }
+    return -1;
+  }
+
+  class Blob {
+    constructor(parts = [], options = {}) {
+      if (
+        parts === null ||
+        typeof parts === "string" ||
+        typeof parts !== "object" ||
+        typeof parts[Symbol.iterator] !== "function"
+      ) {
+        throw new TypeError("Blob parts must be an iterable of parts");
+      }
+      this[BLOB] = joined(parts);
+      this[TYPE] = mediaType(options === null || options === undefined ? "" : options.type);
+    }
+
+    get size() {
+      return this[BLOB].length;
+    }
+
+    get type() {
+      return this[TYPE];
+    }
+
+    slice(start, end, contentType) {
+      return new Blob([this[BLOB].slice(start, end)], { type: contentType });
+    }
+
+    async text() {
+      return core.decode(this[BLOB]);
+    }
+
+    async bytes() {
+      return this[BLOB].slice();
+    }
+
+    async arrayBuffer() {
+      const bytes = this[BLOB];
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    }
+
+    stream() {
+      throw new TypeError("ReadableStream is not implemented yet");
+    }
+  }
+
+  class File extends Blob {
+    constructor(parts, name, options = {}) {
+      super(parts, options);
+      if (name === undefined) {
+        throw new TypeError("File requires a name");
+      }
+      this.name = String(name);
+      const given = options === null || options === undefined ? undefined : options.lastModified;
+      this.lastModified = given === undefined ? Date.now() : Number(given);
+    }
+  }
+
+  /// What a field's value is: a string, or a file. A blob that is not a
+  /// file becomes one, which is the spec's rule and is why a filename
+  /// can be given alongside the value.
+  function fieldValue(value, filename) {
+    if (value instanceof File && filename === undefined) {
+      return value;
+    }
+    if (value instanceof Blob) {
+      const named = filename === undefined ? "blob" : String(filename);
+      return new File([value[BLOB]], named, { type: value.type });
+    }
+    return String(value);
+  }
+
+  class FormData {
+    constructor() {
+      this[FIELDS] = [];
+    }
+
+    append(name, value, filename) {
+      this[FIELDS].push([String(name), fieldValue(value, filename)]);
+    }
+
+    delete(name) {
+      const wanted = String(name);
+      this[FIELDS] = this[FIELDS].filter(([held]) => held !== wanted);
+    }
+
+    get(name) {
+      const found = this[FIELDS].find(([held]) => held === String(name));
+      return found === undefined ? null : found[1];
+    }
+
+    getAll(name) {
+      return this[FIELDS].filter(([held]) => held === String(name)).map(([, value]) => value);
+    }
+
+    has(name) {
+      return this[FIELDS].some(([held]) => held === String(name));
+    }
+
+    set(name, value, filename) {
+      const wanted = String(name);
+      const held = fieldValue(value, filename);
+      const first = this[FIELDS].findIndex(([found]) => found === wanted);
+      if (first === -1) {
+        this[FIELDS].push([wanted, held]);
+        return;
+      }
+      this[FIELDS][first] = [wanted, held];
+      this[FIELDS] = this[FIELDS].filter((field, at) => at <= first || field[0] !== wanted);
+    }
+
+    forEach(callback, self) {
+      for (const [name, value] of this[FIELDS].slice()) {
+        callback.call(self, value, name, this);
+      }
+    }
+
+    *entries() {
+      yield* this[FIELDS].map(([name, value]) => [name, value]);
+    }
+
+    *keys() {
+      for (const [name] of this[FIELDS]) {
+        yield name;
+      }
+    }
+
+    *values() {
+      for (const [, value] of this[FIELDS]) {
+        yield value;
+      }
+    }
+
+    [Symbol.iterator]() {
+      return this.entries();
+    }
+  }
+
+  /// A quoted name in a part's headers, with the three characters that
+  /// would end the quoting written the way the spec writes them.
+  function escaped(name) {
+    return String(name).replace(/\r/g, "%0D").replace(/\n/g, "%0A").replace(/"/g, "%22");
+  }
+
+  /// A boundary that is not anywhere in the form it delimits.
+  ///
+  /// The spec's answer is a random string, and a random string that
+  /// collides is a body that parses back wrong. There is no randomness
+  /// in this runtime yet, so this counts: a candidate found anywhere in
+  /// the form is not used and the next one is tried.
+  function boundaryFor(form) {
+    for (let attempt = 0; ; attempt += 1) {
+      const boundary = `----zouFormBoundary${attempt}`;
+      const needle = encoder.encode(boundary);
+      const clash = form[FIELDS].some(([name, value]) =>
+        typeof value === "string"
+          ? name.includes(boundary) || value.includes(boundary)
+          : name.includes(boundary) ||
+            value.name.includes(boundary) ||
+            indexOfBytes(value[BLOB], needle) !== -1,
+      );
+      if (!clash) {
+        return boundary;
+      }
+    }
+  }
+
+  /// A form as `multipart/form-data`, with the content type naming the
+  /// boundary it was written with.
+  function multipart(form) {
+    const boundary = boundaryFor(form);
+    const pieces = [];
+    for (const [name, value] of form[FIELDS]) {
+      let head = `--${boundary}\r\nContent-Disposition: form-data; name="${escaped(name)}"`;
+      if (typeof value !== "string") {
+        head += `; filename="${escaped(value.name)}"`;
+        head += `\r\nContent-Type: ${value.type === "" ? "application/octet-stream" : value.type}`;
+      }
+      pieces.push(encoder.encode(`${head}\r\n\r\n`));
+      pieces.push(typeof value === "string" ? encoder.encode(value) : value[BLOB]);
+      pieces.push(encoder.encode("\r\n"));
+    }
+    pieces.push(encoder.encode(`--${boundary}--\r\n`));
+    return [joined(pieces), `multipart/form-data; boundary=${boundary}`];
+  }
+
+  /// The boundary a content type names, when it names one.
+  function boundaryOf(contentType) {
+    const parameters = String(contentType).split(";");
+    if (parameters[0].trim().toLowerCase() !== "multipart/form-data") {
+      return null;
+    }
+    for (const parameter of parameters.slice(1)) {
+      const equals = parameter.indexOf("=");
+      if (equals !== -1 && parameter.slice(0, equals).trim().toLowerCase() === "boundary") {
+        return parameter
+          .slice(equals + 1)
+          .trim()
+          .replace(/^"|"$/g, "");
+      }
+    }
+    return null;
+  }
+
+  /// A multipart body read back into a form.
+  ///
+  /// Written out here for the reason the server writes its own out:
+  /// what is needed of multipart is a delimiter, two headers per part
+  /// and bytes. A part that makes no sense is dropped rather than
+  /// thrown over, so one bad part does not lose the ones around it.
+  function formOf(bytes, boundary) {
+    const form = new FormData();
+    const delimiter = encoder.encode(`--${boundary}`);
+    const blank = encoder.encode("\r\n\r\n");
+    let at = indexOfBytes(bytes, delimiter);
+    while (at !== -1) {
+      const from = at + delimiter.length;
+      // The last delimiter of a body has two more dashes on it, and
+      // what is after it is not a part.
+      if (bytes[from] === 45 && bytes[from + 1] === 45) {
+        break;
+      }
+      const next = indexOfBytes(bytes, delimiter, from);
+      const chunk = bytes.slice(from, next === -1 ? bytes.length : next);
+      at = next;
+      const gap = indexOfBytes(chunk, blank);
+      if (gap === -1) {
+        continue;
+      }
+      let body = chunk.slice(gap + blank.length);
+      if (body[body.length - 2] === 13 && body[body.length - 1] === 10) {
+        body = body.slice(0, -2);
+      }
+      let name = null;
+      let filename;
+      let type = "";
+      for (const line of core.decode(chunk.slice(0, gap)).split("\r\n")) {
+        const colon = line.indexOf(":");
+        if (colon === -1) {
+          continue;
+        }
+        const field = line.slice(0, colon).trim().toLowerCase();
+        const value = line.slice(colon + 1);
+        if (field === "content-type") {
+          type = value.trim();
+        }
+        if (field !== "content-disposition") {
+          continue;
+        }
+        for (const parameter of value.split(";")) {
+          const equals = parameter.indexOf("=");
+          if (equals === -1) {
+            continue;
+          }
+          const key = parameter.slice(0, equals).trim().toLowerCase();
+          const given = parameter
+            .slice(equals + 1)
+            .trim()
+            .replace(/^"|"$/g, "");
+          if (key === "name") {
+            name = given;
+          }
+          if (key === "filename") {
+            filename = given;
+          }
+        }
+      }
+      if (name !== null) {
+        form.append(
+          name,
+          filename === undefined ? core.decode(body) : new File([body], filename, { type }),
+        );
+      }
+    }
+    return form;
+  }
+
+  // ---------------------------------------------------------------
   // Bodies
 
   const BODY = Symbol("body");
@@ -514,6 +850,26 @@
     async json() {
       return JSON.parse(core.decode(readBody(this)));
     },
+    /// The body's own content type is the blob's, because that is the
+    /// only place the type of some bytes is written down here.
+    async blob() {
+      return new Blob([readBody(this)], { type: this.headers.get("content-type") ?? "" });
+    },
+    async formData() {
+      const type = this.headers.get("content-type") ?? "";
+      const boundary = boundaryOf(type);
+      if (boundary !== null) {
+        return formOf(readBody(this), boundary);
+      }
+      if (type.split(";")[0].trim().toLowerCase() === "application/x-www-form-urlencoded") {
+        const form = new FormData();
+        for (const [name, value] of pairsOf(core.decode(readBody(this)))) {
+          form.append(name, value);
+        }
+        return form;
+      }
+      throw new TypeError("Body can not be decoded as form data");
+    },
     get bodyUsed() {
       return this[USED];
     },
@@ -530,6 +886,15 @@
     }
     if (body instanceof Uint8Array || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
       return [bytesOf(body), null];
+    }
+    if (body instanceof Blob) {
+      return [body[BLOB].slice(), body.type === "" ? null : body.type];
+    }
+    if (body instanceof FormData) {
+      return multipart(body);
+    }
+    if (body instanceof URLSearchParams) {
+      return [encoder.encode(body.toString()), "application/x-www-form-urlencoded;charset=UTF-8"];
     }
     if (body instanceof ReadableStreamStub) {
       throw new TypeError("a streamed body is not supported yet");
@@ -781,6 +1146,9 @@
   // What the module sees
 
   Object.assign(globalThis, {
+    Blob,
+    File,
+    FormData,
     Headers,
     Request,
     Response,
