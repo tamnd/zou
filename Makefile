@@ -7,7 +7,7 @@ PG_PREFIX := $(abspath build/pg)
 
 ZOU_PG_LIB := $(abspath target/release)
 
-.PHONY: demo test lint pg-init pg-patch pg-build pg-vector pg-clean zou-pg-lib
+.PHONY: demo test test-functions lint pg-init pg-patch pg-build pg-vector pg-clean zou-pg-lib
 
 # The demo in two acts: the object layer on a local directory, then
 # the real Postgres on a store when pg-build has run, see
@@ -15,11 +15,18 @@ ZOU_PG_LIB := $(abspath target/release)
 demo:
 	scripts/demo.sh
 
+# zou-deno is left out because its feature is V8, which is a forty
+# megabyte download and a minute of swc before a single test runs. It
+# has its own target below and its own CI job.
 test:
-	cargo test --workspace --all-features
+	cargo test --workspace --exclude zou-deno --all-features
+
+# The javascript half of edge functions, engine and all.
+test-functions:
+	cargo test -p zou-deno --features isolate
 
 lint:
-	cargo fmt --check && cargo clippy --workspace --all-targets --all-features -- -D warnings
+	cargo fmt --check && cargo clippy --workspace --exclude zou-deno --all-targets --all-features -- -D warnings && cargo clippy -p zou-deno --features isolate --all-targets -- -D warnings
 
 # Fetch the pinned Postgres and pgvector sources. Shallow, the full
 # history is not needed.

@@ -1,0 +1,31 @@
+[package]
+name = "zou-deno"
+description = "A javascript isolate that runs an edge function, behind a feature so nothing pays for V8 unless it asked for it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+# Off by default, and that is the whole point of this crate existing
+# separately. With the feature off it compiles to nothing in about a
+# second, so `cargo test --workspace` on a machine that only cares about
+# the database never downloads V8 or builds swc.
+default = []
+isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:serde", "dep:tokio"]
+
+[dependencies]
+zou-functions = { path = "../zou-functions" }
+deno_ast = { version = "0.52", features = ["transpiling"], optional = true }
+deno_core = { version = "0.410", optional = true }
+deno_error = { version = "0.7", optional = true }
+serde = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
