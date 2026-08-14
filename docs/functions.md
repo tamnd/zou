@@ -183,7 +183,7 @@ What runs is the registry's build of the package rather than the tarball npm wou
 
 - Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
 - A package that reaches for a node built in will not run. `node:` is refused by name and the registry's own shims cover the common ones and not all of them.
-- `@supabase/supabase-js` imports and does not evaluate yet: it wants `Blob`, which is on the list below.
+- `@supabase/supabase-js` imports, evaluates and gets into `createClient`, which then wants a `WebSocket` for the realtime client it builds. That one is on the list below.
 - `http:` is refused. A module arrives and is executed, so it arrives over https.
 - `data:` is not supported yet.
 
@@ -240,14 +240,33 @@ A `Request`'s url is parsed rather than kept as the string it was written as, so
 
 One difference: a percent sequence in a query that is not valid utf-8 is left as it was written rather than becoming a replacement character.
 
+## Blob, File and FormData
+
+A blob is bytes with a media type on it, a file is a blob with a name, and a form is what a browser posts.
+
+```ts
+Deno.serve(async (req) => {
+  const form = await req.formData()
+  const file = form.get("file") as File
+  return Response.json({ name: file.name, type: file.type, size: file.size })
+})
+```
+
+Both form encodings are read: `multipart/form-data` and `application/x-www-form-urlencoded`.
+A form given to `new Request` or `new Response` as a body is written out as multipart with a boundary, and a `URLSearchParams` given as a body is written out urlencoded, each with the content type that says so.
+
+- The multipart boundary is not random. It is a name with a number on it, and the number is stepped until the boundary appears nowhere in the form, which is a stronger guarantee than a random string and is what a runtime with no randomness yet can offer.
+- `blob.stream()` throws, for the same reason `new ReadableStream()` does.
+- A part with no `name` on its content disposition is dropped rather than being an error, so one malformed part does not lose the ones around it.
+
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
 
 Not present yet, and named rather than silently missing:
 
 - `crypto`, and `crypto.subtle` with it.
-- `Blob`, `File` and `FormData`.
+- `WebSocket`, which is what `createClient` reaches for when it builds a realtime client.
 - Streams. `new ReadableStream()` throws with its own name in the message, and a response body is collected before it is sent rather than arriving in chunks.
 - Timers, so a handler that sleeps will not.
 - `EdgeRuntime.waitUntil`, so work that outlives the response has nowhere to go.
