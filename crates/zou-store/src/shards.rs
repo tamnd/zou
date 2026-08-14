@@ -554,6 +554,7 @@ mod tests {
             &[],
             &[entry(2)],
             Some(2),
+            None,
         )
         .unwrap();
         let (descs, _) = load_serving_descs(&store, "t", &manifest, 1).unwrap();
@@ -564,8 +565,16 @@ mod tests {
 
         // Shard 0 covers too: the lineage goes, and stays gone on a
         // rerun.
-        crate::shardmanifest::swap_layers(&store, &layout.shard_manifest(0), 0, &[], &[], Some(2))
-            .unwrap();
+        crate::shardmanifest::swap_layers(
+            &store,
+            &layout.shard_manifest(0),
+            0,
+            &[],
+            &[],
+            Some(2),
+            None,
+        )
+        .unwrap();
         assert!(prune_lineage(&store, "t").unwrap());
         assert!(load(&store, "t").shard_history.is_empty());
         assert!(prune_lineage(&store, "t").unwrap());

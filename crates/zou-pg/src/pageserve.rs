@@ -1880,6 +1880,7 @@ mod tests {
             std::slice::from_ref(&gone),
             &[],
             None,
+            None,
         )
         .expect("retired");
         store
