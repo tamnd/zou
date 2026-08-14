@@ -54,8 +54,9 @@ pub const MAX_RECORD_LEN: u32 = 64 * 1024 * 1024;
 /// record and its entry framing. A footer claiming more is lying.
 const MAX_BLOCK_RAW_LEN: u32 = LAYER_BLOCK_TARGET as u32 + MAX_RECORD_LEN + ENTRY_FIXED_LEN as u32;
 
-/// magic, version, kind, reserved. Public so range readers know how
-/// many bytes to fetch at offset zero for [`read_layer_footer_ranges`].
+/// magic, version, kind, reserved. A range reader never fetches these,
+/// [`read_layer_footer_suffix`] names them from the layer's kind and
+/// lets the footer crc prove the object agrees.
 pub const LAYER_HEADER_LEN: usize = 4 + 2 + 1 + 1;
 const HEADER_LEN: usize = LAYER_HEADER_LEN;
 /// footer body length, crc, footer magic.
@@ -632,19 +633,27 @@ fn parse_shell(buf: &[u8]) -> Result<(LayerFooter, usize), LayerDecodeError> {
     Ok((footer, footer_start))
 }
 
-/// Parse the footer from range reads alone: the fixed size header
-/// fetched at offset zero, and a suffix ending at `object_len`. When
+/// Parse the footer from one suffix read ending at `object_len`. When
 /// the suffix is too short to hold the whole footer the error's `need`
 /// says how many tail bytes to refetch, so a reader guesses once and
 /// refetches exactly at most once. The block index is validated against
 /// `object_len` the same way the full object decode validates it, so a
 /// footer fetched by ranges proves the same claims.
-pub fn read_layer_footer_ranges(
-    header: &[u8],
+///
+/// The header never gets fetched. `kind` names it instead, the caller
+/// taking it from the layer name, and the footer crc covers the header
+/// bytes plus the footer body: a suffix whose crc matches has proved
+/// the object's header is the one the caller named, kind, version and
+/// all. A layer some later format version wrote fails that check as
+/// corrupt rather than as an unsupported version, which is the same
+/// refusal spelled differently, and it saves a round trip to the store
+/// on every cold read of every layer.
+pub fn read_layer_footer_suffix(
+    kind: LayerKind,
     suffix: &[u8],
     object_len: u64,
 ) -> Result<LayerFooter, LayerDecodeError> {
-    let kind = parse_header(header)?;
+    let header = header(kind);
     if suffix.len() < TAIL_LEN || (suffix.len() as u64) > object_len {
         return Err(LayerDecodeError::Truncated {
             have: suffix.len(),
@@ -1284,29 +1293,35 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_parses_from_header_and_suffix_ranges_alone() {
+    fn the_footer_parses_from_one_suffix_range_alone() {
         let entries = delta_entries(120);
         let (buf, footer) = build_delta(&entries, 4096).unwrap();
-        let header = &buf[..HEADER_LEN];
-        // A generous suffix guess parses in one shot.
+        // A generous suffix guess parses in one shot, no header read.
         let from = buf.len().saturating_sub(4096);
-        let got = read_layer_footer_ranges(header, &buf[from..], buf.len() as u64).unwrap();
+        let got =
+            read_layer_footer_suffix(LayerKind::Delta, &buf[from..], buf.len() as u64).unwrap();
         assert_eq!(got, footer);
         // A guess that only covers the tail names the exact refetch.
         let tail_only = &buf[buf.len() - TAIL_LEN..];
-        let need = match read_layer_footer_ranges(header, tail_only, buf.len() as u64) {
+        let need = match read_layer_footer_suffix(LayerKind::Delta, tail_only, buf.len() as u64) {
             Err(LayerDecodeError::Truncated { need, .. }) => need,
             other => panic!("expected a truncated error, got {other:?}"),
         };
         let exact = &buf[buf.len() - need..];
-        let got = read_layer_footer_ranges(header, exact, buf.len() as u64).unwrap();
+        let got = read_layer_footer_suffix(LayerKind::Delta, exact, buf.len() as u64).unwrap();
         assert_eq!(got, footer);
         // A lying object length shifts the block index base and fails.
-        assert!(read_layer_footer_ranges(header, exact, buf.len() as u64 + 8).is_err());
+        assert!(read_layer_footer_suffix(LayerKind::Delta, exact, buf.len() as u64 + 8).is_err());
         // A corrupt suffix byte fails the crc.
         let mut bad = exact.to_vec();
         bad[3] ^= 0x41;
-        assert!(read_layer_footer_ranges(header, &bad, buf.len() as u64).is_err());
+        assert!(read_layer_footer_suffix(LayerKind::Delta, &bad, buf.len() as u64).is_err());
+        // And so does the wrong kind: the crc covers the header bytes
+        // the caller named, so a delta cannot be read as an image.
+        assert!(matches!(
+            read_layer_footer_suffix(LayerKind::Image, exact, buf.len() as u64),
+            Err(LayerDecodeError::Corrupt)
+        ));
     }
 
     #[test]
