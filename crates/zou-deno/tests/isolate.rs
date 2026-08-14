@@ -441,6 +441,7 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
             file: typeof File,
             form: typeof FormData,
             crypto: typeof crypto,
+            subtle: typeof crypto?.subtle?.digest,
             timer: typeof setTimeout,
             stream: (() => { try { new ReadableStream(); return "made one"; } catch (e) { return e.message; } })(),
         }));
@@ -456,7 +457,8 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
     assert_eq!(said["blob"], "function");
     assert_eq!(said["file"], "function");
     assert_eq!(said["form"], "function");
-    assert_eq!(said["crypto"], "undefined");
+    assert_eq!(said["crypto"], "object");
+    assert_eq!(said["subtle"], "function");
     assert_eq!(said["timer"], "undefined");
     assert_eq!(said["stream"], "ReadableStream is not implemented yet");
 }
@@ -803,6 +805,172 @@ fn a_blob_can_be_sent_and_a_body_can_be_read_as_one() {
     assert_eq!(
         said["paramsType"],
         "application/x-www-form-urlencoded;charset=UTF-8"
+    );
+}
+
+#[test]
+fn random_bytes_are_random_and_land_where_they_were_asked_for() {
+    let answer = answered(
+        r#"
+        const one = crypto.getRandomValues(new Uint8Array(16));
+        const two = crypto.getRandomValues(new Uint8Array(16));
+        const wide = crypto.getRandomValues(new Uint32Array(4));
+        const inside = new Uint8Array(8);
+        const view = new Uint8Array(inside.buffer, 4, 4);
+        crypto.getRandomValues(view);
+        Deno.serve(() => Response.json({
+            length: one.length,
+            differ: one.some((byte, at) => byte !== two[at]),
+            filled: one.some((byte) => byte !== 0),
+            same: crypto.getRandomValues(one) === one,
+            wide: wide.some((word) => word > 65535),
+            untouched: Array.from(inside.slice(0, 4)),
+            uuid: crypto.randomUUID(),
+            unique: crypto.randomUUID() !== crypto.randomUUID(),
+            floats: (() => {
+                try { crypto.getRandomValues(new Float64Array(4)); return "filled one"; }
+                catch (e) { return e.message; }
+            })(),
+            tooMuch: (() => {
+                try { crypto.getRandomValues(new Uint8Array(65537)); return "filled one"; }
+                catch (e) { return e.message.split("(")[0].trim(); }
+            })(),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["length"], 16);
+    assert_eq!(said["differ"], true);
+    assert_eq!(said["filled"], true);
+    assert_eq!(said["same"], true);
+    // A wider array is filled with bytes and not with small numbers,
+    // which is what a fill that only wrote the first byte of each word
+    // would look like.
+    assert_eq!(said["wide"], true);
+    // The bytes beside the view are not the view's.
+    assert_eq!(said["untouched"], serde_json::json!([0, 0, 0, 0]));
+    let uuid = said["uuid"].as_str().expect("a uuid");
+    assert_eq!(uuid.len(), 36);
+    assert_eq!(uuid.as_bytes()[14], b'4', "{uuid}");
+    assert!(
+        ['8', '9', 'a', 'b'].contains(&uuid.chars().nth(19).expect("a variant")),
+        "{uuid}"
+    );
+    assert_eq!(said["unique"], true);
+    assert_eq!(
+        said["floats"],
+        "The provided ArrayBufferView is not an integer array type"
+    );
+    assert_eq!(said["tooMuch"], "The ArrayBufferView's byte length");
+}
+
+/// The digests, checked against the values the command line tools give
+/// for the same input, which is what says the bytes crossed intact.
+#[test]
+fn a_digest_is_the_digest_everything_else_computes() {
+    let answer = answered(
+        r#"
+        const hex = (buffer) =>
+            Array.from(new Uint8Array(buffer), (byte) => byte.toString(16).padStart(2, "0")).join("");
+        const zou = new TextEncoder().encode("zou");
+        Deno.serve(async () => Response.json({
+            one: hex(await crypto.subtle.digest("SHA-1", zou)),
+            "256": hex(await crypto.subtle.digest("SHA-256", zou)),
+            "384": hex(await crypto.subtle.digest("SHA-384", zou)),
+            "512": hex(await crypto.subtle.digest("SHA-512", zou)),
+            named: hex(await crypto.subtle.digest({ name: "sha-256" }, zou)),
+            fromBuffer: hex(await crypto.subtle.digest("SHA-256", zou.buffer)),
+            missing: await crypto.subtle.digest("MD5", zou).catch((e) => e.message),
+            notBytes: await crypto.subtle.digest("SHA-256", "zou").catch((e) => e.message),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["one"], "138c4434ce6b0de777e96966217455e122753986");
+    assert_eq!(
+        said["256"],
+        "b20a7d254bdab4ee822c1973b2dca94197261860c5ad468b401c430a9d2c6ca4"
+    );
+    assert_eq!(
+        said["384"],
+        "40c98c7cedcf7a474f65d0d3648bbd85128b898dd50d82354b0c7f6ee11c6c61c57a708216355db4015e9ff1a33284fd"
+    );
+    assert_eq!(
+        said["512"],
+        "cbc2065695af4c488931ed168e8d5da7f043ce9a2502b250b48b34ab2c39d930322652bcd6940be01d12595daa624072688654ebd20f2fd96b28f708da946fb7"
+    );
+    // A name is matched the way the spec matches it, so the lowercase
+    // one is the same hash and not a second one.
+    assert_eq!(said["named"], said["256"]);
+    assert_eq!(said["fromBuffer"], said["256"]);
+    assert_eq!(said["missing"], "Unrecognized algorithm name: MD5");
+    assert_eq!(said["notBytes"], "data must be a BufferSource");
+}
+
+/// Signing and verifying, which is what a function checking a webhook
+/// signature does and is the reason `subtle` is here at all.
+#[test]
+fn an_hmac_signs_what_it_verifies() {
+    let answer = answered(
+        r#"
+        const hex = (buffer) =>
+            Array.from(new Uint8Array(buffer), (byte) => byte.toString(16).padStart(2, "0")).join("");
+        const bytes = (text) => new TextEncoder().encode(text);
+        const key = await crypto.subtle.importKey(
+            "raw", bytes("Jefe"), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"],
+        );
+        const message = bytes("what do ya want for nothing?");
+        const signature = await crypto.subtle.sign("HMAC", key, message);
+        const other = await crypto.subtle.importKey(
+            "raw", bytes("not Jefe"), { name: "HMAC", hash: { name: "SHA-256" } }, false, ["verify"],
+        );
+        Deno.serve(async () => Response.json({
+            signature: hex(signature),
+            hash: key.algorithm.hash.name,
+            length: key.algorithm.length,
+            type: key.type,
+            usages: key.usages,
+            verified: await crypto.subtle.verify("HMAC", key, signature, message),
+            wrongKey: await crypto.subtle.verify("HMAC", other, signature, message),
+            wrongMessage: await crypto.subtle.verify("HMAC", key, signature, bytes("something else")),
+            shortSignature: await crypto.subtle.verify("HMAC", key, bytes("short"), message),
+            notHmac: await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, message).catch((e) => e.message),
+            notRaw: await crypto.subtle
+                .importKey("jwk", {}, { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
+                .catch((e) => e.message),
+            noKeyGeneration: (() => {
+                try { crypto.subtle.generateKey(); return "made one"; } catch (e) { return e.message; }
+            })(),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    // RFC 4231's second test case, the same one the unit tests use, so
+    // the whole path from javascript to the mac and back is the value
+    // everybody else computes.
+    assert_eq!(
+        said["signature"],
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+    );
+    assert_eq!(said["hash"], "SHA-256");
+    assert_eq!(said["length"], 32);
+    assert_eq!(said["type"], "secret");
+    assert_eq!(said["usages"], serde_json::json!(["sign", "verify"]));
+    assert_eq!(said["verified"], true);
+    assert_eq!(said["wrongKey"], false);
+    assert_eq!(said["wrongMessage"], false);
+    assert_eq!(said["shortSignature"], false);
+    assert_eq!(
+        said["notHmac"],
+        "RSASSA-PKCS1-v1_5 is not supported yet, only HMAC is"
+    );
+    assert_eq!(
+        said["notRaw"],
+        "the jwk key format is not supported yet, only raw is"
+    );
+    assert_eq!(
+        said["noKeyGeneration"],
+        "crypto.subtle.generateKey is not supported yet"
     );
 }
 

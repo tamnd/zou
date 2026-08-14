@@ -23,7 +23,8 @@
 //! small implementation of the shapes a handler is written against, and
 //! the gaps are written down here rather than found out in production:
 //!
-//! - `crypto` is not there, and `crypto.subtle` least of all.
+//! - `crypto.subtle` is a digest and HMAC and no more: no encryption,
+//!   no key derivation, no asymmetric algorithms, each refused by name.
 //! - Streams are not there. A `ReadableStream` body throws by name, and
 //!   `fetch` collects an answer before handing it back, so a blob's
 //!   `stream()` throws too.
@@ -33,10 +34,10 @@
 //!   package that reaches for one will not run.
 //!
 //! What is there is `Headers`, `Request`, `Response`, `URL`,
-//! `URLSearchParams`, `Blob`, `File`, `FormData`, `TextEncoder`,
-//! `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`
-//! and `fetch`, which is enough to run a handler that reads a request,
-//! calls something else and answers.
+//! `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`,
+//! `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`,
+//! `Deno.serve`, `Deno.env` and `fetch`, which is enough to run a
+//! handler that reads a request, calls something else and answers.
 //!
 //! `URL` is the `url` crate behind two ops, which is the same parser
 //! Deno's own is built on, rather than a few hundred lines of
@@ -45,6 +46,10 @@
 //! `Blob`, `File` and `FormData` are javascript, because a blob is
 //! bytes with a media type on it and a form is a list of pairs and two
 //! wire formats, none of which is work for the host.
+//!
+//! `crypto` is the other way around: randomness is the operating
+//! system's and a hash is `sha2` and `hmac`, which is the same code
+//! this server signs its own tokens with.
 //!
 //! `fetch` is the client `zou-server` calls a database webhook with,
 //! behind an op, rather than a second HTTP stack linked in beside it.
@@ -59,6 +64,8 @@
 
 #[cfg(not(feature = "isolate"))]
 mod absent;
+#[cfg(feature = "isolate")]
+mod crypto;
 #[cfg(feature = "isolate")]
 mod fetch;
 #[cfg(feature = "isolate")]
