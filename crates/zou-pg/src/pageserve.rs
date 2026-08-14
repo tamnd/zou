@@ -971,12 +971,14 @@ fn fold_loop(
         let started = Instant::now();
         match crate::compact::compact_shard(&*store, &tenant_ref, 0, Some(&pool), data_checksums) {
             Ok(Some(out)) => log::info!(
-                "zou pageserve: folded {} layers into {} in {:.0}s, debt {} MB to {} MB",
+                "zou pageserve: folded {} layers into {} in {:.0}s, debt {} MB to {} MB, imaged {} pages of which {} off the frozen objects",
                 out.retired,
                 out.outputs,
                 started.elapsed().as_secs_f64(),
                 out.debt_before >> 20,
                 out.debt_after >> 20,
+                out.imaged,
+                out.frozen,
             ),
             Ok(None) => log::info!("zou pageserve: fold found nothing to do"),
             Err(e) => log::warn!("zou pageserve: fold: {e}"),
