@@ -70,6 +70,13 @@ const CONTROL_CHECKSUM_BACK: usize = 40;
 /// distance above is made of.
 #[cfg(test)]
 const MOCK_AUTH_NONCE_LEN: usize = 32;
+/// The shortest thing that can be a pg_control. On disk the file is
+/// padded to PG_CONTROL_FILE_SIZE, but a capture holds only the struct,
+/// which is 296 bytes on pg18 and shorter on older releases, so the
+/// floor is the last field anything here reads rather than a block. A
+/// file too short to carry its own crc has no valid crc position, and
+/// that is the check that matters.
+const CONTROL_MIN_LEN: usize = CONTROL_REDO_OFFSET + 8;
 const DB_SHUTDOWNED: u32 = 1;
 const DB_IN_PRODUCTION: u32 = 6;
 
@@ -111,11 +118,14 @@ pub fn wal_file_name(tli: u32, lsn: u64) -> String {
 /// doubles as an integrity check for callers reading pg_control from
 /// under a running server.
 pub fn control_crc_offset(control: &[u8]) -> Result<usize, String> {
-    if control.len() < 512 {
+    if control.len() < CONTROL_MIN_LEN {
         return Err(format!("pg_control is {} bytes, too small", control.len()));
     }
     let mut crc_offset = None;
-    for k in (CONTROL_STATE_OFFSET + 4)..control.len().min(1024) - 4 {
+    // Inclusive of the last word that fits: a capture holds the struct
+    // and nothing after it, so on such a file the crc is the final four
+    // bytes and an exclusive bound would walk straight past it.
+    for k in (CONTROL_STATE_OFFSET + 4)..=control.len().min(1024) - 4 {
         let stored = u32::from_le_bytes(control[k..k + 4].try_into().expect("in bounds"));
         if crc32c::crc32c(&control[..k]) == stored {
             if crc_offset.is_some() {
@@ -667,6 +677,23 @@ mod tests {
         // char signedness bool, the nonce, and the padding that aligns
         // the crc back to four.
         assert_eq!(CONTROL_CHECKSUM_BACK, 4 + 1 + MOCK_AUTH_NONCE_LEN + 3);
+    }
+
+    /// What a capture actually holds. The file on disk is padded to a
+    /// block, but the store keeps sizeof(ControlFileData), 296 bytes on
+    /// pg18, so the crc is the last word in the object and there is
+    /// nothing behind it. Read off a real capture from a scale 10 store
+    /// on server3, where the crc sits at 292 and the version at 252.
+    #[test]
+    fn a_capture_that_stops_at_the_crc_still_reads() {
+        let mut control = control_with_checksums(1);
+        control.truncate(296);
+        assert_eq!(control_crc_offset(&control).unwrap(), 292);
+        assert!(control_data_checksums(&control).unwrap());
+        // One byte short of the crc is a file that cannot vouch for
+        // itself, and that is a refusal.
+        control.truncate(295);
+        assert!(control_data_checksums(&control).is_err());
     }
 
     /// A torn or truncated pg_control has no crc position, and the
