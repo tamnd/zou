@@ -117,17 +117,53 @@ pub async fn call(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     // Blocking on purpose: an isolate is a thread's worth of state and
     // a host handler is ordinary Rust, so neither belongs on the
     // executor that is also answering everything else.
-    let ran = tokio::task::spawn_blocking(move || registry.invoke(&function, call)).await;
-    match ran {
-        Ok(Ok(answer)) => answered(answer),
-        Ok(Err(why)) => {
-            log::error!("functions: {name} failed: {why}");
-            failed()
+    //
+    // The answer arrives on the channel rather than as the return
+    // value, because the two are not the same moment: a function that
+    // left work behind with `EdgeRuntime.waitUntil` has answered long
+    // before it is finished, and the caller is owed the first of those
+    // and not the second.
+    let (sent, arrives) = tokio::sync::oneshot::channel();
+    let ran = tokio::task::spawn_blocking(move || {
+        registry.invoke_answering(
+            &function,
+            call,
+            Box::new(move |answer| {
+                let _ = sent.send(answer);
+            }),
+        )
+    });
+    match arrives.await {
+        Ok(answer) => {
+            // Whatever is still running is watched from here, so a
+            // failure after the answer is a log line rather than
+            // nothing at all.
+            let named = name.clone();
+            tokio::spawn(async move {
+                match ran.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(why)) => log::error!("functions: {named} failed after answering: {why}"),
+                    Err(e) => log::error!("functions: {named} died after answering: {e}"),
+                }
+            });
+            answered(answer)
         }
-        Err(e) => {
-            log::error!("functions: {name} died: {e}");
-            failed()
-        }
+        // Nothing was ever sent, so the call ended before it answered
+        // and the reason is whatever the runtime returned.
+        Err(_) => match ran.await {
+            Ok(Ok(())) => {
+                log::error!("functions: {name} finished without answering");
+                failed()
+            }
+            Ok(Err(why)) => {
+                log::error!("functions: {name} failed: {why}");
+                failed()
+            }
+            Err(e) => {
+                log::error!("functions: {name} died: {e}");
+                failed()
+            }
+        },
     }
 }
 

@@ -308,16 +308,37 @@ Clearing a timer cancels the wait rather than marking it unwanted, so `setTimeou
 - A delay is the spec's signed 32 bit integer: past `2 ** 31 - 1` it wraps, and anything at or below zero fires as soon as the event loop can get to it. `setTimeout(f, Infinity)` is `setTimeout(f, 0)`, which is what browsers do.
 - One difference: `setTimeout("code()")` throws a `TypeError`. Deno evaluates a string there, which is `eval` with a longer name.
 
+## EdgeRuntime.waitUntil
+
+Work that outlives the response.
+
+```ts
+Deno.serve(async (req) => {
+  const body = await req.json()
+  EdgeRuntime.waitUntil(
+    fetch("https://example.com/audit", { method: "POST", body: JSON.stringify(body) }),
+  )
+  return new Response("accepted", { status: 202 })
+})
+```
+
+The caller is answered as soon as the handler returns a `Response`, and what was registered here keeps running afterwards.
+Work registered from inside work counts too, so a promise chain that ends in another `waitUntil` is waited for as well.
+
+- A rejection is logged and nothing else. Whatever registered the work has returned by then and the answer is already on its way, so there is nobody left to tell.
+- Thirty seconds is the budget. Work still running after that is dropped and the drop is logged, because the isolate holding it is memory and the thread running it is a real thread, and a promise nobody resolves is a thing a function can write by accident. This number moves when per isolate limits arrive.
+- An ordinary shutdown waits for it. The work runs on the blocking thread the call already had, so the process does not exit out from under it.
+- On Lambda it is best effort. The response goes back to the runtime api first, and an environment that is frozen straight afterwards stops the work where it stands until the next invocation thaws it, or loses it if the environment is destroyed. That is the platform and not the runtime.
+
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
 
 Not present yet, and named rather than silently missing:
 
 - The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
 - `WebSocket`, which is what `createClient` reaches for when it builds a realtime client.
 - Streams. `new ReadableStream()` throws with its own name in the message, and a response body is collected before it is sent rather than arriving in chunks.
-- `EdgeRuntime.waitUntil`, so work that outlives the response has nowhere to go.
 - Node built ins. `node:fs` and the rest are refused by name.
 
 The rest of that list, and where each line stands, is [issue #369](https://github.com/tamnd/zou/issues/369).

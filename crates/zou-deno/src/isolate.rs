@@ -14,7 +14,7 @@
 //! its own, and nothing about it is ever moved anywhere else.
 
 use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, op2, v8};
-use zou_functions::{Answer, Call, Function, Runtime};
+use zou_functions::{Answer, Call, Function, Runtime, Sink};
 
 use crate::{crypto, fetch, module, timer, url};
 
@@ -137,8 +137,43 @@ impl Default for Isolate {
     }
 }
 
+/// How long work registered with `EdgeRuntime.waitUntil` may go on
+/// after the caller has been answered.
+///
+/// There is a limit because the thread this runs on is a real one and
+/// the isolate holding it is real memory, and because a promise that
+/// never settles is a thing a function can write by accident. Thirty
+/// seconds is long enough for the reason `waitUntil` exists, which is
+/// a log line or a webhook that should not have been on the caller's
+/// critical path, and short enough that a leak is a blip. Per isolate
+/// limits are their own box on #369 and this number moves there when
+/// they arrive.
+const BACKGROUND: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Runtime for Isolate {
     fn invoke(&self, function: &Function, call: Call) -> Result<Answer, String> {
+        // The blocking shape, for a caller that wants the answer and
+        // the background work in the same wait: the sink writes into a
+        // slot rather than anywhere the call could have gone on ahead.
+        let held = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let slot = std::sync::Arc::clone(&held);
+        self.invoke_answering(
+            function,
+            call,
+            Box::new(move |answer| {
+                *slot.lock().expect("nothing else holds this") = Some(answer);
+            }),
+        )?;
+        let answer = held.lock().expect("the isolate is done with it").take();
+        answer.ok_or_else(|| "the handler returned without an answer".to_string())
+    }
+
+    fn invoke_answering(
+        &self,
+        function: &Function,
+        call: Call,
+        answer: Sink,
+    ) -> Result<(), String> {
         // V8 needs one process wide platform and does not care who set
         // it up, so long as it happened before the first isolate.
         static PLATFORM: std::sync::Once = std::sync::Once::new();
@@ -168,7 +203,7 @@ impl Runtime for Isolate {
             .enable_all()
             .build()
             .map_err(|e| format!("the isolate could not have a runtime: {e}"))?;
-        tokio.block_on(run(specifier, held))
+        tokio.block_on(run(specifier, held, answer))
     }
 
     fn describe(&self) -> String {
@@ -176,7 +211,11 @@ impl Runtime for Isolate {
     }
 }
 
-async fn run(specifier: deno_core::ModuleSpecifier, held: Held) -> Result<Answer, String> {
+async fn run(
+    specifier: deno_core::ModuleSpecifier,
+    held: Held,
+    answer: Sink,
+) -> Result<(), String> {
     let mut js = JsRuntime::new(RuntimeOptions {
         module_loader: Some(module::loader()),
         extensions: vec![zou::init()],
@@ -185,9 +224,10 @@ async fn run(specifier: deno_core::ModuleSpecifier, held: Held) -> Result<Answer
     js.op_state().borrow_mut().put(held);
     js.op_state().borrow_mut().put(timer::Pending::default());
 
-    // The prelude is the value of its own last expression, so the entry
-    // point is held here and never on an object the function can reach.
-    let entry = js
+    // The prelude is the value of its own last expression, so the two
+    // entry points are held here and never on an object the function
+    // can reach.
+    let entries = js
         .execute_script("zou:prelude.js", include_str!("prelude.js"))
         .map_err(|e| format!("the prelude did not run: {e}"))?;
 
@@ -201,25 +241,55 @@ async fn run(specifier: deno_core::ModuleSpecifier, held: Held) -> Result<Answer
         .map_err(|e| format!("{specifier}: {e}"))?;
     evaluated.await.map_err(|e| format!("{specifier}: {e}"))?;
 
-    let entry = {
+    let (entry, drain) = {
         let context = js.main_context();
         let isolate = &mut *js.v8_isolate();
         v8::scope_with_context!(let scope, isolate, context);
-        let value = v8::Local::new(scope, entry);
-        let function: v8::Local<v8::Function> = value
+        let value = v8::Local::new(scope, entries);
+        let pair: v8::Local<v8::Array> = value
             .try_into()
-            .map_err(|_| "the prelude did not end in a function".to_string())?;
-        v8::Global::new(scope, function)
+            .map_err(|_| "the prelude did not end in its entry points".to_string())?;
+        let mut held = Vec::new();
+        for at in [0, 1] {
+            let value = pair
+                .get_index(scope, at)
+                .ok_or_else(|| format!("the prelude's entry point {at} is missing"))?;
+            let function: v8::Local<v8::Function> = value
+                .try_into()
+                .map_err(|_| format!("the prelude's entry point {at} is not a function"))?;
+            held.push(v8::Global::new(scope, function));
+        }
+        let drain = held.pop().expect("two of them");
+        (held.pop().expect("two of them"), drain)
     };
     let called = js.call(&entry);
     js.with_event_loop_promise(called, PollEventLoopOptions::default())
         .await
         .map_err(|e| e.to_string())?;
 
-    let state = js.op_state();
-    let mut state = state.borrow_mut();
-    let held = state.borrow_mut::<Held>();
-    held.answered
-        .take()
-        .ok_or_else(|| "the handler returned without an answer".to_string())
+    // The answer goes now, not when this function returns, because
+    // what is left to do after it is the function's own business and
+    // the caller is not a party to it.
+    let answered = {
+        let state = js.op_state();
+        let mut state = state.borrow_mut();
+        state.borrow_mut::<Held>().answered.take()
+    };
+    answer(answered.ok_or_else(|| "the handler returned without an answer".to_string())?);
+
+    // Whatever `EdgeRuntime.waitUntil` was given, until it settles or
+    // until it has had long enough. A promise nobody resolves is not
+    // an error a function is told about, and it is not a thread this
+    // process keeps forever either.
+    let drained = js.call(&drain);
+    let waited = js.with_event_loop_promise(drained, PollEventLoopOptions::default());
+    match tokio::time::timeout(BACKGROUND, waited).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(format!(
+            "{specifier}: work left after the answer failed: {e}"
+        )),
+        Err(_) => Err(format!(
+            "{specifier}: work left after the answer was still running after {BACKGROUND:?} and was dropped"
+        )),
+    }
 }

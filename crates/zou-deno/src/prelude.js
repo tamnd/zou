@@ -1359,6 +1359,33 @@
     };
   }
 
+  // ---------------------------------------------------------------
+  // EdgeRuntime.waitUntil
+  //
+  // Work that outlives the answer. What is registered here is held
+  // until it settles, after the caller has already been answered, and
+  // the host is what decides how long that is allowed to take.
+
+  const waiting = new Set();
+
+  function waitUntil(work) {
+    // A rejection here has nobody left to catch it: whatever
+    // registered the work returned before it failed and the answer is
+    // already on its way, so it is logged and it is not an error the
+    // caller can be told about.
+    waiting.add(Promise.resolve(work).catch((thrown) => console.error(thrown)));
+  }
+
+  async function drain() {
+    // A loop rather than one wait, because work registered from
+    // inside work is still work that was registered.
+    while (waiting.size > 0) {
+      const held = Array.from(waiting);
+      waiting.clear();
+      await Promise.allSettled(held);
+    }
+  }
+
   const env = {
     get(name) {
       const found = ops.op_zou_env_get(String(name));
@@ -1381,9 +1408,12 @@
   // ---------------------------------------------------------------
   // What the module sees
 
+  const EdgeRuntime = { waitUntil };
+
   Object.assign(globalThis, {
     Blob,
     CryptoKey,
+    EdgeRuntime,
     File,
     FormData,
     Headers,
@@ -1442,5 +1472,8 @@
     ops.op_zou_answer(answer.status, Array.from(answer.headers.entries()), answer[BODY]);
   }
 
-  return run;
+  // Two of them: the call, and whatever the call left running. The
+  // host calls the first, takes the answer, and only then calls the
+  // second, which is the whole of what `waitUntil` means.
+  return [run, drain];
 })(globalThis);

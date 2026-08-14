@@ -187,9 +187,34 @@ impl Answer {
 pub trait Runtime: Send + Sync {
     fn invoke(&self, function: &Function, call: Call) -> Result<Answer, String>;
 
+    /// The same call, with the answer handed over the moment there is
+    /// one rather than when the call is finished.
+    ///
+    /// The two are the same moment for a runtime with nothing after
+    /// the answer, which is what the default here says. They are not
+    /// the same moment for the isolate: `EdgeRuntime.waitUntil` is
+    /// work that outlives the response, and the caller is not made to
+    /// wait for it.
+    ///
+    /// An `Err` after the answer has been handed over is the
+    /// background work's and not the caller's, so it is logged and
+    /// nobody is told about it.
+    fn invoke_answering(
+        &self,
+        function: &Function,
+        call: Call,
+        answer: Sink,
+    ) -> Result<(), String> {
+        answer(self.invoke(function, call)?);
+        Ok(())
+    }
+
     /// What to call this in a log line and in `zou status`.
     fn describe(&self) -> String;
 }
+
+/// Where an answer goes as soon as the handler has one.
+pub type Sink = Box<dyn FnOnce(Answer) + Send>;
 
 /// A handler that is Rust in the host application.
 pub type Handler = Box<dyn Fn(&Call) -> Result<Answer, String> + Send + Sync>;
@@ -297,6 +322,18 @@ impl Registry {
     /// allowed to block.
     pub fn invoke(&self, function: &Function, call: Call) -> Result<Answer, String> {
         self.runtime.invoke(function, call)
+    }
+
+    /// Run one, and hand the answer over as soon as the handler has
+    /// one. This returns when the runtime is finished, which is later
+    /// than the answer whenever the function left work behind it.
+    pub fn invoke_answering(
+        &self,
+        function: &Function,
+        call: Call,
+        answer: Sink,
+    ) -> Result<(), String> {
+        self.runtime.invoke_answering(function, call, answer)
     }
 
     pub fn describe(&self) -> String {

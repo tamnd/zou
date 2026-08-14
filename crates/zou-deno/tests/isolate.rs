@@ -442,6 +442,7 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
             form: typeof FormData,
             crypto: typeof crypto,
             subtle: typeof crypto?.subtle?.digest,
+            edge: typeof EdgeRuntime?.waitUntil,
             timer: typeof setTimeout,
             interval: typeof setInterval,
             microtask: typeof queueMicrotask,
@@ -461,6 +462,7 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
     assert_eq!(said["form"], "function");
     assert_eq!(said["crypto"], "object");
     assert_eq!(said["subtle"], "function");
+    assert_eq!(said["edge"], "function");
     assert_eq!(said["timer"], "function");
     assert_eq!(said["interval"], "function");
     assert_eq!(said["microtask"], "function");
@@ -1112,6 +1114,7 @@ fn the_entry_point_is_not_something_a_function_can_reach() {
         r#"
         Deno.serve(() => Response.json({
             run: typeof globalThis.run,
+            drain: typeof globalThis.drain,
             handler: typeof globalThis.handler,
             names: Object.keys(globalThis).filter((n) => n.toLowerCase().includes("run")),
         }));
@@ -1119,8 +1122,11 @@ fn the_entry_point_is_not_something_a_function_can_reach() {
     );
     let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
     assert_eq!(said["run"], "undefined");
+    assert_eq!(said["drain"], "undefined");
     assert_eq!(said["handler"], "undefined");
-    assert_eq!(said["names"], serde_json::json!([]));
+    // `EdgeRuntime` is a global a function is meant to have and it has
+    // the word in it, which is the whole of why it is named here.
+    assert_eq!(said["names"], serde_json::json!(["EdgeRuntime"]));
 }
 
 #[test]
@@ -1143,6 +1149,90 @@ fn the_runtime_says_what_it_is() {
 }
 
 // -------------------------------------------------------------------
+// EdgeRuntime.waitUntil
+
+#[test]
+fn work_left_after_the_answer_does_not_keep_the_caller_waiting_for_it() {
+    let deployed = deployed(
+        r#"
+        Deno.serve(() => {
+            EdgeRuntime.waitUntil(new Promise((resolve) => setTimeout(resolve, 200)));
+            return new Response("answered");
+        });
+        "#,
+    );
+    let started = std::time::Instant::now();
+    let (sent, arrived) = std::sync::mpsc::channel();
+    Isolate::new()
+        .invoke_answering(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+            Box::new(move |answer| {
+                let _ = sent.send((answer, started.elapsed()));
+            }),
+        )
+        .expect("it ran");
+    let finished = started.elapsed();
+    let (answer, answered) = arrived.recv().expect("an answer");
+    assert_eq!(body(&answer), "answered");
+    // The answer is handed over while the work is still going, and the
+    // call is not finished until the work is.
+    assert!(
+        answered < std::time::Duration::from_millis(150),
+        "the caller waited for the background work: {answered:?}"
+    );
+    assert!(
+        finished >= std::time::Duration::from_millis(200),
+        "the background work did not get to run: {finished:?}"
+    );
+}
+
+#[test]
+fn work_left_after_the_answer_is_really_run_and_may_leave_more_behind_it() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(() => {{
+            EdgeRuntime.waitUntil(
+                fetch("{first}", {{ method: "POST" }}).then(() => {{
+                    // Work registered from inside work is still work.
+                    EdgeRuntime.waitUntil(fetch("{second}", {{ method: "POST" }}));
+                }}),
+            );
+            return new Response("answered");
+        }});
+        "#,
+        first = server.url("/webhook"),
+        second = server.url("/and-another"),
+    ));
+    assert_eq!(body(&answer), "answered");
+    assert!(server.saw("/webhook"), "the background work never ran");
+    assert!(
+        server.saw("/and-another"),
+        "work registered from inside work never ran"
+    );
+}
+
+#[test]
+fn work_that_fails_after_the_answer_is_not_the_callers_problem() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(() => {{
+            EdgeRuntime.waitUntil(Promise.reject(new Error("nobody is listening")));
+            EdgeRuntime.waitUntil(fetch("{after}"));
+            return new Response("answered", {{ status: 202 }});
+        }});
+        "#,
+        after = server.url("/after-the-failure"),
+    ));
+    // The rejection is logged and the rest of the work still happens.
+    assert_eq!(answer.status, 202);
+    assert_eq!(body(&answer), "answered");
+    assert!(server.saw("/after-the-failure"));
+}
+
+// -------------------------------------------------------------------
 // fetch
 
 /// A server on a port nobody chose, for the tests that call out.
@@ -1152,14 +1242,26 @@ fn the_runtime_says_what_it_is() {
 mod wire {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
 
     pub struct Server {
         pub port: u16,
+        seen: Arc<Mutex<Vec<String>>>,
     }
 
     impl Server {
         pub fn url(&self, path: &str) -> String {
             format!("http://127.0.0.1:{}{path}", self.port)
+        }
+
+        /// Whether a request for `path` ever arrived, which is the only
+        /// way a test can see work that answered nobody.
+        pub fn saw(&self, path: &str) -> bool {
+            self.seen
+                .lock()
+                .expect("the server thread is not holding it")
+                .iter()
+                .any(|asked| asked == path)
         }
     }
 
@@ -1176,16 +1278,19 @@ mod wire {
     pub fn start() -> Server {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
         let port = listener.local_addr().expect("an address").port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&seen);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                std::thread::spawn(|| answer(stream));
+                let kept = Arc::clone(&kept);
+                std::thread::spawn(move || answer(stream, kept));
             }
         });
-        Server { port }
+        Server { port, seen }
     }
 
-    fn answer(mut stream: TcpStream) {
+    fn answer(mut stream: TcpStream, seen: Arc<Mutex<Vec<String>>>) {
         let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() || line.is_empty() {
@@ -1219,6 +1324,9 @@ mod wire {
         if length > 0 && reader.read_exact(&mut body).is_err() {
             return;
         }
+        seen.lock()
+            .expect("nobody else is holding it")
+            .push(path.clone());
         let body = String::from_utf8_lossy(&body).to_string();
         let (status, reason, kind, said) = match path.as_str() {
             "/moved" => (302, "Found", "text/plain", String::new()),
