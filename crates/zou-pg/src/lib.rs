@@ -1470,6 +1470,43 @@ fn wal_holder() -> String {
     format!("pg-wal-{host}-{digest:016x}")
 }
 
+/// A lap timer for a path worth reporting on. It keeps the phase names
+/// next to their milliseconds so the line reads in the order the work
+/// happened, and it never fails: an open that dies partway still says
+/// what it got through, which is the half that matters.
+struct Laps {
+    started: Instant,
+    last: Instant,
+    spans: Vec<String>,
+}
+
+impl Laps {
+    fn start() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last: now,
+            spans: Vec::new(),
+        }
+    }
+
+    fn lap(&mut self, what: &str) {
+        let now = Instant::now();
+        self.spans
+            .push(format!("{what} {} ms", (now - self.last).as_millis()));
+        self.last = now;
+    }
+
+    /// The whole thing and its parts, for one log line.
+    fn report(&self) -> String {
+        format!(
+            "{} ms, {}",
+            self.started.elapsed().as_millis(),
+            self.spans.join(", ")
+        )
+    }
+}
+
 /// Whether the supervisor asked for a deliberate lease steal. Set only
 /// when the previous holder is known dead; see [`zou_store::lease::steal`]
 /// for why a wrong call fences a live writer instead of corrupting it.
@@ -1479,6 +1516,17 @@ fn lease_steal_requested() -> bool {
 
 fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     init_logging();
+    // Every commit on this node waits on this function, so it says how
+    // long each part of it took. A kill drill on server3 once left a
+    // pusher in here for 59 seconds without a single log line, which is
+    // the whole recovery budget spent somewhere nobody can name
+    // afterwards (zou #375). A lap timer on a path that runs once per
+    // session costs nothing and turns the next one into a report.
+    // The line at the end reports the laps, and it only gets written if
+    // the open returns at all. This one is the other bracket: a session
+    // that never comes out of here still says when it went in.
+    log::info!("zou_wal_open: opening \"{target}\"");
+    let mut laps = Laps::start();
     let store: Arc<dyn CasStore> = match open_store(target) {
         Ok(store) => Arc::from(store),
         Err(e) => {
@@ -1507,6 +1555,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         }
         Err(_) => return Err(ZOU_ERR_STORE),
     }
+    laps.lap("manifest");
     let holder = wal_holder();
     let held = match lease::acquire(&*store, &layout, &holder, WAL_LEASE_TTL_SECS, now_unix()) {
         Ok(held) => held,
@@ -1536,6 +1585,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         log::error!("zou_wal_open: lease epoch {} does not fit u32", held.epoch);
         return Err(ZOU_ERR_STORE);
     };
+    laps.lap("lease");
     let held = Arc::new(Mutex::new(held));
     let heartbeat = Heartbeat::spawn(
         Arc::clone(&store),
@@ -1560,6 +1610,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             return Err(ZOU_ERR_STORE);
         }
     };
+    laps.lap("takeover");
     // The resume point comes from the chain after the takeover sealed
     // it, so no rival can still be appending below it. It is byte exact:
     // frames carry the chunk's Postgres LSN range, and the consolidator
@@ -1584,6 +1635,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             return Err(ZOU_ERR_STORE);
         }
     };
+    laps.lap("stream end");
     let sink = Arc::new(MediaSink::new(
         Arc::clone(&media),
         WAL_SHARD,
@@ -1623,6 +1675,8 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             Arc::clone(&waiter.durable),
         )
     });
+    laps.lap("resume");
+    log::info!("zou_wal_open: {}", laps.report());
     Ok((
         WalPipe {
             seq: Some(seq),
@@ -2132,6 +2186,24 @@ mod tests {
     use super::*;
     use std::ffi::CString;
     use zou_store::LocalFsStore;
+
+    /// The report names every phase in the order it ran, which is the
+    /// only part of it a reader can rely on: the milliseconds are
+    /// whatever the machine was doing at the time. A line that lost a
+    /// phase name would leave the next slow open as unexplained as the
+    /// one that had no line at all.
+    #[test]
+    fn a_lap_report_reads_in_the_order_the_work_happened() {
+        let mut laps = Laps::start();
+        laps.lap("manifest");
+        laps.lap("lease");
+        let report = laps.report();
+        let manifest = report.find("manifest").expect("the first phase is named");
+        let lease = report.find("lease").expect("the second phase is named");
+        assert!(manifest < lease, "{report}");
+        // Two phases and the total, all in milliseconds.
+        assert_eq!(report.matches(" ms").count(), 3, "{report}");
+    }
 
     /// One test drives the whole C ABI lifecycle, because the shim is a
     /// process global and tests share the process.
