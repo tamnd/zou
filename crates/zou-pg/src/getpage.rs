@@ -44,7 +44,7 @@ use zou_store::layer::LayerKey;
 use zou_store::layermap::LayerMap;
 use zou_store::lsn::Lsn;
 use zou_store::memtable::Memtable;
-use zou_store::pageread::{LayerReader, ReadError};
+use zou_store::pageread::{LayerReader, ReadError, Reconstruction};
 
 use crate::redo::{RedoPool, RedoRequest, page_checksum};
 use crate::walscan::{self, BlockRef};
@@ -54,6 +54,9 @@ use crate::walscan::{self, BlockRef};
 pub const MAX_GETPAGE_BATCH: usize = 128;
 
 const BLCKSZ: usize = 8192;
+
+/// Bytes of postgres page header, up to the line pointer array.
+const PAGE_HEADER: usize = 24;
 
 /// A hook resolving base images for keys no image layer covers, see
 /// [`PageService::with_base_fallback`].
@@ -252,14 +255,20 @@ impl<'a> PageService<'a> {
                 .filter(|(_, r)| r.base.is_some() || !r.records.is_empty())
                 .map(|(blk, _)| *blk)
                 .collect();
-            let mut applied = pool
-                .apply(&RedoRequest {
-                    pages: &bases,
-                    records: &records,
-                    gets: &gets,
-                })
-                .map_err(GetPageError::Redo)?
-                .into_iter();
+            let mut applied = match pool.apply(&RedoRequest {
+                pages: &bases,
+                records: &records,
+                gets: &gets,
+            }) {
+                Ok(pages) => pages.into_iter(),
+                Err(e) => {
+                    let blamed = match pin_culprit(pool, blocks, &recons) {
+                        Some(i) => blame(at, &blocks[i..i + 1], &recons[i..i + 1]),
+                        None => blame(at, blocks, &recons),
+                    };
+                    return Err(GetPageError::Redo(format!("{e}, {blamed}")));
+                }
+            };
             for r in &recons {
                 if r.base.is_some() || !r.records.is_empty() {
                     pages.push(applied.next().expect("one page per get"));
@@ -279,6 +288,102 @@ impl<'a> PageService<'a> {
         }
         Ok(pages)
     }
+}
+
+/// Blocks one failed batch names before the message gives up.
+const BLAME_BLOCKS: usize = 8;
+
+/// Which block of a failed batch fails on its own. A batch is up to
+/// [`MAX_GETPAGE_BATCH`] blocks wide and the worker's PANIC names none
+/// of them, so a read that already failed pays one more pass, a block
+/// and its own records at a time, to find the one that breaks. The
+/// pool replaces the worker each time, so a run of these is slow but
+/// safe, and it only ever happens on a read that is lost anyway. A
+/// block that survives alone is not the culprit: its chain rebuilds.
+/// Nothing failing alone is itself worth knowing, it means the batch
+/// broke on the record union rather than on one page's history.
+fn pin_culprit(pool: &RedoPool, blocks: &[BlockRef], recons: &[Reconstruction]) -> Option<usize> {
+    for (i, (blk, r)) in blocks.iter().zip(recons).enumerate() {
+        if r.base.is_none() && r.records.is_empty() {
+            continue;
+        }
+        let bases: Vec<(BlockRef, &[u8])> = r
+            .base
+            .as_deref()
+            .map(|page| (*blk, page))
+            .into_iter()
+            .collect();
+        let records: Vec<(u64, u64, &[u8])> = r
+            .records
+            .iter()
+            .map(|(lsn, bytes)| {
+                (
+                    lsn.0,
+                    walscan::record_end(lsn.0, bytes.len() as u64),
+                    bytes.as_slice(),
+                )
+            })
+            .collect();
+        let one = [*blk];
+        if pool
+            .apply(&RedoRequest {
+                pages: &bases,
+                records: &records,
+                gets: &one,
+            })
+            .is_err()
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// What the batch that killed the worker was made of. The worker dies
+/// inside postgres, and its PANIC names neither the block nor the
+/// record, so the only place the shape of the failure can be written
+/// down is here, where the batch was built. Every one of these
+/// failures so far has had the same tell: a base whose page lsn sits
+/// below the records it is being asked to take, which means the chain
+/// lost the records in between and redo is applying an update to a
+/// page that never got the one before it.
+fn blame(at: u64, blocks: &[BlockRef], recons: &[Reconstruction]) -> String {
+    let mut said = Vec::new();
+    for (blk, r) in blocks.iter().zip(recons).take(BLAME_BLOCKS) {
+        let base = match &r.base {
+            Some(page) if page.len() >= PAGE_HEADER => {
+                let from = match r.base_lsn {
+                    Some(lsn) => format!("image at {:#x}", lsn.0),
+                    None => "the fallback".into(),
+                };
+                let lower = u16::from_le_bytes([page[12], page[13]]);
+                let upper = u16::from_le_bytes([page[14], page[15]]);
+                let hi = u32::from_le_bytes([page[0], page[1], page[2], page[3]]);
+                let lo = u32::from_le_bytes([page[4], page[5], page[6], page[7]]);
+                let page_lsn = ((hi as u64) << 32) | lo as u64;
+                let maxoff = lower.saturating_sub(PAGE_HEADER as u16) / 4;
+                format!(
+                    "base from the {from}, page lsn {page_lsn:#x}, lower {lower} upper {upper} max off {maxoff}"
+                )
+            }
+            Some(page) => format!("base of {} bytes", page.len()),
+            None => "no base".into(),
+        };
+        let recs = match (r.records.first(), r.records.last()) {
+            (Some((first, _)), Some((last, _))) => {
+                format!("{} records {:#x}..{:#x}", r.records.len(), first.0, last.0)
+            }
+            _ => "no records".into(),
+        };
+        said.push(format!(
+            "{}/{}/{}.{} blk {}: {base}, {recs}, {} layers touched",
+            blk.spc, blk.db, blk.rel, blk.fork, blk.blk, r.layers_touched
+        ));
+    }
+    if blocks.len() > BLAME_BLOCKS {
+        said.push(format!("and {} more blocks", blocks.len() - BLAME_BLOCKS));
+    }
+    format!("the batch read at {at:#x} of {}", said.join("; "))
 }
 
 /// The last written lsn per block, bounded. `note` on every ingested
@@ -678,5 +783,41 @@ mod tests {
             );
         }
         assert!(lw.floor() >= 1100, "dropped generations raised the floor");
+    }
+
+    #[test]
+    fn a_failed_batch_says_what_it_fed_the_worker() {
+        // A base sitting well below the records it is asked to take is
+        // the shape every one of these failures has had, so the
+        // message has to carry both numbers to be worth reading.
+        let mut base = vec![0u8; BLCKSZ];
+        base[0..4].copy_from_slice(&0u32.to_le_bytes());
+        base[4..8].copy_from_slice(&0x0cf9_39b0u32.to_le_bytes());
+        base[12..14].copy_from_slice(&96u16.to_le_bytes());
+        base[14..16].copy_from_slice(&1024u16.to_le_bytes());
+        let recon = Reconstruction {
+            base: Some(base),
+            base_lsn: Some(Lsn(0x0cf9_39b0)),
+            records: vec![
+                (Lsn(0x10db_0100), vec![0u8; 32]),
+                (Lsn(0x10db_0288), vec![0u8; 32]),
+            ],
+            layers_touched: 3,
+        };
+        let said = blame(0x10db_0288, &[blk(16404, 42)], std::slice::from_ref(&recon));
+        assert!(said.contains("1663/5/16404.0 blk 42"), "{said}");
+        assert!(said.contains("image at 0xcf939b0"), "{said}");
+        assert!(said.contains("page lsn 0xcf939b0"), "{said}");
+        assert!(said.contains("max off 18"), "{said}");
+        assert!(said.contains("2 records 0x10db0100..0x10db0288"), "{said}");
+
+        let bare = Reconstruction {
+            base: None,
+            base_lsn: None,
+            records: Vec::new(),
+            layers_touched: 0,
+        };
+        let said = blame(7, &[blk(16404, 1)], std::slice::from_ref(&bare));
+        assert!(said.contains("no base, no records"), "{said}");
     }
 }
