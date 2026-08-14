@@ -430,11 +430,16 @@ fn a_segment_that_does_not_link_ends_the_chain_read_rather_than_breaking_it() {
 
 /// A store whose probes cost what an object store's cost, so a test can
 /// tell a walk from a fan out. Only the one byte ranged get sleeps,
-/// which is the probe and nothing else.
+/// which is the probe and nothing else. It records how many probes were
+/// ever in the sleep at the same moment, which is the thing under test,
+/// rather than wall clock, which on a loaded runner says more about the
+/// runner than about the code.
 struct SlowProbeStore {
     inner: Arc<dyn CasStore>,
     probe: Duration,
     probes: AtomicUsize,
+    inflight: AtomicUsize,
+    peak: AtomicUsize,
 }
 
 impl CasStore for SlowProbeStore {
@@ -443,7 +448,10 @@ impl CasStore for SlowProbeStore {
     }
     fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
         self.probes.fetch_add(1, Ordering::Relaxed);
+        let now = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
         std::thread::sleep(self.probe);
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
         self.inner.get_range(key, offset, len)
     }
     fn put_if_match(
@@ -489,31 +497,31 @@ fn the_takeover_probes_its_windows_wide_rather_than_one_seq_at_a_time() {
         prev_digest = tenants_digest(&summaries);
     }
 
-    let probe = Duration::from_millis(20);
     let slow = Arc::new(SlowProbeStore {
         inner: Arc::clone(&store),
-        probe,
+        probe: Duration::from_millis(20),
         probes: AtomicUsize::new(0),
+        inflight: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
     });
     let media = WalMedia::single(Arc::clone(&slow) as Arc<dyn CasStore>);
 
-    let started = std::time::Instant::now();
     let t = take_over(&media, shard, "node-d").unwrap();
-    let elapsed = started.elapsed();
     assert_eq!(t.sealed_seq, 9);
 
-    // Serial, the two windows alone are 2 * MAX_INFLIGHT probes, so the
-    // bound is well under what a walk of one of them costs. The probe
-    // count is unchanged, this is about how many of them are in flight.
+    // The two windows alone are 2 * MAX_INFLIGHT probes, and every one
+    // of them is a round trip a node pays before it can accept a
+    // commit. The count does not change here, what changes is how many
+    // of them are outstanding at once: a walk never has more than one.
     let probes = slow.probes.load(Ordering::Relaxed);
-    let walked = probe * probes as u32;
+    let peak = slow.peak.load(Ordering::SeqCst);
     assert!(
         probes >= zou_log::MAX_INFLIGHT,
         "{probes} probes, the windows are {} wide",
         zou_log::MAX_INFLIGHT
     );
     assert!(
-        elapsed * 4 < walked,
-        "{probes} probes at {probe:?} took {elapsed:?}, a walk of them is {walked:?}"
+        peak >= 16,
+        "{probes} probes but never more than {peak} of them in flight at once"
     );
 }
