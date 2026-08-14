@@ -6,11 +6,13 @@
 //! and a zou that serves a database and a bucket should pay for neither.
 //! With the feature off this compiles to nothing at all.
 //!
-//! What is here is [`Isolate`], which implements
-//! [`zou_functions::Runtime`]. Everything a call meets before and after
-//! it is in `zou-server` and knows nothing about v8, so the two halves
-//! can be worked on separately and the server's tests do not need an
-//! engine to run.
+//! What is here is `Isolate`, which implements
+//! [`zou_functions::Runtime`], and which is spelled without a link
+//! because with the feature off there is no such item to link to and
+//! these docs are built the way a default build is.
+//! Everything a call meets before and after it is in `zou-server` and
+//! knows nothing about v8, so the two halves can be worked on
+//! separately and the server's tests do not need an engine to run.
 //!
 //! # What a function gets, and what it does not
 //!
