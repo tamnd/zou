@@ -45,8 +45,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       # zou-deno is left out of --all-features on purpose: its feature
-      # is V8, and putting it in here would put forty megabytes of it in
-      # front of every other job. It has its own below.
+      # is V8, and putting it in here would put fifty megabytes of it in
+      # front of every other job. Nothing in the workspace enables that
+      # feature on its behalf either, which is why `zou` depends on the
+      # crate and has no feature of its own that turns the engine on. It
+      # has its own job below.
       - run: cargo clippy --workspace --exclude zou-deno --all-targets --all-features -- -D warnings
 
   test:
@@ -78,6 +81,13 @@ jobs:
       - run: cargo build -p zou-deno
       - run: cargo clippy -p zou-deno --features isolate --all-targets -- -D warnings
       - run: cargo test -p zou-deno --features isolate
+      # The binary with an engine in it, which is what a release bundle
+      # is. Nothing else in this file builds that combination, and the
+      # crate being reachable from the binary is the whole point of the
+      # feature. `--no-deps` because the dependency graph a v8 build
+      # unifies is not this job's to lint.
+      - run: cargo clippy -p zou --features zou-deno/isolate --no-deps --all-targets -- -D warnings
+      - run: cargo test -p zou --features zou-deno/isolate --bins
 
   pg-pool:
     name: sql session pool (postgres)

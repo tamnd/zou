@@ -8,6 +8,8 @@ mod config;
 mod db;
 #[cfg(unix)]
 mod dev;
+#[cfg(unix)]
+mod functions;
 mod gc;
 #[cfg(unix)]
 mod inbox;

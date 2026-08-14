@@ -45,8 +45,11 @@ jobs:
           fi
       - name: Build the patched Postgres
         run: make pg-build
+      # With the javascript engine in it, because a person who downloads
+      # a bundle should not have to rebuild it to run a function. It is
+      # the reason the binary is seventy megabytes rather than twenty.
       - name: Build zou
-        run: cargo build --release -p zou
+        run: cargo build --release -p zou --features zou-deno/isolate
       - name: Assemble the bundle
         run: scripts/zou-bundle.sh --tar
       - name: Start a database out of it
@@ -100,7 +103,9 @@ jobs:
           path: dist/wheels/*.whl
 
   # Windows has no embedded story and no patched postgres, so it gets
-  # the binary on its own, which is what every target got before.
+  # the binary on its own, which is what every target got before. It has
+  # no javascript engine either: the dev loop that would start a function
+  # is unix only, so the feature would be fifty megabytes of dead weight.
   windows:
     name: windows (${{ matrix.target }})
     strategy:

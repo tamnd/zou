@@ -21,12 +21,14 @@ demo:
 test:
 	cargo test --workspace --exclude zou-deno --all-features
 
-# The javascript half of edge functions, engine and all.
+# The javascript half of edge functions, engine and all, and then the
+# binary with that engine in it, which is what a release bundle is.
 test-functions:
 	cargo test -p zou-deno --features isolate
+	cargo test -p zou --features zou-deno/isolate --bins
 
 lint:
-	cargo fmt --check && cargo clippy --workspace --exclude zou-deno --all-targets --all-features -- -D warnings && cargo clippy -p zou-deno --features isolate --all-targets -- -D warnings
+	cargo fmt --check && cargo clippy --workspace --exclude zou-deno --all-targets --all-features -- -D warnings && cargo clippy -p zou-deno --features isolate --all-targets -- -D warnings && cargo clippy -p zou --features zou-deno/isolate --no-deps --all-targets -- -D warnings
 
 # Fetch the pinned Postgres and pgvector sources. Shallow, the full
 # history is not needed.

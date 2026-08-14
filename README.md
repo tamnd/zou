@@ -86,6 +86,18 @@ A room can be sent to over http as well, both shapes the client posts, which is 
 Private channels are served too, against the project's own row level security policies on `realtime.messages`, so policies written for Supabase Realtime answer the same way here.
 `postgres_changes` is served as well, so a channel can subscribe to a table and be sent the rows that changed in it, filtered by the same operators upstream takes and checked against the policies on that table, see [docs/realtime.md](docs/realtime.md).
 
+Edge functions run the typescript a project keeps beside its config file:
+
+```ts
+Deno.serve(async (req) => {
+  const { name } = await req.json()
+  return new Response(JSON.stringify({ hello: name }), { headers: { "content-type": "application/json" } })
+})
+```
+
+A directory with an `index.ts` in it is a url under `/functions/v1/`, verified with the project's own keys, and `supabase.functions.invoke` reaches it.
+The javascript engine is fifty megabytes of V8 and a build without it says so at boot rather than at the first call, so it is asked for with `--features zou-deno/isolate` and the released bundles have it, see [docs/functions.md](docs/functions.md).
+
 Database webhooks are served too, which is to say the trigger a dashboard writes:
 
 ```sql
