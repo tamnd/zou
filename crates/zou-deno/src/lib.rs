@@ -29,14 +29,15 @@
 //!   `fetch` collects an answer before handing it back, so a blob's
 //!   `stream()` throws too.
 //! - `WebSocket` is not there, which is what a realtime client wants.
-//! - A timer only fires while the call is running, and there is no
-//!   `EdgeRuntime.waitUntil`, so nothing outlives the answer.
+//! - A timer only fires while there is a call for it to fire in,
+//!   which is until the answer plus whatever `EdgeRuntime.waitUntil`
+//!   is still waiting for, and thirty seconds is the ceiling on that.
 //! - There are no node built ins, so `node:` is refused by name and a
 //!   package that reaches for one will not run.
 //!
 //! What is there is `Headers`, `Request`, `Response`, `URL`,
 //! `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, the timers,
-//! `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`,
+//! `EdgeRuntime.waitUntil`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`,
 //! `Deno.serve`, `Deno.env` and `fetch`, which is enough to run a
 //! handler that reads a request, calls something else and answers.
 //!
@@ -56,6 +57,11 @@
 //! handler waiting on the clock is the event loop's business and not a
 //! thread's, and clearing one cancels the sleep rather than leaving it
 //! pending with nobody wanting the answer.
+//!
+//! `EdgeRuntime.waitUntil` is why `Runtime::invoke_answering` exists:
+//! the answer is handed over the moment the handler has one and the
+//! call goes on afterwards, so a caller is never made to wait for work
+//! that was moved off its critical path on purpose.
 //!
 //! `fetch` is the client `zou-server` calls a database webhook with,
 //! behind an op, rather than a second HTTP stack linked in beside it.
