@@ -1,0 +1,83 @@
+Read the local end again once the store is open.
+
+The pusher samples how far local WAL is known good before it asks for
+the writer lease, and compares the store's resume point against that
+sample after the open returns. Everything between those two moments is
+unaccounted for, and on a node that just crashed it is exactly the
+window recovery runs in.
+
+A pusher kill drill on server3 caught it. The worker came up with the
+postmaster, sampled the replay pointer at 0/BCA5F50 while redo was
+still going, and did not come out of the open for 59 seconds. Redo
+finished at 0/BE2E6E0 in the meantime, the store legitimately held
+0/BE2E028 from the dead session, and RecoveryInProgress was long since
+false, so the check fired on a pointer nobody had looked at for a
+minute and the worker died. Its replacement started 130 ms later, read
+the same store, and re-pushed the difference without a complaint,
+which is what should have happened the first time.
+
+The check itself is right: past recovery, a store ahead of the cluster
+that owns it is unexplainable and the pusher must not paper over it.
+Only the pointer was wrong, so it is read again inside the branch that
+uses it. A store with no stream keeps the older sample on purpose,
+because that is the one mirroring starts from and moving it forward
+would skip whatever was written while the open ran, rather than re-read
+it.
+
+Slow opens are a separate problem and stay one; this only stops a slow
+open from also costing a worker restart. See zou #375.
+
+diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
+index 1de1789..d3ad9f6 100644
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -373,6 +373,23 @@ ZouWalPusherMain(Datum main_arg)
+ 	 */
+ 	if (resume != 0)
+ 	{
++		/*
++		 * How far local WAL is known good now, rather than when this
++		 * worker started. Opening the store takes as long as it takes,
++		 * recovery runs while it does, and a pointer sampled before the
++		 * lease was granted can be a minute behind the one replay has
++		 * reached by the time the answer comes back. Held against that
++		 * stale pointer an ordinary re-push reads as a store ahead of
++		 * its own cluster, and the worker dies for it: that is how one
++		 * kill drill cost sixty seconds instead of two (zou #375).
++		 *
++		 * The fresh sample only decides that question. A store with no
++		 * stream keeps the pointer this worker started from, because
++		 * there mirroring begins at `pushed` and anything written
++		 * during the open would be skipped rather than re-read.
++		 */
++		XLogRecPtr	local = zou_wal_local_end(&tli);
++
+ 		/*
+ 		 * A store ahead of the cluster it belongs to is nothing local
+ 		 * can explain, once the cluster is up. During recovery it is
+@@ -380,20 +397,20 @@ ZouWalPusherMain(Datum main_arg)
+ 		 * store already holds what follows, and there is nothing to
+ 		 * push until replay comes past the end of the stream.
+ 		 */
+-		if ((XLogRecPtr) resume > pushed && !RecoveryInProgress())
++		if ((XLogRecPtr) resume > local && !RecoveryInProgress())
+ 			ereport(FATAL,
+ 					(errmsg("zou store holds WAL through %X/%X but local flush is only %X/%X",
+ 							LSN_FORMAT_ARGS((XLogRecPtr) resume),
+-							LSN_FORMAT_ARGS(pushed))));
+-		if ((XLogRecPtr) resume > pushed)
++							LSN_FORMAT_ARGS(local))));
++		if ((XLogRecPtr) resume > local)
+ 			ereport(LOG,
+ 					(errmsg("zou wal pusher waiting for recovery to replay past %X/%X, where the stream ends",
+ 							LSN_FORMAT_ARGS((XLogRecPtr) resume))));
+-		if ((XLogRecPtr) resume < pushed)
++		if ((XLogRecPtr) resume < local)
+ 			ereport(LOG,
+ 					(errmsg("zou wal pusher re-pushing %X/%X to %X/%X missed by the previous session",
+ 							LSN_FORMAT_ARGS((XLogRecPtr) resume),
+-							LSN_FORMAT_ARGS(pushed))));
++							LSN_FORMAT_ARGS(local))));
+ 		pushed = (XLogRecPtr) resume;
+ 	}
+ 
