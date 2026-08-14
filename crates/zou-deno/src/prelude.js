@@ -1360,6 +1360,339 @@
   }
 
   // ---------------------------------------------------------------
+  // Events
+  //
+  // Enough of an event to be the argument a websocket handler is
+  // written against. There is no capture, no bubbling and no
+  // propagation to stop, because there is no tree here for any of that
+  // to happen in: one object dispatches to its own listeners.
+
+  class Event {
+    constructor(type, init = {}) {
+      this.type = String(type);
+      this.target = null;
+      this.currentTarget = null;
+      this.cancelable = Boolean(init.cancelable);
+      this.bubbles = Boolean(init.bubbles);
+      this.defaultPrevented = false;
+      this.eventPhase = 0;
+      this.timeStamp = 0;
+    }
+    preventDefault() {
+      if (this.cancelable) {
+        this.defaultPrevented = true;
+      }
+    }
+    stopPropagation() {}
+    stopImmediatePropagation() {}
+  }
+
+  class MessageEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.data = init.data ?? null;
+      this.origin = init.origin ?? "";
+      this.lastEventId = "";
+      this.source = null;
+      this.ports = [];
+    }
+  }
+
+  class CloseEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.code = init.code ?? 0;
+      this.reason = init.reason ?? "";
+      this.wasClean = Boolean(init.wasClean);
+    }
+  }
+
+  class ErrorEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.message = init.message ?? "";
+      this.filename = "";
+      this.lineno = 0;
+      this.colno = 0;
+      this.error = init.error ?? null;
+    }
+  }
+
+  const LISTENERS = Symbol("listeners");
+
+  function listens(target) {
+    target[LISTENERS] = new Map();
+  }
+
+  function fires(target, event) {
+    event.target = target;
+    event.currentTarget = target;
+    const named = `on${event.type}`;
+    if (typeof target[named] === "function") {
+      try {
+        target[named].call(target, event);
+      } catch (thrown) {
+        console.error(thrown);
+      }
+    }
+    for (const listener of target[LISTENERS].get(event.type) ?? []) {
+      try {
+        if (typeof listener === "function") {
+          listener.call(target, event);
+        } else {
+          listener.handleEvent(event);
+        }
+      } catch (thrown) {
+        // One listener that throws is not the rest of them, and there
+        // is nobody above this to catch it either way.
+        console.error(thrown);
+      }
+    }
+  }
+
+  function listened(type, listener) {
+    if (listener === null || listener === undefined) {
+      return;
+    }
+    const named = String(type);
+    const held = this[LISTENERS].get(named) ?? [];
+    if (!held.includes(listener)) {
+      held.push(listener);
+    }
+    this[LISTENERS].set(named, held);
+  }
+
+  function unlistened(type, listener) {
+    const held = this[LISTENERS].get(String(type));
+    if (held === undefined) {
+      return;
+    }
+    const at = held.indexOf(listener);
+    if (at !== -1) {
+      held.splice(at, 1);
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // WebSocket
+  //
+  // The handshake, the frames and the close are the host's, because
+  // they are a protocol and the crate that speaks it is already in this
+  // build. What is here is the object: a state machine of four states,
+  // four events, and a read loop that turns what arrived into one of
+  // them.
+  //
+  // A socket lives as long as the call does. The isolate ends with the
+  // answer plus whatever `EdgeRuntime.waitUntil` is still waiting for,
+  // so a function that wants to hear back from a socket has to be
+  // waiting on it when it answers, or to have said so with waitUntil.
+
+  const SOCKET = Symbol("socket");
+  const READY = Symbol("readyState");
+  const BINARY = Symbol("binaryType");
+
+  const CONNECTING = 0;
+  const OPEN = 1;
+  const CLOSING = 2;
+  const CLOSED = 3;
+
+  class WebSocket {
+    constructor(url, protocols = []) {
+      listens(this);
+      this.onopen = null;
+      this.onmessage = null;
+      this.onerror = null;
+      this.onclose = null;
+      const named =
+        protocols === undefined || protocols === null
+          ? []
+          : Array.isArray(protocols)
+            ? protocols.map(String)
+            : [String(protocols)];
+      // The spec's rewrite, so a project that keeps one url in an
+      // environment variable does not need two.
+      const asked = new URL(String(url));
+      if (asked.protocol === "http:") {
+        asked.protocol = "ws:";
+      } else if (asked.protocol === "https:") {
+        asked.protocol = "wss:";
+      }
+      if (asked.protocol !== "ws:" && asked.protocol !== "wss:") {
+        throw new TypeError(`${asked.protocol} is not a scheme a websocket is opened on`);
+      }
+      if (asked.hash !== "") {
+        throw new TypeError("a websocket url may not have a fragment on it");
+      }
+      this.url = asked.href;
+      this.protocol = "";
+      this.extensions = "";
+      this.bufferedAmount = 0;
+      this[BINARY] = "blob";
+      this[READY] = CONNECTING;
+      this[SOCKET] = null;
+      opening(this, this.url, named);
+    }
+
+    get readyState() {
+      return this[READY];
+    }
+
+    get binaryType() {
+      return this[BINARY];
+    }
+
+    set binaryType(kind) {
+      if (kind !== "blob" && kind !== "arraybuffer") {
+        throw new TypeError(`${kind} is not a binaryType`);
+      }
+      this[BINARY] = kind;
+    }
+
+    addEventListener(type, listener) {
+      listened.call(this, type, listener);
+    }
+
+    removeEventListener(type, listener) {
+      unlistened.call(this, type, listener);
+    }
+
+    dispatchEvent(event) {
+      fires(this, event);
+      return true;
+    }
+
+    send(data) {
+      if (this[READY] === CONNECTING) {
+        throw new TypeError("the socket is still connecting");
+      }
+      if (this[READY] !== OPEN) {
+        // The spec's answer for a closed socket is to count the bytes
+        // and drop them rather than to throw.
+        return;
+      }
+      const id = this[SOCKET];
+      if (typeof data === "string") {
+        ops.op_zou_ws_send_text(id, data).catch((thrown) => broke(this, thrown));
+        return;
+      }
+      if (data instanceof Blob) {
+        // A blob is bytes that have not been read yet, which is the one
+        // send that cannot happen in this turn.
+        data.bytes().then(
+          (bytes) => ops.op_zou_ws_send_bytes(id, bytes),
+          (thrown) => broke(this, thrown),
+        ).catch((thrown) => broke(this, thrown));
+        return;
+      }
+      ops.op_zou_ws_send_bytes(id, bytesOf(data)).catch((thrown) => broke(this, thrown));
+    }
+
+    close(code, reason = "") {
+      if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999)) {
+        throw new TypeError(`${code} is not a code a websocket may be closed with`);
+      }
+      if (this[READY] === CLOSING || this[READY] === CLOSED) {
+        return;
+      }
+      if (this[READY] === CONNECTING) {
+        // Nothing to send a frame on yet. The connection is abandoned
+        // as soon as it opens, which is what the spec calls failing it.
+        this[READY] = CLOSING;
+        return;
+      }
+      this[READY] = CLOSING;
+      ops
+        .op_zou_ws_close(this[SOCKET], code ?? 1000, String(reason))
+        .catch((thrown) => broke(this, thrown));
+    }
+  }
+
+  for (const holder of [WebSocket, WebSocket.prototype]) {
+    Object.defineProperties(holder, {
+      CONNECTING: { value: CONNECTING },
+      OPEN: { value: OPEN },
+      CLOSING: { value: CLOSING },
+      CLOSED: { value: CLOSED },
+    });
+  }
+
+  async function opening(socket, url, protocols) {
+    let opened;
+    try {
+      opened = await ops.op_zou_ws_connect(url, protocols);
+    } catch (thrown) {
+      // A handshake that failed is an error and then a close, in that
+      // order, with the code that means the connection went away
+      // without one being agreed.
+      broke(socket, thrown);
+      gone(socket, 1006, "", false);
+      return;
+    }
+    socket[SOCKET] = opened.id;
+    socket.protocol = opened.protocol;
+    socket.extensions = opened.extensions;
+    if (socket[READY] === CLOSING) {
+      // `close()` was called while this was still connecting, so the
+      // socket is opened and immediately given up.
+      ops.op_zou_ws_close(opened.id, 1000, "").catch(() => {});
+    } else {
+      socket[READY] = OPEN;
+      fires(socket, new Event("open"));
+    }
+    await reading(socket, opened.id);
+  }
+
+  async function reading(socket, id) {
+    for (;;) {
+      let arrived;
+      try {
+        arrived = await ops.op_zou_ws_next(id);
+      } catch (thrown) {
+        broke(socket, thrown);
+        gone(socket, 1006, "", false);
+        return;
+      }
+      if (arrived.kind === "close") {
+        gone(socket, arrived.code, arrived.reason, arrived.code !== 1006);
+        return;
+      }
+      if (socket[READY] !== OPEN) {
+        // Something arrived after this end asked to close, which is
+        // ordinary and is not something a handler is told about.
+        continue;
+      }
+      const data =
+        arrived.kind === "text"
+          ? arrived.text
+          : socket[BINARY] === "arraybuffer"
+            ? arrived.bytes.buffer
+            : new Blob([arrived.bytes]);
+      fires(socket, new MessageEvent("message", { data, origin: socket.url }));
+    }
+  }
+
+  function broke(socket, thrown) {
+    fires(
+      socket,
+      new ErrorEvent("error", {
+        message: thrown instanceof Error ? thrown.message : String(thrown),
+        error: thrown,
+      }),
+    );
+  }
+
+  function gone(socket, code, reason, wasClean) {
+    if (socket[READY] === CLOSED) {
+      return;
+    }
+    socket[READY] = CLOSED;
+    if (socket[SOCKET] !== null) {
+      ops.op_zou_ws_drop(socket[SOCKET]);
+    }
+    fires(socket, new CloseEvent("close", { code, reason, wasClean }));
+  }
+
+  // ---------------------------------------------------------------
   // EdgeRuntime.waitUntil
   //
   // Work that outlives the answer. What is registered here is held
@@ -1412,8 +1745,13 @@
 
   Object.assign(globalThis, {
     Blob,
+    CloseEvent,
     CryptoKey,
     EdgeRuntime,
+    ErrorEvent,
+    Event,
+    MessageEvent,
+    WebSocket,
     File,
     FormData,
     Headers,

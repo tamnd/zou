@@ -16,7 +16,7 @@
 use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, op2, v8};
 use zou_functions::{Answer, Call, Function, Runtime, Sink};
 
-use crate::{crypto, fetch, module, timer, url};
+use crate::{crypto, fetch, module, timer, url, websocket};
 
 /// What the isolate is told about the call it is running, and what it
 /// left behind afterwards. Both live in the runtime's op state, which
@@ -101,7 +101,13 @@ deno_core::extension!(
         timer::op_zou_sleep,
         timer::op_zou_clear,
         url::op_zou_url_parse,
-        url::op_zou_url_set
+        url::op_zou_url_set,
+        websocket::op_zou_ws_connect,
+        websocket::op_zou_ws_next,
+        websocket::op_zou_ws_send_text,
+        websocket::op_zou_ws_send_bytes,
+        websocket::op_zou_ws_close,
+        websocket::op_zou_ws_drop
     ]
 );
 
@@ -223,6 +229,9 @@ async fn run(
     });
     js.op_state().borrow_mut().put(held);
     js.op_state().borrow_mut().put(timer::Pending::default());
+    js.op_state()
+        .borrow_mut()
+        .put(websocket::Sockets::default());
 
     // The prelude is the value of its own last expression, so the two
     // entry points are held here and never on an object the function
@@ -235,11 +244,16 @@ async fn run(
         .load_main_es_module(&specifier)
         .await
         .map_err(|e| format!("{specifier}: {e}"))?;
+    // The module is evaluated by waiting on its own promise and not by
+    // running the loop until it is idle. A module that leaves a timer
+    // behind it is ordinary rather than exotic, and `createClient` is
+    // one: it starts a refresh interval on the way through, and an idle
+    // loop is a condition an interval means never happens.
     let evaluated = js.mod_evaluate(id);
-    js.run_event_loop(PollEventLoopOptions::default())
+    let evaluated = std::pin::pin!(evaluated);
+    js.with_event_loop_promise(evaluated, PollEventLoopOptions::default())
         .await
         .map_err(|e| format!("{specifier}: {e}"))?;
-    evaluated.await.map_err(|e| format!("{specifier}: {e}"))?;
 
     let (entry, drain) = {
         let context = js.main_context();
