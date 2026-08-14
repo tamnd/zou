@@ -1,14 +1,14 @@
-//! The front door as a whole: the four Supabase prefixes, what answers
-//! under each of them, and what happens outside all four.
+//! The front door as a whole: the five Supabase prefixes, what answers
+//! under each of them, and what happens outside all five.
 //!
 //! Everything else in this crate tests one surface. This tests that the
 //! surfaces are wired to the paths a Supabase client already calls,
 //! which is a different claim and one nothing else makes. A client
 //! configured with a zou url and no other changes reaches /rest/v1 for
 //! data, /auth/v1 for sessions, /storage/v1 for buckets and objects,
-//! and
-//! gets an honest 501 rather than a confusing 404 everywhere a later
-//! milestone still has to fill in.
+//! /realtime/v1 for a socket and /functions/v1 for somebody else's
+//! code, and gets an honest 501 rather than a confusing 404 everywhere
+//! a later milestone still has to fill in.
 //!
 //! Which side of the apikey gate each route sits on is part of the
 //! wiring and is tested here too. Four auth routes are deliberately
@@ -136,7 +136,7 @@ async fn sent(
 const NO_ROUTE: &str = "no Route matched with those values";
 
 #[tokio::test]
-async fn all_four_prefixes_are_routed() {
+async fn all_five_prefixes_are_routed() {
     let app = app();
     // The claim is only that each prefix reaches something of its own
     // rather than the fallback. What each of them then says is the
@@ -154,6 +154,7 @@ async fn all_four_prefixes_are_routed() {
         "/storage/v1/render/image/public/pics/cat.png",
         "/storage/v1/render/image/sign/pics/cat.png",
         "/realtime/v1/websocket",
+        "/functions/v1/hello",
     ] {
         let answer = keyed(&app, "GET", path).await;
         assert_ne!(
@@ -224,9 +225,9 @@ async fn an_auth_endpoint_nobody_wrote_yet_says_which_it_was() {
 }
 
 #[tokio::test]
-async fn anything_outside_the_four_prefixes_is_the_edges_own_404() {
+async fn anything_outside_the_five_prefixes_is_the_edges_own_404() {
     let app = app();
-    for path in ["/", "/rest", "/auth", "/graphql/v1", "/functions/v1/hello"] {
+    for path in ["/", "/rest", "/auth", "/graphql/v1"] {
         let answer = keyed(&app, "GET", path).await;
         assert_eq!(answer.status, StatusCode::NOT_FOUND, "{path}");
         assert_eq!(
@@ -235,6 +236,30 @@ async fn anything_outside_the_four_prefixes_is_the_edges_own_404() {
             "{path} should be answered in the hosted edge's words",
         );
     }
+}
+
+#[tokio::test]
+async fn a_function_prefix_is_answered_by_the_runtime_and_not_by_the_edge() {
+    let app = app();
+    // /functions/v1 is the fifth prefix and it answers in its own
+    // words, which are not json at all. A server with no functions
+    // configured still owns the route: a client calling a name nobody
+    // deployed hears the runtime's 404 rather than the gateway's line
+    // about routes, which is what upstream does and what the surface
+    // has to keep doing once there are functions behind it.
+    let answer = keyed(&app, "GET", "/functions/v1/hello").await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    assert_eq!(answer.content_type, "text/plain; charset=UTF-8");
+    assert_eq!(answer.written, "Function not found");
+    // The prefix on its own is the same answer, and the prefix without
+    // its trailing slash is a url nothing serves, so that one is the
+    // edge's.
+    let answer = keyed(&app, "POST", "/functions/v1/").await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    assert_eq!(answer.written, "Function not found");
+    let answer = keyed(&app, "GET", "/functions/v1").await;
+    assert_eq!(answer.status, StatusCode::NOT_FOUND);
+    assert_eq!(answer.message(), NO_ROUTE);
 }
 
 #[tokio::test]
