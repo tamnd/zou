@@ -31,11 +31,12 @@ use zou_pg::compact::{
 use zou_pg::gc::DEFAULT_RETENTION_SECS;
 use zou_pg::install;
 use zou_pg::redo::{RedoPool, RedoPoolConfig};
+use zou_pg::restore::store_data_checksums;
 use zou_store::lsn::Lsn;
 use zou_store::open_store;
 use zou_store::shards::prune_lineage;
 
-pub const USAGE: &str = "usage: zou compact <target> <ref> [--workers <n> | --status | --horizon [<lsn>] [--retention <duration>] [--pg-bin <path>] [--data-checksums] [--json]]";
+pub const USAGE: &str = "usage: zou compact <target> <ref> [--workers <n> | --status | --horizon [<lsn>] [--retention <duration>] [--pg-bin <path>] [--data-checksums | --no-data-checksums] [--json]]";
 
 /// A merge fold worker holds a whole image in memory before it cuts it,
 /// so these do not stack the way sweep workers do. One tenant at a time
@@ -127,7 +128,12 @@ struct Fold {
     at: Option<Lsn>,
     retention_secs: u64,
     pg_bin: Option<PathBuf>,
-    data_checksums: bool,
+    /// An override for what the store says about data checksums.
+    /// Nothing should need this: the setting is fixed at initdb and
+    /// the store carries the answer. It exists for a store whose
+    /// captures have been collected out from under it, where the fold
+    /// would otherwise refuse to run at all.
+    data_checksums: Option<bool>,
     /// Report the fold as one JSON array instead of prose, the same
     /// shape `--status` reports the debt table in. A fold on a cadence
     /// is the only thing that ever shrinks a tenant's page layers, so
@@ -141,7 +147,7 @@ fn parse_fold(argv: &[String]) -> Result<Fold, String> {
         at: None,
         retention_secs: DEFAULT_RETENTION_SECS,
         pg_bin: None,
-        data_checksums: false,
+        data_checksums: None,
         json: false,
     };
     let mut it = argv.iter();
@@ -159,7 +165,8 @@ fn parse_fold(argv: &[String]) -> Result<Fold, String> {
                         .ok_or_else(|| "--pg-bin needs a value".to_string())?,
                 ))
             }
-            "--data-checksums" => fold.data_checksums = true,
+            "--data-checksums" => fold.data_checksums = Some(true),
+            "--no-data-checksums" => fold.data_checksums = Some(false),
             "--json" => fold.json = true,
             other if fold.at.is_none() && !other.starts_with('-') => {
                 fold.at = Some(
@@ -185,6 +192,15 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
         ));
     }
     let store = open_store(target)?;
+    // A page built without the checksum a checksummed cluster expects
+    // reads back as a verification failure, and the read that finds it
+    // is usually recovery, so the fold asks the store instead of
+    // defaulting. Guessing wrong here is a server that will not start,
+    // which is exactly how it was found.
+    let data_checksums = match args.data_checksums {
+        Some(on) => on,
+        None => store_data_checksums(&*store, tenant_ref)?,
+    };
     let at = match args.at {
         Some(at) => at,
         None => {
@@ -214,7 +230,7 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
         workers: MERGE_REDO_WORKERS,
         batch_timeout: MERGE_BATCH_TIMEOUT,
         batches_per_worker: MERGE_BATCHES_PER_WORKER,
-        data_checksums: args.data_checksums,
+        data_checksums,
     });
     // One shard at a time. Each fold holds an image in memory while it
     // fills, and the point of the whole exercise is a store bigger than
@@ -222,14 +238,7 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
     let mut failed = 0;
     let mut rows: Vec<String> = Vec::new();
     for job in &jobs {
-        match merge_to_horizon(
-            &*store,
-            tenant_ref,
-            job.shard,
-            at,
-            &pool,
-            args.data_checksums,
-        ) {
+        match merge_to_horizon(&*store, tenant_ref, job.shard, at, &pool, data_checksums) {
             Ok(Some(out)) if args.json => rows.push(fold_row(job.shard, &out)),
             Ok(Some(out)) => println!(
                 "shard {}: {} layers retired into {} at {}, {} pages imaged, {} keys with no base kept {} layers alive, {} to {} bytes",
@@ -297,14 +306,14 @@ mod tests {
         let got = parse_fold(&argv(&[])).unwrap();
         assert_eq!(got.at, None);
         assert_eq!(got.retention_secs, DEFAULT_RETENTION_SECS);
-        assert!(!got.data_checksums);
+        assert_eq!(got.data_checksums, None);
     }
 
     #[test]
     fn a_named_lsn_reads_the_way_postgres_writes_one() {
         let got = parse_fold(&argv(&["0/8B000000", "--data-checksums"])).unwrap();
         assert_eq!(got.at, Some("0/8B000000".parse().unwrap()));
-        assert!(got.data_checksums);
+        assert_eq!(got.data_checksums, Some(true));
     }
 
     #[test]
@@ -312,6 +321,21 @@ mod tests {
         let got = parse_fold(&argv(&["--retention", "10m", "--pg-bin", "/opt/pg/bin"])).unwrap();
         assert_eq!(got.retention_secs, 600);
         assert_eq!(got.pg_bin, Some(PathBuf::from("/opt/pg/bin")));
+    }
+
+    /// Neither flag means the store gets asked, which is the whole
+    /// point: the setting is fixed at initdb and a fold that guessed
+    /// it wrong wrote pages a checksummed cluster refused to start on.
+    /// The flags are there for a store whose captures are gone.
+    #[test]
+    fn the_checksum_setting_comes_off_the_store_unless_a_flag_overrules_it() {
+        assert_eq!(parse_fold(&argv(&[])).unwrap().data_checksums, None);
+        assert_eq!(
+            parse_fold(&argv(&["--no-data-checksums"]))
+                .unwrap()
+                .data_checksums,
+            Some(false)
+        );
     }
 
     #[test]
