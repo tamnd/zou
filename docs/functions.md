@@ -183,7 +183,7 @@ What runs is the registry's build of the package rather than the tarball npm wou
 
 - Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
 - A package that reaches for a node built in will not run. `node:` is refused by name and the registry's own shims cover the common ones and not all of them.
-- `@supabase/supabase-js` imports and evaluates, and `createClient` does not run yet: it wants `URL`, which is on the list below.
+- `@supabase/supabase-js` imports and does not evaluate yet: it wants `Blob`, which is on the list below.
 - `http:` is refused. A module arrives and is executed, so it arrives over https.
 - `data:` is not supported yet.
 
@@ -223,15 +223,32 @@ What a function may reach is not restricted.
 It can call a metadata endpoint on the machine it is running on, the same as upstream's runtime can and the same as `pg_net` can from inside the database.
 A function is the project's own code, and the way to keep it off the local network is a network the server is not on.
 
+## URL
+
+`URL` and `URLSearchParams`, which is how a handler routes on a path and reads a query.
+
+```ts
+Deno.serve((req) => {
+  const url = new URL(req.url)
+  const who = url.searchParams.get("who") ?? "world"
+  return Response.json({ path: url.pathname, hello: who })
+})
+```
+
+The parsing is the same Rust crate the rest of this server parses urls with, which is the same one Deno's `URL` is built on, so a url that comes apart one way there comes apart that way here.
+A `Request`'s url is parsed rather than kept as the string it was written as, so `new Request("https://example.com")` has a `url` of `https://example.com/` and `new Request("/one")` throws, both the same as Deno.
+
+One difference: a percent sequence in a query that is not valid utf-8 is left as it was written rather than becoming a replacement character.
+
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
 
 Not present yet, and named rather than silently missing:
 
 - `crypto`, and `crypto.subtle` with it.
+- `Blob`, `File` and `FormData`.
 - Streams. `new ReadableStream()` throws with its own name in the message, and a response body is collected before it is sent rather than arriving in chunks.
-- `URL` and `URLSearchParams`.
 - Timers, so a handler that sleeps will not.
 - `EdgeRuntime.waitUntil`, so work that outlives the response has nowhere to go.
 - Node built ins. `node:fs` and the rest are refused by name.

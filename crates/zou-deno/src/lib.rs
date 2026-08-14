@@ -26,15 +26,20 @@
 //! - `crypto` is not there, and `crypto.subtle` least of all.
 //! - Streams are not there. A `ReadableStream` body throws by name, and
 //!   `fetch` collects an answer before handing it back.
-//! - `URL` and `URLSearchParams` are not there.
+//! - `Blob`, `File` and `FormData` are not there.
 //! - Timers are not there, so a handler that sleeps will not.
 //! - There are no node built ins, so `node:` is refused by name and a
 //!   package that reaches for one will not run.
 //!
-//! What is there is `Headers`, `Request`, `Response`, `TextEncoder`,
-//! `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`
-//! and `fetch`, which is enough to run a handler that reads a request,
-//! calls something else and answers.
+//! What is there is `Headers`, `Request`, `Response`, `URL`,
+//! `URLSearchParams`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`,
+//! `console`, `Deno.serve`, `Deno.env` and `fetch`, which is enough to
+//! run a handler that reads a request, calls something else and
+//! answers.
+//!
+//! `URL` is the `url` crate behind two ops, which is the same parser
+//! Deno's own is built on, rather than a few hundred lines of
+//! javascript that is wrong in the corners.
 //!
 //! `fetch` is the client `zou-server` calls a database webhook with,
 //! behind an op, rather than a second HTTP stack linked in beside it.
@@ -55,6 +60,8 @@ mod fetch;
 mod isolate;
 #[cfg(feature = "isolate")]
 mod module;
+#[cfg(feature = "isolate")]
+mod url;
 
 #[cfg(feature = "isolate")]
 pub use isolate::Isolate;
