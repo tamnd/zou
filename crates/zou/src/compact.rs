@@ -213,14 +213,15 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
     };
     if !args.json {
         println!(
-            "folding {tenant_ref} to {at}, {}",
+            "folding {tenant_ref} to {at}, {}, data checksums {}",
             match args.at {
                 Some(_) => "named on the command line".to_string(),
                 None => format!(
                     "the oldest lsn a checkpoint still names inside {}",
                     crate::gc::span(args.retention_secs)
                 ),
-            }
+            },
+            if data_checksums { "on" } else { "off" }
         );
     }
     let jobs = debts(&*store, tenant_ref).map_err(|e| e.to_string())?;
@@ -264,9 +265,14 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
     // fold decided it was allowed to cut is the answer to why it did
     // nothing. A shard that had nothing below the horizon is simply
     // absent from the array; the exit status is what says the fold ran
-    // at all.
+    // at all. The checksum setting goes out with it because a fold that
+    // read it wrong writes pages nothing can read back, and a soak that
+    // recorded what the fold believed can say so afterwards.
     if args.json {
-        println!("{{\"horizon\":\"{at}\",\"shards\":[{}]}}", rows.join(","));
+        println!(
+            "{{\"horizon\":\"{at}\",\"data_checksums\":{data_checksums},\"shards\":[{}]}}",
+            rows.join(",")
+        );
     }
     if failed > 0 {
         return Err(format!("{failed} of {} shards failed", jobs.len()));
