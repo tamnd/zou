@@ -60,6 +60,23 @@ const CONTROL_CHECKPOINT_OFFSET: usize = 32;
 /// checkPointCopy.redo: right after checkPoint comes the CheckPoint
 /// struct whose first field is the redo location.
 const CONTROL_REDO_OFFSET: usize = 40;
+/// Bytes from data_checksum_version to the crc: the uint32 itself is
+/// followed by default_char_signedness (1), mock_authentication_nonce
+/// (32) and three bytes of padding that align the crc, so the crc
+/// starts 40 bytes after the field begins. Checked against a real
+/// pg_control in the tests below.
+const CONTROL_CHECKSUM_BACK: usize = 40;
+/// MOCK_AUTH_NONCE_LEN from the vendored pg_control.h, which the
+/// distance above is made of.
+#[cfg(test)]
+const MOCK_AUTH_NONCE_LEN: usize = 32;
+/// The shortest thing that can be a pg_control. On disk the file is
+/// padded to PG_CONTROL_FILE_SIZE, but a capture holds only the struct,
+/// which is 296 bytes on pg18 and shorter on older releases, so the
+/// floor is the last field anything here reads rather than a block. A
+/// file too short to carry its own crc has no valid crc position, and
+/// that is the check that matters.
+const CONTROL_MIN_LEN: usize = CONTROL_REDO_OFFSET + 8;
 const DB_SHUTDOWNED: u32 = 1;
 const DB_IN_PRODUCTION: u32 = 6;
 
@@ -101,11 +118,14 @@ pub fn wal_file_name(tli: u32, lsn: u64) -> String {
 /// doubles as an integrity check for callers reading pg_control from
 /// under a running server.
 pub fn control_crc_offset(control: &[u8]) -> Result<usize, String> {
-    if control.len() < 512 {
+    if control.len() < CONTROL_MIN_LEN {
         return Err(format!("pg_control is {} bytes, too small", control.len()));
     }
     let mut crc_offset = None;
-    for k in (CONTROL_STATE_OFFSET + 4)..control.len().min(1024) - 4 {
+    // Inclusive of the last word that fits: a capture holds the struct
+    // and nothing after it, so on such a file the crc is the final four
+    // bytes and an exclusive bound would walk straight past it.
+    for k in (CONTROL_STATE_OFFSET + 4)..=control.len().min(1024) - 4 {
         let stored = u32::from_le_bytes(control[k..k + 4].try_into().expect("in bounds"));
         if crc32c::crc32c(&control[..k]) == stored {
             if crc_offset.is_some() {
@@ -138,6 +158,58 @@ pub fn control_checkpoint(control: &[u8]) -> Result<u64, String> {
         .try_into()
         .expect("length checked by control_crc_offset");
     Ok(u64::from_le_bytes(bytes))
+}
+
+/// Whether the cluster protects its data pages with checksums.
+///
+/// Anything that materializes a page for this cluster has to answer
+/// this the same way the cluster does. A page built without the
+/// checksum a checksummed cluster expects reads back as "page
+/// verification failed, calculated N but expected 0", and the read
+/// that finds it is usually recovery, so the cost of guessing is a
+/// server that will not start.
+///
+/// The field is the last uint32 before the trailing bool, the 32 byte
+/// nonce and the alignment padding the crc sits after, so it is found
+/// from the crc rather than from the front of the struct: everything
+/// ahead of it moves between releases and nothing behind it does.
+/// Validating the crc first means a torn read errors rather than
+/// answering no.
+pub fn control_data_checksums(control: &[u8]) -> Result<bool, String> {
+    let crc_offset = control_crc_offset(control)?;
+    let at = crc_offset
+        .checked_sub(CONTROL_CHECKSUM_BACK)
+        .ok_or_else(|| "pg_control crc sits too early to hold a checksum version".to_string())?;
+    let version = u32::from_le_bytes(control[at..at + 4].try_into().expect("in bounds"));
+    Ok(version != 0)
+}
+
+/// Whether the tenant's cluster uses data checksums, read out of the
+/// store rather than assumed.
+///
+/// Anything that builds pages outside the postmaster has to know this,
+/// and outside the postmaster there is no `DataChecksumsEnabled()` to
+/// ask. The answer is in the pg_control of the newest capture that
+/// carries one: a delta checkpoint only holds the files that changed,
+/// so the walk goes newest first and stops at the first capture that
+/// has the file. The setting is fixed at initdb, so any capture's
+/// answer is the cluster's answer and the newest is simply the one
+/// most likely to still be there.
+pub fn store_data_checksums(store: &dyn CasStore, tenant_ref: &str) -> Result<bool, String> {
+    let layout = TenantLayout::new(tenant_ref);
+    let (data, _) = store
+        .get(&layout.manifest())
+        .map_err(|e| format!("store: {e}"))?
+        .ok_or_else(|| format!("no manifest at {}", layout.manifest()))?;
+    let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
+    for checkpoint in manifest.checkpoints.iter().rev() {
+        let lay = crate::fold::chk_layout(&layout, checkpoint);
+        let key = lay.chk_file(&checkpoint.id, "global/pg_control");
+        if let Some((control, _)) = store.get(&key).map_err(|e| format!("store: {e}"))? {
+            return control_data_checksums(&control);
+        }
+    }
+    Err("no capture in the manifest carries a pg_control".into())
 }
 
 /// Make pg_control say in production, recomputing the crc. A genesis
@@ -573,6 +645,119 @@ mod tests {
         let crc = crc32c::crc32c(&control[..300]);
         control[300..304].copy_from_slice(&crc.to_le_bytes());
         control
+    }
+
+    /// A pg_control whose tail is laid out the way a real one is:
+    /// data_checksum_version, the char signedness bool, the 32 byte
+    /// nonce, the padding that aligns the crc, then the crc. Checked
+    /// against a pg18 cluster on server3, whose crc sits at 292 with
+    /// the checksum version at 252 and pg_controldata agreeing it is
+    /// on.
+    fn control_with_checksums(version: u32) -> Vec<u8> {
+        let mut control = vec![0u8; 8192];
+        control[0..8].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        control[16..20].copy_from_slice(&DB_IN_PRODUCTION.to_le_bytes());
+        let at = 252;
+        control[at..at + 4].copy_from_slice(&version.to_le_bytes());
+        control[at + 4] = 1;
+        for (i, b) in control[at + 5..at + 37].iter_mut().enumerate() {
+            *b = (i * 7 + 13) as u8;
+        }
+        let crc_at = at + CONTROL_CHECKSUM_BACK;
+        let crc = crc32c::crc32c(&control[..crc_at]);
+        control[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        control
+    }
+
+    #[test]
+    fn the_checksum_setting_is_read_back_from_where_the_crc_puts_it() {
+        assert!(control_data_checksums(&control_with_checksums(1)).unwrap());
+        assert!(!control_data_checksums(&control_with_checksums(0)).unwrap());
+        // The distance is the fields between: the uint32 itself, the
+        // char signedness bool, the nonce, and the padding that aligns
+        // the crc back to four.
+        assert_eq!(CONTROL_CHECKSUM_BACK, 4 + 1 + MOCK_AUTH_NONCE_LEN + 3);
+    }
+
+    /// What a capture actually holds. The file on disk is padded to a
+    /// block, but the store keeps sizeof(ControlFileData), 296 bytes on
+    /// pg18, so the crc is the last word in the object and there is
+    /// nothing behind it. Read off a real capture from a scale 10 store
+    /// on server3, where the crc sits at 292 and the version at 252.
+    #[test]
+    fn a_capture_that_stops_at_the_crc_still_reads() {
+        let mut control = control_with_checksums(1);
+        control.truncate(296);
+        assert_eq!(control_crc_offset(&control).unwrap(), 292);
+        assert!(control_data_checksums(&control).unwrap());
+        // One byte short of the crc is a file that cannot vouch for
+        // itself, and that is a refusal.
+        control.truncate(295);
+        assert!(control_data_checksums(&control).is_err());
+    }
+
+    /// A torn or truncated pg_control has no crc position, and the
+    /// reader has to say so rather than answer no. Answering no is the
+    /// one wrong answer that silently produces pages a checksummed
+    /// cluster refuses to start on.
+    #[test]
+    fn a_control_nobody_can_verify_is_an_error_not_a_no() {
+        let mut control = control_with_checksums(1);
+        control[100] ^= 0xFF;
+        assert!(control_data_checksums(&control).is_err());
+        assert!(control_data_checksums(&[0u8; 8192]).is_err());
+        assert!(control_data_checksums(&[]).is_err());
+    }
+
+    /// The setting is fixed at initdb, so the answer is the same in
+    /// every capture that has a pg_control. A delta only holds what
+    /// changed, so the walk has to keep going back until it finds one.
+    #[test]
+    fn the_store_answers_the_checksum_question_off_the_newest_capture_that_can() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let layout = TenantLayout::new("local");
+        store
+            .put_if_absent(
+                &layout.chk_file("genesis", "global/pg_control"),
+                &control_with_checksums(1),
+            )
+            .unwrap();
+        let mut manifest = Manifest::new("local", 18);
+        manifest.checkpoints.push(CheckpointRef {
+            id: "genesis".into(),
+            lsn: Lsn(0x0100_0028),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        // A delta that carried no pg_control, which is the ordinary
+        // case and the one that would answer wrong if the walk stopped
+        // at the newest capture instead of the newest usable one.
+        manifest.checkpoints.push(CheckpointRef {
+            id: "d1".into(),
+            lsn: Lsn(0x0100_1000),
+            kind: CheckpointKind::Delta,
+            owner: None,
+        });
+        store
+            .put_if_absent(&layout.manifest(), &manifest.to_json())
+            .unwrap();
+        assert!(store_data_checksums(&store, "local").unwrap());
+    }
+
+    /// A store with nothing to read the setting out of is a refusal.
+    /// Answering no would be a fold that quietly writes pages the
+    /// cluster will not start on.
+    #[test]
+    fn a_store_that_cannot_say_is_a_refusal() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let layout = TenantLayout::new("local");
+        assert!(store_data_checksums(&store, "local").is_err());
+        store
+            .put_if_absent(&layout.manifest(), &Manifest::new("local", 18).to_json())
+            .unwrap();
+        assert!(store_data_checksums(&store, "local").is_err());
     }
 
     #[test]
