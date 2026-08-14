@@ -186,6 +186,64 @@ fn image_cut(dcl: Lsn) -> Lsn {
     Lsn(dcl.0.saturating_sub(1))
 }
 
+/// Write one output object and name it in the shard manifest right
+/// away, before the pass builds the next one.
+///
+/// The commit at the end of a pass has to be atomic about the retire,
+/// because a read that lost an input before it gained the output would
+/// have nowhere to look. The add half is not like that: an output
+/// listed early is a layer that holds what the layers below it hold,
+/// and a read that walks it gets the same answer, so nothing waits for
+/// the swap to name it.
+///
+/// What waits for the swap is gc. Its pin set is what a manifest names,
+/// so an output that is uploaded and not yet named looks exactly like
+/// an object a crashed pass abandoned, and the two phase candidate
+/// window is the only thing keeping it: gc stamps it in one run and
+/// deletes it in a later one. That is a promise that the pass commits
+/// faster than the window, and a fold does not. On server3 the folds
+/// grew from 83 s to 322 s and the last one ran fourteen minutes
+/// against a two minute window, which put the first three of its seven
+/// images in the store for long enough that gc stamped and deleted
+/// them, and then the swap named them anyway. The manifest listed
+/// three images with no objects, the same pass had stamped the horizon
+/// at their lsn so every delta under them was retired, and every read
+/// that walked them took the backend down with it (zou #388).
+///
+/// Naming each output as it lands closes that: an output is pinned
+/// from the moment it exists, and no window has to be longer than a
+/// pass. It also means a pass that dies keeps the work it finished.
+fn stage_output(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    shard: u16,
+    bytes: Vec<u8>,
+    footer: &zou_store::layer::LayerFooter,
+) -> Result<LayerEntry, CompactError> {
+    let desc = LayerDesc::from_footer(footer, bytes.len() as u64);
+    let key = format!("{}{}", layout.shard_prefix(shard), desc.name());
+    match store.put_if_absent(&key, &bytes) {
+        Ok(_) | Err(CasError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(CompactError::from(e)),
+    }
+    let entry = LayerEntry {
+        name: desc.name(),
+        size: bytes.len() as u64,
+        owner: None,
+        upto: None,
+    };
+    swap_layers(
+        store,
+        &layout.shard_manifest(shard),
+        shard,
+        &[],
+        std::slice::from_ref(&entry),
+        None,
+        None,
+    )?;
+    Ok(entry)
+}
+
 /// What one pass did, for logs and the scoreboard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactOutcome {
@@ -313,19 +371,8 @@ pub fn compact_shard(
     // same objects and AlreadyExists is a crashed twin, not a problem.
     let mut add = Vec::new();
     let mut publish = |bytes: Vec<u8>, footer: &zou_store::layer::LayerFooter| {
-        let desc = LayerDesc::from_footer(footer, bytes.len() as u64);
-        let key = format!("{}{}", layout.shard_prefix(shard), desc.name());
-        match store.put_if_absent(&key, &bytes) {
-            Ok(_) | Err(CasError::AlreadyExists { .. }) => {}
-            Err(e) => return Err(CompactError::from(e)),
-        }
-        add.push(LayerEntry {
-            name: desc.name(),
-            size: bytes.len() as u64,
-            owner: None,
-            upto: None,
-        });
-        Ok(())
+        add.push(stage_output(store, &layout, shard, bytes, footer)?);
+        Ok::<(), CompactError>(())
     };
 
     // Source images rewritten at their lsn, each group of same lsn
@@ -766,19 +813,8 @@ pub fn merge_to_horizon(
 
     let mut add = Vec::new();
     let mut publish = |bytes: Vec<u8>, footer: &zou_store::layer::LayerFooter| {
-        let desc = LayerDesc::from_footer(footer, bytes.len() as u64);
-        let key = format!("{}{}", layout.shard_prefix(shard), desc.name());
-        match store.put_if_absent(&key, &bytes) {
-            Ok(_) | Err(CasError::AlreadyExists { .. }) => {}
-            Err(e) => return Err(CompactError::from(e)),
-        }
-        add.push(LayerEntry {
-            name: desc.name(),
-            size: bytes.len() as u64,
-            owner: None,
-            upto: None,
-        });
-        Ok(())
+        add.push(stage_output(store, &layout, shard, bytes, footer)?);
+        Ok::<(), CompactError>(())
     };
 
     // Non page keys have no page to materialize, so they are unbased by
@@ -1402,6 +1438,146 @@ mod tests {
         fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
             self.inner.list(prefix)
         }
+    }
+
+    /// A store that runs one gc pass every time the pass writes a layer
+    /// object, on a clock that steps a whole safety window each time.
+    /// That is a soak whose gc cadence is shorter than its compaction,
+    /// which is what server3 was: folds grew to 322 s and then to
+    /// fourteen minutes against a two minute window.
+    struct GcBetweenOutputs {
+        inner: MemStore,
+        clock: AtomicUsize,
+    }
+
+    const GC_WINDOW: u64 = 60;
+
+    impl CasStore for GcBetweenOutputs {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, CasError> {
+            self.inner.get(key)
+        }
+        fn put_if_match(
+            &self,
+            key: &str,
+            data: &[u8],
+            expected: Option<&Version>,
+        ) -> Result<Version, CasError> {
+            let version = self.inner.put_if_match(key, data, expected)?;
+            if key.ends_with(".il") || key.ends_with(".dl") {
+                let step = self.clock.fetch_add(1, Ordering::SeqCst) as u64;
+                let now = 1_000_000 + step * (GC_WINDOW + 1);
+                crate::gc::run(&self.inner, now, GC_WINDOW, 3600).unwrap();
+            }
+            Ok(version)
+        }
+        fn delete(&self, key: &str) -> Result<(), CasError> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+            self.inner.list(prefix)
+        }
+    }
+
+    /// Gc pins what a manifest names and nothing else, so an output a
+    /// pass has uploaded and not yet named is indistinguishable from an
+    /// object a crashed pass abandoned. Holding every output back until
+    /// the commit made that window as long as the pass, and a pass that
+    /// outlives the gc cadence loses the outputs it wrote first: gc
+    /// stamps them in one run, deletes them in the next, and then the
+    /// commit names them anyway. The manifest ends up naming objects
+    /// that are not there, and because the same commit stamps the
+    /// horizon, the layers that held those pages are retired in the
+    /// same breath (zou #388).
+    #[test]
+    fn an_output_is_named_before_the_pass_writes_the_next_one() {
+        let store = GcBetweenOutputs {
+            inner: MemStore::default(),
+            clock: AtomicUsize::new(0),
+        };
+        let layout = seed(&store.inner, "t");
+        let (b0, b1) = split_blocks(90);
+        // Two image groups and a delta run, so a full pass has three
+        // outputs to write and gc gets to run between them.
+        for at in [0x100u64, 0x200] {
+            put_image(
+                &store.inner,
+                &layout,
+                0,
+                &{
+                    let mut entries = vec![
+                        ImageEntry {
+                            key: LayerKey::page(1663, 5, 90, 0, b0),
+                            page: vec![0xAB; PAGE_IMAGE_LEN],
+                        },
+                        ImageEntry {
+                            key: LayerKey::page(1663, 5, 90, 0, b1),
+                            page: vec![0xCD; PAGE_IMAGE_LEN],
+                        },
+                    ];
+                    entries.sort_by_key(|e| e.key);
+                    entries
+                },
+                at,
+            );
+        }
+        put_delta(
+            &store.inner,
+            &layout,
+            0,
+            &mut [rec(90, b0, 0x300), rec(90, b1, 0x310)],
+            0x310,
+        );
+        // A split is what makes the next pass a full one: the child
+        // reads through its parent's era until it has rewritten every
+        // layer down to its own half.
+        split(&store.inner, "t").unwrap();
+
+        let out = compact_shard(&store, "t", 1, None, false)
+            .unwrap()
+            .expect("a full pass over the parent era");
+        assert!(
+            out.outputs >= 2,
+            "{} outputs, gc never got to run between two of them",
+            out.outputs
+        );
+
+        // One more run after the commit, the one a soak does on its
+        // cadence with nothing in flight. Everything the manifest names
+        // is pinned by it, and everything it names is still there.
+        crate::gc::run(&store.inner, 2_000_000, GC_WINDOW, 3600).unwrap();
+        let (m, _) = PageShardManifest::load(&store.inner, &layout.shard_manifest(1))
+            .unwrap()
+            .unwrap();
+        let gone: Vec<&str> = m
+            .layers
+            .iter()
+            .filter(|l| {
+                store
+                    .inner
+                    .get(&format!("{}{}", layout.shard_prefix(1), l.name))
+                    .unwrap()
+                    .is_none()
+            })
+            .map(|l| l.name.as_str())
+            .collect();
+        assert!(
+            gone.is_empty(),
+            "the manifest names {} layers that are not in the store: {gone:?}",
+            gone.len()
+        );
+
+        // And the pages still read, which is the thing the missing
+        // objects took away.
+        let reader = LayerReader::for_shard(&store.inner, "t", 1);
+        let map = m.layer_map().unwrap();
+        let mem = Memtable::new();
+        let key = LayerKey::page(1663, 5, 90, 0, b1);
+        let got = reader.reconstruct(&map, &mem, &key, Lsn(0x500)).unwrap();
+        assert_eq!(got.base, Some(vec![0xCD; PAGE_IMAGE_LEN]));
+        assert_eq!(
+            got.records.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            vec![Lsn(0x310)]
+        );
     }
 
     /// The pass reads the shard manifest twice, once for the lsn it
