@@ -25,7 +25,9 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zou_pg::compact::{READ_AMP_BOUND, debts, horizon_for, merge_to_horizon, run_queue};
+use zou_pg::compact::{
+    MergeOutcome, READ_AMP_BOUND, debts, horizon_for, merge_to_horizon, run_queue,
+};
 use zou_pg::gc::DEFAULT_RETENTION_SECS;
 use zou_pg::install;
 use zou_pg::redo::{RedoPool, RedoPoolConfig};
@@ -33,7 +35,7 @@ use zou_store::lsn::Lsn;
 use zou_store::open_store;
 use zou_store::shards::prune_lineage;
 
-pub const USAGE: &str = "usage: zou compact <target> <ref> [--workers <n> | --status | --horizon [<lsn>] [--retention <duration>] [--pg-bin <path>] [--data-checksums]]";
+pub const USAGE: &str = "usage: zou compact <target> <ref> [--workers <n> | --status | --horizon [<lsn>] [--retention <duration>] [--pg-bin <path>] [--data-checksums] [--json]]";
 
 /// A merge fold worker holds a whole image in memory before it cuts it,
 /// so these do not stack the way sweep workers do. One tenant at a time
@@ -126,6 +128,12 @@ struct Fold {
     retention_secs: u64,
     pg_bin: Option<PathBuf>,
     data_checksums: bool,
+    /// Report the fold as one JSON array instead of prose, the same
+    /// shape `--status` reports the debt table in. A fold on a cadence
+    /// is the only thing that ever shrinks a tenant's page layers, so
+    /// a soak that runs one wants the numbers in its result file, not
+    /// in a sentence somebody has to read.
+    json: bool,
 }
 
 fn parse_fold(argv: &[String]) -> Result<Fold, String> {
@@ -134,6 +142,7 @@ fn parse_fold(argv: &[String]) -> Result<Fold, String> {
         retention_secs: DEFAULT_RETENTION_SECS,
         pg_bin: None,
         data_checksums: false,
+        json: false,
     };
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
@@ -151,6 +160,7 @@ fn parse_fold(argv: &[String]) -> Result<Fold, String> {
                 ))
             }
             "--data-checksums" => fold.data_checksums = true,
+            "--json" => fold.json = true,
             other if fold.at.is_none() && !other.starts_with('-') => {
                 fold.at = Some(
                     other
@@ -185,16 +195,18 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
             horizon_for(&*store, tenant_ref, now, args.retention_secs).map_err(|e| e.to_string())?
         }
     };
-    println!(
-        "folding {tenant_ref} to {at}, {}",
-        match args.at {
-            Some(_) => "named on the command line".to_string(),
-            None => format!(
-                "the oldest lsn a checkpoint still names inside {}",
-                crate::gc::span(args.retention_secs)
-            ),
-        }
-    );
+    if !args.json {
+        println!(
+            "folding {tenant_ref} to {at}, {}",
+            match args.at {
+                Some(_) => "named on the command line".to_string(),
+                None => format!(
+                    "the oldest lsn a checkpoint still names inside {}",
+                    crate::gc::span(args.retention_secs)
+                ),
+            }
+        );
+    }
     let jobs = debts(&*store, tenant_ref).map_err(|e| e.to_string())?;
     let pool = RedoPool::new(RedoPoolConfig {
         postgres,
@@ -208,6 +220,7 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
     // fills, and the point of the whole exercise is a store bigger than
     // the box it runs on.
     let mut failed = 0;
+    let mut rows: Vec<String> = Vec::new();
     for job in &jobs {
         match merge_to_horizon(
             &*store,
@@ -217,6 +230,7 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
             &pool,
             args.data_checksums,
         ) {
+            Ok(Some(out)) if args.json => rows.push(fold_row(job.shard, &out)),
             Ok(Some(out)) => println!(
                 "shard {}: {} layers retired into {} at {}, {} pages imaged, {} keys with no base kept {} layers alive, {} to {} bytes",
                 job.shard,
@@ -229,6 +243,7 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
                 out.bytes_before,
                 out.bytes_after
             ),
+            Ok(None) if args.json => {}
             Ok(None) => println!("shard {}: nothing below the horizon to fold", job.shard),
             Err(e) => {
                 failed += 1;
@@ -236,10 +251,37 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
             }
         }
     }
+    // The horizon goes out even when no shard moved, because where a
+    // fold decided it was allowed to cut is the answer to why it did
+    // nothing. A shard that had nothing below the horizon is simply
+    // absent from the array; the exit status is what says the fold ran
+    // at all.
+    if args.json {
+        println!("{{\"horizon\":\"{at}\",\"shards\":[{}]}}", rows.join(","));
+    }
     if failed > 0 {
         return Err(format!("{failed} of {} shards failed", jobs.len()));
     }
     Ok(())
+}
+
+/// One shard's fold as a JSON object. `bytes_before` and `bytes_after`
+/// are the shard's whole layer footprint either side of the fold, not
+/// the bytes this pass touched, so a soak can plot the store size the
+/// fold is there to hold down.
+fn fold_row(shard: u16, out: &MergeOutcome) -> String {
+    format!(
+        "{{\"shard\":{},\"horizon\":\"{}\",\"retired\":{},\"outputs\":{},\"imaged\":{},\"unbased\":{},\"pinned\":{},\"bytes_before\":{},\"bytes_after\":{}}}",
+        shard,
+        out.horizon,
+        out.retired,
+        out.outputs,
+        out.imaged,
+        out.unbased,
+        out.pinned,
+        out.bytes_before,
+        out.bytes_after
+    )
 }
 
 #[cfg(test)]
@@ -270,6 +312,36 @@ mod tests {
         let got = parse_fold(&argv(&["--retention", "10m", "--pg-bin", "/opt/pg/bin"])).unwrap();
         assert_eq!(got.retention_secs, 600);
         assert_eq!(got.pg_bin, Some(PathBuf::from("/opt/pg/bin")));
+    }
+
+    #[test]
+    fn the_json_flag_is_off_until_it_is_asked_for() {
+        assert!(!parse_fold(&argv(&[])).unwrap().json);
+        let got = parse_fold(&argv(&["--json", "--retention", "10m"])).unwrap();
+        assert!(got.json);
+        assert_eq!(got.retention_secs, 600);
+    }
+
+    #[test]
+    fn a_fold_row_carries_the_footprint_either_side_of_the_cut() {
+        let out = MergeOutcome {
+            horizon: Lsn(0x8B00_0000),
+            retired: 12,
+            outputs: 2,
+            imaged: 3400,
+            unbased: 1,
+            pinned: 1,
+            bytes_before: 136_770_905,
+            bytes_after: 8_715_593,
+        };
+        let row = fold_row(3, &out);
+        assert!(row.contains("\"shard\":3"), "{row}");
+        assert!(row.contains("\"horizon\":\"0/8B000000\""), "{row}");
+        assert!(row.contains("\"bytes_before\":136770905"), "{row}");
+        assert!(row.contains("\"bytes_after\":8715593"), "{row}");
+        // The shape has to survive a round trip, because the whole
+        // point of the flag is that something else reads it.
+        assert_eq!(row.matches('{').count(), row.matches('}').count());
     }
 
     #[test]
