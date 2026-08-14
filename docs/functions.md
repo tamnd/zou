@@ -167,7 +167,31 @@ import { corsHeaders } from "../_shared/cors.ts"
 import settings from "./settings.json" with { type: "json" }
 ```
 
-`npm:`, `jsr:`, `https:`, `node:` and `data:` specifiers are refused by name, with a message saying which one and that it is not supported yet, rather than failing to be found.
+## Packages
+
+`npm:` and `jsr:` work, and so does an ordinary `https:` url.
+
+```ts
+import { z } from "npm:zod@3.23.8"
+import { encodeHex } from "jsr:@std/encoding@1/hex"
+```
+
+They are not resolved the way Deno resolves them.
+There is no node module resolution here, no `package.json` walk, no CJS and no node built ins.
+Both specifiers are rewritten to a url on a registry that serves packages as modules, `esm.sh` by default, and from there a package is an ordinary graph of `https:` imports.
+What runs is the registry's build of the package rather than the tarball npm would have unpacked, which is worth knowing before reporting a difference in behaviour to a package's author.
+
+- Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
+- A package that reaches for a node built in will not run. `node:` is refused by name and the registry's own shims cover the common ones and not all of them.
+- `@supabase/supabase-js` imports and evaluates, and `createClient` does not run yet: it wants `URL`, which is on the list below.
+- `http:` is refused. A module arrives and is executed, so it arrives over https.
+- `data:` is not supported yet.
+
+Everything fetched is kept on disk, keyed by url, so only the first cold start pays for it.
+
+- `ZOU_MODULE_CACHE` is where, and defaults to `$XDG_CACHE_HOME/zou/modules` or `~/.cache/zou/modules`.
+- `ZOU_MODULE_CACHE_ONLY=1` means this server does not fetch. A module that is not in the cache is refused by name rather than reached for, which is what a deployment that warmed its cache somewhere else wants.
+- `ZOU_MODULE_REGISTRY` points `npm:` and `jsr:` at a mirror instead of esm.sh.
 
 ## fetch
 
@@ -210,6 +234,7 @@ Not present yet, and named rather than silently missing:
 - `URL` and `URLSearchParams`.
 - Timers, so a handler that sleeps will not.
 - `EdgeRuntime.waitUntil`, so work that outlives the response has nowhere to go.
+- Node built ins. `node:fs` and the rest are refused by name.
 
 The rest of that list, and where each line stands, is [issue #369](https://github.com/tamnd/zou/issues/369).
 

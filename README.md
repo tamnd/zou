@@ -89,13 +89,19 @@ Private channels are served too, against the project's own row level security po
 Edge functions run the typescript a project keeps beside its config file:
 
 ```ts
+import { z } from "npm:zod@3.23.8"
+
+const body = z.object({ name: z.string() })
+
 Deno.serve(async (req) => {
-  const { name } = await req.json()
-  return new Response(JSON.stringify({ hello: name }), { headers: { "content-type": "application/json" } })
+  const { name } = body.parse(await req.json())
+  const rate = await fetch("https://api.example.com/rates").then((res) => res.json())
+  return Response.json({ hello: name, rate })
 })
 ```
 
 A directory with an `index.ts` in it is a url under `/functions/v1/`, verified with the project's own keys, and `supabase.functions.invoke` reaches it.
+A function can call out, and `npm:` and `jsr:` packages are fetched once and kept on disk.
 The javascript engine is fifty megabytes of V8 and a build without it says so at boot rather than at the first call, so it is asked for with `--features zou-deno/isolate` and the released bundles have it, see [docs/functions.md](docs/functions.md).
 
 Database webhooks are served too, which is to say the trigger a dashboard writes:

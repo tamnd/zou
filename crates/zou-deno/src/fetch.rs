@@ -27,7 +27,7 @@ use deno_error::JsErrorBox;
 /// The same ceiling the server puts on a call's body, applied to what
 /// a function may read back, so one function cannot answer one request
 /// by holding a gigabyte of somebody else's json.
-const BODY_LIMIT: u64 = 20 * 1024 * 1024;
+pub(crate) const BODY_LIMIT: u64 = 20 * 1024 * 1024;
 
 /// How long a call may take. Deno itself has no default and waits
 /// forever, which is a fine answer for a program somebody is watching
@@ -77,7 +77,9 @@ pub async fn op_zou_fetch(
 
 /// One agent for the process, so a function that calls the same host
 /// twice reuses the connection, and so the TLS setup happens once.
-fn agent() -> &'static ureq::Agent {
+/// The module loader fetches with it too, which is the same claim: a
+/// package's graph is a dozen requests to one host.
+pub(crate) fn agent() -> &'static ureq::Agent {
     static AGENTS: OnceLock<ureq::Agent> = OnceLock::new();
     AGENTS.get_or_init(|| {
         ureq::Agent::config_builder()

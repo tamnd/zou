@@ -81,6 +81,12 @@ jobs:
       - run: cargo build -p zou-deno
       - run: cargo clippy -p zou-deno --features isolate --all-targets -- -D warnings
       - run: cargo test -p zou-deno --features isolate
+      # The ones that reach the real network: a package off esm.sh and a
+      # call out over TLS. They are ignored by default so that `cargo
+      # test` on a laptop with no network still passes, and they run
+      # here because a registry answering the way the loader expects is
+      # a claim about somebody else's server that no mock can make.
+      - run: cargo test -p zou-deno --features isolate -- --ignored
       # The binary with an engine in it, which is what a release bundle
       # is. Nothing else in this file builds that combination, and the
       # crate being reachable from the binary is the whole point of the

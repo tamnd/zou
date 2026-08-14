@@ -298,19 +298,21 @@ fn a_function_may_import_the_files_beside_it() {
     assert_eq!(body(&answer), "hello the world");
 }
 
+/// The three that are refused before a request is made, which is why
+/// this test needs no network: `npm:` and `jsr:` are fetched and are
+/// tested in `registry.rs`.
 #[test]
-fn a_specifier_this_runtime_does_not_serve_yet_says_so_by_name() {
+fn a_specifier_this_runtime_does_not_serve_says_so_by_name() {
     for (specifier, said) in [
-        ("npm:zod", "the npm: specifier"),
-        ("jsr:@std/assert", "the jsr: specifier"),
-        ("https://esm.sh/zod", "the https: specifier"),
-        ("node:fs", "the node: specifier"),
+        ("http://esm.sh/zod", "over https"),
+        ("node:fs", "no node built in fs"),
+        ("data:text/javascript,1", "the data: specifier"),
     ] {
         let source = format!(r#"import "{specifier}"; Deno.serve(() => new Response("no"));"#);
         let complaint = called(&source, get("http://localhost:9000/functions/v1/hello"))
             .expect_err("a refusal");
         assert!(
-            complaint.contains(said) && complaint.contains("not supported yet"),
+            complaint.contains(said),
             "{specifier} was refused with {complaint}"
         );
     }

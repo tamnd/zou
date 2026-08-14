@@ -13,7 +13,7 @@ authors.workspace = true
 # second, so `cargo test --workspace` on a machine that only cares about
 # the database never downloads V8 or builds swc.
 default = []
-isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:serde", "dep:tokio", "dep:ureq"]
+isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:serde", "dep:sha2", "dep:tokio", "dep:ureq"]
 
 [dependencies]
 zou-functions = { path = "../zou-functions" }
@@ -21,12 +21,16 @@ deno_ast = { version = "0.52", features = ["transpiling"], optional = true }
 deno_core = { version = "0.410", optional = true }
 deno_error = { version = "0.7", optional = true }
 serde = { workspace = true, optional = true }
+# A url is not a file name, so a cached module is named for its digest.
+sha2 = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 # The same client zou-server calls a webhook with, rather than the
 # hyper and second TLS stack deno_fetch would bring.
 ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The cached module test names a file the way the loader names it.
+sha2 = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 

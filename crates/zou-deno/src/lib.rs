@@ -28,7 +28,8 @@
 //!   `fetch` collects an answer before handing it back.
 //! - `URL` and `URLSearchParams` are not there.
 //! - Timers are not there, so a handler that sleeps will not.
-//! - `npm:`, `jsr:` and `https:` specifiers are refused by name.
+//! - There are no node built ins, so `node:` is refused by name and a
+//!   package that reaches for one will not run.
 //!
 //! What is there is `Headers`, `Request`, `Response`, `TextEncoder`,
 //! `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`
@@ -37,6 +38,11 @@
 //!
 //! `fetch` is the client `zou-server` calls a database webhook with,
 //! behind an op, rather than a second HTTP stack linked in beside it.
+//!
+//! `npm:` and `jsr:` specifiers are fetched from a registry that serves
+//! packages as modules, esm.sh by default, and kept on disk after the
+//! first time. There is no node module resolution here and no CJS: what
+//! runs is the registry's build of the package.
 //!
 //! Typescript is real: `deno_ast` is the same swc transpiler Deno uses,
 //! so what runs is what would run there.
