@@ -186,12 +186,63 @@ pub fn chain_head(media: &WalMedia, shard: u32, floor: u64) -> Result<u64, Chain
     // MAX_INFLIGHT past that hole, so it sits in this window or lo is
     // the true head.
     let base = (floor + 1).max(lo.saturating_sub(MAX_INFLIGHT as u64));
-    for seq in base..=lo {
-        if !media.present(shard, seq)? {
-            return Ok(seq - 1);
+    let window = probe_window(media, shard, base, (lo - base + 1) as usize)?;
+    for (i, present) in window.iter().enumerate() {
+        if !present {
+            return Ok(base + i as u64 - 1);
         }
     }
     Ok(lo)
+}
+
+/// How many probes of a window go out at once. The windows here are
+/// MAX_INFLIGHT wide and every probe is an independent one byte ranged
+/// get, so walking one takes 64 round trips to answer a question that
+/// is really one question. That is nothing on a local disk and one to
+/// three seconds against an object store, paid on every open, by a node
+/// that cannot take a commit until it is done. Wide enough to turn the
+/// window into two round trips, narrow enough not to open a connection
+/// per seq.
+const PROBE_WIDTH: usize = 32;
+
+/// Presence for `len` seqs from `from`, probed concurrently. The answers
+/// come back in seq order, so every caller reads them the same way it
+/// read the loop this replaces. Any probe failing fails the window: a
+/// hole that is really a store error must not read as the end of the
+/// chain.
+fn probe_window(
+    media: &WalMedia,
+    shard: u32,
+    from: u64,
+    len: usize,
+) -> Result<Vec<bool>, ChainError> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if len == 1 {
+        return Ok(vec![media.present(shard, from)?]);
+    }
+    let mut out: Vec<Result<bool, CasError>> = Vec::with_capacity(len);
+    for chunk in 0..len.div_ceil(PROBE_WIDTH) {
+        let base = from + (chunk * PROBE_WIDTH) as u64;
+        let width = PROBE_WIDTH.min(len - chunk * PROBE_WIDTH);
+        let mut slots: Vec<Result<bool, CasError>> = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(width);
+            for i in 0..width {
+                handles.push(scope.spawn(move || media.present(shard, base + i as u64)));
+            }
+            for handle in handles {
+                // A probe thread only calls the store, so a panic in one
+                // is a panic in the store worth propagating as it is.
+                slots.push(handle.join().expect("probe thread"));
+            }
+        });
+        out.extend(slots);
+    }
+    out.into_iter()
+        .map(|r| r.map_err(ChainError::from))
+        .collect()
 }
 
 pub(crate) fn digest_of_segment(media: &WalMedia, shard: u32, seq: u64) -> Result<u64, ChainError> {
@@ -343,24 +394,36 @@ pub(crate) fn straggler_at(
 /// ours means a rival fenced us after our seal landed, and deleting it
 /// would hand that rival's chain a hole under writes it already acked.
 fn sweep_stragglers(media: &WalMedia, shard: u32, sealed_seq: u64) -> Result<(), ChainError> {
+    // The sweep looks a whole window ahead and almost always finds
+    // nothing, because litter needs a writer that was frozen with PUTs
+    // in flight. Probing that window a seq at a time spends the round
+    // trips of a real search on the answer "empty", so the probes go
+    // out a window at a time and the walk below reads the answers.
     let mut seq = sealed_seq;
     let mut gap = 0usize;
-    while gap < MAX_INFLIGHT {
-        seq += 1;
-        if !media.present(shard, seq)? {
-            gap += 1;
-            continue;
+    'sweep: while gap < MAX_INFLIGHT {
+        let base = seq + 1;
+        let window = probe_window(media, shard, base, PROBE_WIDTH)?;
+        for (i, present) in window.iter().enumerate() {
+            seq = base + i as u64;
+            if !present {
+                gap += 1;
+                if gap >= MAX_INFLIGHT {
+                    break 'sweep;
+                }
+                continue;
+            }
+            gap = 0;
+            let Some(bytes) = media.fetch(shard, seq)? else {
+                continue;
+            };
+            let (header, _) =
+                read_footer(&bytes).map_err(|source| ChainError::Segment { shard, seq, source })?;
+            if header.kind != SegmentKind::Landing {
+                break 'sweep;
+            }
+            media.delete_segment(shard, seq)?;
         }
-        gap = 0;
-        let Some(bytes) = media.fetch(shard, seq)? else {
-            continue;
-        };
-        let (header, _) =
-            read_footer(&bytes).map_err(|source| ChainError::Segment { shard, seq, source })?;
-        if header.kind != SegmentKind::Landing {
-            break;
-        }
-        media.delete_segment(shard, seq)?;
     }
     Ok(())
 }

@@ -427,3 +427,93 @@ fn a_segment_that_does_not_link_ends_the_chain_read_rather_than_breaking_it() {
         other => panic!("expected a broken link, got {other:?}"),
     }
 }
+
+/// A store whose probes cost what an object store's cost, so a test can
+/// tell a walk from a fan out. Only the one byte ranged get sleeps,
+/// which is the probe and nothing else.
+struct SlowProbeStore {
+    inner: Arc<dyn CasStore>,
+    probe: Duration,
+    probes: AtomicUsize,
+}
+
+impl CasStore for SlowProbeStore {
+    fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, CasError> {
+        self.inner.get(key)
+    }
+    fn get_range(&self, key: &str, offset: u64, len: u64) -> Result<Option<Vec<u8>>, CasError> {
+        self.probes.fetch_add(1, Ordering::Relaxed);
+        std::thread::sleep(self.probe);
+        self.inner.get_range(key, offset, len)
+    }
+    fn put_if_match(
+        &self,
+        key: &str,
+        data: &[u8],
+        expected: Option<&Version>,
+    ) -> Result<Version, CasError> {
+        self.inner.put_if_match(key, data, expected)
+    }
+    fn delete(&self, key: &str) -> Result<(), CasError> {
+        self.inner.delete(key)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+        self.inner.list(prefix)
+    }
+}
+
+/// The takeover probes two windows a whole inflight cap wide, the head
+/// backscan and the straggler sweep, and on a healthy chain both come
+/// back empty. Walking them a seq at a time spends 64 round trips each
+/// on that answer, which is free on a local disk and seconds against a
+/// store, on the path a node that just came back takes before it can
+/// accept a commit (zou #382).
+#[test]
+fn the_takeover_probes_its_windows_wide_rather_than_one_seq_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _media) = store_in(&dir);
+    let shard = 14;
+
+    let mut prev_digest = 0;
+    for seq in 1..=8u64 {
+        let (bytes, summaries) = SegmentBuilder::new(SegmentHeader {
+            kind: SegmentKind::Landing,
+            shard,
+            seq,
+            prev_digest,
+        })
+        .finish();
+        store
+            .put_if_absent(&segment_key(shard, seq), &bytes)
+            .unwrap();
+        prev_digest = tenants_digest(&summaries);
+    }
+
+    let probe = Duration::from_millis(20);
+    let slow = Arc::new(SlowProbeStore {
+        inner: Arc::clone(&store),
+        probe,
+        probes: AtomicUsize::new(0),
+    });
+    let media = WalMedia::single(Arc::clone(&slow) as Arc<dyn CasStore>);
+
+    let started = std::time::Instant::now();
+    let t = take_over(&media, shard, "node-d").unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(t.sealed_seq, 9);
+
+    // Serial, the two windows alone are 2 * MAX_INFLIGHT probes, so the
+    // bound is well under what a walk of one of them costs. The probe
+    // count is unchanged, this is about how many of them are in flight.
+    let probes = slow.probes.load(Ordering::Relaxed);
+    let walked = probe * probes as u32;
+    assert!(
+        probes >= zou_log::MAX_INFLIGHT,
+        "{probes} probes, the windows are {} wide",
+        zou_log::MAX_INFLIGHT
+    );
+    assert!(
+        elapsed * 4 < walked,
+        "{probes} probes at {probe:?} took {elapsed:?}, a walk of them is {walked:?}"
+    );
+}
