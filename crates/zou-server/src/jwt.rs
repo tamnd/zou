@@ -441,7 +441,7 @@ fn split(token: &str) -> Result<Parts<'_>, Reject> {
 /// segments with a json header on the front, which is a token that
 /// never got as far as having an algorithm.
 ///
-/// This reads the header itself rather than going through [`split`],
+/// This reads the header itself rather than going through `split`,
 /// and the difference is the point: split decodes the signature too, so
 /// a token whose signature is not base64 at all has no parts, while it
 /// very much has an algorithm. The reference reads the header of
