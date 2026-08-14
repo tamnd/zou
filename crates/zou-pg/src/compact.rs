@@ -59,6 +59,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use zou_store::bloom::Bloom;
 use zou_store::cas::{CasError, CasStore};
 use zou_store::layer::{
     DeltaBuilder, ImageBuilder, KEY_PAGE, LayerBuildError, LayerDecodeError, LayerKey, LayerKind,
@@ -524,6 +525,7 @@ pub fn compact_shard(
         &retire,
         &add,
         full.then_some(manifest.shards),
+        None,
     )?;
     let after: Vec<LayerDesc> = published
         .layers
@@ -538,6 +540,349 @@ pub fn compact_shard(
         debt_after: debt(&after),
         imaged,
         frozen: frozen_bases.into_inner(),
+    }))
+}
+
+/// What one merge fold did, for logs and the scoreboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeOutcome {
+    /// The lsn the pass imaged at and stamped, which is the oldest lsn
+    /// the shard still answers afterwards.
+    pub horizon: Lsn,
+    pub retired: usize,
+    pub outputs: usize,
+    /// Pages the merged image holds.
+    pub imaged: usize,
+    /// Keys nobody could build a page for at the horizon. Their layers
+    /// stay listed, because dropping them would lose the only copy of
+    /// their history.
+    pub unbased: usize,
+    /// Layers below the horizon the pass left alone for that reason.
+    pub pinned: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
+/// The highest lsn a merge fold may cut at without breaking a promise
+/// the tenant has already made.
+///
+/// Two things can ask a tenant for an old lsn, and both name it the
+/// same way, through a checkpoint. A branch or a restore starts at a
+/// checkpoint in the live manifest, and a point in time restore starts
+/// at a checkpoint in a history snapshot that gc has not expired yet.
+/// Fold above the oldest of those and the operation that names it finds
+/// half a chain, so that lsn is the ceiling.
+///
+/// Nothing else pins. A branch that already exists copied the parent's
+/// layer list into its own shard manifests at the cut, gc pins objects
+/// off every shard manifest in the store, and a merge only retires
+/// names from the manifest it is folding. The child keeps reading the
+/// bytes it listed, whatever the parent does to its own list
+/// afterwards, which is why an old branch does not hold its parent's
+/// horizon down forever.
+///
+/// A tenant nobody has checkpointed names no old lsn at all, so the
+/// answer is the largest lsn there is and the fold goes as far as the
+/// shard's own
+/// flush point. [`merge_to_horizon`] clamps, so a caller can pass this
+/// through without thinking about it.
+pub fn horizon_for(
+    store: &dyn CasStore,
+    tenant_ref: &str,
+    now_unix: u64,
+    retention_secs: u64,
+) -> Result<Lsn, CompactError> {
+    let layout = TenantLayout::new(tenant_ref);
+    let key = layout.manifest();
+    let Some((data, _)) = store.get(&key)? else {
+        return Err(CompactError::NoTenant { key });
+    };
+    let mut oldest = Lsn(u64::MAX);
+    let mut take = |m: &Manifest| {
+        for c in &m.checkpoints {
+            oldest = oldest.min(c.lsn);
+        }
+    };
+    take(&Manifest::from_json(&data)?);
+    for key in store.list(&layout.manifests_dir())? {
+        // The stamp is the second half of `<epoch>-<unix>.json`. A key
+        // that does not parse is not a snapshot this gc wrote, and
+        // guessing at its age is worse than leaving it out of the
+        // reckoning.
+        let Some(stamp) = key
+            .rsplit('/')
+            .next()
+            .and_then(|n| n.strip_suffix(".json"))
+            .and_then(|n| n.split_once('-'))
+            .and_then(|(_, unix)| unix.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if now_unix.saturating_sub(stamp) >= retention_secs {
+            continue;
+        }
+        if let Some((data, _)) = store.get(&key)? {
+            take(&Manifest::from_json(&data)?);
+        }
+    }
+    Ok(oldest)
+}
+
+/// The most bytes one merged image accumulates before the pass cuts it
+/// and starts the next. Images at one lsn covering disjoint key ranges
+/// cost a read nothing, [`LayerMap::plan`] only hands over the ones
+/// whose range covers the key, so this is free to be small enough that
+/// a worker's memory is bounded by it and not by the size of the
+/// tenant.
+const MERGE_TARGET_BYTES: usize = 128 * 1024 * 1024;
+
+/// The merge fold: buy a retention horizon by paying for it once.
+///
+/// Every ordinary pass leaves the history where it is, so a shard's
+/// layers only ever grow: an old image is the base some read below the
+/// newer ones needs, and every record the tenant ever wrote is in some
+/// delta. The disk a soak needs is the whole write volume of the soak,
+/// which is not a storage bill anybody wants and not a disk server3
+/// has.
+///
+/// The way out is to stop serving reads below a horizon, and the way
+/// to earn that is one image at the horizon holding every key the
+/// layers below it hold. Images are sparse, so no single old image can
+/// simply be dropped, but once one image at `horizon` carries the
+/// union of all of them, every image below it and every delta ending
+/// below it is unreachable for a read at or above `horizon` and can
+/// retire. The manifest records the horizon, and reads below it are
+/// refused rather than answered from half a chain.
+///
+/// Keys nobody can build a page for stay exactly where they are. The
+/// pass finds them by asking the page service for a page and being
+/// told no, and then leaves every layer below the horizon whose bloom
+/// says it may hold one of them. That is the same rule the ordinary
+/// pass uses for the fresh image, spelled with objects instead of
+/// records: nothing is dropped until its contents are somewhere else.
+///
+/// This is the expensive shape. It reads every layer below the horizon
+/// once to learn the keys, then materializes them, so its cost is the
+/// history it is about to retire plus the working set it is about to
+/// image. It is meant to run on a schedule measured in the retention
+/// window, not in minutes.
+pub fn merge_to_horizon(
+    store: &dyn CasStore,
+    tenant_ref: &str,
+    shard: u16,
+    horizon: Lsn,
+    pool: &RedoPool,
+    data_checksums: bool,
+) -> Result<Option<MergeOutcome>, CompactError> {
+    let layout = TenantLayout::new(tenant_ref);
+    let manifest_key = layout.manifest();
+    let Some((data, _)) = store.get(&manifest_key)? else {
+        return Err(CompactError::NoTenant { key: manifest_key });
+    };
+    let manifest = Manifest::from_json(&data)?;
+    let (descs, _) = load_serving_descs(store, tenant_ref, &manifest, shard)?;
+    let Some((own, _)) = PageShardManifest::load(store, &layout.shard_manifest(shard))? else {
+        // A shard still riding its ancestors' manifests owns nothing to
+        // retire, and retiring somebody else's layers is not its call.
+        return Ok(None);
+    };
+    // Same reason: a shard serving inherited or ancestral objects has
+    // to be separated by a full pass before anything below it can go.
+    if descs.iter().any(|d| d.home.is_some() || d.owner.is_some()) {
+        return Ok(None);
+    }
+    let at = horizon.min(own.disk_consistent_lsn);
+    if at == Lsn(0) || own.horizon.is_some_and(|h| h >= at) {
+        return Ok(None);
+    }
+    let below: Vec<&LayerDesc> = descs.iter().filter(|d| d.max_lsn <= at).collect();
+    // One image already sitting at the horizon is the output of this
+    // very pass, run again. Anything else below is history to fold.
+    let cut_already =
+        below.len() == 1 && below[0].kind == LayerKind::Image && below[0].min_lsn == at;
+    if below.is_empty() || cut_already {
+        return Ok(None);
+    }
+    let bytes_before: u64 = descs.iter().map(|d| d.size).sum();
+
+    let keep_count = manifest
+        .shard_history
+        .iter()
+        .flat_map(|c| [c.from, c.to])
+        .chain([manifest.shards])
+        .filter(|&c| c > shard as u32)
+        .min()
+        .expect("the current count always exceeds a valid shard number");
+    let keep = |key: &LayerKey| shard_of(key, keep_count) == shard;
+    let reader = LayerReader::for_shard(store, tenant_ref, shard);
+
+    // One input at a time, keys out, bytes dropped: the whole point is
+    // that the history is bigger than the box, so it never all sits in
+    // memory at once. The bloom rides along for the retire decision at
+    // the end, which is a few kilobytes per input against the layer's
+    // megabytes.
+    let mut keys: BTreeSet<LayerKey> = BTreeSet::new();
+    let mut blooms: Vec<Bloom> = Vec::with_capacity(below.len());
+    for desc in &below {
+        let bytes = reader.fetch(desc)?;
+        let name = desc.name();
+        let decode = |source| CompactError::Decode {
+            name: name.clone(),
+            source,
+        };
+        match desc.kind {
+            LayerKind::Delta => {
+                let cursor = delta_cursor(&bytes).map_err(decode)?;
+                blooms.push(cursor.footer().bloom.clone());
+                for entry in cursor {
+                    let entry = entry.map_err(decode)?;
+                    if keep(&entry.key) {
+                        keys.insert(entry.key);
+                    }
+                }
+            }
+            LayerKind::Image => {
+                let cursor = image_cursor(&bytes).map_err(decode)?;
+                blooms.push(cursor.footer().bloom.clone());
+                for entry in cursor {
+                    let entry = entry.map_err(decode)?;
+                    if keep(&entry.key) {
+                        keys.insert(entry.key);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut add = Vec::new();
+    let mut publish = |bytes: Vec<u8>, footer: &zou_store::layer::LayerFooter| {
+        let desc = LayerDesc::from_footer(footer, bytes.len() as u64);
+        let key = format!("{}{}", layout.shard_prefix(shard), desc.name());
+        match store.put_if_absent(&key, &bytes) {
+            Ok(_) | Err(CasError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(CompactError::from(e)),
+        }
+        add.push(LayerEntry {
+            name: desc.name(),
+            size: bytes.len() as u64,
+            owner: None,
+            upto: None,
+        });
+        Ok(())
+    };
+
+    // Non page keys have no page to materialize, so they are unbased by
+    // construction and their layers stay. Nothing writes them yet; when
+    // something does, this is the line that keeps them safe until the
+    // merge learns how to carry them.
+    let mut unbased: BTreeSet<LayerKey> = keys
+        .iter()
+        .filter(|k| k.kind != KEY_PAGE)
+        .copied()
+        .collect();
+    let page_keys: Vec<LayerKey> = keys
+        .iter()
+        .filter(|k| k.kind == KEY_PAGE)
+        .copied()
+        .collect();
+    drop(keys);
+    let map = LayerMap::new(descs.clone()).map_err(PageShardError::from)?;
+    let frozen_bases = AtomicUsize::new(0);
+    let svc = PageService::for_shard(store, tenant_ref, shard, Some(pool), data_checksums)
+        .with_base_fallback(|blk: &crate::walscan::BlockRef| {
+            let object = layout.pg_block(blk.spc, blk.db, blk.rel, blk.fork, blk.blk);
+            match store.get(&object) {
+                Ok(Some((page, _))) if page.len() == BLCKSZ => {
+                    frozen_bases.fetch_add(1, Ordering::Relaxed);
+                    Some(page)
+                }
+                _ => None,
+            }
+        });
+    let mem = Memtable::new();
+    let mut imaged = 0;
+    let mut builder = ImageBuilder::new(at, BLOCK_TARGET);
+    for batch in page_keys.chunks(MAX_GETPAGE_BATCH) {
+        let blocks: Vec<crate::walscan::BlockRef> = batch
+            .iter()
+            .map(|k| crate::walscan::BlockRef {
+                spc: k.spc,
+                db: k.db,
+                rel: k.rel,
+                fork: k.fork as u32,
+                blk: k.block,
+            })
+            .collect();
+        let pages = svc.get_pages_where_possible(&map, &mem, &blocks, at.0)?;
+        for (key, page) in batch.iter().zip(pages) {
+            let Some(page) = page else {
+                unbased.insert(*key);
+                continue;
+            };
+            builder.push(*key, &page)?;
+            imaged += 1;
+            if builder.bytes() >= MERGE_TARGET_BYTES {
+                let (bytes, footer) = builder.finish()?;
+                publish(bytes, &footer)?;
+                builder = ImageBuilder::new(at, BLOCK_TARGET);
+            }
+        }
+    }
+    if !builder.is_empty() {
+        let (bytes, footer) = builder.finish()?;
+        publish(bytes, &footer)?;
+    }
+
+    // What can go. A layer whose bloom may hold a key the image could
+    // not carry stays: a false positive costs one layer left alone
+    // until the next merge, a false negative would cost the only copy
+    // of a page's history, so the test is allowed to be wrong in
+    // exactly one direction.
+    let own_names: BTreeSet<&str> = own.layers.iter().map(|l| l.name.as_str()).collect();
+    let mut pinned = 0;
+    let mut retire = Vec::new();
+    for (desc, bloom) in below.iter().zip(&blooms) {
+        let name = desc.name();
+        if !own_names.contains(name.as_str()) {
+            continue;
+        }
+        let holds_unbased = unbased
+            .range(desc.min_key..=desc.max_key)
+            .any(|k| bloom.may_contain(&k.encode()));
+        if holds_unbased {
+            pinned += 1;
+        } else {
+            retire.push(name);
+        }
+    }
+
+    // The horizon is stamped only when something actually went. A pass
+    // that pinned everything it read broke no promise and should not
+    // make one.
+    let published = swap_layers(
+        store,
+        &layout.shard_manifest(shard),
+        shard,
+        &retire,
+        &add,
+        None,
+        (!retire.is_empty()).then_some(at),
+    )?;
+    let after: Vec<LayerDesc> = published
+        .layers
+        .iter()
+        .map(|l| LayerDesc::parse(&l.name, l.size))
+        .collect::<Result<_, _>>()
+        .map_err(PageShardError::from)?;
+    Ok(Some(MergeOutcome {
+        horizon: at,
+        retired: retire.len(),
+        outputs: add.len(),
+        imaged,
+        unbased: unbased.len(),
+        pinned,
+        bytes_before,
+        bytes_after: after.iter().map(|d| d.size).sum(),
     }))
 }
 
@@ -630,6 +975,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use zou_store::cas::Version;
     use zou_store::layer::{DeltaEntry, ImageEntry, PAGE_IMAGE_LEN, build_delta, build_image};
+    use zou_store::manifest::{CheckpointKind, CheckpointRef};
     use zou_store::mem::MemStore;
     use zou_store::shardmanifest::publish_layer;
     use zou_store::shards::{prune_lineage, split};
@@ -1192,6 +1538,238 @@ mod tests {
             got.records.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
             vec![0x100],
             "the folded history is still there for a read that needs it"
+        );
+    }
+
+    /// A pool that cannot start a worker, for passes whose bases all
+    /// come out of images and never ask redo for anything.
+    fn dead_pool() -> RedoPool {
+        RedoPool::new(RedoPoolConfig {
+            postgres: "/nonexistent/postgres".into(),
+            scratch_root: std::env::temp_dir(),
+            workers: 1,
+            batch_timeout: std::time::Duration::from_secs(5),
+            batches_per_worker: 1,
+            data_checksums: false,
+        })
+    }
+
+    /// A checkpoint is the only way anybody names an old lsn, so the
+    /// oldest one still nameable is the ceiling. A history snapshot
+    /// counts while gc keeps it and stops counting the moment gc would
+    /// drop it, which is the same line drawn in the same place twice.
+    #[test]
+    fn the_ceiling_is_the_oldest_lsn_a_checkpoint_still_names() {
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+
+        // Nothing checkpointed: nothing names an old lsn, so a fold is
+        // free to go as far as its own flush point takes it.
+        assert_eq!(
+            horizon_for(&store, "t", 10_000, 3_600).unwrap(),
+            Lsn(u64::MAX)
+        );
+
+        let chk = |id: &str, lsn: u64| CheckpointRef {
+            id: id.into(),
+            lsn: Lsn(lsn),
+            kind: CheckpointKind::Full,
+            owner: None,
+        };
+        let mut live = Manifest::new("t", 18);
+        live.checkpoints = vec![chk("c-2", 0x500), chk("c-3", 0x900)];
+        store.put(&layout.manifest(), &live.to_json()).unwrap();
+        assert_eq!(
+            horizon_for(&store, "t", 10_000, 3_600).unwrap(),
+            Lsn(0x500),
+            "the oldest checkpoint a restore can still name"
+        );
+
+        // A snapshot inside the retention window pins what it holds.
+        let mut old = Manifest::new("t", 18);
+        old.checkpoints = vec![chk("c-1", 0x100)];
+        store
+            .put(
+                &format!("{}0000000001-9000.json", layout.manifests_dir()),
+                &old.to_json(),
+            )
+            .unwrap();
+        assert_eq!(
+            horizon_for(&store, "t", 10_000, 3_600).unwrap(),
+            Lsn(0x100),
+            "a retained snapshot names c-1 and the fold has to stay under it"
+        );
+
+        // Past retention gc drops the snapshot, so it stops pinning.
+        assert_eq!(horizon_for(&store, "t", 10_000, 500).unwrap(), Lsn(0x500));
+    }
+
+    #[test]
+    fn a_merge_folds_the_sparse_images_below_the_horizon_and_stamps_it() {
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        let a = LayerKey::page(1663, 5, 90, 0, 1);
+        let b = LayerKey::page(1663, 5, 90, 0, 2);
+        // Two folds, each imaging only the key it merged, which is the
+        // shape that makes a read walk both and neither droppable.
+        let older = put_image(
+            &store,
+            &layout,
+            0,
+            &[ImageEntry {
+                key: a,
+                page: vec![0xAA; BLCKSZ],
+            }],
+            0x100,
+        );
+        let newer = put_image(
+            &store,
+            &layout,
+            0,
+            &[ImageEntry {
+                key: b,
+                page: vec![0xBB; BLCKSZ],
+            }],
+            0x200,
+        );
+        // Live history above the horizon, which the merge must leave
+        // exactly where it is.
+        put_delta(&store, &layout, 0, &mut [rec(90, 1, 0x300)], 0x300);
+
+        let pool = dead_pool();
+        let out = merge_to_horizon(&store, "t", 0, Lsn(0x250), &pool, false)
+            .unwrap()
+            .expect("two images below the horizon");
+        assert_eq!(out.horizon, Lsn(0x250));
+        assert_eq!((out.imaged, out.unbased, out.pinned), (2, 0, 0));
+        assert_eq!((out.retired, out.outputs), (2, 1));
+        assert!(out.bytes_after < out.bytes_before);
+
+        let (m, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.horizon, Some(Lsn(0x250)));
+        assert_eq!(m.layers.len(), 2, "the merged image and the live run");
+        assert!(!m.layers.iter().any(|l| l.name == older || l.name == newer));
+
+        // Both keys read at the horizon and above it, from the one
+        // image that replaced the two.
+        let reader = LayerReader::new(&store, layout.shard_prefix(0));
+        let map = m.layer_map().unwrap();
+        let mem = Memtable::new();
+        let got = reader.reconstruct(&map, &mem, &a, Lsn(0x250)).unwrap();
+        assert_eq!(got.base, Some(vec![0xAA; BLCKSZ]));
+        assert_eq!(got.base_lsn, Some(Lsn(0x250)));
+        let got = reader.reconstruct(&map, &mem, &b, Lsn(0x400)).unwrap();
+        assert_eq!(got.base, Some(vec![0xBB; BLCKSZ]));
+        assert_eq!(
+            map.plan(&a, Lsn(0x400)).read_amp(),
+            2,
+            "one image and the run above it, which is what the fold is for"
+        );
+        // The record above the horizon still applies over the base.
+        assert_eq!(got.records.len(), 0, "the record belongs to the other key");
+        let got = reader.reconstruct(&map, &mem, &a, Lsn(0x400)).unwrap();
+        assert_eq!(
+            got.records.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
+            vec![0x300]
+        );
+
+        // A rerun at the same horizon has nothing left to buy.
+        assert!(
+            merge_to_horizon(&store, "t", 0, Lsn(0x250), &pool, false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_page_nobody_can_build_keeps_the_layers_that_hold_it() {
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        let a = LayerKey::page(1663, 5, 90, 0, 1);
+        // Block 5 has records and no base anywhere: no image holds it
+        // and its first record neither initializes the page nor carries
+        // a full image of it, so nothing can materialize it.
+        let bare = put_delta(&store, &layout, 0, &mut [rec(90, 5, 0x100)], 0x100);
+        let image = put_image(
+            &store,
+            &layout,
+            0,
+            &[ImageEntry {
+                key: a,
+                page: vec![0xAA; BLCKSZ],
+            }],
+            0x150,
+        );
+        put_delta(&store, &layout, 0, &mut [rec(90, 1, 0x300)], 0x300);
+
+        let pool = dead_pool();
+        let out = merge_to_horizon(&store, "t", 0, Lsn(0x200), &pool, false)
+            .unwrap()
+            .expect("history below the horizon");
+        assert_eq!((out.imaged, out.unbased, out.pinned), (1, 1, 1));
+        assert_eq!(out.retired, 1, "the image went, the bare run stayed");
+
+        let (m, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        assert!(
+            m.layers.iter().any(|l| l.name == bare),
+            "dropping it would lose the only copy of that page's history"
+        );
+        assert!(!m.layers.iter().any(|l| l.name == image));
+        let reader = LayerReader::new(&store, layout.shard_prefix(0));
+        let map = m.layer_map().unwrap();
+        let got = reader
+            .reconstruct(
+                &map,
+                &Memtable::new(),
+                &LayerKey::page(1663, 5, 90, 0, 5),
+                Lsn(0x400),
+            )
+            .unwrap();
+        assert_eq!(got.base, None);
+        assert_eq!(
+            got.records.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
+            vec![0x100],
+            "still every record it ever had"
+        );
+    }
+
+    #[test]
+    fn a_merge_refuses_what_it_does_not_own_and_what_it_cannot_reach() {
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        let pool = dead_pool();
+        // No flush point yet, so there is no lsn to image at.
+        put_image(
+            &store,
+            &layout,
+            0,
+            &[ImageEntry {
+                key: LayerKey::page(1663, 5, 90, 0, 1),
+                page: vec![0xAA; BLCKSZ],
+            }],
+            0,
+        );
+        assert!(
+            merge_to_horizon(&store, "t", 0, Lsn(0x100), &pool, false)
+                .unwrap()
+                .is_none()
+        );
+
+        // A shard reading its ancestors' layers after a split has to be
+        // separated by a full pass before anything below it can go.
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        let (b0, _) = split_blocks(90);
+        put_delta(&store, &layout, 0, &mut [rec(90, b0, 0x100)], 0x100);
+        split(&store, "t").unwrap();
+        assert!(
+            merge_to_horizon(&store, "t", 1, Lsn(0x100), &pool, false)
+                .unwrap()
+                .is_none()
         );
     }
 

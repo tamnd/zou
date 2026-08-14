@@ -11,20 +11,53 @@
 //!
 //! When every shard covers its own keyspace after the sweep, the
 //! split lineage is pruned in the same breath.
+//!
+//! `--horizon` is the other command, the merge fold. The sweep above
+//! never drops history: an old image is somebody's base and every
+//! record the tenant wrote is in some delta, so the layers grow with
+//! the write volume and never shrink. The fold buys the right to drop
+//! them by paying for it once, cutting one image that holds every key
+//! the layers below it held, and it needs a redo pool to build those
+//! pages. It is scheduled in retention windows, not minutes, which is
+//! why it is a separate run and not part of the sweep.
 
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use zou_pg::compact::{READ_AMP_BOUND, debts, run_queue};
+use zou_pg::compact::{READ_AMP_BOUND, debts, horizon_for, merge_to_horizon, run_queue};
+use zou_pg::gc::DEFAULT_RETENTION_SECS;
+use zou_pg::install;
+use zou_pg::redo::{RedoPool, RedoPoolConfig};
+use zou_store::lsn::Lsn;
 use zou_store::open_store;
 use zou_store::shards::prune_lineage;
 
-pub const USAGE: &str = "usage: zou compact <target> <ref> [--workers <n> | --status]";
+pub const USAGE: &str = "usage: zou compact <target> <ref> [--workers <n> | --status | --horizon [<lsn>] [--retention <duration>] [--pg-bin <path>] [--data-checksums]]";
+
+/// A merge fold worker holds a whole image in memory before it cuts it,
+/// so these do not stack the way sweep workers do. One tenant at a time
+/// is the shape a scheduled fold wants anyway.
+const MERGE_REDO_WORKERS: usize = 4;
+
+/// The same cap the page service gives a redo batch. A merge asks for
+/// the same work in the same batches, so a batch taking longer than
+/// this means the same thing here as it does there.
+const MERGE_BATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Batches a redo worker serves before the pool replaces it, which
+/// bounds postgres's invalid page tracking over a fold that walks a
+/// tenant's whole history.
+const MERGE_BATCHES_PER_WORKER: u64 = 256;
 
 pub fn run(argv: &[String]) -> Result<(), String> {
     let (target, tenant_ref, rest) = match argv {
         [target, tenant_ref, rest @ ..] => (target, tenant_ref, rest),
         _ => return Err(USAGE.into()),
     };
+    if rest.first().is_some_and(|f| f == "--horizon") {
+        return fold(target, tenant_ref, &rest[1..]);
+    }
     let workers = match rest {
         [] => 4,
         [flag] if flag == "--status" => {
@@ -81,4 +114,168 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         println!("lineage kept, some shard still leans on its ancestors");
     }
     Ok(())
+}
+
+/// What `--horizon` was told, before the store gets a look at it.
+#[derive(Debug, PartialEq, Eq)]
+struct Fold {
+    /// An lsn named on the command line, which overrides the policy.
+    /// Nothing checks it against the checkpoints, so this is the flag
+    /// that lets an operator fold above a restore point on purpose.
+    at: Option<Lsn>,
+    retention_secs: u64,
+    pg_bin: Option<PathBuf>,
+    data_checksums: bool,
+}
+
+fn parse_fold(argv: &[String]) -> Result<Fold, String> {
+    let mut fold = Fold {
+        at: None,
+        retention_secs: DEFAULT_RETENTION_SECS,
+        pg_bin: None,
+        data_checksums: false,
+    };
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--retention" => {
+                fold.retention_secs = crate::gc::secs(
+                    it.next()
+                        .ok_or_else(|| "--retention needs a value".to_string())?,
+                )?
+            }
+            "--pg-bin" => {
+                fold.pg_bin = Some(PathBuf::from(
+                    it.next()
+                        .ok_or_else(|| "--pg-bin needs a value".to_string())?,
+                ))
+            }
+            "--data-checksums" => fold.data_checksums = true,
+            other if fold.at.is_none() && !other.starts_with('-') => {
+                fold.at = Some(
+                    other
+                        .parse()
+                        .map_err(|e| format!("bad horizon lsn {other:?}: {e}"))?,
+                )
+            }
+            other => return Err(format!("unexpected argument {other:?}\n{USAGE}")),
+        }
+    }
+    Ok(fold)
+}
+
+fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
+    let args = parse_fold(argv)?;
+    let pg_bin = install::pg_bin(args.pg_bin);
+    let postgres = pg_bin.join("postgres");
+    if !postgres.is_file() {
+        return Err(format!(
+            "{} not found, point --pg-bin or ZOU_PG_BIN at a patched install",
+            postgres.display()
+        ));
+    }
+    let store = open_store(target)?;
+    let at = match args.at {
+        Some(at) => at,
+        None => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| "the clock is before 1970".to_string())?
+                .as_secs();
+            horizon_for(&*store, tenant_ref, now, args.retention_secs).map_err(|e| e.to_string())?
+        }
+    };
+    println!(
+        "folding {tenant_ref} to {at}, {}",
+        match args.at {
+            Some(_) => "named on the command line".to_string(),
+            None => format!(
+                "the oldest lsn a checkpoint still names inside {}",
+                crate::gc::span(args.retention_secs)
+            ),
+        }
+    );
+    let jobs = debts(&*store, tenant_ref).map_err(|e| e.to_string())?;
+    let pool = RedoPool::new(RedoPoolConfig {
+        postgres,
+        scratch_root: std::env::temp_dir(),
+        workers: MERGE_REDO_WORKERS,
+        batch_timeout: MERGE_BATCH_TIMEOUT,
+        batches_per_worker: MERGE_BATCHES_PER_WORKER,
+        data_checksums: args.data_checksums,
+    });
+    // One shard at a time. Each fold holds an image in memory while it
+    // fills, and the point of the whole exercise is a store bigger than
+    // the box it runs on.
+    let mut failed = 0;
+    for job in &jobs {
+        match merge_to_horizon(
+            &*store,
+            tenant_ref,
+            job.shard,
+            at,
+            &pool,
+            args.data_checksums,
+        ) {
+            Ok(Some(out)) => println!(
+                "shard {}: {} layers retired into {} at {}, {} pages imaged, {} keys with no base kept {} layers alive, {} to {} bytes",
+                job.shard,
+                out.retired,
+                out.outputs,
+                out.horizon,
+                out.imaged,
+                out.unbased,
+                out.pinned,
+                out.bytes_before,
+                out.bytes_after
+            ),
+            Ok(None) => println!("shard {}: nothing below the horizon to fold", job.shard),
+            Err(e) => {
+                failed += 1;
+                eprintln!("shard {}: {e}", job.shard);
+            }
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{failed} of {} shards failed", jobs.len()));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_fold_defaults_to_the_gc_retention_and_no_named_lsn() {
+        let got = parse_fold(&argv(&[])).unwrap();
+        assert_eq!(got.at, None);
+        assert_eq!(got.retention_secs, DEFAULT_RETENTION_SECS);
+        assert!(!got.data_checksums);
+    }
+
+    #[test]
+    fn a_named_lsn_reads_the_way_postgres_writes_one() {
+        let got = parse_fold(&argv(&["0/8B000000", "--data-checksums"])).unwrap();
+        assert_eq!(got.at, Some("0/8B000000".parse().unwrap()));
+        assert!(got.data_checksums);
+    }
+
+    #[test]
+    fn the_retention_and_the_binary_come_off_the_flags() {
+        let got = parse_fold(&argv(&["--retention", "10m", "--pg-bin", "/opt/pg/bin"])).unwrap();
+        assert_eq!(got.retention_secs, 600);
+        assert_eq!(got.pg_bin, Some(PathBuf::from("/opt/pg/bin")));
+    }
+
+    #[test]
+    fn a_word_that_is_not_an_lsn_is_a_refusal_not_a_guess() {
+        assert!(parse_fold(&argv(&["soon"])).is_err());
+        assert!(parse_fold(&argv(&["--retention"])).is_err());
+        assert!(parse_fold(&argv(&["--workers", "4"])).is_err());
+    }
 }

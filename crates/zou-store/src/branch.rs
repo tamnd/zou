@@ -44,6 +44,14 @@ pub enum BranchError {
     AtLsnUnavailable { at_lsn: Lsn },
     #[error("no history snapshot at or before unix {unix_ts}, the retention window has passed it")]
     NoHistory { unix_ts: u64 },
+    #[error(
+        "lsn {at_lsn} is below the page retention horizon {horizon} on shard {shard}, the layers that answered reads there were folded into one image at the horizon and collected"
+    )]
+    BelowHorizon {
+        at_lsn: Lsn,
+        horizon: Lsn,
+        shard: u16,
+    },
     #[error(transparent)]
     Manifest(#[from] ManifestError),
     #[error("shard manifest: {0}")]
@@ -242,11 +250,31 @@ fn branch_shards(
 ) -> Result<(), BranchError> {
     let src = TenantLayout::new(src_ref);
     let dst = TenantLayout::new(dst_ref);
-    for key in store.list(&src.shards_dir())? {
-        if !key.ends_with("/SHARD") {
+    let keys: Vec<String> = store
+        .list(&src.shards_dir())?
+        .into_iter()
+        .filter(|k| k.ends_with("/SHARD"))
+        .collect();
+    // Every shard is asked before anything is written. A branch below
+    // the horizon cannot be served, and finding that out on the fourth
+    // shard after three child manifests have landed would leave a half
+    // built tenant behind for a question that could be answered first.
+    for key in &keys {
+        let Some((parent, _)) = PageShardManifest::load(store, key)? else {
             continue;
+        };
+        if let Some(horizon) = parent.horizon
+            && horizon > at
+        {
+            return Err(BranchError::BelowHorizon {
+                at_lsn: at,
+                horizon,
+                shard: parent.shard,
+            });
         }
-        let Some((parent, _)) = PageShardManifest::load(store, &key)? else {
+    }
+    for key in &keys {
+        let Some((parent, _)) = PageShardManifest::load(store, key)? else {
             continue;
         };
         let mut child = PageShardManifest::new(parent.shard);
@@ -255,6 +283,10 @@ fn branch_shards(
         // layers from the wrong prefix.
         child.format = 2;
         child.disk_consistent_lsn = parent.disk_consistent_lsn.min(at);
+        // The inherited layers are the parent's, and the ones below its
+        // horizon are gone from under both of them, so the child starts
+        // life with the same floor.
+        child.horizon = parent.horizon;
         for l in &parent.layers {
             let desc = LayerDesc::parse(&l.name, l.size).map_err(PageShardError::from)?;
             // A layer that starts past the branch point is entirely
@@ -427,6 +459,38 @@ mod tests {
         // And the map the child attaches with carries all of it.
         let map = m.layer_map().unwrap();
         assert_eq!(map.layers()[2].upto, Some(Lsn(0x200)));
+    }
+
+    #[test]
+    fn a_branch_below_the_page_horizon_is_refused_and_leaves_nothing_behind() {
+        let (_d, store) = setup();
+        setup_shard(&store);
+        let key = TenantLayout::new("p").shard_manifest(0);
+        let (mut m, _) = PageShardManifest::load(&store, &key).unwrap().unwrap();
+        m.horizon = Some(Lsn(0x150));
+        store.put(&key, &m.encode()).unwrap();
+
+        let err = branch(&store, "p", "c", Some(Lsn(0x100)), 5000).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BranchError::BelowHorizon { at_lsn, horizon, shard }
+                    if at_lsn == Lsn(0x100) && horizon == Lsn(0x150) && shard == 0
+            ),
+            "{err}"
+        );
+        assert!(
+            PageShardManifest::load(&store, &TenantLayout::new("c").shard_manifest(0))
+                .unwrap()
+                .is_none(),
+            "the refusal comes before anything of the child is written"
+        );
+
+        // At or above the horizon the branch goes through and the child
+        // inherits the same floor, because the layers below it are gone
+        // from under both of them.
+        branch(&store, "p", "c", Some(Lsn(0x200)), 5000).unwrap();
+        assert_eq!(child_shard(&store, "c").horizon, Some(Lsn(0x150)));
     }
 
     #[test]

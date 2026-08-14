@@ -533,6 +533,14 @@ impl ImageBuilder {
         self.total == 0
     }
 
+    /// Bytes the builder is holding, blocks already encoded plus the
+    /// one filling. A caller cutting layers by size reads this and
+    /// starts a new builder; nobody can afford to find out how big an
+    /// image was going to be by finishing it.
+    pub fn bytes(&self) -> usize {
+        self.buf.len() + self.raw.len()
+    }
+
     pub fn finish(mut self) -> Result<(Vec<u8>, LayerFooter), LayerBuildError> {
         let Some(last_key) = self.last else {
             return Err(LayerBuildError::Empty);

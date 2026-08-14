@@ -88,6 +88,15 @@ pub struct PageShardManifest {
     /// only costs ancestor reads, never data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covers: Option<u32>,
+    /// The retention horizon: the oldest lsn this shard's layers can
+    /// still answer. A merge fold cut one image holding every key the
+    /// layers below it held, which is what makes those layers droppable
+    /// at all, and then dropped them; a read below this lsn would find
+    /// half a chain. Absent means no merge has run and the shard still
+    /// serves back to genesis, which is what every manifest written
+    /// before this field says. Only ever moves forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub horizon: Option<Lsn>,
 }
 
 impl PageShardManifest {
@@ -101,6 +110,7 @@ impl PageShardManifest {
             disk_consistent_lsn: Lsn(0),
             layers: Vec::new(),
             covers: None,
+            horizon: None,
         }
     }
 
@@ -178,7 +188,8 @@ pub fn publish_layer(
 }
 
 /// Compaction's atomic commit: retire the named input layers, list the
-/// outputs, and optionally stamp the coverage claim, all in one CAS.
+/// outputs, and optionally stamp the coverage claim and the retention
+/// horizon, all in one CAS.
 /// Idempotent like [`publish_layer`]: a crash retry that finds its
 /// outputs already listed and its inputs already gone changes nothing,
 /// so a preempted worker can be rerun blindly. Inputs stay as objects,
@@ -190,6 +201,7 @@ pub fn swap_layers(
     retire: &[String],
     add: &[LayerEntry],
     covers: Option<u32>,
+    horizon: Option<Lsn>,
 ) -> Result<PageShardManifest, PageShardError> {
     loop {
         let (mut m, version) = match PageShardManifest::load(store, key)? {
@@ -208,6 +220,12 @@ pub fn swap_layers(
             // older wider claim stops being true the moment the new
             // outputs replace the layers that backed it.
             m.covers = Some(count);
+        }
+        if let Some(at) = horizon {
+            // A max, unlike the coverage claim: the horizon is a
+            // promise about layers that are gone, and nothing a later
+            // pass does brings them back.
+            m.horizon = Some(m.horizon.map_or(at, |had| had.max(at)));
         }
         match store.put_if_match(key, &m.encode(), version.as_ref()) {
             Ok(_) => return Ok(m),
@@ -323,6 +341,7 @@ mod tests {
             &retire,
             std::slice::from_ref(&merged),
             Some(2),
+            None,
         )
         .unwrap();
         assert_eq!(m.layers, vec![fresh.clone(), merged.clone()]);
@@ -334,13 +353,13 @@ mod tests {
         );
 
         // A crashed twin rerunning the same swap changes nothing.
-        let again = swap_layers(&store, key, 0, &retire, &[merged], Some(2)).unwrap();
+        let again = swap_layers(&store, key, 0, &retire, &[merged], Some(2), None).unwrap();
         assert_eq!(again, m);
 
         // A later rewrite at a smaller count overwrites the claim
         // outright: the old wider claim's backing layers are gone, a
         // max would keep asserting something no longer true.
-        let m = swap_layers(&store, key, 0, &[], &[], Some(1)).unwrap();
+        let m = swap_layers(&store, key, 0, &[], &[], Some(1), None).unwrap();
         assert_eq!(m.covers, Some(1));
     }
 }
