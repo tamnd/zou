@@ -328,9 +328,9 @@ impl<'a> PageService<'a> {
             }) {
                 Ok(pages) => pages.into_iter(),
                 Err(e) => {
-                    let blamed = match pin_culprit(pool, blocks, &recons) {
+                    let blamed = match pin_culprit(pool, blocks, &recons, &usable) {
                         Some(i) => blame(at, &blocks[i..i + 1], &recons[i..i + 1]),
-                        None => blame(at, blocks, &recons),
+                        None => format!("no block failed alone in {}", blame(at, blocks, &recons)),
                     };
                     return Err(GetPageError::Redo(format!("{e}, {blamed}")));
                 }
@@ -369,9 +369,22 @@ const BLAME_BLOCKS: usize = 8;
 /// block that survives alone is not the culprit: its chain rebuilds.
 /// Nothing failing alone is itself worth knowing, it means the batch
 /// broke on the record union rather than on one page's history.
-fn pin_culprit(pool: &RedoPool, blocks: &[BlockRef], recons: &[Reconstruction]) -> Option<usize> {
+///
+/// Only blocks the failed request actually carried are asked about.
+/// A block the batch dropped has records and no base anywhere, and
+/// redoing those on the zero page the worker starts from is a heap
+/// insert landing past the end of a page nothing ever built: it dies
+/// every time, for a reason that has nothing to do with why the batch
+/// died, and the first one in key order gets the blame for a batch it
+/// was never in.
+fn pin_culprit(
+    pool: &RedoPool,
+    blocks: &[BlockRef],
+    recons: &[Reconstruction],
+    usable: &[bool],
+) -> Option<usize> {
     for (i, (blk, r)) in blocks.iter().zip(recons).enumerate() {
-        if r.base.is_none() && r.records.is_empty() {
+        if !usable[i] || (r.base.is_none() && r.records.is_empty()) {
             continue;
         }
         let bases: Vec<(BlockRef, &[u8])> = r
@@ -420,7 +433,7 @@ fn blame(at: u64, blocks: &[BlockRef], recons: &[Reconstruction]) -> String {
         let base = match &r.base {
             Some(page) if page.len() >= PAGE_HEADER => {
                 let from = match r.base_lsn {
-                    Some(lsn) => format!("image at {:#x}", lsn.0),
+                    Some(lsn) => format!("the image at {:#x}", lsn.0),
                     None => "the fallback".into(),
                 };
                 let lower = u16::from_le_bytes([page[12], page[13]]);
@@ -430,7 +443,7 @@ fn blame(at: u64, blocks: &[BlockRef], recons: &[Reconstruction]) -> String {
                 let page_lsn = ((hi as u64) << 32) | lo as u64;
                 let maxoff = lower.saturating_sub(PAGE_HEADER as u16) / 4;
                 format!(
-                    "base from the {from}, page lsn {page_lsn:#x}, lower {lower} upper {upper} max off {maxoff}"
+                    "base from {from}, page lsn {page_lsn:#x}, lower {lower} upper {upper} max off {maxoff}"
                 )
             }
             Some(page) => format!("base of {} bytes", page.len()),
@@ -846,6 +859,60 @@ mod tests {
             .get_pages_where_possible(&map, &Memtable::new(), &[blk(90, 4)], 200)
             .expect("the batch is not refused over one unbuildable page");
         assert_eq!(pages, vec![None]);
+    }
+
+    #[test]
+    fn the_blame_names_a_block_the_failed_batch_actually_carried() {
+        // A block the batch dropped and a block it kept. Redo dies on
+        // the batch, and the hunt for the one that dies alone has to
+        // leave the dropped one out of it: its records have no base
+        // anywhere, so redoing them on their own dies every time, for
+        // a reason that has nothing to do with why the batch died.
+        let store = MemStore::default();
+        let layout = TenantLayout::new("t");
+        let images = vec![ImageEntry {
+            key: LayerKey::page(1663, 5, 90, 0, 5),
+            page: page_with(0xC3),
+        }];
+        let (bytes, footer) = build_image(&images, Lsn(100), 4096).unwrap();
+        publish(&store, &layout, &bytes, &footer, 100);
+        let entries = vec![
+            DeltaEntry {
+                key: LayerKey::page(1663, 5, 90, 0, 4),
+                lsn: Lsn(150),
+                record: vec![9; 40],
+            },
+            DeltaEntry {
+                key: LayerKey::page(1663, 5, 90, 0, 5),
+                lsn: Lsn(160),
+                record: vec![9; 40],
+            },
+        ];
+        let (bytes, footer) = build_delta(&entries, 4096).unwrap();
+        publish(&store, &layout, &bytes, &footer, 160);
+        let (manifest, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let map = manifest.layer_map().unwrap();
+
+        let pool = RedoPool::new(crate::redo::RedoPoolConfig {
+            postgres: "/nonexistent".into(),
+            scratch_root: "/nonexistent".into(),
+            workers: 1,
+            batch_timeout: std::time::Duration::from_secs(1),
+            batches_per_worker: 1,
+            data_checksums: false,
+        });
+        let svc = PageService::new(&store, layout.shard_prefix(0), Some(&pool), false);
+        let err = svc
+            .get_pages_where_possible(&map, &Memtable::new(), &[blk(90, 4), blk(90, 5)], 200)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blk 5"), "{err}");
+        assert!(
+            !err.contains("blk 4"),
+            "block 4 was never in the batch that failed: {err}"
+        );
     }
 
     #[test]
