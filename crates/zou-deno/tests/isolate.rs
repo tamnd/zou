@@ -441,7 +441,9 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
         "#,
     );
     let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
-    assert_eq!(said["fetch"], "undefined");
+    // `fetch` is here, and is the one thing on this list that is, which
+    // is worth asserting beside the gaps rather than somewhere else.
+    assert_eq!(said["fetch"], "function");
     assert_eq!(said["crypto"], "undefined");
     assert_eq!(said["url"], "undefined");
     assert_eq!(said["timer"], "undefined");
@@ -493,4 +495,324 @@ fn serving_twice_is_the_functions_own_mistake() {
 fn the_runtime_says_what_it_is() {
     assert_eq!(Isolate::new().describe(), "a v8 isolate per call");
     assert!(zou_deno::available());
+}
+
+// -------------------------------------------------------------------
+// fetch
+
+/// A server on a port nobody chose, for the tests that call out.
+///
+/// Written here rather than pulled in, because a test of `fetch` that
+/// needs an HTTP client to be trustworthy is testing two things.
+mod wire {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    pub struct Server {
+        pub port: u16,
+    }
+
+    impl Server {
+        pub fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}{path}", self.port)
+        }
+    }
+
+    /// A port that had a listener on it and does not any more, which is
+    /// the closest a test can get to a host that will not answer
+    /// without waiting for a timeout.
+    pub fn closed() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        drop(listener);
+        port
+    }
+
+    pub fn start() -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                std::thread::spawn(|| answer(stream));
+            }
+        });
+        Server { port }
+    }
+
+    fn answer(mut stream: TcpStream) {
+        let mut reader = BufReader::new(stream.try_clone().expect("a second handle"));
+        let mut line = String::new();
+        if reader.read_line(&mut line).is_err() || line.is_empty() {
+            return;
+        }
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let path = parts.next().unwrap_or("/").to_string();
+        let mut headers: Vec<(String, String)> = Vec::new();
+        let mut length = 0usize;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).is_err() {
+                return;
+            }
+            let header = header.trim_end().to_string();
+            if header.is_empty() {
+                break;
+            }
+            let Some((name, value)) = header.split_once(':') else {
+                continue;
+            };
+            let name = name.trim().to_lowercase();
+            let value = value.trim().to_string();
+            if name == "content-length" {
+                length = value.parse().unwrap_or(0);
+            }
+            headers.push((name, value));
+        }
+        let mut body = vec![0u8; length];
+        if length > 0 && reader.read_exact(&mut body).is_err() {
+            return;
+        }
+        let body = String::from_utf8_lossy(&body).to_string();
+        let (status, reason, kind, said) = match path.as_str() {
+            "/moved" => (302, "Found", "text/plain", String::new()),
+            "/landed" => (200, "OK", "text/plain", "landed".to_string()),
+            "/teapot" => (418, "I'm a Teapot", "text/plain", "no".to_string()),
+            // Everything else is a mirror: what the function sent, back
+            // as json, which is the only way a test can see what left.
+            _ => {
+                let shown: Vec<serde_json::Value> = headers
+                    .iter()
+                    .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+                    .collect();
+                (
+                    200,
+                    "OK",
+                    "application/json",
+                    serde_json::json!({
+                        "method": method,
+                        "path": path,
+                        "body": body,
+                        "headers": shown,
+                    })
+                    .to_string(),
+                )
+            }
+        };
+        let mut head = format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nx-said-by: the test server\r\nconnection: close\r\n",
+            said.len()
+        );
+        if path == "/moved" {
+            head.push_str("location: /landed\r\n");
+        }
+        head.push_str("\r\n");
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(said.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+#[test]
+fn a_function_may_call_out_and_read_what_came_back() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const res = await fetch("{}");
+            const said = await res.json();
+            return Response.json({{ ok: res.ok, status: res.status, url: res.url, redirected: res.redirected, method: said.method, path: said.path }});
+        }});
+        "#,
+        server.url("/echo")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["ok"], true);
+    assert_eq!(said["status"], 200);
+    assert_eq!(said["method"], "GET");
+    assert_eq!(said["path"], "/echo");
+    assert_eq!(said["url"], server.url("/echo"));
+    assert_eq!(said["redirected"], false);
+}
+
+#[test]
+fn what_a_function_posts_is_what_arrives() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const res = await fetch("{}", {{
+                method: "POST",
+                headers: {{ "x-asked-by": "the function" }},
+                body: JSON.stringify({{ name: "world" }}),
+            }});
+            const said = await res.json();
+            const header = (name) => (said.headers.find((h) => h.name === name) ?? {{ value: null }}).value;
+            return Response.json({{
+                method: said.method,
+                body: said.body,
+                asked: header("x-asked-by"),
+                type: header("content-type"),
+                agent: header("user-agent"),
+                length: header("content-length"),
+            }});
+        }});
+        "#,
+        server.url("/echo")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["method"], "POST");
+    assert_eq!(said["body"], "{\"name\":\"world\"}");
+    assert_eq!(said["asked"], "the function");
+    // Set by the Request constructor because the body is a string, the
+    // same as it would be in Deno.
+    assert_eq!(said["type"], "text/plain;charset=UTF-8");
+    assert_eq!(said["agent"], "zou-edge-runtime");
+    assert_eq!(said["length"], "16");
+}
+
+#[test]
+fn an_answer_that_is_not_ok_is_still_an_answer() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const res = await fetch("{}");
+            return Response.json({{ ok: res.ok, status: res.status, statusText: res.statusText, said: await res.text(), by: res.headers.get("x-said-by") }});
+        }});
+        "#,
+        server.url("/teapot")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["ok"], false);
+    assert_eq!(said["status"], 418);
+    // The canonical phrase for the code and not the one the server
+    // wrote on the status line, which the client does not keep. A
+    // server answering 418 with the word "no" as its reason is a server
+    // whose reason a handler here cannot read.
+    assert_eq!(said["statusText"], "I'm a teapot");
+    assert_eq!(said["said"], "no");
+    assert_eq!(said["by"], "the test server");
+}
+
+#[test]
+fn a_redirect_is_followed_and_the_answer_says_where_it_landed() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const res = await fetch("{}");
+            return Response.json({{ url: res.url, redirected: res.redirected, said: await res.text() }});
+        }});
+        "#,
+        server.url("/moved")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["said"], "landed");
+    assert_eq!(said["url"], server.url("/landed"));
+    assert_eq!(said["redirected"], true);
+}
+
+#[test]
+fn a_host_that_will_not_answer_is_a_type_error_naming_the_url() {
+    let url = format!("http://127.0.0.1:{}/nothing", wire::closed());
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            try {{
+                await fetch("{url}");
+                return new Response("it worked, which it should not have");
+            }} catch (e) {{
+                return new Response(`${{e.constructor.name}}: ${{e.message}}`);
+            }}
+        }});
+        "#
+    ));
+    let said = body(&answer);
+    assert!(
+        said.starts_with("TypeError: error sending request for url"),
+        "{said}"
+    );
+    assert!(said.contains(&url), "{said}");
+}
+
+#[test]
+fn a_scheme_fetch_does_not_serve_says_which_one() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const tried = [];
+            for (const url of ["file:///etc/passwd", "data:text/plain,hi", "nonsense"]) {
+                try {
+                    await fetch(url);
+                    tried.push("it worked");
+                } catch (e) {
+                    tried.push(e.message);
+                }
+            }
+            return Response.json(tried);
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said[0], "fetch does not serve the file scheme yet");
+    assert_eq!(said[1], "fetch does not serve the data scheme yet");
+    assert_eq!(said[2], "Invalid URL: 'nonsense'");
+}
+
+#[test]
+fn a_function_may_call_out_more_than_once() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const first = await (await fetch("{first}")).json();
+            const second = await (await fetch("{second}")).json();
+            return Response.json([first.path, second.path]);
+        }});
+        "#,
+        first = server.url("/one"),
+        second = server.url("/two")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said, serde_json::json!(["/one", "/two"]));
+}
+
+#[test]
+fn a_request_may_be_fetched_and_its_body_goes_with_it() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const request = new Request("{}", {{ method: "PUT", body: "the bytes" }});
+            const said = await (await fetch(request)).json();
+            return Response.json({{ method: said.method, body: said.body }});
+        }});
+        "#,
+        server.url("/echo")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["method"], "PUT");
+    assert_eq!(said["body"], "the bytes");
+}
+
+/// TLS, which is a different code path and needs a real host, so it is
+/// ignored by default and run by hand: `cargo test -p zou-deno
+/// --features isolate -- --ignored`.
+#[test]
+#[ignore = "reaches the network"]
+fn a_function_may_call_out_over_tls() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const res = await fetch("https://example.com/");
+            const said = await res.text();
+            return Response.json({ status: res.status, opened: said.slice(0, 15) });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["status"], 200);
+    assert_eq!(said["opened"], "<!doctype html>");
 }

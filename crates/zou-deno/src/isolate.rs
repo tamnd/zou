@@ -16,7 +16,7 @@
 use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, op2, v8};
 use zou_functions::{Answer, Call, Function, Runtime};
 
-use crate::module;
+use crate::{fetch, module};
 
 /// What the isolate is told about the call it is running, and what it
 /// left behind afterwards. Both live in the runtime's op state, which
@@ -88,7 +88,13 @@ fn op_zou_env(state: &mut OpState) -> std::collections::BTreeMap<String, String>
 
 deno_core::extension!(
     zou,
-    ops = [op_zou_call, op_zou_answer, op_zou_env_get, op_zou_env]
+    ops = [
+        op_zou_call,
+        op_zou_answer,
+        op_zou_env_get,
+        op_zou_env,
+        fetch::op_zou_fetch
+    ]
 );
 
 /// A v8 isolate per call.

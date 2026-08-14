@@ -169,13 +169,42 @@ import settings from "./settings.json" with { type: "json" }
 
 `npm:`, `jsr:`, `https:`, `node:` and `data:` specifiers are refused by name, with a message saying which one and that it is not supported yet, rather than failing to be found.
 
+## fetch
+
+A function can call out.
+
+```ts
+Deno.serve(async () => {
+  const res = await fetch("https://api.example.com/rates", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pair: "eur/usd" }),
+  })
+  return Response.json({ ok: res.ok, rate: (await res.json()).rate })
+})
+```
+
+It is the same HTTP client the server calls a database webhook with, behind an op, rather than a second stack linked in beside the first.
+What that means in practice, written down because a difference from Deno is a difference somebody's function will meet:
+
+- The answer is collected before the handler sees it, so `res.body` is null and a large download is held in memory. The 20 MiB ceiling on a call's body applies to what a function may read back too.
+- A call has 30 seconds. Deno waits forever, which is fine for a program somebody is watching and not for a request holding an isolate.
+- `res.statusText` is the canonical phrase for the code rather than the one the server wrote, because the client does not keep the reason phrase.
+- `res.url` and `res.redirected` are where the answer came from, so a redirect that was followed can be seen. Redirects are followed.
+- The `user-agent`, when the function does not set one, is `zou-edge-runtime`.
+- `http:` and `https:` and nothing else. `file:`, `data:` and a string that is not a url each throw a `TypeError` saying which.
+- A request that could not be made at all throws `TypeError: error sending request for url (<url>): <why>`, which is the sentence Deno throws. A 404 or a 500 is an answer and not a throw.
+
+What a function may reach is not restricted.
+It can call a metadata endpoint on the machine it is running on, the same as upstream's runtime can and the same as `pg_net` can from inside the database.
+A function is the project's own code, and the way to keep it off the local network is a network the server is not on.
+
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
 
 Not present yet, and named rather than silently missing:
 
-- `fetch`. A function that calls out is the next thing built.
 - `crypto`, and `crypto.subtle` with it.
 - Streams. `new ReadableStream()` throws with its own name in the message, and a response body is collected before it is sent rather than arriving in chunks.
 - `URL` and `URLSearchParams`.
