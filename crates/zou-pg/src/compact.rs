@@ -691,7 +691,17 @@ pub fn merge_to_horizon(
     if descs.iter().any(|d| d.home.is_some() || d.owner.is_some()) {
         return Ok(None);
     }
-    let at = horizon.min(own.disk_consistent_lsn);
+    // The ceiling is one byte under the flush point, not the flush
+    // point, for the reason [`image_cut`] gives: the layers hold every
+    // record that starts below `disk_consistent_lsn` and an image lsn
+    // is inclusive, so an image cut at `dcl` claims the record at `dcl`
+    // that nothing ever put in it. Every later read of that page takes
+    // the image as its base, skips straight past the record, and the
+    // next one lands on a page that never got the row before it. A
+    // horizon of its own below that is already sound and stays where
+    // the caller put it: the layers hold that record, so the image
+    // holds it too.
+    let at = horizon.min(image_cut(own.disk_consistent_lsn));
     if at == Lsn(0) || own.horizon.is_some_and(|h| h >= at) {
         return Ok(None);
     }
@@ -1680,6 +1690,81 @@ mod tests {
             merge_to_horizon(&store, "t", 0, Lsn(0x250), &pool, false)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// A horizon off the checkpoints can sit anywhere, including over
+    /// the flush point, and the fold has to take the same one byte gap
+    /// there that the ordinary pass takes: an image cut at
+    /// `disk_consistent_lsn` claims the record starting there, which is
+    /// still only in the log. The lsns are the ones off the server3
+    /// store where this fold put the zou #358 hole back and the redo
+    /// worker died on the insert after it.
+    #[test]
+    fn a_fold_over_the_flush_point_stops_one_byte_under_it() {
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        let key = LayerKey::page(1663, 5, 16402, 0, 79835);
+        let dcl = Lsn(0x2e0fbfd8);
+        put_image(
+            &store,
+            &layout,
+            0,
+            &[ImageEntry {
+                key,
+                page: vec![7; PAGE_IMAGE_LEN],
+            }],
+            0x1c7d1c0,
+        );
+        // The flush that leaves the shard at the dcl, having drained
+        // the record that ends there and not the one that starts there.
+        put_delta(
+            &store,
+            &layout,
+            0,
+            &mut [rec(16402, 79836, 0x2e0fbf40)],
+            dcl.0,
+        );
+
+        let pool = dead_pool();
+        let out = merge_to_horizon(&store, "t", 0, Lsn(0xf3291f88), &pool, false)
+            .unwrap()
+            .expect("history below the horizon");
+        assert_eq!(
+            out.horizon,
+            image_cut(dcl),
+            "a horizon over the flush point still cuts under it"
+        );
+        let (m, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.horizon, Some(image_cut(dcl)));
+
+        // The ingest resumes at the dcl and brings the record starting
+        // there, then the insert that lands on the row it writes.
+        put_delta(
+            &store,
+            &layout,
+            0,
+            &mut [rec(16402, 79835, dcl.0), rec(16402, 79835, 0x2e0fc088)],
+            0x3213fef0,
+        );
+        let (m, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let recon = LayerReader::for_shard(&store, "t", 0)
+            .reconstruct(
+                &m.layer_map().unwrap(),
+                &Memtable::new(),
+                &key,
+                Lsn(0xf3291f88),
+            )
+            .unwrap();
+        assert_eq!(recon.base_lsn, Some(image_cut(dcl)));
+        assert_eq!(
+            recon.records.iter().map(|(l, _)| l.0).collect::<Vec<_>>(),
+            vec![dcl.0, 0x2e0fc088],
+            "the record at the flush point has to reach redo"
         );
     }
 
