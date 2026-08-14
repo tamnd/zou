@@ -226,10 +226,33 @@ fn the_environment_is_the_runtimes_and_never_the_processes() {
     assert_eq!(said["missing"], serde_json::Value::Null);
     assert_eq!(said["has"], true);
     assert_eq!(said["host"], serde_json::Value::Null);
+    // The project's one variable and the call's own, and nothing else:
+    // `SB_EXECUTION_ID` is upstream's per invocation name and is the
+    // only thing the runtime adds to what it was built with.
     assert_eq!(
         said["all"],
-        serde_json::json!({ "SUPABASE_URL": "http://localhost:54321" })
+        serde_json::json!({
+            "SUPABASE_URL": "http://localhost:54321",
+            "SB_EXECUTION_ID": "one",
+        })
     );
+}
+
+/// One per invocation, which is what ties a log line inside a function
+/// to the request that caused it, so a project that sets the name in its
+/// own environment does not get to decide what the logs are keyed on.
+#[test]
+fn the_execution_id_is_the_calls_and_not_the_projects() {
+    let deployed =
+        deployed(r#"Deno.serve(() => new Response(Deno.env.get("SB_EXECUTION_ID") ?? "none"));"#);
+    let isolate = Isolate::with_env(vec![(
+        "SB_EXECUTION_ID".to_string(),
+        "the project tried".to_string(),
+    )]);
+    let mut call = get("http://localhost:9000/functions/v1/hello");
+    call.execution_id = "the call's own".to_string();
+    let answer = isolate.invoke(&deployed.function, call).expect("an answer");
+    assert_eq!(body(&answer), "the call's own");
 }
 
 #[test]

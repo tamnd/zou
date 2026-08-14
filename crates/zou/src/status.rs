@@ -109,6 +109,17 @@ struct Status {
     project: Option<Project>,
 }
 
+/// The names this project would serve, or nothing at all when the
+/// directory cannot be read: `zou status` prints what is there and does
+/// not become the thing that reports a broken disk.
+fn functions(project: &Project) -> Vec<String> {
+    zou_functions::read(&project.dir(), &project.functions)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.name)
+        .collect()
+}
+
 impl Status {
     fn api_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.api)
@@ -165,6 +176,15 @@ impl Status {
             return;
         };
         println!("{:>16}: {}", "config", project.path.display());
+        let served = functions(project);
+        if !served.is_empty() {
+            println!(
+                "{:>16}: {} on {}",
+                "functions",
+                served.join(", "),
+                crate::functions::engine_describe()
+            );
+        }
         if !project.unread.is_empty() {
             println!("{:>16}: {}", "not read yet", project.unread.join(", "));
         }
@@ -209,6 +229,8 @@ impl Status {
             out["config"] = serde_json::json!(project.path.display().to_string());
             out["project_id"] = serde_json::json!(project.id);
             out["unread"] = serde_json::json!(project.unread);
+            out["functions"] = serde_json::json!(functions(project));
+            out["functions_engine"] = serde_json::json!(crate::functions::engine_describe());
         }
         println!("{out}");
     }

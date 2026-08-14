@@ -102,6 +102,10 @@ pub struct Isolate {
     env: Vec<(String, String)>,
 }
 
+/// Upstream's one per invocation variable, which the call carries and
+/// the environment does not.
+const EXECUTION_ID: &str = "SB_EXECUTION_ID";
+
 impl Isolate {
     pub fn new() -> Isolate {
         Isolate { env: Vec::new() }
@@ -132,10 +136,18 @@ impl Runtime for Isolate {
             .map_err(|e| format!("{}: {e}", function.entrypoint.display()))?;
         let specifier = deno_core::ModuleSpecifier::from_file_path(&entrypoint)
             .map_err(|()| format!("{} is not a path v8 can be given", entrypoint.display()))?;
+        // Four of upstream's five variables are the project's and are
+        // the same every call. The fifth is this call's own, which is
+        // what ties a log line from inside a function to the request
+        // that caused it, so it is added here rather than being asked
+        // of the environment the runtime was built with.
+        let mut env = self.env.clone();
+        env.retain(|(name, _)| name != EXECUTION_ID);
+        env.push((EXECUTION_ID.to_string(), call.execution_id.clone()));
         let held = Held {
             call,
             peer,
-            env: self.env.clone(),
+            env,
             answered: None,
         };
         let tokio = tokio::runtime::Builder::new_current_thread()

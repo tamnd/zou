@@ -8,6 +8,15 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+# The javascript engine, and fifty megabytes of V8 with it, behind that
+# crate's own `isolate` feature. The dependency is not optional and
+# there is deliberately no feature here that turns it on, because a
+# feature here would be one `cargo test --workspace --all-features`
+# enables, and an ordinary build of this repository should not be
+# downloading V8. `--features zou-deno/isolate` is the way in, and
+# asking for it is the whole point.
+zou-deno = { path = "../zou-deno" }
+zou-functions = { path = "../zou-functions" }
 zou-log = { path = "../zou-log" }
 zou-ops = { path = "../zou-ops" }
 zou-pg = { path = "../zou-pg" }

@@ -2,9 +2,10 @@
 //! `index.ts` a project deployed, behind the `isolate` feature.
 //!
 //! The feature is the point of this crate being its own crate. V8 is
-//! forty megabytes of static library and swc is a minute of build time,
-//! and a zou that serves a database and a bucket should pay for neither.
-//! With the feature off this compiles to nothing at all.
+//! fifty one megabytes of static library, measured against the same
+//! binary built both ways, and swc is a minute of build time, and a zou
+//! that serves a database and a bucket should pay for neither. With the
+//! feature off this compiles to nothing at all.
 //!
 //! What is here is `Isolate`, which implements
 //! [`zou_functions::Runtime`], and which is spelled without a link
@@ -37,6 +38,8 @@
 //! Typescript is real: `deno_ast` is the same swc transpiler Deno uses,
 //! so what runs is what would run there.
 
+#[cfg(not(feature = "isolate"))]
+mod absent;
 #[cfg(feature = "isolate")]
 mod isolate;
 #[cfg(feature = "isolate")]
@@ -44,6 +47,28 @@ mod module;
 
 #[cfg(feature = "isolate")]
 pub use isolate::Isolate;
+
+/// What this build runs a function with, given the environment every
+/// function of the project will see.
+///
+/// The switch lives here rather than in whatever links this crate,
+/// because the question "is there an engine" is this crate's own and
+/// answering it anywhere else means a second place that can be wrong.
+/// It is also why the dependency on this crate is not optional: a
+/// `--all-features` build of the workspace should not pull V8 in by
+/// accident, so the feature that does it is spelled `zou-deno/isolate`
+/// and nothing enables it on anyone's behalf.
+pub fn engine(env: Vec<(String, String)>) -> std::sync::Arc<dyn zou_functions::Runtime> {
+    #[cfg(feature = "isolate")]
+    {
+        std::sync::Arc::new(isolate::Isolate::with_env(env))
+    }
+    #[cfg(not(feature = "isolate"))]
+    {
+        let _ = env;
+        std::sync::Arc::new(absent::Absent)
+    }
+}
 
 /// Whether this build has an engine in it.
 ///

@@ -4900,6 +4900,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-postgres",
+ "zou-deno",
+ "zou-functions",
  "zou-log",
  "zou-ops",
  "zou-pg",

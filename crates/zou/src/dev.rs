@@ -377,6 +377,23 @@ fn start_http(
     }
     // Local connections are trust, the stock dev loop layout.
     let dsn = format!("host=127.0.0.1 port={pg_port} user={SUPERUSER} dbname=postgres");
+    // The functions a project keeps beside its config file, and the
+    // four variables every one of them sees. What a function is told
+    // about the database is the url shape a client library expects
+    // rather than the keyword dsn this process dials with.
+    let functions = match project {
+        Some(p) => crate::functions::registry(
+            &p.dir(),
+            &p.functions,
+            crate::functions::env(
+                port,
+                &anon,
+                &service,
+                &format!("postgresql://{SUPERUSER}@127.0.0.1:{pg_port}/postgres"),
+            ),
+        )?,
+        None => None,
+    };
     // What the project's own config.toml says, when it has one. The
     // schemas matter most: PostgREST serves what it was told to serve
     // and the first of them is what a request that names no schema
@@ -491,6 +508,11 @@ fn start_http(
             // ten. ZOU_WEBHOOK_ATTEMPTS=1 is pg_net's own behaviour,
             // which is to try once and record whatever happened.
             webhook,
+            // What is deployed under /functions/v1, which is a
+            // directory listing beside the project's config file. A
+            // project without one carries None and every name under
+            // the prefix is the 404 upstream answers.
+            functions,
             // Everything else is GoTrue's default, including the
             // unlimited edge rate the dev loop wants.
             ..Default::default()

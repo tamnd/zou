@@ -390,6 +390,81 @@ const DIRECT: &[&str] = &[
     "storage.s3_protocol.enabled",
 ];
 
+/// The `[functions.<name>]` blocks and the `[edge_runtime]` one, and
+/// every key they accounted for.
+///
+/// A key inside a block this reader does not know goes unread and is
+/// printed by `zou status`, the same as anywhere else in the file, so a
+/// project asking for something that is not honoured hears about it
+/// rather than watching it be ignored.
+fn layout(table: &BTreeMap<String, Value>) -> (zou_functions::Layout, Vec<String>) {
+    let mut out = zou_functions::Layout::default();
+    let mut read = Vec::new();
+    if let Some(word) = table.get("edge_runtime.policy").and_then(Value::as_str)
+        && let Some(policy) = zou_functions::Policy::named(word)
+    {
+        out.policy = policy;
+        read.push("edge_runtime.policy".to_string());
+    }
+    if let Some(port) = table
+        .get("edge_runtime.inspector_port")
+        .and_then(Value::as_int)
+        .and_then(|i| u16::try_from(i).ok())
+    {
+        out.inspector_port = Some(port);
+        read.push("edge_runtime.inspector_port".to_string());
+    }
+    // `enabled` under `[edge_runtime]` is the container the CLI starts,
+    // which this server is instead of, so it is read and then nothing
+    // happens: a project that switched the runtime off should not be
+    // told the setting went unheard.
+    if table.contains_key("edge_runtime.enabled") {
+        read.push("edge_runtime.enabled".to_string());
+    }
+    for (key, value) in table {
+        let Some(rest) = key.strip_prefix("functions.") else {
+            continue;
+        };
+        let Some((name, leaf)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        // A dotted key deeper than one level is not a setting this
+        // reader has, and treating it as one would mean inventing a
+        // function called `hello.something`.
+        if name.contains('.') {
+            continue;
+        }
+        let settings = out.settings.entry(name.to_string()).or_default();
+        let taken = match leaf {
+            "enabled" => value.as_bool().map(|b| settings.enabled = b).is_some(),
+            "verify_jwt" => value.as_bool().map(|b| settings.verify_jwt = b).is_some(),
+            "import_map" => value
+                .as_str()
+                .map(|s| settings.import_map = Some(s.to_string()))
+                .is_some(),
+            "entrypoint" => value
+                .as_str()
+                .map(|s| settings.entrypoint = Some(s.to_string()))
+                .is_some(),
+            "static_files" => match value {
+                Value::List(items) => {
+                    settings.static_files = items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if taken {
+            read.push(key.clone());
+        }
+    }
+    (out, read)
+}
+
 /// A Supabase project, as far as this server is concerned.
 #[derive(Debug, Default)]
 pub struct Project {
@@ -416,6 +491,14 @@ pub struct Project {
     /// directory the config lives in, and empty when the file switches
     /// seeding off.
     pub seed: Vec<String>,
+    /// What the file says about edge functions: a block per function
+    /// and the `[edge_runtime]` settings over all of them.
+    ///
+    /// This one does not become an environment variable, because the
+    /// thing that reads it is a directory listing rather than a
+    /// server: which functions are served is a question about the disk
+    /// beside the file, and the answer is a list rather than a setting.
+    pub functions: zou_functions::Layout,
 }
 
 impl Project {
@@ -562,6 +645,8 @@ impl Project {
                 _ => vec!["./seed.sql".to_string()],
             },
         };
+        let (functions, function_keys) = layout(table);
+        read.extend(function_keys);
         let unread = table
             .keys()
             .filter(|k| !read.iter().any(|r| r == *k))
@@ -590,6 +675,7 @@ impl Project {
             env,
             unread,
             seed,
+            functions,
         }
     }
 
@@ -747,6 +833,22 @@ client_id = "gl-client"
 
 [studio]
 port = 54323
+
+[edge_runtime]
+enabled = true
+policy = "oneshot"
+inspector_port = 8083
+
+[functions.hello]
+verify_jwt = false
+import_map = "./functions/import_map.json"
+
+[functions.quiet]
+enabled = false
+
+[functions.other]
+entrypoint = "./functions/other/main.ts"
+static_files = ["./functions/other/index.html"]
 "#;
 
     fn table() -> BTreeMap<String, Value> {
@@ -793,6 +895,54 @@ port = 54323
             "a list that runs over several lines is still one list"
         );
         assert!(!t.contains_key("A comment"), "comments say nothing");
+    }
+
+    #[test]
+    fn the_functions_blocks_become_a_layout() {
+        let p = project();
+        assert_eq!(p.functions.policy, zou_functions::Policy::OneShot);
+        assert_eq!(p.functions.inspector_port, Some(8083));
+        let hello = p.functions.settings("hello");
+        assert!(!hello.verify_jwt, "one block does not move the others");
+        assert!(hello.enabled, "a block that says nothing about it is on");
+        assert_eq!(
+            hello.import_map.as_deref(),
+            Some("./functions/import_map.json")
+        );
+        assert!(!p.functions.settings("quiet").enabled);
+        let other = p.functions.settings("other");
+        assert_eq!(
+            other.entrypoint.as_deref(),
+            Some("./functions/other/main.ts")
+        );
+        assert_eq!(other.static_files, ["./functions/other/index.html"]);
+        // A function the file never mentions gets upstream's defaults,
+        // which is served and verified.
+        let never = p.functions.settings("never-written-down");
+        assert!(never.enabled && never.verify_jwt);
+    }
+
+    #[test]
+    fn a_setting_the_functions_blocks_have_and_this_reader_does_not_is_unread() {
+        let table = parse(
+            "[functions.hello]\nverify_jwt = false\nsomething_else = 1\n[edge_runtime]\npolicy = \"per_worker\"\n",
+        )
+        .unwrap();
+        let p = Project::from_table(&table, &|_| None);
+        assert!(!p.functions.settings("hello").verify_jwt);
+        assert_eq!(p.unread, ["functions.hello.something_else"]);
+    }
+
+    #[test]
+    fn a_policy_that_is_not_one_of_the_two_is_not_taken() {
+        let table = parse("[edge_runtime]\npolicy = \"whenever\"\n").unwrap();
+        let p = Project::from_table(&table, &|_| None);
+        assert_eq!(
+            p.functions.policy,
+            zou_functions::Policy::PerWorker,
+            "the default, rather than a word nothing knows"
+        );
+        assert_eq!(p.unread, ["edge_runtime.policy"]);
     }
 
     #[test]
