@@ -29,12 +29,13 @@
 //!   `fetch` collects an answer before handing it back, so a blob's
 //!   `stream()` throws too.
 //! - `WebSocket` is not there, which is what a realtime client wants.
-//! - Timers are not there, so a handler that sleeps will not.
+//! - A timer only fires while the call is running, and there is no
+//!   `EdgeRuntime.waitUntil`, so nothing outlives the answer.
 //! - There are no node built ins, so `node:` is refused by name and a
 //!   package that reaches for one will not run.
 //!
 //! What is there is `Headers`, `Request`, `Response`, `URL`,
-//! `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`,
+//! `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, the timers,
 //! `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`,
 //! `Deno.serve`, `Deno.env` and `fetch`, which is enough to run a
 //! handler that reads a request, calls something else and answers.
@@ -50,6 +51,11 @@
 //! `crypto` is the other way around: randomness is the operating
 //! system's and a hash is `sha2` and `hmac`, which is the same code
 //! this server signs its own tokens with.
+//!
+//! The timers are a sleeping op and the bookkeeping around it, so a
+//! handler waiting on the clock is the event loop's business and not a
+//! thread's, and clearing one cancels the sleep rather than leaving it
+//! pending with nobody wanting the answer.
 //!
 //! `fetch` is the client `zou-server` calls a database webhook with,
 //! behind an op, rather than a second HTTP stack linked in beside it.
@@ -72,6 +78,8 @@ mod fetch;
 mod isolate;
 #[cfg(feature = "isolate")]
 mod module;
+#[cfg(feature = "isolate")]
+mod timer;
 #[cfg(feature = "isolate")]
 mod url;
 

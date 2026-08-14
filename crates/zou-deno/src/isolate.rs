@@ -16,7 +16,7 @@
 use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, op2, v8};
 use zou_functions::{Answer, Call, Function, Runtime};
 
-use crate::{crypto, fetch, module, url};
+use crate::{crypto, fetch, module, timer, url};
 
 /// What the isolate is told about the call it is running, and what it
 /// left behind afterwards. Both live in the runtime's op state, which
@@ -98,6 +98,8 @@ deno_core::extension!(
         crypto::op_zou_sign,
         crypto::op_zou_verify,
         fetch::op_zou_fetch,
+        timer::op_zou_sleep,
+        timer::op_zou_clear,
         url::op_zou_url_parse,
         url::op_zou_url_set
     ]
@@ -181,6 +183,7 @@ async fn run(specifier: deno_core::ModuleSpecifier, held: Held) -> Result<Answer
         ..Default::default()
     });
     js.op_state().borrow_mut().put(held);
+    js.op_state().borrow_mut().put(timer::Pending::default());
 
     // The prelude is the value of its own last expression, so the entry
     // point is held here and never on an object the function can reach.

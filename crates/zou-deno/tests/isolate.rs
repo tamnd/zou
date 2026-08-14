@@ -443,6 +443,8 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
             crypto: typeof crypto,
             subtle: typeof crypto?.subtle?.digest,
             timer: typeof setTimeout,
+            interval: typeof setInterval,
+            microtask: typeof queueMicrotask,
             stream: (() => { try { new ReadableStream(); return "made one"; } catch (e) { return e.message; } })(),
         }));
         "#,
@@ -459,7 +461,9 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
     assert_eq!(said["form"], "function");
     assert_eq!(said["crypto"], "object");
     assert_eq!(said["subtle"], "function");
-    assert_eq!(said["timer"], "undefined");
+    assert_eq!(said["timer"], "function");
+    assert_eq!(said["interval"], "function");
+    assert_eq!(said["microtask"], "function");
     assert_eq!(said["stream"], "ReadableStream is not implemented yet");
 }
 
@@ -972,6 +976,123 @@ fn an_hmac_signs_what_it_verifies() {
         said["noKeyGeneration"],
         "crypto.subtle.generateKey is not supported yet"
     );
+}
+
+/// A handler that sleeps, which is what every retry with a backoff in
+/// it is written as.
+#[test]
+fn a_handler_can_wait_on_the_clock_and_the_answer_waits_with_it() {
+    let started = std::time::Instant::now();
+    let answer = answered(
+        r#"
+        const sleep = (millis) => new Promise((wake) => setTimeout(wake, millis));
+        Deno.serve(async () => {
+            const said = [];
+            said.push("before");
+            await sleep(60);
+            said.push("after");
+            return Response.json(said);
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said, serde_json::json!(["before", "after"]));
+    // The wait was a real wait and not a promise that resolved at once,
+    // which is what a `setTimeout` that ignores its delay would look
+    // like from the outside.
+    assert!(started.elapsed() >= std::time::Duration::from_millis(60));
+}
+
+/// Which timer fires first is the delay's business and not the order
+/// they were set in, and a zero delay is still a turn of the loop.
+#[test]
+fn timers_fire_in_the_order_their_delays_say() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => new Promise((answer) => {
+            const said = [];
+            setTimeout(() => said.push("thirty"), 30);
+            setTimeout(() => said.push("ten"), 10);
+            setTimeout(() => said.push("twenty"), 20);
+            setTimeout(() => said.push("zero"), 0);
+            queueMicrotask(() => said.push("microtask"));
+            said.push("now");
+            setTimeout(() => answer(Response.json(said)), 60);
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said,
+        serde_json::json!(["now", "microtask", "zero", "ten", "twenty", "thirty"])
+    );
+}
+
+#[test]
+fn a_timer_that_was_cleared_does_not_fire_and_one_that_repeats_does() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => new Promise((answer) => {
+            const said = [];
+            const cleared = setTimeout(() => said.push("this should not be here"), 10);
+            clearTimeout(cleared);
+            let ticks = 0;
+            const every = setInterval(() => {
+                ticks += 1;
+                said.push(`tick ${ticks}`);
+                if (ticks === 3) {
+                    clearInterval(every);
+                    setTimeout(() => answer(Response.json({ said, id: typeof cleared })), 30);
+                }
+            }, 10);
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said["said"],
+        serde_json::json!(["tick 1", "tick 2", "tick 3"])
+    );
+    // A timer is a number, the same as it is in Deno and in a browser,
+    // rather than an object a handler has to hold onto.
+    assert_eq!(said["id"], "number");
+}
+
+/// A callback throws after whatever set it has returned, so there is
+/// nobody left to catch it. Deno ends the process. Here the answer is
+/// often already written, so ending the process would lose it.
+#[test]
+fn a_timer_that_throws_does_not_take_the_call_with_it() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => new Promise((answer) => {
+            setTimeout(() => { throw new Error("thrown from a timer"); }, 5);
+            setTimeout(() => answer(new Response("answered anyway")), 30);
+        }));
+        "#,
+    );
+    assert_eq!(body(&answer), "answered anyway");
+}
+
+#[test]
+fn a_string_of_code_is_not_a_timer_callback_here() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => Response.json({
+            refused: (() => {
+                try { setTimeout("globalThis.snuck = true", 0); return "took it"; }
+                catch (e) { return e.message; }
+            })(),
+            snuck: globalThis.snuck ?? null,
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said["refused"],
+        "a timer needs a function, and a string of code is not one here"
+    );
+    assert_eq!(said["snuck"], serde_json::Value::Null);
 }
 
 #[test]

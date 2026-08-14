@@ -286,16 +286,37 @@ The verification is done in Rust, so a wrong signature takes as long to reject a
 What is not there is refused by name rather than being undefined: `encrypt`, `decrypt`, `deriveBits`, `deriveKey`, `exportKey`, `generateKey`, `wrapKey` and `unwrapKey`, and every key format other than `raw`.
 One difference from the spec: asking `getRandomValues` for more than 65536 bytes throws a `TypeError` with the spec's message rather than a `QuotaExceededError`, because there is no `DOMException` here yet.
 
+## Timers
+
+`setTimeout`, `setInterval`, `clearTimeout`, `clearInterval` and `queueMicrotask`.
+
+```ts
+Deno.serve(async (req) => {
+  const slow = await Promise.race([
+    fetch("https://example.com/slow").then((res) => res.text()),
+    new Promise((resolve) => setTimeout(() => resolve("gave up"), 500)),
+  ])
+  return new Response(slow)
+})
+```
+
+The waiting is the host's clock and not a loop, so a handler that awaits a timer costs nothing while it waits.
+Clearing a timer cancels the wait rather than marking it unwanted, so `setTimeout(f, 3600_000)` that is cleared a millisecond later is not an hour of anything being held.
+
+- A timer only fires while the call is running. The isolate ends when the handler's answer does, so a timer that has not come due by then never comes due, and there is nothing yet that lets work outlive the response. That is `EdgeRuntime.waitUntil`, which is on the list below.
+- A callback that throws is logged and the call carries on. It cannot be caught, because whatever set the timer returned before it fired, and ending the process the way Deno does would lose an answer that is already written.
+- A delay is the spec's signed 32 bit integer: past `2 ** 31 - 1` it wraps, and anything at or below zero fires as soon as the event loop can get to it. `setTimeout(f, Infinity)` is `setTimeout(f, 0)`, which is what browsers do.
+- One difference: `setTimeout("code()")` throws a `TypeError`. Deno evaluates a string there, which is `eval` with a longer name.
+
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
 
 Not present yet, and named rather than silently missing:
 
 - The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
 - `WebSocket`, which is what `createClient` reaches for when it builds a realtime client.
 - Streams. `new ReadableStream()` throws with its own name in the message, and a response body is collected before it is sent rather than arriving in chunks.
-- Timers, so a handler that sleeps will not.
 - `EdgeRuntime.waitUntil`, so work that outlives the response has nowhere to go.
 - Node built ins. `node:fs` and the rest are refused by name.
 

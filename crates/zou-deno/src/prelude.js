@@ -1251,6 +1251,80 @@
   };
 
   // ---------------------------------------------------------------
+  // Timers
+  //
+  // The sleeping is an op and the bookkeeping is here: which timers are
+  // still wanted, and the callback each one is for. A cleared timer is
+  // taken out of the set and cancelled at the host, so a timer set for
+  // an hour and cleared is not an hour of a future being held.
+
+  const timers = new Set();
+  let nextTimer = 1;
+
+  function after(callback, delay, args, repeating) {
+    if (typeof callback !== "function") {
+      // Deno takes a string here and evaluates it. That is `eval` with
+      // a longer name, and refusing it is a difference in the direction
+      // of no.
+      throw new TypeError("a timer needs a function, and a string of code is not one here");
+    }
+    const id = nextTimer;
+    nextTimer += 1;
+    timers.add(id);
+    const wait = Number(delay);
+    (async () => {
+      while (timers.has(id)) {
+        const fired = await ops.op_zou_sleep(id, wait);
+        if (!fired || !timers.has(id)) {
+          break;
+        }
+        if (!repeating) {
+          timers.delete(id);
+        }
+        try {
+          callback(...args);
+        } catch (thrown) {
+          // A handler cannot catch this: by the time the timer fires,
+          // whatever set it has returned. Deno's answer is to end the
+          // process, which here would be to lose an answer that is
+          // already written, so this says so and the call goes on.
+          console.error(thrown);
+        }
+      }
+      timers.delete(id);
+    })();
+    return id;
+  }
+
+  function setTimeout(callback, delay = 0, ...args) {
+    return after(callback, delay, args, false);
+  }
+
+  function setInterval(callback, delay = 0, ...args) {
+    return after(callback, delay, args, true);
+  }
+
+  function clearTimer(id) {
+    const held = Number(id);
+    if (timers.delete(held)) {
+      ops.op_zou_clear(held);
+    }
+  }
+
+  function queueMicrotask(callback) {
+    if (typeof callback !== "function") {
+      throw new TypeError("queueMicrotask requires a function");
+    }
+    Promise.resolve().then(() => {
+      try {
+        callback();
+      } catch (thrown) {
+        console.error(thrown);
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------
   // Deno.serve and Deno.env
 
   function serve(first, second) {
@@ -1322,9 +1396,14 @@
     URLSearchParams,
     atob,
     btoa,
+    clearInterval: clearTimer,
+    clearTimeout: clearTimer,
     console,
     crypto,
     fetch,
+    queueMicrotask,
+    setInterval,
+    setTimeout,
   });
   globalThis.self = globalThis;
   globalThis.window = undefined;
