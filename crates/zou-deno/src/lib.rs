@@ -23,23 +23,28 @@
 //! small implementation of the shapes a handler is written against, and
 //! the gaps are written down here rather than found out in production:
 //!
-//! - `fetch` is not there. A function that calls out is the next change.
 //! - `crypto` is not there, and `crypto.subtle` least of all.
-//! - Streams are not there. A `ReadableStream` body throws by name.
+//! - Streams are not there. A `ReadableStream` body throws by name, and
+//!   `fetch` collects an answer before handing it back.
 //! - `URL` and `URLSearchParams` are not there.
 //! - Timers are not there, so a handler that sleeps will not.
 //! - `npm:`, `jsr:` and `https:` specifiers are refused by name.
 //!
 //! What is there is `Headers`, `Request`, `Response`, `TextEncoder`,
-//! `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve` and
-//! `Deno.env`, which is enough to run a handler that reads a request and
-//! answers it, and enough to prove the seam works end to end.
+//! `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`
+//! and `fetch`, which is enough to run a handler that reads a request,
+//! calls something else and answers.
+//!
+//! `fetch` is the client `zou-server` calls a database webhook with,
+//! behind an op, rather than a second HTTP stack linked in beside it.
 //!
 //! Typescript is real: `deno_ast` is the same swc transpiler Deno uses,
 //! so what runs is what would run there.
 
 #[cfg(not(feature = "isolate"))]
 mod absent;
+#[cfg(feature = "isolate")]
+mod fetch;
 #[cfg(feature = "isolate")]
 mod isolate;
 #[cfg(feature = "isolate")]

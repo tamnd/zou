@@ -337,6 +337,9 @@
         this.headers.set("content-type", type);
       }
       Object.defineProperty(this, "body", { value: null, enumerable: true });
+      // A response nobody fetched has no url, which is what Deno gives
+      // back for one a handler built itself.
+      this.url = "";
     }
 
     get ok() {
@@ -380,6 +383,58 @@
     }
   }
   Object.assign(Response.prototype, bodyMethods);
+
+  // ---------------------------------------------------------------
+  // fetch
+
+  const FETCHABLE = ["http:", "https:"];
+
+  /// The scheme, without a URL parser to ask, which is the same
+  /// question the module loader answers for a specifier.
+  function schemeOf(url) {
+    const colon = url.indexOf(":");
+    const scheme = colon === -1 ? "" : url.slice(0, colon + 1).toLowerCase();
+    return /^[a-z][a-z0-9+\-.]*:$/.test(scheme) ? scheme : "";
+  }
+
+  /// A response that came off the wire rather than out of a handler, so
+  /// the constructor's rules about status ranges and null bodies do not
+  /// apply: what a server said is what the handler is told it said.
+  function received(answer) {
+    const res = Object.create(Response.prototype);
+    res.status = answer.status;
+    res.statusText = answer.statusText;
+    res.headers = new Headers(answer.headers);
+    res.url = answer.url;
+    res[BODY] = answer.body;
+    res[USED] = false;
+    Object.defineProperty(res, "body", { value: null, enumerable: true });
+    Object.defineProperty(res, "redirected", { value: answer.redirected });
+    return res;
+  }
+
+  async function fetch(input, init) {
+    const request = input instanceof Request && init === undefined ? input : new Request(input, init ?? {});
+    const scheme = schemeOf(request.url);
+    if (scheme === "") {
+      throw new TypeError(`Invalid URL: '${request.url}'`);
+    }
+    if (!FETCHABLE.includes(scheme)) {
+      throw new TypeError(`fetch does not serve the ${scheme.slice(0, -1)} scheme yet`);
+    }
+    // Reading the body is what sending it is, and a request whose body
+    // was already read is a request with nothing left to send.
+    const body = readBody(request);
+    const answer = await ops.op_zou_fetch(
+      {
+        method: request.method,
+        url: request.url,
+        headers: Array.from(request.headers.entries()),
+      },
+      body,
+    );
+    return received(answer);
+  }
 
   // ---------------------------------------------------------------
   // console
@@ -479,6 +534,7 @@
     atob,
     btoa,
     console,
+    fetch,
   });
   globalThis.self = globalThis;
   globalThis.window = undefined;
