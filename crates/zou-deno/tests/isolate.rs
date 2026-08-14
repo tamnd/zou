@@ -435,21 +435,199 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
         r#"
         Deno.serve(() => Response.json({
             fetch: typeof fetch,
-            crypto: typeof crypto,
             url: typeof URL,
+            params: typeof URLSearchParams,
+            crypto: typeof crypto,
             timer: typeof setTimeout,
             stream: (() => { try { new ReadableStream(); return "made one"; } catch (e) { return e.message; } })(),
         }));
         "#,
     );
     let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
-    // `fetch` is here, and is the one thing on this list that is, which
-    // is worth asserting beside the gaps rather than somewhere else.
+    // What is here, asserted beside the gaps rather than somewhere else,
+    // because a list of what is missing is only true if the same list
+    // says what is not.
     assert_eq!(said["fetch"], "function");
+    assert_eq!(said["url"], "function");
+    assert_eq!(said["params"], "function");
     assert_eq!(said["crypto"], "undefined");
-    assert_eq!(said["url"], "undefined");
     assert_eq!(said["timer"], "undefined");
     assert_eq!(said["stream"], "ReadableStream is not implemented yet");
+}
+
+#[test]
+fn a_url_comes_apart_into_the_pieces_a_handler_reads() {
+    let answer = answered(
+        r#"
+        const url = new URL("https://ana:secret@example.com:8443/one/two?a=1&b=2#top");
+        Deno.serve(() => Response.json({
+            href: url.href,
+            origin: url.origin,
+            protocol: url.protocol,
+            username: url.username,
+            password: url.password,
+            host: url.host,
+            hostname: url.hostname,
+            port: url.port,
+            pathname: url.pathname,
+            search: url.search,
+            hash: url.hash,
+            asString: `${url}`,
+            asJson: JSON.stringify({ url }),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said["href"],
+        "https://ana:secret@example.com:8443/one/two?a=1&b=2#top"
+    );
+    assert_eq!(said["origin"], "https://example.com:8443");
+    assert_eq!(said["protocol"], "https:");
+    assert_eq!(said["username"], "ana");
+    assert_eq!(said["password"], "secret");
+    assert_eq!(said["host"], "example.com:8443");
+    assert_eq!(said["hostname"], "example.com");
+    assert_eq!(said["port"], "8443");
+    assert_eq!(said["pathname"], "/one/two");
+    assert_eq!(said["search"], "?a=1&b=2");
+    assert_eq!(said["hash"], "#top");
+    assert_eq!(said["asString"], said["href"]);
+    assert_eq!(
+        said["asJson"],
+        r#"{"url":"https://ana:secret@example.com:8443/one/two?a=1&b=2#top"}"#
+    );
+}
+
+#[test]
+fn a_url_can_be_built_on_another_one_and_changed_afterwards() {
+    let answer = answered(
+        r#"
+        const joined = new URL("../three?x=1", "https://example.com/one/two/four");
+        const changed = new URL("https://example.com/one");
+        changed.pathname = "/two";
+        changed.search = "?a=1";
+        changed.hash = "top";
+        changed.port = "8443";
+        Deno.serve(() => Response.json({
+            joined: joined.href,
+            changed: changed.href,
+            canParse: URL.canParse("https://example.com"),
+            cannot: URL.canParse("not a url"),
+            parsed: URL.parse("not a url"),
+            refused: (() => { try { new URL("/relative"); return "made one"; } catch (e) { return e.message; } })(),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["joined"], "https://example.com/one/three?x=1");
+    assert_eq!(said["changed"], "https://example.com:8443/two?a=1#top");
+    assert_eq!(said["canParse"], true);
+    assert_eq!(said["cannot"], false);
+    assert_eq!(said["parsed"], serde_json::Value::Null);
+    assert_eq!(said["refused"], "Invalid URL: '/relative'");
+}
+
+#[test]
+fn a_query_string_is_read_and_written_a_pair_at_a_time() {
+    let answer = answered(
+        r#"
+        const params = new URLSearchParams("a=1&b=two&a=3&empty");
+        params.append("c", "a value & a half");
+        params.set("b", "TWO");
+        params.delete("a", "1");
+        Deno.serve(() => Response.json({
+            get: params.get("b"),
+            all: params.getAll("a"),
+            has: params.has("empty"),
+            missing: params.get("nothing"),
+            size: params.size,
+            string: params.toString(),
+            entries: Array.from(params.entries()),
+            keys: Array.from(params.keys()),
+            fromPairs: new URLSearchParams([["one", "1"], ["two", "2"]]).toString(),
+            fromObject: new URLSearchParams({ one: 1, two: "2 3" }).toString(),
+            decoded: new URLSearchParams("who=ana+bo%C3%9F&where=%2Fone%2Ftwo").get("who"),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["get"], "TWO");
+    assert_eq!(said["all"], serde_json::json!(["3"]));
+    assert_eq!(said["has"], true);
+    assert_eq!(said["missing"], serde_json::Value::Null);
+    assert_eq!(said["size"], 4);
+    assert_eq!(said["string"], "b=TWO&a=3&empty=&c=a+value+%26+a+half");
+    assert_eq!(said["keys"], serde_json::json!(["b", "a", "empty", "c"]));
+    assert_eq!(said["fromPairs"], "one=1&two=2");
+    assert_eq!(said["fromObject"], "one=1&two=2+3");
+    assert_eq!(said["decoded"], "ana boß");
+    assert_eq!(
+        said["entries"],
+        serde_json::json!([
+            ["b", "TWO"],
+            ["a", "3"],
+            ["empty", ""],
+            ["c", "a value & a half"]
+        ])
+    );
+}
+
+/// A url's `searchParams` is the url's, which is the part of this that
+/// is easy to get wrong: two objects that agree once and then drift.
+#[test]
+fn a_urls_query_and_the_url_are_the_same_thing() {
+    let answer = answered(
+        r#"
+        const url = new URL("https://example.com/one?a=1");
+        const params = url.searchParams;
+        params.set("b", "2");
+        const afterAppend = url.href;
+        url.search = "?c=3";
+        const afterSearch = Array.from(params.entries());
+        Deno.serve(() => Response.json({
+            same: url.searchParams === params,
+            afterAppend,
+            afterSearch,
+            sorted: (() => {
+                const other = new URL("https://example.com/?b=2&a=1&b=1");
+                other.searchParams.sort();
+                return other.href;
+            })(),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["same"], true);
+    assert_eq!(said["afterAppend"], "https://example.com/one?a=1&b=2");
+    assert_eq!(said["afterSearch"], serde_json::json!([["c", "3"]]));
+    assert_eq!(said["sorted"], "https://example.com/?a=1&b=2&b=1");
+}
+
+/// `req.url` is a url, so a handler can take it apart, which is how
+/// every function that routes on a path or reads a query is written.
+#[test]
+fn a_handler_can_read_its_own_url_with_the_parser() {
+    let answer = called(
+        r#"
+        Deno.serve((req) => {
+            const url = new URL(req.url);
+            return Response.json({
+                path: url.pathname,
+                who: url.searchParams.get("who"),
+                normalised: new Request("https://example.com").url,
+            });
+        });
+        "#,
+        get("http://localhost:9000/functions/v1/hello/one/two?who=ana"),
+    )
+    .expect("an answer");
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["path"], "/functions/v1/hello/one/two");
+    assert_eq!(said["who"], "ana");
+    // A Request's url is parsed rather than kept as it was written, the
+    // same as Deno, so the empty path is the root.
+    assert_eq!(said["normalised"], "https://example.com/");
 }
 
 #[test]

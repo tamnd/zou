@@ -16,7 +16,7 @@
 use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, op2, v8};
 use zou_functions::{Answer, Call, Function, Runtime};
 
-use crate::{fetch, module};
+use crate::{fetch, module, url};
 
 /// What the isolate is told about the call it is running, and what it
 /// left behind afterwards. Both live in the runtime's op state, which
@@ -93,7 +93,9 @@ deno_core::extension!(
         op_zou_answer,
         op_zou_env_get,
         op_zou_env,
-        fetch::op_zou_fetch
+        fetch::op_zou_fetch,
+        url::op_zou_url_parse,
+        url::op_zou_url_set
     ]
 );
 

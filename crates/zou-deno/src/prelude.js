@@ -123,6 +123,268 @@
   }
 
   // ---------------------------------------------------------------
+  // URL and URLSearchParams
+  //
+  // The parsing is a pair of ops, because the crate that parses urls is
+  // already in this build and a url parser written here would be a few
+  // hundred lines that is wrong in the corners. What is here is the
+  // shape: properties that read a parsed result, setters that ask for
+  // one component to be changed, and the query string, which is its own
+  // small format and has nothing to do with the parser.
+
+  const PARTS = Symbol("parts");
+  const PARAMS = Symbol("searchParams");
+  const OWNER = Symbol("owner");
+  const PAIRS = Symbol("pairs");
+
+  const COMPONENTS = [
+    "href",
+    "protocol",
+    "username",
+    "password",
+    "host",
+    "hostname",
+    "port",
+    "pathname",
+    "search",
+    "hash",
+  ];
+
+  /// x-www-form-urlencoded, which is not `encodeURIComponent`: a space
+  /// is a plus here, and the set left alone is narrower.
+  function urlencoded(text) {
+    let out = "";
+    for (const character of String(text)) {
+      if (/^[A-Za-z0-9*\-._]$/.test(character)) {
+        out += character;
+      } else if (character === " ") {
+        out += "+";
+      } else {
+        for (const byte of encoder.encode(character)) {
+          out += "%" + byte.toString(16).toUpperCase().padStart(2, "0");
+        }
+      }
+    }
+    return out;
+  }
+
+  /// A percent sequence that is not valid utf-8 is left as it was
+  /// rather than replaced, which is the one place this differs from the
+  /// spec and is a difference nobody sends on purpose.
+  function urldecoded(text) {
+    try {
+      return decodeURIComponent(String(text).replace(/\+/g, " "));
+    } catch {
+      return String(text);
+    }
+  }
+
+  function pairsOf(query) {
+    const pairs = [];
+    for (const piece of String(query).replace(/^\?/, "").split("&")) {
+      if (piece === "") {
+        continue;
+      }
+      const equals = piece.indexOf("=");
+      const name = equals === -1 ? piece : piece.slice(0, equals);
+      const value = equals === -1 ? "" : piece.slice(equals + 1);
+      pairs.push([urldecoded(name), urldecoded(value)]);
+    }
+    return pairs;
+  }
+
+  /// A url's `searchParams` is the url's, so changing one changes the
+  /// other, in both directions.
+  function wroteParams(params) {
+    const url = params[OWNER];
+    if (url !== null) {
+      const changed = ops.op_zou_url_set(url[PARTS].href, "search", params.toString());
+      if (changed !== null) {
+        url[PARTS] = changed;
+      }
+    }
+  }
+
+  function wroteUrl(url) {
+    if (url[PARAMS] !== null) {
+      url[PARAMS][PAIRS] = pairsOf(url[PARTS].search);
+    }
+  }
+
+  class URLSearchParams {
+    constructor(init = "") {
+      this[PAIRS] = [];
+      this[OWNER] = null;
+      if (init instanceof URLSearchParams) {
+        this[PAIRS] = init[PAIRS].map(([name, value]) => [name, value]);
+      } else if (Array.isArray(init)) {
+        for (const pair of init) {
+          if (!Array.isArray(pair) || pair.length !== 2) {
+            throw new TypeError("Each query pair must be an iterable [name, value] tuple");
+          }
+          this[PAIRS].push([String(pair[0]), String(pair[1])]);
+        }
+      } else if (init !== null && typeof init === "object") {
+        for (const name of Object.keys(init)) {
+          this[PAIRS].push([name, String(init[name])]);
+        }
+      } else {
+        this[PAIRS] = pairsOf(init);
+      }
+    }
+
+    get size() {
+      return this[PAIRS].length;
+    }
+
+    append(name, value) {
+      this[PAIRS].push([String(name), String(value)]);
+      wroteParams(this);
+    }
+
+    delete(name, value) {
+      const wanted = String(name);
+      this[PAIRS] = this[PAIRS].filter(
+        ([held, kept]) => held !== wanted || (value !== undefined && kept !== String(value)),
+      );
+      wroteParams(this);
+    }
+
+    get(name) {
+      const found = this[PAIRS].find(([held]) => held === String(name));
+      return found === undefined ? null : found[1];
+    }
+
+    getAll(name) {
+      return this[PAIRS].filter(([held]) => held === String(name)).map(([, value]) => value);
+    }
+
+    has(name, value) {
+      return this[PAIRS].some(
+        ([held, kept]) => held === String(name) && (value === undefined || kept === String(value)),
+      );
+    }
+
+    set(name, value) {
+      const wanted = String(name);
+      const first = this[PAIRS].findIndex(([held]) => held === wanted);
+      if (first === -1) {
+        this[PAIRS].push([wanted, String(value)]);
+      } else {
+        this[PAIRS][first] = [wanted, String(value)];
+        this[PAIRS] = this[PAIRS].filter((pair, at) => at <= first || pair[0] !== wanted);
+      }
+      wroteParams(this);
+    }
+
+    sort() {
+      // By name only, and stable, so pairs with the same name keep the
+      // order they were appended in.
+      this[PAIRS] = this[PAIRS]
+        .map((pair, at) => [pair, at])
+        .sort(([one, first], [two, second]) =>
+          one[0] === two[0] ? first - second : one[0] < two[0] ? -1 : 1,
+        )
+        .map(([pair]) => pair);
+      wroteParams(this);
+    }
+
+    forEach(callback, self) {
+      for (const [name, value] of this[PAIRS].slice()) {
+        callback.call(self, value, name, this);
+      }
+    }
+
+    *entries() {
+      yield* this[PAIRS].map(([name, value]) => [name, value]);
+    }
+
+    *keys() {
+      for (const [name] of this[PAIRS]) {
+        yield name;
+      }
+    }
+
+    *values() {
+      for (const [, value] of this[PAIRS]) {
+        yield value;
+      }
+    }
+
+    [Symbol.iterator]() {
+      return this.entries();
+    }
+
+    toString() {
+      return this[PAIRS].map(([name, value]) => `${urlencoded(name)}=${urlencoded(value)}`).join("&");
+    }
+  }
+
+  class URL {
+    constructor(input, base) {
+      const parts = ops.op_zou_url_parse(String(input), base === undefined ? "" : String(base));
+      if (parts === null) {
+        throw new TypeError(`Invalid URL: '${input}'`);
+      }
+      this[PARTS] = parts;
+      this[PARAMS] = null;
+    }
+
+    get origin() {
+      return this[PARTS].origin;
+    }
+
+    get searchParams() {
+      if (this[PARAMS] === null) {
+        const params = new URLSearchParams(this[PARTS].search);
+        params[OWNER] = this;
+        this[PARAMS] = params;
+      }
+      return this[PARAMS];
+    }
+
+    toString() {
+      return this[PARTS].href;
+    }
+
+    toJSON() {
+      return this[PARTS].href;
+    }
+
+    static canParse(input, base) {
+      return ops.op_zou_url_parse(String(input), base === undefined ? "" : String(base)) !== null;
+    }
+
+    static parse(input, base) {
+      try {
+        return new URL(input, base);
+      } catch {
+        return null;
+      }
+    }
+  }
+
+  // Ten properties that are all the same property, so they are written
+  // once. A setter that the parser will not honour leaves the url as it
+  // was, which is what the spec asks for and is not the same as throwing.
+  for (const component of COMPONENTS) {
+    Object.defineProperty(URL.prototype, component, {
+      enumerable: true,
+      configurable: true,
+      get() {
+        return this[PARTS][component];
+      },
+      set(value) {
+        const changed = ops.op_zou_url_set(this[PARTS].href, component, String(value));
+        if (changed !== null) {
+          this[PARTS] = changed;
+          wroteUrl(this);
+        }
+      },
+    });
+  }
+
+  // ---------------------------------------------------------------
   // Headers
 
   const HEADERS = Symbol("headers");
@@ -294,7 +556,10 @@
         this.headers = new Headers(init.headers ?? input.headers);
         this[BODY] = init.body === undefined ? input[BODY] : intoBody(init.body)[0];
       } else {
-        this.url = String(input);
+        // A request's url is a url, so it is parsed here and not left
+        // as whatever string it arrived as: `new Request("/one")` has
+        // nothing to be relative to and is an error, the same as Deno.
+        this.url = new URL(input).href;
         this.method = init.method ? String(init.method).toUpperCase() : "GET";
         this.headers = new Headers(init.headers);
         const [bytes, type] = intoBody(init.body);
@@ -389,14 +654,6 @@
 
   const FETCHABLE = ["http:", "https:"];
 
-  /// The scheme, without a URL parser to ask, which is the same
-  /// question the module loader answers for a specifier.
-  function schemeOf(url) {
-    const colon = url.indexOf(":");
-    const scheme = colon === -1 ? "" : url.slice(0, colon + 1).toLowerCase();
-    return /^[a-z][a-z0-9+\-.]*:$/.test(scheme) ? scheme : "";
-  }
-
   /// A response that came off the wire rather than out of a handler, so
   /// the constructor's rules about status ranges and null bodies do not
   /// apply: what a server said is what the handler is told it said.
@@ -415,10 +672,9 @@
 
   async function fetch(input, init) {
     const request = input instanceof Request && init === undefined ? input : new Request(input, init ?? {});
-    const scheme = schemeOf(request.url);
-    if (scheme === "") {
-      throw new TypeError(`Invalid URL: '${request.url}'`);
-    }
+    // The Request constructor already refused what is not a url, so
+    // what is left to say is which schemes are served.
+    const scheme = new URL(request.url).protocol;
     if (!FETCHABLE.includes(scheme)) {
       throw new TypeError(`fetch does not serve the ${scheme.slice(0, -1)} scheme yet`);
     }
@@ -531,6 +787,8 @@
     TextDecoder,
     TextEncoder,
     ReadableStream: ReadableStreamStub,
+    URL,
+    URLSearchParams,
     atob,
     btoa,
     console,
