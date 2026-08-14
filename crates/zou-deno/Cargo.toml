@@ -13,15 +13,24 @@ authors.workspace = true
 # second, so `cargo test --workspace` on a machine that only cares about
 # the database never downloads V8 or builds swc.
 default = []
-isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:serde", "dep:sha2", "dep:tokio", "dep:ureq"]
+isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:getrandom", "dep:hmac", "dep:serde", "dep:sha1", "dep:sha2", "dep:tokio", "dep:ureq"]
 
 [dependencies]
 zou-functions = { path = "../zou-functions" }
 deno_ast = { version = "0.52", features = ["transpiling"], optional = true }
 deno_core = { version = "0.410", optional = true }
 deno_error = { version = "0.7", optional = true }
+# `crypto.getRandomValues`, from the operating system and not from here.
+getrandom = { workspace = true, optional = true }
+# The same signing the server does for its own tokens, reached through
+# `crypto.subtle` instead.
+hmac = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-# A url is not a file name, so a cached module is named for its digest.
+# `crypto.subtle.digest` has four hashes and this is the one of them
+# that is not sha2. It is already in the tree.
+sha1 = { workspace = true, optional = true }
+# A url is not a file name, so a cached module is named for its digest,
+# and `crypto.subtle.digest` is three of its four hashes.
 sha2 = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 # The same client zou-server calls a webhook with, rather than the

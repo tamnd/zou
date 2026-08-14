@@ -259,13 +259,40 @@ A form given to `new Request` or `new Response` as a body is written out as mult
 - `blob.stream()` throws, for the same reason `new ReadableStream()` does.
 - A part with no `name` on its content disposition is dropped rather than being an error, so one malformed part does not lose the ones around it.
 
+## crypto
+
+Random bytes, a uuid, the four hashes and HMAC.
+
+```ts
+Deno.serve(async (req) => {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(Deno.env.get("WEBHOOK_SECRET")!),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["verify"],
+  )
+  const sent = Uint8Array.from(atob(req.headers.get("x-signature") ?? ""), (c) => c.charCodeAt(0))
+  const ok = await crypto.subtle.verify("HMAC", key, sent, await req.bytes())
+  return new Response(ok ? "signed" : "not signed", { status: ok ? 200 : 401 })
+})
+```
+
+`crypto.getRandomValues` and `crypto.randomUUID` are the operating system's randomness, and the digest and the HMAC are the same Rust crates this server signs its own tokens with.
+`crypto.subtle.digest` has `SHA-1`, `SHA-256`, `SHA-384` and `SHA-512`, and `sign`, `verify` and `importKey` are HMAC over those four with a raw key.
+
+The verification is done in Rust, so a wrong signature takes as long to reject as a right one takes to accept, which is not true of a comparison written in javascript.
+
+What is not there is refused by name rather than being undefined: `encrypt`, `decrypt`, `deriveBits`, `deriveKey`, `exportKey`, `generateKey`, `wrapKey` and `unwrapKey`, and every key format other than `raw`.
+One difference from the spec: asking `getRandomValues` for more than 65536 bytes throws a `TypeError` with the spec's message rather than a `QuotaExceededError`, because there is no `DOMException` here yet.
+
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
 
 Not present yet, and named rather than silently missing:
 
-- `crypto`, and `crypto.subtle` with it.
+- The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
 - `WebSocket`, which is what `createClient` reaches for when it builds a realtime client.
 - Streams. `new ReadableStream()` throws with its own name in the message, and a response body is collected before it is sent rather than arriving in chunks.
 - Timers, so a handler that sleeps will not.

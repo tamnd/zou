@@ -1058,6 +1058,168 @@
   }
 
   // ---------------------------------------------------------------
+  // crypto
+  //
+  // Randomness is the operating system's and a hash is the host's, so
+  // both are ops. What is here is the shape web crypto has: the names
+  // normalised before they cross, a key object that holds bytes and
+  // the hash it was made for, and promises around calls that are not
+  // actually asynchronous.
+
+  const SECRET = Symbol("secret");
+
+  const HASHES = ["SHA-1", "SHA-256", "SHA-384", "SHA-512"];
+
+  /// The bytes of a buffer source, and a refusal for anything that is
+  /// not one. `bytesOf` would stringify what it does not know, and a
+  /// hash of the word `[object Object]` is worse than an error.
+  function sourceOf(value, called) {
+    if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+      return bytesOf(value);
+    }
+    throw new TypeError(`${called} must be a BufferSource`);
+  }
+
+  /// A hash named the way the spec names it, out of a string or an
+  /// object with a name on it, and a `TypeError` for anything else.
+  function hashNamed(algorithm) {
+    const given =
+      algorithm !== null && typeof algorithm === "object"
+        ? String(algorithm.name ?? "")
+        : String(algorithm);
+    const found = HASHES.find((name) => name.toLowerCase() === given.toLowerCase());
+    if (found === undefined) {
+      throw new TypeError(`Unrecognized algorithm name: ${given}`);
+    }
+    return found;
+  }
+
+  /// The hash an HMAC operation is under, which is the key's and not
+  /// the algorithm's: `sign("HMAC", key, data)` names no hash at all.
+  function hmacHash(algorithm, key) {
+    const named =
+      algorithm !== null && typeof algorithm === "object"
+        ? String(algorithm.name ?? "")
+        : String(algorithm);
+    if (named.toLowerCase() !== "hmac") {
+      throw new TypeError(`${named} is not supported yet, only HMAC is`);
+    }
+    if (!(key instanceof CryptoKey)) {
+      throw new TypeError("a key is required");
+    }
+    return key.algorithm.hash.name;
+  }
+
+  class CryptoKey {
+    constructor(bytes, hash, extractable, usages) {
+      this[SECRET] = bytes;
+      this.type = "secret";
+      this.extractable = Boolean(extractable);
+      this.usages = usages;
+      this.algorithm = { name: "HMAC", hash: { name: hash }, length: bytes.length * 8 };
+    }
+  }
+
+  function refuse(name) {
+    return () => {
+      throw new TypeError(`crypto.subtle.${name} is not supported yet`);
+    };
+  }
+
+  const subtle = {
+    async digest(algorithm, data) {
+      const digested = ops.op_zou_digest(hashNamed(algorithm), sourceOf(data, "data"));
+      return digested.buffer;
+    },
+
+    /// Raw HMAC keys and nothing else, because that is what a function
+    /// verifying a webhook or signing its own token needs and the rest
+    /// wants key formats this has no parser for.
+    async importKey(format, keyData, algorithm, extractable, usages) {
+      if (String(format) !== "raw") {
+        throw new TypeError(`the ${format} key format is not supported yet, only raw is`);
+      }
+      const named =
+        algorithm !== null && typeof algorithm === "object"
+          ? String(algorithm.name ?? "")
+          : String(algorithm);
+      if (named.toLowerCase() !== "hmac") {
+        throw new TypeError(`${named} keys are not supported yet, only HMAC is`);
+      }
+      const hash = hashNamed(algorithm.hash);
+      return new CryptoKey(
+        sourceOf(keyData, "keyData"),
+        hash,
+        extractable,
+        Array.from(usages ?? []).map(String),
+      );
+    },
+
+    async sign(algorithm, key, data) {
+      const hash = hmacHash(algorithm, key);
+      const signature = ops.op_zou_sign(hash, key[SECRET], sourceOf(data, "data"));
+      return signature.buffer;
+    },
+
+    /// The comparison is the host's, because a comparison here would
+    /// stop at the first byte that differs and how long a wrong answer
+    /// took is how a signature is guessed.
+    async verify(algorithm, key, signature, data) {
+      const hash = hmacHash(algorithm, key);
+      return ops.op_zou_verify(
+        hash,
+        key[SECRET],
+        sourceOf(data, "data"),
+        sourceOf(signature, "signature"),
+      );
+    },
+
+    encrypt: refuse("encrypt"),
+    decrypt: refuse("decrypt"),
+    deriveBits: refuse("deriveBits"),
+    deriveKey: refuse("deriveKey"),
+    exportKey: refuse("exportKey"),
+    generateKey: refuse("generateKey"),
+    unwrapKey: refuse("unwrapKey"),
+    wrapKey: refuse("wrapKey"),
+  };
+
+  // The spec's own ceiling on one call, so a function that asks for a
+  // gigabyte of randomness is told no here rather than being handed it.
+  const RANDOM_LIMIT = 65536;
+
+  const crypto = {
+    subtle,
+
+    getRandomValues(into) {
+      if (!ArrayBuffer.isView(into) || into instanceof DataView) {
+        throw new TypeError("The provided value is not of type '(ArrayBufferView or ArrayBuffer)'");
+      }
+      if (into instanceof Float32Array || into instanceof Float64Array) {
+        throw new TypeError("The provided ArrayBufferView is not an integer array type");
+      }
+      if (into.byteLength > RANDOM_LIMIT) {
+        throw new TypeError(
+          `The ArrayBufferView's byte length (${into.byteLength}) exceeds the number of bytes of entropy available via this API (${RANDOM_LIMIT})`,
+        );
+      }
+      ops.op_zou_random(new Uint8Array(into.buffer, into.byteOffset, into.byteLength));
+      return into;
+    },
+
+    randomUUID() {
+      const bytes = new Uint8Array(16);
+      ops.op_zou_random(bytes);
+      // Version 4 and the variant, which are the two fields of a uuid
+      // that are not random.
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    },
+  };
+
+  // ---------------------------------------------------------------
   // console
 
   function shown(value) {
@@ -1147,6 +1309,7 @@
 
   Object.assign(globalThis, {
     Blob,
+    CryptoKey,
     File,
     FormData,
     Headers,
@@ -1160,6 +1323,7 @@
     atob,
     btoa,
     console,
+    crypto,
     fetch,
   });
   globalThis.self = globalThis;
