@@ -315,6 +315,10 @@ impl Runtime for Isolate {
             .map_err(|e| format!("{}: {e}", function.entrypoint.display()))?;
         let specifier = deno_core::ModuleSpecifier::from_file_path(&entrypoint)
             .map_err(|()| format!("{} is not a path v8 can be given", entrypoint.display()))?;
+        let source = Source {
+            specifier,
+            import_map: function.import_map.clone(),
+        };
         // Four of upstream's five variables are the project's and are
         // the same every call. The fifth is this call's own, which is
         // what ties a log line from inside a function to the request
@@ -334,20 +338,45 @@ impl Runtime for Isolate {
         if self.policy == Policy::PerWorker {
             // Somebody else's thread, which already has an isolate with
             // this function in it, or is about to.
-            return self.pool.run(&specifier, held, self.limits);
+            return self.pool.run(&source, held, self.limits);
         }
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("the isolate could not have a runtime: {e}"))?;
         let limits = self.limits;
-        tokio.block_on(once_off(specifier, held, limits))
+        tokio.block_on(once_off(source, held, limits))
     }
 
     fn describe(&self) -> String {
         match self.policy {
             Policy::OneShot => "a v8 isolate per call".to_string(),
             Policy::PerWorker => "a v8 isolate per function, kept between calls".to_string(),
+        }
+    }
+}
+
+/// What an isolate is built out of: the module to start at, and the
+/// file that says what the bare names in it mean.
+///
+/// The two travel together because they are one decision. An isolate
+/// built from the same entrypoint and a different import map is a
+/// different function, and hot reload treats the map as one of the
+/// files the isolate came from for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Source {
+    pub specifier: deno_core::ModuleSpecifier,
+    pub import_map: Option<std::path::PathBuf>,
+}
+
+impl Source {
+    /// What the pool files a kept isolate under, which is both halves
+    /// and not just the entrypoint: two functions pointed at one file
+    /// through different maps are two isolates.
+    pub(crate) fn key(&self) -> String {
+        match &self.import_map {
+            Some(at) => format!("{} through {}", self.specifier, at.display()),
+            None => self.specifier.to_string(),
         }
     }
 }
@@ -359,14 +388,10 @@ impl Runtime for Isolate {
 /// asleep, because terminating execution does not wake a sleeper, and
 /// the watchdog inside is the one that catches a function that never
 /// gives its thread back.
-pub(crate) async fn once_off(
-    specifier: deno_core::ModuleSpecifier,
-    held: Held,
-    limits: Limits,
-) -> Result<(), Failed> {
-    let named = specifier.to_string();
+pub(crate) async fn once_off(source: Source, held: Held, limits: Limits) -> Result<(), Failed> {
+    let named = source.specifier.to_string();
     let call = async move {
-        let mut ready = Ready::new(specifier, limits).await?;
+        let mut ready = Ready::new(source, limits).await?;
         ready.once(held).await
     };
     match tokio::time::timeout(limits.wall, call).await {
@@ -398,11 +423,8 @@ pub(crate) struct Ready {
 }
 
 impl Ready {
-    pub(crate) async fn new(
-        specifier: deno_core::ModuleSpecifier,
-        limits: Limits,
-    ) -> Result<Ready, Failed> {
-        build(specifier, limits).await
+    pub(crate) async fn new(source: Source, limits: Limits) -> Result<Ready, Failed> {
+        build(source, limits).await
     }
 
     /// Whether a file this was built out of has moved since it was.
@@ -419,13 +441,24 @@ impl Ready {
     }
 }
 
-async fn build(specifier: deno_core::ModuleSpecifier, limits: Limits) -> Result<Ready, Failed> {
+async fn build(source: Source, limits: Limits) -> Result<Ready, Failed> {
+    let Source {
+        specifier,
+        import_map,
+    } = source;
+    // The map is read before the isolate exists, because a function
+    // whose `deno.json` is broken has not got a module to load: the
+    // names in it are how the module would have said what it imports.
+    let imports = match &import_map {
+        Some(at) => Some(crate::imports::Imports::read(at)?),
+        None => None,
+    };
     // Everything that stops this call is set up before any of the
     // function's own code has run, including the module it is in, and
     // two of the three have to be in place before the isolate exists at
     // all rather than after it.
     let watch = Watch::new(limits);
-    let (loader, read) = module::loader();
+    let (loader, read) = module::loader(imports);
     let mut js = JsRuntime::new(RuntimeOptions {
         module_loader: Some(loader),
         extensions: vec![zou::init()],

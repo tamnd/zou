@@ -247,6 +247,50 @@ Everything fetched is kept on disk, keyed by url, so only the first cold start p
 - `ZOU_MODULE_CACHE_ONLY=1` means this server does not fetch. A module that is not in the cache is refused by name rather than reached for, which is what a deployment that warmed its cache somewhere else wants.
 - `ZOU_MODULE_REGISTRY` points `npm:` and `jsr:` at a mirror instead of esm.sh.
 
+## Import maps
+
+A bare name in an import is whatever the function's map says it is.
+
+```json
+{
+  "imports": {
+    "zod": "npm:zod@3.23.8",
+    "std/": "jsr:@std/",
+    "@/": "./lib/"
+  }
+}
+```
+
+```ts
+import { z } from "zod"
+import { encodeHex } from "std/encoding/hex"
+import { greet } from "@/greet.ts"
+```
+
+The map is found where the CLI looks for it, in this order, and the first one that exists is the one used.
+
+- `import_map` under `[functions.<name>]`, relative to the project directory.
+- `functions/<name>/deno.json`, then `functions/<name>/deno.jsonc`.
+- `functions/<name>/import_map.json`, which is deprecated and logs a line saying `deno.json` replaces it.
+- `functions/import_map.json`, the project's shared map, which is deprecated the same way and logs a line saying a `deno.json` beside the function replaces it.
+
+A function with no map at all runs, it just has no bare names.
+
+What is in the map is the import maps specification, not all of it.
+
+- The longest matching key wins, so `@/deep/one.ts` takes `@/deep/` over `@/`.
+- A key that ends in `/` is a prefix and the rest of the specifier is appended, and a key that does not is an exact match.
+- `scopes` are consulted before `imports`, innermost first, so a package that needs its own version of something can have it.
+- An entry where only one of the key and the address ends in `/` is dropped with a log line, which is what the specification says to do with it.
+- A relative address is resolved against the directory the map is in, not the file doing the importing.
+- `npm:`, `jsr:` and `https:` addresses mean on the other side of the map exactly what they mean in an import, so everything the packages section says still applies.
+
+The file is read as JSONC, comments and trailing commas and all, because `deno.json` is a file people comment.
+A map that is only `{"importMap": "./other.json"}` is a reference and the other file is read instead, one step and no further.
+
+The map is one of the files the function is built out of, so editing it under `per_worker` reloads the function the same as editing a module.
+A map that is not valid json is the call's error, by the name of the file, rather than something the server refuses at boot.
+
 ## fetch
 
 A function can call out.

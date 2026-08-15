@@ -34,6 +34,8 @@ use deno_core::{
 };
 use deno_error::JsErrorBox;
 
+use crate::imports::Imports;
+
 /// Where a `npm:` or `jsr:` specifier is fetched from. Overridable with
 /// `ZOU_MODULE_REGISTRY`, because a project that will not reach esm.sh
 /// should be able to point at its own mirror rather than give up on the
@@ -49,6 +51,9 @@ pub struct Disk {
     /// Whether this server may fetch at all. A deployment that warmed
     /// its cache and wants a cold start that touches nothing sets it.
     cached_only: bool,
+    /// What a bare specifier means to this function, when it has a
+    /// `deno.json` or an `import_map.json` saying so.
+    imports: Option<Imports>,
     /// Every file off this disk that went into the isolate, and what
     /// its clock said at the time. An isolate kept between calls is
     /// only the function that was deployed for as long as none of these
@@ -81,21 +86,32 @@ fn mtime(path: &Path) -> Option<SystemTime> {
 
 impl Disk {
     /// The loader as the environment describes it.
-    pub fn new() -> Disk {
+    pub fn new(imports: Option<Imports>) -> Disk {
+        let read = Reads::default();
+        // The map's own files count as files this isolate was built
+        // out of, from before it has read a module.
+        if let Some(imports) = &imports {
+            let mut seen = read.borrow_mut();
+            for source in &imports.sources {
+                let when = mtime(source);
+                seen.push((source.clone(), when));
+            }
+        }
         Disk {
             registry: named("ZOU_MODULE_REGISTRY")
                 .map(|it| it.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| REGISTRY.to_string()),
             cache: named("ZOU_MODULE_CACHE").map_or_else(ordinary, PathBuf::from),
             cached_only: named("ZOU_MODULE_CACHE_ONLY").is_some(),
-            read: Reads::default(),
+            imports,
+            read,
         }
     }
 }
 
 impl Default for Disk {
     fn default() -> Disk {
-        Disk::new()
+        Disk::new(None)
     }
 }
 
@@ -124,6 +140,15 @@ impl ModuleLoader for Disk {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> ModuleResolveResponse {
+        // The map first, because what it answers with is a specifier
+        // like any other: `"zod": "npm:zod@3"` has to go through the
+        // registry rewriting below, and `"util": "./lib/util.ts"`
+        // arrives here already a url and falls out at the bottom.
+        let mapped = self
+            .imports
+            .as_ref()
+            .and_then(|imports| imports.resolve(specifier, referrer));
+        let specifier: &str = mapped.as_deref().unwrap_or(specifier);
         if let Some(rest) = specifier.strip_prefix("npm:") {
             return url(&format!("{}/{rest}", self.registry));
         }
@@ -413,8 +438,13 @@ fn fetch(asked: &ModuleSpecifier) -> Result<Fetched, JsErrorBox> {
 
 /// The loader an isolate is built with, and the list of files it will
 /// fill in as it reads them.
-pub fn loader() -> (Rc<dyn ModuleLoader>, Reads) {
-    let disk = Disk::new();
+///
+/// The import map, when the function has one, is already among those
+/// files before a module is loaded at all: editing a `deno.json` is
+/// editing every function it resolves a name for, and hot reload has
+/// to think so too.
+pub fn loader(imports: Option<Imports>) -> (Rc<dyn ModuleLoader>, Reads) {
+    let disk = Disk::new(imports);
     let read = Rc::clone(&disk.read);
     (Rc::new(disk), read)
 }
@@ -434,6 +464,7 @@ mod tests {
             registry: REGISTRY.to_string(),
             cache: PathBuf::from("/nowhere"),
             cached_only: true,
+            imports: None,
             read: Reads::default(),
         }
     }
