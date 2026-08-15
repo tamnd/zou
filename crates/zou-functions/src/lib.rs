@@ -33,9 +33,11 @@ use std::sync::Arc;
 
 mod project;
 mod secrets;
+mod statics;
 
 pub use project::{Layout, Settings, read};
 pub use secrets::{env_file, read as secrets};
+pub use statics::Statics;
 
 /// One function, as far as anything in front of the runtime cares.
 ///

@@ -100,6 +100,10 @@ static_files = ["./functions/other/index.html"]
 `verify_jwt` is on unless the block says otherwise.
 A function that configures nothing is a function nobody can call without a key, rather than one anybody can.
 
+`entrypoint` moves the file the runtime starts at, and the function is still called by its directory's name.
+`import_map` is one of the places a map is looked for, and the first one, which the import maps section covers.
+`static_files` is what the function may read off the disk, which the static files section covers.
+
 `policy` is honoured and `inspector_port` is read and carried until there is an inspector to attach to it.
 
 Anything under `[functions.<name>]` this server does not know is listed by `zou status` as unread, the same as anywhere else in the file.
@@ -290,6 +294,47 @@ A map that is only `{"importMap": "./other.json"}` is a reference and the other 
 
 The map is one of the files the function is built out of, so editing it under `per_worker` reloads the function the same as editing a module.
 A map that is not valid json is the call's error, by the name of the file, rather than something the server refuses at boot.
+
+## Static files
+
+A function may read the files its own `static_files` covers, and nothing else on the disk.
+
+```toml
+[functions.hello]
+static_files = ["./functions/hello/*.html"]
+```
+
+```ts
+Deno.serve(async () => {
+  const page = await Deno.readTextFile("./page.html")
+  return new Response(page, { headers: { "content-type": "text/html" } })
+})
+```
+
+`Deno.readFile`, `Deno.readTextFile` and the two `Sync` spellings of them are here, and they are the whole of the file system a function has.
+There is no writing, no listing a directory, no `Deno.open` and no stat.
+
+A relative name starts at the directory the entrypoint is in, which is upstream's `servicePath`, so `./page.html` in `functions/hello/index.ts` is `functions/hello/page.html`.
+An absolute name and a `file:` url both work and are matched the same way.
+A name is tidied before it is matched, so `..` cannot walk out of what the patterns cover and back in through another door.
+
+The patterns are the ones upstream's deploy path globs with, character for character.
+
+- `*` matches inside one path segment and `**` matches across them.
+- `?` is one character that is not a separator, and `[abc]` is a class that `!` negates.
+- Everything else is a literal, so the `.` in `*.html` is a dot.
+- The slash after a `**` is a slash the path has to have. `dist/**/*.css` covers `dist/app/main.css` and does not cover `dist/one.css`, which is what the regular expression upstream builds does. A project that wants both writes both patterns.
+
+Two errors, and they are Deno's own, so a function can tell them apart.
+
+- `Deno.errors.NotFound` for a file the patterns cover that is not there.
+- `Deno.errors.PermissionDenied` for a name nothing covers, with a message naming the function and saying `static_files`.
+
+A function that configures no `static_files` reads nothing, which is the same rule with an empty list rather than a special case.
+That is deliberate and it is upstream's shape too: the process running these functions holds a database superuser connection and a JWT secret, and a function is somebody else's code.
+
+Static files are data rather than code, so editing one is not a reload.
+The next call reads the new bytes in the same kept isolate, which is what a page being edited during development should do.
 
 ## fetch
 
@@ -495,13 +540,14 @@ Deno.serve(async (req) => {
 
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `Event`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `ReadableStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `Event`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `ReadableStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build` and `Deno.version`.
 
 Not present yet, and named rather than silently missing:
 
 - The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
 - The writable half of streams. There is no `WritableStream` and no `TransformStream`, and so no `pipeTo` and no `pipeThrough`, and no byte stream or BYOB reader.
 - Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet.
+- The rest of the file system. Reading a file the function's own `static_files` covers is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
 - Node built ins. `node:fs` and the rest are refused by name.
 
 The rest of that list, and where each line stands, is [issue #369](https://github.com/tamnd/zou/issues/369).
