@@ -37,7 +37,7 @@ fn keep(cache: &Path, url: &str, content_type: &str, body: &str) {
     .expect("what the module is");
 }
 
-fn invoke(function: &Function) -> Result<zou_functions::Answer, String> {
+fn invoke(function: &Function) -> Result<zou_functions::Answer, zou_functions::Failed> {
     Isolate::new().invoke(
         function,
         Call {
@@ -96,8 +96,11 @@ fn a_warm_cache_is_a_cold_start_that_touches_nothing() {
     std::fs::write(dir.path().join("index.ts"), r#"import "npm:unheard-of@1";"#)
         .expect("the function's file");
     let refused = invoke(&function).expect_err("a module nothing has");
-    assert!(refused.contains("unheard-of@1"), "{refused}");
-    assert!(refused.contains("not in the module cache"), "{refused}");
+    assert!(refused.why().contains("unheard-of@1"), "{refused}");
+    assert!(
+        refused.why().contains("not in the module cache"),
+        "{refused}"
+    );
 
     unsafe {
         std::env::remove_var("ZOU_MODULE_CACHE");

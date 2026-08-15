@@ -269,6 +269,47 @@ impl Answer {
     }
 }
 
+/// Why a call did not end in an answer.
+///
+/// Two of them because upstream answers two different things. A
+/// function that threw is a 500 in plain text. A function that ran past
+/// what it was allowed is a 546 with `WORKER_LIMIT` in it, which is a
+/// status code nothing else in this project uses and upstream's own
+/// invention. Both carry a sentence, and both sentences are the
+/// operator's: they go to the log and never to the caller.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Failed {
+    /// It threw, or it never answered, or its module would not load.
+    Threw(String),
+    /// It ran past its memory, its wall clock or its cpu time.
+    Limit(String),
+}
+
+impl Failed {
+    /// The sentence, whichever kind this is, because the log line is
+    /// the same either way.
+    pub fn why(&self) -> &str {
+        match self {
+            Failed::Threw(why) | Failed::Limit(why) => why,
+        }
+    }
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.why())
+    }
+}
+
+/// Anything that went wrong and did not say it was a limit is a
+/// function that threw, which is what lets a runtime keep saying
+/// `map_err(|e| format!(...))?` about the ordinary failures.
+impl From<String> for Failed {
+    fn from(why: String) -> Failed {
+        Failed::Threw(why)
+    }
+}
+
 /// Whatever runs a function.
 ///
 /// Sync on purpose. A javascript isolate is a thread's worth of state
@@ -278,12 +319,12 @@ impl Answer {
 /// server hands this to `spawn_blocking` the way it does the mail
 /// sender.
 ///
-/// An `Err` is what upstream calls a handler that threw: the caller is
-/// answered 500 `Internal Server Error` as text and the message goes to
-/// the log, which means whatever is in the string is for the operator
-/// and never for the caller.
+/// An `Err` is what upstream calls a handler that threw or a handler
+/// that was stopped: the caller is answered 500 or 546 and the message
+/// goes to the log, which means whatever is in the string is for the
+/// operator and never for the caller.
 pub trait Runtime: Send + Sync {
-    fn invoke(&self, function: &Function, call: Call) -> Result<Answer, String>;
+    fn invoke(&self, function: &Function, call: Call) -> Result<Answer, Failed>;
 
     /// The same call, with the answer handed over the moment there is
     /// one rather than when the call is finished.
@@ -304,7 +345,7 @@ pub trait Runtime: Send + Sync {
         function: &Function,
         call: Call,
         answer: Sink,
-    ) -> Result<(), String> {
+    ) -> Result<(), Failed> {
         answer(self.invoke(function, call)?);
         Ok(())
     }
@@ -354,13 +395,19 @@ impl Hosted {
 }
 
 impl Runtime for Hosted {
-    fn invoke(&self, function: &Function, call: Call) -> Result<Answer, String> {
+    /// A host handler is Rust that either answers or does not, and
+    /// there is no isolate here to run out of anything, so everything
+    /// that goes wrong on this side is a function that threw.
+    fn invoke(&self, function: &Function, call: Call) -> Result<Answer, Failed> {
         match self.handlers.get(&function.name) {
-            Some(handler) => handler(&call),
+            Some(handler) => handler(&call).map_err(Failed::Threw),
             // Only reachable if a registry was built by hand with a
             // name this runtime has never heard of, which is a wiring
             // mistake rather than a caller's, so it reads like one.
-            None => Err(format!("no host handler registered for {}", function.name)),
+            None => Err(Failed::Threw(format!(
+                "no host handler registered for {}",
+                function.name
+            ))),
         }
     }
 
@@ -420,7 +467,7 @@ impl Registry {
 
     /// Run one. Blocking, so the caller owes it a thread that is
     /// allowed to block.
-    pub fn invoke(&self, function: &Function, call: Call) -> Result<Answer, String> {
+    pub fn invoke(&self, function: &Function, call: Call) -> Result<Answer, Failed> {
         self.runtime.invoke(function, call)
     }
 
@@ -432,7 +479,7 @@ impl Registry {
         function: &Function,
         call: Call,
         answer: Sink,
-    ) -> Result<(), String> {
+    ) -> Result<(), Failed> {
         self.runtime.invoke_answering(function, call, answer)
     }
 
@@ -541,7 +588,23 @@ mod tests {
             Registry::hosted(Hosted::new().at("boom", |_| Err("connection refused".to_string())));
         let found = registry.lookup("boom").expect("registered");
         let why = registry.invoke(found, call()).expect_err("it fails");
-        assert_eq!(why, "connection refused");
+        assert_eq!(why, Failed::Threw("connection refused".to_string()));
+        assert_eq!(why.why(), "connection refused");
+    }
+
+    #[test]
+    fn a_limit_is_not_a_function_that_threw() {
+        // The two are different answers to the caller, 546 and 500, so
+        // whatever runs a function has to be able to say which one it
+        // is and a string cannot.
+        let limit = Failed::Limit("it used more than 256 MiB of memory".to_string());
+        assert!(matches!(limit, Failed::Limit(_)));
+        assert_eq!(limit.to_string(), "it used more than 256 MiB of memory");
+        assert_eq!(
+            Failed::from("it threw".to_string()),
+            Failed::Threw("it threw".to_string()),
+            "anything that did not say it was a limit is not one"
+        );
     }
 
     #[test]
