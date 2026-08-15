@@ -14,6 +14,7 @@
 //! ```text
 //! 404 text/plain; charset=UTF-8   Function not found
 //! 500 text/plain;charset=UTF-8    Internal Server Error
+//! 546 application/json            {"code":"WORKER_LIMIT","message":"Worker failed to respond due to a resource limit (please check logs)"}
 //! 401 application/json            {"code":"UNAUTHORIZED_NO_AUTH_HEADER","message":"Missing authorization header","msg":"Missing authorization header"}
 //! 401 application/json            {"code":"UNAUTHORIZED_INVALID_JWT_FORMAT","message":"Invalid JWT format","msg":"Invalid JWT format"}
 //! 401 application/json            {"code":"UNAUTHORIZED_LEGACY_JWT","message":"Invalid JWT","msg":"Invalid JWT"}
@@ -148,12 +149,19 @@ pub async fn call(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
             });
             answered(answer)
         }
+        // A limit reached after the answer has gone out is one of the
+        // lines above and not one of these: the caller already has a
+        // status code, and what it gets is a body that stops early.
         // Nothing was ever sent, so the call ended before it answered
         // and the reason is whatever the runtime returned.
         Err(_) => match ran.await {
             Ok(Ok(())) => {
                 log::error!("functions: {name} finished without answering");
                 failed()
+            }
+            Ok(Err(zou_functions::Failed::Limit(why))) => {
+                log::error!("functions: {name} reached a limit: {why}");
+                limited()
             }
             Ok(Err(why)) => {
                 log::error!("functions: {name} failed: {why}");
@@ -303,6 +311,30 @@ fn failed() -> Response {
         StatusCode::INTERNAL_SERVER_ERROR,
         [(header::CONTENT_TYPE, "text/plain;charset=UTF-8")],
         "Internal Server Error",
+    )
+        .into_response()
+}
+
+/// A function that ran past what it was allowed: too much memory, too
+/// long on the clock, too much cpu.
+///
+/// 546 is not a mistake and not this project's invention. Upstream's
+/// main worker maps its own `WorkerRequestCancelled` onto it, and a
+/// caller that wants to tell "the function was stopped" from "the
+/// function threw" has that number and nothing else to go on, so it is
+/// copied along with the two fields of the body. Which limit was
+/// reached is in the log and not in the answer, on the same rule as the
+/// 500: what a stranger learns about somebody's function should not
+/// depend on how it failed.
+fn limited() -> Response {
+    (
+        StatusCode::from_u16(546).expect("a real status code"),
+        [(header::CONTENT_TYPE, "application/json")],
+        serde_json::json!({
+            "code": "WORKER_LIMIT",
+            "message": "Worker failed to respond due to a resource limit (please check logs)",
+        })
+        .to_string(),
     )
         .into_response()
 }
@@ -884,6 +916,68 @@ mod tests {
         let body = text(res).await;
         assert_eq!(body, "Internal Server Error");
         assert!(!body.contains("kaboom"), "the reason is the operator's");
+    }
+
+    /// Whatever runs the functions of a project that is out of memory,
+    /// out of time, or out of cpu. There is no isolate in this crate's
+    /// tests, so the thing a limit is reached by is stood in for by a
+    /// runtime that says one was.
+    struct Stopped;
+
+    impl zou_functions::Runtime for Stopped {
+        fn invoke(
+            &self,
+            _function: &zou_functions::Function,
+            _call: Call,
+        ) -> Result<Answer, zou_functions::Failed> {
+            Err(zou_functions::Failed::Limit(
+                "it wanted more memory than the 256 MiB it is allowed".to_string(),
+            ))
+        }
+
+        fn describe(&self) -> String {
+            "a runtime that stops everything".to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_function_that_ran_out_of_something_is_upstreams_546() {
+        let app = crate::router(crate::Config {
+            jwt_secret: SECRET.to_vec(),
+            functions: Some(Arc::new(Registry::new(
+                vec![zou_functions::Function::new(
+                    "greedy",
+                    std::path::PathBuf::new(),
+                )],
+                Arc::new(Stopped),
+            ))),
+            ..crate::Config::default()
+        })
+        .expect("router");
+        let res = app
+            .oneshot(
+                post("/functions/v1/greedy")
+                    .header("authorization", format!("Bearer {}", anon()))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("answer");
+        assert_eq!(res.status().as_u16(), 546, "not a 500 and not a 503");
+        assert_eq!(res.headers()["content-type"], "application/json");
+        let body = json(res).await;
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "code": "WORKER_LIMIT",
+                "message": "Worker failed to respond due to a resource limit (please check logs)",
+            }),
+            "byte for byte what the reference answered"
+        );
+        assert!(
+            !body.to_string().contains("256 MiB"),
+            "which limit was reached is the operator's and not the caller's"
+        );
     }
 
     #[tokio::test]

@@ -6,16 +6,16 @@
 //! through. This answers the 500 a broken function answers and puts the
 //! reason in the log, where the operator is.
 
-use zou_functions::{Answer, Call, Function, Runtime};
+use zou_functions::{Answer, Call, Failed, Function, Runtime};
 
 pub struct Absent;
 
 impl Runtime for Absent {
-    fn invoke(&self, function: &Function, _call: Call) -> Result<Answer, String> {
-        Err(format!(
+    fn invoke(&self, function: &Function, _call: Call) -> Result<Answer, Failed> {
+        Err(Failed::Threw(format!(
             "{} needs a javascript engine and this zou was built without one, rebuild with --features zou-deno/isolate",
             function.name
-        ))
+        )))
     }
 
     fn describe(&self) -> String {

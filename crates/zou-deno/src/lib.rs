@@ -104,6 +104,8 @@ mod fetch;
 #[cfg(feature = "isolate")]
 mod isolate;
 #[cfg(feature = "isolate")]
+mod limits;
+#[cfg(feature = "isolate")]
 mod module;
 #[cfg(feature = "isolate")]
 mod timer;
@@ -114,6 +116,8 @@ mod websocket;
 
 #[cfg(feature = "isolate")]
 pub use isolate::Isolate;
+#[cfg(feature = "isolate")]
+pub use limits::Limits;
 
 /// What this build runs a function with, given the environment every
 /// function of the project will see.

@@ -152,7 +152,9 @@ fn a_package_that_is_not_there_says_so_with_its_name() {
         )
         .expect_err("a package that does not exist");
     assert!(
-        refused.contains("@zou/nothing-is-published-here@9.9.9"),
+        refused
+            .why()
+            .contains("@zou/nothing-is-published-here@9.9.9"),
         "{refused}"
     );
 }

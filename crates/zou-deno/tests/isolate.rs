@@ -15,8 +15,8 @@
 
 use std::path::PathBuf;
 
-use zou_deno::Isolate;
-use zou_functions::{Answer, Call, Function, Runtime};
+use zou_deno::{Isolate, Limits};
+use zou_functions::{Answer, Call, Failed, Function, Runtime};
 
 /// A function on disk, one file, named the way a project names it.
 struct Deployed {
@@ -55,7 +55,7 @@ fn get(url: &str) -> Call {
     }
 }
 
-fn called(source: &str, call: Call) -> Result<Answer, String> {
+fn called(source: &str, call: Call) -> Result<Answer, Failed> {
     let deployed = deployed(source);
     Isolate::new().invoke(&deployed.function, call)
 }
@@ -310,7 +310,9 @@ fn a_specifier_this_runtime_does_not_serve_says_so_by_name() {
     ] {
         let source = format!(r#"import "{specifier}"; Deno.serve(() => new Response("no"));"#);
         let complaint = called(&source, get("http://localhost:9000/functions/v1/hello"))
-            .expect_err("a refusal");
+            .expect_err("a refusal")
+            .why()
+            .to_string();
         assert!(
             complaint.contains(said),
             "{specifier} was refused with {complaint}"
@@ -324,7 +326,9 @@ fn a_function_that_forgot_to_serve_is_an_error_and_not_an_empty_answer() {
         "const nothing = 1;",
         get("http://localhost:9000/functions/v1/hello"),
     )
-    .expect_err("a complaint");
+    .expect_err("a complaint")
+    .why()
+    .to_string();
     assert!(complaint.contains("did not call Deno.serve"), "{complaint}");
 }
 
@@ -334,7 +338,9 @@ fn a_handler_that_throws_is_the_operators_message_and_not_the_callers() {
         r#"Deno.serve(() => { throw new Error("the database was not there"); });"#,
         get("http://localhost:9000/functions/v1/hello"),
     )
-    .expect_err("a complaint");
+    .expect_err("a complaint")
+    .why()
+    .to_string();
     assert!(
         complaint.contains("the database was not there"),
         "{complaint}"
@@ -347,7 +353,9 @@ fn a_handler_that_answers_with_something_that_is_not_a_response_is_an_error() {
         r#"Deno.serve(() => "a string is not a Response");"#,
         get("http://localhost:9000/functions/v1/hello"),
     )
-    .expect_err("a complaint");
+    .expect_err("a complaint")
+    .why()
+    .to_string();
     assert!(complaint.contains("must return a Response"), "{complaint}");
 }
 
@@ -357,7 +365,9 @@ fn a_module_that_will_not_parse_names_the_file_it_would_not_parse() {
         "Deno.serve(() => { ",
         get("http://localhost:9000/functions/v1/hello"),
     )
-    .expect_err("a complaint");
+    .expect_err("a complaint")
+    .why()
+    .to_string();
     assert!(complaint.contains("index.ts"), "{complaint}");
 }
 
@@ -1115,7 +1125,9 @@ fn a_module_that_never_finishes_evaluating_says_so() {
         "#,
         get("http://localhost:9000/functions/v1/hello"),
     )
-    .expect_err("a module that does not finish");
+    .expect_err("a module that does not finish")
+    .why()
+    .to_string();
     assert!(
         refused.contains("Top-level await promise never resolved"),
         "{refused}"
@@ -1184,7 +1196,9 @@ fn serving_twice_is_the_functions_own_mistake() {
         "#,
         get("http://localhost:9000/functions/v1/hello"),
     )
-    .expect_err("a complaint");
+    .expect_err("a complaint")
+    .why()
+    .to_string();
     assert!(complaint.contains("called twice"), "{complaint}");
 }
 
@@ -2454,4 +2468,255 @@ fn a_function_may_call_out_over_tls() {
     let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["status"], 200);
     assert_eq!(said["opened"], "<!doctype html>");
+}
+
+// -------------------------------------------------------------------
+// Per isolate limits
+
+/// Upstream's numbers are 256 MiB, four hundred seconds and two seconds
+/// of cpu, and a test that waited for any of them would be a test
+/// nobody runs. What is being tested is that each limit is reached and
+/// which one is named, so each test sets the one it is about small and
+/// leaves the other two where a passing call cannot reach them.
+fn small() -> Limits {
+    Limits {
+        memory: 64 * 1024 * 1024,
+        wall: std::time::Duration::from_secs(30),
+        cpu: std::time::Duration::from_secs(20),
+        background: std::time::Duration::from_secs(30),
+    }
+}
+
+fn stopped(limits: Limits, source: &str) -> Failed {
+    let deployed = deployed(source);
+    Isolate::new()
+        .with_limits(limits)
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect_err("a call that ran past a limit")
+}
+
+#[test]
+fn a_function_that_wants_more_memory_than_it_is_allowed_is_stopped() {
+    let started = std::time::Instant::now();
+    let why = stopped(
+        small(),
+        r#"
+        Deno.serve(() => {
+          const held = [];
+          for (let i = 0; i < 100000; i++) { held.push(new Array(100000).fill(i)); }
+          return new Response("never " + held.length);
+        });
+        "#,
+    );
+    let Failed::Limit(said) = why else {
+        panic!("a limit and not a function that threw: {why:?}");
+    };
+    assert!(said.contains("more memory than the 64 MiB"), "{said}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "it was stopped by the heap limit and not by the clock"
+    );
+}
+
+/// The same function written with buffers, which is a different limit
+/// and the reason there is a counting allocator: this one ran to a
+/// hundred gigabytes under the heap limit alone, because the heap is
+/// not where a backing store lives.
+#[test]
+fn a_function_that_wants_more_buffers_than_it_is_allowed_is_stopped() {
+    let started = std::time::Instant::now();
+    let why = stopped(
+        small(),
+        r#"
+        Deno.serve(() => {
+          const held = [];
+          for (let i = 0; i < 100000; i++) { held.push(new Uint8Array(1024 * 1024)); }
+          return new Response("never " + held.length);
+        });
+        "#,
+    );
+    let Failed::Limit(said) = why else {
+        panic!("a limit and not a function that threw: {why:?}");
+    };
+    assert!(said.contains("more memory than the 64 MiB"), "{said}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "it was stopped by the allocator and not by the clock"
+    );
+}
+
+/// And a function that keeps a large buffer for as long as it needs it
+/// and then does not is a function that works, which is what the count
+/// coming back down is for.
+#[test]
+fn a_function_that_uses_buffers_and_gives_them_back_answers() {
+    let deployed = deployed(
+        r#"
+        Deno.serve(() => {
+          let sum = 0;
+          for (let i = 0; i < 200; i++) {
+            const buffer = new Uint8Array(1024 * 1024);
+            buffer[0] = 1;
+            sum += buffer[0];
+          }
+          return new Response("used " + sum);
+        });
+        "#,
+    );
+    let answer = Isolate::new()
+        .with_limits(small())
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect("two hundred mebibytes one at a time is not two hundred mebibytes at once");
+    assert_eq!(body(&answer), "used 200");
+}
+
+#[test]
+fn a_function_that_stays_under_the_memory_it_is_allowed_answers() {
+    let deployed = deployed(
+        r#"
+        Deno.serve(() => {
+          const held = [];
+          for (let i = 0; i < 8; i++) { held.push("x".repeat(1024 * 1024)); }
+          return new Response("held " + held.length);
+        });
+        "#,
+    );
+    let answer = Isolate::new()
+        .with_limits(small())
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect("an answer");
+    assert_eq!(body(&answer), "held 8");
+}
+
+/// The reason a watchdog thread exists at all. Nothing on the isolate's
+/// own thread can stop this: the loop yields to no timer, no op and no
+/// executor, so only `terminate_execution` from outside ends it.
+#[test]
+fn a_function_that_never_stops_running_is_stopped() {
+    let started = std::time::Instant::now();
+    let why = stopped(
+        Limits {
+            cpu: std::time::Duration::from_millis(200),
+            ..small()
+        },
+        r#"Deno.serve(() => { for (;;) {} });"#,
+    );
+    let Failed::Limit(said) = why else {
+        panic!("a limit and not a function that threw: {why:?}");
+    };
+    assert!(said.contains("cpu time"), "{said}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the clock did not have to be the one to stop it"
+    );
+}
+
+/// The other shape of a call that overruns, and the reason a timer is
+/// kept as well as the watchdog: terminating execution does nothing to
+/// a function that is not executing.
+#[test]
+fn a_function_that_is_asleep_is_stopped_by_the_clock() {
+    let started = std::time::Instant::now();
+    let why = stopped(
+        Limits {
+            wall: std::time::Duration::from_millis(300),
+            ..small()
+        },
+        r#"
+        Deno.serve(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 60000));
+          return new Response("never");
+        });
+        "#,
+    );
+    let Failed::Limit(said) = why else {
+        panic!("a limit and not a function that threw: {why:?}");
+    };
+    assert!(said.contains("still running after"), "{said}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "it was the clock that stopped it"
+    );
+}
+
+/// What makes the cpu limit worth having rather than a second wall
+/// clock: a function that spends its time waiting for something else is
+/// not spending cpu, and upstream's two seconds would be useless if it
+/// were.
+#[test]
+fn a_function_that_waits_is_not_charged_for_waiting() {
+    let deployed = deployed(
+        r#"
+        Deno.serve(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          return new Response("awake");
+        });
+        "#,
+    );
+    let answer = Isolate::new()
+        .with_limits(Limits {
+            cpu: std::time::Duration::from_millis(500),
+            ..small()
+        })
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect("a second and a half of waiting is not half a second of cpu");
+    assert_eq!(body(&answer), "awake");
+}
+
+/// A limit reached after the head of the answer has gone out cannot
+/// become a status code, which is what upstream does too: the caller
+/// keeps its 200 and the body stops where it got to.
+#[test]
+fn a_limit_reached_after_the_answer_truncates_the_body() {
+    let deployed = deployed(
+        r#"
+        Deno.serve(() => new Response(new ReadableStream({
+          start(controller) { controller.enqueue(new TextEncoder().encode("first ")); },
+          async pull() {
+            // A pull is called while the first chunk is being taken, so
+            // one that spun straight away would stop the chunk it was
+            // asked to follow from ever leaving.
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            for (;;) {}
+          },
+        })));
+        "#,
+    );
+    let (sent, arrives) = std::sync::mpsc::channel();
+    let ran = std::thread::spawn(move || {
+        let answering = Isolate::new()
+            .with_limits(Limits {
+                cpu: std::time::Duration::from_millis(500),
+                ..small()
+            })
+            .invoke_answering(
+                &deployed.function,
+                get("http://localhost:9000/functions/v1/hello"),
+                Box::new(move |answer| {
+                    sent.send(answer).expect("the test is listening");
+                }),
+            );
+        drop(deployed);
+        answering
+    });
+    let answer = arrives.recv().expect("a head while the body is still made");
+    assert_eq!(answer.status, 200);
+    assert_eq!(chunks(answer), vec![Ok(b"first ".to_vec())]);
+    let why = ran.join().expect("the isolate's thread");
+    let Failed::Limit(said) = why.expect_err("the call ran past its cpu") else {
+        panic!("a limit");
+    };
+    assert!(said.contains("cpu time"), "{said}");
 }

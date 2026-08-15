@@ -15,12 +15,14 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, op2, v8};
 use deno_error::JsErrorBox;
-use zou_functions::{Answer, Call, Function, Runtime, Sink, Writer};
+use zou_functions::{Answer, Call, Failed, Function, Runtime, Sink, Writer};
 
-use crate::{crypto, fetch, module, timer, url, websocket};
+use crate::limits::{Limits, Watch};
+use crate::{crypto, fetch, limits, module, timer, url, websocket};
 
 /// What the isolate is told about the call it is running, and what it
 /// left behind afterwards. Both live in the runtime's op state, which
@@ -188,6 +190,7 @@ deno_core::extension!(
 /// else's javascript by having been started with it set.
 pub struct Isolate {
     env: Vec<(String, String)>,
+    limits: Limits,
 }
 
 /// Upstream's one per invocation variable, which the call carries and
@@ -196,12 +199,25 @@ const EXECUTION_ID: &str = "SB_EXECUTION_ID";
 
 impl Isolate {
     pub fn new() -> Isolate {
-        Isolate { env: Vec::new() }
+        Isolate {
+            env: Vec::new(),
+            limits: Limits::default(),
+        }
     }
 
     /// The environment every function this runtime serves will see.
     pub fn with_env(env: Vec<(String, String)>) -> Isolate {
-        Isolate { env }
+        Isolate {
+            env,
+            limits: Limits::default(),
+        }
+    }
+
+    /// Other limits than upstream's, which is what a test needs and
+    /// what a deployment that knows its own functions may want.
+    pub fn with_limits(mut self, limits: Limits) -> Isolate {
+        self.limits = limits;
+        self
     }
 }
 
@@ -211,21 +227,8 @@ impl Default for Isolate {
     }
 }
 
-/// How long work registered with `EdgeRuntime.waitUntil` may go on
-/// after the caller has been answered.
-///
-/// There is a limit because the thread this runs on is a real one and
-/// the isolate holding it is real memory, and because a promise that
-/// never settles is a thing a function can write by accident. Thirty
-/// seconds is long enough for the reason `waitUntil` exists, which is
-/// a log line or a webhook that should not have been on the caller's
-/// critical path, and short enough that a leak is a blip. Per isolate
-/// limits are their own box on #369 and this number moves there when
-/// they arrive.
-const BACKGROUND: std::time::Duration = std::time::Duration::from_secs(30);
-
 impl Runtime for Isolate {
-    fn invoke(&self, function: &Function, call: Call) -> Result<Answer, String> {
+    fn invoke(&self, function: &Function, call: Call) -> Result<Answer, Failed> {
         // The blocking shape, for a caller that wants the answer and
         // the background work in the same wait: the sink writes into a
         // slot rather than anywhere the call could have gone on ahead.
@@ -253,8 +256,8 @@ impl Runtime for Isolate {
             }),
         )?;
         let answer = held.lock().expect("the isolate is done with it").take();
-        let mut answer =
-            answer.ok_or_else(|| "the handler returned without an answer".to_string())?;
+        let mut answer = answer
+            .ok_or_else(|| Failed::Threw("the handler returned without an answer".to_string()))?;
         if let Some(collector) = collecting
             .lock()
             .expect("the isolate is done with it")
@@ -273,7 +276,7 @@ impl Runtime for Isolate {
         function: &Function,
         call: Call,
         answer: Sink,
-    ) -> Result<(), String> {
+    ) -> Result<(), Failed> {
         // V8 needs one process wide platform and does not care who set
         // it up, so long as it happened before the first isolate.
         static PLATFORM: std::sync::Once = std::sync::Once::new();
@@ -305,7 +308,22 @@ impl Runtime for Isolate {
             .enable_all()
             .build()
             .map_err(|e| format!("the isolate could not have a runtime: {e}"))?;
-        tokio.block_on(run(specifier, held))
+        // The wall clock is watched twice, from the two sides a call can
+        // overrun on. This timer is the one that catches a function
+        // that is asleep, because terminating execution does not wake a
+        // sleeper, and the watchdog inside is the one that catches a
+        // function that never gives its thread back.
+        let limits = self.limits;
+        let named = specifier.to_string();
+        tokio.block_on(async move {
+            match tokio::time::timeout(limits.wall, run(specifier, held, limits)).await {
+                Ok(ran) => ran,
+                Err(_) => Err(Failed::Limit(format!(
+                    "{named}: it was still running after the {:?} it is allowed",
+                    limits.wall
+                ))),
+            }
+        })
     }
 
     fn describe(&self) -> String {
@@ -313,12 +331,32 @@ impl Runtime for Isolate {
     }
 }
 
-async fn run(specifier: deno_core::ModuleSpecifier, held: Held) -> Result<(), String> {
+async fn run(
+    specifier: deno_core::ModuleSpecifier,
+    held: Held,
+    limits: Limits,
+) -> Result<(), Failed> {
+    // Everything that stops this call is set up before any of the
+    // function's own code has run, including the module it is in, and
+    // two of the three have to be in place before the isolate exists at
+    // all rather than after it.
+    let watch = Watch::new(limits);
     let mut js = JsRuntime::new(RuntimeOptions {
         module_loader: Some(module::loader()),
         extensions: vec![zou::init()],
+        // The memory limits are v8's heap and, because a buffer is not
+        // on that heap, an allocator that counts what the function asks
+        // for outside it.
+        create_params: Some(
+            v8::CreateParams::default()
+                .heap_limits(0, limits.memory)
+                .array_buffer_allocator(limits::buffers(Arc::clone(&watch), limits)),
+        ),
         ..Default::default()
     });
+    let handle = js.v8_isolate().thread_safe_handle();
+    let _watchdog = limits::watch(handle.clone(), Arc::clone(&watch), limits);
+    js.add_near_heap_limit_callback(limits::near_heap_limit(handle, Arc::clone(&watch)));
     js.op_state().borrow_mut().put(held);
     js.op_state().borrow_mut().put(timer::Pending::default());
     js.op_state()
@@ -328,24 +366,33 @@ async fn run(specifier: deno_core::ModuleSpecifier, held: Held) -> Result<(), St
     // The prelude is the value of its own last expression, so the two
     // entry points are held here and never on an object the function
     // can reach.
-    let entries = js
-        .execute_script("zou:prelude.js", include_str!("prelude.js"))
-        .map_err(|e| format!("the prelude did not run: {e}"))?;
+    let entries = {
+        let _running = watch.running();
+        js.execute_script("zou:prelude.js", include_str!("prelude.js"))
+    }
+    .map_err(|e| format!("the prelude did not run: {e}"))?;
 
-    let id = js
-        .load_main_es_module(&specifier)
+    let id = watch
+        .timing(js.load_main_es_module(&specifier))
         .await
-        .map_err(|e| format!("{specifier}: {e}"))?;
+        .map_err(|e| why(&specifier, &watch, e))?;
     // The module is evaluated by waiting on its own promise and not by
     // running the loop until it is idle. A module that leaves a timer
     // behind it is ordinary rather than exotic, and `createClient` is
     // one: it starts a refresh interval on the way through, and an idle
     // loop is a condition an interval means never happens.
-    let evaluated = js.mod_evaluate(id);
+    let evaluated = {
+        // Everything a module does at the top of itself happens here
+        // rather than in the future this returns, so the counting has
+        // to start before the call and not around the await.
+        let _running = watch.running();
+        js.mod_evaluate(id)
+    };
     let evaluated = std::pin::pin!(evaluated);
-    js.with_event_loop_promise(evaluated, PollEventLoopOptions::default())
+    watch
+        .timing(js.with_event_loop_promise(evaluated, PollEventLoopOptions::default()))
         .await
-        .map_err(|e| format!("{specifier}: {e}"))?;
+        .map_err(|e| why(&specifier, &watch, e))?;
 
     let (entry, drain) = {
         let context = js.main_context();
@@ -368,10 +415,17 @@ async fn run(specifier: deno_core::ModuleSpecifier, held: Held) -> Result<(), St
         let drain = held.pop().expect("two of them");
         (held.pop().expect("two of them"), drain)
     };
-    let called = js.call(&entry);
-    js.with_event_loop_promise(called, PollEventLoopOptions::default())
+    // The same again, and this is the one that matters: a handler that
+    // is not async runs to its end inside `call`, so a function that
+    // never returns never returns from here.
+    let called = {
+        let _running = watch.running();
+        js.call(&entry)
+    };
+    watch
+        .timing(js.with_event_loop_promise(called, PollEventLoopOptions::default()))
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| why(&specifier, &watch, e))?;
 
     // The answer goes now, not when this function returns, because
     // what is left to do after it is the function's own business and
@@ -391,22 +445,53 @@ async fn run(specifier: deno_core::ModuleSpecifier, held: Held) -> Result<(), St
     match (answered, sink) {
         (Some(answer), Some(sink)) => sink(answer),
         (_, None) => {}
-        (None, Some(_)) => return Err("the handler returned without an answer".to_string()),
+        (None, Some(_)) => {
+            return Err(Failed::Threw(
+                "the handler returned without an answer".to_string(),
+            ));
+        }
     }
 
     // Whatever `EdgeRuntime.waitUntil` was given, until it settles or
     // until it has had long enough. A promise nobody resolves is not
     // an error a function is told about, and it is not a thread this
     // process keeps forever either.
-    let drained = js.call(&drain);
-    let waited = js.with_event_loop_promise(drained, PollEventLoopOptions::default());
-    match tokio::time::timeout(BACKGROUND, waited).await {
+    //
+    // This budget is the shorter of the two the background work is
+    // under: the call's wall clock is still running and still counts
+    // whatever the function did before it answered.
+    let drained = {
+        let _running = watch.running();
+        js.call(&drain)
+    };
+    let waited = watch.timing(js.with_event_loop_promise(drained, PollEventLoopOptions::default()));
+    match tokio::time::timeout(limits.background, waited).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(format!(
-            "{specifier}: work left after the answer failed: {e}"
+        Ok(Err(e)) => Err(why(
+            &specifier,
+            &watch,
+            format_args!("work left after the answer failed: {e}"),
         )),
-        Err(_) => Err(format!(
-            "{specifier}: work left after the answer was still running after {BACKGROUND:?} and was dropped"
-        )),
+        Err(_) => Err(Failed::Threw(format!(
+            "{specifier}: work left after the answer was still running after {:?} and was dropped",
+            limits.background
+        ))),
+    }
+}
+
+/// Why a step of a call ended badly.
+///
+/// The limit is asked about first because a terminated isolate does not
+/// explain itself: what v8 says about a function that was stopped
+/// halfway through is an uncaught null or a bare `execution terminated`,
+/// which tells an operator nothing about the number that was reached.
+fn why(
+    specifier: &deno_core::ModuleSpecifier,
+    watch: &Watch,
+    said: impl std::fmt::Display,
+) -> Failed {
+    match watch.reached() {
+        Some(what) => Failed::Limit(format!("{specifier}: {}", watch.sentence(what))),
+        None => Failed::Threw(format!("{specifier}: {said}")),
     }
 }

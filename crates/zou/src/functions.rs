@@ -169,7 +169,7 @@ mod tests {
             assert_eq!(answer.bytes(), b"hi");
         } else {
             let complaint = ran.expect_err("no engine to run it");
-            assert!(complaint.contains("zou-deno/isolate"), "{complaint}");
+            assert!(complaint.why().contains("zou-deno/isolate"), "{complaint}");
         }
     }
 }
