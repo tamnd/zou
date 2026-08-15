@@ -494,6 +494,10 @@ struct Postmasters {
     /// store urls instead of bytes. None and every one of them serves
     /// its own.
     passthrough: Option<Passthrough>,
+    /// The http port this node answers on, which is what a function is
+    /// told its own project's url is when the node has no domain to
+    /// build one out of.
+    http: u16,
     store: Arc<dyn CasStore>,
     state: Arc<State>,
 }
@@ -518,6 +522,63 @@ impl Postmasters {
                 .map_err(|e| format!("manifest: {e}"))?
                 .checkpoints
                 .is_empty()),
+        }
+    }
+
+    /// What is deployed under `/functions/v1` for this project, out of
+    /// its own prefix rather than off this node's disk.
+    ///
+    /// A node serving a thousand projects has none of their source, so
+    /// this is where a deployment becomes a directory again. The files
+    /// land under the tenant's own runtime directory, which is removed
+    /// when its postmaster goes, and what reads them is the same
+    /// listing reader a laptop serves through: a deployed project and a
+    /// local one differ in where the files came from and in nothing
+    /// after that.
+    ///
+    /// A deployment that cannot be read is logged and the project comes
+    /// up without it. The database is why a project is being attached,
+    /// and functions that will not load should not be able to hold it
+    /// down; every name answers the 404 upstream answers for a name
+    /// nobody deployed, and the log line says why.
+    fn functions(
+        &self,
+        entry: &Tenant,
+        dir: &Path,
+        pg_port: u16,
+    ) -> Option<Arc<zou_functions::Registry>> {
+        let tenant_ref = &entry.tenant_ref;
+        let found = match crate::bundle::materialize(&*self.store, tenant_ref, &dir.join("edge")) {
+            Ok(found) => found?,
+            Err(e) => {
+                log::error!("{tenant_ref}: {e}");
+                return None;
+            }
+        };
+        let (project, layout) = found;
+        let secret = entry.jwt_secret.as_bytes();
+        let mint = |role: &str| zou_server::jwt::mint(&zou_server::jwt::key_claims(role), secret);
+        // The url a function is told its project is at, which is the
+        // project's own domain when this node has one and this node
+        // otherwise. What it must not be is the loopback port a laptop
+        // would say, because a deployed function calling its own api
+        // through the wrong url is a call that leaves the project.
+        let url = match &self.domain {
+            Some(domain) => format!("https://{tenant_ref}.{domain}"),
+            None => format!("http://127.0.0.1:{}", self.http),
+        };
+        let env = crate::functions::env_at(
+            &url,
+            &mint("anon"),
+            &mint("service_role"),
+            &format!("postgresql://{SUPERUSER}@127.0.0.1:{pg_port}/postgres"),
+        );
+        match crate::functions::registry(&project, &layout, env) {
+            Ok(registry) => registry,
+            Err(e) => {
+                log::error!("{tenant_ref}: deployed functions: {e}");
+                None
+            }
         }
     }
 
@@ -689,6 +750,10 @@ impl Backend for Postmasters {
             }
         }
         boot.lap("recovery");
+        let functions = self.functions(entry, &dir, port);
+        if functions.is_some() {
+            boot.lap("functions");
+        }
         self.state
             .live
             .lock()
@@ -713,6 +778,10 @@ impl Backend for Postmasters {
             objects: Some(self.target.clone()),
             passthrough: self.passthrough,
             tenant: Some(tenant_ref.clone()),
+            // What this project deployed, which is None for the many
+            // that never have and is what `/functions/v1` answers out
+            // of for the ones that did.
+            functions,
             external_url: self
                 .domain
                 .as_ref()
@@ -866,6 +935,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             min_bytes,
             ttl: PASSTHROUGH_TTL,
         }),
+        http: args.http,
         store,
         state: Arc::new(State {
             dying: Mutex::new(HashMap::new()),

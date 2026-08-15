@@ -11,9 +11,12 @@
 //!   shards/<shard>/d-….dl         delta layers, WAL records by key
 //!   shards/<shard>/i-….il         image layers, pages at one lsn
 //!   files/…                       Storage API object bytes
+//!   functions/DEPLOYED            what is deployed under /functions/v1
+//!   functions/blobs/<sha256>      the files those functions are made of
 //! ```
 //!
-//! Everything except `MANIFEST` is immutable once written.
+//! Everything except `MANIFEST` and `functions/DEPLOYED` is immutable
+//! once written.
 
 use crate::layer::LayerKey;
 use crate::lsn::Lsn;
@@ -158,6 +161,32 @@ impl TenantLayout {
         format!("{}/files/", self.prefix)
     }
 
+    /// What is deployed under `/functions/v1` for this tenant: the
+    /// names, what each one starts at, and the sha256 of every file it
+    /// is made of.
+    ///
+    /// The second mutable object in the prefix, swapped with CAS by a
+    /// deploy and read by a node bringing the tenant up. It is not part
+    /// of the database manifest on purpose: a deploy happens from a
+    /// laptop while a postmaster holds the writer lease, and the two
+    /// must not be able to overwrite each other's work.
+    pub fn functions_manifest(&self) -> String {
+        format!("{}/functions/DEPLOYED", self.prefix)
+    }
+
+    /// One file of a deployment, keyed by the sha256 of its bytes, so a
+    /// redeploy that changed one file writes one object and a rollback
+    /// is a manifest that names the older shas.
+    pub fn functions_blob(&self, sha: &str) -> String {
+        format!("{}/functions/blobs/{sha}", self.prefix)
+    }
+
+    /// Everything a deployment is, for removing a tenant's functions
+    /// without touching its database.
+    pub fn functions_prefix(&self) -> String {
+        format!("{}/functions/", self.prefix)
+    }
+
     /// One shard of the layer store. Listed on attach to load the
     /// shard's layer map, swept by compaction gc.
     pub fn shard_prefix(&self, shard: u16) -> String {
@@ -216,12 +245,13 @@ impl TenantLayout {
         )
     }
 
-    /// Whether a key must never be overwritten. The tenant manifest
-    /// and the per shard manifests are the only mutable objects in the
-    /// prefix.
+    /// Whether a key must never be overwritten. The tenant manifest,
+    /// the per shard manifests and the deployed functions are the only
+    /// mutable objects in the prefix.
     pub fn is_immutable(&self, key: &str) -> bool {
         key.starts_with(&self.prefix)
             && key != self.manifest()
+            && key != self.functions_manifest()
             && !(key.ends_with("/SHARD") && key.starts_with(&format!("{}/shards/", self.prefix)))
     }
 }
@@ -248,6 +278,15 @@ mod tests {
             "tenants/acme-prod/chk/chk-000121/00000003.pages"
         );
         assert_eq!(t.files_prefix(), "tenants/acme-prod/files/");
+        assert_eq!(
+            t.functions_manifest(),
+            "tenants/acme-prod/functions/DEPLOYED"
+        );
+        assert_eq!(
+            t.functions_blob("6f2a"),
+            "tenants/acme-prod/functions/blobs/6f2a"
+        );
+        assert_eq!(t.functions_prefix(), "tenants/acme-prod/functions/");
         assert_eq!(t.shard_prefix(3), "tenants/acme-prod/shards/0003/");
         assert_eq!(t.shard_manifest(3), "tenants/acme-prod/shards/0003/SHARD");
         let lo = LayerKey::page(1663, 5, 16384, 0, 0);
@@ -278,6 +317,8 @@ mod tests {
         let t = TenantLayout::new("acme");
         assert!(!t.is_immutable(&t.manifest()));
         assert!(!t.is_immutable(&t.shard_manifest(7)));
+        assert!(!t.is_immutable(&t.functions_manifest()));
+        assert!(t.is_immutable(&t.functions_blob("6f2a")));
         assert!(t.is_immutable(&t.checkpoint_page_index("chk-1")));
         assert!(t.is_immutable(&t.manifest_history(1, 1000)));
         let k = LayerKey::page(1, 1, 1, 0, 0);

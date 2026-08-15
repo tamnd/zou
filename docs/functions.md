@@ -119,6 +119,60 @@ Editing a function's own source is not in that list, because it is already handl
 The ports are the one thing a reload cannot move.
 This process is already listening on one and already telling every function about the other, so changing either in the config file needs the command restarted.
 
+## Deploying them
+
+A laptop serves functions off a directory. A node serving a thousand projects has none of their directories, so a deploy is what turns the first into the second: the files go into the project's own prefix on the store, and a node that brings the project up reads them back out.
+
+```
+zou functions deploy --target s3://bucket --ref acme
+```
+
+```
+deployed hello to acme on s3://bucket
+2 files, 2 of them new, 118 bytes uploaded
+  /functions/v1/hello
+```
+
+Names limit it to some of them, and no name at all is all of them, which is what `supabase functions deploy` with no slug does.
+A deploy is a merge, so deploying one function leaves the others where they are.
+What is deployed is what would have been served: a function `enabled = false` switches off is not deployed, and a directory with no entrypoint in it is not either.
+
+| Flag | What it does |
+| --- | --- |
+| `--target <store>` | The store the project lives on, or `ZOU_TARGET`. |
+| `--ref <tenant>` | Which project on it, or `ZOU_TENANT`, or the config file's `project_id`, which is the field upstream's `--project-ref` names. |
+| `--import-map <path>` | One map for every function of this deploy, the same as on `serve`. |
+| `--no-verify-jwt` | Deploy them callable without a token. |
+| `--config <path>`, `--no-config` | Which `config.toml` to read, or none at all. |
+
+`zou functions list` prints what is deployed right now, which is the question worth asking before changing it.
+
+What a deploy carries is the function's own directory and every `_`-prefixed directory beside it, which is the shared code convention, plus whatever the config file pointed `entrypoint` and `import_map` at.
+Remote imports stay remote: an `npm:`, `jsr:` or `https:` specifier is resolved by the node that runs the function, through the module cache it already has.
+A `.env` is never carried, and neither is anything else whose name starts with a dot.
+The secrets a deployed function gets come from the project rather than from whatever was on the laptop that ran the deploy.
+
+In the store it looks like this.
+
+```text
+tenants/<ref>/functions/DEPLOYED           the names and what each is made of
+tenants/<ref>/functions/blobs/<sha256>     the bytes, once each
+```
+
+Files are addressed by the hash of their contents, so a redeploy of a project where one file changed writes one object, and a rollback is a manifest naming older hashes.
+`DEPLOYED` is swapped with a compare and swap, so two people deploying at once resolve to one of them rather than to half of each.
+It is the second mutable object in a tenant's prefix and it is deliberately not part of the database manifest: a deploy happens from a laptop while a postmaster somewhere else holds the writer lease, and the two must not be able to overwrite each other's work.
+
+A node brings a deployment back to a directory under the project's runtime directory and serves it through the same listing reader a laptop uses, so a deployed project and a local one differ in where the files came from and in nothing after that.
+Every file is checked against the hash that named it on the way in.
+A deployment that cannot be read is logged and the project comes up without it, because the database is why a project is being attached and functions that will not load should not be able to hold it down.
+
+`SUPABASE_URL` inside a deployed function is the project's own url, `https://<ref>.<domain>` on a node that was given a domain, and not the address of the machine it happens to be running on.
+
+A deployment is read when the project is attached, so a redeploy is picked up the next time that happens rather than under a node that is already holding the project up.
+On a node that lets go of idle projects, which is the default, that is the next request after the project has been quiet.
+Making a redeploy visible to a node that is already serving the project is a poll or a push and both cost something at a thousand projects, so it is written down here rather than guessed at.
+
 ## config.toml
 
 The same file the project already has.
