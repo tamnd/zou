@@ -417,6 +417,20 @@ fn layout(
         out.inspector_port = Some(port);
         read.push("edge_runtime.inspector_port".to_string());
     }
+    // `deno_version` is which Deno the CLI's runtime is, and it is one
+    // of two numbers: 1 pulls the older image and 2 is what the current
+    // one already runs. This server has one runtime and it is the
+    // second, so 2 is read and anything else is left unread and named
+    // by `zou status`, the same as a policy nothing knows. What a
+    // function is told the runtime is, `Deno.version`, says the same
+    // thing from the other side.
+    if table
+        .get("edge_runtime.deno_version")
+        .and_then(Value::as_int)
+        == Some(2)
+    {
+        read.push("edge_runtime.deno_version".to_string());
+    }
     // `enabled` under `[edge_runtime]` is the container the CLI starts,
     // which this server is instead of, so it is read and then nothing
     // happens: a project that switched the runtime off should not be
@@ -861,6 +875,7 @@ port = 54323
 enabled = true
 policy = "oneshot"
 inspector_port = 8083
+deno_version = 2
 
 [functions.hello]
 verify_jwt = false
@@ -966,6 +981,26 @@ static_files = ["./functions/other/index.html"]
             "the default, rather than a word nothing knows"
         );
         assert_eq!(p.unread, ["edge_runtime.policy"]);
+    }
+
+    #[test]
+    fn the_deno_this_runtime_is_is_the_only_one_it_can_be_told_to_be() {
+        let two = parse("[edge_runtime]\ndeno_version = 2\n").unwrap();
+        assert!(
+            !Project::from_table(&two, &|_| None)
+                .unread
+                .iter()
+                .any(|k| k == "edge_runtime.deno_version"),
+            "2 is what this runtime is"
+        );
+        for asked in ["1", "3", "\"two\""] {
+            let table = parse(&format!("[edge_runtime]\ndeno_version = {asked}\n")).unwrap();
+            assert_eq!(
+                Project::from_table(&table, &|_| None).unread,
+                ["edge_runtime.deno_version"],
+                "deno_version = {asked} is not something this server can be"
+            );
+        }
     }
 
     #[test]

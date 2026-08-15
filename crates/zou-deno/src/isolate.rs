@@ -169,6 +169,48 @@ fn op_zou_env(state: &mut OpState) -> std::collections::BTreeMap<String, String>
     held.env.iter().cloned().collect()
 }
 
+/// What `Deno.version` says, which is three strings a function is
+/// allowed to read and nothing is allowed to depend on.
+///
+/// The shape is upstream's, measured on `supabase/edge-runtime` 1.74.2
+/// rather than guessed: `deno` is the runtime naming itself and then
+/// the Deno release its surface is written against, in brackets, which
+/// there reads `supabase-edge-runtime-1.74.2 (compatible with Deno
+/// v2.1.4)`. So nothing there is a bare version number either, and a
+/// function comparing this string against one is already wrong on
+/// upstream before it is wrong here.
+#[op2]
+#[serde]
+fn op_zou_version() -> Version {
+    Version {
+        deno: format!(
+            "zou-{} (compatible with Deno v{DENO})",
+            env!("CARGO_PKG_VERSION")
+        ),
+        v8: v8::VERSION_STRING.to_string(),
+        typescript: TYPESCRIPT.to_string(),
+    }
+}
+
+/// The Deno release this runtime's surface is written against, which is
+/// the one upstream's runtime names, because the gaps in it are written
+/// down in `docs/functions.md` and measured against that.
+const DENO: &str = "2.1.4";
+
+/// The highest typescript release whose syntax this transpiler is
+/// tested against, in `tests/typescript.rs`: `satisfies` and `accessor`
+/// from 4.9, `const` type parameters and decorators from 5.0, `using`
+/// from 5.2 and import attributes from 5.3. It moves when a test for a
+/// later release's syntax is written, and not before.
+const TYPESCRIPT: &str = "5.3.3";
+
+#[derive(serde::Serialize)]
+struct Version {
+    deno: String,
+    v8: String,
+    typescript: String,
+}
+
 /// What one of the four read calls got, which is one of four things and
 /// not a value or a throw.
 ///
@@ -238,6 +280,7 @@ deno_core::extension!(
         op_zou_chunk_fail,
         op_zou_env_get,
         op_zou_env,
+        op_zou_version,
         op_zou_read_file,
         op_zou_read_file_sync,
         crypto::op_zou_random,
