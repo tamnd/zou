@@ -278,6 +278,48 @@ The body is upstream's three fields, `code`, `message` and `msg`, with the same 
 
 The code the caller gets is decided by the token's header alone and not by why it failed, which is upstream's behaviour and was measured rather than guessed: a well formed `RS256` token this project has never seen and a garbage one both come back `UNAUTHORIZED_ASYMMETRIC_JWT`.
 
+## CORS
+
+A preflight to `/functions/v1/<name>` is the function's to answer, so the `_shared/cors.ts` pattern every Supabase example is written around works here as written.
+
+```ts
+import { corsHeaders } from "../_shared/cors.ts";
+
+Deno.serve((req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+  return new Response(JSON.stringify({ hello: "world" }), {
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+});
+```
+
+An `OPTIONS` is never checked against `verify_jwt`, whatever the function's setting, because a browser sends no `Authorization` on a preflight.
+Any other method is checked as usual, and the check is on the method alone, which is what upstream's runtime does: the same call sent as `HEAD` with no token is `UNAUTHORIZED_NO_AUTH_HEADER`.
+
+Whatever CORS headers a function sets are the ones the caller gets, on a preflight and on an answer both.
+A function that allows one origin still allows one origin.
+
+A function that says nothing about CORS gets an answer from the server instead, so a project that never wrote a `cors.ts` still works from a browser:
+
+| | |
+| --- | --- |
+| Status | 204 |
+| `Access-Control-Allow-Origin` | the caller's `Origin`, mirrored |
+| `Access-Control-Allow-Credentials` | `true` |
+| `Access-Control-Allow-Methods` | `GET, POST, PATCH, PUT, DELETE, OPTIONS, HEAD` |
+| `Access-Control-Allow-Headers` | whatever the preflight asked for |
+| `Access-Control-Max-Age` | `86400` |
+
+That is the same answer every other surface here gives a preflight, and a name nobody deployed gets it too, rather than the 404 the call after it would get.
+
+Upstream is two different things here and this is neither of them exactly, so the differences are worth stating.
+On `supabase start` the gateway answers every preflight itself, function or not, with a 200, `Access-Control-Allow-Origin: *`, and `GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS,TRACE,CONNECT`, and a function's own `OPTIONS` handler never runs.
+That gateway also replaces the `Access-Control-Allow-Origin` a function set with `*` on ordinary answers, which quietly widens a function that meant to allow one origin.
+The hosted platform does the other thing: the runtime hands the `OPTIONS` to the function, adds no header of its own, and a function that handles no CORS is one a browser cannot call, which is why the pattern above is in every example.
+Here the function is authoritative like the hosted platform, and the server answers for a function that did not like the local stack, and nothing a function says about an origin is ever widened.
+
 ## What the handler is given
 
 `req.url` is the url the runtime was reached on, `http://127.0.0.1:<port>/functions/v1/<name>` with the path after the name and the query string on it, not the public url a caller typed.
