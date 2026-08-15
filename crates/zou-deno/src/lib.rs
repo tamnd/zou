@@ -25,9 +25,10 @@
 //!
 //! - `crypto.subtle` is a digest and HMAC and no more: no encryption,
 //!   no key derivation, no asymmetric algorithms, each refused by name.
-//! - Streams are not there. A `ReadableStream` body throws by name, and
-//!   `fetch` collects an answer before handing it back, so a blob's
-//!   `stream()` throws too.
+//! - Streams are readable only. There is no `WritableStream` and so no
+//!   `pipeTo`, no byte stream and no BYOB reader, and a response body
+//!   is collected before it is sent rather than reaching the caller in
+//!   chunks.
 //! - A timer only fires while there is a call for it to fire in,
 //!   which is until the answer plus whatever `EdgeRuntime.waitUntil`
 //!   is still waiting for, and thirty seconds is the ceiling on that.
@@ -37,6 +38,7 @@
 //! What is there is `Headers`, `Request`, `Response`, `URL`,
 //! `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, the timers,
 //! `EdgeRuntime.waitUntil`, `WebSocket` and the events it dispatches,
+//! `ReadableStream`,
 //! `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`,
 //! `Deno.serve`, `Deno.env` and `fetch`, which is enough to run a
 //! handler that reads a request, calls something else and answers, and
@@ -63,6 +65,12 @@
 //! the answer is handed over the moment the handler has one and the
 //! call goes on afterwards, so a caller is never made to wait for work
 //! that was moved off its critical path on purpose.
+//!
+//! Streams are javascript for the same reason bodies are: a readable
+//! stream is a queue, the readers waiting on it and a source's three
+//! functions, and none of that is work for the host. Every body is one,
+//! whichever way it was made, which is what `req.body` and `res.body`
+//! being real means.
 //!
 //! `WebSocket` is the client half of a protocol this repository already
 //! speaks the server half of, so it is `tokio-tungstenite` with its
