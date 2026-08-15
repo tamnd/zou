@@ -108,6 +108,8 @@ mod limits;
 #[cfg(feature = "isolate")]
 mod module;
 #[cfg(feature = "isolate")]
+mod pool;
+#[cfg(feature = "isolate")]
 mod timer;
 #[cfg(feature = "isolate")]
 mod url;
@@ -120,7 +122,8 @@ pub use isolate::Isolate;
 pub use limits::Limits;
 
 /// What this build runs a function with, given the environment every
-/// function of the project will see.
+/// function of the project will see and the policy the project's
+/// `config.toml` asked for.
 ///
 /// The switch lives here rather than in whatever links this crate,
 /// because the question "is there an engine" is this crate's own and
@@ -129,14 +132,17 @@ pub use limits::Limits;
 /// `--all-features` build of the workspace should not pull V8 in by
 /// accident, so the feature that does it is spelled `zou-deno/isolate`
 /// and nothing enables it on anyone's behalf.
-pub fn engine(env: Vec<(String, String)>) -> std::sync::Arc<dyn zou_functions::Runtime> {
+pub fn engine(
+    env: Vec<(String, String)>,
+    policy: zou_functions::Policy,
+) -> std::sync::Arc<dyn zou_functions::Runtime> {
     #[cfg(feature = "isolate")]
     {
-        std::sync::Arc::new(isolate::Isolate::with_env(env))
+        std::sync::Arc::new(isolate::Isolate::with_env(env).with_policy(policy))
     }
     #[cfg(not(feature = "isolate"))]
     {
-        let _ = env;
+        let _ = (env, policy);
         std::sync::Arc::new(absent::Absent)
     }
 }

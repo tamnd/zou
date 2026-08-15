@@ -1,17 +1,21 @@
-//! One call, one isolate.
+//! What a call runs in, under either of upstream's two policies.
 //!
-//! This is upstream's `oneshot` policy and nothing else yet: a v8
-//! isolate is created for the call, the function's module is loaded and
-//! evaluated in it, the handler is called once, and the isolate is
-//! dropped. That is the honest starting point, because a pool is a
-//! decision about what a function may keep between calls and that
-//! decision deserves its own change rather than being smuggled in with
-//! the engine.
+//! A call is two halves, and they are separate here because the policy
+//! is the question of how long the first half lives. `Ready` is an
+//! isolate with the function's module loaded, transpiled and evaluated
+//! in it, and `Ready::once` is one invocation in that isolate.
 //!
-//! It is also the reason `Runtime::invoke` is sync. An isolate is
-//! thread bound state, so it is built and driven on the blocking thread
-//! the server already handed us, on a current thread tokio runtime of
-//! its own, and nothing about it is ever moved anywhere else.
+//! Under `oneshot` a `Ready` is built for the call and dropped after
+//! it, which is `once_off` below and is what the hosted service does.
+//! Under `per_worker` it is kept and called again, which is `pool` and
+//! is what the CLI does, hot reload and all.
+//!
+//! Either way an isolate is thread bound state, which is why
+//! `Runtime::invoke` is sync: `oneshot` builds and drives it on the
+//! blocking thread the server already handed us, on a current thread
+//! tokio runtime of its own, and `per_worker` hands the call to the
+//! thread its isolate already lives on. Nothing about an isolate is
+//! ever moved anywhere else.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -21,13 +25,15 @@ use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, op2, v
 use deno_error::JsErrorBox;
 use zou_functions::{Answer, Call, Failed, Function, Runtime, Sink, Writer};
 
+use zou_functions::Policy;
+
 use crate::limits::{Limits, Watch};
-use crate::{crypto, fetch, limits, module, timer, url, websocket};
+use crate::{crypto, fetch, limits, module, pool, timer, url, websocket};
 
 /// What the isolate is told about the call it is running, and what it
 /// left behind afterwards. Both live in the runtime's op state, which
 /// is the only place ops can reach.
-struct Held {
+pub(crate) struct Held {
     call: Call,
     peer: String,
     env: Vec<(String, String)>,
@@ -181,7 +187,8 @@ deno_core::extension!(
     ]
 );
 
-/// A v8 isolate per call.
+/// The engine, which is a v8 isolate per call or a v8 isolate per
+/// function depending on the policy it was built with.
 ///
 /// The environment is the same for every function this runtime serves,
 /// which is what a project's secrets are: `Deno.env` inside a function
@@ -191,6 +198,10 @@ deno_core::extension!(
 pub struct Isolate {
     env: Vec<(String, String)>,
     limits: Limits,
+    policy: Policy,
+    /// The isolates kept between calls, which is nothing at all under
+    /// `oneshot` and is where every call goes under `per_worker`.
+    pool: pool::Pool,
 }
 
 /// Upstream's one per invocation variable, which the call carries and
@@ -199,10 +210,7 @@ const EXECUTION_ID: &str = "SB_EXECUTION_ID";
 
 impl Isolate {
     pub fn new() -> Isolate {
-        Isolate {
-            env: Vec::new(),
-            limits: Limits::default(),
-        }
+        Isolate::with_env(Vec::new())
     }
 
     /// The environment every function this runtime serves will see.
@@ -210,6 +218,11 @@ impl Isolate {
         Isolate {
             env,
             limits: Limits::default(),
+            // A fresh isolate per call is the shape that needs nothing
+            // explained, so it is what this is until somebody asks for
+            // the other one. The server asks, out of `config.toml`.
+            policy: Policy::OneShot,
+            pool: pool::Pool::default(),
         }
     }
 
@@ -217,6 +230,13 @@ impl Isolate {
     /// what a deployment that knows its own functions may want.
     pub fn with_limits(mut self, limits: Limits) -> Isolate {
         self.limits = limits;
+        self
+    }
+
+    /// Upstream's `[edge_runtime] policy`: a fresh isolate per call, or
+    /// one kept between calls per function.
+    pub fn with_policy(mut self, policy: Policy) -> Isolate {
+        self.policy = policy;
         self
     }
 }
@@ -304,45 +324,103 @@ impl Runtime for Isolate {
             sink: Some(answer),
             writing: None,
         };
+        if self.policy == Policy::PerWorker {
+            // Somebody else's thread, which already has an isolate with
+            // this function in it, or is about to.
+            return self.pool.run(&specifier, held, self.limits);
+        }
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("the isolate could not have a runtime: {e}"))?;
-        // The wall clock is watched twice, from the two sides a call can
-        // overrun on. This timer is the one that catches a function
-        // that is asleep, because terminating execution does not wake a
-        // sleeper, and the watchdog inside is the one that catches a
-        // function that never gives its thread back.
         let limits = self.limits;
-        let named = specifier.to_string();
-        tokio.block_on(async move {
-            match tokio::time::timeout(limits.wall, run(specifier, held, limits)).await {
-                Ok(ran) => ran,
-                Err(_) => Err(Failed::Limit(format!(
-                    "{named}: it was still running after the {:?} it is allowed",
-                    limits.wall
-                ))),
-            }
-        })
+        tokio.block_on(once_off(specifier, held, limits))
     }
 
     fn describe(&self) -> String {
-        "a v8 isolate per call".to_string()
+        match self.policy {
+            Policy::OneShot => "a v8 isolate per call".to_string(),
+            Policy::PerWorker => "a v8 isolate per function, kept between calls".to_string(),
+        }
     }
 }
 
-async fn run(
+/// A call in an isolate of its own, which is thrown away afterwards.
+///
+/// The wall clock is watched twice, from the two sides a call can
+/// overrun on. This timer is the one that catches a function that is
+/// asleep, because terminating execution does not wake a sleeper, and
+/// the watchdog inside is the one that catches a function that never
+/// gives its thread back.
+pub(crate) async fn once_off(
     specifier: deno_core::ModuleSpecifier,
     held: Held,
     limits: Limits,
 ) -> Result<(), Failed> {
+    let named = specifier.to_string();
+    let call = async move {
+        let mut ready = Ready::new(specifier, limits).await?;
+        ready.once(held).await
+    };
+    match tokio::time::timeout(limits.wall, call).await {
+        Ok(ran) => ran,
+        Err(_) => Err(Failed::Limit(format!(
+            "{named}: it was still running after the {:?} it is allowed",
+            limits.wall
+        ))),
+    }
+}
+
+/// An isolate with a function's module evaluated in it, waiting to be
+/// called.
+///
+/// Under `oneshot` one of these is built and dropped per call, and
+/// under `per_worker` one is built and called until something makes it
+/// unfit: a limit reached, which leaves the isolate terminated, or a
+/// file it was built out of changing on disk, which is hot reload.
+pub(crate) struct Ready {
+    js: JsRuntime,
+    entry: v8::Global<v8::Function>,
+    drain: v8::Global<v8::Function>,
+    watch: Arc<Watch>,
+    handle: v8::IsolateHandle,
+    specifier: deno_core::ModuleSpecifier,
+    limits: Limits,
+    /// The files that went into it, for the question hot reload asks.
+    read: module::Reads,
+}
+
+impl Ready {
+    pub(crate) async fn new(
+        specifier: deno_core::ModuleSpecifier,
+        limits: Limits,
+    ) -> Result<Ready, Failed> {
+        build(specifier, limits).await
+    }
+
+    /// Whether a file this was built out of has moved since it was.
+    pub(crate) fn stale(&self) -> bool {
+        module::changed(&self.read)
+    }
+
+    /// Whether this isolate has reached a limit, which is the end of it
+    /// whatever the call it was reached in went on to do: what v8 does
+    /// to a terminated isolate is not somewhere the next call should
+    /// start from.
+    pub(crate) fn spent(&self) -> bool {
+        self.watch.reached().is_some()
+    }
+}
+
+async fn build(specifier: deno_core::ModuleSpecifier, limits: Limits) -> Result<Ready, Failed> {
     // Everything that stops this call is set up before any of the
     // function's own code has run, including the module it is in, and
     // two of the three have to be in place before the isolate exists at
     // all rather than after it.
     let watch = Watch::new(limits);
+    let (loader, read) = module::loader();
     let mut js = JsRuntime::new(RuntimeOptions {
-        module_loader: Some(module::loader()),
+        module_loader: Some(loader),
         extensions: vec![zou::init()],
         // The memory limits are v8's heap and, because a buffer is not
         // on that heap, an allocator that counts what the function asks
@@ -355,9 +433,8 @@ async fn run(
         ..Default::default()
     });
     let handle = js.v8_isolate().thread_safe_handle();
-    let _watchdog = limits::watch(handle.clone(), Arc::clone(&watch), limits);
-    js.add_near_heap_limit_callback(limits::near_heap_limit(handle, Arc::clone(&watch)));
-    js.op_state().borrow_mut().put(held);
+    let watchdog = limits::watch(handle.clone(), Arc::clone(&watch), limits);
+    js.add_near_heap_limit_callback(limits::near_heap_limit(handle.clone(), Arc::clone(&watch)));
     js.op_state().borrow_mut().put(timer::Pending::default());
     js.op_state()
         .borrow_mut()
@@ -415,67 +492,108 @@ async fn run(
         let drain = held.pop().expect("two of them");
         (held.pop().expect("two of them"), drain)
     };
-    // The same again, and this is the one that matters: a handler that
-    // is not async runs to its end inside `call`, so a function that
-    // never returns never returns from here.
-    let called = {
-        let _running = watch.running();
-        js.call(&entry)
-    };
-    watch
-        .timing(js.with_event_loop_promise(called, PollEventLoopOptions::default()))
-        .await
-        .map_err(|e| why(&specifier, &watch, e))?;
+    drop(watchdog);
+    Ok(Ready {
+        js,
+        entry,
+        drain,
+        watch,
+        handle,
+        specifier,
+        limits,
+        read,
+    })
+}
 
-    // The answer goes now, not when this function returns, because
-    // what is left to do after it is the function's own business and
-    // the caller is not a party to it.
-    //
-    // A streamed answer has already gone, from inside the op that
-    // started it, and the body finished arriving before the handler's
-    // promise resolved. So the sink being gone is the whole test for
-    // whether the caller has been answered, and having neither a sink
-    // nor an answer is the only way to have answered nobody.
-    let (answered, sink) = {
-        let state = js.op_state();
-        let mut state = state.borrow_mut();
-        let held = state.borrow_mut::<Held>();
-        (held.answered.take(), held.sink.take())
-    };
-    match (answered, sink) {
-        (Some(answer), Some(sink)) => sink(answer),
-        (_, None) => {}
-        (None, Some(_)) => {
-            return Err(Failed::Threw(
-                "the handler returned without an answer".to_string(),
-            ));
+impl Ready {
+    /// One call in this isolate.
+    pub(crate) async fn once(&mut self, held: Held) -> Result<(), Failed> {
+        let Ready {
+            js,
+            entry,
+            drain,
+            watch,
+            handle,
+            specifier,
+            limits,
+            ..
+        } = self;
+        let limits = *limits;
+        // The clocks are the call's and not the isolate's, so an
+        // isolate on its tenth call has the same two seconds as one on
+        // its first. What is not reset is the memory, which is the
+        // isolate's for as long as it lives and is the reason a pooled
+        // isolate can reach a limit a fresh one would not.
+        watch.restart();
+        let watchdog = limits::watch(handle.clone(), Arc::clone(watch), limits);
+        js.op_state().borrow_mut().put(held);
+
+        // The same again, and this is the one that matters: a handler
+        // that is not async runs to its end inside `call`, so a
+        // function that never returns never returns from here.
+        let called = {
+            let _running = watch.running();
+            js.call(entry)
+        };
+        watch
+            .timing(js.with_event_loop_promise(called, PollEventLoopOptions::default()))
+            .await
+            .map_err(|e| why(specifier, watch, e))?;
+
+        // The answer goes now, not when this function returns, because
+        // what is left to do after it is the function's own business
+        // and the caller is not a party to it.
+        //
+        // A streamed answer has already gone, from inside the op that
+        // started it, and the body finished arriving before the
+        // handler's promise resolved. So the sink being gone is the
+        // whole test for whether the caller has been answered, and
+        // having neither a sink nor an answer is the only way to have
+        // answered nobody.
+        let (answered, sink) = {
+            let state = js.op_state();
+            let mut state = state.borrow_mut();
+            let held = state.borrow_mut::<Held>();
+            (held.answered.take(), held.sink.take())
+        };
+        match (answered, sink) {
+            (Some(answer), Some(sink)) => sink(answer),
+            (_, None) => {}
+            (None, Some(_)) => {
+                return Err(Failed::Threw(
+                    "the handler returned without an answer".to_string(),
+                ));
+            }
         }
-    }
 
-    // Whatever `EdgeRuntime.waitUntil` was given, until it settles or
-    // until it has had long enough. A promise nobody resolves is not
-    // an error a function is told about, and it is not a thread this
-    // process keeps forever either.
-    //
-    // This budget is the shorter of the two the background work is
-    // under: the call's wall clock is still running and still counts
-    // whatever the function did before it answered.
-    let drained = {
-        let _running = watch.running();
-        js.call(&drain)
-    };
-    let waited = watch.timing(js.with_event_loop_promise(drained, PollEventLoopOptions::default()));
-    match tokio::time::timeout(limits.background, waited).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => Err(why(
-            &specifier,
-            &watch,
-            format_args!("work left after the answer failed: {e}"),
-        )),
-        Err(_) => Err(Failed::Threw(format!(
-            "{specifier}: work left after the answer was still running after {:?} and was dropped",
-            limits.background
-        ))),
+        // Whatever `EdgeRuntime.waitUntil` was given, until it settles
+        // or until it has had long enough. A promise nobody resolves is
+        // not an error a function is told about, and it is not a thread
+        // this process keeps forever either.
+        //
+        // This budget is the shorter of the two the background work is
+        // under: the call's wall clock is still running and still
+        // counts whatever the function did before it answered.
+        let drained = {
+            let _running = watch.running();
+            js.call(drain)
+        };
+        let waited =
+            watch.timing(js.with_event_loop_promise(drained, PollEventLoopOptions::default()));
+        let ended = match tokio::time::timeout(limits.background, waited).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(why(
+                specifier,
+                watch,
+                format_args!("work left after the answer failed: {e}"),
+            )),
+            Err(_) => Err(Failed::Threw(format!(
+                "{specifier}: work left after the answer was still running after {:?} and was dropped",
+                limits.background
+            ))),
+        };
+        drop(watchdog);
+        ended
     }
 }
 

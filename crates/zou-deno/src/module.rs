@@ -22,9 +22,11 @@
 //! start does not repeat the first one's downloads and a deployment can
 //! be handed a warm cache instead of a network.
 
+use std::cell::RefCell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use deno_core::{
     ModuleLoadResponse, ModuleLoader, ModuleResolveResponse, ModuleSource, ModuleSourceCode,
@@ -47,6 +49,34 @@ pub struct Disk {
     /// Whether this server may fetch at all. A deployment that warmed
     /// its cache and wants a cold start that touches nothing sets it.
     cached_only: bool,
+    /// Every file off this disk that went into the isolate, and what
+    /// its clock said at the time. An isolate kept between calls is
+    /// only the function that was deployed for as long as none of these
+    /// has moved, which is what hot reload is.
+    read: Reads,
+}
+
+/// The files an isolate was built out of, shared with whoever is going
+/// to ask whether they have changed. An `Rc` because a module loader
+/// belongs to one isolate and an isolate belongs to one thread.
+pub type Reads = Rc<RefCell<Vec<(PathBuf, Option<SystemTime>)>>>;
+
+/// Whether any file that went into an isolate has changed since it did.
+///
+/// A file that has been deleted counts as changed, and so does one
+/// whose modification time the filesystem will not say: the answer to
+/// not knowing is to build the isolate again, which costs a cold start
+/// and cannot serve anybody stale code.
+pub fn changed(read: &Reads) -> bool {
+    read.borrow()
+        .iter()
+        .any(|(path, when)| &mtime(path) != when)
+}
+
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|it| it.modified().ok())
 }
 
 impl Disk {
@@ -58,6 +88,7 @@ impl Disk {
                 .unwrap_or_else(|| REGISTRY.to_string()),
             cache: named("ZOU_MODULE_CACHE").map_or_else(ordinary, PathBuf::from),
             cached_only: named("ZOU_MODULE_CACHE_ONLY").is_some(),
+            read: Reads::default(),
         }
     }
 }
@@ -127,6 +158,10 @@ impl ModuleLoader for Disk {
         _options: deno_core::ModuleLoadOptions,
     ) -> ModuleLoadResponse {
         if specifier.scheme() == "file" {
+            if let Ok(path) = specifier.to_file_path() {
+                let when = mtime(&path);
+                self.read.borrow_mut().push((path, when));
+            }
             return ModuleLoadResponse::Sync(read(specifier));
         }
         let asked = specifier.clone();
@@ -376,9 +411,12 @@ fn fetch(asked: &ModuleSpecifier) -> Result<Fetched, JsErrorBox> {
     })
 }
 
-/// The loader an isolate is built with.
-pub fn loader() -> Rc<dyn ModuleLoader> {
-    Rc::new(Disk::new())
+/// The loader an isolate is built with, and the list of files it will
+/// fill in as it reads them.
+pub fn loader() -> (Rc<dyn ModuleLoader>, Reads) {
+    let disk = Disk::new();
+    let read = Rc::clone(&disk.read);
+    (Rc::new(disk), read)
 }
 
 #[cfg(test)]
@@ -396,6 +434,7 @@ mod tests {
             registry: REGISTRY.to_string(),
             cache: PathBuf::from("/nowhere"),
             cached_only: true,
+            read: Reads::default(),
         }
     }
 
