@@ -36,7 +36,7 @@ mod secrets;
 mod statics;
 
 pub use project::{Layout, Settings, read};
-pub use secrets::{env_file, read as secrets};
+pub use secrets::{env_file, from as secrets_from, read as secrets};
 pub use statics::Statics;
 
 /// One function, as far as anything in front of the runtime cares.
@@ -428,9 +428,16 @@ impl Runtime for Hosted {
 /// directories a project keeps beside its functions, never becomes an
 /// entry, so the lookup a request does is the whole of the question
 /// `is there a function here`.
+///
+/// Both halves are behind a lock because both of them change while the
+/// server is up. A dev loop watching the disk writes a new listing in
+/// when a function directory appears or goes away, and a new runtime in
+/// when the secrets those functions run with change, and a request that
+/// arrives in the middle of either gets the whole of one side or the
+/// whole of the other rather than half of each.
 pub struct Registry {
-    served: BTreeMap<String, Function>,
-    runtime: Arc<dyn Runtime>,
+    served: std::sync::RwLock<BTreeMap<String, Function>>,
+    runtime: std::sync::RwLock<Arc<dyn Runtime>>,
 }
 
 impl Registry {
@@ -438,8 +445,10 @@ impl Registry {
     /// and the tests both end up calling.
     pub fn new(functions: Vec<Function>, runtime: Arc<dyn Runtime>) -> Registry {
         Registry {
-            served: functions.into_iter().map(|f| (f.name.clone(), f)).collect(),
-            runtime,
+            served: std::sync::RwLock::new(
+                functions.into_iter().map(|f| (f.name.clone(), f)).collect(),
+            ),
+            runtime: std::sync::RwLock::new(runtime),
         }
     }
 
@@ -455,24 +464,57 @@ impl Registry {
 
     /// The function under `name`, or None, which the caller answers
     /// `Function not found` to.
-    pub fn lookup(&self, name: &str) -> Option<&Function> {
-        self.served.get(name)
+    ///
+    /// A copy rather than a borrow, because what is served can be
+    /// replaced under a running server and a call must not hold the
+    /// listing open for as long as it takes to run.
+    pub fn lookup(&self, name: &str) -> Option<Function> {
+        self.read().get(name).cloned()
     }
 
     /// The names served, in order, which is what the dev loop prints
     /// at boot the way `supabase functions serve` does.
-    pub fn names(&self) -> impl Iterator<Item = &str> {
-        self.served.keys().map(String::as_str)
+    pub fn names(&self) -> Vec<String> {
+        self.read().keys().cloned().collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.served.is_empty()
+        self.read().is_empty()
+    }
+
+    /// Serve this list from now on, which is a dev loop noticing that
+    /// the disk changed.
+    ///
+    /// The runtime is left alone on purpose: it is what holds the
+    /// isolates that are kept between calls, so a function directory
+    /// appearing beside them does not cost every other function its
+    /// warm start.
+    pub fn reload(&self, functions: Vec<Function>) {
+        *self
+            .served
+            .write()
+            .expect("a listing is only ever swapped whole") =
+            functions.into_iter().map(|f| (f.name.clone(), f)).collect();
+    }
+
+    /// Run them on this from now on, which is a dev loop noticing that
+    /// what a function runs with changed.
+    ///
+    /// The old runtime is dropped as soon as the calls inside it are
+    /// done, and everything it was keeping goes with it, which is the
+    /// point: an isolate built with the old secrets in its `Deno.env`
+    /// must not answer a call made after they changed.
+    pub fn run_on(&self, runtime: Arc<dyn Runtime>) {
+        *self
+            .runtime
+            .write()
+            .expect("a runtime is only ever swapped whole") = runtime;
     }
 
     /// Run one. Blocking, so the caller owes it a thread that is
     /// allowed to block.
     pub fn invoke(&self, function: &Function, call: Call) -> Result<Answer, Failed> {
-        self.runtime.invoke(function, call)
+        self.runtime().invoke(function, call)
     }
 
     /// Run one, and hand the answer over as soon as the handler has
@@ -484,11 +526,31 @@ impl Registry {
         call: Call,
         answer: Sink,
     ) -> Result<(), Failed> {
-        self.runtime.invoke_answering(function, call, answer)
+        self.runtime().invoke_answering(function, call, answer)
     }
 
     pub fn describe(&self) -> String {
-        self.runtime.describe()
+        self.runtime().describe()
+    }
+
+    /// The listing, held open for as long as the caller is reading it
+    /// and no longer.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, Function>> {
+        self.served
+            .read()
+            .expect("a listing is never held over a call")
+    }
+
+    /// The runtime a call is about to go to, as a handle rather than a
+    /// borrow: a call takes as long as the function does, and the lock
+    /// is not held for any of it.
+    fn runtime(&self) -> Arc<dyn Runtime> {
+        Arc::clone(
+            &self
+                .runtime
+                .read()
+                .expect("a runtime is never held over a call"),
+        )
     }
 }
 
@@ -498,8 +560,8 @@ impl std::fmt::Debug for Registry {
     /// names in it rather than the closures behind them.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Registry")
-            .field("served", &self.served.keys().collect::<Vec<_>>())
-            .field("runtime", &self.runtime.describe())
+            .field("served", &self.names())
+            .field("runtime", &self.describe())
             .finish()
     }
 }
@@ -529,9 +591,50 @@ mod tests {
         let registry = Registry::hosted(hosted);
         let found = registry.lookup("hello").expect("registered");
         assert!(found.verify_jwt, "upstream verifies unless told not to");
-        let answer = registry.invoke(found, call()).expect("handler answered");
+        let answer = registry.invoke(&found, call()).expect("handler answered");
         assert_eq!(answer.status, 200);
         assert_eq!(answer.bytes(), br#"{"method":"POST"}"#);
+    }
+
+    /// What a dev loop does to a registry that is already answering
+    /// requests: a directory appeared, one went away, and the names
+    /// served change without anything being restarted.
+    #[test]
+    fn what_is_served_can_be_replaced_under_a_running_server() {
+        let registry = Registry::hosted(
+            Hosted::new().at("hello", |_| Ok(Answer::new("text/plain", b"hi".to_vec()))),
+        );
+        assert_eq!(registry.names(), vec!["hello".to_string()]);
+        registry.reload(vec![
+            Function::new("hello", PathBuf::from("functions/hello/index.ts")),
+            Function::new("open", PathBuf::from("functions/open/index.ts")),
+        ]);
+        assert_eq!(
+            registry.names(),
+            vec!["hello".to_string(), "open".to_string()]
+        );
+        registry.reload(Vec::new());
+        assert!(
+            registry.is_empty() && registry.lookup("hello").is_none(),
+            "and a project whose last function was deleted serves none"
+        );
+    }
+
+    /// The other half, which is the one that costs something: a runtime
+    /// swapped out is every isolate it was keeping thrown away, so it
+    /// happens when what a function runs with changed and not when the
+    /// listing did.
+    #[test]
+    fn the_runtime_can_be_replaced_too_and_the_listing_stays() {
+        let registry = Registry::hosted(Hosted::new().at("hello", |_| {
+            Ok(Answer::new("text/plain", b"first".to_vec()))
+        }));
+        registry.run_on(Arc::new(Hosted::new().at("hello", |_| {
+            Ok(Answer::new("text/plain", b"second".to_vec()))
+        })));
+        let found = registry.lookup("hello").expect("still served");
+        let answer = registry.invoke(&found, call()).expect("handler answered");
+        assert_eq!(answer.bytes(), b"second");
     }
 
     #[tokio::test]
@@ -591,7 +694,7 @@ mod tests {
         let registry =
             Registry::hosted(Hosted::new().at("boom", |_| Err("connection refused".to_string())));
         let found = registry.lookup("boom").expect("registered");
-        let why = registry.invoke(found, call()).expect_err("it fails");
+        let why = registry.invoke(&found, call()).expect_err("it fails");
         assert_eq!(why, Failed::Threw("connection refused".to_string()));
         assert_eq!(why.why(), "connection refused");
     }

@@ -749,6 +749,34 @@ pub fn locate(explicit: Option<&Path>) -> Result<Option<Project>, String> {
     }
 }
 
+/// The project file a command run from here belongs to, read and put
+/// into this process's environment. A flag beats the file, the file
+/// beats a command's own default, and anything already in the
+/// environment beats the file too, which is what `export` enforces.
+///
+/// A file that cannot be read is an error rather than a shrug: a
+/// project that has a config.toml means it.
+pub fn project(explicit: Option<&Path>, refused: bool) -> Result<Option<Project>, String> {
+    if refused {
+        return Ok(None);
+    }
+    let Some(project) = locate(explicit)? else {
+        return Ok(None);
+    };
+    log::info!("reading {}", project.path.display());
+    let set = project.export();
+    if !set.is_empty() {
+        log::info!("the project file sets {}", set.join(", "));
+    }
+    if !project.unread.is_empty() {
+        log::info!(
+            "{} settings in it are not read yet, zou status names them",
+            project.unread.len()
+        );
+    }
+    Ok(Some(project))
+}
+
 /// The url a client on this machine reaches a `zou dev` cluster with.
 /// Local connections are trust, so the password is there for the
 /// clients that insist on one and is not a secret.
