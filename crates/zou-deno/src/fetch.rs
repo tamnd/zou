@@ -7,10 +7,11 @@
 //! second one linked in beside it.
 //!
 //! The client is blocking and the isolate is not, so the call is made
-//! on a blocking thread and awaited. That is the honest shape while a
-//! response is collected before it is handed back: nothing here streams
-//! yet, in either direction, and a function that wants a chunk at a
-//! time is waiting on the same change a streamed answer is.
+//! on a blocking thread and awaited. A response is collected before it
+//! is handed back, which is the gap left here: an answer this runtime
+//! sends reaches its caller in chunks, and an answer this runtime reads
+//! does not, so a function that wants somebody else's body a chunk at a
+//! time is waiting on a client that can be read as it arrives.
 //!
 //! What a function may reach is not restricted. It can call a metadata
 //! endpoint on the machine it is running on, the same as upstream's

@@ -26,9 +26,9 @@
 //! - `crypto.subtle` is a digest and HMAC and no more: no encryption,
 //!   no key derivation, no asymmetric algorithms, each refused by name.
 //! - Streams are readable only. There is no `WritableStream` and so no
-//!   `pipeTo`, no byte stream and no BYOB reader, and a response body
-//!   is collected before it is sent rather than reaching the caller in
-//!   chunks.
+//!   `pipeTo`, and no byte stream and no BYOB reader. A response body
+//!   reaches the caller in chunks, and a body coming back from `fetch`
+//!   is still collected before the handler sees it.
 //! - A timer only fires while there is a call for it to fire in,
 //!   which is until the answer plus whatever `EdgeRuntime.waitUntil`
 //!   is still waiting for, and thirty seconds is the ceiling on that.
@@ -71,6 +71,13 @@
 //! functions, and none of that is work for the host. Every body is one,
 //! whichever way it was made, which is what `req.body` and `res.body`
 //! being real means.
+//!
+//! A response built out of a stream is the one place that reaches the
+//! host: the head is handed over when the handler returns and every
+//! chunk goes down a channel as it is enqueued, so the caller reads the
+//! first one while the function is still making the last. The op that
+//! hands a chunk over is awaited, which is where backpressure comes
+//! from: a function generating faster than the caller reads waits.
 //!
 //! `WebSocket` is the client half of a protocol this repository already
 //! speaks the server half of, so it is `tokio-tungstenite` with its

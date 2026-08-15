@@ -65,7 +65,7 @@ fn answered(source: &str) -> Answer {
 }
 
 fn body(answer: &Answer) -> String {
-    String::from_utf8(answer.body.clone()).expect("utf-8")
+    String::from_utf8(answer.bytes().to_vec()).expect("utf-8")
 }
 
 #[test]
@@ -135,7 +135,7 @@ fn a_request_is_the_call_the_server_was_given() {
     )
     .expect("an answer");
     assert_eq!(answer.status, 200);
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["method"], "POST");
     assert_eq!(
         said["url"],
@@ -190,7 +190,7 @@ fn bytes_survive_the_trip_in_both_directions() {
         call,
     )
     .expect("an answer");
-    assert_eq!(answer.body, vec![0, 1, 2, 253, 254, 255, 42]);
+    assert_eq!(answer.bytes(), [0, 1, 2, 253, 254, 255, 42]);
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn the_environment_is_the_runtimes_and_never_the_processes() {
             get("http://localhost:9000/functions/v1/hello"),
         )
         .expect("an answer");
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["named"], "http://localhost:54321");
     assert_eq!(said["missing"], serde_json::Value::Null);
     assert_eq!(said["has"], true);
@@ -403,7 +403,7 @@ fn the_web_shapes_a_handler_is_written_against_are_there() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["round"], "héllo");
     assert_eq!(
         said["bytes"],
@@ -455,7 +455,7 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     // What is here, asserted beside the gaps rather than somewhere else,
     // because a list of what is missing is only true if the same list
     // says what is not.
@@ -503,7 +503,7 @@ fn a_url_comes_apart_into_the_pieces_a_handler_reads() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said["href"],
         "https://ana:secret@example.com:8443/one/two?a=1&b=2#top"
@@ -545,7 +545,7 @@ fn a_url_can_be_built_on_another_one_and_changed_afterwards() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["joined"], "https://example.com/one/three?x=1");
     assert_eq!(said["changed"], "https://example.com:8443/two?a=1#top");
     assert_eq!(said["canParse"], true);
@@ -577,7 +577,7 @@ fn a_query_string_is_read_and_written_a_pair_at_a_time() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["get"], "TWO");
     assert_eq!(said["all"], serde_json::json!(["3"]));
     assert_eq!(said["has"], true);
@@ -623,7 +623,7 @@ fn a_urls_query_and_the_url_are_the_same_thing() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["same"], true);
     assert_eq!(said["afterAppend"], "https://example.com/one?a=1&b=2");
     assert_eq!(said["afterSearch"], serde_json::json!([["c", "3"]]));
@@ -648,7 +648,7 @@ fn a_handler_can_read_its_own_url_with_the_parser() {
         get("http://localhost:9000/functions/v1/hello/one/two?who=ana"),
     )
     .expect("an answer");
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["path"], "/functions/v1/hello/one/two");
     assert_eq!(said["who"], "ana");
     // A Request's url is parsed rather than kept as it was written, the
@@ -677,7 +677,7 @@ fn a_blob_is_bytes_with_a_type_on_it() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["size"], 13);
     // Lowercased, because a media type is compared case insensitively
     // and this is where that is settled rather than at every reader.
@@ -708,7 +708,7 @@ fn a_file_is_a_blob_that_knows_what_it_is_called() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["name"], "rows.csv");
     assert_eq!(said["type"], "text/csv");
     assert_eq!(said["size"], 8);
@@ -748,7 +748,7 @@ fn a_form_goes_out_as_multipart_and_comes_back_the_same_form() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["type"], "multipart/form-data");
     assert_eq!(said["boundary"], true);
     assert_eq!(said["who"], serde_json::json!(["ana", "ben"]));
@@ -788,7 +788,7 @@ fn a_posted_form_is_read_as_a_form() {
         },
     )
     .expect("an answer");
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["who"], "ana");
     assert_eq!(said["said"], "a value & a half");
     assert_eq!(said["has"], true);
@@ -814,7 +814,7 @@ fn a_blob_can_be_sent_and_a_body_can_be_read_as_one() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["type"], "application/json");
     assert_eq!(said["body"], "{}");
     assert_eq!(said["blobType"], "text/csv");
@@ -856,7 +856,7 @@ fn random_bytes_are_random_and_land_where_they_were_asked_for() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["length"], 16);
     assert_eq!(said["differ"], true);
     assert_eq!(said["filled"], true);
@@ -903,7 +903,7 @@ fn a_digest_is_the_digest_everything_else_computes() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["one"], "138c4434ce6b0de777e96966217455e122753986");
     assert_eq!(
         said["256"],
@@ -962,7 +962,7 @@ fn an_hmac_signs_what_it_verifies() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     // RFC 4231's second test case, the same one the unit tests use, so
     // the whole path from javascript to the mac and back is the value
     // everybody else computes.
@@ -1009,7 +1009,7 @@ fn a_handler_can_wait_on_the_clock_and_the_answer_waits_with_it() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said, serde_json::json!(["before", "after"]));
     // The wait was a real wait and not a promise that resolved at once,
     // which is what a `setTimeout` that ignores its delay would look
@@ -1035,7 +1035,7 @@ fn timers_fire_in_the_order_their_delays_say() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said,
         serde_json::json!(["now", "microtask", "zero", "ten", "twenty", "thirty"])
@@ -1062,7 +1062,7 @@ fn a_timer_that_was_cleared_does_not_fire_and_one_that_repeats_does() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said["said"],
         serde_json::json!(["tick 1", "tick 2", "tick 3"])
@@ -1135,7 +1135,7 @@ fn a_string_of_code_is_not_a_timer_callback_here() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said["refused"],
         "a timer needs a function, and a string of code is not one here"
@@ -1166,7 +1166,7 @@ fn the_entry_point_is_not_something_a_function_can_reach() {
         }));
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["run"], "undefined");
     assert_eq!(said["drain"], "undefined");
     assert_eq!(said["handler"], "undefined");
@@ -1426,7 +1426,7 @@ fn a_function_may_call_out_and_read_what_came_back() {
         "#,
         server.url("/echo")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["ok"], true);
     assert_eq!(said["status"], 200);
     assert_eq!(said["method"], "GET");
@@ -1460,7 +1460,7 @@ fn what_a_function_posts_is_what_arrives() {
         "#,
         server.url("/echo")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["method"], "POST");
     assert_eq!(said["body"], "{\"name\":\"world\"}");
     assert_eq!(said["asked"], "the function");
@@ -1483,7 +1483,7 @@ fn an_answer_that_is_not_ok_is_still_an_answer() {
         "#,
         server.url("/teapot")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["ok"], false);
     assert_eq!(said["status"], 418);
     // The canonical phrase for the code and not the one the server
@@ -1507,7 +1507,7 @@ fn a_redirect_is_followed_and_the_answer_says_where_it_landed() {
         "#,
         server.url("/moved")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["said"], "landed");
     assert_eq!(said["url"], server.url("/landed"));
     assert_eq!(said["redirected"], true);
@@ -1554,7 +1554,7 @@ fn a_scheme_fetch_does_not_serve_says_which_one() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said[0], "fetch does not serve the file scheme yet");
     assert_eq!(said[1], "fetch does not serve the data scheme yet");
     assert_eq!(said[2], "Invalid URL: 'nonsense'");
@@ -1574,7 +1574,7 @@ fn a_function_may_call_out_more_than_once() {
         first = server.url("/one"),
         second = server.url("/two")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said, serde_json::json!(["/one", "/two"]));
 }
 
@@ -1591,7 +1591,7 @@ fn a_request_may_be_fetched_and_its_body_goes_with_it() {
         "#,
         server.url("/echo")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["method"], "PUT");
     assert_eq!(said["body"], "the bytes");
 }
@@ -1620,7 +1620,7 @@ fn a_stream_a_function_wrote_is_read_back_a_chunk_at_a_time() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said["seen"],
         serde_json::json!(["chunk 1 ", "chunk 2 ", "chunk 3 "])
@@ -1634,9 +1634,10 @@ fn a_stream_a_function_wrote_is_read_back_a_chunk_at_a_time() {
 }
 
 /// A body that is a stream, which is the shape a handler that builds
-/// its answer as it goes writes. It is collected before it is sent,
-/// which is the difference between this and streaming to the caller,
-/// and is written down as such.
+/// its answer as it goes writes. Read through the blocking shape of a
+/// call here, so what is asserted is that all of it arrives and in
+/// order. That it arrives a chunk at a time is asserted further down,
+/// where the answer is taken the way the server takes it.
 #[test]
 fn a_response_may_be_given_a_stream_and_the_caller_gets_all_of_it() {
     let answer = answered(
@@ -1683,7 +1684,7 @@ fn a_reader_is_a_lock_on_the_stream_until_it_is_released() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["twice"], "the stream is locked to a reader");
     assert_eq!(said["locked"], false);
     assert_eq!(
@@ -1728,7 +1729,7 @@ fn a_body_is_a_stream_whether_or_not_it_started_as_one() {
         "#,
         url = server.url("/streamed")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["fetched"], "/streamed");
     assert_eq!(said["made"], "what a handler built");
     assert_eq!(said["blob"], "out of a blob");
@@ -1764,7 +1765,7 @@ fn the_request_a_handler_is_given_can_be_read_as_a_stream() {
         call,
     )
     .expect("an answer");
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said["seen"],
         serde_json::json!(["the bytes that were posted"])
@@ -1794,7 +1795,7 @@ fn a_stream_can_be_split_in_two_and_both_halves_see_everything() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said["both"],
         serde_json::json!([["a", "b", "c"], ["a", "b", "c"]])
@@ -1821,7 +1822,7 @@ fn a_stream_that_is_given_up_on_tells_its_source_so() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said["seen"],
         serde_json::json!(["cancelled because nobody wants it"])
@@ -1846,7 +1847,7 @@ fn a_source_that_throws_is_the_readers_error_and_not_a_hang() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["read"], "the source gave up");
     assert_eq!(said["body"], "errored on purpose");
 }
@@ -1870,13 +1871,180 @@ fn a_byte_stream_is_a_gap_and_says_so() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["bytes"], "a bytes stream is not supported yet");
     assert_eq!(said["byob"], "a byob reader is not supported yet");
     assert_eq!(said["piped"], "undefined");
     // A body of strings is not an error until somebody asks for the
     // bytes of it, which is where the message is.
     assert_eq!(said["chunks"], "it worked");
+}
+
+/// The answer to a call, taken the way the server takes it: the moment
+/// there is one, rather than when the call is over.
+///
+/// The isolate is driven on a thread of its own here because that is
+/// what `spawn_blocking` does to it, and because the whole claim being
+/// tested is that something else can read the body while that thread
+/// is still inside the handler.
+fn streamed(
+    source: &str,
+) -> (
+    std::sync::mpsc::Receiver<Answer>,
+    std::thread::JoinHandle<()>,
+) {
+    let deployed = deployed(source);
+    let (sent, arrives) = std::sync::mpsc::channel();
+    let ran = std::thread::spawn(move || {
+        let answering = Isolate::new().invoke_answering(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+            Box::new(move |answer| {
+                sent.send(answer).expect("the test is listening");
+            }),
+        );
+        // Held to here so the function's own directory outlives it.
+        drop(deployed);
+        answering.expect("the call");
+    });
+    (arrives, ran)
+}
+
+/// Every chunk of a streamed body, in order, read on a thread that is
+/// allowed to block, which is what the collecting is.
+fn chunks(answer: Answer) -> Vec<Result<Vec<u8>, String>> {
+    let zou_functions::Body::Chunks(mut chunks) = answer.body else {
+        panic!("a body that is still arriving");
+    };
+    let mut all = Vec::new();
+    let held = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("a runtime to read on");
+    held.block_on(async {
+        while let Some(chunk) = chunks.next().await {
+            all.push(chunk);
+        }
+    });
+    all
+}
+
+/// The point of all of it: the caller reads the first chunk long
+/// before the function has made the last one.
+///
+/// The assertion is about time because the difference is time and
+/// nothing else. The chunk is enqueued before the function's second
+/// of waiting starts, so if the caller had it in hand well before the
+/// call ended, it was not waiting for the end.
+#[test]
+fn a_streamed_answer_reaches_the_caller_while_it_is_still_being_made() {
+    let started = std::time::Instant::now();
+    let (arrives, ran) = streamed(
+        r#"
+        Deno.serve(() => new Response(new ReadableStream({
+            async start(controller) {
+                const encoder = new TextEncoder();
+                controller.enqueue(encoder.encode("first "));
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+                controller.enqueue(encoder.encode("last"));
+                controller.close();
+            },
+        }), { headers: { "content-type": "text/plain" } }));
+        "#,
+    );
+    let answer = arrives.recv().expect("an answer");
+    assert_eq!(answer.status, 200);
+    assert_eq!(
+        answer.headers,
+        vec![("content-type".to_string(), "text/plain".to_string())]
+    );
+    let zou_functions::Body::Chunks(mut chunks) = answer.body else {
+        panic!("a body that is still arriving");
+    };
+    let held = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime to read on");
+    let first = held.block_on(async { chunks.next().await });
+    let early = started.elapsed();
+    assert_eq!(first, Some(Ok(b"first ".to_vec())));
+    let rest = held.block_on(async {
+        let mut rest = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            rest.push(chunk);
+        }
+        rest
+    });
+    ran.join().expect("the call finished");
+    assert_eq!(rest, vec![Ok(b"last".to_vec())]);
+    assert!(
+        started.elapsed() - early >= std::time::Duration::from_millis(500),
+        "the first chunk arrived {early:?} in and the call took {:?}",
+        started.elapsed()
+    );
+}
+
+/// A body that goes wrong after its headers have gone out.
+///
+/// There is no status code left to change, so what the caller gets is
+/// what was sent and then an end, which is what a chunked body that
+/// stops early is.
+#[test]
+fn a_streamed_body_that_throws_ends_where_it_got_to() {
+    let (arrives, ran) = streamed(
+        r#"
+        Deno.serve(() => new Response(new ReadableStream({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode("as far as here"));
+            },
+            pull() { throw new Error("the model hung up"); },
+        })));
+        "#,
+    );
+    let answer = arrives.recv().expect("an answer");
+    let all = chunks(answer);
+    ran.join().expect("the call finished");
+    assert_eq!(all[0], Ok(b"as far as here".to_vec()));
+    assert_eq!(all.len(), 2, "what was sent, and then the reason: {all:?}");
+    assert_eq!(all[1], Err("the model hung up".to_string()));
+}
+
+/// A stream of strings is a body that cannot be sent, and the refusal
+/// is the same one collecting a body of strings gives.
+#[test]
+fn a_streamed_body_of_anything_but_bytes_is_refused() {
+    let (arrives, ran) = streamed(
+        r#"
+        Deno.serve(() => new Response(ReadableStream.from(["not bytes"])));
+        "#,
+    );
+    let answer = arrives.recv().expect("an answer");
+    let all = chunks(answer);
+    ran.join().expect("the call finished");
+    assert_eq!(all.len(), 1);
+    assert_eq!(
+        all[0],
+        Err("a response body stream may only enqueue buffers".to_string())
+    );
+}
+
+/// A body that was never a stream is still sent whole, which is worth
+/// asserting beside the rest: the streamed path is for a response that
+/// was built out of a stream and for nothing else.
+#[test]
+fn a_body_that_is_bytes_is_not_streamed() {
+    let (arrives, ran) = streamed(
+        r#"
+        Deno.serve(() => new Response("all of it at once"));
+        "#,
+    );
+    let answer = arrives.recv().expect("an answer");
+    ran.join().expect("the call finished");
+    assert!(
+        matches!(answer.body, zou_functions::Body::Bytes(_)),
+        "{:?}",
+        answer.body
+    );
+    assert_eq!(body(&answer), "all of it at once");
 }
 
 /// The other end of a websocket.
@@ -2020,7 +2188,7 @@ fn a_function_can_open_a_socket_and_hear_back_what_it_said() {
         "#,
         url = server.url("/echo")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said["seen"],
         serde_json::json!([
@@ -2065,7 +2233,7 @@ fn bytes_on_a_socket_arrive_as_whatever_the_binary_type_says() {
         "#,
         url = server.url("/echo")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["blob"]["shape"], "Blob");
     assert_eq!(said["blob"]["bytes"], serde_json::json!([104, 105, 0, 255]));
     assert_eq!(said["buffer"]["shape"], "ArrayBuffer");
@@ -2091,7 +2259,7 @@ fn a_socket_the_other_end_closes_is_the_code_and_the_reason_it_gave() {
         "#,
         url = server.url("/goodbye")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["code"], 4000);
     assert_eq!(said["reason"], "that is enough of that");
     assert_eq!(said["wasClean"], true);
@@ -2124,7 +2292,7 @@ fn a_listener_hears_the_same_events_the_properties_do() {
         "#,
         url = server.url("/greeting")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     // The property first, then the listeners in the order they were
     // added, which is what the event spec says and what a library that
     // registers both will see.
@@ -2149,7 +2317,7 @@ fn the_subprotocol_the_server_picked_is_the_one_the_socket_says_it_speaks() {
         "#,
         url = server.url("/named")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["protocol"], "phoenix");
     assert_eq!(said["extensions"], "");
 }
@@ -2181,7 +2349,7 @@ fn a_socket_that_will_not_open_is_an_error_and_then_a_close() {
         "#,
         refused = server.url("/refused")
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     let nothing = said["nowhere"][0].as_str().expect("an error");
     assert!(
         nothing.starts_with("error failed to connect to WebSocket ("),
@@ -2222,7 +2390,7 @@ fn what_a_socket_will_not_do_it_says_rather_than_tries() {
         }});
         "#
     ));
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(
         said["scheme"],
         "TypeError: ftp: is not a scheme a websocket is opened on"
@@ -2283,7 +2451,7 @@ fn a_function_may_call_out_over_tls() {
         });
         "#,
     );
-    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["status"], 200);
     assert_eq!(said["opened"], "<!doctype html>");
 }

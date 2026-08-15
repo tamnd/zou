@@ -166,7 +166,7 @@ mod tests {
         if zou_deno::available() {
             let answer = ran.expect("an isolate ran it");
             assert_eq!(answer.status, 200);
-            assert_eq!(answer.body, b"hi");
+            assert_eq!(answer.bytes(), b"hi");
         } else {
             let complaint = ran.expect_err("no engine to run it");
             assert!(complaint.contains("zou-deno/isolate"), "{complaint}");

@@ -7,8 +7,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+# A body that is still being written is a channel between the thread
+# making it and the executor sending it, and this is the channel both
+# ends of this crate's users already have.
+tokio = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros"] }
 
 [lints]
 workspace = true

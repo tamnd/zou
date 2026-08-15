@@ -144,19 +144,92 @@ impl Call {
 }
 
 /// What a function answered with.
-///
-/// A body is bytes rather than a stream in this shape, and that is a
-/// gap with a name: upstream sends a `ReadableStream` body as it is
-/// enqueued, with `Transfer-Encoding: chunked`, and a function written
-/// to stream tokens out of a model is written against exactly that.
-/// The runtime that can produce one does not exist yet, and inventing
-/// the channel before there is anything to put in it would be
-/// inventing it twice.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Answer {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
+    pub body: Body,
+}
+
+/// A body, which is either all of it or the reading end of a pipe it
+/// is still being written to.
+///
+/// The second is what a `ReadableStream` body is upstream: the headers
+/// go out when the handler returns, the chunks go out as they are
+/// enqueued with `Transfer-Encoding: chunked`, and a caller reads the
+/// first token out of a model long before the last one exists. It is a
+/// channel rather than a trait because both ends of it are already
+/// decided by the shape of everything else here: whatever makes the
+/// chunks is on a blocking thread of its own, and whoever writes them
+/// to a socket is on the server's executor.
+#[derive(Debug)]
+pub enum Body {
+    /// All of it, which is what a handler that returned a string, a
+    /// buffer, or nothing at all answered with.
+    Bytes(Vec<u8>),
+    /// Not all of it yet.
+    Chunks(Chunks),
+}
+
+/// How many chunks may be waiting before whatever is writing them is
+/// made to wait too.
+///
+/// There is a number here because a function generating faster than
+/// the caller reads is otherwise a function that may hold as much
+/// memory as it likes. Eight is enough that a writer is not stopped
+/// and started for every chunk, and small enough that a slow reader is
+/// felt quickly, which is the whole of what backpressure has to be.
+const AHEAD: usize = 8;
+
+/// The reading end of a body that is still arriving.
+///
+/// An `Err` in it is a body that went wrong after its headers were
+/// sent, which cannot be turned back into a status code: the caller is
+/// already reading a 200. All that can be done with it is to stop, and
+/// a truncated response is exactly what an http client is shown when a
+/// chunked body ends early, which is the right thing for it to see.
+#[derive(Debug)]
+pub struct Chunks(tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>);
+
+/// The writing end of one.
+#[derive(Debug, Clone)]
+pub struct Writer(tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>);
+
+impl Chunks {
+    /// The next chunk, and none when there are no more.
+    pub async fn next(&mut self) -> Option<Result<Vec<u8>, String>> {
+        self.0.recv().await
+    }
+
+    /// All of it, on a thread that is allowed to block and that is not
+    /// the one making the chunks. That is what wanting the whole
+    /// answer as one value costs, and it is how the blocking shape of
+    /// a runtime call gets bytes back however they were made.
+    pub fn collect_blocking(mut self) -> Result<Vec<u8>, String> {
+        let mut all = Vec::new();
+        while let Some(chunk) = self.0.blocking_recv() {
+            all.extend_from_slice(&chunk?);
+        }
+        Ok(all)
+    }
+}
+
+impl Writer {
+    /// Hand over one chunk, waiting while the reader is behind.
+    ///
+    /// False means nobody is listening any more, which is a caller that
+    /// went away rather than a failure: whatever is generating should
+    /// stop, and there is nobody left to tell about it.
+    pub async fn write(&self, chunk: Vec<u8>) -> bool {
+        self.0.send(Ok(chunk)).await.is_ok()
+    }
+
+    /// End it badly. Dropped rather than waited for when the reader is
+    /// behind, because this is the last thing said on a body that is
+    /// ending either way.
+    pub fn fail(self, why: String) {
+        let _ = self.0.try_send(Err(why));
+    }
 }
 
 impl Answer {
@@ -166,7 +239,32 @@ impl Answer {
         Answer {
             status: 200,
             headers: vec![("content-type".to_string(), content_type.to_string())],
-            body,
+            body: Body::Bytes(body),
+        }
+    }
+
+    /// The head of an answer whose body is still being made, and the
+    /// end that body is written to. The answer can be handed on the
+    /// moment this returns, which is the entire point of it.
+    pub fn streaming(status: u16, headers: Vec<(String, String)>) -> (Answer, Writer) {
+        let (sender, receiver) = tokio::sync::mpsc::channel(AHEAD);
+        (
+            Answer {
+                status,
+                headers,
+                body: Body::Chunks(Chunks(receiver)),
+            },
+            Writer(sender),
+        )
+    }
+
+    /// The bytes, for an answer that has them, and empty for one still
+    /// arriving. Only something that asked for the answer the moment
+    /// there was one can be holding the second.
+    pub fn bytes(&self) -> &[u8] {
+        match &self.body {
+            Body::Bytes(bytes) => bytes,
+            Body::Chunks(_) => &[],
         }
     }
 }
@@ -194,7 +292,9 @@ pub trait Runtime: Send + Sync {
     /// the answer, which is what the default here says. They are not
     /// the same moment for the isolate: `EdgeRuntime.waitUntil` is
     /// work that outlives the response, and the caller is not made to
-    /// wait for it.
+    /// wait for it. Nor is an answer whose body is [`Body::Chunks`]
+    /// finished when it is handed over, which is why a runtime that
+    /// streams must be called this way and not through `invoke`.
     ///
     /// An `Err` after the answer has been handed over is the
     /// background work's and not the caller's, so it is logged and
@@ -380,7 +480,47 @@ mod tests {
         assert!(found.verify_jwt, "upstream verifies unless told not to");
         let answer = registry.invoke(found, call()).expect("handler answered");
         assert_eq!(answer.status, 200);
-        assert_eq!(answer.body, br#"{"method":"POST"}"#);
+        assert_eq!(answer.bytes(), br#"{"method":"POST"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_arrives_a_chunk_at_a_time_and_ends() {
+        let (answer, writer) = Answer::streaming(200, Vec::new());
+        let written = tokio::spawn(async move {
+            assert!(writer.write(b"one ".to_vec()).await);
+            assert!(writer.write(b"two".to_vec()).await);
+        });
+        let Body::Chunks(mut chunks) = answer.body else {
+            panic!("a streamed answer");
+        };
+        assert_eq!(chunks.next().await, Some(Ok(b"one ".to_vec())));
+        assert_eq!(chunks.next().await, Some(Ok(b"two".to_vec())));
+        written.await.expect("the writer");
+        // The writer is dropped, which is how a body ends.
+        assert_eq!(chunks.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_went_wrong_says_so_where_a_status_code_cannot() {
+        let (answer, writer) = Answer::streaming(200, Vec::new());
+        assert!(writer.write(b"half of it".to_vec()).await);
+        writer.fail("the model hung up".to_string());
+        let Body::Chunks(mut chunks) = answer.body else {
+            panic!("a streamed answer");
+        };
+        assert_eq!(chunks.next().await, Some(Ok(b"half of it".to_vec())));
+        assert_eq!(
+            chunks.next().await,
+            Some(Err("the model hung up".to_string()))
+        );
+        assert_eq!(chunks.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn a_caller_that_went_away_is_told_to_whatever_is_writing() {
+        let (answer, writer) = Answer::streaming(200, Vec::new());
+        drop(answer);
+        assert!(!writer.write(b"nobody is reading".to_vec()).await);
     }
 
     #[test]
