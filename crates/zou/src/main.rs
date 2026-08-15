@@ -1,5 +1,6 @@
 mod boot;
 mod branch;
+mod bundle;
 mod codegen;
 mod compact;
 #[cfg(unix)]

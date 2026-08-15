@@ -31,11 +31,18 @@ use zou_functions::{Function, Layout, Registry};
 /// The fifth, `SB_EXECUTION_ID`, is one per invocation and is added by
 /// the runtime out of the call rather than living here.
 pub fn env(port: u16, anon: &str, service: &str, db: &str) -> Vec<(String, String)> {
+    env_at(&format!("http://127.0.0.1:{port}"), anon, service, db)
+}
+
+/// The same four, for a server that knows its own url rather than a
+/// port on loopback: a node serving a project on a domain of its own
+/// has to tell that project's functions where the project is, because
+/// a function calling `createClient(Deno.env.get("SUPABASE_URL"))` is
+/// calling the api it was deployed next to and not the machine it
+/// happens to be running on.
+pub fn env_at(url: &str, anon: &str, service: &str, db: &str) -> Vec<(String, String)> {
     vec![
-        (
-            "SUPABASE_URL".to_string(),
-            format!("http://127.0.0.1:{port}"),
-        ),
+        ("SUPABASE_URL".to_string(), url.to_string()),
         ("SUPABASE_ANON_KEY".to_string(), anon.to_string()),
         ("SUPABASE_SERVICE_ROLE_KEY".to_string(), service.to_string()),
         ("SUPABASE_DB_URL".to_string(), db.to_string()),
@@ -131,7 +138,7 @@ pub fn keys() -> Result<(String, String, String), String> {
     Ok((secret, anon, service))
 }
 
-pub const USAGE: &str = "usage: zou functions serve [--port <n>] [--env-file <path>] [--import-map <path>] [--no-verify-jwt] [--inspect [<port>]] [--config <config.toml> | --no-config]";
+pub const USAGE: &str = "usage: zou functions <serve [--port <n>] [--env-file <path>] [--import-map <path>] [--no-verify-jwt] [--inspect [<port>]] | deploy [<name>...] [--target <store>] [--ref <tenant>] [--import-map <path>] [--no-verify-jwt] | list [--target <store>] [--ref <tenant>]> [--config <config.toml> | --no-config]";
 
 /// Where upstream's local api answers, which is where a project's
 /// client library already looks for `/functions/v1`.
@@ -231,9 +238,185 @@ pub fn parse(argv: &[String]) -> Result<Serve, String> {
 pub fn run(argv: &[String]) -> Result<(), String> {
     match argv.first().map(String::as_str) {
         Some("serve") => serve(&parse(&argv[1..])?),
+        Some("deploy") => deploy(&parse_deploy(&argv[1..])?),
+        Some("list") => list(&parse_deploy(&argv[1..])?),
         Some(other) => Err(format!("unknown functions command {other:?}\n{USAGE}")),
         None => Err(USAGE.to_string()),
     }
+}
+
+/// `zou functions deploy`, and `zou functions list` which is the same
+/// arguments without the names.
+pub struct Deploy {
+    /// Which functions, and none of them meaning all of them, which is
+    /// what `supabase functions deploy` with no slug does.
+    pub names: Vec<String>,
+    /// The store the project lives on, or `ZOU_TARGET`.
+    pub target: Option<String>,
+    /// Which project on it, or `ZOU_TENANT`, or the config file's
+    /// `project_id`, which is the same field upstream's
+    /// `--project-ref` fills in.
+    pub tenant: Option<String>,
+    /// The same two flags `serve` has, for the same reason: they are
+    /// this run's and not one function's.
+    pub import_map: Option<PathBuf>,
+    pub no_verify_jwt: bool,
+    pub config: Option<PathBuf>,
+    pub no_config: bool,
+}
+
+pub fn parse_deploy(argv: &[String]) -> Result<Deploy, String> {
+    let mut args = Deploy {
+        names: Vec::new(),
+        target: None,
+        tenant: None,
+        import_map: None,
+        no_verify_jwt: false,
+        config: None,
+        no_config: false,
+    };
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--target" => args.target = Some(it.next().ok_or("--target needs a value")?.clone()),
+            "--ref" => args.tenant = Some(it.next().ok_or("--ref needs a value")?.clone()),
+            "--import-map" => {
+                let raw = it.next().ok_or("--import-map needs a value")?;
+                args.import_map = Some(PathBuf::from(raw));
+            }
+            "--no-verify-jwt" => args.no_verify_jwt = true,
+            "--config" => {
+                let raw = it.next().ok_or("--config needs a value")?;
+                args.config = Some(PathBuf::from(raw));
+            }
+            "--no-config" => args.no_config = true,
+            other if other.starts_with('-') => {
+                return Err(format!("unexpected argument {other:?}\n{USAGE}"));
+            }
+            name => args.names.push(name.to_string()),
+        }
+    }
+    Ok(args)
+}
+
+/// The project and the prefix a deploy is between: where the functions
+/// are on this disk, what the config file says about them, which store
+/// they go to and which project on it.
+#[derive(Debug)]
+struct Bound {
+    dir: PathBuf,
+    layout: Layout,
+    target: String,
+    tenant: String,
+}
+
+/// Work out all four, saying which one is missing rather than failing
+/// on the first thing that needs it.
+fn bind(args: &Deploy) -> Result<Bound, String> {
+    let project = crate::config::project(args.config.as_deref(), args.no_config)?;
+    let dir = match &project {
+        Some(project) => project.dir(),
+        None => std::env::current_dir().map_err(|e| format!("cwd: {e}"))?,
+    };
+    let target = args
+        .target
+        .clone()
+        .or_else(|| std::env::var("ZOU_TARGET").ok().filter(|t| !t.is_empty()))
+        .ok_or("no store to deploy to: pass --target or set ZOU_TARGET")?;
+    // The config file's `project_id` last, because it is the one of the
+    // three a project shares with everybody it hands the directory to,
+    // and a deploy naming a ref out loud should beat a file.
+    let tenant = args
+        .tenant
+        .clone()
+        .or_else(|| std::env::var("ZOU_TENANT").ok().filter(|t| !t.is_empty()))
+        .or_else(|| project.as_ref().and_then(|p| p.id.clone()))
+        .ok_or("no project to deploy to: pass --ref, set ZOU_TENANT, or give the config file a project_id")?;
+    zou_store::registry::check_ref(&tenant).map_err(|e| format!("--ref {tenant:?}: {e}"))?;
+    let mut layout = project.map(|p| p.functions.clone()).unwrap_or_default();
+    // Upstream's precedence, and the same two flags `serve` applies:
+    // what is on the command line is every function of this run.
+    for name in zou_functions::read(&dir, &layout)?.iter().map(|f| &f.name) {
+        let mut settings = layout.settings(name);
+        if args.no_verify_jwt {
+            settings.verify_jwt = false;
+        }
+        if let Some(map) = &args.import_map {
+            settings.import_map = Some(map.display().to_string());
+        }
+        layout.settings.insert(name.clone(), settings);
+    }
+    Ok(Bound {
+        dir,
+        layout,
+        target,
+        tenant,
+    })
+}
+
+fn deploy(args: &Deploy) -> Result<(), String> {
+    let bound = bind(args)?;
+    let store = zou_store::open_store(&bound.target)?;
+    let published = crate::bundle::publish(
+        store.as_ref(),
+        &bound.tenant,
+        &bound.dir,
+        &bound.layout,
+        &args.names,
+    )?;
+    println!(
+        "deployed {} to {} on {}",
+        published.names.join(", "),
+        bound.tenant,
+        bound.target
+    );
+    println!(
+        "{} files, {} of them new, {} bytes uploaded",
+        published.files, published.written, published.bytes
+    );
+    // The name a caller uses, because that is the question a deploy
+    // leaves somebody with, and it is the project's url rather than
+    // this machine's.
+    for name in &published.names {
+        println!("  /functions/v1/{name}");
+    }
+    Ok(())
+}
+
+/// What is deployed to this project right now, which is the other half
+/// of a deploy: a person wants to know what a node would run before
+/// they change it.
+fn list(args: &Deploy) -> Result<(), String> {
+    let bound = bind(args)?;
+    let store = zou_store::open_store(&bound.target)?;
+    let Some(deployment) = crate::bundle::fetch(store.as_ref(), &bound.tenant)? else {
+        println!("nothing is deployed to {}", bound.tenant);
+        return Ok(());
+    };
+    println!(
+        "{} {} deployed to {}",
+        deployment.functions.len(),
+        if deployment.functions.len() == 1 {
+            "function"
+        } else {
+            "functions"
+        },
+        bound.tenant
+    );
+    for function in &deployment.functions {
+        println!(
+            "  {} at {}, {} files{}",
+            function.name,
+            function.entrypoint,
+            function.files.len(),
+            if function.verify_jwt {
+                ""
+            } else {
+                ", no jwt verification"
+            }
+        );
+    }
+    Ok(())
 }
 
 /// The listing and the environment as the disk has them right now,
@@ -695,8 +878,58 @@ mod tests {
         assert!(parse(&argv(&["--env-file"])).is_err());
         assert!(parse(&argv(&["--import-map"])).is_err());
         assert!(parse(&argv(&["serve"])).is_err(), "the verb is run's");
-        assert!(run(&argv(&["deploy"])).is_err(), "and there is one verb");
+        assert!(run(&argv(&["publish"])).is_err(), "and it is one of three");
         assert!(run(&argv(&[])).is_err());
+    }
+
+    #[test]
+    fn deploy_takes_names_and_flags_apart() {
+        let args = parse_deploy(&argv(&[
+            "hello",
+            "--target",
+            "/tmp/store",
+            "world",
+            "--ref",
+            "acme",
+            "--no-verify-jwt",
+            "--import-map",
+            "map.json",
+        ]))
+        .expect("parsed");
+        assert_eq!(args.names, ["hello", "world"], "a name is anything else");
+        assert_eq!(args.target.as_deref(), Some("/tmp/store"));
+        assert_eq!(args.tenant.as_deref(), Some("acme"));
+        assert!(args.no_verify_jwt);
+        assert_eq!(args.import_map, Some(PathBuf::from("map.json")));
+        assert!(
+            parse_deploy(&argv(&["--nope"])).is_err(),
+            "a flag nobody knows is not a function name"
+        );
+        assert!(parse_deploy(&argv(&["--ref"])).is_err());
+    }
+
+    /// A deploy needs a store and a project, and says which of the two
+    /// it has not got rather than failing at the first thing that
+    /// needed one.
+    #[test]
+    fn a_deploy_with_nowhere_to_go_says_which_half_is_missing() {
+        let args = parse_deploy(&argv(&[
+            "--no-config",
+            "--ref",
+            "acme",
+            "--target",
+            "/tmp/nowhere",
+        ]))
+        .expect("parsed");
+        assert!(
+            bind(&args).is_ok(),
+            "both named on the command line is enough"
+        );
+        let no_target = parse_deploy(&argv(&["--no-config", "--ref", "acme"])).expect("parsed");
+        if std::env::var("ZOU_TARGET").is_err() {
+            let e = bind(&no_target).expect_err("nowhere to deploy to");
+            assert!(e.contains("--target"), "{e}");
+        }
     }
 
     /// A debugger is a port the runtime opens, so it is the one flag
