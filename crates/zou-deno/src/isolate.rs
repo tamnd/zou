@@ -37,6 +37,9 @@ pub(crate) struct Held {
     call: Call,
     peer: String,
     env: Vec<(String, String)>,
+    /// The files this function may read, which is its `static_files`
+    /// and nothing else on the disk.
+    statics: zou_functions::Statics,
     answered: Option<Answer>,
     /// Where the answer goes. In here rather than held by `run`
     /// because a streamed answer leaves while the handler is still
@@ -165,6 +168,64 @@ fn op_zou_env(state: &mut OpState) -> std::collections::BTreeMap<String, String>
     held.env.iter().cloned().collect()
 }
 
+/// What one of the four read calls got, which is one of four things and
+/// not a value or a throw.
+///
+/// A throw would have been a message, and javascript would then have had
+/// to read the message to know whether this was a file that is not there
+/// or a file the function may not have. Those are two different errors
+/// in Deno, `NotFound` and `PermissionDenied`, and a function catching
+/// the first and not the second is ordinary code.
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum Read {
+    Bytes { bytes: deno_core::ToJsBuffer },
+    Missing { why: String },
+    Refused { why: String },
+    Failed { why: String },
+}
+
+impl Read {
+    /// One file, once the name has already been allowed.
+    fn of(at: &std::path::Path, read: std::io::Result<Vec<u8>>) -> Read {
+        match read {
+            Ok(bytes) => Read::Bytes {
+                bytes: bytes.into(),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Read::Missing {
+                why: format!("{}: {e}", at.display()),
+            },
+            Err(e) => Read::Failed {
+                why: format!("{}: {e}", at.display()),
+            },
+        }
+    }
+}
+
+/// `Deno.readFile` and `Deno.readTextFile`, which are the same op and
+/// differ in javascript by what is done with the bytes.
+#[op2(async(lazy), fast)]
+#[serde]
+async fn op_zou_read_file(state: Rc<RefCell<OpState>>, #[string] name: String) -> Read {
+    let asked = state.borrow().borrow::<Held>().statics.at(&name);
+    match asked {
+        Err(why) => Read::Refused { why },
+        Ok(at) => Read::of(&at, tokio::fs::read(&at).await),
+    }
+}
+
+/// The same, for the two sync spellings, which upstream turns on for a
+/// worker with `useReadSyncFileAPI` and which a function serving a page
+/// out of its own directory usually reaches for.
+#[op2]
+#[serde]
+fn op_zou_read_file_sync(state: &mut OpState, #[string] name: String) -> Read {
+    match state.borrow::<Held>().statics.at(&name) {
+        Err(why) => Read::Refused { why },
+        Ok(at) => Read::of(&at, std::fs::read(&at)),
+    }
+}
+
 deno_core::extension!(
     zou,
     ops = [
@@ -176,6 +237,8 @@ deno_core::extension!(
         op_zou_chunk_fail,
         op_zou_env_get,
         op_zou_env,
+        op_zou_read_file,
+        op_zou_read_file_sync,
         crypto::op_zou_random,
         crypto::op_zou_digest,
         crypto::op_zou_sign,
@@ -331,6 +394,7 @@ impl Runtime for Isolate {
             call,
             peer,
             env,
+            statics: zou_functions::Statics::of(function),
             answered: None,
             sink: Some(answer),
             writing: None,

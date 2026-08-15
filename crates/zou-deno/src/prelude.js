@@ -2122,6 +2122,71 @@
   };
 
   // ---------------------------------------------------------------
+  // Reading a static file
+  //
+  // The four spellings Deno has, over the two ops that do the reading.
+  // What a function may open is its own `static_files` and nothing
+  // else, which the op decides, so everything here is turning a name
+  // into a string and an answer into a value or the error Deno would
+  // have thrown.
+
+  class NotFound extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "NotFound";
+    }
+  }
+
+  class PermissionDenied extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "PermissionDenied";
+    }
+  }
+
+  /// A `string | URL`, which is what Deno takes, as the string the op
+  /// wants. A file url is the path in it, since that is the only thing
+  /// a file url is here.
+  function pathOf(path) {
+    if (path instanceof URL) {
+      if (path.protocol !== "file:") {
+        throw new TypeError(`a file may only be read through a file url, not ${path.protocol}`);
+      }
+      return decodeURIComponent(path.pathname);
+    }
+    return String(path);
+  }
+
+  function fileOf(read) {
+    switch (read.kind) {
+      case "bytes":
+        return read.bytes;
+      case "refused":
+        throw new PermissionDenied(read.why);
+      case "missing":
+        throw new NotFound(read.why);
+      default:
+        throw new Error(read.why);
+    }
+  }
+
+  function readFile(path) {
+    return ops.op_zou_read_file(pathOf(path)).then(fileOf);
+  }
+
+  function readFileSync(path) {
+    return fileOf(ops.op_zou_read_file_sync(pathOf(path)));
+  }
+
+  async function readTextFile(path) {
+    return new TextDecoder().decode(await readFile(path));
+  }
+
+  function readTextFileSync(path) {
+    return new TextDecoder().decode(readFileSync(path));
+  }
+
+  // ---------------------------------------------------------------
   // What the module sees
 
   const EdgeRuntime = { waitUntil };
@@ -2163,6 +2228,14 @@
   Object.assign(Deno, {
     serve,
     env,
+    readFile,
+    readFileSync,
+    readTextFile,
+    readTextFileSync,
+    // The two a function catching one of them by name is written
+    // against, which is what makes a missing file and a file it may
+    // not have two different things to it.
+    errors: { NotFound, PermissionDenied },
     // Enough of it that a function branching on the platform gets an
     // answer rather than an exception.
     build: { target: "unknown", arch: "unknown", os: "linux", vendor: "unknown" },
