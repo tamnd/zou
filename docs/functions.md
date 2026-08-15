@@ -211,7 +211,7 @@ Deno.serve(async () => {
 It is the same HTTP client the server calls a database webhook with, behind an op, rather than a second stack linked in beside the first.
 What that means in practice, written down because a difference from Deno is a difference somebody's function will meet:
 
-- The answer is collected before the handler sees it, so `res.body` is null and a large download is held in memory. The 20 MiB ceiling on a call's body applies to what a function may read back too.
+- The answer is collected before the handler sees it, so a large download is held in memory and the 20 MiB ceiling on a call's body applies to what a function may read back too. `res.body` is a stream over what arrived rather than a stream that is still arriving.
 - A call has 30 seconds. Deno waits forever, which is fine for a program somebody is watching and not for a request holding an isolate.
 - `res.statusText` is the canonical phrase for the code rather than the one the server wrote, because the client does not keep the reason phrase.
 - `res.url` and `res.redirected` are where the answer came from, so a redirect that was followed can be seen. Redirects are followed.
@@ -256,7 +256,7 @@ Both form encodings are read: `multipart/form-data` and `application/x-www-form-
 A form given to `new Request` or `new Response` as a body is written out as multipart with a boundary, and a `URLSearchParams` given as a body is written out urlencoded, each with the content type that says so.
 
 - The multipart boundary is not random. It is a name with a number on it, and the number is stepped until the boundary appears nowhere in the form, which is a stronger guarantee than a random string and is what a runtime with no randomness yet can offer.
-- `blob.stream()` throws, for the same reason `new ReadableStream()` does.
+- `blob.stream()` is a stream over the bytes the blob already holds, because a blob is bytes and there is nothing left to wait for.
 - A part with no `name` on its content disposition is dropped rather than being an error, so one malformed part does not lose the ones around it.
 
 ## crypto
@@ -331,6 +331,37 @@ Work registered from inside work counts too, so a promise chain that ends in ano
 - An ordinary shutdown waits for it. The work runs on the blocking thread the call already had, so the process does not exit out from under it.
 - On Lambda it is best effort. The response goes back to the runtime api first, and an environment that is frozen straight afterwards stops the work where it stands until the next invocation thaws it, or loses it if the environment is destroyed. That is the platform and not the runtime.
 
+## Streams
+
+`ReadableStream`, with a source a function wrote, a reader, `for await`, `tee` and `cancel`.
+
+```ts
+Deno.serve(() => {
+  const encoder = new TextEncoder()
+  let at = 0
+  return new Response(
+    new ReadableStream({
+      pull(controller) {
+        at += 1
+        if (at > 3) return controller.close()
+        controller.enqueue(encoder.encode(`part ${at}\n`))
+      },
+    }),
+  )
+})
+```
+
+Every body is a stream, whichever way it was made: `req.body` on the request a handler is given, `res.body` on an answer that came back from `fetch`, `.body` on a `Response` built out of a string, and `blob.stream()`.
+A body that is not there is `null` rather than an empty stream, so `if (req.body)` means what it says.
+Reading the stream is reading the body, so `bodyUsed` is true afterwards and `text()` says `Body already consumed.` rather than answering with nothing.
+`clone()` on a request or a response whose body is a stream tees it, which is what makes reading the same body twice work.
+
+- A response whose body is a stream is collected before it is sent. The caller gets all of it and gets it at the end, which is the difference between this and streaming, and streaming to the caller is the box left open on [#369](https://github.com/tamnd/zou/issues/369).
+- The queueing strategy is a count of chunks and not a size in bytes, so `highWaterMark` is how many chunks are read ahead. `size` is ignored.
+- A body stream may only give out bytes. A stream of strings is fine until somebody asks for the body, which is where the `TypeError` is.
+- There is no `WritableStream` and no `TransformStream`, so there is no `pipeTo` and no `pipeThrough`. They are absent rather than throwing, because there is nothing to construct.
+- There is no byte stream and no BYOB reader. `new ReadableStream({ type: "bytes" })` and `getReader({ mode: "byob" })` are refused by name.
+
 ## WebSocket
 
 The client half, for a function that talks to something over a socket rather than over a request.
@@ -364,12 +395,13 @@ Deno.serve(async (req) => {
 
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `Event`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `Event`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `ReadableStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
 
 Not present yet, and named rather than silently missing:
 
 - The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
-- Streams. `new ReadableStream()` throws with its own name in the message, and a response body is collected before it is sent rather than arriving in chunks.
+- The writable half of streams. There is no `WritableStream` and no `TransformStream`, and so no `pipeTo` and no `pipeThrough`, and no byte stream or BYOB reader.
+- Streaming to the caller. A response body is collected before it is sent rather than arriving in chunks, so a `ReadableStream` body is an answer that is built as it goes and delivered whole.
 - Node built ins. `node:fs` and the rest are refused by name.
 
 The rest of that list, and where each line stands, is [issue #369](https://github.com/tamnd/zou/issues/369).

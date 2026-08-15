@@ -587,7 +587,7 @@
     }
 
     stream() {
-      throw new TypeError("ReadableStream is not implemented yet");
+      return streamed(this[BLOB].slice());
     }
   }
 
@@ -823,47 +823,399 @@
   }
 
   // ---------------------------------------------------------------
+  // ---------------------------------------------------------------
+  // Streams
+  //
+  // A queue, the readers waiting on it, and the source's three
+  // functions. That is the whole of what a readable stream is, and the
+  // parts of the spec that are not here are the parts that exist for a
+  // browser: there is no byte stream and so no BYOB reader, no
+  // `WritableStream` and so no `pipeTo`, and the queueing strategy is a
+  // count of chunks rather than a size in bytes.
+  //
+  // What a function reaches for is here: a source it wrote itself, a
+  // reader, `for await`, `tee` and `cancel`.
+
+  const STREAM = Symbol("stream");
+
+  class ReadableStream {
+    constructor(source = {}, strategy = {}) {
+      source = source ?? {};
+      if (source.type !== undefined && source.type !== null) {
+        throw new TypeError(`a ${source.type} stream is not supported yet`);
+      }
+      const held = {
+        source,
+        queue: [],
+        waiting: [],
+        state: "readable",
+        stored: undefined,
+        locked: false,
+        pulling: false,
+        want: Number(strategy.highWaterMark ?? 1),
+        started: null,
+      };
+      this[STREAM] = held;
+      const controller = {
+        enqueue(chunk) {
+          arrives(held, chunk);
+        },
+        close() {
+          ends(held);
+        },
+        error(why) {
+          fails(held, why);
+        },
+        get desiredSize() {
+          return held.state === "readable" ? held.want - held.queue.length : null;
+        },
+      };
+      held.controller = controller;
+      // `start` may be a promise, and nothing is pulled until it has
+      // settled, which is what lets a source do its setup before it is
+      // asked for anything.
+      held.started = (async () => {
+        if (typeof source.start === "function") {
+          await source.start(controller);
+        }
+      })().catch((thrown) => fails(held, thrown));
+      pulls(held);
+    }
+
+    get locked() {
+      return this[STREAM].locked;
+    }
+
+    getReader(options = {}) {
+      if (options !== null && options !== undefined && options.mode !== undefined) {
+        throw new TypeError(`a ${options.mode} reader is not supported yet`);
+      }
+      return new ReadableStreamDefaultReader(this);
+    }
+
+    cancel(reason) {
+      if (this[STREAM].locked) {
+        return Promise.reject(new TypeError("the stream is locked to a reader"));
+      }
+      return gives(this[STREAM], reason);
+    }
+
+    /// Two streams that both see every chunk, which is the only way to
+    /// read a body twice.
+    tee() {
+      const reader = this.getReader();
+      const sides = [];
+      const both = (each) => {
+        for (const side of sides) {
+          each(side);
+        }
+      };
+      let reading = false;
+      const pull = async () => {
+        if (reading) {
+          return;
+        }
+        reading = true;
+        try {
+          const { value, done } = await reader.read();
+          if (done) {
+            both((side) => ends(side));
+          } else {
+            both((side) => arrives(side, value));
+          }
+        } catch (thrown) {
+          both((side) => fails(side, thrown));
+        } finally {
+          reading = false;
+        }
+      };
+      const made = [
+        new ReadableStream({ pull }),
+        new ReadableStream({ pull }),
+      ];
+      for (const side of made) {
+        sides.push(side[STREAM]);
+      }
+      return made;
+    }
+
+    async *[Symbol.asyncIterator]() {
+      const reader = this.getReader();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) {
+            return;
+          }
+          yield value;
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    }
+
+    values() {
+      return this[Symbol.asyncIterator]();
+    }
+
+    /// Deno has this and libraries reach for it, and everything it
+    /// needs is already here.
+    static from(source) {
+      const iterator =
+        typeof source[Symbol.asyncIterator] === "function"
+          ? source[Symbol.asyncIterator]()
+          : source[Symbol.iterator]();
+      return new ReadableStream({
+        async pull(controller) {
+          const { value, done } = await iterator.next();
+          if (done) {
+            controller.close();
+          } else {
+            controller.enqueue(value);
+          }
+        },
+        async cancel(reason) {
+          if (typeof iterator.return === "function") {
+            await iterator.return(reason);
+          }
+        },
+      });
+    }
+  }
+
+  class ReadableStreamDefaultReader {
+    constructor(stream) {
+      const held = stream[STREAM];
+      if (held.locked) {
+        throw new TypeError("the stream is locked to a reader");
+      }
+      held.locked = true;
+      this[STREAM] = held;
+      this.closed = new Promise((done, broken) => {
+        held.told = { done, broken };
+      });
+      // Nobody is obliged to look at `closed`, and a promise nobody
+      // looks at that rejects is an unhandled rejection.
+      this.closed.catch(() => {});
+    }
+
+    read() {
+      const held = this[STREAM];
+      if (held === null) {
+        return Promise.reject(new TypeError("the reader has been released"));
+      }
+      return reads(held);
+    }
+
+    cancel(reason) {
+      const held = this[STREAM];
+      if (held === null) {
+        return Promise.reject(new TypeError("the reader has been released"));
+      }
+      return gives(held, reason);
+    }
+
+    releaseLock() {
+      const held = this[STREAM];
+      if (held === null) {
+        return;
+      }
+      held.locked = false;
+      this[STREAM] = null;
+    }
+  }
+
+  function arrives(held, chunk) {
+    if (held.state !== "readable") {
+      return;
+    }
+    const waiting = held.waiting.shift();
+    if (waiting === undefined) {
+      held.queue.push(chunk);
+    } else {
+      waiting.done({ value: chunk, done: false });
+    }
+  }
+
+  function ends(held) {
+    if (held.state !== "readable") {
+      return;
+    }
+    held.state = "closed";
+    for (const waiting of held.waiting.splice(0)) {
+      waiting.done({ value: undefined, done: true });
+    }
+    held.told?.done(undefined);
+  }
+
+  function fails(held, why) {
+    if (held.state !== "readable") {
+      return;
+    }
+    held.state = "errored";
+    held.stored = why;
+    held.queue.length = 0;
+    for (const waiting of held.waiting.splice(0)) {
+      waiting.broken(why);
+    }
+    held.told?.broken(why);
+  }
+
+  async function gives(held, reason) {
+    if (held.state === "readable") {
+      held.queue.length = 0;
+      ends(held);
+      if (typeof held.source.cancel === "function") {
+        await held.source.cancel(reason);
+      }
+    }
+  }
+
+  function reads(held) {
+    if (held.queue.length > 0) {
+      const value = held.queue.shift();
+      pulls(held);
+      return Promise.resolve({ value, done: false });
+    }
+    if (held.state === "closed") {
+      return Promise.resolve({ value: undefined, done: true });
+    }
+    if (held.state === "errored") {
+      return Promise.reject(held.stored);
+    }
+    const waited = new Promise((done, broken) => {
+      held.waiting.push({ done, broken });
+    });
+    pulls(held);
+    return waited;
+  }
+
+  /// Ask the source for more, once at a time, until it has given us as
+  /// much as was asked for or somebody is still waiting.
+  async function pulls(held) {
+    if (held.pulling || typeof held.source.pull !== "function") {
+      return;
+    }
+    held.pulling = true;
+    try {
+      await held.started;
+      while (
+        held.state === "readable" &&
+        (held.waiting.length > 0 || held.queue.length < held.want)
+      ) {
+        const before = held.queue.length + held.waiting.length;
+        await held.source.pull(held.controller);
+        if (held.queue.length + held.waiting.length === before && held.waiting.length === 0) {
+          // A pull that gave us nothing and left nobody waiting is a
+          // source that will speak when it is ready.
+          break;
+        }
+      }
+    } catch (thrown) {
+      fails(held, thrown);
+    } finally {
+      held.pulling = false;
+    }
+  }
+
+  /// Every chunk of a stream, as one run of bytes, which is what a body
+  /// is once somebody has asked for all of it.
+  async function collected(stream) {
+    const held = [];
+    let length = 0;
+    for await (const chunk of stream) {
+      if (!(chunk instanceof Uint8Array) && !ArrayBuffer.isView(chunk) && !(chunk instanceof ArrayBuffer)) {
+        throw new TypeError("a body stream may only give out bytes");
+      }
+      const bytes = bytesOf(chunk);
+      held.push(bytes);
+      length += bytes.length;
+    }
+    const all = new Uint8Array(length);
+    let at = 0;
+    for (const bytes of held) {
+      all.set(bytes, at);
+      at += bytes.length;
+    }
+    return all;
+  }
+
+  /// One run of bytes as a stream, which is what `.body` is for a body
+  /// that was never a stream to begin with.
+  function streamed(bytes, taken) {
+    return new ReadableStream({
+      start(controller) {
+        taken?.();
+        if (bytes.length > 0) {
+          controller.enqueue(bytes);
+        }
+        controller.close();
+      },
+    });
+  }
+
+  // ---------------------------------------------------------------
   // Bodies
 
   const BODY = Symbol("body");
   const USED = Symbol("bodyUsed");
+  const SOURCE = Symbol("bodySource");
 
-  function readBody(target) {
+  /// The bytes of a body, whether they were bytes all along or are
+  /// still arriving.
+  async function readBody(target) {
     if (target[USED]) {
       throw new TypeError("Body already consumed.");
     }
     target[USED] = true;
-    return target[BODY];
+    if (target[SOURCE] !== null && target[SOURCE] !== undefined) {
+      const stream = target[SOURCE];
+      target[SOURCE] = null;
+      target[BODY] = await collected(stream);
+    }
+    return target[BODY] ?? new Uint8Array(0);
+  }
+
+  /// What goes out on the wire, which is not a read: a response the
+  /// host is sending is not a body the handler consumed.
+  async function sending(target) {
+    if (target[SOURCE] !== null && target[SOURCE] !== undefined) {
+      const stream = target[SOURCE];
+      target[SOURCE] = null;
+      target[BODY] = await collected(stream);
+    }
+    return target[BODY] ?? new Uint8Array(0);
   }
 
   const bodyMethods = {
     async arrayBuffer() {
-      const bytes = readBody(this);
+      const bytes = await readBody(this);
       return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
     },
     async bytes() {
-      return readBody(this).slice();
+      return (await readBody(this)).slice();
     },
     async text() {
-      return core.decode(readBody(this));
+      return core.decode(await readBody(this));
     },
     async json() {
-      return JSON.parse(core.decode(readBody(this)));
+      return JSON.parse(core.decode(await readBody(this)));
     },
     /// The body's own content type is the blob's, because that is the
     /// only place the type of some bytes is written down here.
     async blob() {
-      return new Blob([readBody(this)], { type: this.headers.get("content-type") ?? "" });
+      return new Blob([await readBody(this)], { type: this.headers.get("content-type") ?? "" });
     },
     async formData() {
       const type = this.headers.get("content-type") ?? "";
       const boundary = boundaryOf(type);
+      const bytes = await readBody(this);
       if (boundary !== null) {
-        return formOf(readBody(this), boundary);
+        return formOf(bytes, boundary);
       }
       if (type.split(";")[0].trim().toLowerCase() === "application/x-www-form-urlencoded") {
         const form = new FormData();
-        for (const [name, value] of pairsOf(core.decode(readBody(this)))) {
+        for (const [name, value] of pairsOf(core.decode(bytes))) {
           form.append(name, value);
         }
         return form;
@@ -873,41 +1225,51 @@
     get bodyUsed() {
       return this[USED];
     },
+    /// A stream either way: the one the body was made of, or one over
+    /// the bytes it was made of, made the first time somebody asks.
+    get body() {
+      if (this[SOURCE] !== null && this[SOURCE] !== undefined) {
+        return this[SOURCE];
+      }
+      if (this[BODY] === null || this[BODY] === undefined) {
+        return null;
+      }
+      const made = streamed(this[BODY], () => {
+        this[USED] = true;
+      });
+      this[SOURCE] = made;
+      return made;
+    },
   };
 
-  /// The bytes of a body, and the content type it implies when the
-  /// caller did not name one.
+  /// The bytes of a body, the stream it is still arriving on, and the
+  /// content type it implies when the caller did not name one. A body
+  /// that is null is not a body: `res.body` is null and reading it is
+  /// an empty string, which are different things from an empty body.
   function intoBody(body) {
     if (body === undefined || body === null) {
-      return [new Uint8Array(0), null];
+      return [null, null, null];
     }
     if (typeof body === "string") {
-      return [encoder.encode(body), "text/plain;charset=UTF-8"];
+      return [encoder.encode(body), "text/plain;charset=UTF-8", null];
     }
     if (body instanceof Uint8Array || body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-      return [bytesOf(body), null];
+      return [bytesOf(body), null, null];
     }
     if (body instanceof Blob) {
-      return [body[BLOB].slice(), body.type === "" ? null : body.type];
+      return [body[BLOB].slice(), body.type === "" ? null : body.type, null];
     }
     if (body instanceof FormData) {
-      return multipart(body);
+      const [bytes, type] = multipart(body);
+      return [bytes, type, null];
     }
     if (body instanceof URLSearchParams) {
-      return [encoder.encode(body.toString()), "application/x-www-form-urlencoded;charset=UTF-8"];
+      return [encoder.encode(body.toString()), "application/x-www-form-urlencoded;charset=UTF-8", null];
     }
-    if (body instanceof ReadableStreamStub) {
-      throw new TypeError("a streamed body is not supported yet");
+    if (body instanceof ReadableStream) {
+      return [null, null, body];
     }
-    return [encoder.encode(String(body)), "text/plain;charset=UTF-8"];
-  }
-
-  // Named so the check above has something to name, and so a handler
-  // asking for the class gets a clear failure rather than `undefined`.
-  class ReadableStreamStub {
-    constructor() {
-      throw new TypeError("ReadableStream is not implemented yet");
-    }
+    return [encoder.encode(String(body)), "text/plain;charset=UTF-8", null];
   }
 
   // ---------------------------------------------------------------
@@ -919,7 +1281,14 @@
         this.url = input.url;
         this.method = init.method ? String(init.method).toUpperCase() : input.method;
         this.headers = new Headers(init.headers ?? input.headers);
-        this[BODY] = init.body === undefined ? input[BODY] : intoBody(init.body)[0];
+        if (init.body === undefined) {
+          this[BODY] = input[BODY];
+          this[SOURCE] = input[SOURCE];
+        } else {
+          const [bytes, , stream] = intoBody(init.body);
+          this[BODY] = bytes;
+          this[SOURCE] = stream;
+        }
       } else {
         // A request's url is a url, so it is parsed here and not left
         // as whatever string it arrived as: `new Request("/one")` has
@@ -927,23 +1296,31 @@
         this.url = new URL(input).href;
         this.method = init.method ? String(init.method).toUpperCase() : "GET";
         this.headers = new Headers(init.headers);
-        const [bytes, type] = intoBody(init.body);
+        const [bytes, type, stream] = intoBody(init.body);
         this[BODY] = bytes;
+        this[SOURCE] = stream;
         if (type !== null && !this.headers.has("content-type")) {
           this.headers.set("content-type", type);
         }
       }
       this[USED] = false;
-      Object.defineProperty(this, "body", { value: null, enumerable: true });
     }
 
     clone() {
       const copy = new Request(this.url, { method: this.method, headers: this.headers });
-      copy[BODY] = this[BODY];
+      // A stream cannot be in two places, so cloning one is teeing it,
+      // which is what the spec says to do and is why `tee` exists.
+      if (this[SOURCE] !== null && this[SOURCE] !== undefined) {
+        const [mine, theirs] = this[SOURCE].tee();
+        this[SOURCE] = mine;
+        copy[SOURCE] = theirs;
+      } else {
+        copy[BODY] = this[BODY];
+      }
       return copy;
     }
   }
-  Object.assign(Request.prototype, bodyMethods);
+  Object.defineProperties(Request.prototype, Object.getOwnPropertyDescriptors(bodyMethods));
 
   const REDIRECTS = [301, 302, 303, 307, 308];
   const NO_BODY = [101, 204, 205, 304];
@@ -960,13 +1337,13 @@
       if (NO_BODY.includes(status) && body !== undefined && body !== null) {
         throw new TypeError("Response with null body status cannot have body");
       }
-      const [bytes, type] = intoBody(body);
+      const [bytes, type, stream] = intoBody(body);
       this[BODY] = bytes;
+      this[SOURCE] = stream;
       this[USED] = false;
       if (type !== null && !this.headers.has("content-type")) {
         this.headers.set("content-type", type);
       }
-      Object.defineProperty(this, "body", { value: null, enumerable: true });
       // A response nobody fetched has no url, which is what Deno gives
       // back for one a handler built itself.
       this.url = "";
@@ -986,7 +1363,13 @@
 
     clone() {
       const copy = new Response(null, { status: this.status, statusText: this.statusText, headers: this.headers });
-      copy[BODY] = this[BODY];
+      if (this[SOURCE] !== null && this[SOURCE] !== undefined) {
+        const [mine, theirs] = this[SOURCE].tee();
+        this[SOURCE] = mine;
+        copy[SOURCE] = theirs;
+      } else {
+        copy[BODY] = this[BODY];
+      }
       return copy;
     }
 
@@ -1012,7 +1395,7 @@
       return res;
     }
   }
-  Object.assign(Response.prototype, bodyMethods);
+  Object.defineProperties(Response.prototype, Object.getOwnPropertyDescriptors(bodyMethods));
 
   // ---------------------------------------------------------------
   // fetch
@@ -1029,8 +1412,8 @@
     res.headers = new Headers(answer.headers);
     res.url = answer.url;
     res[BODY] = answer.body;
+    res[SOURCE] = null;
     res[USED] = false;
-    Object.defineProperty(res, "body", { value: null, enumerable: true });
     Object.defineProperty(res, "redirected", { value: answer.redirected });
     return res;
   }
@@ -1045,7 +1428,7 @@
     }
     // Reading the body is what sending it is, and a request whose body
     // was already read is a request with nothing left to send.
-    const body = readBody(request);
+    const body = await readBody(request);
     const answer = await ops.op_zou_fetch(
       {
         method: request.method,
@@ -1759,7 +2142,8 @@
     Response,
     TextDecoder,
     TextEncoder,
-    ReadableStream: ReadableStreamStub,
+    ReadableStream,
+    ReadableStreamDefaultReader,
     URL,
     URLSearchParams,
     atob,
@@ -1807,7 +2191,11 @@
     if (!(answer instanceof Response)) {
       throw new TypeError("a handler must return a Response");
     }
-    ops.op_zou_answer(answer.status, Array.from(answer.headers.entries()), answer[BODY]);
+    ops.op_zou_answer(
+      answer.status,
+      Array.from(answer.headers.entries()),
+      await sending(answer),
+    );
   }
 
   // Two of them: the call, and whatever the call left running. The

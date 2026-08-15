@@ -448,7 +448,10 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
             microtask: typeof queueMicrotask,
             socket: typeof WebSocket,
             events: [typeof Event, typeof MessageEvent, typeof CloseEvent, typeof ErrorEvent].join(" "),
-            stream: (() => { try { new ReadableStream(); return "made one"; } catch (e) { return e.message; } })(),
+            stream: typeof ReadableStream,
+            reader: typeof ReadableStreamDefaultReader,
+            writable: typeof WritableStream,
+            transform: typeof TransformStream,
         }));
         "#,
     );
@@ -470,7 +473,12 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
     assert_eq!(said["microtask"], "function");
     assert_eq!(said["socket"], "function");
     assert_eq!(said["events"], "function function function function");
-    assert_eq!(said["stream"], "ReadableStream is not implemented yet");
+    assert_eq!(said["stream"], "function");
+    assert_eq!(said["reader"], "function");
+    // The gaps that are left, and they are gaps by being absent rather
+    // than by throwing, because there is nothing to construct.
+    assert_eq!(said["writable"], "undefined");
+    assert_eq!(said["transform"], "undefined");
 }
 
 #[test]
@@ -1586,6 +1594,289 @@ fn a_request_may_be_fetched_and_its_body_goes_with_it() {
     let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
     assert_eq!(said["method"], "PUT");
     assert_eq!(said["body"], "the bytes");
+}
+
+#[test]
+fn a_stream_a_function_wrote_is_read_back_a_chunk_at_a_time() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const asked = [];
+            let at = 0;
+            const stream = new ReadableStream({
+                start(controller) { asked.push("start"); },
+                pull(controller) {
+                    at += 1;
+                    asked.push(`pull ${at}`);
+                    if (at > 3) { controller.close(); return; }
+                    controller.enqueue(new TextEncoder().encode(`chunk ${at} `));
+                },
+            });
+            const seen = [];
+            for await (const chunk of stream) {
+                seen.push(new TextDecoder().decode(chunk));
+            }
+            return Response.json({ seen, asked });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said["seen"],
+        serde_json::json!(["chunk 1 ", "chunk 2 ", "chunk 3 "])
+    );
+    // The source is asked for more as the reader takes what is there,
+    // rather than everything up front.
+    assert_eq!(
+        said["asked"],
+        serde_json::json!(["start", "pull 1", "pull 2", "pull 3", "pull 4"])
+    );
+}
+
+/// A body that is a stream, which is the shape a handler that builds
+/// its answer as it goes writes. It is collected before it is sent,
+/// which is the difference between this and streaming to the caller,
+/// and is written down as such.
+#[test]
+fn a_response_may_be_given_a_stream_and_the_caller_gets_all_of_it() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const encoder = new TextEncoder();
+            let at = 0;
+            const stream = new ReadableStream({
+                pull(controller) {
+                    at += 1;
+                    if (at > 3) { controller.close(); return; }
+                    controller.enqueue(encoder.encode(`part ${at}\n`));
+                },
+            });
+            return new Response(stream, { headers: { "content-type": "text/plain" } });
+        });
+        "#,
+    );
+    assert_eq!(body(&answer), "part 1\npart 2\npart 3\n");
+}
+
+#[test]
+fn a_reader_is_a_lock_on_the_stream_until_it_is_released() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const stream = ReadableStream.from(["one", "two"]);
+            const reader = stream.getReader();
+            const said = (f) => { try { f(); return "it worked"; } catch (e) { return e.message; } };
+            const twice = said(() => stream.getReader());
+            const first = await reader.read();
+            const second = await reader.read();
+            const third = await reader.read();
+            reader.releaseLock();
+            const released = await reader.read().then(() => "it read", (e) => e.message);
+            return Response.json({
+                twice,
+                locked: stream.locked,
+                first,
+                second,
+                third,
+                released,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["twice"], "the stream is locked to a reader");
+    assert_eq!(said["locked"], false);
+    assert_eq!(
+        said["first"],
+        serde_json::json!({ "value": "one", "done": false })
+    );
+    assert_eq!(
+        said["second"],
+        serde_json::json!({ "value": "two", "done": false })
+    );
+    assert_eq!(said["third"], serde_json::json!({ "done": true }));
+    assert_eq!(said["released"], "the reader has been released");
+}
+
+#[test]
+fn a_body_is_a_stream_whether_or_not_it_started_as_one() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        async function all(stream) {{
+            const seen = [];
+            for await (const chunk of stream) {{
+                seen.push(new TextDecoder().decode(chunk));
+            }}
+            return seen.join("");
+        }}
+        Deno.serve(async () => {{
+            const res = await fetch("{url}");
+            const fetched = await all(res.body);
+            const made = await all(new Response("what a handler built").body);
+            const blob = await all(new Blob(["out of a blob"]).stream());
+            return Response.json({{
+                fetched: JSON.parse(fetched).path,
+                made,
+                blob,
+                used: new Response("x").bodyUsed,
+                empty: new Response(null).body,
+                nothing: new Request("http://example.com/one").body,
+                still: (await all(new Response("read as a stream").body)).length,
+            }});
+        }});
+        "#,
+        url = server.url("/streamed")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["fetched"], "/streamed");
+    assert_eq!(said["made"], "what a handler built");
+    assert_eq!(said["blob"], "out of a blob");
+    assert_eq!(said["used"], false);
+    // A body that is not there is null rather than an empty stream,
+    // which is a difference a handler branching on `res.body` sees.
+    assert_eq!(said["empty"], serde_json::Value::Null);
+    assert_eq!(said["nothing"], serde_json::Value::Null);
+    assert_eq!(said["still"], 16);
+}
+
+#[test]
+fn the_request_a_handler_is_given_can_be_read_as_a_stream() {
+    let call = Call {
+        method: "POST".to_string(),
+        url: "http://localhost:9000/functions/v1/hello".to_string(),
+        headers: Vec::new(),
+        body: b"the bytes that were posted".to_vec(),
+        execution_id: "one".to_string(),
+    };
+    let answer = called(
+        r#"
+        Deno.serve(async (req) => {
+            const seen = [];
+            for await (const chunk of req.body) {
+                seen.push(new TextDecoder().decode(chunk));
+            }
+            const after = req.bodyUsed;
+            const again = await req.text().then(() => "read twice", (e) => e.message);
+            return Response.json({ seen, after, again });
+        });
+        "#,
+        call,
+    )
+    .expect("an answer");
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said["seen"],
+        serde_json::json!(["the bytes that were posted"])
+    );
+    // Reading the stream is reading the body, so what is left for
+    // `text()` is nothing, and it says so rather than answering with an
+    // empty string.
+    assert_eq!(said["after"], true);
+    assert_eq!(said["again"], "Body already consumed.");
+}
+
+#[test]
+fn a_stream_can_be_split_in_two_and_both_halves_see_everything() {
+    let answer = answered(
+        r#"
+        async function all(stream) {
+            const seen = [];
+            for await (const chunk of stream) { seen.push(chunk); }
+            return seen;
+        }
+        Deno.serve(async () => {
+            const [one, two] = ReadableStream.from(["a", "b", "c"]).tee();
+            const both = await Promise.all([all(one), all(two)]);
+            const res = new Response("a body worth reading twice");
+            const copy = res.clone();
+            return Response.json({ both, first: await res.text(), second: await copy.text() });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said["both"],
+        serde_json::json!([["a", "b", "c"], ["a", "b", "c"]])
+    );
+    assert_eq!(said["first"], "a body worth reading twice");
+    assert_eq!(said["second"], "a body worth reading twice");
+}
+
+#[test]
+fn a_stream_that_is_given_up_on_tells_its_source_so() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const seen = [];
+            const stream = new ReadableStream({
+                pull(controller) { controller.enqueue("more"); },
+                cancel(why) { seen.push(`cancelled because ${why}`); },
+            });
+            const reader = stream.getReader();
+            await reader.read();
+            await reader.cancel("nobody wants it");
+            const after = await reader.read();
+            return Response.json({ seen, after });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said["seen"],
+        serde_json::json!(["cancelled because nobody wants it"])
+    );
+    assert_eq!(said["after"], serde_json::json!({ "done": true }));
+}
+
+#[test]
+fn a_source_that_throws_is_the_readers_error_and_not_a_hang() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const stream = new ReadableStream({
+                pull() { throw new Error("the source gave up"); },
+            });
+            const read = await stream.getReader().read().then(() => "it read", (e) => e.message);
+            const answered = new ReadableStream({
+                start(controller) { controller.error(new Error("errored on purpose")); },
+            });
+            const body = await new Response(answered).text().then(() => "it read", (e) => e.message);
+            return Response.json({ read, body });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["read"], "the source gave up");
+    assert_eq!(said["body"], "errored on purpose");
+}
+
+/// What is not there is refused by name, the same as the rest of the
+/// gaps, because a byte stream and a BYOB reader are a different thing
+/// from a stream of chunks and silently treating one as the other is
+/// how a function ends up wrong rather than broken.
+#[test]
+fn a_byte_stream_is_a_gap_and_says_so() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const said = (f) => { try { f(); return "it worked"; } catch (e) { return e.message; } };
+            return Response.json({
+                bytes: said(() => new ReadableStream({ type: "bytes" })),
+                byob: said(() => new ReadableStream().getReader({ mode: "byob" })),
+                piped: typeof new ReadableStream().pipeThrough,
+                chunks: said(() => new Response(ReadableStream.from(["not bytes"]))),
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["bytes"], "a bytes stream is not supported yet");
+    assert_eq!(said["byob"], "a byob reader is not supported yet");
+    assert_eq!(said["piped"], "undefined");
+    // A body of strings is not an error until somebody asks for the
+    // bytes of it, which is where the message is.
+    assert_eq!(said["chunks"], "it worked");
 }
 
 /// The other end of a websocket.
