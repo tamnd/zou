@@ -100,10 +100,33 @@ static_files = ["./functions/other/index.html"]
 `verify_jwt` is on unless the block says otherwise.
 A function that configures nothing is a function nobody can call without a key, rather than one anybody can.
 
-`policy` and `inspector_port` are read and carried.
-The policy in force today is `oneshot`, one isolate per call, whatever the file says, and the line here will change when the pool arrives rather than the file having to.
+`policy` is honoured and `inspector_port` is read and carried until there is an inspector to attach to it.
 
 Anything under `[functions.<name>]` this server does not know is listed by `zou status` as unread, the same as anywhere else in the file.
+
+## What a function keeps between calls
+
+That is the policy, and it is upstream's two words.
+
+`per_worker` is the default, here and upstream, and it keeps one isolate per function and calls it again.
+So whatever the module built at the top of itself is still there on the second call: a database client, a compiled regular expression, a cache.
+The cold start is paid once.
+
+`oneshot` throws the isolate away after the call, so every call starts from nothing and nothing a call leaves behind can reach the next one.
+It is what the hosted service does and what upstream's own config file calls the fallback.
+
+A kept isolate is not a kept call.
+The clocks start again for each call, the request is the one that arrived, and `SB_EXECUTION_ID` is that invocation's own rather than the one the isolate was built for.
+What is not reset is memory, which belongs to the isolate for as long as it lives, so a function that leaks reaches the memory limit eventually rather than never.
+
+Three things end a kept isolate, and none of them is a handler that threw.
+
+- A limit reached. A terminated isolate is not somewhere the next call should start from.
+- A file it was built out of changing, which is hot reload, and which is what the CLI's own config file says `per_worker` is for. Every file off this disk that went into the isolate counts, so editing something under `_shared` reloads every function that imports it.
+- A minute with nobody calling. That number is this project's rather than upstream's, and what it trades is a cold start nobody is waiting on against a quarter of a gigabyte of address space per function nobody is calling.
+
+An isolate is one thread, because a v8 isolate is thread bound.
+A call that arrives while that thread is busy gets an isolate of its own rather than queueing behind the call in front of it, and the extra ones go away when the burst is over.
 
 ## Verification
 
@@ -327,7 +350,7 @@ The caller is answered as soon as the handler returns a `Response`, and what was
 Work registered from inside work counts too, so a promise chain that ends in another `waitUntil` is waited for as well.
 
 - A rejection is logged and nothing else. Whatever registered the work has returned by then and the answer is already on its way, so there is nobody left to tell.
-- Thirty seconds is the budget. Work still running after that is dropped and the drop is logged, because the isolate holding it is memory and the thread running it is a real thread, and a promise nobody resolves is a thing a function can write by accident. This number moves when per isolate limits arrive.
+- Thirty seconds is the budget. Work still running after that is dropped and the drop is logged, because the isolate holding it is memory and the thread running it is a real thread, and a promise nobody resolves is a thing a function can write by accident. The call's own wall clock is still running underneath it, so the background work gets the shorter of the two.
 - An ordinary shutdown waits for it. The work runs on the blocking thread the call already had, so the process does not exit out from under it.
 - On Lambda it is best effort. The response goes back to the runtime api first, and an environment that is frozen straight afterwards stops the work where it stands until the next invocation thaws it, or loses it if the environment is destroyed. That is the platform and not the runtime.
 

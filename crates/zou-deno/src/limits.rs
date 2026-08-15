@@ -195,6 +195,14 @@ impl Watch {
         Duration::from_nanos(spent.saturating_add(running))
     }
 
+    /// The clocks start again, which is what an isolate kept between
+    /// calls needs: a call's cpu and wall are its own, and the memory
+    /// is not, because the memory is still there.
+    pub(crate) fn restart(&self) {
+        self.spent.store(0, Ordering::Release);
+        self.entered.store(0, Ordering::Release);
+    }
+
     /// Buffer bytes handed out, and the total afterwards.
     fn took(&self, len: usize) -> usize {
         self.buffers.fetch_add(len, Ordering::AcqRel) + len

@@ -182,7 +182,7 @@ impl Status {
                 "{:>16}: {} on {}",
                 "functions",
                 served.join(", "),
-                crate::functions::engine_describe()
+                crate::functions::engine_describe(project.functions.policy)
             );
         }
         if !project.unread.is_empty() {
@@ -230,7 +230,8 @@ impl Status {
             out["project_id"] = serde_json::json!(project.id);
             out["unread"] = serde_json::json!(project.unread);
             out["functions"] = serde_json::json!(functions(project));
-            out["functions_engine"] = serde_json::json!(crate::functions::engine_describe());
+            out["functions_engine"] =
+                serde_json::json!(crate::functions::engine_describe(project.functions.policy));
         }
         println!("{out}");
     }
