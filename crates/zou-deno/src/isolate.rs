@@ -140,12 +140,19 @@ fn op_zou_chunk_fail(state: &mut OpState, #[string] why: String) {
 }
 
 /// One variable out of the function's environment, or null.
+///
+/// The last of a name rather than the first, because that is the rule
+/// the environment was stacked with: a project's secrets go in and then
+/// what the server owns goes in over them. `toObject` below collects
+/// into a map, which keeps the last of a name too, and the two answers
+/// have to be the same answer.
 #[op2]
 #[string]
 fn op_zou_env_get(state: &mut OpState, #[string] name: String) -> Option<String> {
     let held = state.borrow::<Held>();
     held.env
         .iter()
+        .rev()
         .find(|(key, _)| *key == name)
         .map(|(_, value)| value.clone())
 }

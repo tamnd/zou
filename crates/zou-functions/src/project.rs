@@ -78,6 +78,10 @@ pub struct Layout {
     /// rather than acted on until there is a runtime with an inspector
     /// in it to attach to.
     pub inspector_port: Option<u16>,
+    /// Upstream's `[edge_runtime.secrets]`, names and values with the
+    /// `env(NAME)` already resolved by whoever read the file, and what
+    /// a project's own `.env` is merged over.
+    pub secrets: BTreeMap<String, String>,
     pub settings: BTreeMap<String, Settings>,
 }
 

@@ -174,9 +174,40 @@ Four variables are the project's and are the same on every call.
 
 `SB_EXECUTION_ID` is the fifth and is one per invocation, which is what ties a log line from inside a function to the request that caused it.
 
-`Deno.env` is that map and nothing else.
 The environment this server process was started with is not in it, which matters because that environment is holding a database password and a function is somebody else's code.
 `Deno.env.set` and `Deno.env.delete` throw: these are a project's settings rather than a shell.
+
+## Secrets
+
+A project's own variables go underneath those five, from two places.
+
+`supabase/functions/.env` is the first, and it is read with no flag and no command.
+
+```
+STRIPE_KEY=sk_test_51H
+GREETING=hello
+```
+
+The format is the one the Supabase CLI parses, which is dotenv.
+`NAME=value` and `NAME: value` both work, `export NAME=value` works, a `#` starts a comment, and a `#` with a space before it ends an unquoted value.
+Single quotes are literal, double quotes unescape `\n` and `\r` and may span lines, and either kind of quote is not part of the value.
+`$NAME` and `${NAME}` expand from names set earlier in the same file, never from this server's own environment, and a name nothing set expands to nothing.
+
+`[edge_runtime.secrets]` in `config.toml` is the second, and it is where a value can stay out of the repository.
+
+```toml
+[edge_runtime.secrets]
+STRIPE_KEY = "env(STRIPE_KEY)"
+```
+
+`env(NAME)` is read from the environment `zou dev` was started with, so the name is committed and the secret is not.
+A name the environment does not have is left out rather than handed to a function as an empty string.
+The `.env` file wins over this block when both name the same variable, which is upstream's order.
+
+A name starting with `SUPABASE_` is refused from either place, with a line in the log saying which one was skipped.
+Those belong to the server, and the five above are the five.
+
+The names that arrived are printed at boot, without their values, so a project can see whether its file was found.
 
 ## Typescript
 
