@@ -27,6 +27,19 @@ const EXPOSE_HEADERS: &str = "Content-Encoding, Content-Location, Content-Range,
 /// headers from preflight requests, so an OPTIONS carrying an Origin
 /// and a requested method must be answered here, never handed to a
 /// gate that would 401 it for the missing apikey.
+///
+/// The functions surface is the exception, and it is measured rather
+/// than chosen. On `supabase start` the gateway answers every preflight
+/// itself, function or not, and a function's own OPTIONS handler never
+/// runs. The runtime behind that gateway does the opposite: asked
+/// directly it hands the OPTIONS to the function, adds no header of its
+/// own, and refuses nothing, which is why the hosted platform's
+/// documented pattern is a `_shared/cors.ts` every function imports. A
+/// server that answered the preflight here would make that pattern
+/// dead code, so a preflight to `/functions/v1/` is handed to the
+/// function, and only if what comes back says nothing about CORS does
+/// the answer above stand in for it. Then a project that never wrote a
+/// cors.ts still works the way it does against the local stack.
 pub async fn cors(req: Request<Body>, next: Next) -> Response {
     let origin = req.headers().get(header::ORIGIN).cloned();
     let preflight = req.method() == Method::OPTIONS
@@ -35,35 +48,35 @@ pub async fn cors(req: Request<Body>, next: Next) -> Response {
             .headers()
             .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
     if preflight {
-        let allow_headers = req
+        let origin = origin.expect("preflight checked origin");
+        let answer = preflight_answer(req.headers(), origin);
+        if !req.uri().path().starts_with(crate::functions::PREFIX) {
+            return answer;
+        }
+        let res = next.run(req).await;
+        return if res
             .headers()
-            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
-            .cloned()
-            .unwrap_or_else(|| HeaderValue::from_static("Authorization, Content-Type, apikey"));
-        let mut res = StatusCode::NO_CONTENT.into_response();
-        let h = res.headers_mut();
-        h.insert(
-            header::ACCESS_CONTROL_ALLOW_ORIGIN,
-            origin.expect("preflight checked origin"),
-        );
-        h.insert(
-            header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
-            HeaderValue::from_static("true"),
-        );
-        h.insert(
-            header::ACCESS_CONTROL_ALLOW_METHODS,
-            HeaderValue::from_static(ALLOW_METHODS),
-        );
-        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, allow_headers);
-        h.insert(
-            header::ACCESS_CONTROL_MAX_AGE,
-            HeaderValue::from_static("86400"),
-        );
-        return res;
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        {
+            res
+        } else {
+            answer
+        };
     }
     let mut res = next.run(req).await;
     if let Some(origin) = origin {
         let h = res.headers_mut();
+        // A handler that named the origins it may be read from has
+        // said the whole thing, so nothing is written over it and
+        // nothing is added beside it. A function that allows one
+        // origin means one origin, and this is the layer that would
+        // otherwise quietly widen it to whoever asked: the gateway on
+        // the local stack does exactly that, replacing what the
+        // function set with `*`, and it is the one part of that
+        // gateway's behaviour worth not copying.
+        if h.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN) {
+            return res;
+        }
         h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
         h.insert(
             header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
@@ -81,6 +94,34 @@ pub async fn cors(req: Request<Body>, next: Next) -> Response {
             );
         }
     }
+    res
+}
+
+/// What this edge tells a browser a preflight is allowed to do.
+///
+/// Built before the request is handed on, because on the functions
+/// surface it is only sent if the function had nothing to say.
+fn preflight_answer(asked: &header::HeaderMap, origin: HeaderValue) -> Response {
+    let allow_headers = asked
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("Authorization, Content-Type, apikey"));
+    let mut res = StatusCode::NO_CONTENT.into_response();
+    let h = res.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        HeaderValue::from_static("true"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static(ALLOW_METHODS),
+    );
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, allow_headers);
+    h.insert(
+        header::ACCESS_CONTROL_MAX_AGE,
+        HeaderValue::from_static("86400"),
+    );
     res
 }
 

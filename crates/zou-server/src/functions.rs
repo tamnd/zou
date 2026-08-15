@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use zou_functions::{Answer, Call};
 
@@ -96,7 +96,16 @@ pub async fn call(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     let Some(function) = registry.lookup(&name) else {
         return not_found();
     };
+    // An OPTIONS is never checked, whatever the function's verify_jwt
+    // says, because a browser sends no Authorization on a preflight
+    // and a function that answers its own preflight has to be reached
+    // to do it. That is the reference's rule too and it is the method
+    // and nothing else: asked directly, the runtime ran the function
+    // for an OPTIONS carrying no token and for one carrying
+    // `Bearer junk`, and answered the same call sent as HEAD with
+    // UNAUTHORIZED_NO_AUTH_HEADER.
     if function.verify_jwt
+        && req.method() != Method::OPTIONS
         && let Some(refusal) = verified(&app, &req)
     {
         return refusal;
@@ -514,6 +523,40 @@ mod tests {
             ..zou_functions::Function::new("open", std::path::PathBuf::new())
         });
         let hosted = hosted.at("open", |_| Ok(Answer::new("text/plain", b"open".to_vec())));
+        // The `_shared/cors.ts` pattern, written out: one origin on the
+        // way in and the same one on the way out, and its verify_jwt is
+        // left on, because a preflight reaching a function that checks
+        // tokens is the whole question.
+        functions.push(zou_functions::Function::new(
+            "cors",
+            std::path::PathBuf::new(),
+        ));
+        let hosted = hosted.at("cors", |call: &Call| {
+            let allow = vec![
+                (
+                    "access-control-allow-origin".to_string(),
+                    "https://only.example".to_string(),
+                ),
+                (
+                    "access-control-allow-headers".to_string(),
+                    "x-only".to_string(),
+                ),
+                (
+                    "access-control-allow-methods".to_string(),
+                    "POST".to_string(),
+                ),
+            ];
+            if call.method == "OPTIONS" {
+                return Ok(Answer {
+                    status: 200,
+                    headers: allow,
+                    body: zou_functions::Body::Bytes(b"ok".to_vec()),
+                });
+            }
+            let mut answer = Answer::new("text/plain", b"cors".to_vec());
+            answer.headers.extend(allow);
+            Ok(answer)
+        });
         crate::router(crate::Config {
             jwt_secret: SECRET.to_vec(),
             functions: Some(Arc::new(Registry::new(functions, Arc::new(hosted)))),
@@ -1104,5 +1147,151 @@ mod tests {
             res.headers()["access-control-allow-origin"],
             "http://localhost:3000"
         );
+    }
+
+    /// A preflight, the way a browser sends one: the method it is
+    /// about, the headers it wants to send, and no token, because a
+    /// browser attaches none to this request.
+    fn preflight(uri: &str) -> axum::http::request::Builder {
+        Request::builder()
+            .method("OPTIONS")
+            .uri(uri)
+            .header("origin", "https://app.example")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "authorization, x-only")
+    }
+
+    #[tokio::test]
+    async fn a_preflight_is_the_functions_to_answer() {
+        let seen = Arc::new(Seen::default());
+        let res = server(&seen)
+            .oneshot(preflight("/functions/v1/cors").body(Body::empty()).unwrap())
+            .await
+            .expect("answer");
+        // What the function said, unedited: the one origin it allows
+        // rather than the caller's, and the two lists it wrote.
+        assert_eq!(res.status(), StatusCode::OK);
+        let h = res.headers().clone();
+        assert_eq!(h["access-control-allow-origin"], "https://only.example");
+        assert_eq!(h["access-control-allow-headers"], "x-only");
+        assert_eq!(h["access-control-allow-methods"], "POST");
+        assert!(
+            !h.contains_key("access-control-allow-credentials"),
+            "the edge adds nothing beside an answer a function gave"
+        );
+        assert_eq!(text(res).await, "ok");
+    }
+
+    #[tokio::test]
+    async fn a_function_that_restricts_an_origin_is_not_widened() {
+        let seen = Arc::new(Seen::default());
+        let res = server(&seen)
+            .oneshot(
+                post("/functions/v1/cors")
+                    .header("origin", "https://app.example")
+                    .header("authorization", format!("Bearer {}", anon()))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("answer");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()["access-control-allow-origin"],
+            "https://only.example",
+            "the caller's origin does not replace the function's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preflight_carries_no_token_and_is_not_refused() {
+        let seen = Arc::new(Seen::default());
+        let res = server(&seen)
+            .oneshot(
+                preflight("/functions/v1/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("answer");
+        assert_ne!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "verify_jwt does not apply to a method a browser sends unauthenticated"
+        );
+        assert_eq!(
+            seen.0
+                .lock()
+                .expect("seen")
+                .as_ref()
+                .map(|c| c.method.clone()),
+            Some("OPTIONS".to_string()),
+            "the function was reached, which is what lets it answer its own preflight"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preflight_a_function_says_nothing_about_is_answered_by_the_edge() {
+        // `hello` answers json and no CORS header, which is every
+        // function written before anyone thought about a browser. The
+        // edge's own answer stands in, so such a project works here the
+        // way it works against the local stack, where the gateway
+        // answers the preflight and the function never sees it.
+        let seen = Arc::new(Seen::default());
+        let res = server(&seen)
+            .oneshot(
+                preflight("/functions/v1/hello")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("answer");
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let h = res.headers();
+        assert_eq!(h["access-control-allow-origin"], "https://app.example");
+        assert_eq!(h["access-control-allow-headers"], "authorization, x-only");
+        assert_eq!(h["access-control-max-age"], "86400");
+    }
+
+    #[tokio::test]
+    async fn a_preflight_for_a_name_nobody_deployed_is_still_a_preflight() {
+        // The local stack answers this one in the gateway without ever
+        // asking whether the name exists, and a browser that got the
+        // 404 instead would report a CORS failure for what is really a
+        // missing function. The call after it is the 404.
+        let seen = Arc::new(Seen::default());
+        let res = server(&seen)
+            .oneshot(
+                preflight("/functions/v1/nosuch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("answer");
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            res.headers()["access-control-allow-origin"],
+            "https://app.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_options_that_is_not_a_preflight_is_an_ordinary_call() {
+        // No Origin and no requested method, so it is not a browser
+        // asking permission, and the reference hands it straight to the
+        // function. So does this.
+        let seen = Arc::new(Seen::default());
+        let res = server(&seen)
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/functions/v1/cors")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("answer");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(text(res).await, "ok");
     }
 }
