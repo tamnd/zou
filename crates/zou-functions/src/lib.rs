@@ -36,7 +36,7 @@ mod secrets;
 mod statics;
 
 pub use project::{Layout, Settings, read};
-pub use secrets::{env_file, from as secrets_from, read as secrets};
+pub use secrets::{dotenv, env_file, from as secrets_from, read as secrets};
 pub use statics::Statics;
 
 /// One function, as far as anything in front of the runtime cares.

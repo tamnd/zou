@@ -567,12 +567,24 @@ impl Postmasters {
             Some(domain) => format!("https://{tenant_ref}.{domain}"),
             None => format!("http://127.0.0.1:{}", self.http),
         };
-        let env = crate::functions::env_at(
+        // The project's own environment first and the four above over
+        // it, which is the order the dev loop stacks them in. Nothing
+        // can collide there, because `SUPABASE_` is the one prefix a
+        // project is not allowed to set, but the stack is written this
+        // way round so reading it does not depend on knowing that.
+        let mut env = match self.secrets(tenant_ref) {
+            Ok(secrets) => secrets,
+            Err(e) => {
+                log::error!("{tenant_ref}: {e}");
+                return None;
+            }
+        };
+        env.extend(crate::functions::env_at(
             &url,
             &mint("anon"),
             &mint("service_role"),
             &format!("postgresql://{SUPERUSER}@127.0.0.1:{pg_port}/postgres"),
-        );
+        ));
         match crate::functions::registry(&project, &layout, env) {
             Ok(registry) => registry,
             Err(e) => {
@@ -580,6 +592,31 @@ impl Postmasters {
                 None
             }
         }
+    }
+
+    /// What this project's functions are told, out of the sealed object
+    /// in its own prefix.
+    ///
+    /// A project with no secrets is the normal case and needs no key at
+    /// all. A project that has them and a node that has no key is the
+    /// case worth being careful about: the functions are not served,
+    /// because a function running without the environment it was
+    /// written against is a function calling somebody else's api with
+    /// an empty token, and a 404 an operator can see beats a 200
+    /// nobody can explain.
+    fn secrets(&self, tenant_ref: &str) -> Result<Vec<(String, String)>, String> {
+        if !crate::secrets::present(&*self.store, tenant_ref)? {
+            return Ok(Vec::new());
+        }
+        let key = crate::secrets::Key::from_env()?.ok_or(
+            "this project has function secrets and this node has no key to open them with, set ZOU_SECRET_KEY",
+        )?;
+        let all = crate::secrets::read(&*self.store, tenant_ref, &key)?;
+        // The names and not the values, which is the question an
+        // operator has: whether the environment arrived at all.
+        let names: Vec<&str> = all.keys().map(String::as_str).collect();
+        log::info!("{tenant_ref}: function secrets: {}", names.join(", "));
+        Ok(all.into_iter().collect())
     }
 
     fn bootstrap(

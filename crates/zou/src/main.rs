@@ -20,6 +20,8 @@ mod map;
 #[cfg(unix)]
 mod schema;
 #[cfg(unix)]
+mod secrets;
+#[cfg(unix)]
 mod serve;
 #[cfg(unix)]
 mod shadow;
@@ -54,6 +56,8 @@ fn usage() -> ExitCode {
     #[cfg(unix)]
     eprintln!("       {}", inbox::USAGE);
     eprintln!("       {}", map::USAGE);
+    #[cfg(unix)]
+    eprintln!("       {}", secrets::USAGE);
     #[cfg(unix)]
     eprintln!("       {}", serve::USAGE);
     #[cfg(unix)]
@@ -134,6 +138,8 @@ fn main() -> ExitCode {
         Some("info") => simple(info::run(&argv[1..])),
         Some("inspect") => simple(inspect::run(&argv[1..])),
         Some("map") => simple(map::run(&argv[1..])),
+        #[cfg(unix)]
+        Some("secrets") => simple(secrets::run(&argv[1..])),
         #[cfg(unix)]
         Some("serve") => {
             let args = match serve::parse(&argv[1..]) {

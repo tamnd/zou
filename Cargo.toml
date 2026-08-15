@@ -15,6 +15,11 @@ authors = ["Tam Nguyen <tamnd87@gmail.com>"]
 anyhow = "1"
 axum = "0.8"
 base64ct = { version = "1", features = ["alloc"] }
+# The AEAD the tenant secrets are sealed with. ChaCha20-Poly1305
+# rather than AES-GCM because it is constant time in software on every
+# machine a node might run on, and a fleet should not have a security
+# property that depends on whether the box has AES-NI.
+chacha20poly1305 = "0.11"
 crc32c = "0.6"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 getrandom = "0.3"
