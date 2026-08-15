@@ -74,9 +74,10 @@ impl Default for Settings {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Layout {
     pub policy: Policy,
-    /// Where a debugger attaches, upstream's `inspector_port`. Carried
-    /// rather than acted on until there is a runtime with an inspector
-    /// in it to attach to.
+    /// Where a debugger attaches, upstream's `inspector_port`. A build
+    /// with an engine in it opens the port and answers the Chrome
+    /// DevTools Protocol on it; a build without one has nothing to
+    /// attach to and ignores it.
     pub inspector_port: Option<u16>,
     /// Upstream's `[edge_runtime.secrets]`, names and values with the
     /// `env(NAME)` already resolved by whoever read the file, and what

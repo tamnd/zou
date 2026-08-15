@@ -104,7 +104,7 @@ A function that configures nothing is a function nobody can call without a key, 
 `import_map` is one of the places a map is looked for, and the first one, which the import maps section covers.
 `static_files` is what the function may read off the disk, which the static files section covers.
 
-`policy` is honoured and `inspector_port` is read and carried until there is an inspector to attach to it.
+`policy` is honoured, and `inspector_port` opens the port a debugger attaches to, which the debugger section covers.
 
 Anything under `[functions.<name>]` this server does not know is listed by `zou status` as unread, the same as anywhere else in the file.
 
@@ -131,6 +131,28 @@ Three things end a kept isolate, and none of them is a handler that threw.
 
 An isolate is one thread, because a v8 isolate is thread bound.
 A call that arrives while that thread is busy gets an isolate of its own rather than queueing behind the call in front of it, and the extra ones go away when the burst is over.
+
+## A debugger
+
+`inspector_port` in `[edge_runtime]` opens a port, and what answers on it is the Chrome DevTools Protocol, which is what Chrome's `chrome://inspect`, VS Code's attach configuration and every other debugger that talks to node or to Deno already speak.
+
+```toml
+[edge_runtime]
+inspector_port = 8083
+```
+
+`GET /json/version` says what is answering, and `GET /json/list` is the isolates that are running, one line each with the websocket url to connect to.
+A function appears in that list once it has been called and leaves it when its isolate goes, so the list is what is running rather than what is deployed.
+Under `per_worker` an isolate is still there between calls, which is what makes it possible to attach after a call, set a breakpoint, and have the next call stop on it.
+
+The port is bound on `127.0.0.1` and nowhere else.
+A session evaluates arbitrary javascript inside an isolate holding the project's secrets, so it is a shell on the process, and a line in a config file should not be able to open one to the network by accident.
+
+A function with a debugger attached runs without the wall clock and cpu limits, because a breakpoint and a time limit are contradictory.
+The memory limit is unchanged.
+
+There is no `--inspect-brk`.
+Upstream has one as a flag on `supabase functions serve`, not as a setting in the config file, and holding the first request until somebody attaches belongs on a command line rather than in a file a deployment also reads.
 
 ## Verification
 

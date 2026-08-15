@@ -27,8 +27,9 @@ use zou_functions::{Answer, Call, Failed, Function, Runtime, Sink, Writer};
 
 use zou_functions::Policy;
 
+use crate::inspector::Inspector;
 use crate::limits::{Limits, Watch};
-use crate::{crypto, fetch, limits, module, pool, timer, url, websocket};
+use crate::{crypto, fetch, inspector, limits, module, pool, timer, url, websocket};
 
 /// What the isolate is told about the call it is running, and what it
 /// left behind afterwards. Both live in the runtime's op state, which
@@ -272,6 +273,8 @@ pub struct Isolate {
     /// The isolates kept between calls, which is nothing at all under
     /// `oneshot` and is where every call goes under `per_worker`.
     pool: pool::Pool,
+    /// The port a debugger attaches to, if the project asked for one.
+    inspector: Option<Arc<Inspector>>,
 }
 
 /// Upstream's one per invocation variable, which the call carries and
@@ -293,6 +296,7 @@ impl Isolate {
             // the other one. The server asks, out of `config.toml`.
             policy: Policy::OneShot,
             pool: pool::Pool::default(),
+            inspector: None,
         }
     }
 
@@ -308,6 +312,43 @@ impl Isolate {
     pub fn with_policy(mut self, policy: Policy) -> Isolate {
         self.policy = policy;
         self
+    }
+
+    /// Upstream's `[edge_runtime] inspector_port`: a port a debugger
+    /// attaches to, and every isolate this runtime makes listed on it.
+    ///
+    /// Zero means the operating system picks, which is what a test
+    /// wants and what [`Isolate::debugging_at`] is for.
+    pub fn with_inspector(self, port: u16) -> Result<Isolate, String> {
+        Ok(self.debugged_by(Inspector::start(port)?))
+    }
+
+    /// The same, for a port somebody else has already bound.
+    pub(crate) fn debugged_by(mut self, inspector: Arc<Inspector>) -> Isolate {
+        self.inspector = Some(inspector);
+        self
+    }
+
+    /// Where a debugger would attach, once one has been asked for.
+    pub fn debugging_at(&self) -> Option<std::net::SocketAddr> {
+        self.inspector.as_ref().map(|inspector| inspector.at())
+    }
+
+    /// What a call runs under, which is not what the project's config
+    /// file said when a debugger can stop it.
+    ///
+    /// A breakpoint is a function not making progress on purpose, and a
+    /// two second cpu limit is this server promising to stop a function
+    /// that is not making progress. They cannot both be honoured, and
+    /// the one the operator asked for most recently is the debugger.
+    /// What stays is the memory limit, which a debugger has no opinion
+    /// about and which is the one whose absence takes the machine down
+    /// with it.
+    fn limits(&self) -> Limits {
+        match self.inspector {
+            Some(_) => self.limits.patient(),
+            None => self.limits,
+        }
     }
 }
 
@@ -399,17 +440,18 @@ impl Runtime for Isolate {
             sink: Some(answer),
             writing: None,
         };
+        let limits = self.limits();
+        let debugger = self.inspector.clone();
         if self.policy == Policy::PerWorker {
             // Somebody else's thread, which already has an isolate with
             // this function in it, or is about to.
-            return self.pool.run(&source, held, self.limits);
+            return self.pool.run(&source, held, limits, debugger);
         }
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("the isolate could not have a runtime: {e}"))?;
-        let limits = self.limits;
-        tokio.block_on(once_off(source, held, limits))
+        tokio.block_on(once_off(source, held, limits, debugger))
     }
 
     fn describe(&self) -> String {
@@ -452,10 +494,15 @@ impl Source {
 /// asleep, because terminating execution does not wake a sleeper, and
 /// the watchdog inside is the one that catches a function that never
 /// gives its thread back.
-pub(crate) async fn once_off(source: Source, held: Held, limits: Limits) -> Result<(), Failed> {
+pub(crate) async fn once_off(
+    source: Source,
+    held: Held,
+    limits: Limits,
+    debugger: Option<Arc<Inspector>>,
+) -> Result<(), Failed> {
     let named = source.specifier.to_string();
     let call = async move {
-        let mut ready = Ready::new(source, limits).await?;
+        let mut ready = Ready::new(source, limits, debugger).await?;
         ready.once(held).await
     };
     match tokio::time::timeout(limits.wall, call).await {
@@ -484,11 +531,18 @@ pub(crate) struct Ready {
     limits: Limits,
     /// The files that went into it, for the question hot reload asks.
     read: module::Reads,
+    /// Its line in the debugger's target list, which it leaves by being
+    /// dropped along with the rest of this.
+    attached: Option<inspector::Attached>,
 }
 
 impl Ready {
-    pub(crate) async fn new(source: Source, limits: Limits) -> Result<Ready, Failed> {
-        build(source, limits).await
+    pub(crate) async fn new(
+        source: Source,
+        limits: Limits,
+        debugger: Option<Arc<Inspector>>,
+    ) -> Result<Ready, Failed> {
+        build(source, limits, debugger).await
     }
 
     /// Whether a file this was built out of has moved since it was.
@@ -503,9 +557,32 @@ impl Ready {
     pub(crate) fn spent(&self) -> bool {
         self.watch.reached().is_some()
     }
+
+    /// Whether a debugger could be attached to this isolate.
+    pub(crate) fn debuggable(&self) -> bool {
+        self.attached.is_some()
+    }
+
+    /// Give whatever a debugger has said a turn, without running any of
+    /// the function's own event loop.
+    ///
+    /// This is what a worker does while it waits for its next call. A
+    /// debugger setting a breakpoint, reading a source or evaluating an
+    /// expression between two calls is asking the isolate and not the
+    /// function, and none of it should start a timer the function left
+    /// behind or resolve a promise nobody is waiting for.
+    pub(crate) fn served(&mut self) {
+        let inspector = self.js.inspector();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        inspector.poll_sessions_from_event_loop(&mut cx);
+    }
 }
 
-async fn build(source: Source, limits: Limits) -> Result<Ready, Failed> {
+async fn build(
+    source: Source,
+    limits: Limits,
+    debugger: Option<Arc<Inspector>>,
+) -> Result<Ready, Failed> {
     let Source {
         specifier,
         import_map,
@@ -526,6 +603,12 @@ async fn build(source: Source, limits: Limits) -> Result<Ready, Failed> {
     let mut js = JsRuntime::new(RuntimeOptions {
         module_loader: Some(loader),
         extensions: vec![zou::init()],
+        // V8 only carries the machinery a debugger needs when it was
+        // built with it, so this is the project's `inspector_port`
+        // reaching all the way down: no port, no inspector, and an
+        // isolate that costs what it did before this existed.
+        inspector: debugger.is_some(),
+        is_main: debugger.is_some(),
         // The memory limits are v8's heap and, because a buffer is not
         // on that heap, an allocator that counts what the function asks
         // for outside it.
@@ -537,6 +620,13 @@ async fn build(source: Source, limits: Limits) -> Result<Ready, Failed> {
         ..Default::default()
     });
     let handle = js.v8_isolate().thread_safe_handle();
+    // Before the module is loaded, so that a debugger which attached
+    // while the isolate was being built sees the scripts go past rather
+    // than having to ask for them afterwards.
+    let attached = debugger.map(|inspector| {
+        let sessions = js.inspector().get_session_sender();
+        inspector.attach(&specifier, sessions)
+    });
     let watchdog = limits::watch(handle.clone(), Arc::clone(&watch), limits);
     js.add_near_heap_limit_callback(limits::near_heap_limit(handle.clone(), Arc::clone(&watch)));
     js.op_state().borrow_mut().put(timer::Pending::default());
@@ -606,6 +696,7 @@ async fn build(source: Source, limits: Limits) -> Result<Ready, Failed> {
         specifier,
         limits,
         read,
+        attached,
     })
 }
 

@@ -105,6 +105,23 @@ impl Limits {
     pub fn memory_mib(&self) -> usize {
         self.memory / MIB
     }
+
+    /// The same limits with the clocks taken off, which is what a
+    /// runtime a debugger can attach to runs under.
+    ///
+    /// Everything the three clocks measure is something a breakpoint
+    /// does on purpose. A day rather than forever because these are
+    /// durations a timer is armed with, and because a debugging session
+    /// somebody walked away from a day ago is over.
+    pub fn patient(self) -> Limits {
+        let day = Duration::from_secs(24 * 60 * 60);
+        Limits {
+            wall: day,
+            cpu: day,
+            background: day,
+            ..self
+        }
+    }
 }
 
 /// Which limit was reached, which decides only what the log says.
