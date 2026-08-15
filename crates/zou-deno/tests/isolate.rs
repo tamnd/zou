@@ -446,6 +446,8 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
             timer: typeof setTimeout,
             interval: typeof setInterval,
             microtask: typeof queueMicrotask,
+            socket: typeof WebSocket,
+            events: [typeof Event, typeof MessageEvent, typeof CloseEvent, typeof ErrorEvent].join(" "),
             stream: (() => { try { new ReadableStream(); return "made one"; } catch (e) { return e.message; } })(),
         }));
         "#,
@@ -466,6 +468,8 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
     assert_eq!(said["timer"], "function");
     assert_eq!(said["interval"], "function");
     assert_eq!(said["microtask"], "function");
+    assert_eq!(said["socket"], "function");
+    assert_eq!(said["events"], "function function function function");
     assert_eq!(said["stream"], "ReadableStream is not implemented yet");
 }
 
@@ -1076,6 +1080,40 @@ fn a_timer_that_throws_does_not_take_the_call_with_it() {
     assert_eq!(body(&answer), "answered anyway");
 }
 
+/// A module is done when its own evaluation says so and not when the
+/// event loop runs out of things to do, which is a distinction a module
+/// with an interval in it makes: `createClient` starts a refresh ticker
+/// while it is being imported, and waiting for an idle loop after that
+/// is waiting forever.
+#[test]
+fn a_module_that_leaves_a_timer_running_still_answers() {
+    let answer = answered(
+        r#"
+        const ticking = setInterval(() => {}, 5);
+        Deno.serve(() => new Response(`answered with ${typeof ticking}`));
+        "#,
+    );
+    assert_eq!(body(&answer), "answered with number");
+}
+
+/// The other half of that: a module that never finishes is an error
+/// saying so rather than a call that hangs until something kills it.
+#[test]
+fn a_module_that_never_finishes_evaluating_says_so() {
+    let refused = called(
+        r#"
+        await new Promise(() => {});
+        Deno.serve(() => new Response("never reached"));
+        "#,
+        get("http://localhost:9000/functions/v1/hello"),
+    )
+    .expect_err("a module that does not finish");
+    assert!(
+        refused.contains("Top-level await promise never resolved"),
+        "{refused}"
+    );
+}
+
 #[test]
 fn a_string_of_code_is_not_a_timer_callback_here() {
     let answer = answered(
@@ -1548,6 +1586,395 @@ fn a_request_may_be_fetched_and_its_body_goes_with_it() {
     let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
     assert_eq!(said["method"], "PUT");
     assert_eq!(said["body"], "the bytes");
+}
+
+/// The other end of a websocket.
+///
+/// The same shape as `wire` above and for the same reason: a websocket
+/// client is only true if something speaks the protocol back at it, and
+/// what a handshake and a frame codec do is not something a test can
+/// assert by reading bytes off a socket by hand. This is the server half
+/// of the crate the client half is built on, one thread per connection,
+/// answering by path.
+mod socket {
+    // The refusal an upgrade is turned down with is a whole http
+    // response by value, because that is the shape tungstenite's
+    // handshake callback is given and returns.
+    #![allow(clippy::result_large_err)]
+
+    use std::net::TcpListener;
+
+    use tungstenite::Message;
+    use tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    use tungstenite::protocol::CloseFrame;
+    use tungstenite::protocol::frame::coding::CloseCode;
+
+    pub struct Server {
+        pub port: u16,
+    }
+
+    impl Server {
+        pub fn url(&self, path: &str) -> String {
+            format!("ws://127.0.0.1:{}{path}", self.port)
+        }
+    }
+
+    pub fn start() -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                std::thread::spawn(move || talk(stream));
+            }
+        });
+        Server { port }
+    }
+
+    fn talk(stream: std::net::TcpStream) {
+        let mut path = String::new();
+        let shook = tungstenite::accept_hdr(stream, |request: &Request, response: Response| {
+            path = request.uri().path().to_string();
+            answer(&path, request, response)
+        });
+        let Ok(mut socket) = shook else { return };
+        if path == "/greeting" {
+            let _ = socket.send(Message::Text("hello".into()));
+        }
+        if path == "/goodbye" {
+            let _ = socket.close(Some(CloseFrame {
+                code: CloseCode::from(4000u16),
+                reason: "that is enough of that".into(),
+            }));
+            let _ = socket.flush();
+        }
+        // Everything else is a mirror, which is what makes what a
+        // function sent visible to the test that sent it.
+        loop {
+            match socket.read() {
+                Ok(Message::Text(text)) => {
+                    let _ = socket.send(Message::Text(text));
+                }
+                Ok(Message::Binary(bytes)) => {
+                    let _ = socket.send(Message::Binary(bytes));
+                }
+                Ok(Message::Close(_)) => {
+                    // The reply frame is the library's, and it goes out
+                    // on the flush rather than on its own.
+                    let _ = socket.flush();
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn answer(
+        path: &str,
+        request: &Request,
+        mut response: Response,
+    ) -> Result<Response, ErrorResponse> {
+        if path == "/refused" {
+            let mut refused = ErrorResponse::new(Some("not you".to_string()));
+            *refused.status_mut() = tungstenite::http::StatusCode::FORBIDDEN;
+            return Err(refused);
+        }
+        if path == "/named" {
+            // The first subprotocol offered, which is how a server picks
+            // one and is what `socket.protocol` is afterwards.
+            let asked = request
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(',').next())
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string();
+            if !asked.is_empty() {
+                response.headers_mut().insert(
+                    "sec-websocket-protocol",
+                    asked.parse().expect("a header value"),
+                );
+            }
+        }
+        Ok(response)
+    }
+}
+
+#[test]
+fn a_function_can_open_a_socket_and_hear_back_what_it_said() {
+    let server = socket::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const seen = [];
+            const ws = new WebSocket("{url}");
+            await new Promise((done) => {{
+                ws.onopen = () => {{
+                    seen.push(`open ${{ws.readyState}}`);
+                    ws.send("what a function said");
+                }};
+                ws.onmessage = (event) => {{
+                    seen.push(`message ${{event.data}} from ${{event.origin}}`);
+                    ws.close(1000, "that is all");
+                }};
+                ws.onclose = (event) => {{
+                    seen.push(`close ${{event.code}} ${{event.reason}} ${{event.wasClean}} ${{ws.readyState}}`);
+                    done();
+                }};
+            }});
+            return Response.json({{ seen, url: ws.url, protocol: ws.protocol }});
+        }});
+        "#,
+        url = server.url("/echo")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said["seen"],
+        serde_json::json!([
+            "open 1",
+            format!("message what a function said from {}", server.url("/echo")),
+            "close 1000 that is all true 3",
+        ])
+    );
+    assert_eq!(said["url"], server.url("/echo"));
+    // Nothing was offered and so nothing was agreed.
+    assert_eq!(said["protocol"], "");
+}
+
+/// The two things a binary message can arrive as, which is a property of
+/// the socket and not of the message, and both of them round trip the
+/// bytes a function sent.
+#[test]
+fn bytes_on_a_socket_arrive_as_whatever_the_binary_type_says() {
+    let server = socket::start();
+    let answer = answered(&format!(
+        r#"
+        function once(url, kind) {{
+            return new Promise((done) => {{
+                const ws = new WebSocket(url);
+                ws.binaryType = kind;
+                ws.onopen = () => ws.send(new Uint8Array([104, 105, 0, 255]));
+                ws.onmessage = async (event) => {{
+                    const bytes = event.data instanceof Blob
+                        ? new Uint8Array(await event.data.arrayBuffer())
+                        : new Uint8Array(event.data);
+                    ws.close();
+                    done({{ kind, shape: event.data.constructor.name, bytes: Array.from(bytes) }});
+                }};
+            }});
+        }}
+        Deno.serve(async () => {{
+            const blob = await once("{url}", "blob");
+            const buffer = await once("{url}", "arraybuffer");
+            const said = (() => {{ try {{ new WebSocket("{url}").binaryType = "bytes"; return "it worked"; }} catch (e) {{ return e.message; }} }})();
+            return Response.json({{ blob, buffer, said }});
+        }});
+        "#,
+        url = server.url("/echo")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["blob"]["shape"], "Blob");
+    assert_eq!(said["blob"]["bytes"], serde_json::json!([104, 105, 0, 255]));
+    assert_eq!(said["buffer"]["shape"], "ArrayBuffer");
+    assert_eq!(
+        said["buffer"]["bytes"],
+        serde_json::json!([104, 105, 0, 255])
+    );
+    assert_eq!(said["said"], "bytes is not a binaryType");
+}
+
+#[test]
+fn a_socket_the_other_end_closes_is_the_code_and_the_reason_it_gave() {
+    let server = socket::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const ws = new WebSocket("{url}");
+            const closed = await new Promise((done) => {{
+                ws.onclose = (event) => done({{ code: event.code, reason: event.reason, wasClean: event.wasClean, type: event.type, state: ws.readyState }});
+            }});
+            return Response.json(closed);
+        }});
+        "#,
+        url = server.url("/goodbye")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["code"], 4000);
+    assert_eq!(said["reason"], "that is enough of that");
+    assert_eq!(said["wasClean"], true);
+    assert_eq!(said["type"], "close");
+    assert_eq!(said["state"], 3);
+}
+
+/// A message the server sent first, heard by a listener rather than by
+/// the `on` property, because both of them are how a library written
+/// against this reaches for one.
+#[test]
+fn a_listener_hears_the_same_events_the_properties_do() {
+    let server = socket::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const ws = new WebSocket("{url}");
+            const seen = [];
+            const ignored = () => seen.push("this one was removed");
+            ws.addEventListener("message", (event) => seen.push(`listener ${{event.data}}`));
+            ws.addEventListener("message", ignored);
+            ws.removeEventListener("message", ignored);
+            ws.onmessage = (event) => seen.push(`property ${{event.data}}`);
+            await new Promise((done) => {{
+                ws.addEventListener("message", () => ws.close());
+                ws.addEventListener("close", done);
+            }});
+            return Response.json(seen);
+        }});
+        "#,
+        url = server.url("/greeting")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    // The property first, then the listeners in the order they were
+    // added, which is what the event spec says and what a library that
+    // registers both will see.
+    assert_eq!(
+        said,
+        serde_json::json!(["property hello", "listener hello"])
+    );
+}
+
+#[test]
+fn the_subprotocol_the_server_picked_is_the_one_the_socket_says_it_speaks() {
+    let server = socket::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const ws = new WebSocket("{url}", ["phoenix", "graphql-ws"]);
+            await new Promise((done) => {{ ws.onopen = done; }});
+            const protocol = ws.protocol;
+            ws.close();
+            return Response.json({{ protocol, extensions: ws.extensions }});
+        }});
+        "#,
+        url = server.url("/named")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(said["protocol"], "phoenix");
+    assert_eq!(said["extensions"], "");
+}
+
+/// A handshake that never happened, twice: nothing listening at all, and
+/// a server that answered the upgrade with a refusal. Both are an error
+/// event and then a close nobody agreed, in that order.
+#[test]
+fn a_socket_that_will_not_open_is_an_error_and_then_a_close() {
+    let server = socket::start();
+    let nowhere = format!("ws://127.0.0.1:{}/nothing", wire::closed());
+    let answer = answered(&format!(
+        r#"
+        function opened(url) {{
+            return new Promise((done) => {{
+                const seen = [];
+                const ws = new WebSocket(url);
+                ws.onerror = (event) => seen.push(`error ${{event.message}}`);
+                ws.onclose = (event) => {{
+                    seen.push(`close ${{event.code}} ${{event.wasClean}} ${{ws.readyState}}`);
+                    done(seen);
+                }};
+            }});
+        }}
+        Deno.serve(async () => Response.json({{
+            nowhere: await opened("{nowhere}"),
+            refused: await opened("{refused}"),
+        }}));
+        "#,
+        refused = server.url("/refused")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    let nothing = said["nowhere"][0].as_str().expect("an error");
+    assert!(
+        nothing.starts_with("error failed to connect to WebSocket ("),
+        "{nothing}"
+    );
+    assert!(nothing.contains(&nowhere), "{nothing}");
+    assert_eq!(said["nowhere"][1], "close 1006 false 3");
+    let refused = said["refused"][0].as_str().expect("an error");
+    assert!(
+        refused.ends_with("the server answered 403 Forbidden"),
+        "{refused}"
+    );
+    assert_eq!(said["refused"][1], "close 1006 false 3");
+}
+
+/// What the constructor and the two methods refuse, all of it before
+/// anything is opened, so a mistake in a function is a message and not a
+/// connection to something that is not a websocket server.
+#[test]
+fn what_a_socket_will_not_do_it_says_rather_than_tries() {
+    let port = wire::closed();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(() => {{
+            const said = (f) => {{ try {{ f(); return "it worked"; }} catch (e) {{ return `${{e.constructor.name}}: ${{e.message}}`; }} }};
+            const opening = new WebSocket("ws://127.0.0.1:{port}/nothing");
+            return Response.json({{
+                scheme: said(() => new WebSocket("ftp://example.com/socket")),
+                fragment: said(() => new WebSocket("ws://example.com/socket#part")),
+                nonsense: said(() => new WebSocket("nonsense")),
+                early: said(() => opening.send("too soon")),
+                code: said(() => opening.close(2000)),
+                allowed: said(() => opening.close(4001, "mine")),
+                rewritten: new WebSocket("http://127.0.0.1:{port}/rewritten").url,
+                states: [WebSocket.CONNECTING, WebSocket.OPEN, WebSocket.CLOSING, WebSocket.CLOSED],
+                own: [WebSocket.prototype.CLOSED, opening.CLOSED],
+            }});
+        }});
+        "#
+    ));
+    let said: serde_json::Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        said["scheme"],
+        "TypeError: ftp: is not a scheme a websocket is opened on"
+    );
+    assert_eq!(
+        said["fragment"],
+        "TypeError: a websocket url may not have a fragment on it"
+    );
+    assert_eq!(said["nonsense"], "TypeError: Invalid URL: 'nonsense'");
+    assert_eq!(said["early"], "TypeError: the socket is still connecting");
+    assert_eq!(
+        said["code"],
+        "TypeError: 2000 is not a code a websocket may be closed with"
+    );
+    assert_eq!(said["allowed"], "it worked");
+    // The scheme the spec rewrites, so one url in one environment
+    // variable is enough for a project that has both.
+    assert_eq!(
+        said["rewritten"],
+        format!("ws://127.0.0.1:{port}/rewritten")
+    );
+    assert_eq!(said["states"], serde_json::json!([0, 1, 2, 3]));
+    assert_eq!(said["own"], serde_json::json!([3, 3]));
+}
+
+/// A socket a function opened and left open is not a call that never
+/// ends: the answer goes when the handler is done and the isolate goes
+/// with it.
+#[test]
+fn a_socket_left_open_does_not_hold_the_answer() {
+    let server = socket::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const ws = new WebSocket("{url}");
+            await new Promise((done) => {{ ws.onopen = done; }});
+            ws.send("nobody is waiting for the answer to this");
+            return new Response("answered with it open");
+        }});
+        "#,
+        url = server.url("/echo")
+    ));
+    assert_eq!(body(&answer), "answered with it open");
 }
 
 /// TLS, which is a different code path and needs a real host, so it is

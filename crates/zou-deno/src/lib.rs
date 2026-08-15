@@ -28,7 +28,6 @@
 //! - Streams are not there. A `ReadableStream` body throws by name, and
 //!   `fetch` collects an answer before handing it back, so a blob's
 //!   `stream()` throws too.
-//! - `WebSocket` is not there, which is what a realtime client wants.
 //! - A timer only fires while there is a call for it to fire in,
 //!   which is until the answer plus whatever `EdgeRuntime.waitUntil`
 //!   is still waiting for, and thirty seconds is the ceiling on that.
@@ -37,9 +36,11 @@
 //!
 //! What is there is `Headers`, `Request`, `Response`, `URL`,
 //! `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, the timers,
-//! `EdgeRuntime.waitUntil`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`,
+//! `EdgeRuntime.waitUntil`, `WebSocket` and the events it dispatches,
+//! `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`,
 //! `Deno.serve`, `Deno.env` and `fetch`, which is enough to run a
-//! handler that reads a request, calls something else and answers.
+//! handler that reads a request, calls something else and answers, and
+//! enough for `@supabase/supabase-js` to build a client.
 //!
 //! `URL` is the `url` crate behind two ops, which is the same parser
 //! Deno's own is built on, rather than a few hundred lines of
@@ -62,6 +63,11 @@
 //! the answer is handed over the moment the handler has one and the
 //! call goes on afterwards, so a caller is never made to wait for work
 //! that was moved off its critical path on purpose.
+//!
+//! `WebSocket` is the client half of a protocol this repository already
+//! speaks the server half of, so it is `tokio-tungstenite` with its
+//! client features on rather than a second frame codec. What is
+//! javascript is the object: four states, four events and a read loop.
 //!
 //! `fetch` is the client `zou-server` calls a database webhook with,
 //! behind an op, rather than a second HTTP stack linked in beside it.
@@ -88,6 +94,8 @@ mod module;
 mod timer;
 #[cfg(feature = "isolate")]
 mod url;
+#[cfg(feature = "isolate")]
+mod websocket;
 
 #[cfg(feature = "isolate")]
 pub use isolate::Isolate;

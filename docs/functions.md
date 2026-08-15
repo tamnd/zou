@@ -183,7 +183,7 @@ What runs is the registry's build of the package rather than the tarball npm wou
 
 - Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
 - A package that reaches for a node built in will not run. `node:` is refused by name and the registry's own shims cover the common ones and not all of them.
-- `@supabase/supabase-js` imports, evaluates and gets into `createClient`, which then wants a `WebSocket` for the realtime client it builds. That one is on the list below.
+- `@supabase/supabase-js` runs. `createClient` builds its auth, storage, functions and realtime clients, and the realtime one is a `WebSocket`, which is why that had to exist before this line could say so.
 - `http:` is refused. A module arrives and is executed, so it arrives over https.
 - `data:` is not supported yet.
 
@@ -303,7 +303,8 @@ Deno.serve(async (req) => {
 The waiting is the host's clock and not a loop, so a handler that awaits a timer costs nothing while it waits.
 Clearing a timer cancels the wait rather than marking it unwanted, so `setTimeout(f, 3600_000)` that is cleared a millisecond later is not an hour of anything being held.
 
-- A timer only fires while the call is running. The isolate ends when the handler's answer does, so a timer that has not come due by then never comes due, and there is nothing yet that lets work outlive the response. That is `EdgeRuntime.waitUntil`, which is on the list below.
+- A timer only fires while the call is running. The isolate ends when the handler's answer does, plus whatever `EdgeRuntime.waitUntil` is still waiting for, so a timer that has not come due by then never comes due unless something registered is still holding the call open.
+- A module may leave a timer running. It is evaluated by waiting on its own evaluation rather than on an idle event loop, which is the difference between importing `@supabase/supabase-js` and hanging on it, because `createClient` starts a token refresh interval on the way through.
 - A callback that throws is logged and the call carries on. It cannot be caught, because whatever set the timer returned before it fired, and ending the process the way Deno does would lose an answer that is already written.
 - A delay is the spec's signed 32 bit integer: past `2 ** 31 - 1` it wraps, and anything at or below zero fires as soon as the event loop can get to it. `setTimeout(f, Infinity)` is `setTimeout(f, 0)`, which is what browsers do.
 - One difference: `setTimeout("code()")` throws a `TypeError`. Deno evaluates a string there, which is `eval` with a longer name.
@@ -330,14 +331,44 @@ Work registered from inside work counts too, so a promise chain that ends in ano
 - An ordinary shutdown waits for it. The work runs on the blocking thread the call already had, so the process does not exit out from under it.
 - On Lambda it is best effort. The response goes back to the runtime api first, and an environment that is frozen straight afterwards stops the work where it stands until the next invocation thaws it, or loses it if the environment is destroyed. That is the platform and not the runtime.
 
+## WebSocket
+
+The client half, for a function that talks to something over a socket rather than over a request.
+
+```ts
+Deno.serve(async (req) => {
+  const ws = new WebSocket("wss://example.com/socket", ["graphql-ws"])
+  const said = await new Promise((answer) => {
+    ws.onopen = () => ws.send("hello")
+    ws.onmessage = (event) => {
+      ws.close(1000, "that is all")
+      answer(event.data)
+    }
+    ws.onerror = (event) => answer(`it did not open: ${event.message}`)
+  })
+  return new Response(said)
+})
+```
+
+`open`, `message`, `error` and `close`, as `onopen` and the rest or through `addEventListener`, with `Event`, `MessageEvent`, `CloseEvent` and `ErrorEvent` as their arguments.
+`readyState` is the four constants, on the class and on an instance both.
+
+- A socket lives as long as the call does. The isolate ends with the answer, so a function that wants to hear back has to be waiting on the socket when it answers, or to have said so with `EdgeRuntime.waitUntil`. A socket left open when the call ends is closed with it.
+- `ws:` and `wss:`, and `http:` and `https:` rewritten into them, which is the spec's own rewrite and means one url in one environment variable is enough. Any other scheme, and a url with a fragment on it, throws before anything is opened.
+- Binary arrives as a `Blob` or as an `ArrayBuffer`, whichever `binaryType` says, and `send` takes a string, a `Blob`, an `ArrayBuffer` or a view of one.
+- `close(code)` takes 1000 or 3000 to 4999, the codes an application may send. Everything else throws, including the ones only the protocol itself may use.
+- A handshake that fails is an `error` event and then a `close` with code 1006, the code that means the connection went away without one being agreed. `send` before the socket is open throws, and after it has closed does nothing.
+- 20 MiB is the largest message, which is the ceiling a call's body has for the same reason. The handshake has 30 seconds.
+- Pings are answered underneath and are not something a handler is told about. Compression is not negotiated, so `extensions` is empty.
+- One difference from the spec: what the constructor throws is a `TypeError` rather than a `SyntaxError`, because there is no `DOMException` here yet.
+
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `Event`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.build` and `Deno.version`.
 
 Not present yet, and named rather than silently missing:
 
 - The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
-- `WebSocket`, which is what `createClient` reaches for when it builds a realtime client.
 - Streams. `new ReadableStream()` throws with its own name in the message, and a response body is collected before it is sent rather than arriving in chunks.
 - Node built ins. `node:fs` and the rest are refused by name.
 

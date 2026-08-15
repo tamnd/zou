@@ -13,7 +13,7 @@ authors.workspace = true
 # second, so `cargo test --workspace` on a machine that only cares about
 # the database never downloads V8 or builds swc.
 default = []
-isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:getrandom", "dep:hmac", "dep:serde", "dep:sha1", "dep:sha2", "dep:tokio", "dep:ureq"]
+isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:futures-util", "dep:getrandom", "dep:hmac", "dep:serde", "dep:sha1", "dep:sha2", "dep:tokio", "dep:tokio-tungstenite", "dep:ureq"]
 
 [dependencies]
 zou-functions = { path = "../zou-functions" }
@@ -33,13 +33,31 @@ sha1 = { workspace = true, optional = true }
 # and `crypto.subtle.digest` is three of its four hashes.
 sha2 = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+# The client half of a websocket, which the server side of this
+# repository already speaks through the same crate. rustls because it
+# is the TLS this build already links for `fetch` and the module
+# loader, rather than a second one for `wss:`.
+tokio-tungstenite = { version = "0.29", features = [
+    "rustls-tls-webpki-roots",
+], optional = true }
 # The same client zou-server calls a webhook with, rather than the
 # hyper and second TLS stack deno_fetch would bring.
 ureq = { workspace = true, optional = true }
+# A split websocket is a sink and a stream, which is what these are for.
+futures-util = { version = "0.3", default-features = false, features = [
+    "sink",
+], optional = true }
 
 [dev-dependencies]
 # The cached module test names a file the way the loader names it.
 sha2 = { workspace = true }
+# The other end of a websocket, for the test server the socket tests
+# talk to. Synchronous, because that server is a thread with a loop in
+# it the same way the http one beside it is, and it is the same crate
+# the client half is built on rather than a second implementation.
+tungstenite = { version = "0.29", default-features = false, features = [
+    "handshake",
+] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 

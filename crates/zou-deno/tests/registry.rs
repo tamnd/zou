@@ -93,6 +93,42 @@ fn a_package_and_a_function_can_import_the_same_thing_once() {
     assert_eq!(body(&answer), r#"{"encoded":"em91","back":"zou"}"#);
 }
 
+/// The one package this whole runtime is for.
+///
+/// `createClient` builds a realtime client on the way through, and that
+/// constructor reaches for `WebSocket`, so until there was one this line
+/// was a `ReferenceError` and every function in every supabase project
+/// stopped on it. Nothing here connects anywhere: what is asserted is
+/// that the client is built and that the pieces a function reaches for
+/// are on it.
+#[test]
+#[ignore = "reaches the registry"]
+fn the_supabase_client_is_built_and_has_its_pieces() {
+    let answer = answered(
+        r#"
+        import { createClient } from "npm:@supabase/supabase-js@2";
+        const client = createClient("http://127.0.0.1:9000", "an anon key");
+        Deno.serve(() => Response.json({
+            from: typeof client.from,
+            rpc: typeof client.rpc,
+            auth: typeof client.auth.getUser,
+            storage: typeof client.storage.from,
+            functions: typeof client.functions.invoke,
+            channel: typeof client.channel,
+            socket: client.realtime.endpointURL().split("?")[0],
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_str(&body(&answer)).expect("json");
+    assert_eq!(said["from"], "function");
+    assert_eq!(said["rpc"], "function");
+    assert_eq!(said["auth"], "function");
+    assert_eq!(said["storage"], "function");
+    assert_eq!(said["functions"], "function");
+    assert_eq!(said["channel"], "function");
+    assert_eq!(said["socket"], "ws://127.0.0.1:9000/realtime/v1/websocket");
+}
+
 #[test]
 #[ignore = "reaches the registry"]
 fn a_package_that_is_not_there_says_so_with_its_name() {
