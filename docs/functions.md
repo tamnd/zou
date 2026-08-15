@@ -74,6 +74,51 @@ The listing is one level deep, it is the directory's name that becomes the url, 
 Every one of those answers `404 Function not found`, as text, which is what upstream answers a name nobody deployed.
 A function that exists and one that does not are the same thing to a caller, on purpose.
 
+## Serving them while you write them
+
+`zou dev <target>` serves functions along with everything else, on the project's api port, because a project is a database and a bucket and its functions together.
+`zou functions serve` is the same surface on its own, for somebody who is writing a function rather than running a project, which is what upstream's `supabase functions serve` is for.
+
+```
+zou functions serve
+```
+
+```
+function hello at supabase/functions/hello/index.ts
+functions run on a v8 isolate per function, kept between calls
+serving functions on http://127.0.0.1:54321
+  http://127.0.0.1:54321/functions/v1/hello
+anon key eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+service_role key eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+sql goes to 127.0.0.1:54322, which is whatever is serving the project
+```
+
+The port is the project's own api port when the file names one, and 54321 otherwise, which is where a client library already looks.
+The keys are minted from `ZOU_JWT_SECRET` when it is set, and pinning it is what makes them the same keys `zou dev` prints, so a project's `.env` keeps working whichever of the two is running.
+The database a function is told about in `SUPABASE_DB_URL` is the project's db port, dialled lazily: a `zou dev` on that port is a database these functions reach through the client library, and no database at all is a function that runs and a `/rest/v1` that says so.
+
+| Flag | What it does |
+| --- | --- |
+| `--port <n>` | Where this listens, over the project's api port. |
+| `--env-file <path>` | The dotenv file the functions' environment is read out of, instead of `functions/.env`. |
+| `--import-map <path>` | One map for every function of this run, over the config file and over what is beside each function. |
+| `--no-verify-jwt` | Every function of this run is callable without a token. |
+| `--inspect [<port>]` | Open the debugger port, which is the config file's `inspector_port` when the flag names none and 8083 when neither does. |
+| `--config <path>`, `--no-config` | Which `config.toml` to read, or none at all. |
+
+The first four are upstream's, spelled the same way and with the same precedence: a flag beats the config file, and the config file beats what is beside the function.
+
+The disk is watched while it serves, and three things change under a running server.
+
+- A function directory that appears is served, and one that is deleted goes back to answering 404. The listing is looked at twice a second, which is the debounce upstream waits before it restarts its container.
+- A secret that changed is a new runtime, so every kept isolate is thrown away, because an isolate built with the old `Deno.env` must not answer a call made after it changed.
+- The config file being written is read again, so a block that switches a function off takes it out of the listing, and a `policy` or an `inspector_port` that moved applies from then on.
+
+Editing a function's own source is not in that list, because it is already handled a layer down: a kept isolate ends itself when a file it was built out of changes, which is the hot reload the policy section covers, and that includes anything the function imports from `_shared`.
+
+The ports are the one thing a reload cannot move.
+This process is already listening on one and already telling every function about the other, so changing either in the config file needs the command restarted.
+
 ## config.toml
 
 The same file the project already has.
@@ -157,8 +202,10 @@ A session evaluates arbitrary javascript inside an isolate holding the project's
 A function with a debugger attached runs without the wall clock and cpu limits, because a breakpoint and a time limit are contradictory.
 The memory limit is unchanged.
 
+`zou functions serve --inspect` opens the same port without the file saying anything, and `--inspect 9229` names another, which is for a debugger somebody attaches once rather than a port a project always opens.
+
 There is no `--inspect-brk`.
-Upstream has one as a flag on `supabase functions serve`, not as a setting in the config file, and holding the first request until somebody attaches belongs on a command line rather than in a file a deployment also reads.
+Upstream has one as a flag on `supabase functions serve`, not as a setting in the config file, and holding the first request until somebody attaches is still to be written.
 
 ## Verification
 

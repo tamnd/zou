@@ -71,9 +71,19 @@ pub fn env_file(dir: &Path) -> PathBuf {
 /// arrange to be told a different `SUPABASE_URL` than the one it is
 /// answering on.
 pub fn read(dir: &Path, layout: &Layout) -> Result<Vec<(String, String)>, String> {
+    from(&env_file(dir), layout)
+}
+
+/// The same, with the dotenv file named rather than found beside the
+/// functions, which is upstream's `--env-file`.
+///
+/// A file that was asked for by name and is not there is still not an
+/// error here, the same as the one that was not asked for. It is the
+/// caller's to complain about, because a dev loop that is watching the
+/// disk is watching for that file to be written.
+pub fn from(path: &Path, layout: &Layout) -> Result<Vec<(String, String)>, String> {
     let mut out: BTreeMap<String, String> = layout.secrets.clone();
-    let path = env_file(dir);
-    match std::fs::read_to_string(&path) {
+    match std::fs::read_to_string(path) {
         Ok(text) => {
             let parsed = parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
             out.extend(parsed);

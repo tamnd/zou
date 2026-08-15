@@ -45,6 +45,8 @@ fn usage() -> ExitCode {
     eprintln!("       {}", db::DB_USAGE);
     #[cfg(unix)]
     eprintln!("       {}", db::MIGRATION_USAGE);
+    #[cfg(unix)]
+    eprintln!("       {}", functions::USAGE);
     eprintln!("       {}", gc::USAGE);
     eprintln!("       {}", info::USAGE);
     eprintln!("       {}", inspect::USAGE);
@@ -122,6 +124,8 @@ fn main() -> ExitCode {
         Some("db") => simple(db::run(&argv[1..])),
         #[cfg(unix)]
         Some("migration") => simple(db::migration(&argv[1..])),
+        #[cfg(unix)]
+        Some("functions") => simple(functions::run(&argv[1..])),
         Some("gc") => simple(gc::run(&argv[1..])),
         Some("gen") => simple(codegen::run(&argv[1..])),
         #[cfg(unix)]

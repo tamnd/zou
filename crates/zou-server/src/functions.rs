@@ -93,7 +93,7 @@ pub async fn call(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     };
     // The lookup first, so that whether a name exists is not something
     // a caller can learn by watching a refusal change shape.
-    let Some(function) = registry.lookup(&name).cloned() else {
+    let Some(function) = registry.lookup(&name) else {
         return not_found();
     };
     if function.verify_jwt
@@ -469,6 +469,7 @@ fn forwarded(
 pub fn served(registry: &zou_functions::Registry) -> Vec<String> {
     registry
         .names()
+        .iter()
         .map(|name| format!("{PREFIX}{name}"))
         .collect()
 }
@@ -562,6 +563,39 @@ mod tests {
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
         assert_eq!(res.headers()["content-type"], "text/plain; charset=UTF-8");
         assert_eq!(text(res).await, "Function not found");
+    }
+
+    /// What `zou functions serve` needs from this surface: a function
+    /// written while the server is up is answered by the server that
+    /// was already running, and until it is written the same url is the
+    /// ordinary 404.
+    #[tokio::test]
+    async fn a_function_deployed_under_a_running_router_is_answered_by_it() {
+        let registry = Arc::new(Registry::new(
+            Vec::new(),
+            Arc::new(Hosted::new().at("late", |_| Ok(Answer::new("text/plain", b"late".to_vec())))),
+        ));
+        let app = crate::router(crate::Config {
+            jwt_secret: SECRET.to_vec(),
+            functions: Some(Arc::clone(&registry)),
+            ..crate::Config::default()
+        })
+        .expect("router");
+        let call = || {
+            post("/functions/v1/late")
+                .header("authorization", format!("Bearer {}", anon()))
+                .body(Body::empty())
+                .expect("request")
+        };
+        let res = app.clone().oneshot(call()).await.expect("answer");
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        registry.reload(vec![zou_functions::Function::new(
+            "late",
+            std::path::PathBuf::new(),
+        )]);
+        let res = app.oneshot(call()).await.expect("answer");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(text(res).await, "late");
     }
 
     #[tokio::test]

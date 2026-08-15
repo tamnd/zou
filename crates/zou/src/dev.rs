@@ -147,32 +147,10 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
     })
 }
 
-/// The project file a command run from here belongs to, read and put
-/// into this process's environment. A flag beats the file, the file
-/// beats a plain `zou dev` default, and anything already in the
-/// environment beats the file too, which is what `export` enforces.
-///
-/// A file that cannot be read is an error rather than a shrug: a
-/// project that has a config.toml means it.
+/// The project file this dev loop belongs to, which is the same
+/// question `zou functions serve` asks and is answered in one place.
 fn project(args: &Args) -> Result<Option<Project>, String> {
-    if args.no_config {
-        return Ok(None);
-    }
-    let Some(project) = config::locate(args.config.as_deref())? else {
-        return Ok(None);
-    };
-    log::info!("reading {}", project.path.display());
-    let set = project.export();
-    if !set.is_empty() {
-        log::info!("the project file sets {}", set.join(", "));
-    }
-    if !project.unread.is_empty() {
-        log::info!(
-            "{} settings in it are not read yet, zou status names them",
-            project.unread.len()
-        );
-    }
-    Ok(Some(project))
+    config::project(args.config.as_deref(), args.no_config)
 }
 
 /// The two ports this command listens on, once the flags, the project
@@ -232,21 +210,7 @@ fn start_http(
     tenant: String,
     project: Option<&Project>,
 ) -> Result<(), String> {
-    let secret = match std::env::var("ZOU_JWT_SECRET") {
-        Ok(s) if !s.is_empty() => s,
-        _ => {
-            let mut raw = [0u8; 32];
-            getrandom::fill(&mut raw).map_err(|e| format!("random secret: {e}"))?;
-            let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-            log::info!("generated a jwt secret, pin ZOU_JWT_SECRET={hex} to keep keys stable");
-            hex
-        }
-    };
-    let anon = zou_server::jwt::mint(&zou_server::jwt::key_claims("anon"), secret.as_bytes());
-    let service = zou_server::jwt::mint(
-        &zou_server::jwt::key_claims("service_role"),
-        secret.as_bytes(),
-    );
+    let (secret, anon, service) = crate::functions::keys()?;
     let listener = std::net::TcpListener::bind(("127.0.0.1", port))
         .map_err(|e| format!("bind http on 127.0.0.1:{port}: {e}"))?;
     log::info!("http api on http://127.0.0.1:{port}");
