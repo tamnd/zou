@@ -104,6 +104,8 @@ mod fetch;
 #[cfg(feature = "isolate")]
 mod imports;
 #[cfg(feature = "isolate")]
+mod inspector;
+#[cfg(feature = "isolate")]
 mod isolate;
 #[cfg(feature = "isolate")]
 mod limits;
@@ -137,14 +139,26 @@ pub use limits::Limits;
 pub fn engine(
     env: Vec<(String, String)>,
     policy: zou_functions::Policy,
+    inspector: Option<u16>,
 ) -> std::sync::Arc<dyn zou_functions::Runtime> {
     #[cfg(feature = "isolate")]
     {
-        std::sync::Arc::new(isolate::Isolate::with_env(env).with_policy(policy))
+        let mut isolate = isolate::Isolate::with_env(env).with_policy(policy);
+        if let Some(port) = inspector {
+            // A port that cannot be bound is a line in the log and a
+            // server that still serves its functions. The alternative
+            // is a project that will not start because a debugger
+            // nobody was going to attach has nowhere to attach to.
+            match inspector::Inspector::start(port) {
+                Ok(started) => isolate = isolate.debugged_by(started),
+                Err(why) => log::error!("{why}, so no debugger can attach"),
+            }
+        }
+        std::sync::Arc::new(isolate)
     }
     #[cfg(not(feature = "isolate"))]
     {
-        let _ = (env, policy);
+        let _ = (env, policy, inspector);
         std::sync::Arc::new(absent::Absent)
     }
 }

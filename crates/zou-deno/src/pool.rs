@@ -43,17 +43,27 @@
 //! would mean a broken function is also a slow one.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use zou_functions::Failed;
 
+use crate::inspector::Inspector;
 use crate::isolate::{Held, Ready, Source};
 use crate::limits::Limits;
 
 /// How long a worker waits for another call before it gives its isolate
 /// back to the operating system.
 const IDLE: Duration = Duration::from_secs(60);
+
+/// How often an isolate a debugger could be attached to looks at what
+/// the debugger has said, while it is waiting for a call.
+///
+/// It is a wakeup every hundredth of a second per idle function, which
+/// is the price of a debugger being able to set a breakpoint between
+/// two calls rather than only during one. Nothing pays it unless the
+/// project put an `inspector_port` in its config file.
+const SERVICE: Duration = Duration::from_millis(10);
 
 /// One call on its way to a worker, and the way back.
 struct Job {
@@ -80,7 +90,13 @@ pub(crate) struct Pool {
 
 impl Pool {
     /// Run one call in a kept isolate, building one if there is none.
-    pub(crate) fn run(&self, source: &Source, held: Held, limits: Limits) -> Result<(), Failed> {
+    pub(crate) fn run(
+        &self,
+        source: &Source,
+        held: Held,
+        limits: Limits,
+        debugger: Option<Arc<Inspector>>,
+    ) -> Result<(), Failed> {
         let specifier = &source.specifier;
         let key = source.key();
         let (done, answered) = mpsc::channel();
@@ -91,7 +107,7 @@ impl Pool {
         for attempt in 0..2 {
             let worker = match self.take(&key) {
                 Some(worker) => worker,
-                None => spawn(source.clone(), limits)?,
+                None => spawn(source.clone(), limits, debugger.clone())?,
             };
             match worker.calls.send(job) {
                 Ok(()) => {
@@ -141,19 +157,28 @@ fn room() -> usize {
     std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
 }
 
-fn spawn(source: Source, limits: Limits) -> Result<Worker, Failed> {
+fn spawn(
+    source: Source,
+    limits: Limits,
+    debugger: Option<Arc<Inspector>>,
+) -> Result<Worker, Failed> {
     let (calls, jobs) = mpsc::channel();
     let named = source.specifier.to_string();
     std::thread::Builder::new()
         .name("zou-function".to_string())
-        .spawn(move || work(&source, limits, &jobs))
+        .spawn(move || work(&source, limits, debugger, &jobs))
         .map_err(|e| Failed::Threw(format!("{named}: it could not have a thread: {e}")))?;
     Ok(Worker { calls })
 }
 
 /// One worker's whole life: build an isolate when there is a call for
 /// it, keep it while it is fit, and go home when nobody calls.
-fn work(source: &Source, limits: Limits, jobs: &mpsc::Receiver<Job>) {
+fn work(
+    source: &Source,
+    limits: Limits,
+    debugger: Option<Arc<Inspector>>,
+    jobs: &mpsc::Receiver<Job>,
+) {
     let specifier = &source.specifier;
     let tokio = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -172,8 +197,8 @@ fn work(source: &Source, limits: Limits, jobs: &mpsc::Receiver<Job>) {
         }
     };
     let mut ready: Option<Ready> = None;
-    while let Ok(job) = jobs.recv_timeout(IDLE) {
-        let out = tokio.block_on(once(&mut ready, source, limits, job.held));
+    while let Some(job) = waited(jobs, ready.as_mut()) {
+        let out = tokio.block_on(once(&mut ready, source, limits, debugger.clone(), job.held));
         if matches!(out, Err(Failed::Limit(_))) || ready.as_ref().is_some_and(Ready::spent) {
             ready = None;
         }
@@ -183,11 +208,34 @@ fn work(source: &Source, limits: Limits, jobs: &mpsc::Receiver<Job>) {
     }
 }
 
+/// The next call, and what the worker does with the time in between.
+///
+/// Ordinarily that is nothing at all: the thread sleeps on the channel
+/// and gives its isolate up after a minute of quiet. An isolate a
+/// debugger can attach to waits differently, in short turns with a look
+/// at the debugger between them, and does not go home: a session with
+/// breakpoints set in it is worth more than the memory a function
+/// nobody is calling would give back, and a dev loop is the only place
+/// either question comes up.
+fn waited(jobs: &mpsc::Receiver<Job>, ready: Option<&mut Ready>) -> Option<Job> {
+    let Some(ready) = ready.filter(|ready| ready.debuggable()) else {
+        return jobs.recv_timeout(IDLE).ok();
+    };
+    loop {
+        match jobs.recv_timeout(SERVICE) {
+            Ok(job) => return Some(job),
+            Err(mpsc::RecvTimeoutError::Timeout) => ready.served(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
 /// One call, in the isolate this worker has or in the one it makes.
 async fn once(
     slot: &mut Option<Ready>,
     source: &Source,
     limits: Limits,
+    debugger: Option<Arc<Inspector>>,
     held: Held,
 ) -> Result<(), Failed> {
     let specifier = &source.specifier;
@@ -196,7 +244,7 @@ async fn once(
     }
     let call = async {
         if slot.is_none() {
-            *slot = Some(Ready::new(source.clone(), limits).await?);
+            *slot = Some(Ready::new(source.clone(), limits, debugger).await?);
         }
         slot.as_mut().expect("it was just built").once(held).await
     };

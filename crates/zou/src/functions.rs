@@ -44,7 +44,7 @@ pub fn env(port: u16, anon: &str, service: &str, db: &str) -> Vec<(String, Strin
 /// two answers must not be able to drift: the whole point of the line
 /// is telling an operator which binary they are running.
 pub fn engine_describe(policy: zou_functions::Policy) -> String {
-    zou_deno::engine(Vec::new(), policy).describe()
+    zou_deno::engine(Vec::new(), policy, None).describe()
 }
 
 /// The functions under `dir`, ready to be served, or None when the
@@ -87,7 +87,10 @@ pub fn registry(
         log::info!("function secrets: {}", names.join(", "));
     }
     all.extend(env);
-    let registry = Registry::new(found, zou_deno::engine(all, layout.policy));
+    let registry = Registry::new(
+        found,
+        zou_deno::engine(all, layout.policy, layout.inspector_port),
+    );
     log::info!("functions run on {}", registry.describe());
     if !zou_deno::available() {
         log::warn!(
