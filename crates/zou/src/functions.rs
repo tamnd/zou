@@ -72,7 +72,22 @@ pub fn registry(
             function.entrypoint.display()
         );
     }
-    let registry = Registry::new(found, zou_deno::engine(env, layout.policy));
+    // A project's own secrets go in first and the four above go in over
+    // them, which is the order the CLI hands them to docker. Nothing can
+    // actually collide there, because the four all start with
+    // `SUPABASE_` and that prefix is the one thing a project's `.env` is
+    // not allowed to set, but the stack is written this way round so
+    // that reading it does not depend on knowing that.
+    let mut all = zou_functions::secrets(dir, layout)?;
+    if !all.is_empty() {
+        // The names and not the values: this is a boot log, and the
+        // question an operator has is whether the `.env` beside the
+        // functions arrived at all.
+        let names: Vec<&str> = all.iter().map(|(name, _)| name.as_str()).collect();
+        log::info!("function secrets: {}", names.join(", "));
+    }
+    all.extend(env);
+    let registry = Registry::new(found, zou_deno::engine(all, layout.policy));
     log::info!("functions run on {}", registry.describe());
     if !zou_deno::available() {
         log::warn!(
@@ -149,6 +164,62 @@ mod tests {
         assert!(
             !env.iter().any(|(name, _)| name == "SB_EXECUTION_ID"),
             "the per invocation one is the call's and not the project's"
+        );
+    }
+
+    #[test]
+    fn a_project_reaches_its_own_secrets_and_nothing_of_the_hosts() {
+        let dir = project(&["hello"]);
+        std::fs::write(
+            dir.path().join("functions").join("hello").join("index.ts"),
+            "Deno.serve(() => new Response(JSON.stringify(Deno.env.toObject())))",
+        )
+        .expect("write");
+        std::fs::write(
+            zou_functions::env_file(dir.path()),
+            "GREETING=from the file\nSHARED=the file wins\n",
+        )
+        .expect("write");
+        let mut layout = zou_functions::Layout::default();
+        layout
+            .secrets
+            .insert("SHARED".to_string(), "the block loses".to_string());
+        layout
+            .secrets
+            .insert("ONLY_IN_THE_BLOCK".to_string(), "here".to_string());
+        let served = registry(
+            dir.path(),
+            &layout,
+            env(54321, "an-anon-key", "a-service-key", "postgres://x/y"),
+        )
+        .expect("read")
+        .expect("a registry");
+        let hello = served.lookup("hello").expect("served").clone();
+        let Ok(answer) = served.invoke(&hello, call()) else {
+            return; // A build with no engine has nothing to ask.
+        };
+        let seen: std::collections::BTreeMap<String, String> =
+            serde_json::from_slice(answer.bytes()).expect("an object");
+        assert_eq!(
+            seen.get("GREETING").map(String::as_str),
+            Some("from the file")
+        );
+        assert_eq!(
+            seen.get("SHARED").map(String::as_str),
+            Some("the file wins")
+        );
+        assert_eq!(
+            seen.get("ONLY_IN_THE_BLOCK").map(String::as_str),
+            Some("here")
+        );
+        assert_eq!(
+            seen.get("SUPABASE_ANON_KEY").map(String::as_str),
+            Some("an-anon-key"),
+            "the four the server owns are still there underneath"
+        );
+        assert!(
+            !seen.contains_key("PATH") && !seen.contains_key("HOME"),
+            "the process this function is running inside is not its environment: {seen:?}"
         );
     }
 

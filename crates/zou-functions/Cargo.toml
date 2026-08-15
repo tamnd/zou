@@ -12,6 +12,10 @@ authors.workspace = true
 # making it and the executor sending it, and this is the channel both
 # ends of this crate's users already have.
 tokio = { workspace = true }
+# A project that asked for a name this server owns is told so, and the
+# only place a library can say anything is the facade the binary
+# already installs a logger for.
+log = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -32,8 +32,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod project;
+mod secrets;
 
 pub use project::{Layout, Settings, read};
+pub use secrets::{env_file, read as secrets};
 
 /// One function, as far as anything in front of the runtime cares.
 ///

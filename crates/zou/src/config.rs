@@ -397,7 +397,10 @@ const DIRECT: &[&str] = &[
 /// printed by `zou status`, the same as anywhere else in the file, so a
 /// project asking for something that is not honoured hears about it
 /// rather than watching it be ignored.
-fn layout(table: &BTreeMap<String, Value>) -> (zou_functions::Layout, Vec<String>) {
+fn layout(
+    table: &BTreeMap<String, Value>,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> (zou_functions::Layout, Vec<String>) {
     let mut out = zou_functions::Layout::default();
     let mut read = Vec::new();
     if let Some(word) = table.get("edge_runtime.policy").and_then(Value::as_str)
@@ -420,6 +423,26 @@ fn layout(table: &BTreeMap<String, Value>) -> (zou_functions::Layout, Vec<String
     // told the setting went unheard.
     if table.contains_key("edge_runtime.enabled") {
         read.push("edge_runtime.enabled".to_string());
+    }
+    // `[edge_runtime.secrets]` is what a project's functions see on top
+    // of the four this server sets, and it is where `env(NAME)` earns
+    // its keep: the name of a variable is committed and the secret is
+    // not. A value that resolves to nothing is a variable the
+    // environment does not have, and upstream leaves that one out
+    // rather than handing a function an empty string that looks like a
+    // key.
+    for (key, value) in table {
+        let Some(name) = key.strip_prefix("edge_runtime.secrets.") else {
+            continue;
+        };
+        let Some(raw) = value.as_str() else {
+            continue;
+        };
+        read.push(key.clone());
+        let secret = expand(raw, var);
+        if !secret.is_empty() {
+            out.secrets.insert(name.to_string(), secret);
+        }
     }
     for (key, value) in table {
         let Some(rest) = key.strip_prefix("functions.") else {
@@ -645,7 +668,7 @@ impl Project {
                 _ => vec!["./seed.sql".to_string()],
             },
         };
-        let (functions, function_keys) = layout(table);
+        let (functions, function_keys) = layout(table, var);
         read.extend(function_keys);
         let unread = table
             .keys()
@@ -943,6 +966,36 @@ static_files = ["./functions/other/index.html"]
             "the default, rather than a word nothing knows"
         );
         assert_eq!(p.unread, ["edge_runtime.policy"]);
+    }
+
+    #[test]
+    fn the_secrets_block_is_read_and_env_is_resolved() {
+        let table = parse(
+            "[edge_runtime.secrets]\nplain = \"in the file\"\ntoken = \"env(TWILIO_TOKEN)\"\nabsent = \"env(NOT_SET)\"\n",
+        )
+        .unwrap();
+        let p = Project::from_table(&table, &|name| match name {
+            "TWILIO_TOKEN" => Some("shhh".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            p.functions.secrets.get("plain").map(String::as_str),
+            Some("in the file")
+        );
+        assert_eq!(
+            p.functions.secrets.get("token").map(String::as_str),
+            Some("shhh"),
+            "the name is in the file and the secret is in the environment"
+        );
+        assert!(
+            !p.functions.secrets.contains_key("absent"),
+            "a variable the environment does not have is left out, not set empty"
+        );
+        assert!(
+            p.unread.is_empty(),
+            "all three arrived, including the one with nothing behind it: {:?}",
+            p.unread
+        );
     }
 
     #[test]
