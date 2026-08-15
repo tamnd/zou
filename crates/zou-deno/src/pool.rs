@@ -46,10 +46,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
 
-use deno_core::ModuleSpecifier;
 use zou_functions::Failed;
 
-use crate::isolate::{Held, Ready};
+use crate::isolate::{Held, Ready, Source};
 use crate::limits::Limits;
 
 /// How long a worker waits for another call before it gives its isolate
@@ -81,13 +80,9 @@ pub(crate) struct Pool {
 
 impl Pool {
     /// Run one call in a kept isolate, building one if there is none.
-    pub(crate) fn run(
-        &self,
-        specifier: &ModuleSpecifier,
-        held: Held,
-        limits: Limits,
-    ) -> Result<(), Failed> {
-        let key = specifier.to_string();
+    pub(crate) fn run(&self, source: &Source, held: Held, limits: Limits) -> Result<(), Failed> {
+        let specifier = &source.specifier;
+        let key = source.key();
         let (done, answered) = mpsc::channel();
         let mut job = Job { held, done };
         // Twice, because a worker taken out of the map may have gone
@@ -96,7 +91,7 @@ impl Pool {
         for attempt in 0..2 {
             let worker = match self.take(&key) {
                 Some(worker) => worker,
-                None => spawn(specifier.clone(), limits)?,
+                None => spawn(source.clone(), limits)?,
             };
             match worker.calls.send(job) {
                 Ok(()) => {
@@ -146,19 +141,20 @@ fn room() -> usize {
     std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get)
 }
 
-fn spawn(specifier: ModuleSpecifier, limits: Limits) -> Result<Worker, Failed> {
+fn spawn(source: Source, limits: Limits) -> Result<Worker, Failed> {
     let (calls, jobs) = mpsc::channel();
-    let named = specifier.to_string();
+    let named = source.specifier.to_string();
     std::thread::Builder::new()
         .name("zou-function".to_string())
-        .spawn(move || work(&specifier, limits, &jobs))
+        .spawn(move || work(&source, limits, &jobs))
         .map_err(|e| Failed::Threw(format!("{named}: it could not have a thread: {e}")))?;
     Ok(Worker { calls })
 }
 
 /// One worker's whole life: build an isolate when there is a call for
 /// it, keep it while it is fit, and go home when nobody calls.
-fn work(specifier: &ModuleSpecifier, limits: Limits, jobs: &mpsc::Receiver<Job>) {
+fn work(source: &Source, limits: Limits, jobs: &mpsc::Receiver<Job>) {
+    let specifier = &source.specifier;
     let tokio = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -177,7 +173,7 @@ fn work(specifier: &ModuleSpecifier, limits: Limits, jobs: &mpsc::Receiver<Job>)
     };
     let mut ready: Option<Ready> = None;
     while let Ok(job) = jobs.recv_timeout(IDLE) {
-        let out = tokio.block_on(once(&mut ready, specifier, limits, job.held));
+        let out = tokio.block_on(once(&mut ready, source, limits, job.held));
         if matches!(out, Err(Failed::Limit(_))) || ready.as_ref().is_some_and(Ready::spent) {
             ready = None;
         }
@@ -190,16 +186,17 @@ fn work(specifier: &ModuleSpecifier, limits: Limits, jobs: &mpsc::Receiver<Job>)
 /// One call, in the isolate this worker has or in the one it makes.
 async fn once(
     slot: &mut Option<Ready>,
-    specifier: &ModuleSpecifier,
+    source: &Source,
     limits: Limits,
     held: Held,
 ) -> Result<(), Failed> {
+    let specifier = &source.specifier;
     if slot.as_ref().is_some_and(Ready::stale) {
         *slot = None;
     }
     let call = async {
         if slot.is_none() {
-            *slot = Some(Ready::new(specifier.clone(), limits).await?);
+            *slot = Some(Ready::new(source.clone(), limits).await?);
         }
         slot.as_mut().expect("it was just built").once(held).await
     };

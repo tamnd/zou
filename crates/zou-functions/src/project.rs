@@ -129,11 +129,15 @@ pub fn read(dir: &Path, layout: &Layout) -> Result<Vec<Function>, String> {
         if !entrypoint.is_file() {
             continue;
         }
+        let import_map = match &settings.import_map {
+            Some(path) => Some(dir.join(path)),
+            None => beside(&root, &name),
+        };
         found.push(Function {
             name,
             entrypoint,
             verify_jwt: settings.verify_jwt,
-            import_map: settings.import_map.as_ref().map(|p| dir.join(p)),
+            import_map,
             static_files: settings.static_files.iter().map(|p| dir.join(p)).collect(),
         });
     }
@@ -143,8 +147,54 @@ pub fn read(dir: &Path, layout: &Layout) -> Result<Vec<Function>, String> {
     Ok(found)
 }
 
+/// The import map a function has without saying so, in the order
+/// `GetFunctionConfig` looks for one.
+///
+/// The config file's own `import_map` beats all of these and is handled
+/// by the caller, which leaves four places and a precedence between
+/// them: `deno.json` beside the function, then `deno.jsonc`, then
+/// `import_map.json`, then one `import_map.json` for the whole project.
+/// The last two are deprecated upstream and warn on the way past, and
+/// the warning is the useful half of copying the order at all: a
+/// project that has both a `deno.json` and an `import_map.json` should
+/// hear the same thing here it hears from the CLI rather than quietly
+/// get the other file.
+///
+/// The directory searched is the function's own, `functions/<name>`,
+/// even when the entrypoint was moved somewhere else, which is what
+/// upstream does: `functionDir` there is built from the name and not
+/// from the entrypoint.
+fn beside(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+    let dir = root.join(name);
+    for file in ["deno.json", "deno.jsonc"] {
+        let at = dir.join(file);
+        if at.is_file() {
+            return Some(at);
+        }
+    }
+    let own = dir.join("import_map.json");
+    if own.is_file() {
+        log::warn!(
+            "function {name} uses a deprecated import_map.json, which deno.json replaces: {}",
+            own.display()
+        );
+        return Some(own);
+    }
+    let shared = root.join("import_map.json");
+    if shared.is_file() {
+        log::warn!(
+            "function {name} falls back to the project's import map, which a deno.json beside the function replaces: {}",
+            shared.display()
+        );
+        return Some(shared);
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
+    use tempfile::TempDir;
+
     use super::*;
 
     /// A project directory shaped like the one the answers above were
@@ -248,6 +298,69 @@ mod tests {
         assert_eq!(
             probe.static_files,
             vec![dir.path().join("./functions/probe/*.html")]
+        );
+    }
+
+    /// The order `GetFunctionConfig` looks in, one file at a time, most
+    /// specific first. Each round writes the next place down and the
+    /// answer has to stay where it was.
+    #[test]
+    fn a_function_finds_the_map_beside_it_without_being_told() {
+        let dir = project();
+        let root = dir.path().join("functions");
+        let map = |dir: &TempDir| {
+            read(dir.path(), &Layout::default())
+                .expect("read")
+                .into_iter()
+                .find(|f| f.name == "hello")
+                .expect("served")
+                .import_map
+        };
+        assert_eq!(map(&dir), None, "a function with nothing beside it");
+
+        std::fs::write(root.join("import_map.json"), "{}").expect("write");
+        assert_eq!(
+            map(&dir),
+            Some(root.join("import_map.json")),
+            "the project's own is the last resort"
+        );
+
+        std::fs::write(root.join("hello/import_map.json"), "{}").expect("write");
+        assert_eq!(
+            map(&dir),
+            Some(root.join("hello/import_map.json")),
+            "one beside the function beats the project's"
+        );
+
+        std::fs::write(root.join("hello/deno.jsonc"), "{}").expect("write");
+        assert_eq!(map(&dir), Some(root.join("hello/deno.jsonc")));
+
+        std::fs::write(root.join("hello/deno.json"), "{}").expect("write");
+        assert_eq!(
+            map(&dir),
+            Some(root.join("hello/deno.json")),
+            "and deno.json beats everything, which is the one upstream tells projects to write"
+        );
+    }
+
+    #[test]
+    fn the_config_file_beats_anything_found_beside_the_function() {
+        let dir = project();
+        std::fs::write(dir.path().join("functions/hello/deno.json"), "{}").expect("write");
+        let mut layout = Layout::default();
+        layout.settings.insert(
+            "hello".to_string(),
+            Settings {
+                import_map: Some("./functions/named.json".to_string()),
+                ..Settings::default()
+            },
+        );
+        let found = read(dir.path(), &layout).expect("read");
+        let hello = found.iter().find(|f| f.name == "hello").expect("served");
+        assert_eq!(
+            hello.import_map,
+            Some(dir.path().join("./functions/named.json")),
+            "a project that named one is not overruled by a file that happens to be there"
         );
     }
 

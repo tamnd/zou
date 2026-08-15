@@ -13,7 +13,7 @@ authors.workspace = true
 # second, so `cargo test --workspace` on a machine that only cares about
 # the database never downloads V8 or builds swc.
 default = []
-isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:futures-util", "dep:getrandom", "dep:hmac", "dep:serde", "dep:sha1", "dep:sha2", "dep:tokio", "dep:tokio-tungstenite", "dep:ureq"]
+isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:futures-util", "dep:getrandom", "dep:hmac", "dep:log", "dep:serde", "dep:serde_json", "dep:sha1", "dep:sha2", "dep:tokio", "dep:tokio-tungstenite", "dep:ureq"]
 
 [dependencies]
 zou-functions = { path = "../zou-functions" }
@@ -25,7 +25,14 @@ getrandom = { workspace = true, optional = true }
 # The same signing the server does for its own tokens, reached through
 # `crypto.subtle` instead.
 hmac = { workspace = true, optional = true }
+# An import map entry that the specification throws away is worth a
+# line in the log rather than silence, and the facade is what the
+# binary above this already installs a logger for.
+log = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
+# An import map is json, and a `deno.jsonc` is json with the comments
+# taken out first. Already in the tree underneath deno_core.
+serde_json = { workspace = true, optional = true }
 # `crypto.subtle.digest` has four hashes and this is the one of them
 # that is not sha2. It is already in the tree.
 sha1 = { workspace = true, optional = true }
