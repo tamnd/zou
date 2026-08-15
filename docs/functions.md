@@ -82,6 +82,7 @@ The same file the project already has.
 [edge_runtime]
 policy = "per_worker"
 inspector_port = 8083
+deno_version = 2
 
 [functions.hello]
 verify_jwt = false
@@ -105,6 +106,11 @@ A function that configures nothing is a function nobody can call without a key, 
 `static_files` is what the function may read off the disk, which the static files section covers.
 
 `policy` is honoured, and `inspector_port` opens the port a debugger attaches to, which the debugger section covers.
+
+`deno_version` is which Deno the CLI's runtime is, and upstream has two answers: `1` pulls an older image and `2` is what the current one runs.
+This server has one runtime and it is the second, so `deno_version = 2` is read and anything else is listed by `zou status` as unread rather than quietly obeyed.
+What a function is told from the other side is `Deno.version`, which reads `zou-<version> (compatible with Deno v2.1.4)` with the real v8 beside it, and that is the shape upstream says it in: measured on `supabase/edge-runtime` 1.74.2, `Deno.version.deno` there is `supabase-edge-runtime-1.74.2 (compatible with Deno v2.1.4)`.
+Neither is a bare version number, so a function that parses one is already wrong upstream.
 
 Anything under `[functions.<name>]` this server does not know is listed by `zou status` as unread, the same as anywhere else in the file.
 
@@ -239,6 +245,13 @@ The names that arrived are printed at boot, without their values, so a project c
 
 Real typescript, through the same swc transpiler Deno itself uses, so what runs here is what would run there.
 Interfaces, enums, generics, decorators and `.tsx` all arrive as javascript before v8 sees them.
+
+`Deno.version.typescript` says `5.3.3`, and what that number means is the highest release whose syntax is tested here, one test per release in `crates/zou-deno/tests/typescript.rs`.
+`satisfies` and `accessor` fields from 4.9, `const` type parameters and decorators from 5.0, `using` from 5.2, and import attributes from 5.3.
+The number moves when a test for a later release's syntax is written, and not before.
+
+Two of those are not type stripping.
+A decorator is a call that has to happen and an `accessor` field is a getter, a setter and a private field that v8 does not make on its own, so both are a transform, and the decorators are the TC39 proposal rather than typescript's older `experimentalDecorators`, which is Deno's default and what upstream's runtime was measured doing.
 
 A function can import the files beside it.
 

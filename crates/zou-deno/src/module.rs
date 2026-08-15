@@ -307,7 +307,14 @@ fn stripped(
     .map_err(|e| JsErrorBox::type_error(e.to_string()))?;
     let emitted = parsed
         .transpile(
-            &deno_ast::TranspileOptions::default(),
+            &deno_ast::TranspileOptions {
+                // Deno's own default, and what upstream's runtime was
+                // measured doing: the TC39 proposal rather than
+                // typescript's older `experimentalDecorators`, which
+                // also lowers `accessor` fields, which v8 does not have.
+                decorators: deno_ast::DecoratorsTranspileOption::Ecma,
+                ..Default::default()
+            },
             &deno_ast::TranspileModuleOptions::default(),
             &deno_ast::EmitOptions::default(),
         )

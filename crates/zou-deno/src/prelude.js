@@ -2239,7 +2239,10 @@
     // Enough of it that a function branching on the platform gets an
     // answer rather than an exception.
     build: { target: "unknown", arch: "unknown", os: "linux", vendor: "unknown" },
-    version: { deno: "zou", v8: "", typescript: "" },
+    // Three strings a function may read, in the shape upstream's
+    // runtime says them: what is running, then the v8 it is running on
+    // and the typescript its transpiler takes.
+    version: ops.op_zou_version(),
     exit() {
       throw new TypeError("a function may not exit the process it is running in");
     },
