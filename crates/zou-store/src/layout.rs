@@ -13,10 +13,11 @@
 //!   files/…                       Storage API object bytes
 //!   functions/DEPLOYED            what is deployed under /functions/v1
 //!   functions/blobs/<sha256>      the files those functions are made of
+//!   functions/SECRETS             those functions' environment, sealed
 //! ```
 //!
-//! Everything except `MANIFEST` and `functions/DEPLOYED` is immutable
-//! once written.
+//! Everything except `MANIFEST`, `functions/DEPLOYED` and
+//! `functions/SECRETS` is immutable once written.
 
 use crate::layer::LayerKey;
 use crate::lsn::Lsn;
@@ -187,6 +188,18 @@ impl TenantLayout {
         format!("{}/functions/", self.prefix)
     }
 
+    /// The tenant's function secrets, sealed. One object holding every
+    /// name and value, encrypted with a key this store does not have a
+    /// copy of, so a bucket somebody walked off with is names and
+    /// values they cannot read.
+    ///
+    /// The third mutable object in the prefix, swapped with CAS the
+    /// same way the other two are, because `zou secrets set` is a read
+    /// and a write of the whole map.
+    pub fn functions_secrets(&self) -> String {
+        format!("{}/functions/SECRETS", self.prefix)
+    }
+
     /// One shard of the layer store. Listed on attach to load the
     /// shard's layer map, swept by compaction gc.
     pub fn shard_prefix(&self, shard: u16) -> String {
@@ -246,12 +259,13 @@ impl TenantLayout {
     }
 
     /// Whether a key must never be overwritten. The tenant manifest,
-    /// the per shard manifests and the deployed functions are the only
-    /// mutable objects in the prefix.
+    /// the per shard manifests, the deployed functions and their
+    /// secrets are the only mutable objects in the prefix.
     pub fn is_immutable(&self, key: &str) -> bool {
         key.starts_with(&self.prefix)
             && key != self.manifest()
             && key != self.functions_manifest()
+            && key != self.functions_secrets()
             && !(key.ends_with("/SHARD") && key.starts_with(&format!("{}/shards/", self.prefix)))
     }
 }
@@ -286,6 +300,7 @@ mod tests {
             t.functions_blob("6f2a"),
             "tenants/acme-prod/functions/blobs/6f2a"
         );
+        assert_eq!(t.functions_secrets(), "tenants/acme-prod/functions/SECRETS");
         assert_eq!(t.functions_prefix(), "tenants/acme-prod/functions/");
         assert_eq!(t.shard_prefix(3), "tenants/acme-prod/shards/0003/");
         assert_eq!(t.shard_manifest(3), "tenants/acme-prod/shards/0003/SHARD");
@@ -318,6 +333,7 @@ mod tests {
         assert!(!t.is_immutable(&t.manifest()));
         assert!(!t.is_immutable(&t.shard_manifest(7)));
         assert!(!t.is_immutable(&t.functions_manifest()));
+        assert!(!t.is_immutable(&t.functions_secrets()));
         assert!(t.is_immutable(&t.functions_blob("6f2a")));
         assert!(t.is_immutable(&t.checkpoint_page_index("chk-1")));
         assert!(t.is_immutable(&t.manifest_history(1, 1000)));

@@ -342,6 +342,63 @@ Those belong to the server, and the five above are the five.
 
 The names that arrived are printed at boot, without their values, so a project can see whether its file was found.
 
+## Secrets in a deployment
+
+A deployed project has no `.env` beside it, because nothing whose name starts with a dot is deployed.
+Its secrets are an object in its own prefix, and the object is sealed.
+
+```
+zou secrets key
+zou secrets set STRIPE_KEY=sk_live_51H GREETING=hello --target ./store --ref acme
+zou secrets list --target ./store --ref acme
+zou secrets unset GREETING --target ./store --ref acme
+```
+
+```
+NAME                             DIGEST
+STRIPE_KEY                       f52fbd32b2b3b86f
+```
+
+`--target` and `--ref` come off `ZOU_TARGET` and `ZOU_TENANT` when they are not passed, and the ref falls back to the config file's `project_id`, which is the same precedence `zou functions deploy` has.
+`set` also takes `--env-file <path>`, read with the same dotenv parser the dev loop reads `supabase/functions/.env` with, so the file a project has been running against locally is a file it can deploy.
+No verb prints a value, because a command that prints a secret is one somebody eventually runs in a shared terminal.
+The digest is the first eight bytes of the sha256 of the value, as hex, which is enough to check that what is set is what was meant without being enough to be worth stealing.
+
+### The key
+
+`ZOU_SECRET_KEY` is thirty two bytes as base64 or hex, or `ZOU_SECRET_KEY_FILE` names a file holding the same thing, and `zou secrets key` prints a new one.
+The file wins where both are set, because a file is what a secret manager mounts and a variable is what a person exports.
+There is deliberately no `--secret-key` flag: an argument is in `ps` output and in the shell history of whoever ran it.
+
+The root key encrypts nothing.
+Every project gets its own, derived as `HMAC-SHA256(root, "zou/functions/secrets/1/<ref>")`, which is one HKDF expand step with the label written out.
+The same label is the associated data, so a ciphertext lifted out of one project's prefix and dropped into another's does not open.
+The cipher is ChaCha20-Poly1305, chosen over AES-GCM because it is constant time in software on every machine a node might run on, and a fleet should not have a security property that depends on whether the box has AES-NI.
+
+### What is in the object
+
+```text
+tenants/<ref>/functions/SECRETS
+```
+
+A nonce, a ciphertext and the time of the last change.
+The names and the values are sealed together rather than one value at a time, because names leak in a per value scheme and `STRIPE_SECRET_KEY` tells somebody what a project is worth breaking into.
+The time is in the clear on purpose: an operator asking how old a project's environment is should not need the key.
+
+The key is not in the store, which is the point.
+A database on object storage is a database whose bytes are somebody else's problem to keep, so a bucket is a thing that can be copied without the copy being noticed, and secrets written in the clear next to the data they unlock are what would make that copy worth having.
+
+### What a node does with them
+
+A node reads and opens them when it attaches the project, and hands them to the functions underneath the five the server sets, the same order the dev loop stacks them in.
+The names are logged and the values are not.
+
+A project with no secrets needs no key on the node at all, which is most projects.
+A project that has them on a node that has none is not served: every name answers the 404 upstream answers for a name nobody deployed, and the log line says why.
+Serving them anyway would be a function running without the environment it was written against, which is a function calling somebody else's api with an empty token.
+
+Like a deployment, the secrets are read at attach, so a change is picked up the next time that happens.
+
 ## Typescript
 
 Real typescript, through the same swc transpiler Deno itself uses, so what runs here is what would run there.

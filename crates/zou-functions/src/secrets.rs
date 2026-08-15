@@ -105,6 +105,15 @@ pub fn from(path: &Path, layout: &Layout) -> Result<Vec<(String, String)>, Strin
 
 /// One dotenv file, in the order a later line overwrites an earlier
 /// one.
+///
+/// Public because `zou secrets set --env-file` reads the same format,
+/// and a project that has been running against a file locally should be
+/// able to hand that exact file to a deployment without finding out
+/// that two parsers disagree about it.
+pub fn dotenv(text: &str) -> Result<BTreeMap<String, String>, String> {
+    parse(text)
+}
+
 pub(crate) fn parse(text: &str) -> Result<BTreeMap<String, String>, String> {
     let text = text.replace("\r\n", "\n");
     let src: Vec<char> = text.chars().collect();

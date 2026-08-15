@@ -310,6 +310,35 @@ struct Bound {
     tenant: String,
 }
 
+/// Which store, and which project on it, for the commands that talk to
+/// one: `zou functions deploy`, `zou functions list` and `zou secrets`.
+///
+/// One function rather than one per command, because the precedence is
+/// the thing a person learns once and then expects everywhere.
+/// `--target` or `ZOU_TARGET` for the store, and for the project
+/// `--ref`, then `ZOU_TENANT`, then the config file's `project_id`,
+/// which is the field upstream's `--project-ref` fills in. The file
+/// last, because it is the one of the three that a project shares with
+/// everybody it hands the directory to, and a command naming a ref out
+/// loud should beat it.
+pub fn place(
+    target: Option<&str>,
+    tenant: Option<&str>,
+    project: Option<&crate::config::Project>,
+) -> Result<(String, String), String> {
+    let target = target
+        .map(str::to_string)
+        .or_else(|| std::env::var("ZOU_TARGET").ok().filter(|t| !t.is_empty()))
+        .ok_or("no store: pass --target or set ZOU_TARGET")?;
+    let tenant = tenant
+        .map(str::to_string)
+        .or_else(|| std::env::var("ZOU_TENANT").ok().filter(|t| !t.is_empty()))
+        .or_else(|| project.and_then(|p| p.id.clone()))
+        .ok_or("no project: pass --ref, set ZOU_TENANT, or give the config file a project_id")?;
+    zou_store::registry::check_ref(&tenant).map_err(|e| format!("--ref {tenant:?}: {e}"))?;
+    Ok((target, tenant))
+}
+
 /// Work out all four, saying which one is missing rather than failing
 /// on the first thing that needs it.
 fn bind(args: &Deploy) -> Result<Bound, String> {
@@ -318,21 +347,11 @@ fn bind(args: &Deploy) -> Result<Bound, String> {
         Some(project) => project.dir(),
         None => std::env::current_dir().map_err(|e| format!("cwd: {e}"))?,
     };
-    let target = args
-        .target
-        .clone()
-        .or_else(|| std::env::var("ZOU_TARGET").ok().filter(|t| !t.is_empty()))
-        .ok_or("no store to deploy to: pass --target or set ZOU_TARGET")?;
-    // The config file's `project_id` last, because it is the one of the
-    // three a project shares with everybody it hands the directory to,
-    // and a deploy naming a ref out loud should beat a file.
-    let tenant = args
-        .tenant
-        .clone()
-        .or_else(|| std::env::var("ZOU_TENANT").ok().filter(|t| !t.is_empty()))
-        .or_else(|| project.as_ref().and_then(|p| p.id.clone()))
-        .ok_or("no project to deploy to: pass --ref, set ZOU_TENANT, or give the config file a project_id")?;
-    zou_store::registry::check_ref(&tenant).map_err(|e| format!("--ref {tenant:?}: {e}"))?;
+    let (target, tenant) = place(
+        args.target.as_deref(),
+        args.tenant.as_deref(),
+        project.as_ref(),
+    )?;
     let mut layout = project.map(|p| p.functions.clone()).unwrap_or_default();
     // Upstream's precedence, and the same two flags `serve` applies:
     // what is on the command line is every function of this run.
