@@ -58,7 +58,7 @@ impl Statics {
             patterns: function
                 .static_files
                 .iter()
-                .map(|pattern| tidy(pattern).to_string_lossy().into_owned())
+                .map(|pattern| slashed(&tidy(pattern)))
                 .collect(),
         }
     }
@@ -75,7 +75,7 @@ impl Statics {
         } else {
             tidy(&self.root.join(asked))
         };
-        let shown = whole.to_string_lossy();
+        let shown = slashed(&whole);
         if self.patterns.iter().any(|pattern| matches(pattern, &shown)) {
             return Ok(whole);
         }
@@ -105,6 +105,16 @@ fn tidy(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// A path the way the patterns are written, which is with forward
+/// slashes.
+///
+/// Upstream matches through `toSlash(resolve(...))` for the same reason:
+/// a glob in a config file is written with slashes wherever the project
+/// is checked out, and so is every pattern in every example.
+fn slashed(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 /// Upstream's glob, which is `globToRegExp` in the CLI's deploy path
@@ -194,6 +204,11 @@ fn class(pattern: &[char], open: usize, against: char) -> Option<(usize, bool)> 
 mod tests {
     use super::*;
 
+    /// The paths in these are unix ones, which is why the tests that
+    /// use them say so: what a path looks like on windows is a
+    /// different question from what these patterns mean, and the
+    /// windows build does not run functions at all.
+    #[cfg(unix)]
     fn function(statics: &[&str]) -> Function {
         let mut function = Function::new("hello", PathBuf::from("/p/functions/hello/index.ts"));
         function.static_files = statics.iter().map(PathBuf::from).collect();
@@ -240,6 +255,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_relative_name_starts_at_the_function() {
         let statics = Statics::of(&function(&["/p/functions/hello/*.html"]));
         assert_eq!(
@@ -253,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_absolute_name_is_matched_as_it_is() {
         let statics = Statics::of(&function(&["/p/functions/hello/*.html"]));
         assert!(statics.at("/p/functions/hello/other.html").is_ok());
@@ -260,6 +277,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_name_cannot_walk_out_and_back_in() {
         let statics = Statics::of(&function(&["/p/functions/hello/*.html"]));
         // Tidied first, so the pattern sees where it actually points
@@ -272,6 +290,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_function_that_configured_nothing_reads_nothing() {
         let statics = Statics::of(&function(&[]));
         let why = statics.at("./index.html").expect_err("nothing is allowed");
