@@ -86,7 +86,10 @@ fn a_warm_cache_is_a_cold_start_that_touches_nothing() {
     .expect("the function's file");
     let function = Function::new("hello", dir.path().join("index.ts"));
     let answer = invoke(&function).expect("an answer");
-    assert_eq!(String::from_utf8(answer.body).expect("utf-8"), "hello zou");
+    assert_eq!(
+        String::from_utf8(answer.bytes().to_vec()).expect("utf-8"),
+        "hello zou"
+    );
 
     // And the other half of the same claim: what is not in the cache is
     // not fetched, it is refused, by name.

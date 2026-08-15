@@ -13,8 +13,12 @@
 //! the server already handed us, on a current thread tokio runtime of
 //! its own, and nothing about it is ever moved anywhere else.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use deno_core::{JsRuntime, OpState, PollEventLoopOptions, RuntimeOptions, op2, v8};
-use zou_functions::{Answer, Call, Function, Runtime, Sink};
+use deno_error::JsErrorBox;
+use zou_functions::{Answer, Call, Function, Runtime, Sink, Writer};
 
 use crate::{crypto, fetch, module, timer, url, websocket};
 
@@ -26,6 +30,12 @@ struct Held {
     peer: String,
     env: Vec<(String, String)>,
     answered: Option<Answer>,
+    /// Where the answer goes. In here rather than held by `run`
+    /// because a streamed answer leaves while the handler is still
+    /// making it, and the only thing running then is an op.
+    sink: Option<Sink>,
+    /// The end of a streamed body, once one has been started.
+    writing: Option<Writer>,
 }
 
 #[derive(serde::Serialize)]
@@ -51,7 +61,7 @@ fn op_zou_call(state: &mut OpState) -> Given {
     }
 }
 
-/// What the handler answered.
+/// What the handler answered, all of it.
 #[op2]
 fn op_zou_answer(
     state: &mut OpState,
@@ -63,8 +73,62 @@ fn op_zou_answer(
     held.answered = Some(Answer {
         status: status as u16,
         headers,
-        body: body.to_vec(),
+        body: zou_functions::Body::Bytes(body.to_vec()),
     });
+}
+
+/// The head of an answer whose body is still being made, which goes to
+/// the caller now and not when the handler is finished.
+#[op2]
+fn op_zou_answer_start(
+    state: &mut OpState,
+    #[smi] status: u32,
+    #[serde] headers: Vec<(String, String)>,
+) -> Result<(), JsErrorBox> {
+    let held = state.borrow_mut::<Held>();
+    let Some(sink) = held.sink.take() else {
+        return Err(JsErrorBox::type_error("the answer has already been sent"));
+    };
+    let (answer, writer) = Answer::streaming(status as u16, headers);
+    held.writing = Some(writer);
+    sink(answer);
+    Ok(())
+}
+
+/// One chunk of it. Awaited, so a function that generates faster than
+/// the caller reads is made to wait rather than allowed to hold the
+/// whole body in memory on the way past.
+#[op2(async(lazy), fast)]
+async fn op_zou_chunk(
+    state: Rc<RefCell<OpState>>,
+    #[buffer(copy)] chunk: Vec<u8>,
+) -> Result<(), JsErrorBox> {
+    let writer = state.borrow().borrow::<Held>().writing.clone();
+    let Some(writer) = writer else {
+        return Err(JsErrorBox::type_error("no answer is being streamed"));
+    };
+    if !writer.write(chunk).await {
+        return Err(JsErrorBox::type_error(
+            "the caller stopped reading the answer",
+        ));
+    }
+    Ok(())
+}
+
+/// The end of it, which is the writer being dropped.
+#[op2(fast)]
+fn op_zou_chunk_end(state: &mut OpState) {
+    state.borrow_mut::<Held>().writing = None;
+}
+
+/// The end of it, badly. The caller is already reading a 200, so all
+/// this can do is stop the body where it is, and the reason is the
+/// operator's the way a handler that threw is.
+#[op2(fast)]
+fn op_zou_chunk_fail(state: &mut OpState, #[string] why: String) {
+    if let Some(writer) = state.borrow_mut::<Held>().writing.take() {
+        writer.fail(why);
+    }
 }
 
 /// One variable out of the function's environment, or null.
@@ -91,6 +155,10 @@ deno_core::extension!(
     ops = [
         op_zou_call,
         op_zou_answer,
+        op_zou_answer_start,
+        op_zou_chunk,
+        op_zou_chunk_end,
+        op_zou_chunk_fail,
         op_zou_env_get,
         op_zou_env,
         crypto::op_zou_random,
@@ -161,17 +229,43 @@ impl Runtime for Isolate {
         // The blocking shape, for a caller that wants the answer and
         // the background work in the same wait: the sink writes into a
         // slot rather than anywhere the call could have gone on ahead.
+        //
+        // A streamed body cannot wait in a slot, though. Nothing would
+        // be reading it, the isolate would fill the channel and stop,
+        // and the call would never come back to be asked for its
+        // answer. So a body that is still arriving is collected on a
+        // thread of its own, started the moment the answer is handed
+        // over, and what this returns is the bytes it collected.
         let held = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let collecting = std::sync::Arc::new(std::sync::Mutex::new(None));
         let slot = std::sync::Arc::clone(&held);
+        let started = std::sync::Arc::clone(&collecting);
         self.invoke_answering(
             function,
             call,
-            Box::new(move |answer| {
+            Box::new(move |mut answer| {
+                if let zou_functions::Body::Chunks(chunks) = answer.body {
+                    answer.body = zou_functions::Body::Bytes(Vec::new());
+                    *started.lock().expect("nothing else holds this") =
+                        Some(std::thread::spawn(move || chunks.collect_blocking()));
+                }
                 *slot.lock().expect("nothing else holds this") = Some(answer);
             }),
         )?;
         let answer = held.lock().expect("the isolate is done with it").take();
-        answer.ok_or_else(|| "the handler returned without an answer".to_string())
+        let mut answer =
+            answer.ok_or_else(|| "the handler returned without an answer".to_string())?;
+        if let Some(collector) = collecting
+            .lock()
+            .expect("the isolate is done with it")
+            .take()
+        {
+            let collected = collector
+                .join()
+                .map_err(|_| "the answer's body could not be collected".to_string())??;
+            answer.body = zou_functions::Body::Bytes(collected);
+        }
+        Ok(answer)
     }
 
     fn invoke_answering(
@@ -204,12 +298,14 @@ impl Runtime for Isolate {
             peer,
             env,
             answered: None,
+            sink: Some(answer),
+            writing: None,
         };
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("the isolate could not have a runtime: {e}"))?;
-        tokio.block_on(run(specifier, held, answer))
+        tokio.block_on(run(specifier, held))
     }
 
     fn describe(&self) -> String {
@@ -217,11 +313,7 @@ impl Runtime for Isolate {
     }
 }
 
-async fn run(
-    specifier: deno_core::ModuleSpecifier,
-    held: Held,
-    answer: Sink,
-) -> Result<(), String> {
+async fn run(specifier: deno_core::ModuleSpecifier, held: Held) -> Result<(), String> {
     let mut js = JsRuntime::new(RuntimeOptions {
         module_loader: Some(module::loader()),
         extensions: vec![zou::init()],
@@ -284,12 +376,23 @@ async fn run(
     // The answer goes now, not when this function returns, because
     // what is left to do after it is the function's own business and
     // the caller is not a party to it.
-    let answered = {
+    //
+    // A streamed answer has already gone, from inside the op that
+    // started it, and the body finished arriving before the handler's
+    // promise resolved. So the sink being gone is the whole test for
+    // whether the caller has been answered, and having neither a sink
+    // nor an answer is the only way to have answered nobody.
+    let (answered, sink) = {
         let state = js.op_state();
         let mut state = state.borrow_mut();
-        state.borrow_mut::<Held>().answered.take()
+        let held = state.borrow_mut::<Held>();
+        (held.answered.take(), held.sink.take())
     };
-    answer(answered.ok_or_else(|| "the handler returned without an answer".to_string())?);
+    match (answered, sink) {
+        (Some(answer), Some(sink)) => sink(answer),
+        (_, None) => {}
+        (None, Some(_)) => return Err("the handler returned without an answer".to_string()),
+    }
 
     // Whatever `EdgeRuntime.waitUntil` was given, until it settles or
     // until it has had long enough. A promise nobody resolves is not

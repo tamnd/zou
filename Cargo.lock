@@ -4997,6 +4997,7 @@ name = "zou-functions"
 version = "0.0.1"
 dependencies = [
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -2191,11 +2191,45 @@
     if (!(answer instanceof Response)) {
       throw new TypeError("a handler must return a Response");
     }
-    ops.op_zou_answer(
-      answer.status,
-      Array.from(answer.headers.entries()),
-      await sending(answer),
-    );
+    const headers = Array.from(answer.headers.entries());
+    const streaming = answer[SOURCE];
+    if (streaming === null || streaming === undefined) {
+      ops.op_zou_answer(answer.status, headers, await sending(answer));
+      return;
+    }
+    // A response that was built out of a stream is sent as it is made:
+    // the head goes now, and every chunk goes as it is enqueued. The
+    // host is waiting on this promise, so the answer is out of here
+    // long before the promise resolves, which is the difference
+    // between a caller reading tokens and a caller waiting for them.
+    ops.op_zou_answer_start(answer.status, headers);
+    const reader = streaming.getReader();
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        await ops.op_zou_chunk(chunkOf(value));
+      }
+      ops.op_zou_chunk_end();
+    } catch (why) {
+      // Too late for a status code: the caller is already reading a
+      // 200. The body stops where it is, which is what an http client
+      // is shown when a chunked body ends early.
+      ops.op_zou_chunk_fail(String(why?.message ?? why));
+    }
+  }
+
+  /// One chunk on its way out. The spec is narrow here and so is this:
+  /// a body stream gives buffers, a string is a TypeError rather than
+  /// something to quietly encode, and a handler that meant text is one
+  /// TextEncoder away from having meant buffers.
+  function chunkOf(value) {
+    if (value instanceof Uint8Array || value instanceof ArrayBuffer || ArrayBuffer.isView(value)) {
+      return bytesOf(value);
+    }
+    throw new TypeError("a response body stream may only enqueue buffers");
   }
 
   // Two of them: the call, and whatever the call left running. The

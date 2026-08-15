@@ -325,8 +325,22 @@ fn too_large() -> Response {
 /// taking the whole answer down with it, because a function that put a
 /// newline in a header value has made a mistake the caller cannot fix
 /// and should still get the body it was sent.
+///
+/// A body that is still being made goes out as it is made. Nothing
+/// here waits for the end of it and nothing here counts its length, so
+/// hyper sends it chunked, which is what upstream sends a
+/// `ReadableStream` body as and what a caller reading tokens out of a
+/// model needs it to be.
 fn answered(answer: Answer) -> Response {
-    let mut res = Response::new(Body::from(answer.body));
+    let body = match answer.body {
+        zou_functions::Body::Bytes(bytes) => Body::from(bytes),
+        zou_functions::Body::Chunks(chunks) => {
+            Body::from_stream(futures_util::stream::unfold(chunks, |mut chunks| async {
+                chunks.next().await.map(|chunk| (chunk, chunks))
+            }))
+        }
+    };
+    let mut res = Response::new(body);
     *res.status_mut() = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::OK);
     for (name, value) in answer.headers {
         if let (Ok(name), Ok(value)) = (
@@ -887,6 +901,55 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()["content-type"], "application/json");
         assert_eq!(json(res).await, serde_json::json!({"hello": "world"}));
+    }
+
+    /// A body that is still being made when the head goes out.
+    ///
+    /// What is asserted is the shape rather than the timing: no length
+    /// was counted, which is what makes hyper send it chunked, and
+    /// every chunk arrived in the order it was written. The timing is
+    /// asserted where it can be, which is in the isolate's own tests.
+    #[tokio::test]
+    async fn a_body_that_is_still_being_made_is_sent_as_it_is_made() {
+        let hosted = Hosted::new().at("tokens", |_| {
+            let (answer, writer) = Answer::streaming(
+                200,
+                vec![("content-type".to_string(), "text/plain".to_string())],
+            );
+            tokio::spawn(async move {
+                for token in ["one ", "two ", "three"] {
+                    if !writer.write(token.as_bytes().to_vec()).await {
+                        return;
+                    }
+                }
+            });
+            Ok(answer)
+        });
+        let functions = vec![zou_functions::Function {
+            verify_jwt: false,
+            ..zou_functions::Function::new("tokens", std::path::PathBuf::new())
+        }];
+        let router = crate::router(crate::Config {
+            jwt_secret: SECRET.to_vec(),
+            functions: Some(Arc::new(Registry::new(functions, Arc::new(hosted)))),
+            ..crate::Config::default()
+        })
+        .expect("router");
+        let res = router
+            .oneshot(
+                post("/functions/v1/tokens")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("answer");
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "text/plain");
+        assert!(
+            res.headers().get(header::CONTENT_LENGTH).is_none(),
+            "a body nobody has counted has no length on it"
+        );
+        assert_eq!(text(res).await, "one two three");
     }
 
     #[tokio::test]

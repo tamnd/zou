@@ -31,7 +31,7 @@ fn answered(source: &str) -> Answer {
 }
 
 fn body(answer: &Answer) -> String {
-    String::from_utf8(answer.body.clone()).expect("utf-8")
+    String::from_utf8(answer.bytes().to_vec()).expect("utf-8")
 }
 
 #[test]

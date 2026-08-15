@@ -356,7 +356,9 @@ A body that is not there is `null` rather than an empty stream, so `if (req.body
 Reading the stream is reading the body, so `bodyUsed` is true afterwards and `text()` says `Body already consumed.` rather than answering with nothing.
 `clone()` on a request or a response whose body is a stream tees it, which is what makes reading the same body twice work.
 
-- A response whose body is a stream is collected before it is sent. The caller gets all of it and gets it at the end, which is the difference between this and streaming, and streaming to the caller is the box left open on [#369](https://github.com/tamnd/zou/issues/369).
+- A response whose body is a stream is sent as it is made. The head goes out when the handler returns and every chunk goes out as it is enqueued, with no length counted and so `Transfer-Encoding: chunked` on the wire, which is what a caller reading tokens out of a model needs. A response built any other way is sent whole, the way it always was.
+- Eight chunks may be waiting before the function is made to wait too, so a handler generating faster than the caller reads is slowed down rather than allowed to hold the whole body in memory.
+- A body that throws after the head has gone out ends where it got to. There is no status code left to change by then, and a chunked body that stops early is what an http client is shown.
 - The queueing strategy is a count of chunks and not a size in bytes, so `highWaterMark` is how many chunks are read ahead. `size` is ignored.
 - A body stream may only give out bytes. A stream of strings is fine until somebody asks for the body, which is where the `TypeError` is.
 - There is no `WritableStream` and no `TransformStream`, so there is no `pipeTo` and no `pipeThrough`. They are absent rather than throwing, because there is nothing to construct.
@@ -401,7 +403,7 @@ Not present yet, and named rather than silently missing:
 
 - The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
 - The writable half of streams. There is no `WritableStream` and no `TransformStream`, and so no `pipeTo` and no `pipeThrough`, and no byte stream or BYOB reader.
-- Streaming to the caller. A response body is collected before it is sent rather than arriving in chunks, so a `ReadableStream` body is an answer that is built as it goes and delivered whole.
+- Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet.
 - Node built ins. `node:fs` and the rest are refused by name.
 
 The rest of that list, and where each line stands, is [issue #369](https://github.com/tamnd/zou/issues/369).
