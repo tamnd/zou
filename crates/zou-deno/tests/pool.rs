@@ -304,3 +304,47 @@ fn the_runtime_says_which_policy_it_is_on() {
         "a v8 isolate per call"
     );
 }
+
+/// A kept isolate serves its second call through the loop the first one
+/// left running.
+///
+/// That is the part of the listener shim a single call cannot show. The
+/// loop is still parked on `nextRequest` when the answer to the first
+/// call has already gone, and the second call has to arrive there
+/// rather than at a connection nobody is accepting any more.
+#[test]
+fn a_kept_isolate_serves_its_second_call_through_the_loop_it_left_running() {
+    let deployed = deployed(
+        r#"
+        let calls = 0;
+        const listener = Deno.listen({ port: 8000 });
+        (async () => {
+          for await (const conn of listener) {
+            const http = Deno.serveHttp(conn);
+            for await (const event of http) {
+              await event.respondWith(new Response("calls " + (++calls)));
+            }
+          }
+        })();
+        "#,
+    );
+    let runtime = kept();
+    assert_eq!(said(&runtime, &deployed, "one"), "calls 1");
+    assert_eq!(said(&runtime, &deployed, "two"), "calls 2");
+    assert_eq!(said(&runtime, &deployed, "three"), "calls 3");
+}
+
+/// The same for a default export, which has nothing to leave running
+/// and so is read out of the module namespace once and called again.
+#[test]
+fn a_kept_isolate_calls_the_same_default_export_again() {
+    let deployed = deployed(
+        r#"
+        let calls = 0;
+        export default { fetch: () => new Response("calls " + (++calls)) };
+        "#,
+    );
+    let runtime = kept();
+    assert_eq!(said(&runtime, &deployed, "one"), "calls 1");
+    assert_eq!(said(&runtime, &deployed, "two"), "calls 2");
+}
