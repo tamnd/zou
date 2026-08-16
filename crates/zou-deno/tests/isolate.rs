@@ -329,7 +329,187 @@ fn a_function_that_forgot_to_serve_is_an_error_and_not_an_empty_answer() {
     .expect_err("a complaint")
     .why()
     .to_string();
-    assert!(complaint.contains("did not call Deno.serve"), "{complaint}");
+    assert!(complaint.contains("did not say what to run"), "{complaint}");
+}
+
+/// The other two ways a module says what to run.
+///
+/// Upstream takes all three, measured on `supabase/edge-runtime:v1.74.2`
+/// asked directly: `Deno.serve(handler)`, a default export with a
+/// `fetch`, and the older `serve()` out of `std/http/server.ts`, which
+/// says so by asking for a socket. The last one is still what most of
+/// the examples in the wild are written against, so a runtime that took
+/// only the first would refuse most of the functions people already
+/// have.
+#[test]
+fn a_default_export_with_a_fetch_is_the_handler() {
+    let answer = answered(
+        r#"
+        export default {
+          fetch(req: Request) {
+            return new Response(`fetched ${new URL(req.url).pathname}`, { status: 202 });
+          },
+        };
+        "#,
+    );
+    assert_eq!(answer.status, 202);
+    assert_eq!(body(&answer), "fetched /functions/v1/hello");
+}
+
+#[test]
+fn a_default_export_whose_fetch_is_async_is_the_handler_too() {
+    let answer = answered(
+        r#"
+        export default {
+          async fetch() {
+            await new Promise((done) => setTimeout(done, 1));
+            return new Response("awaited", { status: 203 });
+          },
+        };
+        "#,
+    );
+    assert_eq!(answer.status, 203);
+    assert_eq!(body(&answer), "awaited");
+}
+
+/// Measured rather than chosen, a pair at a time, on modules that said
+/// it two ways at once. `Deno.serve` beats both of the others, and a
+/// listener beats a default export.
+///
+/// Which is one rule and not three: upstream is a socket, so the module
+/// that took the socket is the module that is served and the default
+/// export is what is left when nobody took it.
+#[test]
+fn the_module_that_took_the_socket_is_the_one_that_is_served() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => new Response("served"));
+        export default { fetch: () => new Response("exported") };
+        "#,
+    );
+    assert_eq!(body(&answer), "served");
+
+    let answer = answered(
+        r#"
+        const listener = Deno.listen({ port: 8000 });
+        (async () => {
+          const http = Deno.serveHttp(await listener.accept());
+          const event = await http.nextRequest();
+          await event.respondWith(new Response("listened"));
+        })();
+        Deno.serve(() => new Response("served"));
+        "#,
+    );
+    assert_eq!(body(&answer), "served");
+
+    let answer = answered(
+        r#"
+        const listener = Deno.listen({ port: 8000 });
+        (async () => {
+          const http = Deno.serveHttp(await listener.accept());
+          const event = await http.nextRequest();
+          await event.respondWith(new Response("listened"));
+        })();
+        export default { fetch: () => new Response("exported") };
+        "#,
+    );
+    assert_eq!(body(&answer), "listened");
+}
+
+/// The listener shim, driven by hand the way `std/http/server.ts`
+/// drives it: listen, accept, upgrade, pull one request off, answer it.
+#[test]
+fn a_module_that_asks_for_a_socket_is_served_through_it() {
+    let answer = answered(
+        r#"
+        const listener = Deno.listen({ port: 8000 });
+        (async () => {
+          for await (const conn of listener) {
+            const http = Deno.serveHttp(conn);
+            for await (const event of http) {
+              await event.respondWith(new Response(`through ${event.request.method}`, { status: 200 }));
+            }
+          }
+        })();
+        "#,
+    );
+    assert_eq!(answer.status, 200);
+    assert_eq!(body(&answer), "through GET");
+}
+
+/// The request that goes into the loop is the whole request, body and
+/// all, and the response that comes out of `respondWith` is the answer.
+#[test]
+fn the_body_a_module_sends_through_a_socket_arrives_whole() {
+    let answer = called(
+        r#"
+        const listener = Deno.listen({ port: 8000 });
+        (async () => {
+          const conn = await listener.accept();
+          const http = Deno.serveHttp(conn);
+          const event = await http.nextRequest();
+          const sent = await event.request.text();
+          await event.respondWith(new Response(`heard ${sent}`, { status: 200 }));
+        })();
+        "#,
+        Call {
+            method: "POST".to_string(),
+            url: "http://localhost:9000/functions/v1/hello".to_string(),
+            headers: Vec::new(),
+            body: b"a shout".to_vec(),
+            execution_id: "one".to_string(),
+        },
+    )
+    .expect("an answer");
+    assert_eq!(body(&answer), "heard a shout");
+}
+
+/// The real `std/http/server.ts` over the network is in `registry.rs`,
+/// because it is a claim about deno.land answering. This is the same
+/// loop written out locally: the pieces of it the shim has to satisfy,
+/// in the order that file puts them in.
+#[test]
+fn the_loop_the_older_examples_run_is_served_end_to_end() {
+    let answer = answered(
+        r#"
+        const closing = new AbortController();
+        closing.signal.addEventListener("abort", () => listener.close(), { once: true });
+        const listener = Deno.listen({ port: 8000, hostname: "0.0.0.0", transport: "tcp" });
+        (async () => {
+          while (true) {
+            let conn: Deno.Conn;
+            try {
+              conn = await listener.accept();
+            } catch (error) {
+              if (
+                error instanceof Deno.errors.BadResource ||
+                error instanceof Deno.errors.InvalidData ||
+                error instanceof Deno.errors.UnexpectedEof ||
+                error instanceof Deno.errors.ConnectionReset ||
+                error instanceof Deno.errors.NotConnected
+              ) {
+                continue;
+              }
+              throw error;
+            }
+            const http = Deno.serveHttp(conn);
+            const info = { localAddr: conn.localAddr, remoteAddr: conn.remoteAddr };
+            (async () => {
+              while (true) {
+                const event = await http.nextRequest();
+                if (event === null) {
+                  break;
+                }
+                const response = new Response(`std ${info.localAddr.transport}`, { status: 207 });
+                await event.respondWith(response);
+              }
+            })();
+          }
+        })();
+        "#,
+    );
+    assert_eq!(answer.status, 207);
+    assert_eq!(body(&answer), "std tcp");
 }
 
 #[test]
@@ -2719,4 +2899,63 @@ fn a_limit_reached_after_the_answer_truncates_the_body() {
         panic!("a limit");
     };
     assert!(said.contains("cpu time"), "{said}");
+}
+
+/// `AbortController` exists because `std/http/server.ts` builds one in
+/// a class field before it has done anything else, so a runtime without
+/// one cannot even load that file.
+///
+/// It is the signal and not the wiring: nothing in this runtime takes an
+/// `AbortSignal` yet, so aborting one tells whoever is listening and
+/// stops nothing.
+#[test]
+fn an_abort_controller_tells_whoever_is_listening() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const said: string[] = [];
+            const controller = new AbortController();
+            controller.signal.addEventListener("abort", () => said.push("once"), { once: true });
+            controller.signal.addEventListener("abort", () => said.push("again"));
+            const before = controller.signal.aborted;
+            controller.abort();
+            controller.abort();
+            let threw = "";
+            try {
+                controller.signal.throwIfAborted();
+            } catch (e) {
+                threw = `${e.name}: ${e.message}`;
+            }
+            return Response.json({
+                before,
+                after: controller.signal.aborted,
+                said,
+                threw,
+                reason: controller.signal.reason instanceof DOMException,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["before"], false);
+    assert_eq!(said["after"], true);
+    assert_eq!(said["said"], serde_json::json!(["once", "again"]));
+    assert_eq!(said["threw"], "AbortError: The signal has been aborted");
+    assert_eq!(said["reason"], true);
+}
+
+/// A reason given is the reason reported, which is the other half of
+/// what a caller catching an abort branches on.
+#[test]
+fn an_abort_with_a_reason_carries_it() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const controller = new AbortController();
+            controller.abort("enough");
+            return new Response(String(controller.signal.reason));
+        });
+        "#,
+    );
+    assert_eq!(body(&answer), "enough");
 }

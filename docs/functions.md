@@ -320,6 +320,38 @@ That gateway also replaces the `Access-Control-Allow-Origin` a function set with
 The hosted platform does the other thing: the runtime hands the `OPTIONS` to the function, adds no header of its own, and a function that handles no CORS is one a browser cannot call, which is why the pattern above is in every example.
 Here the function is authoritative like the hosted platform, and the server answers for a function that did not like the local stack, and nothing a function says about an origin is ever widened.
 
+## How a function says what to run
+
+Three ways, all three of them upstream's, because most of the functions people already have were written against the second or the third.
+
+```ts
+Deno.serve((req) => new Response("one"))
+```
+
+```ts
+export default {
+  fetch(req: Request) {
+    return new Response("two")
+  },
+}
+```
+
+```ts
+import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+serve((req) => new Response("three"))
+```
+
+The third is the one every example written before `Deno.serve` existed uses, and it is a socket rather than a handler: it calls `Deno.listen`, accepts a connection, hands it to `Deno.serveHttp`, pulls a request off with `nextRequest` and answers it with `respondWith`.
+There is no socket under a function here, because the server holds the only one, so `Deno.listen` and `Deno.serveHttp` are that shape with one call going through them.
+Which is enough for the real `std/http/server.ts`, over `https://deno.land/std@0.168.0/http/server.ts` or `jsr:@std/http/server`, and that is what is tested rather than a copy of it.
+
+A module that does two of them at once is answered by the one that took the socket, which was measured a pair at a time against the runtime: `Deno.serve` beats both of the others and a listener beats a default export.
+So it is one rule and not three.
+The default export is what runs when nobody took the socket.
+
+A module that does none of the three is an error naming the three.
+Upstream holds the request until the wall clock and kills the worker with `request has been cancelled by supervisor`, which tells a developer a timeout rather than what is wrong.
+
 ## What the handler is given
 
 `req.url` is the url the runtime was reached on, `http://127.0.0.1:<port>/functions/v1/<name>` with the path after the name and the query string on it, not the public url a caller typed.
@@ -775,7 +807,9 @@ Deno.serve(async (req) => {
 
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `Event`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `ReadableStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `Event`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build` and `Deno.version`.
+
+An `AbortSignal` is a signal an aborted thing can be listened for on, and nothing here takes one yet: `fetch` does not read `init.signal` and neither does a timer.
 
 Not present yet, and named rather than silently missing:
 

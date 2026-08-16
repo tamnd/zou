@@ -1743,6 +1743,140 @@
   }
 
   // ---------------------------------------------------------------
+  // Deno.listen and Deno.serveHttp
+  //
+  // The older way of serving, which half the examples still use:
+  //
+  // ```ts
+  // import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+  // serve(handler)
+  // ```
+  //
+  // That `serve` is a loop over a socket. It listens, accepts a
+  // connection, upgrades it, pulls requests off it one at a time and
+  // answers each with `respondWith`. There is no socket here, because
+  // the host holds the only one, so what is here is that shape with
+  // one call in it rather than a network under it. The reference has
+  // real versions of both, measured: `Deno.listen`, `Deno.serveHttp`
+  // and `Deno.upgradeWebSocket` are functions on its `Deno` and
+  // `Deno.upgradeHttp` is not.
+  //
+  // A pooled isolate serves its second call through the loop the first
+  // one left running, which is why the request goes to whoever is
+  // waiting rather than to a fresh connection each time.
+
+  const accepting = {
+    /// Whether a module asked for a socket at all, which is what makes
+    /// this the entry point rather than `Deno.serve`.
+    listening: false,
+    /// Waiting `accept()` calls, and the waiting `nextRequest()` calls
+    /// of the connection an accept handed out.
+    accepts: [],
+    nexts: [],
+    /// Calls nobody has picked up yet, which is at most one.
+    waiting: [],
+    connected: false,
+  };
+
+  const CONN = {
+    rid: 0,
+    localAddr: { transport: "tcp", hostname: "0.0.0.0", port: 9000 },
+    remoteAddr: { transport: "tcp", hostname: "0.0.0.0", port: 0 },
+    close() {},
+    readable: null,
+    writable: null,
+  };
+
+  function listen(options = {}) {
+    accepting.listening = true;
+    return {
+      rid: 0,
+      addr: {
+        transport: options.transport ?? "tcp",
+        hostname: options.hostname ?? "0.0.0.0",
+        port: options.port ?? 9000,
+      },
+      accept() {
+        if (!accepting.connected && accepting.waiting.length > 0) {
+          accepting.connected = true;
+          return Promise.resolve(CONN);
+        }
+        return new Promise((resolve) => accepting.accepts.push(resolve));
+      },
+      close() {},
+      ref() {},
+      unref() {},
+      [Symbol.asyncIterator]() {
+        const listener = this;
+        return {
+          async next() {
+            return { value: await listener.accept(), done: false };
+          },
+        };
+      },
+    };
+  }
+
+  function serveHttp(conn) {
+    if (conn !== CONN) {
+      throw new BadResource("this connection is not one this runtime handed out");
+    }
+    return {
+      rid: 0,
+      nextRequest() {
+        const held = accepting.waiting.shift();
+        if (held !== undefined) {
+          return Promise.resolve(held);
+        }
+        return new Promise((resolve) => accepting.nexts.push(resolve));
+      },
+      close() {},
+      [Symbol.asyncIterator]() {
+        const http = this;
+        return {
+          async next() {
+            const event = await http.nextRequest();
+            return event === null ? { value: undefined, done: true } : { value: event, done: false };
+          },
+        };
+      },
+    };
+  }
+
+  /// Hand this call to whatever part of that loop is waiting for one,
+  /// and resolve with the response the loop answers it with.
+  function accepted(request) {
+    return new Promise((resolve, reject) => {
+      const event = {
+        request,
+        respondWith(answer) {
+          return Promise.resolve(answer).then(
+            (given) => {
+              resolve(given);
+              return undefined;
+            },
+            (thrown) => {
+              reject(thrown);
+              throw thrown;
+            },
+          );
+        },
+      };
+      const next = accepting.nexts.shift();
+      if (next !== undefined) {
+        next(event);
+        return;
+      }
+      accepting.waiting.push(event);
+      const accept = accepting.accepts.shift();
+      if (accept !== undefined) {
+        accepting.connected = true;
+        accept(CONN);
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------
   // Events
   //
   // Enough of an event to be the argument a websocket handler is
@@ -1853,6 +1987,89 @@
     const at = held.indexOf(listener);
     if (at !== -1) {
       held.splice(at, 1);
+    }
+  }
+
+  // ---------------------------------------------------------------
+  // AbortController
+  //
+  // Here because the older way of serving needs it: `new Server(...)`
+  // in `std/http/server.ts` makes a controller in a field initializer,
+  // so a function written the way the older examples are written cannot
+  // even be constructed without one. It is the shape rather than the
+  // plumbing: nothing here cancels a fetch yet, and `docs/functions.md`
+  // says so.
+
+  const SIGNAL = Symbol("signal");
+  const REASON = Symbol("reason");
+
+  /// The error an abort is reported as, and the one thing anything
+  /// catching an abort tests for by name.
+  class DOMException extends Error {
+    constructor(message = "", name = "Error") {
+      super(message);
+      this.name = name;
+    }
+  }
+
+  class AbortSignal {
+    constructor(guard) {
+      if (guard !== SIGNAL) {
+        throw new TypeError("an AbortSignal is made by an AbortController");
+      }
+      listens(this);
+      this[REASON] = undefined;
+      this.onabort = null;
+    }
+
+    get aborted() {
+      return this[REASON] !== undefined;
+    }
+
+    get reason() {
+      return this[REASON];
+    }
+
+    throwIfAborted() {
+      if (this.aborted) {
+        throw this[REASON];
+      }
+    }
+
+    addEventListener(type, listener) {
+      listened.call(this, type, listener);
+    }
+
+    removeEventListener(type, listener) {
+      unlistened.call(this, type, listener);
+    }
+
+    dispatchEvent(event) {
+      fires(this, event);
+      return true;
+    }
+  }
+
+  class AbortController {
+    constructor() {
+      this[SIGNAL] = new AbortSignal(SIGNAL);
+    }
+
+    get signal() {
+      return this[SIGNAL];
+    }
+
+    abort(reason) {
+      const signal = this[SIGNAL];
+      if (signal.aborted) {
+        return;
+      }
+      // The default reason is the one everything catching an abort is
+      // written against, `err.name === "AbortError"`.
+      signal[REASON] = reason === undefined
+        ? new DOMException("The signal has been aborted", "AbortError")
+        : reason;
+      fires(signal, new Event("abort"));
     }
   }
 
@@ -2144,6 +2361,32 @@
     }
   }
 
+  /// The five `std/http/server.ts` tests an accept failure against by
+  /// name, and the one it throws itself when a closed server is asked
+  /// to serve. None of them is ever raised here, because there is no
+  /// socket to fail, but `error instanceof Deno.errors.BadResource` on
+  /// an `undefined` is a TypeError, so the names have to be there for
+  /// the path that never runs.
+  function named(name) {
+    const raised = class extends Error {
+      constructor(message) {
+        super(message);
+        this.name = name;
+      }
+    };
+    Object.defineProperty(raised, "name", { value: name });
+    return raised;
+  }
+
+  const BadResource = named("BadResource");
+  const InvalidData = named("InvalidData");
+  const UnexpectedEof = named("UnexpectedEof");
+  const ConnectionReset = named("ConnectionReset");
+  const NotConnected = named("NotConnected");
+  const Http = named("Http");
+  const Interrupted = named("Interrupted");
+  const BrokenPipe = named("BrokenPipe");
+
   /// A `string | URL`, which is what Deno takes, as the string the op
   /// wants. A file url is the path in it, since that is the only thing
   /// a file url is here.
@@ -2192,8 +2435,11 @@
   const EdgeRuntime = { waitUntil };
 
   Object.assign(globalThis, {
+    AbortController,
+    AbortSignal,
     Blob,
     CloseEvent,
+    DOMException,
     CryptoKey,
     EdgeRuntime,
     ErrorEvent,
@@ -2232,10 +2478,24 @@
     readFileSync,
     readTextFile,
     readTextFileSync,
+    listen,
+    serveHttp,
     // The two a function catching one of them by name is written
     // against, which is what makes a missing file and a file it may
-    // not have two different things to it.
-    errors: { NotFound, PermissionDenied },
+    // not have two different things to it, and the eight the older way
+    // of serving names in a catch or throws itself.
+    errors: {
+      NotFound,
+      PermissionDenied,
+      BadResource,
+      InvalidData,
+      UnexpectedEof,
+      ConnectionReset,
+      NotConnected,
+      Http,
+      Interrupted,
+      BrokenPipe,
+    },
     // Enough of it that a function branching on the platform gets an
     // answer rather than an exception.
     build: { target: "unknown", arch: "unknown", os: "linux", vendor: "unknown" },
@@ -2251,9 +2511,32 @@
   // ---------------------------------------------------------------
   // The entry point, which is the value of this whole file
 
-  async function run() {
-    if (handler === null) {
-      throw new TypeError("the function did not call Deno.serve");
+  async function run(exported) {
+    // Three ways a module says what to run, in the order upstream picks
+    // between them, measured a pair at a time on a module that did two
+    // of them at once: `Deno.serve` beats both of the others and a
+    // listener beats a default export.
+    //
+    // Which is one rule rather than three. Upstream is a socket: a
+    // module that took the socket is the module that is served, whether
+    // it took it through `Deno.serve` or through the older `serve()`
+    // out of `std/http/server.ts`, and the default export is what is
+    // left when nobody took it.
+    //
+    // The listener is a loop rather than a handler, so the request goes
+    // into it and the answer comes back out of `respondWith`.
+    const fetches =
+      exported !== null && exported !== undefined && typeof exported.fetch === "function"
+        ? exported.fetch.bind(exported)
+        : null;
+    // Upstream has no answer for a module that did none of the three:
+    // it holds the request until the wall clock and kills the worker
+    // with "request has been cancelled by supervisor", so the developer
+    // is told a timeout rather than what is wrong. This says it.
+    if (handler === null && fetches === null && !accepting.listening) {
+      throw new TypeError(
+        "the function did not say what to run: no Deno.serve, no default export with a fetch, no listener",
+      );
     }
     const call = ops.op_zou_call();
     const request = new Request(call.url, {
@@ -2261,9 +2544,13 @@
       headers: call.headers,
       body: call.method === "GET" || call.method === "HEAD" ? undefined : call.body,
     });
-    const answer = await handler(request, {
-      remoteAddr: { transport: "tcp", hostname: call.peer, port: 0 },
-    });
+    const info = { remoteAddr: { transport: "tcp", hostname: call.peer, port: 0 } };
+    const answer =
+      handler !== null
+        ? await handler(request, info)
+        : accepting.listening
+          ? await accepted(request)
+          : await fetches(request, info);
     if (!(answer instanceof Response)) {
       throw new TypeError("a handler must return a Response");
     }

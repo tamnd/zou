@@ -158,3 +158,37 @@ fn a_package_that_is_not_there_says_so_with_its_name() {
         "{refused}"
     );
 }
+
+/// The entry point most of the examples in the wild still use, from the
+/// place they still import it from.
+///
+/// This is here rather than in `isolate.rs` for the same reason as the
+/// rest of this file: what it proves is that the real `std/http/server.ts`
+/// runs against this runtime's `Deno.listen` and `Deno.serveHttp`, and a
+/// hand written copy of that file proves only that the copy does.
+#[test]
+#[ignore = "reaches the registry"]
+fn the_std_serve_the_older_examples_import_is_served() {
+    let answer = answered(
+        r#"
+        import { serve } from "https://deno.land/std@0.168.0/http/server.ts";
+        serve((req: Request) => new Response(`std ${new URL(req.url).pathname}`, { status: 207 }));
+        "#,
+    );
+    assert_eq!(answer.status, 207);
+    assert_eq!(body(&answer), "std /functions/v1/hello");
+}
+
+/// The same by way of jsr, which is where std moved to.
+#[test]
+#[ignore = "reaches the registry"]
+fn the_jsr_spelling_of_that_import_is_served_too() {
+    let answer = answered(
+        r#"
+        import { serve } from "jsr:@std/http@0.224.5/server";
+        serve(() => new Response("jsr std", { status: 208 }));
+        "#,
+    );
+    assert_eq!(answer.status, 208);
+    assert_eq!(body(&answer), "jsr std");
+}

@@ -567,6 +567,10 @@ pub(crate) async fn once_off(
 pub(crate) struct Ready {
     js: JsRuntime,
     entry: v8::Global<v8::Function>,
+    /// What the module exported as `default`, or undefined. Read once
+    /// here rather than per call, because a module is evaluated once and
+    /// its exports do not change after it.
+    exported: v8::Global<v8::Value>,
     drain: v8::Global<v8::Function>,
     watch: Arc<Watch>,
     handle: v8::IsolateHandle,
@@ -708,7 +712,16 @@ async fn build(
         .await
         .map_err(|e| why(&specifier, &watch, e))?;
 
-    let (entry, drain) = {
+    // `export default { fetch }` is one of the three ways upstream lets
+    // a module say what to run, and the only one the module says by
+    // exporting rather than by calling something the prelude handed it.
+    // So it is read out of the namespace here and passed in at call
+    // time, and the prelude decides between it and the other two.
+    let namespace = js
+        .get_module_namespace(id)
+        .map_err(|e| why(&specifier, &watch, e))?;
+
+    let (entry, exported, drain) = {
         let context = js.main_context();
         let isolate = &mut *js.v8_isolate();
         v8::scope_with_context!(let scope, isolate, context);
@@ -727,12 +740,25 @@ async fn build(
             held.push(v8::Global::new(scope, function));
         }
         let drain = held.pop().expect("two of them");
-        (held.pop().expect("two of them"), drain)
+        // A module namespace answers for a name it does not export with
+        // undefined rather than by failing, which is exactly what the
+        // prelude wants to be told about a module that has no default.
+        let namespace = v8::Local::new(scope, namespace);
+        let default = v8::String::new(scope, "default").expect("a four character name");
+        let exported = namespace
+            .get(scope, default.into())
+            .unwrap_or_else(|| v8::undefined(scope).into());
+        (
+            held.pop().expect("two of them"),
+            v8::Global::new(scope, exported),
+            drain,
+        )
     };
     drop(watchdog);
     Ok(Ready {
         js,
         entry,
+        exported,
         drain,
         watch,
         handle,
@@ -749,6 +775,7 @@ impl Ready {
         let Ready {
             js,
             entry,
+            exported,
             drain,
             watch,
             handle,
@@ -771,7 +798,7 @@ impl Ready {
         // function that never returns never returns from here.
         let called = {
             let _running = watch.running();
-            js.call(entry)
+            js.call_with_args(entry, std::slice::from_ref(exported))
         };
         watch
             .timing(js.with_event_loop_promise(called, PollEventLoopOptions::default()))
