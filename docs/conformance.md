@@ -446,9 +446,10 @@ zou took the writes because its bootstrap grants the three api roles everything 
 An edge function is not a request, it is a project: a directory per function, an `index.ts` in each, `_shared` beside them, and a `config.toml` that says which of them may be called without a token.
 So the suite is that project, and both legs put it on disk unedited, one under `zou functions serve` and the other under a `supabase start` with edge-runtime in it.
 There is nothing upstream to copy, the way there was nothing for presence: supabase-js's own suite has one line about functions in it and edge-runtime's tests are about the runtime rather than about the surface a project sees.
-20 tests in three files, and the reference leg is what makes them a statement about Supabase rather than about zou.
+22 tests in three files, and the reference leg is what makes them a statement about Supabase rather than about zou.
 
 `entry.test.ts` is the three ways a module says what to run, all three deployed and all three called, because `Deno.serve` is the documented one and the other two are what most functions in the wild are written with.
+It is also where a function the config file names rather than the listing is asked for, with its entrypoint two directories down and no directory of its own, which is how the examples project deploys its mcp server.
 `invoke.test.ts` is the invocation: supabase-js's own `functions.invoke`, the refusals, the two error pages, and an answer arriving before the work `waitUntil` was handed has finished.
 The refusals are three rather than one because the server tells them apart before it verifies anything, and no header, a string that is not a token, and a token signed with something else are three codes and three messages.
 `runtime.test.ts` is what the handler is given: the five environment variables, the web surface, a body that arrives in pieces as it is written, the headers describing the request that reached the front door, and CORS.
@@ -547,6 +548,10 @@ Forty three of them are the image transforms, and those are the one place where 
 supabase-js 2.111.0 runs 17 of its integration tests against zou and all 17 pass.
 
 storage-js 2.111.0 runs 133 of its 135 against zou and all 133 pass, the 2 it does not run being upstream's own skips.
+
+The five suites this project wrote have lines of their own on the scoreboard now, `js-tus`, `js-realtime`, `js-realtime-private`, `js-realtime-changes` and `js-functions`, and they are labelled with what they were compared with rather than being folded in with the recordings.
+The number on each is the zou leg, and what makes it a compatibility number rather than a self assessment is the other leg: the same file runs against a real `supabase start` in the diff job of the same run, so an assertion the reference does not pass is the suite being wrong.
+They are not written out here in prose on purpose, because prose goes stale and the scoreboard is regenerated on every merge.
 
 The cases that pass "written differently" are all the same three things: zou puts a space after each colon where PostgREST puts a newline between rows, a `select=*` comes back with the columns in a different order, and two auth answers carry their keys in a different order than Go wrote them.
 None of them is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.

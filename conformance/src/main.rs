@@ -71,6 +71,9 @@ the scoreboard
   --report <path>          a report json a check wrote with --json, repeatable
   --js <name>=<path>       a client's own run, as the json jest writes,
                            repeatable: --js supabase-js=/tmp/js.json
+  --ours <name>=<path>     a suite this project wrote, run against zou and
+                           against supabase start in the same CI run, in
+                           the same json: --ours js-functions=/tmp/fn.json
   --pin <sha>              the zou-conformance commit the suites came from
   --out <path>             where to write it, stdout when absent
 
@@ -165,6 +168,7 @@ struct Args {
     setup_sql: Option<String>,
     reports: Vec<String>,
     js: Vec<String>,
+    ours: Vec<String>,
     pin: Option<String>,
     out: Option<String>,
 }
@@ -201,6 +205,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         setup_sql: None,
         reports: Vec::new(),
         js: Vec::new(),
+        ours: Vec::new(),
         pin: None,
         out: None,
     };
@@ -250,6 +255,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--setup" => args.setup_sql = Some(need("--setup")?),
             "--report" => args.reports.push(need("--report")?),
             "--js" => args.js.push(need("--js")?),
+            "--ours" => args.ours.push(need("--ours")?),
             "--pin" => args.pin = Some(need("--pin")?),
             "--out" => args.out = Some(need("--out")?),
             "--port" => {
@@ -282,9 +288,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         }
         return Ok(args);
     }
-    if !args.reports.is_empty() || !args.js.is_empty() || args.pin.is_some() || args.out.is_some() {
+    if !args.reports.is_empty()
+        || !args.js.is_empty()
+        || !args.ours.is_empty()
+        || args.pin.is_some()
+        || args.out.is_some()
+    {
         return Err(format!(
-            "--report, --js, --pin and --out are for scoreboard, not {}",
+            "--report, --js, --ours, --pin and --out are for scoreboard, not {}",
             args.mode
         ));
     }
@@ -518,6 +529,23 @@ fn run(args: Args) -> Result<bool, String> {
     Ok(good)
 }
 
+/// The runs named on the command line, read in the order they were
+/// given.
+///
+/// The name comes from the command line rather than out of the file,
+/// because the file is a test runner's report and has no idea what it
+/// was pointed at.
+fn named(args: &[String], flag: &str) -> Result<Vec<(String, scoreboard::Js)>, String> {
+    let mut runs = Vec::new();
+    for arg in args {
+        let (name, path) = arg
+            .split_once('=')
+            .ok_or_else(|| format!("{flag} takes <name>=<path>, not {arg:?}"))?;
+        runs.push((name.to_string(), scoreboard::read_js(path)?));
+    }
+    Ok(runs)
+}
+
 /// The scoreboard: the json a run wrote, as the markdown CI commits.
 ///
 /// It writes over the file rather than appending to it, and it puts no
@@ -526,17 +554,9 @@ fn run(args: Args) -> Result<bool, String> {
 /// then there is no commit at all.
 fn published(args: &Args) -> Result<bool, String> {
     let runs = scoreboard::read(&args.reports)?;
-    let mut js = Vec::new();
-    for arg in &args.js {
-        // The client is named on the command line rather than guessed
-        // from the file, because the file is a test runner's report and
-        // has no idea what it was pointed at.
-        let (name, path) = arg
-            .split_once('=')
-            .ok_or_else(|| format!("--js takes <name>=<path>, not {arg:?}"))?;
-        js.push((name.to_string(), scoreboard::read_js(path)?));
-    }
-    let text = scoreboard::render(&runs, &js, args.pin.as_deref());
+    let js = named(&args.js, "--js")?;
+    let ours = named(&args.ours, "--ours")?;
+    let text = scoreboard::render(&runs, &js, &ours, args.pin.as_deref());
     match &args.out {
         Some(path) => {
             std::fs::write(path, &text).map_err(|e| format!("{path}: {e}"))?;
