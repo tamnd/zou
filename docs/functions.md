@@ -68,6 +68,7 @@ The listing is one level deep, it is the directory's name that becomes the url, 
 - `functions/hello/index.ts` is served as `hello`.
 - `functions/_shared/` is not served, and neither is anything starting with a dot. That is the convention every example project already uses for the code its functions import.
 - `functions/nested/deep/index.ts` is not served. The listing does not walk.
+- Unless the config file names it: a `[functions.deep]` with an `entrypoint` of `./functions/nested/deep/index.ts` is served as `deep`, with no `functions/deep` anywhere. That is upstream's behaviour, measured on the Supabase examples project, whose `simple-mcp-server` is exactly that shape. It is the block that adds the name, not the depth of the path.
 - `functions/noindex/other.ts` is not served, because the entrypoint is missing.
 - `functions/jsfn.js` is not served. A function is a directory.
 
@@ -148,6 +149,7 @@ What is deployed is what would have been served: a function `enabled = false` sw
 `zou functions list` prints what is deployed right now, which is the question worth asking before changing it.
 
 What a deploy carries is the function's own directory and every `_`-prefixed directory beside it, which is the shared code convention, plus whatever the config file pointed `entrypoint` and `import_map` at.
+For a function the config file named rather than the listing, the function's own directory is the one its entrypoint is in.
 Remote imports stay remote: an `npm:`, `jsr:` or `https:` specifier is resolved by the node that runs the function, through the module cache it already has.
 A `.env` is never carried, and neither is anything else whose name starts with a dot.
 The secrets a deployed function gets come from the project rather than from whatever was on the laptop that ran the deploy.
@@ -200,7 +202,8 @@ static_files = ["./functions/other/index.html"]
 `verify_jwt` is on unless the block says otherwise.
 A function that configures nothing is a function nobody can call without a key, rather than one anybody can.
 
-`entrypoint` moves the file the runtime starts at, and the function is still called by its directory's name.
+`entrypoint` moves the file the runtime starts at, and the function is still called by the block's name.
+A block with an entrypoint is a function even when there is no directory under `functions/` with that name, and what a deploy carries for one is the directory the entrypoint is in.
 `import_map` is one of the places a map is looked for, and the first one, which the import maps section covers.
 `static_files` is what the function may read off the disk, which the static files section covers.
 

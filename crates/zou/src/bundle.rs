@@ -223,7 +223,18 @@ pub fn publish(
             }
             Ok(())
         };
-        for path in walk(&root.join(&function.name))? {
+        // The function's own directory, which for a function the config
+        // file named rather than the listing is the one its entrypoint
+        // is in: `functions/mcp/simple-mcp-server` and not a
+        // `functions/simple-mcp-server` nobody made. Carrying only the
+        // entrypoint there would deploy a function without the files
+        // beside it that it imports.
+        let own = root.join(&function.name);
+        let own = match own.is_dir() {
+            true => own,
+            false => function.entrypoint.parent().unwrap_or(&root).to_path_buf(),
+        };
+        for path in walk(&own)? {
             carry(&path, &mut files)?;
         }
         for dir in &shared {
@@ -530,6 +541,59 @@ mod tests {
             !hello.files.contains_key(".env"),
             "a project's secrets are the one thing that never leaves it"
         );
+    }
+
+    /// A function the config file named rather than the listing, whose
+    /// directory is somewhere else entirely. What it carries is that
+    /// directory, because the alternative is deploying an entrypoint
+    /// without the file next to it that it imports.
+    #[test]
+    fn a_function_whose_directory_is_elsewhere_carries_that_directory() {
+        let (_target, store) = store();
+        let project = project();
+        let root = project.path().join("functions");
+        std::fs::create_dir_all(root.join("mcp/deeper")).expect("mkdir");
+        std::fs::write(
+            root.join("mcp/deeper/index.ts"),
+            "import { how } from './how.ts'\nDeno.serve(() => new Response(how))",
+        )
+        .expect("write");
+        std::fs::write(root.join("mcp/deeper/how.ts"), "export const how = 'so'").expect("write");
+        let mut layout = Layout::default();
+        layout.settings.insert(
+            "deeper".to_string(),
+            Settings {
+                entrypoint: Some("./functions/mcp/deeper/index.ts".to_string()),
+                ..Settings::default()
+            },
+        );
+        let published =
+            publish(store.as_ref(), "acme", project.path(), &layout, &[]).expect("publish");
+        assert_eq!(published.names, ["deeper", "hello", "world"]);
+
+        let deployment = fetch(store.as_ref(), "acme").expect("fetch").expect("some");
+        let deeper = deployment
+            .functions
+            .iter()
+            .find(|f| f.name == "deeper")
+            .expect("deployed");
+        assert_eq!(deeper.entrypoint, "mcp/deeper/index.ts");
+        let carried: Vec<&str> = deeper.files.keys().map(String::as_str).collect();
+        assert_eq!(
+            carried,
+            ["_shared/who.ts", "mcp/deeper/how.ts", "mcp/deeper/index.ts"]
+        );
+
+        // And it comes back the same way, through the reader a laptop
+        // uses, which is the only thing that makes the round trip worth
+        // asserting.
+        let into = tempfile::tempdir().expect("tempdir");
+        let (dir, layout) = materialize(store.as_ref(), "acme", into.path())
+            .expect("materialize")
+            .expect("some");
+        let found = zou_functions::read(&dir, &layout).expect("read");
+        let deeper = found.iter().find(|f| f.name == "deeper").expect("served");
+        assert_eq!(deeper.entrypoint, dir.join("functions/mcp/deeper/index.ts"));
     }
 
     #[test]
