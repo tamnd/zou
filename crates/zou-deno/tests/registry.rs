@@ -192,3 +192,38 @@ fn the_jsr_spelling_of_that_import_is_served_too() {
     assert_eq!(answer.status, 208);
     assert_eq!(body(&answer), "jsr std");
 }
+
+/// The line two of the Supabase examples open with, which is a project
+/// telling its editor what `Deno.serve` is.
+///
+/// A declaration file has no runtime code in it, so there is nothing to
+/// run and nothing to fetch, and the registry has no such file to serve
+/// either: asking esm.sh for it is a 404 and the function it was the
+/// first line of never loaded.
+#[test]
+#[ignore = "reaches the registry"]
+fn a_declaration_file_is_imported_and_nothing_happens() {
+    let answer = answered(
+        r#"
+        import 'jsr:@supabase/functions-js/edge-runtime.d.ts';
+        import { encodeHex } from "jsr:@std/encoding@1/hex";
+        Deno.serve(() => new Response(encodeHex(new TextEncoder().encode("types"))));
+        "#,
+    );
+    assert_eq!(body(&answer), "7479706573");
+}
+
+/// A subpath of a package, spelled the way a registry's own build of
+/// that package spells it: `npm:/name@version/subpath`, with the slash
+/// the scheme allows.
+#[test]
+#[ignore = "reaches the registry"]
+fn a_specifier_with_the_slash_the_scheme_allows_resolves() {
+    let answer = answered(
+        r#"
+        import { encodeHex } from "jsr:/@std/encoding@1/hex";
+        Deno.serve(() => new Response(encodeHex(new TextEncoder().encode("slash"))));
+        "#,
+    );
+    assert_eq!(body(&answer), "736c617368");
+}
