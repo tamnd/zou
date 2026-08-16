@@ -636,10 +636,19 @@ jobs:
         working-directory: /tmp/zou-conformance/js-tus
         run: |
           npm ci
-          npm test
+          npm test -- --reporter=default --reporter=json --outputFile.json=/tmp/js-tus.json
       - name: Keep the server log
         if: always()
         run: cat /tmp/serve.log
+      # For the scoreboard, which is generated in a job of its own out
+      # of what the runs wrote rather than out of a second run.
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-tus
+          path: /tmp/js-tus.json
+          if-no-files-found: ignore
 
   # Presence, driven through the client that implements it. supabase-js
   # ships an integration suite and it has broadcast in it and no
@@ -682,10 +691,19 @@ jobs:
         working-directory: /tmp/zou-conformance/js-realtime
         run: |
           npm ci
-          npm test
+          npm test -- --reporter=default --reporter=json --outputFile.json=/tmp/js-realtime.json
       - name: Keep the server log
         if: always()
         run: cat /tmp/front-door.log
+      # For the scoreboard, which is generated in a job of its own out
+      # of what the runs wrote rather than out of a second run.
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-realtime
+          path: /tmp/js-realtime.json
+          if-no-files-found: ignore
 
   # Private channels, which are the same client asking a different kind
   # of question: whether a room is allowed is decided by row level
@@ -743,10 +761,20 @@ jobs:
         run: |
           npm ci
           ZOU_ANON_KEY="$(awk '/^anon /{print $2}' /tmp/serve.log)" \
-            ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test
+            ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test -- \
+            --reporter=default --reporter=json --outputFile.json=/tmp/js-realtime-private.json
       - name: Keep the server log
         if: always()
         run: cat /tmp/serve.log
+      # For the scoreboard, which is generated in a job of its own out
+      # of what the runs wrote rather than out of a second run.
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-realtime-private
+          path: /tmp/js-realtime-private.json
+          if-no-files-found: ignore
 
   # Rows nobody sent. The two jobs above are about messages a client
   # pushed, and this one is about a table in the publication being
@@ -826,10 +854,20 @@ jobs:
         run: |
           npm ci
           ZOU_ANON_KEY="$(awk '/^anon /{print $2}' /tmp/serve.log)" \
-            ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test
+            ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test -- \
+            --reporter=default --reporter=json --outputFile.json=/tmp/js-realtime-changes.json
       - name: Keep the server log
         if: always()
         run: cat /tmp/serve.log
+      # For the scoreboard, which is generated in a job of its own out
+      # of what the runs wrote rather than out of a second run.
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-realtime-changes
+          path: /tmp/js-realtime-changes.json
+          if-no-files-found: ignore
 
   # The functions a project has on disk, served the way a person serves
   # them. Everything else under conformance is a list of requests, and
@@ -894,10 +932,20 @@ jobs:
           cd /tmp/zou-conformance/js-functions
           npm ci
           ZOU_URL=http://127.0.0.1:54321 \
-            ZOU_ANON_KEY="$(awk '/anon key /{print $NF}' /tmp/functions.log)" npm test
+            ZOU_ANON_KEY="$(awk '/anon key /{print $NF}' /tmp/functions.log)" npm test -- \
+            --reporter=default --reporter=json --outputFile.json=/tmp/js-functions.json
       - name: Keep the server log
         if: always()
         run: cat /tmp/functions.log
+      # For the scoreboard, which is generated in a job of its own out
+      # of what the runs wrote rather than out of a second run.
+      - name: Keep the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-functions
+          path: /tmp/js-functions.json
+          if-no-files-found: ignore
 
   # One of Supabase's own example apps, unedited, driven through a real
   # browser. The suites ask a server questions and this asks an
@@ -1203,7 +1251,17 @@ jobs:
   scoreboard:
     name: scoreboard
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [conformance, auth-conformance, storage-conformance, supabase-js, storage-js]
+    needs:
+      - conformance
+      - auth-conformance
+      - storage-conformance
+      - supabase-js
+      - storage-js
+      - tus-js
+      - realtime-js
+      - realtime-private-js
+      - realtime-changes-js
+      - functions-js
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1231,6 +1289,29 @@ jobs:
         with:
           name: storage-js
           path: /tmp/reports
+      # The suites this project wrote, which are one report each and are
+      # labelled apart on the scoreboard: the number is the zou leg of a
+      # run whose other leg asked a real supabase start the same file.
+      - uses: actions/download-artifact@v4
+        with:
+          name: js-tus
+          path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
+          name: js-realtime
+          path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
+          name: js-realtime-private
+          path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
+          name: js-realtime-changes
+          path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
+          name: js-functions
+          path: /tmp/reports
       - name: Render it
         run: |
           cargo run -p zou-conformance -- scoreboard \
@@ -1239,6 +1320,11 @@ jobs:
             --report /tmp/reports/storage.json \
             --js supabase-js=/tmp/reports/js.json \
             --js storage-js=/tmp/reports/js-storage.json \
+            --ours js-tus=/tmp/reports/js-tus.json \
+            --ours js-realtime=/tmp/reports/js-realtime.json \
+            --ours js-realtime-private=/tmp/reports/js-realtime-private.json \
+            --ours js-realtime-changes=/tmp/reports/js-realtime-changes.json \
+            --ours js-functions=/tmp/reports/js-functions.json \
             --pin "$(jq -r .ref conformance/suites.json)" \
             --out docs/scoreboard.md
       # Nothing in the file moves on its own, so a merge that changed no

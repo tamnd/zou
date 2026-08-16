@@ -88,8 +88,15 @@ struct Block {
 }
 
 /// The whole document. The js runs are named on the command line, one
-/// per client whose own tests were pointed at zou.
-pub fn render(runs: &[Run], js: &[(String, Js)], pin: Option<&str>) -> String {
+/// per client whose own tests were pointed at zou, and the `ours` runs
+/// beside them are the suites this project wrote, which are a different
+/// claim and are labelled as one.
+pub fn render(
+    runs: &[Run],
+    js: &[(String, Js)],
+    ours: &[(String, Js)],
+    pin: Option<&str>,
+) -> String {
     let mut out = String::new();
     out.push_str(
         "# Compatibility scoreboard\n\n\
@@ -120,16 +127,10 @@ pub fn render(runs: &[Run], js: &[(String, Js)], pin: Option<&str>) -> String {
         ));
     }
     for (name, js) in js {
-        let blocks = blocks(js);
-        let passed: usize = blocks.iter().map(|b| b.passed).sum();
-        let failed: usize = blocks.iter().map(|b| b.failed).sum();
-        out.push_str(&format!(
-            "| {} | its own integration tests | {} | {} | {}% | 0 |\n",
-            name,
-            passed,
-            passed + failed,
-            percent(passed, passed + failed)
-        ));
+        out.push_str(&summary(name, "its own integration tests", js));
+    }
+    for (name, js) in ours {
+        out.push_str(&summary(name, "supabase start, in the same run", js));
     }
     out.push('\n');
 
@@ -154,19 +155,53 @@ pub fn render(runs: &[Run], js: &[(String, Js)], pin: Option<&str>) -> String {
              than deleted so that the count keeps saying how much of the file is not \
              being asked.\n\n"
         ));
-        out.push_str("| block | passing | of | skipped |\n");
-        out.push_str("| --- | ---: | ---: | ---: |\n");
-        for block in blocks(js) {
-            out.push_str(&format!(
-                "| {} | {} | {} | {} |\n",
-                block.name,
-                block.passed,
-                block.passed + block.failed,
-                block.skipped
-            ));
-        }
-        out.push('\n');
+        out.push_str(&table_of(js));
     }
+
+    for (name, js) in ours {
+        out.push_str(&format!("## {name}\n\n"));
+        out.push_str(&format!(
+            "The questions in `{name}` are this project's own, because there is nothing \
+             upstream that asks them. What keeps them honest is the other leg: the same \
+             file is run against a real `supabase start` in the diff job of the same CI \
+             run, so an assertion the reference does not pass is this suite being wrong \
+             rather than zou being wrong. The number below is the zou leg.\n\n"
+        ));
+        out.push_str(&table_of(js));
+    }
+    out
+}
+
+/// One line in the table at the top, for a run that is a file of tests
+/// rather than a suite with a recording.
+fn summary(name: &str, compared_with: &str, js: &Js) -> String {
+    let blocks = blocks(js);
+    let passed: usize = blocks.iter().map(|b| b.passed).sum();
+    let failed: usize = blocks.iter().map(|b| b.failed).sum();
+    format!(
+        "| {} | {} | {} | {} | {}% | 0 |\n",
+        name,
+        compared_with,
+        passed,
+        passed + failed,
+        percent(passed, passed + failed)
+    )
+}
+
+/// The per block table, which is the same shape whoever wrote the file.
+fn table_of(js: &Js) -> String {
+    let mut out =
+        String::from("| block | passing | of | skipped |\n| --- | ---: | ---: | ---: |\n");
+    for block in blocks(js) {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            block.name,
+            block.passed,
+            block.passed + block.failed,
+            block.skipped
+        ));
+    }
+    out.push('\n');
     out
 }
 
@@ -263,7 +298,7 @@ mod tests {
 
     #[test]
     fn the_scoreboard_carries_both_cuts_through_the_run() {
-        let out = render(&runs(), &[], None);
+        let out = render(&runs(), &[], &[], None);
         assert!(out.contains("| rest | postgrest 14.15 (recorded) | 71 | 82 | 86% | 11 |"));
         assert!(out.contains("| GET /rest/v1/{table} | 30 | 38 | 78% |"));
         assert!(out.contains("| select | 7 | 8 | 87% |"));
@@ -273,13 +308,17 @@ mod tests {
     /// reads, so there is nothing in it that moves on its own.
     #[test]
     fn the_same_run_twice_is_the_same_file() {
-        assert_eq!(render(&runs(), &[], None), render(&runs(), &[], None));
+        assert_eq!(
+            render(&runs(), &[], &[], None),
+            render(&runs(), &[], &[], None)
+        );
     }
 
     #[test]
     fn the_pin_says_which_questions_these_answers_are_to() {
         let out = render(
             &runs(),
+            &[],
             &[],
             Some("55194722663a1cdfcd9eca133fbed9df64d0294c"),
         );
@@ -304,7 +343,7 @@ mod tests {
     /// invisible either.
     #[test]
     fn a_skipped_client_test_is_counted_apart() {
-        let out = render(&runs(), &[("supabase-js".to_string(), js())], None);
+        let out = render(&runs(), &[("supabase-js".to_string(), js())], &[], None);
         assert!(out.contains("| PostgREST | 2 | 3 | 0 |"));
         assert!(out.contains("| Realtime | 0 | 0 | 1 |"));
         assert!(out.contains("| supabase-js | its own integration tests | 2 | 3 | 66% | 0 |"));
@@ -320,11 +359,31 @@ mod tests {
                 ("supabase-js".to_string(), js()),
                 ("storage-js".to_string(), js()),
             ],
+            &[],
             None,
         );
         assert!(out.contains("| storage-js | its own integration tests | 2 | 3 | 66% | 0 |"));
         assert!(out.contains("## supabase-js\n"));
         assert!(out.contains("## storage-js\n"));
+    }
+
+    /// A suite this project wrote is a different claim from a client's
+    /// own tests, so it says what it was compared with rather than
+    /// borrowing the line above it.
+    #[test]
+    fn a_suite_of_ours_says_which_leg_the_number_is() {
+        let out = render(
+            &runs(),
+            &[("supabase-js".to_string(), js())],
+            &[("js-functions".to_string(), js())],
+            None,
+        );
+        assert!(out.contains("| supabase-js | its own integration tests | 2 | 3 | 66% | 0 |"));
+        assert!(
+            out.contains("| js-functions | supabase start, in the same run | 2 | 3 | 66% | 0 |")
+        );
+        assert!(out.contains("## js-functions\n"));
+        assert!(out.contains("the same file is run against a real `supabase start`"));
     }
 
     #[test]
