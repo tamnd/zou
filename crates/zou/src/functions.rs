@@ -17,7 +17,10 @@
 //!
 //! `zou functions serve` is here too, which is the dev loop for a
 //! person writing a function rather than for a whole project: the same
-//! `/functions/v1` surface, on its own port, watching the disk.
+//! `/functions/v1` surface, on its own port, watching the disk. Given a
+//! store and a project it serves what was deployed there instead, which
+//! is the same bytes a node runs and is how a deploy is checked without
+//! standing a node up.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -138,7 +141,7 @@ pub fn keys() -> Result<(String, String, String), String> {
     Ok((secret, anon, service))
 }
 
-pub const USAGE: &str = "usage: zou functions <serve [--port <n>] [--env-file <path>] [--import-map <path>] [--no-verify-jwt] [--inspect [<port>]] | deploy [<name>...] [--target <store>] [--ref <tenant>] [--import-map <path>] [--no-verify-jwt] | list [--target <store>] [--ref <tenant>]> [--config <config.toml> | --no-config]";
+pub const USAGE: &str = "usage: zou functions <serve [--port <n>] [--env-file <path>] [--import-map <path>] [--no-verify-jwt] [--inspect [<port>]] [--target <store> --ref <tenant>] | deploy [<name>...] [--target <store>] [--ref <tenant>] [--import-map <path>] [--no-verify-jwt] | list [--target <store>] [--ref <tenant>]> [--config <config.toml> | --no-config]";
 
 /// Where upstream's local api answers, which is where a project's
 /// client library already looks for `/functions/v1`.
@@ -181,6 +184,17 @@ pub struct Serve {
     /// config file's.
     pub inspect: bool,
     pub inspect_port: Option<u16>,
+    /// The store to serve a deployment out of, and which project on it.
+    /// Neither is upstream's, because upstream's dev loop only ever
+    /// serves a directory. Naming either of them here serves what `zou
+    /// functions deploy` wrote rather than what is on this disk, which
+    /// is the bytes a node runs.
+    ///
+    /// Only the flags switch it, and not `ZOU_TARGET` in the
+    /// environment: a person with a store exported who runs the dev
+    /// loop in their project means the project.
+    pub target: Option<String>,
+    pub tenant: Option<String>,
     pub config: Option<PathBuf>,
     pub no_config: bool,
 }
@@ -193,6 +207,8 @@ pub fn parse(argv: &[String]) -> Result<Serve, String> {
         no_verify_jwt: false,
         inspect: false,
         inspect_port: None,
+        target: None,
+        tenant: None,
         config: None,
         no_config: false,
     };
@@ -224,6 +240,8 @@ pub fn parse(argv: &[String]) -> Result<Serve, String> {
                     it.next();
                 }
             }
+            "--target" => args.target = Some(it.next().ok_or("--target needs a value")?.clone()),
+            "--ref" => args.tenant = Some(it.next().ok_or("--ref needs a value")?.clone()),
             "--config" => {
                 let raw = it.next().ok_or("--config needs a value")?;
                 args.config = Some(PathBuf::from(raw));
@@ -524,7 +542,20 @@ fn serve(args: &Serve) -> Result<(), String> {
             crate::dev::SUPERUSER
         ),
     );
-    let disk = disk(&dir, &layout, args, &own)?;
+    // Where the functions come from: this disk, or a store, and the
+    // second is the same read a node does at attach.
+    let attached = match args.target.is_some() || args.tenant.is_some() {
+        true => Some(attach(args, project.as_ref(), port, &own)?),
+        false => None,
+    };
+    let (dir, layout, disk) = match attached {
+        Some(attached) => (attached.dir, attached.layout, attached.disk),
+        None => {
+            let disk = disk(&dir, &layout, args, &own)?;
+            (dir, layout, disk)
+        }
+    };
+    let deployed = args.target.is_some() || args.tenant.is_some();
     announce(&disk.functions);
     let registry = Arc::new(Registry::new(
         disk.functions.clone(),
@@ -565,18 +596,116 @@ fn serve(args: &Serve) -> Result<(), String> {
             let _ = failed.send(e);
         }
     });
-    watch(
-        args,
-        &registry,
-        Watched {
-            dir,
-            config: project.map(|p| p.path),
-            layout,
-            own,
-            last: disk,
-        },
-        told,
-    )
+    // A deployment is not watched. The files under it are a copy of
+    // what a store holds, so editing one changes nothing anybody
+    // deployed, and the way a deployment changes is another deploy and
+    // another serve. The dev loop watches a project, which is the
+    // directory somebody is actually typing in.
+    match deployed {
+        true => park(told),
+        false => watch(
+            args,
+            &registry,
+            Watched {
+                dir,
+                config: project.map(|p| p.path),
+                layout,
+                own,
+                last: disk,
+            },
+            told,
+        ),
+    }
+}
+
+/// Serve until the http server stops or somebody interrupts, which is
+/// what a serve with nothing to watch does.
+fn park(told: std::sync::mpsc::Receiver<String>) -> Result<(), String> {
+    match told.recv() {
+        Ok(e) => Err(format!("http server: {e}")),
+        Err(_) => Err("the http server stopped".to_string()),
+    }
+}
+
+/// A deployment, read out of a store and written down as a project
+/// directory this process can serve out of.
+struct Attached {
+    dir: PathBuf,
+    layout: Layout,
+    disk: Disk,
+}
+
+/// Read what is deployed to a project, the way a node reads it at
+/// attach: the same `materialize`, the same listing reader over what it
+/// wrote, and the project's own secrets out of its own prefix.
+///
+/// The files land in a directory named for the project and the port, so
+/// a second serve of the same deployment on another port has its own
+/// copy and a repeat of this one reuses the name rather than leaving a
+/// pile of them behind. Removed first, because what a store says now is
+/// the whole answer and a file left over from a deployment somebody has
+/// since replaced is not part of it.
+fn attach(
+    args: &Serve,
+    project: Option<&crate::config::Project>,
+    port: u16,
+    own: &[(String, String)],
+) -> Result<Attached, String> {
+    let (target, tenant) = place(args.target.as_deref(), args.tenant.as_deref(), project)?;
+    let store = zou_store::open_store(&target)?;
+    let into = std::env::temp_dir().join(format!("zou-deployed-{tenant}-{port}"));
+    if into.exists() {
+        std::fs::remove_dir_all(&into).map_err(|e| format!("remove {}: {e}", into.display()))?;
+    }
+    let Some((dir, layout)) = crate::bundle::materialize(store.as_ref(), &tenant, &into)? else {
+        return Err(format!("nothing is deployed to {tenant} on {target}"));
+    };
+    log::info!("serving what is deployed to {tenant} on {target}");
+    log::info!("its files are at {}", dir.display());
+    let mut functions = zou_functions::read(&dir, &layout)?;
+    for function in &mut functions {
+        // The two flags a serve applies to every function of the run.
+        // `--no-verify-jwt` on a deployment is a local decision about a
+        // deployed project rather than a change to it, which is worth
+        // having: it is how somebody calls a deployed function by hand
+        // without minting a token first.
+        if args.no_verify_jwt {
+            function.verify_jwt = false;
+        }
+        if let Some(map) = &args.import_map {
+            function.import_map = Some(map.clone());
+        }
+    }
+    // The project's own environment first and the four above over it,
+    // which is the order a node stacks them in. A deployment's secrets
+    // come out of the store and never off this disk: the `.env` beside
+    // a project is the one file a deploy does not carry.
+    let mut env = secrets(store.as_ref(), &tenant)?;
+    env.extend(own.iter().cloned());
+    Ok(Attached {
+        dir,
+        layout,
+        disk: Disk { functions, env },
+    })
+}
+
+/// What a deployed project's functions are told, out of the sealed
+/// object in its own prefix. The same read the node does, and the same
+/// refusal: a project that has secrets and a process with no key to
+/// open them serves nothing, because a function running without the
+/// environment it was written against is a function calling somebody
+/// else's api with an empty token.
+fn secrets(store: &dyn zou_store::CasStore, tenant: &str) -> Result<Vec<(String, String)>, String> {
+    if !crate::secrets::present(store, tenant)? {
+        return Ok(Vec::new());
+    }
+    let key = crate::secrets::Key::from_env()?.ok_or(
+        "this project has function secrets and this process has no key to open them with, set ZOU_SECRET_KEY",
+    )?;
+    let all = crate::secrets::read(store, tenant, &key)?;
+    let names: Vec<&str> = all.keys().map(String::as_str).collect();
+    log::info!("function secrets: {}", names.join(", "));
+    Ok(all.into_iter().collect())
 }
 
 /// What the loop below is looking at: where the functions are, which
@@ -821,6 +950,81 @@ mod tests {
         );
     }
 
+    /// A deploy and then a serve of what it wrote, which is the round
+    /// trip a node does and the one thing about a deployment a person
+    /// can check without standing a node up.
+    #[test]
+    fn a_serve_pointed_at_a_store_serves_what_was_deployed() {
+        let dir = project(&["hello", "world"]);
+        let store = tempfile::tempdir().expect("tempdir");
+        let target = store.path().display().to_string();
+        let opened = zou_store::open_store(&target).expect("store");
+        let mut layout = Layout::default();
+        layout.settings.insert(
+            "world".to_string(),
+            zou_functions::Settings {
+                verify_jwt: false,
+                ..zou_functions::Settings::default()
+            },
+        );
+        crate::bundle::publish(opened.as_ref(), "acme", dir.path(), &layout, &[]).expect("deploy");
+
+        let args = parse(&argv(&[
+            "--target",
+            &target,
+            "--ref",
+            "acme",
+            "--no-config",
+        ]))
+        .expect("a serve out of a store");
+        let own = env(54321, "an-anon-key", "a-service-key", "postgres://x/y");
+        let attached = attach(&args, None, 54321, &own).expect("attach");
+        let names: Vec<&str> = attached
+            .disk
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(names, ["hello", "world"]);
+        assert!(attached.disk.functions[0].verify_jwt);
+        assert!(
+            !attached.disk.functions[1].verify_jwt,
+            "what the project said about a function is deployed with it"
+        );
+        assert!(
+            attached.disk.functions[0]
+                .entrypoint
+                .starts_with(&attached.dir),
+            "the files a deployment is served out of are the ones it wrote"
+        );
+        assert!(
+            attached
+                .disk
+                .env
+                .iter()
+                .any(|(name, value)| name == "SUPABASE_ANON_KEY" && value == "an-anon-key"),
+            "and the four a server owns are on top of what the project deployed"
+        );
+    }
+
+    #[test]
+    fn a_serve_of_a_project_nobody_deployed_to_says_so() {
+        let store = tempfile::tempdir().expect("tempdir");
+        let target = store.path().display().to_string();
+        let args = parse(&argv(&[
+            "--target",
+            &target,
+            "--ref",
+            "acme",
+            "--no-config",
+        ]))
+        .expect("a serve out of a store");
+        let Err(e) = attach(&args, None, 54321, &[]) else {
+            panic!("a serve of a project with no deployment has nothing to serve");
+        };
+        assert!(e.contains("nothing is deployed to acme"), "{e}");
+    }
+
     /// The engine is a build time choice, so one of these two runs and
     /// the other is compiled out, and both are worth asserting because
     /// the wrong one silently is the failure this is guarding against.
@@ -853,6 +1057,10 @@ mod tests {
         assert!(args.env_file.is_none() && args.import_map.is_none());
         assert!(!args.no_verify_jwt, "upstream verifies unless told not to");
         assert!(!args.inspect && args.inspect_port.is_none());
+        assert!(
+            args.target.is_none() && args.tenant.is_none(),
+            "a serve nobody pointed at a store is a serve of this directory"
+        );
     }
 
     #[test]
@@ -867,6 +1075,10 @@ mod tests {
             "--no-verify-jwt",
             "--inspect",
             "9229",
+            "--target",
+            "s3://bucket",
+            "--ref",
+            "acme",
             "--config",
             "supabase/config.toml",
         ]))
@@ -877,6 +1089,8 @@ mod tests {
         assert!(args.no_verify_jwt);
         assert!(args.inspect);
         assert_eq!(args.inspect_port, Some(9229));
+        assert_eq!(args.target.as_deref(), Some("s3://bucket"));
+        assert_eq!(args.tenant.as_deref(), Some("acme"));
         assert_eq!(args.config, Some(PathBuf::from("supabase/config.toml")));
     }
 

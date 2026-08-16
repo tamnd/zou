@@ -458,6 +458,12 @@ Two questions have two right answers and both are asserted rather than skipped, 
 A preflight is answered by kong on the local stack before the function is reached, and zou hands it to the function the way the hosted runtime does, so the `_shared/cors.ts` that is in every Supabase example is what decides.
 `SB_EXECUTION_ID` is a uuid on both, and the local stack mints it when the worker is made rather than when a call arrives, so five calls a second apart come back with one id where zou hands each call its own.
 
+The zou leg is run twice, and that is a claim the other suites cannot make.
+The first run serves the project directory, the way a person does while writing a function.
+The second deploys that same directory to a store with `zou functions deploy`, serves what was written there with `zou functions serve --target`, and asks the same 22 questions of it, on a process that has no project directory at all.
+A deploy carries a subset of a project on purpose, it drops every dotfile and it flattens what the config file said into a manifest, so whether what comes back is still the project is exactly the kind of thing that is easy to assume and cheap to ask.
+Both legs are `needs` of the scoreboard job, so a deployment that answered differently stops the page from being regenerated.
+
 It caught one thing on the day it was written, and it is the kind only an end to end suite finds.
 A handler that threw answered 500 after exactly sixty seconds.
 The answer travels back on a channel whose sending end lives in the isolate, the error path returned without taking it, and under the default policy the isolate is kept, so the caller waited for the minute it takes a kept isolate to go idle.
