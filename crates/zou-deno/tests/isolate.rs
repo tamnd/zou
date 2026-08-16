@@ -3317,6 +3317,68 @@ fn a_navigator_says_what_the_function_is_running_on() {
     );
 }
 
+/// What a function may do, asked the way a library asks it before it
+/// reaches for something it can do without.
+///
+/// Upstream answers `granted` to all eight and a worker there can no
+/// more start a process than one here can, so the three that are not
+/// here say so instead, which is the difference a library can act on.
+#[test]
+fn what_a_function_may_do_is_answered_and_not_a_missing_object() {
+    let answer = answered(
+        r#"
+        const names = ["env", "net", "read", "hrtime", "write", "run", "ffi", "sys"];
+        Deno.serve(async () => {
+            const sync = {};
+            for (const name of names) sync[name] = Deno.permissions.querySync({ name }).state;
+            const asked = await Deno.permissions.query({ name: "net" });
+            let refused = "it did not throw";
+            try {
+                Deno.permissions.querySync({ name: "telepathy" });
+            } catch (e) {
+                refused = `${e.constructor.name}: ${e.message}`;
+            }
+            return Response.json({
+                sync,
+                asked: asked.state,
+                listens: typeof asked.addEventListener,
+                partial: asked.partial,
+                change: asked.onchange,
+                requested: (await Deno.permissions.request({ name: "env" })).state,
+                revoked: Deno.permissions.revokeSync({ name: "run" }).state,
+                refused,
+                promised: (await Deno.permissions.query({ name: "nothing" }).catch((e) => e)).name,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["sync"]["env"], "granted");
+    assert_eq!(said["sync"]["net"], "granted");
+    assert_eq!(said["sync"]["read"], "granted");
+    assert_eq!(said["sync"]["hrtime"], "granted");
+    assert_eq!(said["sync"]["write"], "denied");
+    assert_eq!(said["sync"]["run"], "denied");
+    assert_eq!(said["sync"]["ffi"], "denied");
+    assert_eq!(said["sync"]["sys"], "denied");
+    assert_eq!(said["asked"], "granted");
+    // A status is an event target, because that is where `onchange`
+    // would arrive if anything here could change.
+    assert_eq!(said["listens"], "function");
+    assert_eq!(said["partial"], false);
+    assert_eq!(said["change"], serde_json::Value::Null);
+    assert_eq!(said["requested"], "granted");
+    // Nothing here is revocable, so revoking says what asking says
+    // rather than pretending to take away what it is not enforcing.
+    assert_eq!(said["revoked"], "denied");
+    assert_eq!(
+        said["refused"],
+        "TypeError: telepathy is not a permission a function can ask about"
+    );
+    // The async half rejects where the sync half throws.
+    assert_eq!(said["promised"], "TypeError");
+}
+
 /// A reason given is the reason reported, which is the other half of
 /// what a caller catching an abort branches on.
 #[test]
