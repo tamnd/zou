@@ -49,7 +49,7 @@ use std::time::Duration;
 use zou_functions::Failed;
 
 use crate::inspector::Inspector;
-use crate::isolate::{Held, Ready, Source};
+use crate::isolate::{Held, Owned, Ready, Source};
 use crate::limits::Limits;
 
 /// How long a worker waits for another call before it gives its isolate
@@ -67,6 +67,7 @@ const SERVICE: Duration = Duration::from_millis(10);
 
 /// One call on its way to a worker, and the way back.
 struct Job {
+    owned: Owned,
     held: Held,
     done: mpsc::Sender<Result<(), Failed>>,
 }
@@ -93,6 +94,7 @@ impl Pool {
     pub(crate) fn run(
         &self,
         source: &Source,
+        owned: Owned,
         held: Held,
         limits: Limits,
         debugger: Option<Arc<Inspector>>,
@@ -100,7 +102,7 @@ impl Pool {
         let specifier = &source.specifier;
         let key = source.key();
         let (done, answered) = mpsc::channel();
-        let mut job = Job { held, done };
+        let mut job = Job { owned, held, done };
         // Twice, because a worker taken out of the map may have gone
         // home in the moment between being idle and being handed a
         // call, and that is not an error, it is a worker to make.
@@ -198,7 +200,14 @@ fn work(
     };
     let mut ready: Option<Ready> = None;
     while let Some(job) = waited(jobs, ready.as_mut()) {
-        let out = tokio.block_on(once(&mut ready, source, limits, debugger.clone(), job.held));
+        let out = tokio.block_on(once(
+            &mut ready,
+            source,
+            limits,
+            debugger.clone(),
+            job.owned,
+            job.held,
+        ));
         if matches!(out, Err(Failed::Limit(_))) || ready.as_ref().is_some_and(Ready::spent) {
             ready = None;
         }
@@ -236,6 +245,7 @@ async fn once(
     source: &Source,
     limits: Limits,
     debugger: Option<Arc<Inspector>>,
+    owned: Owned,
     held: Held,
 ) -> Result<(), Failed> {
     let specifier = &source.specifier;
@@ -243,8 +253,14 @@ async fn once(
         *slot = None;
     }
     let call = async {
-        if slot.is_none() {
-            *slot = Some(Ready::new(source.clone(), limits, debugger).await?);
+        match slot {
+            // A fresh isolate is built with this call's environment in
+            // it, because the module's own top level runs during the
+            // build and reads it.
+            None => *slot = Some(Ready::new(source.clone(), limits, debugger, owned).await?),
+            // A kept one has the last call's, which differs by the
+            // execution id, and that is this call's to say.
+            Some(ready) => ready.owns(owned),
         }
         slot.as_mut().expect("it was just built").once(held).await
     };

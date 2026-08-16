@@ -175,21 +175,42 @@ fn beside(root: &Path, name: &str) -> Option<std::path::PathBuf> {
     }
     let own = dir.join("import_map.json");
     if own.is_file() {
-        log::warn!(
+        once(format!(
             "function {name} uses a deprecated import_map.json, which deno.json replaces: {}",
             own.display()
-        );
+        ));
         return Some(own);
     }
     let shared = root.join("import_map.json");
     if shared.is_file() {
-        log::warn!(
+        once(format!(
             "function {name} falls back to the project's import map, which a deno.json beside the function replaces: {}",
             shared.display()
-        );
+        ));
         return Some(shared);
     }
     None
+}
+
+/// A warning about how a project is laid out, said once.
+///
+/// The functions of a project are read again on every call, because a
+/// function edited on disk is served without a restart, so a warning
+/// said where they are read is a warning said on every call. A project
+/// with an import map and forty functions in it wrote six thousand
+/// lines into a log for thirty nine calls, which buries the errors the
+/// same log is for. The thing being complained about is the layout, and
+/// the layout is the same on the second reading as it was on the first.
+fn once(said: String) {
+    static ALREADY: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut already = ALREADY.lock().expect("the warnings already said");
+    if already
+        .get_or_insert_with(Default::default)
+        .insert(said.clone())
+    {
+        log::warn!("{said}");
+    }
 }
 
 #[cfg(test)]

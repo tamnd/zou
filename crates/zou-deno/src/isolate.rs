@@ -31,16 +31,29 @@ use crate::inspector::Inspector;
 use crate::limits::{Limits, Watch};
 use crate::{crypto, fetch, inspector, limits, module, pool, timer, url, websocket};
 
+/// What the isolate has whether or not a call is in it: the function's
+/// environment and the files it may read.
+///
+/// Apart from `Held` because it is the isolate's rather than the
+/// call's, and because it has to be in the op state before the module
+/// is evaluated. A function's top level runs once, before any handler
+/// is registered, and reading a key out of the environment there is
+/// the most ordinary line in the corpus: `const client = new
+/// Thing(Deno.env.get("KEY"))`. An op that borrowed a call for that
+/// would not find one.
+pub(crate) struct Owned {
+    env: Vec<(String, String)>,
+    /// The files this function may read, which is its `static_files`
+    /// and nothing else on the disk.
+    statics: zou_functions::Statics,
+}
+
 /// What the isolate is told about the call it is running, and what it
 /// left behind afterwards. Both live in the runtime's op state, which
 /// is the only place ops can reach.
 pub(crate) struct Held {
     call: Call,
     peer: String,
-    env: Vec<(String, String)>,
-    /// The files this function may read, which is its `static_files`
-    /// and nothing else on the disk.
-    statics: zou_functions::Statics,
     answered: Option<Answer>,
     /// Where the answer goes. In here rather than held by `run`
     /// because a streamed answer leaves while the handler is still
@@ -59,18 +72,32 @@ struct Given {
     body: deno_core::ToJsBuffer,
 }
 
+/// The call these ops are for, or an error saying there is not one.
+///
+/// `Deno.core.ops` is reachable from a function, so every one of these
+/// is a function call away from being made at the top of a module,
+/// where no call has been put into the op state yet. A missing type in
+/// the op state is a panic, and a panic in an op cannot unwind, so it
+/// takes the whole server with it. This is what stands between a
+/// mistyped line in somebody's javascript and a process that is gone.
+fn held(state: &mut OpState) -> Result<&mut Held, JsErrorBox> {
+    state
+        .try_borrow_mut::<Held>()
+        .ok_or_else(|| JsErrorBox::type_error("no call is being answered"))
+}
+
 /// Everything the call is: read once, at the top of `run`.
 #[op2]
 #[serde]
-fn op_zou_call(state: &mut OpState) -> Given {
-    let held = state.borrow::<Held>();
-    Given {
+fn op_zou_call(state: &mut OpState) -> Result<Given, JsErrorBox> {
+    let held = held(state)?;
+    Ok(Given {
         method: held.call.method.clone(),
         url: held.call.url.clone(),
         headers: held.call.headers.clone(),
         peer: held.peer.clone(),
         body: held.call.body.clone().into(),
-    }
+    })
 }
 
 /// What the handler answered, all of it.
@@ -80,13 +107,13 @@ fn op_zou_answer(
     #[smi] status: u32,
     #[serde] headers: Vec<(String, String)>,
     #[buffer] body: &[u8],
-) {
-    let held = state.borrow_mut::<Held>();
-    held.answered = Some(Answer {
+) -> Result<(), JsErrorBox> {
+    held(state)?.answered = Some(Answer {
         status: status as u16,
         headers,
         body: zou_functions::Body::Bytes(body.to_vec()),
     });
+    Ok(())
 }
 
 /// The head of an answer whose body is still being made, which goes to
@@ -97,7 +124,7 @@ fn op_zou_answer_start(
     #[smi] status: u32,
     #[serde] headers: Vec<(String, String)>,
 ) -> Result<(), JsErrorBox> {
-    let held = state.borrow_mut::<Held>();
+    let held = held(state)?;
     let Some(sink) = held.sink.take() else {
         return Err(JsErrorBox::type_error("the answer has already been sent"));
     };
@@ -115,7 +142,7 @@ async fn op_zou_chunk(
     state: Rc<RefCell<OpState>>,
     #[buffer(copy)] chunk: Vec<u8>,
 ) -> Result<(), JsErrorBox> {
-    let writer = state.borrow().borrow::<Held>().writing.clone();
+    let writer = held(&mut state.borrow_mut())?.writing.clone();
     let Some(writer) = writer else {
         return Err(JsErrorBox::type_error("no answer is being streamed"));
     };
@@ -129,18 +156,20 @@ async fn op_zou_chunk(
 
 /// The end of it, which is the writer being dropped.
 #[op2(fast)]
-fn op_zou_chunk_end(state: &mut OpState) {
-    state.borrow_mut::<Held>().writing = None;
+fn op_zou_chunk_end(state: &mut OpState) -> Result<(), JsErrorBox> {
+    held(state)?.writing = None;
+    Ok(())
 }
 
 /// The end of it, badly. The caller is already reading a 200, so all
 /// this can do is stop the body where it is, and the reason is the
 /// operator's the way a handler that threw is.
 #[op2(fast)]
-fn op_zou_chunk_fail(state: &mut OpState, #[string] why: String) {
-    if let Some(writer) = state.borrow_mut::<Held>().writing.take() {
+fn op_zou_chunk_fail(state: &mut OpState, #[string] why: String) -> Result<(), JsErrorBox> {
+    if let Some(writer) = held(state)?.writing.take() {
         writer.fail(why);
     }
+    Ok(())
 }
 
 /// One variable out of the function's environment, or null.
@@ -153,8 +182,9 @@ fn op_zou_chunk_fail(state: &mut OpState, #[string] why: String) {
 #[op2]
 #[string]
 fn op_zou_env_get(state: &mut OpState, #[string] name: String) -> Option<String> {
-    let held = state.borrow::<Held>();
-    held.env
+    let owned = state.borrow::<Owned>();
+    owned
+        .env
         .iter()
         .rev()
         .find(|(key, _)| *key == name)
@@ -165,8 +195,8 @@ fn op_zou_env_get(state: &mut OpState, #[string] name: String) -> Option<String>
 #[op2]
 #[serde]
 fn op_zou_env(state: &mut OpState) -> std::collections::BTreeMap<String, String> {
-    let held = state.borrow::<Held>();
-    held.env.iter().cloned().collect()
+    let owned = state.borrow::<Owned>();
+    owned.env.iter().cloned().collect()
 }
 
 /// What `Deno.version` says, which is three strings a function is
@@ -250,7 +280,7 @@ impl Read {
 #[op2(async(lazy), fast)]
 #[serde]
 async fn op_zou_read_file(state: Rc<RefCell<OpState>>, #[string] name: String) -> Read {
-    let asked = state.borrow().borrow::<Held>().statics.at(&name);
+    let asked = state.borrow().borrow::<Owned>().statics.at(&name);
     match asked {
         Err(why) => Read::Refused { why },
         Ok(at) => Read::of(&at, tokio::fs::read(&at).await),
@@ -263,7 +293,7 @@ async fn op_zou_read_file(state: Rc<RefCell<OpState>>, #[string] name: String) -
 #[op2]
 #[serde]
 fn op_zou_read_file_sync(state: &mut OpState, #[string] name: String) -> Read {
-    match state.borrow::<Held>().statics.at(&name) {
+    match state.borrow::<Owned>().statics.at(&name) {
         Err(why) => Read::Refused { why },
         Ok(at) => Read::of(&at, std::fs::read(&at)),
     }
@@ -474,11 +504,13 @@ impl Runtime for Isolate {
         let mut env = self.env.clone();
         env.retain(|(name, _)| name != EXECUTION_ID);
         env.push((EXECUTION_ID.to_string(), call.execution_id.clone()));
+        let owned = Owned {
+            env,
+            statics: zou_functions::Statics::of(function),
+        };
         let held = Held {
             call,
             peer,
-            env,
-            statics: zou_functions::Statics::of(function),
             answered: None,
             sink: Some(answer),
             writing: None,
@@ -488,13 +520,13 @@ impl Runtime for Isolate {
         if self.policy == Policy::PerWorker {
             // Somebody else's thread, which already has an isolate with
             // this function in it, or is about to.
-            return self.pool.run(&source, held, limits, debugger);
+            return self.pool.run(&source, owned, held, limits, debugger);
         }
         let tokio = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("the isolate could not have a runtime: {e}"))?;
-        tokio.block_on(once_off(source, held, limits, debugger))
+        tokio.block_on(once_off(source, owned, held, limits, debugger))
     }
 
     fn describe(&self) -> String {
@@ -539,13 +571,14 @@ impl Source {
 /// gives its thread back.
 pub(crate) async fn once_off(
     source: Source,
+    owned: Owned,
     held: Held,
     limits: Limits,
     debugger: Option<Arc<Inspector>>,
 ) -> Result<(), Failed> {
     let named = source.specifier.to_string();
     let call = async move {
-        let mut ready = Ready::new(source, limits, debugger).await?;
+        let mut ready = Ready::new(source, limits, debugger, owned).await?;
         ready.once(held).await
     };
     match tokio::time::timeout(limits.wall, call).await {
@@ -588,8 +621,18 @@ impl Ready {
         source: Source,
         limits: Limits,
         debugger: Option<Arc<Inspector>>,
+        owned: Owned,
     ) -> Result<Ready, Failed> {
-        build(source, limits, debugger).await
+        build(source, limits, debugger, owned).await
+    }
+
+    /// The environment this isolate answers with from now on.
+    ///
+    /// A kept isolate is called again with a new `SB_EXECUTION_ID` in
+    /// it, and the rest of the environment is the same vector it was
+    /// built with, so this is a replacement rather than a merge.
+    pub(crate) fn owns(&mut self, owned: Owned) {
+        self.js.op_state().borrow_mut().put(owned);
     }
 
     /// Whether a file this was built out of has moved since it was.
@@ -629,6 +672,7 @@ async fn build(
     source: Source,
     limits: Limits,
     debugger: Option<Arc<Inspector>>,
+    owned: Owned,
 ) -> Result<Ready, Failed> {
     let Source {
         specifier,
@@ -677,6 +721,10 @@ async fn build(
     let watchdog = limits::watch(handle.clone(), Arc::clone(&watch), limits);
     js.add_near_heap_limit_callback(limits::near_heap_limit(handle.clone(), Arc::clone(&watch)));
     js.op_state().borrow_mut().put(timer::Pending::default());
+    // Before the module is evaluated rather than with the call, because
+    // the top of a module runs here and reading the environment there
+    // is the most ordinary line there is.
+    js.op_state().borrow_mut().put(owned);
     js.op_state()
         .borrow_mut()
         .put(websocket::Sockets::default());
