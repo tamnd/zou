@@ -833,7 +833,7 @@ Deno.serve(async (req) => {
 
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
 
 An `AbortSignal` is a signal an aborted thing can be listened for on, and nothing here takes one yet: `fetch` does not read `init.signal` and neither does a timer.
 
@@ -841,6 +841,12 @@ An `AbortSignal` is a signal an aborted thing can be listened for on, and nothin
 There is no tree here, so there is no capture and no bubbling and nothing for `stopPropagation` to stop: one object dispatches to its own listeners.
 
 `performance` is `now()` and `timeOrigin`, which is a monotonic clock counting from the moment the isolate started, in milliseconds with a fraction. `mark` and `measure` are not here.
+
+`Deno.permissions` is all six methods, `query`, `querySync`, `request`, `requestSync`, `revoke` and `revokeSync`, and a `PermissionStatus` that is an `EventTarget` with a `state` on it.
+What it is for is a library deciding whether to reach for something it can do without, which is what `@sentry/deno` does while its sdk is being set up.
+`env`, `net`, `read` and `hrtime` are granted, and `write`, `run`, `ffi` and `sys` are denied because none of the four is here at all.
+Upstream answers granted to all eight, and a worker there can no more start a process than one here can, so this is a deliberate difference: a library told granted and then handed a `TypeError` is worse off than one told no.
+Nothing here can be revoked, because a function's permissions are the runtime's rather than the function's, so `revoke` answers what `query` answers rather than pretending to take away something it is not enforcing.
 
 `navigator` is `userAgent`, `hardwareConcurrency`, `language` and `languages`, and nothing else, which is what upstream has. The user agent reads `Deno/2.1.4 (variant; zou/<version>)`, the same sentence upstream builds with its own name in the brackets, and the core count is 1 whatever the host has, because a function gets one thread.
 

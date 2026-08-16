@@ -2854,6 +2854,95 @@
   }
 
   // ---------------------------------------------------------------
+  // Deno.permissions
+  //
+  // A library asks this before it reaches for something it can do
+  // without, so what it is for is a library deciding rather than a
+  // function being stopped: `@sentry/deno` calls `querySync` while its
+  // sdk is being set up and a runtime with no `Deno.permissions` at all
+  // is a `TypeError` at the top of the module.
+  //
+  // Upstream answers `granted` to all eight names, measured on a real
+  // `supabase start` rather than guessed, and a worker there can no
+  // more spawn a process than one here can. This says `denied` to the
+  // three that are not here, because a library told `granted` and then
+  // handed a `TypeError` is worse off than one told no, and the
+  // difference is written down in `docs/functions.md`.
+  //
+  // Nothing here can be revoked either. A function's permissions are
+  // the runtime's rather than the function's, so `revoke` answers what
+  // `query` answers rather than pretending to take something away it is
+  // not enforcing.
+
+  const ALLOWED = {
+    // The environment is readable, the network is reachable, and a
+    // static file is readable, which is the whole of what a function
+    // is given.
+    env: "granted",
+    net: "granted",
+    read: "granted",
+    // `performance.now()` is here, at its full resolution.
+    hrtime: "granted",
+    // Nothing here writes a file, starts a process, opens a library or
+    // asks the host about itself.
+    write: "denied",
+    run: "denied",
+    ffi: "denied",
+    sys: "denied",
+  };
+
+  const STATE = Symbol("state");
+
+  class PermissionStatus extends EventTarget {
+    constructor(state) {
+      super();
+      this[STATE] = state;
+      this.onchange = null;
+      // Whether the answer covers less than what was asked for, which
+      // it never does here: there is no allow list to be partly on.
+      this.partial = false;
+    }
+    get state() {
+      return this[STATE];
+    }
+  }
+
+  function permission(descriptor) {
+    const name = descriptor === null || descriptor === undefined ? undefined : descriptor.name;
+    const state = ALLOWED[name];
+    if (state === undefined) {
+      throw new TypeError(`${String(name)} is not a permission a function can ask about`);
+    }
+    return new PermissionStatus(state);
+  }
+
+  const permissions = {
+    querySync: permission,
+    query(descriptor) {
+      return promised(() => permission(descriptor));
+    },
+    // Asking is the same as knowing, because there is nobody to prompt.
+    requestSync: permission,
+    request(descriptor) {
+      return promised(() => permission(descriptor));
+    },
+    revokeSync: permission,
+    revoke(descriptor) {
+      return promised(() => permission(descriptor));
+    },
+  };
+
+  // The value or the throw, as a promise either way, which is what the
+  // async half of that object is.
+  function promised(get) {
+    try {
+      return Promise.resolve(get());
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+
+  // ---------------------------------------------------------------
   // What the module sees
 
   const EdgeRuntime = { waitUntil };
@@ -2934,6 +3023,8 @@
     // runtime says them: what is running, then the v8 it is running on
     // and the typescript its transpiler takes.
     version: ops.op_zou_version(),
+    permissions,
+    PermissionStatus,
     exit() {
       throw new TypeError("a function may not exit the process it is running in");
     },
