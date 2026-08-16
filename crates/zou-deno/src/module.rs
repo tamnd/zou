@@ -150,10 +150,10 @@ impl ModuleLoader for Disk {
             .and_then(|imports| imports.resolve(specifier, referrer));
         let specifier: &str = mapped.as_deref().unwrap_or(specifier);
         if let Some(rest) = specifier.strip_prefix("npm:") {
-            return url(&format!("{}/{rest}", self.registry));
+            return url(&format!("{}/{}", self.registry, bare(rest)));
         }
         if let Some(rest) = specifier.strip_prefix("jsr:") {
-            return url(&format!("{}/jsr/{rest}", self.registry));
+            return url(&format!("{}/jsr/{}", self.registry, bare(rest)));
         }
         if let Some(rest) = specifier.strip_prefix("node:") {
             return Err(JsErrorBox::type_error(format!(
@@ -182,6 +182,9 @@ impl ModuleLoader for Disk {
         _referrer: Option<&deno_core::ModuleLoadReferrer>,
         _options: deno_core::ModuleLoadOptions,
     ) -> ModuleLoadResponse {
+        if declaration(specifier) {
+            return ModuleLoadResponse::Sync(nothing(specifier));
+        }
         if specifier.scheme() == "file" {
             if let Ok(path) = specifier.to_file_path() {
                 let when = mtime(&path);
@@ -207,8 +210,50 @@ impl ModuleLoader for Disk {
     }
 }
 
+/// The package part of an `npm:` or `jsr:` specifier, without the slash
+/// that is allowed to follow the scheme.
+///
+/// `npm:/drizzle-orm@0.29.1/pg-core` and `npm:drizzle-orm@0.29.1/pg-core`
+/// are the same specifier to Deno, and the first one is not something
+/// somebody types: it is what a registry's own build of a package
+/// imports itself with. Pasting it after the registry's url made
+/// `https://esm.sh//drizzle-orm@0.29.1/pg-core`, which is a 400 and
+/// took the whole graph down with it.
+fn bare(rest: &str) -> &str {
+    rest.trim_start_matches('/')
+}
+
 fn url(text: &str) -> ModuleResolveResponse {
     ModuleSpecifier::parse(text).map_err(|e| JsErrorBox::type_error(format!("{text}: {e}")))
+}
+
+/// Whether this is a declaration file, which is a file about types and
+/// so has no runtime code in it at all.
+///
+/// Importing one is a real line in real functions: two of the examples
+/// in the Supabase repository start with `import
+/// 'jsr:@supabase/functions-js/edge-runtime.d.ts'`, which is how a
+/// project tells its editor what `Deno.serve` is. Deno resolves it for
+/// the types and emits nothing, and nothing is what has to run here.
+fn declaration(specifier: &ModuleSpecifier) -> bool {
+    matches!(
+        deno_ast::MediaType::from_specifier(specifier),
+        deno_ast::MediaType::Dts | deno_ast::MediaType::Dmts | deno_ast::MediaType::Dcts
+    )
+}
+
+/// A module with nothing in it, for the import that was about types.
+///
+/// Nothing is fetched for it either. The registry has no such file to
+/// serve, because a declaration is not a package's build output, and
+/// asking for one is the 404 that took two functions down.
+fn nothing(specifier: &ModuleSpecifier) -> Result<ModuleSource, JsErrorBox> {
+    Ok(ModuleSource::new(
+        ModuleType::JavaScript,
+        ModuleSourceCode::String(deno_core::FastString::from_static("")),
+        specifier,
+        None,
+    ))
 }
 
 fn read(specifier: &ModuleSpecifier) -> Result<ModuleSource, JsErrorBox> {
@@ -494,6 +539,32 @@ mod tests {
     fn a_jsr_specifier_says_jsr_on_the_way() {
         let one = resolved("jsr:@std/encoding@1/hex", "file:///f/index.ts").unwrap();
         assert_eq!(one.as_str(), "https://esm.sh/jsr/@std/encoding@1/hex");
+    }
+
+    /// The slash after the scheme is allowed and is not a second slash
+    /// on the registry, which is a 400 there rather than the package.
+    #[test]
+    fn the_slash_a_registrys_own_build_writes_is_not_a_second_slash() {
+        let one = resolved("npm:/drizzle-orm@0.29.1/pg-core", "file:///f/index.ts").unwrap();
+        assert_eq!(one.as_str(), "https://esm.sh/drizzle-orm@0.29.1/pg-core");
+        let two = resolved("jsr:/@std/encoding@1/hex", "file:///f/index.ts").unwrap();
+        assert_eq!(two.as_str(), "https://esm.sh/jsr/@std/encoding@1/hex");
+    }
+
+    /// A declaration is a file about types, so importing one is a line
+    /// with nothing to run in it and nothing to fetch for it.
+    #[test]
+    fn a_declaration_file_is_a_module_with_nothing_in_it() {
+        for text in [
+            "https://esm.sh/jsr/@supabase/functions-js/edge-runtime.d.ts",
+            "file:///f/types.d.mts",
+            "file:///f/types.d.cts",
+        ] {
+            assert!(declaration(&spec(text)), "{text}");
+        }
+        for text in ["file:///f/index.ts", "https://esm.sh/x@1/a.mjs"] {
+            assert!(!declaration(&spec(text)), "{text}");
+        }
     }
 
     #[test]

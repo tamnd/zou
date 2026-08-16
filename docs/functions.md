@@ -515,6 +515,8 @@ What runs is the registry's build of the package rather than the tarball npm wou
 - `@supabase/supabase-js` runs. `createClient` builds its auth, storage, functions and realtime clients, and the realtime one is a `WebSocket`, which is why that had to exist before this line could say so.
 - `http:` is refused. A module arrives and is executed, so it arrives over https.
 - `data:` is not supported yet.
+- The slash after the scheme is allowed. `npm:/drizzle-orm@0.29.1/pg-core` is the same specifier as the one without it, which matters because that is the spelling a registry's own build of a package imports itself with rather than one anybody types.
+- A declaration file is a module with nothing in it. `import 'jsr:@supabase/functions-js/edge-runtime.d.ts'` is how a project tells its editor what `Deno.serve` is, and there is no runtime code in a `.d.ts` to run and nothing fetched for one.
 
 Everything fetched is kept on disk, keyed by url, so only the first cold start pays for it.
 
