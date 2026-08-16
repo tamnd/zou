@@ -462,6 +462,37 @@ A handler that threw answered 500 after exactly sixty seconds.
 The answer travels back on a channel whose sending end lives in the isolate, the error path returned without taking it, and under the default policy the isolate is kept, so the caller waited for the minute it takes a kept isolate to go idle.
 Every unit test around it passed, because none of them kept the isolate afterwards.
 
+## The corpus, which is not a suite
+
+M4 names Supabase's own examples repository as a gate, and that is a different kind of measurement from everything above.
+A suite is a list of questions with a recording beside it and a case either matches or it does not.
+The examples project is forty two functions somebody else wrote, most of which want a secret nobody has and half of which fetch what they import off the network at boot.
+There is no pass in it.
+
+So it is written down as a measurement rather than run as a suite, in `examples/` in the conformance repository, and nothing in CI touches it.
+`corpus.sh` lays the project out from a checkout of `supabase/supabase` at the commit in `versions.json`, `probe.sh` asks one server every function in it the same question, and `measured.json` is what both servers said.
+The project is not vendored: it moves, and pinning the commit is the part that matters.
+`corpus.sh` was checked against the directory the numbers were taken from and there is no diff, which is the whole claim a corpus number rests on.
+
+The question is a POST with an empty json body and the project's anon key, which is the smallest question that reaches a handler.
+A function ran when its own code or its own library produced the outcome: a refusal from the gateway, a config error out of a library it imports, a throw from the handler.
+It did not run when the module never finished loading or when it reached for a runtime api that is not there.
+Which of the two happened is read off the server log rather than off the status, because from the outside both are a 500.
+
+39 names were asked of both servers on 2026-08-16.
+zou ran 28, `supabase start` ran 34, and they agree on 25.
+The 39 is the union of the two lists a server serves: 39 of the 42 directories have an `index.ts`, `config.toml` adds `simple-mcp-server` which has no directory at all, and `wasm-modules` is left out of the comparison because its build artifact is not in the checkout and the reference has nothing to serve.
+
+The five most useful rows are the failures that are byte for byte identical on both servers, out of Resend, the OpenAI sdk, ElevenLabs, Stripe and grammy.
+Those are third party npm packages resolved, loaded and run far enough to make a decision about their own configuration, and the two runtimes reached the same sentence.
+
+The three zou runs and upstream does not are all one shape: upstream builds the module graph ahead of time and refuses a graph it cannot complete, and zou fetches a module when something asks for it, so a type only file nobody imports at runtime is never fetched.
+The nine the other way are nine different things rather than one, which is why they are follow ups: top level await that never settles because the thing awaited is a server already listening, `Deno.connect`, `Deno.readFile` of an https url, a module served with no content type, esm.sh answering 500, a browser build missing an export, and the mcp sdk failing inside the registry's build of itself.
+
+One finding out of the corpus is not in the file and cost the most to get.
+esm.sh serves different code for different `User-Agent` headers: asking as Deno gets a build that expects node built ins, and asking as a browser gets one that does not.
+zou asks as a browser deliberately, and the corpus is the reason, because asking as Deno took it from 28 running to 21.
+
 ## The package a project installs, asked the same questions
 
 Everything above runs a zou this harness linked in, against a Postgres somebody else brought up, usually in a container.
