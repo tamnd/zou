@@ -16,6 +16,11 @@ The questions and the recorded answers are [tamnd/zou-conformance](https://githu
 | storage | supabase start (recorded) | 478 | 478 | 100% | 0 |
 | supabase-js | its own integration tests | 33 | 33 | 100% | 0 |
 | storage-js | its own integration tests | 133 | 133 | 100% | 0 |
+| js-tus | supabase start, in the same run | 12 | 12 | 100% | 0 |
+| js-realtime | supabase start, in the same run | 18 | 18 | 100% | 0 |
+| js-realtime-private | supabase start, in the same run | 12 | 12 | 100% | 0 |
+| js-realtime-changes | supabase start, in the same run | 11 | 11 | 100% | 0 |
+| js-functions | supabase start, in the same run | 22 | 22 | 100% | 0 |
 
 ## rest against zou
 
@@ -441,4 +446,50 @@ storage-js's own tests, run against zou with the url changed and not one asserti
 | purgeBucketCache | 6 | 6 | 0 |
 | purgeCache | 7 | 7 | 0 |
 | updateBucket | 3 | 3 | 0 |
+
+## js-tus
+
+The questions in `js-tus` are this project's own, because there is nothing upstream that asks them. What keeps them honest is the other leg: the same file is run against a real `supabase start` in the diff job of the same CI run, so an assertion the reference does not pass is this suite being wrong rather than zou being wrong. The number below is the zou leg.
+
+| block | passing | of | skipped |
+| --- | ---: | ---: | ---: |
+| an upload that goes through in one piece | 3 | 3 | 0 |
+| an upload that takes several requests | 2 | 2 | 0 |
+| an upload that was interrupted | 2 | 2 | 0 |
+| what it refuses | 4 | 4 | 0 |
+| what the endpoint says about itself | 1 | 1 | 0 |
+
+## js-realtime
+
+The questions in `js-realtime` are this project's own, because there is nothing upstream that asks them. What keeps them honest is the other leg: the same file is run against a real `supabase start` in the diff job of the same CI run, so an assertion the reference does not pass is this suite being wrong rather than zou being wrong. The number below is the zou leg.
+
+| block | passing | of | skipped |
+| --- | ---: | ---: | ---: |
+| broadcast over http | 8 | 8 | 0 |
+| presence | 8 | 8 | 0 |
+| the frames | 2 | 2 | 0 |
+
+## js-realtime-private
+
+The questions in `js-realtime-private` are this project's own, because there is nothing upstream that asks them. What keeps them honest is the other leg: the same file is run against a real `supabase start` in the diff job of the same CI run, so an assertion the reference does not pass is this suite being wrong rather than zou being wrong. The number below is the zou leg.
+
+| block | passing | of | skipped |
+| --- | ---: | ---: | ---: |
+| private channels | 12 | 12 | 0 |
+
+## js-realtime-changes
+
+The questions in `js-realtime-changes` are this project's own, because there is nothing upstream that asks them. What keeps them honest is the other leg: the same file is run against a real `supabase start` in the diff job of the same CI run, so an assertion the reference does not pass is this suite being wrong rather than zou being wrong. The number below is the zou leg.
+
+| block | passing | of | skipped |
+| --- | ---: | ---: | ---: |
+| postgres changes | 11 | 11 | 0 |
+
+## js-functions
+
+The questions in `js-functions` are this project's own, because there is nothing upstream that asks them. What keeps them honest is the other leg: the same file is run against a real `supabase start` in the diff job of the same CI run, so an assertion the reference does not pass is this suite being wrong rather than zou being wrong. The number below is the zou leg.
+
+| block | passing | of | skipped |
+| --- | ---: | ---: | ---: |
+| ungrouped | 22 | 22 | 0 |
 
