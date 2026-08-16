@@ -831,6 +831,74 @@ jobs:
         if: always()
         run: cat /tmp/serve.log
 
+  # The functions a project has on disk, served the way a person serves
+  # them. Everything else under conformance is a list of requests, and
+  # this one is code somebody deploys: the suite ships a `functions`
+  # directory and a `config.toml`, they go into a project unedited, and
+  # the questions are asked through the front door.
+  #
+  # It needs a build with an engine in it, which is the only job here
+  # besides the v8 one that builds that combination, and no database:
+  # `zou functions serve` dials the rest of the api lazily, so a project
+  # with no postgres behind it is a function that runs.
+  #
+  # The other half of this is in the `cli` job below, where the same
+  # files are asked of a real supabase start. Neither leg is worth much
+  # on its own: the questions are ours, so what makes them a statement
+  # about Supabase is that Supabase answers them the same way.
+  functions-js:
+    name: conformance (edge functions)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      # A project directory and nothing else: the config file the suite
+      # ships, whose only entry turns verify_jwt off for one function,
+      # and the functions beside it.
+      - name: Lay the project out the way a person has it
+        run: |
+          mkdir -p /tmp/fnproj/supabase
+          cp -r /tmp/zou-conformance/js-functions/functions /tmp/fnproj/supabase/functions
+          cp /tmp/zou-conformance/js-functions/config.toml /tmp/fnproj/supabase/config.toml
+          ls /tmp/fnproj/supabase/functions
+      # The keys are read out of the log rather than minted here. The
+      # secret is pinned so a restart does not change them, but the
+      # claims carry an issued-at, so the key itself is the server's to
+      # print and a script that guessed it would be testing its guess.
+      - name: Serve them
+        run: |
+          cd /tmp/fnproj
+          ZOU_JWT_SECRET=super-secret-jwt-token-with-at-least-32-characters-long \
+            RUST_LOG=info \
+            cargo run --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" \
+              -p zou --features zou-deno/isolate -- \
+              functions serve --port 54321 > /tmp/functions.log 2>&1 &
+          for i in $(seq 1 300); do
+            grep -q 'anon key ' /tmp/functions.log && break
+            sleep 1
+          done
+          grep -q 'anon key ' /tmp/functions.log
+          grep 'serving functions on' /tmp/functions.log
+      - name: Ask what a project's functions do
+        run: |
+          cd /tmp/zou-conformance/js-functions
+          npm ci
+          ZOU_URL=http://127.0.0.1:54321 \
+            ZOU_ANON_KEY="$(awk '/anon key /{print $NF}' /tmp/functions.log)" npm test
+      - name: Keep the server log
+        if: always()
+        run: cat /tmp/functions.log
+
   # One of Supabase's own example apps, unedited, driven through a real
   # browser. The suites ask a server questions and this asks an
   # application, which is a different claim: an app goes through the
@@ -1000,7 +1068,14 @@ jobs:
           mkdir -p supabase/migrations
           cp /tmp/zou-conformance/suites/rest/setup.sql \
             supabase/migrations/20200101000000_conformance.sql
-          supabase start -x studio,imgproxy,edge-runtime,logflare,vector
+          # The functions suite is a project rather than a request list,
+          # so its half of this job has to be on disk before the stack
+          # comes up: edge-runtime mounts the directory at start and the
+          # config block that turns verify_jwt off for one of them is
+          # read then too.
+          cp -r /tmp/zou-conformance/js-functions/functions supabase/functions
+          cat /tmp/zou-conformance/js-functions/config.toml >> supabase/config.toml
+          supabase start -x studio,imgproxy,logflare,vector
           supabase status
       # `zou status` prints what a client should be pointed at in the
       # shape `supabase status` prints it, which is only true while the
@@ -1098,6 +1173,19 @@ jobs:
           npm ci
           ZOU_URL="$CLI_URL" ZOU_ANON_KEY="$ANON_KEY" \
             ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test
+      # And the functions suite, whose reference leg this is. The
+      # questions are ours and the two servers are each other's expected
+      # answer, so `ZOU_REFERENCE=1` is not a skip list: it names which
+      # of the two is answering, and the three questions where the two
+      # differ are asserted against what this one does. edge-runtime is
+      # in the stack above for this step alone.
+      - name: Ask the same stack what a project's functions do
+        run: |
+          cd /tmp/project
+          eval "$(supabase status -o env | sed 's/^/export /')"
+          cd /tmp/zou-conformance/js-functions
+          npm ci
+          ZOU_REFERENCE=1 ZOU_URL="$CLI_URL" ZOU_ANON_KEY="$ANON_KEY" npm test
       - name: Keep what the stack was saying
         if: failure()
         run: |
@@ -1105,6 +1193,7 @@ jobs:
           supabase status || true
           docker ps -a || true
           docker logs "$(docker ps -aqf name=supabase_rest)" 2>&1 | tail -60 || true
+          docker logs "$(docker ps -aqf name=supabase_edge_runtime)" 2>&1 | tail -60 || true
 
   # The numbers a merge measured, in a file in the repository rather
   # than in a log that expires. Only on main, and only out of the

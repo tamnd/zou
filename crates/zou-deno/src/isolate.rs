@@ -800,10 +800,24 @@ impl Ready {
             let _running = watch.running();
             js.call_with_args(entry, std::slice::from_ref(exported))
         };
-        watch
+        let ran = watch
             .timing(js.with_event_loop_promise(called, PollEventLoopOptions::default()))
             .await
-            .map_err(|e| why(specifier, watch, e))?;
+            .map_err(|e| why(specifier, watch, e));
+        if let Err(failed) = ran {
+            // The sink goes with the failure, and it has to go from
+            // here rather than with the isolate. A caller is waiting on
+            // the other end of it, and under `per_worker` the isolate
+            // holding it is kept: a handler that threw would have left
+            // the caller waiting for the minute it takes that isolate
+            // to go idle, which is how this was found.
+            let state = js.op_state();
+            let mut state = state.borrow_mut();
+            let held = state.borrow_mut::<Held>();
+            held.answered.take();
+            held.sink.take();
+            return Err(failed);
+        }
 
         // The answer goes now, not when this function returns, because
         // what is left to do after it is the function's own business
