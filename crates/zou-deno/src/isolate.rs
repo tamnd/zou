@@ -235,6 +235,14 @@ fn op_zou_version() -> Version {
 #[op2]
 #[string]
 fn op_zou_agent() -> String {
+    user_agent()
+}
+
+/// The same sentence, for the client this runtime calls out with, which
+/// is the other half of the same claim: upstream sends its navigator
+/// string as the `User-Agent` of a `fetch` a function makes, measured
+/// against an echo on a real `supabase start`.
+pub(crate) fn user_agent() -> String {
     format!("Deno/{DENO} (variant; zou/{})", env!("CARGO_PKG_VERSION"))
 }
 

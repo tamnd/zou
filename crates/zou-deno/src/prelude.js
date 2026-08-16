@@ -2420,21 +2420,28 @@
   /// own, which is most of them: an sdk that reports its own retries,
   /// a redis client, a stripe client. There is no tree here, so this
   /// is one object dispatching to its own listeners and nothing else.
+  ///
+  /// The three methods take the global when they are called without a
+  /// receiver, which is the rule the web platform has for an interface
+  /// on the global object and is why `addEventListener("x", f)` on its
+  /// own works in a module: the global is an event target, these are
+  /// its methods, and a call with no dot in front of it has no `this`
+  /// in module code.
   class EventTarget {
     constructor() {
       listens(this);
     }
 
     addEventListener(type, listener, options = {}) {
-      listened.call(this, type, listener, options);
+      listened.call(this ?? globalThis, type, listener, options);
     }
 
     removeEventListener(type, listener) {
-      unlistened.call(this, type, listener);
+      unlistened.call(this ?? globalThis, type, listener);
     }
 
     dispatchEvent(event) {
-      return fires(this, event);
+      return fires(this ?? globalThis, event);
     }
   }
 
@@ -2988,8 +2995,24 @@
     setInterval,
     setTimeout,
   });
+  // The global is itself an event target, which is not decoration: a
+  // library calls the bare `addEventListener` at the top of a module
+  // often enough that a runtime without one is a ReferenceError before
+  // the function has a handler. `elevenlabs` is the one in the corpus.
+  //
+  // The shape is upstream's, measured through a function on a real
+  // `supabase start`: `globalThis instanceof EventTarget` is true
+  // there, the `addEventListener` on it is the one on
+  // `EventTarget.prototype` rather than a copy, and `self` and `window`
+  // are both the global itself. `window` was `undefined` here, which
+  // was a guess about Deno 2 having removed it, and the runtime a
+  // function actually runs on has it. A package deciding whether it is
+  // in a browser by asking for `window` now takes the same branch on
+  // both servers, which is the whole point.
+  Object.setPrototypeOf(globalThis, EventTarget.prototype);
+  listens(globalThis);
   globalThis.self = globalThis;
-  globalThis.window = undefined;
+  globalThis.window = globalThis;
 
   Object.assign(Deno, {
     serve,
