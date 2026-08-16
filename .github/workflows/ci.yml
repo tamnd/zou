@@ -946,6 +946,40 @@ jobs:
           name: js-functions
           path: /tmp/js-functions.json
           if-no-files-found: ignore
+      # The same project again, through a deploy this time: written to a
+      # store as content addressed blobs and served back out of it, with
+      # no project directory on the machine that serves it. That is what
+      # a node does at attach, so asking the same questions of it is the
+      # only thing that says a deployment is the project rather than a
+      # copy of some of it.
+      - name: Deploy it to a store
+        run: |
+          cd /tmp/fnproj
+          cargo run --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" -p zou -- \
+            functions deploy --target /tmp/fnstore --ref demo
+      - name: Serve what was deployed
+        run: |
+          cd /tmp
+          ZOU_JWT_SECRET=super-secret-jwt-token-with-at-least-32-characters-long \
+            RUST_LOG=info \
+            cargo run --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" \
+              -p zou --features zou-deno/isolate -- \
+              functions serve --port 54331 --target /tmp/fnstore --ref demo --no-config \
+              > /tmp/deployed.log 2>&1 &
+          for i in $(seq 1 300); do
+            grep -q 'anon key ' /tmp/deployed.log && break
+            sleep 1
+          done
+          grep -q 'anon key ' /tmp/deployed.log
+          grep 'serving what is deployed' /tmp/deployed.log
+      - name: Ask a deployment the same questions
+        run: |
+          cd /tmp/zou-conformance/js-functions
+          ZOU_URL=http://127.0.0.1:54331 \
+            ZOU_ANON_KEY="$(awk '/anon key /{print $NF}' /tmp/deployed.log)" npm test
+      - name: Keep the deployed server log
+        if: always()
+        run: cat /tmp/deployed.log
 
   # One of Supabase's own example apps, unedited, driven through a real
   # browser. The suites ask a server questions and this asks an

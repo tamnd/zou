@@ -175,6 +175,36 @@ A deployment is read when the project is attached, so a redeploy is picked up th
 On a node that lets go of idle projects, which is the default, that is the next request after the project has been quiet.
 Making a redeploy visible to a node that is already serving the project is a poll or a push and both cost something at a thousand projects, so it is written down here rather than guessed at.
 
+## Serving what was deployed
+
+The dev loop serves a directory. Given a store and a project it serves what a deploy wrote instead.
+
+```
+zou functions serve --target s3://bucket --ref acme
+```
+
+```
+serving what is deployed to acme on s3://bucket
+its files are at /tmp/zou-deployed-acme-54321
+function hello at /tmp/zou-deployed-acme-54321/functions/hello/index.ts
+serving functions on http://127.0.0.1:54321
+```
+
+This is the same read a node does at attach, through the same `materialize`, the same hash check on every file and the same listing reader over what it wrote, which is the point of it: it is how somebody checks a deployment without standing a node up, and it needs no database.
+Neither flag is upstream's, because upstream's dev loop only ever serves a directory.
+Only the flags switch it and not `ZOU_TARGET` in the environment, because a person with a store exported who runs the dev loop in their project means the project.
+
+What is served is what the store says, so nothing is watched.
+Editing a file under that directory changes a copy of a deployment and not the deployment, and the way a deployment changes is another deploy and another serve.
+The directory is named for the project and the port, so a second serve of the same deployment on another port gets its own copy, and it is emptied first, because a file left over from a deployment somebody has since replaced is not part of the answer.
+
+A project's secrets come out of its own prefix here, the way they do on a node, and not from a `.env` on this disk.
+A project that has secrets and a process with no `ZOU_SECRET_KEY` to open them with serves nothing and says why.
+The four variables above them are this process's own, so `SUPABASE_URL` is the port it is serving on.
+
+The conformance suite for functions is run twice in CI for this reason: once against a project directory and once against the same project deployed to a store and served back out of it, with the same 22 questions and the same file.
+A deployment that answered differently would be a deployment that is not the project.
+
 ## config.toml
 
 The same file the project already has.
