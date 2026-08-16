@@ -49,6 +49,15 @@
 //! does not is dropped when the file is read, which is what the
 //! specification says to do with it.
 //!
+//! One thing here is Deno's rather than the specification's: a bare key
+//! whose address is an `npm:` or a `jsr:` package takes a subpath with
+//! it, so `"@scope/pkg": "npm:@scope/pkg@1"` covers
+//! `@scope/pkg/sub.js` with no second entry and no trailing slashes.
+//! It is tried after every rule above it has failed, so a map that
+//! covers the same ground the specification's way still wins. That is
+//! measured rather than read: the Supabase examples project's mcp
+//! server is written that way and the reference loads it.
+//!
 //! What is deliberately not here is a fallback for a bare specifier
 //! nothing matched. Deno refuses those and so does this, because a name
 //! nobody defined resolving to something is how a function ends up
@@ -138,6 +147,28 @@ fn matched(map: &Map, specifier: &str) -> Option<String> {
         // every module under it without an entry each.
         if key.ends_with('/')
             && let Some(rest) = specifier.strip_prefix(key.as_str())
+        {
+            return Some(format!("{address}{rest}"));
+        }
+    }
+    // Then, and only for a specifier the map above said nothing about,
+    // a bare key naming a package takes the subpath with it. The
+    // specification does not say that and Deno does: the examples
+    // project's mcp server maps `@modelcontextprotocol/sdk` to
+    // `npm:/@modelcontextprotocol/sdk@^1.24.3` with no trailing slash
+    // on either side and then imports
+    // `@modelcontextprotocol/sdk/server/mcp.js`, and the reference
+    // resolves it. Only for a package address, because that is the case
+    // where the rest of the path belongs to the package rather than to
+    // a directory somebody happened to name, and only after the
+    // specification's own rules have had their turn, so a `"@std/"`
+    // covering the same ground still wins.
+    for (key, address) in map {
+        if !address.starts_with("npm:") && !address.starts_with("jsr:") {
+            continue;
+        }
+        if let Some(rest) = specifier.strip_prefix(key.as_str())
+            && rest.starts_with('/')
         {
             return Some(format!("{address}{rest}"));
         }
@@ -367,6 +398,36 @@ mod tests {
             imports.resolve("@std/encoding", &at),
             Some("jsr:@std/encoding@1".to_string()),
             "the longer key wins, which is what makes an exception to a prefix possible"
+        );
+    }
+
+    /// The examples project's mcp server, whose map is four bare keys
+    /// and whose imports reach into two of them.
+    #[test]
+    fn a_bare_key_naming_a_package_takes_the_subpath_with_it() {
+        let (dir, imports) = map(r#"{"imports": {
+                "@modelcontextprotocol/sdk": "npm:/@modelcontextprotocol/sdk@^1.24.3",
+                "hono": "npm:hono@^4.9.2",
+                "sift": "https://deno.land/x/sift@0.6.0/mod.ts"
+            }}"#);
+        let at = from(dir.path(), "index.ts");
+        assert_eq!(
+            imports.resolve("@modelcontextprotocol/sdk/server/mcp.js", &at),
+            Some("npm:/@modelcontextprotocol/sdk@^1.24.3/server/mcp.js".to_string())
+        );
+        assert_eq!(
+            imports.resolve("hono/streaming", &at),
+            Some("npm:hono@^4.9.2/streaming".to_string())
+        );
+        assert_eq!(
+            imports.resolve("sift/mod.ts", &at),
+            None,
+            "a url is a file and not a package, so the path is not the package's to take"
+        );
+        assert_eq!(
+            imports.resolve("honolulu", &at),
+            None,
+            "and a name that merely starts the same way is a different name"
         );
     }
 

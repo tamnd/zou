@@ -23,6 +23,15 @@
 //! was not served. And every one of those five answered the same 404
 //! `Function not found` a name nobody wrote answers, rather than
 //! anything that would tell a caller the difference.
+//!
+//! The config file adds names the listing has not got, which is the
+//! other half and was measured later, on the same runtime, out of the
+//! examples project: `[functions.simple-mcp-server]` has an
+//! `entrypoint` of `./functions/mcp/simple-mcp-server/index.ts` and
+//! there is no `functions/simple-mcp-server`, and the reference serves
+//! it, saying `serving the request with supabase/functions/mcp/simple-mcp-server`.
+//! So `nested/deep` not being served is about a directory nothing in
+//! the config file mentions, and not about how deep a path may go.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -102,9 +111,15 @@ impl Layout {
 /// at all is an error, because that is a permission or a disk saying
 /// something rather than a project saying nothing.
 ///
-/// The names come from the listing. An `entrypoint` in the config moves
-/// which file a function starts at, it does not add a function that has
-/// no directory of its own.
+/// The names come from the listing and from the config file. An
+/// `entrypoint` moves which file a function starts at, and a block that
+/// names one is a function even when the listing never saw it: the
+/// examples project has `[functions.simple-mcp-server]` pointing at
+/// `./functions/mcp/simple-mcp-server/index.ts` with nothing called
+/// `simple-mcp-server` under `functions/`, and the reference serves it.
+/// That is not the same claim as the walk above: `nested/deep` with no
+/// block is still not served, because it is the block that adds the
+/// name rather than the directory being there.
 pub fn read(dir: &Path, layout: &Layout) -> Result<Vec<Function>, String> {
     let root = dir.join("functions");
     let entries = match std::fs::read_dir(&root) {
@@ -132,10 +147,41 @@ pub fn read(dir: &Path, layout: &Layout) -> Result<Vec<Function>, String> {
         }
         let import_map = match &settings.import_map {
             Some(path) => Some(dir.join(path)),
-            None => beside(&root, &name),
+            None => beside(&root, &root.join(&name), &name),
         };
         found.push(Function {
             name,
+            entrypoint,
+            verify_jwt: settings.verify_jwt,
+            import_map,
+            static_files: settings.static_files.iter().map(|p| dir.join(p)).collect(),
+        });
+    }
+    // Then the blocks that named an entrypoint and have no directory of
+    // their own, which the listing above cannot see. The file has to be
+    // there for the same reason it does above: a block pointing at
+    // nothing is a function nobody can serve.
+    for (name, settings) in &layout.settings {
+        if !settings.enabled || found.iter().any(|f| &f.name == name) {
+            continue;
+        }
+        let Some(path) = &settings.entrypoint else {
+            continue;
+        };
+        let entrypoint = dir.join(path);
+        if !entrypoint.is_file() {
+            continue;
+        }
+        // Beside the entrypoint rather than in a `functions/<name>`
+        // that does not exist, which is measured: the examples
+        // project's own mcp server keeps its `deno.json` there and the
+        // reference resolves `@hono/mcp` out of it.
+        let import_map = match &settings.import_map {
+            Some(path) => Some(dir.join(path)),
+            None => beside(&root, entrypoint.parent().unwrap_or(&root), name),
+        };
+        found.push(Function {
+            name: name.clone(),
             entrypoint,
             verify_jwt: settings.verify_jwt,
             import_map,
@@ -164,9 +210,15 @@ pub fn read(dir: &Path, layout: &Layout) -> Result<Vec<Function>, String> {
 /// The directory searched is the function's own, `functions/<name>`,
 /// even when the entrypoint was moved somewhere else, which is what
 /// upstream does: `functionDir` there is built from the name and not
-/// from the entrypoint.
-fn beside(root: &Path, name: &str) -> Option<std::path::PathBuf> {
-    let dir = root.join(name);
+/// from the entrypoint. The exception is a function that has no
+/// directory of that name at all, where the caller passes the directory
+/// the entrypoint is in, because that is the function's directory in
+/// every sense there is. The examples project measures it: its
+/// `simple-mcp-server` keeps a `deno.json` next to the entrypoint that
+/// maps `@hono/mcp` and three more, the reference loads the module, and
+/// the project's own `import_map.json` two directories up has none of
+/// those names in it.
+fn beside(root: &Path, dir: &Path, name: &str) -> Option<std::path::PathBuf> {
     for file in ["deno.json", "deno.jsonc"] {
         let at = dir.join(file);
         if at.is_file() {
@@ -400,6 +452,140 @@ mod tests {
         let found = read(dir.path(), &layout).expect("read");
         let names: Vec<&str> = found.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["open", "probe"]);
+    }
+
+    /// The examples project's `simple-mcp-server`, which is a block
+    /// with an entrypoint two directories down and no directory of its
+    /// own, and which the reference serves.
+    #[test]
+    fn a_block_with_an_entrypoint_is_a_function_the_listing_never_saw() {
+        let dir = project();
+        std::fs::create_dir_all(dir.path().join("functions/mcp/deeper")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("functions/mcp/deeper/index.ts"),
+            "Deno.serve(() => {})",
+        )
+        .expect("write");
+        let mut layout = Layout::default();
+        layout.settings.insert(
+            "deeper".to_string(),
+            Settings {
+                verify_jwt: false,
+                entrypoint: Some("./functions/mcp/deeper/index.ts".to_string()),
+                ..Settings::default()
+            },
+        );
+        let found = read(dir.path(), &layout).expect("read");
+        let names: Vec<&str> = found.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["deeper", "hello", "open", "probe"],
+            "the name is the block's, not the directory's"
+        );
+        let deeper = found.iter().find(|f| f.name == "deeper").expect("served");
+        assert_eq!(
+            deeper.entrypoint,
+            dir.path().join("functions/mcp/deeper/index.ts")
+        );
+        assert!(!deeper.verify_jwt, "the block is read the same way");
+        assert_eq!(
+            deeper.import_map, None,
+            "and nothing beside the entrypoint to find one in"
+        );
+        assert!(
+            !found.iter().any(|f| f.name == "mcp"),
+            "the directory the entrypoint is under is not a function of its own"
+        );
+        assert!(
+            !found.iter().any(|f| f.name == "nested"),
+            "and a nested directory nothing named is still not served"
+        );
+    }
+
+    /// The same function's `deno.json`, which sits next to the
+    /// entrypoint and is the only place the names it imports are
+    /// written down.
+    #[test]
+    fn a_function_the_config_named_finds_the_map_beside_its_entrypoint() {
+        let dir = project();
+        let root = dir.path().join("functions");
+        std::fs::create_dir_all(root.join("mcp/deeper")).expect("mkdir");
+        std::fs::write(root.join("mcp/deeper/index.ts"), "Deno.serve(() => {})").expect("write");
+        std::fs::write(root.join("import_map.json"), "{}").expect("write");
+        let mut layout = Layout::default();
+        layout.settings.insert(
+            "deeper".to_string(),
+            Settings {
+                entrypoint: Some("./functions/mcp/deeper/index.ts".to_string()),
+                ..Settings::default()
+            },
+        );
+        let map = |layout: &Layout| {
+            read(dir.path(), layout)
+                .expect("read")
+                .into_iter()
+                .find(|f| f.name == "deeper")
+                .expect("served")
+                .import_map
+        };
+        assert_eq!(
+            map(&layout),
+            Some(root.join("import_map.json")),
+            "the project's own is still the last resort"
+        );
+
+        std::fs::write(root.join("mcp/deeper/deno.json"), "{}").expect("write");
+        assert_eq!(
+            map(&layout),
+            Some(root.join("mcp/deeper/deno.json")),
+            "and the one beside the entrypoint beats it"
+        );
+    }
+
+    #[test]
+    fn a_block_that_names_no_entrypoint_adds_nothing() {
+        let dir = project();
+        let mut layout = Layout::default();
+        layout.settings.insert(
+            "nobody".to_string(),
+            Settings {
+                verify_jwt: false,
+                ..Settings::default()
+            },
+        );
+        layout.settings.insert(
+            "nowhere".to_string(),
+            Settings {
+                entrypoint: Some("./functions/mcp/nothing/index.ts".to_string()),
+                ..Settings::default()
+            },
+        );
+        let found = read(dir.path(), &layout).expect("read");
+        let names: Vec<&str> = found.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["hello", "open", "probe"]);
+    }
+
+    #[test]
+    fn a_block_switched_off_is_not_added_either() {
+        let dir = project();
+        std::fs::create_dir_all(dir.path().join("functions/mcp/deeper")).expect("mkdir");
+        std::fs::write(
+            dir.path().join("functions/mcp/deeper/index.ts"),
+            "Deno.serve(() => {})",
+        )
+        .expect("write");
+        let mut layout = Layout::default();
+        layout.settings.insert(
+            "deeper".to_string(),
+            Settings {
+                enabled: false,
+                entrypoint: Some("./functions/mcp/deeper/index.ts".to_string()),
+                ..Settings::default()
+            },
+        );
+        let found = read(dir.path(), &layout).expect("read");
+        let names: Vec<&str> = found.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["hello", "open", "probe"]);
     }
 
     #[test]
