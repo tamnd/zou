@@ -222,6 +222,22 @@ fn op_zou_version() -> Version {
     }
 }
 
+/// What `navigator.userAgent` says, which a library reads to work out
+/// what it is running on and which is therefore the one string here
+/// that other people's code branches on.
+///
+/// Upstream's, measured through a function on a real `supabase start`,
+/// is `Deno/2.1.4 (variant; SupabaseEdgeRuntime/1.74.2)`. That is Deno's
+/// own format, where the brackets hold what embedded it, so the honest
+/// answer for this runtime is the same sentence with this runtime's name
+/// in the brackets. A library matching `/Deno\//` gets what it came for
+/// and one reading the brackets is told the truth.
+#[op2]
+#[string]
+fn op_zou_agent() -> String {
+    format!("Deno/{DENO} (variant; zou/{})", env!("CARGO_PKG_VERSION"))
+}
+
 /// The Deno release this runtime's surface is written against, which is
 /// the one upstream's runtime names, because the gaps in it are written
 /// down in `docs/functions.md` and measured against that.
@@ -311,6 +327,7 @@ deno_core::extension!(
         op_zou_env_get,
         op_zou_env,
         op_zou_version,
+        op_zou_agent,
         op_zou_read_file,
         op_zou_read_file_sync,
         crypto::op_zou_random,
@@ -320,6 +337,7 @@ deno_core::extension!(
         fetch::op_zou_fetch,
         timer::op_zou_sleep,
         timer::op_zou_clear,
+        timer::op_zou_now,
         url::op_zou_url_parse,
         url::op_zou_url_set,
         websocket::op_zou_ws_connect,
@@ -721,6 +739,7 @@ async fn build(
     let watchdog = limits::watch(handle.clone(), Arc::clone(&watch), limits);
     js.add_near_heap_limit_callback(limits::near_heap_limit(handle.clone(), Arc::clone(&watch)));
     js.op_state().borrow_mut().put(timer::Pending::default());
+    js.op_state().borrow_mut().put(timer::Started::default());
     // Before the module is evaluated rather than with the call, because
     // the top of a module runs here and reading the environment there
     // is the most ordinary line there is.
