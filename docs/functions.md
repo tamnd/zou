@@ -512,6 +512,7 @@ What runs is the registry's build of the package rather than the tarball npm wou
 
 - Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
 - A package that reaches for a node built in will not run. `node:` is refused by name and the registry's own shims cover the common ones and not all of them.
+- The loader asks the registry as `zou-edge-runtime`, and that decides which build comes back. esm.sh serves a Deno agent the build it makes for Deno, which imports `node:process` or `node:buffer` for a line or two because Deno has them, and serves anything else the build it makes for a browser. The browser build is the one that links here. Asking as a Deno was measured against the Supabase examples and took the corpus from twenty eight functions running to twenty one, all of them on a missing node built in, so the loader asks as itself until those exist. What it costs is the other direction: a package whose browser build needs something a browser has and this does not, such as a `.wasm` esbuild will not bundle, is a 500 from the registry rather than a module.
 - `@supabase/supabase-js` runs. `createClient` builds its auth, storage, functions and realtime clients, and the realtime one is a `WebSocket`, which is why that had to exist before this line could say so.
 - `http:` is refused. A module arrives and is executed, so it arrives over https.
 - `data:` is not supported yet.
@@ -631,7 +632,7 @@ What that means in practice, written down because a difference from Deno is a di
 - A call has 30 seconds. Deno waits forever, which is fine for a program somebody is watching and not for a request holding an isolate.
 - `res.statusText` is the canonical phrase for the code rather than the one the server wrote, because the client does not keep the reason phrase.
 - `res.url` and `res.redirected` are where the answer came from, so a redirect that was followed can be seen. Redirects are followed.
-- The `user-agent`, when the function does not set one, is `zou-edge-runtime`.
+- The `user-agent`, when the function does not set one, is the string `navigator.userAgent` says: `Deno/2.1.4 (variant; zou/<version>)`. That is what upstream sends, measured by having a function on a real `supabase start` fetch an echo, where it read back `Deno/2.1.4 (variant; SupabaseEdgeRuntime/1.74.2)`, which is that runtime's own navigator string. It is not only politeness: a registry serves a different build of a package depending on this header, so a function fetching a module at runtime gets the same one it would have got upstream.
 - `http:` and `https:` and nothing else. `file:`, `data:` and a string that is not a url each throw a `TypeError` saying which.
 - A request that could not be made at all throws `TypeError: error sending request for url (<url>): <why>`, which is the sentence Deno throws. A 404 or a 500 is an answer and not a throw.
 
@@ -839,6 +840,11 @@ An `AbortSignal` is a signal an aborted thing can be listened for on, and nothin
 
 `EventTarget` is the real one and not the three methods a socket needs, so a library that extends it to emit its own events works: `{ once }` and `{ signal }` in the options, `stopImmediatePropagation`, and `dispatchEvent` answering false when a cancelable event was prevented.
 There is no tree here, so there is no capture and no bubbling and nothing for `stopPropagation` to stop: one object dispatches to its own listeners.
+
+The global is one of them.
+`addEventListener`, `removeEventListener` and `dispatchEvent` are there without a receiver in front of them, `globalThis instanceof EventTarget` is true, and `self` and `window` are both the global itself.
+That is the shape upstream was measured having, and it is not decoration: a library calls the bare `addEventListener` while a module is still being evaluated often enough that a runtime without one is a `ReferenceError` before the function has a handler.
+What is not there is anything dispatching to it. Nothing here fires `error` or `unhandledrejection`, so a library that reports crashes by listening on the global reports nothing, and a handler that throws is the log line further down instead.
 
 `performance` is `now()` and `timeOrigin`, which is a monotonic clock counting from the moment the isolate started, in milliseconds with a fraction. `mark` and `measure` are not here.
 

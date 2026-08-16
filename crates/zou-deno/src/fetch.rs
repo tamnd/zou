@@ -36,10 +36,34 @@ pub(crate) const BODY_LIMIT: u64 = 20 * 1024 * 1024;
 /// unreachable host is one isolate that never comes back.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// What a receiver sees when the function did not name one. Upstream's
-/// runtime sends Deno's, and this is neither a lie about being Deno nor
-/// a blank, both of which get a request refused by something eventually.
-const AGENT: &str = "zou-edge-runtime";
+/// What a receiver sees when the function did not name one.
+///
+/// The same string `navigator.userAgent` says, because that is what
+/// upstream was measured sending: a function on a real `supabase start`
+/// fetched an echo and the header read back
+/// `Deno/2.1.4 (variant; SupabaseEdgeRuntime/1.74.2)`, which is its own
+/// navigator string. This one has zou in the brackets and says the same
+/// thing about the surface.
+fn user_agent() -> &'static str {
+    static AGENT: OnceLock<String> = OnceLock::new();
+    AGENT.get_or_init(crate::isolate::user_agent)
+}
+
+/// What the module loader is, which is not what a function's `fetch`
+/// is, and the difference is measured rather than tidy.
+///
+/// esm.sh reads this header and answers a different build depending on
+/// it. A Deno agent is served the `denonext` build, which is the one
+/// upstream runs and which imports `node:process` and `node:buffer` for
+/// a line or two, and there are no node built ins here: asking for it
+/// took the whole corpus from twenty seven functions running to
+/// twenty one. Anything else is served a build for a browser, which is
+/// the one that runs here.
+///
+/// So this name is a statement about what this runtime can link rather
+/// than about what it is compatible with, and the day the node built
+/// ins arrive it should become the other one.
+const LOADER: &str = "zou-edge-runtime";
 
 #[derive(serde::Deserialize)]
 pub struct Sent {
@@ -89,7 +113,10 @@ pub(crate) fn agent() -> &'static ureq::Agent {
             // rejecting when the request could not be made at all.
             .http_status_as_error(false)
             .timeout_global(Some(TIMEOUT))
-            .user_agent(AGENT)
+            // The loader's, because the loader is the one that does not
+            // name a header of its own. A call from a function has
+            // `user_agent()` put on it below.
+            .user_agent(LOADER)
             .build()
             .into()
     })
@@ -102,6 +129,15 @@ fn call(sent: Sent, body: Vec<u8>) -> Result<Received, JsErrorBox> {
         .uri(&sent.url);
     for (name, value) in &sent.headers {
         built = built.header(name, value);
+    }
+    // Unless the function named one itself, in which case it is the
+    // function's call and the function's name on it.
+    if !sent
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        built = built.header(ureq::http::header::USER_AGENT, user_agent());
     }
     let built = built
         .body(&body[..])

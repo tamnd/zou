@@ -1713,6 +1713,7 @@ fn what_a_function_posts_is_what_arrives() {
                 asked: header("x-asked-by"),
                 type: header("content-type"),
                 agent: header("user-agent"),
+                navigator: navigator.userAgent,
                 length: header("content-length"),
             }});
         }});
@@ -1726,7 +1727,19 @@ fn what_a_function_posts_is_what_arrives() {
     // Set by the Request constructor because the body is a string, the
     // same as it would be in Deno.
     assert_eq!(said["type"], "text/plain;charset=UTF-8");
-    assert_eq!(said["agent"], "zou-edge-runtime");
+    // The same string `navigator.userAgent` says, which is what
+    // upstream sends: measured on a real `supabase start` by having a
+    // function fetch an echo and read the header back, where both were
+    // `Deno/2.1.4 (variant; SupabaseEdgeRuntime/1.74.2)`.
+    assert_eq!(said["agent"], said["navigator"]);
+    assert!(
+        said["agent"]
+            .as_str()
+            .expect("a string")
+            .starts_with("Deno/2.1.4 (variant; zou/"),
+        "{}",
+        said["agent"]
+    );
     assert_eq!(said["length"], "16");
 }
 
@@ -3315,6 +3328,46 @@ fn a_navigator_says_what_the_function_is_running_on() {
         said["keys"],
         "hardwareConcurrency,language,languages,userAgent"
     );
+}
+
+/// The global is an event target, and a library that calls the bare
+/// `addEventListener` at the top of a module gets a listener rather
+/// than a ReferenceError.
+///
+/// Every value here was measured through a function on a real
+/// `supabase start`: the global is an `EventTarget`, its
+/// `addEventListener` is the one on the prototype rather than a copy,
+/// and `self` and `window` are both the global.
+#[test]
+fn the_global_is_an_event_target_the_way_upstream_is() {
+    let answer = answered(
+        r#"
+        let heard = 0;
+        addEventListener("zou", (event) => { heard = event.detail; });
+        Deno.serve(() => {
+            dispatchEvent(new CustomEvent("zou", { detail: 7 }));
+            const once = heard;
+            removeEventListener("zou", () => {});
+            return Response.json({
+                target: globalThis instanceof EventTarget,
+                same: globalThis.addEventListener === EventTarget.prototype.addEventListener,
+                self: globalThis.self === globalThis,
+                window: globalThis.window === globalThis,
+                heard: once,
+                bare: [typeof addEventListener, typeof removeEventListener, typeof dispatchEvent].join(","),
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["target"], true);
+    assert_eq!(said["same"], true);
+    assert_eq!(said["self"], true);
+    assert_eq!(said["window"], true);
+    // A listener added at the top of the module, before there was a
+    // call, still hears what the handler dispatches.
+    assert_eq!(said["heard"], 7);
+    assert_eq!(said["bare"], "function,function,function");
 }
 
 /// What a function may do, asked the way a library asks it before it
