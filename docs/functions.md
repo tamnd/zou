@@ -775,8 +775,28 @@ Reading the stream is reading the body, so `bodyUsed` is true afterwards and `te
 - A body that throws after the head has gone out ends where it got to. There is no status code left to change by then, and a chunked body that stops early is what an http client is shown.
 - The queueing strategy is a count of chunks and not a size in bytes, so `highWaterMark` is how many chunks are read ahead. `size` is ignored.
 - A body stream may only give out bytes. A stream of strings is fine until somebody asks for the body, which is where the `TypeError` is.
-- There is no `WritableStream` and no `TransformStream`, so there is no `pipeTo` and no `pipeThrough`. They are absent rather than throwing, because there is nothing to construct.
 - There is no byte stream and no BYOB reader. `new ReadableStream({ type: "bytes" })` and `getReader({ mode: "byob" })` are refused by name.
+
+The writable half is here too: `WritableStream` with a sink a function wrote, its writer, `TransformStream`, and `pipeTo` and `pipeThrough` on a readable.
+
+```ts
+Deno.serve((req) => {
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  const upper = new TransformStream({
+    transform(chunk, controller) {
+      controller.enqueue(encoder.encode(decoder.decode(chunk, { stream: true }).toUpperCase()))
+    },
+  })
+  return new Response(req.body.pipeThrough(upper))
+})
+```
+
+- A sink is `start`, `write`, `close` and `abort`, and a `write` that returns a promise is waited for, so backpressure is the sink taking its time rather than a queue size.
+- The queueing strategy is a count of chunks here as well. A writer's `desiredSize` counts down as chunks go in and `ready` resolves when the sink has taken them.
+- A sink that throws is the error every later `write`, `close` and `ready` gets, and the writer's `closed` rejects with it. Aborting is the same with the reason the caller gave.
+- A pipe ends the way its source ended. A source that closed closes the destination, a source that errored aborts it, and `preventClose`, `preventAbort` and `preventCancel` each stop one half of that.
+- `TextDecoderStream` is the one transform that is not here yet, which is why the example above decodes with a `TextDecoder` of its own.
 
 ## WebSocket
 
@@ -811,14 +831,21 @@ Deno.serve(async (req) => {
 
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `Event`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build` and `Deno.version`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build` and `Deno.version`.
 
 An `AbortSignal` is a signal an aborted thing can be listened for on, and nothing here takes one yet: `fetch` does not read `init.signal` and neither does a timer.
+
+`EventTarget` is the real one and not the three methods a socket needs, so a library that extends it to emit its own events works: `{ once }` and `{ signal }` in the options, `stopImmediatePropagation`, and `dispatchEvent` answering false when a cancelable event was prevented.
+There is no tree here, so there is no capture and no bubbling and nothing for `stopPropagation` to stop: one object dispatches to its own listeners.
+
+`performance` is `now()` and `timeOrigin`, which is a monotonic clock counting from the moment the isolate started, in milliseconds with a fraction. `mark` and `measure` are not here.
+
+`navigator` is `userAgent`, `hardwareConcurrency`, `language` and `languages`, and nothing else, which is what upstream has. The user agent reads `Deno/2.1.4 (variant; zou/<version>)`, the same sentence upstream builds with its own name in the brackets, and the core count is 1 whatever the host has, because a function gets one thread.
 
 Not present yet, and named rather than silently missing:
 
 - The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
-- The writable half of streams. There is no `WritableStream` and no `TransformStream`, and so no `pipeTo` and no `pipeThrough`, and no byte stream or BYOB reader.
+- Byte streams. There is no `new ReadableStream({ type: "bytes" })`, no BYOB reader and no `TextDecoderStream`.
 - Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet.
 - The rest of the file system. Reading a file the function's own `static_files` covers is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
 - Node built ins. `node:fs` and the rest are refused by name.

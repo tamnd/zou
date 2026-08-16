@@ -690,7 +690,15 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
             stream: typeof ReadableStream,
             reader: typeof ReadableStreamDefaultReader,
             writable: typeof WritableStream,
+            writer: typeof WritableStreamDefaultWriter,
             transform: typeof TransformStream,
+            through: typeof ReadableStream.prototype.pipeThrough,
+            target: typeof EventTarget,
+            custom: typeof CustomEvent,
+            clock: typeof performance?.now,
+            agent: typeof navigator?.userAgent,
+            bytes: typeof ReadableStreamBYOBReader,
+            text: typeof TextDecoderStream,
         }));
         "#,
     );
@@ -714,10 +722,18 @@ fn the_gaps_are_gaps_by_name_and_not_by_undefined() {
     assert_eq!(said["events"], "function function function function");
     assert_eq!(said["stream"], "function");
     assert_eq!(said["reader"], "function");
+    assert_eq!(said["writable"], "function");
+    assert_eq!(said["writer"], "function");
+    assert_eq!(said["transform"], "function");
+    assert_eq!(said["through"], "function");
+    assert_eq!(said["target"], "function");
+    assert_eq!(said["custom"], "function");
+    assert_eq!(said["clock"], "function");
+    assert_eq!(said["agent"], "string");
     // The gaps that are left, and they are gaps by being absent rather
     // than by throwing, because there is nothing to construct.
-    assert_eq!(said["writable"], "undefined");
-    assert_eq!(said["transform"], "undefined");
+    assert_eq!(said["bytes"], "undefined");
+    assert_eq!(said["text"], "undefined");
 }
 
 #[test]
@@ -2108,7 +2124,6 @@ fn a_byte_stream_is_a_gap_and_says_so() {
             return Response.json({
                 bytes: said(() => new ReadableStream({ type: "bytes" })),
                 byob: said(() => new ReadableStream().getReader({ mode: "byob" })),
-                piped: typeof new ReadableStream().pipeThrough,
                 chunks: said(() => new Response(ReadableStream.from(["not bytes"]))),
             });
         });
@@ -2117,10 +2132,184 @@ fn a_byte_stream_is_a_gap_and_says_so() {
     let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["bytes"], "a bytes stream is not supported yet");
     assert_eq!(said["byob"], "a byob reader is not supported yet");
-    assert_eq!(said["piped"], "undefined");
     // A body of strings is not an error until somebody asks for the
     // bytes of it, which is where the message is.
     assert_eq!(said["chunks"], "it worked");
+}
+
+/// A sink written to by hand: the chunks arrive in the order they were
+/// written, one at a time, and closing it is the last thing the sink
+/// hears.
+#[test]
+fn a_writable_stream_takes_chunks_in_the_order_they_were_written() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const got: string[] = [];
+            const written = new WritableStream({
+                start() { got.push("start"); },
+                async write(chunk) {
+                    // A slow sink, so a writer that did not wait for
+                    // it would be out of order here.
+                    await new Promise((done) => setTimeout(done, 5 - got.length));
+                    got.push(chunk);
+                },
+                close() { got.push("close"); },
+            });
+            const writer = written.getWriter();
+            const sizes = [writer.desiredSize];
+            writer.write("one");
+            writer.write("two");
+            await writer.write("three");
+            sizes.push(writer.desiredSize);
+            await writer.close();
+            await writer.closed;
+            return Response.json({ got, sizes, locked: written.locked });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said["got"],
+        serde_json::json!(["start", "one", "two", "three", "close"])
+    );
+    // One before anything is in flight, and nothing left in flight
+    // once the last write has been awaited.
+    assert_eq!(said["sizes"], serde_json::json!([1, 1]));
+    assert_eq!(said["locked"], true);
+}
+
+/// A sink that throws is the writer's error, and the stream is errored
+/// from then on rather than quietly taking more.
+#[test]
+fn a_sink_that_throws_is_the_writers_error() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const written = new WritableStream({
+                write(chunk) {
+                    if (chunk === "bad") {
+                        throw new Error("the disk was full");
+                    }
+                },
+            });
+            const writer = written.getWriter();
+            await writer.write("fine");
+            let first = "";
+            try { await writer.write("bad"); } catch (why) { first = why.message; }
+            let after = "";
+            try { await writer.write("more"); } catch (why) { after = why.message; }
+            let closed = "";
+            try { await writer.closed; } catch (why) { closed = why.message; }
+            return Response.json({ first, after, closed });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["first"], "the disk was full");
+    assert_eq!(said["after"], "the disk was full");
+    assert_eq!(said["closed"], "the disk was full");
+}
+
+/// The pair, used the way a transform is always used, and the answer
+/// is a body the caller reads.
+#[test]
+fn a_stream_piped_through_a_transform_is_a_body() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const shouting = new TransformStream({
+                transform(chunk, controller) {
+                    controller.enqueue(new TextEncoder().encode(chunk.toUpperCase()));
+                },
+                flush(controller) {
+                    controller.enqueue(new TextEncoder().encode("!"));
+                },
+            });
+            const said = ReadableStream.from(["one ", "two ", "three"]);
+            return new Response(said.pipeThrough(shouting));
+        });
+        "#,
+    );
+    assert_eq!(body(&answer), "ONE TWO THREE!");
+}
+
+/// A transform with nothing in it passes chunks through, which is what
+/// `new TransformStream()` on its own means, and it is the line the
+/// examples that would not load were written with.
+#[test]
+fn a_transform_that_transforms_nothing_passes_everything_through() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const pair = new TransformStream();
+            const writer = pair.writable.getWriter();
+            (async () => {
+                await writer.write("one");
+                await writer.write("two");
+                await writer.close();
+            })();
+            const got: string[] = [];
+            for await (const chunk of pair.readable) {
+                got.push(chunk);
+            }
+            return Response.json({ got });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["got"], serde_json::json!(["one", "two"]));
+}
+
+/// `pipeTo` is the whole stream and then the close, and a source that
+/// fails part way is an abort at the other end rather than a close.
+#[test]
+fn a_pipe_ends_the_way_the_source_ended() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const ends: string[] = [];
+            const sink = (name: string) => new WritableStream({
+                write(chunk) { ends.push(`${name} ${chunk}`); },
+                close() { ends.push(`${name} closed`); },
+                abort(why) { ends.push(`${name} aborted: ${why.message}`); },
+            });
+            await ReadableStream.from(["a", "b"]).pipeTo(sink("whole"));
+            let failed = "";
+            try {
+                let given = 0;
+                await new ReadableStream({
+                    pull(controller) {
+                        // A chunk and then a failure, given out one
+                        // pull at a time, because a stream that errors
+                        // before anything has been read throws its
+                        // queue away and nothing would be piped at all.
+                        if (given++ === 0) {
+                            controller.enqueue("a");
+                        } else {
+                            controller.error(new Error("the source gave up"));
+                        }
+                    },
+                }).pipeTo(sink("half"));
+            } catch (why) {
+                failed = why.message;
+            }
+            return Response.json({ ends, failed });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said["ends"],
+        serde_json::json!([
+            "whole a",
+            "whole b",
+            "whole closed",
+            "half a",
+            "half aborted: the source gave up"
+        ])
+    );
+    assert_eq!(said["failed"], "the source gave up");
 }
 
 /// The answer to a call, taken the way the server takes it: the moment
@@ -2991,6 +3180,141 @@ fn an_abort_controller_tells_whoever_is_listening() {
     assert_eq!(said["said"], serde_json::json!(["once", "again"]));
     assert_eq!(said["threw"], "AbortError: The signal has been aborted");
     assert_eq!(said["reason"], true);
+}
+
+/// `EventTarget` is what a library extends when it wants to emit
+/// something of its own, and three of the Supabase examples never got
+/// past the top of a module without it: `@upstash/redis` and
+/// `stripe` both build an emitter while they are being imported.
+#[test]
+fn an_event_target_is_a_thing_a_library_can_extend() {
+    let answer = answered(
+        r#"
+        class Client extends EventTarget {}
+        Deno.serve(() => {
+            const said: string[] = [];
+            const client = new Client();
+            const heard = (event: CustomEvent) => said.push(`heard ${event.detail}`);
+            client.addEventListener("retry", heard);
+            client.addEventListener("retry", () => said.push("once"), { once: true });
+            client.dispatchEvent(new CustomEvent("retry", { detail: "one" }));
+            client.dispatchEvent(new CustomEvent("retry", { detail: "two" }));
+            client.removeEventListener("retry", heard);
+            client.dispatchEvent(new CustomEvent("retry", { detail: "three" }));
+            return Response.json({ said });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said["said"],
+        serde_json::json!(["heard one", "once", "heard two"])
+    );
+}
+
+/// What `dispatchEvent` answers, and the one listener that stops the
+/// ones after it.
+#[test]
+fn an_event_that_was_prevented_is_a_false_and_the_rest_are_true() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const target = new EventTarget();
+            const said: string[] = [];
+            target.addEventListener("go", (event: Event) => {
+                said.push("first");
+                event.preventDefault();
+            });
+            target.addEventListener("go", (event: Event) => {
+                said.push("second");
+                event.stopImmediatePropagation();
+            });
+            target.addEventListener("go", () => said.push("third"));
+            const cancelled = target.dispatchEvent(new Event("go", { cancelable: true }));
+            const plain = target.dispatchEvent(new Event("nobody is listening"));
+            return Response.json({ said, cancelled, plain });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["said"], serde_json::json!(["first", "second"]));
+    assert_eq!(said["cancelled"], false);
+    assert_eq!(said["plain"], true);
+}
+
+/// `performance.now` is a duration and not a date, which is why it is
+/// worth having when `Date.now` is already here: `@sentry/deno` reads
+/// it while the sdk is being initialised, so a function importing that
+/// does not load at all without one.
+#[test]
+fn performance_counts_from_when_the_isolate_started() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const first = performance.now();
+            await new Promise((done) => setTimeout(done, 20));
+            const second = performance.now();
+            return Response.json({
+                first,
+                second,
+                origin: performance.timeOrigin,
+                now: Date.now(),
+                fraction: performance.now() % 1 !== 0,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    let first = said["first"].as_f64().expect("a number");
+    let second = said["second"].as_f64().expect("a number");
+    assert!((0.0..60_000.0).contains(&first), "{first}");
+    assert!(second >= first + 15.0, "{first} then {second}");
+    // The origin is a wall clock reading, and the clock the isolate
+    // was made by is the same clock the function reads.
+    let origin = said["origin"].as_f64().expect("a number");
+    let now = said["now"].as_f64().expect("a number");
+    assert!(now - origin >= 0.0 && now - origin < 60_000.0, "{origin}");
+    // Milliseconds with a fraction, which is what tells this apart
+    // from `Date.now()` for anything measuring short work.
+    assert_eq!(said["fraction"], true);
+}
+
+/// `navigator` is the four properties upstream has and not a fifth,
+/// because a library feature detecting on `navigator.gpu` should find
+/// nothing rather than find something that is not there.
+///
+/// The user agent is the one string in this runtime that other people's
+/// code branches on, so it is asserted by shape: Deno's own format, the
+/// release the surface is written against, and this runtime named in
+/// the brackets where upstream names itself.
+#[test]
+fn a_navigator_says_what_the_function_is_running_on() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => Response.json({
+            agent: navigator.userAgent,
+            cores: navigator.hardwareConcurrency,
+            language: navigator.language,
+            languages: navigator.languages,
+            gpu: typeof navigator.gpu,
+            keys: Object.keys(navigator).sort().join(","),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    let agent = said["agent"].as_str().expect("a string");
+    assert!(agent.starts_with("Deno/2.1.4 (variant; zou/"), "{agent}");
+    assert!(agent.ends_with(')'), "{agent}");
+    // One, whatever the host has, because a function gets one thread
+    // and sizing a pool by the machine's cores would be wrong here.
+    assert_eq!(said["cores"], 1);
+    assert_eq!(said["language"], "en");
+    assert_eq!(said["languages"], serde_json::json!(["en"]));
+    assert_eq!(said["gpu"], "undefined");
+    assert_eq!(
+        said["keys"],
+        "hardwareConcurrency,language,languages,userAgent"
+    );
 }
 
 /// A reason given is the reason reported, which is the other half of

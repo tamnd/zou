@@ -939,6 +939,55 @@
       return made;
     }
 
+    /// Everything this gives out, written to somebody else's sink,
+    /// one chunk at a time so the writer's backpressure is felt here.
+    async pipeTo(destination, options = {}) {
+      options = options ?? {};
+      const reader = this.getReader();
+      const writer = destination.getWriter();
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          await writer.ready;
+          await writer.write(value);
+        }
+        if (!options.preventClose) {
+          await writer.close();
+        }
+      } catch (thrown) {
+        if (!options.preventAbort) {
+          await writer.abort(thrown).catch(() => {});
+        }
+        if (!options.preventCancel) {
+          await reader.cancel(thrown).catch(() => {});
+        }
+        throw thrown;
+      } finally {
+        reader.releaseLock();
+        writer.releaseLock();
+      }
+    }
+
+    /// The same, through a pair, which is how a transform is used:
+    /// `stream.pipeThrough(new TransformStream(...))`. The piping is
+    /// left running and the readable side is the answer.
+    pipeThrough(pair, options = {}) {
+      if (pair === null || pair === undefined) {
+        throw new TypeError("pipeThrough requires a writable and a readable");
+      }
+      const { writable, readable } = pair;
+      if (writable === undefined || readable === undefined) {
+        throw new TypeError("pipeThrough requires a writable and a readable");
+      }
+      // Nobody is obliged to look at how the piping went, and the
+      // failure is on the readable side to report either way.
+      this.pipeTo(writable, options).catch(() => {});
+      return readable;
+    }
+
     async *[Symbol.asyncIterator]() {
       const reader = this.getReader();
       try {
@@ -1138,6 +1187,285 @@
       at += bytes.length;
     }
     return all;
+  }
+
+  // ---------------------------------------------------------------
+  // The writable half
+  //
+  // A sink, one write at a time, and the promise a writer waits on.
+  // The queueing strategy is a count of chunks the same way the
+  // readable half's is, so `desiredSize` is one minus what is in
+  // flight rather than a size in bytes.
+  //
+  // This is here because a stream is rarely written without one:
+  // `TransformStream` below is a writable side and a readable side
+  // tied together, `pipeTo` needs somewhere to pipe to, and the two
+  // Supabase examples that would not load at all, `oak` and
+  // `connect-supabase`, both reference `TransformStream` while their
+  // module is being evaluated.
+
+  const SINK = Symbol("sink");
+
+  class WritableStream {
+    constructor(sink = {}, strategy = {}) {
+      sink = sink ?? {};
+      if (sink.type !== undefined && sink.type !== null) {
+        throw new TypeError(`a ${sink.type} sink is not supported yet`);
+      }
+      const held = {
+        sink,
+        state: "writable",
+        stored: undefined,
+        locked: false,
+        inflight: 0,
+        want: Number(strategy.highWaterMark ?? 1),
+        // Writes go through in the order they were made, which is what
+        // makes a stream a stream rather than a pile of promises.
+        last: Promise.resolve(),
+        told: null,
+      };
+      held.closed = new Promise((done, broken) => {
+        held.told = { done, broken };
+      });
+      held.closed.catch(() => {});
+      this[SINK] = held;
+      const controller = {
+        error(why) {
+          stops(held, why);
+        },
+        signal: new AbortController().signal,
+      };
+      held.controller = controller;
+      held.started = (async () => {
+        if (typeof sink.start === "function") {
+          await sink.start(controller);
+        }
+      })().catch((thrown) => stops(held, thrown));
+    }
+
+    get locked() {
+      return this[SINK].locked;
+    }
+
+    getWriter() {
+      return new WritableStreamDefaultWriter(this);
+    }
+
+    abort(reason) {
+      if (this[SINK].locked) {
+        return Promise.reject(new TypeError("the stream is locked to a writer"));
+      }
+      return aborts(this[SINK], reason);
+    }
+
+    close() {
+      if (this[SINK].locked) {
+        return Promise.reject(new TypeError("the stream is locked to a writer"));
+      }
+      return closes(this[SINK]);
+    }
+  }
+
+  class WritableStreamDefaultWriter {
+    constructor(stream) {
+      const held = stream[SINK];
+      if (held.locked) {
+        throw new TypeError("the stream is locked to a writer");
+      }
+      held.locked = true;
+      this[SINK] = held;
+      this.closed = held.closed;
+    }
+
+    /// The backpressure, such as it is: the last write, so a writer
+    /// that awaits this is a writer that is not ahead of the sink.
+    get ready() {
+      const held = this[SINK];
+      if (held === null) {
+        return Promise.reject(new TypeError("the writer has been released"));
+      }
+      return held.last.then(
+        () => undefined,
+        () => undefined,
+      );
+    }
+
+    get desiredSize() {
+      const held = this[SINK];
+      if (held === null) {
+        throw new TypeError("the writer has been released");
+      }
+      return held.state === "writable" ? held.want - held.inflight : null;
+    }
+
+    write(chunk) {
+      const held = this[SINK];
+      if (held === null) {
+        return Promise.reject(new TypeError("the writer has been released"));
+      }
+      return writes(held, chunk);
+    }
+
+    close() {
+      const held = this[SINK];
+      if (held === null) {
+        return Promise.reject(new TypeError("the writer has been released"));
+      }
+      return closes(held);
+    }
+
+    abort(reason) {
+      const held = this[SINK];
+      if (held === null) {
+        return Promise.reject(new TypeError("the writer has been released"));
+      }
+      return aborts(held, reason);
+    }
+
+    releaseLock() {
+      const held = this[SINK];
+      if (held === null) {
+        return;
+      }
+      held.locked = false;
+      this[SINK] = null;
+    }
+  }
+
+  function stops(held, why) {
+    if (held.state !== "writable" && held.state !== "closing") {
+      return;
+    }
+    held.state = "errored";
+    held.stored = why;
+    held.told.broken(why);
+  }
+
+  function writes(held, chunk) {
+    if (held.state === "errored") {
+      return Promise.reject(held.stored);
+    }
+    if (held.state !== "writable") {
+      return Promise.reject(new TypeError("the stream is closed"));
+    }
+    held.inflight += 1;
+    const written = held.last.then(async () => {
+      await held.started;
+      if (held.state === "errored") {
+        throw held.stored;
+      }
+      if (typeof held.sink.write === "function") {
+        await held.sink.write(chunk, held.controller);
+      }
+    });
+    // The queue is this promise chain, so a write that failed is not
+    // allowed to stop the ones behind it from being attempted, and the
+    // failure is still the caller's to see.
+    held.last = written.then(
+      () => {
+        held.inflight -= 1;
+      },
+      (thrown) => {
+        held.inflight -= 1;
+        stops(held, thrown);
+      },
+    );
+    return written;
+  }
+
+  async function closes(held) {
+    if (held.state === "errored") {
+      throw held.stored;
+    }
+    if (held.state !== "writable") {
+      return;
+    }
+    const after = held.last;
+    held.state = "closing";
+    await after;
+    await held.started;
+    if (held.state === "errored") {
+      throw held.stored;
+    }
+    if (typeof held.sink.close === "function") {
+      await held.sink.close();
+    }
+    held.state = "closed";
+    held.told.done(undefined);
+  }
+
+  async function aborts(held, reason) {
+    if (held.state === "closed" || held.state === "errored") {
+      return;
+    }
+    const sink = held.sink;
+    stops(held, reason);
+    if (typeof sink.abort === "function") {
+      await sink.abort(reason);
+    }
+  }
+
+  /// A writable side and a readable side, with whatever the caller
+  /// wrote in between. A transformer that says nothing passes chunks
+  /// through, which is what `new TransformStream()` on its own is for.
+  class TransformStream {
+    constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
+      transformer = transformer ?? {};
+      if (transformer.readableType !== undefined || transformer.writableType !== undefined) {
+        throw new TypeError("a typed transform stream is not supported yet");
+      }
+      let side = null;
+      const readable = new ReadableStream(
+        {
+          start(controller) {
+            side = controller;
+          },
+        },
+        readableStrategy,
+      );
+      const controller = {
+        enqueue(chunk) {
+          side.enqueue(chunk);
+        },
+        terminate() {
+          side.close();
+        },
+        error(why) {
+          side.error(why);
+        },
+        get desiredSize() {
+          return side.desiredSize;
+        },
+      };
+      const writable = new WritableStream(
+        {
+          async start() {
+            if (typeof transformer.start === "function") {
+              await transformer.start(controller);
+            }
+          },
+          async write(chunk) {
+            if (typeof transformer.transform === "function") {
+              await transformer.transform(chunk, controller);
+            } else {
+              controller.enqueue(chunk);
+            }
+          },
+          async close() {
+            if (typeof transformer.flush === "function") {
+              await transformer.flush(controller);
+            }
+            side.close();
+          },
+          async abort(reason) {
+            side.error(reason);
+          },
+        },
+        writableStrategy,
+      );
+      this.readable = readable;
+      this.writable = writable;
+    }
   }
 
   /// One run of bytes as a stream, which is what `.body` is for a body
@@ -1708,6 +2036,71 @@
   }
 
   // ---------------------------------------------------------------
+  // performance
+  //
+  // The clock a library reaches for when it wants a duration rather
+  // than a date, and enough of a reason on its own for two of the
+  // examples not to load: `@sentry/deno` reads it while the sdk is
+  // being initialised, at the top of the module, so the function is
+  // gone before it has served anything.
+  //
+  // `timeOrigin` is when this isolate started, in wall clock
+  // milliseconds, and `now` counts from there on a monotonic clock. An
+  // isolate that is kept and called again keeps counting, which is what
+  // the number means upstream too, where a worker is what holds it.
+  //
+  // The entry buffer is not here: `mark`, `measure` and the
+  // `getEntries` family are absent rather than faked, because a
+  // library that finds them expects to be able to read back what it
+  // recorded, and an empty list is a worse answer than no method at
+  // all. `docs/functions.md` says so.
+
+  const started = Date.now();
+
+  // ---------------------------------------------------------------
+  // navigator
+  //
+  // Four properties, and the reason to have them is that a library
+  // reads one of them to work out what it is running on. `@sentry/deno`
+  // reads `navigator.userAgent` while the sdk is being initialised, so
+  // a function that imports it does not load without this.
+  //
+  // The shape and the values are upstream's, measured on a real
+  // `supabase start` rather than guessed. There, this is
+  // `hardwareConcurrency,userAgent,language,languages`, the user agent
+  // is `Deno/2.1.4 (variant; SupabaseEdgeRuntime/1.74.2)` and the core
+  // count is one whatever the host has, which is the honest answer for
+  // a runtime where a function gets one thread. This says the same in
+  // its own name.
+
+  const navigator = {
+    get hardwareConcurrency() {
+      return 1;
+    },
+    get userAgent() {
+      return ops.op_zou_agent();
+    },
+    get language() {
+      return "en";
+    },
+    get languages() {
+      return ["en"];
+    },
+  };
+
+  const performance = {
+    get timeOrigin() {
+      return started;
+    },
+    now() {
+      return ops.op_zou_now();
+    },
+    toJSON() {
+      return { timeOrigin: started };
+    },
+  };
+
+  // ---------------------------------------------------------------
   // Deno.serve and Deno.env
 
   function serve(first, second) {
@@ -1901,7 +2294,12 @@
       }
     }
     stopPropagation() {}
-    stopImmediatePropagation() {}
+    stopImmediatePropagation() {
+      // No tree, so nothing to stop propagating to, but the listeners
+      // after this one on the same target are still listeners this is
+      // supposed to stop.
+      this[STOPPED] = true;
+    }
   }
 
   class MessageEvent extends Event {
@@ -1935,7 +2333,17 @@
     }
   }
 
+  /// An event with something of the caller's on it, which is how a
+  /// library that emits its own events hands anything over.
+  class CustomEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.detail = init.detail ?? null;
+    }
+  }
+
   const LISTENERS = Symbol("listeners");
+  const STOPPED = Symbol("stopped");
 
   function listens(target) {
     target[LISTENERS] = new Map();
@@ -1944,6 +2352,7 @@
   function fires(target, event) {
     event.target = target;
     event.currentTarget = target;
+    event[STOPPED] = false;
     const named = `on${event.type}`;
     if (typeof target[named] === "function") {
       try {
@@ -1952,12 +2361,20 @@
         console.error(thrown);
       }
     }
-    for (const listener of target[LISTENERS].get(event.type) ?? []) {
+    // A copy, because a listener is allowed to add or remove one while
+    // it is running and the ones being run are the ones there were.
+    for (const held of [...(target[LISTENERS].get(event.type) ?? [])]) {
+      if (event[STOPPED]) {
+        break;
+      }
+      if (held.once) {
+        unlistened.call(target, event.type, held.listener);
+      }
       try {
-        if (typeof listener === "function") {
-          listener.call(target, event);
+        if (typeof held.listener === "function") {
+          held.listener.call(target, event);
         } else {
-          listener.handleEvent(event);
+          held.listener.handleEvent(event);
         }
       } catch (thrown) {
         // One listener that throws is not the rest of them, and there
@@ -1965,18 +2382,27 @@
         console.error(thrown);
       }
     }
+    return !event.defaultPrevented;
   }
 
-  function listened(type, listener) {
+  function listened(type, listener, options = {}) {
     if (listener === null || listener === undefined) {
       return;
     }
     const named = String(type);
     const held = this[LISTENERS].get(named) ?? [];
-    if (!held.includes(listener)) {
-      held.push(listener);
+    if (!held.some((each) => each.listener === listener)) {
+      const once = typeof options === "object" && options !== null && Boolean(options.once);
+      held.push({ listener, once });
     }
     this[LISTENERS].set(named, held);
+    // `{ signal }` is the way a listener is removed without being held
+    // on to, and a library that passes one expects the listener to go
+    // when the controller is aborted rather than to stay.
+    const signal = typeof options === "object" && options !== null ? options.signal : undefined;
+    if (signal !== undefined && signal !== null) {
+      signal.addEventListener("abort", () => unlistened.call(this, named, listener));
+    }
   }
 
   function unlistened(type, listener) {
@@ -1984,9 +2410,31 @@
     if (held === undefined) {
       return;
     }
-    const at = held.indexOf(listener);
+    const at = held.findIndex((each) => each.listener === listener);
     if (at !== -1) {
       held.splice(at, 1);
+    }
+  }
+
+  /// The thing a library extends when it wants to emit events of its
+  /// own, which is most of them: an sdk that reports its own retries,
+  /// a redis client, a stripe client. There is no tree here, so this
+  /// is one object dispatching to its own listeners and nothing else.
+  class EventTarget {
+    constructor() {
+      listens(this);
+    }
+
+    addEventListener(type, listener, options = {}) {
+      listened.call(this, type, listener, options);
+    }
+
+    removeEventListener(type, listener) {
+      unlistened.call(this, type, listener);
+    }
+
+    dispatchEvent(event) {
+      return fires(this, event);
     }
   }
 
@@ -2012,12 +2460,12 @@
     }
   }
 
-  class AbortSignal {
+  class AbortSignal extends EventTarget {
     constructor(guard) {
       if (guard !== SIGNAL) {
         throw new TypeError("an AbortSignal is made by an AbortController");
       }
-      listens(this);
+      super();
       this[REASON] = undefined;
       this.onabort = null;
     }
@@ -2036,18 +2484,6 @@
       }
     }
 
-    addEventListener(type, listener) {
-      listened.call(this, type, listener);
-    }
-
-    removeEventListener(type, listener) {
-      unlistened.call(this, type, listener);
-    }
-
-    dispatchEvent(event) {
-      fires(this, event);
-      return true;
-    }
   }
 
   class AbortController {
@@ -2096,9 +2532,9 @@
   const CLOSING = 2;
   const CLOSED = 3;
 
-  class WebSocket {
+  class WebSocket extends EventTarget {
     constructor(url, protocols = []) {
-      listens(this);
+      super();
       this.onopen = null;
       this.onmessage = null;
       this.onerror = null;
@@ -2148,18 +2584,6 @@
       this[BINARY] = kind;
     }
 
-    addEventListener(type, listener) {
-      listened.call(this, type, listener);
-    }
-
-    removeEventListener(type, listener) {
-      unlistened.call(this, type, listener);
-    }
-
-    dispatchEvent(event) {
-      fires(this, event);
-      return true;
-    }
 
     send(data) {
       if (this[READY] === CONNECTING) {
@@ -2441,9 +2865,11 @@
     CloseEvent,
     DOMException,
     CryptoKey,
+    CustomEvent,
     EdgeRuntime,
     ErrorEvent,
     Event,
+    EventTarget,
     MessageEvent,
     WebSocket,
     File,
@@ -2455,6 +2881,9 @@
     TextEncoder,
     ReadableStream,
     ReadableStreamDefaultReader,
+    TransformStream,
+    WritableStream,
+    WritableStreamDefaultWriter,
     URL,
     URLSearchParams,
     atob,
@@ -2464,6 +2893,8 @@
     console,
     crypto,
     fetch,
+    navigator,
+    performance,
     queueMicrotask,
     setInterval,
     setTimeout,

@@ -54,6 +54,28 @@ pub fn op_zou_clear(state: &mut OpState, #[smi] id: u32) {
     }
 }
 
+/// When this isolate started, which is what `performance.timeOrigin`
+/// counts from.
+///
+/// A monotonic instant rather than a wall clock reading, because the
+/// number this is here for is a duration: a library timing its own
+/// work with `performance.now()` should not see time go backwards
+/// because ntp corrected the host's clock in the middle of a call.
+pub struct Started(pub std::time::Instant);
+
+impl Default for Started {
+    fn default() -> Self {
+        Started(std::time::Instant::now())
+    }
+}
+
+/// Milliseconds since the isolate started, fraction and all, which is
+/// `performance.now()`.
+#[op2(fast)]
+pub fn op_zou_now(state: &mut OpState) -> f64 {
+    state.borrow::<Started>().0.elapsed().as_secs_f64() * 1000.0
+}
+
 /// How long to sleep for, out of a number javascript is allowed to
 /// hand over and this is not allowed to panic on.
 ///
