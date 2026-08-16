@@ -441,6 +441,27 @@ And the fixture itself was wrong in a way only the reference could say.
 It granted the reads and left the writes ungranted, on the reasoning that a service key has `bypassrls` and needs no grant, and every write in it failed against `supabase start` with a 403: `bypassrls` is about policies and grants are grants.
 zou took the writes because its bootstrap grants the three api roles everything in `public`, which upstream's default privileges do not, and that difference is [#344](https://github.com/tamnd/zou/issues/344) rather than something to hide in a fixture.
 
+`js-functions/` is the only directory here that ships code somebody deploys rather than requests somebody sends.
+
+An edge function is not a request, it is a project: a directory per function, an `index.ts` in each, `_shared` beside them, and a `config.toml` that says which of them may be called without a token.
+So the suite is that project, and both legs put it on disk unedited, one under `zou functions serve` and the other under a `supabase start` with edge-runtime in it.
+There is nothing upstream to copy, the way there was nothing for presence: supabase-js's own suite has one line about functions in it and edge-runtime's tests are about the runtime rather than about the surface a project sees.
+20 tests in three files, and the reference leg is what makes them a statement about Supabase rather than about zou.
+
+`entry.test.ts` is the three ways a module says what to run, all three deployed and all three called, because `Deno.serve` is the documented one and the other two are what most functions in the wild are written with.
+`invoke.test.ts` is the invocation: supabase-js's own `functions.invoke`, the refusals, the two error pages, and an answer arriving before the work `waitUntil` was handed has finished.
+The refusals are three rather than one because the server tells them apart before it verifies anything, and no header, a string that is not a token, and a token signed with something else are three codes and three messages.
+`runtime.test.ts` is what the handler is given: the five environment variables, the web surface, a body that arrives in pieces as it is written, the headers describing the request that reached the front door, and CORS.
+
+Two questions have two right answers and both are asserted rather than skipped, because a suite that skips a divergence stops noticing the day one of the two changes.
+A preflight is answered by kong on the local stack before the function is reached, and zou hands it to the function the way the hosted runtime does, so the `_shared/cors.ts` that is in every Supabase example is what decides.
+`SB_EXECUTION_ID` is a uuid on both, and the local stack mints it when the worker is made rather than when a call arrives, so five calls a second apart come back with one id where zou hands each call its own.
+
+It caught one thing on the day it was written, and it is the kind only an end to end suite finds.
+A handler that threw answered 500 after exactly sixty seconds.
+The answer travels back on a channel whose sending end lives in the isolate, the error path returned without taking it, and under the default policy the isolate is kept, so the caller waited for the minute it takes a kept isolate to go idle.
+Every unit test around it passed, because none of them kept the isolate afterwards.
+
 ## The package a project installs, asked the same questions
 
 Everything above runs a zou this harness linked in, against a Postgres somebody else brought up, usually in a container.

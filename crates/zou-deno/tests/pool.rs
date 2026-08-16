@@ -348,3 +348,38 @@ fn a_kept_isolate_calls_the_same_default_export_again() {
     assert_eq!(said(&runtime, &deployed, "one"), "calls 1");
     assert_eq!(said(&runtime, &deployed, "two"), "calls 2");
 }
+
+/// A handler that threw releases the caller as soon as it threw.
+///
+/// The answer travels on a channel rather than as a return value,
+/// because a function that left work behind has answered long before it
+/// is finished. So a call that never answers has to drop its end of
+/// that channel, and a kept isolate is where that goes wrong: whatever
+/// the call was holding stays in the isolate, and the isolate stays.
+/// Before this was fixed the caller waited out the minute it takes an
+/// idle isolate to go home, and then got its 500.
+#[test]
+fn a_handler_that_threw_lets_the_caller_go_at_once() {
+    let deployed = deployed(r#"Deno.serve(() => { throw new Error("no"); });"#);
+    let runtime = kept();
+    let (sent, arrives) = std::sync::mpsc::channel::<zou_functions::Answer>();
+    let refused = runtime.invoke_answering(
+        &deployed.function,
+        call("one"),
+        Box::new(move |answer| {
+            let _ = sent.send(answer);
+        }),
+    );
+    assert!(refused.is_err(), "a handler that threw is an error");
+    // Nobody was answered, and the way a caller is told that is its end
+    // of the channel closing rather than a message arriving.
+    assert!(matches!(
+        arrives.recv_timeout(std::time::Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
+    // And the isolate is still there, which is the other half of it:
+    // this is a release rather than a teardown.
+    let deployed = self::deployed(COUNTING);
+    assert_eq!(said(&runtime, &deployed, "two"), "calls 1");
+    assert_eq!(said(&runtime, &deployed, "three"), "calls 2");
+}

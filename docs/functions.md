@@ -381,6 +381,10 @@ Four variables are the project's and are the same on every call.
 
 `SB_EXECUTION_ID` is the fifth and is one per invocation, which is what ties a log line from inside a function to the request that caused it.
 
+On `supabase start` it is one per worker rather than one per call.
+The local runtime sets it in the worker's environment when the worker is made, and a worker is kept between calls, so a function called five times a second apart is handed one id five times.
+Both are a uuid and both are set on every call, and the difference is only visible to a function that logs it or returns it, which is the case the conformance suite asks about and asserts on both sides.
+
 The environment this server process was started with is not in it, which matters because that environment is holding a database password and a function is somebody else's code.
 `Deno.env.set` and `Deno.env.delete` throw: these are a project's settings rather than a shell.
 
