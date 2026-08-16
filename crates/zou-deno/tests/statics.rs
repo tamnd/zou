@@ -256,3 +256,25 @@ fn an_edited_page_is_read_again_without_the_isolate_going_anywhere() {
         .expect("an answer");
     assert_eq!(String::from_utf8_lossy(twice.bytes()), "after");
 }
+
+/// A page read at the top of the module and answered with from then on,
+/// which is the other half of what an isolate owns whether or not a
+/// call is in it: the environment and the files. A template loaded once
+/// into a constant is ordinary enough that it has to work.
+#[test]
+fn a_page_is_readable_before_anything_is_served() {
+    let deployed = project(
+        &[
+            (
+                "functions/hello/index.ts",
+                r#"
+                const page = Deno.readTextFileSync("./page.html");
+                Deno.serve(() => new Response(page));
+                "#,
+            ),
+            ("functions/hello/page.html", "<h1>read at the top</h1>"),
+        ],
+        &["./functions/hello/*.html"],
+    );
+    assert_eq!(said(&deployed), "<h1>read at the top</h1>");
+}

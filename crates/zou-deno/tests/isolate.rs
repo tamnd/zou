@@ -238,6 +238,32 @@ fn the_environment_is_the_runtimes_and_never_the_processes() {
     );
 }
 
+/// The line the Supabase examples open with, near enough word for word:
+/// `const client = new Thing(Deno.env.get("KEY"))` at the top of the
+/// module, before anything is served. Twenty five of the thirty nine
+/// functions in that repository read the environment there, so a
+/// runtime that only has one once a call is in it serves none of them.
+#[test]
+fn the_environment_is_readable_before_anything_is_served() {
+    let deployed = deployed(
+        r#"
+        const key = Deno.env.get("RESEND_API_KEY") ?? "nothing at the top";
+        Deno.serve(() => new Response(key));
+        "#,
+    );
+    let isolate = Isolate::with_env(vec![(
+        "RESEND_API_KEY".to_string(),
+        "re_the_projects_own".to_string(),
+    )]);
+    let answer = isolate
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect("an answer");
+    assert_eq!(body(&answer), "re_the_projects_own");
+}
+
 /// One per invocation, which is what ties a log line inside a function
 /// to the request that caused it, so a project that sets the name in its
 /// own environment does not get to decide what the logs are keyed on.
@@ -537,6 +563,29 @@ fn a_handler_that_answers_with_something_that_is_not_a_response_is_an_error() {
     .why()
     .to_string();
     assert!(complaint.contains("must return a Response"), "{complaint}");
+}
+
+/// `Deno.core.ops` is reachable from a function, and the ops behind it
+/// are written for a call that is being answered. Reaching one where
+/// there is no call is a mistake somebody's javascript is allowed to
+/// make, and the whole server is not allowed to go for it: a panic in
+/// an op cannot unwind and takes the process with it.
+#[test]
+fn an_op_reached_where_there_is_no_call_is_an_error_and_not_a_dead_server() {
+    let complaint = called(
+        r#"
+        Deno.core.ops.op_zou_call();
+        Deno.serve(() => new Response("never reached"));
+        "#,
+        get("http://localhost:9000/functions/v1/hello"),
+    )
+    .expect_err("a complaint")
+    .why()
+    .to_string();
+    assert!(
+        complaint.contains("no call is being answered"),
+        "{complaint}"
+    );
 }
 
 #[test]
