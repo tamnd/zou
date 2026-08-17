@@ -28,28 +28,52 @@ use std::time::{Duration, SystemTime};
 
 use zou_functions::{Function, Layout, Registry};
 
-/// What every function of this project sees in `Deno.env`, upstream's
-/// four project wide variables.
+/// What every function of this project sees in `Deno.env`, the project
+/// wide variables upstream sets.
 ///
-/// The fifth, `SB_EXECUTION_ID`, is one per invocation and is added by
+/// One more, `SB_EXECUTION_ID`, is one per invocation and is added by
 /// the runtime out of the call rather than living here.
 pub fn env(port: u16, anon: &str, service: &str, db: &str) -> Vec<(String, String)> {
     env_at(&format!("http://127.0.0.1:{port}"), anon, service, db)
 }
 
-/// The same four, for a server that knows its own url rather than a
-/// port on loopback: a node serving a project on a domain of its own
-/// has to tell that project's functions where the project is, because
-/// a function calling `createClient(Deno.env.get("SUPABASE_URL"))` is
+/// The same, for a server that knows its own url rather than a port on
+/// loopback: a node serving a project on a domain of its own has to
+/// tell that project's functions where the project is, because a
+/// function calling `createClient(Deno.env.get("SUPABASE_URL"))` is
 /// calling the api it was deployed next to and not the machine it
 /// happens to be running on.
+///
+/// The two maps at the end are the newer names, and they are here
+/// because a function that reads them is most of the Supabase examples
+/// project now: `npm:@supabase/server` builds a client before the
+/// handler runs, and with no key to build it with it refuses before
+/// anybody's code has said anything. It reads `SUPABASE_PUBLISHABLE_KEY`
+/// first and falls back to a `default` entry in the plural, which is
+/// the shape `supabase start` sets, so that is the shape set here.
+///
+/// The values are this project's anon and service_role keys rather than
+/// `sb_publishable_` and `sb_secret_` strings, because zou does not
+/// issue those and inventing the prefix would be a claim about a format
+/// nothing here implements. A library treats the value as opaque and
+/// sends it back as the apikey, which is a key this server accepts.
 pub fn env_at(url: &str, anon: &str, service: &str, db: &str) -> Vec<(String, String)> {
     vec![
         ("SUPABASE_URL".to_string(), url.to_string()),
         ("SUPABASE_ANON_KEY".to_string(), anon.to_string()),
         ("SUPABASE_SERVICE_ROLE_KEY".to_string(), service.to_string()),
         ("SUPABASE_DB_URL".to_string(), db.to_string()),
+        ("SUPABASE_PUBLISHABLE_KEYS".to_string(), default_key(anon)),
+        ("SUPABASE_SECRET_KEYS".to_string(), default_key(service)),
     ]
+}
+
+/// One key, in the map of named keys a project can have. Written by
+/// hand rather than through serde because it is one string in one
+/// object and the escaping a key needs is none: these are base64url
+/// with dots in, or `sb_`-prefixed, and neither has a quote in it.
+fn default_key(key: &str) -> String {
+    format!("{{\"default\":\"{key}\"}}")
 }
 
 /// What this build runs functions with, in the words the log and
@@ -871,7 +895,7 @@ mod tests {
     }
 
     #[test]
-    fn the_four_variables_are_the_projects_own() {
+    fn the_variables_a_server_owns_are_the_projects_own() {
         let env = env(54321, "an-anon-key", "a-service-key", "postgres://x/y");
         assert_eq!(
             env,
@@ -886,12 +910,40 @@ mod tests {
                     "a-service-key".to_string()
                 ),
                 ("SUPABASE_DB_URL".to_string(), "postgres://x/y".to_string()),
+                (
+                    "SUPABASE_PUBLISHABLE_KEYS".to_string(),
+                    "{\"default\":\"an-anon-key\"}".to_string()
+                ),
+                (
+                    "SUPABASE_SECRET_KEYS".to_string(),
+                    "{\"default\":\"a-service-key\"}".to_string()
+                ),
             ]
         );
         assert!(
             !env.iter().any(|(name, _)| name == "SB_EXECUTION_ID"),
             "the per invocation one is the call's and not the project's"
         );
+    }
+
+    /// The map is what `npm:@supabase/server` reads, so what matters
+    /// about it is that a json parse of it has a `default` in it.
+    #[test]
+    fn the_newer_names_are_a_map_with_a_default_in_it() {
+        let env = env(54321, "an-anon-key", "a-service-key", "postgres://x/y");
+        for (name, key) in [
+            ("SUPABASE_PUBLISHABLE_KEYS", "an-anon-key"),
+            ("SUPABASE_SECRET_KEYS", "a-service-key"),
+        ] {
+            let raw = env
+                .iter()
+                .find(|(seen, _)| seen == name)
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_else(|| panic!("{name} is set"));
+            let keys: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(raw).unwrap_or_else(|e| panic!("{name} is json: {e}"));
+            assert_eq!(keys.get("default").map(String::as_str), Some(key));
+        }
     }
 
     #[test]

@@ -446,21 +446,22 @@ zou took the writes because its bootstrap grants the three api roles everything 
 An edge function is not a request, it is a project: a directory per function, an `index.ts` in each, `_shared` beside them, and a `config.toml` that says which of them may be called without a token.
 So the suite is that project, and both legs put it on disk unedited, one under `zou functions serve` and the other under a `supabase start` with edge-runtime in it.
 There is nothing upstream to copy, the way there was nothing for presence: supabase-js's own suite has one line about functions in it and edge-runtime's tests are about the runtime rather than about the surface a project sees.
-22 tests in three files, and the reference leg is what makes them a statement about Supabase rather than about zou.
+24 tests in three files, and the reference leg is what makes them a statement about Supabase rather than about zou.
 
 `entry.test.ts` is the three ways a module says what to run, all three deployed and all three called, because `Deno.serve` is the documented one and the other two are what most functions in the wild are written with.
 It is also where a function the config file names rather than the listing is asked for, with its entrypoint two directories down and no directory of its own, which is how the examples project deploys its mcp server.
 `invoke.test.ts` is the invocation: supabase-js's own `functions.invoke`, the refusals, the two error pages, and an answer arriving before the work `waitUntil` was handed has finished.
 The refusals are three rather than one because the server tells them apart before it verifies anything, and no header, a string that is not a token, and a token signed with something else are three codes and three messages.
-`runtime.test.ts` is what the handler is given: the five environment variables, the web surface, a body that arrives in pieces as it is written, the headers describing the request that reached the front door, and CORS.
+`runtime.test.ts` is what the handler is given: the environment variables, the web surface, a body that arrives in pieces as it is written, the headers describing the request that reached the front door, and CORS.
 
-Two questions have two right answers and both are asserted rather than skipped, because a suite that skips a divergence stops noticing the day one of the two changes.
+Three questions have two right answers and all three are asserted rather than skipped, because a suite that skips a divergence stops noticing the day one of the two changes.
 A preflight is answered by kong on the local stack before the function is reached, and zou hands it to the function the way the hosted runtime does, so the `_shared/cors.ts` that is in every Supabase example is what decides.
 `SB_EXECUTION_ID` is a uuid on both, and the local stack mints it when the worker is made rather than when a call arrives, so five calls a second apart come back with one id where zou hands each call its own.
+`SUPABASE_JWKS` is set on the local stack, which signs a project's tokens with a key pair and publishes the public half, and unset on zou, which signs with one shared secret and has nothing asymmetric to publish.
 
 The zou leg is run twice, and that is a claim the other suites cannot make.
 The first run serves the project directory, the way a person does while writing a function.
-The second deploys that same directory to a store with `zou functions deploy`, serves what was written there with `zou functions serve --target`, and asks the same 22 questions of it, on a process that has no project directory at all.
+The second deploys that same directory to a store with `zou functions deploy`, serves what was written there with `zou functions serve --target`, and asks the same 24 questions of it, on a process that has no project directory at all.
 A deploy carries a subset of a project on purpose, it drops every dotfile and it flattens what the config file said into a manifest, so whether what comes back is still the project is exactly the kind of thing that is easy to assume and cheap to ask.
 Both legs are `needs` of the scoreboard job, so a deployment that answered differently stops the page from being regenerated.
 
@@ -486,12 +487,20 @@ A function ran when its own code or its own library produced the outcome: a refu
 It did not run when the module never finished loading or when it reached for a runtime api that is not there.
 Which of the two happened is read off the server log rather than off the status, because from the outside both are a 500.
 
-39 names were asked of both servers on 2026-08-16.
-zou ran 28, `supabase start` ran 34, and they agree on 25.
-The 39 is the union of the two lists a server serves: 39 of the 42 directories have an `index.ts`, `config.toml` adds `simple-mcp-server` which has no directory at all, and `wasm-modules` is left out of the comparison because its build artifact is not in the checkout and the reference has nothing to serve.
+40 names were asked on 2026-08-16.
+zou ran 28, `supabase start` ran 34, they agree on 25, and 20 of the 40 answer the same status with the same bytes on both.
+The 40 is the union of the two lists a server serves: 39 of the 42 directories have an `index.ts`, and `config.toml` adds `simple-mcp-server`, which has no directory at all.
+
+One of the 40 is asked of one server only, and it is worth a sentence because the two refuse it differently.
+`wasm-modules` imports a file a wasm build writes and nobody built, so neither server can load it.
+zou serves the other thirty nine and answers 500 for that one, and the CLI reads the whole project before it starts anything and will not bring the stack up at all while the function is in the directory, so the reference copy has it taken out.
 
 The five most useful rows are the failures that are byte for byte identical on both servers, out of Resend, the OpenAI sdk, ElevenLabs, Stripe and grammy.
 Those are third party npm packages resolved, loaded and run far enough to make a decision about their own configuration, and the two runtimes reached the same sentence.
+
+The identical count was 16 until the day zou set `SUPABASE_PUBLISHABLE_KEYS` and `SUPABASE_SECRET_KEYS`.
+Most of this corpus goes through `npm:@supabase/server`, which builds a client out of those before a handler runs and refuses the request when it finds neither, and four functions went straight from that refusal to the reference's own answer.
+A fifth, `custom-jwt-validation`, got past the client and landed on `AbortSignal.timeout`, which zou does not have, so the environment had been hiding a runtime gap rather than there being nothing there.
 
 The three zou runs and upstream does not are all one shape: upstream builds the module graph ahead of time and refuses a graph it cannot complete, and zou fetches a module when something asks for it, so a type only file nobody imports at runtime is never fetched.
 The nine the other way are nine different things rather than one, which is why they are follow ups: top level await that never settles because the thing awaited is a server already listening, `Deno.connect`, `Deno.readFile` of an https url, a module served with no content type, esm.sh answering 500, a browser build missing an export, and the mcp sdk failing inside the registry's build of itself.

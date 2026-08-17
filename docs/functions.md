@@ -403,7 +403,7 @@ The body has a ceiling of 20 MiB, which is zou's own number and not upstream's.
 
 ## Deno.env
 
-Four variables are the project's and are the same on every call.
+Six variables are the project's and are the same on every call.
 
 | Variable | What it is |
 | --- | --- |
@@ -411,8 +411,17 @@ Four variables are the project's and are the same on every call.
 | `SUPABASE_ANON_KEY` | The project's anon key |
 | `SUPABASE_SERVICE_ROLE_KEY` | The service role key, which bypasses row level security, so a function that uses it is deciding who may do what by itself |
 | `SUPABASE_DB_URL` | The database, as a url |
+| `SUPABASE_PUBLISHABLE_KEYS` | `{"default": <the anon key>}` |
+| `SUPABASE_SECRET_KEYS` | `{"default": <the service role key>}` |
 
-`SB_EXECUTION_ID` is the fifth and is one per invocation, which is what ties a log line from inside a function to the request that caused it.
+The last two are the newer names, and they are a map because a project can have several keys with a name each and a library picks one out by name.
+`npm:@supabase/server` reads `SUPABASE_PUBLISHABLE_KEY` first and then the `default` entry of the plural, and it builds its client before a handler runs, so a function that uses it and finds neither refuses the request before anybody's code has said anything.
+
+The values are this project's own keys rather than `sb_publishable_` and `sb_secret_` strings.
+zou does not issue keys in that format and writing the prefix onto something that is not one would be a claim about a format nothing here implements.
+A library treats the value as opaque and sends it back as the apikey header, which is a key this server accepts, so the round trip works either way.
+
+`SB_EXECUTION_ID` is one per invocation, which is what ties a log line from inside a function to the request that caused it.
 
 On `supabase start` it is one per worker rather than one per call.
 The local runtime sets it in the worker's environment when the worker is made, and a worker is kept between calls, so a function called five times a second apart is handed one id five times.
@@ -423,7 +432,7 @@ The environment this server process was started with is not in it, which matters
 
 ## Secrets
 
-A project's own variables go underneath those five, from two places.
+A project's own variables go underneath those, from two places.
 
 `supabase/functions/.env` is the first, and it is read with no flag and no command.
 
