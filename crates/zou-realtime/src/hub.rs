@@ -39,6 +39,29 @@ const BACKLOG: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SocketId(u64);
 
+impl SocketId {
+    /// A name that came from somewhere else, which is a socket on
+    /// another node arriving over a link. The number is that node's
+    /// own and means nothing here beyond telling one from another.
+    pub fn of(id: u64) -> SocketId {
+        SocketId(id)
+    }
+
+    /// Nobody on this node.
+    ///
+    /// What a broadcast from another node's socket is attributed to,
+    /// so that the sender check every socket here makes says no. A
+    /// counter that starts at zero and only goes up never reaches it.
+    pub fn elsewhere() -> SocketId {
+        SocketId(u64::MAX)
+    }
+
+    /// The number itself, which is what goes on a wire.
+    pub fn raw(&self) -> u64 {
+        self.0
+    }
+}
+
 impl std::fmt::Display for SocketId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -124,6 +147,21 @@ impl Hub {
     /// one.
     pub fn fan(&self, from: SocketId, fan: Fanout) -> usize {
         self.send(from, Sent::Broadcast(fan))
+    }
+
+    /// Hand something that was sent somewhere else to the sockets here.
+    ///
+    /// A broadcast or a presence diff that happened on the node holding
+    /// the tenant, arriving on a node that has only the sockets. The
+    /// count is what it reached here, which is what this node spent of
+    /// the project's budget on it.
+    ///
+    /// `from` is the socket it came from when that socket is one of
+    /// this node's and [`SocketId::elsewhere`] when it is not, which is
+    /// what keeps a broadcast that asked not to be echoed from reaching
+    /// its own sender the long way round.
+    pub fn relay(&self, from: SocketId, sent: Sent) -> usize {
+        self.send(from, sent)
     }
 
     fn send(&self, from: SocketId, sent: Sent) -> usize {

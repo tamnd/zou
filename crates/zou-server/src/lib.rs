@@ -36,6 +36,7 @@ pub mod blob;
 pub mod cdc;
 pub mod cron;
 pub mod edge;
+pub mod fanout;
 pub mod fleet;
 pub mod forward;
 pub mod functions;
@@ -62,6 +63,7 @@ pub mod rest;
 pub mod s3;
 pub mod sms;
 pub mod smtp;
+pub mod source;
 pub mod sql;
 pub mod storage;
 pub mod tenant;
@@ -231,6 +233,17 @@ pub struct Config {
     /// project is made with. A zero on any of them is that one off,
     /// which is what a server running its own project usually wants.
     pub realtime: zou_realtime::Limits,
+    /// The node that holds this project, when this one only holds its
+    /// sockets. An http base url like http://10.0.0.4:8000, and the
+    /// link to it is a websocket on that same port.
+    ///
+    /// None, and this node holds everything a socket needs, which is
+    /// every single node deployment and every node serving a tenant it
+    /// has the lease on. Set, and there is no database here and no
+    /// change reader: the topics are carried locally so one message
+    /// from the holder reaches every socket here, and the two questions
+    /// only a database can answer go up the link.
+    pub holder: Option<String>,
     /// How hard a database webhook is tried: how many attempts in
     /// total and how long the first wait between them is. One attempt
     /// is pg_net's own behaviour.
@@ -280,6 +293,7 @@ impl Default for Config {
             s3: None,
             passthrough: None,
             realtime: zou_realtime::Limits::default(),
+            holder: None,
             webhook: webhook::Retries::default(),
             functions: None,
         }
@@ -335,6 +349,11 @@ pub struct App {
     /// what makes two browser tabs on the same channel hear each
     /// other.
     pub hub: zou_realtime::Hub,
+    /// Where a socket's topics, changes and answers come from: this
+    /// node, or the node that holds this tenant over one link per
+    /// tenant. Everything the socket loop does goes through it, so the
+    /// two are the same code with a different answer to one question.
+    pub source: source::Source,
     /// What the sockets have spent of the realtime budget: how many
     /// are connected, how fast they are joining, how many messages a
     /// second are moving. One per server, like the hub, because the
@@ -441,6 +460,10 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         None => None,
     };
     let quota = Arc::new(realtime::Quota::new(cfg.realtime));
+    let source = match &cfg.holder {
+        Some(holder) => source::Source::Away(Arc::new(fanout::Away::new(holder, &cfg.jwt_secret))),
+        None => source::Source::Held,
+    };
     Ok(Arc::new(App {
         cfg,
         pool,
@@ -457,6 +480,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         sending: tokio::sync::OnceCell::new(),
         blobs,
         hub: zou_realtime::Hub::new(),
+        source,
         quota,
         changes: Arc::new(reader::Changes::new()),
         reading: tokio::sync::OnceCell::new(),
@@ -851,6 +875,10 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         // one. Everything else under the prefix is still the honest
         // 501.
         .route("/realtime/v1/websocket", any(realtime::websocket))
+        // The link between a node with the sockets and the node with
+        // the tenant. Under the same gate as everything else, because
+        // what opens it is the project's own service key.
+        .route("/realtime/v1/link", any(fanout::link))
         .route("/realtime/v1/api/broadcast", post(realtime::broadcast))
         .route(
             "/realtime/v1/api/broadcast/{topic}/events/{event}",

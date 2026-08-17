@@ -97,6 +97,16 @@ impl Quota {
         self.events.count(1 + reached as u64);
     }
 
+    /// Events this project spent somewhere this process cannot see.
+    ///
+    /// The budget is the project's rather than a node's, and a project
+    /// whose sockets are on other nodes has most of its deliveries
+    /// happening on them. Each node counts what a message reached
+    /// there and says so up its link, and this is where that lands.
+    pub fn spent(&self, events: u64) {
+        self.events.count(events);
+    }
+
     /// The messages a second this project is moving, which is what the
     /// http broadcast endpoints report in their headers.
     pub fn events_per_second(&self) -> f64 {
@@ -267,6 +277,7 @@ pub async fn websocket(
     axum::extract::State(app): axum::extract::State<Arc<App>>,
     axum::Extension(auth): axum::Extension<AuthContext>,
     uri: Uri,
+    headers: HeaderMap,
     upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
     let Ok(upgrade) = upgrade else {
@@ -307,6 +318,7 @@ pub async fn websocket(
         role: auth.role.clone(),
         claims: (*auth.claims).clone(),
     };
+    let bearer = bearer_of(&headers, &uri);
     let anon_role = app.cfg.anon_role.clone();
     upgrade.on_upgrade(move |socket| async move {
         // A router can be built outside a runtime, so what listens for
@@ -331,7 +343,7 @@ pub async fn websocket(
         };
         run(
             socket,
-            Session::budgeted(vsn, identity, budget),
+            Session::budgeted(vsn, identity, budget).with_bearer(bearer),
             &app,
             &tokens,
         )
@@ -339,19 +351,39 @@ pub async fn websocket(
     })
 }
 
+/// The token this socket connected with, as the client sent it.
+///
+/// The same precedence the gate went by: the bearer when there is one,
+/// and the project key when there is not. Kept as the token rather than
+/// only as the claims read out of it because a node that does not hold
+/// this tenant has to hand it to the node that does, and a node
+/// asserting a claim set would be a node that can claim to be anybody.
+fn bearer_of(headers: &HeaderMap, uri: &Uri) -> Option<String> {
+    if let Some(bearer) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    {
+        return Some(bearer.trim().to_string());
+    }
+    headers
+        .get("apikey")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| query(uri, "apikey"))
+}
+
 /// One connection, until it goes.
 async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens: &dyn Tokens) {
-    let hub = &app.hub;
-    let me = hub.socket();
+    // Where this socket's topics, changes and answers come from, which
+    // is this node when it holds the tenant and the node that does when
+    // it does not. Everything below is the same call under both.
+    let (me, mut watching) = app.source.joined(app).await;
     // The topics this socket is on, each with the receiver it is
     // hearing them through. A join adds one and a leave drops one,
     // which is what stops a channel the client left from being
     // polled.
     let mut carrying: HashMap<String, tokio::sync::broadcast::Receiver<Delivery>> = HashMap::new();
-    // Where this socket's database changes arrive, once it has asked
-    // for any. A socket that never subscribes to a table never has one,
-    // and so costs the reader nothing at all.
-    let mut watching: Option<Listening> = None;
     loop {
         let heard = match (carrying.is_empty(), watching.as_mut()) {
             // Nothing to fan in and nothing subscribed, so this is just
@@ -442,26 +474,24 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
     // Every subscription this socket held, out of the index the reader
     // walks for each changed row. A socket that went and left its
     // bindings behind would be a policy check per row for nobody.
-    if let Some(changes) = watching {
-        app.changes.hung_up(changes.id);
-    }
+    app.source.hung_up(app, me, watching).await;
     let topics: Vec<String> = carrying.keys().cloned().collect();
     // The presence goes before the receivers do, so the diff saying
     // this socket left is fanned while the topic is still up.
     for topic in &topics {
-        hub.untrack(me, topic);
+        app.source.untrack(app, me, topic).await;
     }
     // Dropping the receivers is what actually takes this socket off
     // the topics; releasing after that is the bookkeeping that lets
     // the hub forget a topic nobody is on any more.
     drop(carrying);
     for topic in &topics {
-        hub.released(topic);
+        app.source.released(app, topic).await;
     }
 }
 
 /// What woke the loop.
-enum Heard {
+pub(crate) enum Heard {
     Client(Option<Result<Message, axum::Error>>),
     Fanned(Delivery),
     Lagged(String, u64),
@@ -476,7 +506,7 @@ enum Heard {
 /// of channels rather than thousands, and because the alternative is a
 /// task and a queue per socket to merge them, which is more moving
 /// parts than a browser tab's worth of channels deserves.
-async fn next_delivery(
+pub(crate) async fn next_delivery(
     carrying: &mut HashMap<String, tokio::sync::broadcast::Receiver<Delivery>>,
 ) -> Heard {
     let mut waiting: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Heard> + Send>>> =
@@ -525,7 +555,6 @@ async fn act(
     carrying: &mut HashMap<String, tokio::sync::broadcast::Receiver<Delivery>>,
     watching: &mut Option<Listening>,
 ) -> bool {
-    let hub = &app.hub;
     for action in actions {
         match action {
             Action::Text(text) => {
@@ -539,24 +568,25 @@ async fn act(
                 }
             }
             Action::Carry(topic) => {
-                carrying.insert(topic.clone(), hub.carry(&topic));
+                carrying.insert(topic.clone(), app.source.carry(app, &topic).await);
             }
             Action::Drop(topic) => {
                 carrying.remove(&topic);
-                hub.released(&topic);
+                app.source.released(app, &topic).await;
             }
             // What the message cost the project is what it reached,
             // which is only known here: the hub is the one thing that
             // knows how many sockets were on the topic.
-            Action::Fan(fan) => app.quota.sent(hub.fan(me, fan)),
+            Action::Fan(fan) => app.quota.sent(app.source.fan(app, me, fan).await),
             Action::Track {
                 topic,
                 key,
                 payload,
-            } => hub.track(me, &topic, key, payload),
-            Action::Untrack(topic) => hub.untrack(me, &topic),
+            } => app.source.track(app, me, &topic, key, payload).await,
+            Action::Untrack(topic) => app.source.untrack(app, me, &topic).await,
             Action::State(topic) => {
-                let state = session.state(&topic, hub.state(&topic));
+                let there = app.source.state(app, &topic).await;
+                let state = session.state(&topic, there);
                 if let Action::Text(text) = state
                     && socket.send(Message::Text(text.into())).await.is_err()
                 {
@@ -568,7 +598,10 @@ async fn act(
             // policies have answered, which is what makes a private
             // channel private.
             Action::Ask(ask) => {
-                let granted = answer(app, session.identity(), &ask).await;
+                let granted = app
+                    .source
+                    .ask(app, session.bearer(), session.identity(), &ask)
+                    .await;
                 let next = session.authorized(&ask, granted);
                 if !Box::pin(act(socket, next, session, app, me, carrying, watching)).await {
                     return false;
@@ -578,25 +611,20 @@ async fn act(
             // carries an id per subscription and nobody has one until
             // the reader has been told what to look for.
             Action::Watch { topic, wants } => {
-                let ids = subscribed(app, session.identity(), watching, &wants).await;
+                let ids = app
+                    .source
+                    .watch(app, session.identity(), watching, &wants)
+                    .await;
                 let next = session.watching(&topic, ids);
                 if !Box::pin(act(socket, next, session, app, me, carrying, watching)).await {
                     return false;
                 }
             }
-            Action::Unwatch(ids) => {
-                for id in ids {
-                    app.changes.unbind(id);
-                }
-            }
+            Action::Unwatch(ids) => app.source.unwatch(app, ids).await,
             // The claims a row is checked against are the ones the
             // socket has now, so a refreshed token is told to the
             // reader before it reads anything else.
-            Action::Rewatch => {
-                if let Some(listening) = watching.as_ref() {
-                    app.changes.became(listening.id, asker(session.identity()));
-                }
-            }
+            Action::Rewatch => app.source.became(app, session.identity(), watching).await,
             // Whatever was in front of this has been sent, which is
             // the point of it being an action rather than a return:
             // the client is told why before the socket goes. The close
@@ -614,7 +642,7 @@ async fn act(
 
 /// Who a change is checked against, which is whoever the socket
 /// currently is rather than whoever it was when it subscribed.
-fn asker(who: &Identity) -> Asker {
+pub(crate) fn asker(who: &Identity) -> Asker {
     Asker {
         role: who.role.clone(),
         claims: who.claims.clone(),
@@ -629,7 +657,7 @@ fn asker(who: &Identity) -> Asker {
 /// subscription rather than at the handshake, so a client that only
 /// broadcasts is not a queue the reader has to consider for every
 /// changed row.
-async fn subscribed(
+pub(crate) async fn subscribed(
     app: &Arc<App>,
     who: &Identity,
     watching: &mut Option<Listening>,
@@ -781,7 +809,7 @@ fn reading(app: &Arc<App>) {
 
 /// Go and find out, which is the io a private channel needs and the
 /// reason the session cannot decide one on its own.
-async fn answer(app: &App, who: &Identity, ask: &Ask) -> Result<Grant, String> {
+pub(crate) async fn answer(app: &App, who: &Identity, ask: &Ask) -> Result<Grant, String> {
     let Some(pool) = app.pool.as_ref() else {
         return Err(
             "this server has no database, which is what a private channel is checked against"
