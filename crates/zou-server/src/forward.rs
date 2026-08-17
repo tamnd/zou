@@ -333,7 +333,14 @@ impl Forwarding {
                 status: StatusCode::LOOP_DETECTED,
             };
         }
-        if self.stale_reads && safe(method) {
+        // A socket is not a read, whatever its method says. A handshake
+        // is a GET and what follows it is a connection that lives as
+        // long as the client keeps it, so answering one out of this
+        // node's own copy would not be a slightly old answer, it would
+        // be a room of this node's own for the rest of the day. Where a
+        // socket goes is decided by the caller of this, which serves it
+        // here on a link to the holder rather than out of the data here.
+        if self.stale_reads && safe(method) && !upgrading(headers) {
             let behind = behind(&holder, now_unix());
             if allowed(headers).is_none_or(|max| behind <= max) {
                 return Where::Stale { behind };
@@ -488,6 +495,16 @@ fn behind(holder: &Holder, now_unix: u64) -> u64 {
     holder
         .published_unix
         .map_or(0, |published| now_unix.saturating_sub(published))
+}
+
+/// Whether this request is asking to stop being a request, which is
+/// what a websocket handshake is. The header is a list, and a client
+/// that sends `Upgrade: websocket` sends nothing else in it.
+pub fn upgrading(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
 /// What the caller said it will put up with, if it said anything.
@@ -683,6 +700,30 @@ mod tests {
             decide(&forwarding, "POST", &[]).await.0,
             Where::There { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn a_handshake_is_never_a_stale_read() {
+        let holder = elsewhere(Some("http://10.0.0.4:8000"), Some(now_unix() - 1));
+        let (_peers, _peer, forwarding) = front(Some(holder));
+        let forwarding = forwarding.with_stale_reads(true);
+        // One second behind is inside anything a caller would ask for,
+        // and the method is the same GET a stale read is answered from
+        // here. What makes this different is that the answer is a
+        // connection: the holder is named so its sockets can be served
+        // on a link to it rather than out of this node's own copy.
+        assert_eq!(
+            decide(
+                &forwarding,
+                "GET",
+                &[(header::UPGRADE.as_str(), "websocket")]
+            )
+            .await
+            .0,
+            Where::There {
+                endpoint: "http://10.0.0.4:8000".to_string()
+            }
+        );
     }
 
     #[tokio::test]

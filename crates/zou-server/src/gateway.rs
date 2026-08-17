@@ -18,7 +18,8 @@
 //! more than one project on the node and there is nothing for them to
 //! get wrong about it.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::Body;
@@ -30,7 +31,7 @@ use tower::ServiceExt as _;
 use zou_store::registry::Tenant;
 
 use crate::attach::Attached;
-use crate::forward::{Forwarding, Where};
+use crate::forward::{Forwarding, Where, upgrading};
 use crate::tenant::{Found, Registry, Routing};
 
 struct Front {
@@ -42,6 +43,21 @@ struct Front {
     /// nothing is parsed out of a request at all: every path is that
     /// project's path and every hostname is its hostname.
     only: Option<String>,
+    /// The projects whose sockets are served here and whose data is
+    /// somewhere else, by ref. One entry is one room: every socket for
+    /// that project on this node is on the same hub with the same link
+    /// behind it.
+    sockets: Mutex<HashMap<String, Sockets>>,
+}
+
+/// One project's socket tier on this node.
+struct Sockets {
+    /// The link url this was built for. A lease that moved makes this
+    /// the wrong node to be talking to, so it is compared rather than
+    /// assumed: the next socket to arrive builds a tier pointing at the
+    /// new holder.
+    holder: String,
+    router: Router,
 }
 
 /// A router that serves every tenant on a store.
@@ -71,6 +87,7 @@ pub fn fleet(
             attached,
             forwarding,
             only: None,
+            sockets: Mutex::new(HashMap::new()),
         }))
 }
 
@@ -92,7 +109,52 @@ pub fn only(tenant_ref: String, registry: Arc<Registry>, attached: Arc<Attached>
             attached,
             forwarding: None,
             only: Some(tenant_ref),
+            sockets: Mutex::new(HashMap::new()),
         }))
+}
+
+impl Front {
+    /// The router that serves a project's sockets here while another
+    /// node holds the project itself.
+    ///
+    /// Built once per project per holder, and shared, because one router
+    /// is one hub and one link: every socket for the project on this
+    /// node is then in the same room, and the holder is told about this
+    /// node once rather than once per client.
+    ///
+    /// No lease and no database. What the sockets need of the project is
+    /// its secret, to let a client in, and the address of the node that
+    /// has the rest, to ask it everything else.
+    fn sockets(&self, entry: &Tenant, endpoint: &str) -> Result<Router, String> {
+        // The ref is in the url the link is dialled on, because the node
+        // at the other end has to resolve this project out of something
+        // and a node has no hostname of the project's to present.
+        let holder = format!("{}/{}", endpoint.trim_end_matches('/'), entry.tenant_ref);
+        let mut sockets = self.sockets.lock().expect("the socket tier");
+        if let Some(up) = sockets.get(&entry.tenant_ref)
+            && up.holder == holder
+        {
+            return Ok(up.router.clone());
+        }
+        let router = crate::router(crate::Config {
+            jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
+            holder: Some(holder.clone()),
+            ..crate::Config::default()
+        })?;
+        // Replacing an entry drops this node's old link, and the sockets
+        // that were on it are told there is a gap the way any broken
+        // link tells them, because the room they were in has moved. The
+        // ones still inside a handler keep their own hold on it, so
+        // nothing is cut off mid frame.
+        sockets.insert(
+            entry.tenant_ref.clone(),
+            Sockets {
+                holder,
+                router: router.clone(),
+            },
+        );
+        Ok(router)
+    }
 }
 
 /// Bring the one project up before anything asks for it.
@@ -137,34 +199,46 @@ async fn dispatch(State(front): State<Arc<Front>>, mut req: Request<Body>) -> Re
     // that goes to a peer goes as it arrived, path and all, so the peer
     // resolves the same tenant this node just did.
     let mut stale = None;
+    let mut sockets = None;
     if let Some(forwarding) = &front.forwarding {
         match forwarding
             .decide(&found.tenant_ref, req.method(), req.headers())
             .await
         {
             Where::Here => {}
-            // A socket is not a read, whatever its method says, and it
-            // is not a thing the relay can carry either: forwarding is
-            // a request and an answer, and an upgrade is neither. So a
-            // node that is not the holder says so, and says it to the
-            // one kind of request that would otherwise have been served
-            // here and quietly cut off from the rest of the project.
-            Where::Stale { .. } | Where::There { .. } if upgrading(&req) => {
-                return unavailable("this project's sockets are served by the node holding it");
-            }
             Where::Stale { behind } => stale = Some(behind),
+            // A socket is not a thing the relay can carry: forwarding is
+            // a request and an answer, and an upgrade is neither. It is
+            // also the one part of a project that needs no lease, so it
+            // is served here on this node's own hub with a link to the
+            // holder behind it, which is what the fan out tier is for.
+            Where::There { endpoint } if upgrading(req.headers()) => {
+                match front.sockets(&entry, &endpoint) {
+                    Ok(router) => sockets = Some(router),
+                    Err(e) => {
+                        log::warn!("socket tier for {}: {e}", found.tenant_ref);
+                        return unavailable("this project's sockets could not be served here");
+                    }
+                }
+            }
             Where::There { endpoint } => return forwarding.relay(&endpoint, req).await,
             Where::Refuse { why, status } => {
                 return crate::json_body(status, serde_json::json!({"message": why}));
             }
         }
     }
-    let router = match front.attached.router(&entry).await {
-        Ok(router) => router,
-        Err(e) => {
-            log::warn!("attach {}: {e}", found.tenant_ref);
-            return unavailable("the database for this project could not be started");
-        }
+    // The socket tier when there is one, and it is deliberately not an
+    // attach: a node holding a hundred thousand sockets for projects it
+    // does not write starts no databases for them at all.
+    let router = match sockets {
+        Some(router) => router,
+        None => match front.attached.router(&entry).await {
+            Ok(router) => router,
+            Err(e) => {
+                log::warn!("attach {}: {e}", found.tenant_ref);
+                return unavailable("the database for this project could not be started");
+            }
+        },
     };
     if found.path != req.uri().path() {
         let Some(uri) = repath(req.uri(), &found.path) else {
@@ -236,7 +310,14 @@ async fn tenant(
         };
         return Ok(Some((entry, found)));
     }
-    let Some(found) = front.routing.segment(path) else {
+    // A link is last, because it is the one path that names its project
+    // in the url whatever this node's routing is, and every rule above
+    // it is a rule about a request a client made.
+    let Some(found) = front
+        .routing
+        .segment(path)
+        .or_else(|| crate::tenant::linking(path))
+    else {
         return Ok(None);
     };
     let entry = front.registry.get(&found.tenant_ref).await?;
@@ -261,16 +342,6 @@ fn repath(uri: &Uri, path: &str) -> Option<Uri> {
 /// than 500 because both of these are worth retrying, and neither says
 /// which tenant or which store, because the person holding an anon key
 /// for one project is not owed the operational state of the node.
-/// Whether this request is asking to stop being a request, which is
-/// what a websocket handshake is. The header is a list, and a client
-/// that sends `Upgrade: websocket` sends nothing else in it.
-fn upgrading(req: &Request<Body>) -> bool {
-    req.headers()
-        .get(header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
-}
-
 fn unavailable(why: &str) -> Response {
     crate::json_body(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -448,14 +519,18 @@ mod tests {
         );
     }
 
-    /// A websocket for a project this node does not hold, with stale
-    /// reads on, which is the arrangement where it would otherwise have
-    /// been served: the handshake is a GET, and a GET this node is
-    /// allowed to answer from its own copy. Answering it would put the
-    /// socket on this node's hub and the rest of the project's sockets
-    /// on the holder's, which is two rooms of the same name.
+    /// A handshake for a project another node holds, with stale reads
+    /// both on and off, because a socket is neither a read nor a thing
+    /// the relay can carry. It is served here on this node's own hub
+    /// with a link to the holder behind it, and the thing that has to be
+    /// true of that is that no database was started for it: a node
+    /// holding sockets for projects it does not write holds no leases
+    /// and no postmasters.
+    ///
+    /// What this cannot prove is the connection, since there is no
+    /// socket under a oneshot to upgrade. The two node test does that.
     #[tokio::test]
-    async fn a_socket_for_a_tenant_another_node_holds_is_refused_rather_than_split_off() {
+    async fn a_socket_for_a_tenant_another_node_holds_is_served_here() {
         for stale_reads in [true, false] {
             let (_d, backend, router) = one_of_several(stale_reads, None);
             let answer = router
@@ -467,23 +542,63 @@ mod tests {
                         .header("apikey", anon("acme-prod"))
                         .header(header::UPGRADE, "websocket")
                         .header(header::CONNECTION, "Upgrade")
+                        .header("sec-websocket-version", "13")
+                        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
                         .body(Body::empty())
                         .expect("a request"),
                 )
                 .await
                 .expect("an answer");
-            assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let status = answer.status();
             let body = to_bytes(answer.into_body(), 1 << 20).await.expect("a body");
-            assert!(
-                String::from_utf8_lossy(&body).contains("the node holding it"),
-                "{}",
-                String::from_utf8_lossy(&body)
+            let body = String::from_utf8_lossy(&body);
+            assert!(!body.contains("the node holding it"), "{status}: {body}",);
+            assert_eq!(
+                status,
+                StatusCode::UPGRADE_REQUIRED,
+                "the realtime surface answered it, and there was no connection to upgrade: {body}"
             );
             assert!(
                 backend.up.lock().unwrap().is_empty(),
-                "and no database was started to refuse it"
+                "and no database was started for it"
             );
         }
+    }
+
+    /// The url a node dials to hold another node's sockets, arriving at
+    /// a server that routes by host and reads no path segments at all.
+    /// The link handler answering is what proves the project was
+    /// resolved, since nothing else on this node serves that path.
+    #[tokio::test]
+    async fn a_link_reaches_its_project_on_a_host_routed_node() {
+        let (_d, backend, router) = hosted();
+        let key = jwt::mint(
+            &jwt::key_claims("service_role"),
+            secret("acme-prod").as_bytes(),
+        );
+        let (status, body) = call(
+            &router,
+            "10.0.0.4:8000",
+            &format!("/acme-prod/realtime/v1/link?apikey={key}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UPGRADE_REQUIRED,
+            "the link handler answered a plain GET of its own url: {body}"
+        );
+        assert_eq!(backend.up.lock().unwrap().clone(), vec!["acme-prod"]);
+        // And it is still one path and not path routing switched on by
+        // the back door.
+        let (status, _) = call(
+            &router,
+            "10.0.0.4:8000",
+            &format!("/acme-prod/rest/v1/todos?apikey={key}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
