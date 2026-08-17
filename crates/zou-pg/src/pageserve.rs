@@ -79,6 +79,18 @@ const ANSWER_CAP: Duration = Duration::from_secs(300);
 /// out of the store instead of the tee.
 const POLL: Duration = Duration::from_millis(100);
 
+/// What the cadence relaxes to once the stream has stopped moving.
+///
+/// A poll is a shard manifest and a round index whether or not
+/// anything was written, so a project nobody is using read the store
+/// twenty one times a second forever: 1883 gets in ninety seconds of
+/// an idle laptop node, which on S3 is a bill and a rate limit for
+/// nothing. At two seconds the same ninety seconds cost 243. The
+/// freshness this spends is bounded by the same two seconds and only
+/// on the first read after a quiet spell, since anything that arrives
+/// or anybody who waits puts the cadence straight back to POLL.
+const IDLE_POLL: Duration = Duration::from_secs(2);
+
 /// How long one poll may spend applying before it hands the thread back
 /// to the readers. A service that has fallen a long way behind still
 /// catches up, one slice per poll, and a read that only needs an lsn
@@ -456,6 +468,20 @@ fn hopeless(past_deadline: bool, stalled: Duration, frozen: bool) -> bool {
     past_deadline && (frozen || stalled >= WAIT_CAP)
 }
 
+/// The next gap between polls, given whether this one was worth
+/// making.
+///
+/// Doubling rather than jumping, so that a stream which goes quiet for
+/// a fifth of a second and comes back has paid nothing for it and a
+/// project nobody has touched since yesterday is at the ceiling.
+fn relax(cadence: Duration, worth_it: bool) -> Duration {
+    if worth_it {
+        POLL
+    } else {
+        (cadence * 2).min(IDLE_POLL)
+    }
+}
+
 fn covered(lsn: u64, seen: u64, durable_seen: u64, probed: bool) -> bool {
     if lsn == 0 {
         probed && seen >= durable_seen
@@ -482,6 +508,9 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     let mut frozen: Option<String> = None;
     let mut parked: Vec<GetReq> = Vec::new();
     let mut last_poll = Instant::now() - POLL;
+    // How long the driver waits between polls, POLL while the stream
+    // is moving and doubling towards IDLE_POLL while it is not.
+    let mut cadence = POLL;
     let mut cursor = CatchUpCursor::default();
     let mut behind = false;
     // Whether a walk has ever reached the head of the stream. Until
@@ -536,8 +565,12 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     loop {
         // A poll that stopped on its slice has more waiting, so go
         // straight back to it after the readers have had their turn
-        // rather than idling out the rest of the cadence.
-        if frozen.is_none() && (behind || last_poll.elapsed() >= POLL) {
+        // rather than idling out the rest of the cadence. A reader
+        // waiting on an lsn holds the cadence at POLL; only a service
+        // with nobody waiting and nothing arriving relaxes it.
+        let due = if parked.is_empty() { cadence } else { POLL };
+        if frozen.is_none() && (behind || last_poll.elapsed() >= due) {
+            let was = (ingest.as_ref().map_or(0, ShardIngest::seen), durable_seen);
             last_poll = Instant::now();
             let polled = Instant::now();
             let outcome = poll_ingest(
@@ -563,6 +596,7 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                 durable_seen,
                 &cursor,
             );
+            let moved = (ingest.as_ref().map_or(0, ShardIngest::seen), durable_seen) != was;
             match outcome {
                 Ok(caught_up) => {
                     behind = !caught_up;
@@ -575,6 +609,7 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                     frozen = Some(e);
                 }
             }
+            cadence = relax(cadence, moved || behind);
         }
 
         match rx.recv_timeout(Duration::from_millis(10)) {
@@ -1220,6 +1255,28 @@ mod tests {
         assert!(
             hopeless(true, Duration::ZERO, true),
             "frozen ingest never moves again, so it fails on the deadline"
+        );
+    }
+
+    /// The idle cost behind #457. A project nobody is using polled the
+    /// store ten times a second forever, and the two gets that costs
+    /// are the whole store bill of a node that is doing nothing.
+    #[test]
+    fn an_idle_service_relaxes_its_poll_and_snaps_back() {
+        let mut cadence = POLL;
+        for _ in 0..20 {
+            cadence = relax(cadence, false);
+        }
+        assert_eq!(cadence, IDLE_POLL, "quiet settles at the ceiling");
+        assert_eq!(
+            relax(cadence, true),
+            POLL,
+            "a frame arriving pays back the whole backoff at once"
+        );
+        assert_eq!(
+            relax(POLL, false),
+            POLL * 2,
+            "doubling, so a fifth of a second of quiet costs a fifth of a second"
         );
     }
 
