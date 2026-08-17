@@ -169,6 +169,10 @@ That takes the bundle for the platform, checks it against its sha256, and unpack
 
 The project is being built top to bottom against the milestone checklists, one PR per feature. Issues and PRs are welcome, but expect churn while M1 is in progress.
 
+Every open issue has a place in one tree, so that what is left is read off the tracker rather than out of somebody's head. The roots are the milestones, one issue each, and under them are the five compatibility checklists, one per surface: PostgREST is [#125](https://github.com/tamnd/zou/issues/125), GoTrue [#170](https://github.com/tamnd/zou/issues/170), Storage [#190](https://github.com/tamnd/zou/issues/190), Realtime [#303](https://github.com/tamnd/zou/issues/303) and Edge Functions [#369](https://github.com/tamnd/zou/issues/369). Everything else is a sub issue of the checklist it belongs to, or of the milestone it came out of when it belongs to no surface.
+
+The labels say what a thing is and where it lives. What it is: `bug`, `enhancement`, `compat` for a difference from what upstream Supabase does, `perf` for a number to beat, `flaky` for a test that fails without the code changing, `security`, `blocked` for something waiting on the world outside this repository, and `checklist` or `milestone` for the tracking issues themselves. Where it lives: one `area:` label per surface, and `platform:` for anything that only happens on one operating system.
+
 ## License
 
 Apache 2.0, see [LICENSE](LICENSE).
