@@ -179,6 +179,11 @@ That is why a restore is followed by a warm up: the WAL tail names the pages red
 Redo went from 939.76 s to 246.70 s and the attach from 1103.52 s to 417.45 s at the 32MB pool a packed node gives a tenant, and with a pool that holds what recovery touches redo is 5.09 s against 939.50 s, because the 10,586 pages redo read one at a time became 14.
 `ZOU_WARM_BLOCKS` caps how many pages it will fetch, 65536 by default, and zero turns it off.
 
+An attach that is replaying is given as long as it keeps moving.
+A postmaster has sixty seconds to say it is accepting connections, and one that is still in redo says where it has got to every ten seconds, so every report with a newer LSN than the last one starts those sixty seconds again, up to ten minutes for the attach as a whole.
+Without that a project with an hour of WAL behind it is a project that cannot be attached at all rather than one that is slow to attach, because the postmaster killed at sixty seconds wrote nothing anybody would start from and its replacement begins at the same redo point with the same sixty seconds.
+A redo that reports the same LSN twice is stuck rather than slow and is killed on the spot, and so is one that is still going at the ten minutes, since leaving it be would let the retry start a second postmaster on a project that already has one.
+
 What is left of a cold attach is the writes: recovery dirties every page it changed and the end of recovery checkpoint puts them back one at a time, which is where the rest of those ten minutes goes and is the storage engine's problem rather than this command's.
 
 ### Where a cold start went
