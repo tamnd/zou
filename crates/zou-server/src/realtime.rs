@@ -25,8 +25,11 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 use zou_realtime::{
     About, Action, Ask, BinaryBroadcast, Budget, Counters, Delivery, Encoding, Fanout, Grant, Hub,
-    Identity, Limits, Meter, Session, SocketId, Sockets, Tokens, Vsn, Watched,
+    Identity, Meter, Session, SocketId, Sockets, Tokens, Vsn, Watched,
 };
+// What `limits_from_env` returns, out here so that a caller holding one
+// can name its type without depending on the realtime crate itself.
+pub use zou_realtime::Limits;
 
 use crate::binding::Binding;
 // Two things in scope here are called what a socket heard: the enum
@@ -36,6 +39,11 @@ use crate::ops;
 use crate::reader::{Heard as Feed, Listening, Reader};
 use crate::visible::Asker;
 use crate::{App, AuthContext, cdc, json_body, policy, sql};
+
+/// How much of a socket's read side is held per connection, which is
+/// the largest frame a client can send in one read rather than a limit
+/// on what it may send: a bigger one is read in pieces.
+const READ_BUFFER: usize = 8 * 1024;
 
 /// What checks a token for a socket: the project's own verifier, the
 /// same one every http request goes through.
@@ -262,6 +270,7 @@ struct Connected(Arc<Quota>);
 impl Drop for Connected {
     fn drop(&mut self) {
         self.0.sockets.left();
+        crate::ops::socket_left();
     }
 }
 
@@ -320,6 +329,15 @@ pub async fn websocket(
     };
     let bearer = bearer_of(&headers, &uri);
     let anon_role = app.cfg.anon_role.clone();
+    // What a client sends is a join, a heartbeat every thirty seconds,
+    // and the occasional broadcast, none of which is bigger than a
+    // page. The default read buffer is 128 kb, allocated per socket and
+    // zeroed on every read of it, which a profile of the ten thousand
+    // socket run showed as a sixth of the node's time in memset and
+    // 1.3 gb of buffers holding a few hundred bytes each. A bigger
+    // buffer is for a socket streaming megabytes in, and no realtime
+    // client is one: what is large here goes the other way.
+    let upgrade = upgrade.read_buffer_size(READ_BUFFER);
     upgrade.on_upgrade(move |socket| async move {
         // A router can be built outside a runtime, so what listens for
         // database sends starts on the first socket rather than at
@@ -336,6 +354,7 @@ pub async fn websocket(
         // this task, so a socket that panicked is not one the project
         // is still paying for.
         app.quota.sockets.joined();
+        crate::ops::socket_joined();
         let _connected = Connected(Arc::clone(&app.quota));
         let budget = Budget {
             limits: app.quota.limits,
@@ -742,7 +761,7 @@ async fn asked_for(
     // that looks right hears nothing. So the channel joins, nothing is
     // subscribed, and the reason goes out on the system frame, which
     // is what upstream does down to the wording.
-    let refused = unpublished(pool, &bindings).await?;
+    let refused = unpublished(app, pool, &bindings).await?;
     Ok((bindings, refused))
 }
 
@@ -798,25 +817,15 @@ async fn bound(app: &Arc<App>, listener: u64, bindings: Vec<Binding>) -> Result<
 /// person reads in their console when a subscription is silent and the
 /// thing they will search for. `select: nil` is upstream's own field
 /// for something it does not use.
-async fn unpublished(pool: &sql::Pool, bindings: &[Binding]) -> Result<Option<String>, String> {
+async fn unpublished(
+    app: &Arc<App>,
+    pool: &sql::Pool,
+    bindings: &[Binding],
+) -> Result<Option<String>, String> {
     if bindings.iter().all(|binding| binding.table.is_none()) {
         return Ok(None);
     }
-    let sess = pool
-        .admin()
-        .await
-        .map_err(|e| format!("the publication could not be read: {e}"))?;
-    let rows = sess
-        .query(
-            "select schemaname, tablename from pg_publication_tables where pubname = $1",
-            &[&cdc::PUBLICATION],
-        )
-        .await
-        .map_err(|e| format!("the publication could not be read: {e}"))?;
-    let published: Vec<(String, String)> = rows
-        .iter()
-        .map(|row| (row.get(0), row.get(1)))
-        .collect::<Vec<(String, String)>>();
+    let published = published(app, pool).await?;
     let missing = bindings.iter().find(|binding| match &binding.table {
         None => false,
         Some(table) => !published
@@ -844,6 +853,49 @@ async fn unpublished(pool: &sql::Pool, bindings: &[Binding]) -> Result<Option<St
     }))
 }
 
+/// What the publication carries, read once per catalog epoch rather
+/// than once per join.
+///
+/// A hundred thousand sockets joining is a hundred thousand answers to
+/// one question, and the question is only ever answered differently by
+/// an `alter publication`, which is DDL and moves the epoch the same
+/// event trigger moves for the rest of the catalog. Two joins racing a
+/// cold cache both read and both write, which is one wasted query and
+/// never a wrong answer, so the lock is not held across the read.
+async fn published(app: &Arc<App>, pool: &sql::Pool) -> Result<crate::Published, String> {
+    // The watch is what makes an entry go stale, so it starts here as
+    // well as on the first request that needs a catalog: a project
+    // whose sockets are its only traffic still has to see its own
+    // `alter publication`.
+    app.watching
+        .get_or_init(|| async { pool.watch(Arc::clone(&app.epoch)) })
+        .await;
+    let epoch = app.epoch.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some((at, tables)) = app.published.read().await.as_ref()
+        && *at == epoch
+    {
+        return Ok(Arc::clone(tables));
+    }
+    let sess = pool
+        .admin()
+        .await
+        .map_err(|e| format!("the publication could not be read: {e}"))?;
+    let rows = sess
+        .query(
+            "select schemaname, tablename from pg_publication_tables where pubname = $1",
+            &[&cdc::PUBLICATION],
+        )
+        .await
+        .map_err(|e| format!("the publication could not be read: {e}"))?;
+    let tables = Arc::new(
+        rows.iter()
+            .map(|row| (row.get(0), row.get(1)))
+            .collect::<Vec<(String, String)>>(),
+    );
+    *app.published.write().await = Some((epoch, Arc::clone(&tables)));
+    Ok(tables)
+}
+
 /// How long a join waits for a tap before being answered without one.
 ///
 /// Comfortably inside realtime-js's own ten second join timeout, since
@@ -857,7 +909,11 @@ fn reading(app: &Arc<App>) {
         return;
     };
     let changes = Arc::clone(&app.changes);
-    tokio::spawn(async move { Reader::new(&dsn, pool, changes).run().await });
+    // The same epoch the rest of the server's caches are tagged with,
+    // since what makes a subscriber's privileges stale is what makes a
+    // request's stale: the project's own DDL.
+    let epoch = Arc::clone(&app.epoch);
+    tokio::spawn(async move { Reader::new(&dsn, pool, changes, epoch).run().await });
 }
 
 /// Go and find out, which is the io a private channel needs and the

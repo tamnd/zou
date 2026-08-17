@@ -419,6 +419,24 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
         scrape.contains("zou_realtime_commit_to_socket_seconds_bucket"),
         "{scrape}"
     );
+    // And the two gauges a socket tier is sized on, which are what a
+    // benchmark reads off the node while it is holding the sockets
+    // rather than counting them from the client's side alone.
+    let held = |name: &str| {
+        scrape
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} ")))
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or_default()
+    };
+    assert!(
+        held("zou_realtime_sockets") >= 1,
+        "this socket is one the node is holding, {scrape}"
+    );
+    assert!(
+        held("zou_realtime_subscribers") >= 1,
+        "and it asked for changes, so it is a subscriber too, {scrape}"
+    );
 }
 
 /// The policies decide what a socket is told, not just what it can
@@ -547,6 +565,84 @@ async fn a_table_nobody_published_is_refused_on_the_system_frame() {
     // message.
     run(&dsn, "insert into chg_open (id) values (1)").await;
     quiet(&mut socket).await;
+}
+
+/// And the same table once somebody has run the `alter publication`,
+/// on the same server that refused it a moment ago.
+///
+/// The publication is read once per catalog epoch rather than once per
+/// join, which is what keeps a node holding a hundred thousand sockets
+/// from asking the catalog a hundred thousand times. That cache is only
+/// honest if the answer stops being used when it stops being true, and
+/// the thing that says so is the DDL watch the rest of the catalog
+/// already hangs off.
+#[tokio::test]
+async fn a_table_published_after_the_refusal_is_subscribed_to_on_the_next_join() {
+    let Some(dsn) = dsn() else { return };
+    let _one = alone().lock().await;
+    if !logical(&dsn).await {
+        return;
+    }
+    settled(&dsn).await;
+    let at = serving(&dsn).await;
+    unpublished(
+        &dsn,
+        "chg_late",
+        "create table chg_late (id int primary key);
+         grant select on chg_late to anon, authenticated;",
+    )
+    .await;
+
+    let wants = json!([{"event": "*", "schema": "public", "table": "chg_late"}]);
+    assert_eq!(
+        joined(at, &wants).await["status"],
+        "error",
+        "a table outside the publication is refused, which is what makes the next half mean \
+         something"
+    );
+
+    // The alter is DDL, so the event trigger notifies and the epoch
+    // moves. A database with no trigger installed would take the timed
+    // refresh instead, which is why this waits rather than asserting on
+    // the first join after it.
+    run(
+        &dsn,
+        "alter publication supabase_realtime add table chg_late",
+    )
+    .await;
+    let mut accepted = false;
+    for _ in 0..100 {
+        if joined(at, &wants).await["status"] == "ok" {
+            accepted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        accepted,
+        "the table went into the publication and the joins kept being refused, so the cached \
+         answer outlived the ddl that changed it"
+    );
+}
+
+/// One socket, one join, and the system frame it is answered with,
+/// which says either that the subscriptions exist or why they do not.
+async fn joined(at: SocketAddr, wants: &Value) -> Value {
+    let mut socket = connect(at).await;
+    send(
+        &mut socket,
+        &json!(["1", "1", "realtime:db", "phx_join", {
+            "config": {"postgres_changes": wants},
+            "access_token": token(ANA),
+        }])
+        .to_string(),
+    )
+    .await;
+    let reply = next(&mut socket).await;
+    assert_eq!(reply[4]["status"], "ok", "{reply}");
+    let system = next(&mut socket).await;
+    assert_eq!(system[3], "system", "{system}");
+    system[4].clone()
 }
 
 /// The same row, asked for by a client that reached a node with no

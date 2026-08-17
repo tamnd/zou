@@ -18,6 +18,7 @@
 //! `channel.send`. A server that only reads json hears silence from a
 //! current client and has no way to tell that is what happened.
 
+use serde::Serialize;
 use serde_json::{Value, json};
 
 /// Which encoding this socket is speaking, from `vsn` on the connect
@@ -179,29 +180,95 @@ impl Frame {
     }
 
     /// Encode for a socket speaking `vsn`.
+    ///
+    /// Written straight out of the five fields rather than through a
+    /// `Value` built from them. The old way of this built one and
+    /// printed it, which walked and allocated the whole payload again
+    /// to print it once, and the payload of a changed row goes to every
+    /// socket watching the table: at a hundred thousand of them that
+    /// copy is the most expensive thing on the path. Borrowing costs
+    /// nothing and says the same bytes.
     pub fn encode(&self, vsn: Vsn) -> String {
-        let join_ref = self
-            .join_ref
-            .clone()
-            .map(Value::String)
-            .unwrap_or(Value::Null);
-        let reference = self
-            .reference
-            .clone()
-            .map(Value::String)
-            .unwrap_or(Value::Null);
-        match vsn {
-            Vsn::V2 => json!([join_ref, reference, self.topic, self.event, self.payload]),
-            Vsn::V1 => json!({
-                "join_ref": join_ref,
-                "ref": reference,
-                "topic": self.topic,
-                "event": self.event,
-                "payload": self.payload,
-            }),
-        }
-        .to_string()
+        encoded(
+            vsn,
+            &self.join_ref,
+            &self.reference,
+            &self.topic,
+            &self.event,
+            &self.payload,
+        )
     }
+
+    /// The changed rows one channel is owed, encoded without a frame.
+    ///
+    /// This is the one message on the socket that is worth saying twice
+    /// in the source. Every other frame is built once and sent once, so
+    /// building it and encoding it is the same work either way. A change
+    /// is one row going to every socket watching the table, and the ids
+    /// are the only part of it that belongs to one of them, so a
+    /// `Frame` here would be a copy of the whole row per socket to print
+    /// something that already exists.
+    pub fn changed(vsn: Vsn, topic: &str, ids: &[u64], data: &Value) -> String {
+        encoded(
+            vsn,
+            &None,
+            &None,
+            topic,
+            "postgres_changes",
+            &Change { data, ids },
+        )
+    }
+}
+
+/// One socket's part of a change: the ids of its own subscriptions this
+/// answers, and the row, which is everybody's.
+#[derive(Serialize)]
+struct Change<'a> {
+    data: &'a Value,
+    ids: &'a [u64],
+}
+
+/// The five fields, in the shape `vsn` says, with nothing copied.
+///
+/// The old way of this built a `Value` of the five and printed it,
+/// which walked and allocated the whole payload again to print it once.
+/// Borrowing costs nothing and says the same bytes.
+fn encoded<P: Serialize>(
+    vsn: Vsn,
+    join_ref: &Option<String>,
+    reference: &Option<String>,
+    topic: &str,
+    event: &str,
+    payload: &P,
+) -> String {
+    let encoded = match vsn {
+        Vsn::V2 => serde_json::to_string(&(join_ref, reference, topic, event, payload)),
+        Vsn::V1 => serde_json::to_string(&Named {
+            event,
+            join_ref,
+            payload,
+            reference,
+            topic,
+        }),
+    };
+    // A frame is json already: the payload is a `Value` and the rest
+    // are strings, so there is nothing here serde can refuse.
+    encoded.expect("a frame is json")
+}
+
+/// The five fields as version 1.0.0 names them, borrowed.
+///
+/// The order is the order `serde_json` puts an object's keys in, which
+/// is alphabetical, so that this says the same bytes as the `Value`
+/// this replaced.
+#[derive(Serialize)]
+struct Named<'a, P> {
+    event: &'a str,
+    join_ref: &'a Option<String>,
+    payload: &'a P,
+    #[serde(rename = "ref")]
+    reference: &'a Option<String>,
+    topic: &'a str,
 }
 
 /// A ref is a string on the wire, but phoenix has sent numbers in the

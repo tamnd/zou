@@ -19,6 +19,8 @@ Prerequisites: meson, ninja, a C compiler, flex, bison, and the Postgres librari
 That list is not advice, it is the dependency set a release is built against.
 Most of Postgres' optional dependencies default to `auto` in meson, so a machine with one more dev package than another builds a postmaster that needs one more shared library, from the same commit, and the person who finds out is whoever unpacked the tarball on a machine without it.
 `make pg-build` turns off the ones zou does not offer by name, gssapi and ldap and pam and the rest, and `scripts/zou-bundle.sh` prints what a bundle still expects from the machine and fails on anything outside that list.
+Openssl is named the other way, `-Dssl=openssl` rather than off, because pgcrypto is only built when it is there and the tenant contract needs pgcrypto.
+A build that took openssl from `auto` on a machine without libssl-dev comes up fine and then refuses every new project with `extension "pgcrypto" is not available`, which is a long way from the missing package, so the build stops at configure instead.
 
 Then:
 

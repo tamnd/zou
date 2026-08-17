@@ -5109,6 +5109,7 @@ name = "zou-realtime"
 version = "0.0.1"
 dependencies = [
  "log",
+ "serde",
  "serde_json",
  "tokio",
 ]

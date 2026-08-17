@@ -11,9 +11,18 @@
 //! So the bindings are held the way they are asked: by the table they
 //! are about and the event they are for. A change looks up its own
 //! table, in its own event, and sees only the subscriptions that could
-//! possibly match. What is left after that lookup is the filters, which
-//! are the only part that has to be evaluated per subscription, and a
-//! filter is one column compared with one value.
+//! possibly match.
+//!
+//! And then by the value they filter on, where they filter on one. An
+//! equality is a point, so the subscriptions asking about a value are
+//! found by looking the value up rather than by asking each of them.
+//! That is the difference between a table with a hundred thousand
+//! sockets on it costing a hundred thousand comparisons per changed row
+//! and costing one hash: the first is tens of milliseconds of a core
+//! per row, which at a thousand rows a second is not a slow feed but a
+//! feed that falls behind and stays behind. What is left to walk is the
+//! ranges, the lists, and the subscriptions with no filter at all,
+//! because there is nothing to look a range up by.
 //!
 //! There is no io here and no sockets either. What comes back from a
 //! match is the ids the caller put in, and mapping an id to whoever is
@@ -266,7 +275,225 @@ struct Entry {
 
 /// The three lists a table or a schema keeps, one per event, so that a
 /// change reads only the subscriptions that could match it.
-type Lists = [Vec<Arc<Entry>>; 3];
+type Lists = [List; 3];
+
+/// One event's worth of subscriptions on one table.
+///
+/// Split by what can be looked up and what has to be walked. An
+/// equality filter is a point, so a change can look itself up by the
+/// value it carries and never see the subscriptions asking about
+/// another value. Everything else, which is a range, a list, or no
+/// filter at all, is walked, because there is nothing to look a range
+/// up by.
+///
+/// That split is what a table with a hundred thousand subscriptions on
+/// it costs. Walked, one changed row is a hundred thousand column name
+/// comparisons and a hundred thousand value parses, which is tens of
+/// milliseconds of one core for one row, so a thousand rows a second is
+/// arithmetic that does not come out. Looked up, the same row costs one
+/// parse and one hash per filtered column, and then only the
+/// subscribers who are owed it.
+#[derive(Debug, Default)]
+struct List {
+    /// Subscriptions whose filter is an equality, by the column it is
+    /// on. One entry per column rather than per subscription, and a
+    /// table filtered on one column has one of these however many
+    /// sockets are subscribed to it.
+    eq: HashMap<String, Points>,
+    /// Subscriptions a change has to be compared with one at a time.
+    rest: Vec<Arc<Entry>>,
+}
+
+/// Which subscriptions asked for which value of one column.
+///
+/// Four maps rather than one, because equality here is the column's
+/// own: `id=eq.007` matches the row whose id is 7 on an integer column
+/// and matches nothing on a text one, and a single map keyed by the
+/// text a client wrote would get the first of those wrong. So a value
+/// is filed under every reading of it that parses, and a change reads
+/// the one map its column's type calls for. Which map that is, and what
+/// counts as equal in it, is [`compare`]'s answer for that type and has
+/// to stay [`compare`]'s answer: this is an index over that function,
+/// not a second opinion about what equal means.
+#[derive(Debug, Default)]
+struct Points {
+    /// Integers, for int2, int4, int8 and oid.
+    ints: HashMap<i128, Vec<Arc<Entry>>>,
+    /// Doubles, for float4, float8 and numeric, by the bits of the
+    /// value with the two zeroes read as one, since a comparison says
+    /// they are equal. A filter written as a value that is not a number
+    /// at all is not in here, and neither is one written as `NaN`,
+    /// which is equal to nothing including itself.
+    reals: HashMap<u64, Vec<Arc<Entry>>>,
+    /// False then true, for bool, since there are only the two and a
+    /// map of them would be a map with two keys.
+    truths: [Vec<Arc<Entry>>; 2],
+    /// The text as it was written, which is the answer for text, uuid,
+    /// and a timestamp too: postgres writes those widest field first,
+    /// so their text order is their order.
+    texts: HashMap<String, Vec<Arc<Entry>>>,
+}
+
+impl Points {
+    /// File one subscription under every reading of its value that
+    /// parses, so that whichever map the column's type calls for has it
+    /// if that reading would match.
+    fn add(&mut self, value: &str, entry: &Arc<Entry>) {
+        if let Ok(int) = value.parse::<i128>() {
+            self.ints.entry(int).or_default().push(Arc::clone(entry));
+        }
+        if let Ok(real) = value.parse::<f64>()
+            && !real.is_nan()
+        {
+            self.reals
+                .entry(bits(real))
+                .or_default()
+                .push(Arc::clone(entry));
+        }
+        if let Some(truth) = truth(value) {
+            self.truths[usize::from(truth)].push(Arc::clone(entry));
+        }
+        self.texts
+            .entry(value.to_string())
+            .or_default()
+            .push(Arc::clone(entry));
+    }
+
+    /// Take one out of every map it was filed in, and drop a bucket
+    /// that is empty so that a table nobody is subscribed to any more
+    /// does not keep the shape of the subscriptions it had.
+    fn remove(&mut self, id: u64, value: &str) {
+        if let Ok(int) = value.parse::<i128>() {
+            drop_from(self.ints.get_mut(&int), id);
+            self.ints.retain(|_, held| !held.is_empty());
+        }
+        if let Ok(real) = value.parse::<f64>()
+            && !real.is_nan()
+        {
+            drop_from(self.reals.get_mut(&bits(real)), id);
+            self.reals.retain(|_, held| !held.is_empty());
+        }
+        if let Some(truth) = truth(value) {
+            self.truths[usize::from(truth)].retain(|entry| entry.id != id);
+        }
+        drop_from(self.texts.get_mut(value), id);
+        self.texts.retain(|_, held| !held.is_empty());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ints.is_empty()
+            && self.reals.is_empty()
+            && self.truths.iter().all(Vec::is_empty)
+            && self.texts.is_empty()
+    }
+
+    /// Whoever asked for this value of this column, as the column's own
+    /// type reads it.
+    fn matching(&self, oid: u32, value: &str, ids: &mut Vec<u64>) {
+        let found = match oid {
+            21 | 23 | 20 | 26 => value.parse::<i128>().ok().and_then(|n| self.ints.get(&n)),
+            700 | 701 | 1700 => value
+                .parse::<f64>()
+                .ok()
+                .filter(|n| !n.is_nan())
+                .and_then(|n| self.reals.get(&bits(n))),
+            16 => truth(value).map(|truth| &self.truths[usize::from(truth)]),
+            _ => self.texts.get(value),
+        };
+        if let Some(found) = found {
+            ids.extend(found.iter().map(|entry| entry.id));
+        }
+    }
+}
+
+impl List {
+    fn add(&mut self, entry: &Arc<Entry>) {
+        match point(&entry.binding) {
+            Some(filter) => self
+                .eq
+                .entry(filter.column.clone())
+                .or_default()
+                .add(&filter.value, entry),
+            None => self.rest.push(Arc::clone(entry)),
+        }
+    }
+
+    fn remove(&mut self, id: u64, binding: &Binding) {
+        match point(binding) {
+            Some(filter) => {
+                if let Some(points) = self.eq.get_mut(&filter.column) {
+                    points.remove(id, &filter.value);
+                    if points.is_empty() {
+                        self.eq.remove(&filter.column);
+                    }
+                }
+            }
+            None => self.rest.retain(|entry| entry.id != id),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rest.is_empty() && self.eq.is_empty()
+    }
+
+    /// The ids in this list that asked for this change.
+    fn matching(&self, relation: &Relation, cells: &[Cell], ids: &mut Vec<u64>) {
+        for entry in &self.rest {
+            let passes = match &entry.binding.filter {
+                Some(filter) => filter.passes(relation, cells),
+                None => true,
+            };
+            if passes {
+                ids.push(entry.id);
+            }
+        }
+        for (column, points) in &self.eq {
+            // The name is compared once per filtered column rather than
+            // once per subscription, which is the whole point of
+            // holding them this way.
+            let Some(at) = relation
+                .columns
+                .iter()
+                .position(|held| &held.name == column)
+            else {
+                continue;
+            };
+            // A null is equal to nothing, a value postgres left out of
+            // the message cannot be compared, and bytes are not a value
+            // a filter can name. All three are what walking would have
+            // decided as well.
+            let Some(Cell::Text(value)) = cells.get(at) else {
+                continue;
+            };
+            points.matching(relation.columns[at].type_oid, value, ids);
+        }
+    }
+}
+
+/// The filter this binding can be looked up by, which is an equality
+/// and nothing else.
+fn point(binding: &Binding) -> Option<&Filter> {
+    binding
+        .filter
+        .as_ref()
+        .filter(|filter| filter.compare == Compare::Eq)
+}
+
+/// A double as a hash key, with the two zeroes read as one because a
+/// comparison says they are equal.
+fn bits(real: f64) -> u64 {
+    if real == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        real.to_bits()
+    }
+}
+
+fn drop_from(held: Option<&mut Vec<Arc<Entry>>>, id: u64) {
+    if let Some(held) = held {
+        held.retain(|entry| entry.id != id);
+    }
+}
 
 fn list_of(op: Op) -> usize {
     match op {
@@ -315,7 +542,7 @@ impl Subscriptions {
             None => self.schemas.entry(binding.schema.clone()).or_default(),
         };
         for at in binding.wants.lists() {
-            lists[*at].push(Arc::clone(&entry));
+            lists[*at].add(&entry);
         }
         self.placed.insert(id, binding);
     }
@@ -335,9 +562,9 @@ impl Subscriptions {
         };
         if let Some(lists) = lists {
             for at in binding.wants.lists() {
-                lists[*at].retain(|entry| entry.id != id);
+                lists[*at].remove(id, &binding);
             }
-            if lists.iter().all(Vec::is_empty) {
+            if lists.iter().all(List::is_empty) {
                 match &key {
                     Some(key) => {
                         self.tables.remove(key);
@@ -360,7 +587,10 @@ impl Subscriptions {
     }
 
     /// The ids that asked for this change, in the order they were
-    /// added.
+    /// added, which is ascending because that is how they are handed
+    /// out. Sorted rather than concatenated, since a lookup answers a
+    /// bucket at a time and the caller is owed one order whichever way
+    /// the answer was found.
     ///
     /// A delete is filtered on what postgres published of the row that
     /// is gone, which under the default replica identity is the primary
@@ -377,23 +607,13 @@ impl Subscriptions {
             _ => &change.record,
         };
         let mut ids = Vec::new();
-        let mut take = |lists: &Lists| {
-            for entry in &lists[at] {
-                let passes = match &entry.binding.filter {
-                    Some(filter) => filter.passes(&change.relation, cells),
-                    None => true,
-                };
-                if passes {
-                    ids.push(entry.id);
-                }
-            }
-        };
         if let Some(lists) = self.tables.get(&(schema.clone(), table.clone())) {
-            take(lists);
+            lists[at].matching(&change.relation, cells, &mut ids);
         }
         if let Some(lists) = self.schemas.get(schema) {
-            take(lists);
+            lists[at].matching(&change.relation, cells, &mut ids);
         }
+        ids.sort_unstable();
         ids
     }
 }
@@ -582,8 +802,8 @@ mod tests {
         subs.add(3, binding(r#"{"event":"*","table":"todos"}"#));
         assert_eq!(
             subs.matching(&change(Op::Insert, "1", "wash up", "f")),
-            vec![3, 1],
-            "the table's own subscribers first, then the schema's"
+            vec![1, 3],
+            "both of them, in the order they subscribed, whichever index found them"
         );
     }
 
@@ -624,6 +844,158 @@ mod tests {
             vec![3, 5, 6],
             "eleven is in the list and is not the eleven a text comparison would look for"
         );
+    }
+
+    /// A relation with a number in it that is not an integer, since
+    /// the two are read differently and the lookup has a map each.
+    fn prices() -> Arc<Relation> {
+        Arc::new(Relation {
+            oid: 16_385,
+            schema: "public".into(),
+            table: "prices".into(),
+            replica: Replica::Default,
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    type_oid: 23,
+                    key: true,
+                },
+                Column {
+                    name: "amount".into(),
+                    type_oid: 1700,
+                    key: false,
+                },
+            ],
+        })
+    }
+
+    fn priced(amount: &str) -> Change {
+        Change {
+            relation: prices(),
+            op: Op::Insert,
+            record: vec![Cell::Text("1".into()), Cell::Text(amount.into())],
+            old: None,
+            old_key: false,
+            commit_ts: 0,
+            lsn: 0,
+        }
+    }
+
+    /// The lookup an equality filter goes into has to agree with the
+    /// comparison it replaced, and the two disagree exactly where a
+    /// value can be written more than one way. So a subscriber who
+    /// wrote `007` is owed the row whose id is 7, and one who wrote
+    /// `1.50` is owed the row whose amount is 1.5.
+    #[test]
+    fn an_equality_is_the_column_s_own_and_not_the_text_a_client_wrote() {
+        let mut subs = Subscriptions::new();
+        subs.add(
+            1,
+            binding(r#"{"event":"*","table":"todos","filter":"id=eq.007"}"#),
+        );
+        subs.add(
+            2,
+            binding(r#"{"event":"*","table":"todos","filter":"title=eq.007"}"#),
+        );
+        subs.add(
+            3,
+            binding(r#"{"event":"*","table":"todos","filter":"done=eq.1"}"#),
+        );
+        assert_eq!(
+            subs.matching(&change(Op::Insert, "7", "7", "t")),
+            vec![1, 3],
+            "seven is the id the first one asked for, the title is text and is not the same text,              and one is how a client writes true"
+        );
+
+        let mut subs = Subscriptions::new();
+        subs.add(
+            1,
+            binding(r#"{"event":"*","table":"prices","filter":"amount=eq.1.50"}"#),
+        );
+        subs.add(
+            2,
+            binding(r#"{"event":"*","table":"prices","filter":"amount=eq.-0"}"#),
+        );
+        assert_eq!(
+            subs.matching(&priced("1.5")),
+            vec![1],
+            "a number written two ways is one number"
+        );
+        assert_eq!(
+            subs.matching(&priced("0.0")),
+            vec![2],
+            "and the two zeroes are one number as well, which is what a comparison says"
+        );
+    }
+
+    /// A subscription that has gone is out of every lookup it was in,
+    /// and a table nobody is subscribed to is forgotten. Otherwise a
+    /// socket that hung up keeps costing every change that follows it,
+    /// which on a node holding a hundred thousand of them is the whole
+    /// cost of the node.
+    #[test]
+    fn a_subscription_that_went_is_out_of_the_lookup_too() {
+        let mut subs = Subscriptions::new();
+        subs.add(
+            1,
+            binding(r#"{"event":"*","table":"todos","filter":"id=eq.7"}"#),
+        );
+        subs.add(
+            2,
+            binding(r#"{"event":"*","table":"todos","filter":"id=eq.7"}"#),
+        );
+        subs.remove(1);
+        assert_eq!(
+            subs.matching(&change(Op::Insert, "7", "wash up", "f")),
+            vec![2],
+            "the one that is left"
+        );
+        subs.remove(2);
+        assert!(
+            subs.matching(&change(Op::Insert, "7", "wash up", "f"))
+                .is_empty(),
+            "and then nobody"
+        );
+        assert!(subs.is_empty(), "and nothing is held for the table either");
+        assert!(subs.tables.is_empty(), "not even the shape of it");
+
+        subs.add(
+            3,
+            binding(r#"{"event":"*","table":"todos","filter":"id=eq.7"}"#),
+        );
+        assert_eq!(
+            subs.matching(&change(Op::Insert, "7", "wash up", "f")),
+            vec![3],
+            "a table that was forgotten is subscribed to again the same way"
+        );
+    }
+
+    /// A thousand subscriptions on one table, each asking about one
+    /// value of one column, which is how a fan out is shaped: a row
+    /// belongs to a shard and a socket asked for a shard. What a change
+    /// is owed is the one subscriber, and what a change should not have
+    /// to do is look at the other nine hundred and ninety nine.
+    #[test]
+    fn a_change_reaches_the_subscribers_who_asked_for_its_value_and_no_others() {
+        let mut subs = Subscriptions::new();
+        for id in 1..=1000u64 {
+            subs.add(
+                id,
+                binding(&format!(
+                    r#"{{"event":"*","table":"todos","filter":"id=eq.{id}"}}"#
+                )),
+            );
+        }
+        assert_eq!(
+            subs.matching(&change(Op::Insert, "500", "wash up", "f")),
+            vec![500]
+        );
+        assert!(
+            subs.matching(&change(Op::Insert, "1001", "wash up", "f"))
+                .is_empty(),
+            "a value nobody asked about reaches nobody"
+        );
+        assert_eq!(subs.len(), 1000, "and all of them are still subscribed");
     }
 
     /// A filter naming a column that is not there, a value that is not

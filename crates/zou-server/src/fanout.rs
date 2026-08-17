@@ -831,7 +831,7 @@ async fn took(app: &Arc<App>, away: &Arc<Away>, frame: Wire) -> bool {
                 theirs,
                 Feed::Change {
                     ids,
-                    data: frame.head.get("data").cloned().unwrap_or(Value::Null),
+                    data: Arc::new(frame.head.get("data").cloned().unwrap_or(Value::Null)),
                     commit_ts: frame
                         .head
                         .get("commit_ts")
@@ -998,7 +998,7 @@ async fn holding(mut socket: WebSocket, app: &Arc<App>) {
                     "down": "changed",
                     "socket": named,
                     "ids": ids,
-                    "data": data,
+                    "data": *data,
                     "commit_ts": commit_ts,
                     // How long ago this node read it, rather than when,
                     // because the other end has its own clock and no way

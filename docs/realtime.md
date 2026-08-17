@@ -224,6 +224,9 @@ A project has a budget, the same five numbers upstream keeps on the tenant row, 
 
 Set any of them to `0` and that one is off, which is what a server running its own project usually wants and is not something upstream's tenant row can say.
 
+`zou dev` and `zou serve` both read the five, and on a node they are the tier every project it brings up gets, since a node has no tenant row to keep a different number on per project.
+A node started without them holds 200 sockets per project, upstream's hosted default, which is worth knowing before sizing a box for more.
+
 The three rates are averages and not ceilings on a moment.
 What is counted goes into a bucket per five seconds, twelve of them are kept, and the number compared with the limit is the average per second across that minute, so a burst is forgiven and a sustained rate is not.
 A message costs the send and every delivery of it, so one broadcast to a hundred sockets is a hundred and one messages, which is the arithmetic that makes a hundred a second a real number rather than a generous one.

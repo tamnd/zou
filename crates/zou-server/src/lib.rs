@@ -300,6 +300,10 @@ impl Default for Config {
     }
 }
 
+/// The tables a publication carries, schema then table, as the catalog
+/// spells them. Shared because every join reads the same one.
+pub type Published = Arc<Vec<(String, String)>>;
+
 /// Everything the handlers share: the config and, when postgres is
 /// reachable, the session pool. The pool dials lazily, so building
 /// this never blocks on the database.
@@ -334,6 +338,14 @@ pub struct App {
     pub catalog: tokio::sync::RwLock<HashMap<String, (u64, Arc<Catalog>)>>,
     /// Bumped by the DDL watch whenever the schema may have changed.
     pub epoch: Arc<AtomicU64>,
+    /// What the realtime publication carries, schema and table, tagged
+    /// with the epoch it was read under. A join naming a table has to
+    /// know, and asking the catalog once per join is a hundred thousand
+    /// reads of one answer on a node holding a hundred thousand
+    /// sockets, which is what makes joining slower the more of them
+    /// there are. `alter publication` is DDL, so the same watch that
+    /// moves the rest of the catalog on moves this.
+    pub published: tokio::sync::RwLock<Option<(u64, Published)>>,
     /// The watch starts on the first request that needs a catalog,
     /// because a router can be built outside a runtime.
     pub watching: tokio::sync::OnceCell<()>,
@@ -476,6 +488,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         web,
         catalog: tokio::sync::RwLock::new(HashMap::new()),
         epoch: Arc::new(AtomicU64::new(0)),
+        published: tokio::sync::RwLock::new(None),
         watching: tokio::sync::OnceCell::new(),
         sending: tokio::sync::OnceCell::new(),
         blobs,

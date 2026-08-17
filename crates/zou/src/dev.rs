@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::{self, Project};
+use crate::serve;
 use zou_pg::{bootstrap, install, restore};
 use zou_store::layout::TenantLayout;
 use zou_store::{CasStore, Manifest, open_store};
@@ -544,6 +545,9 @@ pub fn run(args: &Args) -> Result<(), String> {
     fs::set_permissions(&sock, fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("chmod {}: {e}", sock.display()))?;
     log::info!("runtime directory {}", args.runtime.display());
+    // The same reason `zou serve` does it: a socket is a descriptor and
+    // the limit a shell hands a program is a thousand of them.
+    log::debug!("up to {} open files, a socket each", serve::descriptors());
 
     let project = project(args)?;
     let (port, http) = ports(args, project.as_ref());

@@ -50,6 +50,10 @@
 //! runs. And a table with no primary key cannot be checked at all,
 //! which is an error in the payload rather than a silence.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde_json::Value;
 
 use crate::payload::{NO_KEY, Seen, UNAUTHORIZED};
@@ -77,32 +81,151 @@ impl Asker {
     }
 }
 
-/// What this asker may see of this change.
+/// What the catalog says about a table and a role, which is the half of
+/// the answer that is not about the row.
 ///
-/// One database round trip when the table has no row level security on
-/// it, two when it has, and the second one is a primary key lookup as
-/// the subscriber. That cost is per asker per change, which is what
-/// upstream pays as well: a policy is a function of the row and of who
-/// is asking, so there is no answer to cache across either.
-pub async fn seen(pool: &Pool, asker: &Asker, change: &Change) -> Result<Seen, String> {
-    let sess = pool.admin().await.map_err(unreachable)?;
-    let seen = looking(&sess, asker, change).await;
-    // Always, whatever happened: the role and the claims are set with
-    // `set_config` local to this transaction, so the rollback is what
-    // puts the connection back the way the pool handed it over.
-    if let Err(e) = sess.rollback().await {
-        log::warn!("realtime: a visibility check would not roll back, {e}");
-    }
-    seen
+/// Whether row level security is on, which columns the role may select,
+/// which columns name a row and what they are declared as: all four are
+/// facts about the schema and a grant, so two changes to the same table
+/// have the same ones and a hundred thousand subscribers holding the
+/// same role have the same ones too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Facts {
+    /// Whether the table has row level security enabled, which is the
+    /// only reason to ask the database anything per subscriber.
+    pub rls: bool,
+    /// Which of the relation's columns this role may select, in the
+    /// relation's order.
+    pub columns: Vec<bool>,
+    /// Which of them name a row, in the same order.
+    pub keys: Vec<bool>,
+    /// Where those are, which is the same thing counted out.
+    pub key_at: Vec<usize>,
+    /// What each of them is declared as, in `key_at` order, in the form
+    /// a cast can use. Empty when the table has no row level security,
+    /// because then nothing is ever selected back by key.
+    pub key_types: Vec<String>,
 }
 
-async fn looking(sess: &Session, asker: &Asker, change: &Change) -> Result<Seen, String> {
-    let relation = &change.relation;
-    let (rls, columns, keys) = privileges(sess, asker, relation).await?;
+/// The facts above, kept for as long as the catalog they came out of.
+///
+/// This is what makes a change feed cost the database nothing per
+/// subscriber on a table with no row level security. Without it every
+/// delivery is a pooled session, a catalog query and a rollback, which
+/// is three round trips to answer a question whose answer was the same
+/// the last hundred thousand times it was asked, and it is asked once
+/// per subscriber per change: at a thousand rows a second and a hundred
+/// subscribers a row that is three hundred thousand round trips a
+/// second from one serial loop, so the feed falls minutes behind rather
+/// than being slow.
+///
+/// Staleness is the catalog epoch's, which the DDL event trigger moves
+/// and which a database with no trigger installed moves on a timer.
+/// That is the same contract the rest layer's own catalog cache lives
+/// under, so a grant that reaches one late reaches the other late by
+/// the same amount, rather than there being two answers on one server.
+pub struct Catalog {
+    epoch: Arc<AtomicU64>,
+    /// Which epoch the entries below were read under. Everything is
+    /// dropped on a bump rather than rechecked, since a bump is rare
+    /// and rereading a handful of tables is cheaper than being clever.
+    at: u64,
+    known: HashMap<(u32, String), Arc<Facts>>,
+}
+
+impl Catalog {
+    /// A cache under this epoch. The epoch is bumped by the watch the
+    /// join path starts, and a reader only ever runs because a join
+    /// asked for something, so by the time this is read there is one.
+    pub fn new(epoch: Arc<AtomicU64>) -> Catalog {
+        Catalog {
+            epoch,
+            at: 0,
+            known: HashMap::new(),
+        }
+    }
+
+    /// What the catalog says about this table for this role.
+    pub async fn facts(
+        &mut self,
+        pool: &Pool,
+        relation: &Relation,
+        role: &str,
+    ) -> Result<Arc<Facts>, String> {
+        let epoch = self.epoch.load(Ordering::Relaxed);
+        if epoch != self.at {
+            self.known.clear();
+            self.at = epoch;
+        }
+        let key = (relation.oid, role.to_string());
+        if let Some(facts) = self.known.get(&key) {
+            return Ok(Arc::clone(facts));
+        }
+        let facts = Arc::new(reading(pool, relation, role).await?);
+        self.known.insert(key, Arc::clone(&facts));
+        Ok(facts)
+    }
+
+    /// How many tables and roles are held, for a test.
+    pub fn held(&self) -> usize {
+        self.known.len()
+    }
+}
+
+/// One read of the catalog, on a session of its own.
+async fn reading(pool: &Pool, relation: &Relation, role: &str) -> Result<Facts, String> {
+    let sess = pool.admin().await.map_err(unreachable)?;
+    let read = catalogued(&sess, relation, role).await;
+    if let Err(e) = sess.rollback().await {
+        log::warn!("realtime: a catalog read would not roll back, {e}");
+    }
+    read
+}
+
+async fn catalogued(sess: &Session, relation: &Relation, role: &str) -> Result<Facts, String> {
+    let (rls, columns, keys) = privileges(sess, role, relation).await?;
+    let keys = identifying(relation, keys);
+    let key_at: Vec<usize> = keys
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| **key)
+        .map(|(at, _)| at)
+        .collect();
+    // Only the row check compares a key against a value, so a table
+    // without row level security never needs the types and is not
+    // charged a query for them.
+    let key_types = if rls && !key_at.is_empty() {
+        key_types(sess, relation, &key_at).await?
+    } else {
+        Vec::new()
+    };
+    Ok(Facts {
+        rls,
+        columns,
+        keys,
+        key_at,
+        key_types,
+    })
+}
+
+/// What this asker may see of this change, given what the catalog
+/// already said about the table.
+///
+/// No database round trip at all when the table has no row level
+/// security on it, and one when it has: a primary key lookup as the
+/// subscriber. That cost is per asker per change, which is what
+/// upstream pays as well: a policy is a function of the row and of who
+/// is asking, so there is no answer to cache across either.
+pub async fn seen(
+    pool: &Pool,
+    facts: &Facts,
+    asker: &Asker,
+    change: &Change,
+) -> Result<Seen, String> {
     let mut seen = Seen {
         row: true,
-        columns,
-        keys: identifying(relation, keys),
+        columns: facts.columns.clone(),
+        keys: facts.keys.clone(),
         keys_only: false,
         error: None,
     };
@@ -111,32 +234,33 @@ async fn looking(sess: &Session, asker: &Asker, change: &Change) -> Result<Seen,
     // is gone and no policy can be asked about it. What it says is cut
     // down instead.
     if change.op == Op::Delete {
-        seen.keys_only = rls;
+        seen.keys_only = facts.rls;
         return Ok(seen);
     }
 
-    let keys: Vec<usize> = seen
-        .keys
-        .iter()
-        .enumerate()
-        .filter(|(_, key)| **key)
-        .map(|(at, _)| at)
-        .collect();
-    if keys.is_empty() {
+    if facts.key_at.is_empty() {
         // Nothing can name the row, so nothing can check it. Upstream
         // sends the reason rather than the row.
         seen.error = Some(NO_KEY);
         return Ok(seen);
     }
-    if keys.iter().any(|at| !seen.columns[*at]) {
+    if facts.key_at.iter().any(|at| !facts.columns[*at]) {
         seen.error = Some(UNAUTHORIZED);
         return Ok(seen);
     }
-    if !rls {
+    if !facts.rls {
         return Ok(seen);
     }
 
-    seen.row = allowed(sess, asker, relation, &keys, change).await?;
+    let sess = pool.admin().await.map_err(unreachable)?;
+    let allowed = allowed(&sess, asker, &change.relation, facts, change).await;
+    // Always, whatever happened: the role and the claims are set with
+    // `set_config` local to this transaction, so the rollback is what
+    // puts the connection back the way the pool handed it over.
+    if let Err(e) = sess.rollback().await {
+        log::warn!("realtime: a visibility check would not roll back, {e}");
+    }
+    seen.row = allowed?;
     Ok(seen)
 }
 
@@ -169,7 +293,7 @@ fn identifying(relation: &Relation, keys: Vec<bool>) -> Vec<bool> {
 /// with one should see nothing rather than everything.
 async fn privileges(
     sess: &Session,
-    asker: &Asker,
+    role: &str,
     relation: &Relation,
 ) -> Result<(bool, Vec<bool>, Vec<bool>), String> {
     let names: Vec<String> = relation.columns.iter().map(|c| c.name.clone()).collect();
@@ -206,7 +330,7 @@ async fn privileges(
                   where i.indrelid = c.oid and i.indisprimary limit 1
              ) k on true
              where c.oid = $1::int8::oid",
-            &[&oid, &asker.role, &names],
+            &[&oid, &role, &names],
         )
         .await
         .map_err(refused)?;
@@ -225,14 +349,15 @@ async fn allowed(
     sess: &Session,
     asker: &Asker,
     relation: &Relation,
-    keys: &[usize],
+    facts: &Facts,
     change: &Change,
 ) -> Result<bool, String> {
     // The type each key is compared as, which has to come from the
     // catalog: a value arrives as text and comparing it as text would
     // both miss an index and be wrong about anything postgres prints
-    // more than one way.
-    let types = key_types(sess, relation, keys).await?;
+    // more than one way. It came with the rest of the facts, because
+    // the catalog says the same thing about it every time.
+    let (keys, types) = (&facts.key_at, &facts.key_types);
     let mut where_ = String::new();
     let mut values: Vec<Option<String>> = Vec::new();
     for (nth, at) in keys.iter().enumerate() {
