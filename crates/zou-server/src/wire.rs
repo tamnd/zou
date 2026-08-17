@@ -138,6 +138,7 @@ impl Wire {
                 .accept()
                 .await
                 .map_err(|e| format!("accept on the pg port: {e}"))?;
+            nodelay(&sock);
             let wire = Arc::clone(&self);
             tokio::spawn(async move {
                 if let Err(e) = wire.session(sock).await {
@@ -1042,6 +1043,28 @@ async fn authenticate(sock: &mut TcpStream, entry: &Tenant, route: &Route) -> Re
     }
 }
 
+/// Turn Nagle off on a wire socket, both the client's and the one to
+/// the database.
+///
+/// Nagle holds a small write back until the last small write has been
+/// acknowledged, and the other side does not acknowledge straight away
+/// because it is waiting to put the acknowledgement on a reply it has
+/// not written yet. Every transaction through the pooler is a pair of
+/// small writes in each direction, the query and then the reset on one
+/// side and the rows and then the ready on the other, so the second of
+/// each pair waits out the delayed acknowledgement timer, which is 40
+/// ms on linux. Measured on server3 as 42.7 ms for `select 1` through
+/// the pooler against 0.60 ms for the same statement through the
+/// session port on the same node and the same database.
+///
+/// A socket that refuses is still a working socket, so a failure here
+/// is not a reason to fail the connection.
+fn nodelay(sock: &TcpStream) {
+    if let Err(e) = sock.set_nodelay(true) {
+        log::debug!("nodelay: {e}");
+    }
+}
+
 /// Open the session on the tenant's own postgres.
 ///
 /// The startup packet sent on is the client's, with the three things
@@ -1104,6 +1127,7 @@ async fn connect(dsn: &str, params: &[(String, String)], route: &Route) -> Resul
                 message: "the database for this project could not be reached".to_string(),
             }
         })?;
+    nodelay(&up);
     up.write_all(&len.to_be_bytes())
         .await
         .map_err(|e| Stop::Quiet(format!("startup to the database: {e}")))?;
@@ -2070,6 +2094,23 @@ mod tests {
         ];
         let stop = route(&params).err().expect("a refusal");
         assert!(matches!(stop, Stop::Say { code: "28000", .. }), "{stop}");
+    }
+
+    #[tokio::test]
+    async fn nagle_is_off_on_a_socket_the_wire_owns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = listener.local_addr().expect("an address");
+        let accepted = tokio::spawn(async move { listener.accept().await.expect("a client").0 });
+        let client = TcpStream::connect(addr).await.expect("a connection");
+        let server = accepted.await.expect("the accept task");
+        assert!(
+            !server.nodelay().expect("the option"),
+            "a socket arrives with nagle on, which is what this is about"
+        );
+        nodelay(&server);
+        nodelay(&client);
+        assert!(server.nodelay().expect("the option"));
+        assert!(client.nodelay().expect("the option"));
     }
 
     #[test]
