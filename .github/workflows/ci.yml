@@ -859,8 +859,51 @@ jobs:
       - name: Keep the server log
         if: always()
         run: cat /tmp/serve.log
+      # The same file again, against a node that does not hold the
+      # project. A subscription cannot be decided where the sockets are,
+      # because what a subscriber may see of a row is a select of that
+      # row as them, so the list crosses a link and the rows come back
+      # already decided for one socket. What this asks is whether a
+      # client can tell: same suite, same golden, different node.
+      #
+      # In the same job rather than a job of its own, because a second
+      # job is a second database and a second twenty minutes for one url
+      # to change. The fan out node here serves the suite's writes out of
+      # the same database, since a suite that writes rows over /rest/v1
+      # needs an api and a node with no database has none. The node with
+      # no database at all is asked in crates/zou-server/tests/changes.rs.
+      - name: Serve the same project from a fan out node
+        run: |
+          pkill -f zou-conformance || true
+          for _ in $(seq 1 30); do
+            curl -fsS http://127.0.0.1:54321/auth/v1/health >/dev/null 2>&1 || break
+            sleep 1
+          done
+          cargo run -p zou-conformance -- serve \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --fan-out \
+            --setup /tmp/zou-conformance/js-realtime-changes/setup.sql \
+            > /tmp/serve-fanout.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q '^url ' /tmp/serve-fanout.log && break
+            sleep 1
+          done
+          cat /tmp/serve-fanout.log
+          grep -q '^url ' /tmp/serve-fanout.log
+      - name: Read the same rows off a subscription on that node
+        working-directory: /tmp/zou-conformance/js-realtime-changes
+        run: |
+          ZOU_ANON_KEY="$(awk '/^anon /{print $2}' /tmp/serve-fanout.log)" \
+            ZOU_JWT_SECRET="$ZOU_CONFORMANCE_SECRET" npm test -- \
+            --reporter=default
+      - name: Keep the fan out server log
+        if: always()
+        run: cat /tmp/serve-fanout.log
       # For the scoreboard, which is generated in a job of its own out
-      # of what the runs wrote rather than out of a second run.
+      # of what the runs wrote rather than out of a second run. The fan
+      # out run writes no report of its own: it is the same questions and
+      # counting them twice would say the suite is bigger than it is.
       - name: Keep the report
         if: always()
         uses: actions/upload-artifact@v4

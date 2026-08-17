@@ -78,7 +78,7 @@ pub fn start(
     anon: &str,
     s3: Credentials,
 ) -> Result<Served, String> {
-    start_at(0, dsn, secret, schemas, anon, s3)
+    start_at(0, dsn, None, secret, schemas, anon, s3)
 }
 
 /// The same, on a port somebody has to know in advance.
@@ -87,9 +87,15 @@ pub fn start(
 /// so it does not care what port zou got. A suite written in another
 /// language is asked over a client somebody else wrote, and all that
 /// one takes is a url, so it has to be a url that was agreed on.
+///
+/// `holder` is the node that writes the project, when this one is a fan
+/// out node in front of it. Set, and every question a socket asks that
+/// only the tenant or the database can answer goes up a link to that
+/// url, which is the thing a suite run against this one is asking about.
 pub fn start_at(
     port: u16,
     dsn: &str,
+    holder: Option<&str>,
     secret: &[u8],
     schemas: &[String],
     anon: &str,
@@ -107,6 +113,7 @@ pub fn start_at(
     let cfg = Config {
         jwt_secret: secret.to_vec(),
         pg: Some(dsn.to_string()),
+        holder: holder.map(str::to_string),
         external_url: Some(url.clone()),
         // The one piece of configuration that is read from the
         // environment here, because it is the one a suite cannot carry:

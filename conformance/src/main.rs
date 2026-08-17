@@ -89,6 +89,12 @@ serving
                            is where the fixture of a suite asked elsewhere
                            goes. Applied after the auth schema exists, so it
                            may reference auth.users
+  --fan-out                answer on the port from a node that does not hold
+                           the project, with the holder behind it. A socket
+                           is served on the node the client reached and every
+                           question only the tenant or the database can
+                           answer crosses a link, so a suite pointed here is
+                           asking whether a client can tell the difference
 
 deriving
   --from <path>            a PostgREST source tree at the pinned version
@@ -171,6 +177,7 @@ struct Args {
     ours: Vec<String>,
     pin: Option<String>,
     out: Option<String>,
+    fan_out: bool,
 }
 
 fn parse(argv: &[String]) -> Result<Args, String> {
@@ -207,6 +214,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         js: Vec::new(),
         ours: Vec::new(),
         pin: None,
+        fan_out: false,
         out: None,
     };
     let mut it = argv.iter();
@@ -253,6 +261,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--write-known" => args.write_known = true,
             "--suites" => args.suites_dir = Some(need("--suites")?),
             "--setup" => args.setup_sql = Some(need("--setup")?),
+            "--fan-out" => args.fan_out = true,
             "--report" => args.reports.push(need("--report")?),
             "--js" => args.js.push(need("--js")?),
             "--ours" => args.ours.push(need("--ours")?),
@@ -315,6 +324,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     }
     if args.setup_sql.is_some() {
         return Err("--setup is for serve, the other modes apply the suite's own".to_string());
+    }
+    if args.fan_out {
+        return Err("--fan-out is for serve, which is the mode that puts a node on a port".into());
     }
     // Deriving reads a checkout and writes files. There is nothing to
     // ask, so a target would be a command somebody meant differently.
@@ -602,9 +614,25 @@ fn s3_pair(access: &str, secret: &str) -> zou_server::s3::Credentials {
 /// that has happened.
 fn holding(args: &Args) -> Result<bool, String> {
     let dsn = args.zou_dsn.as_deref().expect("parse checked for one");
+    // With --fan-out, the node the suite is pointed at is not the node
+    // that holds the project: the holder goes up first on a port nobody
+    // had to agree on, and the one on the agreed port is a fan out node
+    // in front of it. What that changes is where a socket is served, and
+    // that is the whole question a suite run this way is asking.
+    let holder = match args.fan_out {
+        false => None,
+        true => Some(zou::start(
+            dsn,
+            args.jwt_secret.as_bytes(),
+            &args.schemas,
+            &args.anon_role,
+            s3_pair(&args.s3_key, &args.s3_secret),
+        )?),
+    };
     let served = zou::start_at(
         args.port,
         dsn,
+        holder.as_ref().map(|held| held.url.as_str()),
         args.jwt_secret.as_bytes(),
         &args.schemas,
         &args.anon_role,
@@ -614,6 +642,12 @@ fn holding(args: &Args) -> Result<bool, String> {
         let sql = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         target::apply(dsn, &sql, "serve")?;
         println!("setup {path}");
+    }
+    // The suite reads `url` and nothing else, so a fan out run is a
+    // suite that cannot tell. The holder is printed for a person reading
+    // the log of a run that went wrong.
+    if let Some(held) = &holder {
+        println!("holder {}", held.url);
     }
     println!("url {}", served.url);
     for role in ["anon", "authenticated", "service_role"] {
@@ -1007,6 +1041,24 @@ mod tests {
         assert!(parse(&argv(&["serve"])).is_err());
         assert!(parse(&argv(&["serve", "--zou-dsn", "d", "--url", "u"])).is_err());
         assert!(parse(&argv(&["serve", "--zou-dsn", "d", "--port", "eight"])).is_err());
+    }
+
+    /// The same suite, asked of a node that does not hold the project.
+    /// It is a shape of serving rather than a mode, because what the
+    /// suite is handed is the same url either way.
+    #[test]
+    fn a_fan_out_run_is_a_way_of_serving_rather_than_a_target() {
+        let args = parse(&argv(&["serve", "--zou-dsn", "d", "--fan-out"])).expect("parses");
+        assert!(args.fan_out);
+        assert!(
+            !parse(&argv(&["serve", "--zou-dsn", "d"]))
+                .expect("parses")
+                .fan_out
+        );
+        assert!(
+            parse(&argv(&["check", "--url", "u", "--fan-out"])).is_err(),
+            "there is nothing to put a node in front of when the target is somebody else's url"
+        );
     }
 
     /// A fixture applied by hand belongs to the suite that is asked

@@ -76,7 +76,8 @@
 //! client.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -143,10 +144,107 @@ pub struct Listening {
 
 struct Listener {
     asker: Asker,
-    to: mpsc::Sender<Heard>,
+    to: To,
     /// The bindings this subscriber has, so that a socket hanging up
     /// takes its own out of the index and nobody else's.
     bindings: Vec<u64>,
+}
+
+/// Where one subscriber's changes go.
+///
+/// A socket on this node has a queue of its own, which is the right
+/// shape for a browser tab's worth of channels: the socket's own loop
+/// waits on that queue along with everything else it is waiting on.
+///
+/// A node on the far end of a link is a hundred thousand of those, and
+/// a hundred thousand receivers is not something to wake up and poll
+/// every time one of them has a row in it. So the subscribers on one
+/// link share the one queue that link drains and each row carries the
+/// name of the socket it is for, which puts the fan out back on the
+/// node where the socket is. Nothing is given away by that: the check
+/// happened here either way, so what crosses is a row already decided
+/// for exactly one subscriber.
+#[derive(Clone)]
+enum To {
+    /// A socket on this node.
+    Own(mpsc::Sender<Heard>),
+    /// A socket on the other end of a link, as that link names it.
+    Link { named: u64, link: Arc<Shared> },
+}
+
+impl To {
+    /// Hand one message over, without ever waiting: a reader that
+    /// waited on a subscriber would be a reader that had stopped
+    /// reading the slot. False is somebody who is not keeping up.
+    fn send(&self, heard: Heard) -> bool {
+        match self {
+            To::Own(to) => match to.try_send(heard) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => false,
+                // The socket went between the match and the send, which
+                // is ordinary and is cleaned up by whoever owned it.
+                Err(mpsc::error::TrySendError::Closed(_)) => true,
+            },
+            To::Link { named, link } => link.send(*named, heard),
+        }
+    }
+
+    /// Whether one that is not keeping up is dropped here.
+    ///
+    /// A socket of this node's own is: a subscriber this far behind is
+    /// one whose next message would not have arrived either, and one
+    /// that is told it missed something can go and read the table.
+    ///
+    /// A socket on a link is not, because what is behind is the link
+    /// rather than that one subscription, and the link's own end tells
+    /// every socket on it. Dropping subscriptions one at a time from
+    /// here would be taking the project's changes away from a node that
+    /// is about to reconnect and ask for them again.
+    fn dropped_when_behind(&self) -> bool {
+        matches!(self, To::Own(_))
+    }
+}
+
+/// The one queue every subscriber on one link shares.
+pub struct Shared {
+    to: mpsc::Sender<(u64, Heard)>,
+    /// Set when something did not fit, which is a node that is not
+    /// draining its link. Its own end reads this and tells every socket
+    /// on it there is a gap, which is the same news it would give them
+    /// if the link had broken, because from where they are sitting it
+    /// has.
+    behind: AtomicBool,
+}
+
+impl Shared {
+    /// One, as deep as the end that drains it asked for.
+    pub fn new(depth: usize) -> (Arc<Shared>, mpsc::Receiver<(u64, Heard)>) {
+        let (to, heard) = mpsc::channel(depth);
+        (
+            Arc::new(Shared {
+                to,
+                behind: AtomicBool::new(false),
+            }),
+            heard,
+        )
+    }
+
+    fn send(&self, named: u64, heard: Heard) -> bool {
+        if self.to.try_send((named, heard)).is_err() {
+            self.behind.store(true, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    /// Whether anything was missed since the last time this was asked.
+    ///
+    /// Taken rather than read, because the link tells its sockets once
+    /// for however many rows did not fit: there is no way to say which
+    /// they were, so saying it twice says nothing new.
+    pub fn behind(&self) -> bool {
+        self.behind.swap(false, Ordering::Relaxed)
+    }
 }
 
 /// Whether there is a tap on the database right now.
@@ -220,7 +318,7 @@ impl Changes {
             id,
             Listener {
                 asker,
-                to,
+                to: To::Own(to),
                 bindings: Vec::new(),
             },
         );
@@ -229,6 +327,31 @@ impl Changes {
         // a wake nobody was waiting for is free.
         self.wake.notify_one();
         Listening { id, heard }
+    }
+
+    /// A subscriber on the other end of a link, whose changes go down
+    /// the one queue that link drains with itself named on each of them.
+    ///
+    /// Everything else about it is a subscriber like any other: it is
+    /// the reader that decides what this one may see of a row, against
+    /// the claims in the token its socket is running on, which is why
+    /// there is a subscriber here at all rather than a node asking for
+    /// rows and filtering them itself.
+    pub fn listening_on(&self, asker: Asker, named: u64, link: Arc<Shared>) -> u64 {
+        let mut inner = self.inner.lock().expect("changes");
+        inner.next += 1;
+        let id = inner.next;
+        inner.listeners.insert(
+            id,
+            Listener {
+                asker,
+                to: To::Link { named, link },
+                bindings: Vec::new(),
+            },
+        );
+        drop(inner);
+        self.wake.notify_one();
+        id
     }
 
     /// One thing a subscriber asked for, which comes back as the id a
@@ -378,7 +501,7 @@ impl Changes {
     /// three subscriptions on the same table is owed one message
     /// carrying three ids, which is what upstream sends and what its
     /// clients expect.
-    fn wanted(&self, change: &Change) -> Vec<(u64, Asker, mpsc::Sender<Heard>, Vec<u64>)> {
+    fn wanted(&self, change: &Change) -> Vec<(u64, Asker, To, Vec<u64>)> {
         let inner = self.inner.lock().expect("changes");
         let mut by_listener: HashMap<u64, Vec<u64>> = HashMap::new();
         for id in inner.subs.matching(change) {
@@ -399,7 +522,7 @@ impl Changes {
     }
 
     /// Everybody, for the news that is not about one change.
-    fn everybody(&self) -> Vec<(u64, mpsc::Sender<Heard>)> {
+    fn everybody(&self) -> Vec<(u64, To)> {
         let inner = self.inner.lock().expect("changes");
         inner
             .listeners
@@ -558,26 +681,19 @@ impl Reader {
                     }
                 };
                 let Some(data) = data else { continue };
-                match to.try_send(Heard::Change {
+                let sent = to.send(Heard::Change {
                     ids,
                     data,
                     commit_ts: change.commit_ts,
                     read,
-                }) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        // Not a wait and not a drop of this one
-                        // message: a subscriber that is this far behind
-                        // is one whose next messages would not arrive
-                        // either, and one that is told it missed
-                        // something can go and read the table.
-                        log::warn!("realtime: a subscriber stopped reading, dropping it");
-                        self.changes.hung_up(listener);
-                    }
-                    // The socket went between the match and the send,
-                    // which is ordinary and is cleaned up by whoever
-                    // owned it.
-                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                });
+                // Not a wait and not a drop of this one message: a
+                // subscriber that is this far behind is one whose next
+                // messages would not arrive either, and one that is
+                // told it missed something can go and read the table.
+                if !sent && to.dropped_when_behind() {
+                    log::warn!("realtime: a subscriber stopped reading, dropping it");
+                    self.changes.hung_up(listener);
                 }
             }
         }
@@ -613,7 +729,7 @@ impl Reader {
     /// Tell every subscriber that what they have is not everything.
     async fn gap(&self) {
         for (listener, to) in self.changes.everybody() {
-            if to.try_send(Heard::Gap).is_err() {
+            if !to.send(Heard::Gap) && to.dropped_when_behind() {
                 self.changes.hung_up(listener);
             }
         }
@@ -728,11 +844,15 @@ mod tests {
         changes.bind(slow.id, binding("todos")).expect("a binding");
         let (_, _, to, _) = changes.wanted(&change("todos")).remove(0);
         for _ in 0..QUEUE {
-            to.try_send(Heard::Gap).expect("a queue with room in it");
+            assert!(to.send(Heard::Gap), "a queue with room in it");
         }
         assert!(
-            to.try_send(Heard::Gap).is_err(),
+            !to.send(Heard::Gap),
             "the queue is bounded, which is the whole point of it"
+        );
+        assert!(
+            to.dropped_when_behind(),
+            "and a socket on this node is the kind that is dropped for it"
         );
 
         // What the reader does about it, which is the property that
@@ -741,6 +861,56 @@ mod tests {
         // filling up.
         changes.hung_up(slow.id);
         assert_eq!(changes.listening(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_subscriber_on_a_link_hears_its_rows_on_the_queue_that_link_drains() {
+        // A row for a socket on another node goes down the one queue that
+        // link drains with that node's own name for the socket on it, so
+        // the fan out happens where the sockets are and the check happens
+        // here.
+        let changes = Changes::new();
+        let (link, mut rows) = Shared::new(4);
+        let ana = changes.listening_on(asker("ana"), 7, Arc::clone(&link));
+        let bound = changes.bind(ana, binding("todos")).expect("a binding");
+
+        let wanted = changes.wanted(&change("todos"));
+        assert_eq!(wanted.len(), 1);
+        assert_eq!(wanted[0].0, ana);
+        assert_eq!(wanted[0].3, vec![bound]);
+        assert!(wanted[0].2.send(Heard::Gap));
+        assert_eq!(
+            rows.recv().await,
+            Some((7, Heard::Gap)),
+            "named for the socket the other end knows, since a link's numbers are its own"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_that_stops_draining_is_told_once_rather_than_losing_a_subscriber() {
+        // What is behind is the link and not one subscription, so the news
+        // goes to the link, which tells every socket on it. Dropping
+        // subscribers from here would be taking a project's changes away
+        // from a node that is about to reconnect and ask for them again.
+        let changes = Changes::new();
+        let (link, _rows) = Shared::new(1);
+        let ana = changes.listening_on(asker("ana"), 7, Arc::clone(&link));
+        changes.bind(ana, binding("todos")).expect("a binding");
+        let (_, _, to, _) = changes.wanted(&change("todos")).remove(0);
+
+        assert!(to.send(Heard::Gap), "one fits");
+        assert!(!to.send(Heard::Gap), "and the queue is bounded on purpose");
+        assert!(!to.dropped_when_behind());
+        assert!(link.behind(), "the link is what is told");
+        assert!(
+            !link.behind(),
+            "once, however many rows did not fit, because there is no way to say which they were"
+        );
+        assert_eq!(
+            changes.listening(),
+            1,
+            "and the subscriber is still there for when that node drains its link"
+        );
     }
 
     #[tokio::test]

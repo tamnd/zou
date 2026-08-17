@@ -383,7 +383,7 @@ Upstream behaves the same way, and a project that needs an audit trail of who sa
 
 | asked for | what happens |
 | --- | --- |
-| `postgres_changes` on a server with no database | the join is refused, naming what is missing |
+| `postgres_changes` on a server with no database and no holder behind it | the join is refused, naming what is missing |
 | presence rate limits | presence is not counted separately from the rest |
 
 That is M4, tracked in [tamnd/zou#4](https://github.com/tamnd/zou/issues/4).
@@ -393,8 +393,21 @@ A server can accept any of these joins, reply `SUBSCRIBED` and then send nothing
 
 ## On a fleet
 
-A project's sockets live on the node holding that project.
-A node that is asked to upgrade a socket for a project another node holds refuses it with 503 and a sentence, rather than serving it locally, because serving it locally would put half the room on one node and half on the other with no way for either half to hear the other.
+One node writes a project, and its sockets do not have to be on that node.
+A node a socket arrives at serves it there, on that node's own hub, and opens one link per project to the node that holds it.
+So a room is one room however many nodes the clients are spread over: a broadcast, a presence diff and a changed row all come from the holder, and the node the client reached is the thing that hands them over.
 
-A fan out tier that serves sockets away from the holder is part of M4 and is not built.
-Until it is, the topology is the simple one: the holder serves the project, sockets included.
+Two questions cannot be answered away from the holder, and they are the two a database has to answer.
+Whether a private channel's policies allow a socket is row level security on `realtime.messages`, and what a subscriber may see of a changed row is that row selected back as them, so both cross the link and only the answer comes back.
+A changed row that crosses has already been checked for exactly one socket, which is why a node with no database can serve a subscription and cannot leak a row.
+
+A client cannot tell which kind of node it reached, and that is checked rather than asserted: the recorded suites are run against a holder and against a node in front of one, including the golden that compares every frame a channel is sent with what Supabase Realtime sends.
+
+If the link breaks, every socket on that node is told there is a gap, the same news a subscriber gets when it falls behind, because a client that hears a gap resubscribes and reads the table and a client that missed rows quietly cannot.
+Filling a gap from what the holder already sent, rather than telling it, is a follow up.
+
+What a node cannot do on its own yet is count the project's numbers instead of its own share of them.
+Sockets connected and how fast they are joining are refused per node, so a project whose sockets are spread over four nodes is allowed four times what it should be until those two cross the link as well.
+
+`zou serve` does not build a fleet's forwarding, so a single command still serves every project as its own.
+The tier is reached through the same decision every other request goes through, and it arrives when that does.
