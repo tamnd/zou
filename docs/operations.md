@@ -294,6 +294,11 @@ Off is worth keeping reachable, it is how the two paths get compared, and a comp
 The spellings are `1 0 true false on off yes no` in any case, and anything else is refused at startup rather than read as off, because a value nobody can parse is a mistake and answering it with the slow path is how a month of runs measured the wrong path.
 initdb runs with it off in every command that runs one, since bootstrap is a standalone process with no service to talk to, and the redo workers never see it because they run with no store attached at all.
 
+The service polls the store for the tenant's stream every 100 ms while anything is arriving, and a poll is a shard manifest and a round index whether or not anything was written.
+A project nobody is connected to therefore used to read the store about 21 times a second forever, 1883 gets in ninety seconds of an idle node, which on S3 is a bill and a rate limit for a node that is doing nothing.
+The gap now doubles towards two seconds once the stream stops moving, so the same ninety seconds cost 243, and a frame arriving or a reader waiting on an lsn puts it straight back to 100 ms.
+What that spends is up to two seconds on the first read after a quiet spell, and only on a read that has to wait for the stream at all.
+
 One thing still wants the other path.
 A branch reads the page runs a checkpoint fold packed into a full capture, and with the service on the fold publishes an indexless checkpoint instead, so `zou branch create` on a store that has only ever served this way refuses with `cannot be branched yet`.
 The embedded library runs its postmasters with the service off for that reason, since templates and fixtures are branches, and a dev node that wants to be branched wants `zou dev --page-service off`.
