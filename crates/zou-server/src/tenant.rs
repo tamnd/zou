@@ -123,6 +123,35 @@ impl Routing {
     }
 }
 
+/// The path a node opens a fan out link on, which is a route inside a
+/// tenant's own router the same as every other.
+pub const LINK: &str = "/realtime/v1/link";
+
+/// A ref out of a link's url, whatever this server's routing is.
+///
+/// One path is the fleet's own. A node that is holding another node's
+/// sockets names the project in the url it dials, because it is a node
+/// and not a browser: it presents no hostname belonging to the project
+/// and there is no dns in front of it to have an opinion. So this is
+/// read on a server routing by host, where nothing else would read a
+/// path segment at all.
+///
+/// It widens nothing. A client can already put whatever hostname it
+/// likes in a Host header, so a ref has never been the secret part, and
+/// what a link may do once it is open is decided by the key on it
+/// against the tenant's own secret.
+pub fn linking(path: &str) -> Option<Found> {
+    let (first, rest) = path.strip_prefix('/')?.split_once('/')?;
+    if format!("/{rest}") != LINK {
+        return None;
+    }
+    registry::check_ref(first).ok()?;
+    Some(Found {
+        tenant_ref: first.to_string(),
+        path: LINK.to_string(),
+    })
+}
+
 /// A Host header down to the name: no port, no trailing dot, lower
 /// case. Ports because the header carries the one the client dialled,
 /// trailing dots because a fully qualified name is the same name, and
@@ -417,6 +446,27 @@ mod tests {
             found("acme-prod", "/")
         );
         assert_eq!(routing.resolve(None, "/acme-prod"), found("acme-prod", "/"));
+    }
+
+    #[test]
+    fn a_link_names_its_project_wherever_the_server_routes_by_host() {
+        assert_eq!(
+            linking("/acme-prod/realtime/v1/link"),
+            found("acme-prod", "/realtime/v1/link")
+        );
+        // And it is the one path this works for, so a host routed
+        // server has not quietly grown path routing for everything
+        // else.
+        for path in [
+            "/acme-prod/realtime/v1/websocket",
+            "/acme-prod/rest/v1/todos",
+            "/realtime/v1/link",
+            "/favicon.ico/realtime/v1/link",
+            "/acme-prod/realtime/v1/link/more",
+            "",
+        ] {
+            assert_eq!(linking(path), None, "{path}");
+        }
     }
 
     #[test]
