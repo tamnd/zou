@@ -930,7 +930,7 @@ Not present yet, and named rather than silently missing:
 
 - The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
 - Byte streams. There is no `new ReadableStream({ type: "bytes" })`, no BYOB reader and no `TextDecoderStream`.
-- Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet.
+- Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet. That also moves when the promise settles: upstream hands the response back when the headers arrive and this hands it back when the body is in, so a handler racing a slow answer against a clock sees the clock win here and the headers win there.
 - The rest of the file system. Reading a file the function's own `static_files` covers is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
 - Node built ins. `node:fs` and the rest are refused by name.
 
