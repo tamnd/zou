@@ -446,13 +446,13 @@ zou took the writes because its bootstrap grants the three api roles everything 
 An edge function is not a request, it is a project: a directory per function, an `index.ts` in each, `_shared` beside them, and a `config.toml` that says which of them may be called without a token.
 So the suite is that project, and both legs put it on disk unedited, one under `zou functions serve` and the other under a `supabase start` with edge-runtime in it.
 There is nothing upstream to copy, the way there was nothing for presence: supabase-js's own suite has one line about functions in it and edge-runtime's tests are about the runtime rather than about the surface a project sees.
-26 tests in three files, and the reference leg is what makes them a statement about Supabase rather than about zou.
+29 tests in three files, and the reference leg is what makes them a statement about Supabase rather than about zou.
 
 `entry.test.ts` is the three ways a module says what to run, all three deployed and all three called, because `Deno.serve` is the documented one and the other two are what most functions in the wild are written with.
 It is also where a function the config file names rather than the listing is asked for, with its entrypoint two directories down and no directory of its own, which is how the examples project deploys its mcp server.
 `invoke.test.ts` is the invocation: supabase-js's own `functions.invoke`, the refusals, the two error pages, and an answer arriving before the work `waitUntil` was handed has finished.
 The refusals are three rather than one because the server tells them apart before it verifies anything, and no header, a string that is not a token, and a token signed with something else are three codes and three messages.
-`runtime.test.ts` is what the handler is given: the environment variables, the web surface, giving up on a call, a body that arrives in pieces as it is written, the headers describing the request that reached the front door, and CORS.
+`runtime.test.ts` is what the handler is given: the environment variables, the web surface, giving up on a call, copying a value, a body that arrives in pieces as it is written, the headers describing the request that reached the front door, and CORS.
 
 Three questions have two right answers and all three are asserted rather than skipped, because a suite that skips a divergence stops noticing the day one of the two changes.
 A preflight is answered by kong on the local stack before the function is reached, and zou hands it to the function the way the hosted runtime does, so the `_shared/cors.ts` that is in every Supabase example is what decides.
@@ -466,7 +466,7 @@ The only witness is the far end, so it was measured with a slow server that repo
 
 The zou leg is run twice, and that is a claim the other suites cannot make.
 The first run serves the project directory, the way a person does while writing a function.
-The second deploys that same directory to a store with `zou functions deploy`, serves what was written there with `zou functions serve --target`, and asks the same 26 questions of it, on a process that has no project directory at all.
+The second deploys that same directory to a store with `zou functions deploy`, serves what was written there with `zou functions serve --target`, and asks the same 29 questions of it, on a process that has no project directory at all.
 A deploy carries a subset of a project on purpose, it drops every dotfile and it flattens what the config file said into a manifest, so whether what comes back is still the project is exactly the kind of thing that is easy to assume and cheap to ask.
 Both legs are `needs` of the scoreboard job, so a deployment that answered differently stops the page from being regenerated.
 
@@ -507,8 +507,9 @@ The identical count was 16 until the day zou set `SUPABASE_PUBLISHABLE_KEYS` and
 Most of this corpus goes through `npm:@supabase/server`, which builds a client out of those before a handler runs and refuses the request when it finds neither, and four functions went straight from that refusal to the reference's own answer.
 A fifth, `custom-jwt-validation`, got past the client and landed on `AbortSignal.timeout`, which zou did not have, so the environment had been hiding a runtime gap rather than there being nothing there.
 
-The signal arrived and that function moved again, to `structuredClone`, which is the next thing missing rather than the same thing missing and is [#431](https://github.com/tamnd/zou/issues/431).
-Nothing else in the corpus moved with it and the identical count is still 20, which is the honest shape of a gap found this way: each one is one function's next line, and the value is in the finding rather than in the number.
+The signal arrived and that function moved again, to `structuredClone`, and the copy arrived and it moved a third time, to where upstream stops: both servers now refuse the same jwks out of the same library for the same reason.
+The two bodies still differ by one word, the name of the error class, which is `JOSENotSupported` upstream and `I` here because esm.sh serves jose minified and the class names its errors after itself, and that is [#435](https://github.com/tamnd/zou/issues/435) rather than a runtime difference.
+Nothing else in the corpus moved with any of it and the identical count is still 20, which is the honest shape of a gap found this way: each one is one function's next line, and the value is in the finding rather than in the number.
 
 The three zou runs and upstream does not are all one shape: upstream builds the module graph ahead of time and refuses a graph it cannot complete, and zou fetches a module when something asks for it, so a type only file nobody imports at runtime is never fetched.
 The nine the other way are nine different things rather than one, which is why they are follow ups: top level await that never settles because the thing awaited is a server already listening, `Deno.connect`, `Deno.readFile` of an https url, a module served with no content type, esm.sh answering 500, a browser build missing an export, and the mcp sdk failing inside the registry's build of itself.

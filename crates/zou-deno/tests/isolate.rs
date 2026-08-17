@@ -960,6 +960,9 @@ fn a_file_is_a_blob_that_knows_what_it_is_called() {
             text: await file.text(),
             isBlob: file instanceof Blob,
             needsAName: (() => { try { new File(["x"]); return "made one"; } catch (e) { return e.message; } })(),
+            keys: Object.keys(file),
+            json: JSON.stringify(file),
+            onProto: typeof Object.getOwnPropertyDescriptor(File.prototype, "name").get,
         }));
         "#,
     );
@@ -971,6 +974,12 @@ fn a_file_is_a_blob_that_knows_what_it_is_called() {
     assert_eq!(said["text"], "a,b\n1,2\n");
     assert_eq!(said["isBlob"], true);
     assert_eq!(said["needsAName"], "File requires a name");
+    // What it is called is on the prototype rather than on the file, so
+    // a file has nothing of its own that a `JSON.stringify` or a
+    // `structuredClone` can see, which is where upstream keeps it.
+    assert_eq!(said["keys"], serde_json::json!([]));
+    assert_eq!(said["json"], "{}");
+    assert_eq!(said["onProto"], "function");
 }
 
 /// A form written out as multipart and read straight back in, which is
@@ -3654,4 +3663,245 @@ fn an_abort_with_a_reason_carries_it() {
         "#,
     );
     assert_eq!(body(&answer), "enough");
+}
+
+/// A deep copy that carries what a spread and a trip through JSON both
+/// lose, which is what a library reaches for when it does not want its
+/// caller's object to change under it.
+///
+/// The shapes are the algorithm's own and the cycle is the reason none
+/// of the cheap substitutes is one.
+#[test]
+fn a_value_can_be_copied_whole() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const buf = new Uint8Array([1, 2, 3]).buffer;
+            const value = {
+                n: 1,
+                s: "x",
+                u: undefined,
+                z: null,
+                nested: { deep: [1, 2, { d: 3 }] },
+                map: new Map([["k", { in: 1 }], [2, "two"]]),
+                set: new Set([1, "a"]),
+                date: new Date(1700000000123),
+                re: /ab+c/gi,
+                buf,
+                u8: new Uint8Array([4, 5, 6]),
+                dv: new DataView(new Uint8Array([9, 9]).buffer),
+                big: 12345678901234567890n,
+                nan: NaN,
+                negzero: -0,
+            };
+            const copy = structuredClone(value);
+            const shared = { s: 1 };
+            const cyclic = { one: shared, two: shared };
+            cyclic.self = cyclic;
+            const round = structuredClone(cyclic);
+            return Response.json({
+                same: copy === value,
+                nested: copy.nested === value.nested,
+                deep: copy.nested.deep[2].d,
+                has_undefined: "u" in copy,
+                map: [copy.map instanceof Map, copy.map.get("k").in, copy.map.get(2), copy.map.size],
+                set: [copy.set instanceof Set, copy.set.size, copy.set.has("a")],
+                date: [copy.date instanceof Date, copy.date.getTime()],
+                re: [copy.re instanceof RegExp, copy.re.source, copy.re.flags],
+                buf: [copy.buf instanceof ArrayBuffer, copy.buf.byteLength, new Uint8Array(copy.buf)[0]],
+                u8: [copy.u8 instanceof Uint8Array, Array.from(copy.u8).join(",")],
+                dv: [copy.dv instanceof DataView, copy.dv.getUint8(0)],
+                big: [typeof copy.big, String(copy.big)],
+                odd: [Number.isNaN(copy.nan), Object.is(copy.negzero, -0)],
+                cycle: round.self === round,
+                twice: round.one === round.two,
+                fresh: round.one !== shared,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["same"], false);
+    assert_eq!(said["nested"], false);
+    assert_eq!(said["deep"], 3);
+    // A key whose value is `undefined` is a key, which JSON drops.
+    assert_eq!(said["has_undefined"], true);
+    assert_eq!(said["map"], serde_json::json!([true, 1, "two", 2]));
+    assert_eq!(said["set"], serde_json::json!([true, 2, true]));
+    assert_eq!(
+        said["date"],
+        serde_json::json!([true, 1_700_000_000_123u64])
+    );
+    assert_eq!(said["re"], serde_json::json!([true, "ab+c", "gi"]));
+    assert_eq!(said["buf"], serde_json::json!([true, 3, 1]));
+    assert_eq!(said["u8"], serde_json::json!([true, "4,5,6"]));
+    assert_eq!(said["dv"], serde_json::json!([true, 9]));
+    assert_eq!(
+        said["big"],
+        serde_json::json!(["bigint", "12345678901234567890"])
+    );
+    assert_eq!(said["odd"], serde_json::json!([true, true]));
+    // The three JSON cannot do at all.
+    assert_eq!(said["cycle"], true);
+    assert_eq!(said["twice"], true);
+    assert_eq!(said["fresh"], true);
+}
+
+/// What a copy refuses, and in the sentence a real `supabase start`
+/// refuses it in, because a library catching one branches on the name
+/// and prints the message.
+#[test]
+fn what_cannot_be_copied_says_so_by_name() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const say = (f) => {
+                try {
+                    f();
+                    return "no";
+                } catch (e) {
+                    return `${e.name}: ${e.message}`;
+                }
+            };
+            return Response.json({
+                fn: say(() => structuredClone(() => 1)),
+                sym: say(() => structuredClone(Symbol("s"))),
+                weak: say(() => structuredClone(new WeakMap())),
+                inside: say(() => structuredClone({ ok: 1, bad: () => 1 })),
+                is_dom: (() => {
+                    try {
+                        structuredClone(() => 1);
+                        return false;
+                    } catch (e) {
+                        return e instanceof DOMException;
+                    }
+                })(),
+                none: say(() => structuredClone()),
+                dictionary: say(() => structuredClone({ a: 1 }, 5)),
+                sequence: say(() => structuredClone({ a: 1 }, { transfer: 5 })),
+                str_sequence: say(() => structuredClone({ a: 1 }, { transfer: "ab" })),
+                null_sequence: say(() => structuredClone({ a: 1 }, { transfer: null })),
+                not_object: say(() => structuredClone({ a: 1 }, { transfer: [null] })),
+                second: say(() => structuredClone({ a: 1 }, { transfer: [new ArrayBuffer(2), 5] })),
+                stream: say(() => structuredClone({ a: 1 }, { transfer: [new ReadableStream()] })),
+                view: say(() => structuredClone({ a: 1 }, { transfer: [new Uint8Array(4)] })),
+                getter: say(() => structuredClone({ get g() { throw new RangeError("from the getter"); } })),
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["fn"], "DataCloneError: ()=>1 could not be cloned.");
+    assert_eq!(
+        said["sym"],
+        "DataCloneError: Symbol(s) could not be cloned."
+    );
+    assert_eq!(
+        said["weak"],
+        "DataCloneError: #<WeakMap> could not be cloned."
+    );
+    assert_eq!(said["inside"], "DataCloneError: ()=>1 could not be cloned.");
+    assert_eq!(said["is_dom"], true);
+    assert_eq!(
+        said["none"],
+        "TypeError: Failed to execute 'structuredClone': 1 argument required, but only 0 present"
+    );
+    assert_eq!(
+        said["dictionary"],
+        "TypeError: Failed to execute 'structuredClone': Argument 2 can not be converted to a dictionary"
+    );
+    let sequence = "TypeError: Failed to execute 'structuredClone': 'transfer' of \
+                    'StructuredSerializeOptions' (Argument 2) can not be converted to sequence.";
+    assert_eq!(said["sequence"], sequence);
+    // A string is iterable and is refused all the same, which is the
+    // one place this is not plain iteration.
+    assert_eq!(said["str_sequence"], sequence);
+    assert_eq!(said["null_sequence"], sequence);
+    assert_eq!(
+        said["not_object"],
+        "TypeError: Failed to execute 'structuredClone': 'transfer' of \
+         'StructuredSerializeOptions' (Argument 2), index 0 is not an object"
+    );
+    assert_eq!(
+        said["second"],
+        "TypeError: Failed to execute 'structuredClone': 'transfer' of \
+         'StructuredSerializeOptions' (Argument 2), index 1 is not an object"
+    );
+    // An `ArrayBuffer` is the only transferable thing on either server.
+    assert_eq!(said["stream"], "DataCloneError: Value not transferable");
+    assert_eq!(said["view"], "DataCloneError: Value not transferable");
+    // A getter that throws throws its own error rather than a copy's.
+    assert_eq!(said["getter"], "RangeError: from the getter");
+}
+
+/// The two things a copy does that look like losses and are upstream's,
+/// so a function written against one of them behaves the same on both.
+///
+/// A platform object arrives as an empty object rather than as itself,
+/// and a buffer named for transfer is copied and left where it was.
+#[test]
+fn a_copy_loses_what_upstream_loses() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const blob = structuredClone(new Blob(["hello"], { type: "text/plain" }));
+            const headers = structuredClone(new Headers({ a: "b" }));
+            const url = structuredClone(new URL("http://x/y"));
+            const buf = new Uint8Array([1, 2, 3, 4]).buffer;
+            const moved = structuredClone({ buf }, { transfer: [buf] });
+            class Thing {
+                constructor(v) {
+                    this.v = v;
+                }
+                get twice() {
+                    return this.v * 2;
+                }
+            }
+            const thing = structuredClone(new Thing(2));
+            const plain = structuredClone({ get g() { return 7; } });
+            const error = new TypeError("wrong");
+            error.extra = "kept?";
+            const copied = structuredClone(error);
+            const a = [1, , 3];
+            a.extra = "yes";
+            const sparse = structuredClone(a);
+            return Response.json({
+                blob: [blob instanceof Blob, JSON.stringify(blob), typeof blob.size],
+                headers: [headers instanceof Headers, Object.keys(headers).length],
+                url: [url instanceof URL, Object.keys(url).length],
+                transfer: [buf.byteLength, moved.buf.byteLength, new Uint8Array(moved.buf)[0]],
+                thing: [thing instanceof Thing, thing.constructor.name, thing.v, thing.twice],
+                getter: [
+                    plain.g,
+                    typeof Object.getOwnPropertyDescriptor(plain, "g").get,
+                ],
+                error: [copied.name, copied.message, copied instanceof TypeError, copied.extra],
+                sparse: [sparse.length, 1 in sparse, sparse.extra],
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    // A platform object holds what it holds under symbols and the
+    // serializer copies string keys, so the copy is `{}`.
+    assert_eq!(said["blob"], serde_json::json!([false, "{}", "undefined"]));
+    assert_eq!(said["headers"], serde_json::json!([false, 0]));
+    assert_eq!(said["url"], serde_json::json!([false, 0]));
+    // The buffer is copied and is still four bytes long afterwards,
+    // where a browser would have left it detached.
+    assert_eq!(said["transfer"], serde_json::json!([4, 4, 1]));
+    // A class instance is a plain object and a getter becomes a value.
+    assert_eq!(
+        said["thing"],
+        serde_json::json!([false, "Object", 2, serde_json::Value::Null])
+    );
+    assert_eq!(said["getter"], serde_json::json!([7, "undefined"]));
+    // An error keeps its name, message and kind and loses what was
+    // hung on it.
+    assert_eq!(
+        said["error"],
+        serde_json::json!(["TypeError", "wrong", true, serde_json::Value::Null])
+    );
+    // A hole stays a hole and an own property of an array survives.
+    assert_eq!(said["sparse"], serde_json::json!([3, false, "yes"]));
 }

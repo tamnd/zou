@@ -744,6 +744,28 @@ A form given to `new Request` or `new Response` as a body is written out as mult
 - `blob.stream()` is a stream over the bytes the blob already holds, because a blob is bytes and there is nothing left to wait for.
 - A part with no `name` on its content disposition is dropped rather than being an error, so one malformed part does not lose the ones around it.
 
+## Copying a value
+
+`structuredClone` is the deep copy a library reaches for when it does not want its caller's object to change under it, and it is not a spread and not a trip through JSON.
+
+```ts
+const settings = structuredClone(given)
+settings.headers.set = new Set(["x"])
+```
+
+A cycle stays a cycle, a value that appears twice arrives as one object twice, and a `Map`, a `Set`, a `Date`, a `RegExp`, an `ArrayBuffer`, a typed array, a `DataView` and a `BigInt` all arrive as themselves.
+A key whose value is `undefined` is still a key, which is the first thing JSON loses.
+
+The copy is v8's own serializer, which is what upstream's is too, so what it refuses and the sentence it refuses with are the same on both servers: a function, a symbol, a `WeakMap` and a proxy all throw a `DataCloneError` reading `()=>1 could not be cloned.` with the value's own inspection in front.
+
+Two things a copy loses, both of them measured on a real `supabase start` rather than decided here.
+
+- A platform object arrives as an empty object. A `Blob`, a `File`, a `Headers`, a `URL`, a `Response` and a stream all keep what they hold where the serializer cannot see it, so the copy is `{}` rather than a copy or a refusal. A library cloning options with a `Blob` in them loses it on both servers.
+- A buffer named for transfer is copied and left where it was. `structuredClone(value, { transfer: [buf] })` reads the list and checks it and then does not act on it, so `buf` is still readable afterwards, where a browser and a newer Deno both leave it detached. The checking is not idle: an `ArrayBuffer` is the only transferable thing on either server, and a stream, a typed array or anything that is not an object in that list is refused by name.
+
+A class instance is a plain object afterwards, a getter becomes the value it returned, an error keeps its name and message and loses what was hung on it, and a hole in an array stays a hole.
+All of that is v8 rather than a choice, and all of it is the same on both servers.
+
 ## crypto
 
 Random bytes, a uuid, the four hashes and HMAC.
@@ -902,7 +924,7 @@ Deno.serve(async (req) => {
 
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
 
 `AbortSignal` is the whole of it: the three statics, `AbortSignal.abort`, `AbortSignal.timeout` and `AbortSignal.any`, as well as what a controller makes.
 `fetch` takes one and a `Request` carries one, and the section on giving up on a call says what that does and where it stops.
@@ -931,6 +953,7 @@ Not present yet, and named rather than silently missing:
 - The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
 - Byte streams. There is no `new ReadableStream({ type: "bytes" })`, no BYOB reader and no `TextDecoderStream`.
 - Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet. That also moves when the promise settles: upstream hands the response back when the headers arrive and this hands it back when the body is in, so a handler racing a slow answer against a clock sees the clock win here and the headers win there.
+- `MessageChannel` and `MessagePort`. Upstream has both and nothing here does, so a library that talks to itself over a port has nowhere to send. That is [#434](https://github.com/tamnd/zou/issues/434).
 - The rest of the file system. Reading a file the function's own `static_files` covers is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
 - Node built ins. `node:fs` and the rest are refused by name.
 

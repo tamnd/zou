@@ -498,6 +498,8 @@
   const BLOB = Symbol("blob");
   const TYPE = Symbol("type");
   const FIELDS = Symbol("fields");
+  const NAME = Symbol("name");
+  const MODIFIED = Symbol("lastModified");
 
   /// A media type is printable ascii, lowercased, or it is nothing:
   /// what a blob does with one it cannot use is drop it rather than
@@ -597,9 +599,24 @@
       if (name === undefined) {
         throw new TypeError("File requires a name");
       }
-      this.name = String(name);
+      this[NAME] = String(name);
       const given = options === null || options === undefined ? undefined : options.lastModified;
-      this.lastModified = given === undefined ? Date.now() : Number(given);
+      this[MODIFIED] = given === undefined ? Date.now() : Number(given);
+    }
+
+    // Both of these are getters over a symbol rather than the plain
+    // fields they were, because a `File` upstream has nothing of its
+    // own that a for-in, an `Object.keys`, a `JSON.stringify` or a
+    // `structuredClone` can see, and the two were the only place in
+    // this file where what a platform object holds was visible from
+    // outside it. Measured on a real `supabase start`, where the name
+    // is on the prototype and `JSON.stringify(file)` is `{}`.
+    get name() {
+      return this[NAME];
+    }
+
+    get lastModified() {
+      return this[MODIFIED];
     }
   }
 
@@ -3082,6 +3099,88 @@
   }
 
   // ---------------------------------------------------------------
+  // Copying a value
+
+  // A deep copy a library can rely on, which is not a spread and is not
+  // a trip through JSON: a cycle stays a cycle, a value that appears
+  // twice arrives as one object twice, and a `Map`, a `Set`, a `Date`,
+  // a `RegExp`, a buffer, a typed array and a `BigInt` arrive as
+  // themselves rather than as whatever JSON would have made of them.
+  //
+  // The copy is v8's own serializer, which is what upstream's is too,
+  // so the shapes it carries and the sentence it refuses with are v8's
+  // rather than this file's, and a function or a symbol is refused with
+  // the same words on both servers.
+  //
+  // What does not survive is a platform object. A `Blob`, a `Headers`,
+  // a `URL`, a `Response` and a stream keep what they hold under
+  // symbols, and the serializer copies own string keyed properties, so
+  // a copy of one is an empty object rather than a copy or a refusal.
+  // That is measured on a real `supabase start` rather than decided
+  // here, and it is written down in `docs/functions.md`, because a
+  // library cloning options with a `Blob` in them loses it on both
+  // servers and finding that out here is cheaper than finding it out
+  // there.
+  function structuredClone(value, options) {
+    if (arguments.length < 1) {
+      throw new TypeError(
+        "Failed to execute 'structuredClone': 1 argument required, but only 0 present",
+      );
+    }
+    checkTransfer(options);
+    const bytes = core.serialize(value, undefined, (message) => {
+      throw new DOMException(message, "DataCloneError");
+    });
+    return core.deserialize(bytes);
+  }
+
+  // The transfer list, read and checked and then not acted on.
+  //
+  // That is upstream rather than an omission: a buffer named for
+  // transfer is copied like everything else and is still readable
+  // afterwards, measured by cloning one and asking its `byteLength`,
+  // where a browser and a newer Deno both leave it detached. The
+  // checking is not idle, because these three refusals are the whole of
+  // what a caller passing the wrong thing sees, and a library that
+  // transfers a buffer it then reuses works here and works there.
+  function checkTransfer(options) {
+    if (options === undefined || options === null) return;
+    if (typeof options !== "object" && typeof options !== "function") {
+      throw new TypeError(
+        "Failed to execute 'structuredClone': Argument 2 can not be converted to a dictionary",
+      );
+    }
+    const list = options.transfer;
+    if (list === undefined) return;
+    if (
+      list === null ||
+      typeof list !== "object" ||
+      typeof list[Symbol.iterator] !== "function"
+    ) {
+      throw new TypeError(
+        "Failed to execute 'structuredClone': 'transfer' of 'StructuredSerializeOptions' " +
+          "(Argument 2) can not be converted to sequence.",
+      );
+    }
+    let index = 0;
+    for (const item of list) {
+      if (item === null || (typeof item !== "object" && typeof item !== "function")) {
+        throw new TypeError(
+          "Failed to execute 'structuredClone': 'transfer' of 'StructuredSerializeOptions' " +
+            `(Argument 2), index ${index} is not an object`,
+        );
+      }
+      // An `ArrayBuffer` is the only transferable thing here. A stream
+      // and a typed array are both refused upstream, and there is no
+      // `MessagePort` on either server to be the third case.
+      if (!(item instanceof ArrayBuffer)) {
+        throw new DOMException("Value not transferable", "DataCloneError");
+      }
+      index += 1;
+    }
+  }
+
+  // ---------------------------------------------------------------
   // What the module sees
 
   const EdgeRuntime = { waitUntil };
@@ -3126,6 +3225,7 @@
     queueMicrotask,
     setInterval,
     setTimeout,
+    structuredClone,
   });
   // The global is itself an event target, which is not decoration: a
   // library calls the bare `addEventListener` at the top of a module
