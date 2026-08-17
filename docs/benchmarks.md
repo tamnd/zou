@@ -214,38 +214,49 @@ The spread is the laptop and not the code, and the trimming is worth nothing her
 
 ## A hundred thousand realtime sockets on one node
 
-server3 (8 cores, 23 GB, store on a local MinIO) as the node under test, server2 (6 cores, 12 GB) on the other side of the internet as the generator, 2026-08-17, `zoubench sockets scenarios/sockets-100k.json`.
-A hundred thousand websockets, each joined to a channel filtered `shard=eq.N` over a thousand shards, so a hundred sockets are owed every row written to a shard.
+server3 (8 cores, 23 GB, store on a local MinIO) as the node under test, server2 (6 cores, 12 GB) on the other side of the internet as the generator, 2026-08-17, `zoubench sockets`.
+A hundred thousand websockets, each joined to a channel filtered `shard=eq.N`, so every socket on a shard is owed every row written to it.
 The generator has to be the other box, because a hundred thousand descriptors and a goroutine each on the node under test makes the node's cpu partly the benchmark.
+
+Three runs, and the shards are what tell them apart.
+`sockets-10k` is ten thousand sockets over five hundred shards, `sockets-100k` is a hundred thousand over a thousand, so a hundred sockets are owed every row, and `sockets-100k-wide` is the same hundred thousand over ten thousand shards, so nine are.
+Same socket count, same rows a second, an order of magnitude apart in deliveries: raising the shard count moves the work from fan out to change processing, which is how the two costs are told apart.
 
 Neither box was quiet, and this is not a lab.
 server3 runs the owner's crawler at between one and two of its eight cores and a MinIO at a third of one, load average two to four before the run.
 server2 runs a browser and other work at about one and a half cores.
 Every number below has that in it, and the two the node measures about itself are the ones to read.
 
-| | sockets-10k | sockets-100k |
-| --- | --- | --- |
-| sockets held, of asked | 10000 of 10000 | 100000 of 100000 |
-| refused | 0 | 0 |
-| lost mid run | 0 | 6 |
-| ramp | 42 s | 493 s |
-| node RSS at full ramp | 254 MB | 2.28 GB |
-| rows committed in the window | 33750 in 120 s, 281 a second | 18825 in 300 s, 62.8 a second |
-| deliveries owed | 675000 | 1882500 |
-| deliveries missing | 0 | 110 |
-| shards with no delivery | 0 | 0 of 1000 |
-| node change fan out, mean | 11.8 ms | 47.1 ms |
-| node commit to socket, mean | 73.2 ms | 126.7 ms |
-| client delivery p50 | 394 ms | 2530 ms |
-| client delivery p99 | 2920 ms | 286000 ms |
-| client commit p50 / p99 | 186 ms / 2100 ms | 653 ms / 53566 ms |
-| connect p50 / p99 | 39 ms / 478 ms | 77 ms / 1614 ms |
-| join p50 / p99 | 13 ms / 238 ms | 27 ms / 962 ms |
+| | sockets-10k | sockets-100k | sockets-100k-wide |
+| --- | --- | --- | --- |
+| shards, sockets on each | 500, 20 | 1000, 100 | 10000, 9 |
+| writers, rows a transaction | 4, 25 | 8, 25 | 16, 250 |
+| sockets held, of asked | 10000 of 10000 | 100000 of 100000 | 99979 of 100000 |
+| refused | 0 | 0 | 21 |
+| lost mid run | 0 | 6 | 0 |
+| ramp | 42 s | 493 s | 690 s |
+| node RSS at full ramp | 254 MB | 2.28 GB | 2.37 GB |
+| rows committed in the window | 33750 in 120 s, 281 a second | 18825 in 300 s, 62.8 a second | 136613 in 300 s, 455 a second |
+| deliveries owed | 675000 | 1882500 | 1366046 |
+| deliveries missing | 0 | 110 | 4672 |
+| shards with no delivery | 0 of 500 | 0 of 1000 | 0 of 10000 |
+| node change fan out, mean | 11.8 ms | 47.1 ms | 29.4 ms |
+| node commit to socket, mean | 73.2 ms | 126.7 ms | 106.6 ms |
+| client delivery p50 | 394 ms | 2530 ms | 1790 ms |
+| client delivery p99 | 2920 ms | 286000 ms | 40800 ms |
+| client commit p50 / p99 | 186 ms / 2100 ms | 653 ms / 53566 ms | 727 ms / 15632 ms |
+| connect p50 / p99 | 39 ms / 478 ms | 77 ms / 1614 ms | 74 ms / 2838 ms |
+| join p50 / p99 | 13 ms / 238 ms | 27 ms / 962 ms | 27 ms / 1636 ms |
 
-A hundred thousand sockets on one node is held rather than argued about: every one asked for was accepted, none refused, and the node's own gauges agree at 99994 sockets and 99994 subscribers.
+A hundred thousand sockets on one node is held rather than argued about: on `sockets-100k` every one asked for was accepted, none refused, and the node's own gauges agree at 99994 sockets and 99994 subscribers.
 Six sockets died mid run, all four distinct failures a read timeout, which at a hundred thousand sockets over the public internet for eleven minutes is the internet.
 Of 1,882,500 deliveries owed, 1,882,390 arrived, so 110 did not, one delivery in seventeen thousand, and every one of the thousand shards was served.
 That accounting is per shard and exact, rows in that shard times sockets on it, so a run that dropped frames says so rather than publishing a percentile over the ones that survived.
+
+The wide run's 21 refusals and 4672 missing are both the harness and both worth naming rather than rounding off.
+The refusals are read timeouts on the handshake, spread over all six ports, from a generator whose ramp took eleven and a half minutes against a node at a third of its cpu.
+The missing are the drain: it is fifteen seconds and that run's delivery p99 is 40.8 s, so frames still in flight when the window closed are counted as never arriving, which is the accounting being pessimistic on purpose rather than a node dropping rows.
+A drain longer than the tail it is draining is the fix, and until then 4672 of 1,366,046 is an upper bound on loss and not a measurement of it.
 
 Memory is 23.4 KB a socket, and that number is the whole reason this run fits on the box.
 Before the read buffer on a socket was sized for a realtime client, it was 128 KB eagerly allocated and zeroed before every read, which is 145 KB a socket, and a hundred thousand of those wants 14.5 GB on a 24 GB box that is also running a database, a MinIO and somebody's crawler.
@@ -255,12 +266,18 @@ The node's own cost of a change is the number this page is actually publishing.
 Reading one change out of the stream and writing it to all hundred sockets that are owed it takes 47.1 ms at the mean, and the distance from the database's own commit timestamp to the frame leaving for the socket is 126.7 ms.
 Both are measured by the node, on 1,882,394 changes, and both sit in the result file beside the client's view.
 
-The client's tail is not the fan out, it is the writes, and the run says so in three places.
-The scenario asks for a thousand rows a second and got 62.8, because it uses eight writers and a commit took 3.57 s at the mean, and eight times twenty five rows divided by 3.57 s is the 62.8 that came out.
+The client's tail is not the fan out, it is the writes, and three readings say so together.
+`sockets-100k` asks for a thousand rows a second and got 62.8, because eight writers times twenty five rows over a 3.57 s commit mean is 62.8.
 The delivery clock starts before the insert is sent, on purpose, so a row that waited 550 s to commit is a 563 s delivery, and a commit p99 of 53.6 s is most of a delivery p99 of 286 s.
 The gap that is left, a client mean of 22.8 s against a commit mean of 3.57 s plus the node's 127 ms, is the generator's own read side queueing on six shared cores with a hundred thousand goroutines to schedule, which is why the node's histograms and not the client's mean are the node's number.
 
-So the socket half of the M4 line is measured and the rate half is not, and what is in the way is the engine's commit path rather than anything in the realtime tier.
+`sockets-100k-wide` is the same claim from the other direction.
+Nothing about the realtime tier changed between the two runs: the shards went up, the transactions went from twenty five rows to two hundred and fifty, and the writers from eight to sixteen, which a project's forty connections leave room for.
+The rate went from 62.8 rows a second to 455, the commit mean from 3.57 s to 1.80 s, the client's delivery p99 from 286 s to 40.8 s, and the node's own cost of a change fell too, 47.1 ms to 29.4 ms, because it is delivering nine sockets a row instead of a hundred.
+Two runs at the same socket count, seven times the write rate, and the node under a third of its cpu in both.
+
+So the socket half of the M4 line is measured and the rate half is not: the best of these is 455 rows a second of a thousand, and what is in the way is the engine's commit path rather than anything in the realtime tier.
+More writers is not the answer either, since a project's postmaster takes forty connections in total, and at twenty five rows a transaction all forty of them would only reach 280 rows a second.
 
 ## Pending
 
