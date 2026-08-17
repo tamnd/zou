@@ -371,6 +371,14 @@ pub struct Session {
     /// Who the socket said it was on connect. A join with no token of
     /// its own runs as this.
     identity: Identity,
+    /// The token that identity was read out of, when there was one.
+    ///
+    /// Kept beside the claims rather than instead of them, because
+    /// something that is not this process may have to check the same
+    /// token for itself: a socket on a node that does not hold the
+    /// tenant is answered by the node that does, and a node asserting a
+    /// claim set would be a node that can claim to be anybody.
+    bearer: Option<String>,
     /// The channels this socket is on and what each asked for.
     channels: HashMap<String, Config>,
     /// The private ones among them, with whatever the policies have
@@ -406,12 +414,23 @@ impl Session {
         Session {
             vsn,
             identity,
+            bearer: None,
             channels: HashMap::new(),
             rights: HashMap::new(),
             pending: HashMap::new(),
             watched: HashMap::new(),
             budget,
         }
+    }
+
+    /// The token the handshake proved, for a transport that has it.
+    ///
+    /// Whatever the connect url or headers carried, which is the token
+    /// a channel that joins without one of its own runs as. A join or a
+    /// refresh replaces it with the one it carried.
+    pub fn with_bearer(mut self, token: Option<String>) -> Session {
+        self.bearer = token;
+        self
     }
 
     /// The role this socket is currently acting as, which changes when
@@ -423,6 +442,13 @@ impl Session {
     /// Who the socket is now, which is what a policy check runs as.
     pub fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    /// The token who it is was read out of, for whoever has to check it
+    /// again somewhere else. None is a socket running on no token at
+    /// all, which the other end answers as its own anonymous role.
+    pub fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
     }
 
     /// Whether this socket is on `topic`.
@@ -554,7 +580,10 @@ impl Session {
         // with.
         if let Some(token) = frame.payload.get("access_token").and_then(Value::as_str) {
             match tokens.verify(token) {
-                Ok(identity) => self.identity = identity,
+                Ok(identity) => {
+                    self.identity = identity;
+                    self.bearer = Some(token.to_string());
+                }
                 Err(why) => return vec![self.send(Frame::error(&frame, why))],
             }
         }
@@ -996,6 +1025,7 @@ impl Session {
         match tokens.verify(token) {
             Ok(identity) => {
                 self.identity = identity;
+                self.bearer = Some(token.to_string());
                 let mut actions = vec![self.send(Frame::ok(&frame))];
                 // A row is only allowed to reach whoever this socket
                 // currently is, and it is somebody else now, so whatever
