@@ -370,6 +370,11 @@ Routing, the key and the role are identical to 5432, so the only thing that chan
 What changes underneath is what a connection owns: on 5432 a client holds a backend from login to hangup, and on 6543 it borrows one at the first message of a transaction and hands it back at the ReadyForQuery that ends it, so a hundred idle clients cost a hundred sockets on this node and no backends at all on the database.
 The ceiling is twenty backends per project and role, and a client that arrives when they are all out waits for one rather than being refused, because a queue is what a pooler is for.
 
+What the extra hop costs is 0.4 ms, measured on server3 as 1.19 ms for `select 1` through 6543 against 0.81 ms for the same statement through 5432 on the same node and the same database, so the choice is not about latency.
+What settles it is the other end: a project's postmaster takes forty connections, and the forty first is refused by postgres itself with `sorry, too many clients already` before the client has said anything.
+Writes through both doors on one project on that node, twenty five rows an insert and thirty seconds a point, are 306 a second on 5432 at sixteen clients against 350 on 6543, 373 against 327 at thirty two, and nothing at all on 5432 at sixty four against 221 on 6543.
+Neither door raises the write ceiling, because a commit is one round trip to the store and concurrent commits already merge into one push, so what the pooler is worth is that a client count the database cannot hold is a queue rather than an error.
+
 There is no backend at login, so the greeting is this server's: the parameter set is the one the project's database announced to the first backend opened for it, replayed to every client after, and the cancel key is this node's own.
 A backend is cleaned with `DISCARD ALL` on the way back rather than the next client paying for what the last one left behind, and one that does not come back clean is closed instead of parked.
 A cancel is translated instead of forwarded, to the backend the session is on at that moment and with that backend's own key, and a cancel for a session that is between transactions does nothing at all, because the backend it used last belongs to somebody else now.
