@@ -343,6 +343,7 @@ deno_core::extension!(
         crypto::op_zou_sign,
         crypto::op_zou_verify,
         fetch::op_zou_fetch,
+        fetch::op_zou_fetch_abort,
         timer::op_zou_sleep,
         timer::op_zou_clear,
         timer::op_zou_now,
@@ -755,6 +756,7 @@ async fn build(
     js.op_state()
         .borrow_mut()
         .put(websocket::Sockets::default());
+    js.op_state().borrow_mut().put(fetch::Calls::default());
 
     // The prelude is the value of its own last expression, so the two
     // entry points are held here and never on an object the function
