@@ -158,6 +158,16 @@ async fn a_topic_is_still_a_room_rather_than_a_node() {
     join(&mut elsewhere, "realtime:other", "{}").await;
     join(&mut here, "realtime:other", "{}").await;
 
+    // A join is answered on the spot, before the holder has been told
+    // about the topic, because a client waiting on another node for a
+    // reply that needs nothing from it would be a slow join for the
+    // sake of it. So the round trip is what proves the holder has both
+    // topics: they were asked for in this order down one ordered link,
+    // so the second arriving means the first already has.
+    broadcast(&mut elsewhere, "realtime:other", "cursor", r#"{"x":3}"#).await;
+    let text = heard(&mut here).await;
+    assert!(text.ends_with(r#"{"x":3}"#), "{text}");
+
     // Two sockets on one node on two topics, and the one that is not on
     // the topic hears nothing: a node carries the topics its sockets
     // are on and fans each of them to the sockets on that one.
