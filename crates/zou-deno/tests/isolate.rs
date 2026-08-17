@@ -1632,6 +1632,12 @@ mod wire {
         seen.lock()
             .expect("nobody else is holding it")
             .push(path.clone());
+        // Long enough for a signal to fire while the call is still out,
+        // which is the only way a test can end one in flight rather
+        // than end one that had not started.
+        if path == "/slow" {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+        }
         let body = String::from_utf8_lossy(&body).to_string();
         let (status, reason, kind, said) = match path.as_str() {
             "/moved" => (302, "Found", "text/plain", String::new()),
@@ -1866,6 +1872,145 @@ fn a_request_may_be_fetched_and_its_body_goes_with_it() {
     let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
     assert_eq!(said["method"], "PUT");
     assert_eq!(said["body"], "the bytes");
+}
+
+/// The signal a library bounds a call with, which is how `jose` fetches
+/// a jwks and how most of the sdks reach anything at all.
+///
+/// What is asserted is the rejection and its name: a caller that gave up
+/// gets an `AbortError` and a clock that ran out gets a `TimeoutError`,
+/// and a library branches on which.
+#[test]
+fn a_call_ends_when_the_signal_it_was_given_says_so() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const name = async (signal) => {{
+                try {{
+                    await fetch("{slow}", {{ signal }});
+                    return "answered";
+                }} catch (e) {{
+                    return `${{e.name}}: ${{e.message}}`;
+                }}
+            }};
+            const giving_up = new AbortController();
+            setTimeout(() => giving_up.abort(), 50);
+            const gave_up = await name(giving_up.signal);
+            const ran_out = await name(AbortSignal.timeout(50));
+            const already = await name(AbortSignal.abort());
+            const reason = await name(AbortSignal.abort(new Error("no time for that")));
+            // The same fetch, with nothing to end it, still answers.
+            const fine = await name(undefined);
+            return Response.json({{ gave_up, ran_out, already, reason, fine }});
+        }});
+        "#,
+        slow = server.url("/slow")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["gave_up"], "AbortError: The signal has been aborted");
+    assert_eq!(said["ran_out"], "TimeoutError: Signal timed out.");
+    assert_eq!(said["already"], "AbortError: The signal has been aborted");
+    assert_eq!(said["reason"], "Error: no time for that");
+    assert_eq!(said["fine"], "answered");
+}
+
+/// A call that was given up on had already left, and this runtime cannot
+/// take it back: the request is on a blocking thread inside a client
+/// with no handle to it, so what an abort ends is the waiting and not the
+/// connection. The server seeing the path is that difference, written
+/// down here rather than left to be discovered.
+///
+/// Four of the five calls above are aborted and only four requests can
+/// have been in flight, so what this asserts is that the aborted ones
+/// still arrived rather than how many did.
+#[test]
+fn a_call_that_was_given_up_on_had_already_gone_out() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            try {{
+                await fetch("{slow}", {{ signal: AbortSignal.timeout(50) }});
+                return Response.json({{ threw: null }});
+            }} catch (e) {{
+                return Response.json({{ threw: e.name }});
+            }}
+        }});
+        "#,
+        slow = server.url("/slow")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["threw"], "TimeoutError");
+    assert!(server.saw("/slow"), "the request went out anyway");
+}
+
+/// A request always has a signal, even when nobody gave it one, because
+/// a caller passing `request.signal` on to the next call is the ordinary
+/// way a handler forwards a cancellation it might one day get.
+///
+/// A request handed one gets its own that follows it, which is what a
+/// real `supabase start` was measured doing: the identity is not the
+/// signal that was passed in, and aborting the controller aborts the
+/// request's anyway, through a clone and through a copy.
+#[test]
+fn a_request_always_has_a_signal_to_pass_on() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const named = (signal) => signal.aborted ? signal.reason.message : null;
+            const bare = new Request("{echo}");
+            const giving_up = new AbortController();
+            const built = new Request("{echo}", {{ signal: giving_up.signal }});
+            const copied = built.clone();
+            const onward = new Request(built);
+            const before = [named(built.signal), named(copied.signal), named(onward.signal)];
+            giving_up.abort(new Error("the caller"));
+            return Response.json({{
+                bare: bare.signal instanceof AbortSignal,
+                asleep: bare.signal.aborted,
+                same: built.signal === giving_up.signal,
+                before,
+                after: [named(built.signal), named(copied.signal), named(onward.signal)],
+            }});
+        }});
+        "#,
+        echo = server.url("/echo")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["bare"], true);
+    assert_eq!(said["asleep"], false);
+    assert_eq!(said["same"], false);
+    assert_eq!(said["before"], serde_json::json!([null, null, null]));
+    assert_eq!(
+        said["after"],
+        serde_json::json!(["the caller", "the caller", "the caller"])
+    );
+}
+
+/// A request built with a signal and then fetched as a request rather
+/// than as a url, which is how a handler forwards a call it was given
+/// and is the path where a signal is easiest to drop on the floor.
+#[test]
+fn a_signal_on_a_request_bounds_the_call_the_request_becomes() {
+    let server = wire::start();
+    let answer = answered(&format!(
+        r#"
+        Deno.serve(async () => {{
+            const bounded = new Request("{slow}", {{ signal: AbortSignal.timeout(50) }});
+            try {{
+                await fetch(bounded);
+                return Response.json({{ threw: "answered" }});
+            }} catch (e) {{
+                return Response.json({{ threw: `${{e.name}}: ${{e.message}}` }});
+            }}
+        }});
+        "#,
+        slow = server.url("/slow")
+    ));
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["threw"], "TimeoutError: Signal timed out.");
 }
 
 #[test]
@@ -3193,6 +3338,69 @@ fn an_abort_controller_tells_whoever_is_listening() {
     assert_eq!(said["said"], serde_json::json!(["once", "again"]));
     assert_eq!(said["threw"], "AbortError: The signal has been aborted");
     assert_eq!(said["reason"], true);
+}
+
+/// The three ways a signal is made without a controller, which is how
+/// every library that bounds a call makes one now.
+///
+/// `any` is the one a caller needs when it has a signal of its own and
+/// wants a timeout as well, and it is the reason the other two are not
+/// enough on their own.
+#[test]
+fn a_signal_can_be_made_without_a_controller() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const named = (signal) => signal.aborted ? `${signal.reason.name}: ${signal.reason.message}` : null;
+            const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+
+            const ran_out = AbortSignal.timeout(20);
+            const before = named(ran_out);
+            const heard: string[] = [];
+            ran_out.addEventListener("abort", () => heard.push("timeout"));
+
+            const giving_up = new AbortController();
+            const either = AbortSignal.any([giving_up.signal, AbortSignal.timeout(10_000)]);
+            either.addEventListener("abort", () => heard.push("any"));
+            giving_up.abort(new Error("the caller"));
+
+            await wait(120);
+
+            let refused = "";
+            try {
+                AbortSignal.timeout("soon");
+            } catch (e) {
+                refused = e.name;
+            }
+            let uninstantiable = "";
+            try {
+                new AbortSignal();
+            } catch (e) {
+                uninstantiable = e.name;
+            }
+            return Response.json({
+                before,
+                after: named(ran_out),
+                heard,
+                either: named(either),
+                already: named(AbortSignal.any([AbortSignal.abort(new Error("first")), giving_up.signal])),
+                refused,
+                uninstantiable,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["before"], serde_json::Value::Null);
+    assert_eq!(said["after"], "TimeoutError: Signal timed out.");
+    // The caller's abort is heard first because it happened first, and
+    // the timeout is heard at all because a signal nobody is waiting on
+    // still fires.
+    assert_eq!(said["heard"], serde_json::json!(["any", "timeout"]));
+    assert_eq!(said["either"], "Error: the caller");
+    assert_eq!(said["already"], "Error: first");
+    assert_eq!(said["refused"], "TypeError");
+    assert_eq!(said["uninstantiable"], "TypeError");
 }
 
 /// `EventTarget` is what a library extends when it wants to emit

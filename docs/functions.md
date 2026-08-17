@@ -677,6 +677,32 @@ What that means in practice, written down because a difference from Deno is a di
 - The `user-agent`, when the function does not set one, is the string `navigator.userAgent` says: `Deno/2.1.4 (variant; zou/<version>)`. That is what upstream sends, measured by having a function on a real `supabase start` fetch an echo, where it read back `Deno/2.1.4 (variant; SupabaseEdgeRuntime/1.74.2)`, which is that runtime's own navigator string. It is not only politeness: a registry serves a different build of a package depending on this header, so a function fetching a module at runtime gets the same one it would have got upstream.
 - `http:` and `https:` and nothing else. `file:`, `data:` and a string that is not a url each throw a `TypeError` saying which.
 - A request that could not be made at all throws `TypeError: error sending request for url (<url>): <why>`, which is the sentence Deno throws. A 404 or a 500 is an answer and not a throw.
+- A signal ends the waiting and not the connection, which is the one difference here a function can see from the outside. See below.
+
+### Giving up on a call
+
+`fetch` takes `init.signal`, and a `Request` built with one carries it, so the ordinary way of bounding a call works.
+
+```ts
+Deno.serve(async () => {
+  try {
+    const res = await fetch("https://api.example.com/rates", { signal: AbortSignal.timeout(2_000) })
+    return Response.json(await res.json())
+  } catch (e) {
+    if (e.name === "TimeoutError") return new Response("the rates service is slow", { status: 504 })
+    throw e
+  }
+})
+```
+
+The reasons are the ones a library branches on, and they are the strings a real `supabase start` was measured throwing: a caller that gave up gets `AbortError: The signal has been aborted`, a clock that ran out gets `TimeoutError: Signal timed out.`, and a signal aborted with a reason of its own throws that reason unchanged.
+A signal that was already aborted is a call that is never made.
+
+The difference from upstream is what happens to the connection.
+The call is on a blocking thread inside a client with no handle to it, so an abort rejects the promise and drops the answer while the request runs to its own end.
+Upstream tears the socket down: the same probe against a slow server on a real `supabase start` left it with a broken pipe, and against zou it left it writing an answer nobody reads.
+Nothing a function can observe differs, and what differs is the other end and the thread, which is held for as long as the call would have taken or thirty seconds, whichever is sooner.
+That is [#432](https://github.com/tamnd/zou/issues/432) rather than the way it stays.
 
 What a function may reach is not restricted.
 It can call a metadata endpoint on the machine it is running on, the same as upstream's runtime can and the same as `pg_net` can from inside the database.
@@ -878,7 +904,9 @@ Deno.serve(async (req) => {
 
 Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
 
-An `AbortSignal` is a signal an aborted thing can be listened for on, and nothing here takes one yet: `fetch` does not read `init.signal` and neither does a timer.
+`AbortSignal` is the whole of it: the three statics, `AbortSignal.abort`, `AbortSignal.timeout` and `AbortSignal.any`, as well as what a controller makes.
+`fetch` takes one and a `Request` carries one, and the section on giving up on a call says what that does and where it stops.
+A timer does not take one, because nothing takes a signal on a timer.
 
 `EventTarget` is the real one and not the three methods a socket needs, so a library that extends it to emit its own events works: `{ once }` and `{ signal }` in the options, `stopImmediatePropagation`, and `dispatchEvent` answering false when a cancelable event was prevented.
 There is no tree here, so there is no capture and no bubbling and nothing for `stopPropagation` to stop: one object dispatches to its own listeners.

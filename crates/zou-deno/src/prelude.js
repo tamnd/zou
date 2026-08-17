@@ -1631,11 +1631,28 @@
           this.headers.set("content-type", type);
         }
       }
+      // Always a signal, never null, because that is what a caller
+      // passing `request.signal` on to something else is written
+      // against. A request nobody gave one to gets one nothing aborts.
+      //
+      // A request given one gets its own that follows it rather than
+      // the one it was handed, which is measurable from a function:
+      // `new Request(url, { signal }).signal === signal` is false on a
+      // real `supabase start` and aborting the controller still aborts
+      // the request. `any` of the one is what following is.
+      const given = init.signal ?? (input instanceof Request ? input.signal : undefined);
+      this.signal = given === undefined || given === null
+        ? new AbortController().signal
+        : AbortSignal.any([given]);
       this[USED] = false;
     }
 
     clone() {
-      const copy = new Request(this.url, { method: this.method, headers: this.headers });
+      const copy = new Request(this.url, {
+        method: this.method,
+        headers: this.headers,
+        signal: this.signal,
+      });
       // A stream cannot be in two places, so cloning one is teeing it,
       // which is what the spec says to do and is why `tee` exists.
       if (this[SOURCE] !== null && this[SOURCE] !== undefined) {
@@ -1754,18 +1771,70 @@
     if (!FETCHABLE.includes(scheme)) {
       throw new TypeError(`fetch does not serve the ${scheme.slice(0, -1)} scheme yet`);
     }
+    // A caller that has already given up is a call that is never made,
+    // which is the one part of a signal a client cannot get wrong.
+    const signal = request.signal;
+    if (signal.aborted) {
+      throw signal.reason;
+    }
     // Reading the body is what sending it is, and a request whose body
     // was already read is a request with nothing left to send.
     const body = await readBody(request);
-    const answer = await ops.op_zou_fetch(
+    const id = next();
+    const sent = ops.op_zou_fetch(
       {
         method: request.method,
         url: request.url,
         headers: Array.from(request.headers.entries()),
       },
       body,
+      id,
     );
-    return received(answer);
+    // Nobody awaits the loser of a race, and an op that rejects after
+    // its caller has gone is an unhandled rejection rather than an
+    // error anybody can act on. Attached here rather than below the
+    // race because the abort a body took long enough to miss leaves
+    // this promise with nobody on it either.
+    sent.catch(() => {});
+    // Reading the body is the one await between the check above and
+    // the call, so this is the caller that gave up while it happened.
+    if (signal.aborted) {
+      ops.op_zou_fetch_abort(id);
+      throw signal.reason;
+    }
+    // The abort is two halves. The caller's promise rejects with the
+    // reason the moment the signal says so, which is what a library
+    // waiting on this is written against, and the op is told so the
+    // isolate is not left holding a call nobody wants. What the op
+    // cannot do is take the connection down: the request is on a
+    // blocking thread inside a client with no handle to it, so it runs
+    // to its own end and its answer is dropped. `docs/functions.md`
+    // says so rather than leaving it to be found.
+    let stop = null;
+    const abort = new Promise((_, broken) => {
+      stop = () => {
+        ops.op_zou_fetch_abort(id);
+        broken(signal.reason);
+      };
+      signal.addEventListener("abort", stop, { once: true });
+    });
+    abort.catch(() => {});
+    try {
+      return received(await Promise.race([sent, abort]));
+    } finally {
+      signal.removeEventListener("abort", stop);
+    }
+  }
+
+  // Which call is which, so that ending one ends that one. Per
+  // isolate, because the op state holding the other end is, and back
+  // round at a number v8 still keeps in a register: an isolate with
+  // this many calls behind it has none of the first one left.
+  let calls = 0;
+
+  function next() {
+    calls = (calls + 1) & 0x3fffffff;
+    return calls;
   }
 
   // ---------------------------------------------------------------
@@ -2451,9 +2520,12 @@
   // Here because the older way of serving needs it: `new Server(...)`
   // in `std/http/server.ts` makes a controller in a field initializer,
   // so a function written the way the older examples are written cannot
-  // even be constructed without one. It is the shape rather than the
-  // plumbing: nothing here cancels a fetch yet, and `docs/functions.md`
-  // says so.
+  // even be constructed without one.
+  //
+  // The three statics are here because a library reaching for a timeout
+  // on a fetch is how a library bounds a call now. `jose` does it while
+  // fetching a jwks, which is one line of somebody else's code deciding
+  // whether a function answers at all.
 
   const SIGNAL = Symbol("signal");
   const REASON = Symbol("reason");
@@ -2491,6 +2563,70 @@
       }
     }
 
+    /// A signal that is already aborted, which is how a caller says no
+    /// before the work is started.
+    static abort(reason) {
+      const signal = new AbortSignal(SIGNAL);
+      signal[REASON] = reason === undefined ? aborted() : reason;
+      return signal;
+    }
+
+    /// A signal that aborts itself after a while, with a
+    /// `TimeoutError` rather than an `AbortError`, because a caller
+    /// that gave up and a clock that ran out are two different things
+    /// and a library tells them apart by the name.
+    ///
+    /// The timer is the isolate's, so a call that finished before the
+    /// clock ran out leaves one pending. It fires into a signal
+    /// nobody is listening to any more, which is a wasted wakeup and
+    /// not a wasted answer.
+    static timeout(ms) {
+      const delay = Number(ms);
+      if (!Number.isFinite(delay) || delay < 0) {
+        throw new TypeError("AbortSignal.timeout takes a number of milliseconds");
+      }
+      const signal = new AbortSignal(SIGNAL);
+      setTimeout(() => {
+        if (!signal.aborted) {
+          signal[REASON] = new DOMException("Signal timed out.", "TimeoutError");
+          fires(signal, new Event("abort"));
+        }
+      }, delay);
+      return signal;
+    }
+
+    /// One signal that follows whichever of these aborts first, which
+    /// is how a caller's own signal and a timeout are handed to the
+    /// same fetch.
+    static any(signals) {
+      const held = [...signals];
+      for (const one of held) {
+        if (!(one instanceof AbortSignal)) {
+          throw new TypeError("AbortSignal.any takes AbortSignals");
+        }
+      }
+      const signal = new AbortSignal(SIGNAL);
+      const first = held.find((one) => one.aborted);
+      if (first !== undefined) {
+        signal[REASON] = first.reason;
+        return signal;
+      }
+      for (const one of held) {
+        one.addEventListener("abort", () => {
+          if (!signal.aborted) {
+            signal[REASON] = one.reason;
+            fires(signal, new Event("abort"));
+          }
+        });
+      }
+      return signal;
+    }
+  }
+
+  /// The default reason, which is what everything catching an abort is
+  /// written against: `err.name === "AbortError"`.
+  function aborted() {
+    return new DOMException("The signal has been aborted", "AbortError");
   }
 
   class AbortController {
@@ -2507,11 +2643,7 @@
       if (signal.aborted) {
         return;
       }
-      // The default reason is the one everything catching an abort is
-      // written against, `err.name === "AbortError"`.
-      signal[REASON] = reason === undefined
-        ? new DOMException("The signal has been aborted", "AbortError")
-        : reason;
+      signal[REASON] = reason === undefined ? aborted() : reason;
       fires(signal, new Event("abort"));
     }
   }

@@ -19,11 +19,15 @@
 //! A function is the project's own code and this is written down in
 //! `docs/functions.md` rather than left to be discovered.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use deno_core::{JsBuffer, ToJsBuffer, op2};
+use deno_core::{JsBuffer, OpState, ToJsBuffer, op2};
 use deno_error::JsErrorBox;
+use tokio::sync::oneshot;
 
 /// The same ceiling the server puts on a call's body, applied to what
 /// a function may read back, so one function cannot answer one request
@@ -83,6 +87,19 @@ pub struct Received {
     body: ToJsBuffer,
 }
 
+/// The calls this isolate has in flight, so that a signal can end one.
+///
+/// A call is in `waiting` from its first poll until it answers. It is
+/// in `ended` only in the window where a signal fired before the op
+/// was first polled, which is narrow because the op is called before
+/// the listener that ends it is attached, and is handled anyway
+/// because a narrow window is still a window.
+#[derive(Default)]
+pub(crate) struct Calls {
+    waiting: HashMap<u32, oneshot::Sender<()>>,
+    ended: HashSet<u32>,
+}
+
 /// One call out, awaited by the handler that asked for it.
 ///
 /// `lazy` because the work happens on a blocking thread and there is
@@ -91,13 +108,50 @@ pub struct Received {
 #[op2(async(lazy))]
 #[serde]
 pub async fn op_zou_fetch(
+    state: Rc<RefCell<OpState>>,
     #[serde] sent: Sent,
     #[buffer] body: JsBuffer,
+    #[smi] id: u32,
 ) -> Result<Received, JsErrorBox> {
     let body = body.to_vec();
-    tokio::task::spawn_blocking(move || call(sent, body))
-        .await
-        .map_err(|e| JsErrorBox::type_error(format!("the call could not be started: {e}")))?
+    let (tell, told) = oneshot::channel();
+    {
+        let mut state = state.borrow_mut();
+        let calls = state.borrow_mut::<Calls>();
+        if calls.ended.remove(&id) {
+            return Err(JsErrorBox::type_error("the call was ended before it began"));
+        }
+        calls.waiting.insert(id, tell);
+    }
+    // Whichever comes first. Dropping the handle on an abort lets the
+    // blocking thread finish on its own with nobody to hand its answer
+    // to, which is the honest state of this: the request goes out and
+    // is read to its end, and what an abort ends is the waiting.
+    let answer = tokio::select! {
+        done = tokio::task::spawn_blocking(move || call(sent, body)) => done
+            .map_err(|e| JsErrorBox::type_error(format!("the call could not be started: {e}")))?,
+        _ = told => Err(JsErrorBox::type_error("the call was ended")),
+    };
+    state.borrow_mut().borrow_mut::<Calls>().waiting.remove(&id);
+    answer
+}
+
+/// A call nobody is waiting for any more.
+///
+/// Nothing is reported back. A signal that fired after the answer
+/// arrived has nothing to end, and telling the caller so would be
+/// telling it about a race it already won.
+#[op2(fast)]
+pub fn op_zou_fetch_abort(state: &mut OpState, #[smi] id: u32) {
+    let calls = state.borrow_mut::<Calls>();
+    match calls.waiting.remove(&id) {
+        Some(tell) => {
+            let _ = tell.send(());
+        }
+        None => {
+            calls.ended.insert(id);
+        }
+    }
 }
 
 /// One agent for the process, so a function that calls the same host
