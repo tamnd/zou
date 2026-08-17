@@ -35,7 +35,13 @@ pub struct Doors {
     pub routing: Routing,
     pub registry: Arc<Registry>,
     pub attached: Arc<Attached>,
-    pub http: std::net::TcpListener,
+    /// The http front door, on one port or on several. Several is the
+    /// same api answering on every one of them, which a node published
+    /// at more than one port needs, and which a load generator needs for
+    /// a different reason: one client address has about 64k ports to one
+    /// destination port, so a run holding more sockets than that has to
+    /// spread them over more than one port on this side.
+    pub http: Vec<std::net::TcpListener>,
     /// The postgres port, session mode.
     pub pg: Option<std::net::TcpListener>,
     /// The pooler, transaction mode.
@@ -112,6 +118,7 @@ impl Doors {
             }
         });
 
+        let ports = self.http;
         let front = match self.only {
             // The listener is already bound, so a request that arrives
             // during this waits in the accept queue rather than being
@@ -128,13 +135,41 @@ impl Doors {
             }
             None => crate::gateway::gateway(self.routing, self.registry, self.attached),
         };
-        axum::serve(
-            convert(self.http)?,
-            front.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .await
-        .map_err(|e| format!("http door: {e}"))
+        serve_http(ports, front).await
     }
+}
+
+/// The http api on every port it was given.
+///
+/// The last one is served on this task, so the caller's future only
+/// returns when the front door itself stops, and the others are tasks
+/// like the rest of the doors are. One api behind all of them: a request
+/// cannot tell which port it arrived on and nothing about it should.
+async fn serve_http(
+    mut ports: Vec<std::net::TcpListener>,
+    api: axum::Router,
+) -> Result<(), String> {
+    let front_door = ports.pop().ok_or("the http door needs a port")?;
+    for extra in ports {
+        let api = api.clone();
+        tokio::spawn(async move {
+            let served = axum::serve(
+                convert(extra)?,
+                api.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+            if let Err(e) = served {
+                log::error!("http door: {e}");
+            }
+            Ok::<(), String>(())
+        });
+    }
+    axum::serve(
+        convert(front_door)?,
+        api.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .map_err(|e| format!("http door: {e}"))
 }
 
 /// A listener the caller bound, on this runtime.
@@ -143,4 +178,49 @@ fn convert(listener: std::net::TcpListener) -> Result<tokio::net::TcpListener, S
         .set_nonblocking(true)
         .map_err(|e| format!("nonblocking: {e}"))?;
     tokio::net::TcpListener::from_std(listener).map_err(|e| format!("listener: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn status(at: std::net::SocketAddr) -> String {
+        let mut c = tokio::net::TcpStream::connect(at).await.expect("connect");
+        c.write_all(b"GET /where HTTP/1.1\r\nHost: node\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("request");
+        let mut said = String::new();
+        c.read_to_string(&mut said).await.expect("response");
+        said
+    }
+
+    /// A run holding more sockets than one client address has ports to
+    /// one port needs the api on several, so all of them have to answer
+    /// and answer the same.
+    #[tokio::test]
+    async fn every_port_the_door_was_given_answers_the_same_api() {
+        let api = axum::Router::new().route("/where", axum::routing::get(|| async { "here" }));
+        let mut ports = Vec::new();
+        let mut at = Vec::new();
+        for _ in 0..3 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+            at.push(listener.local_addr().expect("the port"));
+            ports.push(listener);
+        }
+        tokio::spawn(serve_http(ports, api));
+        for one in at {
+            let said = status(one).await;
+            assert!(said.contains("200 OK"), "{one}: {said}");
+            assert!(said.ends_with("here"), "{one}: {said}");
+        }
+    }
+
+    /// A node with no port to serve on is a mistake worth a sentence
+    /// rather than a process that sits there serving nothing.
+    #[tokio::test]
+    async fn a_door_with_no_port_is_refused() {
+        let api = axum::Router::new();
+        assert!(serve_http(Vec::new(), api).await.is_err());
+    }
 }

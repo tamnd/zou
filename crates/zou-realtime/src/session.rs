@@ -775,11 +775,7 @@ impl Session {
                 actions.extend(self.overrun(&topic));
                 continue;
             }
-            actions.push(self.send(Frame::push(
-                &topic,
-                "postgres_changes",
-                json!({"ids": ids, "data": data}),
-            )));
+            actions.push(Action::Text(Frame::changed(self.vsn, &topic, &ids, data)));
         }
         actions
     }

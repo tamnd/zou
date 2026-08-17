@@ -1,0 +1,69 @@
+Leave the relcache init file alone in the redo worker.
+
+Redoing a catalog heap record that carries committed invalidation
+messages reaches RelationCacheInitFilePreInvalidate, which unlinks the
+relcache init file of the database and of global. The redo worker has no
+data directory to unlink anything in, and unlink is not on its seccomp
+allowlist, so the kernel killed it there and the page service reported
+the worker's EOF as a failed batch read.
+
+Caught on server3 reading a project back out of the store, on a cold
+attach where pg_class page 0 had to be materialized rather than found in
+the local cache. The worker died on every retry, so the project never
+came up:
+
+    zou redo: sandbox blocked syscall 87, worker exiting
+    postgres(unlink+0xb)
+    postgres(RelationCacheInitFilePreInvalidate+0x9c)
+    postgres(ProcessCommittedInvalidationMessages+0xe3)
+    postgres(heap_redo+0x20b)
+    postgres(ZouRedoMain+0x732)
+    ERROR zou_pg: getpage 1663/5/1259.0: redo worker failed
+    FATAL: zou smgr readv failed with -1 on rel 1259 fork 0
+
+Skipped rather than allowlisted, because there is no init file here and
+allowing unlink in the sandbox would let a redo routine delete a file
+somebody cares about. The post half is skipped too, since the lock the
+pre half takes is the lock it releases.
+
+diff --git a/src/backend/utils/cache/relcache.c b/src/backend/utils/cache/relcache.c
+index 559ba9c..c7d9c49 100644
+--- a/src/backend/utils/cache/relcache.c
++++ b/src/backend/utils/cache/relcache.c
+@@ -39,6 +39,7 @@
+ #include "access/tableam.h"
+ #include "access/tupdesc_details.h"
+ #include "access/xact.h"
++#include "access/zou_walredo.h"
+ #include "catalog/binary_upgrade.h"
+ #include "catalog/catalog.h"
+ #include "catalog/indexing.h"
+@@ -6862,6 +6863,17 @@ RelationCacheInitFilePreInvalidate(void)
+ 	char		localinitfname[MAXPGPATH];
+ 	char		sharedinitfname[MAXPGPATH];
+ 
++	/*
++	 * The zou redo worker has no data directory and no relcache init file to
++	 * make obsolete, and unlink() is not on its seccomp allowlist, so the
++	 * kernel kills it here rather than letting it find that out.  Redoing a
++	 * catalog heap record with committed invalidation messages on it reaches
++	 * this function through ProcessCommittedInvalidationMessages, so this is
++	 * every catalog page a tenant reads back out of the store.
++	 */
++	if (zou_redo_active)
++		return;
++
+ 	if (DatabasePath)
+ 		snprintf(localinitfname, sizeof(localinitfname), "%s/%s",
+ 				 DatabasePath, RELCACHE_INIT_FILENAME);
+@@ -6884,6 +6896,10 @@ RelationCacheInitFilePreInvalidate(void)
+ void
+ RelationCacheInitFilePostInvalidate(void)
+ {
++	/* The redo worker never took the lock, see above. */
++	if (zou_redo_active)
++		return;
++
+ 	LWLockRelease(RelCacheInitLock);
+ }
+ 

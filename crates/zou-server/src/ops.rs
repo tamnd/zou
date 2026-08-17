@@ -499,6 +499,56 @@ pub fn change_delivered(commit_ts: i64, read: Instant) {
         .since(read);
 }
 
+/// How many realtime sockets this node is holding right now, and how
+/// many of them asked for database changes.
+///
+/// Two gauges rather than one, because they cost different things. A
+/// socket is a connection, a task and whatever the client left in its
+/// send queue, and a subscriber is that plus a place in the change
+/// reader's tables and a policy check per row that matches it. A node
+/// holding a hundred thousand of the first and none of the second is a
+/// different machine from one holding a hundred thousand of both, and a
+/// number that added them up would not say which.
+///
+/// Counted per node rather than per project on purpose: this is the
+/// reading an operator sizes a box on, and it is the same reading
+/// whether the sockets belong to one project or to a thousand. What one
+/// project is allowed is the quota's business and it refuses on its own.
+///
+/// A socket on a fan out node is a socket there and a subscriber on the
+/// holder, so a fleet's two gauges do not add up to one machine's, and
+/// that is the honest shape: the connection is on one box and the place
+/// in the change reader is on the other.
+pub fn socket_joined() {
+    sockets().inc();
+}
+
+pub fn socket_left() {
+    sockets().dec();
+}
+
+fn sockets() -> zou_ops::Gauge {
+    registry().gauge(
+        "zou_realtime_sockets",
+        "realtime sockets connected to this node right now",
+        &[],
+    )
+}
+
+/// The subscriber half of the pair above, moved by the change reader,
+/// since a subscriber's life is the reader's rather than the socket's:
+/// one arrives when a subscription is registered and goes when the
+/// socket does, or when a link carrying it does.
+pub fn subscribers(n: usize) {
+    registry()
+        .gauge(
+            "zou_realtime_subscribers",
+            "sockets subscribed to database changes on this node right now",
+            &[],
+        )
+        .set(n as u64);
+}
+
 /// One registry lookup, hit or miss, which is the reading that says
 /// whether the cache ttls are doing anything.
 pub fn lookup(hit: bool) {
@@ -628,6 +678,31 @@ mod tests {
             (0.2..1.0).contains(&sum),
             "the quarter second is in it and the clock that is an hour ahead is a zero, {sum}"
         );
+    }
+
+    /// The two numbers a socket tier is sized on. A gauge that only
+    /// ever went up would say a node was holding sockets that had gone
+    /// hours ago, which is the reading somebody would buy a box on.
+    #[tokio::test]
+    async fn the_sockets_a_node_holds_go_down_again() {
+        socket_joined();
+        socket_joined();
+        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        let held = |body: &str| {
+            body.lines()
+                .find_map(|line| line.strip_prefix("zou_realtime_sockets "))
+                .and_then(|n| n.parse::<u64>().ok())
+                .expect("a gauge")
+        };
+        let two = held(&body);
+        assert!(two >= 2, "both of them are in it, {two}");
+        socket_left();
+        socket_left();
+        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        assert_eq!(held(&body), two - 2, "and both of them are out of it again");
+        subscribers(7);
+        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        assert!(body.contains("zou_realtime_subscribers 7\n"), "{body}");
     }
 
     #[tokio::test]

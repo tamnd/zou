@@ -155,7 +155,7 @@ async fn next(who: &mut Listening, within: Duration) -> Option<Heard> {
 
 fn data(heard: Heard) -> Value {
     match heard {
-        Heard::Change { data, .. } => data,
+        Heard::Change { data, .. } => (*data).clone(),
         Heard::Gap => panic!("a gap rather than a change"),
     }
 }
@@ -188,6 +188,7 @@ async fn a_changed_row_comes_out_of_the_queue_of_whoever_asked_for_it() {
         &dsn,
         Pool::new(&dsn, 4).expect("a pool"),
         Arc::clone(&changes),
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
     )
     .every(Duration::from_millis(10));
     let running = tokio::spawn(reader.run());
@@ -267,6 +268,7 @@ async fn a_row_a_policy_hides_never_reaches_the_subscriber_it_hides_it_from() {
         &dsn,
         Pool::new(&dsn, 4).expect("a pool"),
         Arc::clone(&changes),
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
     )
     .every(Duration::from_millis(10));
     let running = tokio::spawn(reader.run());
@@ -337,6 +339,7 @@ async fn nothing_holds_a_slot_open_when_nobody_is_listening() {
         &dsn,
         Pool::new(&dsn, 4).expect("a pool"),
         Arc::clone(&changes),
+        Arc::new(std::sync::atomic::AtomicU64::new(1)),
     )
     .every(Duration::from_millis(10));
     let running = tokio::spawn(reader.run());

@@ -88,7 +88,7 @@ use crate::cdc::{PUBLICATION, Tap};
 use crate::payload::{self, Types};
 use crate::pgoutput::Change;
 use crate::sql::Pool;
-use crate::visible::{Asker, seen};
+use crate::visible::{Asker, Catalog, Facts, seen};
 
 /// How long the reader waits before asking again when the database had
 /// nothing for it, which is upstream's `poll_interval_ms` default.
@@ -117,7 +117,11 @@ pub enum Heard {
     /// own subscriptions this is an answer to.
     Change {
         ids: Vec<u64>,
-        data: Value,
+        /// The row, held by pointer: one change goes to every
+        /// subscriber watching the table, and they are all owed the
+        /// same bytes, so the copy that mattered was the one nobody
+        /// needed.
+        data: Arc<Value>,
         /// When the transaction that made it committed, by the
         /// database's clock, in microseconds.
         commit_ts: i64,
@@ -143,7 +147,10 @@ pub struct Listening {
 }
 
 struct Listener {
-    asker: Asker,
+    /// Who this subscriber is, by pointer: every change it is owed
+    /// takes a copy of this out from under the lock, and a copy of a
+    /// token's claims is a walk of the whole json object.
+    asker: Arc<Asker>,
     to: To,
     /// The bindings this subscriber has, so that a socket hanging up
     /// takes its own out of the index and nobody else's.
@@ -317,12 +324,14 @@ impl Changes {
         inner.listeners.insert(
             id,
             Listener {
-                asker,
+                asker: Arc::new(asker),
                 to: To::Own(to),
                 bindings: Vec::new(),
             },
         );
+        let now = inner.listeners.len();
         drop(inner);
+        crate::ops::subscribers(now);
         // Whether this is the first subscriber or the thousandth, since
         // a wake nobody was waiting for is free.
         self.wake.notify_one();
@@ -344,12 +353,14 @@ impl Changes {
         inner.listeners.insert(
             id,
             Listener {
-                asker,
+                asker: Arc::new(asker),
                 to: To::Link { named, link },
                 bindings: Vec::new(),
             },
         );
+        let now = inner.listeners.len();
         drop(inner);
+        crate::ops::subscribers(now);
         self.wake.notify_one();
         id
     }
@@ -413,7 +424,7 @@ impl Changes {
     pub fn became(&self, listener: u64, asker: Asker) {
         let mut inner = self.inner.lock().expect("changes");
         if let Some(who) = inner.listeners.get_mut(&listener) {
-            who.asker = asker;
+            who.asker = Arc::new(asker);
         }
     }
 
@@ -427,6 +438,9 @@ impl Changes {
             inner.subs.remove(id);
             inner.owner.remove(&id);
         }
+        let now = inner.listeners.len();
+        drop(inner);
+        crate::ops::subscribers(now);
     }
 
     /// How many subscribers have asked for something, which is what
@@ -501,7 +515,7 @@ impl Changes {
     /// three subscriptions on the same table is owed one message
     /// carrying three ids, which is what upstream sends and what its
     /// clients expect.
-    fn wanted(&self, change: &Change) -> Vec<(u64, Asker, To, Vec<u64>)> {
+    fn wanted(&self, change: &Change) -> Vec<(u64, Arc<Asker>, To, Vec<u64>)> {
         let inner = self.inner.lock().expect("changes");
         let mut by_listener: HashMap<u64, Vec<u64>> = HashMap::new();
         for id in inner.subs.matching(change) {
@@ -516,7 +530,7 @@ impl Changes {
                 // Ascending, so that a client comparing what it got
                 // with what it asked for sees the same order twice.
                 ids.sort_unstable();
-                Some((listener, who.asker.clone(), who.to.clone(), ids))
+                Some((listener, Arc::clone(&who.asker), who.to.clone(), ids))
             })
             .collect()
     }
@@ -543,6 +557,11 @@ pub struct Reader {
     /// oid means the same thing in the same database whichever
     /// connection asked.
     types: Types,
+    /// What the catalog says about the tables that change and the roles
+    /// that are subscribed to them, kept for as long as the catalog is
+    /// the same one. This is the difference between a delivery costing
+    /// the database three round trips and costing it nothing.
+    catalog: Catalog,
     /// Where the last change came from, which is what the log says when
     /// a tap dies so that somebody can tell how much of the write ahead
     /// log went unread.
@@ -550,7 +569,12 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new(dsn: &str, pool: Pool, changes: std::sync::Arc<Changes>) -> Reader {
+    pub fn new(
+        dsn: &str,
+        pool: Pool,
+        changes: std::sync::Arc<Changes>,
+        epoch: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Reader {
         Reader {
             dsn: dsn.to_string(),
             pool,
@@ -558,6 +582,7 @@ impl Reader {
             every: IDLE,
             most: BATCH,
             types: Types::new(),
+            catalog: Catalog::new(epoch),
             at: 0,
         }
     }
@@ -669,13 +694,36 @@ impl Reader {
             // rather than per subscriber, since two sockets signed in
             // as the same person are owed the same object, and the
             // check is the expensive half of this loop.
-            let mut built: HashMap<String, Option<Value>> = HashMap::new();
+            let mut built: HashMap<String, Option<Arc<Value>>> = HashMap::new();
             for (listener, asker, to, ids) in wanted {
-                let key = format!("{}\u{0}{}", asker.role, asker.claims);
+                let facts = match self
+                    .catalog
+                    .facts(&self.pool, &change.relation, &asker.role)
+                    .await
+                {
+                    Ok(facts) => facts,
+                    Err(why) => {
+                        // The same silence a policy's no gets, for the
+                        // same reason: nobody could find out what this
+                        // subscriber may see.
+                        log::warn!("realtime: {why}");
+                        continue;
+                    }
+                };
+                // Claims are only part of the key when a policy could
+                // read them. Without row level security every holder
+                // of a role is owed the same object, so a hundred
+                // subscribers on a shard are one payload rather than a
+                // hundred identical ones.
+                let key = if facts.rls {
+                    format!("{}\u{0}{}", asker.role, asker.claims)
+                } else {
+                    asker.role.clone()
+                };
                 let data = match built.get(&key) {
                     Some(data) => data.clone(),
                     None => {
-                        let data = self.building(&asker, change).await;
+                        let data = self.building(&facts, &asker, change).await.map(Arc::new);
                         built.insert(key, data.clone());
                         data
                     }
@@ -701,8 +749,8 @@ impl Reader {
 
     /// The payload one subscriber is owed of one change, or nothing
     /// when they are owed none.
-    async fn building(&self, asker: &Asker, change: &Change) -> Option<Value> {
-        match seen(&self.pool, asker, change).await {
+    async fn building(&self, facts: &Facts, asker: &Asker, change: &Change) -> Option<Value> {
+        match seen(&self.pool, facts, asker, change).await {
             Ok(may) if !may.row => None,
             Ok(may) => Some(payload::data(change, &self.types, &may)),
             Err(why) => {

@@ -21,6 +21,10 @@ A subscription is not a request, so the surface counters say nothing about how l
 `zou_realtime_commit_to_socket_seconds` is what an application feels, counted from the commit timestamp postgres wrote, which means it carries whatever a database on another machine disagrees with this one's clock about, and a clock behind the database's is counted as a zero rather than as a negative.
 `zou_realtime_change_seconds` is this server's own share of the same interval, from the tap reading the change out of the slot to the frame going out, on one clock, and it is the one that says whether what moved was here.
 
+`zou_realtime_sockets` and `zou_realtime_subscribers` are what a socket tier is sized on: how many sockets this node is holding, and how many of them asked for database changes.
+Two numbers rather than one because they cost different things: a socket is a connection, a task and whatever the client has not read yet, and a subscriber is that plus a place in the change reader and a policy check per row that matches it.
+On a fleet they do not add up to one machine's, and that is the honest shape rather than a rounding: a socket served away from the node holding its project is a socket there and a subscriber on the holder, because the row it may see is decided where the database is.
+
 Store numbers come from the counter file `ZOU_STORE_STATS` names rather than from counters of this process, and a scrape folds that file in as it reads it.
 That is deliberate: the file is shared memory, so the ops a postgres backend made in another process are in it, and counting in process would count the ones this process can see and miss the rest.
 Set `ZOU_STORE_STATS=/run/zou/stats` and the scrape gains `zou_store_ops_total{op,class}`, `zou_store_bytes_total{op,class}`, `zou_store_errors_total{op}`, `zou_store_conflicts_total`, `zou_store_op_seconds{op}` and the read tier counters.
@@ -133,6 +137,12 @@ Four listeners come up on one runtime: the http front door on 54321, the postgre
 One runtime rather than one each, because four thread pools on an eight core node compete for eight cores and the density this is built for is a number of tenants and not a number of servers.
 They share the registry and the attach manager, so a project brought up by whichever door was asked first is the project the others find already running.
 Any door except http is turned off by giving it port 0.
+
+`--http 54321,54322,54323` puts the same api on more than one port, one accept loop per port and one router behind all of them, so a request cannot tell which port it arrived on and nothing about it should.
+A node published at several ports is one reason to want it.
+A load generator is the other: what one client address has to any one destination port is its ephemeral range, 28231 ports on a stock kernel and not the 65535 the arithmetic wants, and the ceiling does not arrive as a refusal but as a kernel scanning most of that range per connect under a lock.
+So a run holding a great many sockets against one node spreads them over several ports on this side, which is how the 100k socket number in [benchmarks.md](benchmarks.md) was taken: six ports, and the generator's range widened, after three ports made the generator spend 70 percent of itself choosing source ports while the node sat at a fifth of its cpu.
+The first port in the list is the one the node calls its own and builds urls from.
 
 Routing is `--domain` and the path prefix, and at least one of them has to be on, which is checked at the command line rather than at the first request.
 `--domain zou.example` makes `acme-prod.zou.example` a project, and it is also where a tenant's own external url comes from, so the links in its confirmation mail point at the project instead of at the node.

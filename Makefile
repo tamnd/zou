@@ -54,7 +54,12 @@ zou-pg-lib:
 PG_OFF := -Dgssapi=disabled -Dldap=disabled -Dpam=disabled -Dbsd_auth=disabled \
 	-Dbonjour=disabled -Dselinux=disabled -Dsystemd=disabled -Dlibcurl=disabled \
 	-Dlibnuma=disabled -Dliburing=disabled
-PG_OPTS := --prefix=$(PG_PREFIX) -Duuid=e2fs $(PG_OFF) -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg"
+# Openssl is the other way round: it is auto by default too, but a build
+# without it silently leaves out pgcrypto, and the tenant contract needs
+# pgcrypto, so a builder missing libssl-dev would produce a postmaster
+# that comes up and then refuses every new project. Naming it means the
+# build stops at configure instead.
+PG_OPTS := --prefix=$(PG_PREFIX) -Duuid=e2fs -Dssl=openssl $(PG_OFF) -Dc_link_args="-L$(ZOU_PG_LIB) -lzou_pg"
 
 # Out of tree build so the submodule stays clean. LDFLAGS pulls in the
 # zou-pg staticlib for the smgr patch, see docs/postgres.md.

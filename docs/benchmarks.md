@@ -212,6 +212,56 @@ That the saving is four megabytes and the attach halves is the same fact from tw
 Against a plain directory, where the bytes are free, the same five runs attach in 75.1, 81.5, 87.7, 157.2 and 173.2 ms.
 The spread is the laptop and not the code, and the trimming is worth nothing here, which is the point of measuring both.
 
+## A hundred thousand realtime sockets on one node
+
+server3 (8 cores, 23 GB, store on a local MinIO) as the node under test, server2 (6 cores, 12 GB) on the other side of the internet as the generator, 2026-08-17, `zoubench sockets scenarios/sockets-100k.json`.
+A hundred thousand websockets, each joined to a channel filtered `shard=eq.N` over a thousand shards, so a hundred sockets are owed every row written to a shard.
+The generator has to be the other box, because a hundred thousand descriptors and a goroutine each on the node under test makes the node's cpu partly the benchmark.
+
+Neither box was quiet, and this is not a lab.
+server3 runs the owner's crawler at between one and two of its eight cores and a MinIO at a third of one, load average two to four before the run.
+server2 runs a browser and other work at about one and a half cores.
+Every number below has that in it, and the two the node measures about itself are the ones to read.
+
+| | sockets-10k | sockets-100k |
+| --- | --- | --- |
+| sockets held, of asked | 10000 of 10000 | 100000 of 100000 |
+| refused | 0 | 0 |
+| lost mid run | 0 | 6 |
+| ramp | 42 s | 493 s |
+| node RSS at full ramp | 254 MB | 2.28 GB |
+| rows committed in the window | 33750 in 120 s, 281 a second | 18825 in 300 s, 62.8 a second |
+| deliveries owed | 675000 | 1882500 |
+| deliveries missing | 0 | 110 |
+| shards with no delivery | 0 | 0 of 1000 |
+| node change fan out, mean | 11.8 ms | 47.1 ms |
+| node commit to socket, mean | 73.2 ms | 126.7 ms |
+| client delivery p50 | 394 ms | 2530 ms |
+| client delivery p99 | 2920 ms | 286000 ms |
+| client commit p50 / p99 | 186 ms / 2100 ms | 653 ms / 53566 ms |
+| connect p50 / p99 | 39 ms / 478 ms | 77 ms / 1614 ms |
+| join p50 / p99 | 13 ms / 238 ms | 27 ms / 962 ms |
+
+A hundred thousand sockets on one node is held rather than argued about: every one asked for was accepted, none refused, and the node's own gauges agree at 99994 sockets and 99994 subscribers.
+Six sockets died mid run, all four distinct failures a read timeout, which at a hundred thousand sockets over the public internet for eleven minutes is the internet.
+Of 1,882,500 deliveries owed, 1,882,390 arrived, so 110 did not, one delivery in seventeen thousand, and every one of the thousand shards was served.
+That accounting is per shard and exact, rows in that shard times sockets on it, so a run that dropped frames says so rather than publishing a percentile over the ones that survived.
+
+Memory is 23.4 KB a socket, and that number is the whole reason this run fits on the box.
+Before the read buffer on a socket was sized for a realtime client, it was 128 KB eagerly allocated and zeroed before every read, which is 145 KB a socket, and a hundred thousand of those wants 14.5 GB on a 24 GB box that is also running a database, a MinIO and somebody's crawler.
+The 10k run measured that change directly, 1.45 GB down to 254 MB at the same socket count, with `__memset_avx2_unaligned_erms` going from 14.66 percent of the node's profile to 2.30.
+
+The node's own cost of a change is the number this page is actually publishing.
+Reading one change out of the stream and writing it to all hundred sockets that are owed it takes 47.1 ms at the mean, and the distance from the database's own commit timestamp to the frame leaving for the socket is 126.7 ms.
+Both are measured by the node, on 1,882,394 changes, and both sit in the result file beside the client's view.
+
+The client's tail is not the fan out, it is the writes, and the run says so in three places.
+The scenario asks for a thousand rows a second and got 62.8, because it uses eight writers and a commit took 3.57 s at the mean, and eight times twenty five rows divided by 3.57 s is the 62.8 that came out.
+The delivery clock starts before the insert is sent, on purpose, so a row that waited 550 s to commit is a 563 s delivery, and a commit p99 of 53.6 s is most of a delivery p99 of 286 s.
+The gap that is left, a client mean of 22.8 s against a commit mean of 3.57 s plus the node's 127 ms, is the generator's own read side queueing on six shared cores with a hundred thousand goroutines to schedule, which is why the node's histograms and not the client's mean are the node's number.
+
+So the socket half of the M4 line is measured and the rate half is not, and what is in the way is the engine's commit path rather than anything in the realtime tier.
+
 ## Pending
 
 - The same registry walk at a million entries and against real S3, which is the NFR-20 number rather than its smoke.

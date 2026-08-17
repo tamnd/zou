@@ -22,7 +22,7 @@ use zou_server::cdc::{Closed, PUBLICATION, Tap};
 use zou_server::payload::{NO_KEY, Seen, UNAUTHORIZED};
 use zou_server::pgoutput::Change;
 use zou_server::sql::Pool;
-use zou_server::visible::{Asker, seen};
+use zou_server::visible::{Asker, Catalog, seen};
 
 /// Two people, so a policy has somebody to keep a row from.
 const ANA: &str = "11111111-1111-1111-1111-111111111111";
@@ -68,6 +68,20 @@ fn anon() -> Asker {
         role: "anon".into(),
         claims: serde_json::json!({"role": "anon"}),
     }
+}
+
+/// What a subscriber may see, catalog read and all, which is the two
+/// halves the server keeps apart put back together for a test: the
+/// facts about the table and the role, then the question about the row.
+/// A cache of its own per call, so no answer here is one an earlier
+/// test left behind.
+async fn seen_by(pool: &Pool, asker: &Asker, change: &Change) -> Result<Seen, String> {
+    let mut catalog = Catalog::new(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)));
+    let facts = catalog
+        .facts(pool, &change.relation, &asker.role)
+        .await
+        .expect("the catalog");
+    seen(pool, &facts, asker, change).await
 }
 
 /// A table in the publication, dropped and rebuilt so a rerun starts
@@ -170,11 +184,11 @@ async fn a_policy_decides_who_is_told_about_a_row() {
     let changes = of(&until(&mut tap, &[("vis_own", 2)]).await, "vis_own");
     assert_eq!(changes.len(), 2, "two inserts");
 
-    let hers = seen(&pool, &user(ANA), &changes[0])
+    let hers = seen_by(&pool, &user(ANA), &changes[0])
         .await
         .expect("an answer");
     assert!(hers.row, "the policy is what lets her see her own row");
-    let his = seen(&pool, &user(ANA), &changes[1])
+    let his = seen_by(&pool, &user(ANA), &changes[1])
         .await
         .expect("an answer");
     assert!(
@@ -182,7 +196,9 @@ async fn a_policy_decides_who_is_told_about_a_row() {
         "and the same policy is what keeps her from seeing his, which is the whole reason to ask"
     );
 
-    let theirs = seen(&pool, &anon(), &changes[0]).await.expect("an answer");
+    let theirs = seen_by(&pool, &anon(), &changes[0])
+        .await
+        .expect("an answer");
     assert!(
         !theirs.row,
         "a subscriber with no subject matches no row this policy allows"
@@ -217,7 +233,7 @@ async fn an_update_is_checked_against_the_row_it_became() {
     let changes = of(&until(&mut tap, &[("vis_moved", 2)]).await, "vis_moved");
     assert_eq!(changes.len(), 2, "an insert and an update");
 
-    let hers = seen(&pool, &user(ANA), &changes[1])
+    let hers = seen_by(&pool, &user(ANA), &changes[1])
         .await
         .expect("an answer");
     assert!(
@@ -226,7 +242,7 @@ async fn an_update_is_checked_against_the_row_it_became() {
          policy's view is not told to the person it moved away from, which is upstream's \
          behaviour and worth knowing rather than worth relying on"
     );
-    let his = seen(&pool, &user(BEN), &changes[1])
+    let his = seen_by(&pool, &user(BEN), &changes[1])
         .await
         .expect("an answer");
     assert!(his.row, "and it is told to the person it moved to");
@@ -253,7 +269,9 @@ async fn a_table_with_no_policies_is_seen_by_anybody_the_grant_lets_read_it() {
         .await
         .expect("a row");
     let changes = of(&until(&mut tap, &[("vis_open", 1)]).await, "vis_open");
-    let answer = seen(&pool, &anon(), &changes[0]).await.expect("an answer");
+    let answer = seen_by(&pool, &anon(), &changes[0])
+        .await
+        .expect("an answer");
     assert!(
         answer.row,
         "row level security off means the grant is the whole answer, and asking a policy that \
@@ -284,7 +302,7 @@ async fn a_column_nobody_granted_is_not_in_what_a_subscriber_may_see() {
         .await
         .expect("a row");
     let changes = of(&until(&mut tap, &[("vis_cols", 1)]).await, "vis_cols");
-    let answer = seen(&pool, &user(ANA), &changes[0])
+    let answer = seen_by(&pool, &user(ANA), &changes[0])
         .await
         .expect("an answer");
     assert_eq!(
@@ -318,7 +336,7 @@ async fn a_subscriber_who_may_not_select_the_key_is_told_why() {
         .await
         .expect("a row");
     let changes = of(&until(&mut tap, &[("vis_key", 1)]).await, "vis_key");
-    let answer = seen(&pool, &user(ANA), &changes[0])
+    let answer = seen_by(&pool, &user(ANA), &changes[0])
         .await
         .expect("an answer");
     assert_eq!(
@@ -352,7 +370,7 @@ async fn a_table_with_no_primary_key_is_an_error_and_not_a_row() {
         .await
         .expect("a row");
     let changes = of(&until(&mut tap, &[("vis_nokey", 1)]).await, "vis_nokey");
-    let answer = seen(&pool, &user(ANA), &changes[0])
+    let answer = seen_by(&pool, &user(ANA), &changes[0])
         .await
         .expect("an answer");
     assert_eq!(
@@ -403,7 +421,7 @@ async fn a_delete_reaches_everybody_and_says_only_its_key_where_there_are_polici
     let guarded = of(&read, "vis_del");
     let open = of(&read, "vis_del_open");
 
-    let answer = seen(&pool, &user(BEN), &guarded[1])
+    let answer = seen_by(&pool, &user(BEN), &guarded[1])
         .await
         .expect("an answer");
     assert!(
@@ -416,7 +434,7 @@ async fn a_delete_reaches_everybody_and_says_only_its_key_where_there_are_polici
         "what a subscriber is owed is that a row with that key is gone, not what was in it"
     );
 
-    let answer = seen(&pool, &anon(), &open[1]).await.expect("an answer");
+    let answer = seen_by(&pool, &anon(), &open[1]).await.expect("an answer");
     assert!(
         !answer.keys_only,
         "a table with no policies on it publishes what its replica identity publishes"
@@ -448,7 +466,9 @@ async fn a_role_the_database_does_not_have_sees_nothing() {
         role: "a_role_nobody_created".into(),
         claims: serde_json::json!({"sub": ANA, "role": "a_role_nobody_created"}),
     };
-    let answer = seen(&pool, &asker, &changes[0]).await.expect("an answer");
+    let answer = seen_by(&pool, &asker, &changes[0])
+        .await
+        .expect("an answer");
     assert_eq!(
         columns(&changes[0], &answer),
         Vec::<String>::new(),
@@ -485,10 +505,134 @@ async fn a_role_that_bypasses_row_level_security_is_told_about_the_row() {
         role: "service_role".into(),
         claims: serde_json::json!({"role": "service_role"}),
     };
-    let answer = seen(&pool, &service, &changes[0]).await.expect("an answer");
+    let answer = seen_by(&pool, &service, &changes[0])
+        .await
+        .expect("an answer");
     assert!(
         answer.row,
         "the role is created with bypassrls, so the database itself answers yes, and a check that \
          asks the database inherits that without a case for it"
+    );
+}
+
+#[tokio::test]
+async fn the_catalog_half_of_the_answer_is_read_once_per_table_and_role() {
+    let Some(dsn) = dsn() else { return };
+    let client = connect(&dsn).await;
+    published(
+        &client,
+        "vis_cached",
+        "create table vis_cached (id int primary key, details text);
+         grant select on vis_cached to anon, authenticated;",
+    )
+    .await;
+    let Some(mut tap) = tapping(&dsn).await else {
+        return;
+    };
+    let pool = Pool::new(&dsn, 4).expect("a pool");
+
+    client
+        .batch_execute("insert into vis_cached values (1, 'a detail')")
+        .await
+        .expect("a row");
+    let changes = of(&until(&mut tap, &[("vis_cached", 1)]).await, "vis_cached");
+    let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+    let mut catalog = Catalog::new(std::sync::Arc::clone(&epoch));
+
+    let first = catalog
+        .facts(&pool, &changes[0].relation, "authenticated")
+        .await
+        .expect("the catalog");
+    assert!(!first.rls, "nothing has enabled it yet");
+    catalog
+        .facts(&pool, &changes[0].relation, "authenticated")
+        .await
+        .expect("the catalog");
+    assert_eq!(
+        catalog.held(),
+        1,
+        "the second ask is the same table and the same role, which is the ask a hundred thousand \
+         subscribers make"
+    );
+    catalog
+        .facts(&pool, &changes[0].relation, "anon")
+        .await
+        .expect("the catalog");
+    assert_eq!(
+        catalog.held(),
+        2,
+        "another role is another set of privileges and another answer"
+    );
+
+    client
+        .batch_execute("alter table vis_cached enable row level security")
+        .await
+        .expect("row level security on");
+    let stale = catalog
+        .facts(&pool, &changes[0].relation, "authenticated")
+        .await
+        .expect("the catalog");
+    assert!(
+        !stale.rls,
+        "still what it said, which is what makes this a cache rather than a query with a struct \
+         around it"
+    );
+
+    epoch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let fresh = catalog
+        .facts(&pool, &changes[0].relation, "authenticated")
+        .await
+        .expect("the catalog");
+    assert!(
+        fresh.rls,
+        "and the epoch the ddl moves is what makes it read again"
+    );
+    assert_eq!(catalog.held(), 1, "everything older than the epoch went");
+}
+
+#[tokio::test]
+async fn a_table_with_no_row_level_security_is_answered_without_the_database() {
+    let Some(dsn) = dsn() else { return };
+    let client = connect(&dsn).await;
+    published(
+        &client,
+        "vis_free",
+        "create table vis_free (id int primary key, details text);
+         grant select on vis_free to anon, authenticated;",
+    )
+    .await;
+    let Some(mut tap) = tapping(&dsn).await else {
+        return;
+    };
+    let pool = Pool::new(&dsn, 4).expect("a pool");
+
+    client
+        .batch_execute("insert into vis_free values (1, 'a detail')")
+        .await
+        .expect("a row");
+    let changes = of(&until(&mut tap, &[("vis_free", 1)]).await, "vis_free");
+    let mut catalog = Catalog::new(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)));
+    let facts = catalog
+        .facts(&pool, &changes[0].relation, "authenticated")
+        .await
+        .expect("the catalog");
+
+    // A pool pointed at a port nothing is listening on. Every question
+    // asked of it fails, so a check that answers on it is a check that
+    // asked nothing, which is the claim: a subscriber to a table
+    // without row level security costs the database nothing per change.
+    let closed = Pool::new("host=127.0.0.1 port=1 user=postgres dbname=postgres", 4)
+        .expect("a pool that cannot connect");
+    let answer = seen(&closed, &facts, &user(ANA), &changes[0])
+        .await
+        .expect("an answer without a database");
+    assert!(
+        answer.row,
+        "nothing hides a row on a table with no policies"
+    );
+    assert_eq!(
+        columns(&changes[0], &answer),
+        vec!["id".to_string(), "details".to_string()],
+        "and the columns are the ones the grant allows, which came out of the catalog once"
     );
 }

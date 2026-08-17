@@ -41,7 +41,7 @@ use zou_store::layout::TenantLayout;
 use zou_store::registry::Tenant;
 use zou_store::{CasStore, Manifest, open_store};
 
-pub const USAGE: &str = "usage: zou serve <target> [--ref <ref>] [--http <n>] [--pg <n>] [--pool <n>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>]";
+pub const USAGE: &str = "usage: zou serve <target> [--ref <ref>] [--http <n[,n...]>] [--pg <n>] [--pool <n>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>]";
 
 pub const LAMBDA_USAGE: &str = "usage: zou lambda <target> [--ref <ref>] [--pg-bin <dir>] [--runtime <dir>] [--shared-buffers <size>] [--passthrough <size>]";
 
@@ -91,6 +91,10 @@ pub struct Args {
     pub pg_bin: PathBuf,
     pub runtime: PathBuf,
     pub http: u16,
+    /// Extra ports the same http api answers on, from `--http a,b,c`.
+    /// The first port in that list is `http` above and is the one every
+    /// url this node prints is built from.
+    pub http_more: Vec<u16>,
     pub pg: u16,
     pub pool: u16,
     pub ops: u16,
@@ -142,6 +146,7 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
     let mut pg_bin = None;
     let mut runtime = None;
     let mut http = 54321u16;
+    let mut http_more = Vec::new();
     let mut pg = 5432u16;
     let mut pool = 6543u16;
     let mut ops = 0u16;
@@ -178,7 +183,7 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
             "--ref" => only = Some(need(&mut it, "--ref")?.clone()),
             "--pg-bin" => pg_bin = Some(PathBuf::from(need(&mut it, "--pg-bin")?)),
             "--runtime" => runtime = Some(PathBuf::from(need(&mut it, "--runtime")?)),
-            "--http" => http = port(&mut it, "--http")?,
+            "--http" => (http, http_more) = ports(&mut it, "--http")?,
             "--pg" => pg = port(&mut it, "--pg")?,
             "--pool" => pool = port(&mut it, "--pool")?,
             "--ops" => ops = port(&mut it, "--ops")?,
@@ -275,6 +280,7 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
         pg_bin,
         runtime,
         http,
+        http_more,
         pg,
         pool,
         ops,
@@ -320,6 +326,33 @@ fn port(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<u16, String
     let raw = need(it, flag)?;
     raw.parse()
         .map_err(|_| format!("bad {flag} port {raw:?}, use 0 to turn it off"))
+}
+
+/// A port, or a comma separated list of them for a door that can answer
+/// on more than one. The first is the port the node calls its own and
+/// builds urls from, the rest are extra doors onto the same api.
+fn ports(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<(u16, Vec<u16>), String> {
+    let raw = need(it, flag)?;
+    let mut all: Vec<u16> = Vec::new();
+    for part in raw.split(',') {
+        let one = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("bad {flag} port {part:?}, use 0 to turn it off"))?;
+        if all.contains(&one) {
+            return Err(format!("{flag} names port {one} twice"));
+        }
+        all.push(one);
+    }
+    let first = all.remove(0);
+    // Off is a thing one port can be and a list cannot: a door that is
+    // both closed and open on three other ports is a typo.
+    if first == 0 && !all.is_empty() {
+        return Err(format!(
+            "{flag} 0 turns the door off, so a list with a 0 in front of other ports is a typo"
+        ));
+    }
+    Ok((first, all))
 }
 
 /// One tenant's postmaster, as much of it as anything outside the
@@ -498,6 +531,13 @@ struct Postmasters {
     /// told its own project's url is when the node has no domain to
     /// build one out of.
     http: u16,
+    /// What the realtime tier is allowed, read once from the node's
+    /// environment and given to every project it brings up. The dev
+    /// loop reads the same variables, and a node that did not read them
+    /// would hold 200 sockets per project whatever its operator set,
+    /// which is upstream's hosted default and no answer at all for a
+    /// node sized for more.
+    realtime: zou_server::realtime::Limits,
     store: Arc<dyn CasStore>,
     state: Arc<State>,
 }
@@ -802,10 +842,47 @@ impl Backend for Postmasters {
             boot.laps()
         );
 
-        // Local connections are trust, and nothing but this node can
-        // reach the port either way: it is on loopback in a 0700 socket
-        // directory and the client of it is in this process.
-        Ok(Config {
+        Ok(self.config(entry, port, functions))
+    }
+
+    fn down(&self, tenant_ref: &str) {
+        // Nothing is waited for here. This is called from the attach
+        // manager while it holds its own lock, and a postmaster's fast
+        // shutdown is not something a request path should be inside
+        // of: the thread that owns the child reaps it and removes its
+        // directory. The next attach of this same project is what waits
+        // for that, and it is the only thing that has to.
+        let Some(live) = self
+            .state
+            .live
+            .lock()
+            .expect("the live map")
+            .remove(tenant_ref)
+        else {
+            return;
+        };
+        log::info!("{tenant_ref}: detaching");
+        self.state.leaving(tenant_ref, live.pid);
+        stop(live.pid);
+    }
+}
+
+impl Postmasters {
+    /// What a project this node just brought up is served with: its own
+    /// secret and database, the node's store and passthrough rule, and
+    /// the node's realtime tier.
+    ///
+    /// Local connections are trust, and nothing but this node can reach
+    /// the port either way: it is on loopback in a 0700 socket directory
+    /// and the client of it is in this process.
+    fn config(
+        &self,
+        entry: &Tenant,
+        port: u16,
+        functions: Option<Arc<zou_functions::Registry>>,
+    ) -> Config {
+        let tenant_ref = &entry.tenant_ref;
+        Config {
             jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
             pg: Some(format!(
                 "host=127.0.0.1 port={port} user={SUPERUSER} dbname=postgres"
@@ -832,29 +909,9 @@ impl Backend for Postmasters {
             s3: entry
                 .s3()
                 .map(|(access, secret)| zou_server::s3::Credentials::new(access, secret)),
+            realtime: self.realtime,
             ..Config::default()
-        })
-    }
-
-    fn down(&self, tenant_ref: &str) {
-        // Nothing is waited for here. This is called from the attach
-        // manager while it holds its own lock, and a postmaster's fast
-        // shutdown is not something a request path should be inside
-        // of: the thread that owns the child reaps it and removes its
-        // directory. The next attach of this same project is what waits
-        // for that, and it is the only thing that has to.
-        let Some(live) = self
-            .state
-            .live
-            .lock()
-            .expect("the live map")
-            .remove(tenant_ref)
-        else {
-            return;
-        };
-        log::info!("{tenant_ref}: detaching");
-        self.state.leaving(tenant_ref, live.pid);
-        stop(live.pid);
+        }
     }
 }
 
@@ -926,6 +983,51 @@ fn free_port() -> Result<u16, String> {
         .map_err(|e| format!("looking for a free port: {e}"))
 }
 
+/// Take as many open files as this box will give, and say how many that
+/// came to.
+///
+/// A socket is a descriptor, and the soft limit a shell hands a program
+/// is 1024 nearly everywhere. A node that inherits it stops accepting at
+/// the thousandth socket and says `too many open files` for the rest of
+/// the run, whatever the realtime tier it was started with says it can
+/// hold, which is a node sized by whoever typed the command rather than
+/// by the machine. The hard limit is the administrator's answer to how
+/// many this process may have, so it is the one to take, and raising the
+/// soft limit up to it is a thing a process is allowed to do for itself.
+pub fn descriptors() -> libc::rlim_t {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return 0;
+    }
+    // An unlimited hard limit is not a number a kernel will accept as a
+    // soft one on every platform, so what is asked for is a number: a
+    // million descriptors is more sockets than a node this size holds.
+    let want = if limit.rlim_max == libc::RLIM_INFINITY {
+        MOST_FILES
+    } else {
+        limit.rlim_max
+    };
+    for ask in [want, MOST_FILES, 65_536] {
+        if ask <= limit.rlim_cur {
+            break;
+        }
+        let raised = libc::rlimit {
+            rlim_cur: ask,
+            rlim_max: limit.rlim_max,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            return ask;
+        }
+    }
+    limit.rlim_cur
+}
+
+/// The most descriptors worth asking for when the box has not said.
+const MOST_FILES: libc::rlim_t = 1_048_576;
+
 fn bind(port: u16, what: &str) -> Result<Option<std::net::TcpListener>, String> {
     if port == 0 {
         return Ok(None);
@@ -973,6 +1075,7 @@ pub fn run(args: &Args) -> Result<(), String> {
             ttl: PASSTHROUGH_TTL,
         }),
         http: args.http,
+        realtime: zou_server::realtime::limits_from_env()?,
         store,
         state: Arc::new(State {
             dying: Mutex::new(HashMap::new()),
@@ -1030,7 +1133,10 @@ pub fn run(args: &Args) -> Result<(), String> {
         return served;
     }
 
-    let http = bind(args.http, "http")?.ok_or("the http door needs a port")?;
+    let mut http = vec![bind(args.http, "http")?.ok_or("the http door needs a port")?];
+    for extra in &args.http_more {
+        http.push(bind(*extra, "http")?.ok_or("an extra http port cannot be 0")?);
+    }
     let pg = bind(args.pg, "the postgres port")?;
     let pool = bind(args.pool, "the pooler")?;
     let ops = bind(args.ops, "ops")?;
@@ -1048,6 +1154,16 @@ pub fn run(args: &Args) -> Result<(), String> {
     if args.path_prefix {
         log::info!("http://<host>:{}/<ref>/ names one too", args.http);
     }
+    if !args.http_more.is_empty() {
+        log::info!(
+            "the same api answers on {} as well",
+            args.http_more
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if args.pg > 0 {
         log::info!(
             "postgres on {}, transaction pooler on {}",
@@ -1063,6 +1179,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         args.max_attached,
         args.idle.as_secs()
     );
+    log::info!("up to {} open files, a socket each", descriptors());
     if let Some(gc) = args.gc {
         log::info!(
             "collecting every {}, {} of retention, {} of safety window",
@@ -1190,6 +1307,46 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// What this is really asserting is that a node does not serve
+    /// sockets under whatever soft limit the shell had, since the
+    /// thousand a shell hands out is two orders of magnitude under the
+    /// tier this node is started with.
+    #[test]
+    fn a_node_takes_every_open_file_the_box_allows() {
+        let mut before = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) },
+            0
+        );
+        let now = descriptors();
+        assert!(
+            now >= before.rlim_cur,
+            "the limit went down, from {} to {now}",
+            before.rlim_cur
+        );
+        let owed = before.rlim_max.min(MOST_FILES);
+        assert!(
+            now >= owed,
+            "there were {owed} to be had and this took {now}"
+        );
+        let mut after = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) },
+            0
+        );
+        assert_eq!(after.rlim_cur, now, "what it says is what the process has");
+        assert_eq!(
+            after.rlim_max, before.rlim_max,
+            "the hard limit is the administrator's and is not touched"
+        );
     }
 
     #[test]
@@ -1411,6 +1568,30 @@ mod tests {
         assert!(parse(&argv(&["--bogus", "./fleet"])).is_err());
     }
 
+    /// One client address has about 64k ports to one destination port,
+    /// so a load generator holding more sockets than that needs the api
+    /// on more than one port, and a node published at several ports
+    /// wants the same thing for its own reasons.
+    #[test]
+    fn the_http_door_can_be_told_more_than_one_port() {
+        let args = parse(&argv(&["./fleet", "--http", "54321,54322, 54323"])).unwrap();
+        assert_eq!(args.http, 54321);
+        assert_eq!(args.http_more, vec![54322, 54323]);
+
+        // One port is still one port, and nothing extra with it.
+        let args = parse(&argv(&["./fleet", "--http", "8000"])).unwrap();
+        assert_eq!(args.http, 8000);
+        assert!(args.http_more.is_empty());
+
+        // The same port twice would bind twice and fail on the second,
+        // which is worth saying before the node has started anything.
+        assert!(parse(&argv(&["./fleet", "--http", "54321,54321"])).is_err());
+        // Off is a thing one port can be and a list cannot.
+        assert!(parse(&argv(&["./fleet", "--http", "0,54322"])).is_err());
+        assert!(parse(&argv(&["./fleet", "--http", "54321,"])).is_err());
+        assert!(parse(&argv(&["./fleet", "--http", "54321,eleven"])).is_err());
+    }
+
     /// A dead postmaster whose tenant is still in the map is a tenant
     /// nothing would ever fix, so the supervisor lets go of it. One
     /// that was asked to stop is not, because something already did.
@@ -1499,5 +1680,47 @@ mod tests {
         );
         state.left("acme-prod", 4242);
         assert!(state.dying.lock().unwrap().is_empty());
+    }
+
+    fn node(realtime: zou_server::realtime::Limits) -> Postmasters {
+        Postmasters {
+            target: "s3://bucket/fleet".to_string(),
+            pg_bin: PathBuf::from("/nonexistent"),
+            runtime: PathBuf::from("/nonexistent"),
+            shared_buffers: "128MB".to_string(),
+            domain: None,
+            passthrough: None,
+            http: 54321,
+            realtime,
+            store: Arc::new(zou_store::MemStore::new()),
+            state: empty_state(),
+        }
+    }
+
+    /// The tier the node was started with is the tier every project it
+    /// serves gets. Without this the five `ZOU_REALTIME_MAX_` variables
+    /// are read by `zou dev` and ignored by `zou serve`, so a node sized
+    /// for a hundred thousand sockets refuses the two hundred and first.
+    #[test]
+    fn a_served_project_is_given_the_node_realtime_tier() {
+        let tier = zou_server::realtime::Limits {
+            concurrent_users: 200_000,
+            ..Default::default()
+        };
+        let cfg = node(tier).config(
+            &Tenant::new(
+                "acme-prod",
+                "super-secret-jwt-token-with-at-least-32-characters-long",
+                1,
+            ),
+            5433,
+            None,
+        );
+        assert_eq!(cfg.realtime.concurrent_users, 200_000);
+        assert_eq!(
+            cfg.tenant.as_deref(),
+            Some("acme-prod"),
+            "the project is still itself"
+        );
     }
 }
