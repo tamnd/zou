@@ -613,18 +613,29 @@ async fn act(
             Action::Watch { topic, wants } => {
                 let ids = app
                     .source
-                    .watch(app, session.identity(), watching, &wants)
+                    .watch(
+                        app,
+                        session.bearer(),
+                        session.identity(),
+                        me,
+                        watching,
+                        &wants,
+                    )
                     .await;
                 let next = session.watching(&topic, ids);
                 if !Box::pin(act(socket, next, session, app, me, carrying, watching)).await {
                     return false;
                 }
             }
-            Action::Unwatch(ids) => app.source.unwatch(app, ids).await,
+            Action::Unwatch(ids) => app.source.unwatch(app, me, ids).await,
             // The claims a row is checked against are the ones the
             // socket has now, so a refreshed token is told to the
             // reader before it reads anything else.
-            Action::Rewatch => app.source.became(app, session.identity(), watching).await,
+            Action::Rewatch => {
+                app.source
+                    .became(app, session.bearer(), session.identity(), me, watching)
+                    .await
+            }
             // Whatever was in front of this has been sent, which is
             // the point of it being an action rather than a return:
             // the client is told why before the socket goes. The close
@@ -663,6 +674,56 @@ pub(crate) async fn subscribed(
     watching: &mut Option<Listening>,
     wants: &[Value],
 ) -> Result<Watched, String> {
+    let (bindings, refused) = asked_for(app, wants).await?;
+    if refused.is_some() {
+        return Ok(Watched {
+            ids: bindings.iter().map(|_| app.changes.unnamed()).collect(),
+            refused,
+        });
+    }
+    let listener = match watching.as_ref() {
+        Some(listening) => {
+            // A second channel on the same socket, which may have
+            // joined with a different token than the first one did.
+            app.changes.became(listening.id, asker(who));
+            listening.id
+        }
+        None => watching.insert(app.changes.listen(asker(who))).id,
+    };
+    bound(app, listener, bindings).await
+}
+
+/// The same question asked on behalf of a socket that is not on this
+/// node: the subscriber already exists, because the link made it when
+/// the socket first asked to watch, and everything else is identical.
+///
+/// It has to be identical. A subscription that is refused here is
+/// refused there in the same words, a table nobody published is the same
+/// system frame, and the wait for the tap happens on this side of the
+/// link so that the away node's answer means the same thing about the
+/// next row the client writes as a local one does.
+pub(crate) async fn subscribed_on(
+    app: &Arc<App>,
+    listener: u64,
+    wants: &[Value],
+) -> Result<Watched, String> {
+    let (bindings, refused) = asked_for(app, wants).await?;
+    if refused.is_some() {
+        return Ok(Watched {
+            ids: bindings.iter().map(|_| app.changes.unnamed()).collect(),
+            refused,
+        });
+    }
+    bound(app, listener, bindings).await
+}
+
+/// What a client's list means, before anything is bound to anybody: the
+/// bindings in the order they were asked for, and the reason the whole
+/// list is refused if there is one.
+async fn asked_for(
+    app: &Arc<App>,
+    wants: &[Value],
+) -> Result<(Vec<Binding>, Option<String>), String> {
     let Some(pool) = app.pool.as_ref() else {
         return Err("this server has no database to read changes out of".into());
     };
@@ -681,21 +742,13 @@ pub(crate) async fn subscribed(
     // that looks right hears nothing. So the channel joins, nothing is
     // subscribed, and the reason goes out on the system frame, which
     // is what upstream does down to the wording.
-    if let Some(missing) = unpublished(pool, &bindings).await? {
-        return Ok(Watched {
-            ids: bindings.iter().map(|_| app.changes.unnamed()).collect(),
-            refused: Some(missing),
-        });
-    }
-    let listener = match watching.as_ref() {
-        Some(listening) => {
-            // A second channel on the same socket, which may have
-            // joined with a different token than the first one did.
-            app.changes.became(listening.id, asker(who));
-            listening.id
-        }
-        None => watching.insert(app.changes.listen(asker(who))).id,
-    };
+    let refused = unpublished(pool, &bindings).await?;
+    Ok((bindings, refused))
+}
+
+/// Hand a subscriber's bindings to the reader and wait until there is a
+/// tap to carry them.
+async fn bound(app: &Arc<App>, listener: u64, bindings: Vec<Binding>) -> Result<Watched, String> {
     // The reader starts here rather than at boot, because a replication
     // slot exists to be read and one nobody is reading is write ahead
     // log a database cannot free.

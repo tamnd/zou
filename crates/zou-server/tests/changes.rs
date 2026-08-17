@@ -147,6 +147,28 @@ async fn serving(dsn: &str) -> SocketAddr {
     at
 }
 
+/// The node with the database and a node with only the sockets on it,
+/// linked by the websocket the second opens to the first.
+///
+/// The away node has no dsn at all, which is the point of asking these
+/// questions twice: a row it should not have sent could not have been
+/// filtered here, because there is nothing here to filter it with.
+async fn two(dsn: &str) -> (SocketAddr, SocketAddr) {
+    let holder = serving(dsn).await;
+    let app = router(Config {
+        jwt_secret: SECRET.to_vec(),
+        holder: Some(format!("http://{holder}")),
+        ..Config::default()
+    })
+    .expect("router builds");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let away = listener.local_addr().expect("the port");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (holder, away)
+}
+
 /// How many replication slots this server is holding.
 async fn slots(dsn: &str) -> i64 {
     one(
@@ -525,6 +547,159 @@ async fn a_table_nobody_published_is_refused_on_the_system_frame() {
     // message.
     run(&dsn, "insert into chg_open (id) values (1)").await;
     quiet(&mut socket).await;
+}
+
+/// The same row, asked for by a client that reached a node with no
+/// database on it at all.
+///
+/// A subscription cannot be decided by the node with the sockets: what a
+/// subscriber may see of a row is a select of that row as them. So the
+/// list goes up the link, the subscriber lives on the holder, and what
+/// comes back down is a row already decided for one socket. This is the
+/// first test of that end to end, and what it is really asking is
+/// whether a client can tell which kind of node it reached.
+#[tokio::test]
+async fn a_socket_on_a_fan_out_node_hears_the_rows_it_subscribed_to() {
+    let Some(dsn) = dsn() else { return };
+    let _one = alone().lock().await;
+    if !logical(&dsn).await {
+        return;
+    }
+    settled(&dsn).await;
+    let (_holder, away) = two(&dsn).await;
+    published(
+        &dsn,
+        "chg_link",
+        "create table chg_link (id int primary key, details text);
+         grant select on chg_link to anon, authenticated;",
+    )
+    .await;
+
+    let mut socket = connect(away).await;
+    let response = subscribe(
+        &mut socket,
+        ANA,
+        json!([
+            {"event": "*", "schema": "public", "table": "chg_link"},
+            {"event": "INSERT", "schema": "public", "table": "chg_link", "filter": "id=eq.2"},
+        ]),
+    )
+    .await;
+    let echoed = response["postgres_changes"]
+        .as_array()
+        .expect("the reply carries the subscriptions")
+        .clone();
+    assert_eq!(echoed.len(), 2, "{response}");
+    assert!(
+        echoed[0]["id"].is_number(),
+        "the ids are the holder's and they crossed the link, {response}"
+    );
+    let both = vec![echoed[0]["id"].clone(), echoed[1]["id"].clone()];
+    // The slot is on the holder, which is the only node with a database,
+    // and the away node's join waited for it all the same.
+    tapping(&dsn).await;
+
+    run(&dsn, "insert into chg_link values (1, 'wash up')").await;
+    let insert = changed(&mut socket).await;
+    assert_eq!(insert["ids"], json!([both[0]]), "{insert}");
+    assert_eq!(insert["data"]["type"], "INSERT");
+    assert_eq!(
+        insert["data"]["record"],
+        json!({"id": 1, "details": "wash up"})
+    );
+
+    run(&dsn, "insert into chg_link values (2, 'and again')").await;
+    let filtered = changed(&mut socket).await;
+    assert_eq!(
+        filtered["ids"],
+        json!(both),
+        "a row both subscriptions wanted crosses once carrying both ids, {filtered}"
+    );
+
+    // And the channel going takes the subscriptions with it, which on
+    // this side of a link is an unwatch frame going up.
+    send(
+        &mut socket,
+        &json!(["1", "3", "realtime:db", "phx_leave", {}]).to_string(),
+    )
+    .await;
+    let left = next(&mut socket).await;
+    assert_eq!(left[4]["status"], "ok", "{left}");
+    run(&dsn, "insert into chg_link values (3, 'not heard')").await;
+    quiet(&mut socket).await;
+}
+
+/// The policies decide what crosses the link, which is the whole reason
+/// the subscriber lives on the holder.
+///
+/// Neither of these two sockets is on a node with a database, so a row
+/// that reached the wrong one could not have been filtered where it
+/// arrived. What is being asked is that it was never sent.
+#[tokio::test]
+async fn a_row_a_policy_hides_does_not_cross_the_link() {
+    let Some(dsn) = dsn() else { return };
+    let _one = alone().lock().await;
+    if !logical(&dsn).await {
+        return;
+    }
+    settled(&dsn).await;
+    let (_holder, away) = two(&dsn).await;
+    published(
+        &dsn,
+        "chg_link_own",
+        "create table chg_link_own (id int primary key, owner uuid, details text);
+         grant select on chg_link_own to anon, authenticated;
+         alter table chg_link_own enable row level security;
+         create policy mine on chg_link_own for select using (owner = auth.uid());",
+    )
+    .await;
+
+    let wants = json!([{"event": "*", "schema": "public", "table": "chg_link_own"}]);
+    let mut hers = connect(away).await;
+    let mut his = connect(away).await;
+    subscribe(&mut hers, ANA, wants.clone()).await;
+    subscribe(&mut his, BEN, wants).await;
+    tapping(&dsn).await;
+
+    run(
+        &dsn,
+        &format!("insert into chg_link_own values (1, '{ANA}', 'hers'), (2, '{BEN}', 'his')"),
+    )
+    .await;
+
+    let ana = changed(&mut hers).await;
+    assert_eq!(ana["data"]["record"]["details"], "hers");
+    quiet(&mut hers).await;
+
+    let ben = changed(&mut his).await;
+    assert_eq!(
+        ben["data"]["record"]["details"], "his",
+        "the same insert reached the person it belongs to on the same link, so the other row was \
+         withheld rather than lost"
+    );
+
+    // And a token refreshed on one of them changes what it may see from
+    // the next row on. This is the one thing on the link the holder has
+    // to be told rather than asked, because a subscriber is asked
+    // nothing: it sits on the holder and rows are checked against it
+    // there, so a refreshed token has to reach it.
+    send(
+        &mut hers,
+        &json!(["1", "9", "realtime:db", "access_token", {"access_token": token(BEN)}]).to_string(),
+    )
+    .await;
+    let refreshed = next(&mut hers).await;
+    assert_eq!(refreshed[4]["status"], "ok", "{refreshed}");
+    run(
+        &dsn,
+        &format!("insert into chg_link_own values (3, '{BEN}', 'his too')"),
+    )
+    .await;
+    let now = changed(&mut hers).await;
+    assert_eq!(
+        now["data"]["record"]["details"], "his too",
+        "the socket is somebody else now and the holder's reader knows it, {now}"
+    );
 }
 
 /// socket to go takes the replication slot with it, which is the

@@ -185,16 +185,33 @@ impl Source {
     /// This socket is somebody else now, which is a client refreshing
     /// its token on a connection it is keeping.
     ///
-    /// Held, the thing that cares is whatever checks rows against a
-    /// policy. Away, nothing has to be told: every question that
-    /// depends on who the socket is carries the token it is running on
-    /// at the moment it is asked, so there is no state to keep level.
-    pub async fn became(&self, app: &Arc<App>, who: &Identity, watching: &Option<Listening>) {
-        if let Source::Held = self
-            && let Some(listening) = watching.as_ref()
-        {
-            app.changes
-                .became(listening.id, crate::realtime::asker(who));
+    /// The thing that cares is whatever checks rows against a policy,
+    /// which is the change reader, and the reader is on the holder under
+    /// both. Held it is told directly; away the token goes up and the
+    /// holder verifies it and tells its own reader, because a node
+    /// asserting a claim set would be a node that can read any row in
+    /// the project by claiming to be anybody.
+    ///
+    /// This is the one thing on the link the holder has to be told
+    /// rather than asked: every other question carries the token it is
+    /// asked under, but a subscriber is asked nothing. It sits on the
+    /// holder and rows are checked against it there.
+    pub async fn became(
+        &self,
+        app: &Arc<App>,
+        token: Option<&str>,
+        who: &Identity,
+        me: SocketId,
+        watching: &Option<Listening>,
+    ) {
+        match self {
+            Source::Held => {
+                if let Some(listening) = watching.as_ref() {
+                    app.changes
+                        .became(listening.id, crate::realtime::asker(who));
+                }
+            }
+            Source::Away(away) => away.became(me, token).await,
         }
     }
 
@@ -202,33 +219,39 @@ impl Source {
     /// each entry was given, in the order it was asked for, or the
     /// reason there are none.
     ///
-    /// Away, the reason is that this node cannot do it yet. Changes
-    /// over a link are the next piece of this and they are not this
-    /// one, so a client that asks for them is refused in words on the
-    /// system frame rather than joined to a channel that will never say
-    /// anything.
+    /// Away, the list goes up and the holder makes the subscriber, so
+    /// the row a socket is sent has been selected back as that socket's
+    /// claims before it crossed the link. Nothing is filtered here, and
+    /// nothing a socket may not see is sent here to be filtered.
+    ///
+    /// The queue the rows arrive in is the one every socket already has
+    /// away, the one a gap comes down, so a subscription needs nothing
+    /// new on this end.
     pub async fn watch(
         &self,
         app: &Arc<App>,
+        token: Option<&str>,
         who: &Identity,
+        me: SocketId,
         watching: &mut Option<Listening>,
         wants: &[Value],
     ) -> Result<Watched, String> {
         match self {
             Source::Held => crate::realtime::subscribed(app, who, watching, wants).await,
-            Source::Away(_) => {
-                Err("this node does not serve database changes for this project".to_string())
-            }
+            Source::Away(away) => away.watch(me, token, wants).await,
         }
     }
 
     /// Those subscriptions are finished, because the channel they were
     /// asked for on has gone.
-    pub async fn unwatch(&self, app: &Arc<App>, ids: Vec<u64>) {
-        if let Source::Held = self {
-            for id in ids {
-                app.changes.unbind(id);
+    pub async fn unwatch(&self, app: &Arc<App>, me: SocketId, ids: Vec<u64>) {
+        match self {
+            Source::Held => {
+                for id in ids {
+                    app.changes.unbind(id);
+                }
             }
+            Source::Away(away) => away.unwatch(me, ids).await,
         }
     }
 

@@ -4,12 +4,13 @@
 //! only the sockets, linked by the websocket the second opens to the
 //! first. What has to be true is that a client cannot tell which one it
 //! reached: two sockets on one topic hear each other whichever node
-//! they are on, presence is one room across both, and a socket that
-//! asks for something its node cannot do is told so in words.
+//! they are on, presence is one room across both, and a question only
+//! the database can answer is answered by the node that has it.
 //!
 //! No database, which is what makes this a test rather than a fixture:
-//! broadcast and presence are the two things that need no postgres, and
-//! they are the two things this first piece of the fan out tier carries.
+//! broadcast and presence are the two things that need no postgres, so
+//! they are asked here, and the rows a subscriber hears are asked in
+//! tests/changes.rs against a real one.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -226,12 +227,17 @@ async fn presence_is_one_room_across_both_nodes() {
 }
 
 #[tokio::test]
-async fn a_node_says_what_it_cannot_do_rather_than_saying_nothing() {
-    // Database changes over a link are the next piece of this and not
-    // this one. A client that asks for them joins the channel and is
-    // told why there are none on the system frame, which is what
-    // upstream does for a table nobody published: the alternative is a
-    // subscription that looks fine and never says anything.
+async fn a_subscription_is_answered_by_the_node_with_the_database() {
+    // A subscription is not something the node with the sockets can
+    // decide: what a subscriber may see of a row is a select of that row
+    // as them, so the list goes up the link and the holder answers it.
+    //
+    // Neither of these two has a database, which is what makes the
+    // answer readable here: what comes back is the holder's own words
+    // about its own missing database, not this node's about a link it
+    // will not carry. That is the whole point of the test, since the
+    // rows themselves need a database and are asked about in
+    // tests/changes.rs against a real one.
     let (_holder, node) = two().await;
     let mut away = connect(node).await;
     let reply = join(
@@ -247,7 +253,7 @@ async fn a_node_says_what_it_cannot_do_rather_than_saying_nothing() {
         .unwrap_or_default()
         .to_string();
     assert!(
-        message.contains("does not serve database changes"),
+        message.contains("no database to read changes out of"),
         "{reply}"
     );
 }
