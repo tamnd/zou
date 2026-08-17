@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::dev::SUPERUSER;
 use zou_pg::gc::{self, Sweep};
@@ -385,12 +385,18 @@ struct Dying {
 
 /// How long a postmaster gets to leave before it is asked less politely.
 ///
-/// A fast shutdown of a small project is tens of milliseconds, so this
-/// is not a number anything normally reaches. Reaching it means a
-/// backend is not responding to a fast shutdown, and immediate shutdown
-/// is what postgres has for that: the next attach replays the wal,
-/// which is the recovery path a crash takes anyway.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// A fast shutdown of a small project used to be tens of milliseconds.
+/// It is now that plus a checkpoint and the fold of it, because the wal
+/// pusher takes one on the way out so that the next start of the project
+/// replays seconds of wal rather than a checkpoint cycle of it, and the
+/// budget it gives that is ten seconds. This has to be longer, since
+/// cutting the settle short is paid back by every later attach.
+///
+/// Reaching it anyway means a backend is not responding to a fast
+/// shutdown, and immediate shutdown is what postgres has for that: the
+/// next attach replays the wal, which is the recovery path a crash takes
+/// anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 
 /// What the thread supervising a postmaster shares with everything
 /// else: which children are meant to be running, which are on their way
@@ -1251,8 +1257,13 @@ fn stop_all(backend: &Postmasters, runtime: &Path) {
         stop(one.pid);
     }
     // Waiting for postmasters to let go of their runtime directories
-    // before the tree they are in goes away, not for data to be safe.
-    for _ in 0..100 {
+    // before the tree they are in goes away. Not for data to be safe,
+    // which it is either way, but for the checkpoint each of them takes
+    // on the way out: pulling the directory out from under one that is
+    // still writing it wastes the settle and leaves the project with the
+    // replay the settle was there to spare it.
+    let deadline = Instant::now() + SHUTDOWN_GRACE;
+    while Instant::now() < deadline {
         if live.iter().all(|one| !one.dir.exists()) {
             break;
         }

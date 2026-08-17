@@ -1,0 +1,201 @@
+Checkpoint and fold before the pusher goes.
+
+What the next start of a project replays from is the newest checkpoint
+the store holds a fold for, not the newest byte it holds. A node that is
+stopped in the middle of a checkpoint cycle therefore hands its
+successor every byte written since the last one, and the successor walks
+them a store read at a time. On server3 that was an hour of WAL and a
+project that could not be attached again at all: seven attempts in a row
+each started at the same redo point, replayed 15 MB in the first ten
+seconds and then about 20 KB per ten seconds after that, and each was
+killed by the sixty second attach deadline (zou #457).
+
+So the pusher, once it is drained and has been asked to stop, asks for a
+checkpoint and stays up until it has folded it. The request cannot be a
+waiting one: flushing a buffer waits on the durable LSN the pusher
+publishes, so a pusher asleep inside RequestCheckpoint would be the
+other half of its own deadlock. It asks and carries on with its loop,
+which is what the checkpointer needs from it, and leaves when a fold
+newer than the checkpoint that was current at the request has landed.
+
+ZOU_SHUTDOWN_SETTLE_SECS bounds the wait, ten seconds by default, and 0
+turns it off. Going anyway is always safe: nothing acked is at risk
+either way, the cost of giving up is the replay this is here to avoid.
+
+Measured on a laptop against a local directory store, 20000 rows
+inserted and the node stopped with SIGINT. The settle spans 324 ms from
+the request to the fold landing, 211 ms of checkpoint and 113 ms of
+fold, and the whole stop goes from 280 ms to 346 ms because the rest of
+the shutdown runs alongside it. The store's redo point ends 208 bytes
+from the end of its stream instead of 6.5 MB back, and the next start
+replays 4 records against 6.5 MB, redo done in 0.00 s against 0.71 s, on
+a store whose reads are a memcpy.
+
+diff --git a/src/backend/access/transam/zou_wal.c b/src/backend/access/transam/zou_wal.c
+index d3ad9f6..53a10f2 100644
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -34,12 +34,14 @@
+ #include "pgstat.h"
+ #include "port/atomics.h"
+ #include "postmaster/bgworker.h"
++#include "postmaster/bgwriter.h"
+ #include "postmaster/interrupt.h"
+ #include "storage/condition_variable.h"
+ #include "storage/fd.h"
+ #include "storage/ipc.h"
+ #include "storage/latch.h"
+ #include "storage/shmem.h"
++#include "utils/timestamp.h"
+ #include "utils/wait_event.h"
+ 
+ /* C ABI of the zou-pg crate (crates/zou-pg). */
+@@ -269,6 +271,28 @@ zou_lease_wait_secs(void)
+ 	return secs > 0 ? secs : 60;
+ }
+ 
++/*
++ * How long a stopping pusher spends getting the store a checkpoint worth
++ * starting from, before it gives up and goes anyway.
++ *
++ * Ten seconds is a checkpoint of a project that has been running plus the
++ * fold of it, with room for a store having a bad minute, and it is time
++ * the node spends once on the way out against time every later start of
++ * that project would spend replaying. ZOU_SHUTDOWN_SETTLE_SECS tunes it
++ * and 0 turns it off, which is the shutdown this worker did before.
++ */
++static int
++zou_settle_secs(void)
++{
++	const char *setting = getenv("ZOU_SHUTDOWN_SETTLE_SECS");
++	int			secs;
++
++	if (setting == NULL)
++		return 10;
++	secs = atoi(setting);
++	return secs > 0 ? secs : 0;
++}
++
+ void
+ ZouWalPusherMain(Datum main_arg)
+ {
+@@ -280,6 +304,9 @@ ZouWalPusherMain(Datum main_arg)
+ 	TimeLineID	foldtli;
+ 	bool		fold_running = false;
+ 	bool		throttled = false;
++	bool		settling = false;
++	XLogRecPtr	settle_from = InvalidXLogRecPtr;
++	TimestampTz settle_by = 0;
+ 	int			fold_backoff = 0;
+ 	int			waited;
+ 	uint64		resume = 0;
+@@ -471,7 +498,8 @@ ZouWalPusherMain(Datum main_arg)
+ 								LSN_FORMAT_ARGS((XLogRecPtr) fredo), rc)));
+ 			}
+ 		}
+-		else if (!ShutdownRequestPending && !RecoveryInProgress())
++		else if ((!ShutdownRequestPending || (settling && folded <= settle_from))
++				 && !RecoveryInProgress())
+ 		{
+ 			XLogRecPtr	redo;
+ 
+@@ -482,12 +510,13 @@ ZouWalPusherMain(Datum main_arg)
+ 			 * keeps pushing while the capture runs on its thread.
+ 			 * GetOldestRestartPoint reads the control file, so redo only
+ 			 * moves once a checkpoint has fully completed and flushed
+-			 * its pages. Nothing new starts once shutdown is requested,
+-			 * a capture the exit would abandon is wasted work, and
+-			 * nothing starts during recovery either: the pusher is
+-			 * there to get local WAL into the store so replay can read
+-			 * its pages, and a fold competing for the same store calls
+-			 * only slows that down.
++			 * its pages. Once shutdown is requested the only fold worth
++			 * starting is the one the settle below is waiting for, since
++			 * any other is a capture the exit would abandon, and nothing
++			 * starts during recovery either: the pusher is there to get
++			 * local WAL into the store so replay can read its pages, and
++			 * a fold competing for the same store calls only slows that
++			 * down.
+ 			 */
+ 			GetOldestRestartPoint(&redo, &foldtli);
+ 			if (redo > folded && pushed >= redo && fold_backoff == 0)
+@@ -572,17 +601,69 @@ ZouWalPusherMain(Datum main_arg)
+ 			}
+ 
+ 			/*
+-			 * Fully drained, fully durable, and asked to stop.
+-			 * proc_exit runs zou_wal_on_exit, which seals the tail and
+-			 * releases the lease cleanly. A fold still in flight is
+-			 * abandoned, the shim logs it, its publish either landed
+-			 * whole or left no manifest edit, leftover capture objects
+-			 * are gc food, and the next start refolds the same redo.
++			 * Everything the cluster has written is in the store, which
++			 * used to be the end of the job. It is not. What the next
++			 * start of this project replays from is the newest
++			 * checkpoint the store holds a fold for, not the newest
++			 * byte it holds, so a node stopped in the middle of a
++			 * checkpoint cycle hands its successor every byte since the
++			 * last one, and the successor walks them a store read at a
++			 * time (zou #457).
++			 *
++			 * So ask for a checkpoint and stay up long enough to fold
++			 * it. The request cannot be a waiting one: flushing a
++			 * buffer waits on the durable LSN published at the bottom
++			 * of this loop, so a pusher asleep inside RequestCheckpoint
++			 * would be the other half of its own deadlock. It is asked
++			 * for and left, and the loop goes on pushing what the
++			 * checkpointer writes and publishing what the store
++			 * acknowledges, which is what the checkpoint needs from us.
+ 			 */
+-			ereport(LOG,
+-					(errmsg("zou wal pusher drained through %X/%X, shutting down",
+-							LSN_FORMAT_ARGS(pushed))));
+-			proc_exit(0);
++			if (!settling && zou_settle_secs() > 0 && !RecoveryInProgress())
++			{
++				settling = true;
++				GetOldestRestartPoint(&settle_from, &foldtli);
++				settle_by = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
++														zou_settle_secs() * 1000);
++				ereport(LOG,
++						(errmsg("zou wal pusher asked for a checkpoint to fold before it goes, the store starts from %X/%X until it lands",
++								LSN_FORMAT_ARGS(settle_from))));
++				RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE);
++			}
++			else if (settling && folded <= settle_from &&
++					 GetCurrentTimestamp() < settle_by)
++			{
++				/*
++				 * Waiting for a fold newer than the checkpoint that was
++				 * current when we asked. Napping rather than leaving
++				 * the branch, because the publish below is what the
++				 * checkpointer's page flushes are waiting on.
++				 */
++				(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
++								 5, PG_WAIT_EXTENSION);
++				ResetLatch(MyLatch);
++			}
++			else
++			{
++				/*
++				 * Fully drained, fully durable, and asked to stop.
++				 * proc_exit runs zou_wal_on_exit, which seals the tail
++				 * and releases the lease cleanly. A fold still in
++				 * flight is abandoned, the shim logs it, its publish
++				 * either landed whole or left no manifest edit,
++				 * leftover capture objects are gc food, and the next
++				 * start refolds the same redo.
++				 */
++				if (settling && folded <= settle_from)
++					ereport(WARNING,
++							(errmsg("zou wal pusher gave up on a clean checkpoint after %d seconds, the next start replays from %X/%X",
++									zou_settle_secs(),
++									LSN_FORMAT_ARGS(folded))));
++				ereport(LOG,
++						(errmsg("zou wal pusher drained through %X/%X, shutting down",
++								LSN_FORMAT_ARGS(pushed))));
++				proc_exit(0);
++			}
+ 		}
+ 		else
+ 		{

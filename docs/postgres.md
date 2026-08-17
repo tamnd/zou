@@ -93,6 +93,11 @@ The zou binary passes its environment to the postmaster child, so one `RUST_LOG`
 On restart or reattach the pusher resumes right after the store's last record rather than at the local flush pointer, because the previous session can exit before pushing its final bytes, the shutdown checkpoint record at least, which is written after background workers stop.
 The manifest tail chains segment lists across writer sessions, each entry named `<epoch>/<start-lsn>.wal`, and a session opening the store first reconciles the tail against a full listing of `wal/` so segments sealed by a crashed session are never lost.
 
+A pusher asked to stop drains, then asks for a checkpoint and stays up until it has folded it, because what the next start replays from is the newest checkpoint the store holds a fold for and not the newest byte it holds.
+Without that a node stopped in the middle of a checkpoint cycle hands its successor every byte since the last one, and the successor walks them a store read at a time.
+`ZOU_SHUTDOWN_SETTLE_SECS` bounds the wait, ten seconds by default, and 0 turns it off; going anyway is always safe, since nothing acked is at risk either way and the cost of giving up is the replay.
+On a laptop against a local directory store the settle takes a stop from 280 ms to 346 ms once and saves the next start 6.5 MB of replay.
+
 Page writes are gated the same way commits are: `zouwritev` waits until the mirrored stream holds the WAL that produced the page, so a store object can never carry effects of records the stream has never heard of.
 Without that gate a kill -9 could leave future pages in the store, and a node attaching from the store could not explain its own data.
 `scripts/zou-crash-loop.sh` proves the whole contract: it runs pgbench plus a ledger client that records an id only after the server acks the COMMIT, kills the postmaster with -9 mid load, reattaches from the store alone with `zou-restore`, and asserts every recorded id is present, in a loop.
