@@ -52,6 +52,48 @@ pub const LAMBDA_USAGE: &str = "usage: zou lambda <target> [--ref <ref>] [--pg-b
 /// a request somebody is watching.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The whole of what a postmaster gets, replay included.
+///
+/// A project stopped mid checkpoint cycle has to walk everything since
+/// the last one before it opens, and on a slow store that is minutes
+/// rather than the half second an attach is meant to be. Waiting is
+/// still better than killing it, because the replacement starts from the
+/// same redo point and would be killed at the same place, so the project
+/// never comes up at all. Ten minutes is the point at which waiting has
+/// stopped being cheaper than telling somebody.
+const REDO_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often a replaying postmaster says where it has got to.
+///
+/// The attach's patience is now spent against this heartbeat, so it is
+/// named rather than inherited: a node whose postgres defaulted this to
+/// off would have every slow attach look like a hung one.
+const REDO_REPORT_EVERY: &str = "10s";
+
+/// What the postmaster's watcher thread has to say about a start.
+enum Note {
+    /// Accepting connections.
+    Ready,
+    /// Still replaying wal, currently at this lsn.
+    Replaying(String),
+    /// Exited before it was ever ready, for this reason.
+    Gone(String),
+}
+
+/// The lsn out of a startup progress report, if the line is one.
+///
+/// Postgres logs `redo in progress, elapsed time: ... s, current LSN:
+/// 0/1BDEC58` every `log_startup_progress_interval` while it replays.
+/// The lsn is what matters and not the elapsed time, since a redo that
+/// is stuck reports just as often as one that is working.
+fn replaying(line: &str) -> Option<String> {
+    if !line.contains("redo in progress") {
+        return None;
+    }
+    let (_, at) = line.rsplit_once("current LSN: ")?;
+    Some(at.trim().to_string())
+}
+
 /// shared_buffers for one tenant on a packed node.
 ///
 /// `zou dev` gives its single database a quarter of the machine, which
@@ -762,6 +804,13 @@ impl Backend for Postmasters {
             .args(["-c", "wal_level=logical"])
             .args(["-c", &format!("shared_buffers={}", self.shared_buffers)])
             .args(["-c", &format!("max_connections={MAX_CONNECTIONS}")])
+            // How a replaying postmaster keeps its attach alive. Named
+            // here rather than left to the default because the deadline
+            // below counts on it.
+            .args([
+                "-c",
+                &format!("log_startup_progress_interval={REDO_REPORT_EVERY}"),
+            ])
             .env("ZOU_TARGET", &self.target)
             .env("ZOU_TENANT", &tenant_ref)
             .env("ZOU_PAGE_CACHE", &pagecache)
@@ -779,7 +828,10 @@ impl Backend for Postmasters {
         // to one stderr is otherwise unreadable, and it reaps the child
         // at the end, because a zombie per detach on a node that
         // detaches all day is a process table that fills up.
-        let (ready, told) = mpsc::sync_channel::<Result<(), String>>(1);
+        // Unbounded, so that a progress report the wait loop has not
+        // picked up yet cannot be the reason the "ready" behind it is
+        // dropped on the floor.
+        let (ready, told) = mpsc::channel::<Note>();
         let state = Arc::clone(&self.state);
         let watched = tenant_ref.clone();
         let cleanup = dir.clone();
@@ -790,12 +842,14 @@ impl Backend for Postmasters {
                 log::info!("{watched}: {line}");
                 if line.contains("ready to accept connections") && !said {
                     said = true;
-                    let _ = ready.try_send(Ok(()));
+                    let _ = ready.send(Note::Ready);
+                } else if !said && let Some(at) = replaying(&line) {
+                    let _ = ready.send(Note::Replaying(at));
                 }
             }
             let status = child.wait();
             if !said {
-                let _ = ready.try_send(Err(match &status {
+                let _ = ready.send(Note::Gone(match &status {
                     Ok(status) => {
                         format!("postgres for {watched} exited ({status}) before it was ready")
                     }
@@ -814,23 +868,45 @@ impl Backend for Postmasters {
             state.left(&watched, pid);
         });
 
-        match told.recv_timeout(START_TIMEOUT) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                // Noted as leaving before it is asked to, because it is
-                // still running and the retry this failure causes must
-                // not be the second postmaster on this project. Both
-                // orders are wrong the other way round: a child that
-                // dies between the signal and the note leaves a project
-                // waiting for a process that is already gone.
-                self.state.leaving(&tenant_ref, pid);
-                stop(pid);
-                return Err(format!(
-                    "postgres for {tenant_ref} was not ready within {}s",
-                    START_TIMEOUT.as_secs()
-                ));
+        // A postmaster that says nothing for START_TIMEOUT has stopped
+        // starting, and one that is replaying wal says where it has got
+        // to every ten seconds. Each report that moves the lsn on gives
+        // it another window, up to REDO_TIMEOUT altogether, because
+        // killing a postmaster that is making progress is worse than
+        // waiting for it: the replacement starts from the same redo
+        // point and gets the same deadline, so a project that needs
+        // longer than one window never comes up at all.
+        let mut at = String::new();
+        let last = Instant::now() + REDO_TIMEOUT;
+        let why = loop {
+            match told.recv_timeout(START_TIMEOUT) {
+                Ok(Note::Ready) => break None,
+                Ok(Note::Gone(e)) => return Err(e),
+                Ok(Note::Replaying(now)) if now != at && Instant::now() < last => {
+                    if at.is_empty() {
+                        log::info!("{tenant_ref}: replaying wal, waiting for it");
+                    }
+                    at = now;
+                }
+                Ok(Note::Replaying(now)) => {
+                    break Some(format!("has been replaying wal at {now} for too long"));
+                }
+                Err(_) => break Some("said nothing".to_string()),
             }
+        };
+        if let Some(why) = why {
+            // Noted as leaving before it is asked to, because it is
+            // still running and the retry this failure causes must
+            // not be the second postmaster on this project. Both
+            // orders are wrong the other way round: a child that
+            // dies between the signal and the note leaves a project
+            // waiting for a process that is already gone.
+            self.state.leaving(&tenant_ref, pid);
+            stop(pid);
+            return Err(format!(
+                "postgres for {tenant_ref} {why} and was not ready within {}s",
+                START_TIMEOUT.as_secs()
+            ));
         }
         boot.lap("recovery");
         let functions = self.functions(entry, &dir, port);
@@ -1632,6 +1708,30 @@ mod tests {
         );
         // And a tenant nothing knows about is not an error.
         state.died("gone", 4242, "exited".to_string());
+    }
+
+    /// What keeps a slow attach alive, so it is worth pinning the exact
+    /// line postgres writes. Anything else on that stderr is noise and
+    /// must not read as progress.
+    #[test]
+    fn a_startup_progress_report_says_where_redo_has_got_to() {
+        assert_eq!(
+            replaying(
+                "2026-08-18 03:56:27.478 +07 [71409] LOG:  redo in progress, elapsed time: 10.01 s, current LSN: 0/1BDEC58"
+            )
+            .as_deref(),
+            Some("0/1BDEC58")
+        );
+        assert_eq!(replaying("LOG:  redo starts at 0/1BDEC58"), None);
+        assert_eq!(
+            replaying("LOG:  database system is ready to accept connections"),
+            None
+        );
+        // A report without the lsn is not one to count progress by.
+        assert_eq!(
+            replaying("LOG:  redo in progress, elapsed time: 10.01 s"),
+            None
+        );
     }
 
     fn empty_state() -> Arc<State> {
