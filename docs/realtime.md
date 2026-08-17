@@ -396,6 +396,9 @@ A server can accept any of these joins, reply `SUBSCRIBED` and then send nothing
 
 ## On a fleet
 
+The default is that a project's sockets are held by the node that writes it, and the numbers say that is the right default: one node held a hundred thousand of them, all subscribed to a table, at 23.4 KB each and under a third of eight cores while it was writing the project too, see [benchmarks.md](benchmarks.md).
+When to point them somewhere else, and what that costs, is in [operations.md](operations.md).
+
 One node writes a project, and its sockets do not have to be on that node.
 A node a socket arrives at serves it there, on that node's own hub, and opens one link per project to the node that holds it.
 So a room is one room however many nodes the clients are spread over: a broadcast, a presence diff and a changed row all come from the holder, and the node the client reached is the thing that hands them over.

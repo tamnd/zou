@@ -228,6 +228,44 @@ What it gives up is worth knowing before turning it on.
 The url outlives the request that made it, so an object deleted a second later is still readable until it expires, and the caller that follows it is talking to the bucket rather than to a permission check.
 It is also visible: the answer is a 302 where upstream sends 200, which every client library follows and every recorded comparison notices, so the conformance suites run with it off.
 
+## Where the sockets live
+
+The default topology is inline, and a deployment that never thinks about this gets it.
+A node holds the sockets of the projects it holds, in the same process that writes them, and there is no socket tier to install, no second binary and no mode flag.
+A socket that arrives at a node which does not hold its project is served on that node's own hub with one link per project back to the holder, so what a node is being is decided per socket by who holds the lease rather than by how it was started.
+`zou serve` does not build a fleet's forwarding yet ([#444](https://github.com/tamnd/zou/issues/444)), so today the command only ever serves inline and the link is exercised by tests and by an embedder that builds its own front door.
+
+Inline is the default because the measurement says a socket is cheap and a link is not free.
+One node held a hundred thousand sockets, every one of them subscribed to a table, at 23.4 KB of resident memory each and under a third of eight cores, while it was also the holder writing the project, on a box that was also running a MinIO and the owner's crawler, see [benchmarks.md](benchmarks.md).
+So there is no socket count between there and here at which a node has to be split, and a node that is short of memory or cpu below that number is short of it for the databases it is attaching rather than for the sockets.
+
+What a link costs, against that, is four things an inline node does not pay.
+
+A broken link is a gap, and a gap closes every socket on that node.
+Filling one from what the holder already sent, rather than telling it, is a follow up, and catching up out of the store is waiting on the buffered WAL tier ([#39](https://github.com/tamnd/zou/issues/39)) because the change stream retains nothing.
+
+The project's budget is counted per node.
+Sockets at once and joins a second are refused against each node's own share, so a project spread over four nodes is allowed four times what [realtime.md](realtime.md) says it is, until those two numbers cross the link as well.
+A message that crosses is counted once for the crossing and once for each socket it reached, which is one more than the same message costs inline.
+
+A lease that moves while sockets are on it is noticed by the next socket to arrive rather than by the ones already there.
+Until one arrives, the sockets on the old link are talking to a node that no longer writes their project, which broadcast and presence do not need and a subscription does.
+
+A broadcast between two sockets on the same away node goes to the holder and comes back, because one ordering is the whole reason there is one link.
+
+So the threshold for v1 is a rule rather than a socket count, since a socket count is not what the numbers found.
+Run inline until one project's sockets would crowd the node that writes it, and what says they are crowding it is the node's own ops port: resident memory against the box, descriptors against the limit, and the tenant page cache being evicted for work that is not the database's.
+A tenant with a thousand sockets and a busy table wants a bigger holder and not a socket tier.
+
+Descriptors are the one limit to set before a socket count gets large.
+A socket is a descriptor and the soft limit a shell hands a program is 1024 nearly everywhere, so a node that inherits it stops accepting at the thousandth socket and says `too many open files` for the rest of the run, whatever the realtime budget it was started with says it may hold.
+The node raises its own soft limit to the hard one at startup and logs the number it got, so what an operator sets is the hard limit, `LimitNOFILE` under systemd, and the node takes it from there.
+
+When a dedicated tier does become worth it, what makes one is where the load balancer sends the sockets and not how the node was started.
+A node that is sent nothing but `/realtime/v1/websocket` for projects it does not hold attaches nothing, starts no postmaster and takes no lease, because everything a socket needs from the database crosses the link and comes back as an answer.
+Such a node wants the same store and the same jwt secret as the rest of the fleet, since the link is authorized by the project's own secret and a socket's token is verified at both ends.
+That is a fleet's routing decision, so it arrives with the forwarding in [#444](https://github.com/tamnd/zou/issues/444) rather than as a flag of its own.
+
 ## The page service
 
 Reads that miss the local caches go to a page service running as a background worker inside the node, over a unix socket in the data directory, and it answers them out of the page layers it builds by replaying the tenant's durable WAL.
