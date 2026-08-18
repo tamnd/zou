@@ -845,6 +845,13 @@ async fn took(app: &Arc<App>, away: &Arc<Away>, frame: Wire) -> bool {
                     // already spent travelling.
                     read: Instant::now()
                         - Duration::from_micros(frame.number("waited").unwrap_or_default()),
+                    // The same, for the stage that starts where the
+                    // holder stopped deciding. A holder on an older
+                    // release does not send it, and the fallback is
+                    // this instant, which reads as a stage that started
+                    // when the frame arrived rather than as a negative.
+                    queued: Instant::now()
+                        - Duration::from_micros(frame.number("decided").unwrap_or_default()),
                 },
             );
         }
@@ -992,6 +999,7 @@ async fn holding(mut socket: WebSocket, app: &Arc<App>) {
                     data,
                     commit_ts,
                     read,
+                    queued,
                 },
             ))) => {
                 let head = json!({
@@ -1006,6 +1014,13 @@ async fn holding(mut socket: WebSocket, app: &Arc<App>) {
                     // makes countable: the latency a client sees is
                     // measured from the read and the read happened here.
                     "waited": read.elapsed().as_micros() as u64,
+                    // And how long ago the reader here finished deciding
+                    // it, said the same way and for the same reason. The
+                    // stage it starts is everything after the decision,
+                    // which away is a queue, a link, a crossing and a
+                    // socket rather than only the first and the last, so
+                    // it has to carry the crossing to mean anything.
+                    "decided": queued.elapsed().as_micros() as u64,
                 });
                 down(&mut node, &mut socket, head, Vec::new()).await
             }

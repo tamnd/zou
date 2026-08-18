@@ -130,6 +130,24 @@ pub enum Heard {
         /// and they are two clocks because there is no one clock this
         /// question has an answer on.
         read: Instant,
+        /// When the reader had decided this change and started handing
+        /// it to the subscribers who are owed it, on the same clock as
+        /// `read`.
+        ///
+        /// What it is for is the last stage of a change's time, the one
+        /// that happens in the socket's own task rather than in the
+        /// reader: everything from here on is a queue, a wake up and a
+        /// frame written to a client, and on a node holding a hundred
+        /// thousand tasks that is a different cost from anything the
+        /// reader does.
+        ///
+        /// One stamp for the whole hand over rather than one a
+        /// subscriber, because a clock read apiece is a hundred
+        /// thousand of them a change to measure something that costs a
+        /// hundred nanoseconds. What a late subscriber's own wait
+        /// carries is the queueing in front of it, which is the thing
+        /// being asked about.
+        queued: Instant,
     },
     /// Changes were missed, because the tap had to be reopened or this
     /// subscriber was not reading. There is no way to say which
@@ -694,6 +712,7 @@ impl Reader {
                     data,
                     commit_ts: change.commit_ts,
                     read,
+                    queued: handing,
                 });
                 // Not a wait and not a drop of this one message: a
                 // subscriber that is this far behind is one whose next

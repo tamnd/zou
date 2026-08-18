@@ -419,10 +419,10 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
         scrape.contains("zou_realtime_commit_to_socket_seconds_bucket"),
         "{scrape}"
     );
-    // And the three stages of it, for the same reason: what the split
-    // is worth is that a batch which was read, matched and handed over
-    // shows up in all three, and only a reader running against a real
-    // database can say that it did.
+    // And the four stages of it, for the same reason: what the split
+    // is worth is that a change which was read, matched, handed over
+    // and written to a socket shows up in all four, and only a reader
+    // running against a real database can say that it did.
     let stage = |name: &str| {
         scrape
             .lines()
@@ -434,10 +434,10 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
             .and_then(|n| n.parse::<u64>().ok())
             .unwrap_or_default()
     };
-    for name in ["tap", "select", "send"] {
+    for name in ["tap", "select", "send", "socket"] {
         assert!(
             stage(name) >= 1,
-            "the {name} stage of a delivered batch is counted, {scrape}"
+            "the {name} stage of a delivered change is counted, {scrape}"
         );
     }
     // And the two gauges a socket tier is sized on, which are what a
