@@ -55,6 +55,8 @@ jobs:
         run: ZOU_PG_PREFIX=$PWD/build/pg cargo test -p zou-pg --test getpage
       - name: Shutdown integration test
         run: ZOU_PG_PREFIX=$PWD/build/pg cargo test -p zou-pg --test shutdown -- --test-threads=1
+      - name: Page elision integration test
+        run: ZOU_PG_PREFIX=$PWD/build/pg cargo test -p zou-pg --test elided -- --test-threads=1
       - name: Smoke test on zou storage
         run: |
           export ZOU_TARGET=/tmp/zou-pg-store

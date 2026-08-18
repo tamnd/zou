@@ -281,6 +281,57 @@ fn pageserve_code(setting: Result<bool, String>) -> i32 {
     }
 }
 
+/// Whether this store's pages under `pg/` have been left behind by a
+/// session that ran with the page service on, which is the one thing
+/// the object read path cannot survive: 1 yes, and `elided` and
+/// `captured` are filled in with the two LSNs, 0 no, anything else
+/// means the question could not be answered.
+///
+/// The postmaster asks once, before recovery, when it is about to run
+/// without the service. A store it cannot read is not a store it should
+/// start on: the failure otherwise is a PANIC in redo three postmasters
+/// later, with a heap record and a page that have nothing to do with
+/// each other (zou #462).
+///
+/// A store that cannot be read at all answers -1 rather than a refusal.
+/// Everything after this opens the same store and says so far better
+/// than a guess here would.
+///
+/// # Safety
+/// `elided` and `captured` must be valid pointers to u64.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zou_pages_left_behind(elided: *mut u64, captured: *mut u64) -> i32 {
+    wrap(|| {
+        if elided.is_null() || captured.is_null() {
+            return -1;
+        }
+        let Ok(target) = std::env::var("ZOU_TARGET") else {
+            return -1;
+        };
+        let Ok(store) = open_store(&target) else {
+            return -1;
+        };
+        let tenant = std::env::var("ZOU_TENANT").unwrap_or_else(|_| "local".to_string());
+        let layout = TenantLayout::new(&tenant);
+        let Ok(Some((data, _))) = store.get(&layout.manifest()) else {
+            return -1;
+        };
+        let Ok(manifest) = Manifest::from_json(&data) else {
+            return -1;
+        };
+        match manifest.pages_left_behind() {
+            Some((from, upto)) => {
+                unsafe {
+                    *elided = from.0;
+                    *captured = upto.0;
+                }
+                1
+            }
+            None => 0,
+        }
+    })
+}
+
 /// Serve one page from the checkpoint chain, `None` when pg/ must
 /// answer. `ZOU_CHAIN_READER=0` is the escape hatch that pins every
 /// read to pg/.
@@ -1542,10 +1593,14 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     // Where the captured state ends, which is where the stream has to
     // begin on a store that holds no WAL yet. See `floor` below.
     let mut captured = 0u64;
+    // Whether the mark below is already there, so the common start
+    // costs a read it was doing anyway rather than a manifest write.
+    let mut elided_marked = false;
     match store.get(&manifest_key) {
         Ok(Some((data, _))) => {
             if let Ok(manifest) = Manifest::from_json(&data) {
                 captured = manifest.checkpoints.last().map_or(0, |c| c.lsn.0);
+                elided_marked = manifest.pages_elided_from.is_some();
             }
         }
         Ok(None) => {
@@ -1636,6 +1691,34 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
         }
     };
     laps.lap("stream end");
+    // With the page service on this session's page writes never reach
+    // pg/, so from here those objects hold whatever they held when the
+    // session opened and the layers carry everything after. Mark the
+    // store once, under the lease we already hold, so that a later
+    // attach on the object path can refuse instead of replaying wal
+    // onto pages that stopped moving here (zou #462). The resume point
+    // is the mark: recovery of this session starts at or before it, so
+    // a checkpoint older than the mark is one whose pages did land.
+    if pageserve_on() && !elided_marked {
+        let mut held = held.lock().expect("lease mutex poisoned");
+        let mut races = 0;
+        loop {
+            let result = lease::update_manifest(&*store, &layout, &mut held, now_unix(), |m| {
+                if m.pages_elided_from.is_none() {
+                    m.pages_elided_from = Some(Lsn(resume));
+                }
+            });
+            match result {
+                Ok(()) => break,
+                Err(lease::LeaseError::Raced) if races < 5 => races += 1,
+                Err(e) => {
+                    log::error!("zou_wal_open: marking the page elision: {e}");
+                    return Err(ZOU_ERR_STORE);
+                }
+            }
+        }
+        laps.lap("elision mark");
+    }
     let sink = Arc::new(MediaSink::new(
         Arc::clone(&media),
         WAL_SHARD,
