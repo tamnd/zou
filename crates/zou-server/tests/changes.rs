@@ -461,6 +461,59 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
     );
 }
 
+/// Rows committed together arrive together, in the order postgres
+/// wrote them.
+///
+/// One transaction is one batch, and one batch leaves every row it owes
+/// this socket in the socket's queue at once, so this is the one thing
+/// a socket a long way behind is entitled to: nothing reordered and
+/// nothing dropped, however the queue was drained. Every other suite
+/// here writes a row and waits for it, which is a question about one
+/// row and says nothing about sixty. Sixty rather than a round hundred
+/// because the point is a batch big enough that the queue is never
+/// empty while it is being answered.
+#[tokio::test]
+async fn rows_committed_together_arrive_in_the_order_they_were_written() {
+    let Some(dsn) = dsn() else { return };
+    let _one = alone().lock().await;
+    if !logical(&dsn).await {
+        return;
+    }
+    settled(&dsn).await;
+    let at = serving(&dsn).await;
+    published(
+        &dsn,
+        "chg_many",
+        "create table chg_many (id int primary key, details text);
+         grant select on chg_many to anon, authenticated;",
+    )
+    .await;
+
+    let mut socket = connect(at).await;
+    subscribe(
+        &mut socket,
+        ANA,
+        json!([{"event": "*", "schema": "public", "table": "chg_many"}]),
+    )
+    .await;
+    tapping(&dsn).await;
+
+    run(
+        &dsn,
+        "insert into chg_many select i, 'row ' || i from generate_series(1, 60) as i",
+    )
+    .await;
+    for id in 1..=60 {
+        let change = changed(&mut socket).await;
+        assert_eq!(
+            change["data"]["record"]["id"],
+            json!(id),
+            "row {id} of sixty, in the order it was written, {change}"
+        );
+    }
+    quiet(&mut socket).await;
+}
+
 /// The policies decide what a socket is told, not just what it can
 /// select, which is the whole difference between a change feed and a
 /// way around row level security.
