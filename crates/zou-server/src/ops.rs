@@ -555,13 +555,15 @@ pub fn change_delivered(commit_ts: i64, read: Instant) {
 /// happens once per socket rather than once for all of them, and that
 /// difference in what is being counted is the point of it.
 ///
-/// They do not add up to a cycle and are not meant to, because the tap
-/// runs alongside the selection and the sending: the reader asks for
-/// the next batch before handing over the last one. A cycle is the
-/// larger of the tap and the two together, plus the decode, and which
-/// of the two is larger is the useful reading. Tap larger says the
-/// database is the limit and the fan out is waiting on it, the other
-/// way round says the fan out is and the database is idle in between.
+/// The four batch stages add up to a cycle of the reader, and the
+/// largest share is the useful reading: the tap says the database is
+/// the limit, the selection says the policies are, the sending says the
+/// queues are. None of the four waits on any other, so the tap can be
+/// run alongside the selection and the sending and the cycle stops
+/// being a sum. That was built and measured, and it shortened the cycle
+/// by a third while the median a client waited grew by half, so the
+/// reader still runs them one after the other and the stages still add
+/// up.
 ///
 /// The tap is only counted on a poll that came back with something. An
 /// idle reader asks every hundred milliseconds and is told there is

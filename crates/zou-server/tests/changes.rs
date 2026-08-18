@@ -423,9 +423,7 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
     // is worth is that a change which was read, decoded, matched,
     // handed over and written to a socket shows up in all five, and
     // only a reader running against a real database can say that it
-    // did. It is also the only test that exercises the reader asking
-    // for the next batch while it hands over the last one, since that
-    // needs a real slot to ask twice.
+    // did.
     let stage = |name: &str| {
         scrape
             .lines()
