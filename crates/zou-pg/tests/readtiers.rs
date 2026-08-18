@@ -78,6 +78,11 @@ fn smgr_reads_land_in_their_tiers() {
     assert_eq!(tier("store").calls, 2);
     assert_eq!(tier("store").pages, 3);
     assert_eq!(tier("local").calls, 0);
+    // Both tiers timed what they served. Not which one is slower: the
+    // store here is a directory a few hundred microseconds of page cache
+    // away, so on a fast enough machine it beats the local cache read it
+    // is supposed to lose to, and a test that asserts the ordering fails
+    // for being right about the hardware.
     assert!(tier("cache").p50_us > 0);
-    assert!(tier("store").p50_us >= tier("cache").p50_us);
+    assert!(tier("store").p50_us > 0);
 }
