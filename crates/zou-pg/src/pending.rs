@@ -195,6 +195,13 @@ pub fn for_each_parallel<T: Sync>(items: &[T], op: impl Fn(&T) -> bool + Sync) -
 /// same rule the eager extend path follows. The settled size lands in
 /// the local cache too, whichever side won, otherwise a stale local
 /// size from before the buffering would outlive the drain.
+///
+/// The size settled is the buffered fork's own length or the highest
+/// block drained, whichever is larger. A fork that was written to but
+/// never grown through this buffer carries no length of its own, and
+/// its pages still may not sit past the store's SIZE: an extension
+/// leaves its length in shared memory for the checkpoint, so the store
+/// can be behind the block numbers landing here.
 pub(crate) fn flush_fork(
     store: &Arc<dyn CasStore>,
     layout: &TenantLayout,
@@ -212,7 +219,12 @@ pub(crate) fn flush_fork(
     if !ok {
         return Err(());
     }
-    if let Some(new_size) = size {
+    let highest = pages.iter().map(|(blk, _)| *blk + 1).max();
+    let settled = match (size, highest) {
+        (Some(s), Some(h)) => Some(s.max(h)),
+        (s, h) => s.or(h),
+    };
+    if let Some(new_size) = settled {
         let key = layout.pg_size(spc, db, rel, fk);
         let current = match store.get(&key) {
             Ok(Some((data, _))) => {
@@ -295,5 +307,27 @@ mod tests {
         }));
         assert_eq!(hits.load(Ordering::Relaxed), 100);
         assert!(!for_each_parallel(&items, |i| *i != 50));
+    }
+
+    /// A drain of pages the buffer never saw an extend for still moves
+    /// the store's length past them, because the extend that grew the
+    /// fork may have left its length in shared memory for a checkpoint
+    /// that has not run.
+    #[test]
+    fn a_drain_settles_a_length_past_the_blocks_it_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn CasStore> = zou_store::open_store(dir.path().to_str().unwrap())
+            .expect("a directory store")
+            .into();
+        let layout = TenantLayout::new("tenants/local");
+        let fork = (1663, 5, 16384, 0);
+        let pages: Vec<PendingPage> = vec![(2, page(0x11).into()), (5, page(0x22).into())];
+        flush_fork(&store, &layout, None, fork, &pages, None).expect("the drain lands");
+        let (data, _) = store
+            .get(&layout.pg_size(fork.0, fork.1, fork.2, fork.3))
+            .unwrap()
+            .expect("the drain wrote a size");
+        let n = u32::from_le_bytes(data.as_slice().try_into().unwrap());
+        assert_eq!(n, 6, "the highest block drained is inside the fork");
     }
 }

@@ -36,7 +36,7 @@ fn smgr_reads_land_in_their_tiers() {
     for blk in 0u32..2 {
         let page = [blk as u8 + 1; ZOU_PAGE_SIZE];
         assert_eq!(
-            unsafe { zou_smgr_extend(spc, db, rel, fork, blk, page.as_ptr(), 0, 0) },
+            unsafe { zou_smgr_extend(spc, db, rel, fork, blk, page.as_ptr(), 0) },
             ZOU_OK
         );
     }
