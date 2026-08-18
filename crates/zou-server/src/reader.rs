@@ -676,17 +676,20 @@ impl Reader {
             // handed over, and the two run together. A poll is a round
             // trip to postgres and the handing over is this process's
             // own work, so doing them one after the other spends a
-            // cycle on the sum of the two and every change in the next
-            // batch waits behind that. Measured on a node holding a
-            // hundred thousand sockets the round trip was 23 ms of a
-            // 60 ms cycle, and a row that is committed at a random
-            // moment waits about half a cycle before the tap has even
-            // asked for it.
-            let polled = Instant::now();
+            // cycle on the sum of two things that were never waiting on
+            // each other, and every change in the next batch waits
+            // behind that sum. Measured on a node holding a hundred
+            // thousand sockets the poll was 23 ms of a 60 ms cycle.
             let most = self.most;
-            let got = {
+            let (got, polled) = {
                 let open = tap.as_ref().expect("a tap");
-                let reading = open.read(most);
+                // Timed inside the future rather than around the join,
+                // because around the join is the longer of the two and
+                // the whole point of the stage is which one that is.
+                let reading = async {
+                    let asked = Instant::now();
+                    (open.read(most).await, asked.elapsed())
+                };
                 match waiting.take() {
                     Some(batch) => tokio::join!(reading, self.deliver(open.client(), &batch)).0,
                     None => reading.await,
@@ -714,7 +717,7 @@ impl Reader {
                 tokio::time::sleep(self.every).await;
                 continue;
             }
-            crate::ops::change_stage("tap", polled.elapsed());
+            crate::ops::change_stage("tap", polled);
             let decoded = Instant::now();
             waiting = Some(tap.as_mut().expect("a tap").decode(&read));
             crate::ops::change_stage("decode", decoded.elapsed());
