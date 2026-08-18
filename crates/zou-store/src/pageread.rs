@@ -20,6 +20,16 @@
 //! optimization to take or leave: a footer runs to megabytes on a
 //! layer of any size, so a reader that throws it away pays those
 //! megabytes again on the next read of the same layer.
+//!
+//! Blocks cache the same way and for the same reason, see #465. A
+//! block holds many keys and a lookup wants one of them, so a
+//! sequential scan without a block cache fetches the same block once
+//! per page in it: measured at 1.7 range GETs and 111 KB of store
+//! traffic for every 8 KB page served, which is a table read at a
+//! megabyte a second. Immutability makes the block cache free of stale
+//! reads exactly as it does the footer cache; unlike footers, blocks
+//! have no natural bound, so this one is byte budgeted and evicts the
+//! least recently used.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +52,135 @@ const FOOTER_GUESS: u64 = 64 * 1024;
 /// Ceiling on the learned guess, so one layer with an outsized footer
 /// cannot make every later cold read drag megabytes it does not need.
 const FOOTER_GUESS_CAP: u64 = 1024 * 1024;
+
+/// Bytes of layer blocks one reader holds before it starts evicting,
+/// overridable with `ZOU_BLOCK_CACHE_MB`.
+///
+/// This is memory inside the page service worker, which lives in the
+/// postmaster and has been killed for its footprint before, so the
+/// default is deliberately a fraction of what a machine would give it.
+/// A block is cut at [`crate::layer::LAYER_BLOCK_TARGET`], 256 KB of
+/// raw entries, so an image block is around thirty pages and sixty
+/// four megabytes is several hundred blocks. A scan in key order
+/// therefore reads a block once and answers thirty pages out of it
+/// with a budget it barely touches. Raising it buys the case the
+/// default does not cover, which is a scattered read pattern over a
+/// working set that nearly fits.
+const BLOCK_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// One cached block: the bytes as the store returned them, and when
+/// the reader last wanted them.
+struct Cached {
+    bytes: Arc<Vec<u8>>,
+    used: u64,
+}
+
+/// Block bytes by layer name and offset, under a byte budget.
+///
+/// The recency stamp is a counter rather than a clock: it only ever
+/// has to order two entries, and reading a clock per block read is a
+/// syscall in the middle of the read path on some platforms.
+struct BlockCache {
+    blocks: HashMap<(String, u64), Cached>,
+    bytes: usize,
+    budget: usize,
+    clock: u64,
+}
+
+impl BlockCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            blocks: HashMap::new(),
+            bytes: 0,
+            budget,
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, name: &str, offset: u64) -> Option<Arc<Vec<u8>>> {
+        self.clock += 1;
+        let clock = self.clock;
+        // The key allocates, which on a hit is the whole cost of the
+        // lookup, and is still several thousand times cheaper than the
+        // range GET it stands in for.
+        let entry = self.blocks.get_mut(&(name.to_string(), offset))?;
+        entry.used = clock;
+        Some(entry.bytes.clone())
+    }
+
+    fn put(&mut self, name: &str, offset: u64, bytes: Arc<Vec<u8>>) {
+        // A block bigger than the whole budget would evict everything
+        // to hold itself and be evicted by the next one.
+        if bytes.len() > self.budget {
+            return;
+        }
+        self.clock += 1;
+        let cached = Cached {
+            used: self.clock,
+            bytes,
+        };
+        self.bytes += cached.bytes.len();
+        if let Some(old) = self.blocks.insert((name.to_string(), offset), cached) {
+            self.bytes -= old.bytes.len();
+        }
+        if self.bytes > self.budget {
+            self.evict();
+        }
+    }
+
+    /// Drop the least recently used blocks, down to three quarters of
+    /// the budget rather than exactly to it, so that a reader sitting
+    /// at the ceiling sorts once every quarter budget of new blocks
+    /// instead of once per block.
+    fn evict(&mut self) {
+        let target = self.budget - self.budget / 4;
+        let mut by_age: Vec<(u64, (String, u64))> = self
+            .blocks
+            .iter()
+            .map(|(key, entry)| (entry.used, key.clone()))
+            .collect();
+        by_age.sort_unstable_by_key(|(used, _)| *used);
+        for (_, key) in by_age {
+            if self.bytes <= target {
+                break;
+            }
+            if let Some(old) = self.blocks.remove(&key) {
+                self.bytes -= old.bytes.len();
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// Forget the blocks of every layer not in `named`, answering how
+    /// many blocks are still held.
+    fn retain_named(&mut self, named: &std::collections::HashSet<String>) -> usize {
+        let mut freed = 0;
+        self.blocks.retain(|(name, _), entry| {
+            let keep = named.contains(name);
+            if !keep {
+                freed += entry.bytes.len();
+            }
+            keep
+        });
+        self.bytes -= freed;
+        self.blocks.len()
+    }
+}
+
+/// The block budget this process runs with, the default unless
+/// `ZOU_BLOCK_CACHE_MB` says otherwise. A value that does not parse is
+/// the default too: a reader is not the place to refuse to start over
+/// a tuning knob.
+fn block_budget() -> usize {
+    std::env::var("ZOU_BLOCK_CACHE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(BLOCK_CACHE_BYTES)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
@@ -90,6 +229,10 @@ pub struct LayerReader<'a> {
     tenant: Option<String>,
     shard: Option<u16>,
     footers: Mutex<HashMap<String, Arc<LayerFooter>>>,
+    /// Block bodies the lookups have already paid for, see the module
+    /// comment. Separate lock from the footers so that a reader
+    /// evicting blocks is not holding up a footer lookup.
+    blocks: Mutex<BlockCache>,
     /// How many tail bytes the next cold footer fetch asks for. The
     /// layers one shard cuts are all about the same shape, so the
     /// first layer whose footer overflowed the guess is a good guess
@@ -105,6 +248,7 @@ impl<'a> LayerReader<'a> {
             tenant: None,
             shard: None,
             footers: Mutex::new(HashMap::new()),
+            blocks: Mutex::new(BlockCache::new(block_budget())),
             guess: AtomicU64::new(FOOTER_GUESS),
         }
     }
@@ -120,8 +264,18 @@ impl<'a> LayerReader<'a> {
             tenant: Some(tenant_ref.to_string()),
             shard: Some(shard),
             footers: Mutex::new(HashMap::new()),
+            blocks: Mutex::new(BlockCache::new(block_budget())),
             guess: AtomicU64::new(FOOTER_GUESS),
         }
+    }
+
+    /// The same reader with a different block budget, for a caller who
+    /// knows better than the default: compaction reads every block of
+    /// its inputs exactly once, so it wants a small one, and a test
+    /// that wants to watch eviction wants a tiny one.
+    pub fn with_block_budget(self, bytes: usize) -> Self {
+        *self.blocks.lock().unwrap() = BlockCache::new(bytes);
+        self
     }
 
     /// The object key for a layer: its name under this shard's prefix,
@@ -193,6 +347,24 @@ impl<'a> LayerReader<'a> {
         Ok(bytes)
     }
 
+    /// One block of one layer, from cache or one range GET. Layers
+    /// are immutable, so a name and an offset name the same bytes
+    /// forever and a hit needs no validation.
+    fn block(
+        &self,
+        desc: &LayerDesc,
+        name: &str,
+        offset: u64,
+        len: u64,
+    ) -> Result<Arc<Vec<u8>>, ReadError> {
+        if let Some(bytes) = self.blocks.lock().unwrap().get(name, offset) {
+            return Ok(bytes);
+        }
+        let bytes = Arc::new(self.range(desc, name, offset, len)?);
+        self.blocks.lock().unwrap().put(name, offset, bytes.clone());
+        Ok(bytes)
+    }
+
     /// The footer for one layer, from cache or two range GETs. The
     /// footer's own ranges must agree with the name the manifest
     /// listed; a mismatch means the object is not what the map thinks
@@ -241,12 +413,14 @@ impl<'a> LayerReader<'a> {
     /// history in memory.
     pub fn forget_unnamed(&self, map: &LayerMap) -> usize {
         let mut footers = self.footers.lock().unwrap();
-        if footers.is_empty() {
+        let mut blocks = self.blocks.lock().unwrap();
+        if footers.is_empty() && blocks.is_empty() {
             return 0;
         }
         let named: std::collections::HashSet<String> =
             map.layers().iter().map(|d| d.name()).collect();
         footers.retain(|name, _| named.contains(name));
+        blocks.retain_named(&named);
         footers.len()
     }
 
@@ -278,11 +452,12 @@ impl<'a> LayerReader<'a> {
             if !footer.may_contain(key) {
                 continue;
             }
+            let name = desc.name();
             for meta in footer.locate(key) {
-                let bytes = self.range(desc, &desc.name(), meta.offset, meta.len as u64)?;
+                let bytes = self.block(desc, &name, meta.offset, meta.len as u64)?;
                 let entries =
                     decode_image_block(&bytes, meta).map_err(|source| ReadError::Layer {
-                        name: desc.name(),
+                        name: name.clone(),
                         source,
                     })?;
                 if let Ok(i) = entries.binary_search_by(|e| e.key.cmp(key)) {
@@ -308,11 +483,12 @@ impl<'a> LayerReader<'a> {
             // the owner's future; the clamp keeps them out of this
             // tenant's history.
             let ceil = desc.clamp(lsn);
+            let name = desc.name();
             for meta in footer.locate(key) {
-                let bytes = self.range(desc, &desc.name(), meta.offset, meta.len as u64)?;
+                let bytes = self.block(desc, &name, meta.offset, meta.len as u64)?;
                 let entries =
                     decode_delta_block(&bytes, meta).map_err(|source| ReadError::Layer {
-                        name: desc.name(),
+                        name: name.clone(),
                         source,
                     })?;
                 for e in entries {
@@ -636,6 +812,79 @@ mod tests {
             store.ranges.load(Ordering::Relaxed),
             1,
             "one fetch, no refetch"
+        );
+    }
+
+    #[test]
+    fn a_block_is_fetched_once_however_many_keys_come_out_of_it() {
+        // The image layer here cuts a block every couple of pages, so
+        // 8 and 9 are one block. Reading them one after another is the
+        // shape a sequential scan has, and the shape that cost 1.7
+        // range GETs per page served in #465.
+        let (inner, map, mem) = history();
+        let store = Counting {
+            inner,
+            ranges: AtomicUsize::new(0),
+        };
+        let reader = LayerReader::new(&store, "layers/");
+        let got = reader.reconstruct(&map, &mem, &k(8), Lsn(310)).unwrap();
+        assert_eq!(got.base, Some(page(8)));
+        store.ranges.store(0, Ordering::Relaxed);
+        let got = reader.reconstruct(&map, &mem, &k(9), Lsn(310)).unwrap();
+        assert_eq!(got.base, Some(page(9)));
+        assert_eq!(
+            store.ranges.load(Ordering::Relaxed),
+            0,
+            "the neighbour was already in the block the first read paid for"
+        );
+
+        // With no budget to hold it, the second read fetches the same
+        // bytes again, which is what every read used to do.
+        let reader = LayerReader::new(&store, "layers/").with_block_budget(0);
+        reader.reconstruct(&map, &mem, &k(8), Lsn(310)).unwrap();
+        store.ranges.store(0, Ordering::Relaxed);
+        reader.reconstruct(&map, &mem, &k(9), Lsn(310)).unwrap();
+        assert_eq!(store.ranges.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_block_cache_evicts_the_ones_nobody_asked_for_lately() {
+        let mut cache = BlockCache::new(1000);
+        for at in 0..3u64 {
+            cache.put("layer", at, Arc::new(vec![0u8; 300]));
+        }
+        assert_eq!(cache.bytes, 900);
+        // Reading the oldest makes it the newest.
+        assert!(cache.get("layer", 0).is_some());
+        cache.put("layer", 3, Arc::new(vec![0u8; 300]));
+        assert!(cache.bytes <= 1000);
+        assert!(cache.get("layer", 0).is_some(), "touched, so kept");
+        assert!(cache.get("layer", 3).is_some(), "newest, so kept");
+        assert!(cache.get("layer", 1).is_none());
+        assert!(cache.get("layer", 2).is_none());
+
+        // A block that cannot fit is not worth emptying the cache for.
+        cache.put("layer", 4, Arc::new(vec![0u8; 2000]));
+        assert!(cache.get("layer", 4).is_none());
+        assert!(cache.get("layer", 0).is_some());
+    }
+
+    #[test]
+    fn the_blocks_of_retired_layers_go_with_their_footers() {
+        let (store, map, mem) = history();
+        let reader = LayerReader::new(&store, "layers/");
+        reader.reconstruct(&map, &mem, &k(3), Lsn(310)).unwrap();
+        assert!(!reader.blocks.lock().unwrap().is_empty());
+
+        let kept = LayerMap::new(vec![map.layers()[0].clone()]).unwrap();
+        reader.forget_unnamed(&kept);
+        let blocks = reader.blocks.lock().unwrap();
+        let name = map.layers()[0].name();
+        assert!(blocks.blocks.keys().all(|(held, _)| *held == name));
+        assert_eq!(
+            blocks.bytes,
+            blocks.blocks.values().map(|c| c.bytes.len()).sum::<usize>(),
+            "the byte count followed the eviction"
         );
     }
 

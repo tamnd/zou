@@ -84,6 +84,13 @@ const BLOCK_TARGET: usize = 256 * 1024;
 /// be a base.
 const BLCKSZ: usize = 8192;
 
+/// Block cache a compaction pass gives its reader. Small on purpose:
+/// a pass reimages keys in sorted order, so it wants the block it is
+/// walking and its neighbours in the other layers of the plan, not a
+/// working set. The serving path's default would be memory held in
+/// the same worker as the layer being built.
+const COMPACT_BLOCK_CACHE: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CompactError {
     #[error("no manifest at {key}, the tenant does not exist")]
@@ -519,6 +526,7 @@ pub fn compact_shard(
         if !keys.is_empty() {
             let map = LayerMap::new(descs.clone()).map_err(PageShardError::from)?;
             let svc = PageService::for_shard(store, tenant_ref, shard, Some(pool), data_checksums)
+                .with_block_budget(COMPACT_BLOCK_CACHE)
                 .with_base_fallback(|blk: &crate::walscan::BlockRef| {
                     let object = layout.pg_block(blk.spc, blk.db, blk.rel, blk.fork, blk.blk);
                     // A store that errors here reads as no base: the key
@@ -835,6 +843,7 @@ pub fn merge_to_horizon(
     let map = LayerMap::new(descs.clone()).map_err(PageShardError::from)?;
     let frozen_bases = AtomicUsize::new(0);
     let svc = PageService::for_shard(store, tenant_ref, shard, Some(pool), data_checksums)
+        .with_block_budget(COMPACT_BLOCK_CACHE)
         .with_base_fallback(|blk: &crate::walscan::BlockRef| {
             let object = layout.pg_block(blk.spc, blk.db, blk.rel, blk.fork, blk.blk);
             match store.get(&object) {

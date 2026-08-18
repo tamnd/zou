@@ -136,6 +136,15 @@ impl<'a> PageService<'a> {
         }
     }
 
+    /// The same service with a different budget for the reader's block
+    /// cache, see [`LayerReader::with_block_budget`]. A caller reading
+    /// keys in order wants a small one; the default is sized for the
+    /// serving path, which does not know what it will be asked next.
+    pub fn with_block_budget(mut self, bytes: usize) -> Self {
+        self.reader = self.reader.with_block_budget(bytes);
+        self
+    }
+
     /// Let go of the footers of layers `map` no longer names, and
     /// answer how many the reader still holds. A service kept across
     /// reads has to be told when the map moved on.

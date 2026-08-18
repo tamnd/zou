@@ -1806,10 +1806,13 @@ mod tests {
     /// the gamingpc smoke ended with carries a 2 MB bloom and an index
     /// row for each of its 3850 blocks, and the segment holding the
     /// death drill paid 34.5 GB of range reads to serve 18466 pages,
-    /// 2.4 MB a page. The second read of a layer should cost the block
-    /// it wants and nothing else.
+    /// 2.4 MB a page.
+    ///
+    /// Since #465 the block is cached too, so a second read of a page
+    /// out of a layer this reader has already read costs nothing at
+    /// all on the store.
     #[test]
-    fn a_second_read_of_a_layer_does_not_refetch_its_footer() {
+    fn a_second_read_of_a_layer_refetches_nothing() {
         use zou_store::layer::{ImageBuilder, LayerKey};
         use zou_store::layermap::LayerDesc;
         use zou_store::shardmanifest::{LayerEntry, publish_layer};
@@ -1869,8 +1872,8 @@ mod tests {
         srv.stop();
         assert_eq!(
             counting.ranges() - first,
-            4,
-            "four more reads of the same layer cost {} ranges, one block each is 4",
+            0,
+            "four more reads of the same page cost {} ranges, the footer and the block are both held",
             counting.ranges() - first
         );
     }
