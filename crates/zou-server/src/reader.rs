@@ -639,6 +639,7 @@ impl Reader {
                 },
             };
             tap = Some(open);
+            let polled = Instant::now();
             let read = match tap.as_mut().expect("a tap").changes(self.most).await {
                 Ok(read) => read,
                 Err(why) => {
@@ -661,6 +662,7 @@ impl Reader {
                 tokio::time::sleep(self.every).await;
                 continue;
             }
+            crate::ops::change_stage("tap", polled.elapsed());
             let client = tap.as_ref().expect("a tap").client();
             self.deliver(client, &read).await;
             // Straight back round without sleeping: a batch that came
@@ -674,61 +676,19 @@ impl Reader {
         // When this batch came back, which is where the half of the
         // delivery latency that is this server's own starts.
         let read = Instant::now();
+        // The two parts of that which happen here, accumulated across
+        // the batch rather than observed a change at a time, so the
+        // clock is read four times a change however many subscribers
+        // are owed it.
+        let mut selecting = Duration::ZERO;
+        let mut sending = Duration::ZERO;
         for change in batch {
             self.at = change.lsn;
-            let wanted = self.changes.wanted(change);
-            if wanted.is_empty() {
-                continue;
-            }
-            let missing = self.types.missing(&change.relation);
-            if !missing.is_empty()
-                && let Err(why) = self.types.learn(client, &missing).await
-            {
-                // A payload can be built without the catalog: every
-                // value falls back to the text postgres printed, which
-                // is never wrong about what it says, only about what
-                // type it is. Sending that beats sending nothing.
-                log::warn!("realtime: the types of a changed table would not load, {why}");
-            }
-            // One visibility check and one payload per set of claims
-            // rather than per subscriber, since two sockets signed in
-            // as the same person are owed the same object, and the
-            // check is the expensive half of this loop.
-            let mut built: HashMap<String, Option<Arc<Value>>> = HashMap::new();
-            for (listener, asker, to, ids) in wanted {
-                let facts = match self
-                    .catalog
-                    .facts(&self.pool, &change.relation, &asker.role)
-                    .await
-                {
-                    Ok(facts) => facts,
-                    Err(why) => {
-                        // The same silence a policy's no gets, for the
-                        // same reason: nobody could find out what this
-                        // subscriber may see.
-                        log::warn!("realtime: {why}");
-                        continue;
-                    }
-                };
-                // Claims are only part of the key when a policy could
-                // read them. Without row level security every holder
-                // of a role is owed the same object, so a hundred
-                // subscribers on a shard are one payload rather than a
-                // hundred identical ones.
-                let key = if facts.rls {
-                    format!("{}\u{0}{}", asker.role, asker.claims)
-                } else {
-                    asker.role.clone()
-                };
-                let data = match built.get(&key) {
-                    Some(data) => data.clone(),
-                    None => {
-                        let data = self.building(&facts, &asker, change).await.map(Arc::new);
-                        built.insert(key, data.clone());
-                        data
-                    }
-                };
-                let Some(data) = data else { continue };
+            let chose = Instant::now();
+            let owed = self.owed(client, change).await;
+            selecting += chose.elapsed();
+            let handing = Instant::now();
+            for (listener, to, ids, data) in owed {
                 let sent = to.send(Heard::Change {
                     ids,
                     data,
@@ -744,7 +704,82 @@ impl Reader {
                     self.changes.hung_up(listener);
                 }
             }
+            sending += handing.elapsed();
         }
+        crate::ops::change_stage("select", selecting);
+        crate::ops::change_stage("send", sending);
+    }
+
+    /// Who is owed one change, and what each of them is owed of it.
+    ///
+    /// Decided in full before any of it is handed over, which is the
+    /// seam the two timings above are taken at: everything in here is a
+    /// matcher, a catalog and a policy check, and everything after it
+    /// is a queue. Splitting them costs one vector, holding what the
+    /// matcher already allocated and a pointer to a payload that is
+    /// shared anyway.
+    async fn owed(
+        &mut self,
+        client: &tokio_postgres::Client,
+        change: &Change,
+    ) -> Vec<(u64, To, Vec<u64>, Arc<Value>)> {
+        let wanted = self.changes.wanted(change);
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let missing = self.types.missing(&change.relation);
+        if !missing.is_empty()
+            && let Err(why) = self.types.learn(client, &missing).await
+        {
+            // A payload can be built without the catalog: every value
+            // falls back to the text postgres printed, which is never
+            // wrong about what it says, only about what type it is.
+            // Sending that beats sending nothing.
+            log::warn!("realtime: the types of a changed table would not load, {why}");
+        }
+        // One visibility check and one payload per set of claims rather
+        // than per subscriber, since two sockets signed in as the same
+        // person are owed the same object, and the check is the
+        // expensive half of this loop.
+        let mut built: HashMap<String, Option<Arc<Value>>> = HashMap::new();
+        let mut owed = Vec::with_capacity(wanted.len());
+        for (listener, asker, to, ids) in wanted {
+            let facts = match self
+                .catalog
+                .facts(&self.pool, &change.relation, &asker.role)
+                .await
+            {
+                Ok(facts) => facts,
+                Err(why) => {
+                    // The same silence a policy's no gets, for the same
+                    // reason: nobody could find out what this subscriber
+                    // may see.
+                    log::warn!("realtime: {why}");
+                    continue;
+                }
+            };
+            // Claims are only part of the key when a policy could read
+            // them. Without row level security every holder of a role
+            // is owed the same object, so a hundred subscribers on a
+            // shard are one payload rather than a hundred identical
+            // ones.
+            let key = if facts.rls {
+                format!("{}\u{0}{}", asker.role, asker.claims)
+            } else {
+                asker.role.clone()
+            };
+            let data = match built.get(&key) {
+                Some(data) => data.clone(),
+                None => {
+                    let data = self.building(&facts, &asker, change).await.map(Arc::new);
+                    built.insert(key, data.clone());
+                    data
+                }
+            };
+            let Some(data) = data else { continue };
+            owed.push((listener, to, ids, data));
+        }
+        owed
     }
 
     /// The payload one subscriber is owed of one change, or nothing

@@ -27,7 +27,7 @@
 //! twice would mean counting the ones this process can see and missing
 //! the rest.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -499,6 +499,44 @@ pub fn change_delivered(commit_ts: i64, read: Instant) {
         .since(read);
 }
 
+/// Where one batch of changes spent its time, in the three parts a
+/// change passes through.
+///
+/// `zou_realtime_change_seconds` says how long a change took inside
+/// this server, which is the number to look at first and the one that
+/// says nothing at all about what to do next. A batch that took forty
+/// milliseconds took it in one of three quite different places, and
+/// they are fixed by three quite different things.
+///
+/// The tap is the round trip to postgres for the next batch, so it is
+/// the database and the network between here and it. The selection is
+/// asking who wanted each change and what each of them may see of it,
+/// which is a matcher, a catalog and a policy check, and it is the part
+/// that grows with the subscribers on a table. The sending is handing
+/// each finished payload to a queue, which is the part that grows with
+/// the sockets owed a row.
+///
+/// One observation of each per batch rather than per change, so the
+/// three add up to the batch's whole cycle and can be compared as
+/// shares of it. Per change would be three clock reads a change and a
+/// histogram whose count is the changes rather than the polls, which
+/// is a worse trade in both directions.
+///
+/// The tap is only counted on a poll that came back with something. An
+/// idle reader asks every hundred milliseconds and is told there is
+/// nothing, and averaging those in would say the tap is fast when what
+/// it is is unused.
+pub fn change_stage(stage: &'static str, took: Duration) {
+    registry()
+        .histogram(
+            "zou_realtime_stage_seconds",
+            "where one batch of database changes spent its time",
+            SECONDS,
+            &[("stage", stage)],
+        )
+        .observe(took.as_secs_f64());
+}
+
 /// How many realtime sockets this node is holding right now, and how
 /// many of them asked for database changes.
 ///
@@ -678,6 +716,34 @@ mod tests {
             (0.2..1.0).contains(&sum),
             "the quarter second is in it and the clock that is an hour ahead is a zero, {sum}"
         );
+    }
+
+    /// The three stages are one family with a label rather than three
+    /// names, because the question they answer is which share of a
+    /// batch went where, and shares of one thing have to be summable.
+    #[tokio::test]
+    async fn a_batch_of_changes_says_which_of_the_three_stages_it_spent_its_time_in() {
+        change_stage("tap", Duration::from_millis(4));
+        change_stage("select", Duration::from_millis(30));
+        change_stage("send", Duration::from_millis(6));
+        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        assert!(
+            body.contains("# TYPE zou_realtime_stage_seconds histogram\n"),
+            "{body}"
+        );
+        let sum = |stage: &str| {
+            body.lines()
+                .find_map(|line| {
+                    line.strip_prefix(&format!(
+                        "zou_realtime_stage_seconds_sum{{stage=\"{stage}\"}} "
+                    ))
+                })
+                .and_then(|n| n.parse::<f64>().ok())
+                .expect("a sum")
+        };
+        assert!((0.004..0.02).contains(&sum("tap")), "{body}");
+        assert!((0.030..0.05).contains(&sum("select")), "{body}");
+        assert!((0.006..0.02).contains(&sum("send")), "{body}");
     }
 
     /// The two numbers a socket tier is sized on. A gauge that only

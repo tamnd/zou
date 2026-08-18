@@ -21,6 +21,11 @@ A subscription is not a request, so the surface counters say nothing about how l
 `zou_realtime_commit_to_socket_seconds` is what an application feels, counted from the commit timestamp postgres wrote, which means it carries whatever a database on another machine disagrees with this one's clock about, and a clock behind the database's is counted as a zero rather than as a negative.
 `zou_realtime_change_seconds` is this server's own share of the same interval, from the tap reading the change out of the slot to the frame going out, on one clock, and it is the one that says whether what moved was here.
 
+`zou_realtime_stage_seconds{stage}` splits that share into the three parts a change passes through, so a number that moved says what to look at.
+The tap is the round trip to postgres for the next batch, the selection is asking who wanted each change and what each of them may see of it, and the sending is handing each finished payload to a queue.
+They grow with different things: the selection with the subscribers on a table and the policies on it, the sending with the sockets owed a row, and the tap with neither.
+One observation of each per batch rather than per change, so the three are shares of one cycle and add up to it, and the tap is only counted on a poll that came back with something, since an idle reader asks every hundred milliseconds and is told there is nothing.
+
 `zou_realtime_sockets` and `zou_realtime_subscribers` are what a socket tier is sized on: how many sockets this node is holding, and how many of them asked for database changes.
 Two numbers rather than one because they cost different things: a socket is a connection, a task and whatever the client has not read yet, and a subscriber is that plus a place in the change reader and a policy check per row that matches it.
 On a fleet they do not add up to one machine's, and that is the honest shape rather than a rounding: a socket served away from the node holding its project is a socket there and a subscriber on the holder, because the row it may see is decided where the database is.

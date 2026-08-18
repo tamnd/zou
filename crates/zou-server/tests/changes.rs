@@ -419,6 +419,27 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
         scrape.contains("zou_realtime_commit_to_socket_seconds_bucket"),
         "{scrape}"
     );
+    // And the three stages of it, for the same reason: what the split
+    // is worth is that a batch which was read, matched and handed over
+    // shows up in all three, and only a reader running against a real
+    // database can say that it did.
+    let stage = |name: &str| {
+        scrape
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(&format!(
+                    "zou_realtime_stage_seconds_count{{stage=\"{name}\"}} "
+                ))
+            })
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap_or_default()
+    };
+    for name in ["tap", "select", "send"] {
+        assert!(
+            stage(name) >= 1,
+            "the {name} stage of a delivered batch is counted, {scrape}"
+        );
+    }
     // And the two gauges a socket tier is sized on, which are what a
     // benchmark reads off the node while it is holding the sockets
     // rather than counting them from the client's side alone.
