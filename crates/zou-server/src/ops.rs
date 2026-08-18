@@ -181,6 +181,34 @@ const STORE_SECONDS: &[f64] = &[
     0.131_072, 0.524_288, 2.097_152, 8.388_608,
 ];
 
+/// The realtime family's own bucket edges, seconds, from a tenth of a
+/// millisecond to five minutes.
+///
+/// The shared latency edges are a request path's spread, and a request
+/// path that took five minutes has already been given up on. A change
+/// on a node holding a hundred thousand sockets has not: a measured run
+/// put the p99 of what a client waited at forty six seconds and the
+/// worst at three hundred, which the shared edges cannot tell apart
+/// because they stop at ten and everything past it is one bucket.
+///
+/// The other half of it is resolution where the answers are. The shared
+/// edges step from a quarter of a second to a half to a whole, so a p99
+/// anywhere in that stretch reads as exactly 250 or 500 milliseconds,
+/// which is a bucket edge being reported as a measurement. These are
+/// five edges to the decade between a millisecond and ten seconds, so
+/// the worst a quantile is wrong by is the ratio between neighbours,
+/// which is at most a two thirds overstatement rather than a doubling.
+///
+/// Twenty seven edges is more than this tree spends anywhere else, and
+/// on the stage histogram it is four times that in series, one set to a
+/// stage. That is the price of a fan out p99 that can be published, and
+/// it is paid by the three families that need one rather than by every
+/// histogram in the process.
+const FANOUT_SECONDS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.001, 0.0015, 0.0025, 0.004, 0.006, 0.01, 0.015, 0.025, 0.04, 0.06,
+    0.1, 0.15, 0.25, 0.4, 0.6, 1.0, 1.5, 2.5, 4.0, 6.0, 10.0, 30.0, 100.0, 300.0,
+];
+
 /// Count a request and how long it took, and trace it. Layered on the
 /// whole router, so a 404 and a 429 are counted too, which are the two
 /// a graph is most often drawn to explain.
@@ -485,7 +513,7 @@ pub fn change_delivered(commit_ts: i64, read: Instant) {
         .histogram(
             "zou_realtime_commit_to_socket_seconds",
             "how long a change took to reach a socket, from the transaction's commit",
-            SECONDS,
+            FANOUT_SECONDS,
             &[],
         )
         .observe(micros.saturating_sub(commit_ts).max(0) as f64 / 1_000_000.0);
@@ -493,7 +521,7 @@ pub fn change_delivered(commit_ts: i64, read: Instant) {
         .histogram(
             "zou_realtime_change_seconds",
             "how long a change took inside this server, from the tap reading it",
-            SECONDS,
+            FANOUT_SECONDS,
             &[],
         )
         .since(read);
@@ -535,7 +563,7 @@ pub fn change_stage(stage: &'static str, took: Duration) {
         .histogram(
             "zou_realtime_stage_seconds",
             "where one batch of database changes spent its time",
-            SECONDS,
+            FANOUT_SECONDS,
             &[("stage", stage)],
         )
         .observe(took.as_secs_f64());
@@ -720,6 +748,33 @@ mod tests {
             (0.2..1.0).contains(&sum),
             "the quarter second is in it and the clock that is an hour ahead is a zero, {sum}"
         );
+        // And on the fan out edges rather than the shared ones. What
+        // that buys is on both sides of the quarter second: an edge at
+        // four tenths, where the shared set steps straight to a half
+        // and reports every p99 in between as exactly one or the other,
+        // and an edge at five minutes, which is where a node holding a
+        // hundred thousand sockets has actually been measured.
+        let bucket = |le: &str| {
+            body.lines()
+                .find_map(|line| {
+                    line.strip_prefix(&format!(
+                        "zou_realtime_commit_to_socket_seconds_bucket{{le=\"{le}\"}} "
+                    ))
+                })
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("a bucket at {le}, {body}"))
+        };
+        assert_eq!(
+            bucket("0.15"),
+            1,
+            "the clock an hour ahead is the zero, {body}"
+        );
+        assert_eq!(
+            bucket("0.4"),
+            2,
+            "and the quarter second is under it, {body}"
+        );
+        assert_eq!(bucket("300"), 2, "{body}");
     }
 
     /// The four stages are one family with a label rather than four
