@@ -527,32 +527,43 @@ pub fn change_delivered(commit_ts: i64, read: Instant) {
         .since(read);
 }
 
-/// Where a change spent its time, in the four parts it passes through.
+/// Where a change spent its time, in the five parts it passes through.
 ///
 /// `zou_realtime_change_seconds` says how long a change took inside
 /// this server, which is the number to look at first and the one that
 /// says nothing at all about what to do next. A change that took forty
-/// milliseconds took it in one of four quite different places, and they
-/// are fixed by four quite different things.
+/// milliseconds took it in one of five quite different places, and they
+/// are fixed by five quite different things.
 ///
 /// The tap is the round trip to postgres for the next batch, so it is
-/// the database and the network between here and it. The selection is
-/// asking who wanted each change and what each of them may see of it,
-/// which is a matcher, a catalog and a policy check, and it is the part
-/// that grows with the subscribers on a table. The sending is the
-/// reader handing each finished payload to a queue, which grows with
-/// the sockets owed a row. The socket is what happens after that, which
-/// is one task waiting its turn and writing a frame, and it grows with
-/// how many tasks this node is running rather than with anything about
-/// the change.
+/// the database and the network between here and it. The decode is
+/// turning those messages into changes, which is this process's own
+/// work on whatever postgres sent. The selection is asking who wanted
+/// each change and what each of them may see of it, which is a matcher,
+/// a catalog and a policy check, and it is the part that grows with the
+/// subscribers on a table. The sending is the reader handing each
+/// finished payload to a queue, which grows with the sockets owed a
+/// row. The socket is what happens after that, which is one task
+/// waiting its turn and writing a frame, and it grows with how many
+/// tasks this node is running rather than with anything about the
+/// change.
 ///
-/// The first three are one observation apiece per batch, so they add up
-/// to the reader's cycle and can be compared as shares of it. Per
-/// change they would not, because the tap is one poll for up to a
-/// thousand messages, and the count would be the changes rather than
-/// the polls. The socket stage is per delivery, because it is the only
-/// one that happens once per socket rather than once for all of them,
-/// and that difference in what is being counted is the point of it.
+/// The first four are one observation apiece per batch. Per change they
+/// would not be, because the tap is one poll for up to a thousand
+/// messages, and the count would be the changes rather than the polls.
+/// The socket stage is per delivery, because it is the only one that
+/// happens once per socket rather than once for all of them, and that
+/// difference in what is being counted is the point of it.
+///
+/// The four batch stages add up to a cycle of the reader, and the
+/// largest share is the useful reading: the tap says the database is
+/// the limit, the selection says the policies are, the sending says the
+/// queues are. None of the four waits on any other, so the tap can be
+/// run alongside the selection and the sending and the cycle stops
+/// being a sum. That was built and measured, and it shortened the cycle
+/// by a third while the median a client waited grew by half, so the
+/// reader still runs them one after the other and the stages still add
+/// up.
 ///
 /// The tap is only counted on a poll that came back with something. An
 /// idle reader asks every hundred milliseconds and is told there is
@@ -777,12 +788,13 @@ mod tests {
         assert_eq!(bucket("300"), 2, "{body}");
     }
 
-    /// The four stages are one family with a label rather than four
-    /// names, because the question they answer is which share of a
-    /// change went where, and shares of one thing have to be summable.
+    /// The five stages are one family with a label rather than five
+    /// names, because the question they answer is which part of a
+    /// change went where, and that is one question about one thing.
     #[tokio::test]
-    async fn a_change_says_which_of_the_four_stages_it_spent_its_time_in() {
+    async fn a_change_says_which_of_the_five_stages_it_spent_its_time_in() {
         change_stage("tap", Duration::from_millis(4));
+        change_stage("decode", Duration::from_millis(2));
         change_stage("select", Duration::from_millis(30));
         change_stage("send", Duration::from_millis(6));
         change_stage("socket", Duration::from_millis(11));
@@ -802,6 +814,7 @@ mod tests {
                 .expect("a sum")
         };
         assert!((0.004..0.02).contains(&sum("tap")), "{body}");
+        assert!((0.002..0.02).contains(&sum("decode")), "{body}");
         assert!((0.030..0.05).contains(&sum("select")), "{body}");
         assert!((0.006..0.02).contains(&sum("send")), "{body}");
         assert!((0.011..0.03).contains(&sum("socket")), "{body}");

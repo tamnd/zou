@@ -419,10 +419,11 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
         scrape.contains("zou_realtime_commit_to_socket_seconds_bucket"),
         "{scrape}"
     );
-    // And the four stages of it, for the same reason: what the split
-    // is worth is that a change which was read, matched, handed over
-    // and written to a socket shows up in all four, and only a reader
-    // running against a real database can say that it did.
+    // And the five stages of it, for the same reason: what the split
+    // is worth is that a change which was read, decoded, matched,
+    // handed over and written to a socket shows up in all five, and
+    // only a reader running against a real database can say that it
+    // did.
     let stage = |name: &str| {
         scrape
             .lines()
@@ -434,7 +435,7 @@ async fn a_row_written_with_sql_arrives_on_the_socket_that_subscribed_to_it() {
             .and_then(|n| n.parse::<u64>().ok())
             .unwrap_or_default()
     };
-    for name in ["tap", "select", "send", "socket"] {
+    for name in ["tap", "decode", "select", "send", "socket"] {
         assert!(
             stage(name) >= 1,
             "the {name} stage of a delivered change is counted, {scrape}"

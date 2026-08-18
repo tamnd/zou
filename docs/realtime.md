@@ -323,7 +323,7 @@ The wait is bounded at five seconds, inside the client's own join timeout: a dat
 Upstream has nothing to wait for here, since its slot is permanent and always being read, which is the same trade in the other direction.
 
 How long a change takes to arrive is measured rather than assumed.
-`zou_realtime_commit_to_socket_seconds` on the ops port is counted from the transaction's commit timestamp to the frame going out, `zou_realtime_change_seconds` is the part of it that happened here, and `zou_realtime_stage_seconds{stage}` splits that part into the tap, the selection, the sending and the socket.
+`zou_realtime_commit_to_socket_seconds` on the ops port is counted from the transaction's commit timestamp to the frame going out, `zou_realtime_change_seconds` is the part of it that happened here, and `zou_realtime_stage_seconds{stage}` splits that part into the tap, the decode, the selection, the sending and the socket.
 [operations.md](operations.md) says what each is worth relying on.
 
 ## What a change looks like

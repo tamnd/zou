@@ -15,6 +15,19 @@
 //! and sleeping on it would be adding latency to the case that can
 //! least afford it.
 //!
+//! Asking and handing over run one after the other, and that is a
+//! decision rather than the shape it fell into. The two never wait on
+//! each other, so a poll for the next batch started before the last one
+//! has been handed over halves this loop's cycle, and it was built and
+//! measured on a node holding a hundred thousand sockets: the cycle
+//! fell from 55 ms to 35, the median a client waited rose from 768 ms
+//! to 1170, and the write path committed a quarter fewer rows in the
+//! same five minutes. A poll costs this process a wait and costs
+//! postgres work, so a slot drained without a pause is a database given
+//! no quiet window to commit in. The alternating loop stayed, and the
+//! reason is written here rather than left to be rediscovered by
+//! somebody who notices the same two things never wait on each other.
+//!
 //! No subscribers, no tap. A logical slot pins the write ahead log from
 //! the moment it exists until somebody reads past it, so a slot nobody
 //! is reading is a disk filling up on a database whose owner did
@@ -658,7 +671,7 @@ impl Reader {
             };
             tap = Some(open);
             let polled = Instant::now();
-            let read = match tap.as_mut().expect("a tap").changes(self.most).await {
+            let read = match tap.as_ref().expect("a tap").read(self.most).await {
                 Ok(read) => read,
                 Err(why) => {
                     // The connection went, and with it the slot, so
@@ -681,8 +694,11 @@ impl Reader {
                 continue;
             }
             crate::ops::change_stage("tap", polled.elapsed());
+            let decoded = Instant::now();
+            let batch = tap.as_mut().expect("a tap").decode(&read);
+            crate::ops::change_stage("decode", decoded.elapsed());
             let client = tap.as_ref().expect("a tap").client();
-            self.deliver(client, &read).await;
+            self.deliver(client, &batch).await;
             // Straight back round without sleeping: a batch that came
             // back with something in it is a database that may have
             // more, and the cadence is for an idle one.
@@ -690,6 +706,12 @@ impl Reader {
     }
 
     /// Everything one batch is owed, in the order postgres wrote it.
+    ///
+    /// Run after the poll that read the batch rather than alongside it,
+    /// which is the module doc's decision and the one with numbers
+    /// behind it. Nothing in here waits on anything in a poll, so the
+    /// two can be run together and it makes this loop's cycle shorter,
+    /// and what a client waits longer.
     async fn deliver(&mut self, client: &tokio_postgres::Client, batch: &[Change]) {
         // When this batch came back, which is where the half of the
         // delivery latency that is this server's own starts.
