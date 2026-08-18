@@ -1,0 +1,71 @@
+Tell a redo worker how big the fork is before it rebuilds a page.
+
+A batch names its target blocks up front, and until now that was only
+used to keep redo off the bystanders a multi block record references. It
+also happens to be the only thing in the process that knows how big a
+relation is supposed to be, and nothing was told.
+
+So a worker started every fork at zero blocks, and replaying a record
+for block 176526 sent XLogReadBufferExtended down the extension path:
+ExtendBufferedRelTo zero fills its way up to the target, through a
+buffer pool this process deliberately sets to 1 MB, so every block it
+passes is evicted immediately and stored in the page table on the way
+out. Serving block N cost N blocks of work and N blocks of memory, once
+per batch, and the pool recycles a worker every 64 batches so it began
+again from zero.
+
+Measured on server3 (zou #467), a cold sequential scan of a 1.4 GB table
+served 8 pages a second with the redo worker at 94 percent of a core,
+and a profile of that worker put a third of its cycles in
+ExtendBufferedRelShared and another fifth in the hash table underneath
+the pages it was storing. It decayed as it went, 35 pages a second early
+in the relation and 8 twenty minutes later, which is the shape of a cost
+proportional to the block number rather than to the work.
+
+The size is a fiction in this process anyway. Nothing opens a file,
+load_page answers an unknown block with zeros, and the only consumer of
+zredo_nblocks is postgres deciding whether a block exists. A target
+block exists by definition: it is the page the batch was asked to
+rebuild.
+
+--- a/src/backend/access/transam/zou_walredo.c
++++ b/src/backend/access/transam/zou_walredo.c
+@@ -690,6 +690,7 @@
+ handle_target(const uint8 *payload, uint32 len)
+ {
+ 	ZRedoPageKey key;
++	ZRedoFork  *fk;
+ 	RelFileLocator locator;
+ 	ForkNumber	fork;
+ 	BlockNumber block;
+@@ -702,6 +703,30 @@
+ 	key.fork = fork;
+ 	key.block = block;
+ 	hash_search(target_tab, &key, HASH_ENTER, NULL);
++
++	/*
++	 * The fork is at least this big, and saying so up front is the whole
++	 * difference between a batch that costs the block it wants and one
++	 * that costs the block number it wants.  Without it a worker that
++	 * starts every fork at zero blocks sends XLogReadBufferExtended down
++	 * the extension path, and ExtendBufferedRelTo zero fills its way up
++	 * to the target through a 1 MB buffer pool, storing every block it
++	 * evicts.  Serving block 176526 then means materializing 176526
++	 * blocks nobody asked about, once per batch, and the pool recycles
++	 * the worker every so often so it starts again from zero.
++	 *
++	 * Lying is free here because the size is already a fiction: nothing
++	 * in this process opens a file, load_page answers an unknown block
++	 * with zeros, and the sole consumer of zredo_nblocks is postgres
++	 * deciding whether the block exists.  A target block exists by
++	 * definition, it is the page the batch was asked to rebuild.
++	 *
++	 * Targets arrive right after the reset, which destroys every smgr
++	 * relation, so no cached relation size can be stale by the time redo
++	 * asks for one.
++	 */
++	fk = fork_entry(locator, fork, true);
++	fk->nblocks = Max(fk->nblocks, block + 1);
+ }
+ 
+ static void
