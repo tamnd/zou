@@ -36,13 +36,13 @@ fn smgr_reads_land_in_their_tiers() {
     for blk in 0u32..2 {
         let page = [blk as u8 + 1; ZOU_PAGE_SIZE];
         assert_eq!(
-            unsafe { zou_smgr_extend(spc, db, rel, fork, blk, page.as_ptr(), 0) },
+            unsafe { zou_smgr_extend(spc, db, rel, fork, blk, page.as_ptr(), 0, 0) },
             ZOU_OK
         );
     }
     // Blocks 2 and 3 exist by size only, no bytes anywhere local, so
     // reading them must pay the store round trip that answers absent.
-    assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 2, 2), ZOU_OK);
+    assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 2, 2, 0), ZOU_OK);
 
     // Written blocks serve from the local page cache: cache tier.
     let mut buf = [0u8; ZOU_PAGE_SIZE];

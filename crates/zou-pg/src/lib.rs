@@ -561,6 +561,20 @@ fn write_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32)
     Ok(())
 }
 
+/// Remember a grown fork size in this process without a store call.
+///
+/// The deferred half of an extension: the C shim holds the cluster's
+/// answer in shared memory and hands it to the store at the checkpoint,
+/// leaving this process with a cache that would otherwise answer an
+/// older size to its own reads.
+fn note_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) {
+    if let Some(cache) = &shim.cache
+        && cache.load_size((spc, db, rel, fork)).is_none_or(|n| nblocks > n)
+    {
+        cache.save_size((spc, db, rel, fork), nblocks);
+    }
+}
+
 /// Block index of a pg/ object key, parsed from the 8 hex digit tail.
 /// SIZE and anything unparseable return None.
 fn block_index(key: &str) -> Option<u32> {
@@ -1074,6 +1088,11 @@ fn buffer_page(
 /// serializes extension per relation, so the read-modify-write on SIZE
 /// has a single writer.
 ///
+/// With `defer_size` set the caller already holds the new length in
+/// shared memory and will make it durable at the checkpoint, so the
+/// length costs nothing here and the read of the old one is not needed
+/// either.
+///
 /// With `skip_fsync` set the caller owns durability and settles it
 /// later through zou_smgr_sync, so the page only lands in the pending
 /// buffer. Postgres uses this for bulk fills of relfilenodes no other
@@ -1094,6 +1113,7 @@ pub unsafe extern "C" fn zou_smgr_extend(
     blk: u32,
     buf: *const u8,
     skip_fsync: i32,
+    defer_size: i32,
 ) -> i32 {
     if skip_fsync != 0 {
         let rc = with_shim(|shim| {
@@ -1116,15 +1136,21 @@ pub unsafe extern "C" fn zou_smgr_extend(
     if rc != ZOU_OK {
         return rc;
     }
-    with_shim(|shim| match read_size(shim, spc, db, rel, fork) {
-        Ok(size) => {
-            let current = size.unwrap_or(0);
-            if blk + 1 > current && write_size(shim, spc, db, rel, fork, blk + 1).is_err() {
-                return ZOU_ERR_STORE;
-            }
-            ZOU_OK
+    with_shim(|shim| {
+        if defer_size != 0 {
+            note_size(shim, spc, db, rel, fork, blk + 1);
+            return ZOU_OK;
         }
-        Err(()) => ZOU_ERR_STORE,
+        match read_size(shim, spc, db, rel, fork) {
+            Ok(size) => {
+                let current = size.unwrap_or(0);
+                if blk + 1 > current && write_size(shim, spc, db, rel, fork, blk + 1).is_err() {
+                    return ZOU_ERR_STORE;
+                }
+                ZOU_OK
+            }
+            Err(()) => ZOU_ERR_STORE,
+        }
     })
 }
 
@@ -1230,6 +1256,12 @@ pub extern "C" fn zou_smgr_sync(spc: u32, db: u32, rel: u32, fork: u32) -> i32 {
 
 /// Grow the fork by `count` zero pages starting at `blk`. Zero pages are
 /// represented as absent block objects, reads fill zeros.
+///
+/// This is the hot half of every insert into a growing table, and with
+/// `defer_size` set it makes no store call at all: the new length is
+/// already in the shared table the C shim keeps, and the checkpoint
+/// hands it to the store before the redo floor moves past the records
+/// that would rebuild it.
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_smgr_zeroextend(
     spc: u32,
@@ -1238,12 +1270,19 @@ pub extern "C" fn zou_smgr_zeroextend(
     fork: u32,
     blk: u32,
     count: u32,
+    defer_size: i32,
 ) -> i32 {
     with_shim(|shim| {
         let Some(new_size) = blk.checked_add(count) else {
             return ZOU_ERR_BAD_ARGUMENT;
         };
-        match write_size(shim, spc, db, rel, fork, new_size) {
+        let stored = if defer_size != 0 {
+            note_size(shim, spc, db, rel, fork, new_size);
+            Ok(())
+        } else {
+            write_size(shim, spc, db, rel, fork, new_size)
+        };
+        match stored {
             Ok(()) => {
                 // The new blocks are zeros with no pg/ objects and, for
                 // unWALed cases, no records either, so run images of a
@@ -1264,6 +1303,22 @@ pub extern "C" fn zou_smgr_zeroextend(
             }
             Err(()) => ZOU_ERR_STORE,
         }
+    })
+}
+
+/// Make a fork length durable on its own. The checkpoint calls this for
+/// every length an extension left in shared memory and nowhere else.
+#[unsafe(no_mangle)]
+pub extern "C" fn zou_smgr_put_size(
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+    nblocks: u32,
+) -> i32 {
+    with_shim(|shim| match write_size(shim, spc, db, rel, fork, nblocks) {
+        Ok(()) => ZOU_OK,
+        Err(()) => ZOU_ERR_STORE,
     })
 }
 
@@ -2325,7 +2380,7 @@ mod tests {
         for blk in 0u32..3 {
             let page = [blk as u8 + 1; ZOU_PAGE_SIZE];
             assert_eq!(
-                unsafe { zou_smgr_extend(spc, db, rel, fork, blk, page.as_ptr(), 0) },
+                unsafe { zou_smgr_extend(spc, db, rel, fork, blk, page.as_ptr(), 0, 0) },
                 ZOU_OK
             );
         }
@@ -2366,7 +2421,7 @@ mod tests {
         }
 
         // Zero extension: size grows, the new blocks read as zeros.
-        assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 3, 2), ZOU_OK);
+        assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 3, 2, 0), ZOU_OK);
         assert_eq!(
             unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
             ZOU_OK
@@ -2377,6 +2432,32 @@ mod tests {
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0));
+
+        // A deferred extension asks the store for nothing. The length
+        // is in this process and in the shared table the C shim keeps,
+        // the store still holds the length before it, and the
+        // checkpoint's own call is what closes the gap. That gap is the
+        // whole point: it is the store round trip that used to happen
+        // under the relation extension lock.
+        let stored = |shim: &Shim| -> u32 {
+            let (data, _) = shim
+                .store
+                .get(&shim.layout.pg_size(spc, db, rel, fork))
+                .unwrap()
+                .expect("the fork has a size object");
+            u32::from_le_bytes(data.as_slice().try_into().unwrap())
+        };
+        let shim = SHIM.get().unwrap();
+        assert_eq!(stored(shim), 5);
+        assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 5, 3, 1), ZOU_OK);
+        assert_eq!(
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            ZOU_OK
+        );
+        assert_eq!(n, 8, "the deferred length answers this process");
+        assert_eq!(stored(shim), 5, "and has not reached the store");
+        assert_eq!(zou_smgr_put_size(spc, db, rel, fork, 8), ZOU_OK);
+        assert_eq!(stored(shim), 8);
 
         // Truncate drops the tail blocks for real.
         assert_eq!(zou_smgr_truncate(spc, db, rel, fork, 1), ZOU_OK);
@@ -2407,7 +2488,7 @@ mod tests {
         for blk in 0u32..4 {
             let page = [0x40 + blk as u8; ZOU_PAGE_SIZE];
             assert_eq!(
-                unsafe { zou_smgr_extend(spc, db, rel2, fork, blk, page.as_ptr(), 1) },
+                unsafe { zou_smgr_extend(spc, db, rel2, fork, blk, page.as_ptr(), 1, 0) },
                 ZOU_OK
             );
         }
