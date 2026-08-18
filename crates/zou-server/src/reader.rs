@@ -15,6 +15,14 @@
 //! and sleeping on it would be adding latency to the case that can
 //! least afford it.
 //!
+//! Busy, it asks again before it has handed the last batch over, and
+//! the two run together. Asking is a round trip to postgres and handing
+//! over is work in this process, so one after the other spends a cycle
+//! on the sum of two things that were never waiting on each other, and
+//! that cycle is charged to every change twice: once waiting for the
+//! tap to ask at all, and once waiting inside the batch for the rest of
+//! it to be decided.
+//!
 //! No subscribers, no tap. A logical slot pins the write ahead log from
 //! the moment it exists until somebody reads past it, so a slot nobody
 //! is reading is a disk filling up on a database whose owner did
@@ -624,12 +632,19 @@ impl Reader {
         // publication is one warning and one gap rather than ten a
         // second of each.
         let mut told = false;
+        // A batch that has been read and not handed over yet, because
+        // the poll that read it was started before the last one had
+        // been. See `deliver` for why they run together.
+        let mut waiting: Option<Vec<Change>> = None;
         loop {
             if self.changes.listening() == 0 {
                 // The slot goes with the tap, which is the point:
                 // nobody is listening, so nothing should be pinning
                 // this database's write ahead log.
                 tap = None;
+                // And with it whatever it had read and not delivered,
+                // since there is nobody left it was for.
+                waiting = None;
                 told = false;
                 // And the next join waits for the next tap rather than
                 // being answered on the strength of this one.
@@ -657,8 +672,27 @@ impl Reader {
                 },
             };
             tap = Some(open);
+            // The next batch is asked for before the last one has been
+            // handed over, and the two run together. A poll is a round
+            // trip to postgres and the handing over is this process's
+            // own work, so doing them one after the other spends a
+            // cycle on the sum of the two and every change in the next
+            // batch waits behind that. Measured on a node holding a
+            // hundred thousand sockets the round trip was 23 ms of a
+            // 60 ms cycle, and a row that is committed at a random
+            // moment waits about half a cycle before the tap has even
+            // asked for it.
             let polled = Instant::now();
-            let read = match tap.as_mut().expect("a tap").changes(self.most).await {
+            let most = self.most;
+            let got = {
+                let open = tap.as_ref().expect("a tap");
+                let reading = open.read(most);
+                match waiting.take() {
+                    Some(batch) => tokio::join!(reading, self.deliver(open.client(), &batch)).0,
+                    None => reading.await,
+                }
+            };
+            let read = match got {
                 Ok(read) => read,
                 Err(why) => {
                     // The connection went, and with it the slot, so
@@ -681,8 +715,9 @@ impl Reader {
                 continue;
             }
             crate::ops::change_stage("tap", polled.elapsed());
-            let client = tap.as_ref().expect("a tap").client();
-            self.deliver(client, &read).await;
+            let decoded = Instant::now();
+            waiting = Some(tap.as_mut().expect("a tap").decode(&read));
+            crate::ops::change_stage("decode", decoded.elapsed());
             // Straight back round without sleeping: a batch that came
             // back with something in it is a database that may have
             // more, and the cadence is for an idle one.
@@ -690,6 +725,24 @@ impl Reader {
     }
 
     /// Everything one batch is owed, in the order postgres wrote it.
+    ///
+    /// Run alongside the poll for the next batch rather than before it.
+    /// The poll is a round trip to postgres and this is work in this
+    /// process, so nothing in one is waiting on anything in the other,
+    /// and running them one after the other makes a cycle out of the
+    /// sum. That cycle is paid twice by every change: once before the
+    /// tap has asked for it, which is on average half a cycle for a row
+    /// committed at a random moment, and once inside the batch waiting
+    /// for the rest of the batch to be decided.
+    ///
+    /// They share a `client`, which is allowed and has one cost worth
+    /// naming. The connection pipelines, so a query from in here is
+    /// queued behind the poll rather than refused, but it does wait for
+    /// it. The only query in here is a type lookup for a table nobody
+    /// has seen before, which happens once per table per tap and not on
+    /// the path a change normally takes, so what it costs is one batch
+    /// held up by one poll the first time a table changes. The catalog
+    /// and the policy checks go to the pool and are not affected.
     async fn deliver(&mut self, client: &tokio_postgres::Client, batch: &[Change]) {
         // When this batch came back, which is where the half of the
         // delivery latency that is this server's own starts.

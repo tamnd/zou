@@ -186,21 +186,53 @@ impl Tap {
     /// batch on, since the alternative is throwing away the changes
     /// that did decode along with the one that did not.
     pub async fn changes(&mut self, most: i32) -> Result<Vec<Change>, String> {
+        let rows = self.read(most).await?;
+        Ok(self.decode(&rows))
+    }
+
+    /// The messages themselves, undecoded, which is the half of a batch
+    /// that is a round trip to postgres.
+    ///
+    /// Split out from the decoding because only this half is a wait,
+    /// and a caller with something else to do can do it here. It takes
+    /// a shared reference for that reason: the slot is consumed by the
+    /// query and not by this process, so nothing here needs the
+    /// decoder, and a caller holding the tap can start this and go and
+    /// do the work the last batch made for it.
+    ///
+    /// Two calls at once would be two `pg_logical_slot_get_binary_changes`
+    /// on one session, which postgres refuses, and the loop that owns a
+    /// tap does not make them. It is not a thing the type prevents,
+    /// which is worth saying rather than pretending otherwise.
+    pub async fn read(&self, most: i32) -> Result<Vec<tokio_postgres::Row>, String> {
         let limit = (most > 0).then_some(most);
-        let rows = self
-            .client
+        self.client
             .query(
                 "select lsn::text, data from pg_logical_slot_get_binary_changes(\
                  $1::name, null, $2::int, 'proto_version', '1', 'publication_names', $3)",
                 &[&self.slot, &limit, &self.publication],
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())
+    }
+
+    /// What those messages mean, which is the half that is this
+    /// process's own work and cannot be overlapped with anything: the
+    /// decoder carries the relations and the transaction it is in from
+    /// one message to the next, so the messages have to go through it
+    /// in the order postgres wrote them.
+    pub fn decode(&mut self, rows: &[tokio_postgres::Row]) -> Vec<Change> {
         let mut changes = Vec::new();
-        for row in &rows {
+        for row in rows {
             let at: &str = row.get(0);
             let bytes: &[u8] = row.get(1);
-            let lsn = lsn(at)?;
+            let lsn = match lsn(at) {
+                Ok(lsn) => lsn,
+                Err(why) => {
+                    log::warn!("logical decoding at {at}: {why}");
+                    continue;
+                }
+            };
             match self.decoder.message(lsn, bytes) {
                 Ok(Some(change)) => changes.push(change),
                 Ok(None) => {}
@@ -211,7 +243,7 @@ impl Tap {
                 Err(why) => log::warn!("logical decoding at {at}: {why}"),
             }
         }
-        Ok(changes)
+        changes
     }
 
     /// The slot this holds, which is the name in `pg_replication_slots`
