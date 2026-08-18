@@ -488,3 +488,117 @@ fn pool_pages_match_postgres() {
     assert_eq!(psql(by_index), expected_by_index, "index scan differs");
     stop(&datadir);
 }
+
+/// A batch costs the block it asks for, not the block number it asks
+/// for. A worker starts every fork at zero blocks, so a record that
+/// writes a high block went down the extension path, and
+/// ExtendBufferedRelTo zero fills its way up to the block through a
+/// 1 MB buffer pool, storing every block it evicts. The batch below
+/// replays one full page image onto block a billion of a relation the
+/// worker has never heard of: with the fork size declared alongside the
+/// target the record costs the one block it writes, and without it the
+/// worker materializes a billion blocks and the batch dies on its
+/// deadline having eaten the machine's memory on the way. The deadline
+/// is short on purpose so a regression fails fast instead of swapping.
+#[test]
+fn a_record_for_a_high_block_does_not_materialize_the_blocks_below_it() {
+    let Ok(prefix) = std::env::var("ZOU_PG_PREFIX") else {
+        eprintln!("ZOU_PG_PREFIX not set, skipping the redo pool block number test");
+        return;
+    };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let pool = RedoPool::new(RedoPoolConfig {
+        postgres: PathBuf::from(prefix).join("bin").join("postgres"),
+        scratch_root: tmp.path().join("scratch"),
+        workers: 1,
+        batch_timeout: Duration::from_secs(5),
+        batches_per_worker: 8,
+        data_checksums: true,
+    });
+    let far = BlockRef {
+        spc: 1663,
+        db: 5,
+        rel: 16384,
+        fork: 0,
+        blk: 1_000_000_000,
+    };
+    let image = marker_page(0xAB);
+    let record = image_record(far, &image);
+    let lsn = WAL_SEGMENT_SIZE + 0x28;
+    let pages = pool
+        .apply(&RedoRequest {
+            pages: &[],
+            records: &[(lsn, lsn + record.len() as u64 + 8, &record)],
+            gets: &[far],
+        })
+        .expect("a batch for a far block finishes");
+    assert_eq!(pages.len(), 1);
+    // Redo stamps the record's end LSN into the page header, the rest
+    // of the page is the image the record carried.
+    assert_eq!(&pages[0][8..], &image[8..], "the image was restored");
+
+    // The worker is still the same healthy worker afterwards.
+    let near = BlockRef { blk: 0, ..far };
+    let pages = pool
+        .apply(&RedoRequest {
+            pages: &[],
+            records: &[],
+            gets: &[near],
+        })
+        .expect("the worker survives the far block");
+    assert!(
+        pages[0].iter().all(|b| *b == 0),
+        "a block no record explains comes back zeroed"
+    );
+}
+
+/// An empty heap page with a byte pattern where the tuples would go, so
+/// that a restored image is recognizable and postgres still considers
+/// the page well formed.
+fn marker_page(fill: u8) -> Vec<u8> {
+    let mut page = vec![0u8; BLCKSZ];
+    set_u16(&mut page, 12, 24); // pd_lower, just the header
+    set_u16(&mut page, 14, BLCKSZ as u16 / 2); // pd_upper
+    set_u16(&mut page, 16, BLCKSZ as u16); // pd_special
+    set_u16(&mut page, 18, BLCKSZ as u16 | 4); // pd_pagesize_version
+    page[BLCKSZ / 2..].fill(fill);
+    page
+}
+
+/// One XLOG_FPI record carrying a whole page image for a block, the
+/// shape log_newpage writes: no hole, no compression, the image in the
+/// block data region and nothing else in the record. The crc is left at
+/// zero, a redo worker is handed records that the writer already
+/// validated and does not check it again.
+fn image_record(r: BlockRef, image: &[u8]) -> Vec<u8> {
+    const XLOG_FPI: u8 = 0xB0;
+    const BKPBLOCK_HAS_IMAGE: u8 = 0x10;
+    const BKPIMAGE_APPLY: u8 = 0x02;
+    const XLR_BLOCK_ID_DATA_SHORT: u8 = 255;
+    const RECORD_HEADER: usize = 24;
+
+    let mut refs = vec![0u8, r.fork as u8 | BKPBLOCK_HAS_IMAGE];
+    refs.extend_from_slice(&0u16.to_le_bytes()); // data_length
+    refs.extend_from_slice(&(image.len() as u16).to_le_bytes());
+    refs.extend_from_slice(&0u16.to_le_bytes()); // hole_offset
+    refs.push(BKPIMAGE_APPLY);
+    refs.extend_from_slice(&r.spc.to_le_bytes());
+    refs.extend_from_slice(&r.db.to_le_bytes());
+    refs.extend_from_slice(&r.rel.to_le_bytes());
+    refs.extend_from_slice(&r.blk.to_le_bytes());
+    refs.push(XLR_BLOCK_ID_DATA_SHORT);
+    refs.push(0); // main data length
+
+    let tot_len = RECORD_HEADER + refs.len() + image.len();
+    let mut record = Vec::with_capacity(tot_len);
+    record.extend_from_slice(&(tot_len as u32).to_le_bytes()); // xl_tot_len
+    record.extend_from_slice(&7u32.to_le_bytes()); // xl_xid
+    record.extend_from_slice(&0u64.to_le_bytes()); // xl_prev
+    record.push(XLOG_FPI); // xl_info
+    record.push(0); // xl_rmid, the xlog manager
+    record.extend_from_slice(&[0, 0]); // padding
+    record.extend_from_slice(&0u32.to_le_bytes()); // xl_crc
+    record.extend_from_slice(&refs);
+    record.extend_from_slice(image);
+    record
+}
