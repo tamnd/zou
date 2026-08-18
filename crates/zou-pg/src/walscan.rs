@@ -139,9 +139,13 @@ pub fn assemble_window_frames(frames: &[Frame2], from: u64, to: u64) -> WalWindo
 
 /// Why a scan step could not proceed. Truncation means the window ends
 /// inside the current record, which a tolerant caller treats as a clean
-/// stop at the record's start. Corruption always propagates.
+/// stop at the record's start. Aborted means the record the walk was
+/// assembling was never finished by the writer that started it, and the
+/// walk carries on from the page that says so. Corruption always
+/// propagates.
 enum ScanErr {
     Truncated,
+    Aborted,
     Corrupt(String),
 }
 
@@ -166,10 +170,18 @@ impl<'a> Cursor<'a> {
             .ok_or(ScanErr::Truncated)
     }
 
-    /// Skip the page header if the cursor sits on a page boundary.
-    fn skip_page_header(&mut self) -> Result<(), ScanErr> {
+    /// Skip the page header if the cursor sits on a page boundary, and
+    /// say whether the page carried XLP_FIRST_IS_OVERWRITE_CONTRECORD.
+    ///
+    /// Postgres sets that flag on the page it resumes writing on after
+    /// recovery ended inside a record nobody finished, and the first
+    /// record on the page is the overwrite contrecord record itself. So
+    /// at a record boundary the flag says nothing the walk has to act
+    /// on, and mid record it says the record being assembled is the one
+    /// that was abandoned.
+    fn skip_page_header(&mut self) -> Result<bool, ScanErr> {
         if !self.pos.is_multiple_of(XLOG_BLCKSZ) {
-            return Ok(());
+            return Ok(false);
         }
         let header = self.at(self.pos, 4)?;
         let magic = u16::from_le_bytes(header[..2].try_into().expect("checked length"));
@@ -180,20 +192,25 @@ impl<'a> Cursor<'a> {
             )));
         }
         let info = u16::from_le_bytes(header[2..4].try_into().expect("checked length"));
-        if info & 0x0008 != 0 {
-            // XLP_FIRST_IS_OVERWRITE_CONTRECORD only appears when local
-            // WAL diverged from the stream, which reattach via restore
-            // prevents. Refusing beats misparsing.
-            return Err(ScanErr::Corrupt(format!(
-                "overwrite contrecord at {:#X}",
-                self.pos
-            )));
-        }
+        let overwrite = info & 0x0008 != 0;
         self.pos += if self.pos.is_multiple_of(WAL_SEGMENT_SIZE) {
             LONG_PHD
         } else {
             SHORT_PHD
         };
+        Ok(overwrite)
+    }
+
+    /// The page header at a boundary reached inside a record, where the
+    /// overwrite flag means this record was abandoned by the writer that
+    /// started it. Leaves the cursor on the page so the walk can start
+    /// again there.
+    fn skip_page_header_within(&mut self) -> Result<(), ScanErr> {
+        let page = self.pos;
+        if self.skip_page_header()? {
+            self.pos = page;
+            return Err(ScanErr::Aborted);
+        }
         Ok(())
     }
 
@@ -201,7 +218,7 @@ impl<'a> Cursor<'a> {
     fn read(&mut self, len: u64, out: &mut Vec<u8>) -> Result<(), ScanErr> {
         let mut remaining = len;
         while remaining > 0 {
-            self.skip_page_header()?;
+            self.skip_page_header_within()?;
             let run = (XLOG_BLCKSZ - self.pos % XLOG_BLCKSZ).min(remaining);
             out.extend_from_slice(self.at(self.pos, run as usize)?);
             self.pos += run;
@@ -214,7 +231,7 @@ impl<'a> Cursor<'a> {
     fn skip(&mut self, len: u64) -> Result<(), ScanErr> {
         let mut remaining = len;
         while remaining > 0 {
-            self.skip_page_header()?;
+            self.skip_page_header_within()?;
             let run = (XLOG_BLCKSZ - self.pos % XLOG_BLCKSZ).min(remaining);
             if self.pos + run > self.end() {
                 return Err(ScanErr::Truncated);
@@ -424,6 +441,11 @@ fn scan(
             let head = body.min(4096);
             header.clear();
             cursor.read(head, &mut header)?;
+            // Walked to the end of the record before anything it says is
+            // written down, so a record that turns out to have been
+            // abandoned leaves no blocks and no relation events behind.
+            cursor.skip(body - head)?;
+            cursor.pos = (cursor.pos + MAXALIGN - 1) & !(MAXALIGN - 1);
             pairs.clear();
             record_block_refs(
                 &header,
@@ -442,12 +464,14 @@ fn scan(
                 }
             }
             out.refs.extend(pairs.drain(..).map(|(r, _)| r));
-            cursor.skip(body - head)?;
-            cursor.pos = (cursor.pos + MAXALIGN - 1) & !(MAXALIGN - 1);
             Ok(())
         })(&mut cursor);
         match step {
             Ok(()) => out.resume = cursor.pos,
+            // The record was never finished and the page the cursor now
+            // sits on begins the stream again, so nothing it referenced
+            // counts and the walk carries on from there.
+            Err(ScanErr::Aborted) => out.resume = cursor.pos,
             Err(ScanErr::Truncated) if end.is_none() => break,
             Err(ScanErr::Truncated) => {
                 return Err(format!("wal window ends inside record at {rec_start:#X}"));
@@ -562,7 +586,9 @@ impl WalRecord {
         )
         .map_err(|err| match err {
             ScanErr::Corrupt(msg) => msg,
-            ScanErr::Truncated => "record header items overrun".to_string(),
+            // Both of the others need a cursor to happen on and this is
+            // one record's bytes with no stream around them.
+            ScanErr::Truncated | ScanErr::Aborted => "record header items overrun".to_string(),
         })?;
         Ok((refs, image))
     }
@@ -608,7 +634,7 @@ pub fn record_init_refs(bytes: &[u8]) -> Result<Vec<(BlockRef, bool)>, String> {
     )
     .map_err(|err| match err {
         ScanErr::Corrupt(msg) => msg,
-        ScanErr::Truncated => "record header items overrun".to_string(),
+        ScanErr::Truncated | ScanErr::Aborted => "record header items overrun".to_string(),
     })?;
     Ok(refs)
 }
@@ -681,6 +707,10 @@ pub fn read_records(
                     out.records.push(record);
                 }
             }
+            // Half of a record nobody finished. It was never replayed by
+            // the writer either, so it is dropped rather than handed to a
+            // redo worker, and the walk resumes on the page that says so.
+            Err(ScanErr::Aborted) => out.resume = cursor.pos,
             Err(ScanErr::Truncated) if end.is_none() => break,
             Err(ScanErr::Truncated) => {
                 return Err(format!("wal window ends inside record at {rec_start:#X}"));
@@ -702,6 +732,7 @@ pub(crate) mod testwal {
     pub(crate) struct Builder {
         base: u64,
         bytes: Vec<u8>,
+        overwrite_next: bool,
     }
 
     impl Builder {
@@ -709,7 +740,18 @@ pub(crate) mod testwal {
             Self {
                 base,
                 bytes: Vec::new(),
+                overwrite_next: false,
             }
+        }
+
+        /// Cut the stream back to the last page boundary, leaving the
+        /// record in progress half written, and flag the page that
+        /// follows the way postgres flags the one it resumes on.
+        pub(crate) fn abort_at_page_boundary(&mut self) {
+            let keep = (self.pos() / XLOG_BLCKSZ * XLOG_BLCKSZ - self.base) as usize;
+            assert!(keep > 0 && keep < self.bytes.len(), "a record was cut");
+            self.bytes.truncate(keep);
+            self.overwrite_next = true;
         }
 
         pub(crate) fn pos(&self) -> u64 {
@@ -721,9 +763,14 @@ pub(crate) mod testwal {
             for &b in data {
                 if self.pos().is_multiple_of(XLOG_BLCKSZ) {
                     let long = self.pos().is_multiple_of(WAL_SEGMENT_SIZE);
+                    let info = if std::mem::take(&mut self.overwrite_next) {
+                        0x0008u16
+                    } else {
+                        0
+                    };
                     let mut header = Vec::new();
                     header.extend_from_slice(&XLOG_PAGE_MAGIC.to_le_bytes());
-                    header.extend_from_slice(&0u16.to_le_bytes());
+                    header.extend_from_slice(&info.to_le_bytes());
                     header.extend_from_slice(&1u32.to_le_bytes());
                     header.extend_from_slice(&self.pos().to_le_bytes());
                     header.extend_from_slice(&0u32.to_le_bytes());
@@ -896,6 +943,49 @@ mod tests {
         assert_eq!(refs.len(), 6);
         assert_eq!(refs[0], blk(20000, 0));
         assert_eq!(refs[5], blk(20005, 5));
+    }
+
+    /// The freeze behind #463. A node killed mid record leaves the
+    /// stream ending inside one, and the writer that takes over resumes
+    /// on the next page with XLP_FIRST_IS_OVERWRITE_CONTRECORD set. The
+    /// scanner used to call that corruption, which froze the page
+    /// service for the life of the node and failed every read after it.
+    #[test]
+    fn a_record_nobody_finished_is_dropped_and_the_walk_carries_on() {
+        let mut b = Builder::new(WAL_SEGMENT_SIZE);
+        b.record(&[(blk(16384, 1), false)], b"before the kill");
+        let filler = vec![0x42u8; 9000];
+        b.record(&[(blk(16384, 2), false)], &filler);
+        b.abort_at_page_boundary();
+        let resumed = b.pos();
+        b.record(
+            &[(blk(16384, 3), false)],
+            b"the overwrite contrecord record",
+        );
+        let end = b.pos();
+        let window = b.window();
+
+        assert!(
+            resumed.is_multiple_of(XLOG_BLCKSZ),
+            "the writer resumes on a page boundary"
+        );
+        let out = read_records(&window, WAL_SEGMENT_SIZE, Some(end)).unwrap();
+        assert_eq!(out.records.len(), 2, "the half record is not one of them");
+        assert_eq!(out.records[1].lsn, resumed + SHORT_PHD);
+        assert_eq!(out.resume, end);
+
+        let refs = scan_block_refs(&window, WAL_SEGMENT_SIZE, end).unwrap();
+        assert_eq!(
+            refs,
+            vec![blk(16384, 1), blk(16384, 3)],
+            "the block the abandoned record touched is not a block anybody touched"
+        );
+        let faults = scan_faults(&window, WAL_SEGMENT_SIZE).unwrap();
+        assert_eq!(
+            faults.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![blk(16384, 1), blk(16384, 3)],
+            "and warming does not go looking for it either"
+        );
     }
 
     #[test]
