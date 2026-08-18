@@ -38,9 +38,46 @@ on top of a length just lowered or a fork just dropped. Outside a
 postmaster, and when the shared table is full, extensions keep writing
 the length on the spot.
 
+A page a skipFsync extension carries owes its length too. That page
+buffers on the Rust side, so neither it nor the length is in the store
+when the call returns, and recording the length as stored would be a
+lie the cover believes: it finds nothing owed, and a create dropping
+the entry takes the length with it while the drain puts the page.
+
+And a seed is not proof of anything. smgrnblocks answers with the
+length the cluster believes, which the local page cache and the
+pending buffer are both allowed to carry past the SIZE object, so a
+seeded entry starts owed and the first cover or checkpoint that sees
+it writes the length once.
+
+--- a/src/backend/access/transam/xlog.c
++++ b/src/backend/access/transam/xlog.c
+@@ -94,6 +94,7 @@
+ #include "storage/reinit.h"
+ #include "storage/spin.h"
+ #include "storage/sync.h"
++#include "storage/zou_smgr.h"
+ #include "utils/guc_hooks.h"
+ #include "utils/guc_tables.h"
+ #include "utils/injection_point.h"
+@@ -7610,6 +7611,14 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
+ 	CheckpointStats.ckpt_sync_end_t = GetCurrentTimestamp();
+ 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_DONE();
+ 
++	/*
++	 * Relation lengths an extension left in shared memory, part of the
++	 * zou patch series. They go to the store here because this is the
++	 * checkpoint about to move the redo floor past the records replay
++	 * would otherwise use to rebuild them.
++	 */
++	ZouRelSizeFlush();
++
+ 	/* We deliberately delay 2PC checkpointing as long as possible */
+ 	CheckPointTwoPhase(checkPointRedo);
+ }
 --- a/src/backend/storage/smgr/zou_smgr.c
 +++ b/src/backend/storage/smgr/zou_smgr.c
-@@ -58,7 +58,10 @@
+@@ -58,7 +58,10 @@ extern int	zou_smgr_extend(uint32 spc, uint32 db, uint32 rel, uint32 fork,
  							uint32 blk, const uint8 *buf, int32 skip_fsync);
  extern int	zou_smgr_sync(uint32 spc, uint32 db, uint32 rel, uint32 fork);
  extern int	zou_smgr_zeroextend(uint32 spc, uint32 db, uint32 rel,
@@ -52,7 +89,7 @@ the length on the spot.
  extern int	zou_smgr_truncate(uint32 spc, uint32 db, uint32 rel, uint32 fork,
  							  uint32 nblocks);
  extern int	zou_smgr_unlink(uint32 spc, uint32 db, uint32 rel, uint32 fork);
-@@ -109,12 +112,14 @@
+@@ -109,12 +112,14 @@ typedef struct ZouRelSizeEntry
  {
  	ZouRelSizeKey key;
  	BlockNumber nblocks;
@@ -67,9 +104,12 @@ the length on the spot.
  } ZouRelSizeCtl;
  
  #define ZOU_RELSIZE_ENTRIES 4096
-@@ -126,7 +131,8 @@
+@@ -124,9 +129,10 @@ static HTAB *ZouRelSizeHash = NULL;
+ 
+ typedef enum ZouRelSizeMode
  {
- 	ZOU_RELSIZE_SEED,			/* keep an existing entry, fill a miss */
+-	ZOU_RELSIZE_SEED,			/* keep an existing entry, fill a miss */
++	ZOU_RELSIZE_SEED,			/* fill a miss, store unknown */
  	ZOU_RELSIZE_GROW,			/* raise to nblocks, never lower */
 -	ZOU_RELSIZE_SET,			/* overwrite */
 +	ZOU_RELSIZE_SET,			/* overwrite, and the store has it */
@@ -77,7 +117,7 @@ the length on the spot.
  } ZouRelSizeMode;
  
  Size
-@@ -149,6 +155,7 @@
+@@ -149,6 +155,7 @@ ZouRelSizeShmemInit(void)
  	{
  		ZouRelSize->tranche = LWLockNewTrancheId();
  		LWLockInitialize(&ZouRelSize->lock, ZouRelSize->tranche);
@@ -85,7 +125,7 @@ the length on the spot.
  	}
  	LWLockRegisterTranche(ZouRelSize->tranche, "zou_relsize");
  
-@@ -178,16 +185,22 @@
+@@ -178,16 +185,22 @@ zou_relsize_lookup(SMgrRelation reln, ForkNumber forknum, BlockNumber *nblocks)
  	return entry != NULL;
  }
  
@@ -110,7 +150,7 @@ the length on the spot.
  	key.locator = locator;
  	key.forknum = forknum;
  	LWLockAcquire(&ZouRelSize->lock, LW_EXCLUSIVE);
-@@ -195,15 +208,169 @@
+@@ -195,12 +208,200 @@ zou_relsize_note(RelFileLocator locator, ForkNumber forknum,
  	entry = hash_search(ZouRelSizeHash, &key, HASH_ENTER_NULL, &found);
  	if (entry != NULL)
  	{
@@ -124,8 +164,15 @@ the length on the spot.
 +		if (!found || grew || mode == ZOU_RELSIZE_SET)
 +		{
  			entry->nblocks = nblocks;
-+			/* every mode but EXTEND wrote the store before saying so */
-+			if (mode != ZOU_RELSIZE_EXTEND)
++			/*
++			 * Only the two modes that wrote the store may say the store
++			 * has it. A seed may not: smgrnblocks answers with the
++			 * length the cluster believes, which the local page cache
++			 * and the pending buffer can both carry past the SIZE
++			 * object, so a seed that claimed the store had it would put
++			 * a length nothing ever wrote back into circulation.
++			 */
++			if (mode == ZOU_RELSIZE_GROW || mode == ZOU_RELSIZE_SET)
 +				entry->stored = nblocks;
 +		}
 +	}
@@ -212,6 +259,33 @@ the length on the spot.
 +}
 +
 +/*
++ * Put a length now, for a caller that has nowhere to leave it.
++ *
++ * A length ahead of the pages is harmless, a block the store does not
++ * hold reads as zeroes, which is what a hole in a file does too. A
++ * length behind them is the loss all of this is about.
++ */
++static void
++zou_relsize_settle(RelFileLocator locator, ForkNumber forknum,
++				   BlockNumber nblocks)
++{
++	if (ZouRelSizeHash == NULL)
++	{
++		if (zou_smgr_put_size((uint32) locator.spcOid, (uint32) locator.dbOid,
++							  (uint32) locator.relNumber, (uint32) forknum,
++							  (uint32) nblocks) != 0)
++			ereport(ERROR,
++					(errcode_for_file_access(),
++					 errmsg("zou smgr could not store the length of rel %u fork %d",
++							locator.relNumber, forknum)));
++		return;
++	}
++	LWLockAcquire(&ZouRelSize->flushlock, LW_SHARED);
++	zou_relsize_put(locator, forknum, nblocks);
++	LWLockRelease(&ZouRelSize->flushlock);
++}
++
++/*
 + * Make every length an extension left in shared memory durable.
 + *
 + * An extension runs under the relation extension lock, so writing the
@@ -258,14 +332,14 @@ the length on the spot.
 +	pfree(owed);
 +	LWLockRelease(&ZouRelSize->flushlock);
 +	elog(DEBUG1, "zou relsize flushed %d fork lengths", nowed);
- }
- 
++}
++
 +/*
 + * Shut the checkpoint's flush out while a SIZE object is rewritten or
 + * deleted under it. A process with no shared memory has no flush to
 + * shut out.
 + */
- static void
++static void
 +zou_relsize_flush_block(void)
 +{
 +	if (ZouRelSizeHash != NULL)
@@ -277,13 +351,10 @@ the length on the spot.
 +{
 +	if (ZouRelSizeHash != NULL)
 +		LWLockRelease(&ZouRelSize->flushlock);
-+}
-+
-+static void
- zou_relsize_forget(RelFileLocator locator, ForkNumber forknum)
- {
- 	ZouRelSizeKey key = {0};
-@@ -255,12 +422,21 @@
+ }
+ 
+ static void
+@@ -255,12 +456,21 @@ void
  zoucreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
  {
  	/*
@@ -310,7 +381,7 @@ the length on the spot.
  	zou_relsize_forget(reln->smgr_rlocator.locator, forknum);
  	zou_check(zou_smgr_create(ZOU_LOCATOR(reln), (uint32) forknum),
  			  "create", reln, forknum);
-@@ -283,6 +459,8 @@
+@@ -283,6 +493,8 @@ zouunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
  	uint32		db = rlocator.locator.dbOid;
  	uint32		rel = rlocator.locator.relNumber;
  
@@ -319,7 +390,7 @@ the length on the spot.
  	if (forknum == InvalidForkNumber)
  	{
  		for (int fork = 0; fork <= MAX_FORKNUM; fork++)
-@@ -296,6 +474,7 @@
+@@ -296,6 +508,7 @@ zouunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
  		zou_relsize_forget(rlocator.locator, forknum);
  		(void) zou_smgr_unlink(spc, db, rel, (uint32) forknum);
  	}
@@ -327,7 +398,7 @@ the length on the spot.
  	/* like mdunlink, unlink failures are not worth erroring over */
  }
  
-@@ -313,6 +492,30 @@
+@@ -313,27 +526,75 @@ zou_skip_fsync(bool skipFsync)
  	return (skipFsync && IsUnderPostmaster) ? 1 : 0;
  }
  
@@ -354,11 +425,41 @@ the length on the spot.
 + * only move the same store round trip to the cover call the page needs
 + * anyway, and this is not the path the extension lock is contended on:
 + * the buffer manager extends with zeroes and writes the pages after.
++ *
++ * A skipFsync page is the exception. It buffers on the Rust side, so
++ * neither the page nor the length is in the store when this returns, and
++ * saying the store has the length would be a lie a later cover believes:
++ * it would find nothing owed, and a create dropping the entry would take
++ * the length with it while the drain puts the page. So that one is owed
++ * like a zero extension, and if the table cannot hold it there is
++ * nowhere to owe it from and it goes out here.
 + */
  void
  zouextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  		  const void *buffer, bool skipFsync)
-@@ -329,11 +532,17 @@
+ {
++	int			skip = zou_skip_fsync(skipFsync);
++
+ 	zou_check(zou_smgr_extend(ZOU_LOCATOR(reln), (uint32) forknum,
+ 							  (uint32) blocknum, (const uint8 *) buffer,
+-							  zou_skip_fsync(skipFsync)),
++							  skip),
+ 			  "extend", reln, forknum);
+-	zou_relsize_note(reln->smgr_rlocator.locator, forknum,
+-					 blocknum + 1, ZOU_RELSIZE_GROW);
++	if (!skip)
++	{
++		zou_relsize_note(reln->smgr_rlocator.locator, forknum,
++						 blocknum + 1, ZOU_RELSIZE_GROW);
++		return;
++	}
++	if (!zou_relsize_defer(reln->smgr_rlocator.locator, forknum,
++						   blocknum + 1))
++		zou_relsize_settle(reln->smgr_rlocator.locator, forknum,
++						   blocknum + 1);
+ }
+ 
+ void
  zouzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  			  int nblocks, bool skipFsync)
  {
@@ -379,7 +480,7 @@ the length on the spot.
  }
  
  bool
-@@ -491,6 +700,10 @@
+@@ -491,6 +752,10 @@ zouwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  		if (barrier != InvalidXLogRecPtr)
  			ZouWalWaitForLSN(barrier);
  	}
@@ -390,7 +491,19 @@ the length on the spot.
  	zou_check(zou_smgr_writev(ZOU_LOCATOR(reln), (uint32) forknum,
  							  (uint32) blocknum,
  							  (const uint8 *const *) buffers,
-@@ -528,11 +741,14 @@
+@@ -517,7 +782,10 @@ zounblocks(SMgrRelation reln, ForkNumber forknum)
+ 
+ 	/*
+ 	 * Seed, do not overwrite: an extend that landed while we read from
+-	 * the store already knows a newer size than the store told us.
++	 * the store already knows a newer size than the store told us. And
++	 * seed as owed, because this answer is the cluster's length, not the
++	 * store's: the page cache and the pending buffer are both allowed to
++	 * be ahead of the SIZE object.
+ 	 */
+ 	zou_relsize_note(reln->smgr_rlocator.locator, forknum,
+ 					 (BlockNumber) n, ZOU_RELSIZE_SEED);
+@@ -528,11 +796,14 @@ void
  zoutruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks,
  			BlockNumber nblocks)
  {
@@ -405,7 +518,7 @@ the length on the spot.
  }
  
  void
-@@ -540,8 +756,11 @@
+@@ -540,8 +811,11 @@ zouimmedsync(SMgrRelation reln, ForkNumber forknum)
  {
  	/*
  	 * Eager puts are durable before they return, this settles the
@@ -418,7 +531,7 @@ the length on the spot.
  	zou_check(zou_smgr_sync(ZOU_LOCATOR(reln), (uint32) forknum),
  			  "sync", reln, forknum);
  }
-@@ -554,6 +773,7 @@
+@@ -554,6 +828,7 @@ zouregistersync(SMgrRelation reln, ForkNumber forknum)
  	 * defer to, so durability settles here, which still amortizes the
  	 * whole bulk fill into one parallel drain.
  	 */
@@ -428,35 +541,10 @@ the length on the spot.
  }
 --- a/src/include/storage/zou_smgr.h
 +++ b/src/include/storage/zou_smgr.h
-@@ -57,5 +57,6 @@
+@@ -57,5 +57,6 @@ extern int	zoufd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
  
  extern Size ZouRelSizeShmemSize(void);
  extern void ZouRelSizeShmemInit(void);
 +extern void ZouRelSizeFlush(void);
  
  #endif							/* ZOU_SMGR_H */
---- a/src/backend/access/transam/xlog.c
-+++ b/src/backend/access/transam/xlog.c
-@@ -94,6 +94,7 @@
- #include "storage/reinit.h"
- #include "storage/spin.h"
- #include "storage/sync.h"
-+#include "storage/zou_smgr.h"
- #include "utils/guc_hooks.h"
- #include "utils/guc_tables.h"
- #include "utils/injection_point.h"
-@@ -7610,6 +7611,14 @@
- 	CheckpointStats.ckpt_sync_end_t = GetCurrentTimestamp();
- 	TRACE_POSTGRESQL_BUFFER_CHECKPOINT_DONE();
- 
-+	/*
-+	 * Relation lengths an extension left in shared memory, part of the
-+	 * zou patch series. They go to the store here because this is the
-+	 * checkpoint about to move the redo floor past the records replay
-+	 * would otherwise use to rebuild them.
-+	 */
-+	ZouRelSizeFlush();
-+
- 	/* We deliberately delay 2PC checkpointing as long as possible */
- 	CheckPointTwoPhase(checkPointRedo);
- }
