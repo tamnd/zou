@@ -103,6 +103,18 @@ RPO stays zero across all of it.
 The holder that comes back finds its next renewal answered with `Lost`, its uploads sit in an epoch the live manifest never references, and no acked commit is lost.
 Shorten the TTL to shorten the RTO, and read the clock skew bound above before you do, since the two are the same budget.
 
+## Stopping a node
+
+A stop is a Postgres fast shutdown and its order matters: backends first, then background workers, the wal pusher among them, and only then the shutdown checkpoint.
+The pusher leaves in a state that owes nothing, it pushes until insert, flush, pushed and published all agree and asks for a checkpoint to fold before it goes, so the checkpoint that runs after it is writing pages whose WAL the store already holds.
+The checkpointer itself stores no pages while the page service is on, since the eager puts are elided and pages come out of the stream, so it never waits for the pusher that is no longer there.
+That is what keeps a stop from hanging, and before zou #468 it did hang: the checkpointer waited inside the shutdown checkpoint for a durable LSN only the departed pusher could publish, `pg_ctl stop` gave up, and the cluster state stayed "shutting down".
+
+With the page service off the checkpointer does store its own pages and does owe the barrier, so a stop in that mode depends on the pusher having drained.
+If it has not, a waiter gives up ten seconds after the pusher's exit with `zou wal has no pusher to make X/X durable`, the postmaster exits, and the next start replays its WAL tail.
+That is a refusal rather than a failure to try: the store never received the WAL for those pages, and storing them anyway would leave the store holding a page that carries the effects of records it has never seen.
+The same message from a committing backend is a PANIC, which is the answer Postgres gives to any WAL write it cannot make durable, and the restart that follows brings up a fresh pusher.
+
 ## Write forwarding
 
 Any node in a fleet answers for any tenant, but only the lease holder writes one, so a node that is asked for a tenant it does not hold sends the request to the node that does.
