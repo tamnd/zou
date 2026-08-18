@@ -306,6 +306,12 @@ Off is worth keeping reachable, it is how the two paths get compared, and a comp
 The spellings are `1 0 true false on off yes no` in any case, and anything else is refused at startup rather than read as off, because a value nobody can parse is a mistake and answering it with the slow path is how a month of runs measured the wrong path.
 initdb runs with it off in every command that runs one, since bootstrap is a standalone process with no service to talk to, and the redo workers never see it because they run with no store attached at all.
 
+Off is only reachable on a store that has never had it on, and a node asked to do otherwise refuses to start rather than lets you find out later.
+The service elides the eager put per page write, so the objects under `pg/` hold whatever they held when the first such session opened while the checkpoints keep advancing on the layers above them, and the manifest records that point as `pages_elided_from`.
+Reading those objects again puts recovery at a redo location far past the pages it is applying records to: a heap record lands on a page whose line pointers it does not describe and the postmaster dies with `PANIC: invalid lp`, and a store that was shut down cleanly instead comes up serving a catalog from before that point, where a table created after it does not exist.
+So a postmaster with the service off over a store carrying the mark stops before recovery with `zou store has no page objects past X/X to read`, naming that point and the newest capture taken since, and `zou dev --page-service off` says the same thing before it restores anything.
+Comparing the two paths therefore needs a store that has only ever run with the service off, which is one initdb away and is how every number above was taken.
+
 The service polls the store for the tenant's stream every 100 ms while anything is arriving, and a poll is a shard manifest and a round index whether or not anything was written.
 A project nobody is connected to therefore used to read the store about 21 times a second forever, 1883 gets in ninety seconds of an idle node, which on S3 is a bill and a rate limit for a node that is doing nothing.
 The gap now doubles towards two seconds once the stream stops moving, so the same ninety seconds cost 243, and a frame arriving or a reader waiting on an lsn puts it straight back to 100 ms.

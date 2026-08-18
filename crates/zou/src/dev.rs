@@ -554,16 +554,29 @@ pub fn run(args: &Args) -> Result<(), String> {
 
     let store: Arc<dyn CasStore> = Arc::from(open_store(&args.target)?);
     let layout = TenantLayout::new(&args.tenant);
-    let fresh = match store
+    let manifest = match store
         .get(&layout.manifest())
         .map_err(|e| format!("store: {e}"))?
     {
-        None => true,
-        Some((data, _)) => Manifest::from_json(&data)
-            .map_err(|e| format!("manifest: {e}"))?
-            .checkpoints
-            .is_empty(),
+        None => None,
+        Some((data, _)) => Some(Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?),
     };
+    let fresh = manifest.as_ref().is_none_or(|m| m.checkpoints.is_empty());
+    // `--page-service off` reads pages as objects under pg/, and a
+    // store a page service session has run on stopped writing those
+    // (zou #462). The postmaster refuses this too, this is only so that
+    // the answer arrives before a restore rather than three failed
+    // starts later.
+    if args.page_service == Some(false)
+        && let Some((elided, captured)) = manifest.as_ref().and_then(Manifest::pages_left_behind)
+    {
+        return Err(format!(
+            "{} ran with the page service on from {elided} and has captured through {captured}, \
+             so it has no page objects past {elided} to read. Leave the page service on here, \
+             and compare the two paths on a store that has only ever run with it off.",
+            args.target
+        ));
+    }
     // An empty `local` is a store nobody has used yet and initdb is
     // what it is waiting for. An empty anything else is a ref that was
     // named and does not exist, which is a typo far more often than it

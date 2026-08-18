@@ -1,0 +1,89 @@
+Refuse the object read path on a store the page service has run on.
+
+With the page service on the crate elides the eager put per page write,
+because the layers answer reads and writing an 8 KB object per page write
+is the thing the storage layer exists to stop doing. The objects under
+pg/ then hold whatever they held when that session opened, while the
+checkpoints keep advancing on the layers above them.
+
+Start the same store with the service off and the read path goes back to
+those objects. Recovery begins at a redo location far past the pages it
+is applying records to, and a heap record lands on a page whose line
+pointers it does not describe: three postmasters in a row died with
+PANIC: invalid lp, and then the node gave up (zou #462). A clean
+shutdown makes it quieter and no better, since recovery has nothing to
+replay and the node comes up serving a catalog from before the flag day,
+where a table created after it does not exist.
+
+The crate marks the point in the manifest the first time a store opens
+with the service on and decides whether a capture has been taken since,
+which is what makes it a refusal rather than a state to discover. This
+side only has to ask before recovery instead of during it, so the
+postmaster puts the question at the one place it already asks whether
+the service is on at all, and answers a yes with a FATAL that names both
+LSNs and says what a comparison of the two paths needs instead.
+
+A store nobody can read at all answers neither yes nor no and is left
+alone: the open right after this has the real error for it.
+
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -56,6 +56,7 @@
+ extern int	zou_pagesvc_start(const char *target, int data_checksums);
+ extern int	zou_pagesvc_stop(void);
+ extern int	zou_pageserve_on(void);
++extern int	zou_pages_left_behind(uint64 *elided, uint64 *captured);
+ 
+ #define ZOU_ERR_LEASE_HELD (-5)
+ #define ZOU_ERR_THROTTLED (-7)
+@@ -130,6 +131,42 @@
+ 		ZouWalShmem->pusher_latch = NULL;
+ 		ZouWalShmem->pusher_pid = 0;
+ 	}
++}
++
++/*
++ * Refuse to start on the object read path over a store whose page
++ * objects a page service session has left behind.
++ *
++ * With the service on the eager put per page write is elided, because
++ * the layers answer reads and writing an 8 KB object per page write is
++ * the thing the storage layer exists to stop doing. The objects under
++ * pg/ then hold whatever they held when that session opened, while the
++ * checkpoints keep advancing on top of the layers. Reading them again
++ * with the service off puts recovery at a redo location far past the
++ * pages it is applying records to, and the first heap record to land on
++ * a page whose line pointers it does not describe brings the postmaster
++ * down with "invalid lp" (zou #462).
++ *
++ * The crate carries the mark in the manifest and decides, this only has
++ * to say so before recovery rather than during it. A store nobody can
++ * read answers neither yes nor no and is left to the open below, which
++ * has the real error for it.
++ */
++static void
++zou_check_pages_are_ours(void)
++{
++	uint64		elided = 0;
++	uint64		captured = 0;
++
++	if (zou_pages_left_behind(&elided, &captured) != 1)
++		return;
++
++	ereport(FATAL,
++			(errmsg("zou store has no page objects past %X/%X to read",
++					LSN_FORMAT_ARGS(elided)),
++			 errdetail("The store ran with the page service on from %X/%X, which stops writing a page object per page write, and it has captured through %X/%X since. Starting with the service off would replay wal onto pages that stopped moving at the earlier point.",
++					   LSN_FORMAT_ARGS(elided), LSN_FORMAT_ARGS(captured)),
++			 errhint("Start this store with the page service on. Comparing the two read paths needs a store that has only ever run with it off.")));
+ }
+ 
+ void
+@@ -178,6 +215,7 @@
+ 	switch (zou_pageserve_on())
+ 	{
+ 		case 0:
++			zou_check_pages_are_ours();
+ 			return;
+ 		case 1:
+ 			break;

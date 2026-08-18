@@ -49,6 +49,15 @@ pub struct Manifest {
     /// fold. Frames of the shared log at or below this never need replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub folded_upto: Option<Lsn>,
+    /// Pg lsn from which page writes stopped landing under `pg/` as an
+    /// object apiece. Set the first time this store opens with the page
+    /// service on, which is what elides those writes, and never cleared:
+    /// a later session with the service off writes the pages it dirties
+    /// and no others, so the ones left behind stay behind. Absent means
+    /// every page write this store has seen reached `pg/`, which is the
+    /// only state the object read path can be trusted in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages_elided_from: Option<Lsn>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch_of: Option<BranchOf>,
     /// Page shard count, a power of two (spec 04 section 1). One until
@@ -164,11 +173,45 @@ impl Manifest {
             },
             checkpoints: Vec::new(),
             folded_upto: None,
+            pages_elided_from: None,
             branch_of: None,
             shards: 1,
             shard_history: Vec::new(),
             published_unix: None,
         }
+    }
+
+    /// The newest point this store has captured, the redo a restore
+    /// hands recovery. The chain and the fold watermark are written by
+    /// the same publish and agree, the max only covers a manifest that
+    /// carries one and not the other.
+    pub fn captured_upto(&self) -> Option<Lsn> {
+        let newest = self.checkpoints.last().map(|c| c.lsn);
+        match (newest, self.folded_upto) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (some, None) | (None, some) => some,
+        }
+    }
+
+    /// Whether the pages under `pg/` have been left behind by a session
+    /// that ran with the page service on, far enough that reading them
+    /// is wrong. `Some((elided, captured))` names the point they froze
+    /// and the newest checkpoint, and is a refusal.
+    ///
+    /// A checkpoint promises every page dirtied before it is durable,
+    /// and recovery starts at its redo on the strength of that promise.
+    /// A checkpoint that completed while the eager puts were elided
+    /// made that promise about objects nobody wrote, so recovery from
+    /// it applies wal to pages that stopped moving earlier, which is
+    /// how a heap record lands on a page whose line pointers it does
+    /// not describe. A checkpoint from before the freeze is honest and
+    /// replaying from it repairs everything the elision skipped, so the
+    /// comparison is against where the capture ends, not merely whether
+    /// the service was ever on.
+    pub fn pages_left_behind(&self) -> Option<(Lsn, Lsn)> {
+        let elided = self.pages_elided_from?;
+        let captured = self.captured_upto()?;
+        (captured > elided).then_some((elided, captured))
     }
 
     pub fn to_json(&self) -> Vec<u8> {
@@ -235,6 +278,7 @@ mod tests {
                 },
             ],
             folded_upto: Some("0/8B000000".parse().unwrap()),
+            pages_elided_from: None,
             branch_of: None,
             shards: 1,
             shard_history: Vec::new(),
@@ -336,6 +380,31 @@ mod tests {
         }"#;
         let err = Manifest::from_json(json.as_bytes()).unwrap_err();
         assert!(matches!(err, ManifestError::V1WalTail));
+    }
+
+    #[test]
+    fn a_store_that_never_ran_with_the_page_service_serves_its_pages() {
+        assert_eq!(sample().pages_left_behind(), None);
+    }
+
+    #[test]
+    fn a_capture_taken_after_the_pages_froze_is_a_refusal() {
+        let mut m = sample();
+        m.pages_elided_from = Some("0/8A300000".parse().unwrap());
+        let (elided, captured) = m.pages_left_behind().expect("a refusal");
+        assert_eq!(elided, "0/8A300000".parse().unwrap());
+        assert_eq!(captured, "0/8B000000".parse().unwrap());
+    }
+
+    #[test]
+    fn a_capture_from_before_the_pages_froze_is_still_honest() {
+        // Recovery would start at the checkpoint, which is older than
+        // anything the elision skipped, and replay every one of them.
+        let mut m = sample();
+        m.pages_elided_from = Some("0/8B000000".parse().unwrap());
+        assert_eq!(m.pages_left_behind(), None);
+        m.pages_elided_from = Some("0/8C000000".parse().unwrap());
+        assert_eq!(m.pages_left_behind(), None);
     }
 
     #[test]
