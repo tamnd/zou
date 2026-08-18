@@ -27,6 +27,9 @@ They grow with different things: the selection with the subscribers on a table a
 The first three are one observation apiece per batch, so they are shares of the reader's cycle and add up to it, and the tap is only counted on a poll that came back with something, since an idle reader asks every hundred milliseconds and is told there is nothing.
 The socket stage is counted per delivery instead, because it is the only one that happens once per socket rather than once for all of them, and away from the holder it carries the link crossing as well, since everything after the holder decided a row is what the stage is asking about.
 
+These three do not share the bucket edges the request path uses, since a request that took five minutes has been given up on and a change on a node holding a hundred thousand sockets has not.
+They run from a tenth of a millisecond to five minutes, five edges to the decade between a millisecond and ten seconds, so a quantile off the fan out is at worst two thirds high rather than double, and a p99 in the hundreds of milliseconds is a number rather than the nearest round edge.
+
 `zou_realtime_sockets` and `zou_realtime_subscribers` are what a socket tier is sized on: how many sockets this node is holding, and how many of them asked for database changes.
 Two numbers rather than one because they cost different things: a socket is a connection, a task and whatever the client has not read yet, and a subscriber is that plus a place in the change reader and a policy check per row that matches it.
 On a fleet they do not add up to one machine's, and that is the honest shape rather than a rounding: a socket served away from the node holding its project is a socket there and a subscriber on the holder, because the row it may see is decided where the database is.
