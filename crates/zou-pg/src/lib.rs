@@ -511,6 +511,25 @@ fn read_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Result<Opti
     }
 }
 
+/// The fork size the store actually holds, cache bypassed.
+///
+/// `read_size` answers what the cluster believes, which since the
+/// deferred extension can be newer than the store: an extension leaves
+/// its length in shared memory and in this cache and hands it to the
+/// checkpoint. A caller deciding whether a page it is about to put is
+/// covered by the durable length has to ask the store itself, or it
+/// skips a SIZE write on the strength of a length only memory has.
+fn read_size_store(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Result<u32, ()> {
+    match shim.store.get(&shim.layout.pg_size(spc, db, rel, fork)) {
+        Ok(Some((data, _))) => {
+            let bytes: [u8; 4] = data.as_slice().try_into().map_err(|_| ())?;
+            Ok(u32::from_le_bytes(bytes))
+        }
+        Ok(None) => Ok(0),
+        Err(_) => Err(()),
+    }
+}
+
 /// The fork size for the read side: the tenant's own SIZE object when
 /// one exists, an own extend, truncate, or create always writes it
 /// eagerly, and otherwise the chain's folded sizes, but only on a
@@ -548,17 +567,49 @@ fn read_size_chained(
     })
 }
 
-fn write_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> Result<(), ()> {
+/// The SIZE object alone, no local copy. Callers that only need the
+/// store's length to cover a page they are putting use this and raise
+/// the local size themselves, so a length shared memory holds is not
+/// lowered to the one this call happens to write.
+fn put_size_object(
+    shim: &Shim,
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+    nblocks: u32,
+) -> Result<(), ()> {
     let key = shim.layout.pg_size(spc, db, rel, fork);
     shim.store
         .put(&key, &nblocks.to_le_bytes())
-        .map_err(|_| ())?;
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+fn write_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> Result<(), ()> {
+    put_size_object(shim, spc, db, rel, fork, nblocks)?;
     // Local copy only after the store accepted, so a cached size is
     // never newer than the durable one.
     if let Some(cache) = &shim.cache {
         cache.save_size((spc, db, rel, fork), nblocks);
     }
     Ok(())
+}
+
+/// Remember a grown fork size in this process without a store call.
+///
+/// The deferred half of an extension: the C shim holds the cluster's
+/// answer in shared memory and hands it to the store at the checkpoint,
+/// leaving this process with a cache that would otherwise answer an
+/// older size to its own reads.
+fn note_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) {
+    if let Some(cache) = &shim.cache
+        && cache
+            .load_size((spc, db, rel, fork))
+            .is_none_or(|n| nblocks > n)
+    {
+        cache.save_size((spc, db, rel, fork), nblocks);
+    }
 }
 
 /// Block index of a pg/ object key, parsed from the 8 hex digit tail.
@@ -1074,6 +1125,10 @@ fn buffer_page(
 /// serializes extension per relation, so the read-modify-write on SIZE
 /// has a single writer.
 ///
+/// The length stays eager here even though a zero extension defers
+/// its own: this call carries a page, and a page in the store with no
+/// length past it is invisible to an attach.
+///
 /// With `skip_fsync` set the caller owns durability and settles it
 /// later through zou_smgr_sync, so the page only lands in the pending
 /// buffer. Postgres uses this for bulk fills of relfilenodes no other
@@ -1116,12 +1171,16 @@ pub unsafe extern "C" fn zou_smgr_extend(
     if rc != ZOU_OK {
         return rc;
     }
-    with_shim(|shim| match read_size(shim, spc, db, rel, fork) {
-        Ok(size) => {
-            let current = size.unwrap_or(0);
-            if blk + 1 > current && write_size(shim, spc, db, rel, fork, blk + 1).is_err() {
+    // The store's own copy, not the cached one: the page above is in
+    // the store now, and a length only shared memory holds would leave
+    // it past the end of the fork for anything attaching from the
+    // store alone.
+    with_shim(|shim| match read_size_store(shim, spc, db, rel, fork) {
+        Ok(current) => {
+            if blk + 1 > current && put_size_object(shim, spc, db, rel, fork, blk + 1).is_err() {
                 return ZOU_ERR_STORE;
             }
+            note_size(shim, spc, db, rel, fork, blk + 1);
             ZOU_OK
         }
         Err(()) => ZOU_ERR_STORE,
@@ -1230,6 +1289,12 @@ pub extern "C" fn zou_smgr_sync(spc: u32, db: u32, rel: u32, fork: u32) -> i32 {
 
 /// Grow the fork by `count` zero pages starting at `blk`. Zero pages are
 /// represented as absent block objects, reads fill zeros.
+///
+/// This is the hot half of every insert into a growing table, and with
+/// `defer_size` set it makes no store call at all: the new length is
+/// already in the shared table the C shim keeps, and the checkpoint
+/// hands it to the store before the redo floor moves past the records
+/// that would rebuild it.
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_smgr_zeroextend(
     spc: u32,
@@ -1238,12 +1303,19 @@ pub extern "C" fn zou_smgr_zeroextend(
     fork: u32,
     blk: u32,
     count: u32,
+    defer_size: i32,
 ) -> i32 {
     with_shim(|shim| {
         let Some(new_size) = blk.checked_add(count) else {
             return ZOU_ERR_BAD_ARGUMENT;
         };
-        match write_size(shim, spc, db, rel, fork, new_size) {
+        let stored = if defer_size != 0 {
+            note_size(shim, spc, db, rel, fork, new_size);
+            Ok(())
+        } else {
+            write_size(shim, spc, db, rel, fork, new_size)
+        };
+        match stored {
             Ok(()) => {
                 // The new blocks are zeros with no pg/ objects and, for
                 // unWALed cases, no records either, so run images of a
@@ -1264,6 +1336,16 @@ pub extern "C" fn zou_smgr_zeroextend(
             }
             Err(()) => ZOU_ERR_STORE,
         }
+    })
+}
+
+/// Make a fork length durable on its own. The checkpoint calls this for
+/// every length an extension left in shared memory and nowhere else.
+#[unsafe(no_mangle)]
+pub extern "C" fn zou_smgr_put_size(spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> i32 {
+    with_shim(|shim| match write_size(shim, spc, db, rel, fork, nblocks) {
+        Ok(()) => ZOU_OK,
+        Err(()) => ZOU_ERR_STORE,
     })
 }
 
@@ -2366,7 +2448,7 @@ mod tests {
         }
 
         // Zero extension: size grows, the new blocks read as zeros.
-        assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 3, 2), ZOU_OK);
+        assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 3, 2, 0), ZOU_OK);
         assert_eq!(
             unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
             ZOU_OK
@@ -2377,6 +2459,52 @@ mod tests {
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0));
+
+        // A deferred extension asks the store for nothing. The length
+        // is in this process and in the shared table the C shim keeps,
+        // the store still holds the length before it, and the
+        // checkpoint's own call is what closes the gap. That gap is the
+        // whole point: it is the store round trip that used to happen
+        // under the relation extension lock.
+        let stored = |shim: &Shim| -> u32 {
+            let (data, _) = shim
+                .store
+                .get(&shim.layout.pg_size(spc, db, rel, fork))
+                .unwrap()
+                .expect("the fork has a size object");
+            u32::from_le_bytes(data.as_slice().try_into().unwrap())
+        };
+        let shim = SHIM.get().unwrap();
+        assert_eq!(stored(shim), 5);
+        assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 5, 3, 1), ZOU_OK);
+        assert_eq!(
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            ZOU_OK
+        );
+        assert_eq!(n, 8, "the deferred length answers this process");
+        assert_eq!(stored(shim), 5, "and has not reached the store");
+        assert_eq!(zou_smgr_put_size(spc, db, rel, fork, 8), ZOU_OK);
+        assert_eq!(stored(shim), 8);
+
+        // A page put while a deferred length is outstanding settles the
+        // store's length past that page even though this process
+        // believes a longer one. Trusting the local belief here is how
+        // a page object ends up past the SIZE naming it, which an
+        // attach reads as a shorter fork with the page unreachable.
+        assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 8, 2, 1), ZOU_OK);
+        assert_eq!(stored(shim), 8, "the deferred length is still owed");
+        let page = [0x5A; ZOU_PAGE_SIZE];
+        assert_eq!(
+            unsafe { zou_smgr_extend(spc, db, rel, fork, 8, page.as_ptr(), 0) },
+            ZOU_OK
+        );
+        assert_eq!(stored(shim), 9, "the page it just put is inside the fork");
+        assert_eq!(
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            ZOU_OK
+        );
+        assert_eq!(n, 10, "and the deferred length still answers this process");
+        assert_eq!(zou_smgr_put_size(spc, db, rel, fork, 10), ZOU_OK);
 
         // Truncate drops the tail blocks for real.
         assert_eq!(zou_smgr_truncate(spc, db, rel, fork, 1), ZOU_OK);
