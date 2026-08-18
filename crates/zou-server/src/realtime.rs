@@ -456,8 +456,9 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
                 data,
                 commit_ts,
                 read,
+                queued,
             })) => {
-                delivered = Some((commit_ts, read));
+                delivered = Some((commit_ts, read, queued));
                 session.changed(&ids, &data)
             }
             // The same news as a lagging topic and for the same reason:
@@ -486,8 +487,13 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
         {
             break;
         }
-        if let Some((commit_ts, read)) = delivered {
+        if let Some((commit_ts, read, queued)) = delivered {
             ops::change_delivered(commit_ts, read);
+            // The last of the four stages, and the only one counted per
+            // delivery rather than per batch, because it is the only one
+            // that happens once per socket: this task waiting its turn
+            // and writing the frame.
+            ops::change_stage("socket", queued.elapsed());
         }
     }
     // Every subscription this socket held, out of the index the reader

@@ -27,7 +27,7 @@
 //! twice would mean counting the ones this process can see and missing
 //! the rest.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -499,6 +499,48 @@ pub fn change_delivered(commit_ts: i64, read: Instant) {
         .since(read);
 }
 
+/// Where a change spent its time, in the four parts it passes through.
+///
+/// `zou_realtime_change_seconds` says how long a change took inside
+/// this server, which is the number to look at first and the one that
+/// says nothing at all about what to do next. A change that took forty
+/// milliseconds took it in one of four quite different places, and they
+/// are fixed by four quite different things.
+///
+/// The tap is the round trip to postgres for the next batch, so it is
+/// the database and the network between here and it. The selection is
+/// asking who wanted each change and what each of them may see of it,
+/// which is a matcher, a catalog and a policy check, and it is the part
+/// that grows with the subscribers on a table. The sending is the
+/// reader handing each finished payload to a queue, which grows with
+/// the sockets owed a row. The socket is what happens after that, which
+/// is one task waiting its turn and writing a frame, and it grows with
+/// how many tasks this node is running rather than with anything about
+/// the change.
+///
+/// The first three are one observation apiece per batch, so they add up
+/// to the reader's cycle and can be compared as shares of it. Per
+/// change they would not, because the tap is one poll for up to a
+/// thousand messages, and the count would be the changes rather than
+/// the polls. The socket stage is per delivery, because it is the only
+/// one that happens once per socket rather than once for all of them,
+/// and that difference in what is being counted is the point of it.
+///
+/// The tap is only counted on a poll that came back with something. An
+/// idle reader asks every hundred milliseconds and is told there is
+/// nothing, and averaging those in would say the tap is fast when what
+/// it is is unused.
+pub fn change_stage(stage: &'static str, took: Duration) {
+    registry()
+        .histogram(
+            "zou_realtime_stage_seconds",
+            "where one batch of database changes spent its time",
+            SECONDS,
+            &[("stage", stage)],
+        )
+        .observe(took.as_secs_f64());
+}
+
 /// How many realtime sockets this node is holding right now, and how
 /// many of them asked for database changes.
 ///
@@ -678,6 +720,36 @@ mod tests {
             (0.2..1.0).contains(&sum),
             "the quarter second is in it and the clock that is an hour ahead is a zero, {sum}"
         );
+    }
+
+    /// The four stages are one family with a label rather than four
+    /// names, because the question they answer is which share of a
+    /// change went where, and shares of one thing have to be summable.
+    #[tokio::test]
+    async fn a_change_says_which_of_the_four_stages_it_spent_its_time_in() {
+        change_stage("tap", Duration::from_millis(4));
+        change_stage("select", Duration::from_millis(30));
+        change_stage("send", Duration::from_millis(6));
+        change_stage("socket", Duration::from_millis(11));
+        let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
+        assert!(
+            body.contains("# TYPE zou_realtime_stage_seconds histogram\n"),
+            "{body}"
+        );
+        let sum = |stage: &str| {
+            body.lines()
+                .find_map(|line| {
+                    line.strip_prefix(&format!(
+                        "zou_realtime_stage_seconds_sum{{stage=\"{stage}\"}} "
+                    ))
+                })
+                .and_then(|n| n.parse::<f64>().ok())
+                .expect("a sum")
+        };
+        assert!((0.004..0.02).contains(&sum("tap")), "{body}");
+        assert!((0.030..0.05).contains(&sum("select")), "{body}");
+        assert!((0.006..0.02).contains(&sum("send")), "{body}");
+        assert!((0.011..0.03).contains(&sum("socket")), "{body}");
     }
 
     /// The two numbers a socket tier is sized on. A gauge that only
