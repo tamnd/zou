@@ -1,0 +1,189 @@
+Do not wait on a wal pusher that has already gone.
+
+A node with a dirty buffer could hang forever on shutdown. The postmaster
+stops every background worker before the checkpointer runs the shutdown
+checkpoint, the wal pusher is a background worker, and the checkpointer's
+write of a dirty buffer called ZouWalWaitForLSN. So the last process with
+work to do waited for a durable LSN that the only process able to publish
+one had already left the building, and the postmaster sat there with
+nothing alive to finish it (zou #468).
+
+Two halves, because either alone leaves a way to hang.
+
+The wait was owed to the page object the write was about to store, so
+that a page never reaches the store ahead of the WAL that produced it.
+With the page service on, which is the default, a checkpointer write
+stores no page at all: the crate elides the eager put because pages past
+the checkpoint chain are reconstructed from the stream instead. A barrier
+for an object nobody writes is a wait for nothing, so zouwritev now asks
+the crate the same question the crate asks itself and skips it. The
+answer comes from zou_pageserve_on rather than from getenv here so that
+the shim and the shim's caller cannot disagree about it.
+
+The other half is that no wait should be infinite when the thing that
+ends it cannot happen. The pusher publishes its pid in shared memory when
+it starts mirroring and clears it on the way out, and a waiter that finds
+a pusher that has been and gone gives up with an error after ten seconds
+instead of sleeping forever. The grace period is there because the
+postmaster restarts a pusher that died immediately, and a write should
+sit through that rather than fail over it. The sleep becomes a timed one
+so the check gets a chance to run.
+
+The error ends differently for the two callers, and both endings are the
+right one. A page write fails, which is the point of the barrier: a page
+whose WAL never reached the store must not reach it either. A committing
+backend is inside the delayChkpt critical section, so the error is
+promoted to PANIC and the cluster restarts, which is what Postgres does
+when a WAL write fails, and the restart brings up a fresh pusher rather
+than leaving a node that can neither commit nor stop. It happens before
+TransactionIdCommitTree, so no committed xid is ever aborted.
+
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -82,8 +82,26 @@
+ 	 * restart is harmless, latch waits are loop guarded.
+ 	 */
+ 	Latch	   *pusher_latch;
++
++	/*
++	 * The running pusher's pid, 0 when none is running. Set once the
++	 * pusher is mirroring and cleared on its way out, so a waiter can
++	 * tell a durable LSN that is late from one that is never coming.
++	 * Written by the pusher only, read without a lock: a torn read is
++	 * not possible for a pid sized word and a stale one costs a waiter
++	 * one more second of patience.
++	 */
++	pid_t		pusher_pid;
+ } ZouWalShmemStruct;
+ 
++/*
++ * How long a waiter tolerates having no pusher before it gives up on a
++ * durable LSN. Long enough to cover the restart of a pusher that died,
++ * which the postmaster does immediately, short enough that a shutdown
++ * with nobody left to push does not look like a hang.
++ */
++#define ZOU_WAL_NO_PUSHER_SECS 10
++
+ static ZouWalShmemStruct *ZouWalShmem;
+ 
+ bool
+@@ -110,6 +128,7 @@
+ 		pg_atomic_init_u64(&ZouWalShmem->durable_lsn, 0);
+ 		ConditionVariableInit(&ZouWalShmem->durable_cv);
+ 		ZouWalShmem->pusher_latch = NULL;
++		ZouWalShmem->pusher_pid = 0;
+ 	}
+ }
+ 
+@@ -249,6 +268,13 @@
+ static void
+ zou_wal_on_exit(int code, Datum arg)
+ {
++	/*
++	 * Say so before the store goes, and wake everyone waiting on a
++	 * durable LSN. Nothing publishes one after this, so a waiter that
++	 * sleeps through the exit is a waiter that never wakes.
++	 */
++	ZouWalShmem->pusher_pid = 0;
++	ConditionVariableBroadcast(&ZouWalShmem->durable_cv);
+ 	(void) zou_wal_close();
+ }
+ 
+@@ -449,6 +475,7 @@
+ 
+ 	/* Let committing backends wake us the moment they have flushed. */
+ 	ZouWalShmem->pusher_latch = MyLatch;
++	ZouWalShmem->pusher_pid = MyProcPid;
+ 
+ 	/*
+ 	 * Folding starts from the checkpoint already completed at startup, the
+@@ -709,6 +736,8 @@
+ void
+ ZouWalWaitForLSN(XLogRecPtr lsn)
+ {
++	TimestampTz gone_since = 0;
++
+ 	if (!IsUnderPostmaster || ZouWalShmem == NULL || !ZouWalActive())
+ 		return;
+ 
+@@ -736,9 +765,49 @@
+ 	if (ZouWalShmem->pusher_latch != NULL)
+ 		SetLatch(ZouWalShmem->pusher_latch);
+ 
++	/*
++	 * A wait that nothing can satisfy has to end. The pusher is the only
++	 * process that publishes a durable LSN, so once it has been and gone
++	 * this sleep is forever, which is what a node looks like when it
++	 * hangs on shutdown with a dirty buffer to flush (zou #468). The
++	 * grace period is there because the postmaster restarts a pusher that
++	 * died immediately, and a waiter should sit through that rather than
++	 * fail a write over it.
++	 *
++	 * The two callers get two different endings out of this ERROR, and
++	 * both are wanted. A page write fails, which is the point: a page
++	 * whose WAL never reached the store must not reach it either. A
++	 * committing backend is inside the delayChkpt critical section, so
++	 * the ERROR is promoted to PANIC and the cluster restarts, which is
++	 * the same answer Postgres gives when a WAL write fails, and the
++	 * restart brings up a fresh pusher instead of leaving the node
++	 * unable to commit and unable to stop. It lands before
++	 * TransactionIdCommitTree, so no committed xid is ever aborted: the
++	 * outcome is the ordinary one for a commit that was never acked.
++	 */
+ 	ConditionVariablePrepareToSleep(&ZouWalShmem->durable_cv);
+ 	while ((XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn) < lsn)
+-		ConditionVariableSleep(&ZouWalShmem->durable_cv, PG_WAIT_EXTENSION);
++	{
++		if (ZouWalShmem->pusher_latch != NULL && ZouWalShmem->pusher_pid == 0)
++		{
++			if (gone_since == 0)
++				gone_since = GetCurrentTimestamp();
++			else if (TimestampDifferenceExceeds(gone_since, GetCurrentTimestamp(),
++												ZOU_WAL_NO_PUSHER_SECS * 1000))
++			{
++				ConditionVariableCancelSleep();
++				ereport(ERROR,
++						(errmsg("zou wal has no pusher to make %X/%X durable",
++								LSN_FORMAT_ARGS(lsn)),
++						 errdetail("The store holds WAL through %X/%X and the pusher has exited, so this wait cannot end.",
++								   LSN_FORMAT_ARGS((XLogRecPtr) pg_atomic_read_u64(&ZouWalShmem->durable_lsn)))));
++			}
++		}
++		else
++			gone_since = 0;
++		ConditionVariableTimedSleep(&ZouWalShmem->durable_cv, 1000,
++									PG_WAIT_EXTENSION);
++	}
+ 	ConditionVariableCancelSleep();
+ }
+ 
+--- a/src/backend/storage/smgr/zou_smgr.c
++++ b/src/backend/storage/smgr/zou_smgr.c
+@@ -62,6 +62,7 @@
+ extern int	zou_smgr_truncate(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+ 							  uint32 nblocks);
+ extern int	zou_smgr_unlink(uint32 spc, uint32 db, uint32 rel, uint32 fork);
++extern int	zou_pageserve_on(void);
+ 
+ StaticAssertDecl(BLCKSZ == 8192, "the zou shim is built for BLCKSZ 8192");
+ 
+@@ -450,7 +451,18 @@
+ {
+ 	int			skip = zou_skip_fsync(skipFsync);
+ 
+-	if (!skip)
++	/*
++	 * The barrier below belongs to the page objects, so it is owed only
++	 * by a run that writes one. With the page service on, a run that is
++	 * not skipFsync writes none: the crate elides the eager puts because
++	 * pages past the checkpoint chain are served out of the stream
++	 * instead. Waiting for a page that is never written is how a shutdown
++	 * deadlocks (zou #468). The shutdown checkpoint runs after every
++	 * background worker has exited, so a buffer left dirty for it waits
++	 * on a durable LSN the departed pusher can no longer publish, and the
++	 * postmaster sits there with nothing left alive to finish it.
++	 */
++	if (!skip && zou_pageserve_on() != 1)
+ 	{
+ 		XLogRecPtr	barrier = InvalidXLogRecPtr;
+ 
