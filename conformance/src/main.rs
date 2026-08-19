@@ -707,7 +707,7 @@ fn written(args: &Args) -> Result<bool, String> {
 /// next run fails on anything that is not in it, and on anything in it
 /// that has started to agree.
 fn write_known(suite: &Suite, report: &Report) -> Result<(), String> {
-    let known: Vec<serde_json::Value> = report
+    let mut known: Vec<serde_json::Value> = report
         .results
         .iter()
         .filter(|r| r.difference.verdict == diff::Verdict::Different)
@@ -718,6 +718,21 @@ fn write_known(suite: &Suite, report: &Report) -> Result<(), String> {
             })
         })
         .collect();
+    // An entry known against something this run did not ask is kept as
+    // it was. This run has nothing to say about it, and rewriting the
+    // file from one comparison would quietly drop what another one
+    // found.
+    known.extend(
+        suite
+            .known
+            .iter()
+            .filter(|k| {
+                k.against
+                    .as_deref()
+                    .is_some_and(|a| a != report.compared_with)
+            })
+            .map(|k| serde_json::json!({"name": k.name, "why": k.why, "against": k.against})),
+    );
     let path = suite.known_path();
     let text =
         serde_json::to_string_pretty(&known).map_err(|e| format!("writing the known list: {e}"))?;
@@ -879,13 +894,14 @@ fn record(suite: &Suite, target: &Target, setup: Option<&str>) -> Result<suite::
 fn check(suite: &Suite, target: &Target, setup: Option<&str>) -> Result<Report, String> {
     let recording = suite.recording()?;
     let asked = ask(target, suite, setup)?;
+    let compared_with = format!("{} (recorded)", recording.recorded_from);
     let mut report = Report {
         suite: suite.name.clone(),
         against: target.name.clone(),
-        compared_with: format!("{} (recorded)", recording.recorded_from),
+        known: suite.known(&compared_with),
+        compared_with,
         results: Vec::new(),
         errors: asked.errors,
-        known: suite.known(),
     };
     fill(&mut report, suite, &recording.answers, &asked.answers);
     Ok(report)
@@ -935,7 +951,7 @@ fn against(
         compared_with: reference.name.clone(),
         results: Vec::new(),
         errors,
-        known: suite.known(),
+        known: suite.known(&reference.name),
     };
     fill(&mut report, suite, &expected.answers, &found.answers);
     Ok(report)
