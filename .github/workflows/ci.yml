@@ -1098,7 +1098,15 @@ jobs:
         run: |
           npm ci
           npm run install:app
-          npx playwright install --with-deps chromium
+          # --with-deps shells out to apt, and an apt mirror that is not
+          # answering hangs for as long as the job is allowed to run: #509
+          # lost two twenty minute jobs to one that was down. The runner
+          # image already ships what chromium links against, so the deps
+          # are belt and braces, bounded and allowed to fail, and the
+          # browser download is the part that has to work.
+          timeout 300 npx playwright install-deps chromium \
+            || echo "apt did not answer in five minutes, going on with the runner image's libraries"
+          npx playwright install chromium
           npm test
       - name: Keep the server log
         if: always()
@@ -1203,7 +1211,15 @@ jobs:
         run: |
           npm ci
           npm run install:app
-          npx playwright install --with-deps chromium
+          # --with-deps shells out to apt, and an apt mirror that is not
+          # answering hangs for as long as the job is allowed to run: #509
+          # lost two twenty minute jobs to one that was down. The runner
+          # image already ships what chromium links against, so the deps
+          # are belt and braces, bounded and allowed to fail, and the
+          # browser download is the part that has to work.
+          timeout 300 npx playwright install-deps chromium \
+            || echo "apt did not answer in five minutes, going on with the runner image's libraries"
+          npx playwright install chromium
           npm test
       - name: Keep the server log
         if: always()
@@ -1303,7 +1319,15 @@ jobs:
         run: |
           npm ci
           npm run install:app
-          npx playwright install --with-deps chromium
+          # --with-deps shells out to apt, and an apt mirror that is not
+          # answering hangs for as long as the job is allowed to run: #509
+          # lost two twenty minute jobs to one that was down. The runner
+          # image already ships what chromium links against, so the deps
+          # are belt and braces, bounded and allowed to fail, and the
+          # browser download is the part that has to work.
+          timeout 300 npx playwright install-deps chromium \
+            || echo "apt did not answer in five minutes, going on with the runner image's libraries"
+          npx playwright install chromium
           npm test
       - name: Keep the server log
         if: always()
