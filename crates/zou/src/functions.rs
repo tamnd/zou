@@ -57,6 +57,15 @@ pub fn env(port: u16, anon: &str, service: &str, db: &str) -> Vec<(String, Strin
 /// issue those and inventing the prefix would be a claim about a format
 /// nothing here implements. A library treats the value as opaque and
 /// sends it back as the apikey, which is a key this server accepts.
+///
+/// The last one is where the project publishes the public half of its
+/// signing keys. A function that asks who called it verifies the access
+/// token itself rather than asking the server, and the same library
+/// reads this variable to find out what to verify against. The url and
+/// not the key set inline, because a url survives a key rotation and
+/// hands out no key material at all: the endpoint it names is the one
+/// endpoint of the whole surface that needs no apikey, for exactly this
+/// reason.
 pub fn env_at(url: &str, anon: &str, service: &str, db: &str) -> Vec<(String, String)> {
     vec![
         ("SUPABASE_URL".to_string(), url.to_string()),
@@ -65,6 +74,10 @@ pub fn env_at(url: &str, anon: &str, service: &str, db: &str) -> Vec<(String, St
         ("SUPABASE_DB_URL".to_string(), db.to_string()),
         ("SUPABASE_PUBLISHABLE_KEYS".to_string(), default_key(anon)),
         ("SUPABASE_SECRET_KEYS".to_string(), default_key(service)),
+        (
+            "SUPABASE_JWKS_URL".to_string(),
+            format!("{url}/auth/v1/.well-known/jwks.json"),
+        ),
     ]
 }
 
@@ -605,6 +618,11 @@ fn serve(args: &Serve) -> Result<(), String> {
     // that runs and a `/rest/v1` that says so.
     log::info!("sql goes to 127.0.0.1:{db_port}, which is whatever is serving the project");
     let cfg = zou_server::Config {
+        // The keys the dev loop next door signs with, which this
+        // process arrives at from the same secret: a gateway that
+        // could not verify the access tokens the api it belongs to
+        // issues would refuse every signed in caller at the door.
+        jwt_keys: Some(zou_server::jwt::derived_keys(secret.as_bytes())),
         jwt_secret: secret.into_bytes(),
         pg: Some(format!(
             "host=127.0.0.1 port={db_port} user={} dbname=postgres",
@@ -918,6 +936,10 @@ mod tests {
                     "SUPABASE_SECRET_KEYS".to_string(),
                     "{\"default\":\"a-service-key\"}".to_string()
                 ),
+                (
+                    "SUPABASE_JWKS_URL".to_string(),
+                    "http://127.0.0.1:54321/auth/v1/.well-known/jwks.json".to_string()
+                ),
             ]
         );
         assert!(
@@ -944,6 +966,30 @@ mod tests {
                 serde_json::from_str(raw).unwrap_or_else(|e| panic!("{name} is json: {e}"));
             assert_eq!(keys.get("default").map(String::as_str), Some(key));
         }
+    }
+
+    /// A deployed function is told where its own project publishes its
+    /// keys, not where the node it happens to be running on does, for
+    /// the same reason `SUPABASE_URL` is the project's: a function
+    /// verifying a caller against another project's key set verifies
+    /// nothing.
+    #[test]
+    fn the_jwks_url_is_the_projects_own() {
+        let env = env_at(
+            "https://demo.zou.example",
+            "an-anon-key",
+            "a-service-key",
+            "postgres://x/y",
+        );
+        let url = env
+            .iter()
+            .find(|(name, _)| name == "SUPABASE_JWKS_URL")
+            .map(|(_, value)| value.as_str())
+            .expect("SUPABASE_JWKS_URL is set");
+        assert_eq!(
+            url,
+            "https://demo.zou.example/auth/v1/.well-known/jwks.json"
+        );
     }
 
     #[test]

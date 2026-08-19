@@ -403,7 +403,7 @@ The body has a ceiling of 20 MiB, which is zou's own number and not upstream's.
 
 ## Deno.env
 
-Six variables are the project's and are the same on every call.
+Seven variables are the project's and are the same on every call.
 
 | Variable | What it is |
 | --- | --- |
@@ -413,13 +413,22 @@ Six variables are the project's and are the same on every call.
 | `SUPABASE_DB_URL` | The database, as a url |
 | `SUPABASE_PUBLISHABLE_KEYS` | `{"default": <the anon key>}` |
 | `SUPABASE_SECRET_KEYS` | `{"default": <the service role key>}` |
+| `SUPABASE_JWKS_URL` | Where this project publishes the public half of its signing keys |
 
-The last two are the newer names, and they are a map because a project can have several keys with a name each and a library picks one out by name.
+The middle two are the newer names, and they are a map because a project can have several keys with a name each and a library picks one out by name.
 `npm:@supabase/server` reads `SUPABASE_PUBLISHABLE_KEY` first and then the `default` entry of the plural, and it builds its client before a handler runs, so a function that uses it and finds neither refuses the request before anybody's code has said anything.
 
 The values are this project's own keys rather than `sb_publishable_` and `sb_secret_` strings.
 zou does not issue keys in that format and writing the prefix onto something that is not one would be a claim about a format nothing here implements.
 A library treats the value as opaque and sends it back as the apikey header, which is a key this server accepts, so the round trip works either way.
+
+The last one is for a function that wants to know who called it without asking the server.
+`npm:@supabase/server`'s `{ auth: "user" }` verifies the caller's access token itself, against a key set it reads from `SUPABASE_JWKS` or fetches from `SUPABASE_JWKS_URL`, and with neither set it refuses every caller before the handler runs.
+The url and not the key set inline, because a url survives a key rotation and because the endpoint it names is the one endpoint on the whole surface that needs no apikey, which is what makes it fetchable from inside an isolate.
+
+A project's access tokens are signed with a P-256 key derived from the project's own secret, ES256 with the key named in the header, and the public half is what that url serves.
+That is the arrangement a project created on Supabase today has, and it is what makes verifying a caller possible at all: nothing can verify an HS256 token without holding the secret that signed it, so a token signed that way is a token only the server itself can check.
+Keys issued under the legacy format keep working, apikeys included, because a token with no key named in it is still verified against the secret.
 
 `SB_EXECUTION_ID` is one per invocation, which is what ties a log line from inside a function to the request that caused it.
 
@@ -790,7 +799,7 @@ All of that is v8 rather than a choice, and all of it is the same on both server
 
 ## crypto
 
-Random bytes, a uuid, the four hashes and HMAC.
+Random bytes, a uuid, the four hashes, HMAC, AES and ECDSA over P-256.
 
 ```ts
 Deno.serve(async (req) => {
@@ -808,15 +817,17 @@ Deno.serve(async (req) => {
 ```
 
 `crypto.getRandomValues` and `crypto.randomUUID` are the operating system's randomness, and the digest and the HMAC are the same Rust crates this server signs its own tokens with.
-`crypto.subtle.digest` has `SHA-1`, `SHA-256`, `SHA-384` and `SHA-512`, and `sign` and `verify` are HMAC over those four.
+`crypto.subtle.digest` has `SHA-1`, `SHA-256`, `SHA-384` and `SHA-512`, and `sign` and `verify` are HMAC over those four and ECDSA on P-256 with SHA-256, which is the algorithm an access token is signed under.
 `encrypt` and `decrypt` are AES in CBC and in GCM, at all three key lengths, which is what a session cookie or a sealed payload is written with, and `generateKey` and `exportKey` are there for the AES half of that.
 A failed decryption is an `OperationError` saying `Decryption failed` and saying nothing else, because which part of the ciphertext was wrong is not something the party holding the wrong key should be told.
 Two deliberate narrowings inside AES-GCM: the iv is twelve bytes and the tag is the full 128 bits, and an iv or a tag of another length is refused by name rather than served.
-`importKey` reads `raw` and no other format, for either kind of key.
+`importKey` reads `raw` and `jwk`, and no other format.
+A `jwk` is how a key arrives when it came off a published key set rather than out of a variable: `oct` is bytes for HMAC or AES, and `EC` on P-256 is a key for ECDSA, public when it carries only `x` and `y` and private when it carries `d`.
+A private jwk's point is derived from its scalar rather than read off the jwk, so coordinates that disagree with the scalar cannot import as a key that verifies nothing.
 
 The verification is done in Rust, so a wrong signature takes as long to reject as a right one takes to accept, which is not true of a comparison written in javascript.
 
-What is not there is refused by name rather than being undefined: `deriveBits`, `deriveKey`, `wrapKey` and `unwrapKey`, the asymmetric algorithms wherever they are named, and every key format other than `raw`.
+What is not there is refused by name rather than being undefined: `deriveBits`, `deriveKey`, `wrapKey` and `unwrapKey`, the asymmetric algorithms other than ECDSA on P-256, the curves other than P-256, and the der key formats, which want a parser this has no reason to carry.
 One difference from the spec: asking `getRandomValues` for more than 65536 bytes throws a `TypeError` with the spec's message rather than a `QuotaExceededError`, because there is no `DOMException` here yet.
 
 ## Timers

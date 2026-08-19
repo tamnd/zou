@@ -13,7 +13,7 @@ authors.workspace = true
 # second, so `cargo test --workspace` on a machine that only cares about
 # the database never downloads V8 or builds swc.
 default = []
-isolate = ["dep:aes", "dep:aes-gcm", "dep:cbc", "dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:futures-util", "dep:getrandom", "dep:hmac", "dep:log", "dep:rustls", "dep:serde", "dep:serde_json", "dep:sha1", "dep:sha2", "dep:tokio", "dep:tokio-rustls", "dep:tokio-tungstenite", "dep:ureq", "dep:webpki-roots"]
+isolate = ["dep:aes", "dep:aes-gcm", "dep:cbc", "dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:futures-util", "dep:getrandom", "dep:hmac", "dep:log", "dep:p256", "dep:rustls", "dep:serde", "dep:serde_json", "dep:sha1", "dep:sha2", "dep:tokio", "dep:tokio-rustls", "dep:tokio-tungstenite", "dep:ureq", "dep:webpki-roots"]
 
 [dependencies]
 zou-functions = { path = "../zou-functions" }
@@ -35,6 +35,12 @@ hmac = { workspace = true, optional = true }
 # line in the log rather than silence, and the facade is what the
 # binary above this already installs a logger for.
 log = { workspace = true, optional = true }
+# The one asymmetric algorithm `crypto.subtle` here has: ECDSA on
+# P-256, which is what a function verifying an access token against a
+# project's published keys checks a signature with. The same crate the
+# server verifies those tokens with, so both ends agree on what a
+# signature is.
+p256 = { workspace = true, optional = true }
 # `Deno.startTls` and `Deno.connectTls`, which is the same TLS the rest
 # of this build already links rather than a second stack for a socket.
 rustls = { workspace = true, optional = true }

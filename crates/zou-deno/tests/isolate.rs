@@ -1310,8 +1310,11 @@ fn an_hmac_signs_what_it_verifies() {
             wrongMessage: await crypto.subtle.verify("HMAC", key, signature, bytes("something else")),
             shortSignature: await crypto.subtle.verify("HMAC", key, bytes("short"), message),
             notHmac: await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, message).catch((e) => e.message),
-            notRaw: await crypto.subtle
-                .importKey("jwk", {}, { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
+            fromJwk: hex(await crypto.subtle.sign("HMAC", await crypto.subtle.importKey(
+                "jwk", { kty: "oct", k: "SmVmZQ" }, { name: "HMAC", hash: "SHA-256" }, false, ["sign"],
+            ), message)),
+            notDer: await crypto.subtle
+                .importKey("pkcs8", bytes("x"), { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
                 .catch((e) => e.message),
             noHmacGeneration: await crypto.subtle
                 .generateKey({ name: "HMAC", hash: "SHA-256" }, false, ["sign"])
@@ -1339,9 +1342,13 @@ fn an_hmac_signs_what_it_verifies() {
         said["notHmac"],
         "RSASSA-PKCS1-v1_5 is not supported yet, only HMAC is"
     );
+    // The same key again, spelled the way a key set spells it, which
+    // is the format a key arrives in when it came off a jwks rather
+    // than out of a variable.
+    assert_eq!(said["fromJwk"], said["signature"]);
     assert_eq!(
-        said["notRaw"],
-        "the jwk key format is not supported yet, only raw is"
+        said["notDer"],
+        "the pkcs8 key format is not supported yet, only raw and jwk are"
     );
     // A key out of randomness is a key for a cipher here and not for a
     // mac, because the one thing that asks is an AES key nobody handed
@@ -1349,6 +1356,128 @@ fn an_hmac_signs_what_it_verifies() {
     assert_eq!(
         said["noHmacGeneration"],
         "HMAC keys cannot be generated yet, only AES can"
+    );
+}
+
+/// ECDSA over P-256, which is what an access token is signed with and
+/// what a function verifying its caller checks against the key set the
+/// project publishes.
+///
+/// The signature is one another implementation made, node's webcrypto
+/// over the same key and the same bytes, so a pass here is interop and
+/// not this runtime agreeing with itself. The rest is what a key set
+/// asks for: the public half out of a jwk verifies, the private half
+/// signs what the public half then accepts, a tampered message and a
+/// signature of the wrong length are refusals rather than errors, and a
+/// public key handed to `sign` is an error rather than a signature.
+#[test]
+fn an_ecdsa_key_verifies_what_another_runtime_signed() {
+    let answer = answered(
+        r#"
+        const b64 = (text) => {
+            const padded = text.replace(/-/g, "+").replace(/_/g, "/");
+            const whole = padded + "=".repeat((4 - (padded.length % 4)) % 4);
+            return Uint8Array.from(atob(whole), (c) => c.charCodeAt(0));
+        };
+        const bytes = (text) => new TextEncoder().encode(text);
+        const x = "wWGjH6WjqKYdGCGGan8c5-DZmqu0S8bRdJ2t7w0au3s";
+        const y = "_tuMqtnqXBkmQJYKr8fsjXIyWr9NU4twsAL3JTDlumc";
+        const ecdsa = { name: "ECDSA", namedCurve: "P-256" };
+        const sha256 = { name: "ECDSA", hash: "SHA-256" };
+        const publicKey = await crypto.subtle.importKey(
+            "jwk", { kty: "EC", crv: "P-256", x, y }, ecdsa, false, ["verify"],
+        );
+        const privateKey = await crypto.subtle.importKey(
+            "jwk",
+            { kty: "EC", crv: "P-256", d: "ycxb4LMOL6mImeF_ApNvtp4RCpE_5r1VvtNoAmbmDU4", x, y },
+            ecdsa, false, ["sign"],
+        );
+        // The private half spelled with the scalar alone, which is what
+        // a key set that never published the point looks like.
+        const scalarOnly = await crypto.subtle.importKey(
+            "jwk", { kty: "EC", crv: "P-256", d: "ycxb4LMOL6mImeF_ApNvtp4RCpE_5r1VvtNoAmbmDU4" },
+            ecdsa, false, ["sign"],
+        );
+        const elsewhere = b64(
+            "JnCTL_JmDRroI-tDnO4nOwGOfp5d69J1XZWRSqCMu0wx_-ttPL5sjQ6pTU08IYOL4zvAWPHVr8SaYqUYqHKMtg",
+        );
+        const message = bytes("what do ya want for nothing?");
+        const signature = await crypto.subtle.sign(sha256, privateKey, message);
+        Deno.serve(async () => Response.json({
+            type: publicKey.type,
+            privateType: privateKey.type,
+            curve: publicKey.algorithm.namedCurve,
+            length: signature.byteLength,
+            fromNode: await crypto.subtle.verify(sha256, publicKey, elsewhere, bytes("zou")),
+            fromNodeTampered: await crypto.subtle.verify(sha256, publicKey, elsewhere, bytes("zoU")),
+            roundTrip: await crypto.subtle.verify(sha256, publicKey, signature, message),
+            byItself: await crypto.subtle.verify(sha256, privateKey, signature, message),
+            fromScalarOnly: await crypto.subtle.verify(
+                sha256, publicKey, await crypto.subtle.sign(sha256, scalarOnly, message), message,
+            ),
+            wrongMessage: await crypto.subtle.verify(sha256, publicKey, signature, bytes("else")),
+            shortSignature: await crypto.subtle.verify(sha256, publicKey, bytes("short"), message),
+            publicSigning: await crypto.subtle
+                .sign(sha256, publicKey, message).catch((e) => e.message),
+            wrongCall: await crypto.subtle
+                .sign("HMAC", privateKey, message).catch((e) => e.message),
+            wrongHash: await crypto.subtle
+                .sign({ name: "ECDSA", hash: "SHA-512" }, privateKey, message).catch((e) => e.message),
+            wrongCurve: await crypto.subtle
+                .importKey("jwk", { kty: "EC", crv: "P-384", x, y }, ecdsa, false, ["verify"])
+                .catch((e) => e.message),
+            notOnTheCurve: await crypto.subtle.verify(
+                sha256,
+                await crypto.subtle.importKey(
+                    "jwk", { kty: "EC", crv: "P-256", x, y: x }, ecdsa, false, ["verify"],
+                ),
+                signature,
+                message,
+            ).catch((e) => e.message),
+            wrongAlgorithm: await crypto.subtle
+                .importKey("jwk", { kty: "EC", crv: "P-256", x, y },
+                    { name: "HMAC", hash: "SHA-256" }, false, ["verify"])
+                .catch((e) => e.message),
+            wrongKind: await crypto.subtle
+                .importKey("jwk", { kty: "RSA", n: "0", e: "AQAB" }, ecdsa, false, ["verify"])
+                .catch((e) => e.message),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["type"], "public");
+    assert_eq!(said["privateType"], "private");
+    assert_eq!(said["curve"], "P-256");
+    // Two coordinates, which is the shape a JWS carries and not der.
+    assert_eq!(said["length"], 64);
+    assert_eq!(said["fromNode"], true);
+    assert_eq!(said["fromNodeTampered"], false);
+    assert_eq!(said["roundTrip"], true);
+    assert_eq!(said["byItself"], true);
+    assert_eq!(said["fromScalarOnly"], true);
+    assert_eq!(said["wrongMessage"], false);
+    assert_eq!(said["shortSignature"], false);
+    assert_eq!(said["publicSigning"], "a public key signs nothing");
+    assert_eq!(
+        said["wrongCall"],
+        "this key is for ECDSA and the call is for HMAC"
+    );
+    assert_eq!(
+        said["wrongHash"],
+        "ECDSA here is P-256 with SHA-256, and this one asked for SHA-512"
+    );
+    assert_eq!(
+        said["wrongCurve"],
+        "the only curve here is P-256 and this jwk is on P-384"
+    );
+    assert_eq!(said["notOnTheCurve"], "the key is not a point on P-256");
+    assert_eq!(
+        said["wrongAlgorithm"],
+        "an EC jwk is an ECDSA key and the call asked for HMAC"
+    );
+    assert_eq!(
+        said["wrongKind"],
+        "RSA keys are not supported yet, only oct and EC are"
     );
 }
 

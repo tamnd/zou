@@ -368,6 +368,12 @@ fn start_http(
     let site_url = project.and_then(|p| p.site_url.clone());
     std::thread::spawn(move || {
         let cfg = zou_server::Config {
+            // The same key a served project signs with, derived from
+            // the same secret, so a function that verifies its caller
+            // behaves the same in the dev loop as it does deployed.
+            // Pin ZOU_JWT_SECRET and the key is pinned with it, which
+            // is what keeps a session alive across a restart.
+            jwt_keys: Some(zou_server::jwt::derived_keys(secret.as_bytes())),
             jwt_secret: secret.into_bytes(),
             pg: Some(dsn),
             // A project that named its schemas gets them in its own

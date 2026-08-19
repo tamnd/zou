@@ -1992,14 +1992,69 @@
   /// A key holds its bytes and the algorithm it was made for, and the
   /// algorithm is what every operation asks it about afterwards: an
   /// AES-CBC key handed to `sign` is the wrong key and says so.
+  ///
+  /// The tag is here because a library that takes keys from callers
+  /// checks for it rather than for the class: `jose`, which is what
+  /// verifies a JWT in most functions that verify one, decides whether
+  /// it was handed a key by asking what it calls itself.
   class CryptoKey {
-    constructor(bytes, algorithm, extractable, usages) {
+    constructor(bytes, algorithm, extractable, usages, type) {
       this[SECRET] = bytes;
-      this.type = "secret";
+      this.type = type ?? "secret";
       this.extractable = Boolean(extractable);
       this.usages = usages;
       this.algorithm = algorithm;
     }
+
+    get [Symbol.toStringTag]() {
+      return "CryptoKey";
+    }
+  }
+
+  /// The public half of an asymmetric key, as its two coordinates. A
+  /// private key carries one too, derived from the scalar, so a key
+  /// imported from a jwk with only `d` in it can still check what it
+  /// signed.
+  const POINT = Symbol("point");
+
+  /// The one curve, spelled the way a jwk spells it.
+  const CURVE = "P-256";
+
+  function isEcdsa(key) {
+    return key instanceof CryptoKey && key.algorithm.name === "ECDSA";
+  }
+
+  /// The hash an ECDSA call is under, which is the call's rather than
+  /// the key's: a P-256 key is not made for one hash, and the caller
+  /// names it every time.
+  function ecdsaHash(algorithm) {
+    const named = nameOf(algorithm);
+    if (named.toLowerCase() !== "ecdsa") {
+      throw new TypeError(`this key is for ECDSA and the call is for ${named}`);
+    }
+    return hashNamed(
+      algorithm !== null && typeof algorithm === "object" ? algorithm.hash : "SHA-256",
+    );
+  }
+
+  /// The bytes of a base64url field of a jwk, which is how a jwk holds
+  /// every number in it.
+  function fromBase64Url(text, called) {
+    if (typeof text !== "string" || text.length === 0) {
+      throw new DOMException(`the jwk has no ${called}`, "DataError");
+    }
+    const padded = text.replace(/-/g, "+").replace(/_/g, "/");
+    let binary;
+    try {
+      binary = atob(padded + "=".repeat((4 - (padded.length % 4)) % 4));
+    } catch {
+      throw new DOMException(`the jwk's ${called} is not base64url`, "DataError");
+    }
+    const bytes = new Uint8Array(binary.length);
+    for (let at = 0; at < binary.length; at += 1) {
+      bytes[at] = binary.charCodeAt(at);
+    }
+    return bytes;
   }
 
   /// The key an encryption is under, checked against the name the call
@@ -2053,36 +2108,89 @@
     };
   }
 
+  /// A key made of bytes, which is what both raw keys and the `oct`
+  /// half of the jwk format are.
+  function symmetricKey(bytes, algorithm, extractable, held) {
+    const cipher = cipherNamed(algorithm);
+    if (cipher !== undefined) {
+      return new CryptoKey(bytes, aesAlgorithm(cipher, bytes.length * 8), extractable, held);
+    }
+    const named = nameOf(algorithm);
+    if (named.toLowerCase() !== "hmac") {
+      throw new TypeError(`${named} keys are not supported yet, only HMAC, AES and ECDSA are`);
+    }
+    const hash = hashNamed(algorithm.hash);
+    return new CryptoKey(
+      bytes,
+      { name: "HMAC", hash: { name: hash }, length: bytes.length * 8 },
+      extractable,
+      held,
+    );
+  }
+
+  /// A key out of a jwk: the `oct` shape, which is bytes with a base64
+  /// coat on, and the `EC` shape, which is a point and possibly the
+  /// scalar behind it.
+  ///
+  /// A jwks published by a Supabase project is EC and public, one key
+  /// per line of the set, and importing one of them is the whole of
+  /// what a function does before it checks a token.
+  function jwkKey(jwk, algorithm, extractable, held) {
+    if (jwk === null || typeof jwk !== "object") {
+      throw new TypeError("a jwk is required");
+    }
+    const kty = String(jwk.kty ?? "");
+    if (kty === "oct") {
+      return symmetricKey(fromBase64Url(jwk.k, "k"), algorithm, extractable, held);
+    }
+    if (kty !== "EC") {
+      throw new TypeError(`${kty} keys are not supported yet, only oct and EC are`);
+    }
+    const named = nameOf(algorithm);
+    if (named.toLowerCase() !== "ecdsa") {
+      throw new TypeError(`an EC jwk is an ECDSA key and the call asked for ${named}`);
+    }
+    const curve = String(jwk.crv ?? "");
+    if (curve !== CURVE) {
+      throw new DOMException(`the only curve here is ${CURVE} and this jwk is on ${curve}`, "DataError");
+    }
+    const shape = { name: "ECDSA", namedCurve: CURVE };
+    // A private jwk carries d and, in a published set, x and y as
+    // well. The point is derived from d rather than read, so a jwk
+    // whose coordinates disagree with its scalar cannot import as a
+    // key that verifies nothing.
+    if (jwk.d !== undefined) {
+      const scalar = fromBase64Url(jwk.d, "d");
+      const point = ops.op_zou_ec_public(scalar);
+      const key = new CryptoKey(scalar, shape, extractable, held, "private");
+      key[POINT] = { x: point.slice(0, 32), y: point.slice(32) };
+      return key;
+    }
+    const key = new CryptoKey(new Uint8Array(0), shape, extractable, held, "public");
+    key[POINT] = { x: fromBase64Url(jwk.x, "x"), y: fromBase64Url(jwk.y, "y") };
+    return key;
+  }
+
   const subtle = {
     async digest(algorithm, data) {
       const digested = ops.op_zou_digest(hashNamed(algorithm), sourceOf(data, "data"));
       return digested.buffer;
     },
 
-    /// Raw keys and nothing else, because the other formats want a
-    /// parser this has no reason to carry: an HMAC key is bytes and an
-    /// AES key is bytes, and a function that imports either has them.
+    /// Raw keys and jwks, which are the two formats a function has: an
+    /// HMAC key is bytes and an AES key is bytes, and the key a token
+    /// is verified against arrives as a jwk out of a project's
+    /// published set. The der formats want a parser this has no reason
+    /// to carry, so they are refused by name.
     async importKey(format, keyData, algorithm, extractable, usages) {
-      if (String(format) !== "raw") {
-        throw new TypeError(`the ${format} key format is not supported yet, only raw is`);
-      }
-      const bytes = sourceOf(keyData, "keyData");
       const held = Array.from(usages ?? []).map(String);
-      const cipher = cipherNamed(algorithm);
-      if (cipher !== undefined) {
-        return new CryptoKey(bytes, aesAlgorithm(cipher, bytes.length * 8), extractable, held);
+      if (String(format) === "jwk") {
+        return jwkKey(keyData, algorithm, extractable, held);
       }
-      const named = nameOf(algorithm);
-      if (named.toLowerCase() !== "hmac") {
-        throw new TypeError(`${named} keys are not supported yet, only HMAC and AES are`);
+      if (String(format) !== "raw") {
+        throw new TypeError(`the ${format} key format is not supported yet, only raw and jwk are`);
       }
-      const hash = hashNamed(algorithm.hash);
-      return new CryptoKey(
-        bytes,
-        { name: "HMAC", hash: { name: hash }, length: bytes.length * 8 },
-        extractable,
-        held,
-      );
+      return symmetricKey(sourceOf(keyData, "keyData"), algorithm, extractable, held);
     },
 
     /// A key out of the operating system's randomness, which is where
@@ -2157,6 +2265,17 @@
     },
 
     async sign(algorithm, key, data) {
+      if (isEcdsa(key)) {
+        if (key.type !== "private") {
+          throw new DOMException("a public key signs nothing", "InvalidAccessError");
+        }
+        const signature = ops.op_zou_ec_sign(
+          ecdsaHash(algorithm),
+          key[SECRET],
+          sourceOf(data, "data"),
+        );
+        return signature.buffer;
+      }
       const hash = hmacHash(algorithm, key);
       const signature = ops.op_zou_sign(hash, key[SECRET], sourceOf(data, "data"));
       return signature.buffer;
@@ -2166,6 +2285,16 @@
     /// stop at the first byte that differs and how long a wrong answer
     /// took is how a signature is guessed.
     async verify(algorithm, key, signature, data) {
+      if (isEcdsa(key)) {
+        const point = key[POINT];
+        return ops.op_zou_ec_verify(
+          ecdsaHash(algorithm),
+          point.x,
+          point.y,
+          sourceOf(data, "data"),
+          sourceOf(signature, "signature"),
+        );
+      }
       const hash = hmacHash(algorithm, key);
       return ops.op_zou_verify(
         hash,

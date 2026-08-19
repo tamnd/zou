@@ -636,6 +636,12 @@ impl Zou {
             ),
         };
         let cfg = zou_server::Config {
+            // An embedded server signs its access tokens with the key
+            // its secret derives, the same one a served project uses,
+            // so a token minted in a test binary is a token the rest
+            // of zou verifies and a library that checks a caller for
+            // itself has a jwks to check against.
+            jwt_keys: Some(zou_server::jwt::derived_keys(secret.as_bytes())),
             jwt_secret: secret.as_bytes().to_vec(),
             pg: Some(dsn.to_string()),
             schemas: if options.schemas.is_empty() {
