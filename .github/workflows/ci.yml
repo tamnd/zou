@@ -141,13 +141,15 @@ jobs:
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
         run: cargo test -p zou-rest --test pg -- --nocapture
-      - name: Run the import survey against postgres
+      - name: Run the import against postgres
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
         # zou is a bin crate, so its database tests are inline and there
-        # is no integration target to name. The survey is a page of
-        # catalog SQL and nothing but a real server tells it apart from
-        # a page of typos.
+        # is no integration target to name. The survey and the copy are
+        # pages of catalog SQL and nothing but a real server tells them
+        # apart from pages of typos. The object step brings its own
+        # storage api up on a loopback port, so it needs nothing else
+        # here either.
         run: cargo test -p zou --bin zou import -- --nocapture
 
   conformance:

@@ -25,13 +25,19 @@ use std::sync::Arc;
 
 use tokio_postgres::{Client, NoTls, config::SslMode};
 
-pub const USAGE: &str = "usage: zou import supabase <--db-url <url> | --project-ref <ref>> [--db-password <pw>] <--to <url> | --dry-run> [--report <path>]";
+pub const USAGE: &str = "usage: zou import supabase <--db-url <url> | --project-ref <ref>> [--db-password <pw>] <--to <url> | --dry-run> [--store <target> [--tenant <ref>] [--service-key <key>] [--storage-url <url>] [--jobs <n>] [--manifest <path>]] [--report <path>]";
 
 mod copy;
+mod objects;
 
 /// The report's default name, which is the one the milestone asks for
 /// and the one a pull request reviewing an import will look for.
 const DEFAULT_REPORT: &str = "import-report.md";
+
+/// Where the digests of the copied object bytes go, in the shape
+/// `sha256sum` prints, because that is a format people already have a
+/// tool for.
+const DEFAULT_MANIFEST: &str = "import-objects.sha256";
 
 /// Schemas postgres owns, which are nobody's project and are not
 /// reported as one.
@@ -230,6 +236,14 @@ pub struct Args {
     pub to: Option<String>,
     pub dry_run: bool,
     pub report: Option<PathBuf>,
+    /// The store to put the storage object bytes in. Without it the
+    /// rows come over and the bytes do not, which the run says.
+    pub store: Option<String>,
+    pub tenant: Option<String>,
+    pub service_key: Option<String>,
+    pub storage_url: Option<String>,
+    pub jobs: Option<usize>,
+    pub manifest: Option<PathBuf>,
 }
 
 pub fn parse(argv: &[String]) -> Result<Args, String> {
@@ -256,19 +270,96 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 args.report = Some(PathBuf::from(rest.next().ok_or("--report needs a path")?))
             }
             "--to" => args.to = Some(rest.next().ok_or("--to needs a url")?.clone()),
+            "--store" => args.store = Some(rest.next().ok_or("--store needs a target")?.clone()),
+            "--tenant" => args.tenant = Some(rest.next().ok_or("--tenant needs a ref")?.clone()),
+            "--service-key" => {
+                args.service_key = Some(rest.next().ok_or("--service-key needs a key")?.clone())
+            }
+            "--storage-url" => {
+                args.storage_url = Some(rest.next().ok_or("--storage-url needs a url")?.clone())
+            }
+            "--jobs" => {
+                let value = rest.next().ok_or("--jobs needs a number")?;
+                let jobs = value
+                    .parse()
+                    .map_err(|_| format!("bad job count {value:?}"))?;
+                if jobs == 0 {
+                    return Err("a copy with no jobs copies nothing".into());
+                }
+                args.jobs = Some(jobs);
+            }
+            "--manifest" => {
+                args.manifest = Some(PathBuf::from(rest.next().ok_or("--manifest needs a path")?))
+            }
             "--dry-run" => args.dry_run = true,
             other => return Err(format!("unexpected argument {other:?}\n{USAGE}")),
         }
     }
     match (&args.url, &args.project_ref) {
         (Some(_), Some(_)) => {
-            Err("--db-url and --project-ref are two ways to say the same thing, pass one".into())
+            return Err(
+                "--db-url and --project-ref are two ways to say the same thing, pass one".into(),
+            );
         }
-        (None, None) => Err(format!(
-            "nothing to read from, pass --db-url or --project-ref\n{USAGE}"
-        )),
-        _ => Ok(args),
+        (None, None) => {
+            return Err(format!(
+                "nothing to read from, pass --db-url or --project-ref\n{USAGE}"
+            ));
+        }
+        _ => {}
     }
+    // The object bytes are keyed by the rows in `storage.objects`, so
+    // the store cannot be filled without the database it is being
+    // filled for.
+    if args.store.is_some() && args.to.is_none() {
+        return Err("--store needs --to, the object bytes are keyed by the rows in storage.objects and those come over with the database".into());
+    }
+    Ok(args)
+}
+
+/// Where the object bytes come from and go, or nothing when the run was
+/// not asked to move them.
+///
+/// A hosted project's storage api is at its own hostname, so a project
+/// ref is enough to find it. A project reached by a connection string
+/// could be anywhere and has to be told, which is the one case where
+/// `--storage-url` is not optional.
+fn objects_from(args: &Args) -> Result<Option<objects::Where>, String> {
+    let Some(store) = &args.store else {
+        return Ok(None);
+    };
+    let base = match (&args.storage_url, &args.project_ref) {
+        (Some(url), _) => url.clone(),
+        (None, Some(project_ref)) => objects::base_for(project_ref),
+        (None, None) => {
+            return Err(
+                "--store with --db-url needs --storage-url, a connection string does not say where the storage api is"
+                    .into(),
+            );
+        }
+    };
+    let key = args
+        .service_key
+        .clone()
+        .or_else(|| std::env::var("SUPABASE_SERVICE_ROLE_KEY").ok())
+        .filter(|k| !k.is_empty())
+        .ok_or(
+            "reading a private bucket needs the service role key, pass --service-key or set SUPABASE_SERVICE_ROLE_KEY",
+        )?;
+    Ok(Some(objects::Where {
+        store: store.clone(),
+        tenant: args
+            .tenant
+            .clone()
+            .unwrap_or_else(|| objects::DEFAULT_TENANT.to_string()),
+        base,
+        key,
+        jobs: args.jobs.unwrap_or(objects::DEFAULT_JOBS),
+        manifest: args
+            .manifest
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_MANIFEST)),
+    }))
 }
 
 /// The connection string for a project ref, which is the one the
@@ -572,6 +663,9 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         .report
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_REPORT));
+    // Worked out before anything connects, so a missing service key is
+    // said in the first second rather than after a survey.
+    let bytes = objects_from(&args)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -589,8 +683,11 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         summary(&survey, &report);
         let Some(to) = &args.to else { return Ok(()) };
         let mut target = connect(to).await?;
-        let done = copy::run(&client, &mut target, &survey).await?;
+        let done = copy::run(&client, &mut target, &survey, bytes.is_some()).await?;
         print!("{}", done.render());
+        let Some(w) = &bytes else { return Ok(()) };
+        let moved = objects::run(&mut target, w).await?;
+        print!("{}", moved.render());
         Ok(())
     })
 }
@@ -1227,6 +1324,66 @@ mod tests {
         assert_eq!(size(999), "999 bytes");
         assert_eq!(size(1_500), "1.5 kB");
         assert_eq!(size(2_400_000_000), "2.4 GB");
+    }
+
+    /// The object bytes take a store, a tenant and a key, and every one
+    /// of them has an answer that does not have to be typed.
+    #[test]
+    fn the_object_flags_have_defaults_worth_having() {
+        let args = parse(&argv(&[
+            "supabase",
+            "--project-ref",
+            "abcdefghijklmnop",
+            "--to",
+            "postgresql://localhost/zou",
+            "--store",
+            "/var/lib/zou",
+            "--service-key",
+            "a-service-role-key",
+        ]))
+        .unwrap();
+        let w = objects_from(&args).unwrap().expect("a store was asked for");
+        assert_eq!(w.base, "https://abcdefghijklmnop.supabase.co/storage/v1");
+        assert_eq!(w.tenant, objects::DEFAULT_TENANT);
+        assert_eq!(w.jobs, objects::DEFAULT_JOBS);
+        assert_eq!(w.manifest, PathBuf::from(DEFAULT_MANIFEST));
+        assert!(
+            objects_from(&parse(&argv(&["supabase", "--project-ref", "x", "--dry-run"])).unwrap())
+                .unwrap()
+                .is_none(),
+            "no store asked for is no bytes moved"
+        );
+    }
+
+    /// The two shapes of the command that cannot work, both said before
+    /// anything connects.
+    #[test]
+    fn the_bytes_need_somewhere_to_come_from_and_go_to() {
+        let e = parse(&argv(&[
+            "supabase",
+            "--project-ref",
+            "x",
+            "--dry-run",
+            "--store",
+            "/var/lib/zou",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--store needs --to"), "{e}");
+
+        let args = parse(&argv(&[
+            "supabase",
+            "--db-url",
+            "postgresql://elsewhere/postgres",
+            "--to",
+            "postgresql://localhost/zou",
+            "--store",
+            "/var/lib/zou",
+            "--service-key",
+            "k",
+        ]))
+        .unwrap();
+        let e = objects_from(&args).unwrap_err();
+        assert!(e.contains("--storage-url"), "{e}");
     }
 
     /// A command with neither a target nor --dry-run has been asked

@@ -79,8 +79,9 @@ pub struct Done {
     /// Steps the ledger already had, so a resume can say what it
     /// skipped rather than looking like it did nothing.
     pub resumed: Vec<String>,
-    /// What did not come over, and why. Never empty by accident: the
-    /// object bytes are always in it until they are implemented.
+    /// What did not come over, and why. Never empty by accident: what
+    /// no schema read here looks at is in it every run, and so are the
+    /// object bytes unless somebody asked for them.
     pub left: Vec<String>,
 }
 
@@ -144,7 +145,18 @@ fn project_schemas(survey: &Survey) -> Vec<String> {
 }
 
 /// The whole copy, in the order that makes each step safe to repeat.
-pub async fn run(source: &Client, target: &mut Client, survey: &Survey) -> Result<Done, String> {
+///
+/// `bytes` says whether the caller is going on to fetch the storage
+/// objects themselves, which is a step of its own over http rather
+/// than anything this can do down a postgres connection. It changes
+/// nothing here except the sentence about them at the end, and that
+/// sentence is worth being right about.
+pub async fn run(
+    source: &Client,
+    target: &mut Client,
+    survey: &Survey,
+    bytes: bool,
+) -> Result<Done, String> {
     let mut done = Done::default();
     // No search path on either side, so every name postgres hands back
     // is written in full and every name sent is read the same way here
@@ -177,13 +189,16 @@ pub async fn run(source: &Client, target: &mut Client, survey: &Survey) -> Resul
     platform(source, target, &mut done, &already).await?;
     grants(target, &schemas, &mut done, &already).await?;
 
-    // Said every time, because the survey counted these and somebody
-    // who read that count will look for them here.
-    done.left.push(
-        "the bytes of the storage objects, the rows that name them are here \
-         and the objects themselves are https://github.com/tamnd/zou/issues/5"
-            .into(),
-    );
+    // Said unless the caller is about to go and get them, because the
+    // survey counted these and somebody who read that count will look
+    // for them here.
+    if !bytes {
+        done.left.push(
+            "the bytes of the storage objects, the rows that name them are here \
+             and the bytes need --store and --service-key"
+                .into(),
+        );
+    }
     // What the schema read does not look at, minus extensions, which
     // it does not and this does.
     for what in schema::UNREAD.iter().filter(|w| **w != "extensions") {
@@ -196,7 +211,7 @@ pub async fn run(source: &Client, target: &mut Client, survey: &Survey) -> Resul
 /// A postgres error prints as "db error" and keeps the sentence that
 /// says what went wrong in its source, which is no use to somebody
 /// reading a failed import.
-fn why(e: &tokio_postgres::Error) -> String {
+pub(super) fn why(e: &tokio_postgres::Error) -> String {
     let mut out = e.to_string();
     let mut source = std::error::Error::source(e);
     while let Some(e) = source {
@@ -969,7 +984,9 @@ create table storage.buckets (id text primary key, public boolean default false)
             target.batch_execute(TARGET).await.expect("seed the target");
 
             let survey = crate::import::survey(&source).await;
-            let done = run(&source, &mut target, &survey).await.expect("the copy");
+            let done = run(&source, &mut target, &survey, false)
+                .await
+                .expect("the copy");
 
             assert_eq!(
                 number(&target, "select count(*) from app.authors").await,
@@ -1024,7 +1041,7 @@ create table storage.buckets (id text primary key, public boolean default false)
 
             // The same command again does nothing and breaks nothing,
             // which is what resume means when the first run finished.
-            let again = run(&source, &mut target, &survey)
+            let again = run(&source, &mut target, &survey, false)
                 .await
                 .expect("the second copy");
             assert!(again.steps.is_empty(), "{:?}", again.steps);
