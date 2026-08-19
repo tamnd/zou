@@ -538,6 +538,57 @@ fn the_loop_the_older_examples_run_is_served_end_to_end() {
     assert_eq!(body(&answer), "std tcp");
 }
 
+/// The same loop with the module waiting on it, which is oak's shape
+/// and therefore the shape of everything written on oak:
+///
+/// ```ts
+/// const app = new Application()
+/// app.use(router.routes())
+/// await app.listen({ port: 8000 })
+/// ```
+///
+/// A module written like that never finishes evaluating, because what
+/// it is waiting for is a request and the request is waiting for the
+/// module. So the module having parked on an accept is the other way
+/// out of that wait: it has said everything it is going to say, and
+/// the call goes into the loop it parked in.
+#[test]
+fn a_module_that_waits_on_its_own_listener_is_served_through_it() {
+    let answer = answered(
+        r#"
+        const listener = Deno.listen({ port: 8000 });
+        for await (const conn of listener) {
+          const http = Deno.serveHttp(conn);
+          for await (const event of http) {
+            await event.respondWith(new Response("awaited", { status: 201 }));
+          }
+        }
+        "#,
+    );
+    assert_eq!(answer.status, 201);
+    assert_eq!(body(&answer), "awaited");
+}
+
+/// And everything above the listen has run by then. The wait ends
+/// where the module parks and not before, so what the module set up on
+/// the way down to the listen is set up.
+#[test]
+fn what_a_module_did_before_it_parked_is_done_before_it_is_called() {
+    let answer = answered(
+        r#"
+        const slept = await new Promise((resolve) => setTimeout(() => resolve("late"), 20));
+        const listener = Deno.listen({ port: 8000 });
+        for await (const conn of listener) {
+          const http = Deno.serveHttp(conn);
+          for await (const event of http) {
+            await event.respondWith(new Response(`ready ${slept}`));
+          }
+        }
+        "#,
+    );
+    assert_eq!(body(&answer), "ready late");
+}
+
 #[test]
 fn a_handler_that_throws_is_the_operators_message_and_not_the_callers() {
     let complaint = called(

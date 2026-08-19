@@ -299,6 +299,75 @@ impl Read {
     }
 }
 
+/// The wait a module parked on an accept is in, held out here rather
+/// than in javascript.
+///
+/// A module that ends in `await app.listen({ port: 8000 })` is the
+/// ordinary shape of an oak server and it never finishes evaluating,
+/// because what it is waiting for is a request and the request is
+/// waiting for the module. Both halves of that knot are cut here:
+/// `said` is what `boot` waits on to stop waiting for a module that has
+/// already said everything it is going to say, and `calls` is the
+/// arrival that ends the park.
+///
+/// The wait is an op rather than a flag because in real Deno an accept
+/// is an op on a real socket, and being one is what makes the runtime
+/// underneath treat an unfinished top level as work in progress rather
+/// than as a deadlock. Both halves are channels rather than flags for
+/// the same reason: an op runs on the runtime's own turn of the
+/// scheduler and not inside the poll that dispatched it, so a flag set
+/// there is a flag nobody is woken to read, and what it costs to read
+/// it late is the whole wall clock.
+#[derive(Clone)]
+pub(crate) struct Parked {
+    said: Arc<tokio::sync::watch::Sender<bool>>,
+    calls: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl Parked {
+    fn new() -> Parked {
+        Parked {
+            said: Arc::new(tokio::sync::watch::channel(false).0),
+            calls: Arc::new(tokio::sync::watch::channel(0).0),
+        }
+    }
+
+    /// Wait until the module has parked on an accept.
+    ///
+    /// A module that parked before this is asked does not have to park
+    /// again to be heard: the answer is the current value and not the
+    /// next change to it.
+    async fn parked(&self) {
+        let mut said = self.said.subscribe();
+        let _ = said.wait_for(|said| *said).await;
+    }
+
+    /// A call has been handed to the isolate, which is the thing every
+    /// park is waiting for.
+    fn arrived(&self) {
+        self.calls
+            .send_modify(|calls| *calls = calls.wrapping_add(1));
+    }
+}
+
+/// The module has parked on an accept, and stays parked until a call
+/// arrives.
+///
+/// One of these is dispatched per park rather than one per isolate, so
+/// that a pooled isolate serving its tenth call is waiting on the same
+/// terms as one serving its first.
+#[op2(async(lazy), fast)]
+async fn op_zou_parked(state: Rc<RefCell<OpState>>) {
+    let parked = state.borrow().borrow::<Parked>().clone();
+    // Subscribing before saying anything, because the two ends of this
+    // are a call away from each other: what is said here is what lets
+    // the call be made, and a receiver made after that call would have
+    // been made too late to hear it.
+    let mut calls = parked.calls.subscribe();
+    parked.said.send_replace(true);
+    let _ = calls.changed().await;
+}
+
 /// `Deno.readFile` and `Deno.readTextFile`, which are the same op and
 /// differ in javascript by what is done with the bytes.
 #[op2(async(lazy), fast)]
@@ -334,6 +403,7 @@ deno_core::extension!(
         op_zou_chunk_fail,
         op_zou_env_get,
         op_zou_env,
+        op_zou_parked,
         op_zou_version,
         op_zou_agent,
         op_zou_read_file,
@@ -753,6 +823,8 @@ async fn build(
     // the top of a module runs here and reading the environment there
     // is the most ordinary line there is.
     js.op_state().borrow_mut().put(owned);
+    let parked = Parked::new();
+    js.op_state().borrow_mut().put(parked.clone());
     js.op_state()
         .borrow_mut()
         .put(websocket::Sockets::default());
@@ -784,19 +856,48 @@ async fn build(
         js.mod_evaluate(id)
     };
     let evaluated = std::pin::pin!(evaluated);
-    watch
-        .timing(js.with_event_loop_promise(evaluated, PollEventLoopOptions::default()))
-        .await
-        .map_err(|e| why(&specifier, &watch, e))?;
+    // The other way out of that wait: a module that has parked on an
+    // accept has said everything it is going to say, and what it is
+    // waiting for is the call this is on the way to making. oak is
+    // written that way, `await app.listen({ port: 8000 })` as the last
+    // line of the module, and so is everything built on oak, so the
+    // evaluation finishing cannot be the only door out of here or none
+    // of that runs at all.
+    let listening = {
+        let mut waiting =
+            std::pin::pin!(js.with_event_loop_promise(evaluated, PollEventLoopOptions::default()));
+        let mut parked = std::pin::pin!(parked.parked());
+        let until = std::future::poll_fn(|cx| {
+            use std::task::Poll;
+            match std::future::Future::poll(waiting.as_mut(), cx) {
+                Poll::Pending => std::future::Future::poll(parked.as_mut(), cx).map(|()| Ok(true)),
+                other => other.map(|done| done.map(|()| false)),
+            }
+        });
+        watch
+            .timing(until)
+            .await
+            .map_err(|e| why(&specifier, &watch, e))?
+    };
 
     // `export default { fetch }` is one of the three ways upstream lets
     // a module say what to run, and the only one the module says by
     // exporting rather than by calling something the prelude handed it.
     // So it is read out of the namespace here and passed in at call
     // time, and the prelude decides between it and the other two.
-    let namespace = js
-        .get_module_namespace(id)
-        .map_err(|e| why(&specifier, &watch, e))?;
+    //
+    // Except for a module that is still on its own top level, which is
+    // not asked. It took the socket, and taking the socket already
+    // beats a default export in the order the prelude picks in, so the
+    // answer would be thrown away. Reading it would mean reading a
+    // binding the module has not reached yet.
+    let namespace = match listening {
+        true => None,
+        false => Some(
+            js.get_module_namespace(id)
+                .map_err(|e| why(&specifier, &watch, e))?,
+        ),
+    };
 
     let (entry, exported, drain) = {
         let context = js.main_context();
@@ -820,11 +921,16 @@ async fn build(
         // A module namespace answers for a name it does not export with
         // undefined rather than by failing, which is exactly what the
         // prelude wants to be told about a module that has no default.
-        let namespace = v8::Local::new(scope, namespace);
-        let default = v8::String::new(scope, "default").expect("a four character name");
-        let exported = namespace
-            .get(scope, default.into())
-            .unwrap_or_else(|| v8::undefined(scope).into());
+        let exported = match &namespace {
+            None => v8::undefined(scope).into(),
+            Some(namespace) => {
+                let namespace = v8::Local::new(scope, namespace);
+                let default = v8::String::new(scope, "default").expect("a four character name");
+                namespace
+                    .get(scope, default.into())
+                    .unwrap_or_else(|| v8::undefined(scope).into())
+            }
+        };
         (
             held.pop().expect("two of them"),
             v8::Global::new(scope, exported),
@@ -869,6 +975,10 @@ impl Ready {
         watch.restart();
         let watchdog = limits::watch(handle.clone(), Arc::clone(watch), limits);
         js.op_state().borrow_mut().put(held);
+        // A module parked on an accept is waiting on an op out here,
+        // the way a real accept waits on a real socket, and this is
+        // the call arriving that ends that wait.
+        js.op_state().borrow().borrow::<Parked>().arrived();
 
         // The same again, and this is the one that matters: a handler
         // that is not async runs to its end inside `call`, so a

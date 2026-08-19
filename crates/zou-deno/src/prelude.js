@@ -2257,6 +2257,28 @@
     connected: false,
   };
 
+  /// Say that the loop is now waiting for a request.
+  ///
+  /// A module whose last line is `await app.listen({ port: 8000 })` is
+  /// waiting here, and the host is waiting for that module to finish
+  /// evaluating, and neither of those ends without being told. This is
+  /// what tells it: the host stops waiting for the module and calls the
+  /// entry point, which puts the request into the loop that parked.
+  ///
+  /// The promise it hands back is deliberately dropped. What is wanted
+  /// is not its value but the wait itself being out there rather than
+  /// in here, because a wait held in javascript is one the runtime
+  /// underneath cannot see: a module halfway down its own top level
+  /// with nothing outstanding is a deadlock as far as that runtime is
+  /// concerned, and a request arriving with nothing outstanding does
+  /// not wake anything up.
+  ///
+  /// Said again at every park rather than once, because a pooled
+  /// isolate parks again after every call it answers.
+  function parked() {
+    ops.op_zou_parked();
+  }
+
   const CONN = {
     rid: 0,
     localAddr: { transport: "tcp", hostname: "0.0.0.0", port: 9000 },
@@ -2280,7 +2302,10 @@
           accepting.connected = true;
           return Promise.resolve(CONN);
         }
-        return new Promise((resolve) => accepting.accepts.push(resolve));
+        return new Promise((resolve) => {
+          accepting.accepts.push(resolve);
+          parked();
+        });
       },
       close() {},
       ref() {},
@@ -2307,7 +2332,10 @@
         if (held !== undefined) {
           return Promise.resolve(held);
         }
-        return new Promise((resolve) => accepting.nexts.push(resolve));
+        return new Promise((resolve) => {
+          accepting.nexts.push(resolve);
+          parked();
+        });
       },
       close() {},
       [Symbol.asyncIterator]() {
