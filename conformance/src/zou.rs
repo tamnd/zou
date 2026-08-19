@@ -10,6 +10,7 @@
 //! and the server goes with it, which is the whole of the lifecycle a
 //! test binary needs.
 
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::time::Duration;
 
@@ -37,11 +38,51 @@ pub fn key(role: &str, secret: &str) -> String {
 /// `amr` are what a factor check compares against, and `aud` is
 /// checked before any of them.
 pub fn user_key(user: &crate::suite::User, secret: &str) -> String {
+    user_key_shifted(user, secret, &BTreeMap::new())
+        .expect("no claim is moved, so nothing here can be refused")
+}
+
+/// The same token with some of its time claims moved off now.
+///
+/// The offsets are seconds and they are read at the moment the case is
+/// asked rather than when the suite was loaded, so a long run does not
+/// drift into asking a different question than the one written down.
+/// Only the three claims that are about time can be moved: everything
+/// else in the token is what the seeded person is, and a case that
+/// wanted to change one of those would be asking about a different
+/// person rather than about a different time.
+pub fn user_key_shifted(
+    user: &crate::suite::User,
+    secret: &str,
+    shift: &BTreeMap<String, i64>,
+) -> Result<String, String> {
     let iat = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default();
-    let claims = serde_json::json!({
+    // Every offset is from now, exp included, so a case that says
+    // `{"exp": -10}` is a token that ran out ten seconds ago rather
+    // than one that runs out ten seconds before it would have. A claim
+    // nobody moved keeps the value the ordinary token has.
+    let at = |claim: &str, unmoved: u64| -> Result<u64, String> {
+        match shift.get(claim) {
+            Some(by) => (iat as i64)
+                .checked_add(*by)
+                .filter(|t| *t >= 0)
+                .map(|t| t as u64)
+                .ok_or_else(|| format!("{claim} moved by {by} is not a time")),
+            None => Ok(unmoved),
+        }
+    };
+    if let Some(claim) = shift
+        .keys()
+        .find(|c| !matches!(c.as_str(), "iat" | "nbf" | "exp"))
+    {
+        return Err(format!(
+            "{claim} is not a claim about time, so there is no offset to give it"
+        ));
+    }
+    let mut claims = serde_json::json!({
         "iss": "zou",
         "sub": user.id,
         "aud": "authenticated",
@@ -57,7 +98,15 @@ pub fn user_key(user: &crate::suite::User, secret: &str) -> String {
         "iat": iat,
         "exp": iat + 3600,
     });
-    jwt::mint(&claims, secret.as_bytes())
+    claims["iat"] = at("iat", iat)?.into();
+    claims["exp"] = at("exp", iat + 3600)?.into();
+    // Unlike the other two, a token that says nothing about when it
+    // starts working is the ordinary token, so this one is only there
+    // when a case asks for it.
+    if shift.contains_key("nbf") {
+        claims["nbf"] = at("nbf", iat)?.into();
+    }
+    Ok(jwt::mint(&claims, secret.as_bytes()))
 }
 
 /// Start zou against `dsn` on a free port and wait until it answers.
@@ -240,6 +289,67 @@ mod tests {
                 "super-secret-jwt-token-with-at-least-32-characters-long"
             )
         );
+    }
+
+    fn person() -> crate::suite::User {
+        crate::suite::User {
+            id: "f0a2c7d4-9b31-4e58-8c76-2a5d1e3f4b60".to_string(),
+            email: "person@zou.test".to_string(),
+            session_id: "a3f5c108-2b64-4e97-83d1-6c0a9e7b2d45".to_string(),
+        }
+    }
+
+    fn claims_of(token: &str) -> serde_json::Value {
+        let payload = token.split('.').nth(1).expect("three parts");
+        serde_json::from_slice(&base64_url(payload)).expect("json claims")
+    }
+
+    /// An ordinary token says nothing about when it starts working,
+    /// which is what makes a case that moves `nbf` a case at all.
+    #[test]
+    fn a_token_nobody_moved_has_no_nbf_on_it() {
+        let claims = claims_of(&user_key(&person(), "s"));
+        assert!(claims.get("nbf").is_none(), "{claims}");
+        assert_eq!(
+            claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+            3600
+        );
+    }
+
+    #[test]
+    fn an_offset_moves_the_claim_it_names_and_leaves_the_others() {
+        let shift = BTreeMap::from([("nbf".to_string(), 3600)]);
+        let claims = claims_of(&user_key_shifted(&person(), "s", &shift).unwrap());
+        let iat = claims["iat"].as_i64().unwrap();
+        assert_eq!(claims["nbf"].as_i64().unwrap(), iat + 3600);
+        assert_eq!(claims["exp"].as_i64().unwrap(), iat + 3600);
+        // Still the same person, since a case about a time claim is not
+        // a case about somebody else.
+        assert_eq!(claims["sub"], person().id);
+        assert_eq!(claims["role"], "authenticated");
+    }
+
+    /// Every offset is from now, so this is ten seconds past its exp
+    /// rather than ten seconds short of the hour it would have had.
+    #[test]
+    fn an_offset_backwards_is_a_token_that_ran_out() {
+        let shift = BTreeMap::from([("exp".to_string(), -10)]);
+        let claims = claims_of(&user_key_shifted(&person(), "s", &shift).unwrap());
+        assert_eq!(
+            claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+            -10
+        );
+    }
+
+    /// Everything else in the token says who the caller is, and a case
+    /// that moved one of those would be asking about a different person
+    /// rather than about a different moment. Better refused than
+    /// quietly written into a recording.
+    #[test]
+    fn nothing_but_the_three_claims_about_time_can_be_moved() {
+        let shift = BTreeMap::from([("role".to_string(), 1)]);
+        let why = user_key_shifted(&person(), "s", &shift).unwrap_err();
+        assert!(why.contains("not a claim about time"), "{why}");
     }
 
     #[test]

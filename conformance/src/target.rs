@@ -39,6 +39,16 @@ pub struct Keys {
     /// asked the S3 cases at all, which is the hosted case until
     /// somebody makes a pair on a throwaway project.
     pub s3: Option<Credentials>,
+    /// What a case that names its own `token` is minted from. The
+    /// `user` above is one token made once; a case about a time claim
+    /// needs its own, made when the case is asked.
+    pub mint: Option<Mint>,
+}
+
+/// Enough to sign another token for the seeded person.
+pub struct Mint {
+    pub user: crate::suite::User,
+    pub secret: String,
 }
 
 pub struct Target {
@@ -221,6 +231,27 @@ impl Target {
                 .parse()
                 .map_err(|e| format!("{}: {}: header {name}: {e}", self.name, case.name))?;
             request.headers_mut().insert(name, value);
+        }
+        // Last, so that it is the case's own token that goes out rather
+        // than the key's and rather than a header written next to it.
+        // A case naming both is a case that cannot say what it wants,
+        // and this is the half of it that could not have been written
+        // by hand.
+        if !case.token.is_empty() {
+            let Some(mint) = &self.keys.mint else {
+                return Err(format!(
+                    "{}: {}: a token to move, and no seeded person to mint one for",
+                    self.name, case.name
+                ));
+            };
+            let token = crate::zou::user_key_shifted(&mint.user, &mint.secret, &case.token)
+                .map_err(|e| format!("{}: {}: {e}", self.name, case.name))?;
+            let value: ureq::http::HeaderValue = format!("Bearer {token}")
+                .parse()
+                .map_err(|e| format!("{}: {}: the minted token: {e}", self.name, case.name))?;
+            request
+                .headers_mut()
+                .insert(ureq::http::header::AUTHORIZATION, value);
         }
         if case.key.signs() {
             self.sign(&mut request, case)?;
@@ -798,6 +829,7 @@ mod tests {
             path: path.to_string(),
             key: Key::Anon,
             headers: BTreeMap::new(),
+            token: BTreeMap::new(),
             body: None,
             file: None,
             bytes: None,

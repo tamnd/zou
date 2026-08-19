@@ -716,6 +716,7 @@ fn request(bytes: &[char], at: usize, method: &str, spec: &Spec, it: &str) -> Re
         path: format!("/rest/v1{path}"),
         key: crate::suite::Key::Anon,
         headers,
+        token: std::collections::BTreeMap::new(),
         body,
         file: None,
         bytes: None,

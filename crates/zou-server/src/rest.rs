@@ -184,6 +184,81 @@ impl RestError {
     }
 }
 
+/// What this surface says about a bearer token it will not take.
+///
+/// Not the one line the edge says about the same token. Upstream's
+/// gateway passes a bearer through without reading it, so the refusal a
+/// client sees on `/rest/v1` is PostgREST's own: a code, a challenge
+/// naming the reason, and the charset every answer of its carries.
+///
+/// The mapping was measured against 16.1 rather than read off the
+/// source. The three claims about time are PGRST303 and the message is
+/// the claim that failed, and everything about the signature is
+/// PGRST301 under one message with the detail line saying which way it
+/// failed. A key that decoded nothing is "none of the keys" and a token
+/// no key could even be chosen for is "no suitable key was found",
+/// which is the same sentence twice until you have both in front of
+/// you.
+pub fn token_refused(why: &crate::jwt::Reject, token: &str) -> Response {
+    use crate::jwt::Reject;
+    let (code, message, details) = match why {
+        Reject::Expired | Reject::TooEarly | Reject::IssuedLater => {
+            ("PGRST303", why.as_str().to_string(), None)
+        }
+        Reject::BadSignature => (
+            "PGRST301",
+            "No suitable key or wrong key type".to_string(),
+            Some("None of the keys was able to decode the JWT"),
+        ),
+        // A header naming an algorithm this server does not sign with,
+        // and a kid naming a key it does not have, are the same thing
+        // from here: there was no key to try. Only the first of the two
+        // was probed, since the reference has no key set configured in
+        // the run that recorded these.
+        Reject::WrongAlgorithm(_) | Reject::UnknownKey => (
+            "PGRST301",
+            "No suitable key or wrong key type".to_string(),
+            Some("No suitable key was found to decode the JWT"),
+        ),
+        // Two shapes under the one variant here, and the reference tells
+        // them apart: a bearer that is not three parts is counted and
+        // named as such before anything is decoded, and three parts that
+        // do not decode are the operation failing. A client that sent a
+        // session id where a token goes gets the first, which is the one
+        // worth being told plainly.
+        Reject::Malformed => match token.split('.').count() {
+            3 => (
+                "PGRST301",
+                "JWT cryptographic operation failed".to_string(),
+                None,
+            ),
+            parts => (
+                "PGRST301",
+                format!("Expected 3 parts in JWT; got {parts}"),
+                None,
+            ),
+        },
+    };
+    let mut res = error_body(
+        StatusCode::UNAUTHORIZED,
+        serde_json::json!({
+            "code": code,
+            "details": details,
+            "hint": serde_json::Value::Null,
+            "message": message,
+        }),
+    );
+    // The challenge carries the reason where the bare one this surface
+    // sends for a policy refusal does not, which is upstream saying the
+    // difference between "you may not" and "this token is no good".
+    if let Ok(value) = header::HeaderValue::try_from(format!(
+        "Bearer error=\"invalid_token\", error_description=\"{message}\""
+    )) {
+        res.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+    }
+    res
+}
+
 /// An error on the REST surface. PostgREST names the charset on every
 /// answer it sends, including the ones that went wrong, and GoTrue does
 /// not, so this is not the same builder the auth surface uses.
@@ -3424,6 +3499,87 @@ pub async fn rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusal taken apart: the status, the body, and the challenge
+    /// header, which together are everything a conformance case reads.
+    async fn refusal(
+        why: crate::jwt::Reject,
+        token: &str,
+    ) -> (u16, serde_json::Value, Option<String>) {
+        let res = token_refused(&why, token);
+        let status = res.status().as_u16();
+        let challenge = res
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .expect("a refusal has a body");
+        (
+            status,
+            serde_json::from_slice(&bytes).expect("and it is json"),
+            challenge,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_claim_about_time_is_its_own_code_and_the_message_is_the_claim() {
+        for (why, said) in [
+            (crate::jwt::Reject::Expired, "JWT expired"),
+            (crate::jwt::Reject::TooEarly, "JWT not yet valid"),
+            (crate::jwt::Reject::IssuedLater, "JWT issued at future"),
+        ] {
+            let (status, body, challenge) = refusal(why, "a.b.c").await;
+            assert_eq!(status, 401);
+            assert_eq!(body["code"], "PGRST303");
+            assert_eq!(body["message"], said);
+            assert_eq!(body["details"], serde_json::Value::Null);
+            // The challenge carries the reason, which is the half of
+            // this a client reads without opening the body.
+            assert_eq!(
+                challenge.unwrap(),
+                format!("Bearer error=\"invalid_token\", error_description=\"{said}\"")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signature_and_an_algorithm_read_alike_until_the_detail_line() {
+        for (why, detail) in [
+            (
+                crate::jwt::Reject::BadSignature,
+                "None of the keys was able to decode the JWT",
+            ),
+            (
+                crate::jwt::Reject::WrongAlgorithm("HS512".to_string()),
+                "No suitable key was found to decode the JWT",
+            ),
+            (
+                crate::jwt::Reject::UnknownKey,
+                "No suitable key was found to decode the JWT",
+            ),
+        ] {
+            let (status, body, _) = refusal(why, "a.b.c").await;
+            assert_eq!(status, 401);
+            assert_eq!(body["code"], "PGRST301");
+            assert_eq!(body["message"], "No suitable key or wrong key type");
+            assert_eq!(body["details"], detail);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bearer_that_is_not_three_parts_is_counted_and_told_so() {
+        let (_, one, _) = refusal(crate::jwt::Reject::Malformed, "not-a-token").await;
+        assert_eq!(one["code"], "PGRST301");
+        assert_eq!(one["message"], "Expected 3 parts in JWT; got 1");
+        let (_, two, _) = refusal(crate::jwt::Reject::Malformed, "a.b").await;
+        assert_eq!(two["message"], "Expected 3 parts in JWT; got 2");
+        // Three parts that do not decode are the other shape, where
+        // there was something to try and it did not work.
+        let (_, three, _) = refusal(crate::jwt::Reject::Malformed, "a.b.c").await;
+        assert_eq!(three["message"], "JWT cryptographic operation failed");
+    }
 
     #[test]
     fn a_bare_table_defaults_to_select_star() {

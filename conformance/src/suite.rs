@@ -92,6 +92,22 @@ pub struct Case {
     pub key: Key,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// A token minted for this case alone, with some of its time claims
+    /// moved off now. Each entry is a claim and an offset in seconds,
+    /// so `{"nbf": 3600}` is a token that does not start working for an
+    /// hour and `{"exp": -10}` is one that ran out ten seconds ago.
+    ///
+    /// Everything else a case sends is fixed text in a file, and a case
+    /// about `nbf`, `iat` or the window around `exp` cannot be: a token
+    /// that is an hour early is an hour early relative to the run
+    /// asking it, and one written down last week is only expired. The
+    /// suite says how far off and the run works out when that is.
+    ///
+    /// The token is otherwise the seeded person's, the same claims the
+    /// `user` key carries, so a suite with no `user` has nobody to mint
+    /// one for.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub token: BTreeMap<String, i64>,
     /// Sent as is, so a case can test what a malformed body does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,

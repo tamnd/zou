@@ -430,6 +430,16 @@ fn run(args: Args) -> Result<bool, String> {
             .user
             .as_ref()
             .map(|user| zou::user_key(user, &args.jwt_secret));
+        // The same person and the same secret, kept rather than spent,
+        // for the cases that mint their own. Both targets get one: a
+        // case about a time claim is only worth asking if the reference
+        // is asked the same question at the same moment.
+        let mint = || {
+            suite.cases.user.as_ref().map(|user| target::Mint {
+                user: user.clone(),
+                secret: args.jwt_secret.clone(),
+            })
+        };
         // Not derived from anything, unlike the four above. The S3
         // surface checks a signature rather than a token, so the pair
         // is whatever the target was configured with and both targets
@@ -467,6 +477,7 @@ fn run(args: Args) -> Result<bool, String> {
                 service: Some(service.clone()),
                 user: user.clone(),
                 s3: Some(s3.clone()),
+                mint: mint(),
             },
             dsn,
             args.strip.clone(),
@@ -486,6 +497,7 @@ fn run(args: Args) -> Result<bool, String> {
                     ),
                     user: user.clone(),
                     s3: Some(s3.clone()),
+                    mint: mint(),
                 },
                 args.reference_dsn.clone(),
                 args.reference_strip.clone(),
@@ -968,6 +980,7 @@ mod tests {
             path: "/storage/v1/object/notes/hello.txt".to_string(),
             key: suite::Key::Service,
             headers: Default::default(),
+            token: Default::default(),
             body: None,
             file: None,
             bytes: None,
