@@ -25,7 +25,9 @@ use std::sync::Arc;
 
 use tokio_postgres::{Client, NoTls, config::SslMode};
 
-pub const USAGE: &str = "usage: zou import supabase <--db-url <url> | --project-ref <ref>> [--db-password <pw>] --dry-run [--report <path>]";
+pub const USAGE: &str = "usage: zou import supabase <--db-url <url> | --project-ref <ref>> [--db-password <pw>] <--to <url> | --dry-run> [--report <path>]";
+
+mod copy;
 
 /// The report's default name, which is the one the milestone asks for
 /// and the one a pull request reviewing an import will look for.
@@ -225,6 +227,7 @@ pub struct Args {
     pub url: Option<String>,
     pub project_ref: Option<String>,
     pub password: Option<String>,
+    pub to: Option<String>,
     pub dry_run: bool,
     pub report: Option<PathBuf>,
 }
@@ -252,6 +255,7 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--report" => {
                 args.report = Some(PathBuf::from(rest.next().ok_or("--report needs a path")?))
             }
+            "--to" => args.to = Some(rest.next().ok_or("--to needs a url")?.clone()),
             "--dry-run" => args.dry_run = true,
             other => return Err(format!("unexpected argument {other:?}\n{USAGE}")),
         }
@@ -434,7 +438,7 @@ async fn connect(url: &str) -> Result<Client, String> {
 /// One schema and what is in it. Rows are the planner's estimate, which
 /// is what `reltuples` is, and the report says so rather than passing
 /// an estimate off as a count.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Schema {
     pub name: String,
     pub tables: i64,
@@ -559,11 +563,10 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         (None, Some(project_ref)) => url_for(project_ref, args.password.as_deref())?,
         _ => return Err(USAGE.into()),
     };
-    if !args.dry_run {
-        return Err(
-            "the copy is not written yet, only the survey is. Run the same command with --dry-run and it will read the project and write import-report.md, see https://github.com/tamnd/zou/issues/5"
-                .into(),
-        );
+    if !args.dry_run && args.to.is_none() {
+        return Err(format!(
+            "nothing to copy into, pass --to with the database to import into, or --dry-run to read the project and write {DEFAULT_REPORT} without copying anything"
+        ));
     }
     let report = args
         .report
@@ -573,15 +576,23 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         .enable_all()
         .build()
         .map_err(|e| format!("cannot start a runtime: {e}"))?;
-    let survey = runtime.block_on(async {
+    runtime.block_on(async {
         let client = connect(&url).await?;
-        Ok::<_, String>(survey(&client).await)
-    })?;
-    let markdown = render(&survey);
-    std::fs::write(&report, &markdown)
-        .map_err(|e| format!("cannot write {}: {e}", report.display()))?;
-    summary(&survey, &report);
-    Ok(())
+        let survey = survey(&client).await;
+        // The report is written before anything is copied and whether
+        // or not anything is, because the survey is what somebody reads
+        // when a copy goes wrong, and a copy that failed is exactly
+        // when it is least convenient to go and take one.
+        let markdown = render(&survey);
+        std::fs::write(&report, &markdown)
+            .map_err(|e| format!("cannot write {}: {e}", report.display()))?;
+        summary(&survey, &report);
+        let Some(to) = &args.to else { return Ok(()) };
+        let mut target = connect(to).await?;
+        let done = copy::run(&client, &mut target, &survey).await?;
+        print!("{}", done.render());
+        Ok(())
+    })
 }
 
 pub async fn survey(client: &Client) -> Survey {
@@ -1218,13 +1229,14 @@ mod tests {
         assert_eq!(size(2_400_000_000), "2.4 GB");
     }
 
-    /// The copy is not written, and the error has to say that rather
-    /// than looking like the project was read and found empty.
+    /// A command with neither a target nor --dry-run has been asked
+    /// for nothing, and saying so beats reading a whole project and
+    /// throwing the answer away.
     #[test]
-    fn without_dry_run_the_command_says_what_it_cannot_do_yet() {
+    fn a_run_with_nowhere_to_put_it_says_so_before_it_connects() {
         let e = run(&argv(&["supabase", "--db-url", "postgresql://localhost/x"])).unwrap_err();
+        assert!(e.contains("--to"), "{e}");
         assert!(e.contains("--dry-run"), "{e}");
-        assert!(e.contains("issues/5"), "{e}");
     }
 
     /// Enough of a project's shape to survey: the two schemas the
@@ -1364,7 +1376,7 @@ analyze;
         });
     }
 
-    async fn open(config: &tokio_postgres::Config) -> Client {
+    pub(super) async fn open(config: &tokio_postgres::Config) -> Client {
         let (client, connection) = config.connect(NoTls).await.expect("connect");
         tokio::spawn(async move {
             let _ = connection.await;

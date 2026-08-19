@@ -19,7 +19,6 @@ mod inbox;
 mod info;
 mod inspect;
 mod map;
-#[cfg(unix)]
 mod schema;
 #[cfg(unix)]
 mod secrets;

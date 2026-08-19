@@ -1,8 +1,8 @@
 # Migrating a Supabase project
 
-`zou import supabase` reads a hosted project and says what moving it here would cost. Today it reads and reports. It does not copy yet, and the command refuses to run without `--dry-run` rather than pretending otherwise.
+`zou import supabase` reads a hosted project, says what moving it here would cost, and then moves it.
 
-The order is deliberate. A migration tool that finds out halfway through is worse than no migration tool, because the half is now somebody's problem. So the survey is a step of its own and it goes first: connect to the project, count what is there, and write a report naming every extension, schema, role and object that was found and what happens to each of them here. Nothing is silently dropped, which in practice means the report has a section for the things that do not come over, and a section for the things the survey did not look at, and neither one is ever empty by accident.
+The order is deliberate. A migration tool that finds out halfway through is worse than no migration tool, because the half is now somebody's problem. So the survey is a step of its own and it always goes first, whether or not a copy follows: connect to the project, count what is there, and write a report naming every extension, schema, role and object that was found and what happens to each of them here. Nothing is silently dropped, which in practice means the report has a section for the things that do not come over, and a section for the things the survey did not look at, and neither one is ever empty by accident.
 
 ## Running it
 
@@ -10,7 +10,13 @@ The order is deliberate. A migration tool that finds out halfway through is wors
 zou import supabase --project-ref abcdefghijklmnopqrst --dry-run
 ```
 
-The project ref is the one the dashboard prints, and it becomes `db.<ref>.supabase.co:5432` with the database password. The password comes from `--db-password` or from `SUPABASE_DB_PASSWORD`, and it is percent encoded on the way into the url, so a generated password with `@` or `/` or `#` in it works without anybody having to escape it by hand.
+That reads and reports and copies nothing. The project ref is the one the dashboard prints, and it becomes `db.<ref>.supabase.co:5432` with the database password. The password comes from `--db-password` or from `SUPABASE_DB_PASSWORD`, and it is percent encoded on the way into the url, so a generated password with `@` or `/` or `#` in it works without anybody having to escape it by hand.
+
+Reading the report, then moving it:
+
+```
+zou import supabase --project-ref abcdefghijklmnopqrst --to "postgresql://postgres@127.0.0.1:5432/postgres"
+```
 
 The other way in is the connection string itself, which is what a project not on the hosted platform will have:
 
@@ -23,10 +29,11 @@ zou import supabase --db-url "postgresql://postgres:pw@host:5432/postgres?sslmod
 | `--project-ref <ref>` | Build the hosted url from a project ref. |
 | `--db-url <url>` | Use a connection string as given. Not with `--project-ref`. |
 | `--db-password <pw>` | The database password for a project ref, or `SUPABASE_DB_PASSWORD`. |
-| `--dry-run` | Read and report. Required, because reading is all there is so far. |
+| `--to <url>` | The database to copy into. Without it the run is a survey. |
+| `--dry-run` | Survey only, said out loud so that a run with no target is not a typo. |
 | `--report <path>` | Where the report goes, `import-report.md` by default. |
 
-Everything the survey runs is a catalog read or a `count(*)`. The source is not written to and no lease is taken on anything. A probe that fails is written down and the survey carries on, because a project with one table the connecting role cannot see is still a project worth reporting on.
+Everything the survey runs is a catalog read or a `count(*)`. The source is not written to at any point, by the survey or by the copy, and no lease is taken on anything. A probe that fails is written down and the survey carries on, because a project with one table the connecting role cannot see is still a project worth reporting on.
 
 ### TLS
 
@@ -52,9 +59,40 @@ Seven sections, in the order somebody moving a project cares about them.
 
 **What this did not look at.** Column level grants and default privileges, large objects, replication slots and subscriptions, configuration set with `alter database` or `alter role`, and the contents of any table. Plus anything a probe failed on, with the error. This section exists for the same reason `zou db diff` prints one: a section that came back empty from a tool that never looked reads exactly like good news.
 
+## What the copy does
+
+`--to` copies, in eight steps, in this order:
+
+1. **Extensions.** `create extension if not exists` for each one the project has that is built here. The ones zou answers for by other means are not created, because there is nothing to create, and the ones with no answer here were already named in the report.
+2. **Schemas.** Every schema the project owns, which is what the survey found minus the platform's own and minus this server's.
+3. **Sequence definitions.** The sequences a column defaults to, created before the tables that call `nextval` on them. Identity sequences are skipped here because the identity column makes its own.
+4. **Definitions.** Tables, constraints, indexes, views, functions, triggers, policies and comments, read out of the source catalog and diffed against this one.
+5. **Data.** One `copy` out of the source straight into a `copy` into the target, table by table, with `session_replication_role = replica` so foreign keys and user triggers do not care what order the tables arrive in. Generated columns and partition leaves are left out, because the one is computed here and the other arrives through its parent.
+6. **Sequences.** `setval` to where the source had got to, and `alter sequence ... owned by` now that the tables exist.
+7. **Platform rows.** The `auth` and `storage` rows, into the tables this server already made at startup.
+8. **Grants.** Usage and privileges for `anon`, `authenticated` and `service_role` on each schema that arrived, plus default privileges so the next table made in one of them is reachable too.
+
+The definitions step goes through the same code `zou db diff` does, given an empty catalog to diff from, so it can only ever produce creates. If a `drop` were ever to come out of it the copy stops instead of running it.
+
+### Resume
+
+Each step is one transaction, and the row that records the step is written inside that transaction. So a step either happened and is written down, or did not happen and left nothing behind, and there is no third state to detect. Running the same command again skips what the ledger already names and prints what it skipped:
+
+```
+copied 0 rows in 0 steps, 8 steps were already done
+```
+
+The ledger is `zou.import_progress`, one row per step with its row count and the time. Deleting a row from it makes that step run again, which is the supported way to redo one.
+
+### What it will not do
+
+It will not import into a database that already has the project's tables in it. A target with anything of its own in a non platform schema is refused by name, because merging two projects is a decision somebody makes deliberately and not something a migration tool does on their behalf.
+
+The `auth` and `storage` tables are the exception, because this server makes them at startup and so they are always already there. Those two are copied column by column on the intersection of what the source has and what this server has, and every column and table left out of that intersection is named in the output rather than dropped quietly. A platform table that already holds rows here is refused rather than appended to.
+
 ## What is not built yet
 
-The copy. Schema and data, ownership fixups, auth users verified after the move, storage objects copied in parallel with resume, and `zou export` for going the other way, are all on [issue #5](https://github.com/tamnd/zou/issues/5). Until they land the command says so in the error rather than doing part of the job.
+The bytes of the storage objects. The rows that name them come over in step 7, so the metadata is here, but the objects themselves are still on the old project's storage. That, plus auth users verified after the move and `zou export` for going the other way, are on [issue #5](https://github.com/tamnd/zou/issues/5). Every run says which of these it left behind, in the same list as everything else it did not copy.
 
 ## Related
 
