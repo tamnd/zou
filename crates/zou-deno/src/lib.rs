@@ -23,8 +23,9 @@
 //! small implementation of the shapes a handler is written against, and
 //! the gaps are written down here rather than found out in production:
 //!
-//! - `crypto.subtle` is a digest and HMAC and no more: no encryption,
-//!   no key derivation, no asymmetric algorithms, each refused by name.
+//! - `crypto.subtle` is a digest, HMAC, and AES in CBC and GCM: no key
+//!   derivation and no asymmetric algorithms, each refused by name, and
+//!   raw is the only key format there is a parser for.
 //! - Streams are readable only. There is no `WritableStream` and so no
 //!   `pipeTo`, and no byte stream and no BYOB reader. A response body
 //!   reaches the caller in chunks, and a body coming back from `fetch`

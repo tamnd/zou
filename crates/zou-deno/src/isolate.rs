@@ -412,6 +412,8 @@ deno_core::extension!(
         crypto::op_zou_digest,
         crypto::op_zou_sign,
         crypto::op_zou_verify,
+        crypto::op_zou_encrypt,
+        crypto::op_zou_decrypt,
         fetch::op_zou_fetch,
         fetch::op_zou_fetch_abort,
         timer::op_zou_sleep,

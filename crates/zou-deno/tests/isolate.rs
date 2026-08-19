@@ -1271,9 +1271,9 @@ fn an_hmac_signs_what_it_verifies() {
             notRaw: await crypto.subtle
                 .importKey("jwk", {}, { name: "HMAC", hash: "SHA-256" }, false, ["sign"])
                 .catch((e) => e.message),
-            noKeyGeneration: (() => {
-                try { crypto.subtle.generateKey(); return "made one"; } catch (e) { return e.message; }
-            })(),
+            noHmacGeneration: await crypto.subtle
+                .generateKey({ name: "HMAC", hash: "SHA-256" }, false, ["sign"])
+                .catch((e) => e.message),
         }));
         "#,
     );
@@ -1301,9 +1301,116 @@ fn an_hmac_signs_what_it_verifies() {
         said["notRaw"],
         "the jwk key format is not supported yet, only raw is"
     );
+    // A key out of randomness is a key for a cipher here and not for a
+    // mac, because the one thing that asks is an AES key nobody handed
+    // in.
     assert_eq!(
-        said["noKeyGeneration"],
-        "crypto.subtle.generateKey is not supported yet"
+        said["noHmacGeneration"],
+        "HMAC keys cannot be generated yet, only AES can"
+    );
+}
+
+/// AES, which is what a session cookie is written with and is the one
+/// thing in the examples corpus that asked `subtle` for a cipher.
+///
+/// The vector is the first CBC case of NIST SP 800-38A, so the whole
+/// path from javascript through the op and back is the ciphertext
+/// everybody else computes, and the rest is what a round trip has to
+/// hold: a wrong key is one refusal, GCM authenticates what is beside
+/// the ciphertext as well as the ciphertext, and a key made here can be
+/// read back out only if it said it could be.
+#[test]
+fn aes_encrypts_what_it_decrypts_in_both_modes() {
+    let answer = answered(
+        r#"
+        const hex = (buffer) =>
+            Array.from(new Uint8Array(buffer), (byte) => byte.toString(16).padStart(2, "0")).join("");
+        const unhex = (said) => new Uint8Array(said.match(/../g).map((two) => parseInt(two, 16)));
+        const text = (buffer) => new TextDecoder().decode(buffer);
+        const bytes = (said) => new TextEncoder().encode(said);
+
+        const known = await crypto.subtle.importKey(
+            "raw", unhex("2b7e151628aed2a6abf7158809cf4f3c"), "AES-CBC", false, ["encrypt", "decrypt"],
+        );
+        const iv = unhex("000102030405060708090a0b0c0d0e0f");
+        const plain = unhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e51");
+        const known256 = hex(await crypto.subtle.encrypt({ name: "AES-CBC", iv }, known, plain));
+
+        const cbc = await crypto.subtle.generateKey({ name: "AES-CBC", length: 256 }, true, ["encrypt", "decrypt"]);
+        const said = await crypto.subtle.encrypt({ name: "AES-CBC", iv }, cbc, bytes("a session"));
+        const other = await crypto.subtle.generateKey({ name: "AES-CBC", length: 256 }, false, ["decrypt"]);
+
+        const gcmIv = crypto.getRandomValues(new Uint8Array(12));
+        const gcm = await crypto.subtle.generateKey({ name: "AES-GCM", length: 128 }, false, ["encrypt", "decrypt"]);
+        const sealed = await crypto.subtle.encrypt(
+            { name: "AES-GCM", iv: gcmIv, additionalData: bytes("one") }, gcm, bytes("a payload"),
+        );
+
+        Deno.serve(async () => Response.json({
+            known: known256,
+            name: cbc.algorithm.name,
+            length: cbc.algorithm.length,
+            usages: cbc.usages,
+            roundTrip: text(await crypto.subtle.decrypt({ name: "AES-CBC", iv }, cbc, said)),
+            padded: said.byteLength,
+            wrongKey: await crypto.subtle
+                .decrypt({ name: "AES-CBC", iv }, other, said)
+                .then(() => "read it", (e) => `${e.name}: ${e.message}`),
+            sealed: text(await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: gcmIv, additionalData: bytes("one") }, gcm, sealed,
+            )),
+            wrongExtra: await crypto.subtle
+                .decrypt({ name: "AES-GCM", iv: gcmIv, additionalData: bytes("two") }, gcm, sealed)
+                .then(() => "read it", (e) => `${e.name}: ${e.message}`),
+            exported: hex(await crypto.subtle.exportKey("raw", cbc)).length,
+            notExtractable: await crypto.subtle
+                .exportKey("raw", gcm)
+                .then(() => "read it", (e) => `${e.name}: ${e.message}`),
+            wrongCipher: await crypto.subtle
+                .encrypt({ name: "AES-GCM", iv: gcmIv }, cbc, bytes("a session"))
+                .catch((e) => e.message),
+            shortKey: await crypto.subtle
+                .importKey("raw", new Uint8Array(7), "AES-CBC", false, ["encrypt"])
+                .then(() => "made one", (e) => `${e.name}: ${e.message}`),
+            shortIv: await crypto.subtle
+                .encrypt({ name: "AES-CBC", iv: gcmIv }, cbc, bytes("a session"))
+                .catch((e) => e.message),
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said["known"].as_str().expect("a ciphertext")[..64].to_string(),
+        "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2"
+    );
+    assert_eq!(said["name"], "AES-CBC");
+    assert_eq!(said["length"], 256);
+    assert_eq!(said["usages"], serde_json::json!(["encrypt", "decrypt"]));
+    assert_eq!(said["roundTrip"], "a session");
+    // Nine bytes padded up to the block, which is what PKCS#7 does and
+    // is why a ciphertext is longer than what went into it.
+    assert_eq!(said["padded"], 16);
+    assert_eq!(said["sealed"], "a payload");
+    // The one sentence, for the two ways it can fail, and it is a
+    // `DOMException` because that is what the specification calls it.
+    assert_eq!(said["wrongKey"], "OperationError: Decryption failed");
+    assert_eq!(said["wrongExtra"], "OperationError: Decryption failed");
+    assert_eq!(said["exported"], 64);
+    assert_eq!(
+        said["notExtractable"],
+        "InvalidAccessError: key is not extractable"
+    );
+    assert_eq!(
+        said["wrongCipher"],
+        "this key is for AES-CBC and the encrypt is for AES-GCM"
+    );
+    assert_eq!(
+        said["shortKey"],
+        "DataError: an AES key is 128, 192 or 256 bits and this one is 56"
+    );
+    assert_eq!(
+        said["shortIv"],
+        "an AES-CBC iv is 16 bytes and this one is 12"
     );
 }
 

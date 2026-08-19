@@ -1891,13 +1891,18 @@
     return found;
   }
 
+  /// The name an algorithm was asked for by, out of a string or out of
+  /// the object that carries the rest of the parameters with it.
+  function nameOf(algorithm) {
+    return algorithm !== null && typeof algorithm === "object"
+      ? String(algorithm.name ?? "")
+      : String(algorithm);
+  }
+
   /// The hash an HMAC operation is under, which is the key's and not
   /// the algorithm's: `sign("HMAC", key, data)` names no hash at all.
   function hmacHash(algorithm, key) {
-    const named =
-      algorithm !== null && typeof algorithm === "object"
-        ? String(algorithm.name ?? "")
-        : String(algorithm);
+    const named = nameOf(algorithm);
     if (named.toLowerCase() !== "hmac") {
       throw new TypeError(`${named} is not supported yet, only HMAC is`);
     }
@@ -1907,14 +1912,81 @@
     return key.algorithm.hash.name;
   }
 
+  /// The ciphers a key can be made for, spelled the way the spec spells
+  /// them so that a key made for one is refused by the other.
+  const CIPHERS = ["AES-CBC", "AES-GCM"];
+
+  function cipherNamed(algorithm) {
+    const given = nameOf(algorithm);
+    return CIPHERS.find((name) => name.toLowerCase() === given.toLowerCase());
+  }
+
+  /// What an AES key says about itself, and the one check worth making
+  /// while it is being made: there are three key lengths and a key of
+  /// any other length is not a key, whichever end it came from.
+  function aesAlgorithm(cipher, length) {
+    if (length !== 128 && length !== 192 && length !== 256) {
+      throw new DOMException(`an AES key is 128, 192 or 256 bits and this one is ${length}`, "DataError");
+    }
+    return { name: cipher, length };
+  }
+
+  /// A key holds its bytes and the algorithm it was made for, and the
+  /// algorithm is what every operation asks it about afterwards: an
+  /// AES-CBC key handed to `sign` is the wrong key and says so.
   class CryptoKey {
-    constructor(bytes, hash, extractable, usages) {
+    constructor(bytes, algorithm, extractable, usages) {
       this[SECRET] = bytes;
       this.type = "secret";
       this.extractable = Boolean(extractable);
       this.usages = usages;
-      this.algorithm = { name: "HMAC", hash: { name: hash }, length: bytes.length * 8 };
+      this.algorithm = algorithm;
     }
+  }
+
+  /// The key an encryption is under, checked against the name the call
+  /// made, because a key is made for one cipher and used with one.
+  function cipherKey(cipher, key, called) {
+    if (!(key instanceof CryptoKey)) {
+      throw new TypeError("a key is required");
+    }
+    if (key.algorithm.name !== cipher) {
+      throw new TypeError(
+        `this key is for ${key.algorithm.name} and the ${called} is for ${cipher}`,
+      );
+    }
+    return key[SECRET];
+  }
+
+  /// The parameters an AES call carries beside the data: the iv, which
+  /// both modes need, and for GCM what is authenticated without being
+  /// encrypted and how long the tag is.
+  function cipherParams(algorithm, cipher) {
+    if (algorithm === null || typeof algorithm !== "object") {
+      throw new TypeError(`${cipher} needs an iv`);
+    }
+    const iv = sourceOf(algorithm.iv, "iv");
+    if (cipher === "AES-CBC") {
+      return { iv, extra: new Uint8Array(0), tag: 0 };
+    }
+    const extra =
+      algorithm.additionalData === undefined
+        ? new Uint8Array(0)
+        : sourceOf(algorithm.additionalData, "additionalData");
+    const tag = algorithm.tagLength === undefined ? 0 : Number(algorithm.tagLength);
+    return { iv, extra, tag };
+  }
+
+  /// What a failed decryption is, which is one error however it failed:
+  /// the host says this sentence and nothing else, and the party
+  /// holding the wrong key learns nothing from which part was wrong.
+  const FAILED = "Decryption failed";
+
+  function raised(error) {
+    if (error instanceof TypeError && error.message === FAILED) {
+      return new DOMException(FAILED, "OperationError");
+    }
+    return error;
   }
 
   function refuse(name) {
@@ -1929,27 +2001,101 @@
       return digested.buffer;
     },
 
-    /// Raw HMAC keys and nothing else, because that is what a function
-    /// verifying a webhook or signing its own token needs and the rest
-    /// wants key formats this has no parser for.
+    /// Raw keys and nothing else, because the other formats want a
+    /// parser this has no reason to carry: an HMAC key is bytes and an
+    /// AES key is bytes, and a function that imports either has them.
     async importKey(format, keyData, algorithm, extractable, usages) {
       if (String(format) !== "raw") {
         throw new TypeError(`the ${format} key format is not supported yet, only raw is`);
       }
-      const named =
-        algorithm !== null && typeof algorithm === "object"
-          ? String(algorithm.name ?? "")
-          : String(algorithm);
+      const bytes = sourceOf(keyData, "keyData");
+      const held = Array.from(usages ?? []).map(String);
+      const cipher = cipherNamed(algorithm);
+      if (cipher !== undefined) {
+        return new CryptoKey(bytes, aesAlgorithm(cipher, bytes.length * 8), extractable, held);
+      }
+      const named = nameOf(algorithm);
       if (named.toLowerCase() !== "hmac") {
-        throw new TypeError(`${named} keys are not supported yet, only HMAC is`);
+        throw new TypeError(`${named} keys are not supported yet, only HMAC and AES are`);
       }
       const hash = hashNamed(algorithm.hash);
       return new CryptoKey(
-        sourceOf(keyData, "keyData"),
-        hash,
+        bytes,
+        { name: "HMAC", hash: { name: hash }, length: bytes.length * 8 },
+        extractable,
+        held,
+      );
+    },
+
+    /// A key out of the operating system's randomness, which is where
+    /// a key nobody handed in has to come from.
+    async generateKey(algorithm, extractable, usages) {
+      const cipher = cipherNamed(algorithm);
+      if (cipher === undefined) {
+        throw new TypeError(`${nameOf(algorithm)} keys cannot be generated yet, only AES can`);
+      }
+      const length = Number(algorithm?.length);
+      const bytes = new Uint8Array(length / 8);
+      ops.op_zou_random(bytes);
+      return new CryptoKey(
+        bytes,
+        aesAlgorithm(cipher, length),
         extractable,
         Array.from(usages ?? []).map(String),
       );
+    },
+
+    /// The bytes back out, for a key that said it could be, because a
+    /// key that is not extractable is one whose bytes are the host's.
+    async exportKey(format, key) {
+      if (String(format) !== "raw") {
+        throw new TypeError(`the ${format} key format is not supported yet, only raw is`);
+      }
+      if (!(key instanceof CryptoKey)) {
+        throw new TypeError("a key is required");
+      }
+      if (!key.extractable) {
+        throw new DOMException("key is not extractable", "InvalidAccessError");
+      }
+      return key[SECRET].slice().buffer;
+    },
+
+    async encrypt(algorithm, key, data) {
+      const cipher = cipherNamed(algorithm);
+      if (cipher === undefined) {
+        throw new TypeError(`${nameOf(algorithm)} is not supported yet, only AES is`);
+      }
+      const { iv, extra, tag } = cipherParams(algorithm, cipher);
+      const said = ops.op_zou_encrypt(
+        cipher,
+        cipherKey(cipher, key, "encrypt"),
+        iv,
+        extra,
+        tag,
+        sourceOf(data, "data"),
+      );
+      return said.buffer;
+    },
+
+    async decrypt(algorithm, key, data) {
+      const cipher = cipherNamed(algorithm);
+      if (cipher === undefined) {
+        throw new TypeError(`${nameOf(algorithm)} is not supported yet, only AES is`);
+      }
+      const { iv, extra, tag } = cipherParams(algorithm, cipher);
+      try {
+        const said = ops.op_zou_decrypt(
+          cipher,
+          cipherKey(cipher, key, "decrypt"),
+          iv,
+          extra,
+          tag,
+          sourceOf(data, "data"),
+        );
+        return said.buffer;
+      } catch (error) {
+        throw raised(error);
+      }
     },
 
     async sign(algorithm, key, data) {
@@ -1971,12 +2117,8 @@
       );
     },
 
-    encrypt: refuse("encrypt"),
-    decrypt: refuse("decrypt"),
     deriveBits: refuse("deriveBits"),
     deriveKey: refuse("deriveKey"),
-    exportKey: refuse("exportKey"),
-    generateKey: refuse("generateKey"),
     unwrapKey: refuse("unwrapKey"),
     wrapKey: refuse("wrapKey"),
   };
