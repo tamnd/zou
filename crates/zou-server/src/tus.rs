@@ -622,15 +622,33 @@ fn metadata_of(parts: &Parts) -> Result<Vec<(String, String)>, Refusal> {
         .and_then(|v| v.to_str().ok())
         .filter(|text| !text.trim().is_empty())
         .ok_or_else(|| Refusal::new(400, "Metadata header is required"))?;
-    Ok(header
+    Ok(metadata_in(header))
+}
+
+/// The same, from the header's text alone.
+///
+/// Apart so that the parsing can be asked about on its own. It reads
+/// whatever arrived and never refuses: a pair whose value is not base64
+/// is a name with an empty value rather than a bad request, which is
+/// what upstream does and what a client sending a filename with a comma
+/// in it depends on.
+pub fn metadata_in(header: &str) -> Vec<(String, String)> {
+    header
         .split(',')
         .filter_map(|pair| {
             let pair = pair.trim();
             if pair.is_empty() {
                 return None;
             }
+            // Both halves trimmed, not just the value. The split is on
+            // a space and the pair around it was trimmed, so a name
+            // could still come out holding whitespace that is not a
+            // space, and a name with a stray carriage return on the end
+            // of it is not a different name: a head handing the
+            // metadata back writes a space after it, and reading that
+            // again would trim what the first reading kept.
             let (name, value) = match pair.split_once(' ') {
-                Some((name, value)) => (name, value.trim()),
+                Some((name, value)) => (name.trim(), value.trim()),
                 None => (pair, ""),
             };
             let decoded = base64ct::Base64::decode_vec(value)
@@ -639,7 +657,7 @@ fn metadata_of(parts: &Parts) -> Result<Vec<(String, String)>, Refusal> {
                 .unwrap_or_default();
             Some((name.to_string(), decoded))
         })
-        .collect())
+        .collect()
 }
 
 fn value_of(metadata: &[(String, String)], name: &str) -> Option<String> {
@@ -651,7 +669,7 @@ fn value_of(metadata: &[(String, String)], name: &str) -> Option<String> {
 
 /// The metadata as a head hands it back, which is what arrived with a
 /// `cacheControl` on the end that nobody sent.
-fn written_metadata(metadata: &[(String, String)]) -> String {
+pub fn written_metadata(metadata: &[(String, String)]) -> String {
     let mut pairs = metadata.to_vec();
     if !pairs.iter().any(|(name, _)| name == "cacheControl") {
         pairs.push(("cacheControl".to_string(), NO_CACHE.to_string()));

@@ -1,0 +1,1 @@
+{"join_ref":"1","ref":"2","topic":"realtime:room","event":"broadcast","payload":{"type":"broadcast","event":"cursor","payload":{"x":1}}}
