@@ -232,6 +232,27 @@ async fn bootstrap_created_the_three_roles() {
     sess.commit().await.expect("finish");
 }
 
+/// The fourth role, which is not one of the three and is not reached
+/// the way they are. A project's migration grants to it, so it has to
+/// be there, and nothing in this server ever becomes it.
+#[tokio::test]
+async fn bootstrap_created_the_role_a_project_migration_grants_to() {
+    let Some(pool) = pool_of(1) else { return };
+    let sess = pool.unscoped().await.expect("unscoped");
+    assert_eq!(
+        text(
+            &sess,
+            "select rolcanlogin::text from pg_roles where rolname = 'supabase_auth_admin'"
+        )
+        .await,
+        "false"
+    );
+    sess.execute("grant usage on schema public to supabase_auth_admin", &[])
+        .await
+        .expect("a migration written for a Supabase database applies");
+    sess.commit().await.expect("finish");
+}
+
 #[tokio::test]
 async fn the_injected_role_carries_real_privileges() {
     let Some(pool) = pool_of(1) else { return };

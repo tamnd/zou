@@ -1101,6 +1101,111 @@ jobs:
           path: /tmp/zou-conformance/demo/test-results
           if-no-files-found: ignore
 
+  # The second of Supabase's own example apps, and the other half of
+  # the claim. The job above asks whether an application can be built
+  # on the answers. This one asks whether an application can be built
+  # on the frames, which a suite cannot: a suite compares one frame
+  # with a recording at a time, and every frame can match while the
+  # thing a person is looking at never changes. So two browsers per
+  # test, one typing and one watching.
+  demo-realtime:
+    name: demo chat app
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: zou-conformance
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_CONFORMANCE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/postgres
+      ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # A message reaches the other browser by being read out of the
+      # write ahead log, so this one needs the database to be able to
+      # decode logically, the same way the changes suite does it.
+      - name: Turn logical decoding on
+        env:
+          PGPASSWORD: zou-conformance
+        run: |
+          set -e
+          psql -h 127.0.0.1 -U postgres -c "alter system set wal_level = logical"
+          docker restart "$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -1)"
+          for _ in $(seq 1 30); do
+            pg_isready -h 127.0.0.1 -U postgres && break
+            sleep 2
+          done
+          test "$(psql -h 127.0.0.1 -U postgres -tAc 'show wal_level')" = logical
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      # The app's own migrations and its own seed, applied rather than
+      # transcribed. The separator is not decoration: the Supabase CLI
+      # applies each of these files on its own and the last statement in
+      # one of them has no semicolon after it, so a plain cat runs it
+      # into the first line of the next file.
+      - name: Build the project the app ships
+        working-directory: /tmp/zou-conformance/demo-realtime
+        run: |
+          for f in app/supabase/migrations/*.sql app/supabase/seed.sql; do
+            cat "$f"
+            printf '\n;\n'
+          done > /tmp/chat-setup.sql
+          wc -l /tmp/chat-setup.sql
+      # The two hook variables are the app's own supabase/config.toml
+      # read out loud. It enables the custom access token hook and
+      # points it at a function its second migration installs, which is
+      # what puts user_role in the token, which is what the policy that
+      # lets an admin delete somebody else's message reads back.
+      - name: Start zou on the port a local supabase project uses
+        env:
+          ZOU_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED: true
+          ZOU_HOOK_CUSTOM_ACCESS_TOKEN_URI: pg-functions://postgres/public/custom_access_token_hook
+        run: |
+          cargo run -p zou-conformance -- serve \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --setup /tmp/chat-setup.sql \
+            > /tmp/serve.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q '^url ' /tmp/serve.log && break
+            sleep 1
+          done
+          cat /tmp/serve.log
+          grep -q '^url ' /tmp/serve.log
+      - name: Drive the app in two browsers at once
+        working-directory: /tmp/zou-conformance/demo-realtime
+        run: |
+          npm ci
+          npm run install:app
+          npx playwright install --with-deps chromium
+          npm test
+      - name: Keep the server log
+        if: always()
+        run: cat /tmp/serve.log
+      - name: Keep what the failing test saw
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-realtime-traces
+          path: /tmp/zou-conformance/demo-realtime/test-results
+          if-no-files-found: ignore
+
   # The third target the harness was written for. The recordings come
   # from the PostgREST binary, which is the same code, but a binary
   # configured by hand on a flag line is not the stack anybody runs.
