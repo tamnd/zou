@@ -7,6 +7,12 @@ on:
 
 permissions:
   contents: write
+  # What signs the provenance. id-token is the OIDC token sigstore
+  # trades for a short lived certificate, so there is no key anywhere
+  # to keep or to lose, and attestations is where the signed statement
+  # is stored afterwards.
+  id-token: write
+  attestations: write
 
 jobs:
   # What a person downloads: the zou binary and the patched postgres it
@@ -91,12 +97,24 @@ jobs:
             shasum -a 256 zou-${{ matrix.name }}.tar.gz > zou-${{ matrix.name }}.tar.gz.sha256
           fi
           cat zou-${{ matrix.name }}.tar.gz.sha256
+      # What is inside it, which the checksum does not say. Written
+      # here rather than in one job at the end because it is per
+      # platform: the rust graph is resolved for this target with the
+      # features this bundle was built with, and the postgres in it is
+      # the one this leg just compiled.
+      - name: SBOM
+        run: |
+          scripts/zou-sbom.sh \
+            --version "${GITHUB_REF_NAME#v}" \
+            --tarball dist/zou-${{ matrix.name }}.tar.gz \
+            --out dist/zou-${{ matrix.name }}.cdx.json
       - uses: actions/upload-artifact@v4
         with:
           name: zou-${{ matrix.name }}
           path: |
             dist/zou-${{ matrix.name }}.tar.gz
             dist/zou-${{ matrix.name }}.tar.gz.sha256
+            dist/zou-${{ matrix.name }}.cdx.json
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-postgres-${{ matrix.name }}
@@ -183,8 +201,11 @@ jobs:
   publish:
     name: publish the bundles
     # The wheels as well, because a release page that has the tarballs
-    # and not the wheels is a release that is half there.
-    needs: [bundle, wheels]
+    # and not the wheels is a release that is half there. Windows too,
+    # not because anything of its is uploaded here, but because this is
+    # where everything is attested and a windows zip nobody attested
+    # would be the one asset a person cannot check.
+    needs: [bundle, wheels, windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -192,7 +213,24 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # The windows job uploads straight to the release, so its zips
+      # come back down from there to be attested with the rest.
+      - name: Fetch what windows already uploaded
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${GITHUB_REF_NAME}" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*windows*' --dir dist --clobber || echo "no windows assets yet"
       - run: ls -l dist
+      # Every asset gets a statement, signed through sigstore, saying
+      # which workflow at which commit produced it. A sha256 published
+      # on the same page as the file it describes answers whether a
+      # download finished; this answers whether the file is the one
+      # this repository built, which is the question somebody who did
+      # not download it from here needs answered.
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -225,7 +263,10 @@ jobs:
           # The package version is the tag, because the postinstall
           # downloads the release of the same name.
           npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#v}"
-          npm publish --access public
+          # The registry records where this came from, the same way the
+          # release assets do, so the package page says which workflow
+          # at which commit built it rather than only who uploaded it.
+          npm publish --access public --provenance
   # Both wheels together, since pip install zou zou-postgres is the
   # pair: the extension module for every platform, and the patched
   # postgres for every platform. They carry no assets from the release,

@@ -9,9 +9,11 @@ on:
     paths:
       - vendor/**
       - .gitmodules
+      - Cargo.lock
       - patches/**
       - scripts/pg-apply-patches.sh
       - scripts/zou-bundle.sh
+      - scripts/zou-sbom.sh
       - packaging/npm/**
       - packaging/pypi/**
       - Makefile
@@ -42,6 +44,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y meson ninja-build flex bison libreadline-dev zlib1g-dev libicu-dev liblz4-dev libzstd-dev libssl-dev libxml2-dev libxslt1-dev pkg-config uuid-dev patchelf
       - name: Build with the patch series applied
         run: make pg-build
+      # The only job with both vendored trees checked out, so it is the
+      # only one that can prove the sbom names the postmaster and the
+      # vector extension rather than four hundred rust crates and a
+      # confident silence about the largest thing in the bundle. The
+      # script refuses to write a document it would not publish, so
+      # this step failing is that refusal.
+      - name: SBOM
+        run: scripts/zou-sbom.sh --out /tmp/zou.cdx.json
       - name: Smoke test on md
         run: |
           build/pg/bin/initdb -D /tmp/md-pgdata
