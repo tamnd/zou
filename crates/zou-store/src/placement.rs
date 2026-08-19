@@ -50,6 +50,10 @@ pub enum PlacementError {
     NoNodes,
     #[error("shard map: {0}")]
     Map(String),
+    #[error(
+        "shard map format {found} is newer than this binary supports ({MAP_FORMAT}), upgrade zou"
+    )]
+    MapFormatTooNew { found: u32 },
     #[error(transparent)]
     Store(#[from] CasError),
 }
@@ -103,7 +107,23 @@ impl ShardMap {
         out
     }
 
+    /// The format is read before anything else and a map from a format
+    /// this binary does not know is refused rather than parsed. Every
+    /// field here has a default, so a newer map would otherwise parse
+    /// into an empty roster instead of failing, and an empty roster is
+    /// [`PlacementError::NoNodes`] on every lookup: the node would
+    /// stop routing and say the map has no nodes, which reads like a
+    /// fleet that is down rather than like a binary that is behind.
     pub fn from_json(data: &[u8]) -> Result<Self, PlacementError> {
+        #[derive(Deserialize)]
+        struct Peek {
+            format: u32,
+        }
+        let peek: Peek =
+            serde_json::from_slice(data).map_err(|e| PlacementError::Map(e.to_string()))?;
+        if peek.format > MAP_FORMAT {
+            return Err(PlacementError::MapFormatTooNew { found: peek.format });
+        }
         serde_json::from_slice(data).map_err(|e| PlacementError::Map(e.to_string()))
     }
 

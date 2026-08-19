@@ -126,3 +126,17 @@ These are the invariants the test suite enforces, not aspirations:
 - Object store errors: bounded retries with backoff, commits stall rather than lie.
 - Manifest CAS race: the loser rereads and routes to the winner.
 - Partial checkpoint upload: a checkpoint is referenced by the manifest only after every object and the index are verified, orphans are collected later.
+
+## Format numbers
+
+Every durable object carries a format number: the tenant manifest, the page shard manifest, the registry entry and the host alias, the shard map, the chain shard manifest, the round index, and, as two little endian bytes after the magic, the landing segment, the sealed segment and the layer file.
+
+A reader refuses a number higher than the one its binary knows, by name, saying what it found and that the binary is behind. It refuses before it verifies anything else, so an operator reading the log sees a version to upgrade past rather than a file that looks corrupt. `crates/zou-log/tests/formats.rs` holds all ten to that, and a format added later belongs in it.
+
+Which way a change goes is the part worth getting right, because a fleet is never all one version at once. During a rolling restart the new binary writes and the old one reads, and the old one is the one at risk.
+
+Bump the number when an older binary reading the object would get the wrong answer rather than an incomplete one. Adding a field an old reader ignores at its peril is a bump: none of these structs deny unknown fields, so an old binary reading, modifying and CAS writing an object drops every field it does not know, and the write succeeds. The format number is the only thing between that and losing what a newer node wrote. Changing what an existing field means is a bump. Removing a field an old reader requires is a bump.
+
+Leave the number alone when an old reader that ignores the addition is still correct, and only then. A purely additive diagnostic field that nothing routes or fences on is the case that qualifies, and it still has to survive the read modify write question: if an old node can round trip the object and drop the field, the field has to be one nobody misses.
+
+A bump costs a restart ordering: readers have to be upgraded before writers, or the readers refuse until they are. That is the intended cost. The alternative is a node that keeps serving from a map it half understood.
