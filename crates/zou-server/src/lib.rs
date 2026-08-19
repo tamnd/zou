@@ -593,6 +593,13 @@ async fn gate(
                 Err(why) if req.uri().path().starts_with("/auth/v1/") => {
                     return auth::error_body(StatusCode::FORBIDDEN, "bad_jwt", &why.gotrue());
                 }
+                // And the same reasoning one door along. Upstream's
+                // gateway does not read the bearer at all, so what a
+                // client sees on /rest/v1 is PostgREST's own refusal,
+                // which is a code and a challenge rather than a line.
+                Err(why) if req.uri().path().starts_with("/rest/v1/") => {
+                    return rest::token_refused(&why, &token);
+                }
                 Err(why) => {
                     return json_body(
                         StatusCode::UNAUTHORIZED,

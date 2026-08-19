@@ -92,6 +92,22 @@ pub struct Case {
     pub key: Key,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// A token minted for this case alone, with some of its time claims
+    /// moved off now. Each entry is a claim and an offset in seconds,
+    /// so `{"nbf": 3600}` is a token that does not start working for an
+    /// hour and `{"exp": -10}` is one that ran out ten seconds ago.
+    ///
+    /// Everything else a case sends is fixed text in a file, and a case
+    /// about `nbf`, `iat` or the window around `exp` cannot be: a token
+    /// that is an hour early is an hour early relative to the run
+    /// asking it, and one written down last week is only expired. The
+    /// suite says how far off and the run works out when that is.
+    ///
+    /// The token is otherwise the seeded person's, the same claims the
+    /// `user` key carries, so a suite with no `user` has nobody to mint
+    /// one for.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub token: BTreeMap<String, i64>,
     /// Sent as is, so a case can test what a malformed body does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
@@ -264,6 +280,18 @@ pub struct Recording {
 pub struct Known {
     pub name: String,
     pub why: String,
+    /// What this difference is known against, when it is known against
+    /// one comparison and not the others. The name a report prints
+    /// after "compared with", so `supabase start` for the live stack
+    /// and `postgrest 16.1 (recorded)` for the recording.
+    ///
+    /// The suites are recorded from a reference at a pinned version and
+    /// diffed against the stack the CLI brings up, and those two are
+    /// not always the same build. A case where they answer differently
+    /// is a case zou can only match one of, and the field says which
+    /// one it was excused against so that the other still holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub against: Option<String>,
 }
 
 pub struct Suite {
@@ -388,10 +416,21 @@ impl Suite {
         })
     }
 
-    /// The known list in the shape a report reads it.
-    pub fn known(&self) -> BTreeMap<String, String> {
+    /// The known list in the shape a report reads it, for a run
+    /// comparing against the thing named.
+    ///
+    /// An entry that names what it is known against is left out of
+    /// every other comparison, and a run that leaves one out is a run
+    /// that expects the case to agree. That is the point of the field:
+    /// a difference against one reference is not a licence to differ
+    /// from the other.
+    pub fn known(&self, compared_with: &str) -> BTreeMap<String, String> {
         self.known
             .iter()
+            .filter(|k| match &k.against {
+                Some(against) => against == compared_with,
+                None => true,
+            })
             .map(|k| (k.name.clone(), k.why.clone()))
             .collect()
     }
@@ -447,6 +486,42 @@ fn read(path: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A suite with nothing in it but a known list, which is all the
+    /// filter reads.
+    fn with_known(known: Vec<Known>) -> Suite {
+        Suite {
+            name: "rest".to_string(),
+            dir: PathBuf::new(),
+            setup: String::new(),
+            reset: None,
+            cases: serde_json::from_str(r#"{"suite": "rest", "cases": []}"#).expect("parses"),
+            known,
+        }
+    }
+
+    #[test]
+    fn a_difference_known_against_one_thing_is_not_excused_against_another() {
+        let suite = with_known(vec![
+            Known {
+                name: "everywhere".to_string(),
+                why: "zou does it differently and always will".to_string(),
+                against: None,
+            },
+            Known {
+                name: "the live stack only".to_string(),
+                why: "the CLI ships an older build than the one this was recorded from".to_string(),
+                against: Some("supabase start".to_string()),
+            },
+        ]);
+        let stack = suite.known("supabase start");
+        assert_eq!(stack.len(), 2);
+        // And the recording, which is a different comparison, holds
+        // the case to what was recorded.
+        let recorded = suite.known("postgrest 16.1 (recorded)");
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded.contains_key("everywhere"));
+    }
 
     #[test]
     fn a_case_is_a_get_unless_it_says_otherwise() {
