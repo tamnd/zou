@@ -950,9 +950,43 @@ Deno.serve(async (req) => {
 - Pings are answered underneath and are not something a handler is told about. Compression is not negotiated, so `extensions` is empty.
 - One difference from the spec: what the constructor throws is a `TypeError` rather than a `SyntaxError`, because there is no `DOMException` here yet.
 
+## Sockets
+
+A tcp connection, which is what a database driver is written against.
+
+```ts
+import * as postgres from "https://deno.land/x/postgres@v0.17.0/mod.ts"
+
+const pool = new postgres.Pool(Deno.env.get("SUPABASE_DB_URL"), 3, true)
+
+Deno.serve(async () => {
+  const conn = await pool.connect()
+  try {
+    const { rows } = await conn.queryObject`select now()`
+    return Response.json(rows)
+  } finally {
+    conn.release()
+  }
+})
+```
+
+`Deno.connect` opens one, `Deno.connectTls` opens one with the handshake already done, and `Deno.startTls` puts TLS on a connection that is already open, which is what postgres and every STARTTLS protocol needs: they ask in the clear whether the server speaks it before they speak it.
+What comes back has `read`, `write`, `close`, `closeWrite`, `localAddr`, `remoteAddr` and the `readable` and `writable` streams.
+`std/io`'s `BufReader` and `BufWriter` are built on `read` and `write` alone, and so is every driver that uses them.
+
+- tcp only. A unix socket is a file on the machine the function is running on rather than somewhere on the network, so `transport: "unix"` is refused by name. It is the same line `Deno.readFile` draws.
+- Where a function may connect to is not restricted, the same as `fetch`, and for the same reason: a function is the project's own code, and stopping it opening a socket to a host it may already call over http would be drawing a line that means nothing. The way to keep it off the local network is a network the server is not on.
+- An isolate may hold 256 sockets at once. A function that leaks one per call is stopped by a number rather than by the box running out of descriptors, and what it is told says so.
+- A connection lives as long as the isolate does, so under `per_worker` a pool survives between calls and under `oneshot` it does not. A socket left open when the isolate goes is closed with it.
+- 30 seconds to connect, and another 30 for a handshake. Deno waits forever, which is fine for a program somebody is watching and not for a request holding an isolate.
+- A certificate is checked against the Mozilla roots, plus whatever `caCerts` names, which is an array of PEM. Something in there that is not a certificate is refused where it was handed in rather than at a handshake that would have said something about the server instead.
+- `read` fills the buffer it was handed and answers how many bytes went in, or `null` at the end of the stream, and it reads at most 64 KiB at a time however large the buffer is. Upstream reads into that buffer directly and this copies once more, which is what a runtime with no detached buffers costs.
+- What fails is a `Deno.errors` class with the name Deno gives it, so a driver's retry loop takes the same branch: `ConnectionRefused` for nobody listening, `BadResource` for a connection that has been closed, `TimedOut`, `BrokenPipe`, `ConnectionReset` and the rest.
+- Nagle is off on every connection, which is upstream's default too, so `setNoDelay` asks for what is already true and `setKeepAlive` is the operating system's.
+
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.connect`, `Deno.connectTls`, `Deno.startTls`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
 
 `AbortSignal` is the whole of it: the three statics, `AbortSignal.abort`, `AbortSignal.timeout` and `AbortSignal.any`, as well as what a controller makes.
 `fetch` takes one and a `Request` carries one, and the section on giving up on a call says what that does and where it stops.
