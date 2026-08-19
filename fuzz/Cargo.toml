@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 zou-store = { path = "../crates/zou-store" }
 zou-log = { path = "../crates/zou-log" }
+zou-realtime = { path = "../crates/zou-realtime" }
 zou-rest = { path = "../crates/zou-rest" }
 zou-server = { path = "../crates/zou-server" }
 serde_json = "1"
@@ -102,6 +103,27 @@ bench = false
 [[bin]]
 name = "jwt_keys"
 path = "fuzz_targets/jwt_keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tus_metadata"
+path = "fuzz_targets/tus_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "phoenix_frame"
+path = "fuzz_targets/phoenix_frame.rs"
 test = false
 doc = false
 bench = false

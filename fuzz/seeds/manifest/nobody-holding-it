@@ -1,0 +1,22 @@
+{
+  "format": 2,
+  "ref": "acme-prod",
+  "epoch": 42,
+  "pg": {
+    "version": 18,
+    "timeline": 3
+  },
+  "checkpoints": [
+    {
+      "id": "chk-000121",
+      "lsn": "0/8A211000",
+      "kind": "full"
+    },
+    {
+      "id": "chk-000122",
+      "lsn": "0/8B000000",
+      "kind": "delta"
+    }
+  ],
+  "lease": null
+}
