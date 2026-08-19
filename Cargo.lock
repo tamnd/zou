@@ -5153,6 +5153,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-postgres-rustls",
+ "ureq",
  "webpki-roots 1.0.9",
  "zou-deno",
  "zou-functions",

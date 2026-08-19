@@ -32,6 +32,12 @@ zou import supabase --db-url "postgresql://postgres:pw@host:5432/postgres?sslmod
 | `--to <url>` | The database to copy into. Without it the run is a survey. |
 | `--dry-run` | Survey only, said out loud so that a run with no target is not a typo. |
 | `--report <path>` | Where the report goes, `import-report.md` by default. |
+| `--store <target>` | Where this server keeps its objects, which is where the storage object bytes go. Needs `--to`. |
+| `--tenant <ref>` | Which tenant of that store, `local` by default. |
+| `--service-key <key>` | The service role key, or `SUPABASE_SERVICE_ROLE_KEY`. It is what reads a private bucket. |
+| `--storage-url <url>` | The storage api to fetch objects from. Worked out from a project ref, required with `--db-url`. |
+| `--jobs <n>` | How many objects are fetched at once, 8 by default. |
+| `--manifest <path>` | Where the digests go, `import-objects.sha256` by default. |
 
 Everything the survey runs is a catalog read or a `count(*)`. The source is not written to at any point, by the survey or by the copy, and no lease is taken on anything. A probe that fails is written down and the survey carries on, because a project with one table the connecting role cannot see is still a project worth reporting on.
 
@@ -74,6 +80,18 @@ Seven sections, in the order somebody moving a project cares about them.
 
 The definitions step goes through the same code `zou db diff` does, given an empty catalog to diff from, so it can only ever produce creates. If a `drop` were ever to come out of it the copy stops instead of running it.
 
+### Sessions, and the other things left where they are
+
+Step 7 does not copy every `auth` and `storage` table it finds. Fourteen of them are left behind on purpose, and each one gets a `not copied:` line in the run's output saying which and why, because a table the report counted and the copy skipped is exactly the kind of thing somebody finds out about months later.
+
+The first kind is a session. `auth.refresh_tokens` and `auth.sessions` do not come, and neither does `auth.mfa_amr_claims`, which records how a session was proved. This is the policy the report states in its auth section: no token minted by the old project is accepted by this one, so everybody signs in again once after the cutover and that is the whole of it for a signed in user. Passwords are bcrypt on both sides and they do come, so signing in again means typing the same password, not resetting it.
+
+The second kind is something in flight. A sign in part way through a redirect (`auth.flow_state`, `auth.saml_relay_states`, `auth.oauth_client_states`), a factor being proved right now (`auth.mfa_challenges`, `auth.webauthn_challenges`), a confirmation or recovery link already sent (`auth.one_time_tokens`), a multipart upload with its parts still on the old project (`storage.s3_multipart_uploads` and `storage.s3_multipart_uploads_parts`). All of these were going to expire in minutes anyway, and the other half of each one is on a server nobody is going to talk to again. A recovery link sent before the cutover points at the old project and has to be asked for again.
+
+The third kind is the platform's own bookkeeping about the project rather than anything in it: `auth.schema_migrations` and `storage.migrations`, which are GoTrue's and the storage service's migration histories and not this server's, and `auth.instances`, which is the platform's row about the project.
+
+Everything else in those two schemas comes over, which is the part that matters: users, identities, mfa factors, sso and saml providers, buckets and the object rows.
+
 ### Resume
 
 Each step is one transaction, and the row that records the step is written inside that transaction. So a step either happened and is written down, or did not happen and left nothing behind, and there is no third state to detect. Running the same command again skips what the ledger already names and prints what it skipped:
@@ -90,9 +108,29 @@ It will not import into a database that already has the project's tables in it. 
 
 The `auth` and `storage` tables are the exception, because this server makes them at startup and so they are always already there. Those two are copied column by column on the intersection of what the source has and what this server has, and every column and table left out of that intersection is named in the output rather than dropped quietly. A platform table that already holds rows here is refused rather than appended to.
 
+## The storage object bytes
+
+A storage object is two things in two places: a row in `storage.objects` saying which bucket it is in and what it is called, and the bytes, which on a hosted project live behind the storage api and here live in the object store. Step 7 brings the rows. `--store` brings the bytes:
+
+```
+zou import supabase --project-ref abcdefghijklmnopqrst \
+  --to "postgresql://postgres@127.0.0.1:5432/postgres" \
+  --store /var/lib/zou --service-key "$SUPABASE_SERVICE_ROLE_KEY"
+```
+
+Each object is fetched from `/storage/v1/object/authenticated/<bucket>/<name>` with the service role key, which is what reads a private bucket, and written to `tenants/<ref>/files/objects/<id>/<version>`, which is the key this server reads it back from. The `id` and the `version` both come off the row, so nothing about the key is invented here and writing the same object twice writes the same bytes to the same place.
+
+That is also why this step's ledger, `zou.import_objects`, is an optimisation rather than a correctness requirement, unlike the one the eight steps use. Losing it costs a second download and nothing else, which is why it is written a chunk at a time: a run killed halfway repeats at most a chunk.
+
+A row whose bytes are gone on the far side answers 404. Rather than stopping, which would leave every later object unfetched over one deleted file, it is named and the run carries on. A wrong key answers 401 and does stop, because every remaining object would answer the same way. An object whose bytes are not the size the row recorded is copied anyway, the bytes being the thing that is real, and the disagreement is printed.
+
+The manifest at `import-objects.sha256` is a sha256 and a size per object in the shape `sha256sum` prints. It is written from the ledger rather than from the run, so a resumed run still writes one covering every object rather than only the ones it happened to fetch.
+
+Nothing here is a server side copy. The source is one provider's storage and the target is another's, so every byte goes through the machine running the command. `--jobs` is how many at a time.
+
 ## What is not built yet
 
-The bytes of the storage objects. The rows that name them come over in step 7, so the metadata is here, but the objects themselves are still on the old project's storage. That, plus auth users verified after the move and `zou export` for going the other way, are on [issue #5](https://github.com/tamnd/zou/issues/5). Every run says which of these it left behind, in the same list as everything else it did not copy.
+Auth users verified after the move and `zou export` for going the other way, on [issue #5](https://github.com/tamnd/zou/issues/5). Every run says what it left behind, in the same list as everything else it did not copy.
 
 ## Related
 

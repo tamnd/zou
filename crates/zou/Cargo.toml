@@ -40,6 +40,10 @@ sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }
+# The bytes of a hosted project's storage objects come over http and
+# nothing else here does, so this is the one http client in the binary
+# and it is the one the store already builds.
+ureq = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
