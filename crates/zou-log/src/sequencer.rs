@@ -33,6 +33,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use zou_store::stats::{Step, note_commit};
 use zou_store::{CasError, Frame2, Lsn};
 
 use crate::backpressure::{Backpressure, Throttle};
@@ -125,6 +126,11 @@ pub enum AppendError {
 struct TicketInner {
     done: Mutex<Option<Result<Lsn, AppendError>>>,
     cv: Condvar,
+    /// When the append staged this ticket, so resolving it can report
+    /// what the committer behind it waited. Kept on the ticket rather
+    /// than beside it in the batch because the ticket is the one thing
+    /// that survives every hop between the two.
+    staged: Instant,
 }
 
 /// One append's ack. Resolves only after the segment holding the
@@ -152,6 +158,9 @@ impl AppendTicket {
 }
 
 fn resolve(ticket: &TicketInner, result: Result<Lsn, AppendError>) {
+    if result.is_ok() {
+        note_commit(Step::Durable, ticket.staged.elapsed());
+    }
     *ticket.done.lock().unwrap() = Some(result);
     ticket.cv.notify_all();
 }
@@ -193,6 +202,11 @@ struct Dispatch {
     /// Decoded frames for the tee, empty when no tee is configured.
     frames: Vec<Frame2>,
     tickets: Vec<(Arc<TicketInner>, Lsn)>,
+    /// When the flusher closed the window, and when its PUT returned.
+    /// The pair splits the wait between getting to the store and
+    /// waiting on the windows in front of this one.
+    closed: Instant,
+    landed: Instant,
 }
 
 /// Ordered resolution for landed windows. Put workers park their
@@ -229,6 +243,7 @@ impl Lander {
                 break;
             }
             let (d, outcome) = st.parked.remove(&seq).unwrap();
+            note_commit(Step::Ack, d.landed.elapsed());
             if st.failed {
                 // An earlier window failed, so this one sits behind a
                 // hole even if its own PUT landed.
@@ -300,11 +315,15 @@ fn put_worker(
     loop {
         // Holding the receiver lock across the blocking recv is fine:
         // idle workers queue on the mutex instead of the channel.
-        let d = match rx.lock().unwrap().recv() {
+        let mut d = match rx.lock().unwrap().recv() {
             Ok(d) => d,
             Err(_) => return,
         };
+        note_commit(Step::Dispatch, d.closed.elapsed());
+        let started = Instant::now();
         let outcome = sink.put_segment(d.seq, &d.segment);
+        note_commit(Step::Put, started.elapsed());
+        d.landed = Instant::now();
         lander.complete(shared, d, outcome);
     }
 }
@@ -390,6 +409,7 @@ impl Sequencer {
     /// rejects atomically: one stale epoch and nothing is staged.
     pub fn append(&self, frames: Vec<Frame2>) -> Result<AppendTicket, AppendError> {
         assert!(!frames.is_empty(), "an append carries at least one frame");
+        let entered = Instant::now();
         // Encoding is the expensive part, lz4 over the payloads, and it
         // needs nothing from the shared state, so it happens before the
         // lock. A rejected append wastes the work, but rejection is a
@@ -445,6 +465,7 @@ impl Sequencer {
         let ticket = Arc::new(TicketInner {
             done: Mutex::new(None),
             cv: Condvar::new(),
+            staged: Instant::now(),
         });
         let batch = state.batch.get_or_insert_with(|| Batch {
             frames: Vec::new(),
@@ -459,6 +480,7 @@ impl Sequencer {
         batch.tickets.push((Arc::clone(&ticket), durable_lsn));
         drop(state);
         self.shared.work.notify_all();
+        note_commit(Step::Stage, entered.elapsed());
         Ok(AppendTicket { inner: ticket })
     }
 
@@ -535,6 +557,8 @@ fn flusher_loop(
         }
 
         let batch = state.batch.take().unwrap();
+        let closed = Instant::now();
+        note_commit(Step::Window, closed - batch.opened);
         if state.poisoned {
             // A batch staged between the failing PUT and the poison
             // flag propagating: never acked, never PUT.
@@ -578,6 +602,8 @@ fn flusher_loop(
             segment,
             frames,
             tickets: batch.tickets,
+            closed,
+            landed: closed,
         };
         lander.admit(config.inflight);
         if let Err(mpsc::SendError(d)) = tx.send(dispatch) {

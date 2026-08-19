@@ -1515,6 +1515,10 @@ struct WalPipe {
     /// carry `first_of_epoch` and mark the takeover boundary in the
     /// stream.
     first_appended: bool,
+    /// When the last append returned, so the next one can report how
+    /// long the pusher's own loop kept the bytes waiting. None until
+    /// the first append, which has nothing to be late against.
+    last_append: Option<Instant>,
 }
 
 static WAL: OnceLock<Mutex<WalPipe>> = OnceLock::new();
@@ -1856,6 +1860,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             waiter,
             pagesvc,
             first_appended: false,
+            last_append: None,
         },
         resume,
     ))
@@ -1983,6 +1988,15 @@ pub unsafe extern "C" fn zou_wal_append(
         let Some(seq) = pipe.seq.as_ref() else {
             return ZOU_ERR_NOT_INITIALIZED;
         };
+        // Everything the pusher did between the last append and this
+        // one: its own poll of the control file, a fold verdict, a nap
+        // it was in when the flush pointer moved. Locally flushed WAL
+        // waits here before the pipeline has ever seen it, which makes
+        // it part of every commit behind it and invisible from inside
+        // the sequencer.
+        if let Some(last) = pipe.last_append {
+            stats::note_commit(stats::Step::Push, last.elapsed());
+        }
         let chunk = unsafe { std::slice::from_raw_parts(data, len) };
         let frame = Frame2 {
             tenant: pipe.tenant,
@@ -2008,6 +2022,7 @@ pub unsafe extern "C" fn zou_wal_append(
             return if rc != 0 { rc } else { ZOU_ERR_STORE };
         }
         unsafe { *out_durable = pipe.waiter.durable.load(Ordering::Acquire) };
+        pipe.last_append = Some(Instant::now());
         ZOU_OK
     })
 }

@@ -154,6 +154,20 @@ fn store_families(path: &std::path::Path) -> Option<String> {
             seconds.observe_count((1u64 << (at + 1)) as f64 / 1e6, *count);
         }
     }
+    for step in &snapshot.commit {
+        // The one number a person watching a write heavy node wants is
+        // durable, and the other six are there so that a durable that
+        // went up says which of them took it there.
+        let seconds = reg.histogram(
+            "zou_commit_step_seconds",
+            "how long each step of the commit path took",
+            STORE_SECONDS,
+            &[("step", step.step)],
+        );
+        for (at, count) in step.buckets.iter().enumerate() {
+            seconds.observe_count((1u64 << (at + 1)) as f64 / 1e6, *count);
+        }
+    }
     for tier in &snapshot.reads {
         reg.counter(
             "zou_store_read_calls_total",

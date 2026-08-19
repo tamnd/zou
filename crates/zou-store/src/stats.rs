@@ -31,6 +31,20 @@
 //! rather than answering anybody. One serve loop does all three, so
 //! ingest time is read latency for every request queued behind it and
 //! the only way to see that is to measure it.
+//!
+//! The commit path reports the same way through [`note_commit`], and
+//! for the same reason: a commit that takes half a second is a number
+//! with six places it could have come from, and a run that only knows
+//! the total can only guess which. The six add up along one chunk of
+//! WAL: `push` is the pusher's own loop between two appends, so it is
+//! how late the bytes were handed over in the first place, `stage` is
+//! the append call itself, encoding included, `window` is how long the
+//! batch that chunk joined stayed open, `dispatch` is from that window
+//! closing to its PUT starting, which is the inflight bound when it
+//! binds, `put` is the store, and `ack` is what the window waited on
+//! its predecessors after its own PUT returned, because the chain acks
+//! in order. `durable` is the whole of it from the append onwards, the
+//! number a committing backend is actually waiting for.
 
 use std::cell::Cell;
 use std::fs::{self, OpenOptions};
@@ -45,17 +59,21 @@ use crate::cas::{CasError, CasStore, Version};
 /// layout so a dump from a stale binary fails loudly instead of reading
 /// garbage.
 const MAGIC: u64 = u64::from_ne_bytes(*b"ZOUSTATS");
-const FORMAT: u64 = 3;
+const FORMAT: u64 = 4;
 
 pub const OP_NAMES: [&str; 6] = ["get", "get_range", "put_if_match", "put", "delete", "list"];
 pub const CLASS_NAMES: [&str; 7] = ["manifest", "wal", "chk", "shards", "page", "file", "other"];
 pub const TIER_NAMES: [&str; 4] = ["cache", "local", "store", "service"];
 pub const PHASE_NAMES: [&str; 3] = ["park", "read", "ingest"];
+pub const COMMIT_NAMES: [&str; 7] = [
+    "push", "stage", "window", "dispatch", "put", "ack", "durable",
+];
 
 const KINDS: usize = OP_NAMES.len();
 const CLASSES: usize = CLASS_NAMES.len();
 const TIERS: usize = TIER_NAMES.len();
 const PHASES: usize = PHASE_NAMES.len();
+const STEPS: usize = COMMIT_NAMES.len();
 const BUCKETS: usize = 32;
 
 const HEADER: usize = 2;
@@ -64,7 +82,8 @@ const ERROR_BASE: usize = BUCKET_BASE + KINDS * BUCKETS;
 const CONFLICT_SLOT: usize = ERROR_BASE + KINDS;
 const TIER_BASE: usize = CONFLICT_SLOT + 1;
 const PHASE_BASE: usize = TIER_BASE + TIERS * (2 + BUCKETS);
-const SLOTS: usize = PHASE_BASE + PHASES * (1 + BUCKETS);
+const STEP_BASE: usize = PHASE_BASE + PHASES * (1 + BUCKETS);
+const SLOTS: usize = STEP_BASE + STEPS * (1 + BUCKETS);
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -86,6 +105,10 @@ const fn tier_slot(tier: usize) -> usize {
 
 const fn phase_slot(phase: usize) -> usize {
     PHASE_BASE + phase * (1 + BUCKETS)
+}
+
+const fn step_slot(step: usize) -> usize {
+    STEP_BASE + step * (1 + BUCKETS)
 }
 
 /// Which layout region a key belongs to, as an index into
@@ -200,6 +223,33 @@ pub enum Phase {
     Ingest,
 }
 
+/// One step of the commit path, [`COMMIT_NAMES`] in enum form. Each is
+/// sampled once per whatever it measures: `push` and `stage` once per
+/// chunk of WAL, `window`, `dispatch`, `put` and `ack` once per batch,
+/// and `durable` once per chunk again, since that is the one a backend
+/// is waiting on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Step {
+    /// The pusher's own loop, from one append returning to the next
+    /// starting. WAL that has been flushed locally sits here.
+    Push,
+    /// The append call: encode, admission, staging.
+    Stage,
+    /// How long the batch stayed open before the flusher closed it.
+    Window,
+    /// From the window closing to its PUT starting: the segment build,
+    /// the queue, and the inflight bound when that is what binds.
+    Dispatch,
+    /// The store call that makes the window durable.
+    Put,
+    /// After that call returned, what the window waited on the windows
+    /// before it, because a segment behind a hole is not durable.
+    Ack,
+    /// The whole of it from the append: window remainder, dispatch,
+    /// put and ack together.
+    Durable,
+}
+
 thread_local! {
     static THREAD_OPS: Cell<u64> = const { Cell::new(0) };
 }
@@ -254,6 +304,17 @@ pub fn note_phase(phase: Phase, elapsed: Duration) {
         let p = phase as usize;
         c.add(phase_slot(p), 1);
         c.add(phase_slot(p) + 1 + bucket(elapsed), 1);
+    }
+}
+
+/// Record one step of the commit path. Called from the pusher, the
+/// sequencer's flusher and its put workers, all of them in the
+/// postmaster's process, so they all map the file the backends do.
+pub fn note_commit(step: Step, elapsed: Duration) {
+    if let Some(c) = global() {
+        let s = step as usize;
+        c.add(step_slot(s), 1);
+        c.add(step_slot(s) + 1 + bucket(elapsed), 1);
     }
 }
 
@@ -432,6 +493,24 @@ pub struct Snapshot {
     pub ops: Vec<OpSnapshot>,
     pub reads: Vec<TierSnapshot>,
     pub pagesvc: Vec<PhaseSnapshot>,
+    pub commit: Vec<StepSnapshot>,
+}
+
+/// One step of the commit path, decoded. Samples rather than commits:
+/// a batch carrying forty chunks reports one `window` and forty
+/// `durable`, which is what makes the two comparable at all.
+#[derive(Debug, serde::Serialize)]
+pub struct StepSnapshot {
+    pub step: &'static str,
+    pub samples: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+    /// The raw histogram, kept for the same reason [`OpSnapshot`] keeps
+    /// its own and left out of the json for the same reason too.
+    #[serde(skip)]
+    pub buckets: Vec<u64>,
 }
 
 fn percentile(buckets: &[u64], total: u64, q: f64) -> u64 {
@@ -538,11 +617,31 @@ impl Snapshot {
                     .map_or(0, |b| 1u64 << (b + 1)),
             });
         }
+        let mut commit = Vec::with_capacity(STEPS);
+        for (step, name) in COMMIT_NAMES.iter().copied().enumerate() {
+            let samples = slot(step_slot(step));
+            let buckets: Vec<u64> = (0..BUCKETS)
+                .map(|b| slot(step_slot(step) + 1 + b))
+                .collect();
+            commit.push(StepSnapshot {
+                step: name,
+                samples,
+                p50_us: percentile(&buckets, samples, 0.50),
+                p95_us: percentile(&buckets, samples, 0.95),
+                p99_us: percentile(&buckets, samples, 0.99),
+                max_us: buckets
+                    .iter()
+                    .rposition(|&n| n > 0)
+                    .map_or(0, |b| 1u64 << (b + 1)),
+                buckets,
+            });
+        }
         Ok(Self {
             conflicts: slot(CONFLICT_SLOT),
             ops,
             reads,
             pagesvc,
+            commit,
         })
     }
 
@@ -633,6 +732,40 @@ mod tests {
         assert!(phase("park").p50_us >= 200_000);
         assert_eq!(phase("ingest").calls, 0);
         assert_eq!(phase("ingest").max_us, 0);
+    }
+
+    /// The steps share a file with everything else, and a step written
+    /// into the wrong region would land on a read tier or a page
+    /// service phase and be believed. So the check is both ways: the
+    /// steps come back, and nothing that was not written shows up.
+    #[test]
+    fn commit_steps_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Counters::open(&dir.path().join("stats")).unwrap();
+        for _ in 0..7 {
+            counters.add(step_slot(Step::Durable as usize), 1);
+            counters.add(
+                step_slot(Step::Durable as usize) + 1 + bucket(Duration::from_millis(600)),
+                1,
+            );
+        }
+        counters.add(step_slot(Step::Put as usize), 1);
+        counters.add(
+            step_slot(Step::Put as usize) + 1 + bucket(Duration::from_micros(700)),
+            1,
+        );
+        let snap = Snapshot::read(&dir.path().join("stats")).unwrap();
+        let step = |name: &str| snap.commit.iter().find(|s| s.step == name).unwrap();
+        assert_eq!(step("durable").samples, 7);
+        assert!(step("durable").p50_us >= 600_000);
+        assert_eq!(step("put").samples, 1);
+        assert!(step("put").p50_us >= 700 && step("put").p50_us < 2048);
+        for quiet in ["push", "stage", "window", "dispatch", "ack"] {
+            assert_eq!(step(quiet).samples, 0);
+            assert_eq!(step(quiet).max_us, 0);
+        }
+        assert!(snap.pagesvc.iter().all(|p| p.calls == 0));
+        assert!(snap.reads.iter().all(|t| t.calls == 0));
     }
 
     #[test]
