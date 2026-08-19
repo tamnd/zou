@@ -27,7 +27,7 @@ use tokio_postgres::{Client, NoTls, config::SslMode};
 
 pub const USAGE: &str = "usage: zou import supabase <--db-url <url> | --project-ref <ref>> [--db-password <pw>] <--to <url> | --dry-run> [--store <target> [--tenant <ref>] [--service-key <key>] [--storage-url <url>] [--jobs <n>] [--manifest <path>]] [--report <path>]";
 
-mod copy;
+pub(crate) mod copy;
 mod objects;
 
 /// The report's default name, which is the one the milestone asks for
@@ -41,7 +41,7 @@ const DEFAULT_MANIFEST: &str = "import-objects.sha256";
 
 /// Schemas postgres owns, which are nobody's project and are not
 /// reported as one.
-const SYSTEM_SCHEMAS: &[&str] = &["pg_catalog", "pg_toast", "information_schema"];
+pub(crate) const SYSTEM_SCHEMAS: &[&str] = &["pg_catalog", "pg_toast", "information_schema"];
 
 /// Extensions the vendored Postgres builds, so `create extension` here
 /// does what it did there. Taken from `vendor/postgres/contrib` plus
@@ -98,7 +98,7 @@ const NATIVE: &[&str] = &[
 /// functions, their signatures, their defaults and their refusals are
 /// there, and what is behind them is this server rather than a
 /// background worker.
-const EMULATED: &[(&str, &str)] = &[
+pub(crate) const EMULATED: &[(&str, &str)] = &[
     (
         "pg_net",
         "the net schema and its functions are here with upstream's signatures and defaults, and the calls are made by the server instead of a background worker, see docs/webhooks.md",
@@ -497,7 +497,7 @@ fn tls(verify: Verify) -> tokio_postgres_rustls::MakeRustlsConnect {
     tokio_postgres_rustls::MakeRustlsConnect::new(config)
 }
 
-async fn connect(url: &str) -> Result<Client, String> {
+pub(crate) async fn connect(url: &str) -> Result<Client, String> {
     let (url, verify) = ssl_choice(url);
     let config: tokio_postgres::Config = url
         .parse()
@@ -933,7 +933,7 @@ async fn storage(client: &Client, s: &mut Survey) {
 
 /// A count and the noun that goes with it, agreeing, because a report
 /// that says one tables reads like it was generated and not written.
-fn plural(n: i64, one: &str, many: &str) -> String {
+pub(crate) fn plural(n: i64, one: &str, many: &str) -> String {
     if n == 1 {
         format!("{n} {one}")
     } else {

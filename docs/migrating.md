@@ -138,9 +138,29 @@ What changes for them is the one sign in. Their old token is refused, in GoTrue'
 
 `crates/zou-server/tests/auth_imported.rs` is that paragraph as tests. It seeds the rows in the shape the platform's `auth` schema has them, a Go bcrypt hash and two identities and a verified factor and deliberately no session, and then puts the auth api in front of them.
 
-## What is not built yet
+## Going the other way
 
-`zou export`, for going the other way, on [issue #5](https://github.com/tamnd/zou/issues/5). Every run says what it left behind, in the same list as everything else it did not copy.
+```
+zou export --db-url postgresql://postgres:pass@127.0.0.1:5432/postgres --to ./out
+```
+
+That writes four files and nothing else. `schema.sql` is the ddl, `data.sql` is the rows, `platform.sql` is the `auth` and `storage` rows, and `export-report.md` says what is in them and what is not. Restoring is three commands in that order:
+
+```
+psql -v ON_ERROR_STOP=1 -d <target> -f schema.sql
+psql -v ON_ERROR_STOP=1 -d <target> -f data.sql
+psql -v ON_ERROR_STOP=1 -d <target> -f platform.sql
+```
+
+The target can be a stock Postgres, a hosted Supabase project, or another zou. Nothing in the three files is a zou format: the ddl is sql and the rows are Postgres's own copy text format, which is what `pg_dump` writes and what every Postgres since the nineties reads. If this program disappeared tomorrow the files would still restore.
+
+The third command comes last and is the one to skip when the target has no auth in it. `auth` and `storage` are made on the far side by whatever runs them, the platform on hosted Supabase and this server at startup on another zou, which is why their rows are in a file of their own rather than mixed in with the project's.
+
+Two things make the restore work without being a superuser on the target. The tables in `data.sql` are in dependency order, worked out from the foreign keys, so a key never points at a table whose rows have not landed yet. And each table's user triggers are turned off around its own rows, which a table's owner may do and a superuser is not needed for, because those triggers already ran on the database the rows came out of.
+
+What does not come out is in the report, and that section is never empty. The object bytes are not in these files, the rows in `storage.objects` that name them are, and the bytes are in the object store where any client can read them. Roles and their passwords belong to the cluster rather than to the database. Sessions and refresh tokens are left behind for the same reason the import leaves them, so a user signs in once on the other side. And the two extensions this server answers for rather than installs, `pg_net` and `pg_cron`, are named rather than written as a `create extension` that would fail, because a project using them needs the real ones wherever the files land.
+
+Foreign keys that point in a circle are the one case ordering cannot solve. Those tables are still written, last, and the report names them, because their keys are checked as their rows land and somebody should hear that before they run it rather than after.
 
 ## Related
 

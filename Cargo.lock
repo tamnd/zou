@@ -5139,6 +5139,7 @@ name = "zou"
 version = "0.0.1"
 dependencies = [
  "base64ct",
+ "bytes",
  "chacha20poly1305",
  "futures-util",
  "getrandom 0.3.4",
