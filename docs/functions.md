@@ -786,11 +786,15 @@ Deno.serve(async (req) => {
 ```
 
 `crypto.getRandomValues` and `crypto.randomUUID` are the operating system's randomness, and the digest and the HMAC are the same Rust crates this server signs its own tokens with.
-`crypto.subtle.digest` has `SHA-1`, `SHA-256`, `SHA-384` and `SHA-512`, and `sign`, `verify` and `importKey` are HMAC over those four with a raw key.
+`crypto.subtle.digest` has `SHA-1`, `SHA-256`, `SHA-384` and `SHA-512`, and `sign` and `verify` are HMAC over those four.
+`encrypt` and `decrypt` are AES in CBC and in GCM, at all three key lengths, which is what a session cookie or a sealed payload is written with, and `generateKey` and `exportKey` are there for the AES half of that.
+A failed decryption is an `OperationError` saying `Decryption failed` and saying nothing else, because which part of the ciphertext was wrong is not something the party holding the wrong key should be told.
+Two deliberate narrowings inside AES-GCM: the iv is twelve bytes and the tag is the full 128 bits, and an iv or a tag of another length is refused by name rather than served.
+`importKey` reads `raw` and no other format, for either kind of key.
 
 The verification is done in Rust, so a wrong signature takes as long to reject as a right one takes to accept, which is not true of a comparison written in javascript.
 
-What is not there is refused by name rather than being undefined: `encrypt`, `decrypt`, `deriveBits`, `deriveKey`, `exportKey`, `generateKey`, `wrapKey` and `unwrapKey`, and every key format other than `raw`.
+What is not there is refused by name rather than being undefined: `deriveBits`, `deriveKey`, `wrapKey` and `unwrapKey`, the asymmetric algorithms wherever they are named, and every key format other than `raw`.
 One difference from the spec: asking `getRandomValues` for more than 65536 bytes throws a `TypeError` with the spec's message rather than a `QuotaExceededError`, because there is no `DOMException` here yet.
 
 ## Timers
@@ -950,7 +954,7 @@ Nothing here can be revoked, because a function's permissions are the runtime's 
 
 Not present yet, and named rather than silently missing:
 
-- The rest of `crypto.subtle`: encryption, key derivation, key generation and the asymmetric algorithms.
+- The rest of `crypto.subtle`: key derivation, the asymmetric algorithms, and every key format other than `raw`.
 - Byte streams. There is no `new ReadableStream({ type: "bytes" })`, no BYOB reader and no `TextDecoderStream`.
 - Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet. That also moves when the promise settles: upstream hands the response back when the headers arrive and this hands it back when the body is in, so a handler racing a slow answer against a clock sees the clock win here and the headers win there.
 - `MessageChannel` and `MessagePort`. Upstream has both and nothing here does, so a library that talks to itself over a port has nowhere to send. That is [#434](https://github.com/tamnd/zou/issues/434).

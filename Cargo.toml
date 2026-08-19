@@ -12,8 +12,14 @@ repository = "https://github.com/tamnd/zou"
 authors = ["Tam Nguyen <tamnd87@gmail.com>"]
 
 [workspace.dependencies]
+# The block cipher `crypto.subtle` is asked for, which is AES and no
+# other. RustCrypto because the hashing and the AEAD in this workspace
+# already are, so it is one set of traits rather than two.
+aes = "0.9"
+aes-gcm = "0.11"
 anyhow = "1"
 axum = "0.8"
+cbc = { version = "0.2", features = ["alloc"] }
 base64ct = { version = "1", features = ["alloc"] }
 # The AEAD the tenant secrets are sealed with. ChaCha20-Poly1305
 # rather than AES-GCM because it is constant time in software on every

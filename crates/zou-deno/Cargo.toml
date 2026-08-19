@@ -13,10 +13,16 @@ authors.workspace = true
 # second, so `cargo test --workspace` on a machine that only cares about
 # the database never downloads V8 or builds swc.
 default = []
-isolate = ["dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:futures-util", "dep:getrandom", "dep:hmac", "dep:log", "dep:serde", "dep:serde_json", "dep:sha1", "dep:sha2", "dep:tokio", "dep:tokio-tungstenite", "dep:ureq"]
+isolate = ["dep:aes", "dep:aes-gcm", "dep:cbc", "dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:futures-util", "dep:getrandom", "dep:hmac", "dep:log", "dep:serde", "dep:serde_json", "dep:sha1", "dep:sha2", "dep:tokio", "dep:tokio-tungstenite", "dep:ureq"]
 
 [dependencies]
 zou-functions = { path = "../zou-functions" }
+# `crypto.subtle.encrypt` and its other half. A session cookie is the
+# thing in this corpus that asks, and what it asks for is AES-CBC with
+# an iv it hands in.
+aes = { workspace = true, optional = true }
+aes-gcm = { workspace = true, optional = true }
+cbc = { workspace = true, optional = true }
 deno_ast = { version = "0.52", features = ["transpiling"], optional = true }
 deno_core = { version = "0.410", optional = true }
 deno_error = { version = "0.7", optional = true }
