@@ -61,9 +61,14 @@ fn round_trip(claims: &Value, role: Option<&str>) {
     }
     let back = match jwt::verify(&jwt::mint(claims, SECRET), SECRET) {
         Ok(back) => back,
-        // An exp in the past is the one honest refusal of a token that
-        // was signed a moment ago.
-        Err(Reject::Expired) => return,
+        // The three honest refusals of a token that was signed a moment
+        // ago, all of them a claim about time that the claim set itself
+        // carries: an exp already behind us, an nbf still ahead of us,
+        // and an iat ahead of us. Minting says nothing about when, it
+        // writes back whatever the claim set said, so a claim set the
+        // fuzzer shaped with any of the three in it verifies to exactly
+        // the refusal that claim asks for.
+        Err(Reject::Expired | Reject::TooEarly | Reject::IssuedLater) => return,
         Err(why) => panic!("a token minted here did not verify here: {why:?}"),
     };
     assert_eq!(back.role.as_deref(), role, "the role did not round trip");
