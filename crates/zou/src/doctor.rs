@@ -742,9 +742,20 @@ mod tests {
             .unwrap();
         let skew = clock(&store, "local");
         assert_eq!(skew.status, Status::Failed);
+        // The number the report carries is the gap between two readings
+        // of this clock a moment apart, and the second boundary can
+        // fall between them and take one off it, which is how this read
+        // 3599 on a windows runner one afternoon. What the test is
+        // about is that the size of the skew is in the sentence, so it
+        // asks for the size and not for the digits.
+        let ahead: u64 = skew
+            .detail
+            .split_whitespace()
+            .find_map(|word| word.parse().ok())
+            .unwrap_or_else(|| panic!("the report should carry the size of it: {}", skew.detail));
         assert!(
-            skew.detail.contains("3600 seconds from now"),
-            "the report should carry the size of it: {}",
+            (3599..=3600).contains(&ahead),
+            "an hour ahead should read as an hour: {}",
             skew.detail
         );
     }
