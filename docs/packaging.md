@@ -14,6 +14,42 @@ Nothing runs as root and nothing is written outside that directory.
 There is no `--pg-bin` to pass afterwards.
 A zou that was installed this way finds the postmaster next to itself, because the install layout puts one there, and the order it asks in is the flag, then `ZOU_PG_BIN`, then the bundle it shipped in, then `build/pg/bin` for somebody working in a checkout.
 
+## Checking what you downloaded
+
+A sha256 published on the same page as the file it describes answers one question, which is whether the download finished.
+Anybody who could replace the tarball could replace the number next to it, so it is not an answer to where the file came from.
+Two other things on the release are, and they answer different questions.
+
+Where it came from:
+
+```bash
+gh attestation verify zou-linux-x64.tar.gz --repo tamnd/zou
+```
+
+That checks a statement signed through sigstore at the moment the release was built, saying which workflow in this repository, at which commit, produced exactly those bytes.
+There is no zou signing key: the workflow trades its GitHub identity for a short lived certificate, so there is no private key anywhere to keep safe or to lose, and nothing to rotate after a laptop is stolen.
+Every asset a tag produces is attested, the bundles and the wheels and the windows zips alike.
+`npm i -g zou-cli` carries the same provenance on the registry side, which npm shows on the package page and checks with `npm audit signatures`.
+
+What is inside it:
+
+```bash
+jq -r '.components[] | "\(.name) \(.version)"' zou-linux-x64.cdx.json
+```
+
+`zou-<platform>.cdx.json` next to each bundle is a CycloneDX 1.5 document listing everything that went into it: the rust crates cargo resolved for that target with the features a release is built with, marked as normal or build time, and the two vendored C projects, the patched Postgres and pgvector, each with the version it calls itself and the commit this repository pins.
+That last part is why the document is not only a `cargo` dependency list.
+A bundle is mostly Postgres by weight, and an SBOM that names four hundred rust crates and no postmaster would read as complete while being silent about the largest thing in the artifact.
+
+`scripts/zou-sbom.sh` writes it and is the same script the release runs, so it can be read and run against a checkout rather than being something that only happens inside a workflow.
+It refuses to write a document that is missing either vendored tree, that resolved too few crates to be a real graph, or that carries a path from the machine it was built on.
+The serial number is a hash of the contents rather than a fresh uuid each time, so the same tree produces the same document twice and a diff between two releases is only what actually changed.
+
+Advisories are the other half of this and they run on every push, not at a tag.
+`cargo-deny` checks `advisories licenses sources` against the RustSec database, which is the same database and the same `rustsec` crate `cargo audit` reads, and additionally refuses yanked crates, licences outside the allow list, and unknown registries and git sources.
+There is no separate `cargo audit` step because it would be a second copy of one check with a second ignore list to keep in step.
+The four ignores in `deny.toml` each name the crate, the feature that reaches it, and why it cannot be upgraded.
+
 ## What a release is
 
 A zou release is not one binary.
@@ -96,7 +132,9 @@ CI builds a bundle on every postgres build, starts the postmaster out of it, and
 
 ## What a tag builds
 
-The release workflow builds a bundle per unix platform, linux and darwin on both architectures, and each leg builds the patched Postgres from the vendored tree, builds `zou`, assembles, starts a database out of the result, and uploads the tarball with its sha256.
+The release workflow builds a bundle per unix platform, linux and darwin on both architectures, and each leg builds the patched Postgres from the vendored tree, builds `zou`, assembles, starts a database out of the result, and uploads the tarball with its sha256 and its SBOM.
+The SBOM is written per platform rather than once at the end, because the crate graph is resolved for that target with that build's features and the Postgres in it is the one that leg just compiled.
+Everything then lands in one job that attests the lot before uploading, so the provenance covers the windows zips too even though they were uploaded by the job that built them.
 That is roughly fifteen minutes a platform, which is why it runs on tags and not on pushes.
 Windows gets the binary on its own, the way every target did before, because there is no patched Postgres and no embedded story there yet.
 
