@@ -966,6 +966,15 @@ impl Postmasters {
         let tenant_ref = &entry.tenant_ref;
         Config {
             jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
+            // The project signs its access tokens with its own key and
+            // publishes the public half, which is what a library that
+            // verifies a caller for itself needs and what a project
+            // created today on Supabase does. The key comes out of the
+            // secret, so it is this project's alone and no node has to
+            // be handed anything the registry entry does not already
+            // carry. Tokens signed under the legacy format keep
+            // verifying against the secret until they expire.
+            jwt_keys: Some(zou_server::jwt::derived_keys(entry.jwt_secret.as_bytes())),
             pg: Some(format!(
                 "host=127.0.0.1 port={port} user={SUPERUSER} dbname=postgres"
             )),

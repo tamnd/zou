@@ -138,6 +138,12 @@ impl Front {
         }
         let router = crate::router(crate::Config {
             jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
+            // The same keys the node serving this project signs its
+            // access tokens with, arrived at from the same secret, or
+            // a socket arriving with a perfectly good token would be
+            // told the algorithm it is signed with is not one this end
+            // has anything for.
+            jwt_keys: Some(crate::jwt::derived_keys(entry.jwt_secret.as_bytes())),
             holder: Some(holder.clone()),
             ..crate::Config::default()
         })?;

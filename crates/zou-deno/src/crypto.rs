@@ -20,6 +20,8 @@ use aes_gcm::{AesGcm, Nonce};
 use deno_core::op2;
 use deno_error::JsErrorBox;
 use hmac::{Mac, SimpleHmac};
+use p256::ecdsa::signature::{Signer as _, Verifier as _};
+use p256::ecdsa::{Signature as P256Signature, SigningKey as P256SigningKey, VerifyingKey};
 use sha1::Sha1;
 use sha2::digest::common::BlockSizeUser;
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -62,6 +64,94 @@ pub fn op_zou_verify(
     #[buffer] signature: &[u8],
 ) -> Result<bool, JsErrorBox> {
     verified(algorithm, key, data, signature).ok_or_else(|| unknown(algorithm))
+}
+
+/// Whether a P-256 signature over those bytes is the one that public
+/// key makes, which is the check a function does when it verifies an
+/// access token itself instead of asking the server.
+///
+/// The key arrives as its two coordinates and the signature as r and s
+/// laid end to end, which is the shape web crypto has for both: a jwk
+/// carries x and y, and `crypto.subtle.verify` takes the raw pair
+/// rather than the DER structure a certificate would.
+#[op2(fast)]
+pub fn op_zou_ec_verify(
+    #[string] hash: &str,
+    #[buffer] x: &[u8],
+    #[buffer] y: &[u8],
+    #[buffer] data: &[u8],
+    #[buffer] signature: &[u8],
+) -> Result<bool, JsErrorBox> {
+    es256_only(hash)?;
+    // The uncompressed point, which is the byte that says so and then
+    // the two coordinates, because that is the one shape a key is read
+    // from here.
+    let mut sec1 = vec![0x04];
+    sec1.extend_from_slice(coordinate(x, "x")?);
+    sec1.extend_from_slice(coordinate(y, "y")?);
+    let key = VerifyingKey::from_sec1_bytes(&sec1)
+        .map_err(|_| JsErrorBox::type_error("the key is not a point on P-256"))?;
+    // A signature of the wrong length or with a scalar out of range is
+    // a signature that does not verify, not an error: it is an answer
+    // to the question that was asked.
+    Ok(match P256Signature::from_slice(signature) {
+        Ok(signature) => key.verify(data, &signature).is_ok(),
+        Err(_) => false,
+    })
+}
+
+/// The other direction, for a function holding a private key of its
+/// own. The scalar is the jwk's d, and the signature comes back as r
+/// and s, which is what web crypto hands javascript back.
+#[op2]
+#[buffer]
+pub fn op_zou_ec_sign(
+    #[string] hash: &str,
+    #[buffer] d: &[u8],
+    #[buffer] data: &[u8],
+) -> Result<Vec<u8>, JsErrorBox> {
+    es256_only(hash)?;
+    let key = P256SigningKey::from_slice(coordinate(d, "d")?)
+        .map_err(|_| JsErrorBox::type_error("the key is not a P-256 scalar"))?;
+    let signature: P256Signature = key.sign(data);
+    Ok(signature.to_bytes().to_vec())
+}
+
+/// The public half of a private key, so a jwk carrying only d can still
+/// be imported as a key that verifies what it signs.
+#[op2]
+#[buffer]
+pub fn op_zou_ec_public(#[buffer] d: &[u8]) -> Result<Vec<u8>, JsErrorBox> {
+    let key = P256SigningKey::from_slice(coordinate(d, "d")?)
+        .map_err(|_| JsErrorBox::type_error("the key is not a P-256 scalar"))?;
+    let point = key.verifying_key().to_sec1_point(false);
+    // x and y, in that order, which is the uncompressed point without
+    // the byte that says it is uncompressed.
+    let mut out = Vec::with_capacity(64);
+    out.extend_from_slice(point.x().expect("an uncompressed point has x"));
+    out.extend_from_slice(point.y().expect("an uncompressed point has y"));
+    Ok(out)
+}
+
+/// P-256 is the one curve here, and SHA-256 the one hash over it,
+/// because ES256 is what a project's signing keys are and a curve
+/// nothing issues is a curve nothing has to be able to check.
+fn es256_only(hash: &str) -> Result<(), JsErrorBox> {
+    match hash {
+        "SHA-256" => Ok(()),
+        _ => Err(JsErrorBox::type_error(format!(
+            "ECDSA here is P-256 with SHA-256, and this one asked for {hash}"
+        ))),
+    }
+}
+
+fn coordinate<'a>(bytes: &'a [u8], named: &str) -> Result<&'a [u8; 32], JsErrorBox> {
+    bytes.try_into().map_err(|_| {
+        JsErrorBox::type_error(format!(
+            "a P-256 {named} is 32 bytes and this one is {}",
+            bytes.len()
+        ))
+    })
 }
 
 /// The two directions of AES, in the two modes web crypto has for it.

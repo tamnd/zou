@@ -18,7 +18,7 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use hmac::{Hmac, KeyInit, Mac};
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
-use sha2::Sha256;
+use sha2::{Digest as _, Sha256};
 
 /// A verified token: the claim set as parsed JSON plus the fields the
 /// request context needs pulled out.
@@ -319,6 +319,63 @@ impl KeySet {
             }
         }
     }
+}
+
+/// The signing key a project has when nobody handed it one: a P-256
+/// keypair derived from the project's own secret, in the shape
+/// GOTRUE_JWT_KEYS takes, so a project that was created with a secret
+/// and nothing else still signs its access tokens asymmetrically and
+/// still publishes a jwks somebody can verify against.
+///
+/// Derived rather than generated and stored for two reasons. Every
+/// node serving the project arrives at the same key from the one fact
+/// they all already have, so there is no key to distribute and no
+/// registry format to migrate. And the key is exactly as strong a
+/// credential as the secret it comes out of, which is the truth of the
+/// arrangement anyway: whoever holds a project's secret can already
+/// mint that project's service_role key.
+///
+/// The scalar is a counter appended to a labelled hash of the secret,
+/// stepped until it lands in range, which it does on the first try for
+/// all but a vanishing fraction of secrets. The kid names the public
+/// half, so it changes when and only when the key does.
+pub fn derived_keys(secret: &[u8]) -> String {
+    let sk = derived_signing_key(secret);
+    let point = sk.verifying_key().to_sec1_point(false);
+    let x = point.x().expect("an uncompressed point has x");
+    let y = point.y().expect("an uncompressed point has y");
+    let named = Sha256::new()
+        .chain_update(b"zou jwt kid v1")
+        .chain_update(x)
+        .chain_update(y)
+        .finalize();
+    let kid: String = named.iter().take(16).map(|b| format!("{b:02x}")).collect();
+    serde_json::json!([{
+        "kty": "EC",
+        "crv": "P-256",
+        "kid": kid,
+        "alg": "ES256",
+        "use": "sig",
+        "key_ops": ["sign", "verify"],
+        "d": Base64UrlUnpadded::encode_string(&sk.to_bytes()),
+        "x": Base64UrlUnpadded::encode_string(x),
+        "y": Base64UrlUnpadded::encode_string(y),
+    }])
+    .to_string()
+}
+
+fn derived_signing_key(secret: &[u8]) -> SigningKey {
+    for counter in 0u8..=255 {
+        let candidate = Sha256::new()
+            .chain_update(b"zou jwt signing key v1")
+            .chain_update(secret)
+            .chain_update([counter])
+            .finalize();
+        if let Ok(sk) = SigningKey::from_slice(&candidate) {
+            return sk;
+        }
+    }
+    unreachable!("a P-256 scalar is found long before 256 tries")
 }
 
 fn material_of(entry: &serde_json::Value, kid: &str) -> Result<Secret, String> {
@@ -864,6 +921,55 @@ mod tests {
         let token = keys.sign(&serde_json::json!({"role": "authenticated"}));
         let public = Jwks::parse(&published.to_string()).unwrap();
         assert!(verify_any(&token, b"not the secret", Some(&public)).is_ok());
+    }
+
+    /// A project that was handed nothing but a secret still has a
+    /// signing key, and it is the same key every time, because a key
+    /// that changed on a restart would end every session on the
+    /// restart.
+    #[test]
+    fn the_key_derived_from_a_secret_is_the_same_key_every_time() {
+        let one = derived_keys(b"a-project-secret");
+        assert_eq!(one, derived_keys(b"a-project-secret"));
+        assert_ne!(one, derived_keys(b"another-project-secret"));
+
+        let keys = KeySet::parse(&one).expect("a derived set parses as a set");
+        let token = keys.sign(&serde_json::json!({"role": "authenticated", "sub": "u-1"}));
+        let published = Jwks::parse(&keys.published().to_string()).expect("a public set");
+        assert!(
+            verify_any(&token, b"not the secret", Some(&published)).is_ok(),
+            "the published half verifies what the private half signed"
+        );
+
+        // ES256 with the kid in the header, which is what a verifier
+        // that holds several keys picks by, and what a library that
+        // reads a jwks refuses a token for not having.
+        let header = split(&token).unwrap().header;
+        assert_eq!(header["alg"], "ES256");
+        assert!(header["kid"].as_str().is_some_and(|kid| kid.len() == 32));
+
+        // Two secrets, two keys, and neither project's tokens verify
+        // against the other's published set.
+        let other = KeySet::parse(&derived_keys(b"another-project-secret")).unwrap();
+        let elsewhere = Jwks::parse(&other.published().to_string()).unwrap();
+        assert_eq!(
+            verify_any(&token, b"not the secret", Some(&elsewhere)).unwrap_err(),
+            Reject::UnknownKey
+        );
+    }
+
+    /// The secret is the credential the key comes out of, and it must
+    /// not be readable back out of anything the key publishes.
+    #[test]
+    fn a_derived_key_publishes_no_secret() {
+        let keys = KeySet::parse(&derived_keys(b"a-project-secret")).unwrap();
+        let published = keys.published().to_string();
+        assert!(!published.contains("a-project-secret"));
+        assert!(!published.contains(&Base64UrlUnpadded::encode_string(b"a-project-secret")));
+        assert!(
+            !published.contains("\"d\""),
+            "the private scalar is not published either"
+        );
     }
 
     #[test]
