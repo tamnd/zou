@@ -556,6 +556,22 @@ The Github login is the reason `ZOU_EXTERNAL_GITHUB_URL` exists.
 There is no account to sign in as on github.com and no consent anybody can give in CI, so a stub stands where github does, reached the way a GitHub Enterprise install is reached.
 Everything on zou's side of that is the real path: the code exchange, the two profile calls that find the address github keeps out of the profile document, the identity row, the session in the url fragment, and supabase-js parsing it out.
 
+## The other app
+
+That one asks whether an application can be built on the answers. There is a second half to it, and a suite cannot ask it at all: whether an application can be built on the frames.
+
+A realtime suite compares one frame with a recording, one at a time. Every frame in it can match while the thing a person is looking at never changes, because what is on the screen is the application's own state and the frame is only what arrived. The claim is somebody typing and somebody else seeing it, so the only way to ask it the way it is felt is with two browsers open at once.
+
+So a second app, run the same way with nothing changed in it: `examples/slack-clone/nextjs-slack-clone`, in `demo-realtime/` in the conformance repository. It subscribes to `postgres_changes` on three tables through unmodified supabase-js, all three are `replica identity full`, and every one of them has row level security on it.
+
+Five things get driven, each of them two people in a room. A message one person sends arriving on the other person's screen, with the author on it, on the page that was already open. A message taken back disappearing from the other screen too. A channel one person makes appearing in the other's sidebar, and being a room rather than a name: the second person walks into it and sends the first message in it. A third browser with no session, holding the anon key out of the javascript bundle and subscribed to the same three tables, hearing nothing of what the other two are passing, asked of the socket and of the api both. And an admin taking back a message that is not theirs.
+
+"Without a reload" is asserted rather than implied. Every page carries a mark on its window that a reload would wipe, nothing in the app reads it, and it is checked at the moment the change shows up.
+
+The last of the five is the reason `ZOU_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED` appears in CI. The project decides who is an admin in a trigger of its own, writes it into a table of its own, and hands it to the token in a postgres function of its own, named in its `supabase/config.toml`. zou calls that function while minting, the policy that allows the delete reads the claim back with `auth.jwt() ->> 'user_role'`, and the button only renders for somebody the policy would allow.
+
+Running that app found two things a suite had not. Its first migration ends with a grant to `supabase_auth_admin`, which every Supabase database has and zou's bootstrap did not create, so the schema did not apply at all. And the harness built its configuration without reading the hook settings, so the claim was never minted and the admin had no button.
+
 ## Where zou stands
 
 The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes all of them, with no known differences.

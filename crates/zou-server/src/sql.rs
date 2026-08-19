@@ -121,6 +121,16 @@ begin
     if not exists (select 1 from pg_roles where rolname = 'service_role') then
         create role service_role nologin bypassrls;
     end if;
+    -- Not an api role, and nothing here connects as it. Upstream it is
+    -- the role GoTrue logs in as, and a project's own migrations name
+    -- it: the custom access token hook that supabase documents ends
+    -- with a grant of the function and the tables it reads to
+    -- supabase_auth_admin. The auth server is in process here, so the
+    -- role owns nothing and is granted nothing, it exists so that a
+    -- migration written for a Supabase database applies to this one.
+    if not exists (select 1 from pg_roles where rolname = 'supabase_auth_admin') then
+        create role supabase_auth_admin nologin;
+    end if;
 end
 $$;
 

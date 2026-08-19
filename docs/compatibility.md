@@ -45,7 +45,11 @@ A known difference still counts as a failure in every number above. It is excuse
 The last five are asked of both servers in one CI run rather than compared with a recording, because a recording of a socket or of a function is a recording of the thing that answered it.
 Whatever `supabase start` says is the expected answer for zou, in the same job, on the same fixtures.
 
-Next to those eleven there is one more thing that has no number, because it either works or it does not: one of Supabase's own example apps, unedited, driven through a browser on every push. Signing up, signing in, a row level security policy holding between two accounts, and a Github login that goes all the way through the code exchange and comes back as a session. The app is `examples/todo-list/sveltejs-todo-list` and the only file it gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints. Details in [demo/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo/README.md).
+Next to those eleven there are two more things that have no number, because they either work or they do not: two of Supabase's own example apps, unedited, driven through a browser on every push. The only file either of them gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints.
+
+`examples/todo-list/sveltejs-todo-list` covers signing up, signing in, a row level security policy holding between two accounts, and a Github login that goes all the way through the code exchange and comes back as a session. Details in [demo/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo/README.md).
+
+`examples/slack-clone/nextjs-slack-clone` covers the other half, which is what a person sees rather than what a socket sent, and every test in it has two browsers in it. A message arriving on somebody else's screen with the author on it, a message taken back disappearing from it, a channel appearing in the other sidebar and being a room somebody can walk into, the anon key out of the javascript bundle hearing nothing it may not read, and an admin taking back a message that is not theirs through a claim the project's own postgres function mints. Details in [demo-realtime/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo-realtime/README.md).
 
 ## What an auth or storage project will notice
 

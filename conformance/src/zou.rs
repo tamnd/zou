@@ -122,6 +122,14 @@ pub fn start_at(
         // nothing set gets no providers, which is what every suite in
         // this repository is recorded against.
         oauth: zou_server::oauth::from_env()?,
+        // And the second, for the same reason from the other end: a
+        // project's own postgres function, named in the project's own
+        // config.toml, which this harness has no config.toml to read
+        // and could not invent. A run with nothing set gets no hooks,
+        // which is what every suite here is recorded against. The chat
+        // demo sets both variables, because the claim its policies
+        // read is minted by the function its migration installs.
+        hook: zou_server::hook::from_env()?,
         // What the reference is configured with, in the same order,
         // since the first is the one a request that names no schema
         // gets.
