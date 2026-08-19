@@ -111,6 +111,11 @@ pub fn start_at(
         .port();
     let url = format!("http://127.0.0.1:{port}");
     let cfg = Config {
+        // The key a project derives from its own secret, which every
+        // other way of running zou sets too. A target that published an
+        // empty key set here would be a target the demos cannot use and
+        // the suites would be asking a server nobody runs.
+        jwt_keys: Some(zou_server::jwt::derived_keys(secret)),
         jwt_secret: secret.to_vec(),
         pg: Some(dsn.to_string()),
         holder: holder.map(str::to_string),

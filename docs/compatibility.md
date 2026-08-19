@@ -30,7 +30,7 @@ The Postgres line is the one place zou is deliberately ahead. A suite that depen
 | --- | ---: | ---: | ---: | --- |
 | rest, the hand written suite | 82 | 82 | 100% | the surface a Supabase project actually uses |
 | postgrest, derived from upstream's spec files | 1217 | 1217 | 100% | upstream's own test corpus turned into questions |
-| auth | 74 | 77 | 96% | three known differences, below |
+| auth | 73 | 77 | 94% | four known differences, below |
 | storage | 478 | 478 | 100% | buckets, objects, image transforms, resumable uploads and the S3 protocol |
 | supabase-js | 33 | 33 | 100% | upstream's integration file, url changed, no assertion touched |
 | storage-js | 133 | 133 | 100% | upstream's own tests for the storage client, likewise |
@@ -55,11 +55,13 @@ Next to those eleven there are three more things that have no number, because th
 
 ## What an auth or storage project will notice
 
-Three answers differ on purpose. They are checked in as `known.json` in the conformance repository, which means a case that starts matching upstream fails the run too, and the day one of these stops being true is a day CI complains.
+Four answers differ on purpose. They are checked in as `known.json` in the conformance repository, which means a case that starts matching upstream fails the run too, and the day one of these stops being true is a day CI complains.
 
 **`GET /auth/v1/health` reports zou's own version.** The name and the description are GoTrue's, so a client checking what it is talking to still reads GoTrue, but the version string is zou's. Claiming to be a GoTrue release it is not would make this page unnecessary and every bug report harder.
 
 **`GET /auth/v1/settings` answers `saml_private_key_next_configured: false`.** Upstream answers `true` with SAML off and no key of any kind configured, which reads as an inverted flag. Nothing in the clients reads it while `saml_enabled` is false.
+
+**`GET /auth/v1/.well-known/jwks.json` publishes a key.** Upstream answers an empty set, because a GoTrue configured with a symmetric secret and no signing keys file has nothing to publish. A project on zou derives a P-256 key from its own jwt secret and signs its access tokens with it, which is what a project created on Supabase today does and what a library verifying a caller for itself reads, so the set has one EC key in it and the token header names its key id. Tokens signed under the legacy format keep verifying against the secret.
 
 **`GET /auth/v1/admin/users` fills in the identity list.** Upstream answers `identities: null` on the listing, because its ORM does not load the association on that query, and fills it in when a single account is fetched. A client reading identities off a listed account gets them from zou and has to fetch each account again from upstream, so nothing can be branching on a null that the single account fetch never returns.
 
@@ -123,7 +125,7 @@ Two servers can agree on every answer and still be sitting on different database
 
 ## What the suites do not ask yet
 
-The honest reading of a 96% is that it is 96% of the questions somebody thought to write down. These are the areas where the number above is a lower bound on the work and an upper bound on the confidence, tracked on [#170](https://github.com/tamnd/zou/issues/170):
+The honest reading of a 94% is that it is 94% of the questions somebody thought to write down. These are the areas where the number above is a lower bound on the work and an upper bound on the confidence, tracked on [#170](https://github.com/tamnd/zou/issues/170):
 
 - The MFA flow past the factor listing: enroll to challenge to verify, and the `aal2` claim that comes out of it.
 - PKCE, the `code` grant and the flow state behind it.
