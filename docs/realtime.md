@@ -244,6 +244,18 @@ A project with the events budget off reports none of this, because a header sayi
 
 Presence has two limits of its own upstream, on presence events a second and on how often one client may track, and neither is built here yet.
 
+## What a client that stopped reading costs
+
+A budget is about a client asking for too much. This is the other one, a client that asks for nothing and takes nothing: a laptop that went to sleep, a phone in a tunnel, a tab the browser throttled, a debugger stopped on a breakpoint. All four are a live connection whose window is closed, and none of them reports anything. Nothing times out, nothing errors, and the write to that socket simply does not finish.
+
+Three things follow, and each of them is a test rather than a claim, in `crates/zou-server/tests/realtime_slow.rs`.
+
+A socket that is not reading does not slow the sockets beside it, and does not slow whoever is sending either. Every socket is served by its own task off a broadcast of the topic, so a send finishes at the hub and not at the slowest reader.
+
+What is held for it is one backlog per topic, 256 messages, and not a queue per socket. Sixteen asleep in a room cost what one does, and neither costs more the longer they stay asleep. A message sent past the backlog is dropped rather than accumulated, which is the trade this makes on purpose: a bounded server and a client that missed something.
+
+And then the client is told. When it reads again it is closed, so what it sees is everything up to the point it fell off and then the connection ending, never a stream with a hole in it. supabase-js reconnects and resubscribes, and a subscription that starts again reads the table, which is the only honest answer once frames have been dropped. The same news, for the same reason, as a subscriber told there is a gap.
+
 ## Subscribing to a table
 
 Nothing about this is special either:
