@@ -120,6 +120,18 @@ begin
     end if;
     if not exists (select 1 from pg_roles where rolname = 'service_role') then
         create role service_role nologin bypassrls;
+    -- Roles are the cluster's, not the database's, so this one can
+    -- already be there and be wrong: a dump restored with its roles
+    -- created first, or a database somebody prepared by hand, both of
+    -- which are ordinary ways to arrive here from hosted Supabase.
+    -- Without bypassrls the key that is supposed to see everything
+    -- quietly sees only what a policy lets it, which is a compatibility
+    -- break that answers 200 with fewer rows and nothing in a log. So
+    -- the attribute is repaired rather than assumed, and only when it
+    -- is missing, which keeps the statement out of the way of a
+    -- deployment that has no business issuing it.
+    elsif not (select rolbypassrls from pg_roles where rolname = 'service_role') then
+        alter role service_role bypassrls;
     end if;
     -- Not an api role, and nothing here connects as it. Upstream it is
     -- the role GoTrue logs in as, and a project's own migrations name

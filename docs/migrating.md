@@ -128,9 +128,19 @@ The manifest at `import-objects.sha256` is a sha256 and a size per object in the
 
 Nothing here is a server side copy. The source is one provider's storage and the target is another's, so every byte goes through the machine running the command. `--jobs` is how many at a time.
 
+## What a user does the morning after
+
+They sign in, with the password they already had. Nothing is reset and no link is sent.
+
+Passwords are bcrypt on both sides and the hash comes over as it was written, so the same password verifies against the same hash. The user's uuid comes over too, which is what makes an RLS policy written against `auth.uid()` keep matching the rows it matched before, and their identities come over, so an account that signs in with GitHub still signs in with GitHub and a client reading `app_metadata.providers` to decide which buttons to draw sees what it saw. A confirmed address stays confirmed. A second factor enrolled there is still enrolled here: the TOTP secret is carried, so the code the authenticator app is already showing is the code this server expects, and the account goes to `aal2` on it without anybody re enrolling a phone.
+
+What changes for them is the one sign in. Their old token is refused, in GoTrue's words, which is the message every Supabase client already handles by sending them to the sign in page.
+
+`crates/zou-server/tests/auth_imported.rs` is that paragraph as tests. It seeds the rows in the shape the platform's `auth` schema has them, a Go bcrypt hash and two identities and a verified factor and deliberately no session, and then puts the auth api in front of them.
+
 ## What is not built yet
 
-Auth users verified after the move and `zou export` for going the other way, on [issue #5](https://github.com/tamnd/zou/issues/5). Every run says what it left behind, in the same list as everything else it did not copy.
+`zou export`, for going the other way, on [issue #5](https://github.com/tamnd/zou/issues/5). Every run says what it left behind, in the same list as everything else it did not copy.
 
 ## Related
 

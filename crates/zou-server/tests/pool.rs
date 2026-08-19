@@ -230,6 +230,47 @@ async fn bootstrap_created_the_three_roles() {
         "true"
     );
     sess.commit().await.expect("finish");
+
+    // The repair, which is the half that only happens on a database
+    // somebody else prepared. Roles belong to the cluster rather than
+    // to the database, so service_role can already be there and be
+    // wrong: a dump restored with its roles created first, or a
+    // database prepared by hand, are both ordinary ways to arrive here
+    // from hosted Supabase. Without bypassrls the key that is supposed
+    // to see everything sees only what a policy lets it, and answers
+    // 200 with fewer rows while saying nothing, so booting has to fix
+    // it and not merely hope.
+    //
+    // This is in the same test as the assertion above rather than in
+    // one of its own on purpose: it takes the attribute away for a
+    // moment, and the only other thing in this file that reads it is
+    // eight lines up.
+    let sess = pool.unscoped().await.expect("unscoped");
+    sess.execute("alter role service_role nobypassrls", &[])
+        .await
+        .expect("take it away");
+    sess.commit().await.expect("finish");
+
+    let (client, conn) =
+        tokio_postgres::connect(&dsn().expect("gated above"), tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+    let pump = tokio::spawn(conn);
+    zou_server::sql::bootstrap(&client).await.expect("boot");
+    drop(client);
+    let _ = pump.await;
+
+    let sess = pool.unscoped().await.expect("unscoped");
+    assert_eq!(
+        text(
+            &sess,
+            "select rolbypassrls::text from pg_roles where rolname = 'service_role'"
+        )
+        .await,
+        "true",
+        "booting against a database whose service_role cannot bypass rls has to fix it"
+    );
+    sess.commit().await.expect("finish");
 }
 
 /// The fourth role, which is not one of the three and is not reached
