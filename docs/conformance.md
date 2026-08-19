@@ -578,6 +578,18 @@ The last of the five is the reason `ZOU_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED` appear
 
 Running that app found two things a suite had not. Its first migration ends with a grant to `supabase_auth_admin`, which every Supabase database has and zou's bootstrap did not create, so the schema did not apply at all. And the harness built its configuration without reading the hook settings, so the claim was never minted and the admin had no button.
 
+## The third app
+
+Both of those read their code off a disk. A hosted project does not: what runs there was deployed, which is a manifest, blobs addressed by their hashes, and a materialize step on the way back out. Nothing that asks a running server can tell the two apart, so the only way to ask is to deploy first and then drive the thing that answers.
+
+So a third app, `examples/edge-functions`, in `demo-functions/` in the conformance repository. Its functions are deployed to a store and served out of it, and the app invokes them from a browser on another origin. That makes it the longest chain in the product: the client library, a gateway, an isolate built out of the store, a package fetched off a registry, that package calling this same server's rest api with the browser's own access token, and postgres deciding what the person holding it may see.
+
+Six things get driven. The app being upstream's own, listing upstream's four options in upstream's order. A greeting that came out of a deployed function's own code. The claims the function verified being the person at the browser, address and all. Two accounts asking the same function the same question and getting one row each, and not the same row. An anon key not being a person, so the function refuses instead of answering. And the invoke being cross origin, so the browser preflights it and the function answers the preflight rather than the gateway.
+
+Running this one found the two things that made it possible at all. A project published an empty key set and signed its access tokens with a secret and no key id, which is two refusals before `@supabase/server` attempts a verification, so every function that asked for a user answered 401. And zou's own runtime read `raw` keys and nothing else, so `jose` asking for a jwk threw before it reached the signature, and there was no ECDSA to use a P-256 key with even once it imported. Both are in [tamnd/zou#486](https://github.com/tamnd/zou/issues/486).
+
+One step here is not the browser's: accounts are made through the admin api, because a node serving projects out of a registry has no mail settings of its own yet and a sign up in the browser ends at a confirmation nobody can send, which is [tamnd/zou#488](https://github.com/tamnd/zou/issues/488).
+
 ## Where zou stands
 
 The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes all of them, with no known differences.
@@ -585,8 +597,8 @@ That suite asks everything upstream asks itself, including the parts of PostgRES
 
 The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
 
-The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 74 of them, 96%, with 3 known differences.
-All three are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
+The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 73 of them, 94%, with 4 known differences.
+All four are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, it publishes a signing key where upstream publishes an empty set because a project on zou signs its access tokens with a key derived from its own secret, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
 
 The `storage` suite is 478 cases against the storage-api a local Supabase project runs, and zou passes all 478, byte for byte, with no known differences.
 Forty three of them are the image transforms, and those are the one place where byte for byte stops at the picture: a case names the dimensions and the format and gives up on the digest, because two jpeg encoders at the same quality do not agree on a single byte.
