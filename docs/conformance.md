@@ -22,7 +22,7 @@ Point the harness at a checkout with `--suites <dir>`, or with `ZOU_CONFORMANCE_
 Everything except supabase-js comes from the image list the Supabase CLI builds its local stack from, which is what `supabase start` gives people, so the reference is the stack a user actually runs and not a version chosen here.
 Bumping a version means re-recording the suites it covers, and the re-recording is the point: a diff in a recording is upstream changing its mind, and it should be read rather than merged.
 
-Today that is PostgREST 14.15, GoTrue 2.194.0, storage-api 1.67.20, postgres-meta 0.96.6, supabase-js 2.111.0, and the Supabase CLI 2.111.0.
+Today that is PostgREST 16.1, GoTrue 2.195.0, storage-api 1.69.11, postgres-meta 0.98.0, supabase-js 2.112.3, and the Supabase CLI 2.115.0.
 The one line where zou is deliberately ahead is Postgres: the Supabase local stack is on 17 and zou vendors 18, and a suite that depends on the difference is a suite that is testing Postgres rather than the API in front of it.
 
 ## Six modes
@@ -179,7 +179,7 @@ The `postgrest` suite is not written at all.
 `derive` reads a PostgREST checkout at the pinned version, walks its spec files, and turns every request in them into a case: 1217 of them, out of the 22 spec modules the default test app in `Main.hs` runs.
 
 ```
-git clone --branch v14.15 https://github.com/PostgREST/postgrest /tmp/postgrest-src
+git clone --branch v16.1 https://github.com/PostgREST/postgrest /tmp/postgrest-src
 cargo run -p zou-conformance -- derive --from /tmp/postgrest-src --suite postgrest \
   --suites /tmp/zou-conformance/suites
 ```
@@ -216,7 +216,7 @@ db-extra-search-path = ""
 ## The suite compared with GoTrue
 
 The `auth` suite is 77 cases over the endpoints a sign in flow uses: signup, the three token grants, the user endpoints, verify, recover, magiclink, otp, resend, logout, reauthenticate, the MFA listing, the admin endpoints, settings, health, jwks and authorize.
-The reference is GoTrue 2.194.0 configured the way `supabase start` configures it for a project that has changed nothing, with the mail rate limits raised out of the way.
+The reference is GoTrue 2.195.0 configured the way `supabase start` configures it for a project that has changed nothing, with the mail rate limits raised out of the way.
 A rate limit is a configured number and a clock rather than a compatibility surface, and at the default of thirty an hour which case got the 429 would depend on how long the run before it took.
 
 ```
@@ -333,7 +333,7 @@ They are the blocks that cost the most to pass: both protocol versions, every ch
 
 The second is storage-js's own tests, in `js-storage/`, and it is the same arrangement pointed at the client that owns the surface M3 is about.
 Four files, 135 tests, 133 of them passing against zou and 2 skipped, and 6 of upstream's snapshots.
-storage-js is not released on its own: it lives at `packages/core/storage-js` in the supabase-js repository and ships with it, which is why `versions.json` pins it at the same 2.111.0.
+storage-js is not released on its own: it lives at `packages/core/storage-js` in the supabase-js repository and ships with it, which is why `versions.json` pins it at the same 2.112.3.
 
 Two things about it are worth writing down.
 It runs under jest where the supabase-js suite runs under vitest, because the snapshot file is jest's and a snapshot is an expectation like any other here, so running it under something that writes the file in a different shape would be editing upstream's assertions rather than checking them.
@@ -592,20 +592,20 @@ One step here is not the browser's: accounts are made through the admin api, bec
 
 ## Where zou stands
 
-The `postgrest` suite is 1217 cases against PostgREST 14.15, and zou passes all of them, with no known differences.
+The `postgrest` suite is 1217 cases against PostgREST 16.1, and zou passes all of them, with no known differences.
 That suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, and what it took to get there is written down in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125).
 
 The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
 
-The `auth` suite is 77 cases against GoTrue 2.194.0, and zou passes 73 of them, 94%, with 4 known differences.
+The `auth` suite is 77 cases against GoTrue 2.195.0, and zou passes 73 of them, 94%, with 4 known differences.
 All four are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, it publishes a signing key where upstream publishes an empty set because a project on zou signs its access tokens with a key derived from its own secret, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
 
 The `storage` suite is 478 cases against the storage-api a local Supabase project runs, and zou passes all 478, byte for byte, with no known differences.
 Forty three of them are the image transforms, and those are the one place where byte for byte stops at the picture: a case names the dimensions and the format and gives up on the digest, because two jpeg encoders at the same quality do not agree on a single byte.
 
-supabase-js 2.111.0 runs 17 of its integration tests against zou and all 17 pass.
+supabase-js 2.112.3 runs 17 of its integration tests against zou and all 17 pass.
 
-storage-js 2.111.0 runs 133 of its 135 against zou and all 133 pass, the 2 it does not run being upstream's own skips.
+storage-js 2.112.3 runs 133 of its 135 against zou and all 133 pass, the 2 it does not run being upstream's own skips.
 
 The five suites this project wrote have lines of their own on the scoreboard now, `js-tus`, `js-realtime`, `js-realtime-private`, `js-realtime-changes` and `js-functions`, and they are labelled with what they were compared with rather than being folded in with the recordings.
 The number on each is the zou leg, and what makes it a compatibility number rather than a self assessment is the other leg: the same file runs against a real `supabase start` in the diff job of the same run, so an assertion the reference does not pass is the suite being wrong.

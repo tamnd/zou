@@ -347,6 +347,24 @@ impl StorageError {
         }
     }
 
+    /// An s3 request that never claimed to be signed. No authorization
+    /// header, or one whose first word is not the algorithm.
+    ///
+    /// Separate from [`StorageError::invalid_signature`] because
+    /// upstream separated them in 1.69: a header that opens with the
+    /// algorithm and then says something unusable is still a 400 about
+    /// the format, and one that does not open with it at all is a 403
+    /// about not being signed. The line is the first word and nothing
+    /// past it, which is what the probe against 1.69.11 found.
+    pub(crate) fn missing_signature() -> Self {
+        StorageError {
+            status: 403,
+            error: "AccessDenied",
+            message: "Missing signature".to_string(),
+            code: "AccessDenied",
+        }
+    }
+
     /// What a foreign key violation is called. The row that would not
     /// go in named a bucket that is not there, and upstream's mapping
     /// of postgres's codes says so in the general rather than about

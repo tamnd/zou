@@ -195,12 +195,12 @@ struct Signed<'a> {
 /// A header that is not this version, including no header at all, is
 /// the same refusal: the reference splits on spaces and compares the
 /// first word, so the empty string fails the same comparison
-/// `Bearer ...` does.
+/// `Bearer ...` does. What that refusal is changed in storage-api 1.69,
+/// from a 400 saying the authorization type is unsupported to a 403
+/// saying the signature is missing.
 fn parse(raw: &str) -> Result<Signed<'_>, StorageError> {
     let Some(rest) = raw.strip_prefix(ALGORITHM) else {
-        return Err(StorageError::invalid_signature(
-            "Unsupported authorization type".to_string(),
-        ));
+        return Err(StorageError::missing_signature());
     };
     let mut credential = None;
     let mut headers = None;
@@ -2251,13 +2251,14 @@ mod tests {
     }
 
     /// A token is not a signature, and neither is nothing. Both are the
-    /// same refusal, which is recorded.
+    /// same refusal, which is recorded: not signed, rather than signed
+    /// in a way that cannot be read.
     #[test]
-    fn anything_that_is_not_this_version_is_not_an_authorization_type() {
+    fn anything_that_is_not_this_version_is_not_signed_at_all() {
         for raw in ["", "Bearer not-a-signature", "AWS4-HMAC-SHA1 Credential=a"] {
             let why = parse(raw).expect_err("not a signature");
-            assert_eq!(why.said(), "Unsupported authorization type");
-            assert_eq!(why.status(), 400);
+            assert_eq!(why.said(), "Missing signature");
+            assert_eq!(why.status(), 403);
         }
     }
 

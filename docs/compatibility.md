@@ -10,17 +10,17 @@ One file answers "compatible with what", [versions.json](https://github.com/tamn
 
 | piece | version |
 | --- | --- |
-| PostgREST | 14.15 |
-| GoTrue | 2.194.0 |
-| storage-api | 1.67.20 |
-| edge-runtime | 1.74.2, which is Deno 2.1.4 |
-| postgres-meta | 0.96.6 |
-| supabase-js | 2.111.0 |
-| storage-js | 2.111.0, the same release |
+| PostgREST | 16.1 |
+| GoTrue | 2.195.0 |
+| storage-api | 1.69.11 |
+| edge-runtime | 1.74.3, which is Deno 2.1.4 |
+| postgres-meta | 0.98.0 |
+| supabase-js | 2.112.3 |
+| storage-js | 2.112.3, the same release |
 | tus-js-client | 4.3.1 |
-| Postgres | 17.6.1.156 upstream, REL_18_4 in zou |
+| Postgres | 17.6.1.159 upstream, REL_18_4 in zou |
 
-realtime-js has no line of its own because it has no release of its own: it lives in the supabase-js repository and goes out with it, so the client the realtime suites drive is that same 2.111.0.
+realtime-js has no line of its own because it has no release of its own: it lives in the supabase-js repository and goes out with it, so the client the realtime suites drive is that same 2.112.3.
 
 The Postgres line is the one place zou is deliberately ahead. A suite that depends on the difference is a suite testing Postgres rather than the api in front of it.
 

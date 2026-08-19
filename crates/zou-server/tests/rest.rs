@@ -3152,37 +3152,28 @@ async fn a_preference_nobody_has_costs_what_handling_says_it_does() {
         r#"[{"t":"2023-10-18T05:37:59.611-07:00"}]"#
     );
 
-    // One it does not have is refused under strict and ignored
-    // without it, which leaves the answer in the server's own zone.
-    let res = app
-        .clone()
-        .oneshot(req(
-            "GET",
-            "/rest/v1/zou_rest_when?select=t",
-            "",
-            &["handling=strict, timezone=Nowhere/Special"],
-        ))
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
-    assert_eq!(
-        body["details"],
-        "Invalid preferences: timezone=Nowhere/Special"
-    );
-
-    let res = app
-        .clone()
-        .oneshot(req(
-            "GET",
-            "/rest/v1/zou_rest_when?select=t",
-            "",
-            &["timezone=Nowhere/Special"],
-        ))
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    assert!(res.headers().get("preference-applied").is_none());
+    // One postgres does not have is postgres's to refuse, and the
+    // handling has nothing to say about it. PostgREST 14 checked the
+    // name against pg_timezone_names first, so an unknown zone was
+    // PGRST122 under strict and quietly dropped otherwise. 16 sets it
+    // and lets the server answer, which is the same 22023 either way.
+    for line in [
+        "handling=strict, timezone=Nowhere/Special",
+        "timezone=Nowhere/Special",
+    ] {
+        let res = app
+            .clone()
+            .oneshot(req("GET", "/rest/v1/zou_rest_when?select=t", "", &[line]))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{line}");
+        let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+        assert_eq!(body["code"], "22023", "{line}");
+        assert_eq!(
+            body["message"], "invalid value for parameter \"TimeZone\": \"Nowhere/Special\"",
+            "{line}"
+        );
+    }
 }
 
 /// max-affected caps what a mutation may touch, and the rows it
