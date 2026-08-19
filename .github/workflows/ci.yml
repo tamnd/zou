@@ -1206,6 +1206,106 @@ jobs:
           path: /tmp/zou-conformance/demo-realtime/test-results
           if-no-files-found: ignore
 
+  # The third of Supabase's own example apps, and the longest chain in
+  # the product. The two jobs above ask whether an application can be
+  # built on the answers and on the frames. This one asks whether one
+  # can be built on a function somebody deployed: a click goes through
+  # the client library to a gateway, the gateway builds an isolate out
+  # of blobs in an object store, the function imports a package off a
+  # registry, the package calls this same server's rest api with the
+  # browser's own access token, and postgres decides what that person
+  # may see. Every link is a different subsystem and none of them is
+  # stubbed.
+  #
+  # Deployed rather than served off a directory, which is what makes it
+  # a different question from the js-functions suite: what runs here
+  # came out of a store, through a manifest and a materialize.
+  demo-functions:
+    name: demo functions app
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      # Trust rather than a password, because the port the project's
+      # own config.toml names is the one zou dials and it dials it the
+      # way a local project is dialled, with no password in the dsn.
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 54322:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ZOU_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Fetch the suites
+        run: |
+          git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
+          git -C /tmp/zou-conformance checkout -q "$(jq -r .ref conformance/suites.json)"
+          git -C /tmp/zou-conformance log --oneline -1
+      # With the engine in it, because a function that answers 500 is
+      # not a demo of anything.
+      - name: Build zou with a javascript engine
+        run: cargo build -p zou --features zou-deno/isolate
+      - name: Deploy the functions the app invokes
+        working-directory: /tmp/zou-conformance/demo-functions
+        run: |
+          "$GITHUB_WORKSPACE/target/debug/zou" tenant /tmp/fnstore create demo \
+            --secret "$ZOU_JWT_SECRET"
+          "$GITHUB_WORKSPACE/target/debug/zou" functions deploy \
+            --target /tmp/fnstore --ref demo
+          "$GITHUB_WORKSPACE/target/debug/zou" functions list \
+            --target /tmp/fnstore --ref demo
+      - name: Serve what was deployed on the port a local project uses
+        run: |
+          RUST_LOG=info "$GITHUB_WORKSPACE/target/debug/zou" functions serve \
+            --port 54321 --target /tmp/fnstore --ref demo \
+            > /tmp/functions.log 2>&1 &
+          for i in $(seq 1 120); do
+            grep -q 'anon key ' /tmp/functions.log && break
+            sleep 1
+          done
+          grep -q 'anon key ' /tmp/functions.log
+          grep 'serving functions on' /tmp/functions.log
+      # The order matters once: zou installs the auth schema on the
+      # first connection it takes out of its pool, and the table this
+      # applies has a trigger on auth.users, so the request comes
+      # first.
+      - name: Build the table the function selects from
+        working-directory: /tmp/zou-conformance/demo-functions
+        run: |
+          key=$(awk '/anon key /{print $NF}' /tmp/functions.log)
+          curl -sS -o /dev/null -w 'rest %{http_code}\n' \
+            http://127.0.0.1:54321/rest/v1/ -H "apikey: $key"
+          ./setup.sh
+      - name: Drive the app in a browser
+        working-directory: /tmp/zou-conformance/demo-functions
+        run: |
+          npm ci
+          npm run install:app
+          npx playwright install --with-deps chromium
+          npm test
+      - name: Keep the server log
+        if: always()
+        run: cat /tmp/functions.log
+      - name: Keep what the failing test saw
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-functions-traces
+          path: /tmp/zou-conformance/demo-functions/test-results
+          if-no-files-found: ignore
+
   # The third target the harness was written for. The recordings come
   # from the PostgREST binary, which is the same code, but a binary
   # configured by hand on a flag line is not the stack anybody runs.

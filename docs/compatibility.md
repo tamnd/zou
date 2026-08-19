@@ -45,11 +45,13 @@ A known difference still counts as a failure in every number above. It is excuse
 The last five are asked of both servers in one CI run rather than compared with a recording, because a recording of a socket or of a function is a recording of the thing that answered it.
 Whatever `supabase start` says is the expected answer for zou, in the same job, on the same fixtures.
 
-Next to those eleven there are two more things that have no number, because they either work or they do not: two of Supabase's own example apps, unedited, driven through a browser on every push. The only file either of them gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints.
+Next to those eleven there are three more things that have no number, because they either work or they do not: three of Supabase's own example apps, unedited, driven through a browser on every push. The only file either of them gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints.
 
 `examples/todo-list/sveltejs-todo-list` covers signing up, signing in, a row level security policy holding between two accounts, and a Github login that goes all the way through the code exchange and comes back as a session. Details in [demo/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo/README.md).
 
 `examples/slack-clone/nextjs-slack-clone` covers the other half, which is what a person sees rather than what a socket sent, and every test in it has two browsers in it. A message arriving on somebody else's screen with the author on it, a message taken back disappearing from it, a channel appearing in the other sidebar and being a room somebody can walk into, the anon key out of the javascript bundle hearing nothing it may not read, and an admin taking back a message that is not theirs through a claim the project's own postgres function mints. Details in [demo-realtime/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo-realtime/README.md).
+
+`examples/edge-functions` covers the longest chain there is, and it is the only one of the three where what runs was deployed rather than read off a disk: a click goes through the client library to a gateway, the gateway builds an isolate out of blobs in an object store, the function imports a package off a registry, the package calls the same server's rest api with the browser's own access token, and postgres decides what that person may see. A greeting out of a deployed function, the claims the function verified being the person at the browser, two accounts seeing one row each and not the same row, an anon key not being a person, and a cross origin invoke the browser preflights. Details in [demo-functions/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo-functions/README.md).
 
 ## What an auth or storage project will notice
 
