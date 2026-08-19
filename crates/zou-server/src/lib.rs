@@ -557,7 +557,15 @@ async fn gate(
             }),
         );
     };
-    let key = match jwt::verify(&apikey, &app.cfg.jwt_secret) {
+    // Which server a caller thinks it is talking to decides how its
+    // clock is read, because the two references disagree by half a
+    // minute and the difference is a phone with a slow clock rather
+    // than an attack. jwt::Clock says what each one does.
+    let clock = match req.uri().path().starts_with("/rest/v1/") {
+        true => jwt::Clock::Postgrest,
+        false => jwt::Clock::Exact,
+    };
+    let key = match jwt::verify_by(&apikey, &app.cfg.jwt_secret, clock) {
         Ok(v) => v,
         Err(_) => {
             return json_body(
@@ -574,23 +582,25 @@ async fn gate(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string);
     let identity = match bearer {
-        Some(token) => match jwt::verify_any(&token, &app.cfg.jwt_secret, app.jwks.as_ref()) {
-            Ok(v) => v,
-            // The auth surface is told about a bad token in GoTrue's
-            // words and everything else in the edge's, because that is
-            // who a client thinks it is talking to. Upstream's gateway
-            // never looks at the bearer token at all, so the refusal a
-            // client sees for /auth/v1 is the one GoTrue itself wrote.
-            Err(why) if req.uri().path().starts_with("/auth/v1/") => {
-                return auth::error_body(StatusCode::FORBIDDEN, "bad_jwt", &why.gotrue());
+        Some(token) => {
+            match jwt::verify_any_by(&token, &app.cfg.jwt_secret, app.jwks.as_ref(), clock) {
+                Ok(v) => v,
+                // The auth surface is told about a bad token in GoTrue's
+                // words and everything else in the edge's, because that is
+                // who a client thinks it is talking to. Upstream's gateway
+                // never looks at the bearer token at all, so the refusal a
+                // client sees for /auth/v1 is the one GoTrue itself wrote.
+                Err(why) if req.uri().path().starts_with("/auth/v1/") => {
+                    return auth::error_body(StatusCode::FORBIDDEN, "bad_jwt", &why.gotrue());
+                }
+                Err(why) => {
+                    return json_body(
+                        StatusCode::UNAUTHORIZED,
+                        serde_json::json!({"message": why.as_str()}),
+                    );
+                }
             }
-            Err(why) => {
-                return json_body(
-                    StatusCode::UNAUTHORIZED,
-                    serde_json::json!({"message": why.as_str()}),
-                );
-            }
-        },
+        }
         None => key,
     };
 
