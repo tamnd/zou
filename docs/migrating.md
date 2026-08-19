@@ -80,6 +80,18 @@ Seven sections, in the order somebody moving a project cares about them.
 
 The definitions step goes through the same code `zou db diff` does, given an empty catalog to diff from, so it can only ever produce creates. If a `drop` were ever to come out of it the copy stops instead of running it.
 
+### Sessions, and the other things left where they are
+
+Step 7 does not copy every `auth` and `storage` table it finds. Fourteen of them are left behind on purpose, and each one gets a `not copied:` line in the run's output saying which and why, because a table the report counted and the copy skipped is exactly the kind of thing somebody finds out about months later.
+
+The first kind is a session. `auth.refresh_tokens` and `auth.sessions` do not come, and neither does `auth.mfa_amr_claims`, which records how a session was proved. This is the policy the report states in its auth section: no token minted by the old project is accepted by this one, so everybody signs in again once after the cutover and that is the whole of it for a signed in user. Passwords are bcrypt on both sides and they do come, so signing in again means typing the same password, not resetting it.
+
+The second kind is something in flight. A sign in part way through a redirect (`auth.flow_state`, `auth.saml_relay_states`, `auth.oauth_client_states`), a factor being proved right now (`auth.mfa_challenges`, `auth.webauthn_challenges`), a confirmation or recovery link already sent (`auth.one_time_tokens`), a multipart upload with its parts still on the old project (`storage.s3_multipart_uploads` and `storage.s3_multipart_uploads_parts`). All of these were going to expire in minutes anyway, and the other half of each one is on a server nobody is going to talk to again. A recovery link sent before the cutover points at the old project and has to be asked for again.
+
+The third kind is the platform's own bookkeeping about the project rather than anything in it: `auth.schema_migrations` and `storage.migrations`, which are GoTrue's and the storage service's migration histories and not this server's, and `auth.instances`, which is the platform's row about the project.
+
+Everything else in those two schemas comes over, which is the part that matters: users, identities, mfa factors, sso and saml providers, buckets and the object rows.
+
 ### Resume
 
 Each step is one transaction, and the row that records the step is written inside that transaction. So a step either happened and is written down, or did not happen and left nothing behind, and there is no third state to detect. Running the same command again skips what the ledger already names and prints what it skipped:
