@@ -5085,15 +5085,18 @@ dependencies = [
  "getrandom 0.3.4",
  "hmac",
  "log",
+ "rustls",
  "serde",
  "serde_json",
  "sha1 0.11.0",
  "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tungstenite",
  "ureq",
+ "webpki-roots 1.0.9",
  "zou-functions",
 ]
 

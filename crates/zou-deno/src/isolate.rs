@@ -29,7 +29,7 @@ use zou_functions::Policy;
 
 use crate::inspector::Inspector;
 use crate::limits::{Limits, Watch};
-use crate::{crypto, fetch, inspector, limits, module, pool, timer, url, websocket};
+use crate::{crypto, fetch, inspector, limits, module, pool, socket, timer, url, websocket};
 
 /// What the isolate has whether or not a call is in it: the function's
 /// environment and the files it may read.
@@ -447,6 +447,13 @@ deno_core::extension!(
         timer::op_zou_sleep,
         timer::op_zou_clear,
         timer::op_zou_now,
+        socket::op_zou_tcp_connect,
+        socket::op_zou_tcp_connect_tls,
+        socket::op_zou_tcp_start_tls,
+        socket::op_zou_tcp_read,
+        socket::op_zou_tcp_write,
+        socket::op_zou_tcp_shutdown,
+        socket::op_zou_tcp_close,
         url::op_zou_url_parse,
         url::op_zou_url_set,
         websocket::op_zou_ws_connect,
@@ -858,6 +865,7 @@ async fn build(
     js.op_state()
         .borrow_mut()
         .put(websocket::Sockets::default());
+    js.op_state().borrow_mut().put(socket::Streams::default());
     js.op_state().borrow_mut().put(fetch::Calls::default());
 
     // The prelude is the value of its own last expression, so the two

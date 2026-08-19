@@ -492,8 +492,8 @@ A function ran when its own code or its own library produced the outcome: a refu
 It did not run when the module never finished loading or when it reached for a runtime api that is not there.
 Which of the two happened is read off the server log rather than off the status, because from the outside both are a 500.
 
-40 names were asked on 2026-08-17.
-zou ran 28, `supabase start` ran 34, they agree on 25, and 20 of the 40 answer the same status with the same bytes on both.
+40 names were asked, the reference on 2026-08-17 and zou again on 2026-08-19.
+zou ran 32, `supabase start` ran 34, they agree on 29, and 24 of the 40 answer the same status with the same bytes on both.
 The 40 is the union of the two lists a server serves: 39 of the 42 directories have an `index.ts`, and `config.toml` adds `simple-mcp-server`, which has no directory at all.
 
 One of the 40 is asked of one server only, and it is worth a sentence because the two refuse it differently.
@@ -509,14 +509,20 @@ A fifth, `custom-jwt-validation`, got past the client and landed on `AbortSignal
 
 The signal arrived and that function moved again, to `structuredClone`, and the copy arrived and it moved a third time, to where upstream stops: both servers now refuse the same jwks out of the same library for the same reason.
 The two bodies still differ by one word, the name of the error class, which is `JOSENotSupported` upstream and `I` here because esm.sh serves jose minified and the class names its errors after itself, and that is [#435](https://github.com/tamnd/zou/issues/435) rather than a runtime difference.
-Nothing else in the corpus moved with any of it and the identical count is still 20, which is the honest shape of a gap found this way: each one is one function's next line, and the value is in the finding rather than in the number.
+Nothing else in the corpus moved with any of it and the identical count was still 20 at that point, which is the honest shape of a gap found this way: each one is one function's next line, and the value is in the finding rather than in the number.
+
+Four names have moved since, one runtime gap each, and the identical count is 24.
+`oak-server` boots, because a module whose last line is `await app.listen({ port: 8000 })` is parked on an op now rather than waited out and answered 500.
+`connect-supabase` builds the cookie store it could not build, because `crypto.subtle` has AES.
+`image-manipulation` reads fourteen megabytes of wasm out of a package, because `import.meta.resolve` answers with the module the registry served and `Deno.readFile` takes the url beside it.
+`postgres-on-the-edge` opens a socket to the engine, authenticates, runs a select and is told by postgres that the table is not there, because `Deno.connect` is there, and that sentence is the one upstream is told.
 
 The three zou runs and upstream does not are all one shape: upstream builds the module graph ahead of time and refuses a graph it cannot complete, and zou fetches a module when something asks for it, so a type only file nobody imports at runtime is never fetched.
-The nine the other way are nine different things rather than one, which is why they are follow ups: top level await that never settles because the thing awaited is a server already listening, `Deno.connect`, `Deno.readFile` of an https url, a module served with no content type, esm.sh answering 500, a browser build missing an export, and the mcp sdk failing inside the registry's build of itself.
+The five the other way are none of them the runtime any more: three are esm.sh answering 500, one is a browser build missing an export, and one is the mcp sdk failing inside the registry's build of itself.
 
 One finding out of the corpus is not in the file and cost the most to get.
 esm.sh serves different code for different `User-Agent` headers: asking as Deno gets a build that expects node built ins, and asking as a browser gets one that does not.
-zou asks as a browser deliberately, and the corpus is the reason, because asking as Deno took it from 28 running to 21.
+zou asks as a browser deliberately, and the corpus is the reason, because on the build measured at the time asking as Deno took it from 28 running to 21.
 
 ## The package a project installs, asked the same questions
 

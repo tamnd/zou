@@ -26,8 +26,7 @@
 //! - `crypto.subtle` is a digest, HMAC, and AES in CBC and GCM: no key
 //!   derivation and no asymmetric algorithms, each refused by name, and
 //!   raw is the only key format there is a parser for.
-//! - Streams are readable only. There is no `WritableStream` and so no
-//!   `pipeTo`, and no byte stream and no BYOB reader. A response body
+//! - There is no byte stream and no BYOB reader. A response body
 //!   reaches the caller in chunks, and a body coming back from `fetch`
 //!   is still collected before the handler sees it.
 //! - A timer only fires while there is a call for it to fire in,
@@ -35,12 +34,15 @@
 //!   is still waiting for, and thirty seconds is the ceiling on that.
 //! - There are no node built ins, so `node:` is refused by name and a
 //!   package that reaches for one will not run.
+//! - A socket is tcp. A unix socket is a file on the host rather than
+//!   somewhere on the network, so `transport: unix` is refused by name.
 //! - A `TextDecoder` decodes utf-8 and utf-16 and none of the legacy
 //!   single byte pages, and it does not read `fatal`.
 //!
 //! What is there is `Headers`, `Request`, `Response`, `URL`,
 //! `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, the timers,
 //! `EdgeRuntime.waitUntil`, `WebSocket` and the events it dispatches,
+//! `Deno.connect` and the two ways of putting TLS on one,
 //! `ReadableStream`,
 //! `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `console`,
 //! `Deno.serve`, `Deno.env` and `fetch`, which is enough to run a
@@ -82,6 +84,13 @@
 //! hands a chunk over is awaited, which is where backpressure comes
 //! from: a function generating faster than the caller reads waits.
 //!
+//! `Deno.connect` is a socket a function holds, which is what a database
+//! driver is written against: `deno-postgres` is a connect, a
+//! `Deno.startTls` when the server offers one, and a read and a write
+//! loop over the wire protocol. Where it may connect to is not
+//! restricted, the same as `fetch`, and a unix socket is refused
+//! because that is the host's file system rather than the network.
+//!
 //! `WebSocket` is the client half of a protocol this repository already
 //! speaks the server half of, so it is `tokio-tungstenite` with its
 //! client features on rather than a second frame codec. What is
@@ -116,6 +125,8 @@ mod limits;
 mod module;
 #[cfg(feature = "isolate")]
 mod pool;
+#[cfg(feature = "isolate")]
+mod socket;
 #[cfg(feature = "isolate")]
 mod timer;
 #[cfg(feature = "isolate")]

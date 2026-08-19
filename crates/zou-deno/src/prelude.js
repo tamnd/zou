@@ -3171,10 +3171,15 @@
 
   /// The five `std/http/server.ts` tests an accept failure against by
   /// name, and the one it throws itself when a closed server is asked
-  /// to serve. None of them is ever raised here, because there is no
-  /// socket to fail, but `error instanceof Deno.errors.BadResource` on
-  /// an `undefined` is a TypeError, so the names have to be there for
-  /// the path that never runs.
+  /// to serve, and the three a socket fails with.
+  ///
+  /// A read of a connection that was closed really does raise
+  /// `BadResource` now, and a connection nobody is listening for really
+  /// does raise `ConnectionRefused`, so these are the classes a library
+  /// branches on rather than names kept for a path that never runs. The
+  /// ones the server side would have raised are still that: there is no
+  /// accept here to fail, and `error instanceof Deno.errors.BadResource`
+  /// on an `undefined` is a TypeError.
   function named(name) {
     const raised = class extends Error {
       constructor(message) {
@@ -3194,6 +3199,9 @@
   const Http = named("Http");
   const Interrupted = named("Interrupted");
   const BrokenPipe = named("BrokenPipe");
+  const ConnectionRefused = named("ConnectionRefused");
+  const ConnectionAborted = named("ConnectionAborted");
+  const TimedOut = named("TimedOut");
 
   /// A `string | URL`, which is what Deno takes, as the string the op
   /// wants. A file url is the path in it, since that is the only thing
@@ -3246,6 +3254,206 @@
 
   function readTextFileSync(path) {
     return new TextDecoder().decode(readFileSync(path));
+  }
+
+  // ---------------------------------------------------------------
+  // Deno.connect
+  //
+  // A socket, which is what a database driver is written against: a
+  // `Deno.connect`, then a `Deno.startTls` if the server says it
+  // speaks TLS, then reads and writes of the wire protocol.
+  //
+  // `read` and `write` are the whole interface. `std/io`'s BufReader
+  // and BufWriter are built on those two methods and nothing else, and
+  // every driver in this corpus is built on those, so the streams
+  // below are for the code that reaches for them rather than the way
+  // the bytes usually move.
+  //
+  // A read copies once more than upstream's does. The op answers with
+  // the bytes it got and this puts them into the buffer the caller
+  // handed in, where upstream reads into that buffer directly. What
+  // that buys is a runtime with no detached buffers in it, and what it
+  // costs is a memcpy of at most sixty four kilobytes.
+
+  const RID = Symbol("rid");
+  const READABLE = Symbol("readable");
+  const WRITABLE = Symbol("writable");
+
+  /// The classes the host names a failure with, which are the ones a
+  /// library catches by name.
+  const FAILURES = {
+    BadResource,
+    BrokenPipe,
+    ConnectionAborted,
+    ConnectionRefused,
+    ConnectionReset,
+    Interrupted,
+    InvalidData,
+    NotConnected,
+    NotFound,
+    PermissionDenied,
+    TimedOut,
+    UnexpectedEof,
+  };
+
+  function failed(answer) {
+    const Raised = FAILURES[answer.name] ?? Error;
+    throw new Raised(answer.why);
+  }
+
+  class Conn {
+    constructor(made) {
+      this[RID] = made.rid;
+      this[READABLE] = null;
+      this[WRITABLE] = null;
+      this.rid = made.rid;
+      this.localAddr = made.local;
+      this.remoteAddr = made.remote;
+    }
+
+    /// Bytes into the buffer that was handed in, and how many went
+    /// into it, or `null` at the end of the stream.
+    async read(buffer) {
+      if (!ArrayBuffer.isView(buffer)) {
+        throw new TypeError("read takes a buffer to read into");
+      }
+      const got = await ops.op_zou_tcp_read(this[RID], buffer.byteLength);
+      if (got.kind === "failed") {
+        failed(got);
+      }
+      if (got.kind === "eof") {
+        return null;
+      }
+      new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength).set(got.bytes);
+      return got.bytes.length;
+    }
+
+    /// Bytes out, and how many of them went, which may be fewer than
+    /// were handed in: that is what a write is, and every caller of
+    /// one loops.
+    async write(bytes) {
+      const wrote = await ops.op_zou_tcp_write(this[RID], bytesOf(bytes));
+      if (wrote.kind === "failed") {
+        failed(wrote);
+      }
+      return wrote.sent;
+    }
+
+    /// This end has nothing more to say, which is a half close and not
+    /// a hang up: whatever the other end has still to send is still
+    /// readable.
+    closeWrite() {
+      return ops.op_zou_tcp_shutdown(this[RID]);
+    }
+
+    close() {
+      ops.op_zou_tcp_close(this[RID]);
+    }
+
+    get readable() {
+      if (this[READABLE] === null) {
+        const conn = this;
+        this[READABLE] = new ReadableStream({
+          async pull(controller) {
+            const buffer = new Uint8Array(64 * 1024);
+            const read = await conn.read(buffer);
+            if (read === null) {
+              controller.close();
+              conn.close();
+              return;
+            }
+            controller.enqueue(buffer.subarray(0, read));
+          },
+          cancel() {
+            conn.close();
+          },
+        });
+      }
+      return this[READABLE];
+    }
+
+    get writable() {
+      if (this[WRITABLE] === null) {
+        const conn = this;
+        this[WRITABLE] = new WritableStream({
+          async write(chunk) {
+            const bytes = bytesOf(chunk);
+            let sent = 0;
+            while (sent < bytes.byteLength) {
+              sent += await conn.write(bytes.subarray(sent));
+            }
+          },
+          close() {
+            conn.close();
+          },
+          abort() {
+            conn.close();
+          },
+        });
+      }
+      return this[WRITABLE];
+    }
+
+    /// Nagle is off on every socket this opens, which is what upstream
+    /// does too, so asking for it again is asking for what is already
+    /// true. Keep alive is the operating system's default.
+    setNoDelay() {}
+    setKeepAlive() {}
+    ref() {}
+    unref() {}
+  }
+
+  /// What was asked for, as a host and a port, with the transport this
+  /// runtime will not open said by name.
+  ///
+  /// A unix socket is a file on the machine the function is running
+  /// on rather than somewhere on the network, and a function here may
+  /// not open the host's own files. That is the line, and it is the
+  /// same line `Deno.readFile` draws.
+  function connecting(options, what) {
+    const transport = options.transport ?? "tcp";
+    if (transport !== "tcp") {
+      throw new TypeError(
+        `${what} may only open a tcp connection, and this one asked for ${transport}`,
+      );
+    }
+    const port = Number(options.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new TypeError(`${options.port} is not a port`);
+    }
+    return { hostname: options.hostname ?? "127.0.0.1", port };
+  }
+
+  function connOf(made) {
+    if (made.kind === "failed") {
+      failed(made);
+    }
+    return new Conn(made);
+  }
+
+  async function connect(options = {}) {
+    const { hostname, port } = connecting(options, "a function");
+    return connOf(await ops.op_zou_tcp_connect(hostname, port));
+  }
+
+  async function connectTls(options = {}) {
+    const { hostname, port } = connecting(options, "a function");
+    return connOf(await ops.op_zou_tcp_connect_tls(hostname, port, options.caCerts ?? []));
+  }
+
+  /// TLS on a connection that is already open, which is how postgres
+  /// and every STARTTLS protocol does it: ask in the clear whether the
+  /// server speaks it, then speak it.
+  ///
+  /// The connection handed in is gone afterwards and what comes back is
+  /// a new one, which is upstream's shape as well.
+  async function startTls(conn, options = {}) {
+    if (!(conn instanceof Conn)) {
+      throw new TypeError("startTls takes a connection this runtime opened");
+    }
+    const hostname = options.hostname ?? conn.remoteAddr?.hostname ?? "127.0.0.1";
+    const made = await ops.op_zou_tcp_start_tls(conn[RID], hostname, options.caCerts ?? []);
+    return connOf(made);
   }
 
   // ---------------------------------------------------------------
@@ -3494,10 +3702,14 @@
     readTextFileSync,
     listen,
     serveHttp,
+    connect,
+    connectTls,
+    startTls,
     // The two a function catching one of them by name is written
     // against, which is what makes a missing file and a file it may
-    // not have two different things to it, and the eight the older way
-    // of serving names in a catch or throws itself.
+    // not have two different things to it, the eight the older way of
+    // serving names in a catch or throws itself, and the three a
+    // socket fails with.
     errors: {
       NotFound,
       PermissionDenied,
@@ -3509,6 +3721,9 @@
       Http,
       Interrupted,
       BrokenPipe,
+      ConnectionRefused,
+      ConnectionAborted,
+      TimedOut,
     },
     // Enough of it that a function branching on the platform gets an
     // answer rather than an exception.
