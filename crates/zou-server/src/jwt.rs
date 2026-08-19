@@ -28,6 +28,50 @@ pub struct Verified {
     pub role: Option<String>,
 }
 
+/// How strictly the time claims are read, which is not one question but
+/// two, because the two servers zou answers as do not agree.
+///
+/// Both numbers were measured rather than read off a README, against
+/// the pinned references in the conformance stack, and both libraries
+/// have moved their defaults across versions so the measurement is the
+/// only thing worth trusting. PostgREST 14.15 verifies with jose, which
+/// allows thirty seconds either side of `exp`, `nbf` and `iat`: a token
+/// expired half a minute ago is still answered 200, and one issued a
+/// minute from now is refused with `JWT issued at future`. GoTrue
+/// 2.194.0 verifies with golang-jwt, whose validator has no leeway at
+/// all and does not look at `iat`: a token one second past `exp` is
+/// refused, and one issued an hour from now is fine.
+///
+/// The difference is not cosmetic. A phone with a clock thirty seconds
+/// slow is an ordinary thing, and a project moving to zou would find
+/// its rest calls starting to fail where they used to work if this were
+/// rounded to one number for the whole server.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Clock {
+    /// PostgREST's reading, for `/rest/v1`.
+    Postgrest,
+    /// GoTrue's, which is also what everything else here uses: a signed
+    /// url, a storage request and a realtime socket are all better off
+    /// with the strict reading, and none of them is PostgREST.
+    Exact,
+}
+
+impl Clock {
+    /// Seconds a claim may be out by before it counts.
+    fn leeway(&self) -> u64 {
+        match self {
+            Clock::Postgrest => 30,
+            Clock::Exact => 0,
+        }
+    }
+
+    /// Whether a token issued in the future is refused. Only jose reads
+    /// `iat` as a thing that can be wrong.
+    fn reads_iat(&self) -> bool {
+        *self == Clock::Postgrest
+    }
+}
+
 /// Why a token was rejected. The strings are for logs and error
 /// bodies, callers branch on nothing finer than pass or fail.
 #[derive(Debug, PartialEq)]
@@ -38,6 +82,11 @@ pub enum Reject {
     WrongAlgorithm(String),
     BadSignature,
     Expired,
+    /// `nbf` says the token does not start working until later.
+    TooEarly,
+    /// `iat` says the token was issued in the future, which only the
+    /// rest surface treats as a reason to refuse.
+    IssuedLater,
     UnknownKey,
 }
 
@@ -48,6 +97,10 @@ impl Reject {
             Reject::WrongAlgorithm(_) => "unsupported JWT algorithm",
             Reject::BadSignature => "invalid JWT signature",
             Reject::Expired => "JWT expired",
+            // Both of these are PostgREST's own wording for the two
+            // claims it reads besides exp, under the same PGRST303.
+            Reject::TooEarly => "JWT not yet valid",
+            Reject::IssuedLater => "JWT issued at future",
             Reject::UnknownKey => "no JWKS key matches this token",
         }
     }
@@ -77,6 +130,12 @@ impl Reject {
                 "token signature is invalid: signature is invalid".to_string()
             }
             Reject::Expired => "token has invalid claims: token is expired".to_string(),
+            Reject::TooEarly => "token has invalid claims: token is not valid yet".to_string(),
+            // The auth surface never raises this one, golang-jwt not
+            // reading iat at all, but the enum is shared and a match
+            // that guessed would be worse than a sentence that is
+            // never printed.
+            Reject::IssuedLater => "token has invalid claims: token is not valid yet".to_string(),
         };
         format!("invalid JWT: unable to parse or verify signature, {why}")
     }
@@ -523,15 +582,33 @@ pub fn algorithm(token: &str) -> Option<String> {
     }
 }
 
-/// Decode the payload and finish: expiry check, role extraction.
-fn accept(payload: &str) -> Result<Verified, Reject> {
+/// Decode the payload and finish: the time claims, then role
+/// extraction.
+///
+/// A claim that is not a number is not read at all, by either library
+/// and so not here, which is why each of these is an `as_u64` that
+/// falls through when it fails rather than a refusal.
+fn accept(payload: &str, clock: Clock) -> Result<Verified, Reject> {
     let claims = Base64UrlUnpadded::decode_vec(payload).map_err(|_| Reject::Malformed)?;
     let claims: serde_json::Value =
         serde_json::from_slice(&claims).map_err(|_| Reject::Malformed)?;
+    let now = now();
+    let leeway = clock.leeway();
     if let Some(exp) = claims.get("exp").and_then(|e| e.as_u64())
-        && exp <= now()
+        && exp + leeway <= now
     {
         return Err(Reject::Expired);
+    }
+    if let Some(nbf) = claims.get("nbf").and_then(|e| e.as_u64())
+        && nbf > now + leeway
+    {
+        return Err(Reject::TooEarly);
+    }
+    if clock.reads_iat()
+        && let Some(iat) = claims.get("iat").and_then(|e| e.as_u64())
+        && iat > now + leeway
+    {
+        return Err(Reject::IssuedLater);
     }
     let role = claims
         .get("role")
@@ -565,13 +642,18 @@ fn verify_es256(parts: &Parts, jwks: &Jwks) -> Result<(), Reject> {
 /// Verify `token` against `secret`, HS256 only. This is the apikey
 /// path, the legacy key format is the only JWT shaped apikey there is.
 pub fn verify(token: &str, secret: &[u8]) -> Result<Verified, Reject> {
+    verify_by(token, secret, Clock::Exact)
+}
+
+/// The same, reading the time claims the way `clock` says.
+pub fn verify_by(token: &str, secret: &[u8], clock: Clock) -> Result<Verified, Reject> {
     let parts = split(token)?;
     let alg = parts.header.get("alg").and_then(|a| a.as_str());
     if alg != Some("HS256") {
         return Err(Reject::WrongAlgorithm(alg.unwrap_or_default().to_string()));
     }
     verify_hs256(&parts, secret)?;
-    accept(parts.payload)
+    accept(parts.payload, clock)
 }
 
 /// Verify `token` against whichever key material its header names:
@@ -579,6 +661,16 @@ pub fn verify(token: &str, secret: &[u8]) -> Result<Verified, Reject> {
 /// is configured. This is the bearer path, a user access token can be
 /// on either format depending on the project's signing key migration.
 pub fn verify_any(token: &str, secret: &[u8], jwks: Option<&Jwks>) -> Result<Verified, Reject> {
+    verify_any_by(token, secret, jwks, Clock::Exact)
+}
+
+/// The same, reading the time claims the way `clock` says.
+pub fn verify_any_by(
+    token: &str,
+    secret: &[u8],
+    jwks: Option<&Jwks>,
+    clock: Clock,
+) -> Result<Verified, Reject> {
     let parts = split(token)?;
     let alg = parts.header.get("alg").and_then(|a| a.as_str());
     match alg {
@@ -597,7 +689,7 @@ pub fn verify_any(token: &str, secret: &[u8], jwks: Option<&Jwks>) -> Result<Ver
         },
         _ => return Err(Reject::WrongAlgorithm(alg.unwrap_or_default().to_string())),
     }
-    accept(parts.payload)
+    accept(parts.payload, clock)
 }
 
 /// Sign `claims` into a token. zou dev mints the anon and service_role
@@ -666,6 +758,86 @@ mod tests {
         let claims = serde_json::json!({"role": "anon", "exp": 1});
         let token = mint(&claims, SECRET);
         assert_eq!(verify(&token, SECRET).unwrap_err(), Reject::Expired);
+    }
+
+    #[test]
+    fn the_leeway_is_thirty_seconds_on_one_clock_and_none_on_the_other() {
+        let then = now();
+        // Ten seconds past is inside jose's window and outside
+        // golang-jwt's, which is the whole of the difference.
+        let token = mint(
+            &serde_json::json!({"role": "anon", "exp": then - 10}),
+            SECRET,
+        );
+        assert!(verify_by(&token, SECRET, Clock::Postgrest).is_ok());
+        assert_eq!(
+            verify_by(&token, SECRET, Clock::Exact).unwrap_err(),
+            Reject::Expired
+        );
+
+        // A minute past is past both.
+        let token = mint(
+            &serde_json::json!({"role": "anon", "exp": then - 60}),
+            SECRET,
+        );
+        assert_eq!(
+            verify_by(&token, SECRET, Clock::Postgrest).unwrap_err(),
+            Reject::Expired
+        );
+    }
+
+    #[test]
+    fn a_token_that_has_not_started_yet_is_refused_on_both_clocks() {
+        let then = now();
+        let token = mint(
+            &serde_json::json!({"role": "anon", "nbf": then + 10}),
+            SECRET,
+        );
+        assert!(verify_by(&token, SECRET, Clock::Postgrest).is_ok());
+        assert_eq!(
+            verify_by(&token, SECRET, Clock::Exact).unwrap_err(),
+            Reject::TooEarly
+        );
+
+        let token = mint(
+            &serde_json::json!({"role": "anon", "nbf": then + 600}),
+            SECRET,
+        );
+        assert_eq!(
+            verify_by(&token, SECRET, Clock::Postgrest).unwrap_err(),
+            Reject::TooEarly
+        );
+        assert_eq!(Reject::TooEarly.as_str(), "JWT not yet valid");
+    }
+
+    #[test]
+    fn only_one_clock_reads_iat() {
+        let token = mint(
+            &serde_json::json!({"role": "anon", "iat": now() + 600}),
+            SECRET,
+        );
+        assert_eq!(
+            verify_by(&token, SECRET, Clock::Postgrest).unwrap_err(),
+            Reject::IssuedLater
+        );
+        assert!(
+            verify_by(&token, SECRET, Clock::Exact).is_ok(),
+            "golang-jwt does not look at iat"
+        );
+        assert_eq!(Reject::IssuedLater.as_str(), "JWT issued at future");
+    }
+
+    #[test]
+    fn the_default_clock_is_the_exact_one() {
+        let token = mint(
+            &serde_json::json!({"role": "anon", "exp": now() - 10}),
+            SECRET,
+        );
+        assert_eq!(verify(&token, SECRET).unwrap_err(), Reject::Expired);
+        assert_eq!(
+            verify_any(&token, SECRET, None).unwrap_err(),
+            Reject::Expired
+        );
     }
 
     #[test]

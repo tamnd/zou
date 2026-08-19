@@ -1212,15 +1212,12 @@ async fn a_token_the_clock_has_passed_is_not_a_token() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 
-    // And the claims that are not checked, pinned here so that the day
-    // they start being checked is a test edit rather than a surprise.
-    // A token not valid until an hour from now is accepted, and so is
-    // one addressed to somebody else. Both libraries upstream verifies
-    // with do more than this, which is #173.
+    // A token that does not start working until an hour from now is
+    // not a token yet, in PostgREST's own words under its own code.
     let early = jwt::mint(
         &serde_json::json!({
             "sub": U1, "role": "authenticated", "tenant": "acme",
-            "nbf": now() + 3600, "aud": "somebody-else",
+            "nbf": now() + 3600,
         }),
         SECRET,
     );
@@ -1229,11 +1226,53 @@ async fn a_token_the_clock_has_passed_is_not_a_token() {
         .oneshot(as_user("GET", "/rest/v1/zou_atk_clock", Some(&early), ""))
         .await
         .unwrap();
-    assert_eq!(
-        res.status(),
-        StatusCode::OK,
-        "nbf and aud are checked now, so #173 is done and this test is out of date"
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["message"], "JWT not yet valid");
+
+    // One issued an hour from now is refused as well, which is jose
+    // reading iat and is the one time claim the auth surface ignores.
+    let ahead = jwt::mint(
+        &serde_json::json!({
+            "sub": U1, "role": "authenticated", "tenant": "acme",
+            "iat": now() + 3600,
+        }),
+        SECRET,
     );
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/zou_atk_clock", Some(&ahead), ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["message"], "JWT issued at future");
+
+    // The audience is not a time claim and the rest surface does not
+    // read it at all: PostgREST reads aud only when an instance is
+    // configured with jwt-aud, and the reference stack configures
+    // none, so a token addressed to somebody else is answered by both.
+    // What the auth surface does with aud is
+    // a_token_minted_for_another_audience_describes_nobody_here, over
+    // in auth_session.rs, where there is a real account to describe.
+    let elsewhere = jwt::mint(
+        &serde_json::json!({
+            "sub": U1, "role": "authenticated", "tenant": "acme",
+            "aud": "somebody-else",
+        }),
+        SECRET,
+    );
+    let res = app
+        .clone()
+        .oneshot(as_user(
+            "GET",
+            "/rest/v1/zou_atk_clock",
+            Some(&elsewhere),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
     // It is still only the signature that decides, so the gap is a
     // narrower one than it looks: a token nobody could mint is not
     // reachable by waiting for its nbf either.
@@ -1247,6 +1286,96 @@ async fn a_token_the_clock_has_passed_is_not_a_token() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The two references do not read a clock the same way, and a caller
+/// gets whichever reading belongs to the server it thinks it is
+/// talking to. PostgREST allows half a minute either side of every
+/// time claim; GoTrue allows none and never looks at `iat` at all.
+/// The difference is a phone with a slow clock, so a token a few
+/// seconds past its `exp` is answered on /rest/v1 and refused on
+/// /auth/v1, and that is upstream's behaviour rather than ours.
+#[tokio::test]
+async fn the_two_surfaces_read_the_clock_the_way_their_references_do() {
+    let Some(dsn) = dsn() else { return };
+    docs(&dsn, "zou_atk_leeway").await;
+    let app = app(&dsn);
+
+    // Fifteen seconds past, which is inside PostgREST's thirty and
+    // outside GoTrue's nothing.
+    let just_past = jwt::mint(
+        &serde_json::json!({
+            "sub": U1, "role": "authenticated", "tenant": "acme",
+            "exp": now() - 15,
+        }),
+        SECRET,
+    );
+    let res = app
+        .clone()
+        .oneshot(as_user(
+            "GET",
+            "/rest/v1/zou_atk_leeway",
+            Some(&just_past),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/auth/v1/user", Some(&just_past), ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["error_code"], "bad_jwt");
+    assert!(
+        e["msg"].as_str().unwrap().contains("token is expired"),
+        "the auth surface answers in GoTrue's words, got {e}"
+    );
+
+    // Well past, and both refuse.
+    let long_past = jwt::mint(
+        &serde_json::json!({
+            "sub": U1, "role": "authenticated", "tenant": "acme",
+            "exp": now() - 3600,
+        }),
+        SECRET,
+    );
+    let res = app
+        .clone()
+        .oneshot(as_user(
+            "GET",
+            "/rest/v1/zou_atk_leeway",
+            Some(&long_past),
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+    // And an iat an hour out is only the rest surface's business.
+    let ahead = jwt::mint(
+        &serde_json::json!({
+            "sub": U1, "role": "authenticated", "tenant": "acme",
+            "iat": now() + 3600,
+        }),
+        SECRET,
+    );
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/auth/v1/user", Some(&ahead), ""))
+        .await
+        .unwrap();
+    // The seeded sub is not a row in auth.users, so this one is turned
+    // away either way. What says the token itself passed is that the
+    // refusal is about the user rather than about the jwt.
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_ne!(
+        e["error_code"], "bad_jwt",
+        "GoTrue does not read iat, so neither does /auth/v1, got {e}"
+    );
 }
 
 /// Seconds since the epoch, for the claims that are about the clock.

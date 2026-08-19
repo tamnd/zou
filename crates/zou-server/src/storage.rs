@@ -500,6 +500,11 @@ pub(crate) fn jose_words(why: &jwt::Reject) -> &'static str {
         jwt::Reject::WrongAlgorithm(_) => "\"alg\" (Algorithm) Header Parameter value not allowed",
         jwt::Reject::BadSignature => "signature verification failed",
         jwt::Reject::Expired => "\"exp\" claim timestamp check failed",
+        jwt::Reject::TooEarly => "\"nbf\" claim timestamp check failed",
+        // jose reads iat as a timestamp to sanity check as well, and
+        // this endpoint never asks it to, so the string is the shape
+        // the other two have rather than one taken off a run.
+        jwt::Reject::IssuedLater => "\"iat\" claim timestamp check failed",
         jwt::Reject::UnknownKey => "no applicable key found in the JSON Web Key Set",
     }
 }
