@@ -561,6 +561,27 @@ What runs is the registry's build of the package rather than the tarball npm wou
 - The slash after the scheme is allowed. `npm:/drizzle-orm@0.29.1/pg-core` is the same specifier as the one without it, which matters because that is the spelling a registry's own build of a package imports itself with rather than one anybody types.
 - A declaration file is a module with nothing in it. `import 'jsr:@supabase/functions-js/edge-runtime.d.ts'` is how a project tells its editor what `Deno.serve` is, and there is no runtime code in a `.d.ts` to run and nothing fetched for one.
 
+### A package's own files
+
+A package sometimes ships a file that is not a module and reads it itself, which is what a wasm library does with its `.wasm`.
+
+```ts
+const bytes = await Deno.readFile(
+  new URL("magick.wasm", import.meta.resolve("npm:@imagemagick/magick-wasm@^0")),
+)
+```
+
+Upstream unpacks a tarball into a directory, so that line is a file beside a file.
+Here a package is a url, so it is a url beside a url, and two things make it work.
+
+`import.meta.resolve` of a package answers with the module the registry served rather than with the specifier that was asked for.
+A version range is a name for a package and not a place, and `new URL('magick.wasm', ...)` resolves against a place: esm.sh answers `@imagemagick/magick-wasm@^0` with a module that says in `x-esm-path` which build of which version it is, and that is the url this answers with.
+A registry that says nothing answers with wherever the fetch landed, which is the redirect it followed if it followed one.
+
+`Deno.readFile` of an `http:` or `https:` url reads it through the same cache the modules are fetched into, so the file is fetched once and a second cold start has it.
+This is not a new thing for a function to be able to reach: a function has `fetch`, and this is the same reach through a cache that is already paid for.
+The synchronous spellings serve what has been fetched already and will not start a download while an isolate is stopped waiting for one.
+
 Everything fetched is kept on disk, keyed by url, so only the first cold start pays for it.
 
 - `ZOU_MODULE_CACHE` is where, and defaults to `$XDG_CACHE_HOME/zou/modules` or `~/.cache/zou/modules`.
@@ -629,6 +650,7 @@ Deno.serve(async () => {
 
 `Deno.readFile`, `Deno.readTextFile` and the two `Sync` spellings of them are here, and they are the whole of the file system a function has.
 There is no writing, no listing a directory, no `Deno.open` and no stat.
+The same four calls read an `https:` url, which is a package reading a file of its own and is written down in the packages section rather than here: the patterns below are about the disk.
 
 A relative name starts at the directory the entrypoint is in, which is upstream's `servicePath`, so `./page.html` in `functions/hello/index.ts` is `functions/hello/page.html`.
 An absolute name and a `file:` url both work and are matched the same way.
@@ -894,6 +916,8 @@ Deno.serve((req) => {
 - A sink that throws is the error every later `write`, `close` and `ready` gets, and the writer's `closed` rejects with it. Aborting is the same with the reason the caller gave.
 - A pipe ends the way its source ended. A source that closed closes the destination, a source that errored aborts it, and `preventClose`, `preventAbort` and `preventCancel` each stop one half of that.
 - `TextDecoderStream` is the one transform that is not here yet, which is why the example above decodes with a `TextDecoder` of its own.
+- A `TextDecoder` decodes utf-8, `utf-16le` and `utf-16be`, under the labels the encoding standard gives those three. The legacy single byte pages are not here. utf-16 is because a wasm module compiled by emscripten reads its own heap with it, and a lone byte at the end of a utf-16 buffer decodes to the replacement character rather than throwing.
+- `fatal` is not read. A `TextDecoder` here replaces what it cannot decode whether or not it was asked to throw.
 
 ## WebSocket
 

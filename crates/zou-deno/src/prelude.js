@@ -44,21 +44,79 @@
     }
   }
 
+  // The labels the encoding standard gives the three encodings this
+  // has. It is not the standard's whole list, because the rest of that
+  // list is legacy single byte pages and each one is a table of 128
+  // characters that nothing has asked for yet.
+  //
+  // utf-16 is here because a wasm module compiled by emscripten decodes
+  // its own strings with it: the heap holds utf-16 code units and
+  // `new TextDecoder('utf-16le')` is how the glue reads them out.
+  const ENCODINGS = new Map([
+    ["unicode-1-1-utf-8", "utf-8"],
+    ["utf-8", "utf-8"],
+    ["utf8", "utf-8"],
+    ["csunicode", "utf-16le"],
+    ["iso-10646-ucs-2", "utf-16le"],
+    ["ucs-2", "utf-16le"],
+    ["unicode", "utf-16le"],
+    ["unicodefeff", "utf-16le"],
+    ["utf-16", "utf-16le"],
+    ["utf-16le", "utf-16le"],
+    ["unicodefffe", "utf-16be"],
+    ["utf-16be", "utf-16be"],
+  ]);
+
+  const ENCODING = Symbol("encoding");
+  const KEEP_BOM = Symbol("ignoreBOM");
+
+  /// Two bytes at a time, in chunks, because `String.fromCharCode` of a
+  /// million arguments is a stack that has run out rather than a string.
+  ///
+  /// An odd byte at the end is half of a code unit, which is what the
+  /// standard's decoder ends on the replacement character for.
+  function utf16(bytes, big) {
+    const units = bytes.length >> 1;
+    const chunk = 4096;
+    let out = "";
+    for (let start = 0; start < units; start += chunk) {
+      const stop = Math.min(units, start + chunk);
+      const codes = new Array(stop - start);
+      for (let unit = start; unit < stop; unit++) {
+        const first = bytes[unit * 2];
+        const second = bytes[unit * 2 + 1];
+        codes[unit - start] = big ? (first << 8) | second : (second << 8) | first;
+      }
+      out += String.fromCharCode.apply(null, codes);
+    }
+    return bytes.length % 2 === 0 ? out : `${out}\uFFFD`;
+  }
+
   class TextDecoder {
-    constructor(label = "utf-8") {
-      const encoding = String(label).toLowerCase();
-      if (encoding !== "utf-8" && encoding !== "utf8" && encoding !== "unicode-1-1-utf-8") {
+    constructor(label = "utf-8", options = {}) {
+      const encoding = ENCODINGS.get(String(label).trim().toLowerCase());
+      if (encoding === undefined) {
         throw new RangeError(`the encoding label provided ('${label}') is not supported`);
       }
+      this[ENCODING] = encoding;
+      this[KEEP_BOM] = Boolean(options && options.ignoreBOM);
     }
     get encoding() {
-      return "utf-8";
+      return this[ENCODING];
     }
     decode(input) {
       if (input === undefined) {
         return "";
       }
-      return core.decode(bytesOf(input));
+      const bytes = bytesOf(input);
+      if (this[ENCODING] === "utf-8") {
+        return core.decode(bytes);
+      }
+      const text = utf16(bytes, this[ENCODING] === "utf-16be");
+      // A byte order mark is what said which of the two this is, so it
+      // is not part of what it said, unless the caller asked to be
+      // handed the bytes as they are.
+      return this[KEEP_BOM] || !text.startsWith("\uFEFF") ? text : text.slice(1);
     }
   }
 
@@ -3140,10 +3198,21 @@
   /// A `string | URL`, which is what Deno takes, as the string the op
   /// wants. A file url is the path in it, since that is the only thing
   /// a file url is here.
+  ///
+  /// An http url is handed over whole, and the host reads it through
+  /// the cache the modules are fetched into. A package here is a url
+  /// rather than a directory, so a package's own file beside it is a
+  /// url too, and `new URL('magick.wasm', import.meta.resolve('npm:...'))`
+  /// is how a function asks for one.
   function pathOf(path) {
     if (path instanceof URL) {
+      if (path.protocol === "https:" || path.protocol === "http:") {
+        return path.href;
+      }
       if (path.protocol !== "file:") {
-        throw new TypeError(`a file may only be read through a file url, not ${path.protocol}`);
+        throw new TypeError(
+          `a file may only be read through a file url or an http url, not ${path.protocol}`,
+        );
       }
       return decodeURIComponent(path.pathname);
     }

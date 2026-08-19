@@ -368,11 +368,31 @@ async fn op_zou_parked(state: Rc<RefCell<OpState>>) {
     let _ = calls.changed().await;
 }
 
+/// Whether what was handed in is a url on the network rather than a
+/// name on the disk, which is the one case a read does not go through
+/// the static files at all.
+fn elsewhere(name: &str) -> bool {
+    name.starts_with("https://") || name.starts_with("http://")
+}
+
 /// `Deno.readFile` and `Deno.readTextFile`, which are the same op and
 /// differ in javascript by what is done with the bytes.
 #[op2(async(lazy), fast)]
 #[serde]
 async fn op_zou_read_file(state: Rc<RefCell<OpState>>, #[string] name: String) -> Read {
+    if elsewhere(&name) {
+        // On a blocking thread for the same reason a module is: the
+        // client that fetches it is the blocking one.
+        return match tokio::task::spawn_blocking(move || crate::module::bytes(&name, true)).await {
+            Ok(Ok(bytes)) => Read::Bytes {
+                bytes: bytes.into(),
+            },
+            Ok(Err(why)) => Read::Failed { why },
+            Err(why) => Read::Failed {
+                why: why.to_string(),
+            },
+        };
+    }
     let asked = state.borrow().borrow::<Owned>().statics.at(&name);
     match asked {
         Err(why) => Read::Refused { why },
@@ -386,6 +406,14 @@ async fn op_zou_read_file(state: Rc<RefCell<OpState>>, #[string] name: String) -
 #[op2]
 #[serde]
 fn op_zou_read_file_sync(state: &mut OpState, #[string] name: String) -> Read {
+    if elsewhere(&name) {
+        return match crate::module::bytes(&name, false) {
+            Ok(bytes) => Read::Bytes {
+                bytes: bytes.into(),
+            },
+            Err(why) => Read::Failed { why },
+        };
+    }
     match state.borrow::<Owned>().statics.at(&name) {
         Err(why) => Read::Refused { why },
         Ok(at) => Read::of(&at, std::fs::read(&at)),

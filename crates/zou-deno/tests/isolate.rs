@@ -668,6 +668,48 @@ fn the_handler_is_told_who_called() {
     assert_eq!(body(&answer), "203.0.113.7");
 }
 
+/// The other encoding a `TextDecoder` here can be asked for, which is
+/// what a wasm module compiled by emscripten reads its own heap with.
+#[test]
+fn text_decodes_out_of_utf_16_in_both_orders() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const le = new Uint8Array([0x68, 0x00, 0xe9, 0x00, 0x3d, 0xd8, 0x00, 0xde]);
+            const be = new Uint8Array([0x00, 0x68, 0x00, 0xe9, 0xd8, 0x3d, 0xde, 0x00]);
+            const bom = new Uint8Array([0xff, 0xfe, 0x68, 0x00]);
+            const refused = (label) => {
+                try { new TextDecoder(label); return "let me"; } catch (e) { return e.message; }
+            };
+            return Response.json({
+                little: new TextDecoder("utf-16le").decode(le),
+                big: new TextDecoder("utf-16be").decode(be),
+                plain: new TextDecoder("UTF-16").decode(le),
+                named: new TextDecoder("ucs-2").encoding,
+                bom: new TextDecoder("utf-16le").decode(bom),
+                kept: new TextDecoder("utf-16le", { ignoreBOM: true }).decode(bom).length,
+                half: new TextDecoder("utf-16le").decode(new Uint8Array([0x68, 0x00, 0x21])),
+                utf8: new TextDecoder("utf8").encoding,
+                refused: refused("latin1"),
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["little"], "h\u{e9}\u{1f600}");
+    assert_eq!(said["big"], "h\u{e9}\u{1f600}");
+    assert_eq!(said["plain"], "h\u{e9}\u{1f600}");
+    assert_eq!(said["named"], "utf-16le");
+    assert_eq!(said["bom"], "h");
+    assert_eq!(said["kept"], 2);
+    assert_eq!(said["half"], "h\u{fffd}");
+    assert_eq!(said["utf8"], "utf-8");
+    assert_eq!(
+        said["refused"],
+        "the encoding label provided ('latin1') is not supported"
+    );
+}
+
 #[test]
 fn the_web_shapes_a_handler_is_written_against_are_there() {
     let answer = answered(
