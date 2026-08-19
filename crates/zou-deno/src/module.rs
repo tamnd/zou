@@ -59,7 +59,15 @@ pub struct Disk {
     /// only the function that was deployed for as long as none of these
     /// has moved, which is what hot reload is.
     read: Reads,
+    /// Where a specifier ended up, for the ones that ended up somewhere
+    /// other than where they were asked for.
+    landed: Landed,
 }
+
+/// What a redirect said, kept per isolate. A `RefCell` and not a lock
+/// because a loader belongs to one isolate and an isolate belongs to
+/// one thread, which is the same reason `Reads` is one.
+type Landed = Rc<RefCell<std::collections::HashMap<String, String>>>;
 
 /// The files an isolate was built out of, shared with whoever is going
 /// to ask whether they have changed. An `Rc` because a module loader
@@ -101,10 +109,34 @@ impl Disk {
             registry: named("ZOU_MODULE_REGISTRY")
                 .map(|it| it.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| REGISTRY.to_string()),
-            cache: named("ZOU_MODULE_CACHE").map_or_else(ordinary, PathBuf::from),
+            cache: cache(),
             cached_only: named("ZOU_MODULE_CACHE_ONLY").is_some(),
             imports,
             read,
+            landed: Landed::default(),
+        }
+    }
+
+    /// A specifier as the url the module the registry served is at,
+    /// when that is somewhere other than where it was asked for.
+    ///
+    /// Two things move it. A registry answers a version range with a
+    /// redirect to the build it decided the range meant. And esm.sh
+    /// answers a package with a two line module that re opens the same
+    /// package under the version and the build target it picked,
+    /// naming that in `x-esm-path`. Either way the url that was asked
+    /// for is a name for a package rather than a place files sit next
+    /// to each other in.
+    ///
+    /// Which is the whole of what this is for: `new URL('magick.wasm',
+    /// import.meta.resolve('npm:@imagemagick/magick-wasm@^0'))` is a
+    /// real line in a real function, and a version range is not a
+    /// directory to resolve anything against.
+    fn moved(&self, asked: ModuleSpecifier) -> ModuleSpecifier {
+        let landed = self.landed.borrow();
+        match landed.get(asked.as_str()) {
+            Some(landed) => ModuleSpecifier::parse(landed).unwrap_or(asked),
+            None => asked,
         }
     }
 }
@@ -119,6 +151,13 @@ impl Default for Disk {
 /// worth acting on: an empty one is a shell that expanded nothing.
 fn named(variable: &str) -> Option<String> {
     std::env::var(variable).ok().filter(|it| !it.is_empty())
+}
+
+/// Where fetched modules live between runs, which is one answer for the
+/// whole process: a loader and a `Deno.readFile` of a url are looking in
+/// the same place for the same bytes.
+fn cache() -> PathBuf {
+    named("ZOU_MODULE_CACHE").map_or_else(ordinary, PathBuf::from)
 }
 
 /// The ordinary cache directory, or a directory under the temporary one
@@ -176,6 +215,22 @@ impl ModuleLoader for Disk {
             .map_err(|e| JsErrorBox::type_error(e.to_string()))
     }
 
+    /// `import.meta.resolve`, which is the same resolution and then one
+    /// more question: where is the module the registry actually served.
+    ///
+    /// Nothing else asks that, because an import of the same specifier
+    /// wants what the registry hands out for it, polyfill import and
+    /// all. What a function does with this answer is different: it
+    /// resolves a file beside it.
+    fn import_meta_resolve(
+        &self,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<ModuleSpecifier, deno_core::error::ModuleLoaderError> {
+        let asked = self.resolve(specifier, referrer, ResolutionKind::DynamicImport)?;
+        Ok(self.moved(asked))
+    }
+
     fn load(
         &self,
         specifier: &ModuleSpecifier,
@@ -195,6 +250,7 @@ impl ModuleLoader for Disk {
         let asked = specifier.clone();
         let cache = self.cache.clone();
         let cached_only = self.cached_only;
+        let landed = Rc::clone(&self.landed);
         // On a blocking thread, because the client that fetches it is
         // the blocking one, and there may be a dozen of these in the
         // air at once while a package's graph is walked.
@@ -205,6 +261,9 @@ impl ModuleLoader for Disk {
             })
             .await
             .map_err(|e| JsErrorBox::generic(format!("{asked} could not be fetched: {e}")))??;
+            if let Some(own) = fetched.own.clone().filter(|it| it != asked.as_str()) {
+                landed.borrow_mut().insert(asked.to_string(), own);
+            }
             remote(&asked, fetched)
         }))
     }
@@ -374,6 +433,14 @@ fn stripped(
 struct Fetched {
     url: String,
     content_type: String,
+    /// Where the module the registry served is, which is the url above
+    /// unless the registry named another one. Only `import.meta.resolve`
+    /// reads it, and what it is for is written down on `Disk::moved`.
+    ///
+    /// `None` is a cache entry from before this was written down, which
+    /// is a thing that does not know rather than a thing that says the
+    /// module is where it is.
+    own: Option<String>,
     body: Vec<u8>,
 }
 
@@ -391,11 +458,50 @@ fn at(cache: &Path, url: &ModuleSpecifier) -> PathBuf {
     cache.join(url.host_str().unwrap_or("elsewhere")).join(name)
 }
 
+/// A url read as bytes rather than as a module, which is what
+/// `Deno.readFile` of an http url is.
+///
+/// The same cache and the same client the modules go through, because
+/// what asks for this is a package reading a file of its own that sits
+/// beside the module the registry served: a wasm blob next to the
+/// javascript that instantiates it. Upstream resolves an `npm:`
+/// specifier into a directory on disk and the file is simply there;
+/// here a package is a url, so the file beside it is a url too.
+///
+/// This is not a new thing for a function to be able to reach. A
+/// function has `fetch`, and this is that same reach through the cache
+/// that has already been paid for.
+///
+/// `network` is false for the synchronous spelling, which will serve
+/// what has already been fetched and will not start a download while an
+/// isolate is stopped waiting for it.
+pub fn bytes(url: &str, network: bool) -> Result<Vec<u8>, String> {
+    let asked = ModuleSpecifier::parse(url).map_err(|e| format!("{url}: {e}"))?;
+    let cache = cache();
+    if let Some(fetched) = cached(&at(&cache, &asked)) {
+        return Ok(fetched.body);
+    }
+    if !network {
+        return Err(format!(
+            "{asked} is not in the module cache, and a synchronous read will not fetch it: await Deno.readFile instead"
+        ));
+    }
+    held(&cache, named("ZOU_MODULE_CACHE_ONLY").is_some(), &asked)
+        .map(|fetched| fetched.body)
+        .map_err(|why| why.to_string())
+}
+
 /// Cached, or fetched and then cached.
 fn held(cache: &Path, cached_only: bool, asked: &ModuleSpecifier) -> Result<Fetched, JsErrorBox> {
     let path = at(cache, asked);
     if let Some(fetched) = cached(&path) {
-        return Ok(fetched);
+        // An entry written before the cache wrote down where the module
+        // the registry served is knows less than a fresh one would, so a
+        // server that is allowed to fetch asks again rather than answer
+        // with the less. One that is not keeps what it was handed.
+        if fetched.own.is_some() || cached_only {
+            return Ok(fetched);
+        }
     }
     if cached_only {
         return Err(JsErrorBox::type_error(format!(
@@ -415,9 +521,16 @@ fn cached(path: &Path) -> Option<Fetched> {
     let body = std::fs::read(path).ok()?;
     let about = std::fs::read_to_string(path.with_extension("about")).ok()?;
     let mut lines = about.lines();
+    let url = lines.next()?.to_string();
+    let content_type = lines.next().unwrap_or_default().to_string();
+    let own = lines
+        .next()
+        .filter(|it| !it.is_empty())
+        .map(|it| it.to_string());
     Some(Fetched {
-        url: lines.next()?.to_string(),
-        content_type: lines.next().unwrap_or_default().to_string(),
+        own,
+        url,
+        content_type,
         body,
     })
 }
@@ -445,7 +558,12 @@ fn keep(path: &Path, fetched: &Fetched) -> std::io::Result<()> {
     // The body first, so a reader that finds the description finds the
     // bytes it describes.
     once(&fetched.body, path.to_path_buf())?;
-    let about = format!("{}\n{}\n", fetched.url, fetched.content_type);
+    let about = format!(
+        "{}\n{}\n{}\n",
+        fetched.url,
+        fetched.content_type,
+        fetched.own.as_deref().unwrap_or_default()
+    );
     once(about.as_bytes(), path.with_extension("about"))
 }
 
@@ -475,6 +593,17 @@ fn fetch(asked: &ModuleSpecifier) -> Result<Fetched, JsErrorBox> {
         use ureq::ResponseExt;
         answer.get_uri().to_string()
     };
+    // What esm.sh says the module it just served really is, which is a
+    // path on the same host and is the only way to know it from the
+    // outside: the module itself is two lines that re export it. A
+    // registry that says nothing has said the module is where it is.
+    let own = answer
+        .headers()
+        .get("x-esm-path")
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+        .and_then(|path| ModuleSpecifier::parse(&url).ok()?.join(&path).ok())
+        .map_or_else(|| url.clone(), |it| it.to_string());
+    let own = Some(own);
     let body = answer
         .into_body()
         .with_config()
@@ -484,6 +613,7 @@ fn fetch(asked: &ModuleSpecifier) -> Result<Fetched, JsErrorBox> {
     Ok(Fetched {
         url,
         content_type,
+        own,
         body,
     })
 }
@@ -518,6 +648,7 @@ mod tests {
             cached_only: true,
             imports: None,
             read: Reads::default(),
+            landed: Landed::default(),
         }
     }
 
@@ -639,6 +770,7 @@ mod tests {
             &Fetched {
                 url: "https://esm.sh/a@1.2.3/es2022/a.mjs".to_string(),
                 content_type: "application/javascript; charset=utf-8".to_string(),
+                own: Some("https://esm.sh/a@1.2.3/es2022/a.mjs".to_string()),
                 body: b"export const a = 1;".to_vec(),
             },
         )
@@ -667,6 +799,7 @@ mod tests {
             &Fetched {
                 url: asked.to_string(),
                 content_type: "application/javascript".to_string(),
+                own: Some(asked.to_string()),
                 body: b"export default 1;".to_vec(),
             },
         )
@@ -674,6 +807,28 @@ mod tests {
         // Told not to fetch, so an answer at all is an answer off the
         // disk.
         let held = held(directory.path(), true, &asked).unwrap();
+        assert_eq!(held.body, b"export default 1;");
+    }
+
+    /// A cache written by a build that had two lines to say about a
+    /// module rather than three is still a cache. What it does not say
+    /// is where the module the registry served is, and a server that
+    /// was handed it and told not to fetch runs on what it has.
+    #[test]
+    fn a_cache_from_before_there_was_a_third_line_is_still_a_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let asked = spec("https://esm.sh/a@1");
+        let path = at(directory.path(), &asked);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"export default 1;").unwrap();
+        std::fs::write(
+            path.with_extension("about"),
+            "https://esm.sh/a@1.2.3/es2022/a.mjs\napplication/javascript\n",
+        )
+        .unwrap();
+        let held = held(directory.path(), true, &asked).unwrap();
+        assert_eq!(held.url, "https://esm.sh/a@1.2.3/es2022/a.mjs");
+        assert_eq!(held.own, None);
         assert_eq!(held.body, b"export default 1;");
     }
 }

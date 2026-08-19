@@ -227,3 +227,27 @@ fn a_specifier_with_the_slash_the_scheme_allows_resolves() {
     );
     assert_eq!(body(&answer), "736c617368");
 }
+
+/// A package's own file, off the registry, beside where the module
+/// landed rather than beside the range that was asked for.
+///
+/// `image-manipulation` in the Supabase examples is the function that
+/// asks: it reads the wasm blob that sits next to the javascript that
+/// instantiates it. That is fourteen megabytes off esm.sh, which is
+/// why the assertion is on the header and the size rather than on the
+/// bytes.
+#[test]
+#[ignore = "reaches the registry"]
+fn a_package_file_is_read_from_beside_where_the_module_landed() {
+    let answer = answered(
+        r#"
+        import { ImageMagick } from "npm:@imagemagick/magick-wasm@^0";
+        const wasm = await Deno.readFile(
+          new URL("magick.wasm", import.meta.resolve("npm:@imagemagick/magick-wasm@^0")),
+        );
+        const magic = Array.from(wasm.slice(0, 4)).join(",");
+        Deno.serve(() => new Response(`${magic} ${wasm.length > 10_000_000} ${typeof ImageMagick}`));
+        "#,
+    );
+    assert_eq!(body(&answer), "0,97,115,109 true function");
+}

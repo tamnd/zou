@@ -35,6 +35,8 @@
 //!   is still waiting for, and thirty seconds is the ceiling on that.
 //! - There are no node built ins, so `node:` is refused by name and a
 //!   package that reaches for one will not run.
+//! - A `TextDecoder` decodes utf-8 and utf-16 and none of the legacy
+//!   single byte pages, and it does not read `fatal`.
 //!
 //! What is there is `Headers`, `Request`, `Response`, `URL`,
 //! `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, the timers,
