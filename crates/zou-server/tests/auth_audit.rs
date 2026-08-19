@@ -22,7 +22,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use zou_server::sql::Pool;
-use zou_server::{Config, jwt, mail, router, sms, totp};
+use zou_server::{Config, audit, jwt, mail, router, sms, totp};
 
 const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long";
 const SITE: &str = "https://app.zou.test";
@@ -40,16 +40,30 @@ fn dsn() -> Option<String> {
 /// A project that makes the caller confirm, which is what a stock
 /// GoTrue does and so what most of these tests want.
 fn confirming(dsn: &str) -> axum::Router {
-    project(dsn, false)
+    project(dsn, false, audit::Settings::default())
 }
 
 /// A project that confirms its own signups, so a signup is a session.
 fn instant(dsn: &str) -> axum::Router {
-    project(dsn, true)
+    project(dsn, true, audit::Settings::default())
 }
 
-fn project(dsn: &str, autoconfirm: bool) -> axum::Router {
+/// A project that has said to keep the stream and drop the table, which
+/// is what somebody shipping the trail elsewhere turns on.
+fn streaming(dsn: &str) -> axum::Router {
+    project(
+        dsn,
+        true,
+        audit::Settings {
+            disable_postgres: true,
+            retention: None,
+        },
+    )
+}
+
+fn project(dsn: &str, autoconfirm: bool, audit: audit::Settings) -> axum::Router {
     router(Config {
+        audit,
         jwt_secret: SECRET.to_vec(),
         pg: Some(dsn.to_string()),
         external_url: Some("https://zou.test".to_string()),
@@ -404,7 +418,10 @@ async fn a_signup_that_needs_confirming_writes_the_confirmation_request() {
     assert!(!entry.actor_via_sso);
     assert_eq!(entry.actor_name, None, "no full name, so no actor_name key");
     assert_eq!(entry.trait_str("provider"), "email");
-    assert_eq!(entry.ip_address, "", "only the factor entries fill this in");
+    assert_eq!(
+        entry.ip_address, "",
+        "only the factor and identity entries fill this in",
+    );
 
     wipe(&pool, &email).await;
 }
@@ -1027,7 +1044,7 @@ async fn a_generated_invite_link_is_filed_against_the_role() {
 }
 
 #[tokio::test]
-async fn the_factor_entries_are_the_only_ones_that_say_where_they_came_from() {
+async fn the_factor_entries_say_where_they_came_from_and_the_sign_in_ones_do_not() {
     let Some(dsn) = dsn() else { return };
     let pool = pool(&dsn);
     let email = address("factor");
@@ -1128,7 +1145,9 @@ async fn the_factor_entries_are_the_only_ones_that_say_where_they_came_from() {
 
     // And the entries the same account wrote through the front door say
     // nothing about where they came from, which is upstream's oldest
-    // wart and the reason this test is worded the way it is.
+    // wart and the reason this test is worded the way it is. The other
+    // two entries that do fill the column are the identity pair, and
+    // this account has neither: it never linked anything.
     for entry in trail.iter().filter(|e| e.log_type != "factor") {
         assert_eq!(
             entry.ip_address, "",
@@ -1393,11 +1412,12 @@ async fn unlinking_an_identity_names_the_provider_and_the_identity() {
         rows[0].get(0)
     };
 
-    let answer = as_user(
+    let answer = call(
         &app,
         "DELETE",
         &format!("/auth/v1/user/identities/{identity}"),
-        &session.access,
+        Some(&session.access),
+        Some("198.51.100.4"),
         serde_json::json!({}),
     )
     .await;
@@ -1407,6 +1427,10 @@ async fn unlinking_an_identity_names_the_provider_and_the_identity() {
     let last = trail.last().expect("an entry");
     assert_eq!(last.action, "identity_unlinked");
     assert_eq!(
+        last.ip_address, "198.51.100.4",
+        "one of the six entries upstream fills the column for",
+    );
+    assert_eq!(
         last.log_type, "user",
         "upstream files this under the user rather than the account, \
          which is the odd one in its table",
@@ -1414,6 +1438,98 @@ async fn unlinking_an_identity_names_the_provider_and_the_identity() {
     assert_eq!(last.trait_str("identity_id"), identity);
     assert_eq!(last.trait_str("provider"), "github");
     assert_eq!(last.trait_str("provider_id"), "4141");
+
+    wipe(&pool, &email).await;
+}
+
+#[tokio::test]
+async fn a_project_that_turned_the_table_off_still_serves_the_flow() {
+    let Some(dsn) = dsn() else { return };
+    let pool = pool(&dsn);
+    let email = address("stream-only");
+    wipe(&pool, &email).await;
+    let app = streaming(&dsn);
+
+    // A signup and a login, which between them would be three rows on a
+    // stock project and are the flows most likely to notice if turning
+    // the table off had broken the write rather than skipped it.
+    let session = signed_up(&app, &email).await;
+    let signed_in = post(
+        &app,
+        "/auth/v1/token?grant_type=password",
+        serde_json::json!({"email": email, "password": "correct horse battery"}),
+    )
+    .await;
+    assert_eq!(signed_in.status, StatusCode::OK, "{}", signed_in.body);
+
+    assert!(
+        actions(&pool, &session.user_id).await.is_empty(),
+        "the project said not to write rows",
+    );
+
+    // And the flows that would have written them still work, which is
+    // the half of this that a count of zero cannot say on its own.
+    let me = as_user(
+        &app,
+        "GET",
+        "/auth/v1/user",
+        &session.access,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert_eq!(me.str("email"), email);
+
+    wipe(&pool, &email).await;
+}
+
+#[tokio::test]
+async fn the_pruner_takes_the_entries_past_the_retention_and_leaves_the_rest() {
+    let Some(dsn) = dsn() else { return };
+    let pool = pool(&dsn);
+    let email = address("pruned");
+    wipe(&pool, &email).await;
+    let app = instant(&dsn);
+
+    let session = signed_up(&app, &email).await;
+    let before = actions(&pool, &session.user_id).await;
+    assert!(!before.is_empty(), "the signup wrote something to prune");
+
+    // The first entry is pushed back past the retention and the rest are
+    // left where they are, so one sweep has to tell them apart. Ageing
+    // the row is the only way to test this without sleeping.
+    let sess = pool.unscoped().await.expect("connect");
+    sess.execute(
+        "update auth.audit_log_entries
+            set created_at = now() - interval '48 hours'
+          where payload::jsonb ->> 'actor_id' = $1
+            and created_at = (select min(created_at) from auth.audit_log_entries
+                               where payload::jsonb ->> 'actor_id' = $1)",
+        &[&session.user_id],
+    )
+    .await
+    .expect("age one row");
+    sess.commit().await.expect("commit");
+
+    let gone = audit::sweep(&pool, std::time::Duration::from_secs(24 * 60 * 60))
+        .await
+        .expect("the sweep runs");
+    assert!(gone >= 1, "the aged row was deleted");
+
+    let after = actions(&pool, &session.user_id).await;
+    assert_eq!(
+        after,
+        before[1..].to_vec(),
+        "the oldest went and the ones inside the retention stayed",
+    );
+
+    // A second sweep with nothing old enough left finds nothing, which
+    // is what an hourly job on a quiet project does every hour.
+    let again = audit::sweep(&pool, std::time::Duration::from_secs(24 * 60 * 60))
+        .await
+        .expect("the sweep runs");
+    assert_eq!(again, 0, "nothing is old enough now");
+    assert_eq!(actions(&pool, &session.user_id).await, after);
 
     wipe(&pool, &email).await;
 }

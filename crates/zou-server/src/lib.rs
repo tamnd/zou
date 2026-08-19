@@ -195,6 +195,12 @@ pub struct Config {
     /// the endpoint limits do anything until the server is told how to
     /// tell one caller from another.
     pub limit: limit::Settings,
+    /// What happens to the audit trail: whether it is written to this
+    /// project's database at all, and how long a row is kept. The
+    /// defaults write everything and keep it forever, which is
+    /// upstream's behaviour and the only safe thing to do to somebody
+    /// else's trail without being asked.
+    pub audit: audit::Settings,
     /// The external identity providers, GoTrue's GOTRUE_EXTERNAL_*.
     /// Empty is a project with no social login, which is what
     /// /authorize then says about every provider it is asked for.
@@ -286,6 +292,7 @@ impl Default for Config {
             mfa: mfa::Settings::default(),
             hook: hook::Settings::none(),
             limit: limit::Settings::default(),
+            audit: audit::Settings::default(),
             oauth: oauth::Providers::default(),
             http: None,
             objects: None,
@@ -390,6 +397,11 @@ pub struct App {
     /// same first request. Only one node ends up firing them, which is
     /// an advisory lock rather than a decision made here.
     pub ticking: tokio::sync::OnceCell<()>,
+    /// The loop that deletes audit entries older than the project's
+    /// retention, started by the same first request and doing nothing
+    /// at all unless a retention was set. One node deletes, on the same
+    /// terms the ticker fires on.
+    pub pruning: tokio::sync::OnceCell<()>,
 }
 
 impl App {
@@ -436,6 +448,9 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         Some(dsn) => Some(sql::Pool::new(dsn, POOL_SIZE).map_err(|e| format!("pg dsn: {e}"))?),
         None => None,
     };
+    if let Some(pool) = &pool {
+        pool.write_audit_rows(!cfg.audit.disable_postgres);
+    }
     let limiter = cfg.rate.map(edge::RateLimit::new);
     let limits = limit::Limits::new(cfg.limit.clone());
     let configured = match &cfg.jwks {
@@ -499,6 +514,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         reading: tokio::sync::OnceCell::new(),
         dispatching: tokio::sync::OnceCell::new(),
         ticking: tokio::sync::OnceCell::new(),
+        pruning: tokio::sync::OnceCell::new(),
     }))
 }
 
@@ -623,6 +639,9 @@ async fn gate(
         .await;
     app.ticking
         .get_or_init(|| async { cron::tick(Arc::clone(&app)) })
+        .await;
+    app.pruning
+        .get_or_init(|| async { audit::prune(Arc::clone(&app)) })
         .await;
     next.run(req).await
 }

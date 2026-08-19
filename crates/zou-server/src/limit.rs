@@ -103,7 +103,7 @@ impl Rate {
 /// run of number-and-unit pairs, each unit one of the six Go accepts.
 /// Anything else is None, which is a refusal at startup rather than a
 /// limit nobody configured the way they thought they had.
-fn duration(text: &str) -> Option<Duration> {
+pub(crate) fn duration(text: &str) -> Option<Duration> {
     let text = text.trim();
     if text.is_empty() {
         return None;

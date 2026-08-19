@@ -230,6 +230,19 @@ async fn go(app: &axum::Router, uri: &str) -> Response {
     app.clone().oneshot(req).await.expect("router answers")
 }
 
+/// The same navigation, from somewhere. A browser coming back from a
+/// provider is the only caller in this file whose address the server
+/// writes down, so this is the only place that needs one.
+async fn go_from(app: &axum::Router, uri: &str, from: &str) -> Response {
+    let req = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("x-forwarded-for", from)
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.expect("router answers")
+}
+
 async fn post(app: &axum::Router, path: &str, body: serde_json::Value) -> (StatusCode, Value) {
     let req = Request::builder()
         .method("POST")
@@ -1418,6 +1431,71 @@ async fn a_second_provider_joins_the_account_that_asked_for_it() {
         elsewhere_accounts, 0,
         "and no second account was made for the address the provider named"
     );
+}
+
+#[tokio::test]
+async fn a_link_is_written_to_the_trail_with_the_address_it_came_from() {
+    let Some(dsn) = dsn() else { return };
+    let (app, fake) = linking(&dsn);
+    let pool = pool(&dsn).await;
+    let (email, elsewhere) = ("audited@zou.test", "audited-elsewhere@zou.test");
+    wipe(&pool, &[email, elsewhere]).await;
+    let (user_id, token) = signed_up(&app, email).await;
+
+    fake.github(778, "audited", elsewhere, true);
+    let state = start_link(&app, &token, "provider=github").await;
+    // The address is on the callback rather than on the start, because
+    // the callback is the request that writes the entry.
+    let res = go_from(
+        &app,
+        &format!("/auth/v1/callback?state={state}&code=c"),
+        "198.51.100.9",
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::FOUND);
+    let landed = location(&res);
+    assert!(
+        !parts(&landed).contains_key("error"),
+        "the link went through: {landed}"
+    );
+
+    let identity: String = scalar(
+        &pool,
+        "select id::text from auth.identities
+          where user_id = $1::text::uuid and provider = 'github'",
+        &[&user_id],
+    )
+    .await;
+    let (payload, ip): (String, String) = {
+        let sess = pool.unscoped().await.expect("connect");
+        let rows = sess
+            .query(
+                "select payload::text, ip_address from auth.audit_log_entries
+                  where payload::jsonb ->> 'actor_id' = $1
+                    and payload::jsonb ->> 'action' = 'identity_linked'",
+                &[&user_id],
+            )
+            .await
+            .expect("read the trail");
+        sess.commit().await.expect("park");
+        assert_eq!(rows.len(), 1, "one link, one entry");
+        (rows[0].get(0), rows[0].get(1))
+    };
+    let payload: Value = serde_json::from_str(&payload).expect("json");
+    assert_eq!(payload["log_type"], "user");
+    assert_eq!(payload["actor_username"], email);
+    assert_eq!(payload["traits"]["identity_id"], identity);
+    assert_eq!(payload["traits"]["provider"], "github");
+    assert_eq!(
+        payload["traits"]["provider_id"], "778",
+        "the provider's own id for the person, not zou's"
+    );
+    assert_eq!(
+        ip, "198.51.100.9",
+        "the linking entries are two of the six upstream fills the column for"
+    );
+
+    wipe(&pool, &[email, elsewhere]).await;
 }
 
 #[tokio::test]
