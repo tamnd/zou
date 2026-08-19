@@ -38,9 +38,13 @@ On a fleet they do not add up to one machine's, and that is the honest shape rat
 
 Store numbers come from the counter file `ZOU_STORE_STATS` names rather than from counters of this process, and a scrape folds that file in as it reads it.
 That is deliberate: the file is shared memory, so the ops a postgres backend made in another process are in it, and counting in process would count the ones this process can see and miss the rest.
-Set `ZOU_STORE_STATS=/run/zou/stats` and the scrape gains `zou_store_ops_total{op,class}`, `zou_store_bytes_total{op,class}`, `zou_store_errors_total{op}`, `zou_store_conflicts_total`, `zou_store_op_seconds{op}` and the read tier counters.
+Set `ZOU_STORE_STATS=/run/zou/stats` and the scrape gains `zou_store_ops_total{op,class}`, `zou_store_bytes_total{op,class}`, `zou_store_errors_total{op}`, `zou_store_conflicts_total`, `zou_store_op_seconds{op}`, the read tier counters and `zou_commit_step_seconds{step}`.
 Counts and bytes stay separate because that is how S3 bills.
 The latency buckets are the file's own powers of two, folded in at each bucket's upper bound, so the buckets are exact and `_sum` is a ceiling.
+
+The commit steps are the one metric here that is a decomposition rather than a count, and they exist because a commit that got slower is otherwise a number with nowhere to go.
+`durable` is what a committing backend waited from the moment its WAL was handed to the pipeline, and the other six say where that went: `push` is the pusher's own loop between two appends, so it is WAL that was flushed locally and had not been picked up yet, `stage` is the append call with its encoding, `window` is how long the batch it joined stayed open, `dispatch` is from that window closing to its store call starting, which is the inflight bound when the bound is what binds, `put` is the store, and `ack` is what a window waited on the windows in front of it after its own put came back, because the chain acks in order and a segment behind a hole is not durable.
+Six of them are sampled per batch and `push`, `stage` and `durable` per chunk of WAL, so the counts differ on purpose and only the latencies are comparable.
 
 Logs go to stderr, `RUST_LOG` filters them, and `ZOU_LOG_FORMAT=json` writes them as one json object per line with `ts`, `level`, `target`, `msg` and the source location.
 An environment variable rather than a flag, because the thing that wants json is a container runtime, which sets environment and does not get to rewrite the command line of what it runs.
