@@ -10,9 +10,9 @@ The questions and the recorded answers are [tamnd/zou-conformance](https://githu
 
 | suite | compared with | passing | of | | known |
 | --- | --- | ---: | ---: | ---: | ---: |
-| rest | postgrest 14.15 (recorded) | 82 | 82 | 100% | 0 |
-| postgrest | postgrest 14.15 (recorded) | 1217 | 1217 | 100% | 0 |
-| auth | gotrue (recorded) | 73 | 77 | 94% | 4 |
+| rest | postgrest 16.1 (recorded) | 82 | 82 | 100% | 0 |
+| postgrest | postgrest 16.1 (recorded) | 1217 | 1217 | 100% | 0 |
+| auth | gotrue 2.195.0 (recorded) | 73 | 77 | 94% | 4 |
 | storage | supabase start (recorded) | 478 | 478 | 100% | 0 |
 | supabase-js | its own integration tests | 33 | 33 | 100% | 0 |
 | storage-js | its own integration tests | 133 | 133 | 100% | 0 |

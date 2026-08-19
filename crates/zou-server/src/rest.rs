@@ -49,7 +49,7 @@ use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use zou_rest::catalog::{
     COLUMNS_SQL, COMPUTED_SQL, Catalog, Column, ColumnRow, ComputedRow, Details, FkRow,
-    INTROSPECT_SQL, KEYS_SQL, RELATIONS_SQL, TIMEZONES_SQL,
+    INTROSPECT_SQL, KEYS_SQL, RELATIONS_SQL,
 };
 use zou_rest::filter::{self, Error as GrammarError, Failure, Node, Op, Parsed};
 use zou_rest::media::MediaType;
@@ -839,8 +839,9 @@ struct Prefer {
     /// What a write puts in a column its body said nothing about.
     missing: Missing,
     handling: Option<Handling>,
-    /// The timezone as the request spelled it, before anything has
-    /// said whether postgres has one by that name.
+    /// The timezone as the request spelled it. Nothing here decides
+    /// whether postgres has one by that name: it is set, and postgres
+    /// says.
     timezone: Option<String>,
     /// The most rows a mutation may touch. It only binds under
     /// handling=strict, which is upstream's rule and not a shortcut:
@@ -866,12 +867,13 @@ fn parse_prefer(headers: &HeaderMap) -> Prefer {
         let Ok(line) = value.to_str() else { continue };
         for item in line.split(',') {
             let item = item.trim();
-            // A timezone is checked against the schema cache, not
-            // here, so it waits for one. A max-affected that is not a
-            // number is neither applied nor refused: upstream reads
-            // it with a parser that gives up quietly, and a caller
-            // who wrote max-affected=lots gets the request they would
-            // have got without it.
+            // A timezone is applied without being judged, because
+            // postgres is the only thing that knows the list and it
+            // says so itself. A max-affected that is not a number is
+            // neither applied nor refused: upstream reads it with a
+            // parser that gives up quietly, and a caller who wrote
+            // max-affected=lots gets the request they would have got
+            // without it.
             if let Some(tz) = item.strip_prefix("timezone=") {
                 p.timezone = Some(tz.to_string());
                 continue;
@@ -949,20 +951,22 @@ fn parse_prefer(headers: &HeaderMap) -> Prefer {
 }
 
 impl Prefer {
-    /// The preferences judged against the schema cache, which is
-    /// where the timezone names are and therefore the first point a
-    /// timezone can be called wrong. Under handling=strict anything
-    /// unrecognized refuses the request; otherwise the request goes
-    /// on without it.
-    fn check(&mut self, catalog: &Catalog) -> Result<(), RestError> {
+    /// The preferences settled: a timezone is applied as written, and
+    /// under handling=strict anything unrecognized refuses the
+    /// request.
+    ///
+    /// A timezone is not one of the things that can be unrecognized
+    /// here. Upstream used to check it against the names postgres has
+    /// and call an unknown one an invalid preference, and stopped:
+    /// from PostgREST 16 the name goes to `set_config` as written and
+    /// what comes back for a name postgres does not have is postgres's
+    /// own 22023, whatever the handling said. That is the better
+    /// reading anyway, since a list of zone names read out of the
+    /// server is a copy of something the server will consult again a
+    /// moment later.
+    fn check(&mut self) -> Result<(), RestError> {
         if let Some(tz) = &self.timezone {
-            let token = format!("timezone={tz}");
-            if catalog.has_timezone(tz) {
-                self.applied.push(token);
-            } else {
-                self.timezone = None;
-                self.invalid.push(token);
-            }
+            self.applied.push(format!("timezone={tz}"));
         }
         if self.handling == Some(Handling::Strict) && !self.invalid.is_empty() {
             return Err(invalid_prefs(&self.invalid));
@@ -1896,17 +1900,11 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
             single: r.get(3),
         })
         .collect();
-    let rows = sess
-        .query(TIMEZONES_SQL, &[])
-        .await
-        .map_err(|e| pg_error(&e, authed))?;
-    let zones = rows.iter().map(|r| r.get(0)).collect();
     Ok(Catalog::new(fks)
         .with_computed(computed)
         .with_relations(names, cols)
         .with_keys(keys)
         .with_views(views)
-        .with_timezones(zones)
         .with_schema(schema))
 }
 
@@ -1991,20 +1989,15 @@ async fn view_keys(
     ))
 }
 
-/// The preferences settled against the loaded catalog and put to
-/// work: the timezone is checked against the names postgres has, a
-/// strict request carrying anything unrecognized is refused here, and
-/// a timezone that survived is set for the length of the transaction.
+/// The preferences settled and put to work: a strict request carrying
+/// anything unrecognized is refused here, and a timezone is set for
+/// the length of the transaction, which is also where a name postgres
+/// does not have becomes a 22023.
 ///
 /// Local like everything else the request injects, so the connection
 /// goes back to the pool with the timezone it came out with.
-async fn settle_prefs(
-    prefer: &mut Prefer,
-    catalog: &Catalog,
-    sess: &Session,
-    authed: bool,
-) -> Result<(), RestError> {
-    prefer.check(catalog)?;
+async fn settle_prefs(prefer: &mut Prefer, sess: &Session, authed: bool) -> Result<(), RestError> {
+    prefer.check()?;
     if let Some(tz) = &prefer.timezone {
         sess.query("select set_config('timezone', $1, true)", &[tz])
             .await
@@ -2093,7 +2086,7 @@ async fn read(
     // forfeits the connection instead of pooling a dirty one, the
     // containment the pool promises.
     let catalog = load_catalog(app, &sess, authed, schema).await?;
-    settle_prefs(&mut prefer, &catalog, &sess, authed).await?;
+    settle_prefs(&mut prefer, &sess, authed).await?;
     if catalog.relation(table).is_none() {
         return Err(no_table(&catalog, schema, table));
     }
@@ -2401,7 +2394,7 @@ async fn write(
     // about that table's columns. Everything downstream of here can
     // assume the relation exists.
     let catalog = load_catalog(app, &sess, authed, schema).await?;
-    settle_prefs(&mut prefer, &catalog, &sess, authed).await?;
+    settle_prefs(&mut prefer, &sess, authed).await?;
     let Some(relation) = catalog.relation(table) else {
         return Err(no_table(&catalog, schema, table));
     };
@@ -2951,7 +2944,7 @@ async fn invoke(
     // are settled here rather than in the one arm that would have
     // loaded it anyway.
     let catalog = load_catalog(app, &sess, authed, schema).await?;
-    settle_prefs(&mut prefer, &catalog, &sess, authed).await?;
+    settle_prefs(&mut prefer, &sess, authed).await?;
 
     let rows = sess
         .query(rpc::INTROSPECT_SQL, &[&schema, &func])
@@ -3942,17 +3935,11 @@ mod tests {
         parse_prefer(&h)
     }
 
-    /// The catalog a preference is judged against, which for this
-    /// purpose is a list of timezone names and nothing else.
-    fn zones() -> Catalog {
-        Catalog::new(Vec::new()).with_timezones(vec!["UTC".to_string(), "Asia/Bangkok".to_string()])
-    }
-
     #[test]
     fn a_preference_nobody_has_is_refused_only_when_strict_asked_to_be_told() {
         let mut p = prefer("handling=strict, anything");
         assert_eq!(p.invalid, vec!["anything"]);
-        let e = p.check(&zones()).unwrap_err();
+        let e = p.check().unwrap_err();
         assert_eq!(e.code, "PGRST122");
         assert_eq!(
             e.details.as_ref().and_then(|d| d.as_str()),
@@ -3962,32 +3949,33 @@ mod tests {
 
         // Lenient carries on, and so does saying nothing about it.
         let mut p = prefer("handling=lenient, anything");
-        assert!(p.check(&zones()).is_ok());
+        assert!(p.check().is_ok());
         let mut p = prefer("anything");
-        assert!(p.check(&zones()).is_ok());
+        assert!(p.check().is_ok());
         assert!(p.applied.is_empty());
     }
 
     #[test]
-    fn a_timezone_is_judged_against_the_names_postgres_has() {
+    fn a_timezone_is_postgres_business_and_nothing_judges_it_here() {
         let mut p = prefer("timezone=Asia/Bangkok");
-        assert!(p.check(&zones()).is_ok());
+        assert!(p.check().is_ok());
         assert_eq!(p.timezone.as_deref(), Some("Asia/Bangkok"));
         assert_eq!(p.applied, vec!["timezone=Asia/Bangkok"]);
 
-        // Case counts, because it counts to postgres.
-        let mut p = prefer("handling=strict, timezone=utc");
-        let e = p.check(&zones()).unwrap_err();
-        assert_eq!(
-            e.details.as_ref().and_then(|d| d.as_str()),
-            Some("Invalid preferences: timezone=utc")
-        );
-
-        // Without strict the request goes on in the default zone.
-        let mut p = prefer("timezone=Nowhere/Special");
-        assert!(p.check(&zones()).is_ok());
-        assert_eq!(p.timezone, None);
-        assert!(p.applied.is_empty());
+        // A name postgres does not have is carried just the same,
+        // under strict and without it, and the refusal comes from the
+        // set_config that follows rather than from here. Upstream read
+        // the name list itself until PostgREST 16 and stopped.
+        for line in [
+            "timezone=Nowhere/Special",
+            "handling=strict, timezone=Nowhere/Special",
+            "handling=lenient, timezone=utc",
+        ] {
+            let mut p = prefer(line);
+            assert!(p.check().is_ok(), "{line}");
+            assert!(p.timezone.is_some(), "{line}");
+            assert!(p.invalid.is_empty(), "{line}");
+        }
     }
 
     #[test]
@@ -4012,7 +4000,7 @@ mod tests {
     fn preference_applied_says_what_the_request_honored_in_upstreams_order() {
         let applied = |line: &str, surface, method: Method, capped| {
             let mut p = prefer(line);
-            p.check(&zones()).unwrap();
+            p.check().unwrap();
             let mut res = StatusCode::OK.into_response();
             applied_header(&p, surface, &method, capped, &mut res);
             res.headers()

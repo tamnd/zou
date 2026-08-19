@@ -410,17 +410,17 @@ async fn the_s3_door_answers_a_request_with_no_key_on_it() {
         assert_ne!(answer.status, StatusCode::UNAUTHORIZED, "{path}");
     }
     let answer = bare(&app, "GET", "/storage/v1/s3").await;
-    assert_eq!(answer.status, StatusCode::BAD_REQUEST);
+    assert_eq!(answer.status, StatusCode::FORBIDDEN);
     assert_eq!(answer.content_type, "application/xml; charset=utf-8");
     assert!(
-        answer.written.contains("<Code>InvalidSignature</Code>"),
+        answer.written.contains("<Code>AccessDenied</Code>"),
         "{}",
         answer.written
     );
     assert!(
         answer
             .written
-            .contains("<Message>Unsupported authorization type</Message>"),
+            .contains("<Message>Missing signature</Message>"),
         "{}",
         answer.written
     );

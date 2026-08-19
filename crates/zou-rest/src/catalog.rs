@@ -394,14 +394,6 @@ select p.proname::text,
    and rn.nspname = $1
  order by p.proname, arg.relname";
 
-/// Every timezone name postgres will accept, which is what decides
-/// whether `Prefer: timezone=` names a real one. It takes no
-/// parameter: the list is the installation's and not a schema's, and
-/// it is here rather than anywhere else because upstream's schema
-/// cache holds it too, loaded and expired with everything else the
-/// cache holds.
-pub const TIMEZONES_SQL: &str = "select name::text from pg_timezone_names";
-
 /// How the embedded rows relate to the outer ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -509,7 +501,6 @@ pub struct Catalog {
     computed: Vec<ComputedRow>,
     rels: Vec<Relation>,
     views: HashSet<String>,
-    timezones: HashSet<String>,
     schema: String,
 }
 
@@ -524,7 +515,6 @@ impl Catalog {
             computed: Vec::new(),
             rels: Vec::new(),
             views: HashSet::new(),
-            timezones: HashSet::new(),
             schema: String::new(),
         }
     }
@@ -605,23 +595,6 @@ impl Catalog {
             }
         }
         self
-    }
-
-    /// The same catalog knowing which timezone names postgres has,
-    /// the answer to [`TIMEZONES_SQL`].
-    pub fn with_timezones(self, names: Vec<String>) -> Catalog {
-        Catalog {
-            timezones: names.into_iter().collect(),
-            ..self
-        }
-    }
-
-    /// Whether postgres would take this as a timezone. The names are
-    /// case sensitive here because they are case sensitive there: a
-    /// `SET timezone` to `utc` is not the `UTC` pg_timezone_names
-    /// lists, and upstream refuses it on exactly that ground.
-    pub fn has_timezone(&self, name: &str) -> bool {
-        self.timezones.contains(name)
     }
 
     /// The foreign keys as introspected, which the OpenAPI document

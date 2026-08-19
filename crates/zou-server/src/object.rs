@@ -11,13 +11,13 @@
 //! in jose's words. So the read routes fall back to a public read when
 //! the token is missing or bad, and the write routes do not.
 //!
-//! Which failure that fallback gives depends on the door. Asked over
-//! `/object/public/{bucket}/...`, a bucket that is not public is
-//! answered with `NoSuchKey`: the route is about objects, and an object
-//! in a bucket nobody may read is an object nobody can name. Asked over
-//! `/object/{bucket}/...` with no token, the same bucket is answered
-//! with `NoSuchBucket`, because that path looks for a public bucket and
-//! does not find one. Both are recorded and they really do differ.
+//! Either door gives the same failure. A bucket that is not public is
+//! answered with `NoSuchBucket` over `/object/public/{bucket}/...` and
+//! over `/object/{bucket}/...` with no token, because both paths look
+//! for a public bucket and do not find one. The two used to differ, the
+//! public door saying `NoSuchKey` on the reading that the route is
+//! about an object rather than about a bucket, and storage-api 1.69
+//! made them agree.
 //!
 //! Deleting says `Access denied` where reading says `Object not found`,
 //! for one object and the same key. That falls out of asking twice: the
@@ -363,12 +363,16 @@ async fn read_session(
             let sess = public_read().await?;
             match bucket_public(&sess, bucket).await {
                 Err(e) => Err(e),
-                Ok(None) => refuse(sess, StorageError::no_such_bucket()).await,
-                // Not a refusal about the bucket, deliberately. This
-                // route is about an object, and an object in a bucket
-                // that is not public is one this caller cannot name.
-                Ok(Some(false)) => refuse(sess, StorageError::no_such_key()).await,
                 Ok(Some(true)) => Ok(sess),
+                // A bucket that is not public and a bucket that is not
+                // there are one answer here, which they were not before
+                // storage-api 1.69: this route used to say NoSuchKey
+                // about a private bucket, on the reading that the route
+                // is about an object and the object cannot be named.
+                // 1.69 says NoSuchBucket to both, and to the info and
+                // render doors next to it, all four of which were
+                // asked.
+                Ok(_) => refuse(sess, StorageError::no_such_bucket()).await,
             }
         }
         Door::Authenticated => match caller(app, parts) {
