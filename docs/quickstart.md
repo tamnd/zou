@@ -541,6 +541,7 @@ The bytes of an object go where the pages go. `zou dev <target>` hands the stora
 ## Where to go next
 
 - docs/compatibility.md for what a project moving off Supabase will notice, and what is still missing
+- docs/migrating.md for surveying an existing Supabase project before moving it
 - docs/architecture.md for the shape of the whole system
 - docs/storage-engine.md for the manifest, lease, WAL, checkpoint, and branching design
 - docs/postgres.md for the patch series and the storage manager shim
