@@ -13,6 +13,7 @@ mod doctor;
 #[cfg(unix)]
 mod functions;
 mod gc;
+mod import;
 #[cfg(unix)]
 mod inbox;
 mod info;
@@ -53,6 +54,7 @@ fn usage() -> ExitCode {
     #[cfg(unix)]
     eprintln!("       {}", functions::USAGE);
     eprintln!("       {}", gc::USAGE);
+    eprintln!("       {}", import::USAGE);
     eprintln!("       {}", info::USAGE);
     eprintln!("       {}", inspect::USAGE);
     #[cfg(unix)]
@@ -136,6 +138,7 @@ fn main() -> ExitCode {
         Some("functions") => simple(functions::run(&argv[1..])),
         Some("gc") => simple(gc::run(&argv[1..])),
         Some("gen") => simple(codegen::run(&argv[1..])),
+        Some("import") => simple(import::run(&argv[1..])),
         #[cfg(unix)]
         Some("inbox") => simple(inbox::run(&argv[1..])),
         Some("info") => simple(info::run(&argv[1..])),

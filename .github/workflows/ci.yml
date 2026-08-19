@@ -141,6 +141,14 @@ jobs:
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
         run: cargo test -p zou-rest --test pg -- --nocapture
+      - name: Run the import survey against postgres
+        env:
+          ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
+        # zou is a bin crate, so its database tests are inline and there
+        # is no integration target to name. The survey is a page of
+        # catalog SQL and nothing but a real server tells it apart from
+        # a page of typos.
+        run: cargo test -p zou --bin zou import -- --nocapture
 
   conformance:
     name: conformance (postgrest)

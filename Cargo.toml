@@ -53,6 +53,9 @@ sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+# The TLS half of the same client, on the same rustls, so a connection
+# out to a hosted database does not bring a second crypto backend.
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
 tower = "0.5"
 ureq = "3.3"
 webp = "0.3"
