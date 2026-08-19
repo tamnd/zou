@@ -91,6 +91,27 @@ Keep the worst case clock skew across nodes under TTL/3, 5 seconds at the defaul
 NTP or chrony disciplined hosts sit under 100 ms, which leaves the entire slack budget for object store hiccups.
 If your environment cannot bound skew, raise the TTL rather than living with spurious steals, the cost is a longer failover wait after an unclean crash.
 
+## Checking a store
+
+`zou doctor <target>` runs the operations the engine depends on against a scratch prefix and reports what the backend actually did.
+It is the thing to run before pointing a database at a bucket you have not used before, because the two ways a store can be wrong are both invisible under an ordinary smoke test.
+A backend that takes every conditional write passes reads and writes all day and loses a manifest the first time two nodes race, so the check that matters is not that a compare and swap succeeds but that a stale one is refused.
+A backend that answers a range request with the whole object is correct by the letter of the protocol and turns every page read into a full object fetch, so the range check asks for 256 bytes from the middle and compares them.
+
+```
+zou doctor s3://acme-zou/prod
+zou doctor s3://acme-zou/prod --tenant acme --samples 50 -o json
+```
+
+The checks are the prefix listing, a create, a read back with a byte compare, the range read, a swap against the current version, a swap against a stale version that must be refused, a second create that must be refused, the written key appearing in its own listing, a latency probe, the clock, and a cleanup that deletes everything and lists the prefix again to confirm it went.
+Nothing is written outside `doctor/<random>/`, no lease is taken, and no tenant prefix is touched, so it is safe against a store with a live database in it.
+Any failed check exits non-zero.
+
+The clock check can only see one direction and says so.
+A manifest carries the second its holder wrote it, so a manifest dated in the future means this node's clock is behind the writer's by at least that much, which is the case that shortens a lease this node takes.
+A manifest dated in the past is either old or written by a clock this node is ahead of, and nothing in the store separates them, so the check reports the skew it can prove and stays quiet about the rest.
+For the bound that matters and what to do when you cannot hold it, see the section above.
+
 ## Losing the lease
 
 The heartbeat flips `lost()` when the manifest shows another holder or when the store refused renewals past the local expiry.

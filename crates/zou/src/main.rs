@@ -9,6 +9,7 @@ mod config;
 mod db;
 #[cfg(unix)]
 mod dev;
+mod doctor;
 #[cfg(unix)]
 mod functions;
 mod gc;
@@ -48,6 +49,7 @@ fn usage() -> ExitCode {
     eprintln!("       {}", db::DB_USAGE);
     #[cfg(unix)]
     eprintln!("       {}", db::MIGRATION_USAGE);
+    eprintln!("       {}", doctor::USAGE);
     #[cfg(unix)]
     eprintln!("       {}", functions::USAGE);
     eprintln!("       {}", gc::USAGE);
@@ -129,6 +131,7 @@ fn main() -> ExitCode {
         Some("db") => simple(db::run(&argv[1..])),
         #[cfg(unix)]
         Some("migration") => simple(db::migration(&argv[1..])),
+        Some("doctor") => simple(doctor::run(&argv[1..])),
         #[cfg(unix)]
         Some("functions") => simple(functions::run(&argv[1..])),
         Some("gc") => simple(gc::run(&argv[1..])),
