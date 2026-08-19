@@ -1993,7 +1993,11 @@ pub unsafe extern "C" fn zou_wal_append(
         // it was in when the flush pointer moved. Locally flushed WAL
         // waits here before the pipeline has ever seen it, which makes
         // it part of every commit behind it and invisible from inside
-        // the sequencer.
+        // the sequencer. The nap is in the number rather than subtracted
+        // out of it: a pusher waiting on a flush pointer that is not
+        // moving is indistinguishable from here, and a run that writes
+        // slowly reads this step as hundreds of milliseconds of nothing
+        // happening, which is why it is read with the other six in hand.
         if let Some(last) = pipe.last_append {
             stats::note_commit(stats::Step::Push, last.elapsed());
         }
