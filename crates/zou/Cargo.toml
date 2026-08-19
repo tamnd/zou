@@ -47,6 +47,10 @@ ureq = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
+# The export's own test restores what it wrote, which means feeding a
+# copy block back through the wire protocol the way psql does, and the
+# sink that takes it takes bytes.
+bytes = "1"
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

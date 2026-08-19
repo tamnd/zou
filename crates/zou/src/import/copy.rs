@@ -31,13 +31,13 @@ use super::{EMULATED, NATIVE, PLATFORM_ROLES, SYSTEM_SCHEMAS, Survey};
 /// tables are here already and the rows go into them, which is a
 /// different job from the project's own schemas and is done separately
 /// below.
-const PLATFORM: &[&str] = &["auth", "storage"];
+pub(crate) const PLATFORM: &[&str] = &["auth", "storage"];
 
 /// Schemas that belong to the server or to postgres, so neither their
 /// definitions nor their rows come over. `auth` and `storage` are not
 /// in it, because their rows do, one table at a time and only into a
 /// table that is already here.
-const NOT_THE_PROJECTS: &[&str] = &[
+pub(crate) const NOT_THE_PROJECTS: &[&str] = &[
     "cron",
     "extensions",
     "graphql",
@@ -71,7 +71,7 @@ const API_ROLES: &[&str] = &["anon", "authenticated", "service_role"];
 /// Every one of them gets a line in the run's output, because a table
 /// the survey counted and the copy skipped is exactly the kind of thing
 /// somebody finds out about later.
-const NOT_CARRIED: &[(&str, &str)] = &[
+pub(crate) const NOT_CARRIED: &[(&str, &str)] = &[
     (
         "auth.refresh_tokens",
         "a session on the old project, and none of its tokens are honoured here, so everybody signs in again once",
@@ -184,13 +184,13 @@ impl Done {
 /// column: a generated one is computed here and postgres refuses to be
 /// given it.
 #[derive(Debug, PartialEq)]
-struct Copyable {
-    id: String,
-    columns: Vec<String>,
+pub(crate) struct Copyable {
+    pub(crate) id: String,
+    pub(crate) columns: Vec<String>,
 }
 
 impl Copyable {
-    fn list(&self) -> String {
+    pub(crate) fn list(&self) -> String {
         self.columns
             .iter()
             .map(|c| ident(c))
@@ -279,7 +279,7 @@ pub async fn run(
 /// A postgres error prints as "db error" and keeps the sentence that
 /// says what went wrong in its source, which is no use to somebody
 /// reading a failed import.
-pub(super) fn why(e: &tokio_postgres::Error) -> String {
+pub(crate) fn why(e: &tokio_postgres::Error) -> String {
     let mut out = e.to_string();
     let mut source = std::error::Error::source(e);
     while let Some(e) = source {
@@ -542,7 +542,7 @@ order by n.nspname, c.relname, a.attnum";
 /// Every ordinary table in those schemas and the columns of it that can
 /// be given values. Partitions are left out because their rows arrive
 /// through the table they belong to and copying both would double them.
-async fn copyable(client: &Client, schemas: &[String]) -> Result<Vec<Copyable>, String> {
+pub(crate) async fn copyable(client: &Client, schemas: &[String]) -> Result<Vec<Copyable>, String> {
     let rows = client
         .query(COPYABLE_SQL, &[&schemas])
         .await
