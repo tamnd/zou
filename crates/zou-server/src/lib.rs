@@ -790,25 +790,47 @@ async fn well_known_jwks(axum::extract::State(app): axum::extract::State<Arc<App
     res
 }
 
-/// An honest placeholder for surfaces that exist in the router but not
-/// yet in the code, with the milestone that will fill them in.
-pub(crate) fn not_yet(surface: &str) -> Response {
+/// The checklist a surface's missing pieces are boxes on, one per
+/// surface. Naming the milestone was the old answer and it stopped
+/// being a useful one: storage and realtime are served, and what still
+/// reaches a stub under either of them is a box rather than a
+/// milestone.
+pub(crate) mod tracked {
+    pub const REST: u32 = 125;
+    pub const AUTH: u32 = 170;
+    pub const STORAGE: u32 = 190;
+    pub const REALTIME: u32 = 303;
+}
+
+/// An honest placeholder for a route that exists in the router but not
+/// yet in the code.
+///
+/// 501 rather than 404 because a 404 reads as a wrong url and sends
+/// somebody looking for a typo they did not make. The issue is in the
+/// body for the same reason the rest of this tree's errors carry a next
+/// step: knowing that a gap is written down somewhere is not knowing
+/// where, and the difference between the two is whether the reader can
+/// go and see if their case is a box that is nearly ticked or one
+/// nobody has started.
+pub(crate) fn not_yet(surface: &str, tracked: u32) -> Response {
     json_body(
         StatusCode::NOT_IMPLEMENTED,
         serde_json::json!({
-            "message": format!("{surface} is not implemented yet, tracked in tamnd/zou milestones"),
+            "message": format!(
+                "{surface} is not implemented yet, it is tracked on https://github.com/tamnd/zou/issues/{tracked}"
+            ),
         }),
     )
 }
 
 async fn auth_stub() -> Response {
-    not_yet("this auth endpoint")
+    not_yet("this auth endpoint", tracked::AUTH)
 }
 async fn storage_stub() -> Response {
-    not_yet("the storage surface")
+    not_yet("the storage surface", tracked::STORAGE)
 }
 async fn realtime_stub() -> Response {
-    not_yet("the realtime surface")
+    not_yet("the realtime surface", tracked::REALTIME)
 }
 
 /// Anything outside the four prefixes, in the words the hosted edge

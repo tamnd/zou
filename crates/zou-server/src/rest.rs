@@ -2816,7 +2816,7 @@ pub async fn table(
             }
         }
         Method::OPTIONS => options(&app, &table, &auth, &parts).await,
-        _ => return crate::not_yet("this REST method"),
+        _ => return crate::not_yet("this REST method", crate::tracked::REST),
     };
     match result {
         Ok(res) => res,
@@ -2966,7 +2966,7 @@ pub async fn root(
             Ok(res) => res,
             Err(e) => e.into_response(),
         },
-        _ => crate::not_yet("this REST method"),
+        _ => crate::not_yet("this REST method", crate::tracked::REST),
     }
 }
 

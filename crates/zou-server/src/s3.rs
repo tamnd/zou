@@ -520,7 +520,7 @@ pub async fn bucket(
         Method::POST if query_of(&parts).contains_key("delete") => {
             dropped_many(&app, &parts, &bucket, body).await
         }
-        _ => return crate::not_yet("the storage surface"),
+        _ => return crate::not_yet("the storage surface", crate::tracked::STORAGE),
     };
     match answer {
         Ok(response) => response,
@@ -1134,7 +1134,7 @@ pub async fn object(
         },
         Method::DELETE if query.contains_key("uploadId") => abandoned(&app, &parts, &query).await,
         Method::DELETE => dropped(&app, &parts, &bucket, &key).await,
-        _ => return crate::not_yet("the storage surface"),
+        _ => return crate::not_yet("the storage surface", crate::tracked::STORAGE),
     };
     match answer {
         Ok(response) => response,

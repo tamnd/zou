@@ -175,7 +175,7 @@ async fn the_two_stubbed_surfaces_say_so_rather_than_pretending_to_be_missing() 
     assert_eq!(storage.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
         storage.message(),
-        "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
+        "the storage surface is not implemented yet, it is tracked on https://github.com/tamnd/zou/issues/190",
     );
 
     // The socket and the broadcast endpoint are served now, so the
@@ -185,8 +185,40 @@ async fn the_two_stubbed_surfaces_say_so_rather_than_pretending_to_be_missing() 
     assert_eq!(realtime.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
         realtime.message(),
-        "the realtime surface is not implemented yet, tracked in tamnd/zou milestones",
+        "the realtime surface is not implemented yet, it is tracked on https://github.com/tamnd/zou/issues/303",
     );
+}
+
+/// The rule the strings above are three instances of.
+///
+/// Written as a rule as well as three equalities because the failure
+/// worth catching is not one of these three changing, which a person
+/// would have to mean, but a fourth stub arriving with the old wording
+/// or with no issue at all. The body said "tracked in tamnd/zou
+/// milestones" for a long time, which told the reader their problem was
+/// written down somewhere and left them to find where, and nothing here
+/// noticed because every test asserted that exact sentence.
+#[tokio::test]
+async fn every_stubbed_route_says_which_checklist_its_gap_is_a_box_on() {
+    let app = app();
+    for path in [
+        "/storage/v1/analytics/pics/whichever",
+        "/storage/v1",
+        "/realtime/v1/api/tenants/demo/channels",
+        "/auth/v1/sso",
+    ] {
+        let answer = keyed(&app, "GET", path).await;
+        assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
+        let message = answer.message();
+        let issue = message
+            .split_once("https://github.com/tamnd/zou/issues/")
+            .map(|(_, number)| number.to_string())
+            .unwrap_or_else(|| panic!("{path} answered {message:?}, which names no checklist"));
+        assert!(
+            issue.parse::<u32>().is_ok(),
+            "{path} pointed at {issue:?}, which is not an issue number",
+        );
+    }
 }
 
 #[tokio::test]
@@ -220,7 +252,7 @@ async fn an_auth_endpoint_nobody_wrote_yet_says_which_it_was() {
     assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(
         answer.message(),
-        "this auth endpoint is not implemented yet, tracked in tamnd/zou milestones",
+        "this auth endpoint is not implemented yet, it is tracked on https://github.com/tamnd/zou/issues/170",
     );
 }
 
@@ -443,7 +475,7 @@ async fn an_s3_call_this_surface_has_no_answer_for_yet_says_so_without_naming_me
     assert_eq!(answer.allow, "");
     assert_eq!(
         answer.message(),
-        "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
+        "the storage surface is not implemented yet, it is tracked on https://github.com/tamnd/zou/issues/190",
     );
 }
 
@@ -542,7 +574,7 @@ async fn a_stubbed_surface_is_stubbed_all_the_way_to_its_root() {
         assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
         assert_eq!(
             answer.message(),
-            "the storage surface is not implemented yet, tracked in tamnd/zou milestones",
+            "the storage surface is not implemented yet, it is tracked on https://github.com/tamnd/zou/issues/190",
         );
     }
     for path in ["/realtime/v1", "/realtime/v1/"] {
@@ -550,7 +582,7 @@ async fn a_stubbed_surface_is_stubbed_all_the_way_to_its_root() {
         assert_eq!(answer.status, StatusCode::NOT_IMPLEMENTED, "{path}");
         assert_eq!(
             answer.message(),
-            "the realtime surface is not implemented yet, tracked in tamnd/zou milestones",
+            "the realtime surface is not implemented yet, it is tracked on https://github.com/tamnd/zou/issues/303",
         );
     }
 }
