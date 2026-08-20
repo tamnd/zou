@@ -43,6 +43,7 @@ pub mod pending;
 pub mod reader;
 pub mod redo;
 pub mod restore;
+pub mod single;
 pub mod walscan;
 pub mod warm;
 

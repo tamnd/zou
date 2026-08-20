@@ -1,6 +1,7 @@
 mod boot;
 mod branch;
 mod bundle;
+mod check;
 mod codegen;
 mod compact;
 #[cfg(unix)]
@@ -44,6 +45,7 @@ fn usage() -> ExitCode {
     eprintln!("zou {}", env!("CARGO_PKG_VERSION"));
     eprintln!("{DEV_USAGE}");
     eprintln!("       {}", branch::USAGE);
+    eprintln!("       {}", check::USAGE);
     eprintln!("       {}", codegen::USAGE);
     eprintln!("       {}", compact::USAGE);
     #[cfg(unix)]
@@ -129,6 +131,7 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
         Some("branch") => simple(branch::run(&argv[1..])),
+        Some("check") => simple(check::run(&argv[1..])),
         Some("compact") => simple(compact::run(&argv[1..])),
         #[cfg(unix)]
         Some("db") => simple(db::run(&argv[1..])),
