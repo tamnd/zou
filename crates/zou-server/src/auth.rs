@@ -39,7 +39,7 @@ use axum::response::Response;
 
 use crate::audit::{self, Action, Actor};
 use crate::sql::{self, Pool};
-use crate::{App, json_body, no_content, not_yet};
+use crate::{App, json_body, no_content, not_yet, tracked};
 
 /// GoTrue's JWT_EXP default, the lifetime of an access token.
 const ACCESS_TTL: i64 = 3600;
@@ -3690,7 +3690,7 @@ pub(crate) fn refusal(e: Error, doing: &str) -> Response {
             }),
             "weak_password",
         ),
-        Error::NotYet(surface) => not_yet(surface),
+        Error::NotYet(surface) => not_yet(surface, tracked::AUTH),
         Error::Db(e) => {
             log::error!("{doing}: {e}");
             error_body(
@@ -4207,7 +4207,7 @@ pub async fn verify_get(
                 Error::Denied { status, code, msg } | Error::Hook { status, code, msg } => {
                     (status, code, msg)
                 }
-                Error::NotYet(surface) => return not_yet(surface),
+                Error::NotYet(surface) => return not_yet(surface, tracked::AUTH),
                 Error::Weak(_) => unreachable!("a verify never judges a password"),
                 Error::Db(e) => {
                     log::error!("verify: {e}");
@@ -5730,7 +5730,7 @@ fn oauth_refusal(target: &str, e: Error) -> Response {
         Error::Denied { status, code, msg } | Error::Hook { status, code, msg } => {
             (status, code, msg)
         }
-        Error::NotYet(surface) => return not_yet(surface),
+        Error::NotYet(surface) => return not_yet(surface, tracked::AUTH),
         Error::Weak(_) => unreachable!("a callback never judges a password"),
         Error::Db(e) => {
             log::error!("oauth callback: {e}");
@@ -6743,7 +6743,7 @@ pub async fn token(
     match grant.as_str() {
         "refresh_token" | "password" | "pkce" => {}
         "id_token" | "web3" => {
-            return not_yet(&format!("the {grant} grant"));
+            return not_yet(&format!("the {grant} grant"), tracked::AUTH);
         }
         _ => {
             return error_body(
