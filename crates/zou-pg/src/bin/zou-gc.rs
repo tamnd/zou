@@ -62,6 +62,14 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // A candidate stamp is only trusted while the history that would
+    // contradict it is still retained, so the retention has to be the
+    // longer of the two or no stamp comes of age and the sweep frees
+    // nothing. Better said here than found out from a disk graph.
+    if retention <= window {
+        eprintln!("zou-gc: retention {retention}s must be longer than window {window}s");
+        return ExitCode::FAILURE;
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock before 1970")

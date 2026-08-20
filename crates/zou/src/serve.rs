@@ -308,6 +308,17 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
         Some(every) if every.is_zero() => {
             return Err("--gc-every 0 would sweep without pause, leave it off instead".to_string());
         }
+        // Same pairing rule the standalone sweep has: a candidate stamp
+        // is only trusted while the history that would contradict it is
+        // still retained, so a retention no longer than the window is a
+        // node that sweeps on schedule and frees nothing.
+        Some(_) if policy.retention_secs <= policy.window_secs => {
+            return Err(format!(
+                "--gc-retention {} must be longer than --gc-window {}, or nothing is ever collected",
+                crate::gc::span(policy.retention_secs),
+                crate::gc::span(policy.window_secs),
+            ));
+        }
         Some(every) => Some(Gc { every, policy }),
         None if policy != gc::Policy::default() => {
             return Err("--gc-window and --gc-retention need --gc-every to run under".to_string());
