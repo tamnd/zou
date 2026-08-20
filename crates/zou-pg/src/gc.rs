@@ -60,6 +60,42 @@
 //! fold upload and the longest gap between reading a manifest and
 //! publishing a branch from it.
 //!
+//! A stamp is also thrown away once it is older than the retention.
+//! Runs only sample, so between two of them a key can go garbage, live
+//! and garbage again, and a stamp taken before the key was ever
+//! published would otherwise carry through its whole life and get it
+//! deleted the moment it is superseded, window and all. What rules that
+//! out inside the retention is that a key which was live in the gap had
+//! a manifest published naming it, every publish leaves a snapshot, and
+//! a snapshot inside the retention pins, so a run sees the key pinned
+//! and drops the stamp. Past the retention that evidence is gone, so
+//! the stamp goes with it. Retention therefore has to be longer than
+//! the window, or no stamp lives long enough to come of age and nothing
+//! is ever collected. The defaults are a day and a week.
+//!
+//! What none of this covers is a reader that is not a manifest: nothing
+//! records that somebody is part way through fetching a checkpoint, so
+//! the window is the only grace a superseded object gets, and a fetch
+//! slower than the window can still find its bytes gone.
+//!
+//! Two things this job leaks rather than collects, both deliberately.
+//! A prefix with no live manifest is never scanned, so a tenant deleted
+//! by removing its `MANIFEST` keeps its captures and its snapshots for
+//! good; deleting a tenant means deleting its prefix, and this job is
+//! not the thing that does it. That is the same rule that makes branch
+//! creation safe, since a branch has no manifest until its last write
+//! and would otherwise be racing the collector for its own bytes. And a
+//! `manifests/` key whose name does not parse as `<epoch>-<unix>.json`
+//! is skipped entirely, so it neither pins nor expires. Both fail
+//! towards keeping bytes, which is the direction to fail in.
+//!
+//! `tests/gc_model.rs` walks the reachable interleavings of publishes,
+//! folds, branch creations, crashes and runs against a real store, and
+//! checks after every step that nothing a live manifest or an in
+//! retention snapshot names has been collected. It also drops each
+//! precondition in turn and requires the violation to show up, which is
+//! what says the preconditions are load bearing rather than decorative.
+//!
 //! One job runs at a time, because the candidates object is swapped
 //! without a guard and two runs would each write a view of it that the
 //! other's deletions have already made wrong. [`sweep`] is the front
@@ -202,6 +238,17 @@ pub fn run(
 pub fn run_with(store: &dyn CasStore, now_unix: u64, policy: Policy) -> Result<GcStats, String> {
     let window_secs = policy.window_secs;
     let retention_secs = policy.retention_secs;
+    // A stamp is only trusted while the snapshots that would contradict
+    // it are still around, so a retention shorter than the window means
+    // no stamp ever both survives and comes of age, and the job stamps
+    // forever without deleting. That is the safe direction to fail in,
+    // but silently doing nothing is not a way to fail, so it is said.
+    if retention_secs <= window_secs {
+        log::warn!(
+            "gc: retention {retention_secs}s is not longer than the window {window_secs}s, \
+             so nothing will be collected"
+        );
+    }
     let keys = store.list("tenants/").map_err(|e| format!("store: {e}"))?;
 
     let mut refs = BTreeSet::new();
@@ -370,8 +417,27 @@ pub fn run_with(store: &dyn CasStore, now_unix: u64, policy: Policy) -> Result<G
     let mut deleted = 0;
     let mut doomed = Vec::new();
     for key in &garbage {
-        match state.get(key) {
-            Some(&stamp) if now_unix.saturating_sub(stamp) >= window_secs => {
+        // A stamp says the key was garbage then. What makes it say the
+        // key has been garbage *since* then is the snapshot record:
+        // anything that named the key in between published a manifest,
+        // every published manifest leaves a snapshot, and a snapshot
+        // inside the retention pins what it names, which takes the key
+        // off this list and restarts the wait. That reasoning runs out
+        // exactly when the stamp is older than the retention, because
+        // then a life the key lived after being stamped can have left
+        // only snapshots that have since expired. Past that the stamp
+        // is thrown away and the key waits a fresh window.
+        //
+        // Without this a key stamped while its upload was still in
+        // flight keeps that stamp through however long it then spends
+        // published and referenced, and the first run after it is
+        // superseded deletes it on the spot with no window at all.
+        let stamp = state
+            .get(key)
+            .copied()
+            .filter(|stamp| now_unix.saturating_sub(*stamp) < retention_secs);
+        match stamp {
+            Some(stamp) if now_unix.saturating_sub(stamp) >= window_secs => {
                 if policy.dry_run {
                     doomed.push(key.clone());
                 } else {
@@ -379,7 +445,7 @@ pub fn run_with(store: &dyn CasStore, now_unix: u64, policy: Policy) -> Result<G
                 }
                 deleted += 1;
             }
-            Some(&stamp) => {
+            Some(stamp) => {
                 next.insert(key.clone(), stamp);
             }
             None => {
@@ -606,6 +672,99 @@ mod tests {
             store.get(landing).unwrap().is_some(),
             "the log is still there"
         );
+    }
+
+    /// Publish a manifest the way the real one does, leaving behind the
+    /// history snapshot that is the record of what was referenced when.
+    fn publish(
+        store: &dyn CasStore,
+        r: &str,
+        epoch: u64,
+        unix: u64,
+        checkpoints: &[(&str, u64, CheckpointKind)],
+    ) {
+        write_manifest(store, r, checkpoints, None);
+        let (data, _) = store
+            .get(&TenantLayout::new(r).manifest())
+            .unwrap()
+            .unwrap();
+        store
+            .put(&TenantLayout::new(r).manifest_history(epoch, unix), &data)
+            .unwrap();
+    }
+
+    /// Found by the model check in `tests/gc_model.rs`, which is worth
+    /// saying because no scenario anybody wrote by hand put a run in
+    /// the one place this needs it: after the upload and before the
+    /// publish. The stamp taken there is about a checkpoint nothing has
+    /// ever referenced, and it used to survive however long the
+    /// checkpoint then spent referenced, so the first run after it was
+    /// superseded deleted it with none of the window it was owed. A
+    /// branch that read the manifest just before that supersede is left
+    /// naming bytes that are gone, which is the failure the two phases
+    /// exist to prevent.
+    ///
+    /// Reaching it takes a gap between runs longer than the retention,
+    /// because inside the retention the snapshot from the publish is
+    /// still there and pinning, and a run that sees the pin drops the
+    /// stamp. A week without a sweep is a broken cron, not a fantasy.
+    #[test]
+    fn a_stamp_taken_before_a_checkpoint_was_ever_published_does_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        publish(&store, "p", 1, 1_000, &[]);
+        put_chk(&store, "p", "aaa");
+
+        // A run while the fold is still uploading. Nothing names aaa.
+        let stamping = run(&store, 1_000, 100, 5_000).unwrap();
+        assert_eq!(stamping.candidates, 3, "an upload in flight looks garbage");
+
+        // The fold publishes. aaa is live from here, and no sweep runs
+        // for longer than the retention, so by the time one does the
+        // snapshot that would have shown aaa alive has expired.
+        publish(
+            &store,
+            "p",
+            2,
+            2_000,
+            &[("aaa", 0x100, CheckpointKind::Full)],
+        );
+        publish(&store, "p", 3, 9_000, &[]);
+
+        let after = run(&store, 9_000, 100, 5_000).unwrap();
+        assert_eq!(
+            after.deleted, 0,
+            "the window starts when aaa became garbage, not when it was uploaded"
+        );
+        assert!(chk_present(&store, "p", "aaa"));
+
+        assert_eq!(run(&store, 9_099, 100, 5_000).unwrap().deleted, 0);
+        // Three keys of checkpoint, and the two snapshots that fell out
+        // of retention while nothing was sweeping.
+        assert_eq!(run(&store, 9_100, 100, 5_000).unwrap().deleted, 5);
+        assert!(!chk_present(&store, "p", "aaa"));
+    }
+
+    /// The rule above throws a stamp away once it is older than the
+    /// retention, so a retention no longer than the window leaves no
+    /// stamp able to both survive and come of age. Failing that way
+    /// round is the safe one, and it is checked rather than assumed
+    /// because the other way round is deleting early. The command
+    /// refuses the policy outright; this is what the library does if
+    /// something else hands it one.
+    #[test]
+    fn a_retention_shorter_than_the_window_collects_nothing_rather_than_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        write_manifest(&store, "p", &[], None);
+        put_chk(&store, "p", "aaa");
+
+        for now in [1000, 1100, 1200, 1300] {
+            let pass = run(&store, now, 100, 50).unwrap();
+            assert_eq!(pass.deleted, 0, "nothing is collected at {now}");
+            assert_eq!(pass.candidates, 3, "and it is restamped every time");
+        }
+        assert!(chk_present(&store, "p", "aaa"));
     }
 
     #[test]

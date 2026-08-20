@@ -377,9 +377,24 @@ Two numbers are the whole policy and they are promises to different people.
 `--retention` is how far back point in time recovery reaches, a week by default: a manifest snapshot younger than it keeps everything it references alive, so it is what a customer asking to be restored to last Tuesday is relying on, and it is the same window `zou branch --from-time` can reach into, see [branching.md](branching.md).
 `--window` is how long a key that looks like garbage waits before it is deleted, a day by default: it is a promise to whoever is mid publish, and it has to be longer than the longest fold upload and the longest gap between reading a manifest and publishing a branch from it.
 
+The two numbers are not independent: `--retention` has to be longer than `--window`, and both commands refuse a policy where it is not.
+The reason is that a candidate stamp only means the key was garbage at that moment, and what makes it mean the key has been garbage ever since is the snapshot record, which is kept for exactly the retention.
+So a stamp older than the retention is thrown away and the key waits a fresh window, and if the retention were the shorter of the two no stamp would ever live long enough to come of age.
+The defaults, a day against a week, are the shape this wants.
+
 Deleting anything takes two runs whatever the numbers say.
 The first run stamps a key as a candidate, a later run deletes it only if it was still garbage on that run's own scan, so a branch published between the two takes its objects back off the list instead of losing them.
 That is also why a shorter window is not a faster sweep: `--window 0` still takes two runs.
+
+Three things are yours to hold up rather than the sweep's, and all three are the same shape: something that will reference an object has to finish referencing it inside the window.
+A fold has to publish the manifest naming its capture within `--window` of uploading it.
+Branch creation has to write the child's manifest within `--window` of reading the parent's, which is the gap `zou branch` closes and the reason a hand rolled equivalent that reads, thinks and writes hours later is not safe.
+And a reader fetching a checkpoint has to finish inside the window, because nothing in the store records that a fetch is in progress, so the window is the only grace a superseded object gets.
+The default day is chosen to be far longer than any of the three; if you cut it, cut it to something still far longer than your slowest fold.
+
+Missing a sweep entirely is safe, and missing them for longer than the retention is where it stops being free.
+A key stamped before it was ever published used to keep that stamp through its whole life and be deleted the moment it was superseded, with none of the window it was owed, and that needed a gap between sweeps longer than the retention to happen at all.
+It is fixed, and the cost of the fix is that after such a gap the first sweep restamps rather than deletes, so a store that has gone a fortnight without one takes two sweeps to start freeing bytes rather than one.
 
 `--dry-run` names every object that would go and writes nothing at all.
 It is worth reading the second half of that: a dry run does not stamp candidates either, so it is a question and not a first run, and the two runs a deletion takes are still ahead of you.
@@ -402,6 +417,9 @@ The first sweep is one interval in rather than at boot, so a node being restarte
 
 What it never collects is worth saying.
 WAL is not this job's problem, a tenant's log is trimmed by its own rules, and a tenant prefix with no readable manifest is left entirely alone rather than treated as an orphan.
+That last one has a bill attached: deleting a project by removing its `MANIFEST` and stopping there leaves its captures and its snapshots in the bucket for good, because the sweep will not look at a prefix it cannot read a manifest for.
+Delete the prefix, not the manifest.
+The rule is what makes branch creation safe, since a branch has no manifest until its final write and would otherwise be racing the sweep for its own bytes.
 The cost is a full listing of everything under `tenants/`, so this is a daily job on a large fleet and not an hourly one.
 
 ## The postgres port
