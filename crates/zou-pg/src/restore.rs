@@ -459,7 +459,11 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
     let (data, _) = store
         .get(&layout.manifest())
         .map_err(|e| format!("store: {e}"))?
-        .ok_or_else(|| format!("{store_root} has no manifest, nothing to restore"))?;
+        .ok_or_else(|| {
+            format!(
+                "no manifest for tenant {tenant} on {store_root}, nothing to restore, `zou tenant {store_root} list` shows what is there"
+            )
+        })?;
     let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
     let mut stats = restore_manifest(&*store, &layout, &manifest, pgdata)?;
     stats.skeleton_took = started.elapsed();

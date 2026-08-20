@@ -54,7 +54,9 @@ impl HeldLease {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
-    #[error("no manifest at {key}, the database does not exist")]
+    #[error(
+        "no manifest at {key}, the database does not exist, it was never created here or its prefix was removed"
+    )]
     NoManifest { key: String },
     #[error("lease held by {holder} until unix {expires_unix}")]
     Held { holder: String, expires_unix: u64 },

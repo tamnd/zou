@@ -137,8 +137,14 @@ fn run(args: &Args) -> Result<(), String> {
     let keys = from.list(&prefix).map_err(|e| format!("source: {e}"))?;
     if keys.is_empty() {
         return Err(match &args.tenant {
-            Some(r) => format!("no tenant {r} at {} on {}", prefix, args.from),
-            None => format!("{} holds no objects", args.from),
+            Some(r) => format!(
+                "no tenant {r} at {} on {}, `zou tenant {} list` shows what is registered there",
+                prefix, args.from, args.from
+            ),
+            None => format!(
+                "{} holds no objects, nothing to copy, `zou tenant {} list` shows whether anything is registered",
+                args.from, args.from
+            ),
         });
     }
 

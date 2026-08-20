@@ -34,7 +34,9 @@ use crate::shardmanifest::{PageShardError, PageShardManifest};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BranchError {
-    #[error("no manifest at {key}, the source database does not exist")]
+    #[error(
+        "no manifest at {key}, the source database does not exist, `zou tenant <target> list` shows what does"
+    )]
     NoSource { key: String },
     #[error("destination {tenant_ref} already exists")]
     DestinationExists { tenant_ref: String },

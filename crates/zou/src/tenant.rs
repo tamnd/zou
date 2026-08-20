@@ -141,7 +141,9 @@ fn create(store: &dyn CasStore, tenant_ref: &str, jwt_secret: String) -> Result<
 fn info(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
     let entry = registry::get(store, tenant_ref)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no tenant {tenant_ref} on this store"))?;
+        .ok_or_else(|| {
+            format!("no tenant {tenant_ref} on this store, `list` shows what is registered")
+        })?;
     println!("ref {}", entry.tenant_ref);
     println!("format {}", entry.format);
     println!("created unix {}", entry.created_unix);
@@ -213,7 +215,9 @@ fn mint(role: &str, secret: &[u8]) -> String {
 fn keys(store: &dyn CasStore, tenant_ref: &str, as_env: bool) -> Result<(), String> {
     let entry = registry::get(store, tenant_ref)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no tenant {tenant_ref} on this store"))?;
+        .ok_or_else(|| {
+            format!("no tenant {tenant_ref} on this store, `list` shows what is registered")
+        })?;
     let secret = entry.jwt_secret.as_bytes();
     let anon = mint("anon", secret);
     let service = mint("service_role", secret);
@@ -260,7 +264,9 @@ fn zou_server_region() -> &'static str {
 fn s3(store: &dyn CasStore, tenant_ref: &str, rotate: bool) -> Result<(), String> {
     let entry = registry::get(store, tenant_ref)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("no tenant {tenant_ref} on this store"))?;
+        .ok_or_else(|| {
+            format!("no tenant {tenant_ref} on this store, `list` shows what is registered")
+        })?;
     if let Some((access, _)) = entry.s3()
         && !rotate
     {

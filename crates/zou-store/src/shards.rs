@@ -44,7 +44,9 @@ pub const MAX_PAGE_SHARDS: u32 = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ShardError {
-    #[error("no manifest at {key}, the tenant does not exist")]
+    #[error(
+        "no manifest at {key}, the tenant does not exist, `zou tenant <target> list` shows what does"
+    )]
     NoTenant { key: String },
     #[error("tenant already has {MAX_PAGE_SHARDS} shards, the ceiling")]
     AtCeiling,
