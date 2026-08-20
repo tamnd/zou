@@ -209,7 +209,7 @@ impl Sealed {
             serde_json::from_slice(data).map_err(|e| format!("sealed secrets: {e}"))?;
         if sealed.version > VERSION {
             return Err(format!(
-                "these secrets were sealed by a later zou (format {}, this reads {VERSION})",
+                "sealed secrets format {} is newer than this binary supports ({VERSION}), upgrade zou",
                 sealed.version
             ));
         }
@@ -752,6 +752,53 @@ mod tests {
         );
     }
 
+    /// The ciphertext is a new nonce every write, so there are no
+    /// bytes here to freeze the way the other durable formats freeze
+    /// theirs. What can be frozen is the envelope: the four fields
+    /// around the ciphertext, which is all an older node reads before
+    /// it decides whether it can open this at all.
+    ///
+    /// The census in crates/zou-log/tests/upgrade.rs points here, for
+    /// the same reason it points at bundle.rs: zou is a binary crate.
+    #[test]
+    fn the_envelope_around_the_ciphertext_is_frozen() {
+        let (_dir, store) = store();
+        let key = Key::generate().expect("generate");
+        set(
+            store.as_ref(),
+            "acme",
+            &key,
+            &pairs(&[("MY_TOKEN", "swordfish")]),
+        )
+        .expect("set");
+        let object = TenantLayout::new("acme").functions_secrets();
+        let (raw, _) = store.get(&object).expect("get").expect("there");
+
+        let seen: serde_json::Value = serde_json::from_slice(&raw).expect("json");
+        // Sorted, because the order a parsed object hands back its keys
+        // depends on whether something in the build turned on serde_json's
+        // preserve_order, and the format is the set of names rather than
+        // the order a reader happens to see them in.
+        let mut fields: Vec<&str> = seen
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["nonce", "sealed", "updated", "version"]);
+        assert_eq!(seen["version"], serde_json::json!(VERSION));
+        assert!(seen["nonce"].is_string() && seen["sealed"].is_string());
+        // The clear fields are the clear fields. Anything of the
+        // project's own that reached them would be a leak rather than
+        // a format change, and this is the one place both are visible.
+        let text = String::from_utf8(raw).expect("utf8");
+        assert!(
+            !text.contains("MY_TOKEN") && !text.contains("swordfish"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn secrets_from_a_later_zou_are_refused_by_name() {
         let (_dir, store) = store();
@@ -763,7 +810,12 @@ mod tests {
         sealed.version = VERSION + 1;
         store.put(&object, &sealed.to_json()).expect("put");
         let refused = read(store.as_ref(), "acme", &key).expect_err("later format");
-        assert!(refused.contains("later zou"), "{refused}");
+        // The same phrase the rest of the durable formats refuse with.
+        // See the census in crates/zou-log/tests/upgrade.rs.
+        assert!(
+            refused.contains("newer than") && refused.contains("upgrade"),
+            "{refused}"
+        );
     }
 
     fn argv(of: &[&str]) -> Vec<String> {

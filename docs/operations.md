@@ -153,6 +153,34 @@ If it has not, a waiter gives up ten seconds after the pusher's exit with `zou w
 That is a refusal rather than a failure to try: the store never received the WAL for those pages, and storing them anyway would leave the store holding a page that carries the effects of records it has never seen.
 The same message from a committing backend is a PANIC, which is the answer Postgres gives to any WAL write it cannot make durable, and the restart that follows brings up a fresh pusher.
 
+## Upgrading
+
+A rolling restart means two releases are reading the same bucket for as long as it takes, and the old binary is the one at risk, because it meets objects written by something that knows more than it does.
+What keeps that safe is that a writer emits the lowest format that carries what it wrote, so an upgraded node writing an ordinary tenant writes exactly what the nodes still on the old release already read.
+Nothing about a deploy changes a format on its own.
+
+What does change one is using a feature that needs it, and that is where a tenant stops being readable by the older binary.
+Splitting a tenant into shards writes a manifest at format 3, and creating a branch writes that branch's shard manifests at format 2.
+Both are the price of the feature rather than the price of the release, so a fleet mid rollout should finish the rollout before splitting or branching.
+
+A node that meets a format it does not know refuses the object by name and says the binary is behind, and it never half reads one.
+That matters because every one of these objects has fields that default: a newer object parses into something plausible and wrong, an empty roster or a manifest with no layers, and the format number is the only thing standing between that and a node serving it.
+The message reads like `manifest format 4 is newer than this binary supports (3), upgrade zou`, and it is the same shape for every one of them.
+
+The realtime link between a node and the tenant's holder carries its own version, and the two ends say it rather than guess.
+Ends on different versions do not open a link, so broadcast for a tenant held by the other end does not cross until both are upgraded, and the node keeps retrying while that is true.
+
+Two smaller things move under an upgrade.
+The `ZOU_STORE_STATS` counter file is per layout, so a release that changes the layout starts the counters at zero rather than reading the old ones as if they meant the same thing, and a dashboard reading it sees a reset.
+A single file `.zou` store says which way a mismatch goes: newer than the binary means upgrade the binary, older than it means the file has to be exported by the zou that wrote it, because no upgrade of this one will open it.
+
+Going back a release is only safe while no tenant used a feature the older binary predates, which is the same rule read backwards.
+The one case with its own message is a store that still carries a v1 per tenant WAL tail: fold it down with the previous binary first, since this one refuses it rather than guessing what the tail meant.
+
+The rules are not left to reviewers.
+`crates/zou-log/tests/upgrade.rs` holds a census of every durable and spoken format in the tree, checked against the source constant by constant and value by value, together with the frozen bytes of what a plain object of each writes.
+A format that moves, or one that is added and not censused, fails there until somebody says what a binary already running does with it.
+
 ## Write forwarding
 
 Any node in a fleet answers for any tenant, but only the lease holder writes one, so a node that is asked for a tenant it does not hold sends the request to the node that does.

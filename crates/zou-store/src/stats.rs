@@ -159,6 +159,21 @@ impl Counters {
         file.set_len((SLOTS * 8) as u64)?;
         let map = unsafe { memmap2::MmapMut::map_mut(&file)? };
         let this = Self { map };
+        // An upgraded binary is the ordinary way to meet a file from
+        // another layout, because the path is the same across restarts
+        // and nothing deletes it. Stamping the new header over the old
+        // counts would leave every slot meaning something it does not
+        // hold, and the reader's header check would pass, because the
+        // header it checks is the one just written. Zero it instead: a
+        // process loses the counts of the process before it, which it
+        // was never adding to anyway.
+        let fresh = this.slot(0).load(Ordering::Relaxed) != MAGIC
+            || this.slot(1).load(Ordering::Relaxed) != FORMAT;
+        if fresh {
+            for i in 0..SLOTS {
+                this.slot(i).store(0, Ordering::Relaxed);
+            }
+        }
         this.slot(0).store(MAGIC, Ordering::Relaxed);
         this.slot(1).store(FORMAT, Ordering::Relaxed);
         Ok(this)
@@ -657,6 +672,36 @@ mod tests {
 
     fn wrap(dir: &Path, counters: &Path) -> StatsStore {
         StatsStore::new(Box::new(LocalFsStore::new(dir.join("store"))), counters).unwrap()
+    }
+
+    /// The counter file is the one thing a binary upgrade meets in
+    /// place: same path, nothing deletes it, and the slot a number sat
+    /// in under the last layout is a different number under this one.
+    /// A process that stamped its own header over the old counts would
+    /// then pass its own header check and serve them.
+    #[test]
+    fn a_counter_file_from_another_layout_starts_over_rather_than_being_reread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats");
+        {
+            let counters = Counters::open(&path).unwrap();
+            counters.add(count_slot(0, 0), 7);
+            counters.slot(1).store(FORMAT - 1, Ordering::Relaxed);
+        }
+        let counters = Counters::open(&path).unwrap();
+        assert_eq!(
+            counters.slot(count_slot(0, 0)).load(Ordering::Relaxed),
+            0,
+            "a count from another layout was kept"
+        );
+        assert_eq!(counters.slot(1).load(Ordering::Relaxed), FORMAT);
+
+        // And the ordinary case, a restart at the same format, keeps
+        // what the file holds: this is not a reason to lose counts.
+        counters.add(count_slot(0, 0), 9);
+        drop(counters);
+        let again = Counters::open(&path).unwrap();
+        assert_eq!(again.slot(count_slot(0, 0)).load(Ordering::Relaxed), 9);
     }
 
     #[test]
