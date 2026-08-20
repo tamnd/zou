@@ -56,6 +56,13 @@ fn denied(before: &str) -> bool {
 /// The file whose job is to deny them, and the sentence it cannot lose
 /// without this failing.
 const NOTICE: &str = "TRADEMARKS.md";
+
+/// This file, which is the one place the phrases appear as a list rather
+/// than as a sentence, so there is no sentence around them to be a denial.
+/// CI found it before this line existed, on a run where the list had been
+/// committed and the local run that passed had been against a tree where
+/// it was still untracked.
+const RULES: &str = "conformance/tests/trademarks.rs";
 const DISCLAIMER: &str = "not affiliated with, sponsored by or endorsed by Supabase Inc";
 
 /// Marks that must not turn up in the name of anything published from
@@ -99,6 +106,9 @@ fn text(path: &Path) -> Option<String> {
 #[test]
 fn nothing_here_claims_to_be_somebody_else_s_or_to_have_their_blessing() {
     for path in tracked() {
+        if path == Path::new(RULES) {
+            continue;
+        }
         let Some(body) = text(&path) else { continue };
         for (index, line) in body.lines().enumerate() {
             let lowered = line.to_lowercase();
