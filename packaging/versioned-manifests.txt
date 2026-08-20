@@ -1,0 +1,12 @@
+# Every manifest carrying a version number that goes out under this
+# project's name, one per line, relative to the repository root.
+#
+# scripts/zou-version.sh rewrites all of them from the git tag, and
+# conformance/tests/versions.rs checks this list against the tree, so a
+# package added later cannot quietly ship the placeholder version that
+# is committed here.
+Cargo.toml
+crates/zou-node/package.json
+crates/zou-python/pyproject.toml
+packaging/npm/package.json
+packaging/pypi/zou-postgres/pyproject.toml
