@@ -174,9 +174,9 @@ The cost is that a chain is order dependent in a way the rest of a suite is not,
 
 ## The suite derived from upstream
 
-The `rest` suite is hand written, 82 cases about the surface a Supabase project actually uses.
+The `rest` suite is hand written, and it is about the surface a Supabase project actually uses.
 The `postgrest` suite is not written at all.
-`derive` reads a PostgREST checkout at the pinned version, walks its spec files, and turns every request in them into a case: 1217 of them, out of the 22 spec modules the default test app in `Main.hs` runs.
+`derive` reads a PostgREST checkout at the pinned version, walks its spec files, and turns every request in them into a case, out of the 22 spec modules the default test app in `Main.hs` runs.
 
 ```
 git clone --branch v16.1 https://github.com/PostgREST/postgrest /tmp/postgrest-src
@@ -215,7 +215,7 @@ db-extra-search-path = ""
 
 ## The suite compared with GoTrue
 
-The `auth` suite is 77 cases over the endpoints a sign in flow uses: signup, the three token grants, the user endpoints, verify, recover, magiclink, otp, resend, logout, reauthenticate, the MFA listing, the admin endpoints, settings, health, jwks and authorize.
+The `auth` suite is over the endpoints a sign in flow uses: signup, the three token grants, the user endpoints, verify, recover, magiclink, otp, resend, logout, reauthenticate, the MFA listing, the admin endpoints, settings, health, jwks and authorize.
 The reference is GoTrue 2.195.0 configured the way `supabase start` configures it for a project that has changed nothing, with the mail rate limits raised out of the way.
 A rate limit is a configured number and a clock rather than a compatibility surface, and at the default of thirty an hour which case got the 429 would depend on how long the run before it took.
 
@@ -245,7 +245,7 @@ That distinction has to be made here because zou is the gateway as well as the s
 
 ## The suite recorded from an image
 
-The `storage` suite is 478 cases: 66 over the bucket endpoints, 238 over the object ones, and 174 over the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
+The `storage` suite comes in three parts, the bucket endpoints, the object ones and the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
 The reference is storage-api at the version in `versions.json`, and it is the one reference that cannot be downloaded and run on a flag line.
 storage-api ships as an image and nothing else, so the recording comes from `supabase start` rather than from a binary, which is what the record workflow in this repository brings up.
 
@@ -266,7 +266,8 @@ The object cases are the reason a case can say `chained`.
 An upload has to be read back, and a fixture cannot put the bytes there for it: a fixture writes rows and an object is bytes in a store no SQL statement can reach.
 So the first case uploads, and the ones under it that write say they are asked against what the case before them left rather than against the fixture.
 
-What the object cases do not ask about yet: image transforms, and analytics buckets.
+The image transforms are asked about here too, under `/storage/v1/render/image`, and they are the one group whose answers are not compared byte for byte: a case names the dimensions, the format and the header saying what was asked for, and gives up on the digest, because two jpeg encoders at one quality do not agree on a single byte.
+What the object cases do not ask about yet is analytics buckets.
 The S3 cases are the one group here that carries no token at all.
 A client of that surface signs the request itself, so the harness computes the signature the way a client does, from an algorithm written out in `sigv4.rs` rather than borrowed from zou: a harness that signed with the server's own code would agree with the server about anything both of them got wrong.
 Four of the keys a case can name are signatures rather than tokens, three of them correct in every way but one, which is how a case asks what a wrong secret, an unknown access key id or the wrong region is answered with.
@@ -325,14 +326,14 @@ It starts zou on 54321, the port the Supabase CLI serves a local project on, pri
 zou installs the auth schema on the first connection it takes out of its pool, the fixture has a foreign key into `auth.users`, and the health endpoint answers without taking a connection.
 So `serve` makes zou answer a request that has to reach Postgres before it says it is ready, and the `url` line it prints last is a readiness check CI can grep for.
 
-All 34 tests run and zou passes 33: the client constructing, the PostgREST block, the RLS block, the Authentication block, the Storage block, the timeout configuration block and both Realtime blocks.
-The one that does not pass is skipped by upstream itself, a binary broadcast over the older protocol version.
+Every block in the file runs and zou passes all of it: the client constructing, the PostgREST block, the RLS block, the Authentication block, the Storage block, the timeout configuration block and both Realtime blocks.
+The one test that does not run is skipped by upstream itself, a binary broadcast over the older protocol version.
 The Storage block is the one that says something the recorded storage suite cannot, because it goes through storage-js with the anon key and a policy on `storage.objects` decides rather than a service role going around it.
 The Realtime blocks ran behind an environment flag while zou served no Realtime, which is what the Storage block did before storage was served, and both are upstream's own lines again.
 They are the blocks that cost the most to pass: both protocol versions, every channel private and so decided by policies on `realtime.messages`, a socket that has to stay up while channels come and go and hang up when the last one leaves, and a broadcast posted over http arriving on a socket.
 
 The second is storage-js's own tests, in `js-storage/`, and it is the same arrangement pointed at the client that owns the surface M3 is about.
-Four files, 135 tests, 133 of them passing against zou and 2 skipped, and 6 of upstream's snapshots.
+Four files and 6 of upstream's snapshots, with everything in them passing against zou except what upstream skips itself.
 storage-js is not released on its own: it lives at `packages/core/storage-js` in the supabase-js repository and ships with it, which is why `versions.json` pins it at the same 2.112.3.
 
 Two things about it are worth writing down.
@@ -350,13 +351,13 @@ Its fixture is upstream's seed rather than one written here, which is how it fou
 
 There is a third shape, in `js-tus/`, and it exists because resumable uploads cannot be asked about one request at a time.
 
-The recorded storage suite has 60 cases about `/storage/v1/upload/resumable`, which is more than it has about any other route, and all 60 are one request with one answer.
+The recorded storage suite asks more about `/storage/v1/upload/resumable` than about any other route, and every one of those cases is one request with one answer.
 That is the half of the protocol a recording can hold.
 The other half is a conversation: a client picks its own chunk boundaries, asks where it got to after an interruption, believes the number it is told, sends the offset it believes in, and gives up if the server contradicts it.
 A second process finishes what the first one started with nothing but a url.
 
 So `js-tus/` drives the real tus-js-client, at the version pinned in `versions.json`, the way Supabase's own documentation writes a resumable upload, and reads every result back through supabase-js: the claim being made is that an object uploaded this way is an ordinary object, so the client that would have called `upload()` downloads it and lists it.
-12 tests, and they cover an upload in one piece, an upload in three chunks, an upload interrupted and picked up by a second client, a terminated upload, and the four refusals.
+They cover an upload in one piece, an upload in three chunks, an upload interrupted and picked up by a second client, a terminated upload, and the four refusals.
 
 The questions and the assertions there are both ours, which nothing else in this repository or the conformance one can say.
 What keeps that honest is that the same file, unedited, is run against a real `supabase start` in the same CI job that diffs the rest suite against it.
@@ -378,7 +379,7 @@ The server sends a joining socket the whole state once and a diff for every chan
 A server whose diffs the fold cannot apply is a server whose own socket tests pass and whose users watch a room slowly stop matching reality.
 
 So the suite drives the real client at the pinned version the way the Supabase documentation writes a presence channel, a key in the channel config and `track` after SUBSCRIBED, and reads the state back with `presenceState()`.
-8 tests: a tracker seeing itself, a late joiner being told who is already there, a join and a leave reaching everybody else, a client that disconnects without saying anything, one key in two tabs, a client with no key of its own, and presence and broadcast sharing a channel.
+It asks about a tracker seeing itself, a late joiner being told who is already there, a join and a leave reaching everybody else, a client that disconnects without saying anything, one key in two tabs, a client with no key of its own, and presence and broadcast sharing a channel.
 It needs no database and no fixture, because a channel touches no rows, so CI serves it from the front door example rather than from the harness.
 Like the tus suite, it also runs against a real `supabase start`, and that leg is the only thing that makes it a statement about Supabase rather than about zou.
 
@@ -397,7 +398,7 @@ The question about a payload of bytes is deliberately loose, since the two serve
 A private channel is the one part of realtime whose answer is not in the server.
 Whether a room may be read, and whether it may be written to, comes out of row level security policies on `realtime.messages` that the project wrote about its own tables, with the room name in `realtime.topic()` and the person in `auth.uid()`.
 So the suite ships a project rather than a configuration: a membership table, a row per person per room, a flag for whether that membership may send, and two policies that read it, applied to both targets unedited through `serve --setup` on one leg and `psql` on the other.
-12 tests: a join the policies allow, one no policy names, one asked with nothing but the project key behind it, a room named after the person and the same room asked for by somebody else, a broadcast between two members, a send to a room that may only be read, both http shapes, a batch with one allowed room and one refused one, a public channel of the same name hearing none of it, and two about `realtime.send()`.
+It asks about a join the policies allow, one no policy names, one asked with nothing but the project key behind it, a room named after the person and the same room asked for by somebody else, a broadcast between two members, a send to a room that may only be read, both http shapes, a batch with one allowed room and one refused one, a public channel of the same name hearing none of it, and two about `realtime.send()`.
 The public channel one is the question the rest of them rest on: a public channel is joined by name with nothing read, so a private room and a public room of one name have to be two rooms or the policies are decoration.
 The `realtime.send()` pair is the other way into a room, which a project reaches from a trigger on its own table: the suite has no connection to the database, so `setup.sql` puts an ordinary security invoker function in front of it and the questions call that as the person, which leaves the policies deciding as they do everywhere else here.
 
@@ -410,7 +411,7 @@ The difference is written down in [realtime.md](realtime.md) instead, because a 
 `setup.sql` there is five tables and one realtime line, the `alter publication` a project runs when it turns a table on.
 Four of the tables are in the publication and one is not, which is the only way to ask whether a table nobody opted in is really left alone; one of the four publishes its old rows, which is the single setting that changes what an update and a delete carry; one has row level security on it with a policy about who owns a row; and one is written to by nothing but the frame test.
 Every write in the suite goes through `/rest/v1` as the service key, because a suite holding a connection to the database could set a row up in a way no application could.
-11 tests: an insert, an update, a delete, the same update and delete on a table with `replica identity full`, a subscription for one event, a filter, a table nobody published, a policy withholding somebody else's row, a delete on that table telling everybody the key and nothing else, and two subscriptions on one channel.
+It asks about an insert, an update, a delete, the same update and delete on a table with `replica identity full`, a subscription for one event, a filter, a table nobody published, a policy withholding somebody else's row, a delete on that table telling everybody the key and nothing else, and two subscriptions on one channel.
 
 The last one is a different shape of question, and the reason this suite exists rather than being three more tests in the file above.
 Everything else reads what the client handed the application, which is the fold of the frames rather than the frames: the client takes the ids out of the join's answer, routes changes on them, renames `record` to `new` and hands over an object, and a server can get all of that right while sending something upstream never sends.
@@ -446,7 +447,7 @@ zou took the writes because its bootstrap grants the three api roles everything 
 An edge function is not a request, it is a project: a directory per function, an `index.ts` in each, `_shared` beside them, and a `config.toml` that says which of them may be called without a token.
 So the suite is that project, and both legs put it on disk unedited, one under `zou functions serve` and the other under a `supabase start` with edge-runtime in it.
 There is nothing upstream to copy, the way there was nothing for presence: supabase-js's own suite has one line about functions in it and edge-runtime's tests are about the runtime rather than about the surface a project sees.
-29 tests in three files, and the reference leg is what makes them a statement about Supabase rather than about zou.
+Three files, and the reference leg is what makes them a statement about Supabase rather than about zou.
 
 `entry.test.ts` is the three ways a module says what to run, all three deployed and all three called, because `Deno.serve` is the documented one and the other two are what most functions in the wild are written with.
 It is also where a function the config file names rather than the listing is asked for, with its entrypoint two directories down and no directory of its own, which is how the examples project deploys its mcp server.
@@ -466,7 +467,7 @@ The only witness is the far end, so it was measured with a slow server that repo
 
 The zou leg is run twice, and that is a claim the other suites cannot make.
 The first run serves the project directory, the way a person does while writing a function.
-The second deploys that same directory to a store with `zou functions deploy`, serves what was written there with `zou functions serve --target`, and asks the same 29 questions of it, on a process that has no project directory at all.
+The second deploys that same directory to a store with `zou functions deploy`, serves what was written there with `zou functions serve --target`, and asks the same questions of it, on a process that has no project directory at all.
 A deploy carries a subset of a project on purpose, it drops every dotfile and it flattens what the config file said into a manifest, so whether what comes back is still the project is exactly the kind of thing that is easy to assume and cheap to ask.
 Both legs are `needs` of the scoreboard job, so a deployment that answered differently stops the page from being regenerated.
 
@@ -592,46 +593,55 @@ One step here is not the browser's: accounts are made through the admin api, bec
 
 ## Where zou stands
 
-The `postgrest` suite is 1217 cases against PostgREST 16.1, and zou passes all of them, with no known differences.
-That suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, and what it took to get there is written down in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125).
+Not here.
+Every count, per suite and per endpoint and per feature, is in [docs/scoreboard.md](scoreboard.md), which is generated out of the run the last merge failed or passed on and committed by CI when a number moves.
+This section used to hold a paragraph per suite with the numbers typed into the sentences, and by the time anybody noticed, three of them were wrong: the `rest` suite had grown by nine cases, the `auth` suite by three, and the supabase-js line was reporting half of what that suite runs.
+None of it was caught by anything, because there is nothing to catch it.
+A count in a sentence is a count somebody has to remember to change, and the whole point of the scoreboard is that nobody has to.
 
-The `rest` suite is 82 cases against the same PostgREST, and zou passes all 82.
+What belongs here is what the scoreboard cannot say, which is why a number is what it is.
 
-The `auth` suite is 77 cases against GoTrue 2.195.0, and zou passes 73 of them, 94%, with 4 known differences.
-All four are deliberate: zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, it publishes a signing key where upstream publishes an empty set because a project on zou signs its access tokens with a key derived from its own secret, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
+The `auth` suite is the only one of the recorded four that does not pass in full, and the difference is deliberate in every case.
+zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, it publishes a signing key where upstream publishes an empty set because a project on zou signs its access tokens with a key derived from its own secret, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
+Each of the four is written out in `known.json` with the reason next to it, and each is still counted as a failure on the scoreboard, so the number there cannot be improved by writing something down.
 
-The `storage` suite is 478 cases against the storage-api a local Supabase project runs, and zou passes all 478, byte for byte, with no known differences.
-Forty three of them are the image transforms, and those are the one place where byte for byte stops at the picture: a case names the dimensions and the format and gives up on the digest, because two jpeg encoders at the same quality do not agree on a single byte.
+The `postgrest` suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, and what it took to get there is written down in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125).
 
-supabase-js 2.112.3 runs 17 of its integration tests against zou and all 17 pass.
-
-storage-js 2.112.3 runs 133 of its 135 against zou and all 133 pass, the 2 it does not run being upstream's own skips.
-
-The five suites this project wrote have lines of their own on the scoreboard now, `js-tus`, `js-realtime`, `js-realtime-private`, `js-realtime-changes` and `js-functions`, and they are labelled with what they were compared with rather than being folded in with the recordings.
+The five suites this project wrote have lines of their own on the scoreboard, `js-tus`, `js-realtime`, `js-realtime-private`, `js-realtime-changes` and `js-functions`, and they are labelled with what they were compared with rather than being folded in with the recordings.
 The number on each is the zou leg, and what makes it a compatibility number rather than a self assessment is the other leg: the same file runs against a real `supabase start` in the diff job of the same run, so an assertion the reference does not pass is the suite being wrong.
-They are not written out here in prose on purpose, because prose goes stale and the scoreboard is regenerated on every merge.
 
 The cases that pass "written differently" are all the same three things: zou puts a space after each colon where PostgREST puts a newline between rows, a `select=*` comes back with the columns in a different order, and two auth answers carry their keys in a different order than Go wrote them.
 None of them is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.
 
 ## The scoreboard
 
-Those paragraphs are prose, and prose goes stale.
-[docs/scoreboard.md](scoreboard.md) is the same numbers generated out of the run, and CI rewrites it on every merge to main, out of the json the conformance jobs uploaded rather than out of a run of its own.
+[docs/scoreboard.md](scoreboard.md) is every number out of the run, and CI rewrites it on every merge to main, out of the json the conformance jobs uploaded rather than out of a run of its own.
 Rendering it from a fresh run would publish a number nobody had failed a build over.
 
 ```
 cargo run -p zou-conformance -- scoreboard \
-  --report /tmp/conformance.json \
-  --report /tmp/auth.json \
-  --js /tmp/js.json \
+  --report /tmp/reports/conformance.json \
+  --report /tmp/reports/auth.json \
+  --report /tmp/reports/storage.json \
+  --js supabase-js=/tmp/reports/js.json \
+  --js storage-js=/tmp/reports/js-storage.json \
+  --ours js-tus=/tmp/reports/js-tus.json \
+  --ours js-realtime=/tmp/reports/js-realtime.json \
+  --ours js-realtime-private=/tmp/reports/js-realtime-private.json \
+  --ours js-realtime-changes=/tmp/reports/js-realtime-changes.json \
+  --ours js-functions=/tmp/reports/js-functions.json \
   --pin "$(jq -r .ref conformance/suites.json)" \
-  --out docs/scoreboard.md
+  --out docs/scoreboard.md \
+  --compat docs/compatibility.md
 ```
 
 Two cuts through the same run, and the second one is the useful one.
 A feature says what somebody was testing, which is how the suite is organised, and it is upstream's vocabulary: "upsert is at 52%" names a chapter of somebody else's test file rather than a piece of work.
 An endpoint says what the server had to implement, with the fixture's table and function names taken out, and "PATCH /rest/v1/{table} is at 28%" is a piece of work.
+
+The last flag is the same numbers going somewhere else.
+`docs/compatibility.md` is a hand written page with one table in it, and `--compat` rewrites the numeric cells of that table in place between a pair of markers and leaves every word around them alone, so the one page a reader is most likely to open first cannot be carrying a count nobody has measured since they typed it.
+It refuses in both directions, on a suite the page has no row for and on a row no suite in the run answers to, because filling in what matches and skipping the rest is exactly how a row outlives the suite it was counting.
 
 There is no date and no run number in the file, so a merge that moved no number leaves no diff and makes no commit.
 The commit it does make carries `[skip ci]`, so the workflow does not start again to measure what it has just measured.

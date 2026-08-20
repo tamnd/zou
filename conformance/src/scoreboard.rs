@@ -628,4 +628,41 @@ mod tests {
         );
         assert!(table.contains(RULE));
     }
+
+    /// `docs/conformance.md` explains how each suite is built and asked, and it used
+    /// to say how big each one was while it was doing it. Nothing owned those numbers,
+    /// so they drifted: it said the `rest` suite was 82 cases after it had grown to 91,
+    /// the `auth` suite 77 after it had grown to 80, and supabase-js 17 tests when that
+    /// suite runs 33. Sizes belong on the scoreboard, which is generated out of the run.
+    /// This refuses the sentence that would start it again rather than pinning the
+    /// numbers it would drift from, because pinning them is the same act that wrote them.
+    #[test]
+    fn the_page_about_the_suites_does_not_count_them() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/conformance.md");
+        let page = std::fs::read_to_string(path).expect("the page is in the repository");
+        fn bare<'a>(word: &&'a str) -> &'a str {
+            word.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+        }
+        for (index, line) in page.lines().enumerate() {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for (at, word) in words.iter().enumerate() {
+                if bare(word).parse::<u64>().is_err() {
+                    continue;
+                }
+                let counted = words.get(at + 1).map(bare) == Some("cases")
+                    || words.get(at + 1).map(bare) == Some("tests")
+                    || words[..at]
+                        .iter()
+                        .rev()
+                        .map(bare)
+                        .find(|w| *w != "all")
+                        .is_some_and(|w| w == "passes" || w == "passing");
+                assert!(
+                    !counted,
+                    "docs/conformance.md:{}\n{line}\nsays how big a suite is, and a size in a sentence is one somebody has to remember to change, which is how this page went on saying 82 for a suite that had reached 91. The sizes are in docs/scoreboard.md, which is written out of the run.",
+                    index + 1
+                );
+            }
+        }
+    }
 }
