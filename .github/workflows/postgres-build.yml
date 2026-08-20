@@ -114,9 +114,14 @@ jobs:
           build/pg/bin/pg_ctl -D /tmp/zou-pgdata stop
           test "$(ls $ZOU_READ_CACHE_DIR | wc -l)" -ge 1
           grep -q "zou read cache:" /tmp/zou-pg.log
-          target/release/zou-gc "$ZOU_TARGET" 0 0 | tee /tmp/gc1.txt
+          # No window and no history to speak of, which is how this asks
+          # for everything superseded to go now. The retention has to be
+          # the longer of the two or a candidate stamp never comes of
+          # age, and two seconds is both longer than nothing and shorter
+          # than the age of the snapshots this wants collected.
+          target/release/zou-gc "$ZOU_TARGET" 0 2 | tee /tmp/gc1.txt
           grep -q " 0 objects deleted" /tmp/gc1.txt
-          target/release/zou-gc "$ZOU_TARGET" 0 0 | tee /tmp/gc2.txt
+          target/release/zou-gc "$ZOU_TARGET" 0 2 | tee /tmp/gc2.txt
           ! grep -q " 0 objects deleted" /tmp/gc2.txt
           test ! -e "$ZOU_TARGET/tenants/local/chk/$DELTA/INDEX"
           test ! -e "$ZOU_TARGET/tenants/local/chk/genesis/INDEX"
