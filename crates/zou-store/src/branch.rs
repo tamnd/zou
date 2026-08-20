@@ -38,7 +38,9 @@ pub enum BranchError {
         "no manifest at {key}, the source database does not exist, `zou tenant <target> list` shows what does"
     )]
     NoSource { key: String },
-    #[error("destination {tenant_ref} already exists")]
+    #[error(
+        "destination {tenant_ref} already exists, pick another name, or `zou branch <target> delete {tenant_ref}` first if it is a branch you meant to replace"
+    )]
     DestinationExists { tenant_ref: String },
     #[error("source has no checkpoint yet, run zou-bootstrap first")]
     NoCheckpoint,

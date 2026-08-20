@@ -193,12 +193,14 @@ pub enum ReadError {
         name: String,
         source: LayerDecodeError,
     },
-    #[error("layer {name} disagrees with its name, refusing to serve from it")]
+    #[error(
+        "layer {name} disagrees with its name, refusing to serve from it, the object under that key is not the layer the manifest says it is, so either the store handed back the wrong bytes or something wrote over a key that was meant to be write once, `zou inspect <target> {name}` prints what the object actually holds"
+    )]
     Mismatched { name: String },
     #[error("layer {name} came back short at {offset}+{len}")]
     ShortRange { name: String, offset: u64, len: u64 },
     #[error(
-        "layer {name} belongs to {owner} but this reader has no shard context to resolve it, attach with for_shard"
+        "layer {name} belongs to {owner} but this reader has no shard context to resolve it, open it with `for_shard` so it knows which shard's layers are its own"
     )]
     ForeignLayer { name: String, owner: String },
 }
