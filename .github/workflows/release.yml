@@ -36,6 +36,13 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # The tag is the version, and it goes into every manifest at once
+      # rather than into the ones each job remembers. A dispatch run has
+      # a branch name where a tag would be, so it keeps the placeholder
+      # and is never published.
+      - name: The version from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: scripts/zou-version.sh "$GITHUB_REF_NAME"
       - name: Install build dependencies
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
@@ -140,6 +147,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: The version from the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: scripts/zou-version.sh "$GITHUB_REF_NAME"
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: zou
@@ -182,10 +193,7 @@ jobs:
       # tag and builds one that says 0.0.1 and is never published.
       - name: The version from the tag
         if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          sed -i.bak "s/^version = \".*\"$/version = \"${GITHUB_REF_NAME#v}\"/" crates/zou-python/pyproject.toml
-          rm crates/zou-python/pyproject.toml.bak
-          grep '^version' crates/zou-python/pyproject.toml
+        run: scripts/zou-version.sh "$GITHUB_REF_NAME"
       - uses: PyO3/maturin-action@v1
         with:
           command: build
@@ -259,10 +267,10 @@ jobs:
             echo "no NPM_TOKEN, so zou-cli is not published, the tarballs on the release are still there"
             exit 0
           fi
-          cd packaging/npm
           # The package version is the tag, because the postinstall
           # downloads the release of the same name.
-          npm version --no-git-tag-version --allow-same-version "${GITHUB_REF_NAME#v}"
+          scripts/zou-version.sh "$GITHUB_REF_NAME"
+          cd packaging/npm
           # The registry records where this came from, the same way the
           # release assets do, so the package page says which workflow
           # at which commit built it rather than only who uploaded it.

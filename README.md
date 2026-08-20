@@ -165,6 +165,8 @@ That takes the bundle for the platform, checks it against its sha256, and unpack
 
 `brew install tamnd/zou/zou` and `npm install -g zou-cli` are the same tree for anyone who would rather get it from a package manager, and `pip install zou zou-postgres` is the same tree again for python. Either way a project that installs the binding next to the postgres package has a database per test with no path to point anywhere.
 
+Every one of those carries the same number, the git tag it was built from, since nothing in the tree authors a version. What that number promises and what it does not, and the separate rules that keep a store written by one release readable by the next, are in [docs/versioning.md](docs/versioning.md).
+
 ## Contributing
 
 The project is being built top to bottom against the milestone checklists, one PR per feature. Issues and PRs are welcome, but expect churn while M1 is in progress.

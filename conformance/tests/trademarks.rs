@@ -16,8 +16,10 @@
 //! tests read `docs/compatibility.md` and `docs/conformance.md` for the
 //! same reason.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
+
+mod common;
+use common::{text, tracked};
 
 /// Phrasings that say, or let a reader conclude, that this project is
 /// somebody else's or has somebody else's blessing.
@@ -69,39 +71,6 @@ const DISCLAIMER: &str = "not affiliated with, sponsored by or endorsed by Supab
 /// here. The crates are `zou` and `zou-*`, the command line is `zou-cli`
 /// on npm, and the wheel is `zou-postgres`.
 const NOT_OURS: &[&str] = &["supabase", "postgrest", "gotrue", "postgres-meta"];
-
-fn root() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."))
-}
-
-/// Every file git is tracking, which is the right set: what is committed
-/// is what somebody reads, and everything else on the disk is a build
-/// artefact or a checkout of somebody else's tree.
-fn tracked() -> Vec<PathBuf> {
-    let listing = Command::new("git")
-        .arg("-C")
-        .arg(root())
-        .args(["ls-files", "-z"])
-        .output()
-        .expect("git is on the path and this is a checkout");
-    assert!(listing.status.success(), "git ls-files failed");
-    String::from_utf8(listing.stdout)
-        .expect("git wrote utf8 paths")
-        .split('\0')
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .filter(|path| !path.starts_with("vendor"))
-        .collect()
-}
-
-/// A tracked file's text, or nothing if it is not text. Reading the bytes
-/// and giving up on the ones that are not utf8 is how a binary is skipped
-/// without keeping a list of extensions that would go stale on its own.
-fn text(path: &Path) -> Option<String> {
-    std::fs::read(root().join(path))
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-}
 
 #[test]
 fn nothing_here_claims_to_be_somebody_else_s_or_to_have_their_blessing() {
