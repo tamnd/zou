@@ -775,12 +775,17 @@ mod tests {
         let (raw, _) = store.get(&object).expect("get").expect("there");
 
         let seen: serde_json::Value = serde_json::from_slice(&raw).expect("json");
-        let fields: Vec<&str> = seen
+        // Sorted, because the order a parsed object hands back its keys
+        // depends on whether something in the build turned on serde_json's
+        // preserve_order, and the format is the set of names rather than
+        // the order a reader happens to see them in.
+        let mut fields: Vec<&str> = seen
             .as_object()
             .expect("an object")
             .keys()
             .map(|k| k.as_str())
             .collect();
+        fields.sort_unstable();
         assert_eq!(fields, ["nonce", "sealed", "updated", "version"]);
         assert_eq!(seen["version"], serde_json::json!(VERSION));
         assert!(seen["nonce"].is_string() && seen["sealed"].is_string());
