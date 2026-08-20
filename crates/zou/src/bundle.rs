@@ -95,7 +95,7 @@ impl Deployment {
             serde_json::from_slice(data).map_err(|e| format!("deployed functions: {e}"))?;
         if deployment.version > VERSION {
             return Err(format!(
-                "the functions deployed here were written by a later zou (format {}, this reads {VERSION})",
+                "deployed functions format {} is newer than this binary supports ({VERSION}), upgrade zou",
                 deployment.version
             ));
         }
@@ -804,6 +804,58 @@ mod tests {
         assert!(e.contains("is not those bytes"), "{e}");
     }
 
+    /// What a deploy writes is read back by whatever node picks the
+    /// project up, which during a rollout is a node on the release
+    /// before this one. A field renamed, a field that stopped being
+    /// optional, a bool that became a string: each of those is a
+    /// project those nodes can no longer attach, and none of them
+    /// moves the version number on its own. So the shape is written
+    /// out here rather than round tripped, and a change to it is a
+    /// diff somebody has to look at.
+    ///
+    /// The census in crates/zou-log/tests/upgrade.rs points here. It
+    /// cannot hold this one itself: zou is a binary crate and no other
+    /// crate's test can build a Deployment.
+    #[test]
+    fn what_a_deploy_writes_is_frozen() {
+        let deployment = Deployment {
+            version: VERSION,
+            deployed: 1_767_100_000,
+            functions: vec![Deployed {
+                name: "hello".to_string(),
+                entrypoint: "hello/index.ts".to_string(),
+                import_map: None,
+                verify_jwt: true,
+                static_files: Vec::new(),
+                files: BTreeMap::from([(
+                    "hello/index.ts".to_string(),
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                )]),
+            }],
+        };
+        let frozen = r#"{
+  "version": 1,
+  "deployed": 1767100000,
+  "functions": [
+    {
+      "name": "hello",
+      "entrypoint": "hello/index.ts",
+      "verify_jwt": true,
+      "files": {
+        "hello/index.ts": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      }
+    }
+  ]
+}
+"#;
+        assert_eq!(String::from_utf8(deployment.to_json()).unwrap(), frozen);
+        // And it reads back as what it was, not as something plausible
+        // that parsed: every field here defaults or is optional, so
+        // parsing alone proves nothing.
+        let back = Deployment::from_json(frozen.as_bytes()).expect("a deployment");
+        assert_eq!(back, deployment);
+    }
+
     #[test]
     fn a_deployment_from_a_later_zou_is_refused_by_name() {
         let (_target, store) = store();
@@ -814,6 +866,11 @@ mod tests {
             )
             .expect("put");
         let e = fetch(store.as_ref(), "acme").expect_err("refused");
-        assert!(e.contains("written by a later zou"), "{e}");
+        // Worded the way every other durable format words it, because
+        // an operator reading a log learns one phrase and this object
+        // is no different from the ten in the store beside it. The
+        // census in crates/zou-log/tests/upgrade.rs holds the whole
+        // set, this one included.
+        assert!(e.contains("newer than") && e.contains("upgrade"), "{e}");
     }
 }

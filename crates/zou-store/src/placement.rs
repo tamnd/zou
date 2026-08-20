@@ -195,7 +195,14 @@ pub fn publish(
             None => (ShardMap::empty(), None),
         };
         edit(&mut map);
-        map.format = MAP_FORMAT;
+        // The map keeps the format it already had. Stamping the
+        // ceiling here would mean that the first time this constant
+        // moves, the next publish writes a map every node still on the
+        // old binary refuses, and a node that refuses the map stops
+        // routing: a rolling restart would take the fleet down between
+        // the first new node and the last old one. A format is raised
+        // by the feature that needs it, on the write that first needs
+        // it, the way the tenant manifest raises its own on a split.
         map.version += 1;
         map.published_unix = Some(
             SystemTime::now()

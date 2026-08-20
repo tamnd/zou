@@ -1,0 +1,6 @@
+{
+  "format": 1,
+  "ref": "t1",
+  "created_unix": 1767100000,
+  "jwt_secret": "a-jwt-secret"
+}

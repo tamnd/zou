@@ -255,11 +255,29 @@ impl ZouFileStore {
             if &header[..4] != FILE_MAGIC {
                 return Err(corrupt(&path, "not a .zou store, bad magic"));
             }
+            // Which side of this build the file is on decides what the
+            // person holding it should do, so the two are not one
+            // message. Newer means the binary is behind and upgrading
+            // it opens the file. Older means the file predates a change
+            // this build cannot read, and no upgrade of this binary
+            // will help: the file has to be exported by the build that
+            // wrote it. Saying "newer" for both would send half of them
+            // the wrong way.
             let format = u32_at(&header, 4);
-            if format != FORMAT {
+            if format > FORMAT {
                 return Err(corrupt(
                     &path,
-                    &format!("format {format} is newer than this build"),
+                    &format!(
+                        "format {format} is newer than this binary supports ({FORMAT}), upgrade zou"
+                    ),
+                ));
+            }
+            if format < FORMAT {
+                return Err(corrupt(
+                    &path,
+                    &format!(
+                        "format {format} is older than this binary reads ({FORMAT}), export it with the zou that wrote it"
+                    ),
                 ));
             }
         }
@@ -716,5 +734,38 @@ mod tests {
         fs::write(&path, b"PK\x03\x04 definitely not a zou store").unwrap();
         let err = ZouFileStore::open(&path).map(|_| ()).unwrap_err();
         assert!(err.contains("bad magic"), "{err}");
+    }
+
+    /// A file is the one thing here that outlives the binary that
+    /// wrote it and travels: it gets copied to a laptop, attached to a
+    /// bug report, opened by whatever zou is on the machine. So both
+    /// directions of a format mismatch are things a person will meet,
+    /// and each has a different answer.
+    #[test]
+    fn a_file_from_another_format_says_which_way_it_is_wrong() {
+        let (_dir, path) = temp_store("t.zou");
+        let stamp = |format: u32| {
+            drop(ZouFileStore::open(&path));
+            let mut header = fs::read(&path).unwrap();
+            header[4..8].copy_from_slice(&format.to_le_bytes());
+            fs::write(&path, &header).unwrap();
+            ZouFileStore::open(&path).map(|_| ()).unwrap_err()
+        };
+
+        let ahead = stamp(FORMAT + 1);
+        assert!(
+            ahead.contains("newer than") && ahead.contains("upgrade zou"),
+            "{ahead}"
+        );
+
+        let behind = stamp(FORMAT - 1);
+        assert!(
+            behind.contains("older than") && behind.contains("export"),
+            "{behind}"
+        );
+        assert!(
+            !behind.contains("newer"),
+            "an upgrade will not open it, so do not ask for one: {behind}"
+        );
     }
 }

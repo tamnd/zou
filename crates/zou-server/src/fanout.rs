@@ -63,6 +63,20 @@ use crate::{App, AuthContext, json_body};
 /// rather than one that opens and misreads a frame.
 const VERSION: u64 = 1;
 
+/// What the other end said it speaks, or `Err` with the number it said
+/// when that is not this one.
+///
+/// A hello with no version in it at all is the case worth naming: it
+/// is what a very old end sends, and reading it as agreement would
+/// open the link that is least likely to work. It counts as zero,
+/// which is not this version, so it refuses like any other mismatch.
+fn agrees(frame: &Wire) -> Result<(), u64> {
+    match frame.number("version").unwrap_or_default() {
+        theirs if theirs == VERSION => Ok(()),
+        theirs => Err(theirs),
+    }
+}
+
 /// How many frames may be waiting to go up before the link is treated
 /// as broken.
 ///
@@ -761,8 +775,7 @@ async fn carried(
 async fn took(app: &Arc<App>, away: &Arc<Away>, frame: Wire) -> bool {
     match frame.down() {
         "hello" => {
-            let theirs = frame.number("version").unwrap_or_default();
-            if theirs != VERSION {
+            if let Err(theirs) = agrees(&frame) {
                 log::warn!(
                     "realtime: {} speaks link version {theirs} and this node speaks {VERSION}",
                     away.endpoint
@@ -1143,8 +1156,7 @@ async fn down(node: &mut Ashore, socket: &mut WebSocket, mut head: Value, body: 
 async fn asked(app: &Arc<App>, node: &mut Ashore, frame: Wire, socket: &mut WebSocket) -> bool {
     match frame.up() {
         "hello" => {
-            let theirs = frame.number("version").unwrap_or_default();
-            if theirs != VERSION {
+            if let Err(theirs) = agrees(&frame) {
                 log::warn!("realtime: a node speaks link version {theirs} and this one {VERSION}");
                 return false;
             }
@@ -1444,6 +1456,24 @@ mod tests {
                 payload: vec![0, 159, 146, 150],
             },
         }
+    }
+
+    /// A node and a holder on different releases is what a rolling
+    /// restart is made of, so the hello is where the two of them find
+    /// out. What matters most is the third case: a hello that carries
+    /// no version is an end old enough not to have sent one, and the
+    /// safe reading of silence is disagreement.
+    #[test]
+    fn a_link_opens_only_between_ends_that_speak_the_same_version() {
+        assert_eq!(
+            agrees(&Wire::of(json!({"up": "hello", "version": VERSION}))),
+            Ok(())
+        );
+        assert_eq!(
+            agrees(&Wire::of(json!({"up": "hello", "version": VERSION + 1}))),
+            Err(VERSION + 1)
+        );
+        assert_eq!(agrees(&Wire::of(json!({"up": "hello"}))), Err(0));
     }
 
     #[test]

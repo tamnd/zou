@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "shard": 7,
+  "chain_epoch": 1,
+  "head": 0,
+  "consolidated_upto": 0,
+  "consolidated_digest": 0,
+  "rounds": null,
+  "gc_round": 0,
+  "sealed_by": "node-1",
+  "sealed_unix": 1767100000
+}
