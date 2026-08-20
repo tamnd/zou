@@ -48,11 +48,15 @@ pub enum CasError {
     /// The caller should re-read and decide again, never blind-retry.
     #[error("version conflict on {key}")]
     Conflict { key: String },
-    #[error("object {key} already exists and is immutable")]
+    #[error(
+        "object {key} already exists and is immutable, the bytes under that key are final, so a writer meaning to replace them has picked a key an earlier write already used, `zou inspect <target> {key}` prints what is under it"
+    )]
     AlreadyExists { key: String },
     /// The guard refused a versioned overwrite of a write-once key. Unlike
     /// Conflict this is not retryable: no version makes it legal.
-    #[error("refusing to overwrite immutable object {key}")]
+    #[error(
+        "refusing to overwrite immutable object {key}, no version makes this legal so retrying cannot help, this is a bug in zou rather than anything to do about the store, please report it with the key"
+    )]
     ImmutableOverwrite { key: String },
     #[error("io error on {key}: {source}")]
     Io {

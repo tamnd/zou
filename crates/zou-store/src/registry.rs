@@ -63,11 +63,17 @@ pub enum RegistryError {
         "{host:?} is not a usable hostname: {why}. It is a DNS name, so it is labels of a to z, 0 to 9 and hyphen joined by dots"
     )]
     BadHost { host: String, why: String },
-    #[error("tenant {tenant_ref} is already registered")]
+    #[error(
+        "tenant {tenant_ref} is already registered, `zou tenant <target> info {tenant_ref}` shows the one that is there, and creating a second under that name would take over its data"
+    )]
     Exists { tenant_ref: String },
-    #[error("{host} is already claimed by another tenant")]
+    #[error(
+        "{host} is already claimed by another tenant, `zou tenant <target> list` shows which, and `zou tenant <target> host remove <ref> {host}` frees it"
+    )]
     HostTaken { host: String },
-    #[error("{host} belongs to {tenant_ref}, not to the tenant asking")]
+    #[error(
+        "{host} belongs to {tenant_ref}, not to the tenant asking, `zou tenant <target> host remove {tenant_ref} {host}` releases it before it can be claimed again"
+    )]
     HostElsewhere { host: String, tenant_ref: String },
     #[error(
         "no tenant {tenant_ref} on this store, `zou tenant <target> list` shows what is registered"

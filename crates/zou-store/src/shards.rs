@@ -48,9 +48,13 @@ pub enum ShardError {
         "no manifest at {key}, the tenant does not exist, `zou tenant <target> list` shows what does"
     )]
     NoTenant { key: String },
-    #[error("tenant already has {MAX_PAGE_SHARDS} shards, the ceiling")]
+    #[error(
+        "tenant already has {MAX_PAGE_SHARDS} shards, the ceiling, a workload that needs more room grows into a second tenant rather than a wider one, `zou tenant <target> create <ref>` makes it"
+    )]
     AtCeiling,
-    #[error("tenant has one shard, nothing to merge")]
+    #[error(
+        "tenant has one shard, nothing to merge, this is already as narrow as a tenant goes so there is nothing to do about it"
+    )]
     AtFloor,
     #[error(transparent)]
     Manifest(#[from] ManifestError),

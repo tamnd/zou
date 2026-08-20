@@ -9,7 +9,13 @@
 //! a ref typed wrong and a tenant never created, have different answers
 //! and the message picks neither.
 //!
-//! So this walks the workspace for the messages of that shape and
+//! The other place is an error that refuses. "destination proj already
+//! exists" and "lease held by node-a" both leave the same gap, and it
+//! is a worse one, because the reader cannot tell from the words
+//! whether they are looking at a normal thing that resolves itself, a
+//! name they should have picked differently, or a bug.
+//!
+//! So this walks the workspace for messages of those shapes and
 //! requires each one to carry a next step. It is a narrow rule on
 //! purpose. A blanket "every message must end in advice" would be
 //! noise: `crc mismatch, frame is corrupt` has no next step worth
@@ -25,30 +31,73 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// A message that says something is absent. Not every phrasing of
-/// absence, only the ones that name a thing the caller asked for by
-/// name and could have asked for differently.
-const ABSENCE: &[&str] = &["does not exist", "no tenant ", "has no manifest"];
+/// The message shapes the rule covers. Not every phrasing of absence or
+/// refusal, only the ones that name a thing the caller asked for and
+/// could have asked for differently, which is what makes a next step
+/// something a reader can act on.
+const STUCK: &[&str] = &[
+    // Something the caller named is not there.
+    "does not exist",
+    "no tenant ",
+    "has no manifest",
+    // Something the caller asked for was refused.
+    "already exists",
+    "already registered",
+    "already claimed",
+    "belongs to",
+    "refusing to",
+    "nothing to merge",
+    "the ceiling",
+    "lease held by",
+    "lease lost",
+];
 
-/// What counts as a next step. Either the message names something to
-/// run, in backticks so it reads as a command and not as prose, or it
-/// says which of the possible causes it is, which is the answer when
-/// there is nothing to run.
+/// What counts as a next step. Usually something to run, in backticks so
+/// it reads as a command and not as prose, or a setting to change. The
+/// rest are for messages whose honest answer is not a command: which of
+/// the possible causes it is, that the thing to do is move a file, stop
+/// a process or file a bug, or that there is genuinely no action.
+///
+/// Be clear about what this can and cannot do. It cannot tell whether an
+/// ending is good advice, only that the author wrote one, and a
+/// determined author gets past it by pasting a backtick. That is fine.
+/// The failure it exists to catch is not bad advice, it is the message
+/// that stops at the diagnosis because nobody thought about the reader,
+/// and for that a check that makes the ending a required field is
+/// enough. Keeping the list short is what keeps it from drifting into a
+/// prose grader that anything passes.
+const NEXT_STEP: &[&str] = &[
+    "`",
+    "ZOU_",
+    "was never created",
+    "report it",
+    "nothing to do about it",
+    "move it aside",
+    "stop this node",
+    "check both",
+];
+
 fn carries_a_next_step(message: &str) -> bool {
-    message.contains('`') || message.contains("was never created") || message.contains("shows what")
+    NEXT_STEP.iter().any(|n| message.contains(n))
 }
 
-/// Messages that report absence to something other than a person, so
-/// the rule does not apply. Each one is here with the reason, because
-/// an exception list nobody has to justify grows until the rule is
-/// gone.
+/// Messages that reach something other than a person, so the rule does
+/// not apply. Each one is here with the reason, because an exception
+/// list nobody has to justify grows until the rule is gone.
+///
 /// Matched as a substring, and written to be specific enough that it
 /// covers only the message it names. The two sites that build this one
 /// spell the interpolation differently, so the shared part is the key.
-const NOT_FOR_A_PERSON: &[(&str, &str)] = &[(
-    "database \\\"",
-    "sqlstate 3D000 on the postgres wire, whose text is fixed by the protocol and which drivers match on, so the place a person gets told what to do is the connection error their client library raises around it",
-)];
+const NOT_FOR_A_PERSON: &[(&str, &str)] = &[
+    (
+        "database \\\"",
+        "sqlstate 3D000 on the postgres wire, whose text is fixed by the protocol and which drivers match on, so the place a person gets told what to do is the connection error their client library raises around it",
+    ),
+    (
+        "A factor with the friendly name",
+        "the body the mfa enroll endpoint returns, which is GoTrue's word for word, so the supabase client libraries and everything written against them already expect this exact string",
+    ),
+];
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -144,11 +193,11 @@ fn literals(text: &str) -> Vec<(usize, String)> {
 }
 
 #[test]
-fn an_error_that_says_a_thing_is_not_there_says_how_to_find_out_what_is() {
+fn an_error_that_reports_absence_or_refuses_says_what_to_do_about_it() {
     let excused: Vec<&str> = NOT_FOR_A_PERSON.iter().map(|(m, _)| *m).collect();
     let mut stuck = Vec::new();
     for (site, message) in messages() {
-        if !ABSENCE.iter().any(|a| message.contains(a)) {
+        if !STUCK.iter().any(|a| message.contains(a)) {
             continue;
         }
         if excused.iter().any(|e| message.contains(e)) {
@@ -179,7 +228,7 @@ fn the_walk_reaches_the_messages_it_is_meant_to_check() {
     );
     let absent = all
         .values()
-        .filter(|m| ABSENCE.iter().any(|a| m.contains(a)))
+        .filter(|m| STUCK.iter().any(|a| m.contains(a)))
         .count();
     assert!(
         absent >= 5,

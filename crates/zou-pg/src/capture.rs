@@ -117,7 +117,9 @@ pub fn upload(
                 existing.len() as u64
             }
             Err(CasError::AlreadyExists { .. }) => {
-                return Err(format!("chk object for {relpath} already exists"));
+                return Err(format!(
+                    "chk object for {relpath} already exists, a checkpoint writes each of its objects once, so the id this run is using was written by an earlier one, `zou info <target> <ref>` lists the checkpoints already there"
+                ));
             }
             Err(e) => return Err(format!("put {relpath}: {e}")),
         };

@@ -226,7 +226,7 @@ impl Smtp {
         if !self.user.is_empty() {
             if !self.may_authenticate(encrypted) {
                 return Err(format!(
-                    "refusing to send the smtp password to {} in the clear",
+                    "refusing to send the smtp password to {} in the clear, the server offered no STARTTLS and this is not loopback, so either point ZOU_SMTP_HOST at a server that does or clear ZOU_SMTP_USER to send unauthenticated",
                     self.host
                 ));
             }

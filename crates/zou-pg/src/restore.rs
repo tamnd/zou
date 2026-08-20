@@ -535,7 +535,7 @@ fn restore_manifest(
 ) -> Result<RestoreStats, String> {
     if pgdata.exists() {
         return Err(format!(
-            "{} already exists, refusing to restore over it",
+            "{} already exists, refusing to restore over it, a restore builds a fresh data directory and will not merge into one, so move it aside or name a path that is not there yet",
             pgdata.display()
         ));
     }

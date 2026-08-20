@@ -58,13 +58,15 @@ pub enum LeaseError {
         "no manifest at {key}, the database does not exist, it was never created here or its prefix was removed"
     )]
     NoManifest { key: String },
-    #[error("lease held by {holder} until unix {expires_unix}")]
+    #[error(
+        "lease held by {holder} until unix {expires_unix}, this is what a second writer is supposed to see, a holder that is still alive keeps renewing and one that died lets it run out and this node takes over on its own, ZOU_LEASE_STEAL=1 takes it now and is only safe once {holder} is known to be stopped"
+    )]
     Held { holder: String, expires_unix: u64 },
     /// The lease runs out further ahead than any correct clock could
     /// have put it. Waiting it out is not an option worth taking, so
     /// this says the number instead of sleeping on it.
     #[error(
-        "lease held by {holder} until unix {expires_unix}, {ahead_secs}s further out than a {ttl_secs}s lease can reach from this clock, so one of the two clocks is wrong or {holder} runs a longer lease ttl than this node"
+        "lease held by {holder} until unix {expires_unix}, {ahead_secs}s further out than a {ttl_secs}s lease can reach from this clock, so one of the two clocks is wrong or {holder} runs a longer lease ttl than this node, check both before doing anything else because neither cause heals on its own, and ZOU_LEASE_STEAL=1 is the deliberate failover once {holder} is known to be stopped"
     )]
     Skew {
         holder: String,
@@ -79,7 +81,9 @@ pub enum LeaseError {
     Raced,
     /// We are no longer the holder, a steal happened. The caller must stop
     /// writing immediately.
-    #[error("lease lost: manifest now shows {holder} on epoch {epoch}")]
+    #[error(
+        "lease lost: manifest now shows {holder} on epoch {epoch}, nothing this node writes from here counts and what it wrote before is unharmed because it sits under its own epoch, stop this node and it reattaches or steps aside on the next start, `zou info <target> <ref>` shows who holds it now"
+    )]
     Lost { holder: String, epoch: u64 },
     #[error(transparent)]
     Manifest(#[from] ManifestError),
