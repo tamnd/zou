@@ -140,28 +140,58 @@ mod tests {
         assert!(DelayConfig::parse("get").is_err());
     }
 
+    /// A store whose only configured delay is the one named, so that
+    /// every other operation on it is wired to a zero.
+    fn only(dir: &std::path::Path, spec: &str) -> DelayStore {
+        DelayStore::new(
+            Box::new(LocalFsStore::new(dir)),
+            DelayConfig::parse(spec).unwrap(),
+        )
+    }
+
+    /// Each operation sleeps for its own configured time and no other.
+    ///
+    /// Every bound here is a lower one, and that is the point. An upper
+    /// bound on how long a call took measures the machine: a windows
+    /// runner sleeping on a 15.6 ms timer failed a 30 ms bound here
+    /// once, the bound was raised to 250 ms, and a loaded runner failed
+    /// that too. Neither failure said anything about the code, and the
+    /// next number would have been the third guess at how slow a shared
+    /// box gets.
+    ///
+    /// A lower bound cannot flake, since a sleep of n never returns
+    /// early, and asking it of one store per operation says the same
+    /// thing the upper bound was reaching for. The bug worth catching
+    /// is a nap wired to the wrong field, and on a store where every
+    /// other field is zero, a get that naps `put_ms` naps for nothing
+    /// and fails its own bound.
     #[test]
-    fn delays_apply_and_results_pass_through() {
+    fn every_operation_sleeps_for_its_own_delay() {
         let dir = tempfile::tempdir().unwrap();
-        let store = DelayStore::new(
-            Box::new(LocalFsStore::new(dir.path())),
-            DelayConfig::parse("put=300").unwrap(),
-        );
+        let nap = Duration::from_millis(120);
+
+        let store = only(dir.path(), "put=120");
         let start = Instant::now();
         store.put("k", b"v").unwrap();
-        assert!(start.elapsed() >= Duration::from_millis(300));
-        // Reads carry no configured delay here and still see the write.
-        //
-        // The bound is most of the configured delay rather than a small
-        // number of milliseconds, because what is being asked is
-        // whether the put's sleep leaked into the get, and a read of a
-        // file in a temporary directory takes as long as the machine
-        // feels like taking. A windows runner sleeping on a 15.6 ms
-        // timer under load failed a 30 ms bound here, which said
-        // nothing about the code.
+        assert!(start.elapsed() >= nap, "put did not sleep for put_ms");
+
+        let store = only(dir.path(), "get=120");
         let start = Instant::now();
         assert_eq!(store.get("k").unwrap().unwrap().0, b"v");
-        assert!(start.elapsed() < Duration::from_millis(250));
+        assert!(start.elapsed() >= nap, "get did not sleep for get_ms");
+
+        let store = only(dir.path(), "list=120");
+        let start = Instant::now();
         assert_eq!(store.list("").unwrap(), vec!["k"]);
+        assert!(start.elapsed() >= nap, "list did not sleep for list_ms");
+
+        let store = only(dir.path(), "delete=120");
+        let start = Instant::now();
+        store.delete("k").unwrap();
+        assert!(start.elapsed() >= nap, "delete did not sleep for delete_ms");
+        assert!(
+            store.get("k").unwrap().is_none(),
+            "the delete passed through"
+        );
     }
 }
