@@ -175,7 +175,7 @@ pub trait CasStore: Send + Sync {
 /// runs. Whether that is available is asked of the filesystem once per
 /// store rather than once per call, since two creators that pick
 /// different ways of saying no do not say it to each other, see
-/// [`LocalFsStore::links_work`].
+/// `LocalFsStore::links_work`.
 pub struct LocalFsStore {
     root: PathBuf,
     /// Whether a write waits for the disk before it says it landed.
@@ -603,7 +603,7 @@ impl CasStore for LocalFsStore {
     /// Create a key, or refuse because something is already there.
     ///
     /// Which mechanism says no is a property of the filesystem and is
-    /// settled before the first create, see [`Self::links_work`]. Asking
+    /// settled before the first create, see `Self::links_work`. Asking
     /// per call is what let two creators of the same key take different
     /// mechanisms and both be told yes, because a link that failed for a
     /// transient reason is a reason only the caller that hit it can see.
