@@ -586,6 +586,13 @@ struct Postmasters {
     /// which is upstream's hosted default and no answer at all for a
     /// node sized for more.
     realtime: zou_server::realtime::Limits,
+    /// What happens to each project's audit trail, read once from the
+    /// node's environment for the same reason the realtime limits are.
+    /// A node is the deployment that most needs a retention: it holds
+    /// hundreds of projects, it runs for months, and nobody is logging
+    /// into any of those databases to delete a year of refresh events
+    /// by hand.
+    audit: zou_server::audit::Settings,
     store: Arc<dyn CasStore>,
     state: Arc<State>,
 }
@@ -1001,6 +1008,7 @@ impl Postmasters {
                 .s3()
                 .map(|(access, secret)| zou_server::s3::Credentials::new(access, secret)),
             realtime: self.realtime,
+            audit: self.audit.clone(),
             ..Config::default()
         }
     }
@@ -1167,6 +1175,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         }),
         http: args.http,
         realtime: zou_server::realtime::limits_from_env()?,
+        audit: zou_server::audit::from_env()?,
         store,
         state: Arc::new(State {
             dying: Mutex::new(HashMap::new()),
@@ -1804,6 +1813,7 @@ mod tests {
 
     fn node(realtime: zou_server::realtime::Limits) -> Postmasters {
         Postmasters {
+            audit: zou_server::audit::Settings::default(),
             target: "s3://bucket/fleet".to_string(),
             pg_bin: PathBuf::from("/nonexistent"),
             runtime: PathBuf::from("/nonexistent"),

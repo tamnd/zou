@@ -4963,7 +4963,7 @@ async fn settle(
     // join it. Everything after this point is the same either way.
     let attached = match flow.target.is_empty() {
         true => attach(sess, &provider.name, person, post, app.cfg.disable_signup).await?,
-        false => link_to(sess, &flow.target, &provider.name, person, post).await?,
+        false => link_to(sess, &flow.target, &provider.name, person, post, &mint.ip).await?,
     };
     let user_id = match attached {
         Attached::User(id) => id,
@@ -5350,6 +5350,7 @@ async fn link_to(
     provider: &str,
     person: &crate::oauth::Person,
     post: &Post<'_>,
+    ip: &str,
 ) -> Result<Attached, Error> {
     let rows = sess
         .query(
@@ -5369,7 +5370,25 @@ async fn link_to(
             },
         ));
     }
-    new_identity(sess, target, provider, person).await?;
+    let identity_id = new_identity(sess, target, provider, person).await?;
+    // Upstream files this one against the account the identity joined
+    // rather than against whoever consented, which are the same person
+    // here because a link only starts from a session on that account.
+    // The traits are the unlink's traits, which is what makes the pair
+    // of them answer how an identity got onto an account and how it
+    // left again with one query.
+    audit::record(
+        sess,
+        Actor::Account(target),
+        Action::IdentityLinked,
+        ip,
+        Some(serde_json::json!({
+            "identity_id": identity_id,
+            "provider": provider,
+            "provider_id": person.sub,
+        })),
+    )
+    .await?;
 
     // An account that holds an address keeps it. The provider has
     // vouched for nothing that would justify moving somebody's account
@@ -5521,7 +5540,7 @@ pub async fn unlink_identity(
         Ok(v) => v,
         Err(e) => return refusal(Error::Db(e), "unlink identity"),
     };
-    let out = unlink(&sess, &caller.user_id, &identity_id).await;
+    let out = unlink(&sess, &caller.user_id, &identity_id, &client_ip(&req)).await;
     match out {
         Ok(()) => match sess.commit().await {
             Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
@@ -5534,7 +5553,12 @@ pub async fn unlink_identity(
     }
 }
 
-async fn unlink(sess: &sql::Session, user_id: &str, identity_id: &str) -> Result<(), Error> {
+async fn unlink(
+    sess: &sql::Session,
+    user_id: &str,
+    identity_id: &str,
+    ip: &str,
+) -> Result<(), Error> {
     // A 404 for a malformed id rather than a 400, which reads oddly
     // and is what upstream answers.
     if !is_uuid(identity_id) {
@@ -5576,7 +5600,7 @@ async fn unlink(sess: &sql::Session, user_id: &str, identity_id: &str) -> Result
         sess,
         Actor::Account(user_id),
         Action::IdentityUnlinked,
-        "",
+        ip,
         Some(serde_json::json!({
             "identity_id": identity_id,
             "provider": provider,
@@ -5615,21 +5639,25 @@ async fn unlink(sess: &sql::Session, user_id: &str, identity_id: &str) -> Result
     Ok(())
 }
 
+/// The new identity's id, which the linking entry in the audit trail
+/// names and which nothing else here needs.
 async fn new_identity(
     sess: &sql::Session,
     user_id: &str,
     provider: &str,
     person: &crate::oauth::Person,
-) -> Result<(), sql::Error> {
-    sess.execute(
-        "insert into auth.identities
-             (provider_id, user_id, identity_data, provider,
-              last_sign_in_at, created_at, updated_at)
-         values ($1, $2::text::uuid, $3::jsonb, $4, now(), now(), now())",
-        &[&person.sub, &user_id, &person.claims, &provider],
-    )
-    .await?;
-    Ok(())
+) -> Result<String, sql::Error> {
+    let rows = sess
+        .query(
+            "insert into auth.identities
+                 (provider_id, user_id, identity_data, provider,
+                  last_sign_in_at, created_at, updated_at)
+             values ($1, $2::text::uuid, $3::jsonb, $4, now(), now(), now())
+             returning id::text",
+            &[&person.sub, &user_id, &person.claims, &provider],
+        )
+        .await?;
+    Ok(rows[0].get(0))
 }
 
 /// What the provider said, folded into the user metadata, which is

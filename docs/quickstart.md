@@ -478,7 +478,7 @@ The two send limits are different in kind. They are not per caller, they are the
 
 ## The audit trail
 
-Every auth event writes a row to `auth.audit_log_entries`, on the same connection and inside the same transaction as the thing it describes. A signup whose transaction rolled back has no signup entry. Nothing has to be switched on and there is nothing to configure.
+Every auth event writes a row to `auth.audit_log_entries`, on the same connection and inside the same transaction as the thing it describes. A signup whose transaction rolled back has no signup entry. Nothing has to be switched on to get this.
 
 A row is mostly one json payload:
 
@@ -492,17 +492,31 @@ select payload ->> 'action'         as action,
  limit 20;
 ```
 
-`action` is one of `login`, `logout`, `user_signedup`, `user_invited`, `user_deleted`, `user_modified`, `user_recovery_requested`, `user_reauthenticate_requested`, `user_confirmation_requested`, `user_repeated_signup`, `user_updated_password`, `token_refreshed`, `token_revoked`, `identity_unlinked`, `factor_in_progress`, `challenge_created`, `verification_attempted`, or `factor_unenrolled`. Alongside it, `log_type` puts each of those in one of six families, `account`, `team`, `token`, `user`, `factor`, and `recovery_codes`, which is what a dashboard groups by. The names do not always line up with the families: `user_signedup` is a `team` event and `login` is an `account` one.
+`action` is one of `login`, `logout`, `user_signedup`, `user_invited`, `user_deleted`, `user_modified`, `user_recovery_requested`, `user_reauthenticate_requested`, `user_confirmation_requested`, `user_repeated_signup`, `user_updated_password`, `token_refreshed`, `token_revoked`, `identity_linked`, `identity_unlinked`, `factor_in_progress`, `challenge_created`, `verification_attempted`, or `factor_unenrolled`. Alongside it, `log_type` puts each of those in one of five families, `account`, `team`, `token`, `user` and `factor`, which is what a dashboard groups by. The names do not always line up with the families: `user_signedup` is a `team` event and `login` is an `account` one. GoTrue has a sixth family, `recovery_codes`, and nothing zou writes lands in it, because the actions that do belong to the passkey endpoints.
 
 `actor_id`, `actor_username` and `actor_via_sso` say who did it, and `actor_name` appears when the account carries a `full_name` in its metadata. Most events also carry a `traits` object with whatever the event has to say for itself, the provider on a login, the factor and challenge on a verification, the account acted on when an admin did the acting.
 
 Three things about this table surprise people, and all three are GoTrue's behaviour rather than choices made here:
 
-- The `ip_address` column is empty on almost every row. Only the four factor events fill it in. The address is in the request either way.
+- The `ip_address` column is empty on almost every row. Only the four factor events and the two identity events fill it in. The address is in the request either way.
 - An admin acting through the service key is not a person. `actor_id` is the nil uuid and `actor_username` is the role name, so every service key action reads as `service_role` rather than naming whoever holds the key. What the admin acted on is in the traits.
 - An anonymous sign in writes nothing at all. Neither does a signup link generated through `/auth/v1/admin/generate_link`.
 
-The table is not swept. Rows accumulate for as long as the project keeps them, and deciding on a retention policy is the operator's job.
+Every entry also goes out on the log stream at info, under the target `zou_server::audit`, which is the copy to ship somewhere that is not this database. It is GoTrue's `auth_audit_event`: the payload the row holds, plus `audit_log_id`, `ip_address` and `created_at`, which live in columns rather than in the payload. Both copies come out of the one statement, so the line says what the row says rather than a second guess at it assembled before the insert. Under `ZOU_LOG_FORMAT=json` the event is the `msg` field, itself a json object, so a collector that unwraps one nested document gets every field of the entry with the trace and span of the request that wrote it beside them. Two things upstream puts on its line are not here: a request id, because the trace and span open the whole request rather than only naming it, and the user agent, which this table has never been able to filter on.
+
+```
+ZOU_AUDIT_LOG_DISABLE_POSTGRES=true
+```
+
+GoTrue's `GOTRUE_AUDIT_LOG_DISABLE_POSTGRES`, off by default. On, and the flows still work and still emit the line, and no row is written. Turn it on when something else is holding the trail and the table is only costing writes.
+
+```
+ZOU_AUDIT_LOG_RETENTION=720h
+```
+
+Off by default, which means rows accumulate forever, the same as upstream. Set it and one node sweeps once an hour, deleting entries older than the retention in batches, taking the oldest first. Which node is whichever one gets a postgres advisory lock, so a fleet of forty holding the same project does one sweep between them rather than forty overlapping ones. The lock is transaction scoped, so it goes back when the sweep ends however it ends. A sweep is capped at two hundred thousand rows and says so in the log when it hits the cap, and the rest go on the next one, which keeps the first sweep after turning this on off the back of a table that has been filling for a year. Anything under an hour is refused at startup rather than accepted and rounded, since the pruner could not honour it.
+
+There is deliberately no index on `created_at`. The only index GoTrue's schema puts on this table is on `instance_id`, which holds the nil uuid in every row and answers nothing, and one on `created_at` would be a write on the hot path of every login, refresh and revoke to save a sequential scan that happens once an hour on a table the sweep is keeping small. Add one if your own dashboard queries want it and the sweep gets faster for free.
 
 ## Types for the client
 

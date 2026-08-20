@@ -77,6 +77,7 @@ struct Inner {
     idle: Mutex<Vec<Client>>,
     bootstrapped: tokio::sync::OnceCell<()>,
     settings: tokio::sync::RwLock<Option<(std::time::Instant, RoleSettings)>>,
+    audit_rows: std::sync::atomic::AtomicBool,
 }
 
 /// What `alter role x set y to z` wrote, per role, already filtered
@@ -534,7 +535,29 @@ impl Pool {
             idle: Mutex::new(Vec::new()),
             bootstrapped: tokio::sync::OnceCell::new(),
             settings: tokio::sync::RwLock::new(None),
+            audit_rows: std::sync::atomic::AtomicBool::new(true),
         })))
+    }
+
+    /// Whether the audit trail is written to this database as well as to
+    /// the log stream, which is the project's `disable_postgres` setting
+    /// inverted.
+    ///
+    /// It lives on the pool rather than being handed to every call
+    /// because the trail is written from forty places, none of which
+    /// hold anything but the session they are already writing on, and
+    /// threading one bool down forty call chains would put it in front
+    /// of everybody reading any of them forever. The pool is the
+    /// project's, the same as the setting, and it is the one thing every
+    /// audit write already has.
+    pub fn write_audit_rows(&self, on: bool) {
+        self.0
+            .audit_rows
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn audit_rows(&self) -> bool {
+        self.0.audit_rows.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn checkout(&self) -> Result<(OwnedSemaphorePermit, Client), Error> {
@@ -848,6 +871,12 @@ pub struct Session {
 }
 
 impl Session {
+    /// The pool this connection came from, which is how a write reaches
+    /// the project settings that are not carried on the request.
+    pub(crate) fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
     fn client(&self) -> &Client {
         self.client
             .as_ref()

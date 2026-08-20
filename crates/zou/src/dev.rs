@@ -312,6 +312,16 @@ fn start_http(
             hook.custom_access_token.uri
         );
     }
+    let audit = zou_server::audit::from_env()?;
+    if let Some(keep) = audit.retention {
+        log::info!(
+            "audit entries older than {} are deleted once an hour",
+            crate::gc::span(keep.as_secs())
+        );
+    }
+    if audit.disable_postgres {
+        log::info!("the audit trail goes to the log stream only, no rows are written");
+    }
     let limit = zou_server::limit::from_env()?;
     // The endpoint budgets are all configured and none of them do
     // anything until this server can tell one caller from another, so
@@ -467,6 +477,11 @@ fn start_http(
             // the mail and the text messages of the whole project
             // whether or not it is.
             limit,
+            // Every row and forever, unless
+            // ZOU_AUDIT_LOG_RETENTION names how long a project wants
+            // its trail kept, or ZOU_AUDIT_LOG_DISABLE_POSTGRES says it
+            // is keeping the log stream instead.
+            audit,
             // What the sockets are allowed, realtime's own numbers: two
             // hundred at once, a hundred joins a second, a hundred
             // channels each, a hundred messages a second, three
