@@ -26,11 +26,13 @@ The Postgres line is the one place zou is deliberately ahead. A suite that depen
 
 ## Where it stands
 
-| surface | passing | of | | notes |
+<!-- the numbers below come from the run, zou-conformance scoreboard --compat writes them -->
+
+| suite | passing | of | | what it is |
 | --- | ---: | ---: | ---: | --- |
-| rest, the hand written suite | 82 | 82 | 100% | the surface a Supabase project actually uses |
-| postgrest, derived from upstream's spec files | 1217 | 1217 | 100% | upstream's own test corpus turned into questions |
-| auth | 73 | 77 | 94% | four known differences, below |
+| rest | 91 | 91 | 100% | the hand written suite, the surface a Supabase project actually uses |
+| postgrest | 1217 | 1217 | 100% | upstream's own test corpus turned into questions, derived from its spec files |
+| auth | 76 | 80 | 95% | the known differences are below |
 | storage | 478 | 478 | 100% | buckets, objects, image transforms, resumable uploads and the S3 protocol |
 | supabase-js | 33 | 33 | 100% | upstream's integration file, url changed, no assertion touched |
 | storage-js | 133 | 133 | 100% | upstream's own tests for the storage client, likewise |
@@ -40,12 +42,16 @@ The Postgres line is the one place zou is deliberately ahead. A suite that depen
 | js-realtime-changes | 11 | 11 | 100% | `postgres_changes`, with a recorded frame golden |
 | js-functions | 29 | 29 | 100% | a function's answers, asked of edge-runtime in the same run |
 
+<!-- end of the numbers from the run -->
+
+The four numeric cells on each of those rows are written by the run rather than typed, by the same command and in the same CI job that writes [docs/scoreboard.md](scoreboard.md), so the two pages cannot say different things about the same merge. What is in the last cell is a person's and is left alone.
+
 A known difference still counts as a failure in every number above. It is excused from the exit code and from nothing else, so the score cannot be improved by writing an explanation down.
 
-The last five are asked of both servers in one CI run rather than compared with a recording, because a recording of a socket or of a function is a recording of the thing that answered it.
+The rows compared with `supabase start` are asked of both servers in one CI run rather than compared with a recording, because a recording of a socket or of a function is a recording of the thing that answered it.
 Whatever `supabase start` says is the expected answer for zou, in the same job, on the same fixtures.
 
-Next to those eleven there are three more things that have no number, because they either work or they do not: three of Supabase's own example apps, unedited, driven through a browser on every push. The only file either of them gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints.
+Next to the suites there are three more things that have no number, because they either work or they do not: three of Supabase's own example apps, unedited, driven through a browser on every push. The only file either of them gains is the `.env` its own `.env.example` asks for, holding the url and the anon key the Supabase CLI prints.
 
 `examples/todo-list/sveltejs-todo-list` covers signing up, signing in, a row level security policy holding between two accounts, and a Github login that goes all the way through the code exchange and comes back as a session. Details in [demo/README.md](https://github.com/tamnd/zou-conformance/blob/main/demo/README.md).
 
@@ -111,7 +117,7 @@ The S3 protocol half of that is asked with a key pair rather than with an anon o
 
 The bytes of an object go to the same place the pages do: a directory on a laptop, a prefix on an object store, opened by the same code the engine opens its own target with, and under the same tenant prefix as the database whose rows describe them, at `tenants/<ref>/files/`. One prefix per tenant is what lets a bucket hold more than one project without either of them being able to name the other's bytes. A server that names no tenant serves `local`, which is what a single database deployment is. A server built without a store at all answers the bucket surface and refuses the routes that carry bytes, because writing files somewhere nobody asked for would be worse than saying so.
 
-This is also why the supabase-js run skips 17 of its cases, and why the storage-js run skips three of its five. They are skipped rather than deleted so the count keeps saying how much of the file is not being asked, and the other two of the five are skips upstream carries itself.
+This is also why some of the cases in the supabase-js and storage-js runs are skipped. They are skipped rather than deleted so the count keeps saying how much of the file is not being asked, and some of them are skips upstream carries itself. Which ones, and how many, is the skipped column of the per block tables on [docs/scoreboard.md](scoreboard.md).
 
 ## The database underneath
 
@@ -125,7 +131,7 @@ Two servers can agree on every answer and still be sitting on different database
 
 ## What the suites do not ask yet
 
-The honest reading of a 94% is that it is 94% of the questions somebody thought to write down. These are the areas where the number above is a lower bound on the work and an upper bound on the confidence, tracked on [#170](https://github.com/tamnd/zou/issues/170):
+The honest reading of the auth row above is that it is a percentage of the questions somebody thought to write down. These are the areas where that number is a lower bound on the work and an upper bound on the confidence, tracked on [#170](https://github.com/tamnd/zou/issues/170):
 
 - The MFA flow past the factor listing: enroll to challenge to verify, and the `aal2` claim that comes out of it.
 - PKCE, the `code` grant and the flow state behind it.
@@ -184,6 +190,6 @@ That is the whole design: the recordings belong to upstream, they live in their 
 
 ## How this page stays true
 
-The tables come from the same run `docs/scoreboard.md` does. The three known differences are the contents of `known.json`, not a memory of them. The gap lists are the open boxes on [#125](https://github.com/tamnd/zou/issues/125), [#170](https://github.com/tamnd/zou/issues/170), [#190](https://github.com/tamnd/zou/issues/190), [#303](https://github.com/tamnd/zou/issues/303) and [#369](https://github.com/tamnd/zou/issues/369), one per surface, which are ticked by the pull request that earns them.
+The table at the top is written by the run that writes `docs/scoreboard.md`, in the same job, out of the same reports, which is what makes the two pages one claim rather than two. It was typed by hand until [#532](https://github.com/tamnd/zou/issues/532), and by then it had drifted by nine cases on one row and a whole known difference on another, which is the argument. The known differences below it are the contents of `known.json`, not a memory of them. The gap lists are the open boxes on [#125](https://github.com/tamnd/zou/issues/125), [#170](https://github.com/tamnd/zou/issues/170), [#190](https://github.com/tamnd/zou/issues/190), [#303](https://github.com/tamnd/zou/issues/303) and [#369](https://github.com/tamnd/zou/issues/369), one per surface, which are ticked by the pull request that earns them.
 
 If something on this page is out of date, the fix is upstream of the page: prune the known list, tick the box, bump the pin.

@@ -1642,9 +1642,10 @@ jobs:
             --ours js-realtime-changes=/tmp/reports/js-realtime-changes.json \
             --ours js-functions=/tmp/reports/js-functions.json \
             --pin "$(jq -r .ref conformance/suites.json)" \
-            --out docs/scoreboard.md
-      # Nothing in the file moves on its own, so a merge that changed no
-      # number leaves no diff and there is no commit. The skip marker
+            --out docs/scoreboard.md \
+            --compat docs/compatibility.md
+      # Nothing in either file moves on its own, so a merge that changed
+      # no number leaves no diff and there is no commit. The skip marker
       # keeps the one that does from starting the whole workflow again
       # to measure what it just measured.
       #
@@ -1653,15 +1654,16 @@ jobs:
       # if the file has been written in the meantime, because whoever
       # wrote it did so for a later commit than this one and the older
       # numbers are the ones worth losing.
-      - name: Commit it if a number moved
+      - name: Commit them if a number moved
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- docs/scoreboard.md; then
+          pages="docs/scoreboard.md docs/compatibility.md"
+          if git diff --quiet -- $pages; then
             echo "no number moved"
             exit 0
           fi
-          git add docs/scoreboard.md
+          git add $pages
           git commit -m "Scoreboard for ${GITHUB_SHA:0:12} [skip ci]"
           for attempt in 1 2 3; do
             if git push origin HEAD:main; then
@@ -1674,7 +1676,7 @@ jobs:
               echo "a later run wrote the scoreboard first, leaving it"
               exit 0
             fi
-            if git diff --quiet origin/main -- docs/scoreboard.md; then
+            if git diff --quiet origin/main -- $pages; then
               echo "a later run wrote the same numbers, nothing to push"
               exit 0
             fi

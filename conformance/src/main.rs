@@ -76,6 +76,9 @@ the scoreboard
                            the same json: --ours js-functions=/tmp/fn.json
   --pin <sha>              the zou-conformance commit the suites came from
   --out <path>             where to write it, stdout when absent
+  --compat <path>          a hand written page whose marked table holds the
+                           same numbers, rewritten in place from this run so
+                           that nobody has to type them twice
 
 serving
   --zou-dsn <dsn>          the database it reads
@@ -177,6 +180,7 @@ struct Args {
     ours: Vec<String>,
     pin: Option<String>,
     out: Option<String>,
+    compat: Option<String>,
     fan_out: bool,
 }
 
@@ -216,6 +220,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         pin: None,
         fan_out: false,
         out: None,
+        compat: None,
     };
     let mut it = argv.iter();
     args.mode = match it.next() {
@@ -267,6 +272,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--ours" => args.ours.push(need("--ours")?),
             "--pin" => args.pin = Some(need("--pin")?),
             "--out" => args.out = Some(need("--out")?),
+            "--compat" => args.compat = Some(need("--compat")?),
             "--port" => {
                 let value = need("--port")?;
                 args.port = value
@@ -302,9 +308,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         || !args.ours.is_empty()
         || args.pin.is_some()
         || args.out.is_some()
+        || args.compat.is_some()
     {
         return Err(format!(
-            "--report, --js, --ours, --pin and --out are for scoreboard, not {}",
+            "--report, --js, --ours, --pin, --out and --compat are for scoreboard, not {}",
             args.mode
         ));
     }
@@ -587,6 +594,17 @@ fn published(args: &Args) -> Result<bool, String> {
             println!("wrote {path}, {} suites", runs.len());
         }
         None => print!("{text}"),
+    }
+    // The hand written page is the other half of the same idea. It is
+    // rewritten here rather than beside here so that the numbers on it
+    // cannot have come from a different run than the scoreboard's, which
+    // is the whole of what it promises its reader.
+    if let Some(path) = &args.compat {
+        let page = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let counts = scoreboard::counted(&runs, &js, &ours);
+        let rewritten = scoreboard::recount(&page, &counts).map_err(|e| format!("{path}: {e}"))?;
+        std::fs::write(path, &rewritten).map_err(|e| format!("{path}: {e}"))?;
+        println!("wrote {path}, {} rows", counts.len());
     }
     Ok(true)
 }
@@ -1124,6 +1142,25 @@ mod tests {
         assert_eq!(args.out.as_deref(), Some("docs/scoreboard.md"));
         assert!(parse(&argv(&["scoreboard", "--out", "docs/scoreboard.md"])).is_err());
         assert!(parse(&argv(&["scoreboard", "--report", "r.json", "--url", "u"])).is_err());
+    }
+
+    /// The page it also writes is the same run, so it is a flag on the
+    /// same command rather than a second command somebody could forget
+    /// to run.
+    #[test]
+    fn the_hand_written_page_is_written_by_the_same_command() {
+        let args = parse(&argv(&[
+            "scoreboard",
+            "--report",
+            "rest.json",
+            "--out",
+            "docs/scoreboard.md",
+            "--compat",
+            "docs/compatibility.md",
+        ]))
+        .expect("parses");
+        assert_eq!(args.compat.as_deref(), Some("docs/compatibility.md"));
+        assert!(parse(&argv(&["check", "--url", "u", "--compat", "docs/x.md"])).is_err());
     }
 
     /// One client per run of its own tests, and there is more than one
