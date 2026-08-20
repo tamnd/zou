@@ -171,7 +171,11 @@ pub trait CasStore: Send + Sync {
 /// Create if absent does not use the lock at all, because the lock is
 /// breakable and this one operation must hold against a writer that was
 /// stopped mid put and comes back minutes later. It publishes by hard
-/// link instead, which fails against whatever is at the key when it runs.
+/// link instead, which fails against whatever is at the key when it
+/// runs. Whether that is available is asked of the filesystem once per
+/// store rather than once per call, since two creators that pick
+/// different ways of saying no do not say it to each other, see
+/// `LocalFsStore::links_work`.
 pub struct LocalFsStore {
     root: PathBuf,
     /// Whether a write waits for the disk before it says it landed.
@@ -179,6 +183,9 @@ pub struct LocalFsStore {
     /// True everywhere except a store that carries the scratch marker,
     /// see [`SCRATCH_MARKER`].
     durable: bool,
+    /// Whether this filesystem makes hard links, asked once and then
+    /// remembered, see [`LocalFsStore::links_work`].
+    links: std::sync::OnceLock<bool>,
 }
 
 /// A file at the root of a store that says its contents are disposable.
@@ -204,7 +211,49 @@ impl LocalFsStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let durable = !root.join(SCRATCH_MARKER).exists();
-        Self { root, durable }
+        Self {
+            root,
+            durable,
+            links: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Whether a create on this store is decided by a hard link or by
+    /// the key lock, asked of the filesystem once and then held.
+    ///
+    /// It is one answer per store and not one per call, and that is the
+    /// whole point of it. A link and a lock are two ways of saying no to
+    /// a second creator, and they do not say it to each other: a caller
+    /// that links while another caller, refused a link a moment ago, is
+    /// inside the lock writing the same key, gets two winners out of a
+    /// race that has exactly one. Deciding per call is what made that
+    /// reachable, since the decision was a transient error from one
+    /// link, and a transient error is by definition something the next
+    /// caller does not see.
+    ///
+    /// So the question asked here is about the filesystem rather than
+    /// about the call: exFAT on a usb stick and some network mounts make
+    /// no links, and everything else does. The probe is two files in the
+    /// store root, named so that two processes probing at once cannot
+    /// collide.
+    fn links_work(&self) -> bool {
+        *self.links.get_or_init(|| {
+            if fs::create_dir_all(&self.root).is_err() {
+                return false;
+            }
+            let from = self.root.join(format!(".zou-links-{}.tmp", stamp()));
+            let to = from.with_extension("link.tmp");
+            let made = fs::File::create(&from).is_ok() && fs::hard_link(&from, &to).is_ok();
+            let _ = fs::remove_file(&from);
+            let _ = fs::remove_file(&to);
+            if !made {
+                log::warn!(
+                    "localfs: {} makes no hard links, so creates are decided by the key lock instead, which a stalled writer can break",
+                    self.root.display()
+                );
+            }
+            made
+        })
     }
 
     /// Say that the store at `root` is scratch. Stores opened on it after
@@ -287,6 +336,10 @@ impl LocalFsStore {
 /// Held while mutating one key. Dropping releases the lock.
 struct KeyLock {
     dir: PathBuf,
+    /// The name of this acquisition's stamp file, which is what makes
+    /// [`Self::still_mine`] an answer about this lock rather than about
+    /// this process. See [`stamp`].
+    stamp: String,
 }
 
 impl KeyLock {
@@ -303,8 +356,9 @@ impl KeyLock {
                     // Stamp the holder pid so a waiter can tell a crashed
                     // owner from a slow one. A failed stamp only costs the
                     // early break, the age rule still applies.
-                    let _ = fs::File::create(dir.join(format!("pid-{}", std::process::id())));
-                    return Ok(Self { dir });
+                    let stamp = stamp();
+                    let _ = fs::File::create(dir.join(&stamp));
+                    return Ok(Self { dir, stamp });
                 }
                 Err(e) if lock_busy(&e) => {
                     // A crash between mkdir and Drop leaves the lock dir
@@ -344,10 +398,29 @@ impl KeyLock {
     /// comes back to a lock that is somebody else's or gone, and knows
     /// another writer has had the key in the meantime.
     fn still_mine(&self) -> bool {
-        self.dir
-            .join(format!("pid-{}", std::process::id()))
-            .exists()
+        self.dir.join(&self.stamp).exists()
     }
+}
+
+/// A name for one acquisition of one lock.
+///
+/// The pid is in it because a waiter deciding whether to break a lock
+/// asks whether its holder is still alive, and localfs means one host,
+/// so a pid is the whole of that question. The counter is in it because
+/// a pid is not enough to say *which* holder: two threads of one process
+/// stamp the same name, and then a holder whose lock was broken and
+/// taken by a sibling thread looks at the thief's stamp, reads its own
+/// pid, and concludes it still holds a lock somebody else is inside.
+///
+/// That is how two writers got into the critical section on windows,
+/// where everything is slow enough for a live holder to pass the stale
+/// age. It is not a windows bug, it is a stamp that answered the wrong
+/// question, and every platform could hit it under a long enough stall.
+fn stamp() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("pid-{}-{n}", std::process::id())
 }
 
 /// How old a lock dir must be before a waiter breaks it. The default is
@@ -393,9 +466,13 @@ fn lock_owner_dead(dir: &Path) -> bool {
     let mut stamped = false;
     for entry in entries.flatten() {
         let name = entry.file_name();
+        // `pid-<pid>-<n>`, and `pid-<pid>` from a store last written by
+        // a build before the counter existed. Either way what is being
+        // asked is whose process it was.
         let Some(pid) = name
             .to_str()
             .and_then(|n| n.strip_prefix("pid-"))
+            .map(|n| n.split_once('-').map_or(n, |(pid, _)| pid))
             .and_then(|n| n.parse::<u32>().ok())
         else {
             continue;
@@ -474,8 +551,12 @@ impl Drop for KeyLock {
     fn drop(&mut self) {
         // Only our own stamp comes out. If a breaker handed this lock
         // to a new holder while we were still alive, the remove_dir
-        // fails on their stamp and their lock survives us.
-        let _ = fs::remove_file(self.dir.join(format!("pid-{}", std::process::id())));
+        // fails on their stamp and their lock survives us. That holds
+        // for a thief in this process too, which is what the counter in
+        // the stamp name buys: before it, this line removed the thief's
+        // stamp and the remove_dir below then deleted a lock somebody
+        // else was inside.
+        let _ = fs::remove_file(self.dir.join(&self.stamp));
         let _ = fs::remove_dir(&self.dir);
     }
 }
@@ -519,21 +600,25 @@ impl CasStore for LocalFsStore {
         Ok(Some(data))
     }
 
+    /// Create a key, or refuse because something is already there.
+    ///
+    /// Which mechanism says no is a property of the filesystem and is
+    /// settled before the first create, see `Self::links_work`. Asking
+    /// per call is what let two creators of the same key take different
+    /// mechanisms and both be told yes, because a link that failed for a
+    /// transient reason is a reason only the caller that hit it can see.
+    /// On a filesystem that makes no links there is nothing to fence a
+    /// frozen writer with, so the lock is the best available answer and
+    /// the warning at the probe is where that is said.
     fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<Version, CasError> {
-        let path = self.path_for(key);
-        match self.publish(key, &path, data) {
-            // A filesystem without hard links, exFAT on a usb stick or
-            // some network mounts. Nothing frozen can be fenced there,
-            // so fall back to the lock and say so once.
-            Err(CasError::Io { source, .. }) if source.kind() != std::io::ErrorKind::NotFound => {
-                log::warn!("localfs: {key} cannot be created by link ({source}), using the lock");
-                match self.put_if_match(key, data, None) {
-                    Err(CasError::Conflict { key }) => Err(CasError::AlreadyExists { key }),
-                    other => other,
-                }
-            }
-            other => other,
+        if !self.links_work() {
+            return match self.put_if_match(key, data, None) {
+                Err(CasError::Conflict { key }) => Err(CasError::AlreadyExists { key }),
+                other => other,
+            };
         }
+        let path = self.path_for(key);
+        self.publish(key, &path, data)
     }
 
     fn put_if_match(
@@ -706,6 +791,46 @@ mod tests {
         assert!(lock_expired(&lock, Duration::ZERO));
     }
 
+    /// A holder whose lock was broken and taken has to know, and it has
+    /// to know when the thief is a thread of its own process.
+    ///
+    /// The stamp used to be the pid alone, which is the right question
+    /// for "is the holder still alive" and the wrong one for "is this
+    /// still my lock". Two threads stamped the same name, so the victim
+    /// read the thief's stamp, recognised its own pid, and carried on
+    /// into a critical section somebody else was already in. On windows
+    /// that is reachable without freezing anything, because a live
+    /// holder there can take longer than the stale age over one small
+    /// write, and it is how a creator race elected two winners.
+    #[test]
+    fn a_lock_stolen_by_a_sibling_thread_is_noticed_by_the_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("contended");
+        let lock = path.with_extension("lock");
+
+        let held = KeyLock::acquire(&path, "contended").unwrap();
+        assert!(held.still_mine());
+
+        // What a waiter does to a lock it has decided is stale, done
+        // here with a zero age so nothing has to sleep for it.
+        std::thread::sleep(Duration::from_millis(2));
+        break_stale_lock(&lock, Duration::ZERO);
+        let thief = KeyLock::acquire(&path, "contended").unwrap();
+
+        assert!(thief.still_mine(), "the thief holds the lock it took");
+        assert!(
+            !held.still_mine(),
+            "the holder did not notice its lock had been taken, so both are in the critical section"
+        );
+
+        // And the victim going away leaves the thief holding it.
+        drop(held);
+        assert!(
+            thief.still_mine(),
+            "the victim's release took the thief's lock with it"
+        );
+    }
+
     #[test]
     fn a_released_lock_leaves_nothing_behind() {
         let dir = tempfile::tempdir().unwrap();
@@ -725,8 +850,16 @@ mod tests {
         let frozen = KeyLock::acquire(&dir.path().join("seq"), "seq").expect("hold the lock");
 
         // The successor creates the object without waiting on a lock it
-        // could only take by breaking.
+        // could only take by breaking, so the frozen writer is still
+        // holding the lock it froze with afterwards. That is the
+        // assertion rather than how long the create took, because the
+        // difference between the two paths is whether a lock was broken
+        // and not how slow the machine is.
         store.put_if_absent("seq", b"the seal").expect("created");
+        assert!(
+            frozen.still_mine(),
+            "the create went through the lock and broke a live holder's"
+        );
 
         // And the thaw: the same PUT the frozen writer had in flight,
         // arriving after. It loses, and takes nothing with it.
@@ -736,6 +869,34 @@ mod tests {
         }
         assert_eq!(store.get("seq").unwrap().unwrap().0, b"the seal");
         drop(frozen);
+    }
+
+    /// Which way a create says no is settled once, because two creators
+    /// on different mechanisms do not exclude each other.
+    #[test]
+    fn the_link_probe_is_asked_once_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        assert!(
+            store.links_work(),
+            "a temporary directory makes hard links on every platform this builds for"
+        );
+        store.put_if_absent("k", b"v").expect("created");
+
+        // The probe writes two files at the root, and list skips
+        // anything ending .tmp, so ask the directory instead.
+        let left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".zou-links-"))
+            .collect();
+        assert!(left.is_empty(), "the probe left {left:?} in the store");
+
+        // Asked once: the answer outlives the directory it was asked
+        // about, which a second probe would have to recreate to run.
+        fs::remove_dir_all(dir.path()).unwrap();
+        assert!(store.links_work());
+        assert!(!dir.path().exists(), "the probe ran a second time");
     }
 
     /// The marker is a property of the directory, so a store opened on a
