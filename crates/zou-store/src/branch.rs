@@ -23,6 +23,8 @@
 //! way. History only survives the gc retention window, so PITR reaches
 //! back exactly that far.
 
+use std::collections::BTreeSet;
+
 use crate::cas::{CasError, CasStore};
 use crate::layermap::LayerDesc;
 use crate::layout::TenantLayout;
@@ -77,7 +79,7 @@ pub fn branch(
     };
     let parent = Manifest::from_json(&data)?;
     let child = child_of(&parent, src_ref, dst_ref, at_lsn, now_unix)?;
-    branch_shards(store, src_ref, dst_ref, branch_point(&child))?;
+    branch_shards(store, src_ref, dst_ref, branch_point(&child), parent.shards)?;
     publish_child(store, dst_ref, &child)?;
     Ok(child)
 }
@@ -95,7 +97,13 @@ pub fn materialize_at(
 ) -> Result<Manifest, BranchError> {
     let snapshot = snapshot_at(store, src_ref, unix_ts)?;
     let child = child_of(&snapshot, src_ref, dst_ref, None, now_unix)?;
-    branch_shards(store, src_ref, dst_ref, branch_point(&child))?;
+    branch_shards(
+        store,
+        src_ref,
+        dst_ref,
+        branch_point(&child),
+        snapshot.shards,
+    )?;
     publish_child(store, dst_ref, &child)?;
     Ok(child)
 }
@@ -247,14 +255,27 @@ fn branch_shards(
     src_ref: &str,
     dst_ref: &str,
     at: Lsn,
+    shards: u32,
 ) -> Result<(), BranchError> {
     let src = TenantLayout::new(src_ref);
     let dst = TenantLayout::new(dst_ref);
-    let keys: Vec<String> = store
+    // The listing finds the ancestor shards of past eras, which a
+    // shrunk tenant still reads through and which nothing but the
+    // prefix knows about. The live shards come from the count in the
+    // manifest instead, because no object store promises a listing has
+    // caught up with a write that landed a moment ago, and a shard the
+    // listing missed would be a child published complete with one of
+    // its layer lists silently absent. A key that is genuinely not
+    // there loads as None either way.
+    let mut keys: BTreeSet<String> = store
         .list(&src.shards_dir())?
         .into_iter()
         .filter(|k| k.ends_with("/SHARD"))
         .collect();
+    for shard in 0..shards as u16 {
+        keys.insert(src.shard_manifest(shard));
+    }
+    let keys: Vec<String> = keys.into_iter().collect();
     // Every shard is asked before anything is written. A branch below
     // the horizon cannot be served, and finding that out on the fourth
     // shard after three child manifests have landed would leave a half
@@ -525,7 +546,7 @@ mod tests {
         setup_shard(&store);
         // A first attempt died after writing the shard manifest but
         // before the tenant manifest landed.
-        branch_shards(&store, "p", "c", Lsn(0x100)).unwrap();
+        branch_shards(&store, "p", "c", Lsn(0x100), 1).unwrap();
         assert!(
             store
                 .get(&TenantLayout::new("c").manifest())

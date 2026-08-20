@@ -1700,7 +1700,14 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     let holder = wal_holder();
     let held = match lease::acquire(&*store, &layout, &holder, WAL_LEASE_TTL_SECS, now_unix()) {
         Ok(held) => held,
-        Err(lease::LeaseError::Held { holder: other, .. }) if lease_steal_requested() => {
+        // Skew belongs on this arm with Held. It is the same refusal
+        // with a diagnosis attached, and it is the case an operator is
+        // most likely to be reaching for the steal in: a holder whose
+        // clock wrote an expiry nobody can wait out.
+        Err(
+            lease::LeaseError::Held { holder: other, .. }
+            | lease::LeaseError::Skew { holder: other, .. },
+        ) if lease_steal_requested() => {
             // The supervisor set ZOU_LEASE_STEAL because it knows the
             // holder is dead. Epoch fencing keeps this safe if it is
             // wrong; the log line keeps it auditable.
@@ -1717,7 +1724,10 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
                 }
             }
         }
-        Err(lease::LeaseError::Held { .. }) => return Err(ZOU_ERR_LEASE_HELD),
+        Err(e @ (lease::LeaseError::Held { .. } | lease::LeaseError::Skew { .. })) => {
+            log::error!("zou_wal_open: {e}");
+            return Err(ZOU_ERR_LEASE_HELD);
+        }
         Err(_) => return Err(ZOU_ERR_STORE),
     };
     // The lease epoch fences frames in the shared log too: the sequencer

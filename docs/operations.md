@@ -91,6 +91,21 @@ Keep the worst case clock skew across nodes under TTL/3, 5 seconds at the defaul
 NTP or chrony disciplined hosts sit under 100 ms, which leaves the entire slack budget for object store hiccups.
 If your environment cannot bound skew, raise the TTL rather than living with spurious steals, the cost is a longer failover wait after an unclean crash.
 
+The other direction costs more and is quieter.
+A holder whose clock runs fast by S seconds writes an expiry S seconds further out than it should, and every other node reads it.
+Nothing fails, nothing is lost, and the tenant simply stops failing over for S seconds, which for a host that came up before NTP disciplined it can be an hour.
+A node that reads a lease running out further ahead than its own clock plus the TTL can reach says so by name:
+
+```
+lease held by node-7 until unix 1798000000, 3595s further out than a 15s lease can reach from this clock, so one of the two clocks is wrong or node-7 runs a longer lease ttl than this node
+```
+
+Both halves of that sentence are worth checking.
+The usual cause is a clock, and `zou doctor` on each node reports what it can prove about its own.
+The other cause is real: a node configured with a longer TTL than this one writes expiries this one cannot account for, and a rolling change to the TTL looks exactly like skew from the node that has not been restarted yet.
+Neither is a safety problem and neither self heals, so the fix is the clock or the config, not a wait.
+Once the holder is confirmed dead, `ZOU_LEASE_STEAL=1` on the node taking over is the deliberate failover, the same escape hatch as any other stuck lease, and it is safe here for the same reason it is safe there: the epoch bump fences the old holder whatever its clock says.
+
 ## Checking a store
 
 `zou doctor <target>` runs the operations the engine depends on against a scratch prefix and reports what the backend actually did.
