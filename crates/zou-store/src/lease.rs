@@ -23,6 +23,12 @@ use crate::manifest::{Lease, Manifest, ManifestError};
 /// Default lease TTL in seconds. Renewal should run at a third of this.
 pub const DEFAULT_TTL_SECS: u64 = 15;
 
+/// How far past the arithmetic bound a lease may sit before the
+/// disagreement is called skew rather than absorbed. A second of it is
+/// clock granularity on both ends, the rest is the round trip between
+/// the holder's CAS and this node's read.
+pub const SKEW_GRACE_SECS: u64 = 5;
+
 /// Proof of a successful acquisition. The fence goes into every WAL frame
 /// the holder writes, and the version pins the manifest for the next CAS.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +58,19 @@ pub enum LeaseError {
     NoManifest { key: String },
     #[error("lease held by {holder} until unix {expires_unix}")]
     Held { holder: String, expires_unix: u64 },
+    /// The lease runs out further ahead than any correct clock could
+    /// have put it. Waiting it out is not an option worth taking, so
+    /// this says the number instead of sleeping on it.
+    #[error(
+        "lease held by {holder} until unix {expires_unix}, {ahead_secs}s further out than a {ttl_secs}s lease can reach from this clock, so one of the two clocks is wrong or {holder} runs a longer lease ttl than this node"
+    )]
+    Skew {
+        holder: String,
+        expires_unix: u64,
+        ttl_secs: u64,
+        /// How far past the furthest a correct clock could have placed it.
+        ahead_secs: u64,
+    },
     /// Someone swapped the manifest between our read and our write.
     /// Re-read and decide again.
     #[error("lost a manifest race, re-read and retry")]
@@ -310,6 +329,20 @@ fn take(
     if !force && let Some(lease) = &manifest.lease {
         let expired = lease.expires_unix <= now_unix;
         if !expired && lease.holder != holder {
+            // The furthest out a correct clock could have put this: the
+            // holder wrote `its now + ttl` at the CAS, and that CAS
+            // happened before this read, so anything past our own now
+            // plus the ttl is somebody's clock being wrong. Only the
+            // grace separates a marginal disagreement from a real one.
+            let furthest = now_unix + ttl_secs + SKEW_GRACE_SECS;
+            if lease.expires_unix > furthest {
+                return Err(LeaseError::Skew {
+                    holder: lease.holder.clone(),
+                    expires_unix: lease.expires_unix,
+                    ttl_secs,
+                    ahead_secs: lease.expires_unix - furthest,
+                });
+            }
             return Err(LeaseError::Held {
                 holder: lease.holder.clone(),
                 expires_unix: lease.expires_unix,
