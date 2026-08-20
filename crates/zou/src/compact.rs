@@ -172,7 +172,10 @@ fn parse_fold(argv: &[String]) -> Result<Fold, String> {
                 fold.at = Some(
                     other
                         .parse()
-                        .map_err(|e| format!("bad horizon lsn {other:?}: {e}"))?,
+                        // The lsn parse names the value and the form it
+                        // wanted, so repeating the value here would say
+                        // it twice in one line.
+                        .map_err(|e| format!("bad horizon: {e}"))?,
                 )
             }
             other => return Err(format!("unexpected argument {other:?}\n{USAGE}")),

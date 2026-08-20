@@ -58,9 +58,9 @@ fn parse(argv: &[String], usage: &str) -> Result<Args, String> {
         match arg.as_str() {
             "--jobs" => {
                 let value = rest.next().ok_or_else(|| usage.to_string())?;
-                jobs = value
-                    .parse()
-                    .map_err(|_| format!("bad job count {value:?}"))?;
+                jobs = value.parse().map_err(|_| {
+                    format!("bad job count {value:?}, write a whole number of jobs")
+                })?;
                 if jobs == 0 {
                     return Err("a copy with no jobs copies nothing".into());
                 }

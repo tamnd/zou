@@ -360,7 +360,7 @@ fn with_reader<R>(
     }
     let mut slot = shim.reader.lock().map_err(|_| ())?;
     if matches!(*slot, ReaderSlot::Unset) {
-        *slot = if std::env::var("ZOU_CHAIN_READER").is_ok_and(|v| v == "0") {
+        *slot = if zou_store::setting::flag("ZOU_CHAIN_READER") == Some(false) {
             ReaderSlot::Off
         } else {
             match reader::ChainReader::attach(&shim.store, &shim.layout) {
@@ -1552,21 +1552,36 @@ pub(crate) fn log_store(store: Arc<dyn CasStore>, layout: &TenantLayout) -> Arc<
 /// The sequencer defaults, with two knobs for bench work. The window
 /// trades commit latency against request count and ZOU_WAL_INFLIGHT
 /// caps how many landing PUTs ride the wire at once; both fall back
-/// to the library defaults when unset or unparsable.
+/// to the library defaults when unset, and say so when set to
+/// something that cannot be used.
 fn sequencer_config_from_env() -> zou_log::SequencerConfig {
     let mut config = zou_log::SequencerConfig::default();
-    if let Some(ms) = std::env::var("ZOU_WAL_WINDOW_MS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        && ms > 0.0
+    if let Some(ms) =
+        zou_store::setting::number::<f64>("ZOU_WAL_WINDOW_MS", "a number of milliseconds")
     {
-        config.window = std::time::Duration::from_secs_f64(ms / 1000.0);
+        // A window of zero or less is not a faster window, it is no
+        // window, and the sequencer has no meaning for it. Refusing it
+        // out loud beats letting somebody think they turned batching
+        // off when they set it to 0.
+        match ms > 0.0 {
+            true => config.window = std::time::Duration::from_secs_f64(ms / 1000.0),
+            false => log::warn!(
+                "ZOU_WAL_WINDOW_MS is set to {ms}, which is not above zero, so it is being ignored and the default window of {:?} is being used",
+                config.window
+            ),
+        }
     }
-    if let Some(n) = std::env::var("ZOU_WAL_INFLIGHT")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+    if let Some(n) =
+        zou_store::setting::number::<usize>("ZOU_WAL_INFLIGHT", "a whole number of requests")
     {
         config.inflight = n.clamp(1, zou_log::MAX_INFLIGHT);
+        if config.inflight != n {
+            log::warn!(
+                "ZOU_WAL_INFLIGHT is set to {n}, which is outside the 1 to {} this build allows, so {} is being used",
+                zou_log::MAX_INFLIGHT,
+                config.inflight
+            );
+        }
     }
     config
 }
@@ -1648,7 +1663,11 @@ impl Laps {
 /// when the previous holder is known dead; see [`zou_store::lease::steal`]
 /// for why a wrong call fences a live writer instead of corrupting it.
 fn lease_steal_requested() -> bool {
-    std::env::var("ZOU_LEASE_STEAL").is_ok_and(|v| v == "1" || v == "on")
+    // Read as a flag rather than against one spelling. Every error in
+    // this tree that names this variable is read by somebody who has
+    // already lost a lease, and a steal that quietly did not happen
+    // because they wrote `true` is the last thing they need.
+    zou_store::setting::flag("ZOU_LEASE_STEAL").unwrap_or(false)
 }
 
 fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
@@ -1749,8 +1768,8 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     // success wins, which cuts the store's latency tail out of the
     // commit path. With ordered acks one slow PUT otherwise stalls
     // every window behind it. ZOU_WAL_HEDGE=off keeps the raw store.
-    let landing: Arc<dyn CasStore> = match std::env::var("ZOU_WAL_HEDGE").as_deref() {
-        Ok("off") => Arc::clone(&store),
+    let landing: Arc<dyn CasStore> = match zou_store::setting::flag("ZOU_WAL_HEDGE") {
+        Some(false) => Arc::clone(&store),
         _ => Arc::new(zou_store::HedgedStore::new(Arc::clone(&store))),
     };
     let media = Arc::new(WalMedia::single(log_store(landing, &layout)));
@@ -2319,10 +2338,8 @@ pub unsafe extern "C" fn zou_pagesvc_start(target: *const c_char, data_checksums
         let tenant_ref = std::env::var("ZOU_TENANT").unwrap_or_else(|_| "local".to_string());
         let layout = TenantLayout::new(&tenant_ref);
         let tenant = tenant_id(layout.tenant_ref());
-        let workers = std::env::var("ZOU_REDO_WORKERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2);
+        let workers =
+            zou_store::setting::number_or("ZOU_REDO_WORKERS", "a whole number of workers", 2usize);
         let redo = match std::env::current_exe() {
             Ok(postgres) => Some(redo::RedoPoolConfig {
                 postgres,

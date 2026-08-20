@@ -172,12 +172,11 @@ impl BlockCache {
 
 /// The block budget this process runs with, the default unless
 /// `ZOU_BLOCK_CACHE_MB` says otherwise. A value that does not parse is
-/// the default too: a reader is not the place to refuse to start over
-/// a tuning knob.
+/// the default too, said out loud rather than in silence: a reader is
+/// not the place to refuse to start over a tuning knob, but a knob that
+/// does nothing is worth a line.
 fn block_budget() -> usize {
-    std::env::var("ZOU_BLOCK_CACHE_MB")
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
+    crate::setting::number::<usize>("ZOU_BLOCK_CACHE_MB", "a whole number of megabytes")
         .map(|mb| mb * 1024 * 1024)
         .unwrap_or(BLOCK_CACHE_BYTES)
 }

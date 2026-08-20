@@ -103,15 +103,21 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             "--pg-bin" => pg_bin = Some(PathBuf::from(need(&mut it, "--pg-bin")?)),
             "--port" => {
                 let raw = need(&mut it, "--port")?;
-                port = Some(raw.parse().map_err(|_| format!("bad port {raw:?}"))?);
+                port = Some(raw.parse().map_err(|_| {
+                    format!("bad port {raw:?}, write a port number from 1 to 65535")
+                })?);
             }
             "--http" => {
                 let raw = need(&mut it, "--http")?;
-                http = Some(raw.parse().map_err(|_| format!("bad http port {raw:?}"))?);
+                http = Some(raw.parse().map_err(|_| {
+                    format!("bad http port {raw:?}, write a port number from 1 to 65535")
+                })?);
             }
             "--ops" => {
                 let raw = need(&mut it, "--ops")?;
-                ops = Some(raw.parse().map_err(|_| format!("bad ops port {raw:?}"))?);
+                ops = Some(raw.parse().map_err(|_| {
+                    format!("bad ops port {raw:?}, write a port number from 1 to 65535")
+                })?);
             }
             "--runtime" => runtime = Some(PathBuf::from(need(&mut it, "--runtime")?)),
             "--config" => config = Some(PathBuf::from(need(&mut it, "--config")?)),
@@ -233,10 +239,7 @@ fn start_http(
     if s3.is_none() {
         log::info!("the s3 endpoint is off, storage.s3_protocol.enabled is false");
     }
-    let autoconfirm = !matches!(
-        std::env::var("ZOU_MAILER_AUTOCONFIRM").as_deref(),
-        Ok("false") | Ok("0")
-    );
+    let autoconfirm = zou_store::setting::flag("ZOU_MAILER_AUTOCONFIRM").unwrap_or(true);
     // A configured mail server carries the mail, and then there is
     // nothing left in memory for `zou inbox` to print, which is why it
     // says which of the two is happening.
@@ -254,10 +257,7 @@ fn start_http(
     // Phone is off by default, the same as GoTrue, because a project
     // that has not said it wants phone sign in should refuse it by name
     // rather than half serve it.
-    let phone_enabled = matches!(
-        std::env::var("ZOU_EXTERNAL_PHONE_ENABLED").as_deref(),
-        Ok("true") | Ok("1")
-    );
+    let phone_enabled = zou_store::setting::flag("ZOU_EXTERNAL_PHONE_ENABLED").unwrap_or(false);
     let texter: Option<std::sync::Arc<dyn zou_server::sms::Sender>> =
         match zou_server::sms::from_env()? {
             Some(texter) => {
@@ -269,33 +269,20 @@ fn start_http(
     if phone_enabled && texter.is_none() {
         log::info!("phone codes stay in this process, read them with zou inbox --http {port}");
     }
-    let sms_autoconfirm = matches!(
-        std::env::var("ZOU_SMS_AUTOCONFIRM").as_deref(),
-        Ok("true") | Ok("1")
-    );
+    let sms_autoconfirm = zou_store::setting::flag("ZOU_SMS_AUTOCONFIRM").unwrap_or(false);
     let oauth = zou_server::oauth::from_env()?;
     if !oauth.is_empty() {
         log::info!("social sign in with {}", oauth.names().join(", "));
     }
-    let manual_linking = matches!(
-        std::env::var("ZOU_SECURITY_MANUAL_LINKING_ENABLED").as_deref(),
-        Ok("true") | Ok("1")
-    );
-    let anonymous_users = matches!(
-        std::env::var("ZOU_EXTERNAL_ANONYMOUS_USERS_ENABLED").as_deref(),
-        Ok("true") | Ok("1")
-    );
-    // Both of these are the other way round from the flags above: on
-    // and off are GoTrue's, and GoTrue serves addresses and takes
-    // signups unless it is told not to.
-    let email_enabled = !matches!(
-        std::env::var("ZOU_EXTERNAL_EMAIL_ENABLED").as_deref(),
-        Ok("false") | Ok("0")
-    );
-    let disable_signup = matches!(
-        std::env::var("ZOU_DISABLE_SIGNUP").as_deref(),
-        Ok("true") | Ok("1")
-    );
+    let manual_linking =
+        zou_store::setting::flag("ZOU_SECURITY_MANUAL_LINKING_ENABLED").unwrap_or(false);
+    let anonymous_users =
+        zou_store::setting::flag("ZOU_EXTERNAL_ANONYMOUS_USERS_ENABLED").unwrap_or(false);
+    // The default on this one is the other way round from the flags
+    // above: on and off are GoTrue's, and GoTrue serves addresses
+    // unless it is told not to.
+    let email_enabled = zou_store::setting::flag("ZOU_EXTERNAL_EMAIL_ENABLED").unwrap_or(true);
+    let disable_signup = zou_store::setting::flag("ZOU_DISABLE_SIGNUP").unwrap_or(false);
     let hook = zou_server::hook::from_env()?;
     // Worth a line of its own: a hook that rewrites claims is the one
     // piece of a project's own code running in the middle of every sign

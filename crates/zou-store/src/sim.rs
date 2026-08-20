@@ -177,6 +177,16 @@ fn builtin(name: &str) -> Option<SimProfile> {
 /// Names of every built in profile, for error messages and docs.
 pub const BUILTIN_PROFILES: &[&str] = &["s3-standard", "s3-express", "r2", "gcs", "b2", "wasabi"];
 
+/// The three places a key can be wrong say the same thing, because from
+/// the outside they are the same mistake. Naming the whole grammar
+/// rather than the one key beats sending somebody to the source to find
+/// out what `put_p99` was made of.
+fn unknown_key(key: &str) -> String {
+    format!(
+        "unknown sim key {key:?}, the keys are slowdown, mbps, seed, and an op and quantile joined by an underscore, where the op is one of get put list delete and the quantile is one of p50 p95 p99 max"
+    )
+}
+
 /// Parsed `ZOU_STORE_SIM` value: the profile after overrides, plus an
 /// optional seed so a run can be replayed with the same latency draws.
 #[derive(Debug, Clone, PartialEq)]
@@ -197,7 +207,11 @@ impl SimConfig {
             let data = std::fs::read(head)
                 .map_err(|e| format!("cannot read calibration file {head}: {e}"))?;
             serde_json::from_slice::<SimProfile>(&data)
-                .map_err(|e| format!("bad calibration file {head}: {e}"))?
+                .map_err(|e| {
+                    format!(
+                        "bad calibration file {head}: {e}, want the json a calibration run writes out, which is one object with a slowdown, an mbps and a get put list delete each holding p50 p95 p99 max"
+                    )
+                })?
         } else {
             builtin(head).ok_or_else(|| {
                 format!(
@@ -214,46 +228,47 @@ impl SimConfig {
             let num = || -> Result<f64, String> {
                 value
                     .parse()
-                    .map_err(|_| format!("bad sim value {value:?} for {key}"))
+                    .map_err(|_| format!("bad sim value {value:?} for {key}, write a number"))
             };
             match key {
                 "slowdown" => {
                     profile.slowdown = num()?;
                     if !(0.0..=1.0).contains(&profile.slowdown) {
-                        return Err(format!("slowdown must be a probability, got {value}"));
+                        return Err(format!(
+                            "bad sim value {value:?} for slowdown, write a probability from 0 to 1"
+                        ));
                     }
                 }
                 "mbps" => profile.mbps = num()?,
                 "seed" => {
-                    seed = Some(
-                        value
-                            .parse()
-                            .map_err(|_| format!("bad sim value {value:?} for seed"))?,
-                    )
+                    seed = Some(value.parse().map_err(|_| {
+                        format!("bad sim value {value:?} for seed, write a whole number")
+                    })?)
                 }
                 _ => {
-                    let (op, q) = key
-                        .split_once('_')
-                        .ok_or_else(|| format!("unknown sim key {key:?}"))?;
+                    let (op, q) = key.split_once('_').ok_or_else(|| unknown_key(key))?;
                     let dist = match op {
                         "get" => &mut profile.get,
                         "put" => &mut profile.put,
                         "list" => &mut profile.list,
                         "delete" => &mut profile.delete,
-                        _ => return Err(format!("unknown sim key {key:?}")),
+                        _ => return Err(unknown_key(key)),
                     };
                     match q {
                         "p50" => dist.p50_ms = num()?,
                         "p95" => dist.p95_ms = num()?,
                         "p99" => dist.p99_ms = num()?,
                         "max" => dist.max_ms = num()?,
-                        _ => return Err(format!("unknown sim key {key:?}")),
+                        _ => return Err(unknown_key(key)),
                     }
                 }
             }
         }
         if profile.mbps <= 0.0 {
-            return Err(format!("mbps must be positive, got {}", profile.mbps));
+            return Err(format!(
+                "bad sim value {} for mbps, write a number above zero",
+                profile.mbps
+            ));
         }
         for (dist, what) in [
             (&profile.get, "get"),
