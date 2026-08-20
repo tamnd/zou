@@ -252,6 +252,144 @@ fn percent(passed: usize, total: usize) -> usize {
     }
 }
 
+/// The lines a person puts around the table on a hand written page to
+/// say that the numbers inside it are not theirs to type.
+///
+/// Html comments, because they are markdown's only way of writing
+/// something that is in the file and not on the page, and Github renders
+/// the page rather than the file.
+pub const BEGIN: &str =
+    "<!-- the numbers below come from the run, zou-conformance scoreboard --compat writes them -->";
+pub const END: &str = "<!-- end of the numbers from the run -->";
+
+/// The two lines above the rows, written out rather than parsed, so that
+/// a page whose table has grown a column is refused with a message
+/// naming the shape rather than rewritten into something else.
+const HEADER: &str = "| suite | passing | of | | what it is |";
+const RULE: &str = "| --- | ---: | ---: | ---: | --- |";
+
+/// One suite's count, whichever kind of run it came out of.
+pub struct Count {
+    pub suite: String,
+    pub passed: usize,
+    pub total: usize,
+}
+
+/// Every suite in a run, flattened, since a page that quotes numbers
+/// does not care whether one came from a recording or from a client's
+/// own test file.
+pub fn counted(runs: &[Run], js: &[(String, Js)], ours: &[(String, Js)]) -> Vec<Count> {
+    let mut out: Vec<Count> = runs
+        .iter()
+        .map(|run| Count {
+            suite: run.suite.clone(),
+            passed: run.passed,
+            total: run.total,
+        })
+        .collect();
+    for (name, js) in js.iter().chain(ours) {
+        let blocks = blocks(js);
+        let passed: usize = blocks.iter().map(|b| b.passed).sum();
+        let failed: usize = blocks.iter().map(|b| b.failed).sum();
+        out.push(Count {
+            suite: name.clone(),
+            passed,
+            total: passed + failed,
+        });
+    }
+    out
+}
+
+/// Rewrite the numbers in the marked table on a hand written page, and
+/// leave every other byte of the file alone.
+///
+/// This exists because `docs/compatibility.md` said its numbers came
+/// from the same run this scoreboard does while somebody was typing
+/// them in by hand, and they had drifted by nine cases on one row and a
+/// whole known difference on another. The prose on that page is worth
+/// having and no generator can write it, so the answer is not to
+/// generate the page, it is to take the four cells a run knows better
+/// than a person out of the person's hands.
+///
+/// The suite name is the first cell rather than the description, so that
+/// a row can be matched against a run by something that does not change
+/// when somebody improves a sentence. The last cell is the person's and
+/// comes back untouched.
+///
+/// A page and a run that disagree about which suites exist is an error
+/// both ways round. Filling in what is there and quietly dropping the
+/// rest is how a row for a suite that stopped running stays on the page
+/// forever with the last numbers it ever had.
+pub fn recount(page: &str, counts: &[Count]) -> Result<String, String> {
+    let begin = page
+        .find(BEGIN)
+        .ok_or_else(|| format!("no marker line, put {BEGIN} on the line above the table"))?;
+    let end = page[begin..]
+        .find(END)
+        .map(|at| at + begin)
+        .ok_or_else(|| format!("a begin marker and no end, put {END} below the table"))?;
+
+    let mut rows = Vec::new();
+    let mut lines = page[begin + BEGIN.len()..end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('|'));
+    match (lines.next(), lines.next()) {
+        (Some(HEADER), Some(RULE)) => {}
+        _ => {
+            return Err(format!(
+                "the table between the markers has to start\n{HEADER}\n{RULE}"
+            ));
+        }
+    }
+    for line in lines {
+        let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+        let [suite, _, _, _, note] = cells[..] else {
+            return Err(format!(
+                "{line}\nhas {} cells where the header has 5",
+                cells.len()
+            ));
+        };
+        rows.push((suite.to_string(), note.to_string()));
+    }
+
+    for count in counts {
+        if !rows.iter().any(|(suite, _)| *suite == count.suite) {
+            return Err(format!(
+                "the run has a suite named {} and the table has no row for it, add one with {} in the first cell and what it is in the last",
+                count.suite, count.suite
+            ));
+        }
+    }
+    let mut out = page[..begin + BEGIN.len()].to_string();
+    out.push_str("\n\n");
+    out.push_str(HEADER);
+    out.push('\n');
+    out.push_str(RULE);
+    out.push('\n');
+    for (suite, note) in &rows {
+        let count = counts
+            .iter()
+            .find(|count| count.suite == *suite)
+            .ok_or_else(|| {
+                format!(
+                    "the table has a row for {suite} and the run has no suite by that name, either a report went missing from the run or the row is left over from a suite that was renamed"
+                )
+            })?;
+        out.push_str(&format!(
+            "| {} | {} | {} | {}% | {} |\n",
+            suite,
+            count.passed,
+            count.total,
+            percent(count.passed, count.total),
+            note
+        ));
+    }
+    out.push('\n');
+    out.push_str(&page[end..]);
+    Ok(out)
+}
+
 /// A report json, or several, in the order they were named.
 pub fn read(paths: &[String]) -> Result<Vec<Run>, String> {
     let mut runs = Vec::new();
@@ -390,5 +528,104 @@ mod tests {
     fn nothing_asked_is_not_nothing_passing() {
         assert_eq!(percent(0, 0), 100);
         assert_eq!(percent(1, 3), 33);
+    }
+
+    /// A page shaped like the one this is for: prose that matters above
+    /// and below, and four cells in the middle that a person kept
+    /// getting wrong.
+    fn page(rows: &str) -> String {
+        format!(
+            "## Where it stands\n\n{BEGIN}\n\n{HEADER}\n{RULE}\n{rows}\n{END}\n\nA known difference still counts as a failure in every number above.\n"
+        )
+    }
+
+    #[test]
+    fn the_numbers_come_from_the_run_and_the_words_stay_the_person_s() {
+        let out = recount(
+            &page("| rest | 82 | 82 | 100% | the surface a project actually uses |"),
+            &counted(&runs(), &[], &[]),
+        )
+        .expect("the row is the one the run has");
+        assert!(out.contains("| rest | 71 | 82 | 86% | the surface a project actually uses |"));
+        assert!(out.contains("## Where it stands"));
+        assert!(out.contains("A known difference still counts as a failure"));
+    }
+
+    /// The whole point of a generated block is that running it twice
+    /// changes nothing, or CI commits a file on every merge and the
+    /// history stops meaning anything.
+    #[test]
+    fn a_page_already_right_comes_back_byte_for_byte() {
+        let counts = counted(&runs(), &[("supabase-js".to_string(), js())], &[]);
+        let once = recount(
+            &page("| rest | 0 | 0 | 0% | what it is |\n| supabase-js | 0 | 0 | 0% | likewise |"),
+            &counts,
+        )
+        .expect("both rows are in the run");
+        assert_eq!(recount(&once, &counts).expect("still parses"), once);
+    }
+
+    /// Both directions, because the failure this is here to stop is a
+    /// row that outlives the suite it counted and goes on showing the
+    /// last numbers anybody measured for it.
+    #[test]
+    fn a_page_and_a_run_that_disagree_about_the_suites_is_an_error() {
+        let missing = recount(
+            &page("| rest | 0 | 0 | 0% | what it is |"),
+            &counted(&runs(), &[("supabase-js".to_string(), js())], &[]),
+        )
+        .expect_err("the run has a suite the page does not");
+        assert!(missing.contains("supabase-js"), "{missing}");
+        let extra = recount(
+            &page("| rest | 0 | 0 | 0% | a |\n| gone | 0 | 0 | 0% | b |"),
+            &counted(&runs(), &[], &[]),
+        )
+        .expect_err("the page has a row the run does not");
+        assert!(extra.contains("gone"), "{extra}");
+    }
+
+    /// A page nobody marked up is refused rather than left alone, since
+    /// the caller asked for this file to be rewritten and silence would
+    /// read as it having been.
+    #[test]
+    fn a_page_with_no_markers_or_a_changed_table_is_refused() {
+        let counts = counted(&runs(), &[], &[]);
+        let bare = recount("just prose\n", &counts).expect_err("no markers");
+        assert!(bare.contains(BEGIN), "{bare}");
+        let half = recount(&format!("{BEGIN}\n\n{HEADER}\n{RULE}\n"), &counts)
+            .expect_err("a begin and no end");
+        assert!(half.contains(END), "{half}");
+        let widened = page("| rest | 82 | 82 | 100% | what it is | and one more |");
+        let refused = recount(&widened, &counts).expect_err("six cells");
+        assert!(refused.contains("6 cells"), "{refused}");
+    }
+
+    /// The page this was written for, checked here rather than in the
+    /// job that rewrites it.
+    ///
+    /// Nothing in this test can say whether the numbers on it are right,
+    /// because only a run knows that and a run needs a stack. What it
+    /// can say is that somebody editing the prose has not moved the
+    /// markers or changed the columns, which would otherwise be found
+    /// out by the scoreboard job of the merge that landed the edit, at
+    /// which point the page is already on main saying its numbers came
+    /// from a run.
+    #[test]
+    fn the_page_this_was_written_for_is_still_marked_up_for_it() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/compatibility.md");
+        let page = std::fs::read_to_string(path).expect("the page is in the repository");
+        let table = page
+            .split_once(BEGIN)
+            .expect("the page carries the begin marker")
+            .1
+            .split_once(END)
+            .expect("and the end marker")
+            .0;
+        assert_eq!(
+            table.matches(HEADER).count(),
+            1,
+            "the columns between the markers are not the ones this writes"
+        );
+        assert!(table.contains(RULE));
     }
 }
