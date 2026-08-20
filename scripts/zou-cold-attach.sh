@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Time a cold attach over a simulated distant object store, and say what
-# it spent the time on.
+# Time a cold attach to a first answered query, and say what it spent
+# the time on.
 #
-# A cold attach is two phases. The restore pulls the skeleton, which is
-# a fixed and small number of objects. Crash recovery then replays the
-# WAL tail, and every page a record touches is a store round trip taken
-# one at a time, so on a store thirty milliseconds away the second phase
-# is the whole of the attach. This measures both, and dumps the store op
-# counters, because the number that explains the wall clock is gets and
-# not bytes.
+# A cold attach is three phases. The restore pulls the skeleton, which
+# is a fixed and small number of objects. Crash recovery then replays
+# the WAL tail, and every page a record touches is a store round trip
+# taken one at a time, so on a store thirty milliseconds away that phase
+# is most of the attach. The third is the one a client can see: the
+# first query it gets an answer to, which faults in the pages that
+# recovery did not happen to need. This measures all three, and dumps
+# the store op counters, because the number that explains the wall clock
+# is gets and not bytes.
 #
 # The scenario is built once into WORK and reused: a pgbench database,
 # a load, then kill -9, which leaves the store with a WAL tail past its
@@ -18,10 +20,21 @@
 # finds the page LSN already past the record and replays nothing. Runs
 # have to start from the same store or they are not the same run.
 #
+# Two ways to run it. With nothing set the store is a local directory
+# and ZOU_STORE_SIM adds the latency of a distant one, which is cheap
+# and repeatable and is not a measurement of any real store. With
+# REMOTE set to an object store prefix, the pristine store is pushed
+# under it and the attach reads the real thing over the real network,
+# which is what the 500 ms target in docs/perf.md is about.
+#
 # Usage: scripts/zou-cold-attach.sh [label]
-# Env overrides: PG_BIN, ZOU_BIN, WORK, SIM, SCALE, LOAD_SECS, and the
-# ZOU_WARM_* knobs, which pass through, so ZOU_WARM_BLOCKS=0 measures
-# the same store with the warm up off.
+# Env overrides: PG_BIN, ZOU_BIN, WORK, REMOTE, SIM, SCALE, LOAD_SECS,
+# and the ZOU_WARM_* knobs, which pass through, so ZOU_WARM_BLOCKS=0
+# measures the same store with the warm up off.
+#
+#   REMOTE=s3://zou-bench/cold ZOU_S3_ENDPOINT=http://127.0.0.1:9100 \
+#     AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+#     scripts/zou-cold-attach.sh minio-1
 
 set -euo pipefail
 
@@ -29,6 +42,7 @@ LABEL=${1:-run}
 PG_BIN=${PG_BIN:-build/pg/bin}
 ZOU_BIN=${ZOU_BIN:-target/release}
 WORK=${WORK:-/tmp/zou-cold-attach}
+REMOTE=${REMOTE:-}
 SIM=${SIM:-s3-standard}
 SCALE=${SCALE:-25}
 LOAD_SECS=${LOAD_SECS:-20}
@@ -37,6 +51,12 @@ LOAD_SECS=${LOAD_SECS:-20}
 # then never reads again, which is not what a real attach looks like.
 SHARED_BUFFERS=${SHARED_BUFFERS:-32MB}
 PORT=${PORT:-5613}
+# The first query. One row out of one page of the biggest table, by the
+# primary key, which is the cheapest thing that still has to reach the
+# store for a page. A fixed key rather than a random one because every
+# run starts with an empty page cache directory anyway, and a fixed key
+# is one less thing that differs between two runs being compared.
+FIRST_QUERY=${FIRST_QUERY:-select abalance from pgbench_accounts where aid = 1}
 
 STORE="$WORK/store"
 PRISTINE="$WORK/store-pristine"
@@ -80,32 +100,60 @@ if [ ! -d "$PRISTINE" ]; then
 	say "scenario kept at $PRISTINE, $(du -sh "$PRISTINE" | awk '{print $1}')"
 fi
 
-rm -rf "$STORE"
-cp -R "$PRISTINE" "$STORE"
-
 PGDATA="$WORK/pgdata-$LABEL"
 CACHE="$WORK/cache-$LABEL"
 rm -rf "$PGDATA" "$CACHE" "$WORK/stats-$LABEL"
 mkdir -p "$CACHE"
 
-export ZOU_TARGET="$STORE"
+if [ -n "$REMOTE" ]; then
+	# Each run gets its own prefix, because the attach writes into the
+	# store it reads and the second attach of a prefix is not a cold
+	# one. The upload is not timed and is not part of the number.
+	TARGET="$REMOTE/$LABEL"
+	say "uploading the scenario to $TARGET"
+	"$ZOU_BIN/zou" push "$PRISTINE" "$TARGET" >"$WORK/push-$LABEL.log" 2>&1
+	unset ZOU_STORE_SIM
+else
+	TARGET="$STORE"
+	rm -rf "$STORE"
+	cp -R "$PRISTINE" "$STORE"
+	export ZOU_STORE_SIM="$SIM"
+fi
+
+export ZOU_TARGET="$TARGET"
 export ZOU_TENANT=local
 # This starts postgres itself, with no page service to read through,
 # so the object path is the one being timed here.
 export ZOU_PAGESERVE=0
 export ZOU_PAGE_CACHE="$CACHE"
-export ZOU_STORE_SIM="$SIM"
 export ZOU_STORE_STATS="$WORK/stats-$LABEL"
 
-say "attaching as $LABEL under $SIM, shared_buffers $SHARED_BUFFERS, warm blocks ${ZOU_WARM_BLOCKS:-default}"
+say "attaching as $LABEL from $TARGET${ZOU_STORE_SIM:+ under $ZOU_STORE_SIM}, shared_buffers $SHARED_BUFFERS, warm blocks ${ZOU_WARM_BLOCKS:-default}"
 t0=$(now)
-"$ZOU_BIN/zou-restore" "$STORE" "$PGDATA" local
+"$ZOU_BIN/zou-restore" "$TARGET" "$PGDATA" local
 t1=$(now)
-"$PG_BIN/pg_ctl" -D "$PGDATA" -l "$WORK/attach-$LABEL.log" -w -t 3600 \
+# -W on purpose, so pg_ctl does not wait. What it waits for is a
+# connection it then asks nothing, which is ready to take a client
+# rather than ready to answer one, and the difference between those two
+# is a phase of this measurement. The loop below asks the real question
+# instead and stops on the first answer.
+"$PG_BIN/pg_ctl" -D "$PGDATA" -l "$WORK/attach-$LABEL.log" -W \
 	-o "-p $PORT -k $WORK -c listen_addresses='' -c shared_buffers=$SHARED_BUFFERS" start
+until answer=$("$PG_BIN/psql" -h "$WORK" -p "$PORT" -d postgres -Atqc "$FIRST_QUERY" 2>/dev/null); do
+	# No sleep. A poll interval is dead time that lands in the number,
+	# and a connection refused during recovery costs a connect and an
+	# error rather than a query, so the loop is cheap enough to spin.
+	# The pid file is written before the postmaster opens its socket,
+	# so its absence this early is the start still happening.
+	pid=$(head -1 "$PGDATA/postmaster.pid" 2>/dev/null || true)
+	if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+		say "the postmaster is gone, see $WORK/attach-$LABEL.log"
+		exit 1
+	fi
+done
 t2=$(now)
 "$PG_BIN/pg_ctl" -D "$PGDATA" -w -t 120 stop >/dev/null
 
-say "restore $(took "$t0" "$t1")s, recovery to ready $(took "$t1" "$t2")s, attach $(took "$t0" "$t2")s"
+say "restore $(took "$t0" "$t1")s, recovery and first query $(took "$t1" "$t2")s, attach $(took "$t0" "$t2")s, answered ${answer:-null}"
 "$ZOU_BIN/zou" stats "$ZOU_STORE_STATS" | tee "$WORK/stats-$LABEL.json"
 say "log $WORK/attach-$LABEL.log"
