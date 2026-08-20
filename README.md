@@ -176,3 +176,5 @@ The labels say what a thing is and where it lives. What it is: `bug`, `enhanceme
 ## License
 
 Apache 2.0, see [LICENSE](LICENSE).
+
+Zou is not a Supabase product and this project is not affiliated with, sponsored by or endorsed by Supabase Inc. The mark is used here to say what zou is compatible with and for nothing else, which is written out in [TRADEMARKS.md](TRADEMARKS.md) along with the other names this repository borrows.
