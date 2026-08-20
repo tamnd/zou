@@ -117,6 +117,33 @@ impl S3Store {
         }
     }
 
+    /// A request that never got an answer. The underlying error says
+    /// what the socket did and nothing about where it was pointed, and
+    /// where it was pointed is the whole question, so the endpoint goes
+    /// in. Retries are named too, since "it failed" and "it failed four
+    /// times over a couple of seconds" call for different next moves,
+    /// and a PUT says plainly that it is not known whether the write
+    /// landed, because that is the one thing a caller must not assume.
+    fn transport(&self, key: &str, method: &str, e: &str) -> CasError {
+        let retried = match method == "GET" || method == "DELETE" {
+            true => format!(", after {MAX_ATTEMPTS} attempts"),
+            false => String::new(),
+        };
+        let ambiguity = match method == "PUT" {
+            true => {
+                ", and a PUT that died on the wire may or may not have landed, so this is not retried here and a reader deciding what to do next has to look at the object rather than assume either way"
+            }
+            false => "",
+        };
+        Self::io(
+            key,
+            format!(
+                "transport: {e}{retried}, talking to {}{ambiguity}, so check that the endpoint is reachable from this node and that ZOU_S3_ENDPOINT names the one you meant",
+                self.cfg.endpoint
+            ),
+        )
+    }
+
     /// The caller's headers plus the session token, when there is one.
     ///
     /// A temporary credential's token is a header like any other, so it
@@ -193,9 +220,9 @@ impl S3Store {
                         }
                         continue;
                     }
-                    None => return Err(Self::io(err_key, format!("transport: {e}"))),
+                    None => return Err(self.transport(err_key, method, &e)),
                 },
-                Err(e) => return Err(Self::io(err_key, format!("transport: {e}"))),
+                Err(e) => return Err(self.transport(err_key, method, &e)),
             };
             if retryable(status)
                 && let Some(wait) = retry(&format!("status {status}"))
@@ -310,6 +337,48 @@ fn error_snippet(body: &[u8]) -> String {
     text.chars().take(300).collect()
 }
 
+/// What a status that got this far means for whoever is reading the log.
+///
+/// The statuses a caller handles never reach here: a 404 on a GET is an
+/// absent object, a 412 is a lost race, a 5xx has already been retried
+/// to the attempt limit. What is left is a request the store understood
+/// and refused, and for those the body is written for whoever operates
+/// the store rather than for whoever configured this one. So the reading
+/// goes next to it, because the difference between a wrong key, a wrong
+/// bucket and a wrong region is invisible in an XML snippet and is the
+/// only thing the reader needs.
+///
+/// An empty reading is the honest answer for a status with no single
+/// cause worth naming, and the caller leaves the sentence where it was.
+fn what_it_means(status: u16) -> &'static str {
+    match status {
+        400 => {
+            ", the store understood the request and rejected its shape, which usually means it does not speak this s3 dialect, and ZOU_STORE_DIALECT picks another"
+        }
+        401 | 403 => {
+            ", the signature was refused, so it is AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, or the pair is right and lacks this permission on this bucket, or the clock on this node is more than a few minutes off, since a signature carries its timestamp"
+        }
+        404 => {
+            ", a 404 on this path is the bucket and not the object, since an absent object is an ordinary answer and never reaches here, so ZOU_S3_ENDPOINT and the bucket named in the target are pointing at something that is not there"
+        }
+        301 | 307 => {
+            ", the bucket lives in another region, which ZOU_S3_REGION sets and which has to match the endpoint"
+        }
+        413 => ", the store refused the size of this object rather than the request itself",
+        _ => "",
+    }
+}
+
+/// The message for a status that reached a caller, with the reading
+/// appended.
+fn refused(what: &str, status: u16, body: &[u8]) -> String {
+    format!(
+        "{what} returned {status}: {}{}",
+        error_snippet(body),
+        what_it_means(status)
+    )
+}
+
 impl CasStore for S3Store {
     fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, CasError> {
         let path = self.object_path(key);
@@ -321,10 +390,7 @@ impl CasStore for S3Store {
                 Ok(Some((body, Version::from_backend(version))))
             }
             404 => Ok(None),
-            s => Err(Self::io(
-                key,
-                format!("GET returned {s}: {}", error_snippet(&body)),
-            )),
+            s => Err(Self::io(key, refused("GET", s, &body))),
         }
     }
 
@@ -347,10 +413,7 @@ impl CasStore for S3Store {
             404 => Ok(None),
             // The range starts at or past the object's end.
             416 => Ok(Some(Vec::new())),
-            s => Err(Self::io(
-                key,
-                format!("ranged GET returned {s}: {}", error_snippet(&body)),
-            )),
+            s => Err(Self::io(key, refused("ranged GET", s, &body))),
         }
     }
 
@@ -449,10 +512,7 @@ impl CasStore for S3Store {
             404 if expected.is_some() => Err(CasError::Conflict {
                 key: key.to_string(),
             }),
-            s => Err(Self::io(
-                key,
-                format!("PUT returned {s}: {}", error_snippet(&body)),
-            )),
+            s => Err(Self::io(key, refused("PUT", s, &body))),
         }
     }
 
@@ -465,10 +525,7 @@ impl CasStore for S3Store {
                     .ok_or_else(|| Self::io(key, "put response without a version".into()))?;
                 Ok(Version::from_backend(version))
             }
-            s => Err(Self::io(
-                key,
-                format!("PUT returned {s}: {}", error_snippet(&body)),
-            )),
+            s => Err(Self::io(key, refused("PUT", s, &body))),
         }
     }
 
@@ -479,10 +536,7 @@ impl CasStore for S3Store {
             // 204 on both dialects, and 404 when already gone, which
             // delete treats as success.
             204 | 404 => Ok(()),
-            s => Err(Self::io(
-                key,
-                format!("DELETE returned {s}: {}", error_snippet(&body)),
-            )),
+            s => Err(Self::io(key, refused("DELETE", s, &body))),
         }
     }
 
@@ -499,10 +553,7 @@ impl CasStore for S3Store {
             query.push_str(&format!("list-type=2&prefix={}", uri_encode(prefix, true)));
             let (status, _, body) = self.request("GET", &path, &query, None, &[], prefix)?;
             if status != 200 {
-                return Err(Self::io(
-                    prefix,
-                    format!("LIST returned {status}: {}", error_snippet(&body)),
-                ));
+                return Err(Self::io(prefix, refused("LIST", status, &body)));
             }
             let text = String::from_utf8_lossy(&body);
             keys.extend(xml_values(&text, "Key"));
@@ -982,6 +1033,72 @@ mod tests {
         assert_eq!(
             xml_value(body, "NextContinuationToken").as_deref(),
             Some("tok+1/2=")
+        );
+    }
+
+    /// The status a store refuses with is the one thing that separates a
+    /// wrong key from a wrong bucket from a wrong region, and the body
+    /// it sends is written for whoever runs the store rather than
+    /// whoever configured this one. So each of these has to name the
+    /// setting the reader would go change, and naming the wrong one is
+    /// worse than naming none.
+    #[test]
+    fn a_refusal_names_the_setting_behind_that_status() {
+        let body = b"<Error><Code>SignatureDoesNotMatch</Code></Error>";
+
+        let denied = refused("PUT", 403, body);
+        assert!(denied.contains("PUT returned 403"), "{denied}");
+        assert!(denied.contains("SignatureDoesNotMatch"), "{denied}");
+        assert!(denied.contains("AWS_ACCESS_KEY_ID"), "{denied}");
+        // The clock belongs in this one. A signature carries its
+        // timestamp, so a node hours out of step gets a 403 that reads
+        // exactly like a bad key and sends the reader rotating
+        // credentials that were never wrong.
+        assert!(denied.contains("clock"), "{denied}");
+
+        let missing = refused("LIST", 404, body);
+        assert!(missing.contains("ZOU_S3_ENDPOINT"), "{missing}");
+        assert!(
+            missing.contains("not the object"),
+            "a 404 that reaches a caller is the bucket, and saying so is the point: {missing}"
+        );
+
+        let elsewhere = refused("GET", 301, body);
+        assert!(elsewhere.contains("ZOU_S3_REGION"), "{elsewhere}");
+
+        let dialect = refused("PUT", 400, body);
+        assert!(dialect.contains("ZOU_STORE_DIALECT"), "{dialect}");
+
+        // A status with no single cause worth naming gets no invented
+        // one. The sentence ends where the body ends.
+        let odd = refused("GET", 418, body);
+        assert!(odd.ends_with("</Error>"), "{odd}");
+    }
+
+    /// A transport failure says nothing about where it was pointed, and
+    /// where it was pointed is the entire question.
+    #[test]
+    fn a_transport_failure_names_the_endpoint_and_whether_it_was_retried() {
+        let store = S3Store::new(example_cfg());
+
+        let get = store
+            .transport("k", "GET", "connection refused")
+            .to_string();
+        assert!(get.contains("connection refused"), "{get}");
+        assert!(get.contains("examplebucket.s3.amazonaws.com"), "{get}");
+        assert!(
+            get.contains(&format!("after {MAX_ATTEMPTS} attempts")),
+            "a reader deciding whether to wait needs to know this already waited: {get}"
+        );
+
+        // The one thing a caller must not assume either way. A PUT is
+        // not retried here precisely because the outcome is unknown, so
+        // the message that reports it has to say so.
+        let put = store.transport("k", "PUT", "broken pipe").to_string();
+        assert!(put.contains("may or may not have landed"), "{put}");
+        assert!(
+            !put.contains("attempts"),
+            "a PUT is not retried at this layer and must not claim to have been: {put}"
         );
     }
 }

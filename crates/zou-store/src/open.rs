@@ -116,7 +116,9 @@ fn parse(target: &str) -> Result<Parsed<'_>, String> {
     };
     if scheme == "sqlite" {
         if rest.is_empty() {
-            return Err(format!("{target} names no database file"));
+            return Err(format!(
+                "{target} names no database file, a sqlite target is sqlite:// followed by a path, as in sqlite:///var/lib/zou/store.db"
+            ));
         }
         return Ok(Parsed::Sqlite(rest));
     }
@@ -127,7 +129,9 @@ fn parse(target: &str) -> Result<Parsed<'_>, String> {
     }
     let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
     if bucket.is_empty() {
-        return Err(format!("{target} names no bucket"));
+        return Err(format!(
+            "{target} names no bucket, a remote target is {scheme}://bucket with an optional prefix after it, as in {scheme}://my-bucket/zou"
+        ));
     }
     Ok(Parsed::Remote {
         scheme,
@@ -213,7 +217,11 @@ fn open_remote(scheme: &str, bucket: &str) -> Result<Box<dyn CasStore>, String> 
         Dialect::Gcs => "https://storage.googleapis.com".into(),
     });
     let need = |name: &str| {
-        var(name).ok_or_else(|| format!("{scheme}:// needs {name} in the environment"))
+        var(name).ok_or_else(|| {
+            format!(
+                "{scheme}:// needs {name} in the environment, a remote store is opened with the credential in the environment rather than in the target, so nothing that names a bucket carries a secret"
+            )
+        })
     };
     Ok(Box::new(S3Store::new(S3Config {
         endpoint,
