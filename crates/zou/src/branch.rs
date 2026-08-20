@@ -48,18 +48,21 @@ fn parse_at(value: &str) -> Result<At, String> {
         let lo = u64::from_str_radix(lo, 16);
         return match (hi, lo) {
             (Ok(hi), Ok(lo)) => Ok(At::Lsn((hi << 32) | lo)),
-            _ => Err(format!("bad lsn {value:?}")),
+            _ => Err(format!(
+                "bad lsn {value:?}, both halves of the X/XXXXXXXX form are hex digits"
+            )),
         };
     }
     if let Some(hex) = value.strip_prefix("0x") {
         return u64::from_str_radix(hex, 16)
             .map(At::Lsn)
-            .map_err(|_| format!("bad lsn {value:?}"));
+            .map_err(|_| format!("bad lsn {value:?}, the 0x form wants hex digits after it"));
     }
-    value
-        .parse()
-        .map(At::Ts)
-        .map_err(|_| format!("bad timestamp {value:?}"))
+    value.parse().map(At::Ts).map_err(|_| {
+        format!(
+            "bad timestamp {value:?}, write a unix second like 1700000000, or an lsn in the X/XXXXXXXX form"
+        )
+    })
 }
 
 /// `--from-time` only ever means a unix second. An lsn shaped value

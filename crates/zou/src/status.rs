@@ -59,11 +59,15 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--config" => args.config = Some(PathBuf::from(need("--config")?)),
             "--api" => {
                 let raw = need("--api")?;
-                args.api = Some(raw.parse().map_err(|_| format!("bad port {raw:?}"))?);
+                args.api = Some(raw.parse().map_err(|_| {
+                    format!("bad port {raw:?}, write a port number from 1 to 65535")
+                })?);
             }
             "--db" => {
                 let raw = need("--db")?;
-                args.db = Some(raw.parse().map_err(|_| format!("bad port {raw:?}"))?);
+                args.db = Some(raw.parse().map_err(|_| {
+                    format!("bad port {raw:?}, write a port number from 1 to 65535")
+                })?);
             }
             "-o" | "--output" => {
                 let raw = need("-o")?;

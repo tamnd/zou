@@ -62,10 +62,11 @@ const FOLD_DOWN_FACTOR: u64 = 5;
 const MAX_DELTA_CHAIN: usize = 4;
 
 fn fold_down_factor() -> u64 {
-    std::env::var("ZOU_FOLD_DOWN_FACTOR")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(FOLD_DOWN_FACTOR)
+    zou_store::setting::number_or(
+        "ZOU_FOLD_DOWN_FACTOR",
+        "a whole number of deltas",
+        FOLD_DOWN_FACTOR,
+    )
 }
 
 #[derive(Debug)]

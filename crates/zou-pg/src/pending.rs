@@ -32,18 +32,13 @@ pub type PendingPage = (u32, Box<[u8]>);
 /// How many store operations run at once during a drain, a truncate,
 /// or an unlink. ZOU_SMGR_PARALLEL overrides, minimum 1.
 pub fn parallelism() -> usize {
-    std::env::var("ZOU_SMGR_PARALLEL")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(16)
+    zou_store::setting::number_or("ZOU_SMGR_PARALLEL", "a whole number of operations", 16usize)
         .max(1)
 }
 
 fn buffer_cap_bytes() -> usize {
-    let mb = std::env::var("ZOU_SMGR_BUFFER_MB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8);
+    let mb =
+        zou_store::setting::number_or("ZOU_SMGR_BUFFER_MB", "a whole number of megabytes", 8usize);
     mb << 20
 }
 

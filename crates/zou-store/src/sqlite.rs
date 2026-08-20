@@ -82,8 +82,8 @@ impl SqliteStore {
             .map_err(|e| context("wal mode", &e))?;
         // FULL is the durability bar every backend meets, an acked put
         // survives power loss. normal is a documented benchmark knob.
-        let sync = match std::env::var("ZOU_SQLITE_SYNC").as_deref() {
-            Ok("normal") => "NORMAL",
+        let sync = match crate::setting::word("ZOU_SQLITE_SYNC", &["full", "normal"]) {
+            Some("normal") => "NORMAL",
             _ => "FULL",
         };
         conn.pragma_update(None, "synchronous", sync)

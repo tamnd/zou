@@ -15,6 +15,12 @@
 //! whether they are looking at a normal thing that resolves itself, a
 //! name they should have picked differently, or a bug.
 //!
+//! The third is a setting somebody typed that zou would not take, and
+//! the gap there is the opposite one. They already know what they
+//! wrote, so saying it back is not information. What they do not know
+//! is what would have been accepted, and `bad lsn "12345"` picks the
+//! half they had.
+//!
 //! So this walks the workspace for messages of those shapes and
 //! requires each one to carry a next step. It is a narrow rule on
 //! purpose. A blanket "every message must end in advice" would be
@@ -236,11 +242,105 @@ fn the_walk_reaches_the_messages_it_is_meant_to_check() {
     );
 }
 
+/// Where text a person typed enters zou: the command line, which is the
+/// `zou` crate, and the two settings whose value is a small language of
+/// its own. The files that parse zou's own formats are outside this,
+/// and deliberately so. `bad INDEX line "x y z"` is not a value
+/// somebody chose, there is no accepted shape to offer them, and the
+/// honest answer there is that a layer is corrupt.
+const TYPED_BY_A_PERSON: &[&str] = &[
+    "crates/zou/src/",
+    "crates/zou-store/src/sim.rs",
+    "crates/zou-store/src/delay.rs",
+];
+
+/// A message that refuses a value somebody typed.
+const REFUSED_A_VALUE: &[&str] = &["bad ", "unknown "];
+
+/// What counts as naming the accepted shape. `{USAGE}` is on the list
+/// because a message that prints the usage text has already answered
+/// the question, at more length than the line itself could.
+const SHAPE: &[&str] = &[
+    "write ",
+    "want ",
+    "takes ",
+    "one of ",
+    "the keys are",
+    "builtins are",
+    "form",
+    "USAGE",
+    "usage",
+];
+
+/// Refusals that hand the question to the error they wrap. This is the
+/// pressure valve on the rule above and it is a narrow one on purpose,
+/// because "the cause explains it" is the excuse every unhelpful
+/// message would give if it were allowed to.
+///
+/// It is also this tree's answer to the wider question of what to do
+/// with the long tail of wrapped errors, the ones shaped `cannot read
+/// the schemas: {e}`. The answer is that a wrapper whose cause already
+/// carries the shape should say less rather than more, and repeating
+/// the value in both halves of one line is worse than not saying it
+/// twice. What the wrapper owes the reader is the context the cause
+/// cannot know, which is which setting was being read.
+const THE_CAUSE_SAYS_IT: &[(&str, &str)] = &[(
+    "bad horizon: ",
+    "the lsn parse this wraps already says the value and the X/XXXXXXXX form it wanted, so naming the value again here would put it twice in one line and the word horizon is the only thing that parse cannot know",
+)];
+
+/// The other half of the same idea as the rule above, for the other
+/// reader. Somebody who set a value already knows what they set, so
+/// repeating it back to them is not information. What they do not know
+/// is what zou would have taken instead, and that is the whole content
+/// of a good message here. `invalid lsn "12345", expected the
+/// X/XXXXXXXX form` in lsn.rs is the shape, `bad lsn "12345"` was not.
+#[test]
+fn refusing_a_value_somebody_typed_names_the_shape_that_was_wanted() {
+    let mut bare = Vec::new();
+    for (site, message) in messages() {
+        if !TYPED_BY_A_PERSON.iter().any(|p| site.starts_with(p)) {
+            continue;
+        }
+        if !REFUSED_A_VALUE.iter().any(|r| message.starts_with(r)) {
+            continue;
+        }
+        if THE_CAUSE_SAYS_IT.iter().any(|(m, _)| message.contains(m)) {
+            continue;
+        }
+        if !SHAPE.iter().any(|s| message.contains(s)) {
+            bare.push(format!("{site}: {message}"));
+        }
+    }
+    assert!(
+        bare.is_empty(),
+        "these refuse a value without saying what would have been taken:\n  {}",
+        bare.join("\n  ")
+    );
+}
+
+/// The same floor as the walk test above, for the same reason. A rule
+/// that matches nothing passes forever.
+#[test]
+fn the_walk_reaches_the_refusals_it_is_meant_to_check() {
+    let refusals = messages()
+        .into_iter()
+        .filter(|(site, message)| {
+            TYPED_BY_A_PERSON.iter().any(|p| site.starts_with(p))
+                && REFUSED_A_VALUE.iter().any(|r| message.starts_with(r))
+        })
+        .count();
+    assert!(
+        refusals >= 15,
+        "only {refusals} messages refuse a typed value, the rule is checking nothing"
+    );
+}
+
 /// An excuse has to name a reason. The list is the pressure valve on
 /// the rule and a valve nobody has to justify is a hole.
 #[test]
 fn every_message_excused_from_the_rule_says_why() {
-    for (message, reason) in NOT_FOR_A_PERSON {
+    for (message, reason) in NOT_FOR_A_PERSON.iter().chain(THE_CAUSE_SAYS_IT) {
         assert!(
             reason.len() > 30,
             "{message} is excused with {reason:?}, which does not say why"

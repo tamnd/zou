@@ -37,7 +37,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
         match arg.as_str() {
             "--http" => {
                 let raw = it.next().ok_or_else(|| "--http needs a port".to_string())?;
-                args.port = raw.parse().map_err(|_| format!("bad http port {raw:?}"))?;
+                args.port = raw.parse().map_err(|_| {
+                    format!("bad http port {raw:?}, write a port number from 1 to 65535")
+                })?;
             }
             "--clear" => args.clear = true,
             "--json" => args.json = true,

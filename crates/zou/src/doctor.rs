@@ -88,11 +88,15 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
                 output = match rest.next().map(String::as_str) {
                     Some("pretty") => Output::Pretty,
                     Some("json") => Output::Json,
-                    Some(other) => return Err(format!("unknown output {other}")),
+                    Some(other) => {
+                        return Err(format!("unknown output {other:?}, -o takes pretty or json"));
+                    }
                     None => return Err("-o needs pretty or json".into()),
                 };
             }
-            other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
+            other if other.starts_with('-') => {
+                return Err(format!("unknown flag {other}\n{USAGE}"));
+            }
             other if target.is_none() => target = Some(other.to_string()),
             _ => return Err(USAGE.into()),
         }

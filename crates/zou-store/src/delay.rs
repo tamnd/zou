@@ -36,15 +36,19 @@ impl DelayConfig {
             let (key, value) = part
                 .split_once('=')
                 .ok_or_else(|| format!("bad delay entry {part:?}, want key=ms"))?;
-            let ms = value
-                .parse()
-                .map_err(|_| format!("bad delay value {value:?} for {key}"))?;
+            let ms = value.parse().map_err(|_| {
+                format!("bad delay value {value:?} for {key}, write a whole number of milliseconds")
+            })?;
             match key {
                 "get" => cfg.get_ms = ms,
                 "put" => cfg.put_ms = ms,
                 "list" => cfg.list_ms = ms,
                 "delete" => cfg.delete_ms = ms,
-                _ => return Err(format!("unknown delay key {key:?}")),
+                _ => {
+                    return Err(format!(
+                        "unknown delay key {key:?}, the keys are get put list delete"
+                    ));
+                }
             }
         }
         Ok(cfg)

@@ -280,9 +280,9 @@ pub fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--jobs" => {
                 let value = rest.next().ok_or("--jobs needs a number")?;
-                let jobs = value
-                    .parse()
-                    .map_err(|_| format!("bad job count {value:?}"))?;
+                let jobs = value.parse().map_err(|_| {
+                    format!("bad job count {value:?}, write a whole number of jobs")
+                })?;
                 if jobs == 0 {
                     return Err("a copy with no jobs copies nothing".into());
                 }

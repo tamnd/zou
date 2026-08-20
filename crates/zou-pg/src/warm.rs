@@ -60,20 +60,13 @@ use crate::{ZOU_PAGE_SIZE, restore::RestoreStats};
 /// tail cannot turn the attach into a download. Zero turns warming
 /// off.
 fn block_cap() -> usize {
-    std::env::var("ZOU_WARM_BLOCKS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(65536)
+    zou_store::setting::number_or("ZOU_WARM_BLOCKS", "a whole number of pages", 65536usize)
 }
 
 /// How much WAL the fault scan reads off disk, over ZOU_WARM_WAL_MB.
 /// The scan is local and cheap, this only bounds the memory it holds.
 fn wal_cap() -> u64 {
-    std::env::var("ZOU_WARM_WAL_MB")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(256)
-        << 20
+    zou_store::setting::number_or("ZOU_WARM_WAL_MB", "a whole number of megabytes", 256u64) << 20
 }
 
 /// What a warm up did. `wanted` is the fault list the WAL named,

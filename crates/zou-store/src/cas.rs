@@ -356,10 +356,11 @@ impl KeyLock {
 /// minute per case. Read on the contended path only, which is already
 /// sleeping.
 fn stale_lock_age() -> Duration {
-    let ms = std::env::var("ZOU_LOCALFS_LOCK_STALE_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(60_000);
+    let ms = crate::setting::number_or(
+        "ZOU_LOCALFS_LOCK_STALE_MS",
+        "a number of milliseconds",
+        60_000u64,
+    );
     Duration::from_millis(ms)
 }
 

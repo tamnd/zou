@@ -29,6 +29,7 @@ pub mod placement;
 pub mod registry;
 #[cfg(feature = "s3")]
 pub mod s3;
+pub mod setting;
 pub mod shardmanifest;
 pub mod shards;
 pub mod sim;

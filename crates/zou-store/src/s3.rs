@@ -97,9 +97,7 @@ impl S3Store {
             .into();
         // First backoff step, doubling per retry. The env knob exists so
         // fault injection tests can run a fast schedule.
-        let retry_base = std::env::var("ZOU_S3_RETRY_BASE_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let retry_base = crate::setting::number("ZOU_S3_RETRY_BASE_MS", "a number of milliseconds")
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_millis(100));
         Self {

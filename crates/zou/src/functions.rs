@@ -254,7 +254,9 @@ pub fn parse(argv: &[String]) -> Result<Serve, String> {
         match arg.as_str() {
             "--port" => {
                 let raw = it.next().ok_or("--port needs a value")?;
-                args.port = Some(raw.parse().map_err(|_| format!("bad port {raw:?}"))?);
+                args.port = Some(raw.parse().map_err(|_| {
+                    format!("bad port {raw:?}, write a port number from 1 to 65535")
+                })?);
             }
             "--env-file" => {
                 let raw = it.next().ok_or("--env-file needs a value")?;

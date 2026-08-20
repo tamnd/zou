@@ -233,13 +233,15 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
             "--no-path-prefix" => path_prefix = false,
             "--max-attached" => {
                 let raw = need(&mut it, "--max-attached")?;
-                max_attached = raw
-                    .parse()
-                    .map_err(|_| format!("bad tenant ceiling {raw:?}"))?;
+                max_attached = raw.parse().map_err(|_| {
+                    format!("bad tenant ceiling {raw:?}, write a whole number of tenants")
+                })?;
             }
             "--idle-secs" => {
                 let raw = need(&mut it, "--idle-secs")?;
-                let secs: u64 = raw.parse().map_err(|_| format!("bad idle {raw:?}"))?;
+                let secs: u64 = raw
+                    .parse()
+                    .map_err(|_| format!("bad idle {raw:?}, write a whole number of seconds"))?;
                 idle = Duration::from_secs(secs);
             }
             "--shared-buffers" => shared_buffers = need(&mut it, "--shared-buffers")?.clone(),
@@ -378,7 +380,7 @@ fn need<'a>(it: &mut std::slice::Iter<'a, String>, flag: &str) -> Result<&'a Str
 fn port(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<u16, String> {
     let raw = need(it, flag)?;
     raw.parse()
-        .map_err(|_| format!("bad {flag} port {raw:?}, use 0 to turn it off"))
+        .map_err(|_| format!("bad {flag} port {raw:?}, write a port number, or 0 to turn it off"))
 }
 
 /// A port, or a comma separated list of them for a door that can answer
@@ -388,10 +390,9 @@ fn ports(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<(u16, Vec<
     let raw = need(it, flag)?;
     let mut all: Vec<u16> = Vec::new();
     for part in raw.split(',') {
-        let one = part
-            .trim()
-            .parse()
-            .map_err(|_| format!("bad {flag} port {part:?}, use 0 to turn it off"))?;
+        let one = part.trim().parse().map_err(|_| {
+            format!("bad {flag} port {part:?}, write a port number, or 0 to turn it off")
+        })?;
         if all.contains(&one) {
             return Err(format!("{flag} names port {one} twice"));
         }
