@@ -69,7 +69,9 @@ pub enum RegistryError {
     HostTaken { host: String },
     #[error("{host} belongs to {tenant_ref}, not to the tenant asking")]
     HostElsewhere { host: String, tenant_ref: String },
-    #[error("no tenant {tenant_ref} on this store")]
+    #[error(
+        "no tenant {tenant_ref} on this store, `zou tenant <target> list` shows what is registered"
+    )]
     Missing { tenant_ref: String },
     #[error("invalid registry json for {tenant_ref}: {source}")]
     Json {

@@ -31,14 +31,23 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     let (data, _) = store
         .get(&layout.manifest())
         .map_err(|e| format!("store: {e}"))?
-        .ok_or_else(|| format!("{target} has no manifest for tenant {tenant}"))?;
+        .ok_or_else(|| {
+            format!(
+                "{target} has no manifest for tenant {tenant}, `zou tenant {target} list` shows what is there"
+            )
+        })?;
     let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
 
+    // The shard count is here because it is the authoritative one.
+    // Every walk of the tree iterates it rather than trusting a
+    // listing, so a person reconciling what they see under a prefix
+    // against what the tenant actually has needs the number itself.
     println!(
-        "ref {}, format {}, epoch {}, pg {} timeline {}",
+        "ref {}, format {}, epoch {}, shards {}, pg {} timeline {}",
         manifest.tenant_ref,
         manifest.format,
         manifest.epoch,
+        manifest.shards,
         manifest.pg.version,
         manifest.pg.timeline
     );

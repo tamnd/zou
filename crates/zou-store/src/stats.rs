@@ -545,7 +545,12 @@ fn percentile(buckets: &[u64], total: u64, q: f64) -> u64 {
 
 impl Snapshot {
     pub fn read(path: &Path) -> Result<Self, String> {
-        let data = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let data = fs::read(path).map_err(|e| {
+            format!(
+                "read {}: {e}, a counter file exists only where ZOU_STORE_STATS pointed a running node, and `zou dev` logs the path it used on boot",
+                path.display()
+            )
+        })?;
         if data.len() < SLOTS * 8 {
             return Err(format!("{} is not a counter file", path.display()));
         }

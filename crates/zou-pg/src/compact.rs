@@ -93,7 +93,9 @@ const COMPACT_BLOCK_CACHE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompactError {
-    #[error("no manifest at {key}, the tenant does not exist")]
+    #[error(
+        "no manifest at {key}, the tenant does not exist, `zou tenant <target> list` shows what does"
+    )]
     NoTenant { key: String },
     #[error(transparent)]
     Manifest(#[from] ManifestError),

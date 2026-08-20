@@ -129,7 +129,11 @@ fn chain(
     let layout = TenantLayout::new(tenant_ref);
     let (manifest, _) = PageShardManifest::load(&*store, &layout.shard_manifest(shard))
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("{tenant_ref} shard {shard} has no manifest"))?;
+        .ok_or_else(|| {
+            format!(
+                "{tenant_ref} has no manifest for shard {shard}, either the shard number is past what this tenant has or nothing has been written to it yet, `zou info {target} {tenant_ref}` prints the shard count"
+            )
+        })?;
     let map = manifest.layer_map().map_err(|e| e.to_string())?;
     let at = match rest {
         [] => manifest.disk_consistent_lsn.0,
