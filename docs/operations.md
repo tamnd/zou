@@ -447,10 +447,11 @@ Footers are cached whole, because a footer is a bloom filter and an index row pe
 Blocks are cached under a byte budget, 64 MB by default and `ZOU_BLOCK_CACHE_MB` to change it, because a block is 256 KB of entries and a page read wants one entry out of it: without the cache a sequential scan fetched the same block once per page in it, which measured 1.7 range GETs and 111 KB of store traffic for every 8 KB page served and read a table at about a megabyte a second.
 That budget is memory inside the postmaster and it is per shard reader, so a node that is short of memory should lower it before it lowers anything the database itself is using, and a node reading scattered pages out of a working set that nearly fits is the one case worth raising it for.
 
-One thing still wants the other path.
-A branch reads the page runs a checkpoint fold packed into a full capture, and with the service on the fold publishes an indexless checkpoint instead, so `zou branch create` on a store that has only ever served this way refuses with `cannot be branched yet`.
-The embedded library runs its postmasters with the service off for that reason, since templates and fixtures are branches, and a dev node that wants to be branched wants `zou dev --page-service off`.
-Issue #320 is taking a branch off the page layers directly, which is where this ends.
+Branching asks a different question with the service on.
+A child served this way reads the pages it inherited out of the layers, never out of the parent's `pg/` prefix, because those are the parent's live base images and a truncate deletes them, so what it needs is an image layer at or below the branch point on every page shard.
+Compaction cuts one on its own once a shard has 128 MB of delta debt, which a project that has been running for a while has and a store somebody made this morning has not, and `zou compact <target> <ref> --horizon` cuts one on demand for a store that has not got there yet.
+Without one, `zou branch create` refuses with `cannot be branched yet` and names the shard.
+The embedded library runs its postmasters with the service off, so templates and fixtures keep answering the capture question instead: a template is a fresh initdb and a few thousand rows and would never earn a fold, and issue #578 is letting a branch ask for one rather than wait.
 
 ## Retention and collecting
 

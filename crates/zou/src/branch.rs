@@ -11,8 +11,11 @@
 //! way the child only references the parent's objects, nothing is
 //! copied, so the call finishes in the time of two manifest round trips.
 //! What the child would read is checked before the call returns, and a
-//! source whose captures do not cover the whole chain is refused here
-//! instead of an hour later on the first page read.
+//! source that has folded nothing down for it to stand on is refused
+//! here instead of an hour later on the first page read. What counts
+//! as folded down follows the read path this node serves through: page
+//! runs in a full capture with the page service off, an image layer at
+//! or below the branch point on every shard with it on.
 //!
 //! `list` reads every manifest on the store and prints the ones that
 //! name a parent, optionally only the children of one ref. `delete`
@@ -28,7 +31,7 @@
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zou_pg::branching::{discard, refuse_unservable};
+use zou_pg::branching::{ReadPath, discard, refuse_unservable};
 use zou_store::layout::TenantLayout;
 use zou_store::registry;
 use zou_store::{CasStore, Lsn, Manifest, branch, materialize_at, open_store};
@@ -90,13 +93,23 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     };
     let store: Arc<dyn CasStore> = Arc::from(open_store(target)?);
     match rest {
-        [verb, src, dst] if verb == "create" => create(store.as_ref(), src, dst, At::Head),
-        [verb, src, dst, flag, value] if verb == "create" && flag == "--at" => {
-            create(store.as_ref(), src, dst, parse_at(value)?)
+        [verb, src, dst] if verb == "create" => {
+            create(store.as_ref(), src, dst, At::Head, ReadPath::current())
         }
-        [verb, src, dst, flag, value] if verb == "create" && flag == "--from-time" => {
-            create(store.as_ref(), src, dst, parse_from_time(value)?)
-        }
+        [verb, src, dst, flag, value] if verb == "create" && flag == "--at" => create(
+            store.as_ref(),
+            src,
+            dst,
+            parse_at(value)?,
+            ReadPath::current(),
+        ),
+        [verb, src, dst, flag, value] if verb == "create" && flag == "--from-time" => create(
+            store.as_ref(),
+            src,
+            dst,
+            parse_from_time(value)?,
+            ReadPath::current(),
+        ),
         [verb] if verb == "list" => list(store.as_ref(), None),
         [verb, parent] if verb == "list" => list(store.as_ref(), Some(parent)),
         [verb, tenant_ref] if verb == "delete" => delete(store.as_ref(), tenant_ref),
@@ -104,7 +117,13 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     }
 }
 
-fn create(store: &dyn CasStore, src: &str, dst: &str, at: At) -> Result<(), String> {
+fn create(
+    store: &dyn CasStore,
+    src: &str,
+    dst: &str,
+    at: At,
+    path: ReadPath,
+) -> Result<(), String> {
     let now = now();
     let manifest = match at {
         At::Head => branch(store, src, dst, None, now),
@@ -115,7 +134,7 @@ fn create(store: &dyn CasStore, src: &str, dst: &str, at: At) -> Result<(), Stri
     // A child that would not serve is taken back off the store rather
     // than left as something only shaped like a database. The embedded
     // library does the same, out of the same function.
-    refuse_unservable(store, src, dst, &manifest)?;
+    refuse_unservable(store, src, dst, &manifest, path)?;
     let of = manifest
         .branch_of
         .as_ref()
@@ -234,7 +253,10 @@ fn delete(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use zou_store::LocalFsStore;
+    use zou_store::layer::LayerKey;
+    use zou_store::layermap::LayerDesc;
     use zou_store::manifest::{CheckpointKind, CheckpointRef};
+    use zou_store::shardmanifest::{LayerEntry, PageShardManifest};
 
     /// A root database with one checkpoint, which is the least a
     /// branch can be taken from.
@@ -272,6 +294,43 @@ mod tests {
         store.put(&layout.manifest(), &m.to_json()).unwrap();
     }
 
+    /// The same again for the page service, where what a child stands
+    /// on is an image layer at or below the cut rather than a page run
+    /// in a capture.
+    fn layered_root(store: &dyn CasStore, tenant_ref: &str, image_at: Option<Lsn>) {
+        let layout = TenantLayout::new(tenant_ref);
+        let mut m = Manifest::new(tenant_ref, 18);
+        m.checkpoints.push(CheckpointRef {
+            id: "c1".into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        let lo = LayerKey::page(0, 0, 0, 0, 0);
+        let hi = LayerKey::page(u32::MAX, u32::MAX, u32::MAX, u8::MAX, u32::MAX);
+        let mut shard = PageShardManifest::new(0);
+        shard.disk_consistent_lsn = Lsn(0x100);
+        // A shard always has deltas. Whether it has an image below the
+        // cut is the whole question, so that is the one thing the
+        // caller varies.
+        let mut layer = |desc: LayerDesc| {
+            shard.layers.push(LayerEntry {
+                name: desc.name(),
+                size: 4096,
+                owner: None,
+                upto: None,
+            });
+        };
+        layer(LayerDesc::delta(lo, hi, Lsn(0x10), Lsn(0x100)));
+        if let Some(at) = image_at {
+            layer(LayerDesc::image(lo, hi, at));
+        }
+        store
+            .put(&layout.shard_manifest(0), &shard.encode())
+            .unwrap();
+        store.put(&layout.manifest(), &m.to_json()).unwrap();
+    }
+
     /// A pull request database that answers nothing is worse than one
     /// that was never made, because the job that made it went green.
     #[test]
@@ -280,7 +339,7 @@ mod tests {
         let store = LocalFsStore::new(dir.path());
         root(&store, "prod");
 
-        let err = create(&store, "prod", "pr-1", At::Head).unwrap_err();
+        let err = create(&store, "prod", "pr-1", At::Head, ReadPath::Objects).unwrap_err();
         assert!(err.contains("cannot be branched yet"), "{err}");
         assert!(err.contains("run bearing full capture"), "{err}");
         // And nothing of the child is left on the store, so the next
@@ -289,8 +348,34 @@ mod tests {
         assert!(store.list("tenants/pr-1/").unwrap().is_empty());
 
         folded_root(&store, "ready");
-        create(&store, "ready", "pr-1", At::Head).unwrap();
+        create(&store, "ready", "pr-1", At::Head, ReadPath::Objects).unwrap();
         assert!(read_manifest(&store, "pr-1").unwrap().is_some());
+    }
+
+    /// The page service asks its own question of the same source, and
+    /// a source that satisfies one rule is not thereby excused the
+    /// other: a fold packs down what each path reads.
+    #[test]
+    fn create_refuses_a_source_with_no_image_under_the_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        layered_root(&store, "deltas", None);
+
+        let err = create(&store, "deltas", "pr-2", At::Head, ReadPath::Layers).unwrap_err();
+        assert!(err.contains("cannot be branched yet"), "{err}");
+        assert!(err.contains("no image layer at or below"), "{err}");
+        assert!(read_manifest(&store, "pr-2").unwrap().is_none());
+        assert!(store.list("tenants/pr-2/").unwrap().is_empty());
+
+        // An image above the branch point is the parent's future, and
+        // the branch drops it, so it buys the child nothing.
+        layered_root(&store, "later", Some(Lsn(0x200)));
+        let err = create(&store, "later", "pr-2", At::Head, ReadPath::Layers).unwrap_err();
+        assert!(err.contains("no image layer at or below"), "{err}");
+
+        layered_root(&store, "folded", Some(Lsn(0x80)));
+        create(&store, "folded", "pr-2", At::Head, ReadPath::Layers).unwrap();
+        assert!(read_manifest(&store, "pr-2").unwrap().is_some());
     }
 
     #[test]
