@@ -648,22 +648,27 @@ impl Postmasters {
         *self.state.attached.lock().expect("the attach manager") = attached;
     }
 
-    /// Whether this tenant's prefix holds a database yet. A registered
-    /// ref with nothing under it is a project somebody created and has
-    /// not used, and the first request for it is what makes it real.
-    fn fresh(&self, tenant_ref: &str) -> Result<bool, String> {
+    /// The manifest of the database under this tenant's prefix, or None
+    /// when there is no database there yet. A registered ref with
+    /// nothing under it, or with a manifest that has no checkpoint in
+    /// it, is a project somebody created and has not used, and the
+    /// first request for it is what makes it real.
+    ///
+    /// The manifest comes back rather than a yes or no because the
+    /// restore that follows needs the same object, and against a store
+    /// thirty milliseconds away reading it twice is a round trip on the
+    /// cold path with a user waiting on it.
+    fn database(&self, tenant_ref: &str) -> Result<Option<Manifest>, String> {
         let layout = TenantLayout::new(tenant_ref);
-        match self
+        let Some((data, _)) = self
             .store
             .get(&layout.manifest())
             .map_err(|e| format!("store: {e}"))?
-        {
-            None => Ok(true),
-            Some((data, _)) => Ok(Manifest::from_json(&data)
-                .map_err(|e| format!("manifest: {e}"))?
-                .checkpoints
-                .is_empty()),
-        }
+        else {
+            return Ok(None);
+        };
+        let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
+        Ok((!manifest.checkpoints.is_empty()).then_some(manifest))
     }
 
     /// What is deployed under `/functions/v1` for this project, out of
@@ -827,11 +832,8 @@ impl Backend for Postmasters {
             .map_err(|e| format!("chmod {}: {e}", sock.display()))?;
 
         boot.lap("wait");
-        if self.fresh(&tenant_ref)? {
-            self.bootstrap(&tenant_ref, &pgdata, &pagecache)?;
-            boot.lap("initdb");
-        } else {
-            let stats = restore::restore(&self.target, &tenant_ref, &pgdata)?;
+        if let Some(manifest) = self.database(&tenant_ref)? {
+            let stats = restore::restore_head(&self.store, &tenant_ref, &manifest, &pgdata)?;
             log::debug!(
                 "{tenant_ref}: restored {} files in {}, replayed {} wal records in {}",
                 stats.files,
@@ -842,6 +844,9 @@ impl Backend for Postmasters {
             boot.lap("restore");
             warm_pages(&self.target, &tenant_ref, &pgdata, &pagecache, &stats);
             boot.lap("warm");
+        } else {
+            self.bootstrap(&tenant_ref, &pgdata, &pagecache)?;
+            boot.lap("initdb");
         }
 
         let port = free_port()?;
