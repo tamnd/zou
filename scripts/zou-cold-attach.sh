@@ -135,14 +135,20 @@ t1=$(now)
 # -W on purpose, so pg_ctl does not wait. What it waits for is a
 # connection it then asks nothing, which is ready to take a client
 # rather than ready to answer one, and the difference between those two
-# is a phase of this measurement. The loop below asks the real question
-# instead and stops on the first answer.
+# is a phase of this measurement.
 "$PG_BIN/pg_ctl" -D "$PGDATA" -l "$WORK/attach-$LABEL.log" -W \
 	-o "-p $PORT -k $WORK -c listen_addresses='' -c shared_buffers=$SHARED_BUFFERS" start
-until answer=$("$PG_BIN/psql" -h "$WORK" -p "$PORT" -d postgres -Atqc "$FIRST_QUERY" 2>/dev/null); do
-	# No sleep. A poll interval is dead time that lands in the number,
-	# and a connection refused during recovery costs a connect and an
-	# error rather than a query, so the loop is cheap enough to spin.
+trap 'kill -9 "$(head -1 "$PGDATA/postmaster.pid" 2>/dev/null)" 2>/dev/null || true' EXIT
+
+# Wait on the log rather than on the socket. The obvious loop here is a
+# psql retried until it answers, and the first run of this script did
+# that: it spun without a sleep, on the theory that a refused connection
+# is cheap. It is not. Postgres answers a connection during recovery by
+# forking a backend that then says FATAL, so the loop forked a third of
+# a million backends on the box that was trying to recover, wrote 33MB
+# of log doing it, and measured its own interference. Grepping a file
+# costs the recovery nothing.
+until grep -q "ready to accept connections" "$WORK/attach-$LABEL.log"; do
 	# The pid file is written before the postmaster opens its socket,
 	# so its absence this early is the start still happening.
 	pid=$(head -1 "$PGDATA/postmaster.pid" 2>/dev/null || true)
@@ -150,10 +156,22 @@ until answer=$("$PG_BIN/psql" -h "$WORK" -p "$PORT" -d postgres -Atqc "$FIRST_QU
 		say "the postmaster is gone, see $WORK/attach-$LABEL.log"
 		exit 1
 	fi
+	sleep 0.05
 done
 t2=$(now)
-"$PG_BIN/pg_ctl" -D "$PGDATA" -w -t 120 stop >/dev/null
+# Then the query, once, on a connection made after readiness, which is
+# the first thing a client gets to ask. Ready is not answered: the pages
+# this reads are still in the store at this point, and on a store thirty
+# milliseconds away that gap is the part of the wait a user sees.
+answer=$("$PG_BIN/psql" -h "$WORK" -p "$PORT" -d postgres -Atqc "$FIRST_QUERY")
+t3=$(now)
 
-say "restore $(took "$t0" "$t1")s, recovery and first query $(took "$t1" "$t2")s, attach $(took "$t0" "$t2")s, answered ${answer:-null}"
+# Immediate, and after the numbers are printed. A smart shutdown writes
+# a checkpoint, which over a simulated distant store took longer than
+# any timeout worth waiting and left a postmaster holding the socket
+# against the next run. Nothing here needs the cluster again.
+say "restore $(took "$t0" "$t1")s, recovery $(took "$t1" "$t2")s, first query $(took "$t2" "$t3")s, attach $(took "$t0" "$t3")s, answered ${answer:-null}"
+"$PG_BIN/pg_ctl" -D "$PGDATA" -m immediate -w -t 120 stop >/dev/null || true
+trap - EXIT
 "$ZOU_BIN/zou" stats "$ZOU_STORE_STATS" | tee "$WORK/stats-$LABEL.json"
 say "log $WORK/attach-$LABEL.log"
