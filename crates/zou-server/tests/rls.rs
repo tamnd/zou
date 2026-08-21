@@ -191,10 +191,11 @@ async fn a_table_created_after_bootstrap_is_granted_to_nobody() {
         .query("select count(*) from zou_rls_open", &[])
         .await
         .expect_err("a table nobody granted");
-    assert!(
-        refused.to_string().contains("permission denied"),
-        "{refused}"
-    );
+    // The debug form rather than the display one, because a client
+    // error prints as "db error" and keeps what postgres said in the
+    // source underneath it.
+    let said = format!("{refused:?}");
+    assert!(said.contains("permission denied"), "{said}");
     // The session is done for once postgres has refused inside it, so
     // this ends the transaction rather than pretending it is still one.
     drop(anon);

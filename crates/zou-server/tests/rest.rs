@@ -73,8 +73,41 @@ async fn seed(dsn: &str, statements: &[&str]) {
              to anon, authenticated, service_role"
         );
         sess.execute(&grant, &[]).await.expect(&grant);
+        let seqs = sequences(object);
+        sess.execute(&seqs, &[]).await.expect(&seqs);
     }
     sess.commit().await.expect("park");
+}
+
+/// The grant on the sequences an object made along with itself, which
+/// is the other half of granting a table.
+///
+/// A column that is an identity or a serial is filled with a `nextval`
+/// of its own sequence, and usage on a sequence is its own privilege
+/// that upstream's default privileges do not hand out either. A view
+/// owns no sequences and gets an empty loop.
+fn sequences(object: &str) -> String {
+    format!(
+        "do $$
+         declare
+             rel oid := to_regclass('{object}');
+             seq oid;
+         begin
+             for seq in
+                 select d.objid from pg_depend d
+                   join pg_class c on c.oid = d.objid and c.relkind = 'S'
+                  where d.classid = 'pg_class'::regclass
+                    and d.refclassid = 'pg_class'::regclass
+                    and d.refobjid = rel
+             loop
+                 execute format(
+                     'grant usage, select on sequence %s \
+                      to anon, authenticated, service_role',
+                     seq::regclass);
+             end loop;
+         end
+         $$"
+    )
 }
 
 /// The name a `create table` or `create view` statement just made, or

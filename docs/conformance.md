@@ -447,7 +447,8 @@ The wording is asserted whole now, on both servers, because it is what somebody 
 
 And the fixture itself was wrong in a way only the reference could say.
 It granted the reads and left the writes ungranted, on the reasoning that a service key has `bypassrls` and needs no grant, and every write in it failed against `supabase start` with a 403: `bypassrls` is about policies and grants are grants.
-zou took the writes because its bootstrap grants the three api roles everything in `public`, which upstream's default privileges do not, and that difference is [#344](https://github.com/tamnd/zou/issues/344) rather than something to hide in a fixture.
+zou took the writes because its bootstrap granted the three api roles everything in `public`, which upstream's default privileges do not, and that was [#344](https://github.com/tamnd/zou/issues/344) rather than something to hide in a fixture.
+The bootstrap grants what upstream grants now, so a fixture that means to write says so on both legs.
 
 `js-functions/` is the only directory here that ships code somebody deploys rather than requests somebody sends.
 
