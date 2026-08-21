@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use crate::config::{self, Project};
 use crate::serve;
-use zou_pg::{bootstrap, install, restore};
+use zou_pg::{install, restore};
 use zou_store::layout::TenantLayout;
 use zou_store::{CasStore, Manifest, open_store};
 
@@ -650,45 +650,16 @@ pub fn run(args: &Args) -> Result<(), String> {
     }
     if fresh {
         log::info!("{} is empty, running initdb", args.target);
-        let out = Command::new(args.pg_bin.join("initdb"))
-            .arg("-D")
-            .arg(&pgdata)
-            // The same superuser `zou serve` gives a tenant, so a store
-            // made by one command is one the other can open, and so the
-            // role a project's migrations run as is postgres here as it
-            // is on Supabase rather than whichever account happened to
-            // start the process.
-            .args(["-U", SUPERUSER])
-            .args(["--set", "io_method=sync"])
-            // Pages live as store objects and a put is atomic on every
-            // backend, so the torn write full page protection guards
-            // against cannot be observed here. The whole argument is
-            // in docs/storage-engine.md. Set at initdb time so
-            // restarts, restores and branches inherit it through the
-            // captured config.
-            .args(["--set", "full_page_writes=off"])
-            .env("ZOU_TARGET", &args.target)
-            .env("ZOU_TENANT", &args.tenant)
-            .env("ZOU_PAGE_CACHE", &pagecache)
-            // No page service exists during bootstrap, initdb is a
-            // standalone process. Writes stay eager whatever the
-            // caller exported, and the off is explicit because unset
-            // means on.
-            .env("ZOU_PAGESERVE", "0")
-            .output()
-            .map_err(|e| format!("initdb: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "initdb failed:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-        let control = fs::read(pgdata.join("global/pg_control"))
-            .map_err(|e| format!("read pg_control: {e}"))?;
-        let redo = restore::control_redo(&control)?;
-        let stats = bootstrap::capture_genesis(&*store, &layout, &pgdata, redo)?;
+        let stats = crate::genesis::make(
+            &*store,
+            &args.target,
+            &args.tenant,
+            &args.pg_bin,
+            &pgdata,
+            &pagecache,
+        )?;
         log::info!(
-            "captured genesis, {} files, {} bytes, redo {redo:#X}",
+            "captured genesis, {} files, {} bytes",
             stats.files,
             stats.bytes
         );

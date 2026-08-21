@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use crate::dev::SUPERUSER;
 use zou_pg::gc::{self, Sweep};
-use zou_pg::{bootstrap, install, restore, warm};
+use zou_pg::{install, restore, warm};
 use zou_server::Config;
 use zou_server::attach::{Attached, Backend};
 use zou_server::fleet::Doors;
@@ -772,45 +772,14 @@ impl Postmasters {
         pagecache: &std::path::Path,
     ) -> Result<(), String> {
         log::info!("{tenant_ref} has no database yet, running initdb");
-        let layout = TenantLayout::new(tenant_ref);
-        // An attach killed partway through the last one leaves pages of
-        // a cluster that never finished, and initdb on top of those is
-        // the "relation pg_attrdef already exists" a second attach dies
-        // with. Nothing under a manifest with no checkpoint is anyone's
-        // database.
-        let cleared = bootstrap::clear_unfinished(&*self.store, &layout)?;
-        if cleared > 0 {
-            log::info!("{tenant_ref}: cleared {cleared} objects an unfinished attach left");
-        }
-        let out = Command::new(self.pg_bin.join("initdb"))
-            .arg("-D")
-            .arg(pgdata)
-            // Named rather than left to the OS user, because the
-            // cluster superuser is the role a project's own migrations
-            // run as, and a Supabase project's is postgres wherever it
-            // is hosted. Taking the OS user would make the owner of a
-            // database depend on which account started the node.
-            .args(["-U", SUPERUSER])
-            .args(["--set", "io_method=sync"])
-            .args(["--set", "full_page_writes=off"])
-            .env("ZOU_TARGET", &self.target)
-            .env("ZOU_TENANT", tenant_ref)
-            .env("ZOU_PAGE_CACHE", pagecache)
-            // Bootstrap has no page service to talk to, and unset
-            // means on, so say off.
-            .env("ZOU_PAGESERVE", "0")
-            .output()
-            .map_err(|e| format!("initdb: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "initdb for {tenant_ref} failed:\n{}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
-        let control =
-            fs::read(pgdata.join("global/pg_control")).map_err(|e| format!("pg_control: {e}"))?;
-        let redo = restore::control_redo(&control)?;
-        let stats = bootstrap::capture_genesis(&*self.store, &layout, pgdata, redo)?;
+        let stats = crate::genesis::make(
+            &*self.store,
+            &self.target,
+            tenant_ref,
+            &self.pg_bin,
+            pgdata,
+            pagecache,
+        )?;
         log::info!(
             "{tenant_ref}: captured genesis, {} files, {} bytes",
             stats.files,

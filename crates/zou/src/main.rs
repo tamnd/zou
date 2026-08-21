@@ -29,6 +29,8 @@ mod export;
 #[cfg(unix)]
 mod functions;
 mod gc;
+#[cfg(unix)]
+mod genesis;
 mod import;
 #[cfg(unix)]
 mod inbox;
