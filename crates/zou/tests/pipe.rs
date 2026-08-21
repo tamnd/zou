@@ -55,22 +55,41 @@ fn a_listing_whose_reader_hangs_up_ends_as_a_command_that_finished() {
     );
 }
 
-/// The same through a shell, which is where it actually bites, with
-/// pipefail on so the writer's status is the one that is reported.
+/// The same against the readers it actually happens with. The pipeline
+/// is built here rather than handed to a shell, because the status
+/// being checked is the writer's and a shell reports the reader's
+/// unless it has pipefail, which is a bash option that the /bin/sh of
+/// a debian is not obliged to have.
+#[cfg(unix)]
 #[test]
 fn grep_q_and_head_leave_the_pipeline_green() {
     let dir = store();
-    let at = dir.path().to_str().expect("a path");
-    for reader in ["head -1", "grep -q acme"] {
-        let script = format!("set -o pipefail; {ZOU} tenant {at} list | {reader}");
-        let ran = Command::new("sh")
-            .arg("-c")
-            .arg(&script)
-            .output()
-            .expect("sh runs");
-        let said = String::from_utf8_lossy(&ran.stderr);
-        assert!(!said.contains("panicked"), "{reader}: {said}");
-        assert_eq!(ran.status.code(), Some(0), "{reader}: {said}");
+    for reader in [["head", "-1"], ["grep", "-q"]] {
+        let mut args = reader.to_vec();
+        if reader[0] == "grep" {
+            args.push("acme");
+        }
+        let mut writing = Command::new(ZOU)
+            .args(["tenant", dir.path().to_str().expect("a path"), "list"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("zou runs");
+        let out = writing.stdout.take().expect("the write end");
+        let mut reading = Command::new(args[0])
+            .args(&args[1..])
+            .stdin(Stdio::from(out))
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("the reader runs");
+        // The reader first: it is the one that hangs up, and the writer
+        // has nowhere to go until it does.
+        reading.wait().expect("the reader stops");
+        let done = writing.wait_with_output().expect("zou stops");
+        let said = String::from_utf8_lossy(&done.stderr);
+        let name = args.join(" ");
+        assert!(!said.contains("panicked"), "{name}: {said}");
+        assert_eq!(done.status.code(), Some(0), "{name}: {said}");
     }
 }
 
