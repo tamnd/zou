@@ -324,6 +324,7 @@ mod tests {
             expires_unix: now_unix() + 60,
             fence: 1,
             endpoint: None,
+            ttl_secs: None,
         });
         store.put(&layout.manifest(), &manifest.to_json()).unwrap();
         let err = clear_unfinished(&store, &layout).unwrap_err();

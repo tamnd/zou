@@ -13,6 +13,12 @@
 //! question to one documented place: the TTL must exceed the worst clock
 //! skew between nodes plus the longest upload pause, and the default of
 //! 15 seconds assumes NTP disciplined hosts.
+//!
+//! A lease records the TTL it was written for as well as when it runs
+//! out, because a holder that deliberately runs a longer TTL and a holder
+//! whose clock is wrong put the same impossible looking number in
+//! `expires_unix`, and the first is a lease to wait on while the second
+//! is a machine to go and fix.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -340,7 +346,13 @@ fn take(
             // happened before this read, so anything past our own now
             // plus the ttl is somebody's clock being wrong. Only the
             // grace separates a marginal disagreement from a real one.
-            let furthest = now_unix + ttl_secs + SKEW_GRACE_SECS;
+            //
+            // The ttl is the holder's own where it wrote one down. A
+            // holder that has backed off on a project nobody is writing
+            // holds a longer lease on purpose, and that must not read as
+            // a broken clock.
+            let their_ttl = lease.ttl_secs.unwrap_or(ttl_secs).max(ttl_secs);
+            let furthest = now_unix + their_ttl + SKEW_GRACE_SECS;
             if lease.expires_unix > furthest {
                 return Err(LeaseError::Skew {
                     holder: lease.holder.clone(),
@@ -363,6 +375,7 @@ fn take(
         expires_unix: now_unix + ttl_secs,
         fence,
         endpoint: endpoint.map(str::to_string),
+        ttl_secs: Some(ttl_secs),
     });
 
     let version = swap(store, &key, &manifest, &version)?;
@@ -379,6 +392,16 @@ fn take(
 
 /// Extend a held lease. Fails with `Lost` if a steal happened, in which
 /// case the caller must stop writing immediately.
+///
+/// One request, not two. The holder already has the manifest it last
+/// swapped and the version that swap returned, so the renewal is a
+/// conditional PUT against that version and the read is only paid when
+/// the condition fails. That is not a weaker check than re-reading
+/// first: anything that changed the manifest changed its version, so a
+/// steal comes back as a conflict here and is identified by the read
+/// that follows it. What it saves is the GET on every renewal of every
+/// attached project, which on a node holding a hundred of them is half
+/// the store traffic of a fleet doing nothing at all.
 pub fn renew(
     store: &dyn CasStore,
     layout: &TenantLayout,
@@ -387,12 +410,43 @@ pub fn renew(
     now_unix: u64,
 ) -> Result<(), LeaseError> {
     let key = layout.manifest();
-    let (mut manifest, version) = reread_checking_ownership(store, &key, held)?;
+    let mut manifest = held.manifest.clone();
+    let lease = match manifest.lease.as_mut() {
+        Some(lease) => lease,
+        // Nothing in hand to renew from, so read what is there and let
+        // the ownership check answer whether it is still ours.
+        None => return renew_by_reading(store, &key, held, ttl_secs, now_unix),
+    };
+    lease.expires_unix = now_unix + ttl_secs;
+    lease.ttl_secs = Some(ttl_secs);
+    match swap(store, &key, &manifest, &held.version) {
+        Ok(version) => {
+            held.version = version;
+            held.expires_unix = now_unix + ttl_secs;
+            held.manifest = manifest;
+            Ok(())
+        }
+        // Somebody swapped the manifest: this holder's own fold thread
+        // publishing a checkpoint, or another node taking the lease.
+        // Which one it was is exactly what the read says.
+        Err(LeaseError::Raced) => renew_by_reading(store, &key, held, ttl_secs, now_unix),
+        Err(e) => Err(e),
+    }
+}
 
+fn renew_by_reading(
+    store: &dyn CasStore,
+    key: &str,
+    held: &mut HeldLease,
+    ttl_secs: u64,
+    now_unix: u64,
+) -> Result<(), LeaseError> {
+    let (mut manifest, version) = reread_checking_ownership(store, key, held)?;
     let lease = manifest.lease.as_mut().expect("ownership was just checked");
     lease.expires_unix = now_unix + ttl_secs;
+    lease.ttl_secs = Some(ttl_secs);
 
-    held.version = swap(store, &key, &manifest, &version)?;
+    held.version = swap(store, key, &manifest, &version)?;
     held.expires_unix = now_unix + ttl_secs;
     held.manifest = manifest;
     Ok(())
@@ -505,6 +559,7 @@ fn swap(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use super::*;
@@ -518,6 +573,154 @@ mod tests {
             .put_if_absent(&layout.manifest(), &Manifest::new("t1", 18).to_json())
             .unwrap();
         (dir, store, layout)
+    }
+
+    /// Counts what reaches the store, which is what a renewal is billed
+    /// on and the only way to hold the cost of an idle project to a
+    /// number in a test.
+    struct Counting {
+        inner: LocalFsStore,
+        gets: AtomicUsize,
+        puts: AtomicUsize,
+    }
+
+    impl CasStore for Counting {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, Version)>, CasError> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(key)
+        }
+
+        fn put_if_match(
+            &self,
+            key: &str,
+            data: &[u8],
+            expected: Option<&Version>,
+        ) -> Result<Version, CasError> {
+            self.puts.fetch_add(1, Ordering::Relaxed);
+            self.inner.put_if_match(key, data, expected)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), CasError> {
+            self.inner.delete(key)
+        }
+
+        fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+            self.inner.list(prefix)
+        }
+    }
+
+    fn counted() -> (tempfile::TempDir, Counting, TenantLayout) {
+        let (dir, inner, layout) = setup();
+        (
+            dir,
+            Counting {
+                inner,
+                gets: AtomicUsize::new(0),
+                puts: AtomicUsize::new(0),
+            },
+            layout,
+        )
+    }
+
+    #[test]
+    fn a_renewal_costs_one_store_request() {
+        // The bill for an attached project doing nothing is this number
+        // times the renewal rate, so it is worth a test of its own.
+        let (_d, store, layout) = counted();
+        let mut held = acquire(&store, &layout, "node-a", 15, 1000).unwrap();
+        store.gets.store(0, Ordering::Relaxed);
+        store.puts.store(0, Ordering::Relaxed);
+
+        for i in 1..=10 {
+            renew(&store, &layout, &mut held, 15, 1000 + i * 5).unwrap();
+        }
+        assert_eq!(store.puts.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            store.gets.load(Ordering::Relaxed),
+            0,
+            "the holder already knows what it last wrote, so a renewal reads nothing"
+        );
+        assert_eq!(
+            holder(&store, &layout, 1051).unwrap().unwrap().expires_unix,
+            1065
+        );
+    }
+
+    #[test]
+    fn a_renewal_that_races_reads_and_says_who_won() {
+        let (_d, store, layout) = counted();
+        let mut held = acquire(&store, &layout, "node-a", 15, 1000).unwrap();
+
+        // Somebody else swapped the manifest, so the cached version is
+        // stale. This one is still ours, a checkpoint publish rather than
+        // a steal, and the renewal has to notice the difference.
+        let key = layout.manifest();
+        let (data, version) = store.get(&key).unwrap().unwrap();
+        let mut m = Manifest::from_json(&data).unwrap();
+        m.folded_upto = Some(crate::lsn::Lsn(99));
+        store
+            .put_if_match(&key, &m.to_json(), Some(&version))
+            .unwrap();
+
+        renew(&store, &layout, &mut held, 15, 1005).unwrap();
+        assert_eq!(
+            holder(&store, &layout, 1006).unwrap().unwrap().expires_unix,
+            1020
+        );
+
+        // And the same race lost to a real steal is a loss, not a retry.
+        let (data, version) = store.get(&key).unwrap().unwrap();
+        let mut m = Manifest::from_json(&data).unwrap();
+        m.epoch += 1;
+        m.lease = Some(Lease {
+            holder: "node-b".into(),
+            expires_unix: 1080,
+            fence: 99,
+            endpoint: None,
+            ttl_secs: Some(15),
+        });
+        store
+            .put_if_match(&key, &m.to_json(), Some(&version))
+            .unwrap();
+        let err = renew(&store, &layout, &mut held, 15, 1010).unwrap_err();
+        assert!(matches!(err, LeaseError::Lost { ref holder, .. } if holder == "node-b"));
+    }
+
+    #[test]
+    fn a_longer_lease_is_not_read_as_a_broken_clock() {
+        // A holder that has backed off on an idle project writes an
+        // expiry further out than this node's own ttl can reach. That is
+        // a lease to wait on, not a machine to go and fix.
+        let (_d, store, layout) = setup();
+        acquire(&store, &layout, "node-a", 300, 1000).unwrap();
+        let err = acquire(&store, &layout, "node-b", 15, 1001).unwrap_err();
+        assert!(
+            matches!(err, LeaseError::Held { ref holder, expires_unix: 1300 } if holder == "node-a"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_lease_further_out_than_its_own_ttl_allows_is_still_skew() {
+        let (_d, store, layout) = setup();
+        let key = layout.manifest();
+        let (data, version) = store.get(&key).unwrap().unwrap();
+        let mut m = Manifest::from_json(&data).unwrap();
+        m.epoch = 1;
+        m.lease = Some(Lease {
+            holder: "node-a".into(),
+            expires_unix: 9000,
+            fence: 1,
+            endpoint: None,
+            // It says it runs a 15s ttl and then wrote an expiry hours
+            // out, so the two do not agree and the clock is the reason.
+            ttl_secs: Some(15),
+        });
+        store
+            .put_if_match(&key, &m.to_json(), Some(&version))
+            .unwrap();
+        let err = acquire(&store, &layout, "node-b", 15, 1000).unwrap_err();
+        assert!(matches!(err, LeaseError::Skew { .. }), "{err}");
     }
 
     #[test]
