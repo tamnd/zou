@@ -13,6 +13,14 @@
 //! nobody has asked for in an hour is the cheapest one to make somebody
 //! wait for again.
 //!
+//! Neither budget takes a tenant somebody is in the middle of using. A
+//! caller that is about to do work holds the tenant while it does it,
+//! and a held tenant is passed over by the ceiling and by the sweep. On
+//! a node whose working set is up against its ceiling that means the
+//! ceiling is briefly exceeded, which is the honest trade: the other
+//! answer is stopping a database under work the node has already
+//! accepted, and the client sees that as the connection being cut.
+//!
 //! What starts a database is not in here. This owns the policy, which
 //! is a map, two budgets and a clock, and takes the machinery as a
 //! [`Backend`] so that the policy is testable without a postmaster and
@@ -20,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -72,6 +80,62 @@ struct Slot {
     /// Milliseconds since the manager was made, so that touching a
     /// tenant on the read path is one relaxed store and not a lock.
     used: AtomicU64,
+    /// How many callers are inside this tenant right now. Not zero and
+    /// neither budget will take it, which is what keeps a database from
+    /// being stopped under a request that is still talking to it.
+    busy: AtomicUsize,
+}
+
+impl Slot {
+    /// Nobody is inside it, so a budget may take it.
+    fn free(&self) -> bool {
+        self.busy.load(Ordering::Acquire) == 0
+    }
+}
+
+/// A tenant held up for as long as this lives.
+///
+/// What a caller does with the router or the dsn outlives the lookup
+/// that produced them, so the lookup hands back the thing that keeps
+/// the tenant attached rather than a bare copy of either. Dropping it
+/// is what says the work is over, so a holder wants to live as long as
+/// the work does: a request until its answer is written, a postgres
+/// session until the client goes away.
+pub struct Hold {
+    _busy: Busy,
+    up: Arc<Up>,
+}
+
+impl Hold {
+    /// The http door for this tenant. A clone, because a router is
+    /// cheap to clone and axum wants it by value.
+    pub fn router(&self) -> Router {
+        self.up.router.clone()
+    }
+
+    /// Where a postgres client is proxied to. None is a tenant its
+    /// backend brought up without a database to talk to.
+    pub fn dsn(&self) -> Option<&str> {
+        self.up.pg.as_deref()
+    }
+}
+
+/// The counting half of [`Hold`], taken before the attach so that a
+/// tenant being built is as safe from eviction as one being used, and
+/// so that an attach that failed lets go on the way out.
+struct Busy(Arc<Slot>);
+
+impl Busy {
+    fn of(slot: Arc<Slot>) -> Busy {
+        slot.busy.fetch_add(1, Ordering::AcqRel);
+        Busy(slot)
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.busy.fetch_sub(1, Ordering::Release);
+    }
 }
 
 /// The attached set.
@@ -107,14 +171,32 @@ impl Attached {
 
     /// The front door for a tenant, attaching it if it is not up.
     ///
-    /// The returned router is a clone, so a request that is already
-    /// running holds what it needs even if the tenant is detached
-    /// underneath it. What that does not save it from is the backend
-    /// stopping the database it talks to, which is why detach picks the
-    /// least recently used: a request in flight has just touched its
-    /// tenant, so it is the last thing eviction reaches for.
+    /// The caller holds the answer for as long as it is using it, and
+    /// while it does, neither budget will take the tenant away. That is
+    /// what the hold is for: a router is a clone and survives a detach,
+    /// but the database behind it does not survive the backend stopping
+    /// the postmaster, and the client sees that as its connection being
+    /// cut halfway through an answer.
+    pub async fn hold(&self, entry: &Tenant) -> Result<Hold, String> {
+        let slot = self.slot(&entry.tenant_ref).await;
+        slot.used.store(self.now(), Ordering::Relaxed);
+        // Before the attach, not after: a tenant that is being built is
+        // in the map already, and the request paying for the build is
+        // the last one that should find it evicted when it gets there.
+        let busy = Busy::of(slot.clone());
+        let up = self.up(&slot, entry).await?;
+        Ok(Hold { _busy: busy, up })
+    }
+
+    /// The router on its own, for a caller with no work to hold it
+    /// through.
+    ///
+    /// The hold is over by the time this returns, so what is left
+    /// behind is an attach rather than a promise: it is the right thing
+    /// for bringing a tenant up ahead of the requests that will use it,
+    /// and the wrong thing for serving one out of.
     pub async fn router(&self, entry: &Tenant) -> Result<Router, String> {
-        Ok(self.up(entry).await?.router.clone())
+        Ok(self.hold(entry).await?.router())
     }
 
     /// The dsn of the tenant's database, attaching it if it is not up.
@@ -124,12 +206,10 @@ impl Attached {
     /// to, which is a legitimate answer on the http side and nothing a
     /// postgres client can be given.
     pub async fn dsn(&self, entry: &Tenant) -> Result<Option<String>, String> {
-        Ok(self.up(entry).await?.pg.clone())
+        Ok(self.hold(entry).await?.dsn().map(str::to_string))
     }
 
-    async fn up(&self, entry: &Tenant) -> Result<Arc<Up>, String> {
-        let slot = self.slot(&entry.tenant_ref).await;
-        slot.used.store(self.now(), Ordering::Relaxed);
+    async fn up(&self, slot: &Arc<Slot>, entry: &Tenant) -> Result<Arc<Up>, String> {
         let backend = self.backend.clone();
         let entry = entry.clone();
         let tenant_ref = entry.tenant_ref.clone();
@@ -182,9 +262,13 @@ impl Attached {
         };
         let cutoff = self.now().saturating_sub(idle);
         let mut slots = self.slots.lock().await;
+        // A held tenant is untouched only in the sense that nothing has
+        // attached it lately, and a postgres session that has sat quiet
+        // for an hour is exactly that. It is still somebody's, so the
+        // idle budget passes over it the same way the ceiling does.
         let stale: Vec<String> = slots
             .iter()
-            .filter(|(_, slot)| slot.used.load(Ordering::Relaxed) < cutoff)
+            .filter(|(_, slot)| slot.used.load(Ordering::Relaxed) < cutoff && slot.free())
             .map(|(tenant_ref, _)| tenant_ref.clone())
             .collect();
         for tenant_ref in stale {
@@ -192,6 +276,11 @@ impl Attached {
             self.backend.down(&tenant_ref);
         }
         crate::ops::attached(slots.len());
+        drop(slots);
+        // The ceiling too, because the attach that last exceeded it may
+        // have been held over it and there is no promise of another one
+        // arriving to try again.
+        self.enforce().await;
     }
 
     /// Let one tenant go now, for a project that was just deleted or a
@@ -221,12 +310,20 @@ impl Attached {
                 Arc::new(Slot {
                     up: OnceCell::new(),
                     used: AtomicU64::new(0),
+                    busy: AtomicUsize::new(0),
                 })
             })
             .clone()
     }
 
-    /// Back down to the ceiling, oldest use first.
+    /// Back down to the ceiling, oldest use first, skipping whatever
+    /// somebody is inside.
+    ///
+    /// Skipping is why this can finish with the node still over its
+    /// ceiling. It happens when the working set is the ceiling and every
+    /// tenant on the node is being used at once, and it lasts until the
+    /// holds are let go, at which point the next attach or the next
+    /// sweep takes the room back.
     async fn enforce(&self) {
         let mut slots = self.slots.lock().await;
         // Reported from here because this runs on every attach and
@@ -237,13 +334,28 @@ impl Attached {
         }
         let mut by_use: Vec<(u64, String)> = slots
             .iter()
+            .filter(|(_, slot)| slot.free())
             .map(|(tenant_ref, slot)| (slot.used.load(Ordering::Relaxed), tenant_ref.clone()))
             .collect();
         by_use.sort_unstable();
         let over = slots.len() - self.max;
         for (_, tenant_ref) in by_use.into_iter().take(over) {
+            // Read again rather than trusted from the filter: a request
+            // takes its tenant without this lock, so the last word on
+            // whether one is in use is the word said next to the
+            // removal itself.
+            if slots.get(&tenant_ref).is_some_and(|slot| !slot.free()) {
+                continue;
+            }
             slots.remove(&tenant_ref);
             self.backend.down(&tenant_ref);
+        }
+        let left = slots.len().saturating_sub(self.max);
+        if left > 0 {
+            log::debug!(
+                "{left} tenants over the ceiling of {}, all in use",
+                self.max
+            );
         }
         crate::ops::attached(slots.len());
     }
@@ -396,6 +508,64 @@ mod tests {
             vec!["one", "two", "three", "two"],
             "and the evicted one comes back by being asked for"
         );
+    }
+
+    #[tokio::test]
+    async fn a_tenant_somebody_is_using_is_not_the_one_the_ceiling_takes() {
+        let (fake, attached) = manager();
+        let attached = attached.with_budget(2, IDLE);
+        // The oldest use by a mile, and in the middle of a request, so
+        // the ceiling has to reach past it for the next one instead.
+        let one = attached.hold(&entry("one")).await.unwrap();
+        let _ = attached.router(&entry("two")).await.unwrap();
+        let _ = attached.router(&entry("three")).await.unwrap();
+        assert_eq!(
+            fake.downs(),
+            vec!["two"],
+            "the least recently used that nobody was inside"
+        );
+        drop(one);
+        // And once the request is over it is an ordinary candidate.
+        let _ = attached.router(&entry("four")).await.unwrap();
+        assert_eq!(fake.downs(), vec!["two", "one"]);
+    }
+
+    #[tokio::test]
+    async fn the_ceiling_is_exceeded_rather_than_a_request_failed() {
+        let (fake, attached) = manager();
+        let attached = attached.with_budget(1, IDLE);
+        let held: Vec<Hold> = vec![
+            attached.hold(&entry("one")).await.unwrap(),
+            attached.hold(&entry("two")).await.unwrap(),
+            attached.hold(&entry("three")).await.unwrap(),
+        ];
+        assert_eq!(attached.len().await, 3, "a ceiling of one, three in use");
+        assert!(
+            fake.downs().is_empty(),
+            "nothing was stopped under work the node had accepted"
+        );
+        drop(held);
+        // Nothing else attaches, so it is the sweep that takes the room
+        // back rather than a request that happened to arrive.
+        attached.sweep().await;
+        assert_eq!(attached.len().await, 1);
+        assert_eq!(fake.downs(), vec!["one", "two"]);
+    }
+
+    #[tokio::test]
+    async fn an_idle_tenant_somebody_is_still_connected_to_stays() {
+        let (fake, attached) = manager();
+        let attached = attached.with_budget(MAX_ATTACHED, Duration::from_millis(20));
+        let session = attached.hold(&entry("quiet")).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        attached.sweep().await;
+        assert!(
+            fake.downs().is_empty(),
+            "a session that has sat quiet is not a project nobody is using"
+        );
+        drop(session);
+        attached.sweep().await;
+        assert_eq!(fake.downs(), vec!["quiet"]);
     }
 
     #[tokio::test]
