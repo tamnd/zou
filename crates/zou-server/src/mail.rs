@@ -457,6 +457,96 @@ fn default_body(template: &str) -> &'static str {
     }
 }
 
+/// The six template names in the order GoTrue lists them, paired with
+/// the tail of the env var that names each one.
+const NAMED: [(&str, &str); 6] = [
+    (INVITE, "INVITE"),
+    (CONFIRMATION, "CONFIRMATION"),
+    (RECOVERY, "RECOVERY"),
+    (MAGIC_LINK, "MAGIC_LINK"),
+    (EMAIL_CHANGE, "EMAIL_CHANGE"),
+    (REAUTHENTICATION, "REAUTHENTICATION"),
+];
+
+/// The mail settings from the environment, GoTrue's `GOTRUE_MAILER_*`
+/// and `GOTRUE_SMTP_MAX_FREQUENCY` with the prefix swapped.
+pub fn settings_from_env() -> Result<Settings, String> {
+    settings(&|name| std::env::var(name).unwrap_or_default(), &read)
+}
+
+/// The same over anything that can look a name up, and anything that
+/// can fetch a template. The second one is split out because upstream's
+/// template settings name a location rather than holding a template,
+/// so reading this configuration is what does the io.
+pub fn settings(
+    var: &dyn Fn(&str) -> String,
+    fetch: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<Settings, String> {
+    let stock = Settings::default();
+    let mut subjects = BTreeMap::new();
+    let mut bodies = BTreeMap::new();
+    for (template, tail) in NAMED {
+        let subject = var(&format!("ZOU_MAILER_SUBJECTS_{tail}"));
+        if !subject.trim().is_empty() {
+            subjects.insert(template.to_string(), subject.trim().to_string());
+        }
+        let at = var(&format!("ZOU_MAILER_TEMPLATES_{tail}"));
+        if !at.trim().is_empty() {
+            bodies.insert(template.to_string(), fetch(at.trim())?);
+        }
+    }
+    Ok(Settings {
+        paths: UrlPaths {
+            invite: path(var, "INVITE", &stock.paths.invite),
+            confirmation: path(var, "CONFIRMATION", &stock.paths.confirmation),
+            recovery: path(var, "RECOVERY", &stock.paths.recovery),
+            email_change: path(var, "EMAIL_CHANGE", &stock.paths.email_change),
+        },
+        subjects,
+        bodies,
+        max_frequency: crate::limit::seconds(var, "ZOU_SMTP_MAX_FREQUENCY", stock.max_frequency)?,
+    })
+}
+
+fn path(var: &dyn Fn(&str) -> String, tail: &str, stock: &str) -> String {
+    match var(&format!("ZOU_MAILER_URLPATHS_{tail}")).trim() {
+        "" => stock.to_string(),
+        set => set.to_string(),
+    }
+}
+
+/// A template from wherever the setting pointed. Upstream's value is a
+/// url it fetches, so an http one is fetched here too, once, at
+/// startup rather than per message. Anything else is a path on disk,
+/// which is what a project running zou on its own box has.
+///
+/// A template that cannot be read is an error and not a warning. The
+/// alternative is sending GoTrue's stock email to somebody who wrote
+/// their own and never hearing about it.
+pub fn read(at: &str) -> Result<String, String> {
+    if at.starts_with("http://") || at.starts_with("https://") {
+        use std::io::Read;
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(10)))
+            .build()
+            .into();
+        let mut res = agent
+            .get(at)
+            .header("user-agent", "zou")
+            .call()
+            .map_err(|e| format!("fetching the mail template at {at}: {e}"))?;
+        let mut body = String::new();
+        res.body_mut()
+            .as_reader()
+            .take(1 << 20)
+            .read_to_string(&mut body)
+            .map_err(|e| format!("reading the mail template at {at}: {e}"))?;
+        return Ok(body);
+    }
+    std::fs::read_to_string(at.strip_prefix("file://").unwrap_or(at))
+        .map_err(|e| format!("reading the mail template at {at}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,5 +702,74 @@ mod tests {
         assert_eq!(kept[1].to, "2@zou.test");
         inbox.clear();
         assert!(inbox.kept().is_empty());
+    }
+
+    #[test]
+    fn the_settings_are_gotrues_with_the_prefix_swapped() {
+        let env = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            settings(
+                &move |name| {
+                    pairs
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default()
+                },
+                // Whatever the setting pointed at, said back, so what
+                // is under test here is which name was looked up and
+                // not what a file server had that day.
+                &|at| Ok(format!("<p>{at}</p>")),
+            )
+        };
+        let stock = env(&[]).expect("nothing set is not an error");
+        assert_eq!(stock.max_frequency, 60);
+        assert_eq!(stock.subject(RECOVERY), "Reset your password");
+        assert_eq!(stock.path(INVITE), "/auth/v1/verify");
+        assert!(
+            stock
+                .body(CONFIRMATION)
+                .contains("Confirm your email address")
+        );
+
+        let set = env(&[
+            ("ZOU_MAILER_SUBJECTS_RECOVERY", "Reset it"),
+            ("ZOU_MAILER_TEMPLATES_RECOVERY", "/etc/zou/recovery.html"),
+            ("ZOU_MAILER_URLPATHS_RECOVERY", "/reset"),
+            ("ZOU_SMTP_MAX_FREQUENCY", "5s"),
+        ])
+        .expect("all of it is readable");
+        assert_eq!(set.subject(RECOVERY), "Reset it");
+        assert_eq!(set.body(RECOVERY), "<p>/etc/zou/recovery.html</p>");
+        assert_eq!(set.path(RECOVERY), "/reset");
+        assert_eq!(set.max_frequency, 5);
+        // A magic link takes the recovery path upstream and here, and
+        // the one that was not named keeps the default.
+        assert_eq!(set.path(MAGIC_LINK), "/reset");
+        assert_eq!(set.path(CONFIRMATION), "/auth/v1/verify");
+        assert_eq!(set.subject(INVITE), "You've been invited");
+
+        assert!(env(&[("ZOU_SMTP_MAX_FREQUENCY", "often")]).is_err());
+    }
+
+    #[test]
+    fn a_template_that_cannot_be_read_stops_the_start() {
+        let out = settings(
+            &|name| match name {
+                "ZOU_MAILER_TEMPLATES_INVITE" => "/no/such/template.html".to_string(),
+                _ => String::new(),
+            },
+            &read,
+        );
+        let Err(e) = out else {
+            panic!("a template nobody can read is not a working configuration");
+        };
+        assert!(
+            e.starts_with("reading the mail template at /no/such/template.html"),
+            "{e}"
+        );
     }
 }

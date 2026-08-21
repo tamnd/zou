@@ -269,6 +269,19 @@ fn start_http(
     if !autoconfirm && sender.is_none() {
         log::info!("signups need a confirmation link, read it with zou inbox --http {port}");
     }
+    // The subjects, the templates, where each link points and how often
+    // one may be asked for. A project that set none of them gets
+    // GoTrue's own defaults, and a project that set them for GoTrue
+    // gets what it wrote, because the names are upstream's with the
+    // prefix swapped. A template setting names a file or a url, which
+    // is read here, once, rather than on the way to somebody's inbox.
+    let mail = zou_server::mail::settings_from_env()?;
+    if !mail.bodies.is_empty() {
+        log::info!(
+            "the {} mail templates are this project's own",
+            mail.bodies.len()
+        );
+    }
     // Phone is off by default, the same as GoTrue, because a project
     // that has not said it wants phone sign in should refuse it by name
     // rather than half serve it.
@@ -284,7 +297,10 @@ fn start_http(
     if phone_enabled && texter.is_none() {
         log::info!("phone codes stay in this process, read them with zou inbox --http {port}");
     }
-    let sms_autoconfirm = zou_store::setting::flag("ZOU_SMS_AUTOCONFIRM").unwrap_or(false);
+    // The template a code arrives in, how many digits it has, how long
+    // it lasts and how often one may be asked for, all of them
+    // GOTRUE_SMS_ with the prefix swapped.
+    let sms = zou_server::sms::settings_from_env()?;
     let oauth = zou_server::oauth::from_env()?;
     if !oauth.is_empty() {
         log::info!("social sign in with {}", oauth.names().join(", "));
@@ -420,6 +436,8 @@ fn start_http(
             // nothing set this is None and the messages stay in the
             // process, which is what a laptop wants.
             sender,
+            // What those messages say, and how often one is sent.
+            mail,
             // Set ZOU_EXTERNAL_GOOGLE_CLIENT_ID and its secret, or the
             // same pair for github, and /authorize starts offering
             // them. With nothing set this is empty and every provider
@@ -459,17 +477,14 @@ fn start_http(
             email_enabled,
             disable_signup,
             // Off unless ZOU_EXTERNAL_PHONE_ENABLED=true, and then set
-            // ZOU_SMS_PROVIDER=twilio or messagebird with its
-            // credentials to send for real. With no provider the codes
-            // stay in the process and `zou inbox` prints them, which is
-            // how a phone sign in screen gets written on a laptop with
-            // no Twilio account.
+            // ZOU_SMS_PROVIDER to twilio, messagebird, vonage or
+            // textlocal with its credentials to send for real. With no
+            // provider the codes stay in the process and `zou inbox`
+            // prints them, which is how a phone sign in screen gets
+            // written on a laptop with no Twilio account.
             phone_enabled,
             texter,
-            sms: zou_server::sms::Settings {
-                autoconfirm: sms_autoconfirm,
-                ..Default::default()
-            },
+            sms,
             // An authenticator app is on by default, the same as
             // GoTrue. ZOU_MFA_TOTP_VERIFY_ENABLED=false turns MFA off
             // without deleting anybody's factors, and the two

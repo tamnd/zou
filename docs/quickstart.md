@@ -202,9 +202,35 @@ ZOU_SMS_TWILIO_MESSAGE_SERVICE_SID=MG... \
   zou dev /tmp/mydb --http 54321
 ```
 
-`messagebird` is the other one, on `ZOU_SMS_MESSAGEBIRD_ACCESS_KEY` and `ZOU_SMS_MESSAGEBIRD_ORIGINATOR`. WhatsApp is Twilio's alone, through `ZOU_SMS_TWILIO_CONTENT_SID`, and asking any other provider for the `whatsapp` channel is refused by name. `ZOU_SMS_AUTOCONFIRM=true` takes a number at its word the way `ZOU_MAILER_AUTOCONFIRM` takes an address, which is what a project wants while it is still being written.
+Three more providers take the same shape:
+
+| `ZOU_SMS_PROVIDER` | what it needs |
+| --- | --- |
+| `messagebird` | `ZOU_SMS_MESSAGEBIRD_ACCESS_KEY`, `ZOU_SMS_MESSAGEBIRD_ORIGINATOR` |
+| `vonage` | `ZOU_SMS_VONAGE_API_KEY`, `ZOU_SMS_VONAGE_API_SECRET`, `ZOU_SMS_VONAGE_FROM` |
+| `textlocal` | `ZOU_SMS_TEXTLOCAL_API_KEY`, `ZOU_SMS_TEXTLOCAL_SENDER` |
+
+WhatsApp is Twilio's alone, through `ZOU_SMS_TWILIO_CONTENT_SID`, and asking any other provider for the `whatsapp` channel is refused by name.
+
+What the message says and how long a code is good for are settings of their own, GoTrue's names again. `ZOU_SMS_TEMPLATE` takes one variable, `{{ .Code }}`, and defaults to `Your code is {{ .Code }}`. `ZOU_SMS_OTP_LENGTH` is six digits and will not go under six or over ten. `ZOU_SMS_OTP_EXP` is sixty seconds. `ZOU_SMS_MAX_FREQUENCY` is how long an account waits before it may ask for another code, also sixty seconds, and it reads either a number of seconds or a Go duration like `1m0s` so a hosted project's own value works unchanged. `ZOU_SMS_AUTOCONFIRM=true` takes a number at its word the way `ZOU_MAILER_AUTOCONFIRM` takes an address, which is what a project wants while it is still being written.
 
 A number is held in E.164 with the plus taken off, so somebody who typed `+1 555 010 0000` and somebody who typed `15550100000` are one account. Changing a number through `updateUser({ phone })` stages it and texts the new one, and the account keeps the old number until that code comes back with `type: 'phone_change'`.
+
+## What the emails say
+
+The subjects and the bodies are GoTrue's, word for word, so a project that never wrote a template gets the same mail from zou that it got before. A project that did wrote it under `GOTRUE_MAILER_SUBJECTS_*` and `GOTRUE_MAILER_TEMPLATES_*`, and those names work here with the prefix swapped, one per template: `INVITE`, `CONFIRMATION`, `RECOVERY`, `MAGIC_LINK`, `EMAIL_CHANGE`, `REAUTHENTICATION`.
+
+```bash
+ZOU_MAILER_SUBJECTS_RECOVERY="Reset your password" \
+ZOU_MAILER_TEMPLATES_RECOVERY=/etc/zou/recovery.html \
+ZOU_MAILER_URLPATHS_RECOVERY=/auth/v1/verify \
+ZOU_SMTP_MAX_FREQUENCY=1m0s \
+  zou dev /tmp/mydb --http 54321
+```
+
+A template setting names a location rather than holding the template: an `http://` or `https://` url is fetched, anything else is a path on disk. Either way it is read once, at startup, so a template nobody can read stops the server there instead of quietly mailing the stock one for a week. The variables are GoTrue's, `{{ .ConfirmationURL }}`, `{{ .Token }}`, `{{ .Email }}`, `{{ .NewEmail }}`, `{{ .SiteURL }}` and `{{ .Data }}`.
+
+`ZOU_MAILER_URLPATHS_*` moves where the link points, which a project that serves its own confirmation page needs. `ZOU_SMTP_MAX_FREQUENCY` is the mail side of the frequency ceiling above and reads the same two ways.
 
 ## Signing in with Google, Github, or Apple
 
@@ -317,7 +343,7 @@ const settings = await fetch(`${url}/auth/v1/settings`, {
 
 settings.external.google      // true once a client id and a secret are set
 settings.disable_signup       // false unless the project closed the door
-settings.sms_provider         // "twilio", "messagebird", or ""
+settings.sms_provider         // "twilio", "vonage", "textlocal", "messagebird", or ""
 ```
 
 A provider nobody configured is `false` rather than missing, so a client can read the whole set without guarding every name.
