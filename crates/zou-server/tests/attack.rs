@@ -68,9 +68,6 @@ fn user(sub: &str, tenant: &str, secret: &[u8]) -> String {
     )
 }
 
-/// The fixture's tables, and the grant a real project's migrations
-/// would carry, since a table in public arrives readable by nobody who
-/// comes through the api.
 async fn seed(dsn: &str, statements: &[impl AsRef<str>]) {
     let pool = Pool::new(dsn, 1).expect("dsn parses");
     let sess = pool.unscoped().await.expect("connect");
@@ -78,9 +75,6 @@ async fn seed(dsn: &str, statements: &[impl AsRef<str>]) {
         let stmt = stmt.as_ref();
         sess.execute(stmt, &[]).await.expect(stmt);
     }
-    let grant = "grant select, insert, update, delete on all tables in schema public \
-                 to anon, authenticated, service_role";
-    sess.execute(grant, &[]).await.expect(grant);
     sess.commit().await.expect("park");
 }
 

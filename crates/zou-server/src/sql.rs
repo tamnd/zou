@@ -325,6 +325,33 @@ begin
         alter default privileges in schema public
             grant references, trigger, truncate, maintain
             on tables to anon, authenticated, service_role;
+    elsif (
+        -- A database an older zou opened carries that release's stance,
+        -- which handed every future table to all three roles, and a
+        -- database is opened once so it would carry it forever. The
+        -- signature is all three holding select, which is what the old
+        -- bootstrap wrote and nothing else here writes; a project that
+        -- widened the default itself did so for one role at a time and
+        -- is left alone. Only the default changes, so a table that
+        -- already exists keeps whatever it was granted.
+        select count(distinct a.grantee) = 3
+        from pg_default_acl d
+        join pg_namespace n on n.oid = d.defaclnamespace
+        cross join aclexplode(d.defaclacl) a
+        where n.nspname = 'public'
+          and d.defaclobjtype = 'r'
+          and a.privilege_type = 'SELECT'
+          and a.grantee in (
+              'anon'::regrole, 'authenticated'::regrole, 'service_role'::regrole
+          )
+    ) then
+        alter default privileges in schema public
+            revoke select, insert, update, delete
+            on tables from anon, authenticated, service_role;
+        alter default privileges in schema public
+            revoke all on sequences from anon, authenticated, service_role;
+        alter default privileges in schema public
+            revoke all on functions from anon, authenticated, service_role;
     end if;
 end
 $$;

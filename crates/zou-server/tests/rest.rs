@@ -53,22 +53,58 @@ fn app_with_schemas(dsn: &str, schemas: &[&str]) -> axum::Router {
 /// would carry.
 ///
 /// A table in public arrives readable by nobody who comes through the
-/// api, same as upstream, so a suite that reads one through the api
-/// has to say so. Granting the whole schema rather than each table is
-/// the test database being a test database; what matters is that the
-/// grant is here and not in the bootstrap.
+/// api, same as upstream, so a suite that reads one through the api has
+/// to say so. The grant names each object this seed just created rather
+/// than the whole schema, for two reasons: the suites in this crate run
+/// as separate binaries against one database, so a blanket grant would
+/// hand out tables belonging to a test that is asserting nobody was
+/// given them, and two blanket grants running at once rewrite the same
+/// catalog rows and one of them dies with "tuple concurrently updated".
 async fn seed(dsn: &str, statements: &[&str]) {
     let pool = Pool::new(dsn, 1).expect("dsn parses");
     let sess = pool.unscoped().await.expect("connect");
     for stmt in statements {
         sess.execute(stmt, &[]).await.expect(stmt);
+        let Some(object) = created(stmt) else {
+            continue;
+        };
+        let grant = format!(
+            "grant select, insert, update, delete on {object} \
+             to anon, authenticated, service_role"
+        );
+        sess.execute(&grant, &[]).await.expect(&grant);
     }
-    sess.execute(GRANT, &[]).await.expect(GRANT);
     sess.commit().await.expect("park");
 }
 
-const GRANT: &str = "grant select, insert, update, delete on all tables in schema public \
-                     to anon, authenticated, service_role";
+/// The name a `create table` or `create view` statement just made, or
+/// None for a statement that made neither.
+fn created(stmt: &str) -> Option<&str> {
+    let rest = word(stmt.trim_start(), "create")?;
+    let rest = word(rest, "or replace").unwrap_or(rest);
+    let rest = word(rest, "materialized").unwrap_or(rest);
+    let rest = word(rest, "table").or_else(|| word(rest, "view"))?;
+    let rest = word(rest, "if not exists").unwrap_or(rest);
+    let name = rest.split(|c: char| c.is_whitespace() || c == '(').next()?;
+    match name.is_empty() {
+        true => None,
+        false => Some(name),
+    }
+}
+
+/// What is left of `s` after `kw`, whose words may be separated by any
+/// run of whitespace, or None if `s` does not start with it.
+fn word<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let mut rest = s;
+    for want in kw.split(' ') {
+        let cut = rest.find(char::is_whitespace)?;
+        if !rest[..cut].eq_ignore_ascii_case(want) {
+            return None;
+        }
+        rest = rest[cut..].trim_start();
+    }
+    Some(rest)
+}
 
 async fn body_text(res: axum::response::Response) -> String {
     let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
