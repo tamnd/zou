@@ -104,7 +104,7 @@ zou serve s3://my-bucket/projects --ref demo --http 54321   # once, then stop it
 ```
 
 That second line is worth doing even though the function would do it itself.
-It also installs the auth schema, which the first request that needs it does, once in a project's life, and it takes about three seconds.
+The initdb it runs is also where the auth, storage, realtime, net, functions and cron schemas are installed, and they go into the genesis capture with the rest of the cluster, so every environment after this one restores them rather than building them.
 
 Lambda sends SIGTERM before destroying an environment only when the function has an extension registered, so a function with no extension is always killed.
 The cost of that is the paragraph above: reads are unaffected, and the first write in the next environment waits out what is left of the 15 second lease.
@@ -139,18 +139,19 @@ So `tenant keys` reads the store, which is where the answer is.
 
 `scripts/zou-lambda-smoke.sh` runs the whole adapter against a fake runtime api on a laptop: it hands out function url events, the real binary answers them, and every answer is checked.
 Two environments, because the interesting one is the second, which is what every cold start after a project's first does.
-On an M-series laptop against a store on the local disk:
+On gamingpc (i9-13900K, 32 GB, Ubuntu under WSL2, store on a local directory), 2026-08-21:
 
 | | |
 | --- | --- |
-| exec to the runtime api loop | 0.3 ms |
-| attach, before the first event | 25 to 57 ms |
-| a health check | 0.7 ms |
-| the first request to the rest surface | 97 ms |
-| a signup, the first write of a project's life | 3.5 s |
-| the same signup again | 55.8 ms |
+| exec to the runtime api loop | 0.2 ms |
+| attach, before the first event | 26.8 ms |
+| a health check | 1.2 ms |
+| the first request to the rest surface | 107.8 ms |
+| a signup, the first write of a project's life | 483.0 ms |
+| the same signup again | 57.2 ms |
 
-The rest surface's first request builds the schema cache, and the first signup installs the auth schema, and both are once per project rather than once per environment.
+The rest surface's first request builds the schema cache, which is once per project rather than once per environment.
+The first signup is dearer than the ones after it because it is the first connection and the first password hash of the environment, not because of any DDL: the auth schema is in the genesis capture and arrives with the restore.
 A project that was warmed once, as above, starts answering in tens of milliseconds.
 
 The cold attach against object storage is the number that matters more and it is measured separately, with the wire latency of S3 simulated, in [benchmarks.md](benchmarks.md).

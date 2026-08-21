@@ -125,9 +125,9 @@ fn initdb(
     Ok(())
 }
 
-/// Start a postmaster nobody else can reach, apply the contract over
-/// it, and stop it cleanly so the pages it wrote are in a shutdown
-/// checkpoint before the capture reads pg_control.
+/// The roles, the grants and the schemas, over a postmaster nobody
+/// else can reach, stopped cleanly afterwards so the pages it wrote are
+/// in a shutdown checkpoint before the capture reads pg_control.
 fn contract(
     target: &str,
     tenant_ref: &str,
@@ -135,6 +135,27 @@ fn contract(
     pgdata: &Path,
     pagecache: &Path,
 ) -> Result<(), String> {
+    over_a_private_postmaster(target, tenant_ref, pg_bin, pgdata, pagecache, |dsn| {
+        on_a_connection(dsn, |client| async move {
+            let out = zou_server::sql::bootstrap(&client)
+                .await
+                .map_err(|e| format!("the tenant contract: {e}"));
+            drop(client);
+            out
+        })
+    })
+}
+
+/// Start a postmaster on a private unix socket, hand its dsn to `with`,
+/// and stop it whether that worked or not.
+fn over_a_private_postmaster<T>(
+    target: &str,
+    tenant_ref: &str,
+    pg_bin: &Path,
+    pgdata: &Path,
+    pagecache: &Path,
+    with: impl FnOnce(&str) -> Result<T, String>,
+) -> Result<T, String> {
     let sock = pgdata
         .parent()
         .ok_or("pgdata has no parent to put a socket beside")?
@@ -184,12 +205,12 @@ fn contract(
         "host={} port={PORT} user={SUPERUSER} dbname=postgres",
         sock.display()
     );
-    let out = ready(&mut child, &dsn).and_then(|()| apply(&dsn));
+    let out = ready(&mut child, &dsn).and_then(|()| with(&dsn));
     let stopped = stop(&mut child);
-    out?;
+    let out = out?;
     stopped?;
     let _ = std::fs::remove_dir_all(&sock);
-    Ok(())
+    Ok(out)
 }
 
 /// Connect until it answers, the postmaster dies, or the wait runs out.
@@ -229,26 +250,14 @@ fn dial(dsn: &str) -> Result<(), String> {
     })
 }
 
-/// The roles, the grants and the schemas, over a database nobody is
-/// waiting on.
-fn apply(dsn: &str) -> Result<(), String> {
-    on_a_connection(dsn, |client| async move {
-        let out = zou_server::sql::bootstrap(&client)
-            .await
-            .map_err(|e| format!("the tenant contract: {e}"));
-        drop(client);
-        out
-    })
-}
-
 /// Run one thing over a connection to `dsn` on a runtime of its own.
 /// The callers are `zou serve`'s attach path and `zou dev`'s startup,
 /// neither of which is inside a runtime, and one connection that is
 /// closed again is not worth a pool.
-fn on_a_connection<F, Fut>(dsn: &str, with: F) -> Result<(), String>
+fn on_a_connection<T, F, Fut>(dsn: &str, with: F) -> Result<T, String>
 where
     F: FnOnce(tokio_postgres::Client) -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
+    Fut: std::future::Future<Output = Result<T, String>>,
 {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -291,4 +300,71 @@ fn stop(child: &mut Child) -> Result<(), String> {
         "postgres would not shut down within {}s",
         STOP_TIMEOUT.as_secs()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A patched install, or nothing, in which case the test below
+    /// skips and `cargo test` stays a build away from a database:
+    ///
+    ///   ZOU_PG_BIN=$PWD/build/pg/bin cargo test -p zou
+    fn patched() -> Option<std::path::PathBuf> {
+        let bin = std::env::var_os("ZOU_PG_BIN").map(std::path::PathBuf::from)?;
+        bin.join("postgres").exists().then_some(bin)
+    }
+
+    /// The whole point of putting the contract in genesis: a node that
+    /// has never seen this project, and runs no DDL of its own, finds
+    /// the schemas already there after a restore.
+    #[test]
+    fn a_restore_of_genesis_has_the_schemas_without_installing_them() {
+        let Some(pg_bin) = patched() else { return };
+        let dir = tempfile::tempdir().expect("a directory to write into");
+        let target = dir.path().join("store");
+        std::fs::create_dir_all(&target).unwrap();
+        let target = target.to_string_lossy().to_string();
+        let store = zou_store::open_store(&target).unwrap();
+
+        let first = dir.path().join("first");
+        std::fs::create_dir_all(first.join("pagecache")).unwrap();
+        make(
+            &*store,
+            &target,
+            "local",
+            &pg_bin,
+            &first.join("pgdata"),
+            &first.join("pagecache"),
+        )
+        .expect("a database made from nothing");
+
+        let second = dir.path().join("second");
+        std::fs::create_dir_all(second.join("pagecache")).unwrap();
+        restore::restore(&target, "local", &second.join("pgdata")).expect("a restore of genesis");
+        let found = over_a_private_postmaster(
+            &target,
+            "local",
+            &pg_bin,
+            &second.join("pgdata"),
+            &second.join("pagecache"),
+            |dsn| {
+                on_a_connection(dsn, |client| async move {
+                    let row = client
+                        .query_one(
+                            "select count(*) from pg_namespace where nspname in \
+                             ('auth', 'storage', 'realtime', 'net', 'supabase_functions', 'cron')",
+                            &[],
+                        )
+                        .await
+                        .map_err(|e| format!("query: {e}"))?;
+                    let count: i64 = row.get(0);
+                    drop(client);
+                    Ok(count)
+                })
+            },
+        )
+        .expect("a postmaster over the restored cluster");
+        assert_eq!(found, 6, "every schema the contract installs is in genesis");
+    }
 }
