@@ -251,6 +251,10 @@ jobs:
           jwt-secret = "$ZOU_CONFORMANCE_SECRET"
           server-port = 3998
           db-pool = 4
+          # Not upstream's test default. zou has no switch for aggregates,
+          # so a reference with them off answers a different question, see
+          # docs/conformance.md and #555.
+          db-aggregates-enabled = true
           CONF
           psql "$ZOU_CONFORMANCE_DSN" -v ON_ERROR_STOP=1 -f /tmp/zou-conformance/suites/postgrest/setup.sql
           /tmp/postgrest /tmp/upstream.conf &

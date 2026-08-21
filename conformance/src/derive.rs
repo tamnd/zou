@@ -27,19 +27,47 @@ use crate::suite::{Case, Cases};
 /// read off the `specs` list in `test/spec/Main.hs`. A file that needs a
 /// server flag is answering a question about that flag rather than about
 /// the REST surface, and a target configured differently would differ
-/// for a reason that is not interesting.
+/// for a reason that is not interesting. The test is whether a block
+/// hands `withConfig` a bare `baseCfg`: anything written `baseCfg { ... }`
+/// is configured, and the scanner applies it, so a file whose blocks are
+/// a mix of the two can be named here and only the default ones are read.
 ///
 /// `only` is for the files that export more than one spec, where just
 /// one of them runs on the default app.
+///
+/// This list is against a version and rots when the pin moves. Bumping
+/// PostgREST in versions.json means running the deriver again, and a
+/// file that has been renamed or split makes it stop with the path it
+/// could not read rather than quietly deriving a smaller suite. That is
+/// how the split of `PreferencesSpec.hs` into three was found, two
+/// versions after it happened. A binding named in `only` that the file
+/// no longer defines stops it the same way, which is how the merge of
+/// `pgErrorCodeMapping` into `ErrorSpec.hs`'s `spec` was found after it
+/// had been quietly costing nine cases.
 struct Spec {
     file: &'static str,
     feature: &'static str,
     only: Option<&'static str>,
+    /// A setting the reference is given for this file, which turns the
+    /// rule above off for it. There is one, and adding a second wants
+    /// the same argument made again: the flag has to be a thing zou
+    /// cannot be configured out of, so that a reference without it is
+    /// the one answering a different question. Whatever is named here
+    /// belongs in the config in docs/conformance.md and in ci.yml.
+    flag: Option<&'static str>,
 }
 
 const SPECS: &[Spec] = &[
-    spec("Feature/Query/QuerySpec.hs", "query"),
+    // `spec` and not the whole file: the other binding turns
+    // `url-use-legacy-target-names` off, and the default has it on.
+    Spec {
+        file: "Feature/Query/QuerySpec.hs",
+        feature: "query",
+        only: Some("spec"),
+        flag: None,
+    },
     spec("Feature/Query/AndOrParamsSpec.hs", "andor"),
+    spec("Feature/Query/CustomMediaSpec.hs", "media"),
     spec("Feature/Query/ComputedRelsSpec.hs", "computed"),
     spec("Feature/Query/DeleteSpec.hs", "delete"),
     spec("Feature/Query/EmbedDisambiguationSpec.hs", "embed"),
@@ -47,7 +75,9 @@ const SPECS: &[Spec] = &[
     spec("Feature/Query/InsertSpec.hs", "insert"),
     spec("Feature/Query/JsonOperatorSpec.hs", "json"),
     spec("Feature/Query/NullsStripSpec.hs", "nulls"),
-    spec("Feature/Query/PreferencesSpec.hs", "prefer"),
+    spec("Feature/Query/Preferences/HandlingSpec.hs", "prefer"),
+    spec("Feature/Query/Preferences/MaxAffectedSpec.hs", "prefer"),
+    spec("Feature/Query/Preferences/TimezoneSpec.hs", "prefer"),
     spec("Feature/Query/RangeSpec.hs", "range"),
     spec("Feature/Query/RawOutputTypesSpec.hs", "raw"),
     spec("Feature/Query/RelatedQueriesSpec.hs", "related"),
@@ -57,10 +87,14 @@ const SPECS: &[Spec] = &[
     spec("Feature/Query/UpdateSpec.hs", "update"),
     spec("Feature/Query/UpsertSpec.hs", "upsert"),
     spec("Feature/OptionsSpec.hs", "options"),
+    // Four blocks in one binding, two of them on the default app and two
+    // of them asking about `jwt-audience` and `client-error-verbosity`.
+    // The scanner leaves the configured two where they are.
     Spec {
         file: "Feature/Query/ErrorSpec.hs",
         feature: "error",
-        only: Some("pgErrorCodeMapping"),
+        only: Some("spec"),
+        flag: None,
     },
     // What the surface does with the feature turned off, which is how
     // every Supabase project runs.
@@ -68,11 +102,28 @@ const SPECS: &[Spec] = &[
         file: "Feature/Query/PlanSpec.hs",
         feature: "plan",
         only: Some("disabledSpec"),
+        flag: None,
     },
     Spec {
         file: "Feature/Query/PgSafeUpdateSpec.hs",
         feature: "safeupdate",
         only: Some("disabledSpec"),
+        flag: None,
+    },
+    // The one place the rule above is applied the other way round. This
+    // file exports `allowed`, which sets `db-aggregates-enabled`, and
+    // `disallowed`, which leaves it at its default and asserts the
+    // PGRST123 refusal. The half taken here is the one that runs with
+    // the flag on, because zou has no such flag: aggregates are part of
+    // its select surface and there is no way to configure them off, so
+    // the reference has to be configured on for the two ends to be
+    // asked the same question. The refusal half is a question about a
+    // flag rather than about the surface, and it is #555.
+    Spec {
+        file: "Feature/Query/AggregateFunctionsSpec.hs",
+        feature: "aggregate",
+        only: Some("allowed"),
+        flag: Some("db-aggregates-enabled"),
     },
 ];
 
@@ -81,6 +132,7 @@ const fn spec(file: &'static str, feature: &'static str) -> Spec {
         file,
         feature,
         only: None,
+        flag: None,
     }
 }
 
@@ -123,6 +175,17 @@ pub fn derive(from: &Path, suite: &str) -> Result<Derived, String> {
     let mut taken: BTreeMap<String, usize> = BTreeMap::new();
     for spec in SPECS {
         let text = read(&spec_dir.join(spec.file))?;
+        if let Some(only) = spec.only
+            && !defines(&text, only)
+        {
+            return Err(format!(
+                "{} has no {only} in it any more. The binding was renamed, \
+                 merged or split upstream, and going on would derive a \
+                 smaller suite without saying so. Read the file and fix the \
+                 list in derive.rs.",
+                spec.file
+            ));
+        }
         let (found, missed) = scan(&text, spec);
         for mut case in found {
             if a_guess(&case) {
@@ -206,6 +269,12 @@ fn note(skipped: &[String], guessed: usize) -> Vec<String> {
         "count=estimated, and the answer to those is the planner's row estimate,".to_string(),
         "which moves with the page count of the table and so is not a function".to_string(),
         "of the request. A recording of a guess is not something to compare.".to_string(),
+        String::new(),
+        "The aggregate cases need db-aggregates-enabled on the reference, which is".to_string(),
+        "the one setting here that is not upstream's test default. zou has no such".to_string(),
+        "switch and cannot be configured to refuse an aggregate, so a reference with".to_string(),
+        "the flag off would be answering a different question. The four cases that".to_string(),
+        "ask what the refusal looks like are not here for the same reason: see #555.".to_string(),
     ]
 }
 
@@ -549,6 +618,15 @@ fn read(path: &Path) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Whether a file defines a top level binding by that name, by the same
+/// rule the scanner uses to tell one definition from the next.
+fn defines(text: &str, name: &str) -> bool {
+    let bytes: Vec<char> = text.chars().collect();
+    (0..bytes.len()).any(|at| {
+        (at == 0 || bytes[at - 1] == '\n') && top_level(&bytes, at).as_deref() == Some(name)
+    })
+}
+
 /// Every request one spec file makes, and what could not be read.
 fn scan(text: &str, spec: &Spec) -> (Vec<Case>, Vec<String>) {
     // `import Protolude hiding (get)` is not a request, and it is the
@@ -568,6 +646,7 @@ fn scan(text: &str, spec: &Spec) -> (Vec<Case>, Vec<String>) {
     let mut skipped = Vec::new();
     let mut it = String::new();
     let mut binding = String::new();
+    let mut configured = false;
     let mut at = 0;
     let mut line = 1;
     while at < bytes.len() {
@@ -579,6 +658,7 @@ fn scan(text: &str, spec: &Spec) -> (Vec<Case>, Vec<String>) {
             // say where one ends.
             if let Some(name) = top_level(&bytes, at) {
                 binding = name;
+                configured = false;
             }
             continue;
         }
@@ -599,7 +679,15 @@ fn scan(text: &str, spec: &Spec) -> (Vec<Case>, Vec<String>) {
             at = end;
             continue;
         }
-        let wanted = spec.only.is_none_or(|only| binding == only);
+        if word == "withConfig"
+            && let Some(state) = config_at(&bytes, after)
+        {
+            configured = state;
+            at = after;
+            continue;
+        }
+        let default = !configured || spec.flag.is_some();
+        let wanted = spec.only.is_none_or(|only| binding == only) && default;
         let method = match word.as_str() {
             "get" => Some("GET"),
             "post" => Some("POST"),
@@ -655,6 +743,31 @@ fn top_level(bytes: &[char], at: usize) -> Option<String> {
         Some(':') | Some('=') => Some(word),
         _ => None,
     }
+}
+
+/// Whether the block a `withConfig` opens runs on a configured app,
+/// read from just after the word. `None` when this is not a call, which
+/// is the `spec withConfig = do` every one of these files opens with.
+///
+/// A bare `baseCfg` is upstream's own default and is the only thing that
+/// answers false. Anything else is a server flag set for the block, and
+/// the answers under it are about that flag.
+fn config_at(bytes: &[char], at: usize) -> Option<bool> {
+    let mut start = space(bytes, at);
+    // `withConfig (baseCfg { ... })` is the same thing with brackets
+    // around it, which is how the longer ones are written.
+    while bytes.get(start) == Some(&'(') {
+        start = space(bytes, start + 1);
+    }
+    let word = word_at(bytes, start);
+    if word.is_empty() {
+        return None;
+    }
+    if word != "baseCfg" {
+        return Some(true);
+    }
+    let after = space(bytes, start + word.chars().count());
+    Some(bytes.get(after) == Some(&'{'))
 }
 
 fn word_at(bytes: &[char], at: usize) -> String {
@@ -1086,12 +1199,65 @@ mod tests {
             file: "F.hs",
             feature: "f",
             only: Some("wanted"),
+            flag: None,
         };
         let source = "\nunwanted :: Spec\nunwanted = do\n  it \"a\" $\n    get \"/a\"\n\
                       \nwanted :: Spec\nwanted = do\n  it \"b\" $\n    get \"/b\"\n";
         let (cases, _) = scan(source, &spec);
         assert_eq!(cases.len(), 1);
         assert_eq!(cases[0].path, "/rest/v1/b");
+    }
+
+    /// The rule the list in SPECS is written against, applied by the
+    /// scanner so that a file whose blocks are a mix of the two can be
+    /// taken for the half that runs on the default app.
+    #[test]
+    fn a_block_that_sets_a_flag_is_not_asked() {
+        let spec = spec("F.hs", "f");
+        let source = concat!(
+            "\nspec :: SpecWithConfig\nspec withConfig = do\n",
+            "  withConfig baseCfg $ describe \"d\" $ do\n",
+            "    it \"a\" $\n      get \"/a\"\n",
+            "  withConfig baseCfg { configJwtAudience = Just \"x\" } $ do\n",
+            "    it \"b\" $\n      get \"/b\"\n",
+            "  withConfig (baseCfg { configDbPreparedStatements = False }) $ do\n",
+            "    it \"c\" $\n      get \"/c\"\n",
+            "  withConfig baseCfg $ describe \"e\" $ do\n",
+            "    it \"d\" $\n      get \"/d\"\n",
+        );
+        let (cases, _) = scan(source, &spec);
+        let paths: Vec<&str> = cases.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["/rest/v1/a", "/rest/v1/d"]);
+
+        // Unless the flag is one the reference is given anyway, which
+        // is the aggregates file and nothing else.
+        let flagged = Spec {
+            file: "F.hs",
+            feature: "f",
+            only: None,
+            flag: Some("some-setting"),
+        };
+        let (cases, _) = scan(source, &flagged);
+        assert_eq!(cases.len(), 4);
+    }
+
+    /// The lambda every one of these files opens with is not a call, and
+    /// reading it as one would empty the file.
+    #[test]
+    fn the_name_the_config_arrives_under_is_not_a_config() {
+        let line: Vec<char> = "spec withConfig = do\n".chars().collect();
+        assert_eq!(config_at(&line, "spec withConfig".len()), None);
+    }
+
+    /// What a binding renamed upstream looks like from here.
+    #[test]
+    fn a_binding_that_is_gone_is_gone() {
+        let source = "\nspec :: Spec\nspec = do\n  it \"a\" $\n    get \"/a\"\n";
+        assert!(defines(source, "spec"));
+        assert!(!defines(source, "pgErrorCodeMapping"));
+        // Indented is part of the one above it, and a mention is not a
+        // definition.
+        assert!(!defines("spec = do\n  wanted = 1\n  -- wanted\n", "wanted"));
     }
 
     #[test]

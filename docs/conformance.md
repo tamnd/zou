@@ -211,7 +211,13 @@ The reference for this suite is configured the way upstream configures its own:
 db-schemas = "test"
 db-anon-role = "postgrest_test_anonymous"
 db-extra-search-path = ""
+db-aggregates-enabled = true
 ```
+
+The last line is the one that is not upstream's test default, and it is there because zou has no matching switch.
+PostgREST has kept aggregates behind `db-aggregates-enabled` since 12 and defaults it off; zou accepts `count()`, `sum()`, `avg()`, `max()` and `min()` as part of its select surface with no way to configure them away.
+So a reference with the flag off would be refusing requests zou cannot refuse, and the comparison would be about the flag rather than about the surface.
+That difference is real and it is [#555](https://github.com/tamnd/zou/issues/555), which is also why the four cases in upstream's `AggregateFunctionsSpec` that ask what the refusal looks like are not in the suite: there is nothing here for them to ask.
 
 ## The suite compared with GoTrue
 
