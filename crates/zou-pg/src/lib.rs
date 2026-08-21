@@ -1520,6 +1520,13 @@ struct WalPipe {
     /// long the pusher's own loop kept the bytes waiting. None until
     /// the first append, which has nothing to be late against.
     last_append: Option<Instant>,
+    /// Why the last refused append was refused, waiting for the pusher
+    /// to read it with [`zou_wal_throttle_reason`]. The error code on
+    /// its own says only that a bound tripped, and an operator reading
+    /// the log needs to know which one and for which tenant before the
+    /// line is worth anything. Taken, not copied, so a later streak
+    /// cannot report the bound that tripped in an earlier one.
+    throttle: Option<String>,
 }
 
 static WAL: OnceLock<Mutex<WalPipe>> = OnceLock::new();
@@ -1891,6 +1898,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             pagesvc,
             first_appended: false,
             last_append: None,
+            throttle: None,
         },
         resume,
     ))
@@ -2045,7 +2053,10 @@ pub unsafe extern "C" fn zou_wal_append(
         let ticket = match seq.append(vec![frame]) {
             Ok(ticket) => ticket,
             Err(AppendError::WrongEpoch { .. }) => return ZOU_ERR_LEASE_LOST,
-            Err(AppendError::Throttled { .. }) => return ZOU_ERR_THROTTLED,
+            Err(AppendError::Throttled { tenant, reason }) => {
+                pipe.throttle = Some(throttle_note(tenant, &reason));
+                return ZOU_ERR_THROTTLED;
+            }
             Err(_) => return ZOU_ERR_STORE,
         };
         pipe.first_appended = true;
@@ -2059,6 +2070,68 @@ pub unsafe extern "C" fn zou_wal_append(
         pipe.last_append = Some(Instant::now());
         ZOU_OK
     })
+}
+
+/// Why the last append was refused, for the log line the pusher writes
+/// when it starts napping. Writes a NUL terminated string into `out`
+/// and answers its length without the NUL, truncating to fit `cap`, or
+/// zero when there is no unread reason, which is every call that does
+/// not follow a [`ZOU_ERR_THROTTLED`]. The reason is taken rather than
+/// copied: the pusher logs once per streak, and a reason left behind
+/// would be reported again by the next streak, naming a bound that has
+/// long since stopped tripping.
+///
+/// # Safety
+/// `out` must point at `cap` writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zou_wal_throttle_reason(out: *mut c_char, cap: usize) -> i32 {
+    wrap(|| {
+        if out.is_null() || cap == 0 {
+            return ZOU_ERR_BAD_ARGUMENT;
+        }
+        let Some(pipe) = WAL.get() else {
+            return ZOU_ERR_NOT_INITIALIZED;
+        };
+        let Some(reason) = pipe
+            .lock()
+            .expect("wal pipe mutex poisoned")
+            .throttle
+            .take()
+        else {
+            unsafe { *out = 0 };
+            return 0;
+        };
+        let room = unsafe { std::slice::from_raw_parts_mut(out.cast::<u8>(), cap) };
+        hand_over(&reason, room)
+    })
+}
+
+/// What the pusher's log line quotes: the tenant, then the bound that
+/// tripped and how far past it the lag is, which between them are the
+/// two things an operator needs before deciding whether to wait or to
+/// go look at the shard. Not the error's own wording, which reads
+/// "tenant x is throttled" underneath a line that has already said the
+/// pusher is throttled.
+fn throttle_note(tenant: u128, reason: &zou_log::Throttle) -> String {
+    format!("tenant {tenant:#x}, {reason}")
+}
+
+/// Copy `reason` into a C caller's buffer as a NUL terminated string
+/// and answer its length without the NUL. A buffer too small for the
+/// whole reason gets as much of it as fits: a truncated bound still
+/// names the bound, which is the front of the sentence.
+fn hand_over(reason: &str, out: &mut [u8]) -> i32 {
+    // Cut on a character boundary, so a truncated reason is still a
+    // string and not half a codepoint. A buffer with room to spare
+    // walks back to the end of the reason, which is a boundary too.
+    let mut room = out.len() - 1;
+    while room > 0 && !reason.is_char_boundary(room) {
+        room -= 1;
+    }
+    let bytes = &reason.as_bytes()[..room];
+    out[..bytes.len()].copy_from_slice(bytes);
+    out[bytes.len()] = 0;
+    bytes.len() as i32
 }
 
 /// The durable watermark of the append pipeline: the end Postgres LSN of
@@ -2415,6 +2488,74 @@ mod tests {
         assert!(manifest < lease, "{report}");
         // Two phases and the total, all in milliseconds.
         assert_eq!(report.matches(" ms").count(), 3, "{report}");
+    }
+
+    /// The three admission reasons are three different things to go
+    /// look at, so each has to arrive at the log as itself. This is the
+    /// whole point of the line: an operator reading "consolidation is
+    /// behind" when it was the tenant's own ingest bound goes and reads
+    /// the wrong dashboard.
+    #[test]
+    fn each_throttle_reason_says_which_bound_tripped_and_for_which_tenant() {
+        let tenant = 0x2a_u128;
+        let bytes = throttle_note(
+            tenant,
+            &zou_log::Throttle::IngestBytes {
+                lag: 900,
+                bound: 512,
+            },
+        );
+        assert!(bytes.contains("0x2a"), "{bytes}");
+        assert!(bytes.contains("900") && bytes.contains("512"), "{bytes}");
+        let secs = throttle_note(
+            tenant,
+            &zou_log::Throttle::IngestSecs { lag: 90, bound: 30 },
+        );
+        let behind = throttle_note(
+            tenant,
+            &zou_log::Throttle::Consolidation {
+                shard: 7,
+                backlog: 4096,
+                bound: 1024,
+            },
+        );
+        assert!(behind.contains("shard 7"), "{behind}");
+        // And no two of them read the same, which is what a reader
+        // telling them apart depends on.
+        assert_ne!(bytes, secs);
+        assert_ne!(secs, behind);
+        assert_ne!(bytes, behind);
+    }
+
+    /// The buffer belongs to C, which will read it as a string whatever
+    /// this writes, so it comes back terminated and inside its bounds
+    /// even when the reason is longer than it.
+    #[test]
+    fn a_reason_handed_to_c_is_terminated_and_stays_in_its_buffer() {
+        let mut room = [0xffu8; 64];
+        let n = hand_over("tenant 0x2a, ingest is 900 bytes behind durable", &mut room);
+        assert_eq!(n, 47);
+        assert_eq!(room[n as usize], 0);
+        assert_eq!(
+            std::str::from_utf8(&room[..n as usize]).unwrap(),
+            "tenant 0x2a, ingest is 900 bytes behind durable"
+        );
+
+        let mut tight = [0xffu8; 12];
+        let n = hand_over(
+            "tenant 0x2a, ingest is 900 bytes behind durable",
+            &mut tight,
+        );
+        assert_eq!(n, 11);
+        assert_eq!(tight[11], 0);
+        assert_eq!(std::str::from_utf8(&tight[..11]).unwrap(), "tenant 0x2a");
+
+        // A cut through a multibyte character would hand C bytes that
+        // are not a string.
+        let mut narrow = [0xffu8; 4];
+        let n = hand_over("¡tenant", &mut narrow);
+        assert!(std::str::from_utf8(&narrow[..n as usize]).is_ok());
+        assert_eq!(narrow[n as usize], 0);
     }
 
     /// One test drives the whole C ABI lifecycle, because the shim is a
