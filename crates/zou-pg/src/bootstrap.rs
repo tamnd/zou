@@ -96,7 +96,15 @@ pub fn capture_genesis(
         .map_err(|e| format!("walk {}: {e}", pgdata.display()))?;
     paths.dirs.sort();
     let files = capture::read_files(&paths)?;
-    let bytes = capture::upload(store, layout, GENESIS_ID, &files, &paths.dirs, false)?;
+    let bytes = capture::upload(
+        store,
+        layout,
+        GENESIS_ID,
+        &files,
+        &paths.dirs,
+        false,
+        Some(redo),
+    )?;
 
     lease::update_manifest(store, layout, &mut held, now_unix(), |m| {
         m.checkpoints.push(CheckpointRef {

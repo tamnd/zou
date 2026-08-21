@@ -253,6 +253,17 @@ fn set_mode(_path: &Path, _mode: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// One file an INDEX asks for: its path, the length it has to end up,
+/// the length of the object holding its bytes, and for a wal segment
+/// captured as two extents, how much of the object belongs at offset
+/// zero and where the rest of it belongs.
+struct Wanted<'a> {
+    relpath: &'a str,
+    size: u64,
+    stored: u64,
+    hole: Option<(u64, u64)>,
+}
+
 /// Rebuild the captured tree under `pgdata` from the checkpoint INDEX.
 fn restore_fs(
     store: &dyn CasStore,
@@ -266,9 +277,7 @@ fn restore_fs(
         .ok_or_else(|| format!("checkpoint {chk_id} has no INDEX object"))?;
     let index = String::from_utf8(index).map_err(|_| "INDEX is not utf8".to_string())?;
 
-    // Path, the file's length, and the object's, which differ when the
-    // capture dropped a file's trailing zeros.
-    let mut files: Vec<(&str, u64, u64)> = Vec::new();
+    let mut files: Vec<Wanted<'_>> = Vec::new();
     let mut dirs = 0usize;
     for line in index.lines() {
         if let Some(rest) = line.strip_prefix("f ") {
@@ -278,7 +287,12 @@ fn restore_fs(
             let size: u64 = size
                 .parse()
                 .map_err(|_| format!("bad INDEX line {line:?}"))?;
-            files.push((relpath, size, size));
+            files.push(Wanted {
+                relpath,
+                size,
+                stored: size,
+                hole: None,
+            });
         } else if let Some(rest) = line.strip_prefix("t ") {
             let (size, rest) = rest
                 .split_once(' ')
@@ -290,7 +304,38 @@ fn restore_fs(
             let (Ok(size), Ok(stored)) = (size, stored) else {
                 return Err(format!("bad INDEX line {line:?}"));
             };
-            files.push((relpath, size, stored));
+            files.push(Wanted {
+                relpath,
+                size,
+                stored,
+                hole: None,
+            });
+        } else if let Some(rest) = line.strip_prefix("h ") {
+            let mut field = rest.splitn(5, ' ');
+            let numbers = (field.next(), field.next(), field.next(), field.next());
+            let (Some(size), Some(stored), Some(head), Some(at)) = numbers else {
+                return Err(format!("bad INDEX line {line:?}"));
+            };
+            let relpath = field
+                .next()
+                .ok_or_else(|| format!("bad INDEX line {line:?}"))?;
+            let (Ok(size), Ok(stored), Ok(head), Ok(at)) = (
+                size.parse::<u64>(),
+                stored.parse::<u64>(),
+                head.parse::<u64>(),
+                at.parse::<u64>(),
+            ) else {
+                return Err(format!("bad INDEX line {line:?}"));
+            };
+            if head > stored || at + (stored - head) > size {
+                return Err(format!("INDEX line {line:?} describes a file it overruns"));
+            }
+            files.push(Wanted {
+                relpath,
+                size,
+                stored,
+                hole: Some((head, at)),
+            });
         } else if let Some(relpath) = line.strip_prefix("d ") {
             std::fs::create_dir_all(pgdata.join(relpath))
                 .map_err(|e| format!("mkdir {relpath}: {e}"))?;
@@ -303,8 +348,8 @@ fn restore_fs(
     // of them are the same handful of directories, and a restore that
     // made them inside the fetch would have every thread making the
     // same one.
-    for (relpath, _, _) in &files {
-        if let Some(parent) = pgdata.join(relpath).parent() {
+    for wanted in &files {
+        if let Some(parent) = pgdata.join(wanted.relpath).parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
@@ -320,7 +365,13 @@ fn restore_fs(
         failed.get_or_insert(e);
         false
     };
-    crate::pending::for_each_parallel(&files, |(relpath, size, stored)| {
+    crate::pending::for_each_parallel(&files, |wanted| {
+        let Wanted {
+            relpath,
+            size,
+            stored,
+            hole,
+        } = wanted;
         let data = match store.get(&layout.chk_file(chk_id, relpath)) {
             Ok(Some((data, _))) => data,
             Ok(None) => return note(format!("checkpoint object for {relpath} is missing")),
@@ -336,8 +387,20 @@ fn restore_fs(
         // A file whose object is shorter had its trailing zeros dropped
         // by the capture, so the file is made at its real length and the
         // tail comes back as the hole a fresh file already is. See
-        // capture::without_trailing_zeros.
-        if let Err(e) = write_at_length(&path, &data, *size) {
+        // capture::without_trailing_zeros. A file with a hole in the
+        // middle is the same trick twice: the object is two extents and
+        // what lies between them is bytes nothing will read.
+        let written = match hole {
+            Some((head, at)) => write_pieces(
+                &path,
+                &data[..*head as usize],
+                &data[*head as usize..],
+                *at,
+                *size,
+            ),
+            None => write_at_length(&path, &data, *size),
+        };
+        if let Err(e) = written {
             return note(format!("write {relpath}: {e}"));
         }
         match set_mode(&path, 0o600) {
@@ -359,6 +422,21 @@ fn write_at_length(path: &Path, data: &[u8], size: u64) -> Result<(), String> {
     let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     file.write_all(data).map_err(|e| e.to_string())?;
     if data.len() as u64 != size {
+        file.set_len(size).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Write a fresh `size` byte file holding `head` at offset zero and
+/// `tail` at offset `at`, with a hole between them. Same idea as
+/// [`write_at_length`], the gap reads back as zeros and costs nothing on
+/// a filesystem that keeps holes.
+fn write_pieces(path: &Path, head: &[u8], tail: &[u8], at: u64, size: u64) -> Result<(), String> {
+    let mut file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    file.write_all(head).map_err(|e| e.to_string())?;
+    file.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
+    file.write_all(tail).map_err(|e| e.to_string())?;
+    if at + tail.len() as u64 != size {
         file.set_len(size).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -979,6 +1057,45 @@ mod tests {
         assert_eq!(restored, segment, "the zeros came back");
         // A path with a space in it, which is why the lengths lead.
         assert_eq!(std::fs::read(pgdata.join("empty file")).unwrap(), [0; 4096]);
+    }
+
+    #[test]
+    fn a_segment_captured_as_two_ends_comes_back_with_both_of_them() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(store_dir.path());
+        let layout = TenantLayout::new("local");
+
+        // A segment written up to a redo well past the first page, which
+        // is what a cluster that has run for a moment looks like.
+        let page = WAL_PAGE_SIZE as usize;
+        let redo = WAL_SEGMENT_SIZE + 9 * WAL_PAGE_SIZE + 0x58;
+        let mut segment = vec![0u8; WAL_SEGMENT_SIZE as usize];
+        for (i, b) in segment[..12 * page].iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let name = "pg_wal/000000010000000000000001";
+        let files = vec![(name.to_string(), segment.clone())];
+        let stored =
+            crate::capture::upload(&store, &layout, "genesis", &files, &[], false, Some(redo))
+                .unwrap();
+        // Page zero and the three written pages from redo on, not the
+        // sixteen megabytes and not the twelve pages either.
+        assert_eq!(stored, 4 * WAL_PAGE_SIZE);
+
+        let pgdata = out_dir.path().join("restored");
+        std::fs::create_dir_all(&pgdata).unwrap();
+        restore_fs(&store, &layout, "genesis", &pgdata).unwrap();
+
+        let restored = std::fs::read(pgdata.join(name)).unwrap();
+        assert_eq!(restored.len() as u64, WAL_SEGMENT_SIZE);
+        // The long header recovery insists on, and every byte from the
+        // redo page on, are the originals.
+        assert_eq!(restored[..page], segment[..page]);
+        assert_eq!(restored[9 * page..], segment[9 * page..]);
+        // The pages in between are the hole, which no reader of this
+        // checkpoint goes near.
+        assert!(restored[page..9 * page].iter().all(|b| *b == 0));
     }
 
     #[test]

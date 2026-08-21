@@ -91,7 +91,8 @@ pub(crate) fn chk_layout(own: &TenantLayout, c: &CheckpointRef) -> TenantLayout 
 /// Total stored bytes a checkpoint describes, summed from its INDEX.
 /// A trimmed line carries the file's length and the object's; the
 /// object's is what the store holds and what a fold down would move, so
-/// that is the one the policy weighs.
+/// that is the one the policy weighs. A holed line keeps the object's
+/// length in the same field, which is why both read alike here.
 fn index_bytes(store: &dyn CasStore, layout: &TenantLayout, id: &str) -> Result<u64, String> {
     let (data, _) = store
         .get(&layout.chk_index(id))
@@ -107,7 +108,7 @@ fn index_bytes(store: &dyn CasStore, layout: &TenantLayout, id: &str) -> Result<
                 .and_then(|v| v.parse::<u64>().ok())
                 .ok_or_else(|| format!("bad INDEX line {line:?} in {id}"))?;
             total += len;
-        } else if let Some(rest) = line.strip_prefix("t ") {
+        } else if let Some(rest) = line.strip_prefix("t ").or_else(|| line.strip_prefix("h ")) {
             let len = rest
                 .split(' ')
                 .nth(1)
@@ -641,7 +642,7 @@ pub fn prepare(
         .map_err(|e| format!("store: {e}"))?
         .is_none()
     {
-        bytes = capture::upload(store, layout, &id, &files, &paths.dirs, true)?;
+        bytes = capture::upload(store, layout, &id, &files, &paths.dirs, true, Some(redo))?;
     }
 
     // The WAL slice recovery anchors on: from the redo page boundary
