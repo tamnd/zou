@@ -15,11 +15,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::frame::{BinaryBroadcast, Encoding, Frame, Vsn};
-use crate::limit::{Counters, Limits, Unlimited};
+use crate::limit::{Calls, Counters, Limits, Unlimited};
 
 /// Who the socket is, once a token has been read.
 #[derive(Debug, Clone, PartialEq)]
@@ -398,6 +399,11 @@ pub struct Session {
     watched: HashMap<String, Vec<u64>>,
     /// What the project is allowed and what is counting it.
     budget: Budget,
+    /// When this socket last tracked its presence, for the one limit
+    /// that is about a connection rather than a project. It lives here
+    /// because there is nowhere else it could: every other counter is
+    /// shared by every socket on the project, and this one is not.
+    presence_calls: Calls,
 }
 
 impl Session {
@@ -420,6 +426,7 @@ impl Session {
             pending: HashMap::new(),
             watched: HashMap::new(),
             budget,
+            presence_calls: Calls::new(),
         }
     }
 
@@ -942,6 +949,13 @@ impl Session {
     /// both are visible to the whole topic whatever this socket asked
     /// for in its join: `presence.enabled` decides what comes back to
     /// this socket, not whether this socket can be seen.
+    ///
+    /// Three limits are asked here, in upstream's order: the project's
+    /// presence budget, which both events spend, then how often this
+    /// one socket has tracked, then how big the thing it is tracking
+    /// is. Each of them takes the channel down rather than answering
+    /// the client's ref, because that is what upstream does with all
+    /// three.
     fn presence(&mut self, frame: Frame) -> Vec<Action> {
         let Some(config) = self.channels.get(&frame.topic) else {
             return vec![self.send(Frame::error(
@@ -949,12 +963,20 @@ impl Session {
                 "this socket has not joined that topic",
             ))];
         };
+        // Taken now, because everything below needs the session
+        // mutably and these two are all the channel is read for.
+        let room = room(&frame.topic, config.private);
+        let key = config.presence_key.clone();
         let event = frame
             .payload
             .get("event")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_ascii_lowercase();
+        if matches!(event.as_str(), "track" | "untrack") && !self.budget.counters.presence() {
+            let topic = frame.topic.clone();
+            return self.stopped(&topic, "Too many presence messages per second");
+        }
         match event.as_str() {
             "track" => {
                 let payload = frame
@@ -968,19 +990,24 @@ impl Session {
                         "a presence track carries an object as its payload",
                     ))];
                 }
+                if self.tracking_too_often() {
+                    let topic = frame.topic.clone();
+                    return self.stopped(&topic, "Client presence rate limit exceeded");
+                }
+                if self.track_too_big(&payload) {
+                    let topic = frame.topic.clone();
+                    return self.stopped(&topic, "Track message size exceeded");
+                }
                 let track = Action::Track {
-                    topic: room(&frame.topic, config.private),
-                    key: config.presence_key.clone(),
+                    topic: room,
+                    key,
                     payload,
                 };
                 let actions = vec![track, self.send(Frame::ok(&frame))];
                 let topic = frame.topic.clone();
                 self.gated(&topic, About::Presence, frame, actions)
             }
-            "untrack" => vec![
-                Action::Untrack(room(&frame.topic, config.private)),
-                self.send(Frame::ok(&frame)),
-            ],
+            "untrack" => vec![Action::Untrack(room), self.send(Frame::ok(&frame))],
             other => vec![self.send(Frame::error(
                 &frame,
                 format!("{other} is not a presence event, which is track or untrack"),
@@ -1115,6 +1142,32 @@ impl Session {
         (push.payload.len() + push.event.len()) as u64 > allowed
     }
 
+    /// Whether this socket has tracked more often than one socket may.
+    ///
+    /// The window is a plain sliding one rather than the five second
+    /// buckets the project meters use, because upstream counts this
+    /// one differently too: it is a handful of calls over half a
+    /// minute, which is a number small enough that a bucket boundary
+    /// would be most of the answer.
+    fn tracking_too_often(&mut self) -> bool {
+        let limits = self.budget.limits;
+        self.presence_calls.over(
+            limits.presence_calls_per_window,
+            Duration::from_millis(limits.presence_window_ms),
+        )
+    }
+
+    /// Whether what a client wants to be seen as is more than the
+    /// project allows a message to be. It is the same budget a
+    /// broadcast is held to, since a track ends up on the wire of
+    /// everyone on the topic the same way.
+    fn track_too_big(&self, payload: &Value) -> bool {
+        let Some(allowed) = self.budget.limits.payload_bytes() else {
+            return false;
+        };
+        payload.to_string().len() as u64 > allowed
+    }
+
     /// What a message too big for the project gets: an error to the
     /// client that asked to be told, and silence for one that did not,
     /// which is upstream's answer to both.
@@ -1131,12 +1184,18 @@ impl Session {
 
     /// The project has moved more messages a second than it may, and
     /// this channel is one that noticed.
+    fn overrun(&mut self, topic: &str) -> Vec<Action> {
+        self.stopped(topic, "Too many messages per second")
+    }
+
+    /// A channel taken down over a limit, with the words upstream uses
+    /// for whichever limit it was.
     ///
     /// Upstream tells the client on the channel's own system event and
     /// then stops the channel, which the client sees as a close on
     /// that topic and not on the socket: its other channels carry on
     /// and this one is resubscribed by the client's own retry.
-    fn overrun(&mut self, topic: &str) -> Vec<Action> {
+    fn stopped(&mut self, topic: &str, message: &str) -> Vec<Action> {
         let room = self.room(topic);
         self.channels.remove(topic);
         self.rights.remove(topic);
@@ -1148,7 +1207,7 @@ impl Session {
                 json!({
                     "extension": "system",
                     "status": "error",
-                    "message": "Too many messages per second",
+                    "message": message,
                     "channel": name_of(topic),
                 }),
             )),
@@ -1170,14 +1229,31 @@ impl Session {
     /// This is also where a project that is moving more messages than
     /// it may is noticed, because it is the only place that sees every
     /// message: upstream counts on delivery too, and the channel that
-    /// was about to be handed one is the channel it takes down.
+    /// was about to be handed one is the channel it takes down. A
+    /// presence diff is held to the presence budget instead, which is
+    /// the third place that one is spent.
     pub fn deliver(&mut self, sent: &Sent, mine: bool) -> Vec<Action> {
-        if self.budget.counters.over_events()
-            && let Some(topic) = self.on_room(sent.topic()).map(str::to_string)
-        {
-            return self.overrun(&topic);
+        // Nothing goes down a socket that is not on the room this was
+        // sent to, and nothing is counted against it either.
+        let Some(topic) = self.on_room(sent.topic()).map(str::to_string) else {
+            return Vec::new();
+        };
+        match sent {
+            // Built first and charged after, so that a socket which
+            // asked for no presence, or may not read this topic's,
+            // spends nothing on a diff it was never going to see.
+            Sent::Diff { .. } => {
+                let Some(diff) = self.delivered(sent, mine) else {
+                    return Vec::new();
+                };
+                if !self.budget.counters.presence() {
+                    return self.stopped(&topic, "Too many presence messages per second");
+                }
+                vec![diff]
+            }
+            Sent::Broadcast(_) if self.budget.counters.over_events() => self.overrun(&topic),
+            Sent::Broadcast(_) => self.delivered(sent, mine).into_iter().collect(),
         }
-        self.delivered(sent, mine).into_iter().collect()
     }
 
     fn delivered(&self, sent: &Sent, mine: bool) -> Option<Action> {
@@ -2199,6 +2275,10 @@ mod tests {
         fn over_events(&self) -> bool {
             false
         }
+
+        fn presence(&self) -> bool {
+            true
+        }
     }
 
     /// A project that is already moving more messages a second than it
@@ -2212,6 +2292,28 @@ mod tests {
 
         fn over_events(&self) -> bool {
             true
+        }
+
+        fn presence(&self) -> bool {
+            true
+        }
+    }
+
+    /// A project that has spent its presence budget and none of the
+    /// rest of what it is allowed.
+    struct NoPresence;
+
+    impl Counters for NoPresence {
+        fn join(&self) -> bool {
+            true
+        }
+
+        fn over_events(&self) -> bool {
+            false
+        }
+
+        fn presence(&self) -> bool {
+            false
         }
     }
 
@@ -2368,5 +2470,156 @@ mod tests {
         // taken off, so the channel is told once and not on every
         // message that follows.
         assert!(only(over.deliver(&sent, false)).is_none());
+    }
+
+    /// What a channel taken down over a limit says, which is the same
+    /// four actions whichever limit it was.
+    fn stopped_with(actions: &[Action], message: &str) {
+        let system = text_of(&actions[0]);
+        assert_eq!(system.event, "system");
+        assert_eq!(
+            system.payload,
+            json!({
+                "extension": "system",
+                "status": "error",
+                "message": message,
+                "channel": "room",
+            })
+        );
+        assert_eq!(text_of(&actions[1]).event, "phx_close");
+        assert_eq!(actions[2], Action::Untrack("realtime:room".into()));
+        assert_eq!(actions[3], Action::Drop("realtime:room".into()));
+    }
+
+    #[test]
+    fn a_track_on_a_project_over_its_presence_budget_is_taken_down() {
+        let mut session = on_budget(Limits::none(), Arc::new(NoPresence));
+        join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        let told = session.text(
+            r#"["1","5","realtime:room","presence",{"event":"track","payload":{}}]"#,
+            &OneToken,
+        );
+        stopped_with(&told, "Too many presence messages per second");
+        assert!(!session.on("realtime:room"));
+    }
+
+    /// Upstream spends the budget on the way out of presence as well as
+    /// on the way in, so an untrack is not a way to keep talking.
+    #[test]
+    fn an_untrack_spends_the_presence_budget_a_track_does() {
+        let mut session = on_budget(Limits::none(), Arc::new(NoPresence));
+        join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        let told = session.text(
+            r#"["1","5","realtime:room","presence",{"event":"untrack"}]"#,
+            &OneToken,
+        );
+        stopped_with(&told, "Too many presence messages per second");
+    }
+
+    #[test]
+    fn a_socket_that_tracks_faster_than_it_may_is_taken_down() {
+        let mut session = on_budget(
+            Limits {
+                presence_calls_per_window: 2,
+                presence_window_ms: 30_000,
+                ..Limits::none()
+            },
+            Arc::new(Unlimited),
+        );
+        join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        for nth in ["5", "6"] {
+            let actions = session.text(
+                &format!(
+                    r#"["1","{nth}","realtime:room","presence",{{"event":"track","payload":{{}}}}]"#
+                ),
+                &OneToken,
+            );
+            assert!(matches!(actions[0], Action::Track { .. }), "{actions:?}");
+        }
+        let told = session.text(
+            r#"["1","7","realtime:room","presence",{"event":"track","payload":{}}]"#,
+            &OneToken,
+        );
+        stopped_with(&told, "Client presence rate limit exceeded");
+        assert!(!session.on("realtime:room"));
+    }
+
+    /// The window is this socket's own, so one client using all of it
+    /// says nothing about the next one.
+    #[test]
+    fn the_track_window_belongs_to_one_socket() {
+        let limits = Limits {
+            presence_calls_per_window: 1,
+            presence_window_ms: 30_000,
+            ..Limits::none()
+        };
+        let track = r#"["1","5","realtime:room","presence",{"event":"track","payload":{}}]"#;
+
+        let mut first = on_budget(limits, Arc::new(Unlimited));
+        join(&mut first, r#"{"config":{"presence":{"enabled":true}}}"#);
+        assert!(matches!(
+            first.text(track, &OneToken)[0],
+            Action::Track { .. }
+        ));
+        assert!(!first.text(track, &OneToken).is_empty());
+        assert!(!first.on("realtime:room"));
+
+        let mut second = on_budget(limits, Arc::new(Unlimited));
+        join(&mut second, r#"{"config":{"presence":{"enabled":true}}}"#);
+        assert!(matches!(
+            second.text(track, &OneToken)[0],
+            Action::Track { .. }
+        ));
+    }
+
+    #[test]
+    fn a_track_bigger_than_a_message_may_be_is_taken_down() {
+        let mut session = on_budget(
+            Limits {
+                payload_size_kb: 1,
+                ..Limits::none()
+            },
+            Arc::new(Unlimited),
+        );
+        join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        let big = "x".repeat(2000);
+        let told = session.text(
+            &format!(
+                r#"["1","5","realtime:room","presence",{{"event":"track","payload":{{"blob":"{big}"}}}}]"#
+            ),
+            &OneToken,
+        );
+        stopped_with(&told, "Track message size exceeded");
+        assert!(!session.on("realtime:room"));
+    }
+
+    #[test]
+    fn a_diff_on_a_project_over_its_presence_budget_takes_the_channel_down() {
+        let mut session = on_budget(Limits::none(), Arc::new(NoPresence));
+        join(&mut session, r#"{"config":{"presence":{"enabled":true}}}"#);
+        let diff = Sent::Diff {
+            topic: "realtime:room".into(),
+            payload: json!({"joins": {}, "leaves": {}}),
+        };
+        stopped_with(
+            &session.deliver(&diff, false),
+            "Too many presence messages per second",
+        );
+        assert!(!session.on("realtime:room"));
+    }
+
+    /// A socket that bound nothing to presence was never going to be
+    /// sent this diff, so it does not pay for it and is not taken down
+    /// over what the rest of the project spent.
+    #[test]
+    fn a_socket_that_asked_for_no_presence_spends_none_of_the_budget() {
+        let mut session = on_budget(Limits::none(), Arc::new(NoPresence));
+        join(&mut session, r#"{"config":{}}"#);
+        let diff = Sent::Diff {
+            topic: "realtime:room".into(),
+            payload: json!({"joins": {}, "leaves": {}}),
+        };
+        assert!(session.deliver(&diff, false).is_empty());
+        assert!(session.on("realtime:room"));
     }
 }

@@ -1,23 +1,26 @@
 //! What a project is allowed: how many sockets, how many joins a
 //! second, how many channels one socket may hold, how many messages a
-//! second the whole project may move, and how big one of them may be.
+//! second the whole project may move, how big one of them may be, and
+//! how much presence is allowed on top of all that.
 //!
 //! These are Supabase's tenant limits, the numbers and the refusals
 //! both. Upstream keeps them on the tenant row and reads them out of
 //! the environment when a tenant is made, which is where the defaults
 //! here come from: two hundred sockets, a hundred joins a second, a
 //! hundred channels per socket, a hundred messages a second, three
-//! megabytes a message. They are the shape of a hosted project on the
+//! megabytes a message, a thousand presence events a second, and five
+//! tracks per socket every thirty seconds. They are the shape of a
+//! hosted project on the
 //! free plan, and a self hosted zou serving one project it owns has
 //! nobody to be fair to and may well want them off, which is what a
 //! zero means.
 //!
-//! Two of these can be answered by one socket on its own, so the
-//! session answers them: how many channels this socket is on, and how
-//! big the payload in front of it is. The other three are about every
-//! socket on the project at once, which is not something a session can
-//! see, so they arrive as a [`Counters`] the transport implements and
-//! the session asks.
+//! Three of these can be answered by one socket on its own, so the
+//! session answers them: how many channels this socket is on, how big
+//! the payload in front of it is, and how often it has tracked its own
+//! presence. The rest are about every socket on the project at once,
+//! which is not something a session can see, so they arrive as a
+//! [`Counters`] the transport implements and the session asks.
 //!
 //! The counting is upstream's shape too. A rate counter there is a
 //! bucket per five seconds, twelve of them kept, and the limit is
@@ -62,6 +65,18 @@ pub struct Limits {
     pub events_per_second: u64,
     /// `max_payload_size_in_kb`: how big one message may be.
     pub payload_size_kb: u64,
+    /// `max_presence_events_per_second`: how many presence events the
+    /// project may move a second, counted apart from the messages
+    /// budget rather than out of it. A track, an untrack and the diff
+    /// that follows one all cost it.
+    pub presence_events_per_second: u64,
+    /// `max_client_presence_events_per_window`: how many times one
+    /// socket may track inside its window. This is the only limit here
+    /// that belongs to a connection rather than to a project, so it is
+    /// the only one a session can answer without asking anybody.
+    pub presence_calls_per_window: u64,
+    /// `client_presence_window_ms`: how wide that window is.
+    pub presence_window_ms: u64,
 }
 
 impl Default for Limits {
@@ -75,6 +90,9 @@ impl Default for Limits {
             channels_per_client: 100,
             events_per_second: 100,
             payload_size_kb: 3000,
+            presence_events_per_second: 1000,
+            presence_calls_per_window: 5,
+            presence_window_ms: 30_000,
         }
     }
 }
@@ -89,6 +107,9 @@ impl Limits {
             channels_per_client: 0,
             events_per_second: 0,
             payload_size_kb: 0,
+            presence_events_per_second: 0,
+            presence_calls_per_window: 0,
+            presence_window_ms: 30_000,
         }
     }
 
@@ -118,6 +139,15 @@ pub trait Counters: Send + Sync {
     /// the socket that is about to be handed one, which is where
     /// upstream notices too.
     fn over_events(&self) -> bool;
+    /// One presence event is about to happen. False is over budget,
+    /// and nothing is counted for one that did not happen.
+    ///
+    /// This is a join's shape rather than an event's: presence has its
+    /// own meter, and the only things that touch it are the three
+    /// paths that ask here, so counting and asking are one step. The
+    /// messages budget is spent where a message is fanned instead,
+    /// which is somewhere a session cannot see.
+    fn presence(&self) -> bool;
 }
 
 /// Counters for a project with no limits on it, which is what a
@@ -131,6 +161,10 @@ impl Counters for Unlimited {
 
     fn over_events(&self) -> bool {
         false
+    }
+
+    fn presence(&self) -> bool {
+        true
     }
 }
 
@@ -243,6 +277,48 @@ impl Meter {
     }
 }
 
+/// How often one socket has done something, in a window that slides
+/// with it rather than in buckets.
+///
+/// This is not a [`Meter`] and should not be one. A meter answers what
+/// a project's sustained rate is, which is a question about a lot of
+/// sockets and is deliberately forgiving of a burst. This answers
+/// whether one client has called something more than N times in the
+/// last W milliseconds, which is a question about a burst and nothing
+/// else, and it is upstream's own shape for the one limit that belongs
+/// to a connection. Five calls is what it holds, so the memory is the
+/// limit rather than the traffic.
+#[derive(Debug, Default)]
+pub struct Calls {
+    /// When each of the last calls happened, oldest first.
+    at: Vec<Instant>,
+}
+
+impl Calls {
+    pub fn new() -> Calls {
+        Calls { at: Vec::new() }
+    }
+
+    /// Count one call now and say whether it is over the window.
+    pub fn over(&mut self, max: u64, window: Duration) -> bool {
+        self.over_at(max, window, Instant::now())
+    }
+
+    /// The same with the clock handed in. The call is counted whether
+    /// or not it is allowed, which is upstream's order and the one that
+    /// matters: a client hammering track does not get its window back
+    /// by being refused.
+    pub fn over_at(&mut self, max: u64, window: Duration, now: Instant) -> bool {
+        if max == 0 {
+            return false;
+        }
+        self.at
+            .retain(|&at| now.saturating_duration_since(at) < window);
+        self.at.push(now);
+        self.at.len() as u64 > max
+    }
+}
+
 /// How many sockets are connected, which is a number and not a rate:
 /// upstream counts the live connections of a tenant rather than how
 /// fast they arrived.
@@ -341,6 +417,40 @@ mod tests {
         let limits = Limits::default();
         assert_eq!(limits.payload_bytes(), Some(3_000_500));
         assert_eq!(Limits::none().payload_bytes(), None);
+    }
+
+    /// The per socket window is about a burst, so it counts calls and
+    /// not an average: five in thirty seconds is fine and the sixth is
+    /// not, however the five were spread.
+    #[test]
+    fn the_sixth_call_in_the_window_is_over_it() {
+        let mut calls = Calls::new();
+        let window = Duration::from_millis(30_000);
+        let start = Instant::now();
+        for i in 0..5 {
+            assert!(
+                !calls.over_at(5, window, start + Duration::from_millis(i * 100)),
+                "call {i} of the five"
+            );
+        }
+        assert!(calls.over_at(5, window, start + Duration::from_millis(500)));
+        // And the window slides: once the first five have aged out
+        // there is room again.
+        assert!(!calls.over_at(5, window, start + Duration::from_millis(31_000)));
+    }
+
+    /// A refused call still counts, which is what stops a client from
+    /// getting its window back by being told no.
+    #[test]
+    fn being_refused_does_not_buy_room() {
+        let mut calls = Calls::new();
+        let window = Duration::from_millis(1000);
+        let start = Instant::now();
+        for _ in 0..2 {
+            calls.over_at(1, window, start);
+        }
+        assert!(calls.over_at(1, window, start + Duration::from_millis(500)));
+        assert!(!calls.over_at(0, window, start), "zero is no limit");
     }
 
     #[test]

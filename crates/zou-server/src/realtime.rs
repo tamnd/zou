@@ -81,10 +81,11 @@ impl Tokens for ProjectTokens {
 /// What this project is allowed and what it has spent.
 ///
 /// One of these per server, which is one per project: upstream keeps
-/// the same numbers on the tenant row and counts the same three things
-/// across every node the tenant is on. The two a socket can answer for
-/// itself, how many channels it holds and how big a message is, are
-/// not here, because a session answers those without asking anybody.
+/// the same numbers on the tenant row and counts the same things
+/// across every node the tenant is on. The three a socket can answer
+/// for itself, how many channels it holds, how big a message is, and
+/// how often it has tracked, are not here, because a session answers
+/// those without asking anybody.
 pub struct Quota {
     pub limits: Limits,
     /// How many sockets are connected right now.
@@ -93,6 +94,11 @@ pub struct Quota {
     joins: Meter,
     /// Messages sent and messages delivered, as a rate.
     events: Meter,
+    /// Presence tracks, untracks and diffs, as a rate. Upstream counts
+    /// presence against a budget of its own rather than against the
+    /// message budget, so this is a second meter and not more counts
+    /// on `events`.
+    presence: Meter,
 }
 
 impl Quota {
@@ -102,6 +108,7 @@ impl Quota {
             sockets: Sockets::default(),
             joins: Meter::new(),
             events: Meter::new(),
+            presence: Meter::new(),
         }
     }
 
@@ -152,6 +159,14 @@ impl Counters for Quota {
     fn over_events(&self) -> bool {
         self.events.over(self.limits.events_per_second)
     }
+
+    fn presence(&self) -> bool {
+        if self.presence.over(self.limits.presence_events_per_second) {
+            return false;
+        }
+        self.presence.count(1);
+        true
+    }
 }
 
 /// What the environment says the realtime tier is allowed.
@@ -191,6 +206,21 @@ pub fn limits_configured(var: &dyn Fn(&str) -> String) -> Result<Limits, String>
             var,
             "ZOU_REALTIME_MAX_PAYLOAD_SIZE_IN_KB",
             fallback.payload_size_kb,
+        )?,
+        presence_events_per_second: count(
+            var,
+            "ZOU_REALTIME_MAX_PRESENCE_EVENTS_PER_SECOND",
+            fallback.presence_events_per_second,
+        )?,
+        presence_calls_per_window: count(
+            var,
+            "ZOU_REALTIME_MAX_CLIENT_PRESENCE_EVENTS_PER_WINDOW",
+            fallback.presence_calls_per_window,
+        )?,
+        presence_window_ms: count(
+            var,
+            "ZOU_REALTIME_CLIENT_PRESENCE_WINDOW_MS",
+            fallback.presence_window_ms,
         )?,
     })
 }
