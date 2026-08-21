@@ -20,7 +20,8 @@
 //! can come up before postgres does and the first request pays the
 //! connect. The first successful connection applies the tenant
 //! contract in the BOOTSTRAP batch: the anon, authenticated, and
-//! service_role roles, the auth schema with Supabase's uid, role,
+//! service_role roles with an authenticator granted the three of
+//! them, the auth schema with Supabase's uid, role,
 //! email, and jwt functions verbatim, and the open public schema
 //! grants that make row level security the actual guard, exactly the
 //! stance a Supabase project ships with. Then the two schemas whose
@@ -144,6 +145,41 @@ begin
     if not exists (select 1 from pg_roles where rolname = 'supabase_auth_admin') then
         create role supabase_auth_admin nologin;
     end if;
+end
+$$;
+
+-- The role a Supabase api connects as: it owns nothing, inherits
+-- nothing, and has been granted exactly the three above, so a session
+-- opened as it can become those and nothing else however the role
+-- claim of a token is written. That is the fence issue #92 is about,
+-- and it is the database half of it. The application half is the
+-- exposed set in Config, which refuses a claim before it reaches
+-- set_config, and it is the half that is load bearing today: nothing
+-- here connects as authenticator yet, the server still connects as
+-- whatever the dsn names.
+--
+-- Granted one at a time and only when the grant is missing, because a
+-- grant that is already there still writes a row and prints a notice
+-- on every boot.
+do $$
+declare
+    api text;
+begin
+    if not exists (select 1 from pg_roles where rolname = 'authenticator') then
+        create role authenticator nologin noinherit;
+    end if;
+    foreach api in array array['anon', 'authenticated', 'service_role'] loop
+        if not exists (
+            select 1 from pg_auth_members m
+              join pg_roles granted on granted.oid = m.roleid
+              join pg_roles member on member.oid = m.member
+             where member.rolname = 'authenticator' and granted.rolname = api
+        ) then
+            execute format('grant %I to authenticator', api);
+        end if;
+    end loop;
+exception when insufficient_privilege then
+    raise warning 'zou: no authenticator role: %', sqlerrm;
 end
 $$;
 

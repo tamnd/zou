@@ -748,8 +748,9 @@ async fn the_role_switch_is_only_as_narrow_as_the_connection() {
     let app = app(&dsn);
     let role = |r: &str| jwt::mint(&serde_json::json!({"role": r, "sub": U1}), SECRET);
 
-    // A role that does not exist cannot be entered, and the session
-    // fails before any query runs.
+    // A role that does not exist cannot be entered, and now it is the
+    // server rather than the database that says so, in the state the
+    // database would have used.
     let res = app
         .clone()
         .oneshot(as_user(
@@ -764,8 +765,9 @@ async fn the_role_switch_is_only_as_narrow_as_the_connection() {
     let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
     assert_eq!(e["code"], "22023");
 
-    // A role that exists but was never granted the table gets in and
-    // then gets nothing, which is postgres deciding rather than zou.
+    // A role that exists but is not one the project exposes used to
+    // get in and then get nothing, which left the answer up to what
+    // the role happened to have been granted. It does not get in now.
     let res = app
         .clone()
         .oneshot(as_user(
@@ -776,19 +778,20 @@ async fn the_role_switch_is_only_as_narrow_as_the_connection() {
         ))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
-    assert_eq!(e["code"], "42501");
+    assert_eq!(e["code"], "22023");
+    assert_eq!(e["message"], "role \"pg_read_server_files\" is not exposed");
 
-    // And a role the connection role may become is entered, superuser
-    // included. That is issue #92: hosted Supabase connects as
+    // And the one #92 was really about: a role the connection role may
+    // become, superuser included. Hosted Supabase connects as
     // authenticator, which was granted exactly anon, authenticated and
     // service_role and so cannot become anything else, while zou
     // connects as whatever the dsn names, which in development is
-    // usually the superuser. This assertion pins today's behavior so
-    // that closing #92 has to change it on purpose rather than by
-    // accident, and it is written against the dsn's own user so it
-    // stays true wherever the suite runs.
+    // usually the superuser. The bootstrap creates that authenticator
+    // now, but nothing connects as it yet, so what refuses this is the
+    // exposed set: the claim never reaches set_config. Written against
+    // the dsn's own user so it stays true wherever the suite runs.
     let me = std::env::var("ZOU_PG_TEST_DSN")
         .ok()
         .and_then(|d| {
@@ -806,12 +809,88 @@ async fn the_role_switch_is_only_as_narrow_as_the_connection() {
         ))
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let rows: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
     assert_eq!(
-        rows.as_array().unwrap().len(),
-        2,
-        "the dsn's own role reads past the policy, see #92"
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "the dsn's own role is not an api role, see #92"
+    );
+    let e: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(e["code"], "22023");
+    assert_eq!(e["message"], format!("role \"{me}\" is not exposed"));
+    assert_eq!(
+        e["hint"],
+        "Only the following roles are exposed: anon, authenticated, service_role"
+    );
+
+    // The three that are exposed still work, so what changed is the
+    // door and not the building.
+    for known in ["anon", "authenticated", "service_role"] {
+        let res = app
+            .clone()
+            .oneshot(as_user(
+                "GET",
+                "/rest/v1/zou_atk_switch",
+                Some(&role(known)),
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{known} is an api role");
+    }
+}
+
+/// The database half of #92: the role a Supabase api connects as is
+/// there, it can become the three api roles, and it can become
+/// nothing else. Nothing connects as it yet, so this is a statement
+/// about the bootstrap rather than about a request.
+#[tokio::test]
+async fn the_authenticator_role_may_become_the_api_roles_and_no_others() {
+    let Some(dsn) = dsn() else { return };
+    // Any request bootstraps the database, which is what creates it.
+    let app = app(&dsn);
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/", None, ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let pool = Pool::new(&dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    let rows = sess
+        .query(
+            "select rolcanlogin, rolinherit from pg_roles where rolname = 'authenticator'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let row = rows.first().expect("the bootstrap creates authenticator");
+    assert!(!row.get::<_, bool>(0), "authenticator cannot log in");
+    assert!(!row.get::<_, bool>(1), "authenticator inherits nothing");
+
+    let members: Vec<String> = sess
+        .query(
+            "select granted.rolname from pg_auth_members m
+               join pg_roles granted on granted.oid = m.roleid
+               join pg_roles member on member.oid = m.member
+              where member.rolname = 'authenticator'
+              order by 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    sess.commit().await.expect("park");
+    assert_eq!(
+        members,
+        vec![
+            "anon".to_string(),
+            "authenticated".to_string(),
+            "service_role".to_string()
+        ],
+        "exactly the three, which is the whole of what a connection as it could enter"
     );
 }
 
@@ -1019,8 +1098,8 @@ async fn a_claim_with_sql_in_it_is_a_claim_and_not_sql() {
     assert_eq!(truth(&dsn, "zou_atk_guc").await, "1:one,2:two");
 
     // The same string as a role, which is the one setting postgres
-    // reads back as an identifier. It is a role nobody has, so the
-    // session fails before a statement runs.
+    // reads back as an identifier. It is not a role this project
+    // exposes, so there is no session at all.
     let as_role = jwt::mint(&serde_json::json!({"role": payload, "sub": U1}), SECRET);
     let res = app
         .clone()

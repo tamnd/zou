@@ -240,6 +240,21 @@ fn start_http(
         log::info!("the s3 endpoint is off, storage.s3_protocol.enabled is false");
     }
     let autoconfirm = zou_store::setting::flag("ZOU_MAILER_AUTOCONFIRM").unwrap_or(true);
+    // Which roles a token may ask to run as. A project that made its
+    // own role and wrote policies for it says so here, comma
+    // separated, and everything else keeps the three a Supabase
+    // project has. Naming a set replaces the default rather than
+    // adding to it, and the anonymous role is in either way.
+    let exposed_roles: Vec<String> = std::env::var("ZOU_EXPOSED_ROLES")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(str::to_string)
+        .collect();
+    if !exposed_roles.is_empty() {
+        log::info!("the exposed roles are {}", exposed_roles.join(", "));
+    }
     // A configured mail server carries the mail, and then there is
     // nothing left in memory for `zou inbox` to print, which is why it
     // says which of the two is happening.
@@ -380,6 +395,13 @@ fn start_http(
             } else {
                 schemas
             },
+            // What a `role` claim is allowed to name, from
+            // ZOU_EXPOSED_ROLES and otherwise the three a Supabase
+            // project has. The dev loop connects to postgres as the
+            // superuser, so without this a token signed with the
+            // project secret and carrying "role": "postgres" would be
+            // a superuser session. See #92.
+            exposed_roles,
             // Where a confirmation link sends a person, which is the
             // project's own front end and not this server.
             site_url,

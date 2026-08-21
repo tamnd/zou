@@ -99,6 +99,19 @@ pub struct Config {
     /// on it, and the same refusal to a caller who did is a 403 with
     /// nothing to try next.
     pub anon_role: String,
+    /// The roles a request is allowed to run as, which is the set the
+    /// `role` claim of a token may name. Empty means the three a
+    /// Supabase project has, and [`Config::anon_role`] is always in
+    /// the set whatever it is called.
+    ///
+    /// Hosted Supabase does not need this list because its api
+    /// connects as `authenticator`, a role granted exactly those
+    /// three, so a claim naming anything else fails at the database.
+    /// zou connects as whatever the dsn names, and in a dev loop that
+    /// is the superuser, which would make a token carrying
+    /// `"role": "postgres"` a superuser session with server file
+    /// access in it. See #92.
+    pub exposed_roles: Vec<String>,
     /// Where this server answers from the outside, GoTrue's
     /// API_EXTERNAL_URL. It is the `iss` claim of every access token,
     /// with /auth/v1 appended, which is the one place a client can
@@ -274,6 +287,7 @@ impl Default for Config {
             jwks: None,
             schemas: Vec::new(),
             anon_role: "anon".to_string(),
+            exposed_roles: Vec::new(),
             external_url: None,
             jwt_keys: None,
             mailer_autoconfirm: false,
@@ -304,6 +318,43 @@ impl Default for Config {
             webhook: webhook::Retries::default(),
             functions: None,
         }
+    }
+}
+
+/// The roles a Supabase project exposes to its api, which is what an
+/// `authenticator` there has been granted and so the whole of what a
+/// `role` claim can usefully name.
+pub const PROJECT_ROLES: [&str; 3] = ["anon", "authenticated", "service_role"];
+
+impl Config {
+    /// Whether a request may run as `role`, asked before the name
+    /// reaches `set_config('role', ...)`.
+    ///
+    /// The anonymous role is always in, because it is not a claim: it
+    /// is what a request that named no role falls back to, and an
+    /// operator who renamed it has said so already.
+    #[must_use]
+    pub fn exposes(&self, role: &str) -> bool {
+        role == self.anon_role
+            || match self.exposed_roles.is_empty() {
+                true => PROJECT_ROLES.contains(&role),
+                false => self.exposed_roles.iter().any(|known| known == role),
+            }
+    }
+
+    /// The same set written out, for the hint on a refusal. A caller
+    /// that guessed wrong is told what there was to guess, the way an
+    /// unexposed schema is.
+    #[must_use]
+    pub fn exposed(&self) -> Vec<&str> {
+        let mut roles: Vec<&str> = match self.exposed_roles.is_empty() {
+            true => PROJECT_ROLES.to_vec(),
+            false => self.exposed_roles.iter().map(String::as_str).collect(),
+        };
+        if !roles.contains(&self.anon_role.as_str()) {
+            roles.push(&self.anon_role);
+        }
+        roles
     }
 }
 
@@ -627,8 +678,14 @@ async fn gate(
         None => key,
     };
 
+    // The claim is carried as it was written, not checked here. What
+    // may be entered as a database role is a narrower question than
+    // what a token may say, and the two surfaces that ask it are the
+    // ones that put the name into a session: an auth request from a
+    // user whose role column is something a project made up is still
+    // that user's request, and GoTrue answers it.
     req.extensions_mut().insert(AuthContext {
-        role: identity.role.unwrap_or_else(|| "anon".to_string()),
+        role: identity.role.unwrap_or_else(|| app.cfg.anon_role.clone()),
         claims: Arc::new(identity.claims),
     });
     // A router can be built outside a runtime, so what makes the calls

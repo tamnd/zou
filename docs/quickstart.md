@@ -442,6 +442,26 @@ The request fails with that message at that status, and the signup or sign in be
 
 Leaving the URI set and `ZOU_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED` unset wires the hook up and leaves it switched off, which is how upstream lets an operator put the plumbing in place first. Only `pg-functions://` URIs work here so far. The HTTP variant of a hook is not built, and a URI naming an endpoint is refused at startup rather than quietly ignored.
 
+## The roles a token may name
+
+The `role` claim of a token decides what the request runs as: the API sets it on the transaction, and every policy and grant in the database is then read against it. Three roles are allowed, the same three a Supabase project has, and a claim naming anything else is refused with a 401 before the database is asked.
+
+```
+anon             a request with no session, and what a bare anon key is
+authenticated    somebody signed in
+service_role     the project's own back end, past every policy
+```
+
+That list matters because `zou dev` connects to postgres as the superuser. Without the check, a token signed with the project secret and carrying `"role": "postgres"` would be a superuser session, which can read and write server files and run programs, so holding the JWT secret would mean holding the machine rather than only the data. Hosted Supabase gets the same fence from the database instead: its API connects as `authenticator`, a role granted exactly those three and nothing else. zou creates that role too, with the same grants, so a project's own migrations and dumps find what they expect.
+
+A project that made a role of its own and wrote policies for it names it:
+
+```bash
+ZOU_EXPOSED_ROLES=anon,authenticated,service_role,reporting zou dev /tmp/mydb --http 54321
+```
+
+Naming a set replaces the default rather than adding to it, so list the three as well unless you mean to drop them. The role must exist in the database and be granted what it needs, the same as any other.
+
 ## Rate limits
 
 Every auth endpoint has a budget, and they are GoTrue's own numbers: 150 token grants and 30 of everything else per caller per five minutes, 30 anonymous sign ins an hour, 15 factor challenges and verifications a minute, 30 emails and 30 text messages an hour for the whole project. A caller over budget gets a 429 with `over_request_rate_limit`.

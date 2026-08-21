@@ -60,6 +60,12 @@ impl Tokens for ProjectTokens {
                     None | Some("") => self.anon_role.clone(),
                     Some(role) => role.to_string(),
                 };
+                // A channel's policy check enters this role, so it is
+                // held to the same set the rest surface holds a claim
+                // to. See #92.
+                if !self.app.cfg.exposes(&role) {
+                    return Err(format!("role \"{role}\" is not exposed"));
+                }
                 Ok(Identity {
                     role,
                     claims: verified.claims,
@@ -321,6 +327,17 @@ pub async fn websocket(
         return json_body(
             StatusCode::TOO_MANY_REQUESTS,
             json!({"error": "Too many joins per second"}),
+        );
+    }
+    // The identity the socket starts on, before any access_token
+    // arrives, is the one the gate read off the request, and it is
+    // held to the project's roles the same way. Refused here rather
+    // than on the socket, because a connection that is going to be
+    // told no on its first join is one worth not making. See #92.
+    if !app.cfg.exposes(&auth.role) {
+        return json_body(
+            StatusCode::UNAUTHORIZED,
+            json!({"error": format!("role \"{}\" is not exposed", auth.role)}),
         );
     }
     let identity = Identity {
