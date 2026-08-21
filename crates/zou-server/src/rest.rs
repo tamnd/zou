@@ -2003,12 +2003,39 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
             single: r.get(3),
         })
         .collect();
+    let rows = sess
+        .query(rpc::ROUTINES_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let routines = rows.iter().map(routine_of).collect();
     Ok(Catalog::new(fks)
         .with_computed(computed)
         .with_relations(names, cols)
         .with_keys(keys)
         .with_views(views)
+        .with_routines(routines)
         .with_schema(schema))
+}
+
+/// One row of [`rpc::ROUTINES_SQL`], which is the function's name and
+/// then the eleven columns of one overload.
+fn routine_of(r: &tokio_postgres::Row) -> (String, rpc::Routine) {
+    (
+        r.get(0),
+        rpc::routine(rpc::RoutineRow {
+            arg_names: r.get(1),
+            arg_types: r.get(2),
+            arg_casts: r.get(3),
+            arg_variadic: r.get(4),
+            defaults: r.get(5),
+            returns_set: r.get(6),
+            volatile: r.get(7),
+            rettype: r.get(8),
+            return_table: r.get(9),
+            composite: r.get(10),
+            media: r.get(11),
+        }),
+    )
 }
 
 /// The keys the schema's views inherit from the tables under them,
@@ -3049,28 +3076,10 @@ async fn invoke(
     let catalog = load_catalog(app, &sess, authed, schema).await?;
     settle_prefs(&mut prefer, &sess, authed).await?;
 
-    let rows = sess
-        .query(rpc::INTROSPECT_SQL, &[&schema, &func])
-        .await
-        .map_err(|e| pg_error(&e, authed))?;
-    let overloads: Vec<rpc::Routine> = rows
-        .iter()
-        .map(|r| {
-            rpc::routine(rpc::RoutineRow {
-                arg_names: r.get(0),
-                arg_types: r.get(1),
-                arg_casts: r.get(2),
-                arg_variadic: r.get(3),
-                defaults: r.get(4),
-                returns_set: r.get(5),
-                volatile: r.get(6),
-                rettype: r.get(7),
-                return_table: r.get(8),
-                composite: r.get(9),
-                media: r.get(10),
-            })
-        })
-        .collect();
+    // The overloads come off that cache rather than off a query of
+    // their own. #178 measured the query at 1.4 ms a call, which is
+    // the whole of what this shape cost over the read path.
+    let overloads = catalog.routines(func);
 
     // Which query pairs are arguments: on a GET every pair the
     // result grammar has no word for and whose value is a bare one,
@@ -3205,7 +3214,7 @@ async fn invoke(
     let choice = match rpc::choose(
         schema,
         func,
-        &overloads,
+        overloads,
         &supplied,
         payload_of(&content),
         is_post,
@@ -3213,9 +3222,10 @@ async fn invoke(
         Ok(c) => c,
         Err(mut e) => {
             // A name the schema has no function of at all is the one
-            // case worth a second query: the suggestion is the
-            // nearest name it does have, and nothing loaded so far
-            // knows the others.
+            // case worth a query of its own: the suggestion is the
+            // nearest name it does have, and the cache holds only the
+            // functions a request could call rather than every name
+            // that could be meant.
             if e.unknown_name {
                 let rows = sess
                     .query(rpc::NAMES_SQL, &[&schema])

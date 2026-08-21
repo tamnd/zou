@@ -3,8 +3,9 @@
 //! PostgREST turns a request into a call with named notation, so
 //! callers hit overloads, defaults, and variadic parameters exactly
 //! as SQL would resolve them. The work splits
-//! three ways: [`INTROSPECT_SQL`] pulls every overload of a name
-//! out of pg_proc, [`choose`] picks the one the supplied argument
+//! three ways: [`ROUTINES_SQL`] pulls every overload of every
+//! callable name out of pg_proc into the schema cache, [`choose`]
+//! picks the one the supplied argument
 //! names identify with PostgREST's PGRST202 and PGRST203 errors
 //! when the answer is none or several, and the call builders bind
 //! arguments the way each method carries them, a json body as one
@@ -73,7 +74,7 @@ pub enum RetKind {
 }
 
 /// One overload of the requested function, straight off
-/// [`INTROSPECT_SQL`].
+/// [`ROUTINES_SQL`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Routine {
     pub args: Vec<Arg>,
@@ -88,15 +89,22 @@ pub struct Routine {
     pub media: Option<String>,
 }
 
-/// Every overload of one function name in one schema. Bind the
-/// schema as $1 and the function name as $2. Eleven columns per row:
-/// input argument names (empty string for unnamed), their types via
+/// Every overload of every function one schema can be called on.
+/// Bind the schema as $1. The first column is the function's own
+/// name, and the eleven after it are one [`RoutineRow`]: input
+/// argument names (empty string for unnamed), their types via
 /// format_type, the type each one casts an incoming value to, a
 /// variadic flag per argument, the count of trailing defaults, then
 /// proretset, provolatile = 'v', the return type's name, the table
 /// whose rowtype it is when there is one, whether the result is a row
 /// rather than a value, and the media type the return type names when
 /// it names one.
+///
+/// The whole schema rather than the one name a request asked for,
+/// because this is read once per catalog epoch and held, the way
+/// upstream holds its own schema cache. Asking per call cost every
+/// call a round trip and a recursive walk of `pg_type`, which is
+/// what #178 measured as 1.4 ms the read path was not paying.
 ///
 /// The cast column is the declared type for all but four entries.
 /// `character` and `bit` written without a length are `character(1)`
@@ -113,7 +121,10 @@ pub struct Routine {
 /// A domain is not a type of its own here. `bases` walks typbasetype
 /// down to whatever the domain was declared over, and every question
 /// about the return type is asked of that, because a domain over a
-/// table's rowtype returns rows and postgres will not say so.
+/// table's rowtype returns rows and postgres will not say so. The
+/// walk is seeded from the return types these functions actually
+/// have rather than from all of `pg_type`, which is the same answer
+/// off a few rows instead of every type the database knows.
 ///
 /// Except one question. The domain's own name is how a function
 /// declares what media type it answers in, so the last column asks
@@ -128,18 +139,10 @@ pub struct Routine {
 /// function with an unnamed integer argument is not a function this
 /// surface has, which is why one is answered as a name nobody has
 /// rather than as a call that got its arguments wrong.
-pub const INTROSPECT_SQL: &str = "\
-with recursive bases as (
-  select oid, typbasetype, coalesce(nullif(typbasetype, 0), oid) as base
-    from pg_type
-  union
-  select t.oid, b.typbasetype, coalesce(nullif(b.typbasetype, 0), b.oid)
-    from bases t
-    join pg_type b on b.oid = t.typbasetype
-),
-base_types as (select oid, base from bases where typbasetype = 0),
-fns as (
-  select p.oid, p.pronargdefaults, p.proretset, p.provolatile, p.prorettype,
+pub const ROUTINES_SQL: &str = "\
+with recursive fns as (
+  select p.oid, p.proname::text as name,
+         p.pronargdefaults, p.proretset, p.provolatile, p.prorettype,
          coalesce(p.proallargtypes, p.proargtypes::oid[]) as types,
          coalesce(p.proargmodes,
                   array_fill('i'::\"char\",
@@ -147,8 +150,18 @@ fns as (
          p.proargnames as names
     from pg_proc p
     join pg_namespace n on n.oid = p.pronamespace
-   where n.nspname = $1 and p.proname = $2 and p.prokind = 'f'
+   where n.nspname = $1 and p.prokind = 'f'
 ),
+bases as (
+  select t.oid, t.typbasetype, coalesce(nullif(t.typbasetype, 0), t.oid) as base
+    from pg_type t
+   where t.oid in (select f.prorettype from fns f)
+  union
+  select t.oid, b.typbasetype, coalesce(nullif(b.typbasetype, 0), b.oid)
+    from bases t
+    join pg_type b on b.oid = t.typbasetype
+),
+base_types as (select oid, base from bases where typbasetype = 0),
 args as (
   select f.oid,
          coalesce((select array_agg(coalesce(f.names[u.ord], '') order by u.ord)
@@ -171,7 +184,8 @@ args as (
                     where f.modes[u.ord] in ('i', 'b', 'v')), '{}'::bool[]) as variadic
     from fns f
 )
-select a.names,
+select f.name,
+       a.names,
        a.types,
        a.casts,
        a.variadic,
@@ -198,11 +212,11 @@ select a.names,
     or (cardinality(array_positions(a.names, '')) = 1
         and a.types[(array_positions(a.names, ''))[1]]
             in ('bytea', 'json', 'jsonb', 'text', 'xml'))
- order by f.oid";
+ order by f.name, f.oid";
 
 /// Every function name in one schema this surface can call, which is
 /// what a name nobody has is compared against for the suggestion.
-/// Bind the schema as $1. The two clauses are [`INTROSPECT_SQL`]'s:
+/// Bind the schema as $1. The two clauses are [`ROUTINES_SQL`]'s:
 /// a trigger is not callable over http, and neither is a function
 /// whose unnamed arguments no body can fill.
 pub const NAMES_SQL: &str = "\
@@ -220,7 +234,7 @@ select distinct p.proname::text
    and p.prorettype <> 'trigger'::regtype
    and (coalesce(a.unnamed, 0) = 0 or (a.unnamed = 1 and a.spoken))";
 
-/// One overload as [`INTROSPECT_SQL`] hands it over, the raw
+/// One overload as [`ROUTINES_SQL`] hands it over, the raw
 /// catalog shape [`routine`] folds into a [`Routine`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutineRow {
@@ -242,7 +256,7 @@ pub struct RoutineRow {
     pub media: Option<String>,
 }
 
-/// Assemble one overload from an [`INTROSPECT_SQL`] row.
+/// Assemble one overload from a [`ROUTINES_SQL`] row.
 pub fn routine(row: RoutineRow) -> Routine {
     let n = row.arg_names.len();
     let first_default = n.saturating_sub(row.defaults.max(0) as usize);
@@ -1112,8 +1126,8 @@ mod tests {
         );
         // The two the substitution is for are the only ones it
         // touches, and the catalog is where it happens.
-        assert!(INTROSPECT_SQL.contains("when 'character'::regtype then 'character varying'"));
-        assert!(INTROSPECT_SQL.contains("when 'bit'::regtype then 'bit varying'"));
+        assert!(ROUTINES_SQL.contains("when 'character'::regtype then 'character varying'"));
+        assert!(ROUTINES_SQL.contains("when 'bit'::regtype then 'bit varying'"));
     }
 
     #[test]

@@ -54,7 +54,8 @@
 //! there for the same reason: a write has to spell out what it is
 //! unpacking a body into before either cast can be called.
 
-use std::collections::HashSet;
+use crate::rpc::Routine;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 /// One foreign key, straight off [`INTROSPECT_SQL`]. `table` is the
@@ -501,6 +502,7 @@ pub struct Catalog {
     computed: Vec<ComputedRow>,
     rels: Vec<Relation>,
     views: HashSet<String>,
+    routines: HashMap<String, Vec<Routine>>,
     schema: String,
 }
 
@@ -515,6 +517,7 @@ impl Catalog {
             computed: Vec::new(),
             rels: Vec::new(),
             views: HashSet::new(),
+            routines: HashMap::new(),
             schema: String::new(),
         }
     }
@@ -548,6 +551,31 @@ impl Catalog {
     /// Whether that name is a view rather than a table.
     pub fn is_view(&self, name: &str) -> bool {
         self.views.contains(name)
+    }
+
+    /// The same catalog with the schema's callable functions in it,
+    /// the answer to [`crate::rpc::ROUTINES_SQL`] as name and overload
+    /// pairs. They arrive in the order the query put them in and stay
+    /// in it, since that is the order an ambiguous call reports its
+    /// candidates in.
+    ///
+    /// Functions live here rather than being asked for per call for
+    /// the reason the rest of this catalog does: a call needs the
+    /// same answer every time until the schema changes, and the epoch
+    /// is what says it has.
+    pub fn with_routines(self, rows: Vec<(String, Routine)>) -> Catalog {
+        let mut routines: HashMap<String, Vec<Routine>> = HashMap::new();
+        for (name, routine) in rows {
+            routines.entry(name).or_default().push(routine);
+        }
+        Catalog { routines, ..self }
+    }
+
+    /// Every overload of that function this surface can call, which
+    /// is none when the schema has no such function, and none as well
+    /// when it has one no request could supply the arguments of.
+    pub fn routines(&self, name: &str) -> &[Routine] {
+        self.routines.get(name).map_or(&[], Vec::as_slice)
     }
 
     /// The same catalog knowing which schema it was read out of,
