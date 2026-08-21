@@ -87,6 +87,52 @@ fn without_trailing_zeros(data: &[u8]) -> &[u8] {
     &data[..end]
 }
 
+/// The two pieces of the redo segment a capture has to carry, and where
+/// the second one goes.
+struct WalPieces {
+    body: Vec<u8>,
+    /// How much of the body belongs at offset zero.
+    head: u64,
+    /// Where the rest of it belongs.
+    at: u64,
+}
+
+/// The bytes of the wal segment holding `redo` that a restore of this
+/// capture can actually read, which is not the whole segment.
+///
+/// Recovery reads the segment's first page, because the reader insists
+/// on a valid long header there, and then reads from the checkpoint's
+/// redo location forward. The pages in between were written by a
+/// cluster that has since checkpointed past them: no restore of this
+/// capture will look at them, the wal tail object and the live stream
+/// both begin at the redo page, and on a fresh project they are most of
+/// what the capture moves. So page zero and the redo page onward are
+/// stored, and the middle is left to be the hole a file created at its
+/// length already is.
+///
+/// None for every other file, and for a redo that lands on the first
+/// page, where there is nothing in between to leave out.
+fn wal_pieces(relpath: &str, data: &[u8], redo: u64) -> Option<WalPieces> {
+    let name = relpath.strip_prefix("pg_wal/")?;
+    if !wal_segment_holds(name, redo) {
+        return None;
+    }
+    let page = crate::restore::WAL_PAGE_SIZE;
+    let at = (redo % crate::restore::WAL_SEGMENT_SIZE) & !(page - 1);
+    if at <= page || at as usize >= data.len() {
+        return None;
+    }
+    let head = (page as usize).min(data.len());
+    let end = without_trailing_zeros(data).len().max(at as usize);
+    let mut body = data[..head].to_vec();
+    body.extend_from_slice(&data[at as usize..end]);
+    Some(WalPieces {
+        body,
+        head: head as u64,
+        at,
+    })
+}
+
 /// Upload a capture as checkpoint `id` and write its INDEX. Returns the
 /// bytes uploaded, which is what the store holds and so what a restore
 /// pays to read, not what the files measure on disk. Objects under chk/
@@ -94,6 +140,11 @@ fn without_trailing_zeros(data: &[u8]) -> &[u8] {
 /// checkpoint is kept when `keep_existing` is set, which keeps a retried
 /// fold consistent with what the store already holds. Bootstrap passes
 /// false and fails instead, mixing two initdb runs would corrupt.
+///
+/// `redo` is the checkpoint's redo location when the capture carries the
+/// wal segment holding it, which lets that one file go up as its two
+/// readable ends rather than all sixteen megabytes. Delta captures and
+/// tests with no wal in them pass None.
 pub fn upload(
     store: &dyn CasStore,
     layout: &TenantLayout,
@@ -101,12 +152,17 @@ pub fn upload(
     files: &[(String, Vec<u8>)],
     dirs: &[String],
     keep_existing: bool,
+    redo: Option<u64>,
 ) -> Result<u64, String> {
     let mut index = String::new();
     let mut bytes = 0u64;
     for (relpath, data) in files {
         let key = layout.chk_file(id, relpath);
-        let body = without_trailing_zeros(data);
+        let pieces = redo.and_then(|redo| wal_pieces(relpath, data, redo));
+        let body = match &pieces {
+            Some(pieces) => &pieces.body[..],
+            None => without_trailing_zeros(data),
+        };
         let stored = match store.put_if_absent(&key, body) {
             Ok(_) => body.len() as u64,
             Err(CasError::AlreadyExists { .. }) if keep_existing => {
@@ -131,10 +187,28 @@ pub fn upload(
         // same way, by what it holds now and the length the file has
         // here, which is the honest description of what a restore of
         // this checkpoint would produce.
-        if stored == data.len() as u64 {
-            index.push_str(&format!("f {relpath} {stored}\n"));
-        } else {
-            index.push_str(&format!("t {} {stored} {relpath}\n", data.len()));
+        //
+        // An `h` line is the trimmed one plus where the hole is: the
+        // object holds `head` bytes for offset zero and the rest for
+        // offset `at`. The stored length sits in the same field as a
+        // trimmed line's so everything that only wants to know what a
+        // checkpoint costs can read the two kinds alike. It is only
+        // claimed when the object really is the two pieces this run
+        // built, an object kept from an earlier attempt is described by
+        // its own length as before.
+        match &pieces {
+            Some(pieces) if stored == pieces.body.len() as u64 => {
+                index.push_str(&format!(
+                    "h {} {stored} {} {} {relpath}\n",
+                    data.len(),
+                    pieces.head,
+                    pieces.at
+                ));
+            }
+            _ if stored == data.len() as u64 => {
+                index.push_str(&format!("f {relpath} {stored}\n"));
+            }
+            _ => index.push_str(&format!("t {} {stored} {relpath}\n", data.len())),
         }
     }
     for dir in dirs {
@@ -312,13 +386,13 @@ mod tests {
             .unwrap();
 
         let files = vec![("pg_xact/0000".to_string(), b"newer".to_vec())];
-        let err = upload(&store, &layout, "d1", &files, &[], false).unwrap_err();
+        let err = upload(&store, &layout, "d1", &files, &[], false, None).unwrap_err();
         assert!(err.contains("already exists"));
 
         // With keep_existing the INDEX records the stored length, so the
         // description always matches the immutable object, and the
         // file's own length beside it.
-        upload(&store, &layout, "d1", &files, &[], true).unwrap();
+        upload(&store, &layout, "d1", &files, &[], true, None).unwrap();
         let (index, _) = store.get(&layout.chk_index("d1")).unwrap().unwrap();
         assert_eq!(
             String::from_utf8(index).unwrap(),
@@ -344,7 +418,7 @@ mod tests {
             ("pg_xact/0000".to_string(), vec![0u8; 8192]),
         ];
 
-        let bytes = upload(&store, &layout, "genesis", &files, &[], false).unwrap();
+        let bytes = upload(&store, &layout, "genesis", &files, &[], false, None).unwrap();
         assert_eq!(bytes, (b"a wal record".len() + b"control".len()) as u64);
         let (index, _) = store.get(&layout.chk_index("genesis")).unwrap().unwrap();
         assert_eq!(
@@ -353,5 +427,51 @@ mod tests {
              f global/pg_control 7\n\
              t 8192 0 pg_xact/0000\n"
         );
+    }
+
+    #[test]
+    fn the_redo_segments_unread_middle_stays_out_of_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let layout = TenantLayout::new("local");
+        let page = 8192usize;
+        // Segment one, which is where a fresh cluster's redo lands.
+        let redo = 16 * 1024 * 1024 + 5 * page as u64 + 0x40;
+        let mut segment = vec![0u8; 16 * 1024 * 1024];
+        segment[..24].copy_from_slice(b"the segment long header ");
+        segment[3 * page..3 * page + 5].copy_from_slice(b"stale");
+        segment[5 * page..5 * page + 7].copy_from_slice(b"the end");
+        let files = vec![("pg_wal/000000010000000000000001".to_string(), segment)];
+
+        let bytes = upload(&store, &layout, "genesis", &files, &[], false, Some(redo)).unwrap();
+        // Page zero, then the redo page through the last written byte.
+        assert_eq!(bytes, (page + 7) as u64);
+        let (index, _) = store.get(&layout.chk_index("genesis")).unwrap().unwrap();
+        assert_eq!(
+            String::from_utf8(index).unwrap(),
+            format!(
+                "h 16777216 {} 8192 40960 pg_wal/000000010000000000000001\n",
+                page + 7
+            )
+        );
+        let (object, _) = store
+            .get(&layout.chk_file("genesis", "pg_wal/000000010000000000000001"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(&object[..24], b"the segment long header ");
+        assert_eq!(&object[page..page + 7], b"the end");
+    }
+
+    #[test]
+    fn a_redo_on_the_first_page_leaves_nothing_to_skip() {
+        let mut segment = vec![0u8; 16 * 1024 * 1024];
+        segment[..4].copy_from_slice(b"head");
+        let seg1 = 16 * 1024 * 1024;
+        let name = "pg_wal/000000010000000000000001";
+        assert!(wal_pieces(name, &segment, seg1 + 0x40).is_none());
+        // Nor does any of this apply to a file that is not the segment
+        // holding redo.
+        assert!(wal_pieces(name, &segment, 2 * seg1 + 0x8000).is_none());
+        assert!(wal_pieces("global/pg_control", &segment, seg1 + 0x8000).is_none());
     }
 }
