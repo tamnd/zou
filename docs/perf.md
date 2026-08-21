@@ -29,6 +29,39 @@ Run any leg yourself with `scripts/zou-bench.sh <target> [scale] [seconds]`, whi
 | select-only tps | 167 | 172 | pending | pending |
 | select-only latency avg | 48.0 ms | 46.4 ms | pending | pending |
 
+## Cold attach to first query
+
+The other number a storage engine on object storage lives or dies by, and the one issue #36 asks for: how long from nothing but a store to a query with an answer in it.
+`scripts/zou-cold-attach.sh <label>` measures it, and the scenario it measures is deliberately the bad case.
+It builds a pgbench database at scale 25, checkpoints, runs 20 seconds of four client load, and kills the postmaster with a 9, which leaves the store holding a WAL tail past its last checkpoint the way a crashed node does.
+That store is kept pristine and every leg attaches from a fresh copy of it, because an attach is a write and the second attach of a store is not a cold one.
+
+Measured on gamingpc, a 13th Gen Core i9-13900K, 32 threads, 31 GB of RAM, WSL2 Ubuntu on NVMe, with a 1.6 GB store and shared_buffers held down to 32 MB so recovery faults pages rather than holding the database in the pool.
+The MinIO leg is a real MinIO on the same box reached over HTTP with SigV4, so it carries a real object store client and no network distance.
+
+| phase | local fs | MinIO | s3-standard profile (simulated) | real S3 |
+|---|---|---|---|---|
+| zou-restore | 0.16 s | 0.78 s | 28.27 s | pending |
+| crash recovery to ready | 26.32 s | 188.96 s | 552.43 s | pending |
+| first answered query | 0.04 s | 0.10 s | 4.34 s | pending |
+| attach, total | 26.52 s | 189.83 s | 585.04 s | pending |
+
+The target is 500 ms and the closest leg misses it by 53 times, so what follows is the gap analysis the issue asks for rather than a victory.
+
+The store op counters say where it all goes, and it is not the restore.
+Recovery of this tail does about 16,100 page gets and 20,600 page puts, one at a time, and both counts scale with the length of the WAL tail rather than with the size of the database.
+On local fs a get has a p50 of 8 microseconds and the whole thing still takes 26 seconds, which is the shape of the problem: it is not the per operation latency, it is that there are 37,000 operations in a line.
+MinIO multiplies that by a real client, a p50 of 1 ms per get and 32 ms per put, and lands at 190 seconds.
+The s3-standard profile at a p50 of 32 ms per get pushes it to 585.
+
+Three things follow, and they are all engine work rather than tuning.
+Recovery reads a page, changes it, and writes it back, which is why the puts outnumber the gets, and nothing about a crash recovery requires those pages to be durable individually before the cluster is up.
+The reads are issued one at a time by redo, which knows every block it is about to touch and could ask for all of them at once.
+And the tail itself is the multiplier, so folding more often is worth more here than anywhere else, since it is what decides how many records recovery has to replay at all.
+The buffered WAL tier in the storage redesign is aimed at the same term.
+
+Two legs of this are still owed: real S3 waits on credentials, and a run from a box at a real network distance from the bucket is what turns the simulated column into a measured one.
+
 ## Reading the numbers
 
 - The load phase is extend heavy: every new block is a foreground round trip to the store, which is why init time grows with store latency and why bulk load batching is the obvious next optimization.
