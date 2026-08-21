@@ -1,0 +1,63 @@
+Say which lag bound throttled the pusher, and for which tenant.
+
+Admission refuses an append for three different reasons: the tenant's
+ingest is past its byte bound, its ingest is past its seconds bound, or
+consolidation on the WAL shard is past the backlog bound. The pusher
+logged all three as "consolidation is behind", so the one line an
+operator has to work from named the wrong thing two times out of three
+and never named the tenant (zou #255).
+
+The Rust side already formats the exact reason, bound and tenant into
+the error it refuses with, but the shim only handed C an error code. It
+now keeps that text and hands it over on request, so the log line quotes
+it: "zou wal pusher throttled: tenant 0x..., ingest is N bytes behind
+durable, the bound is M". The reason is taken rather than
+copied, because the line is logged once per streak and a leftover reason
+would be reported again by the next one, naming a bound that had stopped
+tripping. A pusher running against a shim without the call still logs,
+just without the detail.
+
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -49,6 +49,7 @@
+ 						 uint64 *out_resume);
+ extern int	zou_wal_append(const uint8 *data, size_t len, uint64 pg_lsn,
+ 						   uint64 *out_durable);
++extern int	zou_wal_throttle_reason(char *out, size_t cap);
+ extern int	zou_wal_durable(uint64 *out_pg_lsn);
+ extern int	zou_wal_fold_start(uint64 redo);
+ extern int	zou_wal_fold_poll(uint64 *out_redo, uint32 *out_dropped);
+@@ -619,15 +620,26 @@
+ 			if (rc == ZOU_ERR_THROTTLED)
+ 			{
+ 				/*
+-				 * The lag bounds refused admission, consolidation is
+-				 * too far behind. Nap and retry the same chunk: staged
+-				 * WAL stops growing, the commit gate stalls honestly,
+-				 * and the fold thread's next backlog report lifts the
+-				 * throttle. Log once per streak, not per retry.
++				 * A lag bound refused admission: this tenant's ingest
++				 * is too far behind, or consolidation on the shard is.
++				 * Nap and retry the same chunk: staged WAL stops
++				 * growing, the commit gate stalls honestly, and the
++				 * next gauge report lifts the throttle. Log once per
++				 * streak, not per retry, and say which bound tripped,
++				 * since that is the whole use of the line: the three
++				 * reasons are three different things to go look at.
+ 				 */
+ 				if (!throttled)
+-					ereport(LOG,
+-							(errmsg("zou wal pusher throttled, consolidation is behind")));
++				{
++					char		reason[256];
++
++					if (zou_wal_throttle_reason(reason, sizeof(reason)) > 0)
++						ereport(LOG,
++								(errmsg("zou wal pusher throttled: %s", reason)));
++					else
++						ereport(LOG,
++								(errmsg("zou wal pusher throttled, a lag bound is blown")));
++				}
+ 				throttled = true;
+ 				(void) WaitLatch(MyLatch,
+ 								 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
