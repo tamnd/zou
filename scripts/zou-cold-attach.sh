@@ -136,6 +136,11 @@ t1=$(now)
 # connection it then asks nothing, which is ready to take a client
 # rather than ready to answer one, and the difference between those two
 # is a phase of this measurement.
+#
+# Emptied first, because pg_ctl appends and the wait below is a grep of
+# this file. A previous run's ready line sitting in it is a wait that
+# ends before the postmaster has read anything.
+: >"$WORK/attach-$LABEL.log"
 "$PG_BIN/pg_ctl" -D "$PGDATA" -l "$WORK/attach-$LABEL.log" -W \
 	-o "-p $PORT -k $WORK -c listen_addresses='' -c shared_buffers=$SHARED_BUFFERS" start
 trap 'kill -9 "$(head -1 "$PGDATA/postmaster.pid" 2>/dev/null)" 2>/dev/null || true' EXIT
