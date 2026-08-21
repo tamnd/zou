@@ -136,9 +136,13 @@ pub struct Pool(Arc<Inner>);
 /// The auth.* function bodies are Supabase's own definitions verbatim,
 /// including the legacy request.jwt.claim.<name> fallbacks, because
 /// user policies copied from Supabase docs must behave identically.
-/// The public schema grants mirror Supabase's stance: the three API
-/// roles get everything and row level security is the actual guard,
-/// which is also why enabling RLS is the app's job, not ours.
+/// The public schema grants mirror Supabase's stance, which is that a
+/// table arrives readable and writable by nobody who comes in through
+/// the api and a project says which ones are not. The three roles get
+/// the privileges that are not a way in on their own, truncate,
+/// references, trigger and maintain, and enabling row level security
+/// is still the app's job because a granted table with no policy is
+/// still open.
 const BOOTSTRAP: &str = "
 select pg_advisory_xact_lock(730501);
 
@@ -298,12 +302,10 @@ grant execute on all functions in schema auth to anon, authenticated, service_ro
 
 do $$
 begin
-    -- Only the first bootstrap sweeps existing objects. The sweep
-    -- rewrites the acl of every table in public, so re running it on
-    -- every restart would both race concurrent DDL (tuple concurrently
-    -- updated) and silently undo revokes the operator made on purpose.
-    -- The marker is the default acl entry this block creates, not
-    -- has_schema_privilege, which is always true via PUBLIC.
+    -- Only the first bootstrap touches this, because re running it on
+    -- every restart would silently undo grants the project made on
+    -- purpose. The marker is the default acl entry this block creates,
+    -- not has_schema_privilege, which is always true via PUBLIC.
     if not exists (
         select 1
         from pg_default_acl d
@@ -314,15 +316,42 @@ begin
           and a.grantee = 'anon'::regrole
     ) then
         grant usage on schema public to anon, authenticated, service_role;
-        grant all on all tables in schema public to anon, authenticated, service_role;
-        grant all on all sequences in schema public to anon, authenticated, service_role;
-        grant all on all functions in schema public to anon, authenticated, service_role;
+        -- What a table in public arrives with, matched to what a real
+        -- project gets today: truncate, references, trigger and
+        -- maintain, and not one of select, insert, update or delete.
+        -- Nothing existing is swept, so a database restored from a
+        -- dump keeps the acls its dump carried rather than having
+        -- them widened by having been opened here.
         alter default privileges in schema public
-            grant all on tables to anon, authenticated, service_role;
+            grant references, trigger, truncate, maintain
+            on tables to anon, authenticated, service_role;
+    elsif (
+        -- A database an older zou opened carries that release's stance,
+        -- which handed every future table to all three roles, and a
+        -- database is opened once so it would carry it forever. The
+        -- signature is all three holding select, which is what the old
+        -- bootstrap wrote and nothing else here writes; a project that
+        -- widened the default itself did so for one role at a time and
+        -- is left alone. Only the default changes, so a table that
+        -- already exists keeps whatever it was granted.
+        select count(distinct a.grantee) = 3
+        from pg_default_acl d
+        join pg_namespace n on n.oid = d.defaclnamespace
+        cross join aclexplode(d.defaclacl) a
+        where n.nspname = 'public'
+          and d.defaclobjtype = 'r'
+          and a.privilege_type = 'SELECT'
+          and a.grantee in (
+              'anon'::regrole, 'authenticated'::regrole, 'service_role'::regrole
+          )
+    ) then
         alter default privileges in schema public
-            grant all on sequences to anon, authenticated, service_role;
+            revoke select, insert, update, delete
+            on tables from anon, authenticated, service_role;
         alter default privileges in schema public
-            grant all on functions to anon, authenticated, service_role;
+            revoke all on sequences from anon, authenticated, service_role;
+        alter default privileges in schema public
+            revoke all on functions from anon, authenticated, service_role;
     end if;
 end
 $$;

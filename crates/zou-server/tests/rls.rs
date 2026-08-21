@@ -88,6 +88,17 @@ async fn policies_on_auth_uid_isolate_users() {
         )
         .await
         .expect("policy");
+    // The grant a project's migrations carry. A table arrives granted
+    // to nobody who came in through the api, so the policy below has
+    // to be given something to decide about.
+    admin
+        .execute(
+            "grant select, insert, update, delete on zou_rls_docs \
+             to anon, authenticated, service_role",
+            &[],
+        )
+        .await
+        .expect("grant");
     admin
         .execute(
             &format!("insert into zou_rls_docs values ('{U1}', 'u1 doc'), ('{U2}', 'u2 doc')"),
@@ -155,8 +166,11 @@ async fn policies_on_auth_uid_isolate_users() {
     admin.commit().await.expect("finish");
 }
 
+/// A table nobody granted is a table nobody reads, which is what a
+/// project gets upstream. The grant is the project's to make and row
+/// level security is the second fence rather than the only one.
 #[tokio::test]
-async fn default_privileges_cover_tables_created_after_bootstrap() {
+async fn a_table_created_after_bootstrap_is_granted_to_nobody() {
     let Some(pool) = pool() else { return };
     let admin = pool.unscoped().await.expect("unscoped");
     admin
@@ -169,9 +183,30 @@ async fn default_privileges_cover_tables_created_after_bootstrap() {
         .expect("create");
     admin.commit().await.expect("finish");
 
-    // No explicit grant on the new table, anon can still read it: the
-    // alter default privileges from bootstrap did the granting, which
-    // is Supabase's open-by-default stance with RLS as the guard.
+    let anon = pool
+        .session(&RequestContext::bare("anon", "{}"), false)
+        .await
+        .expect("session");
+    let refused = anon
+        .query("select count(*) from zou_rls_open", &[])
+        .await
+        .expect_err("a table nobody granted");
+    // The debug form rather than the display one, because a client
+    // error prints as "db error" and keeps what postgres said in the
+    // source underneath it.
+    let said = format!("{refused:?}");
+    assert!(said.contains("permission denied"), "{said}");
+    // The session is done for once postgres has refused inside it, so
+    // this ends the transaction rather than pretending it is still one.
+    drop(anon);
+
+    let admin = pool.unscoped().await.expect("unscoped");
+    admin
+        .execute("grant select on zou_rls_open to anon", &[])
+        .await
+        .expect("grant");
+    admin.commit().await.expect("finish");
+
     let anon = pool
         .session(&RequestContext::bare("anon", "{}"), false)
         .await

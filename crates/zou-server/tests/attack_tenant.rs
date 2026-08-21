@@ -247,7 +247,10 @@ async fn table(p: &Project, name: &str, whose: &str) {
         format!("drop table if exists public.{name}"),
         format!("create table public.{name} (id int primary key, whose text)"),
         format!("insert into public.{name} values (1, '{whose}')"),
-        format!("grant select, insert, update, delete on public.{name} to anon, authenticated"),
+        format!(
+            "grant select, insert, update, delete on public.{name} \
+             to anon, authenticated, service_role"
+        ),
     ] {
         sess.execute(&stmt, &[]).await.expect(&stmt);
     }
