@@ -34,7 +34,7 @@ tokio-postgres = { workspace = true }
 # The client half of a websocket, for the link from a node with the
 # sockets to the node with the tenant. rustls because it is the TLS this
 # build already links, rather than a second one for `wss:`.
-tokio-tungstenite = { version = "0.29", features = [
+tokio-tungstenite = { version = "0.30", features = [
     "rustls-tls-webpki-roots",
 ] }
 tower = { workspace = true, features = ["util"] }

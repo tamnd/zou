@@ -23,7 +23,7 @@ zou-functions = { path = "../zou-functions" }
 aes = { workspace = true, optional = true }
 aes-gcm = { workspace = true, optional = true }
 cbc = { workspace = true, optional = true }
-deno_ast = { version = "0.52", features = ["transpiling"], optional = true }
+deno_ast = { version = "0.53", features = ["transpiling"], optional = true }
 deno_core = { version = "0.410", optional = true }
 deno_error = { version = "0.7", optional = true }
 # `crypto.getRandomValues`, from the operating system and not from here.
@@ -67,7 +67,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 # repository already speaks through the same crate. rustls because it
 # is the TLS this build already links for `fetch` and the module
 # loader, rather than a second one for `wss:`.
-tokio-tungstenite = { version = "0.29", features = [
+tokio-tungstenite = { version = "0.30", features = [
     "rustls-tls-webpki-roots",
 ], optional = true }
 # The same client zou-server calls a webhook with, rather than the
@@ -91,7 +91,7 @@ rustls = { workspace = true }
 # talk to. Synchronous, because that server is a thread with a loop in
 # it the same way the http one beside it is, and it is the same crate
 # the client half is built on rather than a second implementation.
-tungstenite = { version = "0.29", default-features = false, features = [
+tungstenite = { version = "0.30", default-features = false, features = [
     "handshake",
 ] }
 serde_json = { workspace = true }
