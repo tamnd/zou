@@ -21,7 +21,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     match rest {
         [verb] if verb == "show" => {
             let map = placement::load(&*store).map_err(|e| e.to_string())?;
-            print!("{}", String::from_utf8_lossy(&map.to_json()));
+            put!("{}", String::from_utf8_lossy(&map.to_json()));
             Ok(())
         }
         [verb, entries @ ..] if verb == "nodes" && !entries.is_empty() => {
@@ -37,7 +37,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
                 .collect::<Result<Vec<_>, &str>>()?;
             let map = placement::publish(&*store, |m| m.nodes = nodes.clone())
                 .map_err(|e| e.to_string())?;
-            println!("map version {} with {} nodes", map.version, map.nodes.len());
+            say!("map version {} with {} nodes", map.version, map.nodes.len());
             Ok(())
         }
         [verb, tenant_ref, shard, node] if verb == "pin" => {
@@ -53,7 +53,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
                 m.pins.push(pin.clone());
             })
             .map_err(|e| e.to_string())?;
-            println!(
+            say!(
                 "map version {}: {tenant_ref} shard {shard} pinned to {node}",
                 map.version
             );
@@ -66,7 +66,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
                     .retain(|p| !(p.tenant == *tenant_ref && p.shard == shard));
             })
             .map_err(|e| e.to_string())?;
-            println!(
+            say!(
                 "map version {}: {tenant_ref} shard {shard} unpinned",
                 map.version
             );
@@ -78,9 +78,9 @@ pub fn run(argv: &[String]) -> Result<(), String> {
             let owner = map
                 .node_for(tenant_ref, shard)
                 .ok_or("the map has no nodes")?;
-            println!("{} {}", owner.id, owner.addr);
+            say!("{} {}", owner.id, owner.addr);
             for standby in map.rank(tenant_ref, shard).iter().skip(1) {
-                println!("  standby {} {}", standby.id, standby.addr);
+                say!("  standby {} {}", standby.id, standby.addr);
             }
             Ok(())
         }

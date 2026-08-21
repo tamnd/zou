@@ -42,7 +42,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     // Every walk of the tree iterates it rather than trusting a
     // listing, so a person reconciling what they see under a prefix
     // against what the tenant actually has needs the number itself.
-    println!(
+    say!(
         "ref {}, format {}, epoch {}, shards {}, pg {} timeline {}",
         manifest.tenant_ref,
         manifest.format,
@@ -52,20 +52,22 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         manifest.pg.timeline
     );
     match &manifest.lease {
-        Some(l) => println!(
+        Some(l) => say!(
             "lease held by {} until unix {}, fence {}",
-            l.holder, l.expires_unix, l.fence
+            l.holder,
+            l.expires_unix,
+            l.fence
         ),
-        None => println!("lease free"),
+        None => say!("lease free"),
     }
     if let Some(of) = &manifest.branch_of {
-        println!("branch of {} at {:#X}", of.tenant_ref, of.at_lsn.0);
+        say!("branch of {} at {:#X}", of.tenant_ref, of.at_lsn.0);
     }
     if let Some(unix) = manifest.published_unix {
-        println!("last published unix {unix}");
+        say!("last published unix {unix}");
     }
 
-    println!("checkpoints: {}", manifest.checkpoints.len());
+    say!("checkpoints: {}", manifest.checkpoints.len());
     for c in &manifest.checkpoints {
         let kind = match c.kind {
             CheckpointKind::Full => "full",
@@ -75,31 +77,35 @@ pub fn run(argv: &[String]) -> Result<(), String> {
             Some(owner) => format!(", owned by {owner}"),
             None => String::new(),
         };
-        println!("  {} {kind} at {:#X}{owner}", c.id, c.lsn.0);
+        say!("  {} {kind} at {:#X}{owner}", c.id, c.lsn.0);
     }
 
     if let Some(f) = manifest.folded_upto {
-        println!("folded upto {:#X}", f.0);
+        say!("folded upto {:#X}", f.0);
     }
     let logs: Arc<dyn CasStore> =
         Arc::new(PrefixStore::over(Arc::clone(&store), &layout.log_prefix()));
     let media = WalMedia::single(Arc::clone(&logs));
     let end = stream_end(&media, WAL_SHARD, tenant_id(tenant)).map_err(|e| format!("wal: {e}"))?;
     match end {
-        Some(lsn) => println!("wal stream end {:#X}", lsn.0),
-        None => println!("wal stream end: nothing appended"),
+        Some(lsn) => say!("wal stream end {:#X}", lsn.0),
+        None => say!("wal stream end: nothing appended"),
     }
     match ShardManifest::load(&*logs, WAL_SHARD).map_err(|e| format!("wal: {e}"))? {
-        Some((sm, _)) => println!(
+        Some((sm, _)) => say!(
             "log shard {}: chain epoch {}, head {}, consolidated upto {}, gc round {}",
-            sm.shard, sm.chain_epoch, sm.head, sm.consolidated_upto, sm.gc_round
+            sm.shard,
+            sm.chain_epoch,
+            sm.head,
+            sm.consolidated_upto,
+            sm.gc_round
         ),
-        None => println!("log: no shard manifest yet"),
+        None => say!("log: no shard manifest yet"),
     }
 
     let snapshots = store
         .list(&layout.manifests_dir())
         .map_err(|e| format!("store: {e}"))?;
-    println!("history: {} manifest snapshots", snapshots.len());
+    say!("history: {} manifest snapshots", snapshots.len());
     Ok(())
 }

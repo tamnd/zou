@@ -87,10 +87,7 @@ for _ in $(seq 1 12); do
     PSQL -c "insert into settling(pad) select repeat('x', 80) from generate_series(1, 2000)"
     PSQL -c "checkpoint"
     sleep 2
-    # Through a file rather than a pipe: `grep -q` closes the pipe on
-    # its first match and the writer dies of it.
-    "$ZOU" info "$STORE" >"$DEMO_DIR/settling.txt"
-    if grep -qE '^  [0-9a-f]{16} full at ' "$DEMO_DIR/settling.txt"; then
+    if "$ZOU" info "$STORE" | grep -qE '^  [0-9a-f]{16} full at '; then
         SETTLED=yes
         break
     fi

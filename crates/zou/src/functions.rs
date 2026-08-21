@@ -440,21 +440,23 @@ fn deploy(args: &Deploy) -> Result<(), String> {
         &bound.layout,
         &args.names,
     )?;
-    println!(
+    say!(
         "deployed {} to {} on {}",
         published.names.join(", "),
         bound.tenant,
         bound.target
     );
-    println!(
+    say!(
         "{} files, {} of them new, {} bytes uploaded",
-        published.files, published.written, published.bytes
+        published.files,
+        published.written,
+        published.bytes
     );
     // The name a caller uses, because that is the question a deploy
     // leaves somebody with, and it is the project's url rather than
     // this machine's.
     for name in &published.names {
-        println!("  /functions/v1/{name}");
+        say!("  /functions/v1/{name}");
     }
     Ok(())
 }
@@ -466,10 +468,10 @@ fn list(args: &Deploy) -> Result<(), String> {
     let bound = bind(args)?;
     let store = zou_store::open_store(&bound.target)?;
     let Some(deployment) = crate::bundle::fetch(store.as_ref(), &bound.tenant)? else {
-        println!("nothing is deployed to {}", bound.tenant);
+        say!("nothing is deployed to {}", bound.tenant);
         return Ok(());
     };
-    println!(
+    say!(
         "{} {} deployed to {}",
         deployment.functions.len(),
         if deployment.functions.len() == 1 {
@@ -480,7 +482,7 @@ fn list(args: &Deploy) -> Result<(), String> {
         bound.tenant
     );
     for function in &deployment.functions {
-        println!(
+        say!(
             "  {} at {}, {} files{}",
             function.name,
             function.entrypoint,

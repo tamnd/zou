@@ -78,7 +78,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
                     )
                 })
                 .collect();
-            println!("[{}]", rows.join(","));
+            say!("[{}]", rows.join(","));
             return Ok(());
         }
         [flag, n] if flag == "--workers" => n.parse().map_err(|_| USAGE.to_string())?,
@@ -91,7 +91,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     let mut failed = 0;
     for (job, result) in &results {
         match result {
-            Ok(Some(out)) => println!(
+            Ok(Some(out)) => say!(
                 "shard {}: {} layers into {}, debt {} to {}, imaged {} pages of which {} off the frozen objects",
                 job.shard,
                 out.retired,
@@ -101,7 +101,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
                 out.imaged,
                 out.frozen
             ),
-            Ok(None) => println!("shard {}: nothing to do", job.shard),
+            Ok(None) => say!("shard {}: nothing to do", job.shard),
             Err(e) => {
                 failed += 1;
                 eprintln!("shard {}: {e}", job.shard);
@@ -112,9 +112,9 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         return Err(format!("{failed} of {} shards failed", results.len()));
     }
     if prune_lineage(&*store, tenant_ref).map_err(|e| e.to_string())? {
-        println!("lineage clear, every shard stands alone");
+        say!("lineage clear, every shard stands alone");
     } else {
-        println!("lineage kept, some shard still leans on its ancestors");
+        say!("lineage kept, some shard still leans on its ancestors");
     }
     Ok(())
 }
@@ -215,7 +215,7 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
         }
     };
     if !args.json {
-        println!(
+        say!(
             "folding {tenant_ref} to {at}, {}, data checksums {}",
             match args.at {
                 Some(_) => "named on the command line".to_string(),
@@ -244,7 +244,7 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
     for job in &jobs {
         match merge_to_horizon(&*store, tenant_ref, job.shard, at, &pool, data_checksums) {
             Ok(Some(out)) if args.json => rows.push(fold_row(job.shard, &out)),
-            Ok(Some(out)) => println!(
+            Ok(Some(out)) => say!(
                 "shard {}: {} layers retired into {} at {}, {} pages imaged, {} keys with no base kept {} layers alive, {} to {} bytes",
                 job.shard,
                 out.retired,
@@ -257,7 +257,7 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
                 out.bytes_after
             ),
             Ok(None) if args.json => {}
-            Ok(None) => println!("shard {}: nothing below the horizon to fold", job.shard),
+            Ok(None) => say!("shard {}: nothing below the horizon to fold", job.shard),
             Err(e) => {
                 failed += 1;
                 eprintln!("shard {}: {e}", job.shard);
@@ -272,7 +272,7 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
     // read it wrong writes pages nothing can read back, and a soak that
     // recorded what the fold believed can say so afterwards.
     if args.json {
-        println!(
+        say!(
             "{{\"horizon\":\"{at}\",\"data_checksums\":{data_checksums},\"shards\":[{}]}}",
             rows.join(",")
         );

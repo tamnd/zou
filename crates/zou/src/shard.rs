@@ -27,9 +27,11 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         .shard_history
         .last()
         .ok_or("a resize always leaves a lineage entry")?;
-    println!(
+    say!(
         "{verb} {tenant_ref} from {} to {} shards, floor {:#X}",
-        change.from, change.to, change.at.0
+        change.from,
+        change.to,
+        change.at.0
     );
     Ok(())
 }

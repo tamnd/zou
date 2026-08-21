@@ -93,7 +93,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     match &args.output {
         Some(path) => std::fs::write(path, &file).map_err(|e| format!("cannot write {path}: {e}")),
         None => {
-            print!("{file}");
+            put!("{file}");
             Ok(())
         }
     }

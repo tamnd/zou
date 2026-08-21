@@ -174,15 +174,15 @@ impl Status {
             )),
         }
         for (label, value) in lines {
-            println!("{label:>16}: {value}");
+            say!("{label:>16}: {value}");
         }
         let Some(project) = &self.project else {
             return;
         };
-        println!("{:>16}: {}", "config", project.path.display());
+        say!("{:>16}: {}", "config", project.path.display());
         let served = functions(project);
         if !served.is_empty() {
-            println!(
+            say!(
                 "{:>16}: {} on {}",
                 "functions",
                 served.join(", "),
@@ -190,29 +190,29 @@ impl Status {
             );
         }
         if !project.unread.is_empty() {
-            println!("{:>16}: {}", "not read yet", project.unread.join(", "));
+            say!("{:>16}: {}", "not read yet", project.unread.join(", "));
         }
     }
 
     fn env(&self) {
         let (anon, service) = self.keys().unzip();
-        println!("API_URL=\"{}\"", self.api_url());
-        println!("STORAGE_S3_URL=\"{}\"", self.s3_url());
-        println!("DB_URL=\"{}\"", self.db_url());
+        say!("API_URL=\"{}\"", self.api_url());
+        say!("STORAGE_S3_URL=\"{}\"", self.s3_url());
+        say!("DB_URL=\"{}\"", self.db_url());
         if let Some(secret) = &self.secret {
-            println!("JWT_SECRET=\"{secret}\"");
+            say!("JWT_SECRET=\"{secret}\"");
         }
         if let (Some(anon), Some(service)) = (anon, service) {
-            println!("ANON_KEY=\"{anon}\"");
-            println!("SERVICE_ROLE_KEY=\"{service}\"");
+            say!("ANON_KEY=\"{anon}\"");
+            say!("SERVICE_ROLE_KEY=\"{service}\"");
         }
         // The names are the CLI's, not ours: a project's scripts read
         // these out of `supabase status -o env` today, and a rename
         // here would be a script to edit for no reason.
         if let Some(s3) = &self.s3 {
-            println!("S3_PROTOCOL_ACCESS_KEY_ID=\"{}\"", s3.access);
-            println!("S3_PROTOCOL_ACCESS_KEY_SECRET=\"{}\"", s3.secret);
-            println!("S3_PROTOCOL_REGION=\"{}\"", s3.region);
+            say!("S3_PROTOCOL_ACCESS_KEY_ID=\"{}\"", s3.access);
+            say!("S3_PROTOCOL_ACCESS_KEY_SECRET=\"{}\"", s3.secret);
+            say!("S3_PROTOCOL_REGION=\"{}\"", s3.region);
         }
     }
 
@@ -237,7 +237,7 @@ impl Status {
             out["functions_engine"] =
                 serde_json::json!(crate::functions::engine_describe(project.functions.policy));
         }
-        println!("{out}");
+        say!("{out}");
     }
 }
 

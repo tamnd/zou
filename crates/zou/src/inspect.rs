@@ -53,20 +53,20 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         LayerKind::Delta => "delta",
         LayerKind::Image => "image",
     };
-    println!("{kind} layer, {} bytes", bytes.len());
-    println!("keys {} .. {}", footer.min_key.hex(), footer.max_key.hex());
+    say!("{kind} layer, {} bytes", bytes.len());
+    say!("keys {} .. {}", footer.min_key.hex(), footer.max_key.hex());
     match footer.kind {
-        LayerKind::Delta => println!("lsns {:#X} .. {:#X}", footer.min_lsn.0, footer.max_lsn.0),
-        LayerKind::Image => println!("lsn {:#X}", footer.min_lsn.0),
+        LayerKind::Delta => say!("lsns {:#X} .. {:#X}", footer.min_lsn.0, footer.max_lsn.0),
+        LayerKind::Image => say!("lsn {:#X}", footer.min_lsn.0),
     }
-    println!(
+    say!(
         "{} entries in {} blocks, bloom {} bytes",
         footer.entry_count,
         footer.blocks.len(),
         footer.bloom.bits().len()
     );
     for (i, b) in footer.blocks.iter().enumerate() {
-        println!(
+        say!(
             "  block {i}: {} entries, {} bytes at {}, {} raw, keys {} .. {}",
             b.entries,
             b.len,
@@ -82,14 +82,14 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         LayerKind::Delta => {
             let (entries, _) = decode_delta(&bytes).map_err(|e| format!("layer: {e}"))?;
             let payload: usize = entries.iter().map(|e| e.record.len()).sum();
-            println!(
+            say!(
                 "verified: {} records, {payload} record bytes",
                 entries.len()
             );
         }
         LayerKind::Image => {
             let (entries, _) = decode_image(&bytes).map_err(|e| format!("layer: {e}"))?;
-            println!(
+            say!(
                 "verified: {} pages, {} page bytes",
                 entries.len(),
                 entries.len() * PAGE_IMAGE_LEN
@@ -140,7 +140,7 @@ fn chain(
         [at] => parse_lsn(at)?,
         _ => return Err(USAGE.into()),
     };
-    println!(
+    say!(
         "shard {shard} of {tenant_ref}, dcl {:#x}, {} layers in the map, reading at {at:#x}",
         manifest.disk_consistent_lsn.0,
         map.layers().len()
@@ -151,9 +151,11 @@ fn chain(
             LayerKind::Image => "image",
         };
         if desc.min_key <= key && key <= desc.max_key {
-            println!(
+            say!(
                 "  {kind} {:#x}..{:#x} covers the key, {} bytes",
-                desc.min_lsn.0, desc.max_lsn.0, desc.size
+                desc.min_lsn.0,
+                desc.max_lsn.0,
+                desc.size
             );
         }
     }
@@ -168,16 +170,16 @@ fn chain(
             let lo = u32::from_le_bytes(page[4..8].try_into().expect("a page header"));
             let lower = u16::from_le_bytes([page[12], page[13]]);
             let upper = u16::from_le_bytes([page[14], page[15]]);
-            println!(
+            say!(
                 "base from the image at {:#x}, page lsn {:#x}, lower {lower} upper {upper}, max off {}",
                 lsn.0,
                 ((hi as u64) << 32) | lo as u64,
                 lower.saturating_sub(24) / 4
             );
         }
-        _ => println!("no base, the first record has to build the page"),
+        _ => say!("no base, the first record has to build the page"),
     }
-    println!(
+    say!(
         "{} records, {} layers touched",
         recon.records.len(),
         recon.layers_touched
@@ -206,7 +208,7 @@ fn chain(
                 .join(", "),
             Err(e) => format!("refs unreadable: {e}"),
         };
-        println!(
+        say!(
             "  {:#x} {} bytes, rmgr {rmid} info {info:#04x}, {refs}",
             lsn.0,
             record.len()
@@ -264,13 +266,13 @@ fn wal(
     let frames = catch_up(&media, WAL_SHARD, &TeeFilter::Tenant(tenant), Lsn(from))
         .map_err(|e| format!("log: {e}"))?;
     let window = walscan::assemble_window_frames(&frames, from, to);
-    println!(
+    say!(
         "{} frames over {from:#x}..{to:#x}, window covered from {:#x}",
         frames.len(),
         window.covered_from
     );
     if window.covered_from > from {
-        println!(
+        say!(
             "the log has nothing below {:#x} in this window",
             window.covered_from
         );
@@ -295,7 +297,7 @@ fn wal(
             .map(|r| format!("{}/{}/{}.{} blk {}", r.spc, r.db, r.rel, r.fork, r.blk))
             .collect::<Vec<_>>()
             .join(", ");
-        println!(
+        say!(
             "  {:#x}..{:#x} {} bytes, rmgr {} info {:#04x}, xid {}, {refs}",
             record.lsn,
             record.end_lsn,
@@ -305,7 +307,7 @@ fn wal(
             record.xid
         );
     }
-    println!(
+    say!(
         "{} records in the window, {matched} shown, resume {:#x}",
         out.records.len(),
         out.resume

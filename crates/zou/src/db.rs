@@ -365,25 +365,25 @@ fn quoted(name: &str) -> String {
 async fn push(client: &Client, dir: &Path, dry_run: bool) -> Result<(), String> {
     let all = migrations(dir)?;
     if all.is_empty() {
-        println!("no migrations in {}", dir.display());
+        say!("no migrations in {}", dir.display());
         return Ok(());
     }
     let done = applied(client).await?;
     let todo: Vec<&Migration> = all.iter().filter(|m| !done.contains(&m.version)).collect();
     if todo.is_empty() {
-        println!("nothing to apply, all {} are already there", all.len());
+        say!("nothing to apply, all {} are already there", all.len());
         return Ok(());
     }
     for m in &todo {
         if dry_run {
-            println!("would apply {}", m.path.display());
+            say!("would apply {}", m.path.display());
             continue;
         }
         apply(client, m).await?;
-        println!("applied {}", m.path.display());
+        say!("applied {}", m.path.display());
     }
     if !dry_run {
-        println!("{} applied, {} were already there", todo.len(), done.len());
+        say!("{} applied, {} were already there", todo.len(), done.len());
     }
     Ok(())
 }
@@ -402,7 +402,7 @@ async fn reset(client: &Client, project: Option<&Project>, dir: &Path) -> Result
             ))
             .await
             .map_err(|e| format!("cannot drop schema {schema}: {}", why(&e)))?;
-        println!("dropped schema {schema}");
+        say!("dropped schema {schema}");
     }
     client
         .batch_execute(PUBLIC_SCHEMA)
@@ -418,7 +418,7 @@ async fn reset(client: &Client, project: Option<&Project>, dir: &Path) -> Result
             .await
             .map_err(|e| format!("cannot grant the public schema back: {}", why(&e)))?;
     } else {
-        println!("the api roles are not there yet, the server grants public when it starts");
+        say!("the api roles are not there yet, the server grants public when it starts");
     }
     // The ledger is emptied rather than dropped, because a database
     // nobody has pushed to yet does not have one to drop, and the
@@ -456,7 +456,7 @@ async fn seed(client: &Client, project: Option<&Project>) -> Result<(), String> 
             .batch_execute(&sql)
             .await
             .map_err(|e| format!("{}: {}", path.display(), why(&e)))?;
-        println!("seeded from {}", path.display());
+        say!("seeded from {}", path.display());
     }
     Ok(())
 }
@@ -559,7 +559,7 @@ async fn diff(
     }
     let sql = format!("{}\n", statements.join("\n\n"));
     let Some(name) = &args.file else {
-        print!("{sql}");
+        put!("{sql}");
         return Ok(());
     };
     let dir = project
@@ -572,7 +572,7 @@ async fn diff(
     let path = dir.join(format!("{}_{}.sql", stamp(now), slug(name)));
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     std::fs::write(&path, &sql).map_err(|e| format!("write {}: {e}", path.display()))?;
-    println!("{}", path.display());
+    say!("{}", path.display());
     Ok(())
 }
 
@@ -645,7 +645,7 @@ pub fn migration(argv: &[String]) -> Result<(), String> {
         return Err(format!("{} is already there", path.display()));
     }
     std::fs::write(&path, "").map_err(|e| format!("write {}: {e}", path.display()))?;
-    println!("{}", path.display());
+    say!("{}", path.display());
     Ok(())
 }
 

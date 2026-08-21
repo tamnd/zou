@@ -207,7 +207,7 @@ fn run(args: &Args) -> Result<(), String> {
     let copied = copied.load(Ordering::Relaxed);
     let skipped = skipped.load(Ordering::Relaxed);
     let bytes = bytes.load(Ordering::Relaxed);
-    println!(
+    say!(
         "{} to {}: {copied} objects copied, {skipped} already there, {bytes} bytes in {:.1}s",
         args.from,
         args.to,
