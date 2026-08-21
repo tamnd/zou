@@ -50,7 +50,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use zou_store::registry::{Tenant, check_ref};
 
-use crate::attach::Attached;
+use crate::attach::{Attached, Hold};
 use crate::tenant::Registry;
 
 /// The magic protocol numbers a startup packet can carry instead of a
@@ -199,8 +199,8 @@ impl Wire {
     /// The session itself, on whatever it turned out to be running on.
     async fn run<S: Wired>(self: Arc<Self>, mut sock: S) -> Result<(), String> {
         let login = tokio::time::timeout(LOGIN_TIMEOUT, self.login(&mut sock)).await;
-        let ready = match login {
-            Ok(Ok(Some(ready))) => ready,
+        let (ready, _held) = match login {
+            Ok(Ok(Some(both))) => both,
             // A cancel, which is a whole connection that carries one
             // message and expects no answer at all.
             Ok(Ok(None)) => return Ok(()),
@@ -230,9 +230,10 @@ impl Wire {
     }
 
     /// Startup to authenticated, answering with whatever the session
-    /// runs on. None is a cancel request, which is finished by the time
+    /// runs on and the hold that keeps the project attached while it
+    /// does. None is a cancel request, which is finished by the time
     /// this returns.
-    async fn login<S: Wired>(&self, sock: &mut S) -> Result<Option<Ready>, Stop> {
+    async fn login<S: Wired>(&self, sock: &mut S) -> Result<Option<(Ready, Hold)>, Stop> {
         let params = match hello(sock).await? {
             Hello::Cancel { pid, key } => {
                 self.cancel(pid, key).await;
@@ -262,14 +263,12 @@ impl Wire {
         };
         authenticate(sock, &entry, &route).await?;
 
-        let dsn = match self.attached.dsn(&entry).await {
-            Ok(Some(dsn)) => dsn,
-            Ok(None) => {
-                return Err(Stop::Say {
-                    code: "08006",
-                    message: format!("project \"{}\" has no database", route.tenant),
-                });
-            }
+        // Held for as long as the session is, because a postgres client
+        // is talking to the postmaster itself: a node at its ceiling
+        // that detached this project underneath the session would take
+        // the connection down with it.
+        let held = match self.attached.hold(&entry).await {
+            Ok(held) => held,
             Err(e) => {
                 log::warn!("attach {}: {e}", route.tenant);
                 return Err(Stop::Say {
@@ -278,10 +277,20 @@ impl Wire {
                 });
             }
         };
-        match self.mode {
-            Mode::Session => Ok(Some(Ready::Direct(connect(&dsn, &params, &route).await?))),
-            Mode::Transaction => Ok(Some(Ready::Pooled(self.bank(&dsn, &route).await))),
-        }
+        let dsn = match held.dsn().map(str::to_string) {
+            Some(dsn) => dsn,
+            None => {
+                return Err(Stop::Say {
+                    code: "08006",
+                    message: format!("project \"{}\" has no database", route.tenant),
+                });
+            }
+        };
+        let ready = match self.mode {
+            Mode::Session => Ready::Direct(connect(&dsn, &params, &route).await?),
+            Mode::Transaction => Ready::Pooled(self.bank(&dsn, &route).await),
+        };
+        Ok(Some((ready, held)))
     }
 
     /// The pool for one project and role, made on first use.

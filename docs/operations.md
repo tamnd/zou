@@ -280,6 +280,9 @@ That is the shape a function or a container per project wants, and the Lambda, C
 Nothing is running until a request names a project.
 The first one for a cold tenant restores its runtime directory out of that tenant's own prefix and starts a postmaster on loopback with a private socket directory, and both are thrown away when it is let go of.
 `--max-attached` is how many are up at once and `--idle-secs` is how long an untouched one stays up, both defaulting to what the attach manager uses, and the sweep that enforces the second runs on a timer at a quarter of it, because a node that has gone quiet is exactly the node with no requests to notice on.
+Neither budget takes a project somebody is in the middle of using: a request holds its project until the answer is written and a postgres session holds its project until the client goes away, and a held project is passed over by both.
+On a node whose working set is up against its ceiling that means the ceiling is briefly exceeded, which is the trade worth making, since the other answer is stopping a database under work the node has already accepted and the client reads that as `57P01` or `57P03` in the middle of a request.
+The room comes back on the next attach, or on the next sweep if no attach arrives.
 `--shared-buffers` is per tenant and defaults to 16MB, small on purpose: the ceiling multiplies it, and the store backed page cache is the tier that is supposed to be doing the work.
 A node running a few large projects rather than a thousand small ones should raise it.
 

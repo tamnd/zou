@@ -236,10 +236,14 @@ async fn dispatch(State(front): State<Arc<Front>>, mut req: Request<Body>) -> Re
     // The socket tier when there is one, and it is deliberately not an
     // attach: a node holding a hundred thousand sockets for projects it
     // does not write starts no databases for them at all.
-    let router = match sockets {
-        Some(router) => router,
-        None => match front.attached.router(&entry).await {
-            Ok(router) => router,
+    //
+    // The hold lives until the answer is made, which is what keeps a
+    // node at its ceiling from stopping this project's database halfway
+    // through this request.
+    let (router, _held) = match sockets {
+        Some(router) => (router, None),
+        None => match front.attached.hold(&entry).await {
+            Ok(held) => (held.router(), Some(held)),
             Err(e) => {
                 log::warn!("attach {}: {e}", found.tenant_ref);
                 return unavailable("the database for this project could not be started");
