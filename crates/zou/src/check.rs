@@ -120,20 +120,19 @@ impl Drop for Scratch {
     }
 }
 
-/// One table and what reading all of it did.
-struct Scanned {
-    database: String,
-    table: String,
-    rows: Option<u64>,
-    refused: Option<String>,
-}
-
-pub fn run(argv: &[String]) -> Result<(), String> {
-    let args = parse(argv)?;
+/// Look before restoring, so a ref that is not there is a sentence
+/// rather than a restore that fails halfway with a key.
+///
+/// The store is opened and closed inside this function on purpose, and
+/// the reason is a `.zou` target: the single file backend admits one
+/// process at a time through an OS lock, and every stage after this one
+/// opens the store for itself, the restore in this process and then the
+/// backend in a child. A handle held across them is this command
+/// refusing itself, which is the confusing half of a real limitation.
+/// See #44.
+fn read_the_manifest(args: &Args) -> Result<Manifest, String> {
     let store: Arc<dyn CasStore> = Arc::from(open_store(&args.target)?);
     let layout = TenantLayout::new(&args.tenant);
-    // Read the manifest before restoring, so a ref that is not there is
-    // a sentence rather than a restore that fails halfway with a key.
     let (data, _) = store
         .get(&layout.manifest())
         .map_err(|e| format!("store: {e}"))?
@@ -150,6 +149,20 @@ pub fn run(argv: &[String]) -> Result<(), String> {
             args.target, args.tenant
         ));
     }
+    Ok(manifest)
+}
+
+/// One table and what reading all of it did.
+struct Scanned {
+    database: String,
+    table: String,
+    rows: Option<u64>,
+    refused: Option<String>,
+}
+
+pub fn run(argv: &[String]) -> Result<(), String> {
+    let args = parse(argv)?;
+    read_the_manifest(&args)?;
 
     let pg_bin = install::pg_bin(args.pg_bin.as_ref().map(Into::into));
     let work = Scratch::new()?;

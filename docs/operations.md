@@ -153,6 +153,8 @@ zou: 1 of 2 tables could not be read out of /srv/store
 Attaching to read the database is still an attach, so the backend takes the writer lease through the ordinary protocol and a tenant a server is serving right now refuses this with the lease error.
 Run it against a branch or a ref nothing is serving, or stop the server first.
 
+A target ending `.zou` works, which a postmaster over the same file does not, because the single file backend admits one process at a time and this is a chain of one process at a time: the restore, and then the backend.
+
 One failure it cannot see, and the reason to keep the row counts rather than the ok line: a page that reads back as zeros is a page postgres accepts as empty, so a relation that lost one scans clean and comes up short by the rows that page held.
 Comparing the counts of a check against the counts of the one before it catches that, and issue #546 is about closing it off in the read path where it belongs.
 

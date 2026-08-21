@@ -89,10 +89,24 @@ fn the_backend_answers_what_the_parser_expects_it_to() {
     assert_eq!(sets[0].get(1, "b"), Some("plain"));
     assert_eq!(sets[1].scalar(), Some("3"));
 
-    // A write in one session is in the store for the next one, which is
-    // the half of this that makes it a maintenance tool rather than
-    // only a way of asking questions.
+    // A write needs asking for, and the refusal is at the statement
+    // rather than at the api, because that is where a caller who set
+    // out to write finds out that a write from here would be lost.
+    let refused = session()
+        .run("create table t (id int primary key);")
+        .expect_err("a session is read only unless it says otherwise");
+    assert!(
+        refused.contains("read-only transaction"),
+        "the refusal should be the read only one, got {refused:?}"
+    );
+
+    // A write in one session is in the store for the next one, which
+    // holds here for the reason issue #548 sets out: this store has
+    // never been captured, so there is no checkpoint run holding an
+    // older copy of the catalog pages this write changes. On a store
+    // with a checkpoint in it the same two sessions would disagree.
     session()
+        .writable()
         .run("create table t (id int primary key); insert into t values (7);")
         .expect("write");
     let sets = session()

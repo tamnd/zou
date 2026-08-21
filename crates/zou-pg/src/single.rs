@@ -5,9 +5,15 @@
 //! to stdout. Nothing listens, nothing forks, and nothing has to be
 //! waited for. Against a real zou store the M1 spike measured it at
 //! about 40 ms from nothing to a first answered query where a
-//! postmaster took about 150, and the write it made committed through
-//! the store and survived the session. That measurement is in
+//! postmaster took about 150. That measurement is in
 //! docs/architecture.md next to the decision it settled.
+//!
+//! A session is read only unless the caller asks for otherwise, and
+//! [`Session::writable`] says why: without a postmaster nothing
+//! publishes, so a write reaches the block objects and no further, and
+//! a store with a checkpoint in it shadows those objects on the next
+//! attach. The spike's write survived because it ran against a store
+//! that had never been captured.
 //!
 //! It is an internal tool and never a serving path, which is the other
 //! half of that decision. One session per process is the design rather
@@ -49,6 +55,7 @@ pub struct Session {
     pgdata: PathBuf,
     database: String,
     env: Vec<(OsString, OsString)>,
+    writable: bool,
 }
 
 /// One statement's answer, columns and rows, every value as the text
@@ -86,12 +93,35 @@ impl Session {
             pgdata: pgdata.to_path_buf(),
             database: DEFAULT_DATABASE.to_string(),
             env: Vec::new(),
+            writable: false,
         }
     }
 
     /// Open a database other than `postgres`.
     pub fn database(mut self, name: &str) -> Self {
         self.database = name.to_string();
+        self
+    }
+
+    /// Let this session write, which it may not by default.
+    ///
+    /// The default is read only because of where a write from here
+    /// goes. There is no postmaster, so there is no wal pusher and no
+    /// checkpointer of the kind that publishes: the pages land in the
+    /// block objects and the wal never reaches the shared log, so the
+    /// manifest does not learn that anything happened. On a store with
+    /// a checkpoint in it, which is every store an ordinary database
+    /// lives in, a later attach rebuilds its pages out of that
+    /// checkpoint and the run after it, and the block objects a session
+    /// here wrote are shadowed by it. The statement succeeded, the
+    /// process exited 0, and the change is not in the database. See
+    /// #548.
+    ///
+    /// Where it does hold is a store with no checkpoint yet, which is
+    /// the bootstrap window between initdb and the first capture, and
+    /// that is what this is for. Anywhere else, write through a server.
+    pub fn writable(mut self) -> Self {
+        self.writable = true;
         self
     }
 
@@ -114,10 +144,14 @@ impl Session {
     /// maintenance run that half worked is not a run that worked.
     pub fn run(&self, sql: &str) -> Result<Vec<Rows>, String> {
         let mut cmd = Command::new(&self.postgres);
-        cmd.arg("--single")
-            .arg("-D")
-            .arg(&self.pgdata)
-            .arg(&self.database)
+        cmd.arg("--single").arg("-D").arg(&self.pgdata);
+        if !self.writable {
+            // A guard rather than a policy: a write from here is lost
+            // quietly, see writable(), and an error at the statement is
+            // the only way a caller finds out at all.
+            cmd.arg("-c").arg("default_transaction_read_only=on");
+        }
+        cmd.arg(&self.database)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
