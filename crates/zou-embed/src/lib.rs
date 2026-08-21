@@ -37,9 +37,9 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -48,7 +48,7 @@ use axum::http::Request;
 use tower::ServiceExt;
 use zou_pg::{bootstrap, restore};
 use zou_store::layout::TenantLayout;
-use zou_store::{Manifest, open_store};
+use zou_store::{CasStore, Manifest, open_store};
 
 mod template;
 
@@ -523,12 +523,14 @@ impl Zou {
             .map_err(io(format!("chmod {}", sock.display())))?;
 
         let at = std::time::Instant::now();
-        if fresh(&target, &tenant)? {
+        let (store, manifest) = database(&target, &tenant)?;
+        if let Some(manifest) = manifest {
+            restore::restore_head(&store, &tenant, &manifest, &pgdata)
+                .map_err(|e| Error::new(Kind::Store, e))?;
+            log::debug!("open: restore in {:?}", at.elapsed());
+        } else {
             initdb(pg_bin, &pgdata, &target, &tenant, &pagecache)?;
             log::debug!("open: initdb in {:?}", at.elapsed());
-        } else {
-            restore::restore(&target, &tenant, &pgdata).map_err(|e| Error::new(Kind::Store, e))?;
-            log::debug!("open: restore in {:?}", at.elapsed());
         }
 
         let at = std::time::Instant::now();
@@ -1011,21 +1013,31 @@ fn pg_bin(options: &Options) -> PathBuf {
     zou_pg::install::pg_bin(Some(options.pg_bin.clone()))
 }
 
-/// Whether the store has no database at this ref yet, which is the one
-/// case that runs initdb.
-fn fresh(target: &str, tenant: &str) -> Result<bool, Error> {
-    let store = open_store(target).map_err(|e| Error::new(Kind::Store, e))?;
+/// The store, and the manifest of the database at this ref, or None
+/// where there is no database there yet, which is the one case that
+/// runs initdb. Both come back because the restore that follows wants
+/// the same two things, and opening the store and reading the manifest
+/// a second time is two round trips on the open path against anything
+/// that is not a directory.
+fn database(target: &str, tenant: &str) -> Result<(Arc<dyn CasStore>, Option<Manifest>), Error> {
+    let store: Arc<dyn CasStore> = Arc::from(open_store(target).map_err(io_store)?);
     let layout = TenantLayout::new(tenant);
-    match store
+    let Some((data, _)) = store
         .get(&layout.manifest())
         .map_err(|e| Error::new(Kind::Store, e.to_string()))?
-    {
-        None => Ok(true),
-        Some((data, _)) => Ok(Manifest::from_json(&data)
-            .map_err(|e| Error::new(Kind::Store, e.to_string()))?
-            .checkpoints
-            .is_empty()),
-    }
+    else {
+        return Ok((store, None));
+    };
+    let manifest =
+        Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+    Ok((
+        store,
+        (!manifest.checkpoints.is_empty()).then_some(manifest),
+    ))
+}
+
+fn io_store(e: String) -> Error {
+    Error::new(Kind::Store, e)
 }
 
 /// Make the database and capture it, the once.

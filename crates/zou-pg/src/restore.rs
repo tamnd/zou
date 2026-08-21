@@ -447,15 +447,8 @@ fn ensure_segment_header(pg_wal: &Path, tli: u32, sysid: u64, seg_lsn: u64) -> R
 /// must not already exist. Returns what was rebuilt; a plain server start
 /// on the result completes the attach.
 pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreStats, String> {
-    // The two halves are timed apart because they fail differently: the
-    // skeleton is a fixed number of objects a project's size does not
-    // change, and the catch up grows with how much stream sits past the
-    // newest checkpoint. A caller printing an attach breakdown wants to
-    // know which of the two it is looking at.
-    let started = Instant::now();
     let store: Arc<dyn CasStore> = Arc::from(open_store(store_root)?);
     let layout = TenantLayout::new(tenant);
-
     let (data, _) = store
         .get(&layout.manifest())
         .map_err(|e| format!("store: {e}"))?
@@ -465,7 +458,28 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
             )
         })?;
     let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
-    let mut stats = restore_manifest(&*store, &layout, &manifest, pgdata)?;
+    restore_head(&store, tenant, &manifest, pgdata)
+}
+
+/// The same restore for a caller that has the store open and the
+/// manifest in hand already, which the attach path does: it read the
+/// manifest to decide between an initdb and a restore, and against a
+/// store thirty milliseconds away reading it a second time is a round
+/// trip on the cold path with a user waiting on it.
+pub fn restore_head(
+    store: &Arc<dyn CasStore>,
+    tenant: &str,
+    manifest: &Manifest,
+    pgdata: &Path,
+) -> Result<RestoreStats, String> {
+    // The two halves are timed apart because they fail differently: the
+    // skeleton is a fixed number of objects a project's size does not
+    // change, and the catch up grows with how much stream sits past the
+    // newest checkpoint. A caller printing an attach breakdown wants to
+    // know which of the two it is looking at.
+    let started = Instant::now();
+    let layout = TenantLayout::new(tenant);
+    let mut stats = restore_manifest(&**store, &layout, manifest, pgdata)?;
     stats.skeleton_took = started.elapsed();
     let caught_up = Instant::now();
 
@@ -483,7 +497,7 @@ pub fn restore(store_root: &str, tenant: &str, pgdata: &Path) -> Result<RestoreS
         .checkpoints
         .last()
         .map_or(0, |checkpoint| checkpoint.lsn.0);
-    let media = WalMedia::single(crate::log_store(Arc::clone(&store), &layout));
+    let media = WalMedia::single(crate::log_store(Arc::clone(store), &layout));
     let tli = manifest.pg.timeline;
     let pg_wal = pgdata.join("pg_wal");
     catch_up_with::<String, _>(
