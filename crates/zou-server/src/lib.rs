@@ -85,6 +85,17 @@ pub mod wire;
 pub struct Config {
     pub jwt_secret: Vec<u8>,
     pub pg: Option<String>,
+    /// The dsn a request session logs in as, if it is not the one
+    /// above. Upstream this is a separate process with a separate
+    /// connection string: PostgREST connects as `authenticator` and
+    /// nothing it serves can reach past the three api roles, whatever
+    /// a token claims. Pointing this at `authenticator` buys the same
+    /// fence here, since the refusal then comes from postgres rather
+    /// than from [`Config::exposed_roles`]. None means both identities
+    /// are `pg`, which is what a deployment that has not thought about
+    /// it gets, and it is the behaviour zou had before the field
+    /// existed. Ignored when `pg` is None.
+    pub pg_request: Option<String>,
     pub rate: Option<edge::Rate>,
     pub jwks: Option<String>,
     /// The schemas the REST surface exposes, PostgREST's db-schemas.
@@ -107,10 +118,13 @@ pub struct Config {
     /// Hosted Supabase does not need this list because its api
     /// connects as `authenticator`, a role granted exactly those
     /// three, so a claim naming anything else fails at the database.
-    /// zou connects as whatever the dsn names, and in a dev loop that
-    /// is the superuser, which would make a token carrying
-    /// `"role": "postgres"` a superuser session with server file
-    /// access in it. See #92.
+    /// [`Config::pg_request`] is how a zou deployment gets that same
+    /// fence, and `zou dev` sets it. This list is the check in front
+    /// of it: it refuses the claim before it reaches set_config, so a
+    /// deployment that left both identities on one dsn, which is
+    /// usually the superuser in a dev loop, does not turn a token
+    /// carrying `"role": "postgres"` into a superuser session with
+    /// server file access in it. See #92.
     pub exposed_roles: Vec<String>,
     /// Where this server answers from the outside, GoTrue's
     /// API_EXTERNAL_URL. It is the `iss` claim of every access token,
@@ -283,6 +297,7 @@ impl Default for Config {
         Config {
             jwt_secret: Vec::new(),
             pg: None,
+            pg_request: None,
             rate: None,
             jwks: None,
             schemas: Vec::new(),
@@ -495,9 +510,14 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
     if cfg.schemas.is_empty() {
         cfg.schemas.push("public".to_string());
     }
-    let pool = match &cfg.pg {
-        Some(dsn) => Some(sql::Pool::new(dsn, POOL_SIZE).map_err(|e| format!("pg dsn: {e}"))?),
-        None => None,
+    let pool = match (&cfg.pg, &cfg.pg_request) {
+        (Some(dsn), Some(request)) => Some(
+            sql::Pool::with_request(dsn, request, POOL_SIZE).map_err(|e| format!("pg dsn: {e}"))?,
+        ),
+        (Some(dsn), None) => {
+            Some(sql::Pool::new(dsn, POOL_SIZE).map_err(|e| format!("pg dsn: {e}"))?)
+        }
+        (None, _) => None,
     };
     if let Some(pool) = &pool {
         pool.write_audit_rows(!cfg.audit.disable_postgres);

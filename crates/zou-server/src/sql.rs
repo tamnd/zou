@@ -18,8 +18,9 @@
 //!
 //! Connections are lazy. Building a pool never dials, so the server
 //! can come up before postgres does and the first request pays the
-//! connect. The first successful connection applies the tenant
-//! contract in the BOOTSTRAP batch: the anon, authenticated, and
+//! connect. That first request also pays for a second connection,
+//! dialled as the dsn's own role and thrown away again, which applies
+//! the tenant contract in the BOOTSTRAP batch: the anon, authenticated, and
 //! service_role roles with an authenticator granted the three of
 //! them, the auth schema with Supabase's uid, role,
 //! email, and jwt functions verbatim, and the open public schema
@@ -74,11 +75,38 @@ impl RequestContext {
 
 struct Inner {
     pg: tokio_postgres::Config,
+    /// Who a request session logs in as, which is the same as `pg`
+    /// unless a deployment named a second dsn for it.
+    request: tokio_postgres::Config,
+    /// Whether those two are different, which is the only thing that
+    /// decides whether idle connections are one list or two.
+    split: bool,
     permits: Arc<Semaphore>,
     idle: Mutex<Vec<Client>>,
+    idle_request: Mutex<Vec<Client>>,
     bootstrapped: tokio::sync::OnceCell<()>,
     settings: tokio::sync::RwLock<Option<(std::time::Instant, RoleSettings)>>,
     audit_rows: std::sync::atomic::AtomicBool,
+}
+
+/// Which of the pool's two logins a connection is wanted on.
+///
+/// Upstream this is two servers rather than two idle lists: PostgREST
+/// connects as `authenticator` and GoTrue as `supabase_auth_admin`,
+/// and neither can do the other's work. In one process it is one pool
+/// with two identities, and the split is what keeps a request from
+/// being able to do the work only the owner should.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Identity {
+    /// The dsn zou was given. It owns the schemas, writes the
+    /// bootstrap ddl, and reads auth and storage past their policies,
+    /// which is why nothing a request can steer runs on it.
+    Owner,
+    /// What a request logs in as before its `set role`. Upstream calls
+    /// it `authenticator`: granted the api roles and nothing else, so
+    /// a `role` claim naming anything further is refused by postgres
+    /// whatever the server in front of it believed.
+    Request,
 }
 
 /// What `alter role x set y to z` wrote, per role, already filtered
@@ -98,7 +126,9 @@ const OURS: [&str; 2] = ["role", "search_path"];
 #[derive(Clone)]
 pub struct Pool(Arc<Inner>);
 
-/// The tenant contract, applied once per pool on the first connection.
+/// The tenant contract, applied once per pool on a connection of its
+/// own, dialled as the owner because this is the batch that creates
+/// the role the request identity logs in as.
 /// The whole batch runs as one implicit transaction under an advisory
 /// lock, so concurrent bootstrappers serialize instead of racing the
 /// if not exists checks, and it is idempotent throughout.
@@ -152,11 +182,20 @@ $$;
 -- nothing, and has been granted exactly the three above, so a session
 -- opened as it can become those and nothing else however the role
 -- claim of a token is written. That is the fence issue #92 is about,
--- and it is the database half of it. The application half is the
--- exposed set in Config, which refuses a claim before it reaches
--- set_config, and it is the half that is load bearing today: nothing
--- here connects as authenticator yet, the server still connects as
--- whatever the dsn names.
+-- and this is the database half of it. The other half is the exposed
+-- set in Config, which refuses a claim before it reaches set_config,
+-- and the two are worth having together: one of them is a check in a
+-- server and the other is what the database will do about a server
+-- that got its check wrong.
+--
+-- It can log in, which upstream's can too and which a role has to be
+-- able to do to be connected as. That is not a way in that was not
+-- there already: it carries no password, so a cluster asking for one
+-- refuses it, and a cluster asking for nothing was already handing
+-- out its superuser to whoever could reach the port. Repaired when it
+-- is missing for the same reason the bypassrls above is, since a role
+-- created by an older zou or restored from a dump is an ordinary way
+-- to arrive here.
 --
 -- Granted one at a time and only when the grant is missing, because a
 -- grant that is already there still writes a row and prints a notice
@@ -166,7 +205,9 @@ declare
     api text;
 begin
     if not exists (select 1 from pg_roles where rolname = 'authenticator') then
-        create role authenticator nologin noinherit;
+        create role authenticator login noinherit;
+    elsif not (select rolcanlogin from pg_roles where rolname = 'authenticator') then
+        alter role authenticator login;
     end if;
     foreach api in array array['anon', 'authenticated', 'service_role'] loop
         if not exists (
@@ -563,16 +604,51 @@ const SETTLED: std::time::Duration = std::time::Duration::from_secs(10);
 impl Pool {
     /// Parse the dsn now, dial nothing. `max` caps the number of live
     /// connections, checkouts past it wait their turn.
+    ///
+    /// One login for everything, which is what a deployment that named
+    /// one dsn asked for and what every embedded caller wants.
     pub fn new(dsn: &str, max: usize) -> Result<Pool, Error> {
         let pg: tokio_postgres::Config = dsn.parse()?;
-        Ok(Pool(Arc::new(Inner {
+        Ok(Pool::build(pg.clone(), pg, false, max))
+    }
+
+    /// The same pool with request sessions logging in as somebody
+    /// else, which is the fence hosted Supabase has and #552 is about.
+    ///
+    /// `dsn` still owns the database and still writes the bootstrap,
+    /// the auth tables and the storage rows. `request` is only ever
+    /// the connection a REST or storage request runs its transaction
+    /// on, and the point of it is what that role has not been granted:
+    /// a `set role` to anything outside the api roles fails in the
+    /// database, so a hole in the server's own check is still not a
+    /// superuser session.
+    ///
+    /// Two dsns that spell the same thing are one login again, since
+    /// then there is no boundary to keep and two idle lists would only
+    /// halve how often a connection is reused.
+    pub fn with_request(dsn: &str, request: &str, max: usize) -> Result<Pool, Error> {
+        let pg: tokio_postgres::Config = dsn.parse()?;
+        let theirs: tokio_postgres::Config = request.parse()?;
+        Ok(Pool::build(pg, theirs, dsn != request, max))
+    }
+
+    fn build(
+        pg: tokio_postgres::Config,
+        request: tokio_postgres::Config,
+        split: bool,
+        max: usize,
+    ) -> Pool {
+        Pool(Arc::new(Inner {
             pg,
+            request,
+            split,
             permits: Arc::new(Semaphore::new(max)),
             idle: Mutex::new(Vec::new()),
+            idle_request: Mutex::new(Vec::new()),
             bootstrapped: tokio::sync::OnceCell::new(),
             settings: tokio::sync::RwLock::new(None),
             audit_rows: std::sync::atomic::AtomicBool::new(true),
-        })))
+        }))
     }
 
     /// Whether the audit trail is written to this database as well as to
@@ -596,30 +672,70 @@ impl Pool {
         self.0.audit_rows.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn checkout(&self) -> Result<(OwnedSemaphorePermit, Client), Error> {
+    /// The idle list that identity's connections come back to. One
+    /// list when both identities are the same login, because then a
+    /// connection an admin call parked is a connection a request may
+    /// have, which is what the pool did before it had two.
+    fn idle(&self, who: Identity) -> &Mutex<Vec<Client>> {
+        match self.0.split && who == Identity::Request {
+            true => &self.0.idle_request,
+            false => &self.0.idle,
+        }
+    }
+
+    fn config(&self, who: Identity) -> &tokio_postgres::Config {
+        match who {
+            Identity::Owner => &self.0.pg,
+            Identity::Request => &self.0.request,
+        }
+    }
+
+    async fn checkout(&self, who: Identity) -> Result<(OwnedSemaphorePermit, Client), Error> {
         let permit = Arc::clone(&self.0.permits)
             .acquire_owned()
             .await
             .expect("pool semaphore is never closed");
         loop {
-            let reused = self.0.idle.lock().await.pop();
+            let reused = self.idle(who).lock().await.pop();
             match reused {
                 Some(client) if !client.is_closed() => return Ok((permit, client)),
                 Some(_) => continue,
                 None => break,
             }
         }
-        let (client, connection) = self.0.pg.connect(NoTls).await?;
+        // Before the dial rather than on it, because the request
+        // identity logs in as a role the bootstrap is what creates. On
+        // a database nobody has served from yet, a first request that
+        // dialled as it would be told there is no such role.
+        self.bootstrapped().await?;
+        let (client, connection) = self.config(who).connect(NoTls).await?;
         tokio::spawn(async move {
             // The pool notices a dead connection through is_closed at
             // the next checkout, an error here has nowhere better to go.
             let _ = connection.await;
         });
+        Ok((permit, client))
+    }
+
+    /// The tenant contract, applied once per process, on a connection
+    /// of its own on the owner identity.
+    ///
+    /// Its own connection because the first checkout of a process is
+    /// usually a request, and a request is exactly what must not be
+    /// the thing creating roles and schemas. It costs one dial, once,
+    /// and that connection is closed as soon as the batch is done.
+    async fn bootstrapped(&self) -> Result<(), Error> {
         self.0
             .bootstrapped
-            .get_or_try_init(|| async { bootstrap(&client).await })
+            .get_or_try_init(|| async {
+                let (client, connection) = self.0.pg.connect(NoTls).await?;
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                bootstrap(&client).await
+            })
             .await?;
-        Ok((permit, client))
+        Ok(())
     }
 
     /// The DDL watch that drives catalog invalidation. A connection of
@@ -799,7 +915,7 @@ impl Pool {
     /// REST and auth request runs in. Commit or roll back explicitly,
     /// a dropped session forfeits its connection.
     pub async fn session(&self, ctx: &RequestContext, read_only: bool) -> Result<Session, Error> {
-        let (permit, client) = self.checkout().await?;
+        let (permit, client) = self.checkout(Identity::Request).await?;
         // Read before the begin, so a database that will not answer
         // this fails the request rather than poisoning a transaction.
         let known = self.settings(&client).await?;
@@ -849,6 +965,7 @@ impl Pool {
             Ok(()) => Ok(Session {
                 pool: self.clone(),
                 client: Some(client),
+                who: Identity::Request,
                 _permit: permit,
                 in_txn: true,
             }),
@@ -862,13 +979,14 @@ impl Pool {
     /// rotating a refresh token is several statements that have to
     /// land together or not at all.
     pub async fn admin(&self) -> Result<Session, Error> {
-        let (permit, client) = self.checkout().await?;
+        let (permit, client) = self.checkout(Identity::Owner).await?;
         match client.batch_execute("begin").await {
             // The client is dropped on failure, never pooled mid begin.
             Err(e) => Err(e),
             Ok(()) => Ok(Session {
                 pool: self.clone(),
                 client: Some(client),
+                who: Identity::Owner,
                 _permit: permit,
                 in_txn: true,
             }),
@@ -878,21 +996,22 @@ impl Pool {
     /// A connection with no transaction and no injected identity, for
     /// bootstrap work and tests. finish() returns it to the pool.
     pub async fn unscoped(&self) -> Result<Session, Error> {
-        let (permit, client) = self.checkout().await?;
+        let (permit, client) = self.checkout(Identity::Owner).await?;
         Ok(Session {
             pool: self.clone(),
             client: Some(client),
+            who: Identity::Owner,
             _permit: permit,
             in_txn: false,
         })
     }
 
-    async fn park(&self, client: Client) {
+    async fn park(&self, client: Client, who: Identity) {
         // Scrub before reuse: reset role covers a session level role
         // switch, reset all covers everything else. If the scrub
         // fails the connection is dropped instead of pooled.
         if client.batch_execute("reset role; reset all").await.is_ok() {
-            self.0.idle.lock().await.push(client);
+            self.idle(who).lock().await.push(client);
         }
     }
 }
@@ -902,6 +1021,9 @@ impl Pool {
 pub struct Session {
     pool: Pool,
     client: Option<Client>,
+    /// Which login this connection was dialled on, which is the list
+    /// it goes back to.
+    who: Identity,
     _permit: OwnedSemaphorePermit,
     in_txn: bool,
 }
@@ -960,7 +1082,7 @@ impl Session {
         if self.in_txn {
             client.batch_execute(stmt).await?;
         }
-        self.pool.park(client).await;
+        self.pool.park(client, self.who).await;
         Ok(())
     }
 
@@ -981,7 +1103,7 @@ impl Session {
     pub async fn commit_reading(mut self, sql: &str) -> Result<Vec<Option<String>>, Error> {
         let client = self.client.take().expect("session ended twice");
         if !self.in_txn {
-            self.pool.park(client).await;
+            self.pool.park(client, self.who).await;
             return Ok(Vec::new());
         }
         let read = client.simple_query(&format!("{sql}; commit")).await;
@@ -998,7 +1120,7 @@ impl Session {
                 break;
             }
         }
-        self.pool.park(client).await;
+        self.pool.park(client, self.who).await;
         Ok(row)
     }
 

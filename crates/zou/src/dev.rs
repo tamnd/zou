@@ -370,6 +370,14 @@ fn start_http(
     }
     // Local connections are trust, the stock dev loop layout.
     let dsn = format!("host=127.0.0.1 port={pg_port} user={SUPERUSER} dbname=postgres");
+    // And the one a request logs in as, which is the split hosted
+    // Supabase has between its api and the rest of a project. The
+    // superuser dsn above still owns the schemas and still reads auth
+    // and storage past their policies; what a token can steer runs
+    // here instead, as a role granted the three api roles and nothing
+    // more, so a `role` claim naming the superuser is refused by
+    // postgres rather than by us. See #92.
+    let request = format!("host=127.0.0.1 port={pg_port} user=authenticator dbname=postgres");
     // The functions a project keeps beside its config file, and the
     // four variables every one of them sees. What a function is told
     // about the database is the url shape a client library expects
@@ -404,6 +412,7 @@ fn start_http(
             jwt_keys: Some(zou_server::jwt::derived_keys(secret.as_bytes())),
             jwt_secret: secret.into_bytes(),
             pg: Some(dsn),
+            pg_request: Some(request),
             // A project that named its schemas gets them in its own
             // order, and one that did not gets the server's default.
             schemas: if schemas.is_empty() {
