@@ -475,7 +475,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         // nothing, so it works before a fleet exists, which is when
         // somebody needs it.
         Some("key") => {
-            println!("{}", Key::generate()?.encoded());
+            say!("{}", Key::generate()?.encoded());
             eprintln!(
                 "set ZOU_SECRET_KEY to this on every node that serves functions, and keep a copy: nothing sealed with it can be read without it"
             );
@@ -535,8 +535,8 @@ fn set_command(args: &Args) -> Result<(), String> {
     let pairs = wanted(args)?;
     let (store, tenant, key) = open_for(args)?;
     let done = set(store.as_ref(), &tenant, &key, &pairs)?;
-    println!("set {} on {tenant}", done.join(", "));
-    println!("the functions deployed there read them the next time the project is attached");
+    say!("set {} on {tenant}", done.join(", "));
+    say!("the functions deployed there read them the next time the project is attached");
     Ok(())
 }
 
@@ -544,16 +544,16 @@ fn list_command(args: &Args) -> Result<(), String> {
     let (store, tenant, key) = open_for(args)?;
     let all = read(store.as_ref(), &tenant, &key)?;
     if all.is_empty() {
-        println!("no secrets are set on {tenant}");
+        say!("no secrets are set on {tenant}");
         return Ok(());
     }
     // Names and digests, which is what upstream's table holds. The
     // values are not printed by any verb here, because a command that
     // prints a secret is one somebody eventually runs in a shared
     // terminal.
-    println!("{:<32} DIGEST", "NAME");
+    say!("{:<32} DIGEST", "NAME");
     for (name, value) in &all {
-        println!("{name:<32} {}", digest(value));
+        say!("{name:<32} {}", digest(value));
     }
     Ok(())
 }
@@ -565,8 +565,8 @@ fn unset_command(args: &Args) -> Result<(), String> {
     let (store, tenant, key) = open_for(args)?;
     let gone = unset(store.as_ref(), &tenant, &key, &args.names)?;
     match gone.is_empty() {
-        true => println!("none of those were set on {tenant}"),
-        false => println!("unset {} on {tenant}", gone.join(", ")),
+        true => say!("none of those were set on {tenant}"),
+        false => say!("unset {} on {tenant}", gone.join(", ")),
     }
     Ok(())
 }

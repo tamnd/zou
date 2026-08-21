@@ -192,8 +192,8 @@ impl Report {
     }
 
     fn pretty(&self) {
-        println!("store {}", self.target);
-        println!("scratch prefix {}", self.prefix);
+        say!("store {}", self.target);
+        say!("scratch prefix {}", self.prefix);
         let width = self
             .checks
             .iter()
@@ -202,7 +202,7 @@ impl Report {
             .unwrap_or(0)
             .max(4);
         for check in &self.checks {
-            println!(
+            say!(
                 "  {:width$}  {:7}  {}",
                 check.name,
                 check.status.word(),
@@ -242,7 +242,7 @@ impl Report {
             "get": latency(&self.get),
             "ok": self.failures() == 0,
         });
-        println!("{out}");
+        say!("{out}");
     }
 }
 

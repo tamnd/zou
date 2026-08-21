@@ -168,11 +168,12 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     let work = Scratch::new()?;
     let pgdata = work.path().join("pgdata");
 
-    println!("checking {} at ref {}", args.target, args.tenant);
+    say!("checking {} at ref {}", args.target, args.tenant);
     let stats = restore::restore(&args.target, &args.tenant, &pgdata)?;
-    println!(
+    say!(
         "restored {} files and replayed {} wal records",
-        stats.files, stats.wal_records
+        stats.files,
+        stats.wal_records
     );
 
     let scanned = scan_everything(&pg_bin, &pgdata, &args)?;
@@ -182,15 +183,15 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         match (&one.refused, one.rows) {
             (Some(said), _) => {
                 failed += 1;
-                println!("  {}.{} refused: {said}", one.database, one.table);
+                say!("  {}.{} refused: {said}", one.database, one.table);
             }
             (None, Some(n)) => {
                 rows += n;
-                println!("  {}.{} {n} rows", one.database, one.table);
+                say!("  {}.{} {n} rows", one.database, one.table);
             }
             (None, None) => {
                 failed += 1;
-                println!("  {}.{} answered nothing", one.database, one.table);
+                say!("  {}.{} answered nothing", one.database, one.table);
             }
         }
     }
@@ -201,7 +202,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
             args.target
         ));
     }
-    println!(
+    say!(
         "ok: {} tables read, {rows} rows, nothing refused",
         scanned.len()
     );

@@ -1,3 +1,17 @@
+// Everything the commands print goes through `out`, so a reader that
+// stopped reading ends the command instead of panicking at it. Defined
+// here rather than exported, because that is what puts them in scope
+// for every module below without an import in each one.
+macro_rules! say {
+    () => { $crate::out::line(format_args!("")) };
+    ($($arg:tt)*) => { $crate::out::line(format_args!($($arg)*)) };
+}
+
+/// The same with no newline of its own.
+macro_rules! put {
+    ($($arg:tt)*) => { $crate::out::text(format_args!($($arg)*)) };
+}
+
 mod boot;
 mod branch;
 mod bundle;
@@ -21,6 +35,7 @@ mod inbox;
 mod info;
 mod inspect;
 mod map;
+mod out;
 mod schema;
 #[cfg(unix)]
 mod secrets;
@@ -105,7 +120,7 @@ fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     match argv.first().map(String::as_str) {
         Some("--version") | Some("-V") => {
-            println!("zou {}", env!("CARGO_PKG_VERSION"));
+            say!("zou {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         #[cfg(unix)]

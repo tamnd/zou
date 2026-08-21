@@ -690,10 +690,10 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         let Some(to) = &args.to else { return Ok(()) };
         let mut target = connect(to).await?;
         let done = copy::run(&client, &mut target, &survey, bytes.is_some()).await?;
-        print!("{}", done.render());
+        put!("{}", done.render());
         let Some(w) = &bytes else { return Ok(()) };
         let moved = objects::run(&mut target, w).await?;
-        print!("{}", moved.render());
+        put!("{}", moved.render());
         Ok(())
     })
 }
@@ -1125,7 +1125,7 @@ pub fn render(s: &Survey) -> String {
 
 fn summary(s: &Survey, report: &std::path::Path) {
     let (native, emulated, missing) = s.classify();
-    println!(
+    say!(
         "{} schemas, {} tables, roughly {} rows, {} on disk",
         s.schemas.len(),
         s.schemas.iter().map(|x| x.tables).sum::<i64>(),
@@ -1133,27 +1133,27 @@ fn summary(s: &Survey, report: &std::path::Path) {
         size(s.total_bytes())
     );
     if let Some(users) = s.auth.get("users") {
-        println!("{users} auth users");
+        say!("{users} auth users");
     }
     if let Some(objects) = s.storage.get("objects") {
-        println!("{objects} storage objects");
+        say!("{objects} storage objects");
     }
-    println!(
+    say!(
         "extensions: {} built here, {} answered for, {} with no answer",
         native.len(),
         emulated.len(),
         missing.len()
     );
     for (e, why) in &missing {
-        println!("  {}: {}", e.name, why);
+        say!("  {}: {}", e.name, why);
     }
     if !s.unread.is_empty() {
-        println!(
+        say!(
             "{} things could not be read, they are in the report",
             s.unread.len()
         );
     }
-    println!("written to {}", report.display());
+    say!("written to {}", report.display());
 }
 
 #[cfg(test)]

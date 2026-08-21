@@ -83,16 +83,16 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         [verb, tenant_ref] if verb == "delete" => delete(store.as_ref(), tenant_ref),
         [verb, act, tenant_ref, host] if verb == "host" && act == "add" => {
             registry::add_host(store.as_ref(), tenant_ref, host).map_err(|e| e.to_string())?;
-            println!("{host} routes to {tenant_ref}");
+            say!("{host} routes to {tenant_ref}");
             // Said because DNS is the half of this that is not on the
             // store, and a claimed host that resolves nowhere looks
             // exactly like a claim that did not work.
-            println!("point {host} at this server for it to mean anything");
+            say!("point {host} at this server for it to mean anything");
             Ok(())
         }
         [verb, act, tenant_ref, host] if verb == "host" && act == "remove" => {
             registry::remove_host(store.as_ref(), tenant_ref, host).map_err(|e| e.to_string())?;
-            println!("{host} no longer routes to {tenant_ref}");
+            say!("{host} no longer routes to {tenant_ref}");
             Ok(())
         }
         _ => Err(USAGE.into()),
@@ -104,7 +104,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
 fn list(store: &dyn CasStore) -> Result<(), String> {
     let refs = registry::list(store).map_err(|e| e.to_string())?;
     if refs.is_empty() {
-        println!("no tenants registered");
+        say!("no tenants registered");
         return Ok(());
     }
     for tenant_ref in &refs {
@@ -112,9 +112,9 @@ fn list(store: &dyn CasStore) -> Result<(), String> {
             true => "has a database",
             false => "registered, no database yet",
         };
-        println!("{tenant_ref}\t{state}");
+        say!("{tenant_ref}\t{state}");
     }
-    println!("{} tenants", refs.len());
+    say!("{} tenants", refs.len());
     Ok(())
 }
 
@@ -128,13 +128,13 @@ fn create(store: &dyn CasStore, tenant_ref: &str, jwt_secret: String) -> Result<
     entry.s3_access_key = access.clone();
     entry.s3_secret_key = secret.clone();
     registry::create(store, &entry).map_err(|e| e.to_string())?;
-    println!("registered {tenant_ref}");
-    println!("jwt secret {jwt_secret}");
-    println!("s3 access key {access}");
-    println!("s3 secret key {secret}");
+    say!("registered {tenant_ref}");
+    say!("jwt secret {jwt_secret}");
+    say!("s3 access key {access}");
+    say!("s3 secret key {secret}");
     // Said out loud because the next thing somebody does is point a
     // client at it and get told there is no manifest.
-    println!("no database yet, make one with zou branch <target> create <src> {tenant_ref}");
+    say!("no database yet, make one with zou branch <target> create <src> {tenant_ref}");
     Ok(())
 }
 
@@ -144,27 +144,27 @@ fn info(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
         .ok_or_else(|| {
             format!("no tenant {tenant_ref} on this store, `list` shows what is registered")
         })?;
-    println!("ref {}", entry.tenant_ref);
-    println!("format {}", entry.format);
-    println!("created unix {}", entry.created_unix);
-    println!("jwt secret {}", entry.jwt_secret);
+    say!("ref {}", entry.tenant_ref);
+    say!("format {}", entry.format);
+    say!("created unix {}", entry.created_unix);
+    say!("jwt secret {}", entry.jwt_secret);
     match entry.s3() {
         Some((access, secret)) => {
-            println!("s3 access key {access}");
-            println!("s3 secret key {secret}");
+            say!("s3 access key {access}");
+            say!("s3 secret key {secret}");
         }
         // Said out loud rather than left blank, because an S3 client
         // being told its key is not one this project has looks the same
         // as a wrong key typed in.
-        None => println!("no s3 pair, make one with zou tenant <target> s3 {tenant_ref}"),
+        None => say!("no s3 pair, make one with zou tenant <target> s3 {tenant_ref}"),
     }
     match entry.hosts.is_empty() {
-        true => println!("hosts: none besides its own label"),
-        false => println!("hosts: {}", entry.hosts.join(", ")),
+        true => say!("hosts: none besides its own label"),
+        false => say!("hosts: {}", entry.hosts.join(", ")),
     }
     match has_database(store, tenant_ref)? {
-        true => println!("database at {}", TenantLayout::new(tenant_ref).prefix()),
-        false => println!("no database yet"),
+        true => say!("database at {}", TenantLayout::new(tenant_ref).prefix()),
+        false => say!("no database yet"),
     }
     Ok(())
 }
@@ -222,24 +222,24 @@ fn keys(store: &dyn CasStore, tenant_ref: &str, as_env: bool) -> Result<(), Stri
     let anon = mint("anon", secret);
     let service = mint("service_role", secret);
     if as_env {
-        println!("ANON_KEY=\"{anon}\"");
-        println!("SERVICE_ROLE_KEY=\"{service}\"");
+        say!("ANON_KEY=\"{anon}\"");
+        say!("SERVICE_ROLE_KEY=\"{service}\"");
     } else {
-        println!("anon key {anon}");
-        println!("service_role key {service}");
+        say!("anon key {anon}");
+        say!("service_role key {service}");
     }
     // The S3 pair is read rather than minted, and it is printed here
     // because a client configured against a project needs all of these
     // together. The names are the ones `supabase status -o env` uses.
     if let Some((access, s3_secret)) = entry.s3() {
         if as_env {
-            println!("S3_PROTOCOL_ACCESS_KEY_ID=\"{access}\"");
-            println!("S3_PROTOCOL_ACCESS_KEY_SECRET=\"{s3_secret}\"");
-            println!("S3_PROTOCOL_REGION=\"{}\"", zou_server_region());
+            say!("S3_PROTOCOL_ACCESS_KEY_ID=\"{access}\"");
+            say!("S3_PROTOCOL_ACCESS_KEY_SECRET=\"{s3_secret}\"");
+            say!("S3_PROTOCOL_REGION=\"{}\"", zou_server_region());
         } else {
-            println!("s3 access key {access}");
-            println!("s3 secret key {s3_secret}");
-            println!("s3 region {}", zou_server_region());
+            say!("s3 access key {access}");
+            say!("s3 secret key {s3_secret}");
+            say!("s3 region {}", zou_server_region());
         }
     }
     Ok(())
@@ -276,21 +276,21 @@ fn s3(store: &dyn CasStore, tenant_ref: &str, rotate: bool) -> Result<(), String
     }
     let (access, secret) = s3_pair()?;
     registry::set_s3(store, tenant_ref, &access, &secret).map_err(|e| e.to_string())?;
-    println!("s3 access key {access}");
-    println!("s3 secret key {secret}");
+    say!("s3 access key {access}");
+    say!("s3 secret key {secret}");
     // Said because the pair a running server holds came out of the
     // entry when it attached the project, and it goes on holding it.
     if rotate {
-        println!("the old pair still works until this project is next attached");
+        say!("the old pair still works until this project is next attached");
     }
     Ok(())
 }
 
 fn delete(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
     registry::delete(store, tenant_ref).map_err(|e| e.to_string())?;
-    println!("unregistered {tenant_ref}");
+    say!("unregistered {tenant_ref}");
     if has_database(store, tenant_ref)? {
-        println!(
+        say!(
             "the database is still at {}, remove that prefix to delete it for good",
             TenantLayout::new(tenant_ref).prefix()
         );

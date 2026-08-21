@@ -17,6 +17,6 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         return Err(USAGE.into());
     };
     let snapshot = Snapshot::read(Path::new(path))?;
-    println!("{}", snapshot.to_json());
+    say!("{}", snapshot.to_json());
     Ok(())
 }

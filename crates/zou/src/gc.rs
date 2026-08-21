@@ -43,14 +43,14 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     match gc::sweep(&*store, &holder(), now, policy)? {
         Sweep::Ran(stats) => {
             for key in &stats.doomed {
-                println!("would delete {key}");
+                say!("would delete {key}");
             }
             let did = if policy.dry_run {
                 "would delete"
             } else {
                 "deleted"
             };
-            println!(
+            say!(
                 "{} tenants, {} {} objects, {} waiting out the {} window",
                 stats.tenants,
                 did,

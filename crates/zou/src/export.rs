@@ -155,8 +155,8 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         let written = write_all(&client, &dir).await?;
         std::fs::write(&report, render_report(&written))
             .map_err(|e| format!("cannot write {}: {e}", report.display()))?;
-        print!("{}", written.render());
-        println!("the report is {}", report.display());
+        put!("{}", written.render());
+        say!("the report is {}", report.display());
         Ok(())
     })
 }

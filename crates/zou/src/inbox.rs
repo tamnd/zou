@@ -76,7 +76,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     };
     let body = ask(args.port, method, &key)?;
     if args.json {
-        println!("{body}");
+        say!("{body}");
         return Ok(());
     }
     let parsed: serde_json::Value =
@@ -87,19 +87,19 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     let empty = Vec::new();
     let texts = parsed["texts"].as_array().unwrap_or(&empty);
     if args.clear {
-        println!("inbox cleared");
+        say!("inbox cleared");
         return Ok(());
     }
     if messages.is_empty() && texts.is_empty() {
-        println!("no mail");
+        say!("no mail");
         return Ok(());
     }
     let now = now();
     for message in messages {
-        print!("{}", render(message, now));
+        put!("{}", render(message, now));
     }
     for text in texts {
-        print!("{}", texted(text, now));
+        put!("{}", texted(text, now));
     }
     Ok(())
 }

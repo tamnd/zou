@@ -120,7 +120,7 @@ fn create(store: &dyn CasStore, src: &str, dst: &str, at: At) -> Result<(), Stri
         .branch_of
         .as_ref()
         .ok_or("a child names its parent")?;
-    println!(
+    say!(
         "branched {src} into {dst} at {:#X}, {} checkpoints inherited",
         of.at_lsn.0,
         manifest.checkpoints.len()
@@ -167,7 +167,7 @@ fn list(store: &dyn CasStore, parent: Option<&str>) -> Result<(), String> {
         if parent.is_some_and(|p| p != of.tenant_ref) {
             continue;
         }
-        println!(
+        say!(
             "{tenant_ref}\tfrom {} at {:#X}, {} checkpoints",
             of.tenant_ref,
             of.at_lsn.0,
@@ -176,9 +176,9 @@ fn list(store: &dyn CasStore, parent: Option<&str>) -> Result<(), String> {
         lines += 1;
     }
     match (lines, parent) {
-        (0, Some(p)) => println!("no branches of {p}"),
-        (0, None) => println!("no branches on this store"),
-        (n, _) => println!("{n} branches"),
+        (0, Some(p)) => say!("no branches of {p}"),
+        (0, None) => say!("no branches on this store"),
+        (n, _) => say!("{n} branches"),
     }
     Ok(())
 }
@@ -220,13 +220,13 @@ fn delete(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
 
     let deleted = discard(store, tenant_ref)?;
     match registry::delete(store, tenant_ref) {
-        Ok(()) => println!("unregistered {tenant_ref}"),
+        Ok(()) => say!("unregistered {tenant_ref}"),
         // A branch nobody registered is the common case, the registry
         // is a router's index and branching does not touch it.
         Err(registry::RegistryError::Missing { .. }) => {}
         Err(e) => return Err(e.to_string()),
     }
-    println!("deleted branch {tenant_ref}, {deleted} objects");
+    say!("deleted branch {tenant_ref}, {deleted} objects");
     Ok(())
 }
 
