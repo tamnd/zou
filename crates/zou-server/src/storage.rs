@@ -570,11 +570,20 @@ pub(crate) fn caller(
             }
         }
     }
+    let role = verified
+        .role
+        .clone()
+        .unwrap_or_else(|| app.cfg.anon_role.clone());
+    // Same fence as the rest surface, for the same reason: this role
+    // is about to be a database role, and the connection it enters
+    // from is whatever the dsn named. See #92.
+    if !app.cfg.exposes(&role) {
+        return Err(StorageError::access_denied(format!(
+            "role \"{role}\" is not exposed"
+        )));
+    }
     let ctx = RequestContext {
-        role: verified
-            .role
-            .clone()
-            .unwrap_or_else(|| app.cfg.anon_role.clone()),
+        role,
         claims: verified.claims.to_string(),
         method: parts.method.as_str().to_string(),
         path: parts.uri.path().to_string(),

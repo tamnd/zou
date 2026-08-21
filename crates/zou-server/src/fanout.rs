@@ -1383,13 +1383,22 @@ fn who(app: &Arc<App>, token: Option<&str>) -> Result<Identity, String> {
         });
     };
     match crate::jwt::verify_any(token, &app.cfg.jwt_secret, app.jwks.as_ref()) {
-        Ok(verified) => Ok(Identity {
-            role: match verified.role.as_deref() {
+        Ok(verified) => {
+            let role = match verified.role.as_deref() {
                 None | Some("") => app.cfg.anon_role.clone(),
                 Some(role) => role.to_string(),
-            },
-            claims: verified.claims,
-        }),
+            };
+            // The hub asks its questions as this role, so it is held
+            // to the project's set the way a socket's own token is.
+            // See #92.
+            if !app.cfg.exposes(&role) {
+                return Err(format!("role \"{role}\" is not exposed"));
+            }
+            Ok(Identity {
+                role,
+                claims: verified.claims,
+            })
+        }
         Err(_) => Err("invalid claim: token is expired or malformed".to_string()),
     }
 }

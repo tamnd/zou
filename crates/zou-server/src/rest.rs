@@ -59,7 +59,7 @@ use zou_rest::plan::{self, PlanError, Query};
 use zou_rest::{csv as csvbody, media, order, page, rpc, select};
 
 use crate::sql::{RequestContext, Session};
-use crate::{App, AuthContext, openapi};
+use crate::{App, AuthContext, Config, openapi};
 
 /// PostgREST's getSchema: writes pick their schema through
 /// Content-Profile, everything else through Accept-Profile, a header
@@ -1819,7 +1819,35 @@ fn plan_error(e: PlanError) -> RestError {
 /// injects, which is the whole per request contract RLS policies
 /// read, plus the search_path scoping the transaction to the
 /// negotiated schema.
-fn request_context(auth: &AuthContext, req: &Parts, schema: &str) -> RequestContext {
+///
+/// Fallible for one reason: the role. A `role` claim naming a role
+/// this server does not expose is refused here rather than passed to
+/// `set_config`, because the connection role is whatever the dsn
+/// names and a dev loop's dsn is usually the superuser, so a token
+/// claiming `postgres` would otherwise be a superuser session. See
+/// #92, and [`Config::exposes`] for what the set is.
+fn request_context(
+    cfg: &Config,
+    auth: &AuthContext,
+    req: &Parts,
+    schema: &str,
+) -> Result<RequestContext, RestError> {
+    if !cfg.exposes(&auth.role) {
+        return Err(RestError {
+            status: StatusCode::UNAUTHORIZED,
+            // The state postgres itself raises for a role it will not
+            // enter, so a client that already handles that answer
+            // handles this one.
+            code: "22023".to_string(),
+            message: format!("role \"{}\" is not exposed", auth.role),
+            details: None,
+            hint: Some(format!(
+                "Only the following roles are exposed: {}",
+                cfg.exposed().join(", ")
+            )),
+            headers: None,
+        });
+    }
     let mut headers = serde_json::Map::new();
     for (name, value) in &req.headers {
         if let Ok(v) = value.to_str() {
@@ -1838,7 +1866,7 @@ fn request_context(auth: &AuthContext, req: &Parts, schema: &str) -> RequestCont
             }
         }
     }
-    RequestContext {
+    Ok(RequestContext {
         role: auth.role.clone(),
         claims: auth.claims.to_string(),
         method: req.method.as_str().to_string(),
@@ -1846,7 +1874,7 @@ fn request_context(auth: &AuthContext, req: &Parts, schema: &str) -> RequestCont
         headers: serde_json::Value::Object(headers).to_string(),
         cookies: serde_json::Value::Object(cookies).to_string(),
         search_path: format!("\"{}\"", schema.replace('"', "\"\"")),
-    }
+    })
 }
 
 /// The path as PostgREST would have seen it, which is the path with
@@ -2151,7 +2179,7 @@ async fn read(
     let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != app.cfg.anon_role;
-    let ctx = request_context(auth, req, schema);
+    let ctx = request_context(&app.cfg, auth, req, schema)?;
     let sess = pool
         .session(&ctx, true)
         .await
@@ -2459,7 +2487,7 @@ async fn write(
 
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != app.cfg.anon_role;
-    let ctx = request_context(auth, req, schema);
+    let ctx = request_context(&app.cfg, auth, req, schema)?;
     let sess = pool
         .session(&ctx, false)
         .await
@@ -2770,7 +2798,7 @@ async fn options(
     let (schema, _) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != app.cfg.anon_role;
-    let ctx = request_context(auth, req, schema);
+    let ctx = request_context(&app.cfg, auth, req, schema)?;
     let sess = pool
         .session(&ctx, true)
         .await
@@ -2835,7 +2863,7 @@ async fn describe(app: &App, auth: &AuthContext, req: &Parts) -> Result<Response
 
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != app.cfg.anon_role;
-    let ctx = request_context(auth, req, schema);
+    let ctx = request_context(&app.cfg, auth, req, schema)?;
     let sess = pool
         .session(&ctx, true)
         .await
@@ -3006,7 +3034,7 @@ async fn invoke(
     let (schema, negotiated) = profile(&app.cfg.schemas, &req.method, &req.headers)?;
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != app.cfg.anon_role;
-    let ctx = request_context(auth, req, schema);
+    let ctx = request_context(&app.cfg, auth, req, schema)?;
     // GET and HEAD run read only, so a volatile function fails with
     // pg's 25006, which the status table maps to PostgREST's 405.
     let sess = pool
@@ -4370,14 +4398,66 @@ mod tests {
             role: "anon".to_string(),
             claims: Arc::new(serde_json::json!({})),
         };
+        let cfg = Config::default();
         assert_eq!(
-            request_context(&auth, &parts, "public").search_path,
+            request_context(&cfg, &auth, &parts, "public")
+                .unwrap()
+                .search_path,
             "\"public\""
         );
         assert_eq!(
-            request_context(&auth, &parts, "we\"ird").search_path,
+            request_context(&cfg, &auth, &parts, "we\"ird")
+                .unwrap()
+                .search_path,
             "\"we\"\"ird\"",
             "a quote in the name doubles instead of escaping the list"
+        );
+    }
+
+    /// The fence from #92, without a database in the way: a claim
+    /// naming a role the project does not expose never becomes a
+    /// context, so there is nothing to hand `set_config`.
+    #[test]
+    fn a_role_the_project_does_not_expose_is_refused_before_the_session() {
+        let parts = Request::builder()
+            .uri("/rest/v1/t")
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0;
+        let claiming = |role: &str| AuthContext {
+            role: role.to_string(),
+            claims: Arc::new(serde_json::json!({})),
+        };
+        let cfg = Config::default();
+        for role in ["anon", "authenticated", "service_role"] {
+            assert!(
+                request_context(&cfg, &claiming(role), &parts, "public").is_ok(),
+                "{role} is one of the three a project has"
+            );
+        }
+        let e = request_context(&cfg, &claiming("postgres"), &parts, "public")
+            .expect_err("the superuser is not an api role");
+        assert_eq!(e.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(e.code, "22023");
+        assert_eq!(e.message, "role \"postgres\" is not exposed");
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("Only the following roles are exposed: anon, authenticated, service_role")
+        );
+
+        // And a project that named its own set gets its own set, plus
+        // whatever it calls the anonymous role.
+        let cfg = Config {
+            anon_role: "web_anon".to_string(),
+            exposed_roles: vec!["reporting".to_string()],
+            ..Config::default()
+        };
+        assert!(request_context(&cfg, &claiming("reporting"), &parts, "public").is_ok());
+        assert!(request_context(&cfg, &claiming("web_anon"), &parts, "public").is_ok());
+        assert!(
+            request_context(&cfg, &claiming("authenticated"), &parts, "public").is_err(),
+            "a named set replaces the default rather than adding to it"
         );
     }
 
