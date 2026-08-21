@@ -1143,7 +1143,7 @@ fn start(
         // cut off it would be refused. The embedded library is the
         // branching product surface, so it stays on the object path
         // until a branch can ask for that fold rather than wait for
-        // it, which is #578.
+        // it, which is #579.
         .env("ZOU_PAGESERVE", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

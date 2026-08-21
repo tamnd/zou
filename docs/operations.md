@@ -451,7 +451,7 @@ Branching asks a different question with the service on.
 A child served this way reads the pages it inherited out of the layers, never out of the parent's `pg/` prefix, because those are the parent's live base images and a truncate deletes them, so what it needs is an image layer at or below the branch point on every page shard.
 Compaction cuts one on its own once a shard has 128 MB of delta debt, which a project that has been running for a while has and a store somebody made this morning has not, and `zou compact <target> <ref> --horizon` cuts one on demand for a store that has not got there yet.
 Without one, `zou branch create` refuses with `cannot be branched yet` and names the shard.
-The embedded library runs its postmasters with the service off, so templates and fixtures keep answering the capture question instead: a template is a fresh initdb and a few thousand rows and would never earn a fold, and issue #578 is letting a branch ask for one rather than wait.
+The embedded library runs its postmasters with the service off, so templates and fixtures keep answering the capture question instead: a template is a fresh initdb and a few thousand rows and would never earn a fold, and issue #579 is letting a branch ask for one rather than wait.
 
 ## Retention and collecting
 
