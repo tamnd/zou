@@ -43,7 +43,11 @@ PG_BIN=${PG_BIN:-build/pg/bin}
 ZOU_BIN=${ZOU_BIN:-target/release}
 WORK=${WORK:-/tmp/zou-cold-attach}
 REMOTE=${REMOTE:-}
-SIM=${SIM:-s3-standard}
+# No colon, so SIM= means no simulation rather than the default. The
+# store reads an empty ZOU_STORE_SIM as off, and a run of this with SIM=
+# is how the floor gets measured, which the colon form quietly turned
+# into a second copy of the default run.
+SIM=${SIM-s3-standard}
 SCALE=${SCALE:-25}
 LOAD_SECS=${LOAD_SECS:-20}
 # The pool the attaching server gets. Small on purpose: a recovery that
