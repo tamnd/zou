@@ -220,6 +220,7 @@ fn jittered(base: u64, spread: u64, rng: &mut Jitter) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU32;
+    use std::time::Instant;
 
     use super::*;
     use crate::cas::{CasError, LocalFsStore, Version};
@@ -252,14 +253,24 @@ mod tests {
             Arc::clone(&held),
             2,
         );
-        // Base interval is ~667 ms, so this covers a few renewals and lets
-        // wall clock seconds advance past the acquisition second.
-        std::thread::sleep(Duration::from_millis(2100));
+        // Wait for the renewal rather than for the clock. The base
+        // interval is ~667 ms and an expiry is whole seconds, so the
+        // first renewal that lands in a later wall clock second than
+        // the acquisition is the one that moves it, which on a fast
+        // machine is the first or second try and on a loaded runner is
+        // whichever one gets scheduled. A fixed sleep long enough for
+        // the slowest of them is one every other run pays for, and one
+        // short enough for the rest is a coin flip there.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while held.lock().unwrap().expires_unix == initial_expiry {
+            assert!(!hb.lost(), "the heartbeat lost the lease");
+            assert!(
+                Instant::now() < deadline,
+                "no renewal extended the lease in 20 s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(!hb.lost());
-        assert!(
-            held.lock().unwrap().expires_unix > initial_expiry,
-            "no renewal extended the lease"
-        );
 
         hb.detach().unwrap();
         let (data, _) = store.get(&layout.manifest()).unwrap().unwrap();
