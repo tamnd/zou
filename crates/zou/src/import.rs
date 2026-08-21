@@ -196,7 +196,6 @@ const KNOWN_MISSING: &[(&str, &str)] = &[
 /// grants has to be taken without owners and privileges, or they have
 /// to be created first. See docs/compatibility.md.
 const PLATFORM_ROLES: &[&str] = &[
-    "authenticator",
     "dashboard_user",
     "pgbouncer",
     "pgsodium_keyholder",
@@ -213,9 +212,16 @@ const PLATFORM_ROLES: &[&str] = &[
 ];
 
 /// Roles that already exist here, so the report does not list them as
-/// something to recreate. The three api roles, and the superuser, which
-/// is a database's own rather than anything a project made.
-const HERE_ALREADY: &[&str] = &["anon", "authenticated", "postgres", "service_role"];
+/// something to recreate. The three api roles, the authenticator the
+/// bootstrap grants them to, and the superuser, which is a database's
+/// own rather than anything a project made.
+const HERE_ALREADY: &[&str] = &[
+    "anon",
+    "authenticated",
+    "authenticator",
+    "postgres",
+    "service_role",
+];
 
 /// What the survey does not look at. Printed with every report, for the
 /// same reason `zou db diff` prints its own list: a section that came
