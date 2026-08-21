@@ -134,6 +134,32 @@ pub(crate) fn duration(text: &str) -> Option<Duration> {
     Some(Duration::from_secs_f64(total))
 }
 
+/// A number of seconds a setting names, for the two settings upstream
+/// holds as Go durations rather than as numbers: the mail and the sms
+/// frequency ceilings, which a hosted config writes as `1m0s`.
+///
+/// A plain number is taken as seconds as well, because it is what
+/// somebody writing the value by hand writes and reading it as
+/// nanoseconds the way Go's own parser would is a trap. Anything else
+/// is refused rather than defaulted, so a project that wrote `1 minute`
+/// hears about it at startup instead of sending a code a second.
+pub(crate) fn seconds(var: &dyn Fn(&str) -> String, name: &str, stock: u64) -> Result<u64, String> {
+    let raw = var(name);
+    let text = raw.trim();
+    if text.is_empty() {
+        return Ok(stock);
+    }
+    if let Ok(plain) = text.parse::<u64>() {
+        return Ok(plain);
+    }
+    match duration(text) {
+        Some(over) => Ok(over.as_secs()),
+        None => Err(format!(
+            "{name} is {text:?}, which is neither a number of seconds nor a duration like 1m0s"
+        )),
+    }
+}
+
 /// What the environment says the budgets are, GoTrue's GOTRUE_RATE_LIMIT_*
 /// with GOTRUE_ swapped for ZOU_.
 #[derive(Debug, Clone, PartialEq)]

@@ -16,10 +16,10 @@
 //! form fields and the exact error strings testable without a network
 //! and without a fake HTTP server.
 //!
-//! Two of GoTrue's five providers are here, Twilio and MessageBird.
-//! Vonage and TextLocal are the same shape again and are waiting on
-//! anyone who wants them. Twilio Verify is not: it verifies the code
-//! itself, which inverts the flow rather than adding a provider to it.
+//! Four of GoTrue's five providers are here: Twilio, MessageBird,
+//! Vonage and TextLocal. Twilio Verify is not, and it is not the same
+//! shape as these: it draws and checks the code itself, which inverts
+//! the flow rather than adding a provider to it.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -552,6 +552,159 @@ impl Sender for MessageBird {
     }
 }
 
+/// Vonage, which used to be Nexmo and still answers on that hostname.
+pub struct Vonage {
+    pub api_key: String,
+    pub api_secret: String,
+    /// Who the message is from: a number, or an alphanumeric sender id
+    /// where the country allows one.
+    pub from: String,
+    pub base: String,
+    pub wire: Arc<dyn Wire>,
+}
+
+impl Vonage {
+    pub fn new(api_key: &str, api_secret: &str, from: &str) -> Vonage {
+        Vonage {
+            api_key: api_key.to_string(),
+            api_secret: api_secret.to_string(),
+            from: from.to_string(),
+            base: "https://rest.nexmo.com".to_string(),
+            wire: Arc::new(Web::default()),
+        }
+    }
+
+    pub fn request(&self, text: &Text) -> Call {
+        Call {
+            url: format!("{}/sms/json", self.base.trim_end_matches('/')),
+            // The credentials are form fields rather than a header on
+            // this one, which is why there is no authorization here to
+            // forget.
+            form: vec![
+                ("api_key".to_string(), self.api_key.clone()),
+                ("api_secret".to_string(), self.api_secret.clone()),
+                ("from".to_string(), self.from.clone()),
+                ("to".to_string(), text.to.clone()),
+                ("text".to_string(), text.body.clone()),
+                ("type".to_string(), "unicode".to_string()),
+            ],
+            headers: Vec::new(),
+        }
+    }
+
+    /// Vonage answers 200 whatever happened and puts the outcome in the
+    /// message, so the status field is the only thing worth reading and
+    /// `"0"` is the only value that means sent.
+    pub fn read(reply: &Reply) -> Result<String, String> {
+        let body: serde_json::Value = serde_json::from_str(&reply.body)
+            .map_err(|e| format!("vonage sent something that is not json: {e}"))?;
+        let Some(first) = body.get("messages").and_then(|m| m.get(0)) else {
+            return Err("vonage error: no messages found in response".to_string());
+        };
+        let status = text_of(first, "status");
+        if status != "0" {
+            return Err(format!(
+                "vonage error: {} (status: {status})",
+                text_of(first, "error-text")
+            ));
+        }
+        Ok(text_of(first, "message-id"))
+    }
+}
+
+impl Sender for Vonage {
+    fn deliver(&self, text: &Text) -> Result<String, String> {
+        let call = self.request(text);
+        Vonage::read(&self.wire.post(&call)?)
+    }
+
+    fn describe(&self) -> String {
+        format!("vonage, from {}", self.from)
+    }
+
+    fn provider(&self) -> &'static str {
+        "vonage"
+    }
+}
+
+/// TextLocal, which sends to India and takes a whole list of numbers at
+/// once. Only ever one here, because a code goes to one person.
+pub struct TextLocal {
+    pub api_key: String,
+    /// The sender id, which TextLocal registers rather than allocating,
+    /// so it is a name and not a number.
+    pub sender: String,
+    pub base: String,
+    pub wire: Arc<dyn Wire>,
+}
+
+impl TextLocal {
+    pub fn new(api_key: &str, sender: &str) -> TextLocal {
+        TextLocal {
+            api_key: api_key.to_string(),
+            sender: sender.to_string(),
+            base: "https://api.textlocal.in".to_string(),
+            wire: Arc::new(Web::default()),
+        }
+    }
+
+    pub fn request(&self, text: &Text) -> Call {
+        Call {
+            url: format!("{}/send", self.base.trim_end_matches('/')),
+            form: vec![
+                ("apikey".to_string(), self.api_key.clone()),
+                ("sender".to_string(), self.sender.clone()),
+                ("numbers".to_string(), text.to.clone()),
+                ("message".to_string(), text.body.clone()),
+            ],
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn read(reply: &Reply) -> Result<String, String> {
+        let body: serde_json::Value = serde_json::from_str(&reply.body)
+            .map_err(|e| format!("textlocal sent something that is not json: {e}"))?;
+        if text_of(&body, "status") != "success" {
+            let first = body
+                .get("errors")
+                .and_then(|e| e.get(0))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let message = text_of(&first, "message");
+            if message.is_empty() {
+                return Err("textlocal error: internal error".to_string());
+            }
+            return Err(format!(
+                "textlocal error: {message} (code: {})",
+                text_of(&first, "code")
+            ));
+        }
+        // A success with nothing in it is not one this can name, and
+        // upstream reads the first message's id the same way.
+        let first = body
+            .get("messages")
+            .and_then(|m| m.get(0))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        Ok(text_of(&first, "id"))
+    }
+}
+
+impl Sender for TextLocal {
+    fn deliver(&self, text: &Text) -> Result<String, String> {
+        let call = self.request(text);
+        TextLocal::read(&self.wire.post(&call)?)
+    }
+
+    fn describe(&self) -> String {
+        format!("textlocal, sender {}", self.sender)
+    }
+
+    fn provider(&self) -> &'static str {
+        "textlocal"
+    }
+}
+
 /// A number with the plus and the spaces taken off, which is the form
 /// everything here holds and sends.
 pub fn strip(phone: &str) -> String {
@@ -611,9 +764,78 @@ pub fn configured(var: &dyn Fn(&str) -> String) -> Result<Option<Arc<dyn Sender>
             }
             Ok(Some(Arc::new(MessageBird::new(&key, &originator))))
         }
+        "vonage" => {
+            let (key, secret, from) = (
+                var("ZOU_SMS_VONAGE_API_KEY"),
+                var("ZOU_SMS_VONAGE_API_SECRET"),
+                var("ZOU_SMS_VONAGE_FROM"),
+            );
+            if key.is_empty() || secret.is_empty() || from.is_empty() {
+                return Err(
+                    "vonage needs ZOU_SMS_VONAGE_API_KEY, ZOU_SMS_VONAGE_API_SECRET and ZOU_SMS_VONAGE_FROM"
+                        .to_string(),
+                );
+            }
+            Ok(Some(Arc::new(Vonage::new(&key, &secret, &from))))
+        }
+        "textlocal" => {
+            let (key, sender) = (
+                var("ZOU_SMS_TEXTLOCAL_API_KEY"),
+                var("ZOU_SMS_TEXTLOCAL_SENDER"),
+            );
+            if key.is_empty() || sender.is_empty() {
+                return Err(
+                    "textlocal needs ZOU_SMS_TEXTLOCAL_API_KEY and ZOU_SMS_TEXTLOCAL_SENDER"
+                        .to_string(),
+                );
+            }
+            Ok(Some(Arc::new(TextLocal::new(&key, &sender))))
+        }
         other => Err(format!(
-            "sms provider {other} is not one of twilio, messagebird"
+            "sms provider {other} is not one of twilio, messagebird, vonage, textlocal"
         )),
+    }
+}
+
+/// The text message settings from the environment, GoTrue's
+/// `GOTRUE_SMS_*` with the prefix swapped, so a project moving across
+/// brings its own template and its own ceilings with it.
+pub fn settings_from_env() -> Result<Settings, String> {
+    settings(&|name| std::env::var(name).unwrap_or_default())
+}
+
+/// The same over anything that can look a name up.
+pub fn settings(var: &dyn Fn(&str) -> String) -> Result<Settings, String> {
+    let stock = Settings::default();
+    Ok(Settings {
+        template: var("ZOU_SMS_TEMPLATE").trim().to_string(),
+        otp_length: count(var, "ZOU_SMS_OTP_LENGTH", stock.otp_length)?,
+        // Upstream holds this one as a plain number of seconds rather
+        // than as a duration, but a project that wrote `60s` meant the
+        // same minute, so both are read.
+        otp_exp: crate::limit::seconds(var, "ZOU_SMS_OTP_EXP", stock.otp_exp as u64)? as i64,
+        max_frequency: crate::limit::seconds(var, "ZOU_SMS_MAX_FREQUENCY", stock.max_frequency)?,
+        autoconfirm: switch(var, "ZOU_SMS_AUTOCONFIRM", stock.autoconfirm)?,
+    })
+}
+
+/// A whole number, refused rather than defaulted when it is not one.
+fn count(var: &dyn Fn(&str) -> String, name: &str, stock: usize) -> Result<usize, String> {
+    let raw = var(name);
+    let text = raw.trim();
+    if text.is_empty() {
+        return Ok(stock);
+    }
+    text.parse()
+        .map_err(|_| format!("{name} is {text:?}, which is not a number"))
+}
+
+fn switch(var: &dyn Fn(&str) -> String, name: &str, stock: bool) -> Result<bool, String> {
+    match var(name).trim() {
+        "" => Ok(stock),
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        other => Err(format!("{name} is {other:?}, which is not true or false")),
     }
 }
 
@@ -929,9 +1151,156 @@ mod tests {
         .expect("and it is there");
         assert_eq!(bird.describe(), "messagebird, originator zou");
         assert!(env(&[("ZOU_SMS_PROVIDER", "messagebird")]).is_err());
+        let vonage = env(&[
+            ("ZOU_SMS_PROVIDER", "vonage"),
+            ("ZOU_SMS_VONAGE_API_KEY", "key"),
+            ("ZOU_SMS_VONAGE_API_SECRET", "secret"),
+            ("ZOU_SMS_VONAGE_FROM", "zou"),
+        ])
+        .expect("all three is a provider")
+        .expect("and it is there");
+        assert_eq!(vonage.describe(), "vonage, from zou");
+        assert!(env(&[("ZOU_SMS_PROVIDER", "vonage")]).is_err());
+        let textlocal = env(&[
+            ("ZOU_SMS_PROVIDER", "textlocal"),
+            ("ZOU_SMS_TEXTLOCAL_API_KEY", "key"),
+            ("ZOU_SMS_TEXTLOCAL_SENDER", "zou"),
+        ])
+        .expect("both is a provider")
+        .expect("and it is there");
+        assert_eq!(textlocal.describe(), "textlocal, sender zou");
+        assert!(env(&[("ZOU_SMS_PROVIDER", "textlocal")]).is_err());
         assert!(
-            env(&[("ZOU_SMS_PROVIDER", "vonage")]).is_err(),
+            env(&[("ZOU_SMS_PROVIDER", "plivo")]).is_err(),
             "a provider that is not here says so rather than sending nothing"
         );
+    }
+
+    #[test]
+    fn vonage_sends_the_credentials_in_the_form_and_reads_the_first_message() {
+        let vonage = Vonage::new("key", "secret", "zou");
+        let call = vonage.request(&text(SMS));
+        assert_eq!(call.url, "https://rest.nexmo.com/sms/json");
+        assert_eq!(call.field("api_key"), "key");
+        assert_eq!(call.field("api_secret"), "secret");
+        assert_eq!(call.field("from"), "zou");
+        // The number goes without the plus, which is the form the
+        // column holds and what upstream sends.
+        assert_eq!(call.field("to"), "15551234567");
+        assert_eq!(call.field("text"), "Your code is 123456");
+        assert_eq!(call.field("type"), "unicode");
+        assert!(
+            call.headers.is_empty(),
+            "the credentials are the form, so there is no header to get wrong"
+        );
+
+        let sent = |body: &str| {
+            Vonage::read(&Reply {
+                status: 200,
+                body: body.to_string(),
+            })
+        };
+        assert_eq!(
+            sent(r#"{"messages":[{"status":"0","message-id":"0A"}]}"#),
+            Ok("0A".to_string())
+        );
+        // Vonage answers 200 on a refusal too, so a status that is not
+        // zero is the failure and the text beside it is what happened.
+        assert_eq!(
+            sent(r#"{"messages":[{"status":"4","error-text":"Bad Credentials"}]}"#),
+            Err("vonage error: Bad Credentials (status: 4)".to_string())
+        );
+        assert_eq!(
+            sent(r#"{"messages":[]}"#),
+            Err("vonage error: no messages found in response".to_string())
+        );
+        assert!(sent("not json").is_err());
+    }
+
+    #[test]
+    fn textlocal_reads_the_status_word_rather_than_the_http_one() {
+        let textlocal = TextLocal::new("key", "zou");
+        let call = textlocal.request(&text(SMS));
+        assert_eq!(call.url, "https://api.textlocal.in/send");
+        assert_eq!(call.field("apikey"), "key");
+        assert_eq!(call.field("sender"), "zou");
+        assert_eq!(call.field("numbers"), "15551234567");
+        assert_eq!(call.field("message"), "Your code is 123456");
+
+        let sent = |body: &str| {
+            TextLocal::read(&Reply {
+                status: 200,
+                body: body.to_string(),
+            })
+        };
+        assert_eq!(
+            sent(r#"{"status":"success","messages":[{"id":"77"}]}"#),
+            Ok("77".to_string())
+        );
+        assert_eq!(
+            sent(r#"{"status":"failure","errors":[{"code":3,"message":"Invalid login details"}]}"#),
+            Err("textlocal error: Invalid login details (code: 3)".to_string())
+        );
+        // A failure it did not explain is still a failure, and saying
+        // so is better than reading an id that is not there.
+        assert_eq!(
+            sent(r#"{"status":"failure"}"#),
+            Err("textlocal error: internal error".to_string())
+        );
+        assert!(sent("not json").is_err());
+    }
+
+    #[test]
+    fn neither_of_the_two_new_providers_carries_whatsapp() {
+        assert!(!Vonage::new("k", "s", "zou").carries(WHATSAPP));
+        assert!(Vonage::new("k", "s", "zou").carries(SMS));
+        assert!(!TextLocal::new("k", "zou").carries(WHATSAPP));
+        assert!(TextLocal::new("k", "zou").carries(SMS));
+    }
+
+    #[test]
+    fn the_settings_are_gotrues_with_the_prefix_swapped() {
+        let env = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            settings(&move |name| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            })
+        };
+        let stock = env(&[]).expect("nothing set is not an error");
+        assert_eq!(stock.otp_length, 6);
+        assert_eq!(stock.otp_exp, 60);
+        assert_eq!(stock.max_frequency, 60);
+        assert!(!stock.autoconfirm);
+        assert_eq!(stock.body("123456"), "Your code is 123456");
+
+        let set = env(&[
+            ("ZOU_SMS_TEMPLATE", "{{ .Code }} is your zou code"),
+            ("ZOU_SMS_OTP_LENGTH", "8"),
+            ("ZOU_SMS_OTP_EXP", "300"),
+            // Upstream holds this one as a Go duration and a hosted
+            // config is full of them, so it has to read as one.
+            ("ZOU_SMS_MAX_FREQUENCY", "1m30s"),
+            ("ZOU_SMS_AUTOCONFIRM", "true"),
+        ])
+        .expect("all of it is readable");
+        assert_eq!(set.body("42"), "42 is your zou code");
+        assert_eq!(set.digits(), 8);
+        assert_eq!(set.otp_exp, 300);
+        assert_eq!(set.max_frequency, 90);
+        assert!(set.autoconfirm);
+
+        // A value nobody can act on is a startup error rather than the
+        // default arriving in its place, which is the whole reason
+        // these are read here and not with a parse and an unwrap_or.
+        assert!(env(&[("ZOU_SMS_OTP_LENGTH", "six")]).is_err());
+        assert!(env(&[("ZOU_SMS_MAX_FREQUENCY", "1 minute")]).is_err());
+        assert!(env(&[("ZOU_SMS_AUTOCONFIRM", "yes")]).is_err());
     }
 }
