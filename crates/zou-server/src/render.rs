@@ -514,7 +514,7 @@ async fn answer(
     // upstream's and is recorded: two transforms of one object carry
     // the same one.
     let etag = row.meta("eTag");
-    let cache = row.meta("cacheControl");
+    let cache = row.served_cache();
     let cache = cache.as_str().unwrap_or(object::NO_CACHE);
     let length = bytes.len();
 
