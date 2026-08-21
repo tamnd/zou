@@ -710,6 +710,11 @@ pub fn run(args: &Args) -> Result<(), String> {
             // What postgres changes reads. See the same line in
             // zou-embed for why it is on from the first boot.
             .args(["-c", "wal_level=logical"])
+            // A node holds one slot while anybody is subscribed, so
+            // the stock ten is ten nodes on one database. See SLOTS
+            // for why the same number is on every boot.
+            .args(["-c", &format!("max_replication_slots={}", zou_pg::SLOTS)])
+            .args(["-c", &format!("max_wal_senders={}", zou_pg::SLOTS)])
             .args(["-c", &format!("shared_buffers={}", shared_buffers())])
             .env("ZOU_TARGET", &args.target)
             .env("ZOU_TENANT", &args.tenant)

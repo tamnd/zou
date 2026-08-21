@@ -1133,6 +1133,11 @@ fn start(
         // is the standing price of a database that can say what
         // changed, and is what every Supabase project runs at.
         .args(["-c", "wal_level=logical"])
+        // The same slot count the servers run with, since a
+        // postmaster refuses to start when it finds more slots on disk
+        // than it allows and this is the boot that writes the pgdata.
+        .args(["-c", &format!("max_replication_slots={}", zou_pg::SLOTS)])
+        .args(["-c", &format!("max_wal_senders={}", zou_pg::SLOTS)])
         .env("ZOU_TARGET", target)
         .env("ZOU_TENANT", tenant)
         .env("ZOU_PAGE_CACHE", pagecache)

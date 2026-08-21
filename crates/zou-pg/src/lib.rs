@@ -137,6 +137,18 @@ use zou_store::{CasStore, Frame2, HeldLease, Lsn, Manifest, open_store, tenant_i
 /// Postgres BLCKSZ. The patch checks this against its own BLCKSZ at init.
 pub const ZOU_PAGE_SIZE: usize = 8192;
 
+/// How many logical replication slots a postmaster zou starts allows,
+/// and how many wal senders, since a slot being read holds one.
+///
+/// A node holds a slot for as long as anybody is subscribed to postgres
+/// changes, so the stock ten is ten nodes on one database, which is
+/// under what a fleet is. It lives here rather than in each of the four
+/// places a postmaster is started because a postmaster refuses to start
+/// when it finds more slots in its pgdata than it allows, so the number
+/// the genesis boot wrote and the number a serve boot allows have to be
+/// the same number.
+pub const SLOTS: u32 = 64;
+
 pub const ZOU_OK: i32 = 0;
 pub const ZOU_ERR_STORE: i32 = -1;
 pub const ZOU_ERR_NOT_INITIALIZED: i32 = -2;

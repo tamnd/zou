@@ -311,6 +311,10 @@ Two things have to be true of a database before any of this delivers anything, a
 It is a postmaster setting and a restart, so `zou dev` and `zou serve` start postgres with it rather than turning it on when somebody first subscribes.
 A database you brought yourself is whatever you set it to, and a tap against one below logical says so rather than reporting that nothing changed.
 
+`max_replication_slots` has to be at least as large as the number of taps open at once, and so does `max_wal_senders`, because a slot being read holds a wal sender.
+Both are ten on a stock postgres and both are postmaster settings, so raising them is a restart.
+A server that runs out says `all replication slots are in use` on the tap that lost, which reads as a subscription that heard nothing rather than as a setting.
+
 The table has to be in the `supabase_realtime` publication, which the bootstrap contract creates empty:
 
 ```sql
