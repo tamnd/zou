@@ -1314,10 +1314,13 @@ async fn connect(dsn: &str, params: &[(String, String)], route: &Route) -> Resul
 /// AuthenticationOk that ends the exchange.
 ///
 /// Trust, cleartext and md5 are what a postmaster this node started
-/// asks for. SCRAM is refused with a sentence rather than attempted,
-/// because a half implemented SCRAM is a connection that fails in a way
-/// nobody can read.
+/// asks for, and SCRAM-SHA-256 is what a postgres somebody else
+/// initialised asks for instead, so all four are answered here. A
+/// mechanism this side does not have is a sentence rather than a
+/// hangup, because a connection that fails without saying why is a
+/// connection nobody can fix.
 async fn handshake(up: &mut TcpStream, password: &[u8], user: &str) -> Result<(), Stop> {
+    let mut scram: Option<crate::scram::Scram> = None;
     loop {
         let (tag, body) = read_message(up, MAX_LOGIN).await?;
         if tag == b'E' {
@@ -1349,13 +1352,52 @@ async fn handshake(up: &mut TcpStream, password: &[u8], user: &str) -> Result<()
                     .await
                     .map_err(|e| Stop::Quiet(format!("password to the database: {e}")))?;
             }
+            // AuthenticationSASL, and the mechanisms it will take.
             10 => {
-                return Err(Stop::Say {
-                    code: "0A000",
-                    message:
-                        "this project's database asks for SCRAM, which this port does not speak yet"
-                            .to_string(),
-                });
+                let offered = mechanisms(&body[4..]);
+                if !offered.iter().any(|name| name == SCRAM_SHA_256) {
+                    return Err(Stop::Say {
+                        code: "0A000",
+                        message: format!(
+                            "this project's database asks for {}, and this port speaks {SCRAM_SHA_256}",
+                            offered.join(" or ")
+                        ),
+                    });
+                }
+                let started = crate::scram::Scram::new();
+                let first = started.first();
+                let mut msg = SCRAM_SHA_256.as_bytes().to_vec();
+                msg.push(0);
+                msg.extend_from_slice(&(first.len() as i32).to_be_bytes());
+                msg.extend_from_slice(first.as_bytes());
+                scram = Some(started);
+                up.write_all(&raw(b'p', &msg))
+                    .await
+                    .map_err(|e| Stop::Quiet(format!("sasl to the database: {e}")))?;
+            }
+            // AuthenticationSASLContinue: the salt and the server's
+            // nonce, answered with this side's proof.
+            11 => {
+                let scram = scram.as_mut().ok_or_else(|| {
+                    Stop::Quiet("the database continued a sasl exchange it never started".into())
+                })?;
+                let last = scram
+                    .last(password, &text(&body[4..])?)
+                    .map_err(|e| Stop::Quiet(format!("sasl: {e}")))?;
+                up.write_all(&raw(b'p', last.as_bytes()))
+                    .await
+                    .map_err(|e| Stop::Quiet(format!("sasl to the database: {e}")))?;
+            }
+            // AuthenticationSASLFinal: the server's own proof, which is
+            // checked rather than taken, and then the loop reads the
+            // AuthenticationOk after it.
+            12 => {
+                let scram = scram.as_ref().ok_or_else(|| {
+                    Stop::Quiet("the database finished a sasl exchange it never started".into())
+                })?;
+                scram
+                    .done(&text(&body[4..])?)
+                    .map_err(|e| Stop::Quiet(format!("sasl: {e}")))?;
             }
             other => {
                 return Err(Stop::Quiet(format!(
@@ -1364,6 +1406,31 @@ async fn handshake(up: &mut TcpStream, password: &[u8], user: &str) -> Result<()
             }
         }
     }
+}
+
+/// The one mechanism this side has. The PLUS of it is channel binding,
+/// which this client does not do and does not claim to.
+const SCRAM_SHA_256: &str = "SCRAM-SHA-256";
+
+/// The mechanism names in an AuthenticationSASL, which are null
+/// terminated strings one after the other and then one more zero.
+fn mechanisms(body: &[u8]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = body;
+    while let Some((name, tail)) = cstr(rest) {
+        if name.is_empty() {
+            break;
+        }
+        names.push(name.to_string());
+        rest = tail;
+    }
+    names
+}
+
+/// A sasl message body, which is utf8 and not null terminated.
+fn text(body: &[u8]) -> Result<String, Stop> {
+    String::from_utf8(body.to_vec())
+        .map_err(|_| Stop::Quiet("the database's sasl message is not utf8".into()))
 }
 
 /// Postgres' md5 password: the hex of the digest of the hex of the
@@ -1644,14 +1711,27 @@ mod tests {
         mode: Mode,
         tls: Option<TlsAcceptor>,
     ) -> (tempfile::TempDir, Arc<Fake>, Arc<Point>, String) {
-        let dir = tempfile::tempdir().expect("a directory");
-        let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(dir.path()));
-        registry::create(&*store, &Tenant::new("acme-prod", SECRET, 1)).expect("a project");
-
         let fake = Arc::new(Fake::default());
         let addr = fake.spawn().await;
         let (host, port) = addr.rsplit_once(':').expect("host and port");
         let dsn = format!("host={host} port={port} user=zou dbname=postgres");
+        let (dir, backend, at) = behind(mode, tls, &dsn).await;
+        (dir, fake, backend, at)
+    }
+
+    /// A project, a door in front of it, and whatever dsn is behind it,
+    /// which is the fake for most tests and a real postgres for the one
+    /// that needs a real login.
+    async fn behind(
+        mode: Mode,
+        tls: Option<TlsAcceptor>,
+        dsn: &str,
+    ) -> (tempfile::TempDir, Arc<Point>, String) {
+        let dir = tempfile::tempdir().expect("a directory");
+        let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(dir.path()));
+        registry::create(&*store, &Tenant::new("acme-prod", SECRET, 1)).expect("a project");
+
+        let dsn = dsn.to_string();
         let backend = Arc::new(Point {
             dsn,
             ups: StdMutex::new(Vec::new()),
@@ -1671,7 +1751,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
         let addr = listener.local_addr().expect("an address").to_string();
         tokio::spawn(wire.serve(listener));
-        (dir, fake, backend, addr)
+        (dir, backend, addr)
     }
 
     fn key(role: &str) -> String {
@@ -2062,6 +2142,42 @@ mod tests {
                 .0,
             b'R',
             "and the request that follows is the one it takes"
+        );
+    }
+
+    /// A postgres this node did not start asks for SCRAM-SHA-256, and
+    /// a door that cannot answer that is a door that only works against
+    /// its own postmasters. The test cluster is whatever it was
+    /// initialised with, so this says the login goes through however it
+    /// is asked for rather than naming a method.
+    #[tokio::test]
+    async fn a_database_this_node_did_not_start_is_logged_in_to_however_it_asks() {
+        let Ok(dsn) = std::env::var("ZOU_PG_TEST_DSN") else {
+            return;
+        };
+        let pool = crate::sql::Pool::new(&dsn, 1).expect("the dsn parses");
+        let sess = pool.unscoped().await.expect("connect");
+        for role in ["anon", "authenticated", "service_role"] {
+            let make = format!(
+                "do $$ begin if not exists (select 1 from pg_roles where rolname = '{role}') \
+                 then create role {role}; end if; end $$"
+            );
+            sess.execute(&make, &[]).await.expect("a role to become");
+        }
+        sess.commit().await.expect("park");
+
+        let (_d, _backend, addr) = behind(Mode::Session, None, &dsn).await;
+        let mut client = Client::open(&addr).await;
+        client.up("service_role").await;
+        let answer = client.query("select current_user").await;
+        let row = answer
+            .iter()
+            .find(|(tag, _)| *tag == b'D')
+            .map(|(_, body)| String::from_utf8_lossy(body).to_string())
+            .expect("a row came back");
+        assert!(
+            row.contains("service_role"),
+            "the session runs as the role it asked for: {row}"
         );
     }
 
