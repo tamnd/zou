@@ -724,6 +724,12 @@ impl Pool {
     /// usually a request, and a request is exactly what must not be
     /// the thing creating roles and schemas. It costs one dial, once,
     /// and that connection is closed as soon as the batch is done.
+    ///
+    /// A project bootstrapped by a recent zou has the whole contract in
+    /// its genesis capture already, so this finds everything there and
+    /// only pays for the asking. It stays because a database made
+    /// before that, or restored from a dump, or branched from either,
+    /// has to get the same schemas from somewhere.
     async fn bootstrapped(&self) -> Result<(), Error> {
         self.0
             .bootstrapped
