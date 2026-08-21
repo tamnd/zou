@@ -42,6 +42,63 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// What an interrupted first attach left on the store, cleared so the
+/// initdb about to run writes onto an empty prefix.
+///
+/// A first attach is an initdb through the patched storage manager and
+/// then a genesis capture, and the pages initdb writes land in the
+/// store as it goes. Kill it partway, over a slow link or a wait that
+/// ran out, and the prefix holds pages of a cluster that was never
+/// finished: enough that the next initdb finds relations already there
+/// and dies with "relation pg_attrdef already exists", not enough that
+/// anything can be restored from it.
+///
+/// A project is a project once the manifest names its first checkpoint,
+/// the same rule every later state change already follows, so anything
+/// found under a manifest that names none is scratch from an attempt
+/// that did not finish and goes. Refuses when the manifest does name a
+/// checkpoint, since then the pages are somebody's database, and when a
+/// live lease says another node is in the middle of this same work.
+///
+/// The project's own uploads are left alone. Storage objects and
+/// deployed functions are not made by initdb and not read by a restore,
+/// so nothing here has an opinion about them.
+pub fn clear_unfinished(store: &dyn CasStore, layout: &TenantLayout) -> Result<usize, String> {
+    let tenant_ref = layout.tenant_ref();
+    if let Some((data, _)) = store
+        .get(&layout.manifest())
+        .map_err(|e| format!("store: {e}"))?
+    {
+        let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
+        if !manifest.checkpoints.is_empty() {
+            return Err(format!(
+                "{tenant_ref} already has a database, {} checkpoints, nothing here may touch it",
+                manifest.checkpoints.len()
+            ));
+        }
+        if let Some(lease) = &manifest.lease
+            && lease.expires_unix > now_unix()
+        {
+            return Err(format!(
+                "{tenant_ref} is being bootstrapped by {} until unix {}, waiting for that to finish or expire beats racing it",
+                lease.holder, lease.expires_unix
+            ));
+        }
+    }
+    let prefix = format!("{}/", layout.prefix());
+    let keys = store.list(&prefix).map_err(|e| format!("store: {e}"))?;
+    let mut cleared = 0;
+    for key in &keys {
+        let rest = key.strip_prefix(&prefix).unwrap_or(key);
+        if rest.starts_with("files/") || rest.starts_with("functions/") {
+            continue;
+        }
+        store.delete(key).map_err(|e| format!("store: {e}"))?;
+        cleared += 1;
+    }
+    Ok(cleared)
+}
+
 /// Capture `pgdata` as the genesis checkpoint of the tenant, creating
 /// the manifest if the store is empty. `redo` is the checkpoint redo
 /// location from pg_control, [`crate::restore::control_redo`] reads it
@@ -177,6 +234,107 @@ mod tests {
         assert!(
             err.contains("NoSuchKey"),
             "the backend error must survive: {err}"
+        );
+    }
+
+    /// A store holding what an attach killed during initdb leaves: pages
+    /// of a half made cluster, a manifest naming no checkpoint, and the
+    /// project's own uploads beside them.
+    fn interrupted(store: &dyn CasStore, layout: &TenantLayout) {
+        store
+            .put(&layout.manifest(), &Manifest::new("local", 18).to_json())
+            .unwrap();
+        for key in [
+            layout.pg_block(1663, 5, 1249, 0, 0),
+            layout.pg_size(1663, 5, 1249, 0),
+            layout.chk_file(GENESIS_ID, "global/pg_control"),
+            format!("{}/log/00000000.frames", layout.prefix()),
+        ] {
+            store.put_if_absent(&key, b"scratch").unwrap();
+        }
+        store
+            .put_if_absent(
+                &format!("{}/files/avatars/one.png", layout.prefix()),
+                b"png",
+            )
+            .unwrap();
+        store
+            .put_if_absent(&format!("{}/functions/DEPLOYED", layout.prefix()), b"{}")
+            .unwrap();
+    }
+
+    #[test]
+    fn what_an_unfinished_attach_left_goes_and_the_uploads_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = zou_store::LocalFsStore::new(dir.path());
+        let layout = TenantLayout::new("local");
+        interrupted(&store, &layout);
+
+        // The manifest and the four scratch objects.
+        assert_eq!(clear_unfinished(&store, &layout).unwrap(), 5);
+        assert!(store.get(&layout.manifest()).unwrap().is_none());
+        assert!(
+            store
+                .get(&layout.pg_block(1663, 5, 1249, 0, 0))
+                .unwrap()
+                .is_none(),
+            "a page of the cluster that never finished is what the next initdb trips over"
+        );
+        assert!(
+            store
+                .get(&format!("{}/files/avatars/one.png", layout.prefix()))
+                .unwrap()
+                .is_some(),
+            "an upload is not made by initdb and not read by a restore"
+        );
+        assert!(
+            store
+                .get(&format!("{}/functions/DEPLOYED", layout.prefix()))
+                .unwrap()
+                .is_some()
+        );
+        // And on a store with nothing there at all it is a no op.
+        assert_eq!(
+            clear_unfinished(&store, &TenantLayout::new("nobody")).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_database_and_a_live_bootstrap_are_both_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = zou_store::LocalFsStore::new(dir.path());
+        let layout = TenantLayout::new("local");
+        interrupted(&store, &layout);
+
+        let mut manifest = Manifest::new("local", 18);
+        manifest.checkpoints.push(CheckpointRef {
+            id: GENESIS_ID.to_string(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        store.put(&layout.manifest(), &manifest.to_json()).unwrap();
+        let err = clear_unfinished(&store, &layout).unwrap_err();
+        assert!(err.contains("already has a database"), "{err}");
+
+        let mut manifest = Manifest::new("local", 18);
+        manifest.lease = Some(zou_store::manifest::Lease {
+            holder: "another-node".to_string(),
+            expires_unix: now_unix() + 60,
+            fence: 1,
+            endpoint: None,
+        });
+        store.put(&layout.manifest(), &manifest.to_json()).unwrap();
+        let err = clear_unfinished(&store, &layout).unwrap_err();
+        assert!(err.contains("another-node"), "{err}");
+
+        // Nothing went in either case.
+        assert!(
+            store
+                .get(&layout.pg_block(1663, 5, 1249, 0, 0))
+                .unwrap()
+                .is_some()
         );
     }
 }

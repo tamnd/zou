@@ -1048,6 +1048,16 @@ fn initdb(
     tenant: &str,
     pagecache: &Path,
 ) -> Result<(), Error> {
+    let store = open_store(target).map_err(|e| Error::new(Kind::Store, e))?;
+    let layout = TenantLayout::new(tenant);
+    // An open killed partway through the last initdb left pages of a
+    // cluster that never finished, and this one would land on top of
+    // them. See bootstrap::clear_unfinished.
+    let cleared =
+        bootstrap::clear_unfinished(&*store, &layout).map_err(|e| Error::new(Kind::Store, e))?;
+    if cleared > 0 {
+        log::debug!("open: cleared {cleared} objects an unfinished open left");
+    }
     let out = Command::new(pg_bin.join("initdb"))
         .arg("-D")
         .arg(pgdata)
@@ -1073,8 +1083,7 @@ fn initdb(
     }
     let control = fs::read(pgdata.join("global/pg_control")).map_err(io("read pg_control"))?;
     let redo = restore::control_redo(&control).map_err(|e| Error::new(Kind::Store, e))?;
-    let store = open_store(target).map_err(|e| Error::new(Kind::Store, e))?;
-    bootstrap::capture_genesis(&*store, &TenantLayout::new(tenant), pgdata, redo)
+    bootstrap::capture_genesis(&*store, &layout, pgdata, redo)
         .map_err(|e| Error::new(Kind::Store, e))?;
     Ok(())
 }

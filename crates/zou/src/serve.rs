@@ -772,6 +772,16 @@ impl Postmasters {
         pagecache: &std::path::Path,
     ) -> Result<(), String> {
         log::info!("{tenant_ref} has no database yet, running initdb");
+        let layout = TenantLayout::new(tenant_ref);
+        // An attach killed partway through the last one leaves pages of
+        // a cluster that never finished, and initdb on top of those is
+        // the "relation pg_attrdef already exists" a second attach dies
+        // with. Nothing under a manifest with no checkpoint is anyone's
+        // database.
+        let cleared = bootstrap::clear_unfinished(&*self.store, &layout)?;
+        if cleared > 0 {
+            log::info!("{tenant_ref}: cleared {cleared} objects an unfinished attach left");
+        }
         let out = Command::new(self.pg_bin.join("initdb"))
             .arg("-D")
             .arg(pgdata)
@@ -800,7 +810,6 @@ impl Postmasters {
         let control =
             fs::read(pgdata.join("global/pg_control")).map_err(|e| format!("pg_control: {e}"))?;
         let redo = restore::control_redo(&control)?;
-        let layout = TenantLayout::new(tenant_ref);
         let stats = bootstrap::capture_genesis(&*self.store, &layout, pgdata, redo)?;
         log::info!(
             "{tenant_ref}: captured genesis, {} files, {} bytes",
