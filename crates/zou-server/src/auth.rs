@@ -482,10 +482,24 @@ pub(crate) async fn send_phone_code(
     // The same for text messages, before the code is drawn, because a
     // code drawn and not sent is a code the account is left holding.
     post.limits.sms_sent(post.sms.autoconfirm)?;
-    let code = mint_digits(sess, user_id, out.to, token_type, post.sms.digits()).await?;
+    let code = match post.texter.verifies() {
+        // Twilio Verify holds the code, so there is none to draw here
+        // and none to write down. Everything else about the flow is
+        // unchanged, including the send being stamped, because the
+        // frequency ceiling is this project's rule rather than the
+        // provider's.
+        true => stamp_sent(sess, user_id, token_type).await?,
+        false => mint_digits(sess, user_id, out.to, token_type, post.sms.digits()).await?,
+    };
     let text = crate::sms::Text {
         to: out.to.to_string(),
-        body: post.sms.body(&code.code),
+        // Nothing to render when the provider composes its own message,
+        // and rendering the template against no code would put "Your
+        // code is" on its own into a log line.
+        body: match code.code.is_empty() {
+            true => String::new(),
+            false => post.sms.body(&code.code),
+        },
         code: code.code.clone(),
         channel: out.channel.to_string(),
         at: now(),
@@ -1900,12 +1914,7 @@ async fn mint_digits(
     token_type: &str,
     digits: usize,
 ) -> Result<Code, sql::Error> {
-    let (column, sent) = match token_type {
-        "recovery_token" => ("recovery_token", "recovery_sent_at"),
-        "reauthentication_token" => ("reauthentication_token", "reauthentication_sent_at"),
-        "phone_change_token" => ("phone_change_token", "phone_change_sent_at"),
-        _ => ("confirmation_token", "confirmation_sent_at"),
-    };
+    let (column, sent) = columns_for(token_type);
     let code = code_of(digits);
     let hashed = token_hash(to, &code);
     sess.execute(
@@ -1919,6 +1928,45 @@ async fn mint_digits(
     .await?;
     keep_token(sess, user_id, token_type, &hashed, to).await?;
     Ok(Code { code, hash: hashed })
+}
+
+/// Which column holds a code of this type, and which one says when it
+/// went out.
+fn columns_for(token_type: &str) -> (&'static str, &'static str) {
+    match token_type {
+        "recovery_token" => ("recovery_token", "recovery_sent_at"),
+        "reauthentication_token" => ("reauthentication_token", "reauthentication_sent_at"),
+        "phone_change_token" => ("phone_change_token", "phone_change_sent_at"),
+        _ => ("confirmation_token", "confirmation_sent_at"),
+    }
+}
+
+/// Write down that a code went out without writing down the code,
+/// which is what a provider that keeps its own leaves behind.
+///
+/// The column is emptied rather than left alone. A project that moved
+/// from Twilio to Twilio Verify has accounts carrying a code somebody
+/// was texted last week, and that code should not still be spendable
+/// now that nothing here draws them.
+async fn stamp_sent(
+    sess: &sql::Session,
+    user_id: &str,
+    token_type: &str,
+) -> Result<Code, sql::Error> {
+    let (column, sent) = columns_for(token_type);
+    sess.execute(
+        &format!(
+            "update auth.users
+                set {column} = '', {sent} = now(), updated_at = now()
+              where id = $1::text::uuid"
+        ),
+        &[&user_id],
+    )
+    .await?;
+    Ok(Code {
+        code: String::new(),
+        hash: String::new(),
+    })
 }
 
 /// A verify request, GoTrue's VerifyParams. The code arrives either as
@@ -2157,13 +2205,14 @@ async fn by_email(
 /// own. A phone change is found by the number being moved to rather
 /// than the one held, because the account keeps the old one until this
 /// code is spent.
-async fn by_phone(
-    sess: &sql::Session,
-    kind: &str,
-    phone: &str,
-    hash: &str,
-    sms_exp: i64,
-) -> Result<Holder, Error> {
+///
+/// Whether the code is right is asked one of two ways. Normally it is
+/// the column, which holds the hash of the number and the digits
+/// together and which this server wrote when it sent them. Under a
+/// provider that keeps its own codes there is no column to read and the
+/// provider is asked instead.
+async fn by_phone(sess: &sql::Session, asked: &Asked, rules: &Rules) -> Result<Holder, Error> {
+    let kind = asked.kind.as_str();
     let (held, token, sent) = match kind {
         "sms" => ("phone", "confirmation_token", "confirmation_sent_at"),
         "phone_change" => ("phone_change", "phone_change_token", "phone_change_sent_at"),
@@ -2181,7 +2230,10 @@ async fn by_phone(
           limit 1"
     );
     let rows = sess
-        .query(&sql, &[&phone, &hash, &AUD, &(sms_exp as i32)])
+        .query(
+            &sql,
+            &[&asked.phone, &asked.hash, &AUD, &(rules.sms_exp as i32)],
+        )
         .await?;
     let Some(row) = rows.first() else {
         return expired(TOKEN_EXPIRED);
@@ -2190,8 +2242,23 @@ async fn by_phone(
     if row.get::<_, bool>(1) {
         return banned();
     }
-    if !row.get::<_, bool>(2) {
-        return expired(TOKEN_EXPIRED);
+    match &rules.verifier {
+        // The account was found by the number it holds, which is the
+        // whole of what this database knows. Whether the digits are the
+        // ones that went out is the provider's answer, and so is
+        // whether they are still good, because it drew them and it
+        // timed them.
+        Some(sender) => {
+            if let Err(e) = crate::sms::checked(sender, &asked.phone, &asked.token).await {
+                log::info!("the provider did not accept the code: {e}");
+                return expired(TOKEN_EXPIRED);
+            }
+        }
+        None => {
+            if !row.get::<_, bool>(2) {
+                return expired(TOKEN_EXPIRED);
+            }
+        }
     }
     Ok(Holder {
         user_id,
@@ -2375,6 +2442,11 @@ pub(crate) struct Rules {
     pub(crate) secure_change: bool,
     pub(crate) autoconfirm: bool,
     pub(crate) sms_exp: i64,
+    /// The provider, when it is one that keeps the codes itself. Then a
+    /// phone code is checked by asking it rather than by comparing a
+    /// column, and how long the code lasts is its business too, so
+    /// `sms_exp` says nothing about the codes it drew.
+    pub(crate) verifier: Option<Arc<dyn crate::sms::Sender>>,
 }
 
 /// The project's settings as a verify reads them.
@@ -2383,6 +2455,7 @@ fn rules(app: &App) -> Rules {
         secure_change: app.cfg.secure_email_change,
         autoconfirm: app.cfg.mailer_autoconfirm,
         sms_exp: app.cfg.sms.otp_exp,
+        verifier: app.texter.verifies().then(|| Arc::clone(&app.texter)),
     }
 }
 
@@ -2623,7 +2696,7 @@ async fn verified(
     let holder = if asked.token.is_empty() {
         by_hash(sess, &asked.kind, &asked.hash, LINK_EXPIRED).await?
     } else if !asked.phone.is_empty() {
-        by_phone(sess, &asked.kind, &asked.phone, &asked.hash, rules.sms_exp).await?
+        by_phone(sess, asked, rules).await?
     } else {
         by_email(sess, &asked.kind, &asked.email, &asked.hash).await?
     };
@@ -3109,12 +3182,16 @@ fn validate_new_password(password: &str) -> Result<(), Error> {
 
 /// Check the code from a reauthenticate against the one written down,
 /// and spend it. The window is the same day a mailed code lives for.
+///
+/// An account whose code went out through a provider that keeps its own
+/// has nothing written down, so there the code is checked by asking.
 async fn check_nonce(
     sess: &sql::Session,
+    post: &Post<'_>,
     user_id: &str,
     nonce: &str,
-    sms_exp: i64,
 ) -> Result<(), Error> {
+    let sms_exp = post.sms.otp_exp;
     let invalid = || {
         Err(refused(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -3144,10 +3221,14 @@ async fn check_nonce(
     let email: String = row.get(2);
     let phone: String = row.get(3);
     let fresh_text: bool = row.get(4);
+    // A code that went out through a provider that keeps its own left
+    // nothing behind, so this account is asked about before it is
+    // asked whether it holds a token: it never will.
+    let by_provider = email.is_empty() && !phone.is_empty() && post.texter.verifies();
     // An account holding no code at all is asked before it is asked
     // what the code would have been hashed against, which is upstream's
     // order and the one a client branches on.
-    if token.is_empty() {
+    if token.is_empty() && !by_provider {
         return invalid();
     }
     let (against, fresh) = if email.is_empty() {
@@ -3162,7 +3243,12 @@ async fn check_nonce(
             "Reauthentication requires an email or a phone number",
         ));
     }
-    if token.is_empty() || !fresh || token_hash(&against, nonce) != token {
+    if by_provider {
+        if let Err(e) = crate::sms::checked(post.texter, &against, nonce).await {
+            log::info!("the provider did not accept the nonce: {e}");
+            return invalid();
+        }
+    } else if !fresh || token_hash(&against, nonce) != token {
         return invalid();
     }
     sess.execute(
@@ -3319,7 +3405,7 @@ async fn update_user(
                     "Password update requires reauthentication",
                 );
             }
-            check_nonce(sess, &caller.user_id, nonce, post.sms.otp_exp).await?;
+            check_nonce(sess, post, &caller.user_id, nonce).await?;
         }
         if !stored.is_empty() && matches_off_thread(password, &stored).await {
             return Err(refused(
@@ -3370,6 +3456,7 @@ async fn update_user(
                     secure_change: false,
                     autoconfirm: true,
                     sms_exp: 0,
+                    verifier: None,
                 },
             )
             .await?;
