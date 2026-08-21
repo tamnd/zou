@@ -4436,8 +4436,9 @@ mod tests {
                 "{role} is one of the three a project has"
             );
         }
-        let e = request_context(&cfg, &claiming("postgres"), &parts, "public")
-            .expect_err("the superuser is not an api role");
+        let Err(e) = request_context(&cfg, &claiming("postgres"), &parts, "public") else {
+            panic!("the superuser is not an api role");
+        };
         assert_eq!(e.status, StatusCode::UNAUTHORIZED);
         assert_eq!(e.code, "22023");
         assert_eq!(e.message, "role \"postgres\" is not exposed");
