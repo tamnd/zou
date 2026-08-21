@@ -127,6 +127,37 @@ A manifest carries the second its holder wrote it, so a manifest dated in the fu
 A manifest dated in the past is either old or written by a clock this node is ahead of, and nothing in the store separates them, so the check reports the skew it can prove and stays quiet about the rest.
 For the bound that matters and what to do when you cannot hold it, see the section above.
 
+## Checking a database
+
+`zou doctor` asks whether a store could hold a database.
+`zou check <target> [ref]` asks the other question, which is whether the database already in one still reads.
+
+```
+zou check s3://acme-zou/prod
+zou check s3://acme-zou/prod yesterday
+```
+
+It restores the ref into a temporary directory that goes away on the way out, then reads every ordinary table of every database that allows connections with `select count(*)`, one table per session so a refusal names the table it came from.
+Index only scans and bitmap scans are off, because a count answered out of an index would say nothing about the heap it was counting.
+There is no server in it: the SQL runs through the single user backend, which reaches a first answer in about a third of the time a postmaster takes and does not have to be waited for or shut down.
+A table that could not be read is printed with what postgres said and the command exits non-zero.
+
+```
+checking /srv/store at ref local
+restored 44 files and replayed 5 wal records
+  postgres.public.empty 0 rows
+  postgres.public.t refused: ERROR:  invalid page in block 5 of relation "base/5/16384"
+zou: 1 of 2 tables could not be read out of /srv/store
+```
+
+Attaching to read the database is still an attach, so the backend takes the writer lease through the ordinary protocol and a tenant a server is serving right now refuses this with the lease error.
+Run it against a branch or a ref nothing is serving, or stop the server first.
+
+A target ending `.zou` works, which a postmaster over the same file does not, because the single file backend admits one process at a time and this is a chain of one process at a time: the restore, and then the backend.
+
+One failure it cannot see, and the reason to keep the row counts rather than the ok line: a page that reads back as zeros is a page postgres accepts as empty, so a relation that lost one scans clean and comes up short by the rows that page held.
+Comparing the counts of a check against the counts of the one before it catches that, and issue #546 is about closing it off in the read path where it belongs.
+
 ## Losing the lease
 
 The heartbeat flips `lost()` when the manifest shows another holder or when the store refused renewals past the local expiry.
