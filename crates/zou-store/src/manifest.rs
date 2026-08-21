@@ -119,6 +119,18 @@ pub struct Lease {
     /// absent is what every manifest written before this field says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// How long this lease was written for, so a node reading it can
+    /// tell a holder running a longer ttl from a holder whose clock is
+    /// wrong. Both look identical in `expires_unix` alone, and they are
+    /// not the same problem: one is a project the holder has backed off
+    /// on because nobody is writing it, the other is a machine to go and
+    /// fix.
+    ///
+    /// Absent is what every manifest written before this field says, and
+    /// a reader that finds it absent falls back to its own ttl, which is
+    /// the assumption it had to make anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +270,7 @@ mod tests {
                 expires_unix: 1_767_100_000,
                 fence: 1042,
                 endpoint: None,
+                ttl_secs: None,
             }),
             pg: PgInfo {
                 version: 18,

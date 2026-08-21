@@ -78,6 +78,15 @@ The lease lives in the manifest and every take, renewal, and release is a manife
 The default TTL is 15 seconds (`DEFAULT_TTL_SECS`).
 The heartbeat renews at a third of the TTL with plus or minus 20 percent jitter, so 5 seconds nominal at the default, and drops to a quarter of that cadence while retrying transient store errors.
 A clean shutdown calls `Heartbeat::detach`, which clears the lease from the manifest so the next writer attaches immediately instead of waiting out the TTL.
+A renewal is one conditional PUT and no read: the holder already has the manifest it last swapped, so it swaps that one again and only reads when the condition fails, which is also how it learns whether the thing that changed the manifest was its own checkpoint publish or somebody taking the lease.
+
+An attached project that is not being written backs off.
+The TTL is a promise about how long a dead node's work stays unavailable, and a database that has taken no writes has no work to be unavailable, so after three quiet renewals the heartbeat writes a 300 second lease and renews it at a third of that instead.
+That takes an idle attached project from 720 store requests an hour to 12, and the first WAL append puts the 15 second lease back before it returns, waking the heartbeat out of the long sleep rather than letting it finish, so a project taking writes has the failover time measured below and nothing else does anything different.
+The number is chosen against the attach manager's idle budget rather than against a price list: a project this quiet is detached outright a quarter of an hour in, which releases the lease and takes the cost to zero, and the backoff only has to carry it that far.
+The window it opens is worth naming.
+A node that dies holding a backed off lease makes the next writer for that project wait out what is left of the 300 seconds instead of 15, and reads are unaffected because reads do not need the lease.
+`ZOU_LEASE_IDLE_SECS=15` turns the backoff off for a deployment that would rather pay the requests, and any value at or below the 15 second TTL does the same.
 
 ## Clock skew bound
 
@@ -100,6 +109,7 @@ A node that reads a lease running out further ahead than its own clock plus the 
 lease held by node-7 until unix 1798000000, 3595s further out than a 15s lease can reach from this clock, so one of the two clocks is wrong or node-7 runs a longer lease ttl than this node
 ```
 
+A lease records the TTL it was written for as well as when it runs out, so the one case that is not worth reporting no longer is: a holder that has deliberately backed off on an idle project says so in the lease and reads as held, and what is left in this message is a genuine disagreement between the two numbers.
 Both halves of that sentence are worth checking.
 The usual cause is a clock, and `zou doctor` on each node reports what it can prove about its own.
 The other cause is real: a node configured with a longer TTL than this one writes expiries this one cannot account for, and a rolling change to the TTL looks exactly like skew from the node that has not been restarted yet.

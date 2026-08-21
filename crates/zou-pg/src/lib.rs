@@ -1540,6 +1540,30 @@ fn now_unix() -> u64 {
 
 const WAL_LEASE_TTL_SECS: u64 = 15;
 
+/// The lease a project that is not being written holds instead. It is
+/// only the renewal rate that changes, and only while nothing is writing:
+/// the first append puts [`WAL_LEASE_TTL_SECS`] back before it returns,
+/// so the failover number a live database is measured against is the
+/// short one. Five minutes is chosen against the attach manager's idle
+/// budget rather than against the store's price list, because a project
+/// this quiet is detached outright a few renewals later and stops costing
+/// anything at all, and a shorter backoff would save nothing while a
+/// longer one would only widen the window in which a node dying with an
+/// idle project makes the next writer wait.
+const WAL_IDLE_LEASE_TTL_SECS: u64 = 300;
+
+/// The idle lease this process runs, `ZOU_LEASE_IDLE_SECS` if it is set.
+/// Setting it to the busy TTL or below turns the backoff off, which is
+/// the switch for a deployment that would rather pay the store requests
+/// than widen the window in which an idle project fails over slowly.
+fn idle_lease_ttl_secs() -> u64 {
+    zou_store::setting::number_or(
+        "ZOU_LEASE_IDLE_SECS",
+        "a number of seconds",
+        WAL_IDLE_LEASE_TTL_SECS,
+    )
+}
+
 /// The WAL shard a tenant pins to inside its own log. The pusher hosts
 /// this one shard's sequencer, a cell with many shards spreads tenants
 /// across them later.
@@ -1765,11 +1789,12 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     };
     laps.lap("lease");
     let held = Arc::new(Mutex::new(held));
-    let heartbeat = Heartbeat::spawn(
+    let heartbeat = Heartbeat::spawn_idling(
         Arc::clone(&store),
         layout.clone(),
         Arc::clone(&held),
         WAL_LEASE_TTL_SECS,
+        idle_lease_ttl_secs(),
     );
     // The landing chain hedges its creation PUTs: past an adaptive
     // delay a second identical attempt races the first and the fastest
@@ -2016,8 +2041,13 @@ pub unsafe extern "C" fn zou_wal_append(
             return ZOU_ERR_NOT_INITIALIZED;
         };
         let mut pipe = pipe.lock().expect("wal pipe mutex poisoned");
-        if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
-            return ZOU_ERR_LEASE_LOST;
+        if let Some(hb) = pipe.heartbeat.as_ref() {
+            if hb.lost() {
+                return ZOU_ERR_LEASE_LOST;
+            }
+            // This project is writing, so it keeps the short lease and
+            // the failover time that goes with it.
+            hb.working();
         }
         let rc = pipe.waiter.failed.load(Ordering::Acquire);
         if rc != 0 {
@@ -2205,8 +2235,13 @@ pub extern "C" fn zou_wal_fold_start(redo: u64) -> i32 {
         };
         let (store, layout, media, tenant, held, gate) = {
             let pipe = pipe.lock().expect("wal pipe mutex poisoned");
-            if pipe.heartbeat.as_ref().is_some_and(Heartbeat::lost) {
-                return ZOU_ERR_LEASE_LOST;
+            if let Some(hb) = pipe.heartbeat.as_ref() {
+                if hb.lost() {
+                    return ZOU_ERR_LEASE_LOST;
+                }
+                // A fold is about to swap the manifest under the same
+                // lease, so this is not an idle project either.
+                hb.working();
             }
             if pipe.seq.is_none() {
                 return ZOU_ERR_NOT_INITIALIZED;
