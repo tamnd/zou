@@ -49,14 +49,26 @@ fn app_with_schemas(dsn: &str, schemas: &[&str]) -> axum::Router {
     .expect("router builds")
 }
 
+/// The fixture's tables, and the grant a real project's migrations
+/// would carry.
+///
+/// A table in public arrives readable by nobody who comes through the
+/// api, same as upstream, so a suite that reads one through the api
+/// has to say so. Granting the whole schema rather than each table is
+/// the test database being a test database; what matters is that the
+/// grant is here and not in the bootstrap.
 async fn seed(dsn: &str, statements: &[&str]) {
     let pool = Pool::new(dsn, 1).expect("dsn parses");
     let sess = pool.unscoped().await.expect("connect");
     for stmt in statements {
         sess.execute(stmt, &[]).await.expect(stmt);
     }
+    sess.execute(GRANT, &[]).await.expect(GRANT);
     sess.commit().await.expect("park");
 }
+
+const GRANT: &str = "grant select, insert, update, delete on all tables in schema public \
+                     to anon, authenticated, service_role";
 
 async fn body_text(res: axum::response::Response) -> String {
     let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
