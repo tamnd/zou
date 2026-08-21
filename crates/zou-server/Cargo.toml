@@ -31,6 +31,7 @@ sha1 = "0.11"
 sha2 = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
+tokio-rustls = { workspace = true }
 # The client half of a websocket, for the link from a node with the
 # sockets to the node with the tenant. rustls because it is the TLS this
 # build already links, rather than a second one for `wss:`.
@@ -50,6 +51,10 @@ zou-store = { path = "../zou-store", features = ["s3"] }
 [dev-dependencies]
 base64ct = { workspace = true }
 env_logger = { workspace = true }
+# A certificate for the tests that speak TLS to the postgres port. Its
+# defaults are ring and pem, which is the crypto this build already
+# links and the format the door reads, so it brings nothing new with it.
+rcgen = "0.14"
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["macros"] }
 tempfile = { workspace = true }
