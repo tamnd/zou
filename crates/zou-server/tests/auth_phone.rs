@@ -116,6 +116,63 @@ impl Recorder {
     }
 }
 
+/// A sender that keeps its own codes, the way Twilio Verify does. It
+/// is handed a message with no body and no digits in it, and the only
+/// thing that says whether a person typed the right code is asking it.
+///
+/// It approves one code and refuses everything else, which is enough to
+/// tell a flow that asks the provider from one that compares a column
+/// this server wrote.
+struct Verifier {
+    started: Mutex<Vec<sms::Text>>,
+    asked: Mutex<Vec<(String, String)>>,
+}
+
+impl sms::Sender for Verifier {
+    fn deliver(&self, text: &sms::Text) -> Result<String, String> {
+        self.started
+            .lock()
+            .expect("not poisoned")
+            .push(text.clone());
+        Ok("VE0123456789".to_string())
+    }
+    fn describe(&self) -> String {
+        "a test verifier".to_string()
+    }
+    fn verifies(&self) -> bool {
+        true
+    }
+    fn check(&self, to: &str, code: &str) -> Result<(), String> {
+        self.asked
+            .lock()
+            .expect("not poisoned")
+            .push((to.to_string(), code.to_string()));
+        match code == Verifier::RIGHT {
+            true => Ok(()),
+            false => Err("twilio verification error: pending".to_string()),
+        }
+    }
+}
+
+impl Verifier {
+    /// The digits the fake provider drew, which this server never sees
+    /// until somebody types them back in.
+    const RIGHT: &'static str = "424242";
+
+    fn new() -> Arc<Verifier> {
+        Arc::new(Verifier {
+            started: Mutex::new(Vec::new()),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+    fn started(&self) -> Vec<sms::Text> {
+        self.started.lock().expect("not poisoned").clone()
+    }
+    fn asked(&self) -> Vec<(String, String)> {
+        self.asked.lock().expect("not poisoned").clone()
+    }
+}
+
 fn app_with(dsn: &str, texter: Arc<dyn sms::Sender>) -> axum::Router {
     router(Config {
         texter: Some(texter),
@@ -1630,4 +1687,213 @@ async fn an_anonymous_account_that_proves_a_number_stops_being_anonymous() {
     )
     .await;
     assert_eq!(identity, "phone", "and it has the identity to show for it");
+}
+
+#[tokio::test]
+async fn a_provider_that_keeps_its_own_codes_is_asked_rather_than_the_column() {
+    let Some(dsn) = dsn() else { return };
+    let phone = number(29);
+    let (verifier, pool) = (Verifier::new(), pool(&dsn).await);
+    let app = app_with(&dsn, verifier.clone());
+    wipe(&pool, &phone).await;
+
+    let up = post(
+        &app,
+        "/auth/v1/signup",
+        serde_json::json!({"phone": &phone, "password": "correct horse"}),
+    )
+    .await;
+    assert_eq!(up.status, StatusCode::OK, "{}", up.body);
+    assert!(
+        up.body["access_token"].is_null(),
+        "a number that has not answered yet is not a session: {}",
+        up.body
+    );
+
+    // What went out is a request to start a verification, not a
+    // message. Sending a body here would be sending a second code
+    // beside the one the service composes.
+    let started = verifier.started();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].to, phone);
+    assert_eq!(started[0].channel, "sms");
+    assert_eq!(started[0].body, "", "the provider writes the message");
+    assert_eq!(started[0].code, "", "and it draws the digits");
+
+    // So there is nothing in the column to compare against later, and
+    // the send is still stamped, because the frequency ceiling is this
+    // project's rule rather than the provider's.
+    let held: String = scalar(
+        &pool,
+        "select confirmation_token from auth.users where phone = $1",
+        &[&phone],
+    )
+    .await;
+    assert_eq!(held, "", "there is no code here to write down");
+    let stamped: bool = scalar(
+        &pool,
+        "select confirmation_sent_at is not null from auth.users where phone = $1",
+        &[&phone],
+    )
+    .await;
+    assert!(stamped, "the send is still stamped");
+
+    // Digits the provider does not recognise are the same refusal a
+    // wrong code has always been.
+    assert_eq!(
+        post(
+            &app,
+            "/auth/v1/verify",
+            serde_json::json!({"type": "sms", "phone": &phone, "token": "111111"}),
+        )
+        .await
+        .refusal(),
+        (403, "otp_expired", "Token has expired or is invalid")
+    );
+    assert_eq!(
+        verifier.asked(),
+        [(phone.clone(), "111111".to_string())],
+        "and the provider is what was asked"
+    );
+
+    // The expiry is the provider's too, so a verification started
+    // longer ago than this server's own window is still the provider's
+    // to accept.
+    run(
+        &pool,
+        "update auth.users set confirmation_sent_at = now() - interval '2 minutes'
+          where phone = $1",
+        &[&phone],
+    )
+    .await;
+    let done = post(
+        &app,
+        "/auth/v1/verify",
+        serde_json::json!({"type": "sms", "phone": &phone, "token": Verifier::RIGHT}),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+    assert!(!done.token().is_empty());
+    assert_eq!(done.body["user"]["phone"], serde_json::json!(phone));
+
+    let confirmed: bool = scalar(
+        &pool,
+        "select phone_confirmed_at is not null from auth.users where phone = $1",
+        &[&phone],
+    )
+    .await;
+    assert!(confirmed, "the provider said the person answered");
+    let verified: bool = scalar(
+        &pool,
+        "select (i.identity_data->>'phone_verified')::bool
+           from auth.identities i join auth.users u on u.id = i.user_id
+          where u.phone = $1 and i.provider = 'phone'",
+        &[&phone],
+    )
+    .await;
+    assert!(verified, "and the identity says so");
+}
+
+#[tokio::test]
+async fn a_provider_that_keeps_its_own_codes_answers_the_reauthentication_nonce_too() {
+    let Some(dsn) = dsn() else { return };
+    let phone = number(30);
+    let (verifier, pool) = (Verifier::new(), pool(&dsn).await);
+    wipe(&pool, &phone).await;
+    // Autoconfirm gets the account to a confirmed number with no
+    // mailbox on it, which is the case where the nonce is a text and
+    // so the provider's to answer.
+    let app = router(Config {
+        reauthentication_required: true,
+        texter: Some(verifier.clone()),
+        sms: sms::Settings {
+            autoconfirm: true,
+            max_frequency: 0,
+            ..sms::Settings::default()
+        },
+        ..base(&dsn)
+    })
+    .expect("router builds");
+    let token = post(
+        &app,
+        "/auth/v1/signup",
+        serde_json::json!({"phone": &phone, "password": "correct horse"}),
+    )
+    .await
+    .token();
+    run(
+        &pool,
+        "update auth.sessions set created_at = now() - interval '2 days',
+                                  refreshed_at = now() - interval '2 days'
+           from auth.users u where u.id = auth.sessions.user_id and u.phone = $1",
+        &[&phone],
+    )
+    .await;
+
+    let asked = as_user(
+        &app,
+        "GET",
+        "/auth/v1/reauthenticate",
+        &token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(asked.status, StatusCode::OK, "{}", asked.body);
+    let started = verifier.started();
+    assert_eq!(started.len(), 1, "the signup autoconfirmed without a text");
+    assert_eq!(started[0].to, phone);
+    assert_eq!(started[0].body, "");
+
+    let held: String = scalar(
+        &pool,
+        "select coalesce(reauthentication_token, '') from auth.users where phone = $1",
+        &[&phone],
+    )
+    .await;
+    assert_eq!(held, "", "an account with no code held still has a nonce");
+
+    // An empty column would once have been the whole answer here. Now
+    // it is the provider's answer, and it says no to the wrong digits.
+    assert_eq!(
+        as_user(
+            &app,
+            "PUT",
+            "/auth/v1/user",
+            &token,
+            serde_json::json!({"password": "a different horse", "nonce": "000000"}),
+        )
+        .await
+        .refusal(),
+        (
+            422,
+            "reauthentication_not_valid",
+            "Nonce has expired or is invalid"
+        )
+    );
+    let changed = as_user(
+        &app,
+        "PUT",
+        "/auth/v1/user",
+        &token,
+        serde_json::json!({"password": "a different horse", "nonce": Verifier::RIGHT}),
+    )
+    .await;
+    assert_eq!(changed.status, StatusCode::OK, "{}", changed.body);
+    assert_eq!(
+        verifier.asked(),
+        [
+            (phone.clone(), "000000".to_string()),
+            (phone.clone(), Verifier::RIGHT.to_string()),
+        ]
+    );
+
+    // And the new password is the one that works, which is what the
+    // nonce was guarding.
+    let signed = post(
+        &app,
+        "/auth/v1/token?grant_type=password",
+        serde_json::json!({"phone": &phone, "password": "a different horse"}),
+    )
+    .await;
+    assert_eq!(signed.status, StatusCode::OK, "{}", signed.body);
 }

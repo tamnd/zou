@@ -16,10 +16,11 @@
 //! form fields and the exact error strings testable without a network
 //! and without a fake HTTP server.
 //!
-//! Four of GoTrue's five providers are here: Twilio, MessageBird,
-//! Vonage and TextLocal. Twilio Verify is not, and it is not the same
-//! shape as these: it draws and checks the code itself, which inverts
-//! the flow rather than adding a provider to it.
+//! All five of GoTrue's providers are here: Twilio, MessageBird,
+//! Vonage, TextLocal and Twilio Verify. The last one is not the same
+//! shape as the others. It draws and checks the code itself, so it
+//! answers [`Sender::verifies`] and the phone flows ask it about a code
+//! instead of comparing a column.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -166,12 +167,39 @@ pub trait Sender: Send + Sync {
     fn provider(&self) -> &'static str {
         ""
     }
+
+    /// Whether this sender keeps the code rather than carrying one.
+    /// True of Twilio Verify and nothing else, and it turns the phone
+    /// flows inside out: no code is drawn here, none is written down,
+    /// and verifying is [`Sender::check`] rather than a column
+    /// comparison.
+    fn verifies(&self) -> bool {
+        false
+    }
+
+    /// Ask the provider whether these are the digits it sent. Only
+    /// called on a sender that says it verifies, and the default is the
+    /// refusal a sender that does not would deserve if it ever were.
+    fn check(&self, _to: &str, _code: &str) -> Result<(), String> {
+        Err(format!("{} does not check codes", self.describe()))
+    }
 }
 
 /// Hand a message to the sender without blocking the request thread.
 pub async fn post(sender: &Arc<dyn Sender>, text: Text) -> Result<String, String> {
     let sender = Arc::clone(sender);
     match tokio::task::spawn_blocking(move || sender.deliver(&text)).await {
+        Ok(out) => out,
+        Err(e) => Err(format!("the sms task died: {e}")),
+    }
+}
+
+/// Ask the provider about a code, off the request thread for the same
+/// reason sending is off it.
+pub async fn checked(sender: &Arc<dyn Sender>, to: &str, code: &str) -> Result<(), String> {
+    let sender = Arc::clone(sender);
+    let (to, code) = (to.to_string(), code.to_string());
+    match tokio::task::spawn_blocking(move || sender.check(&to, &code)).await {
         Ok(out) => out,
         Err(e) => Err(format!("the sms task died: {e}")),
     }
@@ -472,6 +500,163 @@ impl Sender for Twilio {
     }
 }
 
+/// Twilio Verify, which is not a way of sending a code but a service
+/// that owns one.
+///
+/// Nothing here is handed a message. A verification is started by
+/// naming the number and the channel, Twilio draws the digits, composes
+/// whatever the service was configured to say and sends it, and the
+/// only way to find out whether a person typed the right thing is to
+/// ask. So there is no code for this server to write down and the
+/// column that would hold it stays empty, which is why the flows
+/// upstream and here branch on the provider rather than treating this
+/// as another way out.
+///
+/// The service sid stands where the account's messaging service would:
+/// it is the thing that was configured with the template, the code
+/// length and the expiry, all of which are Twilio's business here
+/// rather than this project's.
+pub struct TwilioVerify {
+    pub account_sid: String,
+    pub auth_token: String,
+    /// GOTRUE_SMS_TWILIO_VERIFY_MESSAGE_SERVICE_SID, which for this one
+    /// is a Verify service sid, `VA...`.
+    pub service_sid: String,
+    pub base: String,
+    pub wire: Arc<dyn Wire>,
+}
+
+impl TwilioVerify {
+    pub fn new(account_sid: &str, auth_token: &str, service_sid: &str) -> TwilioVerify {
+        TwilioVerify {
+            account_sid: account_sid.to_string(),
+            auth_token: auth_token.to_string(),
+            service_sid: service_sid.to_string(),
+            base: "https://verify.twilio.com".to_string(),
+            wire: Arc::new(Web::default()),
+        }
+    }
+
+    fn under(&self, leaf: &str) -> String {
+        format!(
+            "{}/v2/Services/{}/{leaf}",
+            self.base.trim_end_matches('/'),
+            self.service_sid
+        )
+    }
+
+    /// Start a verification. The body of the text is not sent, because
+    /// the service composes its own.
+    pub fn request(&self, text: &Text) -> Call {
+        Call {
+            url: self.under("Verifications"),
+            form: vec![
+                ("To".to_string(), format!("+{}", text.to)),
+                ("Channel".to_string(), text.channel.clone()),
+            ],
+            headers: vec![(
+                "authorization".to_string(),
+                basic(&self.account_sid, &self.auth_token),
+            )],
+        }
+    }
+
+    /// Ask whether these are the digits it sent.
+    pub fn checking(&self, to: &str, code: &str) -> Call {
+        Call {
+            url: self.under("VerificationCheck"),
+            form: vec![
+                ("To".to_string(), format!("+{to}")),
+                ("Code".to_string(), code.to_string()),
+            ],
+            headers: vec![(
+                "authorization".to_string(),
+                basic(&self.account_sid, &self.auth_token),
+            )],
+        }
+    }
+
+    /// The answer to starting one, which is the verification's own sid.
+    pub fn read(reply: &Reply) -> Result<String, String> {
+        let body = judged(reply, "twilio")?;
+        let sid = text_of(&body, "sid");
+        let status = text_of(&body, "status");
+        if status == "failed" || status == "undelivered" {
+            return Err(format!(
+                "twilio error: {} {} for message {sid}",
+                text_of(&body, "error_message"),
+                text_of(&body, "error_code")
+            ));
+        }
+        Ok(sid)
+    }
+
+    /// The answer to a check. Approved and valid, or the person typed
+    /// the wrong thing, and both of those are the same answer as far as
+    /// the caller is concerned.
+    pub fn judge(reply: &Reply) -> Result<(), String> {
+        let body = judged(reply, "twilio verification")?;
+        let approved = text_of(&body, "status") == "approved";
+        let valid = body
+            .get("valid")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !approved || !valid {
+            return Err(format!(
+                "twilio verification error: {} {} for verification {}",
+                text_of(&body, "error_message"),
+                text_of(&body, "error_code"),
+                text_of(&body, "sid")
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The part both Verify answers share: anything that is not a 2xx is
+/// Twilio saying no in its own words, which is the same shape the
+/// messaging api uses.
+fn judged(reply: &Reply, whose: &str) -> Result<serde_json::Value, String> {
+    let body: serde_json::Value = serde_json::from_str(&reply.body)
+        .map_err(|e| format!("{whose} sent something that is not json: {e}"))?;
+    if reply.status / 100 != 2 {
+        return Err(format!(
+            "{} More information: {}",
+            text_of(&body, "message"),
+            text_of(&body, "more_info")
+        ));
+    }
+    Ok(body)
+}
+
+impl Sender for TwilioVerify {
+    fn deliver(&self, text: &Text) -> Result<String, String> {
+        let call = self.request(text);
+        TwilioVerify::read(&self.wire.post(&call)?)
+    }
+
+    fn carries(&self, channel: &str) -> bool {
+        channel == SMS || channel == WHATSAPP
+    }
+
+    fn describe(&self) -> String {
+        format!("twilio verify, service {}", self.service_sid)
+    }
+
+    fn provider(&self) -> &'static str {
+        "twilio_verify"
+    }
+
+    fn verifies(&self) -> bool {
+        true
+    }
+
+    fn check(&self, to: &str, code: &str) -> Result<(), String> {
+        let call = self.checking(to, code);
+        TwilioVerify::judge(&self.wire.post(&call)?)
+    }
+}
+
 /// MessageBird, which is SMS and nothing else.
 pub struct MessageBird {
     pub access_key: String,
@@ -751,6 +936,17 @@ pub fn configured(var: &dyn Fn(&str) -> String) -> Result<Option<Arc<dyn Sender>
             twilio.content_sid = var("ZOU_SMS_TWILIO_CONTENT_SID");
             Ok(Some(Arc::new(twilio)))
         }
+        "twilio_verify" => {
+            let (sid, token, service) = (
+                var("ZOU_SMS_TWILIO_VERIFY_ACCOUNT_SID"),
+                var("ZOU_SMS_TWILIO_VERIFY_AUTH_TOKEN"),
+                var("ZOU_SMS_TWILIO_VERIFY_MESSAGE_SERVICE_SID"),
+            );
+            if sid.is_empty() || token.is_empty() || service.is_empty() {
+                return Err("twilio_verify needs ZOU_SMS_TWILIO_VERIFY_ACCOUNT_SID, ZOU_SMS_TWILIO_VERIFY_AUTH_TOKEN and ZOU_SMS_TWILIO_VERIFY_MESSAGE_SERVICE_SID".to_string());
+            }
+            Ok(Some(Arc::new(TwilioVerify::new(&sid, &token, &service))))
+        }
         "messagebird" => {
             let (key, originator) = (
                 var("ZOU_SMS_MESSAGEBIRD_ACCESS_KEY"),
@@ -792,7 +988,7 @@ pub fn configured(var: &dyn Fn(&str) -> String) -> Result<Option<Arc<dyn Sender>
             Ok(Some(Arc::new(TextLocal::new(&key, &sender))))
         }
         other => Err(format!(
-            "sms provider {other} is not one of twilio, messagebird, vonage, textlocal"
+            "sms provider {other} is not one of twilio, twilio_verify, messagebird, vonage, textlocal"
         )),
     }
 }
@@ -1170,6 +1366,31 @@ mod tests {
         .expect("and it is there");
         assert_eq!(textlocal.describe(), "textlocal, sender zou");
         assert!(env(&[("ZOU_SMS_PROVIDER", "textlocal")]).is_err());
+        let verify = env(&[
+            ("ZOU_SMS_PROVIDER", "twilio_verify"),
+            ("ZOU_SMS_TWILIO_VERIFY_ACCOUNT_SID", "AC1"),
+            ("ZOU_SMS_TWILIO_VERIFY_AUTH_TOKEN", "secret"),
+            ("ZOU_SMS_TWILIO_VERIFY_MESSAGE_SERVICE_SID", "VA2"),
+        ])
+        .expect("all three is a provider")
+        .expect("and it is there");
+        assert_eq!(verify.describe(), "twilio verify, service VA2");
+        assert!(
+            verify.verifies(),
+            "and it is the one that keeps the code itself"
+        );
+        assert!(env(&[("ZOU_SMS_PROVIDER", "twilio_verify")]).is_err());
+        // Its credentials are its own, so the plain twilio ones do not
+        // stand in for them.
+        assert!(
+            env(&[
+                ("ZOU_SMS_PROVIDER", "twilio_verify"),
+                ("ZOU_SMS_TWILIO_ACCOUNT_SID", "AC1"),
+                ("ZOU_SMS_TWILIO_AUTH_TOKEN", "secret"),
+                ("ZOU_SMS_TWILIO_MESSAGE_SERVICE_SID", "MG9"),
+            ])
+            .is_err()
+        );
         assert!(
             env(&[("ZOU_SMS_PROVIDER", "plivo")]).is_err(),
             "a provider that is not here says so rather than sending nothing"
@@ -1256,6 +1477,150 @@ mod tests {
         assert!(Vonage::new("k", "s", "zou").carries(SMS));
         assert!(!TextLocal::new("k", "zou").carries(WHATSAPP));
         assert!(TextLocal::new("k", "zou").carries(SMS));
+    }
+
+    #[test]
+    fn starting_a_verification_names_the_number_and_the_channel_and_nothing_else() {
+        let verify = TwilioVerify::new("AC1", "secret", "VA2");
+        let call = verify.request(&text(SMS));
+        assert_eq!(
+            call.url,
+            "https://verify.twilio.com/v2/Services/VA2/Verifications"
+        );
+        assert_eq!(call.field("To"), "+15551234567");
+        assert_eq!(call.field("Channel"), "sms");
+        assert_eq!(
+            call.field("Body"),
+            "",
+            "the service composes its own message, so sending one would be sending a second code"
+        );
+        assert_eq!(call.header("authorization"), "Basic QUMxOnNlY3JldA==");
+        // The channel goes through as it is, because Verify names them
+        // the same way the messaging api does.
+        assert_eq!(verify.request(&text(WHATSAPP)).field("Channel"), "whatsapp");
+        assert!(verify.carries(SMS) && verify.carries(WHATSAPP));
+    }
+
+    #[test]
+    fn checking_a_code_is_a_second_url_under_the_same_service() {
+        let verify = TwilioVerify::new("AC1", "secret", "VA2");
+        let call = verify.checking("15551234567", "123456");
+        assert_eq!(
+            call.url,
+            "https://verify.twilio.com/v2/Services/VA2/VerificationCheck"
+        );
+        assert_eq!(call.field("To"), "+15551234567");
+        assert_eq!(call.field("Code"), "123456");
+        assert_eq!(call.header("authorization"), "Basic QUMxOnNlY3JldA==");
+    }
+
+    #[test]
+    fn a_started_verification_reads_the_same_way_a_message_does() {
+        let sent = |status: u16, body: &str| {
+            TwilioVerify::read(&Reply {
+                status,
+                body: body.to_string(),
+            })
+        };
+        assert_eq!(
+            sent(201, r#"{"sid":"VE1","status":"pending"}"#),
+            Ok("VE1".to_string())
+        );
+        assert_eq!(
+            sent(
+                400,
+                r#"{"code":60200,"message":"Invalid parameter",
+                    "more_info":"https://www.twilio.com/docs/errors/60200"}"#
+            ),
+            Err(
+                "Invalid parameter More information: https://www.twilio.com/docs/errors/60200"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            sent(
+                201,
+                r#"{"sid":"VE2","status":"undelivered","error_code":30006,
+                    "error_message":"Landline or unreachable carrier"}"#
+            ),
+            Err("twilio error: Landline or unreachable carrier 30006 for message VE2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_code_is_only_right_when_twilio_says_both_approved_and_valid() {
+        let judged = |status: u16, body: &str| {
+            TwilioVerify::judge(&Reply {
+                status,
+                body: body.to_string(),
+            })
+        };
+        assert_eq!(
+            judged(200, r#"{"sid":"VE1","status":"approved","valid":true}"#),
+            Ok(())
+        );
+        // A person who typed the wrong digits gets a 200 with pending
+        // on it, so the http status is not the answer.
+        assert_eq!(
+            judged(200, r#"{"sid":"VE1","status":"pending","valid":false}"#),
+            Err("twilio verification error:   for verification VE1".to_string())
+        );
+        // Approved without valid is a verification that was already
+        // spent, and it is refused for the same reason a spent code is.
+        assert!(judged(200, r#"{"sid":"VE1","status":"approved"}"#).is_err());
+        assert_eq!(
+            judged(
+                404,
+                r#"{"code":20404,"message":"The requested resource was not found",
+                    "more_info":"https://www.twilio.com/docs/errors/20404"}"#
+            ),
+            Err(
+                "The requested resource was not found More information: https://www.twilio.com/docs/errors/20404"
+                    .to_string()
+            )
+        );
+        assert!(judged(200, "not json").is_err());
+    }
+
+    #[test]
+    fn only_twilio_verify_says_it_keeps_the_code() {
+        assert!(TwilioVerify::new("AC1", "secret", "VA2").verifies());
+        for other in [
+            Arc::new(Twilio::new("AC1", "secret", "MG9")) as Arc<dyn Sender>,
+            Arc::new(MessageBird::new("key", "zou")),
+            Arc::new(Vonage::new("k", "s", "zou")),
+            Arc::new(TextLocal::new("k", "zou")),
+            Arc::new(Sink::default()),
+        ] {
+            assert!(!other.verifies(), "{}", other.describe());
+            // And asking one to check is the caller's mistake rather
+            // than a code that quietly passes.
+            assert_eq!(
+                other.check("15551234567", "123456"),
+                Err(format!("{} does not check codes", other.describe()))
+            );
+        }
+    }
+
+    #[test]
+    fn checking_goes_through_the_wire_the_same_way_sending_does() {
+        let wire = Arc::new(Recorded {
+            reply: Mutex::new(Some(Reply {
+                status: 200,
+                body: r#"{"sid":"VE1","status":"approved","valid":true}"#.to_string(),
+            })),
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut verify = TwilioVerify::new("AC1", "secret", "VA2");
+        verify.wire = wire.clone();
+        assert_eq!(verify.check("15551234567", "123456"), Ok(()));
+        assert_eq!(
+            wire.seen.lock().expect("not poisoned").as_slice(),
+            ["https://verify.twilio.com/v2/Services/VA2/VerificationCheck"]
+        );
+        // A wire that cannot answer is Twilio being unreachable, which
+        // is not a code that was right.
+        assert!(verify.check("15551234567", "123456").is_err());
     }
 
     #[test]

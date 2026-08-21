@@ -212,6 +212,8 @@ Three more providers take the same shape:
 
 WhatsApp is Twilio's alone, through `ZOU_SMS_TWILIO_CONTENT_SID`, and asking any other provider for the `whatsapp` channel is refused by name.
 
+`twilio_verify` is the fifth and it works the other way round. Twilio draws the digits, composes the message from whatever the Verify service was configured with and checks the answer itself, so zou never sees a code and never writes one down. It takes `ZOU_SMS_TWILIO_VERIFY_ACCOUNT_SID`, `ZOU_SMS_TWILIO_VERIFY_AUTH_TOKEN` and `ZOU_SMS_TWILIO_VERIFY_MESSAGE_SERVICE_SID`, which for this one is a Verify service sid, `VA...`. The flows a client sends are unchanged, `signInWithOtp` and `verifyOtp` and the reauthentication nonce all the same, but `ZOU_SMS_TEMPLATE`, `ZOU_SMS_OTP_LENGTH` and `ZOU_SMS_OTP_EXP` stop applying, because all three are the service's settings rather than this server's. `ZOU_SMS_MAX_FREQUENCY` still applies: how often an account may ask for a code is this project's rule wherever the code comes from.
+
 What the message says and how long a code is good for are settings of their own, GoTrue's names again. `ZOU_SMS_TEMPLATE` takes one variable, `{{ .Code }}`, and defaults to `Your code is {{ .Code }}`. `ZOU_SMS_OTP_LENGTH` is six digits and will not go under six or over ten. `ZOU_SMS_OTP_EXP` is sixty seconds. `ZOU_SMS_MAX_FREQUENCY` is how long an account waits before it may ask for another code, also sixty seconds, and it reads either a number of seconds or a Go duration like `1m0s` so a hosted project's own value works unchanged. `ZOU_SMS_AUTOCONFIRM=true` takes a number at its word the way `ZOU_MAILER_AUTOCONFIRM` takes an address, which is what a project wants while it is still being written.
 
 A number is held in E.164 with the plus taken off, so somebody who typed `+1 555 010 0000` and somebody who typed `15550100000` are one account. Changing a number through `updateUser({ phone })` stages it and texts the new one, and the account keeps the old number until that code comes back with `type: 'phone_change'`.
@@ -343,7 +345,7 @@ const settings = await fetch(`${url}/auth/v1/settings`, {
 
 settings.external.google      // true once a client id and a secret are set
 settings.disable_signup       // false unless the project closed the door
-settings.sms_provider         // "twilio", "vonage", "textlocal", "messagebird", or ""
+settings.sms_provider         // "twilio", "twilio_verify", "vonage", "textlocal", "messagebird", or ""
 ```
 
 A provider nobody configured is `false` rather than missing, so a client can read the whole set without guarding every name.
