@@ -1094,6 +1094,29 @@ fn free_port() -> Result<u16, String> {
         .map_err(|e| format!("looking for a free port: {e}"))
 }
 
+/// Refuse a target no postmaster can be run over, before anything has
+/// been opened or restored.
+///
+/// A `.zou` file admits one process at a time and a postmaster is a
+/// process per connection, so this pairing has never worked. What it
+/// did until now was fail late and blame the wrong thing: the command
+/// opened the store, restored, started the postmaster, and the first
+/// backend to read a page was told another process had the store open,
+/// which was true and was this command holding it. See #44 for the two
+/// ways out of that, one of which is `zou check` and is here today.
+pub fn a_postmaster_cannot_run_over(target: &str, command: &str) -> Result<(), String> {
+    if !zou_store::one_process_at_a_time(target) {
+        return Ok(());
+    }
+    Err(format!(
+        "{target} is a single file store, which admits one process at a time, \
+         and {command} runs a postmaster with a process per connection. \
+         Copy it into a directory to serve it, which is zou push {target} <dir>, \
+         or read it where it is with zou check {target}. \
+         docs/storage-engine.md has the why."
+    ))
+}
+
 /// Take as many open files as this box will give, and say how many that
 /// came to.
 ///
@@ -1153,6 +1176,7 @@ pub fn run(args: &Args) -> Result<(), String> {
     // a request arriving at a cold node waits for before it is even
     // routed, see boot.rs.
     let mut boot = crate::boot::Boot::from_entry();
+    a_postmaster_cannot_run_over(&args.target, "zou serve")?;
     let postgres = args.pg_bin.join("postgres");
     if !postgres.is_file() {
         return Err(format!(
@@ -1424,6 +1448,21 @@ mod tests {
 
     fn argv(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_single_file_target_is_refused_by_name_rather_than_by_lock() {
+        let said = a_postmaster_cannot_run_over("/tmp/one.zou", "zou dev")
+            .expect_err("a postmaster over a single file store cannot work");
+        // The old failure said another process had the store open, of a
+        // store this command was the only holder of. What a reader needs
+        // instead is the format, the command, and a way forward.
+        assert!(said.contains("one process at a time"), "{said}");
+        assert!(said.contains("zou dev"), "{said}");
+        assert!(said.contains("zou push /tmp/one.zou"), "{said}");
+        a_postmaster_cannot_run_over("/tmp/store", "zou dev")
+            .expect("a directory is the usual way");
+        a_postmaster_cannot_run_over("s3://bucket/zou", "zou serve").expect("so is a bucket");
     }
 
     /// What this is really asserting is that a node does not serve

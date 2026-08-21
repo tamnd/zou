@@ -140,6 +140,28 @@ fn parse(target: &str) -> Result<Parsed<'_>, String> {
     })
 }
 
+/// Whether this target is one the operating system admits a single
+/// process to at a time.
+///
+/// True of a `.zou` file and nothing else. The format has no shared
+/// memory index and no cross process coordination, so [`ZouFileStore`]
+/// takes an exclusive lock on open and the second opener is refused,
+/// see [`crate::zoufile`].
+///
+/// It is a question worth asking before opening rather than after,
+/// because the commands that run a postmaster are the ones that break
+/// on it, and they break twice over: they hold the store open in the
+/// parent and then spawn children that open it again, so what they get
+/// out of the lock is a complaint about another process which is
+/// really themselves. Asking first turns that into a sentence about
+/// the format. See #44.
+///
+/// [`ZouFileStore`]: crate::zoufile::ZouFileStore
+#[must_use]
+pub fn one_process_at_a_time(target: &str) -> bool {
+    matches!(parse(target), Ok(Parsed::Local(path)) if path.ends_with(".zou"))
+}
+
 /// Open the backend a target string names: a filesystem directory, or an
 /// `s3://bucket/prefix` style URL configured from the environment.
 /// `ZOU_STORE_SIM` wraps the result in [`SimStore`] for a full provider
@@ -260,6 +282,22 @@ fn open_sqlite(path: &str) -> Result<Box<dyn CasStore>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_single_file_store_admits_one_process() {
+        assert!(one_process_at_a_time("/var/lib/zou/one.zou"));
+        assert!(one_process_at_a_time("one.zou"));
+        // A directory whose name happens to end that way is still a
+        // directory of objects, and the suffix is what open_store reads
+        // as the format, so these two have to agree.
+        assert!(one_process_at_a_time("/var/lib/my.zou"));
+        assert!(!one_process_at_a_time("/var/lib/zou"));
+        assert!(!one_process_at_a_time("/var/lib/store.db"));
+        assert!(!one_process_at_a_time("s3://bucket/zou"));
+        // Not a target at all. A refusal belongs to whoever opens it,
+        // and answering true here would refuse it for the wrong reason.
+        assert!(!one_process_at_a_time("ftp://host/one.zou"));
+    }
 
     #[test]
     fn plain_paths_stay_local_and_urls_split_into_bucket_and_prefix() {
