@@ -787,8 +787,17 @@ impl Zou {
             .as_secs();
         let manifest = zou_store::branch(&*store, &self.tenant, name, None, now)
             .map_err(|e| Error::new(Kind::Store, e.to_string()))?;
-        zou_pg::branching::refuse_unservable(&*store, &self.tenant, name, &manifest)
-            .map_err(|e| Error::new(Kind::Store, e))?;
+        zou_pg::branching::refuse_unservable(
+            &*store,
+            &self.tenant,
+            name,
+            &manifest,
+            // This crate serves through the object path whatever the
+            // ambient setting says, so that is the rule the child has
+            // to satisfy.
+            zou_pg::branching::ReadPath::Objects,
+        )
+        .map_err(|e| Error::new(Kind::Store, e))?;
         Zou::open_inheriting(
             Options {
                 target: self.target.clone(),
@@ -840,9 +849,14 @@ impl Zou {
         };
         let manifest =
             Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
-        zou_pg::reader::why_unservable(&*store, &layout, &manifest)
-            .map(|why| why.is_none())
-            .map_err(|e| Error::new(Kind::Store, e))
+        zou_pg::branching::why_unbranchable(
+            &*store,
+            &layout,
+            &manifest,
+            zou_pg::branching::ReadPath::Objects,
+        )
+        .map(|why| why.is_none())
+        .map_err(|e| Error::new(Kind::Store, e))
     }
 
     /// Push everything committed so far into the store, so a branch or
@@ -1122,12 +1136,14 @@ fn start(
         .env("ZOU_TARGET", target)
         .env("ZOU_TENANT", tenant)
         .env("ZOU_PAGE_CACHE", pagecache)
-        // Templates, fixtures and branches all read the page runs a
-        // fold packed down, and with the page service on the fold
-        // publishes an indexless checkpoint instead, so a branch of a
-        // project made this way would be refused. The embedded library
-        // is the branching product surface, so it stays on the object
-        // path until a branch can be taken off the page layers.
+        // A branch off the page layers needs an image layer at or
+        // below the cut, and the background fold cuts one after 128 MB
+        // of delta debt. A template is a fresh initdb and a couple of
+        // thousand rows, so it would never earn one, and every fixture
+        // cut off it would be refused. The embedded library is the
+        // branching product surface, so it stays on the object path
+        // until a branch can ask for that fold rather than wait for
+        // it, which is #579.
         .env("ZOU_PAGESERVE", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

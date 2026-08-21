@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use zou_pg::branching::ReadPath;
 use zou_store::layout::TenantLayout;
 use zou_store::{Manifest, open_store};
 
@@ -364,7 +365,10 @@ pub(crate) fn servable(target: &str, tenant: &str) -> Result<bool, Error> {
     };
     let manifest =
         Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
-    zou_pg::reader::why_unservable(&*store, &layout, &manifest)
+    // Fixtures are served by a postmaster this crate starts, and it
+    // starts them with the page service pinned off, so the object
+    // path's rule is the one that decides.
+    zou_pg::branching::why_unbranchable(&*store, &layout, &manifest, ReadPath::Objects)
         .map(|why| why.is_none())
         .map_err(|e| Error::new(Kind::Store, e))
 }
@@ -399,7 +403,7 @@ pub(crate) fn cut(target: &str, tenant: &str) -> Result<(), Error> {
     if proven {
         return Ok(());
     }
-    zou_pg::branching::refuse_unservable(&*store, TEMPLATE, tenant, &manifest)
+    zou_pg::branching::refuse_unservable(&*store, TEMPLATE, tenant, &manifest, ReadPath::Objects)
         .map_err(|e| Error::new(Kind::Store, e))?;
     PROVEN
         .lock()

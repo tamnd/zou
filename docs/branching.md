@@ -97,7 +97,8 @@ That window is `zou gc --retention`, see [operations.md](operations.md), and it 
 
 ## The one thing that can refuse a branch
 
-A child reads the pages it inherited out of the parent's captures, and a capture that has not been folded into page runs cannot serve them.
+A child has to have something to stand on, and what that is depends on which read path serves it.
+With the page service off, it reads the pages it inherited out of the parent's captures, and a capture that has not been folded into page runs cannot serve them.
 
 ```
 zou branch ./store create local pr-142
@@ -105,7 +106,20 @@ zou branch ./store create local pr-142
 # pages from, fold one in the source first. Nothing of pr-142 was left on the store
 ```
 
-A fold packs a full capture down after a few checkpoints of writes, so a project that has been running for a while has one and a store somebody made this morning may not.
+With the page service on, which is the default for a server, it reads them out of the layers instead, and what it needs there is an image layer at or below the branch point on every page shard.
+It never reads the parent's `pg/` prefix: those objects are the parent's live base images and a truncate deletes them, so a child that leaned on them would lose its floor the first time the parent dropped a table.
+
+```
+zou branch ./store create local pr-142
+# local cannot be branched yet, no image layer at or below 0x3f1a800 on page shard 0 to
+# serve inherited pages from, fold one in the source first. Nothing of pr-142 was left
+# on the store
+```
+
+Compaction cuts an image on its own once a shard has 128 MB of delta debt behind it.
+A store that has not written that much yet can cut one on demand instead, which is `zou compact <target> <ref> --horizon --pg-bin <path>`: it merges everything the shard holds into one image and moves the retention horizon up to it, and a branch taken afterwards has its floor.
+
+Either way a fold is what produces one, so a project that has been running for a while has one and a store somebody made this morning may not.
 The check runs before the call returns and takes the half made child back off the store, which is the difference between an error now and a database that fails on its first query an hour from now.
 `ZOU_FOLD_DOWN_FACTOR=0` in the server's environment brings the fold forward, the second checkpoint packs a full instead of the fifth, which is how the tests get a branchable database out of one that has only just started.
 
