@@ -383,8 +383,8 @@ pub fn page_checksum(page: &[u8], blkno: u32) -> u16 {
         tmp.wrapping_mul(FNV_PRIME) ^ (tmp >> 17)
     };
     let mut sums = BASE;
-    for (i, chunk) in page.chunks_exact(4).enumerate() {
-        let mut word = u32::from_le_bytes(chunk.try_into().expect("checked length"));
+    for (i, chunk) in page.as_chunks::<4>().0.iter().enumerate() {
+        let mut word = u32::from_le_bytes(*chunk);
         if i == 2 {
             // pd_checksum occupies bytes 8..10, computed as zero.
             word &= 0xFFFF0000;

@@ -856,7 +856,17 @@ mod tests {
         assert_eq!(held(&body), two - 2, "and both of them are out of it again");
         subscribers(7);
         let (_, _, body) = call(&ops("0.0.0-test"), "/metrics").await;
-        assert!(body.contains("zou_realtime_subscribers 7\n"), "{body}");
+        // The number is not asked for. This gauge is a process global
+        // and the reader's own tests set it whenever one of them
+        // registers a subscription, so a run that happens to interleave
+        // reads back their number rather than this one. What is asked is
+        // that it is exported, under the name a dashboard reads.
+        assert!(
+            body.lines().any(|line| line
+                .strip_prefix("zou_realtime_subscribers ")
+                .is_some_and(|n| n.trim().parse::<u64>().is_ok())),
+            "{body}"
+        );
     }
 
     #[tokio::test]

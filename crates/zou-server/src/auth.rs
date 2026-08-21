@@ -3791,6 +3791,11 @@ pub(crate) fn refusal(e: Error, doing: &str) -> Response {
 
 /// The json body of a request, or the response that says why it could
 /// not be read. Both failures are GoTrue's own.
+///
+/// The error is a whole response because that is what every caller does
+/// with it, which is hand it back. Boxing it to please the lint would
+/// put the same bytes on the heap and add a dereference at every `?`.
+#[allow(clippy::result_large_err, reason = "the error is the response")]
 pub(crate) async fn read_json(body: Body) -> Result<serde_json::Value, Response> {
     let bytes = to_bytes(body, MAX_BODY).await.map_err(|_| {
         error_body(
