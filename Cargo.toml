@@ -6,7 +6,7 @@ exclude = ["fuzz"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.97"
+rust-version = "1.98"
 license = "Apache-2.0"
 repository = "https://github.com/tamnd/zou"
 authors = ["Tam Nguyen <tamnd87@gmail.com>"]
@@ -28,7 +28,7 @@ base64ct = { version = "1", features = ["alloc"] }
 chacha20poly1305 = "0.11"
 crc32c = "0.6"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
-getrandom = "0.3"
+getrandom = "0.4"
 hmac = "0.13"
 # The decoders the storage suite needs and the avif encoder the render
 # routes need, without the two dozen formats nothing asks for. webp is
@@ -41,7 +41,7 @@ log = "0.4"
 p256 = "0.14"
 lz4_flex = "0.14"
 memmap2 = "0.9"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # The same knobs ureq builds it with, so the two share one build and
 # nothing pulls in a second crypto backend.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
@@ -57,7 +57,7 @@ tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 # out to a hosted database does not bring a second crypto backend.
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
 tower = "0.5"
-ureq = "3.3"
+ureq = "3.4"
 webp = "0.3"
 webpki-roots = "1"
 
