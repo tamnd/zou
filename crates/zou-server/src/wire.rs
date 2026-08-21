@@ -23,10 +23,20 @@
 //! key closes this door as well. Verification happens before the attach,
 //! so a stranger cannot make this node start a database.
 //!
-//! Until TLS lands here the key crosses the wire in the clear, so this
-//! port belongs on a private network or behind a terminator. An
-//! `SSLRequest` is answered with a refusal rather than ignored, which is
-//! what tells a client to decide rather than to guess.
+//! TLS is a certificate away. Given one, the `SSLRequest` every client
+//! sends first is accepted, the handshake happens on the same socket,
+//! and the startup packet is read out of the encrypted stream, which is
+//! the same order postgres itself does it in. Given none, that request
+//! is declined with the single byte the protocol has for it, which tells
+//! a client to decide rather than to guess, and then the key crosses in
+//! the clear and the port belongs on a private network or behind a
+//! terminator.
+//!
+//! A door with a certificate takes nothing but TLS. A startup packet
+//! that arrives without the request in front of it is refused with a
+//! sentence saying so, because an operator who configured a certificate
+//! did not mean "encrypted when the client feels like it", and the
+//! project key is the whole credential.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -37,6 +47,7 @@ use md5::{Digest, Md5};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio_rustls::TlsAcceptor;
 use zou_store::registry::{Tenant, check_ref};
 
 use crate::attach::Attached;
@@ -100,6 +111,10 @@ pub struct Wire {
     registry: Arc<Registry>,
     attached: Arc<Attached>,
     mode: Mode,
+    /// The certificate this door answers an `SSLRequest` with, if it
+    /// was given one. None is the plaintext door, which declines the
+    /// request instead.
+    tls: Option<TlsAcceptor>,
     /// Where each live session's backend is, keyed by the cancel key
     /// that session was handed. A cancel arrives on a connection of its
     /// own that carries nothing but this pair, so without the map there
@@ -118,6 +133,7 @@ impl Wire {
             registry,
             attached,
             mode: Mode::Session,
+            tls: None,
             cancels: Mutex::new(HashMap::new()),
             banks: Mutex::new(HashMap::new()),
         }
@@ -126,6 +142,13 @@ impl Wire {
     /// The same door in transaction mode, which is 6543.
     pub fn pooling(mut self) -> Wire {
         self.mode = Mode::Transaction;
+        self
+    }
+
+    /// The same door with a certificate on it, which makes TLS the only
+    /// way in rather than one of two.
+    pub fn secured(mut self, tls: TlsAcceptor) -> Wire {
+        self.tls = Some(tls);
         self
     }
 
@@ -148,9 +171,33 @@ impl Wire {
         }
     }
 
-    /// One connection, from the startup packet to the last byte.
-    pub async fn session(self: Arc<Self>, mut sock: TcpStream) -> Result<(), String> {
+    /// One connection, from the first packet to the last byte.
+    ///
+    /// A door with a certificate does its handshake here, before
+    /// anything reads a startup packet, because everything after this
+    /// point is the same protocol whether or not there is TLS under it
+    /// and the only difference is which stream it is written to.
+    pub async fn session(self: Arc<Self>, sock: TcpStream) -> Result<(), String> {
         let _live = Live::new();
+        let Some(tls) = self.tls.clone() else {
+            return self.run(sock).await;
+        };
+        let secured = tokio::time::timeout(LOGIN_TIMEOUT, secure(sock, &tls)).await;
+        match secured {
+            Ok(Ok(stream)) => self.run(stream).await,
+            Ok(Err(stop)) => {
+                crate::ops::pg_login(stop.outcome());
+                Err(stop.to_string())
+            }
+            Err(_) => {
+                crate::ops::pg_login("error");
+                Err("the tls handshake did not finish in time".to_string())
+            }
+        }
+    }
+
+    /// The session itself, on whatever it turned out to be running on.
+    async fn run<S: Wired>(self: Arc<Self>, mut sock: S) -> Result<(), String> {
         let login = tokio::time::timeout(LOGIN_TIMEOUT, self.login(&mut sock)).await;
         let ready = match login {
             Ok(Ok(Some(ready))) => ready,
@@ -159,18 +206,19 @@ impl Wire {
             Ok(Ok(None)) => return Ok(()),
             Ok(Err(stop)) => {
                 crate::ops::pg_login(stop.outcome());
-                if let Stop::Say { code, message } = &stop {
-                    let _ = sock.write_all(&error(code, message)).await;
-                }
-                let _ = sock.shutdown().await;
+                refuse(&mut sock, &stop).await;
                 return Err(stop.to_string());
             }
             Err(_) => {
                 crate::ops::pg_login("error");
-                let _ = sock
-                    .write_all(&error("57P05", "no startup packet arrived in time"))
-                    .await;
-                let _ = sock.shutdown().await;
+                refuse(
+                    &mut sock,
+                    &Stop::Say {
+                        code: "57P05",
+                        message: "no startup packet arrived in time".to_string(),
+                    },
+                )
+                .await;
                 return Err("login timed out".to_string());
             }
         };
@@ -184,7 +232,7 @@ impl Wire {
     /// Startup to authenticated, answering with whatever the session
     /// runs on. None is a cancel request, which is finished by the time
     /// this returns.
-    async fn login(&self, sock: &mut TcpStream) -> Result<Option<Ready>, Stop> {
+    async fn login<S: Wired>(&self, sock: &mut S) -> Result<Option<Ready>, Stop> {
         let params = match hello(sock).await? {
             Hello::Cancel { pid, key } => {
                 self.cancel(pid, key).await;
@@ -262,7 +310,7 @@ impl Wire {
     /// Everything after login: relay until the session is ready,
     /// remembering the cancel key on the way past, then get out of the
     /// middle and copy bytes.
-    async fn pump(&self, mut sock: TcpStream, mut upstream: TcpStream) -> Result<(), String> {
+    async fn pump<S: Wired>(&self, mut sock: S, mut upstream: TcpStream) -> Result<(), String> {
         let addr = upstream
             .peer_addr()
             .map(|a| a.to_string())
@@ -327,7 +375,7 @@ impl Wire {
     /// under the pooler there is no backend yet to have sent them, so
     /// the parameters are the ones the project's database announced to
     /// the first backend opened for it and the key is one of ours.
-    async fn pooled(&self, sock: TcpStream, bank: Arc<Bank>) -> Result<(), String> {
+    async fn pooled<S: Wired>(&self, sock: S, bank: Arc<Bank>) -> Result<(), String> {
         let greeting = bank.greeting().await.map_err(|e| e.to_string())?;
         let mut client = Framed::new(sock);
         let key = (random_i32(), random_i32());
@@ -357,9 +405,9 @@ impl Wire {
     /// The pooled session's whole life: borrow at the first message of
     /// a transaction, hand back at the ReadyForQuery that says the
     /// transaction is over.
-    async fn transactions(
+    async fn transactions<S: Wired>(
         &self,
-        client: &mut Framed<TcpStream>,
+        client: &mut Framed<S>,
         bank: &Arc<Bank>,
         held: &Held,
     ) -> Result<(), Stop> {
@@ -857,50 +905,130 @@ impl std::fmt::Display for Stop {
 
 /// Read startup packets until one of them is a startup packet.
 ///
-/// Encryption requests are the reason this is a loop. Both are declined
-/// with a single byte and the client sends its real startup packet
-/// after, and a client that asks twice is a client that is not going to
-/// stop, so two is the limit.
-async fn hello(sock: &mut TcpStream) -> Result<Hello, Stop> {
+/// Encryption requests are the reason this is a loop. On a door with no
+/// certificate both are declined with a single byte and the client sends
+/// its real startup packet after, and a client that asks twice is a
+/// client that is not going to stop, so two is the limit. On a door with
+/// one the request was already answered and the handshake already
+/// happened, so what arrives here is the startup packet.
+async fn hello<S: Wired>(sock: &mut S) -> Result<Hello, Stop> {
     for _ in 0..3 {
-        let mut head = [0u8; 4];
-        sock.read_exact(&mut head)
-            .await
-            .map_err(|e| Stop::Quiet(format!("no startup packet: {e}")))?;
-        let len = i32::from_be_bytes(head) as usize;
-        if !(8..=MAX_STARTUP).contains(&len) {
-            return Err(Stop::Say {
-                code: "08P01",
-                message: format!("invalid startup packet length {len}"),
-            });
-        }
-        let mut body = vec![0u8; len - 4];
-        sock.read_exact(&mut body)
-            .await
-            .map_err(|e| Stop::Quiet(format!("short startup packet: {e}")))?;
-        let code = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-        match code {
-            SSL_REQUEST | GSSENC_REQUEST => {
+        match packet(sock).await? {
+            Packet::Encryption(_) => {
                 sock.write_all(b"N")
                     .await
                     .map_err(|e| Stop::Quiet(format!("declining encryption: {e}")))?;
             }
-            CANCEL_REQUEST if body.len() == 12 => {
-                return Ok(Hello::Cancel {
-                    pid: i32::from_be_bytes([body[4], body[5], body[6], body[7]]),
-                    key: i32::from_be_bytes([body[8], body[9], body[10], body[11]]),
-                });
+            Packet::Cancel { pid, key } => return Ok(Hello::Cancel { pid, key }),
+            Packet::Startup(params) => return Ok(Hello::Startup(params)),
+        }
+    }
+    Err(Stop::Quiet(
+        "asked for encryption too many times".to_string(),
+    ))
+}
+
+/// One packet of the shape a connection opens with: a length, a code,
+/// and whatever that code says follows. Reading it is the same work
+/// whether the answer is going to be a handshake or a session, so it is
+/// one function and the two callers decide what to do with it.
+enum Packet {
+    /// An SSLRequest or a GSSENCRequest, which carry the code and
+    /// nothing else and are answered with a single byte rather than a
+    /// message.
+    Encryption(i32),
+    Cancel {
+        pid: i32,
+        key: i32,
+    },
+    Startup(Vec<(String, String)>),
+}
+
+async fn packet<S: Wired>(sock: &mut S) -> Result<Packet, Stop> {
+    let mut head = [0u8; 4];
+    sock.read_exact(&mut head)
+        .await
+        .map_err(|e| Stop::Quiet(format!("no startup packet: {e}")))?;
+    let len = i32::from_be_bytes(head) as usize;
+    if !(8..=MAX_STARTUP).contains(&len) {
+        return Err(Stop::Say {
+            code: "08P01",
+            message: format!("invalid startup packet length {len}"),
+        });
+    }
+    let mut body = vec![0u8; len - 4];
+    sock.read_exact(&mut body)
+        .await
+        .map_err(|e| Stop::Quiet(format!("short startup packet: {e}")))?;
+    let code = i32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    match code {
+        SSL_REQUEST | GSSENC_REQUEST => Ok(Packet::Encryption(code)),
+        CANCEL_REQUEST if body.len() == 12 => Ok(Packet::Cancel {
+            pid: i32::from_be_bytes([body[4], body[5], body[6], body[7]]),
+            key: i32::from_be_bytes([body[8], body[9], body[10], body[11]]),
+        }),
+        PROTOCOL_3 => Ok(Packet::Startup(params(&body[4..])?)),
+        other => Err(Stop::Say {
+            code: "0A000",
+            message: format!(
+                "unsupported frontend protocol {}.{}: server supports 3.0",
+                other >> 16,
+                other & 0xffff
+            ),
+        }),
+    }
+}
+
+/// The handshake, on a door that has a certificate.
+///
+/// The exchange is postgres's own and it is older than TLS's own
+/// negotiation: the client asks in the clear, the server answers with
+/// one byte, and only then does the socket become a TLS one. So this
+/// reads packets on the plain socket until the client asks, which for
+/// every libpq built this century is either the first packet or the
+/// second, since a client with GSSAPI compiled in tries that first and
+/// takes an N for an answer.
+///
+/// A startup packet here is a client that meant to talk in the clear,
+/// and it is refused rather than served. An operator who put a
+/// certificate on this port did not mean "encrypted when the client
+/// asks", and the credential the next packet would carry is the
+/// project's api key.
+async fn secure(
+    mut sock: TcpStream,
+    tls: &TlsAcceptor,
+) -> Result<tokio_rustls::server::TlsStream<TcpStream>, Stop> {
+    for _ in 0..3 {
+        let asked = match packet(&mut sock).await {
+            Ok(asked) => asked,
+            Err(stop) => {
+                refuse(&mut sock, &stop).await;
+                return Err(stop);
             }
-            PROTOCOL_3 => return Ok(Hello::Startup(params(&body[4..])?)),
-            other => {
-                return Err(Stop::Say {
-                    code: "0A000",
-                    message: format!(
-                        "unsupported frontend protocol {}.{}: server supports 3.0",
-                        other >> 16,
-                        other & 0xffff
-                    ),
-                });
+        };
+        match asked {
+            Packet::Encryption(SSL_REQUEST) => {
+                sock.write_all(b"S")
+                    .await
+                    .map_err(|e| Stop::Quiet(format!("accepting encryption: {e}")))?;
+                return tls
+                    .accept(sock)
+                    .await
+                    .map_err(|e| Stop::Quiet(format!("tls handshake: {e}")));
+            }
+            Packet::Encryption(_) => {
+                sock.write_all(b"N")
+                    .await
+                    .map_err(|e| Stop::Quiet(format!("declining encryption: {e}")))?;
+            }
+            Packet::Cancel { .. } | Packet::Startup(_) => {
+                let stop = Stop::Say {
+                    code: "28000",
+                    message: "this port requires TLS: connect with sslmode=require or better"
+                        .to_string(),
+                };
+                refuse(&mut sock, &stop).await;
+                return Err(stop);
             }
         }
     }
@@ -908,6 +1036,50 @@ async fn hello(sock: &mut TcpStream) -> Result<Hello, Stop> {
         "asked for encryption too many times".to_string(),
     ))
 }
+
+/// Say why on the way out, in the client's own protocol, and hang up.
+/// A quiet stop has nothing to say, which is what it is for.
+async fn refuse<S: Wired>(sock: &mut S, stop: &Stop) {
+    if let Stop::Say { code, message } = stop {
+        let _ = sock.write_all(&error(code, message)).await;
+    }
+    let _ = sock.shutdown().await;
+}
+
+/// Read a certificate chain and its key, both PEM, and build the
+/// acceptor a door is handed.
+///
+/// The chain is the leaf first and whatever intermediates a client
+/// might not have, the same file `ssl_cert_file` takes, so a pair
+/// already cut for a postgres is the pair this reads. A key that is
+/// not the certificate's is caught here rather than at the first
+/// connection, since rustls checks the pair when the config is built.
+pub fn acceptor(cert: &std::path::Path, key: &std::path::Path) -> Result<TlsAcceptor, String> {
+    use rustls::pki_types::pem::PemObject;
+
+    let chain: Vec<_> = rustls::pki_types::CertificateDer::pem_file_iter(cert)
+        .map_err(|e| format!("reading {}: {e}", cert.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("reading {}: {e}", cert.display()))?;
+    if chain.is_empty() {
+        return Err(format!("{} holds no certificate", cert.display()));
+    }
+    let private = rustls::pki_types::PrivateKeyDer::from_pem_file(key)
+        .map_err(|e| format!("reading {}: {e}", key.display()))?;
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(chain, private)
+        .map_err(|e| format!("the certificate and the key do not go together: {e}"))?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// What a client session runs on: the socket, or the socket with TLS
+/// over it. Everything from the startup packet onwards is the same
+/// protocol either way, so it is written once and the door decides
+/// which of the two it is written to.
+trait Wired: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Wired for T {}
 
 /// The key value pairs of a startup packet: nul terminated strings in
 /// pairs, ended by an empty key.
@@ -1004,7 +1176,7 @@ fn route(params: &[(String, String)]) -> Result<Route, Stop> {
 /// Cleartext, because the password is a JWT and the point is to read
 /// it: md5 and SCRAM both prove a shared secret without revealing it,
 /// which is the opposite of what a bearer token is for.
-async fn authenticate(sock: &mut TcpStream, entry: &Tenant, route: &Route) -> Result<(), Stop> {
+async fn authenticate<S: Wired>(sock: &mut S, entry: &Tenant, route: &Route) -> Result<(), Stop> {
     let mut ask = Vec::with_capacity(9);
     ask.push(b'R');
     ask.extend_from_slice(&8i32.to_be_bytes());
@@ -1465,6 +1637,13 @@ mod tests {
     }
 
     async fn project(mode: Mode) -> (tempfile::TempDir, Arc<Fake>, Arc<Point>, String) {
+        door(mode, None).await
+    }
+
+    async fn door(
+        mode: Mode,
+        tls: Option<TlsAcceptor>,
+    ) -> (tempfile::TempDir, Arc<Fake>, Arc<Point>, String) {
         let dir = tempfile::tempdir().expect("a directory");
         let store: Arc<dyn CasStore> = Arc::new(LocalFsStore::new(dir.path()));
         registry::create(&*store, &Tenant::new("acme-prod", SECRET, 1)).expect("a project");
@@ -1481,9 +1660,13 @@ mod tests {
             Arc::new(Registry::new(store)),
             Arc::new(Attached::new(backend.clone())),
         );
-        let wire = Arc::new(match mode {
+        let door = match mode {
             Mode::Session => door,
             Mode::Transaction => door.pooling(),
+        };
+        let wire = Arc::new(match tls {
+            Some(tls) => door.secured(tls),
+            None => door,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
         let addr = listener.local_addr().expect("an address").to_string();
@@ -1497,17 +1680,24 @@ mod tests {
 
     /// A client: the startup packet, the password, and whatever comes
     /// back.
-    struct Client {
-        sock: TcpStream,
+    ///
+    /// It is written over whatever the socket turned out to be for the
+    /// same reason the door is: a session on a TLS stream is the same
+    /// exchange as a session on a plain one, and a test that says so
+    /// should be the same test.
+    struct Client<S = TcpStream> {
+        sock: S,
     }
 
-    impl Client {
-        async fn open(addr: &str) -> Client {
+    impl Client<TcpStream> {
+        async fn open(addr: &str) -> Client<TcpStream> {
             Client {
                 sock: TcpStream::connect(addr).await.expect("the wire port"),
             }
         }
+    }
 
+    impl<S: Wired> Client<S> {
         async fn startup(&mut self, params: &[(&str, &str)]) {
             let mut body = Vec::new();
             body.extend_from_slice(&PROTOCOL_3.to_be_bytes());
@@ -1593,6 +1783,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A certificate for a door, written to a pair of files because
+    /// files are what an operator hands over, and handed back as well
+    /// so a client can be made that trusts this one and no other.
+    fn certificate(
+        dir: &std::path::Path,
+    ) -> (TlsAcceptor, rustls::pki_types::CertificateDer<'static>) {
+        let made =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a key pair");
+        let cert = dir.join("wire.crt");
+        let key = dir.join("wire.key");
+        std::fs::write(&cert, made.cert.pem()).expect("the certificate on disk");
+        std::fs::write(&key, made.signing_key.serialize_pem()).expect("the key on disk");
+        (
+            acceptor(&cert, &key).expect("a pair that goes together"),
+            made.cert.der().clone(),
+        )
+    }
+
+    /// A client that asks for encryption, is given it, and speaks the
+    /// rest of the protocol inside it, which is what libpq does for
+    /// `sslmode=require` and above.
+    async fn encrypted(
+        addr: &str,
+        cert: rustls::pki_types::CertificateDer<'static>,
+    ) -> Client<tokio_rustls::client::TlsStream<TcpStream>> {
+        let sock = TcpStream::connect(addr).await.expect("the wire port");
+        handshake(sock, cert).await
+    }
+
+    /// The request, the one byte back, and the handshake, on a socket
+    /// that may already have had a word or two on it.
+    async fn handshake(
+        mut sock: TcpStream,
+        cert: rustls::pki_types::CertificateDer<'static>,
+    ) -> Client<tokio_rustls::client::TlsStream<TcpStream>> {
+        let mut ask = Vec::new();
+        ask.extend_from_slice(&8i32.to_be_bytes());
+        ask.extend_from_slice(&SSL_REQUEST.to_be_bytes());
+        sock.write_all(&ask).await.expect("an ssl request");
+        let mut answer = [0u8; 1];
+        sock.read_exact(&mut answer).await.expect("an answer");
+        assert_eq!(&answer, b"S", "the door has a certificate on it");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).expect("the door's own certificate");
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+        let sock = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(name, sock)
+            .await
+            .expect("the handshake");
+        Client { sock }
     }
 
     /// Ask a fake to cancel whatever the pair names, on a connection of
@@ -1738,6 +1983,86 @@ mod tests {
             .login(&[("user", "anon.acme-prod")], &key("anon"))
             .await;
         assert_eq!(tag, b'R');
+    }
+
+    /// The whole point of the certificate: the same session, the same
+    /// answers, with the bytes encrypted between the client and the
+    /// door.
+    #[tokio::test]
+    async fn a_door_with_a_certificate_runs_the_session_inside_the_handshake() {
+        let held = tempfile::tempdir().expect("a directory");
+        let (tls, cert) = certificate(held.path());
+        let (_d, fake, _backend, addr) = door(Mode::Session, Some(tls)).await;
+        let mut client = encrypted(&addr, cert).await;
+        assert_eq!(
+            client.up("anon").await,
+            (4242, 99),
+            "the greeting is the backend's own, handshake or no handshake"
+        );
+        let answer = client.query("select 1").await;
+        assert_eq!(
+            answer.first().map(|(tag, body)| (*tag, body.as_slice())),
+            Some((b'C', &b"select 1\0"[..])),
+            "the query crossed encrypted and reached the database in the clear"
+        );
+        assert_eq!(
+            fake.startup()
+                .iter()
+                .find(|(k, _)| k == "user")
+                .map(|(_, v)| v.as_str()),
+            Some("zou"),
+            "the connection out is the dsn's own, as it is on the plain door"
+        );
+    }
+
+    /// A client that meant to talk in the clear to a door that has a
+    /// certificate is told so, rather than served or hung up on. The
+    /// packet it would have sent next carries the project's key.
+    #[tokio::test]
+    async fn a_startup_packet_in_the_clear_is_refused_by_a_door_with_a_certificate() {
+        let held = tempfile::tempdir().expect("a directory");
+        let (tls, _cert) = certificate(held.path());
+        let (_d, fake, _backend, addr) = door(Mode::Session, Some(tls)).await;
+        let mut client = Client::open(&addr).await;
+        let (tag, body) = client
+            .login(&[("user", "anon.acme-prod")], &key("anon"))
+            .await;
+        assert_eq!(tag, b'E');
+        let (code, message) = says(&body);
+        assert_eq!(code, "28000");
+        assert!(message.contains("sslmode=require"), "{message}");
+        assert_eq!(
+            fake.opened(),
+            0,
+            "nothing was dialled for a connection that was never let in"
+        );
+    }
+
+    /// A libpq with GSSAPI compiled in asks for that first and takes an
+    /// N for an answer, so the byte before the one that matters must
+    /// not cost the client its connection.
+    #[tokio::test]
+    async fn a_gssenc_request_is_declined_and_the_ssl_request_after_it_is_taken() {
+        let held = tempfile::tempdir().expect("a directory");
+        let (tls, cert) = certificate(held.path());
+        let (_d, _fake, _backend, addr) = door(Mode::Session, Some(tls)).await;
+        let mut sock = TcpStream::connect(&addr).await.expect("the wire port");
+        let mut ask = Vec::new();
+        ask.extend_from_slice(&8i32.to_be_bytes());
+        ask.extend_from_slice(&GSSENC_REQUEST.to_be_bytes());
+        sock.write_all(&ask).await.expect("a request");
+        let mut answer = [0u8; 1];
+        sock.read_exact(&mut answer).await.expect("an answer");
+        assert_eq!(&answer, b"N", "this door does not speak gssapi");
+        let mut client = handshake(sock, cert).await;
+        assert_eq!(
+            client
+                .login(&[("user", "anon.acme-prod")], &key("anon"))
+                .await
+                .0,
+            b'R',
+            "and the request that follows is the one it takes"
+        );
     }
 
     #[tokio::test]

@@ -518,8 +518,15 @@ A key for it is minted from the project's secret the same way the other three ar
 
 A database initialised by a build before this one took its superuser from the account that ran the node, and this build asks for `postgres`, so such a store answers `role "postgres" does not exist` and wants recreating.
 
-There is no TLS on this port yet, and an `SSLRequest` is declined rather than ignored, which is what makes a client decide instead of guess.
-Until there is, put the port on a private network or behind a terminator, because the key crosses in the clear.
+TLS is a certificate and its key, given at startup, and one pair covers both postgres ports because it is the same credential crossing the same network.
+
+    zou serve --pg 5432 --pool 6543 --pg-tls-cert /etc/zou/tls.crt --pg-tls-key /etc/zou/tls.key
+
+The file the certificate goes in is the leaf first and then whatever intermediates a client might not already have, which is the same file `ssl_cert_file` takes, and the key is PEM beside it.
+A key that does not belong to the certificate is a sentence at startup rather than a surprise at the first connection.
+With a certificate the ports take `sslmode=require` and above and nothing else: a client that sends a startup packet in the clear is told `this port requires TLS` and hung up on, since the packet after it would carry the project key.
+There are no client certificates, because the key is the credential and a second one would only be a second thing to rotate.
+Without a certificate an `SSLRequest` is declined rather than ignored, which is what makes a client decide instead of guess, and the port belongs on a private network or behind a terminator because the key crosses in the clear.
 A database that asks this node for SCRAM is refused with a sentence saying so, since trust, cleartext and md5 are what a postmaster this node started asks for.
 Replication connections are refused too, and a startup packet over 10000 bytes or a login that takes longer than 30 seconds is dropped.
 

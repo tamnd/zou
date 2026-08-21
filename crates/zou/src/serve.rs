@@ -41,7 +41,7 @@ use zou_store::layout::TenantLayout;
 use zou_store::registry::Tenant;
 use zou_store::{CasStore, Manifest, open_store};
 
-pub const USAGE: &str = "usage: zou serve <target> [--ref <ref>] [--http <n[,n...]>] [--pg <n>] [--pool <n>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>]";
+pub const USAGE: &str = "usage: zou serve <target> [--ref <ref>] [--http <n[,n...]>] [--pg <n>] [--pool <n>] [--pg-tls-cert <file> --pg-tls-key <file>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>]";
 
 pub const LAMBDA_USAGE: &str = "usage: zou lambda <target> [--ref <ref>] [--pg-bin <dir>] [--runtime <dir>] [--shared-buffers <size>] [--passthrough <size>]";
 
@@ -140,6 +140,13 @@ pub struct Args {
     pub pg: u16,
     pub pool: u16,
     pub ops: u16,
+    /// The certificate the two postgres ports answer an SSLRequest
+    /// with, PEM, leaf first. Both of these or neither: a key with no
+    /// certificate is nothing to serve and a certificate with no key
+    /// cannot be used, so the pair is checked at the command line
+    /// rather than at the first connection.
+    pub pg_tls_cert: Option<PathBuf>,
+    pub pg_tls_key: Option<PathBuf>,
     pub domains: Vec<String>,
     pub path_prefix: bool,
     pub max_attached: usize,
@@ -191,6 +198,8 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
     let mut http_more = Vec::new();
     let mut pg = 5432u16;
     let mut pool = 6543u16;
+    let mut pg_tls_cert = None;
+    let mut pg_tls_key = None;
     let mut ops = 0u16;
     let mut domains = Vec::new();
     let mut path_prefix = true;
@@ -209,6 +218,8 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
                 "--http"
                     | "--pg"
                     | "--pool"
+                    | "--pg-tls-cert"
+                    | "--pg-tls-key"
                     | "--ops"
                     | "--domain"
                     | "--no-path-prefix"
@@ -228,6 +239,10 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
             "--http" => (http, http_more) = ports(&mut it, "--http")?,
             "--pg" => pg = port(&mut it, "--pg")?,
             "--pool" => pool = port(&mut it, "--pool")?,
+            "--pg-tls-cert" => {
+                pg_tls_cert = Some(PathBuf::from(need(&mut it, "--pg-tls-cert")?));
+            }
+            "--pg-tls-key" => pg_tls_key = Some(PathBuf::from(need(&mut it, "--pg-tls-key")?)),
             "--ops" => ops = port(&mut it, "--ops")?,
             "--domain" => domains.push(need(&mut it, "--domain")?.clone()),
             "--no-path-prefix" => path_prefix = false,
@@ -302,6 +317,23 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
                 "--ref serves one project, so --domain has nothing left to name".to_string(),
             );
         }
+        // Half a pair is a node that would come up and serve in the
+        // clear, which is the opposite of what whoever typed one of
+        // these two was after.
+        match (&pg_tls_cert, &pg_tls_key) {
+            (Some(_), None) => {
+                return Err("--pg-tls-cert needs --pg-tls-key beside it".to_string());
+            }
+            (None, Some(_)) => {
+                return Err("--pg-tls-key needs the --pg-tls-cert it belongs to".to_string());
+            }
+            _ => {}
+        }
+        // And a certificate on a node with no postgres port is a
+        // certificate for nothing, worth saying rather than ignoring.
+        if pg_tls_cert.is_some() && pg == 0 && pool == 0 {
+            return Err("--pg-tls-cert is for the postgres ports, and both are off".to_string());
+        }
     }
     // A retention window set on a node that never collects is a policy
     // nobody is applying, and finding that out from a full bucket is
@@ -338,6 +370,8 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
         http_more,
         pg,
         pool,
+        pg_tls_cert,
+        pg_tls_key,
         ops,
         domains,
         path_prefix,
@@ -1284,6 +1318,14 @@ pub fn run(args: &Args) -> Result<(), String> {
     let pg = bind(args.pg, "the postgres port")?;
     let pool = bind(args.pool, "the pooler")?;
     let ops = bind(args.ops, "ops")?;
+    // Before the doors open rather than at the first handshake, so a
+    // certificate that cannot be read or does not match its key is a
+    // sentence at startup instead of every client being turned away by
+    // a node that came up looking healthy.
+    let pg_tls = match (&args.pg_tls_cert, &args.pg_tls_key) {
+        (Some(cert), Some(key)) => Some(zou_server::wire::acceptor(cert, key)?),
+        _ => None,
+    };
     // Listening is the moment a request stops being refused, so it is
     // the moment the node counts as up whatever else it does after.
     boot.lap("doors");
@@ -1314,6 +1356,10 @@ pub fn run(args: &Args) -> Result<(), String> {
             args.pg,
             args.pool
         );
+        match args.pg_tls_cert.is_some() {
+            true => log::info!("both take TLS and nothing else, sslmode=require or better"),
+            false => log::info!("neither takes TLS, keep them off a network you do not own"),
+        }
     }
     if args.ops > 0 {
         log::info!("metrics on http://0.0.0.0:{}/metrics", args.ops);
@@ -1352,6 +1398,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         http,
         pg,
         pool,
+        pg_tls,
         ops,
         // A quarter of the idle budget, so a tenant is let go of within
         // a quarter of it of going quiet rather than up to twice as

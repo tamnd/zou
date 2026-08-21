@@ -46,6 +46,13 @@ pub struct Doors {
     pub pg: Option<std::net::TcpListener>,
     /// The pooler, transaction mode.
     pub pool: Option<std::net::TcpListener>,
+    /// The certificate both of those answer an `SSLRequest` with. One
+    /// for the two of them, because they are the same credential
+    /// crossing the same network, and a node encrypting one of its two
+    /// postgres ports would be a node that encrypts neither. None is
+    /// the plaintext pair, which declines the request and belongs on a
+    /// private network.
+    pub pg_tls: Option<tokio_rustls::TlsAcceptor>,
     pub ops: Option<std::net::TcpListener>,
     /// How often to let go of tenants nobody has asked for. A node
     /// that has gone quiet is the one that should be dropping leases
@@ -69,10 +76,11 @@ impl Doors {
 
     async fn serve(self, version: &'static str) -> Result<(), String> {
         if let Some(listener) = self.pg {
-            let door = Arc::new(Wire::new(
-                Arc::clone(&self.registry),
-                Arc::clone(&self.attached),
-            ));
+            let wire = Wire::new(Arc::clone(&self.registry), Arc::clone(&self.attached));
+            let door = Arc::new(match self.pg_tls.clone() {
+                Some(tls) => wire.secured(tls),
+                None => wire,
+            });
             tokio::spawn(async move {
                 if let Err(e) = door.serve(convert(listener)?).await {
                     log::error!("postgres port: {e}");
@@ -81,9 +89,11 @@ impl Doors {
             });
         }
         if let Some(listener) = self.pool {
-            let door = Arc::new(
-                Wire::new(Arc::clone(&self.registry), Arc::clone(&self.attached)).pooling(),
-            );
+            let wire = Wire::new(Arc::clone(&self.registry), Arc::clone(&self.attached)).pooling();
+            let door = Arc::new(match self.pg_tls.clone() {
+                Some(tls) => wire.secured(tls),
+                None => wire,
+            });
             tokio::spawn(async move {
                 if let Err(e) = door.serve(convert(listener)?).await {
                     log::error!("pooler: {e}");

@@ -56,6 +56,11 @@ tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 # The TLS half of the same client, on the same rustls, so a connection
 # out to a hosted database does not bring a second crypto backend.
 tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"] }
+# The server half, for the postgres port's own SSLRequest. Same knobs as
+# the rustls above for the same reason, since the default here is
+# aws-lc-rs and taking it would link a second crypto library into a
+# binary that already has one.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tower = "0.5"
 ureq = "3.4"
 webp = "0.3"
