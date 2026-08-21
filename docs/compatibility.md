@@ -31,7 +31,7 @@ The Postgres line is the one place zou is deliberately ahead. A suite that depen
 | suite | passing | of | | what it is |
 | --- | ---: | ---: | ---: | --- |
 | rest | 91 | 91 | 100% | the hand written suite, the surface a Supabase project actually uses |
-| postgrest | 1217 | 1217 | 100% | upstream's own test corpus turned into questions, derived from its spec files |
+| postgrest | 1276 | 1317 | 96% | upstream's own test corpus turned into questions, derived from its spec files |
 | auth | 76 | 80 | 95% | the known differences are below |
 | storage | 478 | 478 | 100% | buckets, objects, image transforms, resumable uploads and the S3 protocol |
 | supabase-js | 33 | 33 | 100% | upstream's integration file, url changed, no assertion touched |
