@@ -527,7 +527,8 @@ A key that does not belong to the certificate is a sentence at startup rather th
 With a certificate the ports take `sslmode=require` and above and nothing else: a client that sends a startup packet in the clear is told `this port requires TLS` and hung up on, since the packet after it would carry the project key.
 There are no client certificates, because the key is the credential and a second one would only be a second thing to rotate.
 Without a certificate an `SSLRequest` is declined rather than ignored, which is what makes a client decide instead of guess, and the port belongs on a private network or behind a terminator because the key crosses in the clear.
-A database that asks this node for SCRAM is refused with a sentence saying so, since trust, cleartext and md5 are what a postmaster this node started asks for.
+What the connection behind the door answers is trust, cleartext, md5 or SCRAM-SHA-256: the first three are what a postmaster this node started asks for, and the fourth is what a postgres somebody else initialised asks for instead.
+There is no channel binding, so the gs2 header says this client does not do it rather than that the server cannot, and a deployment whose tenant database is across a network it does not own wants a terminator in front of that database until there is.
 Replication connections are refused too, and a startup packet over 10000 bytes or a login that takes longer than 30 seconds is dropped.
 
 Cancellation works the way it does against postgres directly: the key the client is handed is the key its own backend generated, this node only remembers which database that pair is on so a cancel arriving on a fresh connection has somewhere to go.

@@ -61,6 +61,7 @@ pub mod realtime;
 pub mod render;
 pub mod rest;
 pub mod s3;
+pub mod scram;
 pub mod sms;
 pub mod smtp;
 pub mod source;
