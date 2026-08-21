@@ -23,7 +23,7 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
-use zou_server::sql::Pool;
+use zou_server::sql::{Pool, RequestContext};
 use zou_server::{Config, jwt, router};
 
 const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long";
@@ -786,12 +786,13 @@ async fn the_role_switch_is_only_as_narrow_as_the_connection() {
     // And the one #92 was really about: a role the connection role may
     // become, superuser included. Hosted Supabase connects as
     // authenticator, which was granted exactly anon, authenticated and
-    // service_role and so cannot become anything else, while zou
-    // connects as whatever the dsn names, which in development is
-    // usually the superuser. The bootstrap creates that authenticator
-    // now, but nothing connects as it yet, so what refuses this is the
-    // exposed set: the claim never reaches set_config. Written against
-    // the dsn's own user so it stays true wherever the suite runs.
+    // service_role and so cannot become anything else. zou has that
+    // now too, through the second dsn `zou dev` sets, but this app is
+    // built with one dsn on purpose: a deployment that never named a
+    // request identity is the case worth pinning, and there the
+    // exposed set is the whole of the defence, so the claim has to be
+    // refused before it reaches set_config. Written against the dsn's
+    // own user so it stays true wherever the suite runs.
     let me = std::env::var("ZOU_PG_TEST_DSN")
         .ok()
         .and_then(|d| {
@@ -840,9 +841,10 @@ async fn the_role_switch_is_only_as_narrow_as_the_connection() {
 }
 
 /// The database half of #92: the role a Supabase api connects as is
-/// there, it can become the three api roles, and it can become
-/// nothing else. Nothing connects as it yet, so this is a statement
-/// about the bootstrap rather than about a request.
+/// there, it can be connected as, it can become the three api roles,
+/// and it can become nothing else. A statement about what the
+/// bootstrap leaves behind; the test below it is the one that goes
+/// through a connection.
 #[tokio::test]
 async fn the_authenticator_role_may_become_the_api_roles_and_no_others() {
     let Some(dsn) = dsn() else { return };
@@ -865,7 +867,11 @@ async fn the_authenticator_role_may_become_the_api_roles_and_no_others() {
         .await
         .unwrap();
     let row = rows.first().expect("the bootstrap creates authenticator");
-    assert!(!row.get::<_, bool>(0), "authenticator cannot log in");
+    // Login because a role has to have it to be connected as, and it
+    // opens nothing that was not open: the role carries no password,
+    // so a cluster that asks for one turns it away, and a cluster that
+    // asks for nothing was already handing out its superuser.
+    assert!(row.get::<_, bool>(0), "authenticator can log in");
     assert!(!row.get::<_, bool>(1), "authenticator inherits nothing");
 
     let members: Vec<String> = sess
@@ -892,6 +898,91 @@ async fn the_authenticator_role_may_become_the_api_roles_and_no_others() {
         ],
         "exactly the three, which is the whole of what a connection as it could enter"
     );
+}
+
+/// The half of #92 only a connection can show: with the request
+/// identity pointed at `authenticator`, a session that asks for the
+/// superuser is refused by postgres, and the exposed list in front of
+/// it has nothing to do with it. Done as a bare `set role` rather than
+/// through a token so that what is being tested is the database's
+/// answer and not the server's.
+#[tokio::test]
+async fn a_request_connection_is_refused_the_superuser_by_the_database() {
+    let Some(dsn) = dsn() else { return };
+    // Any request bootstraps the database, which is what creates the
+    // role this connects as.
+    let app = app(&dsn);
+    let res = app
+        .clone()
+        .oneshot(as_user("GET", "/rest/v1/", None, ""))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // A password, because CI's postgres asks for one and the role the
+    // bootstrap creates has none. A deployment doing this for real
+    // gives it one the same way; what the bootstrap will not do is
+    // invent a credential nobody chose.
+    const PASSWORD: &str = "zou-attack-authenticator";
+    let owner = Pool::new(&dsn, 1).expect("dsn parses");
+    let sess = owner.unscoped().await.expect("connect");
+    sess.execute(
+        &format!("alter role authenticator password '{PASSWORD}'"),
+        &[],
+    )
+    .await
+    .expect("the dsn's role created authenticator, so it may set its password");
+    let me: String = sess
+        .query("select current_user", &[])
+        .await
+        .unwrap()
+        .first()
+        .expect("one row")
+        .get(0);
+    sess.commit().await.expect("park");
+
+    let password = format!("password={PASSWORD}");
+    let request = dsn
+        .split_whitespace()
+        .filter(|kv| !kv.starts_with("user=") && !kv.starts_with("password="))
+        .chain(["user=authenticator", password.as_str()])
+        .collect::<Vec<_>>()
+        .join(" ");
+    let pool = Pool::with_request(&dsn, &request, 1).expect("both dsns parse");
+    let sess = pool
+        .session(&RequestContext::bare("anon", "{}"), false)
+        .await
+        .expect("a session logs in as authenticator");
+    let who: String = sess
+        .query("select current_user", &[])
+        .await
+        .unwrap()
+        .first()
+        .expect("one row")
+        .get(0);
+    assert_eq!(who, "anon", "the injected role is the one in effect");
+
+    let err = sess
+        .execute(&format!("set role {me}"), &[])
+        .await
+        .expect_err("the connection may not become the dsn's own role");
+    assert_eq!(
+        err.code().map(|c| c.code()),
+        Some("42501"),
+        "postgres refuses it as insufficient privilege, not the server"
+    );
+    // The transaction is aborted now, so the session forfeits its
+    // connection rather than parking a poisoned one.
+    drop(sess);
+
+    // And the three it was granted still work through the same pool.
+    for known in ["anon", "authenticated", "service_role"] {
+        let sess = pool
+            .session(&RequestContext::bare(known, "{}"), false)
+            .await
+            .unwrap_or_else(|e| panic!("{known} session: {e}"));
+        sess.rollback().await.expect("park");
+    }
 }
 
 #[tokio::test]

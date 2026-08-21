@@ -997,6 +997,14 @@ impl Postmasters {
             pg: Some(format!(
                 "host=127.0.0.1 port={port} user={SUPERUSER} dbname=postgres"
             )),
+            // The identity a request logs in as, which is not the one
+            // that owns the schemas. It is granted the three api roles
+            // and nothing else, so a token whose `role` claim names
+            // the superuser is refused by the database and not only by
+            // the exposed list in front of it. See #92.
+            pg_request: Some(format!(
+                "host=127.0.0.1 port={port} user=authenticator dbname=postgres"
+            )),
             // Objects go where the pages go: the same store, the same
             // tenant prefix, under files/.
             objects: Some(self.target.clone()),

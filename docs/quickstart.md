@@ -480,7 +480,7 @@ authenticated    somebody signed in
 service_role     the project's own back end, past every policy
 ```
 
-That list matters because `zou dev` connects to postgres as the superuser. Without the check, a token signed with the project secret and carrying `"role": "postgres"` would be a superuser session, which can read and write server files and run programs, so holding the JWT secret would mean holding the machine rather than only the data. Hosted Supabase gets the same fence from the database instead: its API connects as `authenticator`, a role granted exactly those three and nothing else. zou creates that role too, with the same grants, so a project's own migrations and dumps find what they expect.
+There are two fences and the list is the outer one. The inner one is the database's: a request logs in as `authenticator`, a role that owns nothing and has been granted exactly those three, so a session that asks for anything further is refused by postgres whatever the server in front of it believed. That is how hosted Supabase does it, and `zou dev` does the same, with the superuser connection kept for the work a token cannot steer, which is the schemas, the auth tables and the storage internals. The list is what refuses the claim before it ever becomes a session, and it is the whole of the defence for a deployment that pointed both identities at one dsn: without it, a token signed with the project secret and carrying `"role": "postgres"` would be a superuser session, which can read and write server files and run programs, so holding the JWT secret would mean holding the machine rather than only the data.
 
 A project that made a role of its own and wrote policies for it names it:
 
