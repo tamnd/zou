@@ -514,6 +514,7 @@ fn start_ops(port: u16) -> Result<(), String> {
 }
 
 pub fn run(args: &Args) -> Result<(), String> {
+    serve::a_postmaster_cannot_run_over(&args.target, "zou dev")?;
     let postgres = args.pg_bin.join("postgres");
     if !postgres.is_file() {
         return Err(format!(

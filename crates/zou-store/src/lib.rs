@@ -57,7 +57,7 @@ pub use lease::{DEFAULT_TTL_SECS, HeldLease, LeaseError};
 pub use lsn::Lsn;
 pub use manifest::{MANIFEST_FORMAT, Manifest, ShardChange};
 pub use mem::MemStore;
-pub use open::{PrefixStore, open_store};
+pub use open::{PrefixStore, one_process_at_a_time, open_store};
 pub use placement::{MAP_FORMAT, MapClient, MapServer, Node, Pin, PlacementError, ShardMap};
 #[cfg(feature = "s3")]
 pub use s3::{Dialect, S3Config, S3Store};
