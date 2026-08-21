@@ -212,7 +212,7 @@ A server running without a database refuses a private channel by saying that, ra
 
 ## What a project is allowed
 
-A project has a budget, the same five numbers upstream keeps on the tenant row, and the defaults are upstream's too.
+A project has a budget, the same numbers upstream keeps on the tenant row, and the defaults are upstream's too.
 
 | what | default | environment | what a client sees over it |
 | --- | --- | --- | --- |
@@ -221,14 +221,19 @@ A project has a budget, the same five numbers upstream keeps on the tenant row, 
 | channels per socket | 100 | `ZOU_REALTIME_MAX_CHANNELS_PER_CLIENT` | `ChannelRateLimitReached: Too many channels` on the join |
 | messages a second | 100 | `ZOU_REALTIME_MAX_EVENTS_PER_SECOND` | the channel is sent `Too many messages per second` on its system event and closed |
 | bytes in a message | 3000 kb | `ZOU_REALTIME_MAX_PAYLOAD_SIZE_IN_KB` | `payload_size_exceeded` when the channel asked for acks, and nothing when it did not |
+| presence events a second | 1000 | `ZOU_REALTIME_MAX_PRESENCE_EVENTS_PER_SECOND` | the channel is sent `Too many presence messages per second` on its system event and closed |
+| tracks per socket per window | 5 | `ZOU_REALTIME_MAX_CLIENT_PRESENCE_EVENTS_PER_WINDOW` | the channel is sent `Client presence rate limit exceeded` on its system event and closed |
+| how wide that window is | 30000 ms | `ZOU_REALTIME_CLIENT_PRESENCE_WINDOW_MS` | |
 
 Set any of them to `0` and that one is off, which is what a server running its own project usually wants and is not something upstream's tenant row can say.
+The window is the exception: it is a width rather than a limit, so turning presence calls off is the `0` on the line above it.
 
-`zou dev` and `zou serve` both read the five, and on a node they are the tier every project it brings up gets, since a node has no tenant row to keep a different number on per project.
+`zou dev` and `zou serve` both read all of them, and on a node they are the tier every project it brings up gets, since a node has no tenant row to keep a different number on per project.
 A node started without them holds 200 sockets per project, upstream's hosted default, which is worth knowing before sizing a box for more.
 
-The three rates are averages and not ceilings on a moment.
+The project rates are averages and not ceilings on a moment.
 What is counted goes into a bucket per five seconds, twelve of them are kept, and the number compared with the limit is the average per second across that minute, so a burst is forgiven and a sustained rate is not.
+The per socket track window is the one exception, a plain sliding window of the last thirty seconds, because five calls is a small enough number that a bucket boundary would be most of the answer.
 A message costs the send and every delivery of it, so one broadcast to a hundred sockets is a hundred and one messages, which is the arithmetic that makes a hundred a second a real number rather than a generous one.
 
 The http broadcast endpoints report the same budget on every answer.
@@ -242,7 +247,8 @@ x-rate-limit-remaining: 88
 A post that arrives when the project is already over its budget is 429 with `{"message":"Too many requests"}` and the same three headers, so a caller posting on a loop can read how much room is left without waiting to be refused.
 A project with the events budget off reports none of this, because a header saying zero of zero left reads as refused.
 
-Presence has two limits of its own upstream, on presence events a second and on how often one client may track, and neither is built here yet.
+Presence spends a budget of its own rather than the messages budget: a track, an untrack and every diff delivered off one all cost a presence event, and a track is held to the message size limit as well, which a channel over it is told with `Track message size exceeded`.
+A socket that asked for no presence pays nothing for the diffs it was never going to be sent.
 
 ## What a client that stopped reading costs
 
@@ -400,7 +406,6 @@ Upstream behaves the same way, and a project that needs an audit trail of who sa
 | asked for | what happens |
 | --- | --- |
 | `postgres_changes` on a server with no database and no holder behind it | the join is refused, naming what is missing |
-| presence rate limits | presence is not counted separately from the rest |
 
 That is M4, tracked in [tamnd/zou#4](https://github.com/tamnd/zou/issues/4).
 
