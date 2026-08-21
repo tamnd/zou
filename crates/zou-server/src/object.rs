@@ -166,6 +166,33 @@ impl ObjectRow {
         self.metadata.get(field).cloned().unwrap_or(Value::Null)
     }
 
+    /// What the bytes are served with, which is not always what the
+    /// upload asked for.
+    ///
+    /// storage-api keeps two answers about one object. The row
+    /// remembers the cache control the upload named, and the file it
+    /// wrote carries a header of its own. For an ordinary upload they
+    /// are the same, because the backend is handed what the client
+    /// said. For a resumable one they are not: the tus store writes
+    /// every file `no-cache` whatever the metadata asked for, while the
+    /// row still records the asking. A listing reads the row and the
+    /// info route reads the file, so both answers are visible and a
+    /// client that sets `cacheControl` on a resumable upload sees
+    /// `max-age=3600` in one place and `no-cache` in the other.
+    ///
+    /// zou has rows and bytes and no headers on the bytes, so it reads
+    /// the second answer off the first. `user_metadata` is null exactly
+    /// on the objects a resumable upload made, because that is the
+    /// other thing that path leaves out and an ordinary upload writes
+    /// an empty object there even when nothing was attached, so a null
+    /// there is the same fact as a `no-cache` on the file.
+    pub(crate) fn served_cache(&self) -> Value {
+        match self.user_metadata.is_null() {
+            true => Value::from(NO_CACHE),
+            false => self.meta("cacheControl"),
+        }
+    }
+
     /// Where the bytes of this version are.
     pub(crate) fn key(&self) -> String {
         blob::key(&self.id, &self.version)
@@ -180,9 +207,11 @@ impl ObjectRow {
     ///
     /// Half of it is the row and half is the metadata unpacked into
     /// fields with different names: `mimetype` is answered as
-    /// `content_type`, `cacheControl` as `cache_control`, `eTag` as
-    /// `etag`. The renaming is upstream's and so is the choice of which
-    /// of the two metadata columns is called `metadata` here: it is the
+    /// `content_type`, `eTag` as `etag`, and `cacheControl` as
+    /// `cache_control` with the caveat in [`ObjectRow::served_cache`],
+    /// since this route reads the file upstream rather than the row.
+    /// The renaming is upstream's and so is the choice of which of the
+    /// two metadata columns is called `metadata` here: it is the
     /// client's, answered as it stands.
     ///
     /// Which is not the same as answering an empty object for a client
@@ -200,7 +229,7 @@ impl ObjectRow {
             "version": self.version,
             "created_at": self.created_at,
             "last_modified": self.meta("lastModified"),
-            "cache_control": self.meta("cacheControl"),
+            "cache_control": self.served_cache(),
             "content_type": self.meta("mimetype"),
             "etag": self.meta("eTag"),
             "size": self.meta("size"),
@@ -521,7 +550,7 @@ async fn deliver(
     let blobs = blobs(app)?;
     let mime = row.meta("mimetype");
     let mime = mime.as_str().unwrap_or_default();
-    let cache = row.meta("cacheControl");
+    let cache = row.served_cache();
     let cache = cache.as_str().unwrap_or(NO_CACHE);
     let etag = row.meta("eTag");
 
@@ -3069,6 +3098,33 @@ mod tests {
             metadata,
             user_metadata,
         }
+    }
+
+    /// The two answers the reference gives about one object's cache
+    /// control, both of which a client sees.
+    #[test]
+    fn a_resumable_upload_lists_what_it_asked_for_and_serves_no_cache() {
+        let asked = json!({"cacheControl": "max-age=3600", "mimetype": "text/plain"});
+        // A resumable upload: the row remembers the asking, and nothing
+        // was attached, which is what says the bytes went in through
+        // tus and so carry no cache control of their own.
+        let resumable = row(asked.clone(), Value::Null);
+        assert_eq!(
+            resumable.meta("cacheControl"),
+            "max-age=3600",
+            "a listing reads the row and the reference's says max-age"
+        );
+        assert_eq!(resumable.served_cache(), "no-cache");
+        let answer: Value = serde_json::from_str(&resumable.info()).unwrap();
+        assert_eq!(answer["cache_control"], "no-cache");
+
+        // The same upload through the ordinary door: one answer in
+        // both places, because there the file is written with what the
+        // client said.
+        let ordinary = row(asked, json!({}));
+        assert_eq!(ordinary.served_cache(), "max-age=3600");
+        let answer: Value = serde_json::from_str(&ordinary.info()).unwrap();
+        assert_eq!(answer["cache_control"], "max-age=3600");
     }
 
     /// The recorded answer, field for field.

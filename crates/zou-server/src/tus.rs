@@ -37,11 +37,12 @@
 //! since none of it is in the protocol. `bucketName` and `objectName`
 //! say where the object goes, `contentType` is what it is, and any
 //! other key is carried along and then dropped rather than kept as the
-//! object's user metadata. `cacheControl` is dropped too and every
-//! object a resumable upload makes is `no-cache`, which is not what the
-//! same request through the ordinary upload door does. Those two are
-//! recorded next to each other so that the difference is a decision
-//! rather than a guess.
+//! object's user metadata. `cacheControl` is written into the row, so a
+//! listing reads back what was asked for, and it is not written onto
+//! the bytes, which the reference's tus store always stores `no-cache`,
+//! so the info route and a download say `no-cache` instead. Both halves
+//! of that are recorded so the difference is a decision rather than a
+//! guess.
 
 use std::sync::Arc;
 
@@ -667,6 +668,19 @@ fn value_of(metadata: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
+/// The cache control the row records for a finished upload, which is
+/// what the metadata asked for and `no-cache` when it asked for
+/// nothing.
+///
+/// It is what a listing reads back and it is not what the bytes are
+/// served with. The reference's tus store writes every file `no-cache`
+/// whatever the metadata said, so the info route and a download say
+/// that instead, and where zou reads that second answer from is in
+/// [`object::ObjectRow::served_cache`].
+fn cache_of(metadata: &[(String, String)]) -> String {
+    value_of(metadata, "cacheControl").unwrap_or_else(|| NO_CACHE.to_string())
+}
+
 /// The metadata as a head hands it back, which is what arrived with a
 /// `cacheControl` on the end that nobody sent.
 pub fn written_metadata(metadata: &[(String, String)]) -> String {
@@ -982,12 +996,10 @@ async fn accept(
 /// The parts, joined up and written as an ordinary object.
 ///
 /// Through the same code an ordinary upload ends in, so that the two of
-/// them leave the same row behind for the same bytes. The two things
-/// that are not the same are deliberate and both are recorded: the
-/// cache control is always `no-cache` here whatever the metadata asked
-/// for, and nothing is attached, so the object's own metadata reads
-/// back as null where an ordinary upload's reads back as an empty
-/// object.
+/// them leave the same row behind for the same bytes. The one thing
+/// that is not the same is deliberate and is recorded: nothing is
+/// attached, so the object's own metadata reads back as null where an
+/// ordinary upload's reads back as an empty object.
 async fn finish(
     app: &App,
     sess: Session,
@@ -1017,7 +1029,7 @@ async fn finish(
         Upload {
             bytes,
             mime: upload.mime.clone(),
-            cache: NO_CACHE.to_string(),
+            cache: cache_of(&upload.metadata),
         },
         None,
         sub,
@@ -1149,6 +1161,18 @@ mod tests {
             written_metadata(&pairs("cacheControl bWF4LWFnZT0zNjAw")),
             "cacheControl bWF4LWFnZT0zNjAw"
         );
+    }
+
+    /// The row a finished upload leaves says what was asked for, so
+    /// that a listing does. What the bytes are served with is the other
+    /// answer and is decided in `object`.
+    #[test]
+    fn the_row_records_the_cache_control_the_metadata_asked_for() {
+        assert_eq!(
+            cache_of(&pairs("bucketName bm90ZXM=,cacheControl bWF4LWFnZT0zNjAw")),
+            "max-age=3600"
+        );
+        assert_eq!(cache_of(&pairs("bucketName bm90ZXM=")), "no-cache");
     }
 
     #[test]

@@ -375,8 +375,9 @@ The bookkeeping is written with the policies off now, as upstream writes it, and
 
 The `supabase start` leg earned its keep on the same day, by refusing an assertion.
 Every upload in that suite sends a `cacheControl` in its metadata, and the reference answers two different things about the same object: a listing reads `max-age=3600` off the row and the info route reads `no-cache` off the stored file.
-zou keeps one value and says `no-cache` in both places, so it matches the recording of the info route and not the listing.
-The suite now asks nothing about cache control and the question is [#285](https://github.com/tamnd/zou/issues/285), which is a decision about how an object records what was asked for apart from what is served rather than anything about tus.
+zou used to keep one value and say `no-cache` in both places, so it matched the recording of the info route and not the listing.
+It keeps both now: the row records what the metadata asked for, which is what a listing reads, and the info route and a download answer `no-cache` for an object a resumable upload made, which zou knows by the null `user_metadata` that path leaves behind and an ordinary upload never does.
+The suite can ask about cache control again.
 
 `js-realtime/` is the same shape for the same reason, about presence and about sending to a room over http.
 
