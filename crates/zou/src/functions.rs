@@ -1122,6 +1122,12 @@ mod tests {
         );
     }
 
+    /// The ref and the port here are not the ones the test above uses,
+    /// and that is the point. A serve names its scratch directory after
+    /// the two of them under the shared temp directory, and it clears
+    /// that directory before it writes, so two tests agreeing on a ref
+    /// and a port are two threads taking turns removing what the other
+    /// is still unpacking.
     #[test]
     fn a_serve_of_a_project_nobody_deployed_to_says_so() {
         let store = tempfile::tempdir().expect("tempdir");
@@ -1130,14 +1136,14 @@ mod tests {
             "--target",
             &target,
             "--ref",
-            "acme",
+            "nobody",
             "--no-config",
         ]))
         .expect("a serve out of a store");
-        let Err(e) = attach(&args, None, 54321, &[]) else {
+        let Err(e) = attach(&args, None, 54322, &[]) else {
             panic!("a serve of a project with no deployment has nothing to serve");
         };
-        assert!(e.contains("nothing is deployed to acme"), "{e}");
+        assert!(e.contains("nothing is deployed to nobody"), "{e}");
     }
 
     /// The engine is a build time choice, so one of these two runs and
