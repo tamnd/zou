@@ -42,16 +42,22 @@
 //!
 //! Aggregates group by every non aggregated output expression, the
 //! PostgREST rule, and jsonb embed columns take part since jsonb has
-//! equality. What the planner refuses, it refuses loudly: mixing an
-//! aggregate with `*` or with a spread, aggregating inside a spread
-//! to many, casting to a type that is not a plain identifier.
+//! equality. A spread is not a level of its own for this: an
+//! aggregate written inside one counts the rows of the join it
+//! flattens into, so the spread hands its columns up rather than
+//! answering them itself, and the level that owns the group by writes
+//! the call. That is what makes `...processes(count())` one row per
+//! parent group instead of one per process. What the planner refuses,
+//! it refuses loudly: mixing an aggregate with `*`, aggregating
+//! inside a spread to many, casting to a type that is not a plain
+//! identifier.
 
 use std::fmt;
 
 use crate::catalog::{Catalog, Column, Details, EmbedError, Kind, Rel, Relation};
 use crate::filter::{Node, Op, Value};
 use crate::order::{Direction, Nulls, Term};
-use crate::select::{Col, Embed, Item, Join};
+use crate::select::{Agg, Col, Embed, Item, Join};
 use crate::sql::{
     CompileError, EmbedTest, Sql, field_expr, path_expr, quote_ident, where_clause_over,
 };
@@ -384,18 +390,49 @@ struct OutCol {
 /// because the order belongs inside the aggregate. A spread of a to
 /// one nested in one has to spell its columns out too, since they
 /// become the outer spread's columns, but it keeps its own order.
+///
+/// A spread that flattens into a group by is a third thing again: it
+/// hands its select list up as descriptions rather than as answers,
+/// so the level that owns the group by can write the aggregate calls
+/// itself over the join it made.
 #[derive(Clone, Copy, Default)]
 struct Wanted {
     names: bool,
     order: bool,
+    hoist: bool,
+}
+
+/// One item of a spread's select list as the level that owns the
+/// group by sees it.
+///
+/// A plain column is already an answer and only needs naming. An
+/// aggregate is not: the spread selected the values bare under
+/// `inner`, and the call goes around them up where the grouping
+/// happens, because that is the row set it counts. `count()` reads no
+/// column at all, so it carries none.
+struct Hoisted {
+    key: String,
+    inner: Option<String>,
+    agg: Option<(Agg, Option<String>)>,
+}
+
+/// The hoisted form of columns that are answers already.
+fn plain(keys: &[String]) -> impl Iterator<Item = Hoisted> + '_ {
+    keys.iter().map(|k| Hoisted {
+        key: k.clone(),
+        inner: Some(k.clone()),
+        agg: None,
+    })
 }
 
 /// A planned level: the SELECT, the keys its select list answers to,
-/// and the order terms it handed back instead of applying.
+/// the order terms it handed back instead of applying, and what it
+/// hoisted when it was a spread inside a grouping level.
 struct Level {
     sql: String,
     keys: Vec<String>,
     order: Vec<String>,
+    hoist: Vec<Hoisted>,
 }
 
 /// An embedded resource as the level around it sees it: the name it
@@ -474,6 +511,12 @@ impl Planner<'_> {
         let mut cols: Vec<OutCol> = Vec::new();
         let mut laterals: Vec<String> = Vec::new();
         let mut embeds: Vec<Embedded> = Vec::new();
+        let mut hoisted: Vec<Hoisted> = Vec::new();
+
+        // Whether the spreads under this level flatten into it: either
+        // this level owns a group by, or it is itself inside a spread
+        // that hands everything up to one that does.
+        let flatten = wanted.hoist || aggregates_flat(items);
 
         let rel = self.catalog.relation(table);
         // Whether this level reads a mutation or an rpc CTE instead
@@ -489,16 +532,23 @@ impl Planner<'_> {
                 // spelled out too, since every column of it has to be
                 // aggregated by name. Every other star stays a star.
                 Item::Star => match rel.filter(|r| r.represented() || wanted.names) {
-                    Some(rel) => cols.extend(rel.columns.iter().map(|c| {
-                        let expr = represented(alias, c);
-                        OutCol {
-                            rendered: format!("{expr} as {}", quote_ident(&c.name)),
-                            expr,
-                            aggregated: false,
-                            splat: false,
-                            keys: vec![c.name.clone()],
+                    Some(rel) => {
+                        cols.extend(rel.columns.iter().map(|c| {
+                            let expr = represented(alias, c);
+                            OutCol {
+                                rendered: format!("{expr} as {}", quote_ident(&c.name)),
+                                expr,
+                                aggregated: false,
+                                splat: false,
+                                keys: vec![c.name.clone()],
+                            }
+                        }));
+                        if wanted.hoist {
+                            let names: Vec<String> =
+                                rel.columns.iter().map(|c| c.name.clone()).collect();
+                            hoisted.extend(plain(&names));
                         }
-                    })),
+                    }
                     None => cols.push(OutCol {
                         expr: format!("{}.*", quote_ident(alias)),
                         rendered: format!("{}.*", quote_ident(alias)),
@@ -507,7 +557,16 @@ impl Planner<'_> {
                         keys: Vec::new(),
                     }),
                 },
-                Item::Col(c) => cols.push(self.col(table, alias, rel, source, c)?),
+                Item::Col(c) => self.column(
+                    table,
+                    alias,
+                    rel,
+                    source,
+                    c,
+                    wanted.hoist,
+                    &mut cols,
+                    &mut hoisted,
+                )?,
                 Item::Embed(e) => self.embed(
                     table,
                     alias,
@@ -515,9 +574,11 @@ impl Planner<'_> {
                     path,
                     false,
                     wanted,
+                    flatten,
                     &mut cols,
                     &mut laterals,
                     &mut embeds,
+                    &mut hoisted,
                 )?,
                 Item::Spread(e) => self.embed(
                     table,
@@ -526,9 +587,11 @@ impl Planner<'_> {
                     path,
                     true,
                     wanted,
+                    flatten,
                     &mut cols,
                     &mut laterals,
                     &mut embeds,
+                    &mut hoisted,
                 )?,
             }
         }
@@ -548,7 +611,7 @@ impl Planner<'_> {
 
         let grouped = cols.iter().any(|c| c.aggregated);
         if grouped && cols.iter().any(|c| c.splat) {
-            return refuse("an aggregate cannot mix with * or a spread in one select list");
+            return refuse("an aggregate cannot mix with * in one select list");
         }
         if grouped && wanted.order {
             return Err(not_implemented(
@@ -676,6 +739,7 @@ impl Planner<'_> {
             sql,
             keys,
             order: lifted,
+            hoist: hoisted,
         })
     }
 
@@ -797,7 +861,79 @@ impl Planner<'_> {
         source: bool,
         c: &Col,
     ) -> Result<OutCol, PlanError> {
-        let mut expr = match &c.field {
+        let expr = aggregated(self.field_sql(table, alias, rel, source, c)?, c)?;
+        let key = col_key(c);
+        Ok(OutCol {
+            rendered: format!("{expr} as {}", quote_ident(&key)),
+            expr,
+            aggregated: c.agg.is_some(),
+            splat: false,
+            keys: vec![key],
+        })
+    }
+
+    /// One column of a spread that flattens, or of a level that
+    /// answers for itself, into the select list and the hoist list.
+    ///
+    /// The difference is the aggregate. A level that answers writes
+    /// the call; a spread selects what the call will read, under a
+    /// name of its own so nothing collides with a column somebody
+    /// asked for, and says up the chain what to do with it.
+    #[allow(clippy::too_many_arguments)]
+    fn column(
+        &self,
+        table: &str,
+        alias: &str,
+        rel: Option<&Relation>,
+        source: bool,
+        c: &Col,
+        hoist: bool,
+        cols: &mut Vec<OutCol>,
+        hoisted: &mut Vec<Hoisted>,
+    ) -> Result<(), PlanError> {
+        if !hoist {
+            cols.push(self.col(table, alias, rel, source, c)?);
+            return Ok(());
+        }
+        let key = col_key(c);
+        let Some(agg) = c.agg else {
+            cols.push(self.col(table, alias, rel, source, c)?);
+            hoisted.extend(plain(&[key]));
+            return Ok(());
+        };
+        let inner = match &c.field {
+            None => None,
+            Some(_) => {
+                let name = format!("{alias}_a{}", hoisted.len() + 1);
+                let expr = self.field_sql(table, alias, rel, source, c)?;
+                cols.push(OutCol {
+                    rendered: format!("{expr} as {}", quote_ident(&name)),
+                    expr,
+                    aggregated: false,
+                    splat: false,
+                    keys: Vec::new(),
+                });
+                Some(name)
+            }
+        };
+        hoisted.push(Hoisted {
+            key,
+            inner,
+            agg: Some((agg, c.agg_cast.clone())),
+        });
+        Ok(())
+    }
+
+    /// The column expression before any aggregate goes around it.
+    fn field_sql(
+        &self,
+        table: &str,
+        alias: &str,
+        rel: Option<&Relation>,
+        source: bool,
+        c: &Col,
+    ) -> Result<String, PlanError> {
+        let expr = match &c.field {
             Some(f) => {
                 let json = rel.is_none_or(|r| r.steps_as_json(&f.name));
                 let known = rel.and_then(|r| r.column(&f.name));
@@ -818,36 +954,7 @@ impl Planner<'_> {
             }
             None => String::new(),
         };
-        if let Some(agg) = c.agg {
-            expr = match &c.field {
-                Some(_) => format!("{}({expr})", agg.name()),
-                None => "count(*)".into(),
-            };
-            if let Some(cast) = &c.agg_cast {
-                expr = format!("{expr}::{}", checked_cast(cast)?);
-            }
-        }
-        let key = match (&c.alias, c.agg, &c.field) {
-            (Some(a), _, _) => a.clone(),
-            (None, Some(agg), _) => agg.name().to_string(),
-            (None, None, Some(f)) => f
-                .path
-                .iter()
-                .rev()
-                .find_map(|s| match &s.key {
-                    crate::scan::JsonKey::Name(n) => Some(n.clone()),
-                    crate::scan::JsonKey::Index(_) => None,
-                })
-                .unwrap_or_else(|| f.name.clone()),
-            (None, None, None) => unreachable!("a field free column is always an aggregate"),
-        };
-        Ok(OutCol {
-            rendered: format!("{expr} as {}", quote_ident(&key)),
-            expr,
-            aggregated: c.agg.is_some(),
-            splat: false,
-            keys: vec![key],
-        })
+        Ok(expr)
     }
 
     /// One embedded resource: resolve the relationship, build the
@@ -861,10 +968,13 @@ impl Planner<'_> {
         path: &[String],
         spread: bool,
         wanted: Wanted,
+        flatten: bool,
         cols: &mut Vec<OutCol>,
         laterals: &mut Vec<String>,
         embeds: &mut Vec<Embedded>,
+        hoisted: &mut Vec<Hoisted>,
     ) -> Result<(), PlanError> {
+        let mine = cols.len();
         let rel = self
             .catalog
             .resolve(parent_table, &e.relation, e.hint.as_deref())?;
@@ -879,12 +989,17 @@ impl Planner<'_> {
             (true, Kind::ToMany) => Wanted {
                 names: true,
                 order: true,
+                hoist: false,
             },
             // A spread of a to one hands its columns straight up, so
-            // it owes its own parent whatever its parent was owed.
+            // it owes its own parent whatever its parent was owed. A
+            // spread inside a grouping level owes more than that: it
+            // has to spell every column out under a name, since a
+            // group by cannot name a star.
             (true, Kind::ToOne) => Wanted {
-                names: wanted.names,
+                names: wanted.names || flatten,
                 order: false,
+                hoist: flatten,
             },
         };
         let body = self.level(
@@ -951,10 +1066,23 @@ impl Planner<'_> {
                 } else {
                     laterals.push(format!("left join lateral {lateral} on true"));
                 }
+                if wanted.hoist {
+                    let keys: Vec<String> =
+                        cols[mine..].iter().flat_map(|c| c.keys.clone()).collect();
+                    hoisted.extend(plain(&keys));
+                }
                 return Ok(());
             }
             let joiner = if inner { "join" } else { "left join" };
             laterals.push(format!("{joiner} lateral ({}) as {wrap} on true", body.sql));
+            // A spread inside a grouping level is not a level of its
+            // own: its columns are the grouping level's, and so are
+            // its aggregates, which have to be written up there over
+            // the join rather than down here over one parent's rows.
+            if flatten {
+                self.flattened(body.hoist, &wrap, wanted.hoist, cols, hoisted)?;
+                return Ok(());
+            }
             if !e.items.is_empty() {
                 cols.push(OutCol {
                     expr: format!("{wrap}.*"),
@@ -1011,8 +1139,119 @@ impl Planner<'_> {
                 }
             }
         }
+        if wanted.hoist {
+            let keys: Vec<String> = cols[mine..].iter().flat_map(|c| c.keys.clone()).collect();
+            hoisted.extend(plain(&keys));
+        }
         Ok(())
     }
+
+    /// What a flattening spread leaves in the level around it.
+    ///
+    /// If that level owns the group by, a plain column is named and
+    /// an aggregate is called here, over the join the lateral made.
+    /// If it is a spread itself the whole thing goes up again, the
+    /// column carried along under the name the call will read it by.
+    fn flattened(
+        &self,
+        hoist: Vec<Hoisted>,
+        wrap: &str,
+        up: bool,
+        cols: &mut Vec<OutCol>,
+        hoisted: &mut Vec<Hoisted>,
+    ) -> Result<(), PlanError> {
+        for h in hoist {
+            if up {
+                if let Some(i) = &h.inner {
+                    let expr = format!("{wrap}.{}", quote_ident(i));
+                    cols.push(OutCol {
+                        rendered: format!("{expr} as {}", quote_ident(i)),
+                        expr,
+                        aggregated: false,
+                        splat: false,
+                        keys: match h.agg {
+                            Some(_) => Vec::new(),
+                            None => vec![i.clone()],
+                        },
+                    });
+                }
+                hoisted.push(h);
+                continue;
+            }
+            let (expr, aggregated) = match &h.agg {
+                None => (format!("{wrap}.{}", quote_ident(&h.key)), false),
+                Some((agg, cast)) => {
+                    let mut e = match &h.inner {
+                        Some(i) => format!("{}({wrap}.{})", agg.name(), quote_ident(i)),
+                        None => "count(*)".to_string(),
+                    };
+                    if let Some(cast) = cast {
+                        e = format!("{e}::{}", checked_cast(cast)?);
+                    }
+                    (e, true)
+                }
+            };
+            cols.push(OutCol {
+                rendered: format!("{expr} as {}", quote_ident(&h.key)),
+                expr,
+                aggregated,
+                splat: false,
+                keys: vec![h.key.clone()],
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The aggregate call around a column expression, and the cast the
+/// request put on the result of it. `count()` names no column, so it
+/// counts rows rather than values.
+fn aggregated(expr: String, c: &Col) -> Result<String, PlanError> {
+    let Some(agg) = c.agg else {
+        return Ok(expr);
+    };
+    let mut out = match &c.field {
+        Some(_) => format!("{}({expr})", agg.name()),
+        None => "count(*)".to_string(),
+    };
+    if let Some(cast) = &c.agg_cast {
+        out = format!("{out}::{}", checked_cast(cast)?);
+    }
+    Ok(out)
+}
+
+/// The name a column answers to: its alias, the aggregate's own name
+/// when it has none, the last named json step, or the column.
+fn col_key(c: &Col) -> String {
+    match (&c.alias, c.agg, &c.field) {
+        (Some(a), _, _) => a.clone(),
+        (None, Some(agg), _) => agg.name().to_string(),
+        (None, None, Some(f)) => f
+            .path
+            .iter()
+            .rev()
+            .find_map(|s| match &s.key {
+                crate::scan::JsonKey::Name(n) => Some(n.clone()),
+                crate::scan::JsonKey::Index(_) => None,
+            })
+            .unwrap_or_else(|| f.name.clone()),
+        (None, None, None) => unreachable!("a field free column is always an aggregate"),
+    }
+}
+
+/// Whether a select list aggregates at this level once its spreads
+/// are flattened into it.
+///
+/// A spread is not a level of its own, so an aggregate inside one is
+/// this level's to write. An embed under its own key is a level of
+/// its own and answers its own aggregates, which is why this does not
+/// read into one.
+fn aggregates_flat(items: &[Item]) -> bool {
+    items.iter().any(|item| match item {
+        Item::Star | Item::Embed(_) => false,
+        Item::Col(c) => c.agg.is_some(),
+        Item::Spread(e) => aggregates_flat(&e.items),
+    })
 }
 
 /// One column of a level as the client should see it: the column
@@ -1663,6 +1902,66 @@ mod tests {
         let q = query("orders", "*,count()");
         let e = fails(&q);
         assert!(e.to_string().contains("cannot mix"), "{e}");
+    }
+
+    /// A spread is flattened into the level around it, so an
+    /// aggregate written inside one is written out there, over the
+    /// join, and every plain column of the spread joins the group by.
+    /// Without this the aggregate lands inside the lateral and counts
+    /// one parent's rows, which answers one row per row of the child
+    /// instead of one per group.
+    #[test]
+    fn an_aggregate_inside_a_spread_belongs_to_the_level_around_it() {
+        let q = query("orders", "...users(id,count())");
+        assert_eq!(
+            text(&q),
+            r#"select "e_z1"."id" as "id", count(*) as "count" from "orders" as "orders" left join lateral (select "z1"."id" as "id" from "users" as "z1" where "z1"."id" = "orders"."user_id") as "e_z1" on true group by "e_z1"."id""#
+        );
+
+        // An aggregate over a column reads it out of the lateral
+        // under a name of its own, so nothing collides with a column
+        // the request also asked to see.
+        let q = query("orders", "...users(id.sum(),name)");
+        assert_eq!(
+            text(&q),
+            r#"select sum("e_z1"."z1_a1") as "sum", "e_z1"."name" as "name" from "orders" as "orders" left join lateral (select "z1"."id" as "z1_a1", "z1"."name" as "name" from "users" as "z1" where "z1"."id" = "orders"."user_id") as "e_z1" on true group by "e_z1"."name""#
+        );
+
+        // Aggregates alone group by nothing, which is one row.
+        let t = text(&query("orders", "...users(id.sum())"));
+        assert!(!t.contains("group by"), "{t}");
+    }
+
+    /// The same through a chain of spreads: the column the call reads
+    /// is carried up level by level under the name it was given, and
+    /// the call itself is written where the grouping happens.
+    #[test]
+    fn a_spread_inside_a_spread_carries_the_aggregate_further_up() {
+        let q = query("order_items", "id,...orders(...users(id.max()::text))");
+        assert_eq!(
+            text(&q),
+            r#"select "order_items"."id" as "id", max("e_z1"."z2_a1")::text as "max" from "order_items" as "order_items" left join lateral (select "e_z2"."z2_a1" as "z2_a1" from "orders" as "z1" left join lateral (select "z2"."id" as "z2_a1" from "users" as "z2" where "z2"."id" = "z1"."user_id") as "e_z2" on true where "z1"."id" = "order_items"."order_id") as "e_z1" on true group by "order_items"."id""#
+        );
+
+        // A plain column two spreads down is a group by term up here,
+        // and an aggregate at this level counts the joined rows.
+        let q = query("order_items", "id,...orders(...users(name),count())");
+        let t = text(&q);
+        assert!(t.contains(r#"count(*) as "count""#), "{t}");
+        assert!(
+            t.contains(r#"group by "order_items"."id", "e_z1"."name""#),
+            "{t}"
+        );
+
+        // A spread with nothing to aggregate anywhere near it is left
+        // alone: a star merges as a star, which no group by has to
+        // name and no column list has to spell out.
+        let t = text(&query(
+            "order_items",
+            "id,...orders(user_id,...users(name))",
+        ));
+        assert!(t.contains(r#""e_z1".*"#), "{t}");
+        assert!(!t.contains("group by"), "{t}");
     }
 
     #[test]
