@@ -1205,10 +1205,18 @@ jobs:
       # applies each of these files on its own and the last statement in
       # one of them has no semicolon after it, so a plain cat runs it
       # into the first line of the next file.
+      #
+      # grants.sql in the middle is the one file that is not the app's.
+      # Upstream's migrations grant nothing, because the project they
+      # were written against handed every new table in public to anon
+      # and authenticated by itself, and a project today gets a table
+      # the api roles may truncate and may not read: #344. It is the
+      # migration the app would carry if it were written now, and app/
+      # stays upstream's unedited.
       - name: Build the project the app ships
         working-directory: /tmp/zou-conformance/demo-realtime
         run: |
-          for f in app/supabase/migrations/*.sql app/supabase/seed.sql; do
+          for f in app/supabase/migrations/*.sql grants.sql app/supabase/seed.sql; do
             cat "$f"
             printf '\n;\n'
           done > /tmp/chat-setup.sql
