@@ -48,6 +48,8 @@ struct Front {
     /// that project on this node is on the same hub with the same link
     /// behind it.
     sockets: Mutex<HashMap<String, Sockets>>,
+    /// How long one of those is kept once nobody is on it.
+    empty: std::time::Duration,
 }
 
 /// One project's socket tier on this node.
@@ -64,6 +66,17 @@ struct Sockets {
     /// so a tier nobody is arriving at goes on talking to the old holder
     /// until somebody says otherwise. See [`watch`].
     app: Arc<crate::App>,
+    /// When the front door last handed a request to this tier, which is
+    /// the half of idleness a socket count cannot answer.
+    ///
+    /// A socket that has been given the router but has not reached the
+    /// count yet is a tier that looks empty and is not, and dropping one
+    /// there would leave that socket alone on a tier the next arrival
+    /// replaces, which is two rooms with one name. This is stamped under
+    /// the same lock the sweep removes under, so the sweep either sees
+    /// the stamp or the arrival finds no tier and builds one. See
+    /// [`watch`].
+    handed: std::time::Instant,
 }
 
 /// How often a socket tier rereads the lease it was built from.
@@ -76,6 +89,19 @@ struct Sockets {
 /// the lookup is the same one the front door makes on every request for
 /// that project anyway.
 const MOVED: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a socket tier with nobody on it is kept before it is
+/// dropped.
+///
+/// The same fifteen minutes an idle attach gets, and for the same
+/// reason rather than for symmetry: what is being weighed either way is
+/// a client that comes back against the cost of holding the thing until
+/// it does. A tier costs far less than an attach, one socket and one
+/// task and a small map against a postmaster, but it costs the holder
+/// the same again at the other end and the holder is the node with the
+/// write path on it. A node that has served a thousand projects' sockets
+/// over a day should not be holding a thousand links at the end of it.
+const EMPTY: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// A router that serves every tenant on a store.
 ///
@@ -96,6 +122,23 @@ pub fn fleet(
     attached: Arc<Attached>,
     forwarding: Option<Arc<Forwarding>>,
 ) -> Router {
+    fleet_keeping(routing, registry, attached, forwarding, EMPTY)
+}
+
+/// The same, saying how long a socket tier nobody is on is kept before
+/// it is dropped.
+///
+/// [`EMPTY`] is what `fleet` uses and is the number to want. This is
+/// for an embedder that knows something about its own clients that the
+/// default cannot, and for the test that proves an empty tier goes,
+/// which cannot wait a quarter of an hour to watch one.
+pub fn fleet_keeping(
+    routing: Routing,
+    registry: Arc<Registry>,
+    attached: Arc<Attached>,
+    forwarding: Option<Arc<Forwarding>>,
+    empty: std::time::Duration,
+) -> Router {
     Router::new()
         .fallback(any(dispatch))
         .with_state(Arc::new(Front {
@@ -105,6 +148,7 @@ pub fn fleet(
             forwarding,
             only: None,
             sockets: Mutex::new(HashMap::new()),
+            empty,
         }))
 }
 
@@ -127,6 +171,7 @@ pub fn only(tenant_ref: String, registry: Arc<Registry>, attached: Arc<Attached>
             forwarding: None,
             only: Some(tenant_ref),
             sockets: Mutex::new(HashMap::new()),
+            empty: EMPTY,
         }))
 }
 
@@ -145,9 +190,10 @@ impl Front {
     fn sockets(self: &Arc<Self>, entry: &Tenant, endpoint: &str) -> Result<Router, String> {
         let holder = link(endpoint, &entry.tenant_ref);
         let mut sockets = self.sockets.lock().expect("the socket tier");
-        if let Some(up) = sockets.get(&entry.tenant_ref)
+        if let Some(up) = sockets.get_mut(&entry.tenant_ref)
             && up.holder == holder
         {
+            up.handed = std::time::Instant::now();
             return Ok(up.router.clone());
         }
         let (router, app) = crate::routed(crate::Config {
@@ -166,22 +212,29 @@ impl Front {
         // link tells them, because the room they were in has moved. The
         // ones still inside a handler keep their own hold on it, so
         // nothing is cut off mid frame.
-        sockets.insert(
+        let replaced = sockets.insert(
             entry.tenant_ref.clone(),
             Sockets {
                 holder: holder.clone(),
                 router: router.clone(),
                 app,
+                handed: std::time::Instant::now(),
             },
         );
+        // One out and one in is one tier either way, so the gauge only
+        // moves when this is a project the node was not already holding
+        // sockets for.
+        if replaced.is_none() {
+            crate::ops::tier_built();
+        }
         drop(sockets);
         watch(self, entry.tenant_ref.clone(), holder);
         Ok(router)
     }
 }
 
-/// Watch the lease this tier was built from, and tell its sockets when
-/// it moves.
+/// Watch the lease this tier was built from, tell its sockets when it
+/// moves, and drop the tier when nobody has been on it for a while.
 ///
 /// The tier points at whoever held the project when the first socket
 /// arrived, and what used to notice a handover was the next socket to
@@ -196,25 +249,60 @@ impl Front {
 /// happens at the end of it. They reconnect, the front door resolves
 /// the new holder, and they rejoin the room the rest of the project is
 /// in.
+///
+/// The other end of a tier's life is here for the same reason it is one
+/// loop rather than two: nothing dropped a tier when its last socket
+/// went, so a node that had seen a project once held its link forever.
+/// A tier with nobody on it and nothing handed to it for [`EMPTY`] is
+/// dropped, which drops the router, the state, the hub and the link
+/// behind them, and tells the holder one less node is listening.
 fn watch(front: &Arc<Front>, tenant_ref: String, holder: String) {
     let Some(forwarding) = front.forwarding.clone() else {
         return;
     };
+    // A tier held for less time than the lease is reread in still has to
+    // be looked at often enough to go, which is only ever the case where
+    // somebody set the window deliberately.
+    let every = MOVED.min(front.empty);
     let front = Arc::downgrade(front);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(MOVED).await;
+            tokio::time::sleep(every).await;
             let Some(front) = front.upgrade() else { return };
             // Somebody else replaced this tier while this task slept,
             // which means a socket arrived and did the work: that entry
             // has a watcher of its own and this one is done.
-            let held = {
+            let (held, handed) = {
                 let sockets = front.sockets.lock().expect("the socket tier");
                 match sockets.get(&tenant_ref) {
-                    Some(up) if up.holder == holder => Arc::clone(&up.app),
+                    Some(up) if up.holder == holder => (Arc::clone(&up.app), up.handed),
                     _ => return,
                 }
             };
+            // Nobody on it and nothing sent to it since well before the
+            // last socket left. The second half is what makes the first
+            // half safe to believe: a socket between being handed the
+            // router and reaching the count is a tier that reads empty,
+            // and it stamped the tier on its way past.
+            if held.quota.sockets.now() == 0 && handed.elapsed() >= front.empty {
+                let mut sockets = front.sockets.lock().expect("the socket tier");
+                // Read again under the lock a request stamps under, so
+                // one that arrived while this task was deciding either
+                // moved the stamp, which stops this, or finds no tier
+                // and builds one against a freshly read lease.
+                if sockets.get(&tenant_ref).is_some_and(|up| {
+                    up.holder == holder && up.handed == handed && up.app.quota.sockets.now() == 0
+                }) {
+                    log::info!(
+                        "realtime: nobody has been on the socket tier for {tenant_ref} for {}s, so it and its link to {holder} are dropped",
+                        front.empty.as_secs()
+                    );
+                    sockets.remove(&tenant_ref);
+                    crate::ops::tier_dropped();
+                    return;
+                }
+                continue;
+            }
             let now = match forwarding.holders().get(&tenant_ref).await {
                 Ok(now) => now,
                 // The lease could not be read, which is a store this
@@ -245,6 +333,7 @@ fn watch(front: &Arc<Front>, tenant_ref: String, holder: String) {
                 .is_some_and(|up| up.holder == holder)
             {
                 sockets.remove(&tenant_ref);
+                crate::ops::tier_dropped();
             }
             return;
         }
