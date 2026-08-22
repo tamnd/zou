@@ -2804,7 +2804,7 @@
       this.origin = init.origin ?? "";
       this.lastEventId = "";
       this.source = null;
-      this.ports = [];
+      this.ports = init.ports ?? [];
     }
   }
 
@@ -4017,58 +4017,330 @@
         "Failed to execute 'structuredClone': 1 argument required, but only 0 present",
       );
     }
-    checkTransfer(options);
-    const bytes = core.serialize(value, undefined, (message) => {
-      throw new DOMException(message, "DataCloneError");
-    });
-    return core.deserialize(bytes);
+    return copied(value, checkTransfer(options)).data;
   }
 
-  // The transfer list, read and checked and then not acted on.
+  // The copy itself, shared with `postMessage` rather than written
+  // twice, so a message and a clone carry the same shapes and refuse
+  // the same values with the same words.
   //
-  // That is upstream rather than an omission: a buffer named for
+  // A `MessagePort` is the one thing here v8 cannot copy and this file
+  // can move. Every port carries v8's host object brand, so the
+  // serializer stops and asks about it rather than writing it out as
+  // the empty object its own string keyed properties would make: a
+  // port that was named for transfer is written as its place in the
+  // list and read back as the fresh port that took its end over, and a
+  // port that was not is refused in v8's words, `Unsupported object
+  // type`, which is the same refusal upstream gives.
+  function copied(value, list) {
+    const ports = list.filter((item) => item instanceof MessagePort);
+    const bytes = core.serialize(
+      value,
+      ports.length > 0 ? { hostObjects: ports } : undefined,
+      (message) => {
+        throw new DOMException(message, "DataCloneError");
+      },
+    );
+    // After the writing rather than before it, because a value that
+    // cannot be copied throws and a throw leaves the ports where they
+    // were.
+    const arrived = ports.map(handedOver);
+    return {
+      data: core.deserialize(
+        bytes,
+        arrived.length > 0 ? { hostObjects: arrived } : undefined,
+      ),
+      ports: arrived,
+    };
+  }
+
+  // The transfer list, read and checked and then acted on for a port
+  // and not for a buffer.
+  //
+  // The buffer is upstream rather than an omission: one named for
   // transfer is copied like everything else and is still readable
   // afterwards, measured by cloning one and asking its `byteLength`,
   // where a browser and a newer Deno both leave it detached. The
   // checking is not idle, because these three refusals are the whole of
   // what a caller passing the wrong thing sees, and a library that
   // transfers a buffer it then reuses works here and works there.
-  function checkTransfer(options) {
-    if (options === undefined || options === null) return;
+  function checkTransfer(options, called = "structuredClone") {
+    if (options === undefined || options === null) return [];
     if (typeof options !== "object" && typeof options !== "function") {
       throw new TypeError(
-        "Failed to execute 'structuredClone': Argument 2 can not be converted to a dictionary",
+        `Failed to execute '${called}': Argument 2 can not be converted to a dictionary`,
       );
     }
     const list = options.transfer;
-    if (list === undefined) return;
+    if (list === undefined) return [];
     if (
       list === null ||
       typeof list !== "object" ||
       typeof list[Symbol.iterator] !== "function"
     ) {
       throw new TypeError(
-        "Failed to execute 'structuredClone': 'transfer' of 'StructuredSerializeOptions' " +
+        `Failed to execute '${called}': 'transfer' of 'StructuredSerializeOptions' ` +
           "(Argument 2) can not be converted to sequence.",
       );
     }
+    const named = [];
     let index = 0;
     for (const item of list) {
       if (item === null || (typeof item !== "object" && typeof item !== "function")) {
         throw new TypeError(
-          "Failed to execute 'structuredClone': 'transfer' of 'StructuredSerializeOptions' " +
+          `Failed to execute '${called}': 'transfer' of 'StructuredSerializeOptions' ` +
             `(Argument 2), index ${index} is not an object`,
         );
       }
-      // An `ArrayBuffer` is the only transferable thing here. A stream
-      // and a typed array are both refused upstream, and there is no
-      // `MessagePort` on either server to be the third case.
-      if (!(item instanceof ArrayBuffer)) {
+      // An `ArrayBuffer` and a `MessagePort` are the transferable
+      // things here, and only the port is really moved. A stream and a
+      // typed array are both refused upstream.
+      if (!(item instanceof ArrayBuffer) && !(item instanceof MessagePort)) {
         throw new DOMException("Value not transferable", "DataCloneError");
       }
+      named.push(item);
       index += 1;
     }
+    return named;
   }
+
+  // ---------------------------------------------------------------
+  // A channel with two ends
+
+  // Two ports, each holding the other's end, where what is posted into
+  // one arrives at the other as an event. There is one isolate here and
+  // no worker to be on the far side, so both ends are in this call, and
+  // the point of them is not the thread they cross but the queue they
+  // are: a library that wants a reader on one side and a writer on the
+  // other, an sdk that hands work to itself and waits, a wrapper that
+  // adapts a callback into an async iterator. Several of them make a
+  // channel whether or not they ever send anything across it, and until
+  // now that was a `ReferenceError` at import time.
+  //
+  // What arrives is a copy taken when it was posted, not the object,
+  // and it goes through the same serializer `structuredClone` uses.
+  //
+  // The end, which is what actually holds the channel: what has
+  // arrived and not been read yet, whether anybody has started
+  // reading, and the other end. It outlives the port it is attached to,
+  // because transferring a port means giving its end to a new one, and
+  // what it was holding goes with it.
+  const END = Symbol("end");
+  const ONMESSAGE = Symbol("onmessage");
+  const ONMESSAGEERROR = Symbol("onmessageerror");
+  const PORT1 = Symbol("port1");
+  const PORT2 = Symbol("port2");
+
+  // v8's own brand for an object the host owns. The serializer asks
+  // about anything carrying it rather than writing out its properties,
+  // which is what makes a port either a transfer or a refusal instead
+  // of quietly arriving as `{}`.
+  const HOST = Symbol.for("Deno.core.hostObject");
+
+  const arriving = [];
+  let scheduled = false;
+
+  // When a message is delivered, which is the part a library can tell
+  // apart from the outside. A message posted from a call is delivered
+  // on the microtask queue, so it arrives ahead of a timer that was set
+  // before it, which is what the reference runtime does and what a race
+  // between a message and a `setTimeout` deadline is written against.
+  function queued(end) {
+    if (!arriving.includes(end)) {
+      arriving.push(end);
+    }
+    if (scheduled) {
+      return;
+    }
+    scheduled = true;
+    Promise.resolve().then(delivers);
+  }
+
+  // A round of messages is what was waiting when the round began, and
+  // what a handler posts while it is running belongs to the next one.
+  // That next round is booked before any handler runs, which is what
+  // puts it ahead of a timer a handler sets and behind a timer that was
+  // already waiting, and it is why two ports answering each other never
+  // starve the timers. The reference runtime interleaves them the same
+  // way, one round of messages per turn of the loop.
+  function delivers() {
+    scheduled = false;
+    const ends = arriving.splice(0, arriving.length);
+    if (ends.length === 0) {
+      return;
+    }
+    scheduled = true;
+    after(delivers, 0, [], false);
+    for (const end of ends) {
+      let left = end.holding.length;
+      while (left > 0 && end.started && !end.closed) {
+        const message = end.holding.shift();
+        left -= 1;
+        fires(
+          end.port,
+          new MessageEvent("message", { data: message.data, ports: message.ports }),
+        );
+      }
+      if (end.holding.length > 0 && end.started && !end.closed) {
+        queued(end);
+      }
+    }
+  }
+
+  // A port is never constructed by a caller: it comes from a channel or
+  // from a transfer, and `new MessagePort()` is the same refusal
+  // upstream gives.
+  let entangling = false;
+
+  function made() {
+    entangling = true;
+    try {
+      return new MessagePort();
+    } finally {
+      entangling = false;
+    }
+  }
+
+  // Transferring a port: the end moves to a fresh port, listeners and
+  // all the rest of the old one stay behind, and the old one is left
+  // holding nothing. Posting into it afterwards is not an error, it
+  // just reaches nobody, which is measured rather than chosen.
+  function handedOver(port) {
+    const end = port[END];
+    const fresh = made();
+    port[END] = null;
+    if (end !== null) {
+      end.port = fresh;
+      fresh[END] = end;
+    }
+    return fresh;
+  }
+
+  // The transfer list of a `postMessage`, which takes either the array
+  // itself or an options object with it under `transfer`.
+  function transferred(transfer, from) {
+    let list = transfer;
+    if (list === null) {
+      list = undefined;
+    } else if (list !== undefined && !Array.isArray(list) && typeof list === "object") {
+      list = list.transfer;
+    }
+    const named = checkTransfer({ transfer: list }, "postMessage");
+    for (const item of named) {
+      if (item === from) {
+        throw new DOMException("Can not transfer self", "DataCloneError");
+      }
+    }
+    return named;
+  }
+
+  class MessagePort extends EventTarget {
+    constructor() {
+      if (!entangling) {
+        throw new TypeError("Illegal constructor");
+      }
+      super();
+      this[END] = null;
+      this[ONMESSAGE] = null;
+      this[ONMESSAGEERROR] = null;
+    }
+
+    get onmessage() {
+      return this[ONMESSAGE];
+    }
+
+    // Setting a handler starts the port, which is the difference
+    // between this and `addEventListener`: a handler set long after the
+    // messages were posted still sees them, and a listener added the
+    // other way sees nothing until somebody calls `start`. Setting it
+    // to null does not start anything, and does not stop a port that
+    // was already started either.
+    set onmessage(handler) {
+      this[ONMESSAGE] = handler;
+      if (handler !== null && handler !== undefined) {
+        this.start();
+      }
+    }
+
+    get onmessageerror() {
+      return this[ONMESSAGEERROR];
+    }
+
+    set onmessageerror(handler) {
+      this[ONMESSAGEERROR] = handler;
+    }
+
+    postMessage(data, transfer) {
+      // The copy is made before the port is looked at, so a value that
+      // cannot be copied is refused whether or not anybody is left to
+      // receive it.
+      const message = copied(data, transferred(transfer, this));
+      const end = this[END];
+      const other = end === null ? null : end.other;
+      if (other === null || other.closed) {
+        return;
+      }
+      other.holding.push(message);
+      if (other.started) {
+        queued(other);
+      }
+    }
+
+    start() {
+      const end = this[END];
+      if (end === null || end.started || end.closed) {
+        return;
+      }
+      end.started = true;
+      if (end.holding.length > 0) {
+        queued(end);
+      }
+    }
+
+    // Closing throws away what has arrived and not been read, and takes
+    // the other end with it: a message posted after this reaches
+    // nobody, and one posted before it and not yet delivered is gone.
+    close() {
+      const end = this[END];
+      if (end === null || end.closed) {
+        return;
+      }
+      end.closed = true;
+      end.holding.length = 0;
+      const other = end.other;
+      end.other = null;
+      if (other !== null) {
+        other.other = null;
+      }
+    }
+  }
+
+  MessagePort.prototype[HOST] = true;
+  MessagePort.prototype[Symbol.toStringTag] = "MessagePort";
+
+  class MessageChannel {
+    constructor() {
+      const one = made();
+      const two = made();
+      const here = { port: one, other: null, holding: [], started: false, closed: false };
+      const there = { port: two, other: here, holding: [], started: false, closed: false };
+      here.other = there;
+      one[END] = here;
+      two[END] = there;
+      this[PORT1] = one;
+      this[PORT2] = two;
+    }
+
+    get port1() {
+      return this[PORT1];
+    }
+
+    get port2() {
+      return this[PORT2];
+    }
+  }
+
+  MessageChannel.prototype[Symbol.toStringTag] = "MessageChannel";
 
   // ---------------------------------------------------------------
   // What the module sees
@@ -4087,7 +4359,9 @@
     ErrorEvent,
     Event,
     EventTarget,
+    MessageChannel,
     MessageEvent,
+    MessagePort,
     PromiseRejectionEvent,
     WebSocket,
     File,

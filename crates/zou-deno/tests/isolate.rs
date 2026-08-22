@@ -4279,3 +4279,382 @@ fn a_copy_loses_what_upstream_loses() {
     // A hole stays a hole and an own property of an array survives.
     assert_eq!(said["sparse"], serde_json::json!([3, false, "yes"]));
 }
+
+/// A channel and its two ports, which several libraries make on the way
+/// to something else and until now was a `ReferenceError` at import
+/// time.
+///
+/// The shape is measured against the reference runtime, down to which
+/// names are on the prototype and what a caller who tries to construct
+/// a port for themselves is told.
+#[test]
+fn a_channel_has_two_ports() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const channel = new MessageChannel();
+            let refused = "no";
+            try {
+                new MessagePort();
+            } catch (e) {
+                refused = `${e.name}: ${e.message}`;
+            }
+            return Response.json({
+                kinds: [typeof MessageChannel, typeof MessagePort, typeof MessageEvent],
+                ports: [
+                    channel.port1 instanceof MessagePort,
+                    channel.port2 instanceof MessagePort,
+                    channel.port1 instanceof EventTarget,
+                    channel.port1 === channel.port2,
+                ],
+                names: [MessageChannel.name, MessagePort.name, channel.port1.constructor.name],
+                methods: ["postMessage", "start", "close", "addEventListener"].map(
+                    (name) => typeof channel.port1[name],
+                ),
+                own: [
+                    Object.getOwnPropertyNames(channel).length,
+                    Object.getOwnPropertyNames(channel.port1).length,
+                ],
+                keys: Object.getOwnPropertyNames(MessageChannel.prototype).sort(),
+                tags: [
+                    Object.prototype.toString.call(channel),
+                    Object.prototype.toString.call(channel.port1),
+                ],
+                handler: ["onmessage" in channel.port1, channel.port1.onmessage],
+                refused,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said["kinds"],
+        serde_json::json!(["function", "function", "function"])
+    );
+    assert_eq!(said["ports"], serde_json::json!([true, true, true, false]));
+    assert_eq!(
+        said["names"],
+        serde_json::json!(["MessageChannel", "MessagePort", "MessagePort"])
+    );
+    assert_eq!(
+        said["methods"],
+        serde_json::json!(["function", "function", "function", "function"])
+    );
+    // Both ends of both objects are accessors on the prototype, so a
+    // caller enumerating one finds nothing of the machinery.
+    assert_eq!(said["own"], serde_json::json!([0, 0]));
+    assert_eq!(
+        said["keys"],
+        serde_json::json!(["constructor", "port1", "port2"])
+    );
+    assert_eq!(
+        said["tags"],
+        serde_json::json!(["[object MessageChannel]", "[object MessagePort]"])
+    );
+    assert_eq!(
+        said["handler"],
+        serde_json::json!([true, serde_json::Value::Null])
+    );
+    assert_eq!(said["refused"], "TypeError: Illegal constructor");
+}
+
+/// What arrives is a copy of what was posted, taken when it was posted,
+/// and it arrives as the same `MessageEvent` a socket delivers.
+#[test]
+fn a_message_arrives_as_a_copy_of_what_was_posted() {
+    let answer = answered(
+        r#"
+        const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+        Deno.serve(async () => {
+            const channel = new MessageChannel();
+            const seen = {};
+            let got = null;
+            channel.port1.onmessage = (event) => {
+                got = event.data;
+                seen.type = event.type;
+                seen.origin = event.origin;
+                seen.lastEventId = event.lastEventId;
+                seen.source = event.source;
+                seen.ports = Array.isArray(event.ports) ? event.ports.length : String(event.ports);
+                seen.kind = event instanceof MessageEvent;
+                seen.target = event.target === channel.port1;
+                seen.cancelable = event.cancelable;
+                seen.bubbles = event.bubbles;
+            };
+            const sent = { n: 1, deep: { m: new Map([["k", "v"]]) } };
+            channel.port2.postMessage(sent);
+            sent.n = 2;
+            let refused = "no";
+            try {
+                channel.port2.postMessage(() => {});
+            } catch (e) {
+                refused = `${e.name}: ${e.message}`;
+            }
+            await wait();
+            return Response.json({
+                seen,
+                copy: [got === sent, got.n, got.deep.m instanceof Map, got.deep.m.get("k")],
+                refused,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["seen"]["type"], "message");
+    assert_eq!(said["seen"]["origin"], "");
+    assert_eq!(said["seen"]["lastEventId"], "");
+    assert_eq!(said["seen"]["source"], serde_json::Value::Null);
+    assert_eq!(said["seen"]["ports"], 0);
+    assert_eq!(said["seen"]["kind"], true);
+    assert_eq!(said["seen"]["target"], true);
+    assert_eq!(said["seen"]["cancelable"], false);
+    assert_eq!(said["seen"]["bubbles"], false);
+    // The copy is taken at the post, so the sender changing it
+    // afterwards changes nothing that arrives.
+    assert_eq!(said["copy"], serde_json::json!([false, 1, true, "v"]));
+    assert_eq!(
+        said["refused"],
+        "DataCloneError: ()=>{} could not be cloned."
+    );
+}
+
+/// When a message arrives, which is the part a library can tell apart
+/// from the outside.
+///
+/// A message posted from a call arrives before a timer that was set
+/// before it, and a handler that posts waits a turn, so two ports
+/// answering each other do not starve the timers. Both are the
+/// reference runtime's order rather than this file's.
+#[test]
+fn a_message_arrives_ahead_of_a_timer_and_a_handler_that_answers_waits_a_turn() {
+    let answer = answered(
+        r#"
+        const wait = (ms = 50) => new Promise((r) => setTimeout(r, ms));
+        Deno.serve(async () => {
+            const order = [];
+            const first = new MessageChannel();
+            first.port1.onmessage = (event) => order.push(`message:${event.data}`);
+            queueMicrotask(() => order.push("micro"));
+            setTimeout(() => order.push("timer"), 0);
+            first.port2.postMessage("one");
+            first.port2.postMessage("two");
+            await wait();
+
+            const back = [];
+            const second = new MessageChannel();
+            let left = 3;
+            setTimeout(() => back.push("timer"), 0);
+            second.port1.onmessage = () => {
+                back.push("ping");
+                if (left-- > 0) second.port1.postMessage("back");
+            };
+            second.port2.onmessage = () => {
+                back.push("pong");
+                second.port2.postMessage("back");
+            };
+            second.port2.postMessage("start");
+            await wait();
+
+            const nested = [];
+            const third = new MessageChannel();
+            third.port1.onmessage = (event) => {
+                nested.push(`in:${event.data}`);
+                if (event.data === "one") {
+                    setTimeout(() => nested.push("timer inside"), 0);
+                    third.port2.postMessage("two");
+                }
+            };
+            third.port2.postMessage("one");
+            await wait();
+
+            return Response.json({ order, back, nested });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said["order"],
+        serde_json::json!(["micro", "message:one", "message:two", "timer"])
+    );
+    let back: Vec<String> = serde_json::from_value(said["back"].clone()).expect("a list");
+    // Four pings and three pongs, because the handler stops answering,
+    // and the timer somewhere in among them rather than after all of
+    // them: the pair does not hold the loop.
+    assert_eq!(back.iter().filter(|each| *each == "ping").count(), 4);
+    assert_eq!(back.iter().filter(|each| *each == "pong").count(), 3);
+    assert_eq!(back.first().map(String::as_str), Some("ping"));
+    assert_ne!(back.last().map(String::as_str), Some("timer"));
+    assert_eq!(
+        said["nested"],
+        serde_json::json!(["in:one", "in:two", "timer inside"])
+    );
+}
+
+/// A port holds what it was sent until somebody reads it, and setting a
+/// handler is what starts the reading.
+#[test]
+fn a_port_holds_what_it_was_sent_until_it_is_started() {
+    let answer = answered(
+        r#"
+        const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+        Deno.serve(async () => {
+            const listening = new MessageChannel();
+            const heard = [];
+            listening.port1.addEventListener("message", (event) => heard.push(event.data));
+            listening.port2.postMessage("held");
+            await wait();
+            const before = [...heard];
+            listening.port1.start();
+            await wait();
+
+            const late = new MessageChannel();
+            const lately = [];
+            late.port2.postMessage("early");
+            await wait();
+            late.port1.onmessage = (event) => lately.push(event.data);
+            await wait();
+
+            const cleared = new MessageChannel();
+            const still = [];
+            cleared.port1.onmessage = () => still.push("handler");
+            cleared.port1.onmessage = null;
+            cleared.port1.addEventListener("message", () => still.push("listener"));
+            cleared.port2.postMessage("after");
+            await wait();
+
+            const never = new MessageChannel();
+            const nothing = [];
+            never.port1.onmessage = null;
+            never.port1.addEventListener("message", (event) => nothing.push(event.data));
+            never.port2.postMessage("nobody started this");
+            await wait();
+
+            return Response.json({
+                before,
+                after: heard,
+                lately,
+                still,
+                nothing,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    // A listener on its own does not start the port.
+    assert_eq!(said["before"], serde_json::json!([]));
+    assert_eq!(said["after"], serde_json::json!(["held"]));
+    // A handler set long after the message was posted still sees it.
+    assert_eq!(said["lately"], serde_json::json!(["early"]));
+    // Setting the handler started the port and taking it away again
+    // does not stop it.
+    assert_eq!(said["still"], serde_json::json!(["listener"]));
+    // Setting it to null never started anything.
+    assert_eq!(said["nothing"], serde_json::json!([]));
+}
+
+/// Closing a port throws away what was waiting and takes the other end
+/// with it, and posting into a closed one is quiet rather than an
+/// error, which is what the reference runtime does.
+#[test]
+fn closing_a_port_throws_away_what_was_waiting() {
+    let answer = answered(
+        r#"
+        const wait = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+        Deno.serve(async () => {
+            const receiver = new MessageChannel();
+            const heard = [];
+            receiver.port1.onmessage = (event) => heard.push(event.data);
+            receiver.port2.postMessage("before");
+            receiver.port1.close();
+            receiver.port2.postMessage("after");
+
+            const sender = new MessageChannel();
+            const other = [];
+            sender.port1.onmessage = (event) => other.push(event.data);
+            sender.port2.close();
+            let threw = null;
+            try {
+                sender.port2.postMessage("after");
+            } catch (e) {
+                threw = `${e.name}: ${e.message}`;
+            }
+
+            await wait();
+            return Response.json({ heard, other, threw });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["heard"], serde_json::json!([]));
+    assert_eq!(said["other"], serde_json::json!([]));
+    assert_eq!(said["threw"], serde_json::Value::Null);
+}
+
+/// A port is the one thing here that is really transferred: named in a
+/// transfer list it arrives as a fresh port holding the same end, and
+/// not named it is refused in v8's own words rather than arriving as an
+/// empty object the way a `Blob` does.
+#[test]
+fn a_port_is_transferred_or_refused_by_name() {
+    let answer = answered(
+        r#"
+        const wait = (ms = 50) => new Promise((r) => setTimeout(r, ms));
+        Deno.serve(async () => {
+            const say = (f) => {
+                try {
+                    f();
+                    return "no";
+                } catch (e) {
+                    return `${e.name}: ${e.message}`;
+                }
+            };
+
+            const cloned = new MessageChannel();
+            const copy = structuredClone(cloned.port1, { transfer: [cloned.port1] });
+            const heard = [];
+            copy.onmessage = (event) => heard.push(event.data);
+            cloned.port2.postMessage("to the copy");
+            const stranded = say(() => cloned.port1.postMessage("to nobody"));
+            await wait();
+
+            const carrier = new MessageChannel();
+            const carried = new MessageChannel();
+            carried.port2.postMessage("posted before");
+            const arrived = [];
+            let ports = null;
+            carrier.port1.onmessage = (event) => {
+                ports = event.ports.length;
+                event.ports[0].onmessage = (inner) => arrived.push(inner.data);
+            };
+            carrier.port2.postMessage("carrying", [carried.port1]);
+            await wait();
+
+            const self = new MessageChannel();
+            const alone = new MessageChannel();
+            return Response.json({
+                clone: [copy instanceof MessagePort, copy === cloned.port1, heard, stranded],
+                carry: [ports, arrived],
+                bare: say(() => structuredClone(alone.port1)),
+                inside: say(() => alone.port1.postMessage({ port: alone.port2 })),
+                itself: say(() => self.port2.postMessage("itself", [self.port2])),
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    // The copy is a different port holding the end the original had, so
+    // the message reaches it and the original reaches nobody without
+    // saying so.
+    assert_eq!(
+        said["clone"],
+        serde_json::json!([true, false, ["to the copy"], "no"])
+    );
+    // A port sent down another channel arrives in `ports`, entangled
+    // with what its own other end was entangled with, and still holding
+    // what was posted to it before it was sent.
+    assert_eq!(said["carry"], serde_json::json!([1, ["posted before"]]));
+    // v8's refusal, which is the reference runtime's refusal too.
+    assert_eq!(said["bare"], "DataCloneError: Unsupported object type");
+    assert_eq!(said["inside"], "DataCloneError: Unsupported object type");
+    assert_eq!(said["itself"], "DataCloneError: Can not transfer self");
+}
