@@ -3724,6 +3724,119 @@ async fn a_spread_of_a_list_arrives_one_column_at_a_time() {
     assert_eq!(body_text(res).await, r#"[{"name":"labs","players":[]}]"#);
 }
 
+/// A spread is flattened into the level around it, so an aggregate
+/// written inside one is an aggregate of the level around it: it
+/// reads the rows of the join rather than one parent's rows, and
+/// every plain column anywhere in the flattened tree groups it.
+///
+/// The tables are upstream's own shape, a junction with a table
+/// either side of it and a one to one hanging off one of them, since
+/// that is what the cases in PostgREST's AggregateFunctionsSpec ask
+/// about and where the answer used to be one row per underlying row.
+#[tokio::test]
+async fn an_aggregate_inside_a_spread_groups_the_level_around_it() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_ps cascade",
+            "drop table if exists zou_rest_cost cascade",
+            "drop table if exists zou_rest_proc cascade",
+            "drop table if exists zou_rest_factory cascade",
+            "drop table if exists zou_rest_super cascade",
+            "create table zou_rest_factory (id int primary key, name text)",
+            "create table zou_rest_super (id int primary key, name text)",
+            "create table zou_rest_proc (\
+               id int primary key, \
+               name text, \
+               factory_id int references zou_rest_factory (id))",
+            "create table zou_rest_cost (\
+               proc_id int primary key references zou_rest_proc (id), \
+               cost int)",
+            "create table zou_rest_ps (\
+               proc_id int references zou_rest_proc (id), \
+               super_id int references zou_rest_super (id), \
+               primary key (proc_id, super_id))",
+            "insert into zou_rest_factory values (1, 'alpha'), (2, 'beta')",
+            "insert into zou_rest_super values (1, 'ada'), (2, 'bob')",
+            "insert into zou_rest_proc values (1, 'p1', 1), (2, 'p2', 1), (3, 'p3', 2)",
+            "insert into zou_rest_cost values (1, 10), (2, 32), (3, 5)",
+            "insert into zou_rest_ps values (1, 1), (2, 1), (3, 2)",
+        ],
+    )
+    .await;
+    let app = app(&dsn);
+
+    // count() inside the spread counts the junction rows the join
+    // kept, grouped by the column beside it, rather than counting one
+    // row at a time and answering as many rows as the junction has.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_ps?select=super_id,...zou_rest_proc(count())&order=super_id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"super_id":1,"count":2},{"super_id":2,"count":1}]"#
+    );
+
+    // A spread inside a spread reaches just as far up: the column the
+    // sum reads is two levels down and the sum is written at the top.
+    let res = app
+        .clone()
+        .oneshot(get("/rest/v1/zou_rest_ps?select=super_id,\
+             ...zou_rest_proc(...zou_rest_cost(cost.sum()))&order=super_id"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"super_id":1,"sum":42},{"super_id":2,"sum":5}]"#
+    );
+
+    // A plain column in one spread groups the aggregate in another,
+    // which is the shape a spread used to be refused for outright.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_proc?select=...zou_rest_cost(cost.sum()),\
+             ...zou_rest_factory(name)&order=zou_rest_factory(name)",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"sum":42,"name":"alpha"},{"sum":5,"name":"beta"}]"#
+    );
+
+    // Nothing to group by is one row over the lot.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_proc?select=...zou_rest_cost(total:cost.sum())",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(body_text(res).await, r#"[{"total":47}]"#);
+
+    // A spread with no aggregate anywhere near it is untouched: the
+    // columns merge into the parent and nothing groups.
+    let res = app
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_rest_proc?select=name,...zou_rest_factory(factory:name)&order=id",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"name":"p1","factory":"alpha"},{"name":"p2","factory":"alpha"},{"name":"p3","factory":"beta"}]"#
+    );
+}
+
 #[tokio::test]
 async fn a_view_embeds_on_the_keys_of_the_tables_under_it() {
     let Some(dsn) = dsn() else { return };
