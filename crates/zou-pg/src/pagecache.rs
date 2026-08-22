@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ZOU_PAGE_SIZE;
 use crate::pending::ForkId;
+use zou_store::forksize::ForkSize;
 
 /// Positional reads and writes without touching the shared cursor,
 /// pread and pwrite on unix, seek_read and seek_write on windows.
@@ -180,19 +181,48 @@ impl PageCache {
     /// extend sees the old size exactly as a vanilla reader whose
     /// lseek lands before the extend completes.
     pub fn load_size(&self, fork: ForkId) -> Option<u32> {
+        self.load_marker(fork).map(|fs| fs.nblocks)
+    }
+
+    /// The whole marker, length and written watermark together.
+    ///
+    /// A file this cache wrote before the watermark existed is four
+    /// bytes and reads back as a length claiming nothing, which is the
+    /// same thing an old SIZE object in the store does.
+    pub fn load_marker(&self, fork: ForkId) -> Option<ForkSize> {
         let f = File::open(self.size_path(fork)).ok()?;
+        let mut buf = [0u8; 16];
+        if read_exact_at(&f, &mut buf, 0).is_ok() {
+            return ForkSize::decode(&buf);
+        }
         let mut n = [0u8; 4];
         read_exact_at(&f, &mut n, 0).ok()?;
-        Some(u32::from_le_bytes(n))
+        ForkSize::decode(&n)
     }
 
     /// Land a fork size, called only after the store accepted it, so
     /// the local answer is never newer than the store. Absence is
     /// never cached, an absent SIZE means the fork does not exist and
     /// that answer has to keep coming from the store.
+    ///
+    /// The watermark already cached is kept, because a caller with a
+    /// length and nothing else has learned nothing about which blocks
+    /// have pages, and dropping it would cost the seed a fresh shared
+    /// memory entry takes from here.
     pub fn save_size(&self, fork: ForkId, nblocks: u32) {
+        let mut fs = self.load_marker(fork).unwrap_or_default();
+        fs.nblocks = nblocks;
+        if fs.dense > nblocks {
+            fs.truncate(nblocks);
+        }
+        self.save_marker(fork, &fs);
+    }
+
+    /// Land a whole marker, watermark included.
+    pub fn save_marker(&self, fork: ForkId, fs: &ForkSize) {
         if let Some(f) = self.open_rw(&self.size_path(fork)) {
-            let _ = write_all_at(&f, &nblocks.to_le_bytes(), 0);
+            let _ = write_all_at(&f, &fs.encode(), 0);
+            let _ = f.set_len(16);
         }
     }
 

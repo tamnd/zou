@@ -11,6 +11,7 @@ pub mod branch;
 pub mod cas;
 pub mod delay;
 pub mod filecache;
+pub mod forksize;
 pub mod frame;
 pub mod guard;
 pub mod heartbeat;

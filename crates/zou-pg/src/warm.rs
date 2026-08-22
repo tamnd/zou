@@ -179,9 +179,9 @@ pub fn warm(
     // answers it.
     for_each_parallel(&forks, |&(spc, db, rel, fork)| {
         if let Ok(Some((data, _))) = store.get(&layout.pg_size(spc, db, rel, fork))
-            && let Ok(n) = <[u8; 4]>::try_from(data.as_slice())
+            && let Some(fs) = zou_store::forksize::ForkSize::decode(&data)
         {
-            cache.save_size((spc, db, rel, fork), u32::from_le_bytes(n));
+            cache.save_size((spc, db, rel, fork), fs.nblocks);
         }
         true
     });

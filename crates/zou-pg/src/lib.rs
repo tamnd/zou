@@ -120,7 +120,7 @@ pub(crate) mod testv2 {
 use std::ffi::{CStr, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -128,6 +128,7 @@ use zou_log::{
     AppendError, AppendTicket, Backpressure, MediaSink, Sequencer, Tee, WalMedia, consolidate,
     gc_landing, landing_backlog, stream_end, take_over,
 };
+use zou_store::forksize::ForkSize;
 use zou_store::heartbeat::Heartbeat;
 use zou_store::layout::TenantLayout;
 use zou_store::lease;
@@ -503,22 +504,35 @@ fn with_shim(f: impl FnOnce(&'static Shim) -> i32) -> i32 {
     })
 }
 
-fn read_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Result<Option<u32>, ()> {
+fn read_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Result<Option<ForkSize>, ()> {
     if let Some(cache) = &shim.cache
-        && let Some(n) = cache.load_size((spc, db, rel, fork))
+        && let Some(fs) = cache.load_marker((spc, db, rel, fork))
     {
-        return Ok(Some(n));
+        return Ok(Some(fs));
     }
+    match read_marker(shim, spc, db, rel, fork)? {
+        Some(fs) => {
+            if let Some(cache) = &shim.cache {
+                cache.save_marker((spc, db, rel, fork), &fs);
+            }
+            Ok(Some(fs))
+        }
+        None => Ok(None),
+    }
+}
+
+/// The whole SIZE marker, cache bypassed. The page cache only holds
+/// lengths, so anything wanting the written watermark comes here.
+fn read_marker(
+    shim: &Shim,
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+) -> Result<Option<ForkSize>, ()> {
     let key = shim.layout.pg_size(spc, db, rel, fork);
     match shim.store.get(&key) {
-        Ok(Some((data, _))) => {
-            let bytes: [u8; 4] = data.as_slice().try_into().map_err(|_| ())?;
-            let n = u32::from_le_bytes(bytes);
-            if let Some(cache) = &shim.cache {
-                cache.save_size((spc, db, rel, fork), n);
-            }
-            Ok(Some(n))
-        }
+        Ok(Some((data, _))) => ForkSize::decode(&data).map(Some).ok_or(()),
         Ok(None) => Ok(None),
         Err(_) => Err(()),
     }
@@ -532,15 +546,8 @@ fn read_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Result<Opti
 /// checkpoint. A caller deciding whether a page it is about to put is
 /// covered by the durable length has to ask the store itself, or it
 /// skips a SIZE write on the strength of a length only memory has.
-fn read_size_store(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Result<u32, ()> {
-    match shim.store.get(&shim.layout.pg_size(spc, db, rel, fork)) {
-        Ok(Some((data, _))) => {
-            let bytes: [u8; 4] = data.as_slice().try_into().map_err(|_| ())?;
-            Ok(u32::from_le_bytes(bytes))
-        }
-        Ok(None) => Ok(0),
-        Err(_) => Err(()),
-    }
+fn read_size_store(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Result<ForkSize, ()> {
+    Ok(read_marker(shim, spc, db, rel, fork)?.unwrap_or_default())
 }
 
 /// The fork size for the read side: the tenant's own SIZE object when
@@ -557,14 +564,17 @@ fn read_size_chained(
     db: u32,
     rel: u32,
     fork: u32,
-) -> Result<Option<u32>, ()> {
+) -> Result<Option<ForkSize>, ()> {
     let pending = shim
         .pending
         .lock()
         .map_err(|_| ())?
         .size((spc, db, rel, fork));
-    if let Some(n) = read_size(shim, spc, db, rel, fork)? {
-        return Ok(Some(pending.map_or(n, |p| p.max(n))));
+    if let Some(mut fs) = read_size(shim, spc, db, rel, fork)? {
+        if let Some(p) = pending {
+            fs.grow(p);
+        }
+        return Ok(Some(fs));
     }
     let chained = with_reader(shim, |rd| {
         if rd.branched() {
@@ -574,9 +584,12 @@ fn read_size_chained(
         }
     })
     .map(Option::flatten)?;
+    // A length folded into the chain, or one only this process's
+    // pending buffer knows about. Neither says anything about which
+    // blocks have pages, so both come back with nothing claimed.
     Ok(match (chained, pending) {
-        (Some(n), Some(p)) => Some(n.max(p)),
-        (n, p) => n.or(p),
+        (Some(n), Some(p)) => Some(ForkSize::plain(n.max(p))),
+        (n, p) => n.or(p).map(ForkSize::plain),
     })
 }
 
@@ -584,6 +597,30 @@ fn read_size_chained(
 /// store's length to cover a page they are putting use this and raise
 /// the local size themselves, so a length shared memory holds is not
 /// lowered to the one this call happens to write.
+fn put_marker(
+    shim: &Shim,
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+    fs: &ForkSize,
+) -> Result<(), ()> {
+    let key = shim.layout.pg_size(spc, db, rel, fork);
+    shim.store
+        .put(&key, &fs.encode())
+        .map(|_| ())
+        .map_err(|_| ())
+}
+
+/// Grow the marker to `nblocks`, keeping the written watermark that is
+/// already in it.
+///
+/// Every length writer goes through here rather than putting four
+/// bytes of its own, because a length written on its own would drop
+/// the watermark to zero and the fork would stop being able to tell a
+/// lost page from a hole. The extra read is on the extension path,
+/// which is already one round trip, and not on the write path, where
+/// the length is settled by the shared table instead.
 fn put_size_object(
     shim: &Shim,
     spc: u32,
@@ -592,11 +629,9 @@ fn put_size_object(
     fork: u32,
     nblocks: u32,
 ) -> Result<(), ()> {
-    let key = shim.layout.pg_size(spc, db, rel, fork);
-    shim.store
-        .put(&key, &nblocks.to_le_bytes())
-        .map(|_| ())
-        .map_err(|_| ())
+    let mut fs = read_size_store(shim, spc, db, rel, fork)?;
+    fs.grow(nblocks);
+    put_marker(shim, spc, db, rel, fork, &fs)
 }
 
 fn write_size(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> Result<(), ()> {
@@ -730,14 +765,20 @@ pub unsafe extern "C" fn zou_smgr_nblocks(
     rel: u32,
     fork: u32,
     out: *mut u32,
+    dense: *mut u32,
+    filled: *mut u64,
 ) -> i32 {
     with_shim(|shim| {
-        if out.is_null() {
+        if out.is_null() || dense.is_null() || filled.is_null() {
             return ZOU_ERR_BAD_ARGUMENT;
         }
         match read_size_chained(shim, spc, db, rel, fork) {
-            Ok(Some(n)) => {
-                unsafe { *out = n };
+            Ok(Some(fs)) => {
+                unsafe {
+                    *out = fs.nblocks;
+                    *dense = fs.dense;
+                    *filled = fs.filled;
+                }
                 ZOU_OK
             }
             Ok(None) => ZOU_ERR_STORE,
@@ -852,6 +893,9 @@ pub unsafe extern "C" fn zou_smgr_read(
             }
             Ok(Some(_)) => ZOU_ERR_STORE,
             Ok(None) => {
+                if lost(shim, spc, db, rel, fork, blk) {
+                    return ZOU_ERR_STORE;
+                }
                 // Absent blocks read as zeros and stay out of the
                 // cache, absence is already a local answer once SIZE
                 // is known and zeros cached across a truncate and
@@ -863,6 +907,43 @@ pub unsafe extern "C" fn zou_smgr_read(
             Err(_) => ZOU_ERR_STORE,
         }
     })
+}
+
+/// Has a block that no tier could produce gone missing?
+///
+/// This is the last word on an absent block object, and it is the
+/// difference between a page that was never written and a page that is
+/// not there any more. Zeros are the right answer for the first: a
+/// block extended and not written yet is a hole in a file and postgres
+/// reads it as a new and empty page on purpose. Zeros are silent data
+/// loss for the second, because the same all zero page makes a table
+/// come up short by exactly the rows the block held and nothing
+/// anywhere says a word (zou #546).
+///
+/// The marker is what tells them apart. Every block below its
+/// watermark has had a page reach the store, so one that no tier can
+/// produce now is gone, and the read fails rather than inventing an
+/// empty page. Above the watermark nothing was ever claimed and the
+/// answer stays zeros, which is also what a store written before the
+/// watermark existed gets.
+///
+/// Cost is one get, on a path that has already had a get come back
+/// empty, and only for blocks a reader is about to be told are blank.
+fn lost(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, blk: u32) -> bool {
+    let Ok(Some(fs)) = read_marker(shim, spc, db, rel, fork) else {
+        return false;
+    };
+    if !fs.written(blk) {
+        return false;
+    }
+    log::error!(
+        "zou_smgr_read: block {blk} of {spc}/{db}/{rel}.{fork} is gone: \
+         the fork is {} blocks and its first {} have been written, \
+         but no tier holds this one",
+        fs.nblocks,
+        fs.dense
+    );
+    true
 }
 
 /// Read a run of `nblocks` pages starting at `blk` into `bufs`. Each
@@ -975,6 +1056,7 @@ pub unsafe extern "C" fn zou_smgr_readv(
         unsafe impl Send for Job {}
         unsafe impl Sync for Job {}
         let jobs: Vec<Job> = misses.iter().map(|(i, b)| Job(*b, ptrs[*i])).collect();
+        let absent = AtomicU32::new(u32::MAX);
         let ok = pending::for_each_parallel(&jobs, |Job(b, ptr)| {
             let out = unsafe { std::slice::from_raw_parts_mut(*ptr, ZOU_PAGE_SIZE) };
             match shim
@@ -990,12 +1072,21 @@ pub unsafe extern "C" fn zou_smgr_readv(
                 }
                 Ok(Some(_)) | Err(_) => false,
                 Ok(None) => {
+                    absent.fetch_min(*b, Ordering::Relaxed);
                     out.fill(0);
                     true
                 }
             }
         });
         if !ok {
+            return ZOU_ERR_STORE;
+        }
+        // One marker read for the whole run, and only when something
+        // came back blank. The lowest absent block is the one to ask
+        // about: the watermark is a prefix, so if any block in this run
+        // is below it that one is.
+        let lowest = absent.load(Ordering::Relaxed);
+        if lowest != u32::MAX && lost(shim, spc, db, rel, fork, lowest) {
             return ZOU_ERR_STORE;
         }
         // Pages count where they were served, the call lands once
@@ -1190,7 +1281,16 @@ pub unsafe extern "C" fn zou_smgr_extend(
     // store alone.
     with_shim(|shim| match read_size_store(shim, spc, db, rel, fork) {
         Ok(current) => {
-            if blk + 1 > current && put_size_object(shim, spc, db, rel, fork, blk + 1).is_err() {
+            // The page above is in the store, so this is also the one
+            // extension path that can move the watermark itself. Both
+            // halves ride in the one object, so a marker that has to
+            // be rewritten for the length carries the block for free.
+            let mut next = current;
+            next.grow(blk + 1);
+            if shim.pageserve.is_none() {
+                next.fill(blk);
+            }
+            if next != current && put_marker(shim, spc, db, rel, fork, &next).is_err() {
                 return ZOU_ERR_STORE;
             }
             note_size(shim, spc, db, rel, fork, blk + 1);
@@ -1352,13 +1452,43 @@ pub extern "C" fn zou_smgr_zeroextend(
     })
 }
 
-/// Make a fork length durable on its own. The checkpoint calls this for
-/// every length an extension left in shared memory and nowhere else.
+/// Make a fork length durable on its own, with what the cluster knows
+/// about which of its blocks have been written. The checkpoint calls
+/// this for every length an extension left in shared memory and
+/// nowhere else, and the watermark rides along because the shared
+/// table is the only place an ordinary page writeback records itself:
+/// a writeback settles no length, so this is its one way out.
+///
+/// The two are merged rather than overwritten. Both halves only move
+/// forward and this caller is not the only writer of the object, so
+/// taking the further of each is the answer that cannot go backwards.
 #[unsafe(no_mangle)]
-pub extern "C" fn zou_smgr_put_size(spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> i32 {
-    with_shim(|shim| match write_size(shim, spc, db, rel, fork, nblocks) {
-        Ok(()) => ZOU_OK,
-        Err(()) => ZOU_ERR_STORE,
+pub extern "C" fn zou_smgr_put_size(
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+    nblocks: u32,
+    dense: u32,
+    filled: u64,
+) -> i32 {
+    with_shim(|shim| {
+        let Ok(current) = read_size_store(shim, spc, db, rel, fork) else {
+            return ZOU_ERR_STORE;
+        };
+        let mut next = current.merge(&ForkSize {
+            nblocks,
+            dense,
+            filled,
+        });
+        next.grow(nblocks);
+        if put_marker(shim, spc, db, rel, fork, &next).is_err() {
+            return ZOU_ERR_STORE;
+        }
+        if let Some(cache) = &shim.cache {
+            cache.save_size((spc, db, rel, fork), next.nblocks);
+        }
+        ZOU_OK
     })
 }
 
@@ -1412,8 +1542,21 @@ pub extern "C" fn zou_smgr_truncate(
             cache.truncate((spc, db, rel, fork), nblocks);
         }
         note_truncate(shim, spc, db, rel, fork, nblocks);
-        if write_size(shim, spc, db, rel, fork, nblocks).is_err() {
+        // A cut takes the length down, which write_size cannot do: it
+        // only grows, so the marker is composed here. The blocks past
+        // the new end stop being claimed as written at the same time,
+        // in the same object, so no read can see the shorter fork
+        // still vouching for a page the sweep below is deleting.
+        let Ok(current) = read_size_store(shim, spc, db, rel, fork) else {
             return ZOU_ERR_STORE;
+        };
+        let mut cut = current;
+        cut.truncate(nblocks);
+        if put_marker(shim, spc, db, rel, fork, &cut).is_err() {
+            return ZOU_ERR_STORE;
+        }
+        if let Some(cache) = &shim.cache {
+            cache.save_size((spc, db, rel, fork), nblocks);
         }
         // A short tail is named rather than looked up. Postgres has
         // just said where the fork ended, so every block object past
@@ -2753,7 +2896,7 @@ mod tests {
         }
         let mut n = 0u32;
         assert_eq!(
-            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n, &mut 0, &mut 0) },
             ZOU_OK
         );
         assert_eq!(n, 3);
@@ -2767,7 +2910,7 @@ mod tests {
             .delete(&shim.layout.pg_size(spc, db, rel, fork))
             .unwrap();
         assert_eq!(
-            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n, &mut 0, &mut 0) },
             ZOU_OK
         );
         assert_eq!(n, 3);
@@ -2790,7 +2933,7 @@ mod tests {
         // Zero extension: size grows, the new blocks read as zeros.
         assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 3, 2, 0), ZOU_OK);
         assert_eq!(
-            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n, &mut 0, &mut 0) },
             ZOU_OK
         );
         assert_eq!(n, 5);
@@ -2812,18 +2955,18 @@ mod tests {
                 .get(&shim.layout.pg_size(spc, db, rel, fork))
                 .unwrap()
                 .expect("the fork has a size object");
-            u32::from_le_bytes(data.as_slice().try_into().unwrap())
+            ForkSize::decode(&data).expect("and it is a marker").nblocks
         };
         let shim = SHIM.get().unwrap();
         assert_eq!(stored(shim), 5);
         assert_eq!(zou_smgr_zeroextend(spc, db, rel, fork, 5, 3, 1), ZOU_OK);
         assert_eq!(
-            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n, &mut 0, &mut 0) },
             ZOU_OK
         );
         assert_eq!(n, 8, "the deferred length answers this process");
         assert_eq!(stored(shim), 5, "and has not reached the store");
-        assert_eq!(zou_smgr_put_size(spc, db, rel, fork, 8), ZOU_OK);
+        assert_eq!(zou_smgr_put_size(spc, db, rel, fork, 8, 0, 0), ZOU_OK);
         assert_eq!(stored(shim), 8);
 
         // A page put while a deferred length is outstanding settles the
@@ -2840,16 +2983,16 @@ mod tests {
         );
         assert_eq!(stored(shim), 9, "the page it just put is inside the fork");
         assert_eq!(
-            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n, &mut 0, &mut 0) },
             ZOU_OK
         );
         assert_eq!(n, 10, "and the deferred length still answers this process");
-        assert_eq!(zou_smgr_put_size(spc, db, rel, fork, 10), ZOU_OK);
+        assert_eq!(zou_smgr_put_size(spc, db, rel, fork, 10, 0, 0), ZOU_OK);
 
         // Truncate drops the tail blocks for real.
         assert_eq!(zou_smgr_truncate(spc, db, rel, fork, 10, 1), ZOU_OK);
         assert_eq!(
-            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
+            unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n, &mut 0, &mut 0) },
             ZOU_OK
         );
         assert_eq!(n, 1);
@@ -2880,7 +3023,7 @@ mod tests {
             );
         }
         assert_eq!(
-            unsafe { zou_smgr_nblocks(spc, db, rel2, fork, &mut n) },
+            unsafe { zou_smgr_nblocks(spc, db, rel2, fork, &mut n, &mut 0, &mut 0) },
             ZOU_OK
         );
         assert_eq!(n, 4);
@@ -2913,7 +3056,7 @@ mod tests {
         let after = shim.store.list(&prefix).unwrap();
         assert_eq!(after.len(), 5, "four blocks plus SIZE: {after:?}");
         assert_eq!(
-            unsafe { zou_smgr_nblocks(spc, db, rel2, fork, &mut n) },
+            unsafe { zou_smgr_nblocks(spc, db, rel2, fork, &mut n, &mut 0, &mut 0) },
             ZOU_OK
         );
         assert_eq!(n, 4);
@@ -3008,7 +3151,7 @@ mod tests {
         // sends.
         assert_eq!(zou_smgr_truncate(spc, db, rel3, fork, 1, 5), ZOU_OK);
         assert_eq!(
-            unsafe { zou_smgr_nblocks(spc, db, rel3, fork, &mut n) },
+            unsafe { zou_smgr_nblocks(spc, db, rel3, fork, &mut n, &mut 0, &mut 0) },
             ZOU_OK
         );
         assert_eq!(n, 1, "the shorter length stands");
@@ -3020,6 +3163,92 @@ mod tests {
             ZOU_OK
         );
         assert_eq!(blocks(shim), 0);
+
+        // A block the fork says has been written and no tier can
+        // produce is a lost page, not a new and empty one. That
+        // distinction is the whole of zou #546: zeros are the right
+        // answer for a block extended and never written, and they are
+        // also what a page that went missing reads as, so postgres
+        // takes a table that lost a page for a shorter table and
+        // nobody says a word.
+        let (rel4, shim) = (16402, SHIM.get().unwrap());
+        assert_eq!(zou_smgr_create(spc, db, rel4, fork), ZOU_OK);
+        let page = [0x77; ZOU_PAGE_SIZE];
+        assert_eq!(
+            unsafe { zou_smgr_extend(spc, db, rel4, fork, 0, page.as_ptr(), 0) },
+            ZOU_OK
+        );
+        // Blocks 1 and 2 are extended and never written, the
+        // legitimate case, and they read as zeros.
+        assert_eq!(zou_smgr_zeroextend(spc, db, rel4, fork, 1, 2, 0), ZOU_OK);
+        for blk in [1u32, 2] {
+            assert_eq!(
+                unsafe { zou_smgr_read(spc, db, rel4, fork, blk, buf.as_mut_ptr(), 0) },
+                ZOU_OK,
+                "block {blk} was extended and never written"
+            );
+            assert!(buf.iter().all(|b| *b == 0), "block {blk}");
+        }
+        let mut out = [[0u8; ZOU_PAGE_SIZE]; 2];
+        let mut outp: Vec<*mut u8> = out.iter_mut().map(|p| p.as_mut_ptr()).collect();
+        assert_eq!(
+            unsafe { zou_smgr_readv(spc, db, rel4, fork, 1, outp.as_mut_ptr(), 2, 0) },
+            ZOU_OK
+        );
+        assert!(out.iter().all(|p| p.iter().all(|b| *b == 0)));
+
+        // Now the marker says all three have had a page in the store,
+        // which is what a checkpoint after the writes would have left,
+        // and blocks 1 and 2 have no object anywhere.
+        let mut fs = read_size_store(shim, spc, db, rel4, fork).expect("the fork has a marker");
+        assert_eq!(fs.nblocks, 3);
+        fs.fill_run(0, 3);
+        assert_eq!(fs.dense, 3);
+        put_marker(shim, spc, db, rel4, fork, &fs).expect("the marker goes back");
+        assert_eq!(
+            unsafe { zou_smgr_read(spc, db, rel4, fork, 2, buf.as_mut_ptr(), 0) },
+            ZOU_ERR_STORE,
+            "a page below the watermark that no tier holds is gone"
+        );
+        assert_eq!(
+            unsafe { zou_smgr_readv(spc, db, rel4, fork, 1, outp.as_mut_ptr(), 2, 0) },
+            ZOU_ERR_STORE,
+            "and a run of them is refused as a run"
+        );
+        // Block 0 is still there, so a read of it is untouched by any
+        // of this. A refusal has to be about the block that is missing
+        // and not about the fork.
+        assert_eq!(
+            unsafe { zou_smgr_read(spc, db, rel4, fork, 0, buf.as_mut_ptr(), 0) },
+            ZOU_OK
+        );
+        assert!(buf.iter().all(|b| *b == 0x77));
+
+        // Two ways the fork stays permissive, both of which have to
+        // keep working, because a false accusation turns a healthy
+        // database into one that refuses to read. A block above the
+        // watermark is a hole whatever else is claimed, and a marker
+        // in the old four byte form claims nothing at all.
+        let mut ahead = fs;
+        ahead.grow(5);
+        put_marker(shim, spc, db, rel4, fork, &ahead).expect("the marker goes back");
+        assert_eq!(
+            unsafe { zou_smgr_read(spc, db, rel4, fork, 4, buf.as_mut_ptr(), 0) },
+            ZOU_OK
+        );
+        assert!(buf.iter().all(|b| *b == 0));
+        shim.store
+            .put(
+                &shim.layout.pg_size(spc, db, rel4, fork),
+                &5u32.to_le_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            unsafe { zou_smgr_read(spc, db, rel4, fork, 2, buf.as_mut_ptr(), 0) },
+            ZOU_OK,
+            "a store written before any of this is read the way it was"
+        );
+        assert!(buf.iter().all(|b| *b == 0));
     }
 
     /// One test for the WAL side too, the pipe is its own process global.
