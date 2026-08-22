@@ -383,8 +383,12 @@ So there is no socket count between there and here at which a node has to be spl
 
 What a link costs, against that, is four things an inline node does not pay.
 
-A broken link is a gap, and a gap closes every socket on that node.
-Filling one from what the holder already sent, rather than telling it, is a follow up, and catching up out of the store is waiting on the buffered WAL tier ([#39](https://github.com/tamnd/zou/issues/39)) because the change stream retains nothing.
+A link that drops is resumed rather than gapped, inside a window.
+The holder keeps the last 1024 frames it sent down each link plus everything that link's sockets held, presence and subscriptions included, for 30 seconds; a node names its link and says which frame number it got to; and a link back inside both is handed what it missed, in order, with no socket closed and nothing rejoined.
+Past either the resume is refused and the node is told so, and then it is a gap again, which closes every socket on that node.
+Both numbers are in `crates/zou-server/src/fanout.rs` as `KEPT` and `GRACE` with the reasoning next to them, and both refusals name their numbers in the log.
+What a resume does not restore is a subscription that was never announced: subscriptions live on the holder and are kept with the rest, but a node whose link could not be resumed re-announces its sockets and its topics and lets its sockets hear the gap and resubscribe, because a subscription asked for again comes back under new ids while the client is still holding the ones its join reply carried.
+Catching up further back than the ring is waiting on the buffered WAL tier ([#39](https://github.com/tamnd/zou/issues/39)), because the change stream itself retains nothing.
 
 The project's budget is counted per node.
 Sockets at once and joins a second are refused against each node's own share, so a project spread over four nodes is allowed four times what [realtime.md](realtime.md) says it is, until those two numbers cross the link as well.

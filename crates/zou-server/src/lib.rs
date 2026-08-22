@@ -445,6 +445,11 @@ pub struct App {
     /// second are moving. One per server, like the hub, because the
     /// budget is the project's and not a connection's.
     pub quota: Arc<realtime::Quota>,
+    /// What the links that dropped left behind, kept for a grace in
+    /// case they dial again. A node's link going is almost always a
+    /// node's link coming back, and closing every socket behind it in
+    /// the meantime is a reconnect storm this end asked for.
+    pub links: fanout::Dropped,
     /// Who is subscribed to postgres changes and what they asked for,
     /// one per server for the same reason the hub is: the one thing
     /// reading the database has to be able to find every subscription
@@ -582,6 +587,7 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
         hub: zou_realtime::Hub::new(),
         source,
         quota,
+        links: fanout::Dropped::default(),
         changes: Arc::new(reader::Changes::new()),
         reading: tokio::sync::OnceCell::new(),
         dispatching: tokio::sync::OnceCell::new(),

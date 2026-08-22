@@ -431,8 +431,11 @@ A changed row that crosses has already been checked for exactly one socket, whic
 
 A client cannot tell which kind of node it reached, and that is checked rather than asserted: the recorded suites are run against a holder and against a node in front of one, including the golden that compares every frame a channel is sent with what Supabase Realtime sends.
 
-If the link breaks, every socket on that node is told there is a gap, the same news a subscriber gets when it falls behind, because a client that hears a gap resubscribes and reads the table and a client that missed rows quietly cannot.
-Filling a gap from what the holder already sent, rather than telling it, is a follow up.
+If the link breaks it is resumed rather than gapped, as long as it comes back inside the window.
+The holder keeps the last 1024 frames it sent down that link, and everything the link's sockets held over there, for 30 seconds; the node names its link and says which frame number it got to; and a link back inside both is handed what it missed, in order, with nothing closed and nothing rejoined.
+That is on purpose rather than incidental: two servers losing a tcp connection for a second should not be a hundred thousand browsers reconnecting and reading their tables again.
+Past the frames or past the 30 seconds the holder refuses the resume and says so, and then every socket on that node is told there is a gap, the same news a subscriber gets when it falls behind, because a client that hears a gap resubscribes and reads the table and a client that missed rows quietly cannot.
+Filling a gap further back than that, out of what the store kept, is a follow up.
 
 What a node cannot do on its own yet is count the project's numbers instead of its own share of them.
 Sockets connected and how fast they are joining are refused per node, so a project whose sockets are spread over four nodes is allowed four times what it should be until those two cross the link as well.

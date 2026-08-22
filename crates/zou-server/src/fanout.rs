@@ -31,13 +31,23 @@
 //! a gap. A client that hears a gap reconnects and resubscribes; a
 //! client that missed messages quietly cannot.
 //!
+//! Which is the last resort rather than the first. A link that drops is
+//! usually a link that comes back a second later, and gapping a hundred
+//! thousand sockets because two servers lost a tcp connection is a
+//! reconnect storm this end asked for. So the holder keeps the last
+//! [`KEPT`] frames it sent per link and everything that link's sockets
+//! held, for [`GRACE`]; a node names its link and says which number it
+//! got to; and a link that comes back inside both is given what it
+//! missed, in order, with nothing closed. Past either, it is told, and
+//! then the gap is the honest answer again.
+//!
 //! What does not cross this link is a row the socket may not see. The
 //! two questions only the holder can answer, whether a private
 //! channel's policies allow this socket and what a subscriber may see
 //! of a changed row, are answered where the database is, so a fan out
 //! node is handed conclusions rather than rows to filter.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -45,6 +55,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
 use axum::response::Response;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -131,6 +142,29 @@ const CHANGES: usize = 4096;
 /// holder did would tell a client its subscription failed while it was
 /// being set up.
 const WATCHING: Duration = Duration::from_secs(8);
+
+/// How many frames the holder keeps per link, so that a link which
+/// comes back can be given what it missed rather than every socket on
+/// the far end being closed.
+///
+/// Bounded on purpose, and this is the one number: a node nobody can
+/// reach cannot be the holder's memory problem, which is the same
+/// bargain a slow subscriber already gets. Four times one socket's own
+/// feed, because what fills this is a whole node's worth of sockets
+/// rather than one, and small enough that a fleet of them is megabytes.
+/// A frame is kept as the bytes that went out, so keeping one costs a
+/// refcount rather than a copy.
+const KEPT: usize = 1024;
+
+/// How long the holder waits for a link that dropped before giving back
+/// what it was holding for it.
+///
+/// A redial starts at 250 ms and a handover moves a lease in seconds, so
+/// a link that is coming back is back well inside this. Past it the
+/// presence its sockets were in is given up and their subscriptions are
+/// let go, because a room full of people who are not there is worse for
+/// everybody else on the channel than a reconnect is for them.
+const GRACE: Duration = Duration::from_secs(30);
 
 /// One message on the link.
 ///
@@ -282,11 +316,26 @@ pub struct Away {
     /// once per topic rather than once per socket, and told it is done
     /// with one when the last socket here leaves it.
     topics: Mutex<HashMap<String, usize>>,
+    /// What this node calls its link to the holder, said on every
+    /// hello, so that a link which dropped and dialled again is known
+    /// on the other end to be the same one and can be given what it
+    /// missed. One per tenant per process, and drawn from the system
+    /// random source rather than counted, because every node in a fleet
+    /// counting from one would be a fleet of link ones.
+    link: u64,
+    /// The last numbered frame from the holder that this node has
+    /// processed, which is what a redial asks to carry on after.
+    ///
+    /// Here rather than in the link task because it outlives the task:
+    /// it is the whole of what a reconnect has to say for itself.
+    seen: AtomicU64,
 }
 
 impl Away {
     pub fn new(endpoint: &str, secret: &[u8]) -> Away {
         let (up, queue) = mpsc::channel(QUEUE);
+        let mut raw = [0u8; 8];
+        getrandom::fill(&mut raw).expect("the os rng never fails");
         Away {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             key: crate::jwt::mint(&crate::jwt::key_claims("service_role"), secret),
@@ -297,6 +346,10 @@ impl Away {
             next: AtomicU64::new(0),
             sockets: Mutex::new(HashMap::new()),
             topics: Mutex::new(HashMap::new()),
+            // Never zero, because zero is what the holder reads as a
+            // node old enough not to name its link at all.
+            link: u64::from_be_bytes(raw).max(1),
+            seen: AtomicU64::new(0),
         }
     }
 
@@ -660,6 +713,44 @@ impl Away {
         }
     }
 
+    /// Everything this end of the link holds, said again, because the
+    /// holder that answered is not the one that was told it.
+    ///
+    /// A link that could not be resumed is a holder with nothing on it:
+    /// no sockets, so a broadcast from one of them is dropped for
+    /// naming a socket that link never announced, and no topics, so
+    /// nothing on them ever comes back down. Both are this end's to
+    /// say, and saying them again is cheap and idempotent.
+    ///
+    /// Not the subscriptions. A subscription asked for again comes back
+    /// under new ids while the client is still holding the ids its join
+    /// reply carried, so what a socket that lost its subscriber gets is
+    /// the gap, and it resubscribes for itself.
+    async fn again(&self) {
+        let sockets: Vec<u64> = self
+            .sockets
+            .lock()
+            .expect("the link")
+            .keys()
+            .copied()
+            .collect();
+        for socket in sockets {
+            self.tell(Wire::of(json!({"up": "socket", "socket": socket})))
+                .await;
+        }
+        let topics: Vec<String> = self
+            .topics
+            .lock()
+            .expect("the link")
+            .keys()
+            .cloned()
+            .collect();
+        for topic in topics {
+            self.tell(Wire::of(json!({"up": "carry", "topic": topic})))
+                .await;
+        }
+    }
+
     /// How many sockets here, for a test and for a metric later.
     pub fn sockets(&self) -> usize {
         self.sockets.lock().expect("the link").len()
@@ -668,13 +759,25 @@ impl Away {
 
 /// The link, dialled and redialled for as long as this node is up.
 ///
-/// A link that broke is a gap, told rather than filled: the change
-/// stream on the holder is a temporary slot which retains nothing,
-/// which is what makes a server with no subscribers cost a database
-/// nothing, and it means there is no log to replay a gap out of. What
-/// fills one instead is the client, which reconnects and reads.
+/// A link that broke is not a gap on its own. The holder keeps what it
+/// sent and what this node's sockets held for [`GRACE`], so a link back
+/// inside that is handed the frames it missed and nothing here notices.
+/// What is a gap is a link that stays down past it, because then what
+/// was being kept has been given back, and a gap is also what a holder
+/// says when it cannot resume: the change stream over there is a
+/// temporary slot which retains nothing, so past the ring there is no
+/// log to replay out of and the client is the one that reconnects and
+/// reads.
 async fn dialling(app: Weak<App>, away: Arc<Away>, mut queue: mpsc::Receiver<Vec<u8>>) {
     let mut wait = FIRST;
+    // Whether there has ever been a link at all, since when this
+    // outage started, and whether the sockets here have been told about
+    // it. The last two are reset by a connection that opens, because a
+    // link that opens either resumes or says it could not, and either
+    // way the answer comes from the holder rather than a clock here.
+    let mut ever = false;
+    let mut went: Option<Instant> = None;
+    let mut told = false;
     loop {
         if app.upgrade().is_none() {
             // The tenant this link belonged to has gone, which on a
@@ -686,6 +789,9 @@ async fn dialling(app: Weak<App>, away: Arc<Away>, mut queue: mpsc::Receiver<Vec
             Ok((socket, _)) => {
                 log::info!("realtime: linked to {}", away.endpoint);
                 wait = FIRST;
+                ever = true;
+                went = None;
+                told = false;
                 carried(socket, &app, &away, &mut queue).await;
                 log::warn!("realtime: the link to {} ended", away.endpoint);
             }
@@ -694,9 +800,25 @@ async fn dialling(app: Weak<App>, away: Arc<Away>, mut queue: mpsc::Receiver<Vec
                 away.endpoint
             ),
         }
-        // Whatever ended it, every socket here has missed whatever was
-        // sent while it was down, and there is no way to say what.
-        away.gapped();
+        // A first dial that fails is not an outage to be waited out.
+        // Nothing has ever been kept for this node, so there is nothing
+        // for a grace to protect, and a socket whose join went nowhere
+        // is told at once rather than half a minute later.
+        if !ever {
+            away.gapped();
+        } else {
+            let since = *went.get_or_insert_with(Instant::now);
+            if !told && since.elapsed() >= GRACE {
+                log::warn!(
+                    "realtime: the link to {} has been down {}s, past the {}s the holder keeps a link's {KEPT} frames, so the sockets here are told there is a gap",
+                    away.endpoint,
+                    since.elapsed().as_secs(),
+                    GRACE.as_secs(),
+                );
+                away.gapped();
+                told = true;
+            }
+        }
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(MOST);
     }
@@ -715,7 +837,16 @@ async fn carried(
     // Split, so that sending a frame does not wait on the next one
     // arriving and the other way round.
     let (mut writer, mut reader) = socket.split();
-    let hello = Wire::of(json!({"up": "hello", "version": VERSION})).encode();
+    // Which link this is and where its numbering got to, which is the
+    // whole of what a reconnect has to say for itself: everything the
+    // holder needs to work out whether it can carry on.
+    let hello = Wire::of(json!({
+        "up": "hello",
+        "version": VERSION,
+        "link": away.link,
+        "seen": away.seen.load(Ordering::Relaxed),
+    }))
+    .encode();
     if writer
         .send(tokio_tungstenite::tungstenite::Message::Binary(
             hello.into(),
@@ -725,9 +856,6 @@ async fn carried(
     {
         return;
     }
-    // Numbered from one, per link. A number that is not the one
-    // expected is a hole, and a hole is a gap.
-    let mut seen = 0u64;
     loop {
         tokio::select! {
             going = queue.recv() => {
@@ -753,15 +881,26 @@ async fn carried(
                     log::warn!("realtime: the holder sent something that is not a frame");
                     return;
                 };
+                // The handshake sits outside the numbering, because it
+                // is the frame that says where the numbering starts.
+                // Everything after it is numbered from there, resumed
+                // or not, so the check below holds either way.
+                if frame.down() == "hello" {
+                    if !greeting(away, &frame).await {
+                        return;
+                    }
+                    continue;
+                }
                 let Some(seq) = frame.number("seq") else {
                     log::warn!("realtime: the holder sent a frame with no number on it");
                     return;
                 };
+                let seen = away.seen.load(Ordering::Relaxed);
                 if seq != seen + 1 {
                     log::warn!("realtime: the link missed frame {} of {}", seen + 1, away.endpoint);
                     return;
                 }
-                seen = seq;
+                away.seen.store(seq, Ordering::Relaxed);
                 let Some(app) = app.upgrade() else { return };
                 if !took(&app, away, frame).await {
                     return;
@@ -771,18 +910,44 @@ async fn carried(
     }
 }
 
+/// The holder's answer to the hello, which says whether it still had
+/// this link. False ends the link.
+async fn greeting(away: &Arc<Away>, frame: &Wire) -> bool {
+    if let Err(theirs) = agrees(frame) {
+        log::warn!(
+            "realtime: {} speaks link version {theirs} and this node speaks {VERSION}",
+            away.endpoint
+        );
+        return false;
+    }
+    if frame.head.get("resumed").and_then(Value::as_bool) == Some(true) {
+        log::info!(
+            "realtime: the link to {} carried on after frame {}",
+            away.endpoint,
+            away.seen.load(Ordering::Relaxed),
+        );
+        return true;
+    }
+    // A link starting over. Whatever went down the old one while this
+    // node was away is not coming and cannot be named, so the sockets
+    // here are told there is a gap, exactly once and only if there was
+    // an old one: a first dial has missed nothing.
+    if away.seen.swap(0, Ordering::Relaxed) > 0 {
+        log::warn!(
+            "realtime: {} could not carry the link on, so the sockets here are told there is a gap",
+            away.endpoint,
+        );
+        away.gapped();
+    }
+    // And a holder that could not carry it on is a holder that knows
+    // nothing about this node, which is this node's to fix.
+    away.again().await;
+    true
+}
+
 /// One frame from the holder. False ends the link.
 async fn took(app: &Arc<App>, away: &Arc<Away>, frame: Wire) -> bool {
     match frame.down() {
-        "hello" => {
-            if let Err(theirs) = agrees(&frame) {
-                log::warn!(
-                    "realtime: {} speaks link version {theirs} and this node speaks {VERSION}",
-                    away.endpoint
-                );
-                return false;
-            }
-        }
         "reply" => {
             let Some(id) = frame.number("for") else {
                 return true;
@@ -926,6 +1091,10 @@ pub async fn link(
 
 /// One socket on the far end of a link, which is a whole node.
 struct Ashore {
+    /// What the node calls this link, off its hello. Zero for a node
+    /// old enough not to name one, which is a link that cannot be
+    /// resumed and is not asking to be.
+    link: u64,
     /// What each socket on the node is called here. The node names its
     /// own with numbers that mean nothing off its link, so presence and
     /// the sender check need a name of this hub's own.
@@ -949,6 +1118,51 @@ struct Ashore {
     /// What has gone down this link, so that a hole in it is something
     /// the other end can see.
     seq: u64,
+    /// The last [`KEPT`] frames that went down it, exactly as they went,
+    /// so that a link which comes back can be given the ones it missed
+    /// rather than every socket behind it being closed. The bytes are
+    /// shared with what was sent, so keeping one is a refcount.
+    kept: VecDeque<(u64, Bytes)>,
+}
+
+/// What a link that dropped left behind, waiting for it to dial again.
+struct Kept {
+    node: Ashore,
+    /// The one queue its subscribers share, still being filled by the
+    /// change reader while nobody is draining it. That is the point: a
+    /// subscriber whose node blinked reads its rows when the node is
+    /// back, and a queue that fills says there was a gap the same way
+    /// it would with the link up.
+    rows: mpsc::Receiver<(u64, Feed)>,
+}
+
+/// Every link that dropped and might come back, by the id its node
+/// gave it.
+///
+/// One per project rather than one per node, because the node it
+/// belongs to is by definition not connected. Bounded by the fleet: one
+/// entry per node that dropped, each let go [`GRACE`] after it did.
+#[derive(Default)]
+pub struct Dropped(Mutex<HashMap<u64, Kept>>);
+
+impl Dropped {
+    fn keep(&self, link: u64, kept: Kept) {
+        self.0.lock().expect("the dropped links").insert(link, kept);
+    }
+
+    fn take(&self, link: u64) -> Option<Kept> {
+        self.0.lock().expect("the dropped links").remove(&link)
+    }
+
+    /// How many links are being held, for a test and for a metric
+    /// later.
+    pub fn len(&self) -> usize {
+        self.0.lock().expect("the dropped links").len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// One socket on the far end.
@@ -976,13 +1190,11 @@ enum Woke {
 }
 
 async fn holding(mut socket: WebSocket, app: &Arc<App>) {
-    let (changes, mut rows) = Shared::new(CHANGES);
-    let mut node = Ashore {
-        sockets: HashMap::new(),
-        theirs: HashMap::new(),
-        carrying: HashMap::new(),
-        changes,
-        seq: 0,
+    // The hello comes first and decides everything: whether this is a
+    // new link or the one that dropped, and in the second case what it
+    // is owed. Nothing else is read until it has been answered.
+    let Some((mut node, mut rows)) = greeted(&mut socket, app).await else {
+        return;
     };
     loop {
         let woke = if node.carrying.is_empty() {
@@ -1100,10 +1312,162 @@ async fn holding(mut socket: WebSocket, app: &Arc<App>) {
             }
         }
     }
-    // Everything that node's sockets held, given back. A node that went
-    // and left its presence behind would be a room full of people who
-    // are not there, and one that left its subscribers behind would be a
-    // policy check per changed row for nobody.
+    // The link went, which is almost always the link coming back. What
+    // it held is kept under its name for the grace rather than given
+    // back now, so that a node which redials in a second finds its
+    // sockets still in the rooms they were in and its subscribers still
+    // subscribed. A node that never says its name has nothing to come
+    // back as, so its end is its end.
+    match node.link {
+        0 => release(app, node),
+        link => keep(app, link, Kept { node, rows }),
+    }
+}
+
+/// The handshake, which is where a link finds out whether it is the one
+/// that dropped. None ends it.
+async fn greeted(
+    socket: &mut WebSocket,
+    app: &Arc<App>,
+) -> Option<(Ashore, mpsc::Receiver<(u64, Feed)>)> {
+    let Some(Ok(Message::Binary(bytes))) = socket.recv().await else {
+        return None;
+    };
+    let frame = Wire::decode(&bytes)?;
+    if frame.up() != "hello" {
+        log::warn!(
+            "realtime: a link sent a {} frame before it said hello",
+            frame.up()
+        );
+        return None;
+    }
+    if let Err(theirs) = agrees(&frame) {
+        log::warn!("realtime: a node speaks link version {theirs} and this one {VERSION}");
+        return None;
+    }
+    let link = frame.number("link").unwrap_or_default();
+    let seen = frame.number("seen").unwrap_or_default();
+    // What was kept for this link, if it is still here and if what it
+    // is asking for is still in the ring.
+    let resumed = match link {
+        0 => None,
+        link => match app.links.take(link) {
+            Some(kept) if replayable(&kept.node, seen) => Some(kept),
+            Some(kept) => {
+                log::warn!(
+                    "realtime: link {link} came back asking for frame {}, and this end has {} frames ending at {}, so it starts over",
+                    seen + 1,
+                    kept.node.kept.len(),
+                    kept.node.seq,
+                );
+                release(app, kept.node);
+                None
+            }
+            None => None,
+        },
+    };
+    // Answered before anything is replayed, so that a node which is
+    // starting over knows it before a numbered frame reaches it.
+    let hello = Wire::of(json!({
+        "down": "hello",
+        "version": VERSION,
+        "resumed": resumed.is_some(),
+    }));
+    let greeted = socket
+        .send(Message::Binary(hello.encode().into()))
+        .await
+        .is_ok();
+    let Some(Kept { mut node, rows }) = resumed else {
+        if !greeted {
+            return None;
+        }
+        let (changes, rows) = Shared::new(CHANGES);
+        return Some((
+            Ashore {
+                link,
+                sockets: HashMap::new(),
+                theirs: HashMap::new(),
+                carrying: HashMap::new(),
+                changes,
+                seq: 0,
+                kept: VecDeque::new(),
+            },
+            rows,
+        ));
+    };
+    // What went down the old link after the number the node got to, in
+    // the order it went and under the numbers it went under. That is
+    // the whole of the resume: the node's own check that each frame is
+    // the one after the last holds straight through it, and everything
+    // sent from here on carries on from where the old link stopped.
+    let again: Vec<Bytes> = node
+        .kept
+        .iter()
+        .filter(|(seq, _)| *seq > seen)
+        .map(|(_, bytes)| bytes.clone())
+        .collect();
+    log::info!(
+        "realtime: link {link} came back at frame {seen} and is being given the {} it missed, up to {}",
+        again.len(),
+        node.seq,
+    );
+    let mut carried = greeted;
+    for bytes in again {
+        carried = carried && socket.send(Message::Binary(bytes)).await.is_ok();
+    }
+    if !carried {
+        // It went again mid replay. Which is the same thing that just
+        // happened, so it is kept again on the same terms rather than
+        // thrown away for having bad luck twice.
+        keep(app, link, Kept { node, rows });
+        return None;
+    }
+    node.link = link;
+    Some((node, rows))
+}
+
+/// Whether a link asking to carry on after `seen` can be given what it
+/// missed out of what is still kept.
+///
+/// Three cases, and only the middle one needs the ring: a node that
+/// says it saw more than was ever sent is not the link this end was
+/// holding, one that is exactly up to date needs nothing replayed, and
+/// one that is behind needs the ring to still reach back to the frame
+/// after the last it saw.
+fn replayable(node: &Ashore, seen: u64) -> bool {
+    match seen {
+        seen if seen > node.seq => false,
+        seen if seen == node.seq => true,
+        seen => matches!(node.kept.front(), Some((oldest, _)) if *oldest <= seen + 1),
+    }
+}
+
+/// Hold what a link left behind, and give it back if it does not come
+/// for it.
+fn keep(app: &Arc<App>, link: u64, kept: Kept) {
+    app.links.keep(link, kept);
+    let app = Arc::downgrade(app);
+    tokio::spawn(async move {
+        tokio::time::sleep(GRACE).await;
+        let Some(app) = app.upgrade() else { return };
+        // Gone already means it came back and took it, which is the
+        // ordinary ending.
+        let Some(kept) = app.links.take(link) else {
+            return;
+        };
+        log::warn!(
+            "realtime: link {link} has been gone {}s, so what its sockets held is given back",
+            GRACE.as_secs(),
+        );
+        release(&app, kept.node);
+    });
+}
+
+/// Everything a node's sockets held, given back. A node that went and
+/// left its presence behind would be a room full of people who are not
+/// there, and one that left its subscribers behind would be a policy
+/// check per changed row for nobody.
+fn release(app: &Arc<App>, node: Ashore) {
     for socket in node.sockets.values() {
         for topic in &socket.tracking {
             app.hub.untrack(socket.id, topic);
@@ -1112,6 +1476,8 @@ async fn holding(mut socket: WebSocket, app: &Arc<App>) {
             app.changes.hung_up(listener);
         }
     }
+    // The receivers go before the hub is told, so that a topic nobody
+    // is left on is a topic with nothing still listening to it.
     let topics: Vec<String> = node.carrying.keys().cloned().collect();
     drop(node.carrying);
     for topic in &topics {
@@ -1140,38 +1506,41 @@ fn payload(sent: &Sent) -> Vec<u8> {
     }
 }
 
-/// One frame down the link, numbered. False ends it.
+/// One frame down the link, numbered and kept. False ends it.
 async fn down(node: &mut Ashore, socket: &mut WebSocket, mut head: Value, body: Vec<u8>) -> bool {
     node.seq += 1;
     if let Some(head) = head.as_object_mut() {
         head.insert("seq".into(), json!(node.seq));
     }
-    socket
-        .send(Message::Binary(Wire::with(head, body).encode().into()))
-        .await
-        .is_ok()
+    let bytes = Bytes::from(Wire::with(head, body).encode());
+    // Kept as it goes, so that a link which drops and comes back inside
+    // the grace is handed what it missed instead of every socket behind
+    // it being closed. The oldest goes when the ring is full, which is
+    // what keeps a node nobody can reach to a bounded cost here.
+    if node.kept.len() == KEPT {
+        node.kept.pop_front();
+    }
+    node.kept.push_back((node.seq, bytes.clone()));
+    socket.send(Message::Binary(bytes)).await.is_ok()
 }
 
 /// One frame from a node. False ends the link.
 async fn asked(app: &Arc<App>, node: &mut Ashore, frame: Wire, socket: &mut WebSocket) -> bool {
     match frame.up() {
-        "hello" => {
-            if let Err(theirs) = agrees(&frame) {
-                log::warn!("realtime: a node speaks link version {theirs} and this one {VERSION}");
-                return false;
-            }
-            return down(
-                node,
-                socket,
-                json!({"down": "hello", "version": VERSION}),
-                Vec::new(),
-            )
-            .await;
-        }
+        // The handshake happened before this loop started. A second one
+        // is a node saying hello twice, which changes nothing here.
+        "hello" => {}
         "socket" => {
             let Some(theirs) = frame.number("socket") else {
                 return true;
             };
+            // Idempotent, because a node whose link could not be
+            // resumed says its sockets again and a holder that made a
+            // second name for one would leave the first in the hub with
+            // nothing pointing at it.
+            if node.sockets.contains_key(&theirs) {
+                return true;
+            }
             let id = app.hub.socket();
             node.sockets.insert(
                 theirs,
@@ -1527,6 +1896,42 @@ mod tests {
                 .url()
                 .starts_with("wss://holder.example/realtime/v1/link"),
         );
+    }
+
+    /// The one number that decides whether a link can carry on, read
+    /// three ways: from a link that is up to date, one that is behind
+    /// but still inside the ring, and one that fell off the back of it.
+    #[test]
+    fn a_link_can_carry_on_only_from_a_frame_the_ring_still_reaches() {
+        let (changes, _rows) = Shared::new(CHANGES);
+        let mut node = Ashore {
+            link: 7,
+            sockets: HashMap::new(),
+            theirs: HashMap::new(),
+            carrying: HashMap::new(),
+            changes,
+            seq: 0,
+            kept: VecDeque::new(),
+        };
+        // Nothing sent yet, so a link that has seen nothing is up to
+        // date and one that claims to have seen something is not the
+        // link this end was holding.
+        assert!(replayable(&node, 0));
+        assert!(!replayable(&node, 1));
+
+        // Twice the ring, so the first half of it has been dropped.
+        for _ in 0..KEPT * 2 {
+            node.seq += 1;
+            if node.kept.len() == KEPT {
+                node.kept.pop_front();
+            }
+            node.kept.push_back((node.seq, Bytes::new()));
+        }
+        assert!(replayable(&node, node.seq), "it is up to date");
+        let oldest = node.seq - KEPT as u64;
+        assert!(replayable(&node, oldest), "the ring reaches back to it");
+        assert!(!replayable(&node, oldest - 1), "it fell off the back");
+        assert!(!replayable(&node, node.seq + 1), "it saw more than went");
     }
 
     #[tokio::test]

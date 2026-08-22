@@ -13,11 +13,14 @@
 //! tests/changes.rs against a real one.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
+use zou_server::fanout::Wire;
 use zou_server::{Config, jwt, router};
 
 const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long";
@@ -47,6 +50,84 @@ async fn two() -> (SocketAddr, SocketAddr) {
 
 fn anon_key() -> String {
     jwt::mint(&jwt::key_claims("anon"), SECRET)
+}
+
+/// A tcp proxy that can be cut and mended, so that the link between two
+/// servers can drop without either of them going.
+///
+/// Cutting drops every connection through it and refuses the next ones,
+/// which is what a node with a working holder and a broken network
+/// between them sees. Mending lets the redial through.
+struct Cuttable {
+    at: SocketAddr,
+    open: Arc<AtomicBool>,
+    cut: tokio::sync::watch::Sender<u64>,
+}
+
+impl Cuttable {
+    async fn to(onward: SocketAddr) -> Cuttable {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let at = listener.local_addr().expect("the port");
+        let open = Arc::new(AtomicBool::new(true));
+        let (cut, _) = tokio::sync::watch::channel(0u64);
+        let accepting = Arc::clone(&open);
+        let cutting = cut.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut from, _)) = listener.accept().await else {
+                    return;
+                };
+                if !accepting.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let mut watching = cutting.subscribe();
+                tokio::spawn(async move {
+                    let Ok(mut to) = tokio::net::TcpStream::connect(onward).await else {
+                        return;
+                    };
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut from, &mut to) => {}
+                        _ = watching.changed() => {}
+                    }
+                });
+            }
+        });
+        Cuttable { at, open, cut }
+    }
+
+    fn cut(&self) {
+        self.open.store(false, Ordering::Relaxed);
+        self.cut.send_modify(|cuts| *cuts += 1);
+    }
+
+    fn mend(&self) {
+        self.open.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A link opened by hand, as a node would, with the service key a node
+/// presents.
+async fn linked(at: SocketAddr) -> Socket {
+    let key = jwt::mint(&jwt::key_claims("service_role"), SECRET);
+    let (socket, _) =
+        tokio_tungstenite::connect_async(format!("ws://{at}/realtime/v1/link?apikey={key}"))
+            .await
+            .expect("a link opens");
+    socket
+}
+
+async fn crossed(socket: &mut Socket, frame: Wire) {
+    socket
+        .send(Message::Binary(frame.encode().into()))
+        .await
+        .expect("the link takes it");
+}
+
+async fn frame(socket: &mut Socket) -> Wire {
+    match next(socket).await {
+        Message::Binary(bytes) => Wire::decode(&bytes).expect("a frame"),
+        other => panic!("{other:?} is not a frame"),
+    }
 }
 
 type Socket =
@@ -280,6 +361,118 @@ async fn a_socket_whose_node_cannot_reach_the_holder_is_told_rather_than_left_qu
         closed.is_ok(),
         "the socket was left waiting on a link that will never open"
     );
+}
+
+#[tokio::test]
+async fn a_link_that_drops_and_comes_back_delivers_what_it_missed() {
+    // The whole of the bargain: a link is two servers losing a tcp
+    // connection, and the sockets behind it must not find out. What was
+    // sent while it was down arrives when it is back, in the order it
+    // was sent, and nothing is closed.
+    let holder = serving(None).await;
+    let between = Cuttable::to(holder).await;
+    let node = serving(Some(between.at)).await;
+    let mut away = connect(node).await;
+    let mut here = connect(holder).await;
+    join(&mut away, "realtime:room", "{}").await;
+    join(&mut here, "realtime:room", "{}").await;
+
+    // The link is up and the topic is carried, which is what the round
+    // trip proves and why it goes first.
+    broadcast(&mut here, "realtime:room", "cursor", r#"{"x":1}"#).await;
+    assert!(heard(&mut away).await.ends_with(r#"{"x":1}"#));
+
+    // Cut, and then say three things into the hole.
+    between.cut();
+    for x in 2..=4 {
+        broadcast(
+            &mut here,
+            "realtime:room",
+            "cursor",
+            &format!(r#"{{"x":{x}}}"#),
+        )
+        .await;
+    }
+    // Long enough that the node has tried to redial and failed, so this
+    // is a resume rather than a race with a link that never dropped.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    between.mend();
+
+    // All three, in order, on the socket that never noticed.
+    for x in 2..=4 {
+        let text = heard(&mut away).await;
+        assert!(text.ends_with(&format!(r#"{{"x":{x}}}"#)), "{text}");
+    }
+    // And it is still the same socket, on the same channel, still in
+    // the room: a broadcast of its own goes up the new link and comes
+    // back to the other node.
+    broadcast(&mut away, "realtime:room", "cursor", r#"{"x":5}"#).await;
+    let text = heard(&mut here).await;
+    assert!(text.ends_with(r#"{"x":5}"#), "{text}");
+}
+
+#[tokio::test]
+async fn a_link_that_comes_back_is_given_the_frames_after_the_one_it_got_to() {
+    // The same thing from the link's own end, where the numbers are
+    // readable. A link says which one it is and how far it got, and
+    // what it is handed is everything after that, under the numbers it
+    // would have had.
+    let holder = serving(None).await;
+    let mut link = linked(holder).await;
+    crossed(
+        &mut link,
+        Wire::of(serde_json::json!({"up": "hello", "version": 1, "link": 7, "seen": 0})),
+    )
+    .await;
+    let hello = frame(&mut link).await;
+    assert_eq!(hello.head["down"], "hello");
+    assert_eq!(hello.head["resumed"], false, "there was nothing to resume");
+    // The handshake is outside the numbering, because it is the frame
+    // that says where the numbering starts.
+    assert!(hello.head.get("seq").is_none(), "{}", hello.head);
+
+    // Two numbered frames, which is two questions answered.
+    for id in 1..=2u64 {
+        crossed(
+            &mut link,
+            Wire::of(serde_json::json!({"up": "state", "id": id, "topic": "realtime:room"})),
+        )
+        .await;
+        let reply = frame(&mut link).await;
+        assert_eq!(reply.head["for"], id);
+        assert_eq!(reply.head["seq"], id);
+    }
+
+    // The link goes, and comes back saying it got as far as the first.
+    drop(link);
+    // Long enough for the holder to notice, since what it is holding is
+    // put away when the socket ends rather than when it is dropped here.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut link = linked(holder).await;
+    crossed(
+        &mut link,
+        Wire::of(serde_json::json!({"up": "hello", "version": 1, "link": 7, "seen": 1})),
+    )
+    .await;
+    let hello = frame(&mut link).await;
+    assert_eq!(hello.head["resumed"], true, "{}", hello.head);
+    // And the second frame again, under the number it had, so the far
+    // end's own check that each frame is the one after the last holds
+    // straight through the reconnect.
+    let again = frame(&mut link).await;
+    assert_eq!(again.head["for"], 2);
+    assert_eq!(again.head["seq"], 2);
+    nothing(&mut link, "a frame it had already seen was sent again").await;
+
+    // A link nobody was holding is told so rather than quietly handed a
+    // stream that starts in the middle.
+    let mut other = linked(holder).await;
+    crossed(
+        &mut other,
+        Wire::of(serde_json::json!({"up": "hello", "version": 1, "link": 99, "seen": 40})),
+    )
+    .await;
+    assert_eq!(frame(&mut other).await.head["resumed"], false);
 }
 
 #[tokio::test]
