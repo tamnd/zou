@@ -714,7 +714,7 @@ impl Away {
     /// client that reconnects rejoins its channels and reads whatever
     /// it needs back; a client that carried on would have a hole in its
     /// stream and no way to know.
-    fn gapped(&self) {
+    pub(crate) fn gapped(&self) {
         let sockets = self.sockets.lock().expect("the link");
         for to in sockets.values() {
             // Try, because a socket that already has one queued has
