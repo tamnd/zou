@@ -4012,3 +4012,74 @@ async fn a_text_search_makes_the_vector_it_needs() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(body_text(res).await, r#"[{"id":1}]"#);
 }
+
+#[tokio::test]
+async fn a_surface_with_aggregates_off_refuses_them_and_serves_everything_else() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_agg_lines cascade",
+            "create table zou_agg_lines (id int primary key, total int)",
+            "insert into zou_agg_lines values (1, 10), (2, 32)",
+        ],
+    )
+    .await;
+
+    // On, which is what this server does unless it is told otherwise
+    // and what the hosted platform does.
+    let res = app(&dsn)
+        .oneshot(get("/rest/v1/zou_agg_lines?select=total.sum()"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_text(res).await, r#"[{"sum":42}]"#);
+
+    // Off, which is PostgREST's own default and what a project run by
+    // `supabase start` answers, because the CLI never sets the flag.
+    let off = router(Config {
+        jwt_secret: SECRET.to_vec(),
+        pg: Some(dsn.to_string()),
+        aggregates: false,
+        ..Config::default()
+    })
+    .expect("router builds");
+    let res = off
+        .clone()
+        .oneshot(get("/rest/v1/zou_agg_lines?select=total.sum()"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST123");
+    assert_eq!(body["message"], "Use of aggregate functions is not allowed");
+    assert_eq!(body["details"], serde_json::Value::Null);
+    assert_eq!(body["hint"], serde_json::Value::Null);
+
+    // An aggregate inside an embed is the same refusal, since what is
+    // switched off is aggregating and not the top level of a select.
+    let res = off
+        .clone()
+        .oneshot(get(
+            "/rest/v1/zou_agg_lines?select=id,zou_agg_lines(count())",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = serde_json::from_str(&body_text(res).await).unwrap();
+    assert_eq!(body["code"], "PGRST123");
+
+    // And a select that does not aggregate is untouched by any of it,
+    // which is the whole surface for everybody who never asked for a
+    // sum.
+    let res = off
+        .clone()
+        .oneshot(get("/rest/v1/zou_agg_lines?select=id,total&order=id"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"id":1,"total":10},{"id":2,"total":32}]"#
+    );
+}

@@ -182,6 +182,25 @@ pub fn columns(value: &str) -> Result<Vec<String>, Error> {
     }
 }
 
+/// Whether anything in a parsed select list aggregates, at the root or
+/// inside an embed at any depth.
+///
+/// PostgREST has had aggregates behind `db-aggregates-enabled` since
+/// 12 and defaults it off, and the Supabase CLI never sets it, so a
+/// local project refuses `select=total.sum()` with PGRST123 while the
+/// hosted platform answers it. A caller that has been told which of
+/// the two it is asks this before planning, since the refusal is the
+/// whole query's and not one column's: an aggregate five embeds down
+/// is still a query that aggregates.
+#[must_use]
+pub fn aggregates(items: &[Item]) -> bool {
+    items.iter().any(|item| match item {
+        Item::Star => false,
+        Item::Col(col) => col.agg.is_some(),
+        Item::Embed(embed) | Item::Spread(embed) => aggregates(&embed.items),
+    })
+}
+
 /// Bytes that end a bare name in a select item. Unlike the filter
 /// grammar this breaks on the alias and cast colon and the hint bang.
 fn name_break(b: u8) -> bool {
@@ -665,6 +684,25 @@ mod tests {
         );
         assert_eq!(fail("a.sum"), "unexpected end of input expecting \"()\"");
         assert_eq!(fail("a.sum(x)"), "unexpected \"(\" expecting \"()\"");
+    }
+
+    #[test]
+    fn a_query_that_aggregates_anywhere_is_one_that_aggregates() {
+        for value in [
+            "amount.sum()",
+            "count()",
+            "id,orders(count())",
+            "id,orders(items(total.max()))",
+            "...orders(total.avg())",
+        ] {
+            assert!(aggregates(&ok(value)), "{value} aggregates");
+        }
+        // A relation called count is an embed rather than the bare
+        // aggregate, which is the one shape that reads like the thing
+        // it is not.
+        for value in ["*", "id,name", "id,orders(id,total)", "\"count\"()"] {
+            assert!(!aggregates(&ok(value)), "{value} does not aggregate");
+        }
     }
 
     #[test]

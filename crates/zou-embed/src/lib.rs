@@ -157,6 +157,11 @@ pub struct Options {
     /// The role a request that carries no key of its own runs as.
     /// Empty for `anon`, which is what a Supabase project calls it.
     pub anon_role: String,
+    /// Whether the rest surface answers a select that aggregates,
+    /// PostgREST's db-aggregates-enabled. True, which is what the
+    /// hosted platform does; false is the stock local stack, where the
+    /// same request is a PGRST123. See #555.
+    pub aggregates: bool,
     /// shared_buffers for the child postmaster.
     pub shared_buffers: Option<String>,
     /// Cut this database out of the machine's template instead of
@@ -198,6 +203,7 @@ impl Default for Options {
             jwt_secret: None,
             schemas: Vec::new(),
             anon_role: String::new(),
+            aggregates: true,
             shared_buffers: None,
             fixture: false,
             s3: None,
@@ -360,6 +366,10 @@ pub struct Zou {
     /// Kept so a branch of this database answers the S3 surface the
     /// same way its parent does.
     s3: Option<S3Keys>,
+    /// Kept for the same reason: a branch of a project that refuses
+    /// aggregates refuses them too, since a suite takes a branch per
+    /// test and every one of them is meant to be the same surface.
+    aggregates: bool,
     /// Removed on close, always: this is the running copy and the store
     /// is where the data actually is.
     runtime: PathBuf,
@@ -572,6 +582,7 @@ impl Zou {
             secret,
             keys,
             s3: options.s3.clone(),
+            aggregates: options.aggregates,
             runtime: runtime.to_path_buf(),
             owned_store: cut.owned_store.clone(),
             owned_tenant: cut.owned_tenant,
@@ -655,6 +666,7 @@ impl Zou {
                 true => zou_server::Config::default().anon_role,
                 false => options.anon_role.clone(),
             },
+            aggregates: options.aggregates,
             // Objects go where the pages go, the same store under the
             // same tenant prefix.
             objects: Some(target.to_string()),
@@ -807,6 +819,7 @@ impl Zou {
                 jwt_secret: Some(self.secret.clone()),
                 schemas: Vec::new(),
                 anon_role: String::new(),
+                aggregates: self.aggregates,
                 shared_buffers: None,
                 // The child names the store the parent is on, which is
                 // the template store when the parent is a fixture, so

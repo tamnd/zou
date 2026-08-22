@@ -48,6 +48,11 @@ pub struct ZouOptions {
     /// The role a request with no key of its own runs as, `anon`
     /// unless a suite recorded against something else says otherwise.
     pub anon_role: Option<String>,
+    /// Whether a select may aggregate, PostgREST's
+    /// db-aggregates-enabled. On unless a suite asks for the stock
+    /// local stack's refusal, which is what `supabase start` gives a
+    /// project. See #555.
+    pub aggregates: Option<bool>,
     pub shared_buffers: Option<String>,
     /// Cut this database out of the machine's template instead of
     /// making one, which is milliseconds rather than seconds and is
@@ -79,6 +84,7 @@ impl From<ZouOptions> for zou_embed::Options {
         out.jwt_secret = options.jwt_secret;
         out.schemas = options.schemas.unwrap_or_default();
         out.anon_role = options.anon_role.unwrap_or_default();
+        out.aggregates = options.aggregates.unwrap_or(true);
         out.shared_buffers = options.shared_buffers;
         out.fixture = options.fixture.unwrap_or(false);
         // Half a pair is not a pair, and a project given one half has

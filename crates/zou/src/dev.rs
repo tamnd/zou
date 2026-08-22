@@ -245,6 +245,15 @@ fn start_http(
     // separated, and everything else keeps the three a Supabase
     // project has. Naming a set replaces the default rather than
     // adding to it, and the anonymous role is in either way.
+    // PostgREST's db-aggregates-enabled, which upstream defaults off
+    // and the hosted platform turns on. On here, so what an
+    // application writes against the dev loop is what production
+    // answers, and off for anybody who wants the stock local stack's
+    // refusal or does not want a sum over a table nobody bounded.
+    let aggregates = zou_store::setting::flag("ZOU_DB_AGGREGATES_ENABLED").unwrap_or(true);
+    if !aggregates {
+        log::info!("aggregate functions are off, a select with count() in it is refused");
+    }
     let exposed_roles: Vec<String> = std::env::var("ZOU_EXPOSED_ROLES")
         .unwrap_or_default()
         .split(',')
@@ -420,6 +429,12 @@ fn start_http(
             } else {
                 schemas
             },
+            // Whether a select may aggregate, PostgREST's
+            // db-aggregates-enabled. On here and on hosted, off in the
+            // stock local stack, which is the difference #555 is
+            // about, and this is the switch that lets a dev loop hold
+            // itself to whichever of the two it deploys to.
+            aggregates,
             // What a `role` claim is allowed to name, from
             // ZOU_EXPOSED_ROLES and otherwise the three a Supabase
             // project has. The dev loop connects to postgres as the
