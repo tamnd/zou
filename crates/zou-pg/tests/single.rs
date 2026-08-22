@@ -114,6 +114,52 @@ fn the_backend_answers_what_the_parser_expects_it_to() {
         .expect("count");
     assert_eq!(sets[0].scalar(), Some("1"));
 
+    // And once the store has been captured, the same write is refused
+    // before the backend starts. This is issue #548: the pages a one
+    // shot session writes would be shadowed by the newest run on the
+    // next attach, because nothing here pushes its wal into the shared
+    // log for the chain to replay.
+    //
+    // The manifest is written here rather than captured. initdb leaves
+    // none at all, which is itself the bootstrap window the two
+    // sessions above just wrote through, and what the refusal reads is
+    // the count of checkpoints in the manifest and nothing else.
+    let layout = zou_store::layout::TenantLayout::new("local");
+    let backing = zou_store::open_store(store.to_str().unwrap()).expect("open the store");
+    assert!(
+        backing
+            .get(&layout.manifest())
+            .expect("read the manifest")
+            .is_none(),
+        "initdb leaves no manifest, which is why the write above held"
+    );
+    let mut manifest = zou_store::Manifest::new("local", 18);
+    manifest
+        .checkpoints
+        .push(zou_store::manifest::CheckpointRef {
+            id: "pretend".into(),
+            lsn: zou_store::Lsn(0x100),
+            kind: zou_store::manifest::CheckpointKind::Full,
+            owner: None,
+        });
+    backing
+        .put(&layout.manifest(), &manifest.to_json())
+        .expect("write the manifest");
+    let refused = session()
+        .writable()
+        .run("insert into t values (8);")
+        .expect_err("a captured store refuses a one shot writer");
+    assert!(
+        refused.contains("one shot backend may not write"),
+        "the refusal should name the reason, got {refused:?}"
+    );
+    // Reading is untouched by it, which is what the one production
+    // caller of a session does.
+    let sets = session()
+        .run("select count(*) as n from t;")
+        .expect("count");
+    assert_eq!(sets[0].scalar(), Some("1"));
+
     // The failure the exit status does not report. The backend logs
     // ERROR, runs the statement after it, and exits 0, so a caller that
     // trusted the status would read the empty result as a clean run.
