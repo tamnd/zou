@@ -1777,3 +1777,162 @@ async fn an_account_that_has_proved_an_address_does_not_prove_the_provider_s() {
     assert_eq!(address, email, "the account is where it was");
     assert!(confirmed, "and is still confirmed");
 }
+
+/// Invite somebody, and hand back their account id along with the token
+/// their invitation carries. The token is read out of the link that was
+/// mailed, because that is where a client that wants to offer the
+/// provider route instead of the link gets it from.
+async fn invite(app: &axum::Router, email: &str) -> (String, String) {
+    let (status, body) = as_user(
+        app,
+        "POST",
+        "/auth/v1/invite",
+        &service_key(),
+        serde_json::json!({"email": email}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let user_id = body["id"].as_str().expect("an invited account").to_string();
+    let mail = inbox_for(app, email).await;
+    let link = mail
+        .last()
+        .unwrap_or_else(|| panic!("nothing was mailed to {email}"))["link"]
+        .as_str()
+        .expect("a link")
+        .to_string();
+    let token = parts(&link)
+        .remove("token")
+        .unwrap_or_else(|| panic!("no token in {link}"));
+    (user_id, token)
+}
+
+async fn accepted(pool: &Pool, user_id: &str) -> i64 {
+    scalar(
+        pool,
+        "select count(*) from auth.audit_log_entries
+          where payload::jsonb ->> 'action' = 'invite_accepted'
+            and payload::jsonb ->> 'actor_id' = $1",
+        &[&user_id],
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_invitation_can_be_accepted_by_signing_in_with_a_provider() {
+    let Some(dsn) = dsn() else { return };
+    let (app, fake) = app(&dsn, false);
+    let pool = pool(&dsn).await;
+    let email = "invited-by-provider@zou.test";
+    wipe(&pool, &[email]).await;
+    let (user_id, token) = invite(&app, email).await;
+
+    // The link is never followed. The person goes to the provider
+    // instead, with the invitation's token riding along.
+    fake.google("google-sub-invited", email, true);
+    let state = start(&app, &format!("provider=google&invite_token={token}")).await;
+    let landed = location(&go(&app, &format!("/auth/v1/callback?state={state}&code=c")).await);
+    let back = parts(&landed);
+    assert!(!back.contains_key("error"), "{landed}");
+    assert_eq!(
+        claims(&back["access_token"])["sub"],
+        user_id,
+        "the invited account is the one they are signed in to"
+    );
+
+    let (accounts, confirmed): (i64, bool) = (
+        scalar(
+            &pool,
+            "select count(*) from auth.users where email = $1",
+            &[&email],
+        )
+        .await,
+        scalar(
+            &pool,
+            "select email_confirmed_at is not null from auth.users where id = $1::text::uuid",
+            &[&user_id],
+        )
+        .await,
+    );
+    assert_eq!(accounts, 1, "and there is no second account");
+    assert!(
+        confirmed,
+        "the invitation was read, which is what confirming the address means here"
+    );
+    assert_eq!(accepted(&pool, &user_id).await, 1, "and the trail says so");
+
+    // Spent: the token is gone, so the same invitation cannot start a
+    // second flow with it.
+    let res = go(
+        &app,
+        &format!("/auth/v1/authorize?provider=google&invite_token={token}"),
+    )
+    .await;
+    let status = res.status();
+    let body = json(res).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error_code"], "invite_not_found");
+    assert_eq!(body["msg"], "Invite not found");
+}
+
+#[tokio::test]
+async fn a_provider_naming_another_address_does_not_take_the_invitation() {
+    let Some(dsn) = dsn() else { return };
+    let (app, fake) = app(&dsn, false);
+    let pool = pool(&dsn).await;
+    let (work, personal) = ("invited-at-work@zou.test", "personal@zou.test");
+    wipe(&pool, &[work, personal]).await;
+    let (user_id, token) = invite(&app, work).await;
+
+    // Signed in with a google account at an address the invitation was
+    // not sent to. Upstream refuses this rather than moving the
+    // invitation, and so does this: an invitation is addressed to a
+    // person at a place.
+    fake.google("google-sub-personal", personal, true);
+    let state = start(&app, &format!("provider=google&invite_token={token}")).await;
+    let landed = location(&go(&app, &format!("/auth/v1/callback?state={state}&code=c")).await);
+    let back = parts(&landed);
+    assert_eq!(back["error_code"], "invite_not_found", "{landed}");
+    assert_eq!(
+        back["error_description"], "Invited email does not match emails from external provider",
+        "{landed}"
+    );
+
+    let strangers: i64 = scalar(
+        &pool,
+        "select count(*) from auth.users where email = $1",
+        &[&personal],
+    )
+    .await;
+    assert_eq!(strangers, 0, "and no second account was made");
+    let identities: i64 = scalar(
+        &pool,
+        "select count(*) from auth.identities where user_id = $1::text::uuid",
+        &[&user_id],
+    )
+    .await;
+    assert_eq!(
+        identities, 1,
+        "the invited account kept the one identity the invitation gave it"
+    );
+    assert_eq!(accepted(&pool, &user_id).await, 0);
+}
+
+#[tokio::test]
+async fn an_invitation_nobody_issued_is_refused_before_the_provider_is_involved() {
+    let Some(dsn) = dsn() else { return };
+    let (app, fake) = app(&dsn, false);
+
+    let res = go(
+        &app,
+        "/auth/v1/authorize?provider=google&invite_token=not-a-token-anybody-minted",
+    )
+    .await;
+    let status = res.status();
+    let body = json(res).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error_code"], "invite_not_found");
+    assert!(
+        fake.asked().is_empty(),
+        "nothing was exchanged, because the flow never started"
+    );
+}

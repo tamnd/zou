@@ -610,14 +610,13 @@ mod tests {
 
     /// Actions this server names and writes nowhere, with the reason.
     ///
-    /// `invite_accepted` is upstream's `processInvite`: an account that
-    /// was invited by mail and then accepts by signing in through a
-    /// social provider instead. Reaching it needs `/authorize` to take
-    /// an `invite_token`, which it does not, so the flow is not here to
-    /// write from. The action stays because `log_type` is the mapping
-    /// this module is, and a dashboard grouping by it should get the
-    /// same answer against either server.
-    const UNWRITTEN: [Action; 1] = [Action::InviteAccepted];
+    /// Empty, and the intent is that it stays that way. It held
+    /// `invite_accepted` until zou #517 gave `/authorize` an
+    /// `invite_token`, which was the flow that had nowhere to write
+    /// from. Anything added here needs the reason next to it, because
+    /// this is the list a reviewer reads to find out what the trail
+    /// does not cover.
+    const UNWRITTEN: [Action; 0] = [];
 
     /// The completeness review, as a test rather than as a paragraph
     /// somebody wrote once.
