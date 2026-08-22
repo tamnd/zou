@@ -1381,7 +1381,7 @@ const SWEEP_BY_NAME: u32 = 512;
 /// so a later re-extend cannot resurrect stale pages.
 ///
 /// `old_blocks` is where postgres believes the fork ends, or
-/// [`UNKNOWN_BLOCKS`]. It is allowed to be ahead of the SIZE object,
+/// `UNKNOWN_BLOCKS`. It is allowed to be ahead of the SIZE object,
 /// since an extension may still be sitting in the page cache or the
 /// pending buffer, which is the direction that keeps the sweep whole:
 /// everything the cluster ever wrote is at or under it.
