@@ -123,6 +123,17 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// share a directory with the postmaster that is still shutting down.
 static ATTACHES: AtomicU64 = AtomicU64::new(0);
 
+/// How many part way runtime directories a node holds on to at once.
+///
+/// One per project and only for a project whose replay was given up on,
+/// which is rare, but a node with a thousand projects and a store it
+/// cannot keep up with could otherwise set aside a thousand restored
+/// data directories and fill its disk with them. Over the cap the new
+/// one is dropped rather than an older one: an older one belongs to a
+/// project somebody is retrying, and this one may be a project nobody
+/// asks for again.
+const KEPT_ATTACHES: usize = 8;
+
 extern "C" fn on_signal(_sig: libc::c_int) {
     SHUTDOWN.store(true, Ordering::SeqCst);
 }
@@ -560,13 +571,118 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(15);
 struct State {
     live: Mutex<HashMap<String, Live>>,
     dying: Mutex<HashMap<String, Arc<Dying>>>,
+    /// Runtime directories of attaches that were given up on part way
+    /// through a replay, by project. See `Leftover`.
+    kept: Mutex<HashMap<String, Leftover>>,
     /// Weak because the attach manager owns the backend, so a strong
     /// one here would be a cycle that never frees. Empty until the
     /// server is built, which cannot happen before the backend exists.
     attached: Mutex<Weak<Attached>>,
 }
 
+/// What an attach that ran out of patience mid replay leaves behind.
+///
+/// A postmaster that was replaying when it was killed had done real
+/// work: the skeleton was restored out of the store, the wal ahead of
+/// it was replayed into the data directory, and every page redo touched
+/// after that was pulled out of the store into the page cache. Throwing
+/// the directory away means the next attempt does all of it again from
+/// the same place, which is how a project ends up unattachable no
+/// matter how many times it is tried.
+///
+/// Redo itself still restarts where it started, because crash recovery
+/// takes no restartpoints, so this does not move the finish line. What
+/// it removes is the restore and every store read the last attempt
+/// already paid for, which on a remote store is nearly all of the wall
+/// clock.
+struct Leftover {
+    dir: PathBuf,
+    /// The store's manifest for this project as it stood when the
+    /// directory was set aside, and the whole of it rather than a
+    /// watermark out of it.
+    ///
+    /// The page cache under here is keyed by block and holds no lsn, so
+    /// it is only safe to read again while nothing else has written to
+    /// this project's prefix. Requiring the manifest to be identical is
+    /// the strictest way of asking that and the easiest to be sure of:
+    /// a fold, a checkpoint, a shard split or another node taking the
+    /// lease all change it, and any of those means the directory goes.
+    manifest: Manifest,
+}
+
 impl State {
+    /// The runtime directory a previous attach of this project left
+    /// part way through, if there is one and the store has not moved
+    /// since. Either way the entry is consumed, and a directory that
+    /// cannot be reused is removed here rather than left for the node's
+    /// shutdown to find.
+    fn resume_from(&self, tenant_ref: &str, manifest: Option<&Manifest>) -> Option<PathBuf> {
+        let kept = self.kept.lock().expect("the kept map").remove(tenant_ref)?;
+        if manifest == Some(&kept.manifest) {
+            log::info!(
+                "{tenant_ref}: carrying on from the attach that was given up on, at {}",
+                kept.dir.display()
+            );
+            return Some(kept.dir);
+        }
+        log::info!("{tenant_ref}: the store moved since the last attach, starting over");
+        let _ = fs::remove_dir_all(&kept.dir);
+        None
+    }
+
+    /// Hold on to a runtime directory for the next attach of this
+    /// project. The manifest is read here, after the postmaster has
+    /// been reaped, so that anything written between now and the next
+    /// attach is seen as the change it is.
+    fn set_aside(&self, store: &dyn CasStore, tenant_ref: &str, dir: &Path) {
+        let manifest = match database_at(store, tenant_ref) {
+            Ok(Some(manifest)) => manifest,
+            // No database, or a store that will not answer. Neither is
+            // a state to resume out of.
+            _ => {
+                let _ = fs::remove_dir_all(dir);
+                return;
+            }
+        };
+        // Only the two directories that took the time to build. The
+        // socket directory and any deployment materialized under here
+        // are rebuilt by the next attach in a few milliseconds, and a
+        // stale socket in a directory postgres is about to be pointed
+        // at is a puzzle nobody needs.
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name != "pgdata" && name != "pagecache" {
+                    let _ = fs::remove_dir_all(entry.path());
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        let mut kept = self.kept.lock().expect("the kept map");
+        if kept.len() >= KEPT_ATTACHES && !kept.contains_key(tenant_ref) {
+            log::warn!(
+                "{tenant_ref}: {KEPT_ATTACHES} part way attaches are already set aside, so this \
+                 one starts over next time"
+            );
+            drop(kept);
+            let _ = fs::remove_dir_all(dir);
+            return;
+        }
+        log::info!(
+            "{tenant_ref}: keeping {} so the next attach carries on from it",
+            dir.display()
+        );
+        if let Some(old) = kept.insert(
+            tenant_ref.to_string(),
+            Leftover {
+                dir: dir.to_path_buf(),
+                manifest,
+            },
+        ) {
+            let _ = fs::remove_dir_all(&old.dir);
+        }
+    }
+
     /// Note that a postmaster has been asked to leave, so the next
     /// attach of this project knows there is something to wait for.
     fn leaving(&self, tenant_ref: &str, pid: u32) {
@@ -685,6 +801,23 @@ impl State {
     }
 }
 
+/// The manifest of the database under a tenant's prefix, or None when
+/// there is no database there yet.
+///
+/// Free standing because the thread that reaps a postmaster asks the
+/// same question and has the store but not the backend.
+fn database_at(store: &dyn CasStore, tenant_ref: &str) -> Result<Option<Manifest>, String> {
+    let layout = TenantLayout::new(tenant_ref);
+    let Some((data, _)) = store
+        .get(&layout.manifest())
+        .map_err(|e| format!("store: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
+    Ok((!manifest.checkpoints.is_empty()).then_some(manifest))
+}
+
 /// A postmaster per attached tenant.
 struct Postmasters {
     target: String,
@@ -747,16 +880,7 @@ impl Postmasters {
     /// thirty milliseconds away reading it twice is a round trip on the
     /// cold path with a user waiting on it.
     fn database(&self, tenant_ref: &str) -> Result<Option<Manifest>, String> {
-        let layout = TenantLayout::new(tenant_ref);
-        let Some((data, _)) = self
-            .store
-            .get(&layout.manifest())
-            .map_err(|e| format!("store: {e}"))?
-        else {
-            return Ok(None);
-        };
-        let manifest = Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
-        Ok((!manifest.checkpoints.is_empty()).then_some(manifest))
+        database_at(&*self.store, tenant_ref)
     }
 
     /// What is deployed under `/functions/v1` for this project, out of
@@ -890,10 +1014,17 @@ impl Backend for Postmasters {
         // Before anything is read out of the store for this project,
         // and long before anything is started that would write to it.
         self.state.wait_for_the_last_one(&tenant_ref)?;
-        let dir = self.runtime.join(format!(
-            "{tenant_ref}-{}",
-            ATTACHES.fetch_add(1, Ordering::Relaxed)
-        ));
+        // Read before anything is decided, because both of the next two
+        // questions want it: whether a directory the last attempt left
+        // behind is still good, and, if it is not, what to restore.
+        let manifest = self.database(&tenant_ref)?;
+        let resumed = self.state.resume_from(&tenant_ref, manifest.as_ref());
+        let dir = resumed.clone().unwrap_or_else(|| {
+            self.runtime.join(format!(
+                "{tenant_ref}-{}",
+                ATTACHES.fetch_add(1, Ordering::Relaxed)
+            ))
+        });
         let pgdata = dir.join("pgdata");
         let pagecache = dir.join("pagecache");
         let sock = dir.join("sock");
@@ -904,8 +1035,14 @@ impl Backend for Postmasters {
             .map_err(|e| format!("chmod {}: {e}", sock.display()))?;
 
         boot.lap("wait");
-        if let Some(manifest) = self.database(&tenant_ref)? {
-            let stats = restore::restore_head(&self.store, &tenant_ref, &manifest, &pgdata)?;
+        if resumed.is_some() {
+            // The skeleton is already on disk and the wal ahead of it is
+            // already in it. Postgres picks up its own crash recovery
+            // from where the last postmaster was stopped, and the page
+            // cache next to it answers everything that attempt read.
+            boot.lap("resume");
+        } else if let Some(manifest) = &manifest {
+            let stats = restore::restore_head(&self.store, &tenant_ref, manifest, &pgdata)?;
             log::debug!(
                 "{tenant_ref}: restored {} files in {}, replayed {} wal records in {}",
                 stats.files,
@@ -972,6 +1109,12 @@ impl Backend for Postmasters {
         let state = Arc::clone(&self.state);
         let watched = tenant_ref.clone();
         let cleanup = dir.clone();
+        // Set by the wait below when it gives up on a replay that was
+        // moving, and read here once the child is reaped. Set before
+        // the signal, because the reap can happen the instant after it.
+        let keep = Arc::new(AtomicBool::new(false));
+        let keeping = Arc::clone(&keep);
+        let store = Arc::clone(&self.store);
         std::thread::spawn(move || {
             let mut said = false;
             for line in BufReader::new(stderr).lines() {
@@ -998,7 +1141,11 @@ impl Backend for Postmasters {
                 Err(e) => format!("could not be waited for: {e}"),
             };
             state.died(&watched, pid, why);
-            let _ = fs::remove_dir_all(&cleanup);
+            if keeping.load(Ordering::SeqCst) {
+                state.set_aside(&*store, &watched, &cleanup);
+            } else {
+                let _ = fs::remove_dir_all(&cleanup);
+            }
             // Last, because the next attach of this project starts as
             // soon as this says so, and it should not start while this
             // one's directory is still on disk.
@@ -1038,6 +1185,12 @@ impl Backend for Postmasters {
             // orders are wrong the other way round: a child that
             // dies between the signal and the note leaves a project
             // waiting for a process that is already gone.
+            //
+            // A postmaster that reported a redo lsn got part way, so
+            // what it built is worth the next attempt's while. One that
+            // said nothing at all built nothing worth keeping, and the
+            // directory goes as it always did.
+            keep.store(!at.is_empty(), Ordering::SeqCst);
             self.state.leaving(&tenant_ref, pid);
             stop(pid);
             return Err(format!(
@@ -1420,6 +1573,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         state: Arc::new(State {
             dying: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            kept: Mutex::new(HashMap::new()),
             attached: Mutex::new(Weak::new()),
         }),
     });
@@ -2074,6 +2228,7 @@ mod tests {
         let state = State {
             live: Mutex::new(HashMap::new()),
             dying: Mutex::new(HashMap::new()),
+            kept: Mutex::new(HashMap::new()),
             attached: Mutex::new(Weak::new()),
         };
         state.live.lock().unwrap().insert(
@@ -2128,8 +2283,142 @@ mod tests {
         Arc::new(State {
             live: Mutex::new(HashMap::new()),
             dying: Mutex::new(HashMap::new()),
+            kept: Mutex::new(HashMap::new()),
             attached: Mutex::new(Weak::new()),
         })
+    }
+
+    /// A store with one project's manifest in it, and the manifest, so
+    /// a test can move the store on and see what that does.
+    fn a_store_holding(tenant_ref: &str, lsn: u64) -> (Arc<zou_store::MemStore>, Manifest) {
+        use zou_store::manifest::{CheckpointKind, CheckpointRef};
+
+        let store = Arc::new(zou_store::MemStore::new());
+        let mut manifest = Manifest::new(tenant_ref, 18);
+        manifest.checkpoints.push(CheckpointRef {
+            id: format!("chk-{lsn}"),
+            lsn: zou_store::lsn::Lsn(lsn),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        store
+            .put(
+                &TenantLayout::new(tenant_ref).manifest(),
+                &manifest.to_json(),
+            )
+            .expect("write the manifest");
+        (store, manifest)
+    }
+
+    /// A directory with the two things worth keeping in it and some
+    /// things that are not.
+    fn a_part_way_attach(at: &Path) {
+        fs::create_dir_all(at.join("pgdata")).unwrap();
+        fs::create_dir_all(at.join("pagecache")).unwrap();
+        fs::create_dir_all(at.join("sock")).unwrap();
+        fs::create_dir_all(at.join("edge-0")).unwrap();
+        fs::write(at.join("pgdata/PG_VERSION"), "18").unwrap();
+        fs::write(at.join("pagecache/1-2-3-0.pages"), "pages").unwrap();
+        fs::write(at.join("sock/.s.PGSQL.5432"), "").unwrap();
+    }
+
+    /// The point of the whole thing: an attach that was given up on part
+    /// way through leaves its work where the next one can carry on from
+    /// it, so seven attempts are not seven copies of the first.
+    #[test]
+    fn an_attach_that_was_given_up_on_is_carried_on_from() {
+        let runtime = tempfile::tempdir().unwrap();
+        let dir = runtime.path().join("acme-prod-0");
+        a_part_way_attach(&dir);
+        let (store, manifest) = a_store_holding("acme-prod", 0x1BDEC58);
+
+        let state = empty_state();
+        state.set_aside(&*store, "acme-prod", &dir);
+
+        // The restore and the pages it pulled out of the store are
+        // still there. The socket directory and the deployment are not,
+        // since the next attach builds both in milliseconds.
+        assert!(dir.join("pgdata/PG_VERSION").exists());
+        assert!(dir.join("pagecache/1-2-3-0.pages").exists());
+        assert!(!dir.join("sock").exists());
+        assert!(!dir.join("edge-0").exists());
+
+        assert_eq!(
+            state.resume_from("acme-prod", Some(&manifest)),
+            Some(dir.clone()),
+            "the next attach did not carry on from it"
+        );
+        // Taken, so a third attach of the same project starts over
+        // rather than being handed a directory somebody is already in.
+        assert_eq!(state.resume_from("acme-prod", Some(&manifest)), None);
+    }
+
+    /// The page cache under a kept directory is keyed by block and holds
+    /// no lsn, so reading it again is only safe while nothing has
+    /// written to the project's prefix. Anything that moves the manifest
+    /// says something has.
+    #[test]
+    fn a_store_that_moved_takes_the_kept_directory_with_it() {
+        let runtime = tempfile::tempdir().unwrap();
+        let dir = runtime.path().join("acme-prod-0");
+        a_part_way_attach(&dir);
+        let (store, manifest) = a_store_holding("acme-prod", 0x1BDEC58);
+
+        let state = empty_state();
+        state.set_aside(&*store, "acme-prod", &dir);
+
+        let mut moved = manifest.clone();
+        moved.epoch += 1;
+        assert_eq!(
+            state.resume_from("acme-prod", Some(&moved)),
+            None,
+            "a directory was reused after another writer had been in the store"
+        );
+        assert!(!dir.exists(), "the directory it refused was left on disk");
+
+        // And a project the store has no database for at all, which is
+        // the shape a store that was reset underneath the node has.
+        a_part_way_attach(&dir);
+        state.set_aside(&*store, "acme-prod", &dir);
+        assert_eq!(state.resume_from("acme-prod", None), None);
+    }
+
+    /// A node that cannot keep up with its store must not answer by
+    /// filling its disk with data directories nobody comes back for.
+    #[test]
+    fn only_so_many_part_way_attaches_are_held_at_once() {
+        let runtime = tempfile::tempdir().unwrap();
+        let state = empty_state();
+        let mut manifests = Vec::new();
+        for n in 0..KEPT_ATTACHES + 1 {
+            let tenant_ref = format!("acme-{n}");
+            let dir = runtime.path().join(&tenant_ref);
+            a_part_way_attach(&dir);
+            let (store, manifest) = a_store_holding(&tenant_ref, 0x1BDEC58);
+            state.set_aside(&*store, &tenant_ref, &dir);
+            manifests.push((tenant_ref, dir, manifest));
+        }
+        assert_eq!(state.kept.lock().unwrap().len(), KEPT_ATTACHES);
+
+        // The one over the cap is the one that went, and it went off
+        // the disk too rather than being merely forgotten.
+        let (tenant_ref, dir, manifest) = manifests.pop().unwrap();
+        assert_eq!(state.resume_from(&tenant_ref, Some(&manifest)), None);
+        assert!(!dir.exists());
+        for (tenant_ref, dir, manifest) in manifests {
+            assert_eq!(state.resume_from(&tenant_ref, Some(&manifest)), Some(dir));
+        }
+
+        // A project that is already held does not count against the cap
+        // a second time, since it replaces its own entry.
+        let dir = runtime.path().join("acme-again");
+        a_part_way_attach(&dir);
+        let (store, manifest) = a_store_holding("acme-again", 0x1BDEC58);
+        for _ in 0..3 {
+            a_part_way_attach(&dir);
+            state.set_aside(&*store, "acme-again", &dir);
+        }
+        assert_eq!(state.resume_from("acme-again", Some(&manifest)), Some(dir));
     }
 
     /// The rule the store depends on: one postmaster per project at a

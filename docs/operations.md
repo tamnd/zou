@@ -333,6 +333,13 @@ A postmaster has sixty seconds to say it is accepting connections, and one that 
 Without that a project with an hour of WAL behind it is a project that cannot be attached at all rather than one that is slow to attach, because the postmaster killed at sixty seconds wrote nothing anybody would start from and its replacement begins at the same redo point with the same sixty seconds.
 A redo that reports the same LSN twice is stuck rather than slow and is killed on the spot, and so is one that is still going at the ten minutes, since leaving it be would let the retry start a second postmaster on a project that already has one.
 
+An attach that was given up on part way leaves its runtime directory behind, and the next attach of that project carries on from it.
+Crash recovery takes no restartpoints, so redo does begin where it began before; what the next attempt does not do again is restore the skeleton, replay the WAL ahead of it, or read a single page the last attempt already pulled out of the store into the tenant's page cache.
+On a remote store that is nearly all of the wall clock, and it is the difference between attempts that add up and seven identical attempts that all die in the same place.
+The directory is only reused while the project's manifest is byte for byte the one it was set aside with, because the page cache is keyed by block and holds no LSN, so anything that moved the store, a fold, a checkpoint, a shard split, or another node taking the lease, throws it away and starts over.
+A node holds at most eight of them at once and only for projects whose redo was moving when it was given up on; over that the newest is dropped rather than an older one, since an older one belongs to a project somebody is retrying.
+The lines to look for are `keeping <dir> so the next attach carries on from it` and `carrying on from the attach that was given up on`.
+
 What is left of a cold attach is the writes: recovery dirties every page it changed and the end of recovery checkpoint puts them back one at a time, which is where the rest of those ten minutes goes and is the storage engine's problem rather than this command's.
 
 ### Where a cold start went
