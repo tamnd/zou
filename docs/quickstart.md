@@ -490,6 +490,20 @@ ZOU_EXPOSED_ROLES=anon,authenticated,service_role,reporting zou dev /tmp/mydb --
 
 Naming a set replaces the default rather than adding to it, so list the three as well unless you mean to drop them. The role must exist in the database and be granted what it needs, the same as any other.
 
+## Aggregate functions
+
+`select=total.sum()` answers, and so do `avg()`, `count()`, `max()` and `min()`, at the root of a select or inside an embed. That is what a hosted Supabase project does.
+
+It is not what `supabase start` does. PostgREST has had aggregates behind `db-aggregates-enabled` since 12 and defaults it off, and the CLI never sets it, so the same request against the stock local stack is a 400 with `PGRST123`, `Use of aggregate functions is not allowed`. There is no behaviour that matches both, so zou takes the platform's: an application that works here works in production.
+
+An unbounded aggregate reads the whole table, which is why upstream turned it off, so it can be turned off here too:
+
+```bash
+ZOU_DB_AGGREGATES_ENABLED=false zou dev /tmp/mydb --http 54321
+```
+
+Then a select with an aggregate anywhere in it is the same `PGRST123` the local stack answers, and everything else is unchanged. `zou serve` reads the same variable for every project on the node.
+
 ## Rate limits
 
 Every auth endpoint has a budget, and they are GoTrue's own numbers: 150 token grants and 30 of everything else per caller per five minutes, 30 anonymous sign ins an hour, 15 factor challenges and verifications a minute, 30 emails and 30 text messages an hour for the whole project. A caller over budget gets a 429 with `over_request_rate_limit`.

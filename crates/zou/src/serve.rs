@@ -914,6 +914,12 @@ struct Postmasters {
     /// address at all.
     node: Option<String>,
     endpoint: Option<String>,
+    /// Whether the REST surface of every project here answers a select
+    /// that aggregates, read once from the node's environment for the
+    /// same reason the realtime limits are. An operator who does not
+    /// want an unbounded sum over somebody's table turns it off for
+    /// the node, since the projects on one are not theirs to ask.
+    aggregates: bool,
     store: Arc<dyn CasStore>,
     state: Arc<State>,
 }
@@ -1445,6 +1451,9 @@ impl Postmasters {
             // registry asks, and the registry asks the one a person
             // means: whether the address is proved before the account
             // works.
+            // PostgREST's db-aggregates-enabled, the node's answer for
+            // every project on it. See #555.
+            aggregates: self.aggregates,
             mailer_autoconfirm: !auth.confirm_email,
             // Where a confirmation link lands, and the only redirect
             // target trusted without being listed. A project with a
@@ -1656,6 +1665,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         endpoint: args.advertise.clone(),
         realtime: zou_server::realtime::limits_from_env()?,
         audit: zou_server::audit::from_env()?,
+        aggregates: zou_store::setting::flag("ZOU_DB_AGGREGATES_ENABLED").unwrap_or(true),
         sender: zou_server::smtp::from_env()?
             .map(|smtp| Arc::new(smtp) as Arc<dyn zou_server::mail::Sender>),
         mail: zou_server::mail::settings_from_env()?,
@@ -2614,6 +2624,7 @@ mod tests {
             passthrough: None,
             http: 54321,
             realtime,
+            aggregates: true,
             store: Arc::new(zou_store::MemStore::new()),
             state: empty_state(),
         }
@@ -2644,6 +2655,18 @@ mod tests {
             Some("acme-prod"),
             "the project is still itself"
         );
+    }
+
+    /// The same shape as the realtime tier above, for the same
+    /// reason: ZOU_DB_AGGREGATES_ENABLED is read once by the node and
+    /// a project built from the default would answer a sum on a node
+    /// whose operator switched them off.
+    #[test]
+    fn a_served_project_is_given_the_nodes_answer_on_aggregates() {
+        let mut node = node(Default::default());
+        node.aggregates = false;
+        let cfg = node.config(&a_tenant("acme-prod"), 5433, None);
+        assert!(!cfg.aggregates);
     }
 
     fn a_tenant(tenant_ref: &str) -> Tenant {

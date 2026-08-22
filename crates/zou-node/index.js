@@ -66,6 +66,7 @@ async function createZou(options = {}) {
     jwtSecret: options.jwtSecret,
     schemas: options.schemas,
     anonRole: options.anonRole,
+    aggregates: options.aggregates,
     sharedBuffers: options.sharedBuffers,
     fixture: options.fixture,
     s3AccessKey: options.s3AccessKey,
