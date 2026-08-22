@@ -2299,11 +2299,10 @@ fn a_call_ends_when_the_signal_it_was_given_says_so() {
     assert_eq!(said["fine"], "answered");
 }
 
-/// A call that was given up on had already left, and this runtime cannot
-/// take it back: the request is on a blocking thread inside a client
-/// with no handle to it, so what an abort ends is the waiting and not the
-/// connection. The server seeing the path is that difference, written
-/// down here rather than left to be discovered.
+/// A call that was given up on had already left, and no signal takes a
+/// request back: what an abort ends is the answer, and the server has
+/// seen the path either way. What happens to the connection after that
+/// is `tests/hangup.rs`, which watches from the other end.
 ///
 /// Four of the five calls above are aborted and only four requests can
 /// have been in flight, so what this asserts is that the aborted ones

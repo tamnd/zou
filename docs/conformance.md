@@ -468,10 +468,11 @@ A preflight is answered by kong on the local stack before the function is reache
 `SB_EXECUTION_ID` is a uuid on both, and the local stack mints it when the worker is made rather than when a call arrives, so five calls a second apart come back with one id where zou hands each call its own.
 `SUPABASE_JWKS` is set on the local stack, which signs a project's tokens with a key pair and publishes the public half, and unset on zou, which signs with one shared secret and has nothing asymmetric to publish.
 
-There is a fourth difference that is not in the suite, because a suite cannot see it.
+There was a fourth difference that a suite cannot see, and it is closed.
 Giving up on a call is two questions here, the three statics and what a signal handed to a `Request` reaches, and both servers answer both the same way down to the message on the rejection.
-What differs is the connection: upstream tears the socket down and zou ends the waiting while the request runs to its own end.
-The only witness is the far end, so it was measured with a slow server that reports what it saw, which came back with a broken pipe from upstream and with an answer nobody read from zou, and it is written down in `docs/functions.md` and in the examples README rather than asserted anywhere, as [#432](https://github.com/tamnd/zou/issues/432).
+What differed was the connection: upstream tore the socket down and zou ended the waiting while the request ran to its own end.
+The only witness is the far end, so it was measured with a slow server that reports what it saw, which came back with a broken pipe from upstream and with an answer nobody read from zou.
+Both tear it down now, and the far end is where it is asserted too, in `crates/zou-deno/tests/hangup.rs`.
 
 The zou leg is run twice, and that is a claim the other suites cannot make.
 The first run serves the project directory, the way a person does while writing a function.

@@ -123,6 +123,8 @@ mod crypto;
 #[cfg(feature = "isolate")]
 mod fetch;
 #[cfg(feature = "isolate")]
+mod hangup;
+#[cfg(feature = "isolate")]
 mod imports;
 #[cfg(feature = "isolate")]
 mod inspector;
