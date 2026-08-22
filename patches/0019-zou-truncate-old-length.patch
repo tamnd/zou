@@ -1,0 +1,55 @@
+Hand the old fork length to the truncate shim.
+
+The shim deletes the block objects past the new end, and it finds them
+by listing the fork's whole prefix. Postgres already knows where the
+fork ended: smgrtruncate takes old_nblocks and passes it to every
+smgr_truncate, and this one has been dropping it on the floor.
+
+That list is not free. In redo it is one per fork per Storage TRUNCATE
+record, three for a heap, each waiting for the last, inside the startup
+process before the cluster can accept a connection. On a long fork it
+is a page of results per thousand keys on top of that.
+
+With the length across, a short tail names the objects it is dropping
+and asks the store nothing, and a truncate that asks for a fork longer
+than the one that is there returns without touching anything, which is
+the early exit mdtruncate takes for the same reason: a replica
+restarting from a restartpoint below a truncate replays it against a
+fork that is already the shorter length.
+
+InvalidBlockNumber goes across as is and reads as unknown on the other
+side, which falls back to the list.
+
+See zou #382.
+
+--- a/src/backend/storage/smgr/zou_smgr.c
++++ b/src/backend/storage/smgr/zou_smgr.c
+@@ -63,7 +63,7 @@
+ extern int	zou_smgr_put_size(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+ 							  uint32 nblocks);
+ extern int	zou_smgr_truncate(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+-							  uint32 nblocks);
++							  uint32 old_blocks, uint32 nblocks);
+ extern int	zou_smgr_unlink(uint32 spc, uint32 db, uint32 rel, uint32 fork);
+ extern int	zou_pageserve_on(void);
+ 
+@@ -796,10 +796,17 @@
+ zoutruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber old_blocks,
+ 			BlockNumber nblocks)
+ {
+-	/* against a checkpoint's flush putting the old length back */
++	/*
++	 * The old length goes across too. Without it the shim has to LIST
++	 * the fork's whole prefix to find the blocks past the new end, and
++	 * in redo that is one list per fork per Storage TRUNCATE record,
++	 * serialized in the startup process. With it a small truncate names
++	 * the objects it is dropping and asks the store nothing (zou #382).
++	 * InvalidBlockNumber is passed through as is and reads as unknown.
++	 */
+ 	zou_relsize_flush_block();
+ 	zou_check(zou_smgr_truncate(ZOU_LOCATOR(reln), (uint32) forknum,
+-								(uint32) nblocks),
++								(uint32) old_blocks, (uint32) nblocks),
+ 			  "truncate", reln, forknum);
+ 	zou_relsize_note(reln->smgr_rlocator.locator, forknum,
+ 					 nblocks, ZOU_RELSIZE_SET);
