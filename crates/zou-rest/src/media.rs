@@ -97,6 +97,16 @@ pub fn decode(raw: &str) -> MediaType {
     }
 }
 
+/// A name with its parameters taken off, which is what a media type
+/// domain is compared against: a domain is named for a type and a
+/// subtype and has nowhere to keep a charset.
+pub fn name(raw: &str) -> String {
+    match tokenize(raw) {
+        Some(Tokens(main, sub, _)) => format!("{main}/{sub}"),
+        None => raw.trim().to_ascii_lowercase(),
+    }
+}
+
 /// The name of a media type, which is what a 406 lists and what a
 /// Content-Type header carries once the charset is on it.
 pub fn mime(m: &MediaType) -> String {
@@ -278,6 +288,15 @@ mod tests {
         );
         assert_eq!(mime(&decode("audio/mpeg3")), "audio/mpeg3");
         assert_eq!(decode("nonsense"), MediaType::Other("nonsense".to_string()));
+    }
+
+    #[test]
+    fn a_name_a_domain_could_carry_is_the_type_and_the_subtype() {
+        assert_eq!(name("application/json;charset=UTF-8"), "application/json");
+        assert_eq!(name("Text/XML"), "text/xml");
+        assert_eq!(name("*/*"), "*/*");
+        assert_eq!(name("pg/outfunc"), "pg/outfunc");
+        assert_eq!(name("undefined"), "undefined");
     }
 
     #[test]

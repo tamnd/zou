@@ -87,6 +87,10 @@ pub struct Routine {
     /// so it is the function's own and travels with the overload
     /// rather than with the request.
     pub media: Option<String>,
+    /// Whether that media type sits on bytea, so the value is bytes
+    /// and reading it back as text would hand over a hex literal
+    /// rather than the body the function wrote.
+    pub media_bytes: bool,
 }
 
 /// Every overload of every function one schema can be called on.
@@ -297,12 +301,14 @@ pub fn routine(row: RoutineRow) -> Routine {
     // A row is many values and a value is one body, so only the
     // second can be handed over as a media type of its own.
     let value = kind == RetKind::Scalar;
+    let media_bytes = row.rettype == "bytea";
     Routine {
         args,
         kind,
         returns_set: row.returns_set,
         volatile: row.volatile,
         media: row.media.filter(|_| value),
+        media_bytes,
     }
 }
 
@@ -726,12 +732,22 @@ pub fn scalar_wrap(call: Sql, set: bool) -> Sql {
 /// The count is one because a value is one row by definition. Only a
 /// value can carry a media type this way, a row being many values and
 /// so many bodies.
-pub fn value_wrap(call: Sql) -> Sql {
+///
+/// The value comes back as bytes either way. A domain over bytea has
+/// to, since its text is the hex literal and not the body, and the
+/// rest go through convert_to so that one column type answers for
+/// every media type a function can declare.
+pub fn value_wrap(call: Sql, bytes: bool) -> Sql {
     let src = quote_ident(SOURCE);
     let col = quote_ident(VALUE);
+    let body = if bytes {
+        format!("{src}.{col}::bytea")
+    } else {
+        format!("convert_to({src}.{col}::text, 'UTF8')")
+    };
     Sql {
         text: format!(
-            "with {src} as ({}) select {src}.{col}::text, 1::bigint from {src}",
+            "with {src} as ({}) select {body}, 1::bigint from {src}",
             call.text
         ),
         params: call.params,

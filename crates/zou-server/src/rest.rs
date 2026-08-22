@@ -48,8 +48,8 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode
 use axum::response::{IntoResponse, Response};
 use tokio_postgres::types::{Format, IsNull, ToSql, Type, to_sql_checked};
 use zou_rest::catalog::{
-    COLUMNS_SQL, COMPUTED_SQL, Catalog, Column, ColumnRow, ComputedRow, Details, FkRow,
-    INTROSPECT_SQL, KEYS_SQL, RELATIONS_SQL,
+    self, COLUMNS_SQL, COMPUTED_SQL, Catalog, Column, ColumnRow, ComputedRow, Details, FkRow,
+    HANDLERS_SQL, Handler, INTROSPECT_SQL, KEYS_SQL, RELATIONS_SQL,
 };
 use zou_rest::filter::{self, Error as GrammarError, Failure, Node, Op, Parsed};
 use zou_rest::media::MediaType;
@@ -1108,11 +1108,26 @@ enum Media {
     /// wrapped around it, which is the whole point: a function can
     /// hand back an xml document or a png rather than a json string
     /// holding one.
-    Custom(String),
+    Custom {
+        name: String,
+        binary: bool,
+    },
+    /// A media type the schema renders the whole result in, by an
+    /// aggregate declared over a domain of that name. The rows go
+    /// into the aggregate and what it built is the body.
+    Handler(Handler),
 }
 
 impl Media {
     fn content_type(&self) -> String {
+        let named = |name: &str| match name {
+            // A handler that answers every media type says nothing
+            // about what it wrote, so the answer is the type that
+            // means unread bytes until the function says otherwise
+            // through response.headers.
+            catalog::ANY_MEDIA => media::content_type(&MediaType::Bytes),
+            _ => media::content_type(&media::decode(name)),
+        };
         match self {
             Media::Json { stripped: false } => media::content_type(&MediaType::Json),
             Media::Json { stripped: true } => media::content_type(&MediaType::ArrayStripped),
@@ -1120,7 +1135,16 @@ impl Media {
                 stripped: *stripped,
             }),
             Media::Csv => media::content_type(&MediaType::Csv),
-            Media::Custom(name) => media::content_type(&media::decode(name)),
+            Media::Custom { name, .. } => named(name),
+            Media::Handler(h) => named(&h.media),
+        }
+    }
+
+    /// The handler answering, when one is.
+    fn handler(&self) -> Option<&Handler> {
+        match self {
+            Media::Handler(h) => Some(h),
+            _ => None,
         }
     }
 
@@ -1195,30 +1219,57 @@ fn unacceptable(offered: Vec<String>) -> RestError {
     }
 }
 
-/// Content negotiation for a table: the first weighed item with a
-/// handler wins.
-fn negotiate(headers: &HeaderMap) -> Result<Media, RestError> {
-    negotiate_call(headers, None)
+/// Content negotiation for a table, which is the built in handlers
+/// plus whatever the schema declared over that relation.
+///
+/// A declared handler is weighed first, so an aggregate over a domain
+/// called `application/json` renders that table's json rather than
+/// the ordinary rendering. The vendored names are the exception and
+/// they are dropped when the catalog is read, so nothing here has to
+/// know about them.
+fn negotiate_table(
+    headers: &HeaderMap,
+    catalog: &Catalog,
+    table: &str,
+) -> Result<Media, RestError> {
+    negotiate_with(headers, |name| {
+        catalog.handler(table, name).cloned().map(Media::Handler)
+    })
 }
 
 /// Content negotiation for a call, which is a table's plus whatever
 /// media type the function itself answers in.
 ///
-/// The function's own handler is looked up first, so a function
+/// The function's own type is looked up first, so a function
 /// returning a domain named `text/csv` writes the csv rather than
-/// the csv aggregate. It is not looked up under `*/*` though: a
-/// client that stated no preference gets json, and the only way to
-/// the function's own type is to name it.
-fn negotiate_call(headers: &HeaderMap, custom: Option<&str>) -> Result<Media, RestError> {
-    let Some(items) = accept_items(headers) else {
-        return Ok(Media::Json { stripped: false });
-    };
+/// the csv aggregate. A function returning `*/*` says it will answer
+/// under any name at all and sort out the content type itself, which
+/// is the one way a client that asked for nothing in particular gets
+/// something other than json.
+fn negotiate_call(headers: &HeaderMap, custom: Option<(&str, bool)>) -> Result<Media, RestError> {
+    negotiate_with(headers, |name| {
+        custom
+            .filter(|(declared, _)| *declared == name || *declared == catalog::ANY_MEDIA)
+            .map(|(declared, binary)| Media::Custom {
+                name: declared.to_string(),
+                binary,
+            })
+    })
+}
+
+/// The first weighed Accept item something can answer wins, and what
+/// the schema declared is asked before what is built in. No Accept at
+/// all is `*/*`, the one item every client that named none is taken
+/// to have written.
+fn negotiate_with(
+    headers: &HeaderMap,
+    declared: impl Fn(&str) -> Option<Media>,
+) -> Result<Media, RestError> {
+    let items = accept_items(headers).unwrap_or_else(|| vec![catalog::ANY_MEDIA.to_string()]);
     let mut offered: Vec<String> = Vec::new();
     for mime in &items {
-        if let Some(name) = custom
-            && media::decode(mime) == media::decode(name)
-        {
-            return Ok(Media::Custom(name.to_string()));
+        if let Some(m) = declared(&media::name(mime)) {
+            return Ok(m);
         }
         match decode_media(mime) {
             Ok(m) => return Ok(m),
@@ -1284,6 +1335,31 @@ fn row_json(media: &Media) -> &'static str {
 /// column. An empty result comes out as a lone newline, same as
 /// upstream. Callers prepend `with ... "_zou_source" as (...)`.
 const CSV_AGG: &str = "select (select coalesce(string_agg(a.k, ','), '') from (select json_object_keys(r)::text as k from (select row_to_json(hh) as r from \"_zou_source\" as hh limit 1) s) a) || E'\\n' || coalesce(string_agg(substring(\"_zou_t\"::text, 2, length(\"_zou_t\"::text) - 2), E'\\n'), ''), count(*) from (select * from \"_zou_source\") as \"_zou_t\"";
+
+/// The select a media type handler answers with: the aggregate over
+/// the rows of the named source, and the count of them beside it, the
+/// same two columns the csv aggregate hands back.
+///
+/// The rows go in as whole rows, which is what makes an aggregate
+/// declared over a relation's rowtype refuse a select list that is
+/// not that relation. Postgres does the refusing and it is right to:
+/// a handler written for three columns cannot render two, and
+/// upstream lets the database say so rather than guessing on its
+/// behalf.
+///
+/// Text is converted to bytes rather than read back as a string, so
+/// that one column type carries both kinds of body. A domain over
+/// bytea is the reason: casting one to text writes the hex literal,
+/// which is a description of the bytes and not the bytes.
+fn handler_agg(h: &Handler, source: &str) -> String {
+    let call = format!("{}(\"_zou_t\")", h.aggregate);
+    let body = if h.binary {
+        format!("{call}::bytea")
+    } else {
+        format!("convert_to({call}::text, 'UTF8')")
+    };
+    format!("select {body}, count(*) from (select * from {source}) as \"_zou_t\"")
+}
 
 /// What the body is written as, which is the Content-Type header and
 /// nothing else: no sniffing, and a request that says nothing is
@@ -2039,7 +2115,21 @@ async fn introspect(sess: &Session, authed: bool, schema: &str) -> Result<Catalo
         .await
         .map_err(|e| pg_error(&e, authed))?;
     let routines = rows.iter().map(routine_of).collect();
+    let rows = sess
+        .query(HANDLERS_SQL, &[&schema])
+        .await
+        .map_err(|e| pg_error(&e, authed))?;
+    let handlers = rows
+        .iter()
+        .map(|r| Handler {
+            media: r.get(0),
+            target: r.get(1),
+            aggregate: r.get(2),
+            binary: r.get(3),
+        })
+        .collect();
     Ok(Catalog::new(fks)
+        .with_handlers(handlers)
         .with_computed(computed)
         .with_relations(names, cols)
         .with_keys(keys)
@@ -2254,16 +2344,30 @@ async fn read(
     }
 
     let sql = plan::plan(&catalog, &q).map_err(plan_error)?;
-    let media = negotiate(&req.headers)?;
+    let media = negotiate_table(&req.headers, &catalog, table)?;
     let params: Vec<Text> = sql.params.into_iter().map(Text).collect();
-    let (body, returned) = if media == Media::Csv {
+    let (body, returned) = if let Some(h) = media.handler() {
+        let text = format!(
+            "with \"_zou_source\" as ({}) {}",
+            sql.text,
+            handler_agg(h, "\"_zou_source\"")
+        );
+        let rows = sess
+            .query(&text, &param_refs(&params))
+            .await
+            .map_err(|e| pg_error(&e, authed))?;
+        (
+            rows[0].get::<_, Option<Vec<u8>>>(0).unwrap_or_default(),
+            rows[0].get::<_, i64>(1) as usize,
+        )
+    } else if media == Media::Csv {
         let text = format!("with \"_zou_source\" as ({}) {}", sql.text, CSV_AGG);
         let rows = sess
             .query(&text, &param_refs(&params))
             .await
             .map_err(|e| pg_error(&e, authed))?;
         (
-            rows[0].get::<_, String>(0),
+            rows[0].get::<_, String>(0).into_bytes(),
             rows[0].get::<_, i64>(1) as usize,
         )
     } else {
@@ -2284,7 +2388,7 @@ async fn read(
         } else {
             json_array(&rows)
         };
-        (body, rows.len())
+        (body.into_bytes(), rows.len())
     };
 
     // The total, when count= asked for one, on the same transaction
@@ -2543,8 +2647,6 @@ async fn write(
         _ => None,
     };
 
-    let media = negotiate(&req.headers)?;
-
     let pool = app.pool.as_ref().ok_or_else(no_database)?;
     let authed = auth.role != app.cfg.anon_role;
     let ctx = request_context(&app.cfg, auth, req, schema)?;
@@ -2561,6 +2663,12 @@ async fn write(
     let Some(relation) = catalog.relation(table) else {
         return Err(no_table(&catalog, schema, table));
     };
+
+    // Which media types are on offer is a question about the relation,
+    // so it waits for the catalog: a handler the schema declared over
+    // this table is one of the answers and there is no knowing it
+    // before the table is known.
+    let media = negotiate_table(&req.headers, &catalog, table)?;
 
     // What max-affected binds. An insert is not counted at all,
     // upstream's own reading: the rows a POST writes are the rows the
@@ -2671,10 +2779,14 @@ async fn write(
         Ret::Representation => {
             let r = mutate::representation(&catalog, m, &mut q).map_err(plan_error)?;
             let params: Vec<Text> = r.select.params.into_iter().map(Text).collect();
-            if media == Media::Csv {
+            if media == Media::Csv || media.handler().is_some() {
+                let agg = match media.handler() {
+                    Some(h) => handler_agg(h, "\"_zou_source\""),
+                    None => CSV_AGG.to_string(),
+                };
                 let text = format!(
-                    "with {}, \"_zou_source\" as ({}) {}",
-                    r.cte, r.select.text, CSV_AGG
+                    "with {}, \"_zou_source\" as ({}) {agg}",
+                    r.cte, r.select.text
                 );
                 let rows = sess
                     .query(&text, &param_refs(&params))
@@ -2691,12 +2803,11 @@ async fn write(
                         .await
                         .map_err(|e| pg_error(&e, authed))?,
                 );
-                (
-                    status,
-                    [(header::CONTENT_TYPE, media.content_type())],
-                    rows[0].get::<_, String>(0),
-                )
-                    .into_response()
+                let out: Vec<u8> = match media.handler() {
+                    Some(_) => rows[0].get::<_, Option<Vec<u8>>>(0).unwrap_or_default(),
+                    None => rows[0].get::<_, String>(0).into_bytes(),
+                };
+                (status, [(header::CONTENT_TYPE, media.content_type())], out).into_response()
             } else {
                 let text = format!(
                     "with {} select {}::text from ({}) as \"_zou_row\"",
@@ -3275,7 +3386,12 @@ async fn invoke(
     // hands back what the function returns. A select list of its own
     // makes the answer a shape the request invented, and nothing the
     // function declared speaks for that.
-    let custom = choice.routine.media.as_deref().filter(|_| default_select);
+    let custom = choice
+        .routine
+        .media
+        .as_deref()
+        .filter(|_| default_select)
+        .map(|name| (name, choice.routine.media_bytes));
     let media = negotiate_call(&req.headers, custom)?;
     let kind = choice.routine.kind.clone();
     let returns_set = choice.routine.returns_set;
@@ -3327,7 +3443,7 @@ async fn invoke(
             // travelled in, and the function's own media type sends
             // the value itself with nothing around it.
             let wrapped = match &media {
-                Media::Custom(_) => rpc::value_wrap(m),
+                Media::Custom { binary, .. } => rpc::value_wrap(m, *binary),
                 Media::Csv => zou_rest::sql::Sql {
                     text: format!("with \"_zou_source\" as ({}) {CSV_AGG}", m.text),
                     params: m.params,
@@ -3353,15 +3469,22 @@ async fn invoke(
             );
             // Nothing is the empty body everywhere except json, where
             // nothing is still something to write.
-            let out = rows
-                .first()
-                .and_then(|r| r.get::<_, Option<String>>(0))
-                .unwrap_or_else(|| match &media {
-                    Media::Json { .. } | Media::Single { .. } => {
-                        if returns_set { "[]" } else { "null" }.to_string()
-                    }
-                    _ => String::new(),
-                });
+            let out: Vec<u8> = match &media {
+                Media::Custom { .. } => rows
+                    .first()
+                    .and_then(|r| r.get::<_, Option<Vec<u8>>>(0))
+                    .unwrap_or_default(),
+                _ => rows
+                    .first()
+                    .and_then(|r| r.get::<_, Option<String>>(0))
+                    .unwrap_or_else(|| match &media {
+                        Media::Json { .. } | Media::Single { .. } => {
+                            if returns_set { "[]" } else { "null" }.to_string()
+                        }
+                        _ => String::new(),
+                    })
+                    .into_bytes(),
+            };
             // One value is one row as far as the range goes and a
             // folded set is as many rows as it folded, which is how
             // upstream counts them. Nothing here is paged, so an
@@ -3802,20 +3925,21 @@ mod tests {
             if let Some(v) = v {
                 h.insert(header::ACCEPT, v.parse().unwrap());
             }
-            negotiate_call(&h, Some("text/plain"))
+            negotiate_call(&h, Some(("text/plain", false)))
+        };
+        let plain = Media::Custom {
+            name: "text/plain".to_string(),
+            binary: false,
         };
         assert_eq!(accept(None).unwrap(), Media::Json { stripped: false });
         assert_eq!(
             accept(Some("*/*")).unwrap(),
             Media::Json { stripped: false }
         );
-        assert_eq!(
-            accept(Some("text/plain")).unwrap(),
-            Media::Custom("text/plain".to_string())
-        );
+        assert_eq!(accept(Some("text/plain")).unwrap(), plain);
         assert_eq!(
             accept(Some("text/plain; charset=utf-8")).unwrap(),
-            Media::Custom("text/plain".to_string()),
+            plain,
             "a parameter nobody reads does not hide the type"
         );
         // Without the function's own type on offer the same request
@@ -3830,6 +3954,31 @@ mod tests {
         );
     }
 
+    /// A function returning the star domain answers whatever was
+    /// asked for, the star included, and says octet-stream about it
+    /// unless it sets a content type of its own.
+    #[test]
+    fn a_function_that_answers_every_media_type_is_asked_no_questions() {
+        let accept = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(header::ACCEPT, v.parse().unwrap());
+            negotiate_call(&h, Some(("*/*", true))).unwrap()
+        };
+        let any = Media::Custom {
+            name: "*/*".to_string(),
+            binary: true,
+        };
+        assert_eq!(accept("*/*"), any);
+        assert_eq!(accept("app/chico"), any);
+        assert_eq!(accept("image/boingo"), any);
+        assert_eq!(
+            accept("text/csv"),
+            any,
+            "a type this surface can write is still the function's to answer"
+        );
+        assert_eq!(any.content_type(), "application/octet-stream");
+    }
+
     /// The 406 names what was asked for the way this surface spells
     /// it, not the way the request wrote it, which is why a bare plan
     /// comes back with the media type it is a plan of on it.
@@ -3841,7 +3990,7 @@ mod tests {
             "application/vnd.pgrst.plan".parse().unwrap(),
         );
         assert_eq!(
-            negotiate(&h).unwrap_err().message,
+            negotiate_call(&h, None).unwrap_err().message,
             "None of these media types are available: \
              application/vnd.pgrst.plan+text; for=\"application/json\""
         );
@@ -4306,7 +4455,7 @@ mod tests {
             if let Some(a) = accept {
                 h.insert("accept", a.parse().unwrap());
             }
-            negotiate(&h)
+            negotiate_call(&h, None)
         };
         assert_eq!(m(None).unwrap(), Media::Json { stripped: false });
         assert_eq!(m(Some("*/*")).unwrap(), Media::Json { stripped: false });

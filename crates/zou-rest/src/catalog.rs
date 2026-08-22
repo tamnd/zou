@@ -395,6 +395,85 @@ select p.proname::text,
    and rn.nspname = $1
  order by p.proname, arg.relname";
 
+/// The media type name a handler answers under when it answers under
+/// every one of them.
+pub const ANY_MEDIA: &str = "*/*";
+
+/// One media type handler: an aggregate the schema declared over a
+/// domain whose name is a media type.
+///
+/// `target` is the relation whose rows the aggregate takes, and none
+/// of it means `anyelement`, which is the same handler offered for
+/// every relation. `binary` says the domain sits on bytea, so the
+/// value it builds is bytes rather than text and casting it to text
+/// would hand back a hex literal instead of the body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Handler {
+    pub media: String,
+    pub target: Option<String>,
+    pub aggregate: String,
+    pub binary: bool,
+}
+
+/// Every media type handler one schema declares. Bind the schema
+/// name as $1.
+///
+/// A handler is an aggregate of one argument whose result type is a
+/// domain named after a media type, which is the whole of the
+/// registration: there is no table of them to write to, the name of
+/// the type is the declaration. The argument says which relations it
+/// answers for, a rowtype naming one and `anyelement` naming all of
+/// them.
+///
+/// The vendored names are left out. A schema may well declare a
+/// domain called `application/vnd.pgrst.object+json` and upstream
+/// goes on answering those itself, because the vendored names say
+/// what shape the json is in rather than what the project wanted to
+/// render, and a handler cannot take that over.
+///
+/// `bases` walks the domain down to what it was declared over, since
+/// what a handler builds is text of some sort or bytes and only the
+/// second may not be written out as text.
+pub const HANDLERS_SQL: &str = "\
+with recursive aggs as (
+  select p.oid, p.prorettype, p.proargtypes[0] as argtype,
+         (quote_ident(n.nspname) || '.' || quote_ident(p.proname))::text as call
+    from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = $1 and p.prokind = 'a' and p.pronargs = 1
+),
+bases as (
+  select t.oid, t.typbasetype, coalesce(nullif(t.typbasetype, 0), t.oid) as base
+    from pg_type t
+   where t.oid in (select a.prorettype from aggs a)
+  union
+  select t.oid, b.typbasetype, coalesce(nullif(b.typbasetype, 0), b.oid)
+    from bases t
+    join pg_type b on b.oid = t.typbasetype
+),
+base_types as (select oid, base from bases where typbasetype = 0)
+select lower(d.typname)::text,
+       (select c.relname::text
+          from pg_class c
+         where c.oid = at.typrelid
+           and c.relkind in ('r', 'v', 'p', 'm', 'f')),
+       a.call,
+       b.typname = 'bytea'
+  from aggs a
+  join pg_type d on d.oid = a.prorettype
+  join base_types bt on bt.oid = a.prorettype
+  join pg_type b on b.oid = bt.base
+  join pg_type at on at.oid = a.argtype
+ where d.typtype = 'd'
+   and (d.typname ~ '^[A-Za-z0-9.-]+/[A-Za-z0-9.+-]+$' or d.typname = '*/*')
+   and d.typname not like 'application/vnd.pgrst.%'
+   and (at.oid = 'anyelement'::regtype
+        or exists (select 1
+                     from pg_class c
+                    where c.oid = at.typrelid
+                      and c.relkind in ('r', 'v', 'p', 'm', 'f')))
+ order by d.typname, a.call";
+
 /// How the embedded rows relate to the outer ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -503,6 +582,7 @@ pub struct Catalog {
     rels: Vec<Relation>,
     views: HashSet<String>,
     routines: HashMap<String, Vec<Routine>>,
+    handlers: Vec<Handler>,
     schema: String,
 }
 
@@ -518,6 +598,7 @@ impl Catalog {
             rels: Vec::new(),
             views: HashSet::new(),
             routines: HashMap::new(),
+            handlers: Vec::new(),
             schema: String::new(),
         }
     }
@@ -576,6 +657,41 @@ impl Catalog {
     /// when it has one no request could supply the arguments of.
     pub fn routines(&self, name: &str) -> &[Routine] {
         self.routines.get(name).map_or(&[], Vec::as_slice)
+    }
+
+    /// The same catalog with the schema's media type handlers in it,
+    /// the answer to [`HANDLERS_SQL`].
+    pub fn with_handlers(self, handlers: Vec<Handler>) -> Catalog {
+        Catalog { handlers, ..self }
+    }
+
+    /// The handler that answers a request for that media type on that
+    /// relation, if the schema declared one.
+    ///
+    /// Four lookups in the order upstream weighs them. A handler
+    /// written for this relation beats one written for every
+    /// relation, and a handler written for the media type asked for
+    /// beats one written for all of them, which is what a domain
+    /// named `*/*` is: a project saying it will answer whatever the
+    /// request wanted and set the content type itself.
+    ///
+    /// The name has to arrive canonical, type and subtype and nothing
+    /// else, since a domain name carries no parameters to compare
+    /// against.
+    pub fn handler(&self, table: &str, media: &str) -> Option<&Handler> {
+        let pick = |name: &str, own: bool| {
+            self.handlers.iter().find(|h| {
+                h.media == name
+                    && match &h.target {
+                        Some(t) => own && t == table,
+                        None => !own,
+                    }
+            })
+        };
+        pick(media, true)
+            .or_else(|| pick(media, false))
+            .or_else(|| pick(ANY_MEDIA, true))
+            .or_else(|| pick(ANY_MEDIA, false))
     }
 
     /// The same catalog knowing which schema it was read out of,
