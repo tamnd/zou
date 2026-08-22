@@ -237,8 +237,14 @@ const CENSUS: &[Format] = &[
         file: "crates/zou-server/src/fanout.rs",
         konst: "VERSION",
         reach: Reach::Wire,
-        floor: 1,
-        ceiling: 1,
+        // Equal, and always will be: a link is refused unless both
+        // ends say the same number, so a node meets a holder of its
+        // own version or it meets nothing. Two because the budget
+        // frames replaced the one a node sent per relayed message, so
+        // a version 1 holder would have counted a version 2 node's
+        // deliveries as nothing at all.
+        floor: 2,
+        ceiling: 2,
         // Both ends are live, so there is nothing to freeze: the
         // hello names the version and a link whose ends disagree does
         // not open.

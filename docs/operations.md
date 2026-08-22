@@ -390,8 +390,11 @@ Both numbers are in `crates/zou-server/src/fanout.rs` as `KEPT` and `GRACE` with
 What a resume does not restore is a subscription that was never announced: subscriptions live on the holder and are kept with the rest, but a node whose link could not be resumed re-announces its sockets and its topics and lets its sockets hear the gap and resubscribe, because a subscription asked for again comes back under new ids while the client is still holding the ones its join reply carried.
 Catching up further back than the ring is waiting on the buffered WAL tier ([#39](https://github.com/tamnd/zou/issues/39)), because the change stream itself retains nothing.
 
-The project's budget is counted per node.
-Sockets at once and joins a second are refused against each node's own share, so a project spread over four nodes is allowed four times what [realtime.md](realtime.md) says it is, until those two numbers cross the link as well.
+The project's budget is the project's on every node.
+Each node says its four numbers up its link once a second, sockets connected and joins, messages and presence events a second; the holder adds every node's up and answers with the project less that node's own share, and every refusal on every node is then that node's live numbers plus what it was last told.
+So sockets at once, joins a second, messages a second and presence events a second are all one number across the fleet, and the three headers the http broadcast endpoints report are the project's whichever node answered.
+The cadence is `TALLY` in `crates/zou-server/src/fanout.rs`, and a second of lag on meters averaged over a minute is not a number anybody can tell apart from the true one.
+A node that cannot reach the holder goes back to refusing against its own numbers alone, because a node refusing every socket for as long as a partition lasts is a partition made worse rather than survived.
 A message that crosses is counted once for the crossing and once for each socket it reached, which is one more than the same message costs inline.
 
 A lease that moves while sockets are on it is noticed by the next socket to arrive rather than by the ones already there.

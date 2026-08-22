@@ -28,9 +28,16 @@ const SECRET: &[u8] = b"super-secret-jwt-token-with-at-least-32-characters-long"
 /// A server on a port of the kernel's choosing. `holder` is where the
 /// project is, and None is a node that has it.
 async fn serving(holder: Option<SocketAddr>) -> SocketAddr {
+    serving_allowed(holder, zou_realtime::Limits::default()).await
+}
+
+/// The same, with the tier's numbers turned down to something a test
+/// can reach.
+async fn serving_allowed(holder: Option<SocketAddr>, realtime: zou_realtime::Limits) -> SocketAddr {
     let app = router(Config {
         jwt_secret: SECRET.to_vec(),
         holder: holder.map(|at| format!("http://{at}")),
+        realtime,
         ..Config::default()
     })
     .expect("router builds");
@@ -427,7 +434,7 @@ async fn a_link_that_comes_back_is_given_the_frames_after_the_one_it_got_to() {
     let mut link = linked(holder).await;
     crossed(
         &mut link,
-        Wire::of(serde_json::json!({"up": "hello", "version": 1, "link": 7, "seen": 0})),
+        Wire::of(serde_json::json!({"up": "hello", "version": 2, "link": 7, "seen": 0})),
     )
     .await;
     let hello = frame(&mut link).await;
@@ -457,7 +464,7 @@ async fn a_link_that_comes_back_is_given_the_frames_after_the_one_it_got_to() {
     let mut link = linked(holder).await;
     crossed(
         &mut link,
-        Wire::of(serde_json::json!({"up": "hello", "version": 1, "link": 7, "seen": 1})),
+        Wire::of(serde_json::json!({"up": "hello", "version": 2, "link": 7, "seen": 1})),
     )
     .await;
     let hello = frame(&mut link).await;
@@ -475,7 +482,7 @@ async fn a_link_that_comes_back_is_given_the_frames_after_the_one_it_got_to() {
     let mut other = linked(holder).await;
     crossed(
         &mut other,
-        Wire::of(serde_json::json!({"up": "hello", "version": 1, "link": 99, "seen": 40})),
+        Wire::of(serde_json::json!({"up": "hello", "version": 2, "link": 99, "seen": 40})),
     )
     .await;
     assert_eq!(frame(&mut other).await.head["resumed"], false);
@@ -498,4 +505,118 @@ async fn a_link_is_the_projects_own_infrastructure_and_nobody_elses() {
     let url = format!("ws://{node}/realtime/v1/link?apikey={key}");
     let refused = tokio_tungstenite::connect_async(url).await;
     assert!(refused.is_err(), "a node with no tenant took a link");
+}
+
+/// A project's ceiling is the project's, so two nodes with one socket
+/// each are two sockets towards it and not one each.
+///
+/// Both directions at once, which is the point: the node has to hear
+/// what the holder has as much as the holder has to hear what the node
+/// has, or a fleet is a licence to have the tier's number of sockets
+/// once per server.
+#[tokio::test]
+async fn sockets_on_one_node_count_against_the_ceiling_on_the_other() {
+    let limits = zou_realtime::Limits {
+        concurrent_users: 2,
+        ..zou_realtime::Limits::none()
+    };
+    let holder = serving_allowed(None, limits).await;
+    let node = serving_allowed(Some(holder), limits).await;
+    // One each, which is the project's two, and the link is dialled by
+    // the first socket to need it rather than at boot.
+    let _here = connect(holder).await;
+    let mut away = connect(node).await;
+    join(&mut away, "realtime:room", "{}").await;
+    // Long enough for a tally to go up and the answer to come back.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    for (at, whose) in [(holder, "the holder"), (node, "the node")] {
+        let url = format!(
+            "ws://{at}/realtime/v1/websocket?apikey={}&vsn=2.0.0",
+            anon_key()
+        );
+        let refused = tokio_tungstenite::connect_async(url).await;
+        assert!(
+            refused.is_err(),
+            "{whose} took a third socket for a project allowed two"
+        );
+    }
+}
+
+/// What the http broadcast endpoint reports is the project's rate, so
+/// a caller polling a node reads the same number it would have read
+/// off the holder rather than that node's share of it.
+#[tokio::test]
+async fn the_broadcast_headers_report_the_projects_rate_on_every_node() {
+    let limits = zou_realtime::Limits {
+        events_per_second: 1000,
+        ..zou_realtime::Limits::none()
+    };
+    let holder = serving_allowed(None, limits).await;
+    let node = serving_allowed(Some(holder), limits).await;
+    // A socket on the node, so that the link is up and there is
+    // something for the node to report.
+    let mut away = connect(node).await;
+    join(&mut away, "realtime:room", "{}").await;
+    // Spend some of the budget on the holder and none of it on the
+    // node, which is the case a per process number gets wrong.
+    for _ in 0..200 {
+        let (status, _, _) = post_rated(
+            holder,
+            "/realtime/v1/api/broadcast",
+            br#"{"messages":[{"topic":"realtime:room","event":"x","payload":{}}]}"#.to_vec(),
+        )
+        .await;
+        assert_eq!(status, 202, "the broadcast was taken");
+    }
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    let (_, rate, _) = post_rated(
+        node,
+        "/realtime/v1/api/broadcast",
+        br#"{"messages":[{"topic":"realtime:other","event":"x","payload":{}}]}"#.to_vec(),
+    )
+    .await;
+    let rolling: u64 = rate[0].parse().expect("a rolling rate");
+    assert!(
+        rolling > 1,
+        "the node reported {rolling} messages a second, which is its own share and not the project's"
+    );
+    assert_eq!(rate[1], "1000", "the limit is the project's either way");
+}
+
+/// The same post with the rate headers read off it, in the order
+/// upstream's plug writes them: what the project is moving, what it is
+/// allowed, and what is left of that.
+async fn post_rated(at: SocketAddr, path: &str, body: Vec<u8>) -> (u16, Vec<String>, String) {
+    let url = format!("http://{at}{path}");
+    let key = jwt::mint(&jwt::key_claims("service_role"), SECRET);
+    tokio::task::spawn_blocking(move || {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut answer = agent
+            .post(&url)
+            .header("apikey", &key)
+            .header("content-type", "application/json")
+            .send(&body[..])
+            .expect("the request goes");
+        let status = answer.status().as_u16();
+        let rate = ["x-rate-rolling", "x-rate-limit", "x-rate-limit-remaining"]
+            .iter()
+            .map(|name| {
+                answer
+                    .headers()
+                    .get(*name)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        let text = answer.body_mut().read_to_string().expect("a body");
+        (status, rate, text)
+    })
+    .await
+    .expect("the request runs")
 }
