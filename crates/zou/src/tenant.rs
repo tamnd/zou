@@ -19,7 +19,7 @@ use zou_store::layout::TenantLayout;
 use zou_store::registry::{self, Tenant};
 use zou_store::{CasStore, open_store};
 
-pub const USAGE: &str = "usage: zou tenant <target> <list | create <ref> [--secret <s>] | info <ref> | keys <ref> [--env] | s3 <ref> [--rotate] | delete <ref> | host add <ref> <host> | host remove <ref> <host>>";
+pub const USAGE: &str = "usage: zou tenant <target> <list | create <ref> [--secret <s>] | info <ref> | keys <ref> [--env] | s3 <ref> [--rotate] | auth <ref> [--confirm-email on|off] [--site-url <url>] | delete <ref> | host add <ref> <host> | host remove <ref> <host>>";
 
 /// A fresh project secret: 32 bytes of the os rng as hex, which is the
 /// shape and the strength the dev loop's own generated secret has, and
@@ -80,6 +80,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         [verb, tenant_ref, flag] if verb == "keys" && flag == "--env" => {
             keys(store.as_ref(), tenant_ref, true)
         }
+        [verb, tenant_ref, flags @ ..] if verb == "auth" => auth(store.as_ref(), tenant_ref, flags),
         [verb, tenant_ref] if verb == "delete" => delete(store.as_ref(), tenant_ref),
         [verb, act, tenant_ref, host] if verb == "host" && act == "add" => {
             registry::add_host(store.as_ref(), tenant_ref, host).map_err(|e| e.to_string())?;
@@ -158,6 +159,7 @@ fn info(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
         // as a wrong key typed in.
         None => say!("no s3 pair, make one with zou tenant <target> s3 {tenant_ref}"),
     }
+    say_auth(&entry);
     match entry.hosts.is_empty() {
         true => say!("hosts: none besides its own label"),
         false => say!("hosts: {}", entry.hosts.join(", ")),
@@ -293,6 +295,73 @@ fn s3(store: &dyn CasStore, tenant_ref: &str, rotate: bool) -> Result<(), String
     Ok(())
 }
 
+/// Read or change what a project asks of the auth service.
+///
+/// With no flags it prints what is set, because the first thing anybody
+/// does with a setting is look at it, and because a registry field
+/// nobody can read is a field nobody trusts. With flags it changes only
+/// what was named: a `--site-url` on its own leaves confirmations where
+/// they were, which is what a person changing one of the two means.
+fn auth(store: &dyn CasStore, tenant_ref: &str, flags: &[String]) -> Result<(), String> {
+    let entry = registry::get(store, tenant_ref)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            format!("no tenant {tenant_ref} on this store, `list` shows what is registered")
+        })?;
+    if flags.is_empty() {
+        say_auth(&entry);
+        return Ok(());
+    }
+    let mut want = entry.auth.clone().unwrap_or_default();
+    let mut rest = flags;
+    while let [flag, value, tail @ ..] = rest {
+        match flag.as_str() {
+            "--confirm-email" => {
+                want.confirm_email = match value.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => {
+                        return Err(format!("--confirm-email takes on or off, not {other:?}"));
+                    }
+                }
+            }
+            // Empty clears it, so there is a way back to the node's own
+            // url without hand editing the entry.
+            "--site-url" => {
+                want.site_url = (!value.is_empty()).then(|| value.clone());
+            }
+            other => return Err(format!("unknown option {other}\n{USAGE}")),
+        }
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        return Err(format!("{} takes a value\n{USAGE}", rest[0]));
+    }
+    registry::set_auth(store, tenant_ref, Some(want.clone())).map_err(|e| e.to_string())?;
+    let mut written = entry;
+    written.auth = Some(want);
+    say_auth(&written);
+    // The same lag a rotated secret has, and worth saying for the same
+    // reason: a node holding this project built its config from the
+    // entry it read when it attached.
+    say!("a node already serving {tenant_ref} keeps the old settings until it next attaches it");
+    Ok(())
+}
+
+/// The two settings in the words the flags use, so that what is printed
+/// can be typed back in.
+fn say_auth(entry: &Tenant) {
+    let auth = entry.auth.clone().unwrap_or_default();
+    match auth.confirm_email {
+        true => say!("confirm email on, a sign up waits for the address to be proved"),
+        false => say!("confirm email off, a sign up is confirmed on the spot"),
+    }
+    match &auth.site_url {
+        Some(url) => say!("site url {url}"),
+        None => say!("no site url, links point at this project's own address"),
+    }
+}
+
 fn delete(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
     registry::delete(store, tenant_ref).map_err(|e| e.to_string())?;
     say!("unregistered {tenant_ref}");
@@ -317,6 +386,71 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The registry field is only usable if there is a way to write it,
+    /// and a flag that was not named leaves what it names alone.
+    #[test]
+    fn auth_settings_are_written_one_flag_at_a_time() {
+        let (_d, target) = target();
+        run(&argv(&[&target, "create", "acme-prod", "--secret", "sh"])).unwrap();
+        let store: Arc<dyn CasStore> = Arc::from(open_store(&target).unwrap());
+        let auth_of = |store: &dyn CasStore| {
+            registry::get(store, "acme-prod")
+                .unwrap()
+                .unwrap()
+                .auth
+                .unwrap_or_default()
+        };
+
+        run(&argv(&[&target, "auth", "acme-prod"])).unwrap();
+        assert_eq!(
+            registry::get(store.as_ref(), "acme-prod")
+                .unwrap()
+                .unwrap()
+                .auth,
+            None
+        );
+
+        run(&argv(&[
+            &target,
+            "auth",
+            "acme-prod",
+            "--confirm-email",
+            "on",
+        ]))
+        .unwrap();
+        assert!(auth_of(store.as_ref()).confirm_email);
+
+        run(&argv(&[
+            &target,
+            "auth",
+            "acme-prod",
+            "--site-url",
+            "https://acme.example",
+        ]))
+        .unwrap();
+        let auth = auth_of(store.as_ref());
+        assert_eq!(auth.site_url.as_deref(), Some("https://acme.example"));
+        assert!(auth.confirm_email, "the flag nobody named was left alone");
+
+        run(&argv(&[&target, "auth", "acme-prod", "--site-url", ""])).unwrap();
+        assert_eq!(auth_of(store.as_ref()).site_url, None);
+
+        assert!(
+            run(&argv(&[
+                &target,
+                "auth",
+                "acme-prod",
+                "--confirm-email",
+                "yes"
+            ]))
+            .is_err(),
+            "on or off, and anything else is a typo worth refusing"
+        );
+        assert!(run(&argv(&[&target, "auth", "acme-prod", "--nonsense", "1"])).is_err());
+        assert!(run(&argv(&[&target, "auth", "acme-prod", "--site-url"])).is_err());
+        assert!(run(&argv(&[&target, "auth", "nobody"])).is_err());
     }
 
     #[test]

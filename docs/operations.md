@@ -284,6 +284,13 @@ Routing is `--domain` and the path prefix, and at least one of them has to be on
 `--domain zou.example` makes `acme-prod.zou.example` a project, and it is also where a tenant's own external url comes from, so the links in its confirmation mail point at the project instead of at the node.
 The path prefix is on by default and `--no-path-prefix` turns it off, for a deployment that has a wildcard certificate and does not want a second way in.
 
+Mail is a node setting and what a project wants of it is a project setting, and both halves have to be there for a sign up to work.
+The node half is the `ZOU_SMTP_` variables, the same ones `zou dev` reads, and a node that has them hands its mail server to every project it brings up.
+The project half is `zou tenant <target> auth <ref> --confirm-email on|off --site-url <url>`, kept in the registry entry because a node builds a project's config before it attaches the project and because two projects on one node have to be able to differ.
+A project that has never been told anything confirms its own sign ups, which is what makes a node with no mail server work at all rather than answering every sign up with a 200 and sending nothing.
+A project that asks for a confirmation on a node with no `ZOU_SMTP_HOST` is warned about in the log when it attaches and its sign ups are refused rather than left waiting, and the fix is either of the two halves: configure the node, or turn confirmations off for the project.
+The dev inbox is not used here on purpose, because a person reading their mail cannot read this node's log.
+
 `--ref demo` is the other shape: one project, at every url the node answers, with the routing taken out rather than configured off.
 Nothing is resolved per request, `--domain` has nothing left to name and is refused alongside it, and the project is attached before the http door starts accepting, so the first request waits in the accept queue for an attach instead of being the reason for it.
 `ZOU_REF` sets it and `ZOU_TARGET` sets the store, for a platform that configures a container with variables rather than a command line.

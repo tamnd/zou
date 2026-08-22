@@ -139,6 +139,40 @@ pub struct Tenant {
     /// number nobody built with.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub deployed: u64,
+    /// What this project wants of the auth service, when it wants
+    /// anything in particular.
+    ///
+    /// Here rather than in the project's own database because a node
+    /// builds the config for a project before it has attached it, and
+    /// because two projects on one node have to be able to differ. A
+    /// fleet wide environment variable can only say one thing, and one
+    /// thing is the wrong number for a fleet.
+    ///
+    /// Absent is a project nobody has said anything about, and it means
+    /// a sign up confirms itself. That is the safe default for a node
+    /// rather than the strict one: a node with no mailer that asked for
+    /// a confirmation would answer a sign up with a 200 and then never
+    /// send the mail, which is the failure this field exists to end.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<TenantAuth>,
+}
+
+/// The auth settings one project differs from another by.
+///
+/// Deliberately small. This is not a copy of the auth service's config,
+/// it is the part of it that has to be decided per project and that a
+/// node cannot work out for itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantAuth {
+    /// Whether a sign up has to click a link before the account is
+    /// usable. False, the default, is a sign up that confirms itself.
+    #[serde(default)]
+    pub confirm_email: bool,
+    /// Where the links in that mail point. Without it a confirmation
+    /// mail names the node's own address, which is right for a project
+    /// with no front end of its own and wrong for every other one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_url: Option<String>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -156,6 +190,7 @@ impl Tenant {
             s3_access_key: String::new(),
             s3_secret_key: String::new(),
             deployed: 0,
+            auth: None,
         }
     }
 
@@ -436,6 +471,31 @@ pub fn set_s3(
     Ok(())
 }
 
+/// Set what a project asks of the auth service, or clear it.
+///
+/// Whole rather than field by field, because the caller reads the
+/// entry, changes the part it means to change and writes the result
+/// back, and a partial update here would only move that same read into
+/// this function with a worse view of what the caller intended.
+///
+/// Takes effect the next time a node reads the entry, the same lag a
+/// rotated secret or a new host has, for the same reason: a node
+/// holding the project built its config from the entry it read.
+pub fn set_auth(
+    store: &dyn CasStore,
+    tenant_ref: &str,
+    auth: Option<TenantAuth>,
+) -> Result<(), RegistryError> {
+    let Some(mut entry) = get(store, tenant_ref)? else {
+        return Err(RegistryError::Missing {
+            tenant_ref: tenant_ref.to_string(),
+        });
+    };
+    entry.auth = auth;
+    store.put(&entry_key(tenant_ref), &entry.to_json())?;
+    Ok(())
+}
+
 /// Say that something new is deployed under `/functions/v1`, and
 /// answer with the number it is now on.
 ///
@@ -572,6 +632,64 @@ mod tests {
         );
         let err = set_s3(&store, "nobody", "a", "b").unwrap_err();
         assert!(matches!(err, RegistryError::Missing { .. }));
+    }
+
+    /// Two projects on one node differ, which is the whole point of the
+    /// field, and an entry nobody has set it on reads as asking for
+    /// nothing rather than failing to parse.
+    #[test]
+    fn a_project_says_what_it_wants_of_auth_and_another_says_something_else() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        create(&store, &tenant("acme-staging")).unwrap();
+        assert_eq!(get(&store, "acme-prod").unwrap().unwrap().auth, None);
+        assert!(
+            !String::from_utf8(tenant("acme-prod").to_json())
+                .unwrap()
+                .contains("auth"),
+            "and an entry with nothing set does not carry the field at all"
+        );
+
+        set_auth(
+            &store,
+            "acme-prod",
+            Some(TenantAuth {
+                confirm_email: true,
+                site_url: Some("https://acme.example".to_string()),
+            }),
+        )
+        .unwrap();
+        let prod = get(&store, "acme-prod").unwrap().unwrap();
+        assert_eq!(
+            prod.auth,
+            Some(TenantAuth {
+                confirm_email: true,
+                site_url: Some("https://acme.example".to_string()),
+            })
+        );
+        assert_eq!(
+            get(&store, "acme-staging").unwrap().unwrap().auth,
+            None,
+            "the other project on the same store was not touched"
+        );
+
+        set_auth(&store, "acme-prod", None).unwrap();
+        assert_eq!(get(&store, "acme-prod").unwrap().unwrap().auth, None);
+        let err = set_auth(&store, "nobody", None).unwrap_err();
+        assert!(matches!(err, RegistryError::Missing { .. }));
+    }
+
+    /// Every entry on every store that already has one was written
+    /// before this field existed, and reading one has to mean the same
+    /// thing as a project that asked for nothing.
+    #[test]
+    fn an_entry_written_before_auth_existed_asks_for_nothing() {
+        let store = MemStore::new();
+        let older = br#"{"format":1,"ref":"acme-prod","created_unix":1,"jwt_secret":"s"}"#;
+        store.put(&entry_key("acme-prod"), older).unwrap();
+        let entry = get(&store, "acme-prod").unwrap().expect("it reads");
+        assert_eq!(entry.auth, None);
+        assert!(!String::from_utf8(entry.to_json()).unwrap().contains("auth"));
     }
 
     /// What a node compares against what it is serving. It counts up

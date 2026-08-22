@@ -186,6 +186,17 @@ pub struct Config {
     /// hand it over rather than configure a second one, and because a
     /// test needs to be able to watch a send fail.
     pub sender: Option<Arc<dyn mail::Sender>>,
+    /// What no sender means. True, the default, and it means the dev
+    /// inbox, which is right for `zou dev` and for a test. False and it
+    /// means no mail server at all, so anything that would have been
+    /// sent is an error where it was asked for.
+    ///
+    /// A node serving other people's projects sets this false. Its
+    /// projects are reached by people who cannot read its log, so an
+    /// inbox in its memory is a message delivered nowhere and reported
+    /// as delivered, and a sign up that answers 200 and never arrives
+    /// is worse than one that says it could not be done.
+    pub dev_inbox: bool,
     /// GoTrue's GOTRUE_EXTERNAL_EMAIL_ENABLED, on by default there and
     /// here. Off, and every way in that names an address is refused,
     /// which is what a project that signs everyone in by number or by
@@ -314,6 +325,7 @@ impl Default for Config {
             anonymous_users: false,
             mail: mail::Settings::default(),
             sender: None,
+            dev_inbox: true,
             email_enabled: true,
             disable_signup: false,
             phone_enabled: false,
@@ -550,7 +562,8 @@ fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
     };
     let mailer: Arc<dyn mail::Sender> = match cfg.sender.take() {
         Some(sender) => sender,
-        None => Arc::new(mail::Inbox::default()),
+        None if cfg.dev_inbox => Arc::new(mail::Inbox::default()),
+        None => Arc::new(mail::Nowhere),
     };
     let texter: Arc<dyn sms::Sender> = match cfg.texter.take() {
         Some(texter) => texter,
