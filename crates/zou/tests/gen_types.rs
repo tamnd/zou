@@ -35,7 +35,23 @@ fn dsn() -> Option<String> {
 
 /// The same server, a different database. The generator reads whole
 /// schemas, so it needs one nobody else is writing to.
+///
+/// Both spellings of a dsn, because both are in use: a url is what a
+/// person types and the keyword form is what CI sets. A url only ever
+/// went through the url half of this, which is why the keyword half was
+/// missing for as long as it was: handed `dbname=postgres` it found no
+/// `/` to cut at, kept the whole string as the host part, and produced
+/// `dbname=postgres/zou_gen_types`, which is a database nobody has.
 fn with_database(dsn: &str, database: &str) -> String {
+    if !dsn.contains("://") {
+        let mut out: Vec<String> = dsn
+            .split_whitespace()
+            .filter(|word| !word.starts_with("dbname="))
+            .map(str::to_string)
+            .collect();
+        out.push(format!("dbname={database}"));
+        return out.join(" ");
+    }
     let (head, query) = match dsn.split_once('?') {
         Some((head, query)) => (head, Some(query)),
         None => (dsn, None),
@@ -49,6 +65,40 @@ fn with_database(dsn: &str, database: &str) -> String {
         Some(query) => format!("{base}/{database}?{query}"),
         None => format!("{base}/{database}"),
     }
+}
+
+/// The two spellings, and what each of them has to come out as.
+///
+/// A unit test on a helper in a suite that skips itself without a
+/// database, because skipping itself is how it hid: nobody looked at
+/// what this produced until the whole workspace was pointed at a real
+/// postgres.
+#[test]
+fn a_child_database_is_named_in_whichever_way_the_dsn_was_written() {
+    assert_eq!(
+        with_database("postgres://postgres@127.0.0.1:5432/postgres", "zou_gen_one"),
+        "postgres://postgres@127.0.0.1:5432/zou_gen_one"
+    );
+    assert_eq!(
+        with_database(
+            "postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable",
+            "zou_gen_one"
+        ),
+        "postgres://postgres@127.0.0.1:5432/zou_gen_one?sslmode=disable"
+    );
+    assert_eq!(
+        with_database(
+            "host=127.0.0.1 port=5432 user=postgres dbname=postgres",
+            "zou_gen_one"
+        ),
+        "host=127.0.0.1 port=5432 user=postgres dbname=zou_gen_one"
+    );
+    // And one with no database named at all, which is legal: postgres
+    // falls back to the user's name.
+    assert_eq!(
+        with_database("host=127.0.0.1 user=postgres", "zou_gen_one"),
+        "host=127.0.0.1 user=postgres dbname=zou_gen_one"
+    );
 }
 
 /// A database of its own with the fixture in it, and the dsn that
