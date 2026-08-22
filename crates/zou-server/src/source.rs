@@ -101,6 +101,21 @@ impl Source {
         app.hub.carry(topic)
     }
 
+    /// Tell every socket here that there is a gap, which the socket
+    /// loop answers by closing.
+    ///
+    /// The link tells them this for itself when it breaks. This is for
+    /// the caller that knows something the link does not: the front
+    /// door, which reads the lease and can see that the node at the
+    /// other end of a perfectly healthy link is no longer the one that
+    /// writes the project. Nothing to do when the project is written
+    /// here, since there is no link and no other room.
+    pub fn gapped(&self) {
+        if let Source::Away(away) = self {
+            away.gapped();
+        }
+    }
+
     /// A socket here has left a topic.
     pub async fn released(&self, app: &Arc<App>, topic: &str) {
         app.hub.released(topic);

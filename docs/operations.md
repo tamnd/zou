@@ -397,8 +397,9 @@ The cadence is `TALLY` in `crates/zou-server/src/fanout.rs`, and a second of lag
 A node that cannot reach the holder goes back to refusing against its own numbers alone, because a node refusing every socket for as long as a partition lasts is a partition made worse rather than survived.
 A message that crosses is counted once for the crossing and once for each socket it reached, which is one more than the same message costs inline.
 
-A lease that moves while sockets are on it is noticed by the next socket to arrive rather than by the ones already there.
-Until one arrives, the sockets on the old link are talking to a node that no longer writes their project, which broadcast and presence do not need and a subscription does.
+A lease that moves while sockets are on it is noticed by the tier that was built from it, which rereads the lease every `MOVED` in `crates/zou-server/src/gateway.rs` and gaps its sockets when the answer is a different node.
+Five seconds against a busy lease of fifteen that is renewed well inside that, so a handover is published inside one lease and noticed inside one of these, and the clients reconnect and land on the tier the new holder is behind.
+The cost is one cached lease lookup per project this node holds sockets for, which is the lookup the front door already makes for every request for that project.
 
 A broadcast between two sockets on the same away node goes to the holder and comes back, because one ordering is the whole reason there is one link.
 

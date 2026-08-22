@@ -58,7 +58,24 @@ struct Sockets {
     /// new holder.
     holder: String,
     router: Router,
+    /// The state that router was built on, kept so the tier can be told
+    /// its project moved. Dropping the router is not enough on its own:
+    /// every live socket holds the state for as long as it is connected,
+    /// so a tier nobody is arriving at goes on talking to the old holder
+    /// until somebody says otherwise. See [`watch`].
+    app: Arc<crate::App>,
 }
+
+/// How often a socket tier rereads the lease it was built from.
+///
+/// The busy lease is fifteen seconds and is renewed well under that, so
+/// a handover is published inside one of those and noticed inside one
+/// of these, which puts the window this closes at a few seconds rather
+/// than at however long it is before somebody new connects. The cost is
+/// one cached lease lookup per project this node holds sockets for, and
+/// the lookup is the same one the front door makes on every request for
+/// that project anyway.
+const MOVED: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A router that serves every tenant on a store.
 ///
@@ -125,18 +142,15 @@ impl Front {
     /// No lease and no database. What the sockets need of the project is
     /// its secret, to let a client in, and the address of the node that
     /// has the rest, to ask it everything else.
-    fn sockets(&self, entry: &Tenant, endpoint: &str) -> Result<Router, String> {
-        // The ref is in the url the link is dialled on, because the node
-        // at the other end has to resolve this project out of something
-        // and a node has no hostname of the project's to present.
-        let holder = format!("{}/{}", endpoint.trim_end_matches('/'), entry.tenant_ref);
+    fn sockets(self: &Arc<Self>, entry: &Tenant, endpoint: &str) -> Result<Router, String> {
+        let holder = link(endpoint, &entry.tenant_ref);
         let mut sockets = self.sockets.lock().expect("the socket tier");
         if let Some(up) = sockets.get(&entry.tenant_ref)
             && up.holder == holder
         {
             return Ok(up.router.clone());
         }
-        let router = crate::router(crate::Config {
+        let (router, app) = crate::routed(crate::Config {
             jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
             // The same keys the node serving this project signs its
             // access tokens with, arrived at from the same secret, or
@@ -155,12 +169,93 @@ impl Front {
         sockets.insert(
             entry.tenant_ref.clone(),
             Sockets {
-                holder,
+                holder: holder.clone(),
                 router: router.clone(),
+                app,
             },
         );
+        drop(sockets);
+        watch(self, entry.tenant_ref.clone(), holder);
         Ok(router)
     }
+}
+
+/// Watch the lease this tier was built from, and tell its sockets when
+/// it moves.
+///
+/// The tier points at whoever held the project when the first socket
+/// arrived, and what used to notice a handover was the next socket to
+/// arrive. Until one did, the sockets already here were broadcasting to
+/// each other on a node that no longer writes the project, which is two
+/// rooms with one name and the exact thing the tier exists to prevent.
+/// A quiet project with a handful of long lived sockets and no new ones
+/// could sit that way for as long as nobody connected.
+///
+/// What the sockets get is the gap they would have got from the next
+/// arrival, so this changes how long the window is rather than what
+/// happens at the end of it. They reconnect, the front door resolves
+/// the new holder, and they rejoin the room the rest of the project is
+/// in.
+fn watch(front: &Arc<Front>, tenant_ref: String, holder: String) {
+    let Some(forwarding) = front.forwarding.clone() else {
+        return;
+    };
+    let front = Arc::downgrade(front);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(MOVED).await;
+            let Some(front) = front.upgrade() else { return };
+            // Somebody else replaced this tier while this task slept,
+            // which means a socket arrived and did the work: that entry
+            // has a watcher of its own and this one is done.
+            let held = {
+                let sockets = front.sockets.lock().expect("the socket tier");
+                match sockets.get(&tenant_ref) {
+                    Some(up) if up.holder == holder => Arc::clone(&up.app),
+                    _ => return,
+                }
+            };
+            let now = match forwarding.holders().get(&tenant_ref).await {
+                Ok(now) => now,
+                // The lease could not be read, which is a store this
+                // node cannot reach rather than news about the project.
+                // Gapping every socket over that would be this node
+                // punishing them for its own outage.
+                Err(e) => {
+                    log::warn!("socket tier for {tenant_ref}: lease lookup, {e}");
+                    continue;
+                }
+            };
+            // Still the same writer at the same address, which is the
+            // answer nearly every time round this loop.
+            let still = now.as_ref().and_then(|now| now.endpoint.as_deref());
+            if still.map(|at| link(at, &tenant_ref)) == Some(holder.clone()) {
+                continue;
+            }
+            log::info!(
+                "realtime: {tenant_ref} is no longer written by {holder}, so the sockets held here are told there is a gap and this tier is dropped"
+            );
+            // The gap first and the entry after, so that a socket
+            // arriving in between finds no tier and builds one against
+            // the new holder rather than joining the one being dropped.
+            held.source.gapped();
+            let mut sockets = front.sockets.lock().expect("the socket tier");
+            if sockets
+                .get(&tenant_ref)
+                .is_some_and(|up| up.holder == holder)
+            {
+                sockets.remove(&tenant_ref);
+            }
+            return;
+        }
+    });
+}
+
+/// The url a node dials to reach a project on `endpoint`. The ref is in
+/// it because the node at the other end has to resolve this project out
+/// of something.
+fn link(endpoint: &str, tenant_ref: &str) -> String {
+    format!("{}/{}", endpoint.trim_end_matches('/'), tenant_ref)
 }
 
 /// Bring the one project up before anything asks for it.

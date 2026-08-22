@@ -951,6 +951,16 @@ pub(crate) const REST_PREFIX: &str = "/rest/v1";
 /// so preflights never reach the gate and every response with an
 /// Origin gets its mirror, then the rate limit, then the apikey gate.
 pub fn router(cfg: Config) -> Result<Router, String> {
+    routed(cfg).map(|(router, _)| router)
+}
+
+/// The same, with the state it was built on handed back.
+///
+/// For a caller that has to reach into the server it just built rather
+/// than only serve it. There is one: the fan out socket tier, which
+/// holds a router for a project another node writes and has to be able
+/// to tell the sockets on it that the project has moved.
+pub fn routed(cfg: Config) -> Result<(Router, Arc<App>), String> {
     let app = app_state(cfg)?;
     let gated = Router::new()
         .route("/auth/v1/health", get(auth_health))
@@ -1216,28 +1226,31 @@ pub fn router(cfg: Config) -> Result<Router, String> {
         .route("/storage/v1/s3/{bucket}", any(s3::bucket))
         .route("/storage/v1/s3/{bucket}/{*key}", any(s3::object))
         .with_state(Arc::clone(&app));
-    Ok(Router::new()
-        .merge(open)
-        .merge(gated)
-        .fallback(no_route)
-        // The per endpoint budgets, over both routers because /verify
-        // is outside the gate and is limited too. Inside the envelope
-        // so a client on the newer api version hears about a 429 in
-        // the shape it asked for.
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&app),
-            limit::guard,
-        ))
-        // Inside the request id, because the id is what a failure of
-        // this server's own carries back, and outside everything that
-        // answers, because every auth refusal leaves through it.
-        .layer(middleware::from_fn(auth::envelope))
-        .layer(middleware::from_fn(edge::cors))
-        .layer(middleware::from_fn(edge::request_id))
-        // Outermost, so what is counted is what a caller waited for,
-        // including the refusals: a graph of a rate limit or a 404 is
-        // drawn from the same series as a graph of the answers.
-        .layer(middleware::from_fn(ops::measure)))
+    Ok((
+        Router::new()
+            .merge(open)
+            .merge(gated)
+            .fallback(no_route)
+            // The per endpoint budgets, over both routers because /verify
+            // is outside the gate and is limited too. Inside the envelope
+            // so a client on the newer api version hears about a 429 in
+            // the shape it asked for.
+            .layer(middleware::from_fn_with_state(
+                Arc::clone(&app),
+                limit::guard,
+            ))
+            // Inside the request id, because the id is what a failure of
+            // this server's own carries back, and outside everything that
+            // answers, because every auth refusal leaves through it.
+            .layer(middleware::from_fn(auth::envelope))
+            .layer(middleware::from_fn(edge::cors))
+            .layer(middleware::from_fn(edge::request_id))
+            // Outermost, so what is counted is what a caller waited for,
+            // including the refusals: a graph of a rate limit or a 404 is
+            // drawn from the same series as a graph of the answers.
+            .layer(middleware::from_fn(ops::measure)),
+        app,
+    ))
 }
 
 /// Serve `router(cfg)` on `listener` forever. Builds a private tokio

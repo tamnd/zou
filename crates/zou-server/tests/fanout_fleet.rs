@@ -56,17 +56,36 @@ impl Backend for Ups {
 
 /// Who writes the project, as the lease would say it. None is a project
 /// nobody has taken, which any node may then take itself.
-struct Lease(Option<String>);
+///
+/// Behind a lock because a lease moves, and a test that wants to prove
+/// what a node does when one moves has to be able to move it.
+#[derive(Default)]
+struct Lease(Mutex<Option<String>>);
+
+impl Lease {
+    fn at(endpoint: Option<String>) -> Lease {
+        Lease(Mutex::new(endpoint))
+    }
+
+    fn moved(&self, to: Option<String>) {
+        *self.0.lock().expect("the lease") = to;
+    }
+}
 
 impl Peers for Lease {
     fn holder(&self, _tenant_ref: &str) -> Result<Option<Holder>, String> {
-        Ok(self.0.as_ref().map(|endpoint| Holder {
-            node: "node-holder".to_string(),
-            endpoint: Some(endpoint.clone()),
-            expires_unix: u64::MAX,
-            epoch: 1,
-            published_unix: None,
-        }))
+        Ok(self
+            .0
+            .lock()
+            .expect("the lease")
+            .as_ref()
+            .map(|endpoint| Holder {
+                node: "node-holder".to_string(),
+                endpoint: Some(endpoint.clone()),
+                expires_unix: u64::MAX,
+                epoch: 1,
+                published_unix: None,
+            }))
     }
 }
 
@@ -88,6 +107,8 @@ struct Fleet {
     /// What the node with the sockets on it brought up, which is the
     /// number this is all for.
     ups: Arc<Ups>,
+    /// The lease the away node reads, so a test can move it.
+    lease: Arc<Lease>,
 }
 
 async fn serve(router: axum::Router) -> SocketAddr {
@@ -122,11 +143,12 @@ async fn two(held_elsewhere: bool) -> Fleet {
     // And the node with only the sockets on it: the lease names an
     // address, and the name on it is not this node's.
     let ups = Arc::new(Ups::default());
+    let lease = Arc::new(Lease::at(
+        held_elsewhere.then(|| format!("http://{holder}")),
+    ));
     let forwarding = Forwarding::new(
         "node-away",
-        Holders::new(Arc::new(Lease(
-            held_elsewhere.then(|| format!("http://{holder}")),
-        ))),
+        Holders::new(lease.clone()),
         Arc::new(forward::Http::default()),
     );
     let away = serve(fleet(
@@ -141,6 +163,7 @@ async fn two(held_elsewhere: bool) -> Fleet {
         holder,
         away,
         ups,
+        lease,
     }
 }
 
@@ -273,4 +296,46 @@ async fn a_socket_for_a_project_nobody_writes_is_this_nodes_own_work() {
     assert_eq!(reply[3], "phx_reply");
     assert_eq!(reply[4]["status"], "ok", "{reply}");
     assert_eq!(at.ups.attached(), vec![REF]);
+}
+
+/// A tier points at whoever held the project when its first socket
+/// arrived, and what used to notice a handover was the next socket to
+/// arrive. A quiet project with a few long lived sockets and no new
+/// ones could sit for as long as nobody connected, broadcasting to
+/// itself on a node that no longer writes the project, which is two
+/// rooms with one name.
+#[tokio::test]
+async fn a_socket_tier_notices_that_its_holder_moved_without_being_asked() {
+    let at = two(true).await;
+    let mut socket = connect(at.away).await;
+    let reply = join(&mut socket, "realtime:room").await;
+    assert_eq!(reply[4]["status"], "ok", "{reply}");
+    assert!(
+        at.ups.attached().is_empty(),
+        "the away node started a database for a project it does not write"
+    );
+
+    // The lease moves, and nothing new connects. Somewhere else is
+    // enough: what matters is that it is not where this tier is
+    // pointing.
+    at.lease.moved(Some("http://127.0.0.1:9/other".to_string()));
+
+    // The socket is told there is a gap, which the socket loop answers
+    // by closing, and a client that is closed reconnects and rejoins
+    // into whichever room the project is in now.
+    let closed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match socket.next().await {
+                None | Some(Err(_)) => return true,
+                Some(Ok(Message::Close(_))) => return true,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        closed,
+        Ok(true),
+        "the socket was still open on a node that no longer writes the project"
+    );
 }
