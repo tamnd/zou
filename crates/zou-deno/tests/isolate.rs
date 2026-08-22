@@ -326,12 +326,13 @@ fn a_function_may_import_the_files_beside_it() {
 
 /// The three that are refused before a request is made, which is why
 /// this test needs no network: `npm:` and `jsr:` are fetched and are
-/// tested in `registry.rs`.
+/// tested in `registry.rs`. The node built in named here is one nobody
+/// has written, since the ones that are written are served.
 #[test]
 fn a_specifier_this_runtime_does_not_serve_says_so_by_name() {
     for (specifier, said) in [
         ("http://esm.sh/zod", "over https"),
-        ("node:fs", "no node built in fs"),
+        ("node:child_process", "no node built in child_process"),
         ("data:text/javascript,1", "the data: specifier"),
     ] {
         let source = format!(r#"import "{specifier}"; Deno.serve(() => new Response("no"));"#);
