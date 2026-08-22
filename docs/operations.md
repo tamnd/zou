@@ -510,6 +510,26 @@ Delete the prefix, not the manifest.
 The rule is what makes branch creation safe, since a branch has no manifest until its final write and would otherwise be racing the sweep for its own bytes.
 The cost is a full listing of everything under `tenants/`, so this is a daily job on a large fleet and not an hourly one.
 
+### Page history
+
+The sweep above collects what nothing references, and until recently nothing under a shard ever stopped being referenced.
+Every fold cut a new image and left the old ones where they were, because an old image is the base a read below the new one needs, and every record the tenant ever wrote stayed in some delta.
+So the disk a shard needed was the whole write volume of its life: at pgbench scale 500 with eight clients that is hundreds of gigabytes a day, and none of it was garbage the sweep could take.
+
+The page service now buys itself a horizon on a schedule.
+The pass merges every image below the horizon into one image sitting at it, which is the only way old images can go, since they are sparse and each one is the only copy of the base for whatever has not been written since it was cut.
+After that merge every layer below the horizon is unreachable for a read at or above it, and comes off the shard manifest; the bytes themselves go on the next `zou gc` that sees them unreferenced, with the usual two runs and the usual window.
+Reads below the horizon are refused rather than answered from half a chain.
+
+Where the horizon is is not a setting.
+It is the oldest lsn anything still names, which means the oldest checkpoint in the live manifest and the oldest in any history snapshot inside the retention window, so a branch, a restore and a point in time recovery all pin exactly what they are relying on.
+`ZOU_PAGE_RETENTION_SECS` is the window that reckoning uses, a week by default, the same default `zou gc --retention` carries.
+Set it to zero and the merge never runs and the shard keeps everything, which is what it did before and is an escape hatch rather than a tuning.
+
+The pass runs eight times per window, so a shard holds the window plus at most an eighth of it, and never more often than once a minute whatever the window is.
+That floor is there because this is the expensive shape: it reads every layer below the horizon once to learn which keys they hold, then materializes those keys, so its cost is the history it is about to retire plus the working set it is about to image.
+It logs what it did at info, including the keys it could build no page for and the layers it therefore left alone, which is the one case where a merge frees less than the numbers suggest it should.
+
 ## The postgres port
 
 A node serving many projects listens once on 5432 and proxies each connection to the project's own postgres, because a thousand databases on a node have no thousand ports to be exposed on.
