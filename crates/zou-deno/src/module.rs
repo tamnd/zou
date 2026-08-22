@@ -354,9 +354,15 @@ fn source(
         | deno_ast::MediaType::Dcts
         | deno_ast::MediaType::Jsx
         | deno_ast::MediaType::Tsx => (stripped(landed, text, media)?, ModuleType::JavaScript),
+        // Upstream's own sentence, which is deno_graph's, because the
+        // person reading this line is a function author who will search
+        // for it and find what everybody else writing Deno found. What
+        // is left off is the two prefixes upstream's boot wraps it in,
+        // `worker boot error: failed to create the graph:`, since those
+        // name machinery this does not have.
         other => {
             return Err(JsErrorBox::type_error(format!(
-                "{landed} is a {other} and a function may not import one"
+                "Expected a JavaScript or TypeScript module, but identified a {other} module. Specifier: {landed}"
             )));
         }
     };
@@ -680,6 +686,27 @@ mod tests {
         assert_eq!(one.as_str(), "https://esm.sh/drizzle-orm@0.29.1/pg-core");
         let two = resolved("jsr:/@std/encoding@1/hex", "file:///f/index.ts").unwrap();
         assert_eq!(two.as_str(), "https://esm.sh/jsr/@std/encoding@1/hex");
+    }
+
+    /// A cdn that serves a module with no content type, which is one
+    /// row of the examples corpus and a refusal on both servers. The
+    /// sentence is upstream's, minus the prefixes its boot wraps
+    /// everything in, because the person reading it is a function
+    /// author searching for it.
+    #[test]
+    fn a_module_that_is_neither_javascript_nor_typescript_is_refused_the_way_upstream_refuses_it() {
+        let landed = spec("https://cdn.skypack.dev/http-cache-semantics?dts");
+        let refused = source(
+            &landed,
+            &landed,
+            "whatever it was".to_string(),
+            deno_ast::MediaType::Unknown,
+        )
+        .expect_err("not a module");
+        assert_eq!(
+            refused.to_string(),
+            "Expected a JavaScript or TypeScript module, but identified a Unknown module. Specifier: https://cdn.skypack.dev/http-cache-semantics?dts"
+        );
     }
 
     /// A declaration is a file about types, so importing one is a line
