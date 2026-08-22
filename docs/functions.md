@@ -572,6 +572,7 @@ What runs is the registry's build of the package rather than the tarball npm wou
 - Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
 - A package that reaches for a node built in runs if the built in is one of the ones below, and is refused by the name of the one it wanted if it is not.
 - The loader asks the registry as `zou-edge-runtime`, and that decides which build comes back. esm.sh serves a Deno agent the build it makes for Deno, which is the build a package author tested on a Deno runtime, and serves anything else the build it makes for a browser, with the platform bits stubbed out. The browser build is the one that links here, and the reason is measured rather than argued: the Supabase examples corpus, run on the same machine on the same afternoon against both, ran thirty two of forty functions asking as this and twenty five asking as Deno. The seven it costs are packages whose Deno build imports `node:child_process`, `node:diagnostics_channel` or `node:module`, and four of the seven want to start a process, which is not something a function here is ever going to do. What asking as itself costs is the other direction: a package whose browser build needs something a browser has and this does not, such as a `.wasm` esbuild will not bundle, is a 500 from the registry rather than a module.
+- A build the registry could not make is asked for again as the one it can. esm.sh answers 500 for `@vercel/og` asked as a browser, because that build hands esbuild a `.wasm` and esbuild has no loader for one, so a 5xx from the registry is asked again as Deno and what comes back is the `denonext` build. The modules it re exports name the build in their own path, so the rest of that package's graph arrives without asking twice, and a package the registry can build for a browser never takes this path at all.
 - `@supabase/supabase-js` runs. `createClient` builds its auth, storage, functions and realtime clients, and the realtime one is a `WebSocket`, which is why that had to exist before this line could say so.
 - `http:` is refused. A module arrives and is executed, so it arrives over https.
 - `data:` is not supported yet.
@@ -621,7 +622,19 @@ A registry that says nothing answers with wherever the fetch landed, which is th
 
 `Deno.readFile` of an `http:` or `https:` url reads it through the same cache the modules are fetched into, so the file is fetched once and a second cold start has it.
 This is not a new thing for a function to be able to reach: a function has `fetch`, and this is the same reach through a cache that is already paid for.
-The synchronous spellings serve what has been fetched already and will not start a download while an isolate is stopped waiting for one.
+The synchronous spellings serve what has been fetched already and will not start a download while a handler is waiting on one.
+While the module is still being loaded they will, because a package reading its own wasm with `readFileSync` at the top of itself is the ordinary shape and there is nothing else for the isolate to be doing: the module load either side of that read is a blocking fetch on the same thread.
+
+A package that goes the other way and asks for a path rather than a url gets the url back.
+
+```ts
+import { fileURLToPath } from "node:url"
+readFileSync(fileURLToPath(new URL("./resvg.wasm", import.meta.url)))
+```
+
+That is what `@vercel/og` does, and on node it is a path because the package is a directory.
+Here it is a url, so `fileURLToPath` of an `http:` or `https:` url answers with the url rather than throwing, and the read that follows takes it.
+A url that is neither a file nor http is still `ERR_INVALID_URL_SCHEME`, the way node spells it.
 
 Everything fetched is kept on disk, keyed by url, so only the first cold start pays for it.
 

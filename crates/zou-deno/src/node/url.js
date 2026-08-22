@@ -10,6 +10,17 @@ const URLSearchParamsClass = globalThis.URLSearchParams;
 
 export function fileURLToPath(url) {
   const held = typeof url === "string" ? new URLClass(url) : url;
+  // A package here is a url rather than a directory somebody unpacked,
+  // so the file a package reads beside itself is a url too. What this
+  // is for is `readFileSync(fileURLToPath(new URL('./x.wasm',
+  // import.meta.url)))`, which is how a wasm library finds its own
+  // wasm, and the reads take a url already: `Deno.readFile` of one
+  // goes through the cache the modules are fetched into. So the url
+  // comes back as it went in rather than as a path that would name
+  // nothing on this disk.
+  if (held.protocol === "https:" || held.protocol === "http:") {
+    return held.href;
+  }
   if (held.protocol !== "file:") {
     const wrong = new TypeError("The URL must be of scheme file");
     wrong.code = "ERR_INVALID_URL_SCHEME";

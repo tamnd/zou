@@ -601,15 +601,42 @@ fn keep(path: &Path, fetched: &Fetched) -> std::io::Result<()> {
     once(about.as_bytes(), path.with_extension("about"))
 }
 
-/// One module off the network, with the client the rest of this crate
-/// calls out with.
-fn fetch(asked: &ModuleSpecifier) -> Result<Fetched, JsErrorBox> {
-    let request = ureq::http::Request::get(asked.as_str())
+/// One request for one module, as the loader or as somebody named.
+fn get(
+    asked: &ModuleSpecifier,
+    named: Option<&str>,
+) -> Result<ureq::http::Response<ureq::Body>, JsErrorBox> {
+    let mut request = ureq::http::Request::get(asked.as_str());
+    if let Some(who) = named {
+        request = request.header(ureq::http::header::USER_AGENT, who);
+    }
+    let request = request
         .body(())
         .map_err(|e| JsErrorBox::type_error(format!("{asked}: {e}")))?;
-    let answer = crate::fetch::agent()
+    crate::fetch::agent()
         .run(request)
-        .map_err(|e| JsErrorBox::type_error(format!("{asked} could not be fetched: {e}")))?;
+        .map_err(|e| JsErrorBox::type_error(format!("{asked} could not be fetched: {e}")))
+}
+
+/// One module off the network, with the client the rest of this crate
+/// calls out with.
+///
+/// A registry that serves packages as modules builds them, and a build
+/// can fail: esm.sh answers 500 for `@vercel/og` because its browser
+/// build hands esbuild a `.wasm` and esbuild has no loader for one.
+/// Which build it was asked for is the user agent, so a 500 is asked
+/// again as the runtime the registry builds for, and that is the whole
+/// fallback: the answer to a build that could not be made is the other
+/// build, not a function that will not load. What comes back imports
+/// `node:`, which is why it is worth asking at all now that the built
+/// ins are here, and the modules it re exports name the build in their
+/// own path, so the rest of the graph arrives without asking twice.
+fn fetch(asked: &ModuleSpecifier) -> Result<Fetched, JsErrorBox> {
+    let answer = get(asked, None)?;
+    let answer = match answer.status().is_server_error() {
+        true => get(asked, Some(crate::fetch::user_agent()))?,
+        false => answer,
+    };
     let status = answer.status();
     if !status.is_success() {
         return Err(JsErrorBox::type_error(format!(

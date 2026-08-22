@@ -124,13 +124,32 @@ fn a_package_reads_a_file_of_its_own_from_beside_where_it_landed() {
         "{refused}"
     );
 
-    // The synchronous spelling says the other half of that: it will
-    // serve what has been fetched and will not stop an isolate to
-    // fetch what has not.
+    // The synchronous spelling at the top of a module is allowed to
+    // fetch, because a package reading its own wasm with `readFileSync`
+    // while it is being loaded is the ordinary shape and there is
+    // nothing else for the isolate to be doing. So what refuses it here
+    // is the same thing that refused the await: a server told not to
+    // fetch at all.
     std::fs::write(
         &entrypoint,
         r#"
         Deno.readFileSync(new URL("https://esm.sh/wasmy@1.2.0/es2022/nothing.bin"));
+        "#,
+    )
+    .expect("the function's file");
+    let refused = answer(&function).expect_err("a file nothing has");
+    assert!(refused.why().contains("told not to fetch"), "{refused}");
+
+    // Once the module is loaded the other rule is back: a handler that
+    // reads synchronously serves what has been fetched and does not
+    // stop the isolate to fetch what has not.
+    std::fs::write(
+        &entrypoint,
+        r#"
+        Deno.serve(() => {
+          Deno.readFileSync(new URL("https://esm.sh/wasmy@1.2.0/es2022/nothing.bin"));
+          return new Response("never");
+        });
         "#,
     )
     .expect("the function's file");
