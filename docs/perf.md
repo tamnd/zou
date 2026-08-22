@@ -62,6 +62,23 @@ The buffered WAL tier in the storage redesign is aimed at the same term.
 
 Two legs of this are still owed: real S3 waits on credentials, and a run from a box at a real network distance from the bucket is what turns the simulated column into a measured one.
 
+## The write leg, one build against another
+
+The third measurement here is not a table of absolutes but a comparison: a change to the write path, before and after, on the same box.
+`scripts/zou-write-ab.sh --before <prefix> --after <prefix>` is that harness, and it is a separate script from `zou-bench.sh` because the thing that makes an A against B trustworthy is not the workload, it is the schedule.
+
+The workload is one insert of 250 rows a transaction into a two column table with no index, sixteen connections, forty five seconds, which is the shape the relation extension path shows up in.
+Three legs, all on the same postgres binary and the same settings: vanilla with nothing to point the store shim at, zou over a filesystem store, and zou over an object store.
+Each prefix is a full install with a `zou-bootstrap` next to it, built by whoever is running the comparison, because the store code runs inside the postmaster and a `cargo build` that never went through `ninja install` measures the old one and reports that the change did nothing.
+
+What the script does that a pair of runs does not is alternate.
+Both sides of a leg are measured inside the same round, the order they go in swaps every round, and three rounds are reported as min, median and max rather than as a mean.
+That is a direct answer to how the numbers in issue #476 went wrong: they were taken on a box that was also running its owner's crawler, and four runs of the same binary against MinIO came back 553, 515, 454 and 264 tps, so a single before against a single after was reading the box rather than the change.
+The spread is the finding and is printed first for that reason.
+
+None of this makes a busy box quiet, and the harness cannot tell that it is on one.
+The numbers this is meant to produce are still owed, and they are owed on a machine with nothing else running.
+
 ## Reading the numbers
 
 - The load phase is extend heavy: every new block is a foreground round trip to the store, which is why init time grows with store latency and why bulk load batching is the obvious next optimization.
