@@ -565,18 +565,41 @@ import { encodeHex } from "jsr:@std/encoding@1/hex"
 ```
 
 They are not resolved the way Deno resolves them.
-There is no node module resolution here, no `package.json` walk, no CJS and no node built ins.
+There is no node module resolution here, no `package.json` walk and no CJS.
 Both specifiers are rewritten to a url on a registry that serves packages as modules, `esm.sh` by default, and from there a package is an ordinary graph of `https:` imports.
 What runs is the registry's build of the package rather than the tarball npm would have unpacked, which is worth knowing before reporting a difference in behaviour to a package's author.
 
 - Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
-- A package that reaches for a node built in will not run. `node:` is refused by name and the registry's own shims cover the common ones and not all of them.
-- The loader asks the registry as `zou-edge-runtime`, and that decides which build comes back. esm.sh serves a Deno agent the build it makes for Deno, which imports `node:process` or `node:buffer` for a line or two because Deno has them, and serves anything else the build it makes for a browser. The browser build is the one that links here. Asking as a Deno was measured against the Supabase examples and took the corpus from twenty eight functions running to twenty one, all of them on a missing node built in, so the loader asks as itself until those exist. What it costs is the other direction: a package whose browser build needs something a browser has and this does not, such as a `.wasm` esbuild will not bundle, is a 500 from the registry rather than a module.
+- A package that reaches for a node built in runs if the built in is one of the ones below, and is refused by the name of the one it wanted if it is not.
+- The loader asks the registry as `Deno/2.1.4 (variant; zou/<version>)`, the same sentence `navigator.userAgent` reads, and that decides which build comes back. esm.sh serves a Deno agent the build it makes for Deno, which is the build a package author tested on a Deno runtime, and serves anything else the build it makes for a browser. What the Deno build imports is `node:`, which is the whole reason the built ins exist here.
 - `@supabase/supabase-js` runs. `createClient` builds its auth, storage, functions and realtime clients, and the realtime one is a `WebSocket`, which is why that had to exist before this line could say so.
 - `http:` is refused. A module arrives and is executed, so it arrives over https.
 - `data:` is not supported yet.
 - The slash after the scheme is allowed. `npm:/drizzle-orm@0.29.1/pg-core` is the same specifier as the one without it, which matters because that is the spelling a registry's own build of a package imports itself with rather than one anybody types.
 - A declaration file is a module with nothing in it. `import 'jsr:@supabase/functions-js/edge-runtime.d.ts'` is how a project tells its editor what `Deno.serve` is, and there is no runtime code in a `.d.ts` to run and nothing fetched for one.
+
+### Node built ins
+
+`node:` is a specifier here, and what it resolves to is javascript carried in the binary rather than anything on the network.
+
+```
+assert  buffer  crypto  events  fs  fs/promises  os  path  process
+querystring  stream  stream/promises  stream/web  string_decoder
+timers  timers/promises  url  util  util/types
+```
+
+`path/posix` and `path/win32` are the same module as `path`, which is posix, because there is one file system here and it has one separator.
+
+What each one is is the part of it a package reaches for and not node's whole surface, and the shape of the difference is worth reading before depending on one:
+
+- `buffer` is a real `Buffer`, which is a `Uint8Array` with node's methods on it: the seven encodings, the fixed width readers and writers including the variable width `readUIntBE` pair, `concat`, `compare`, `copy`, `fill`, `indexOf` and the byte swaps.
+- `crypto` is `createHash` and `createHmac` over the same digests `crypto.subtle` has, plus `randomBytes`, `randomInt`, `randomUUID` and `timingSafeEqual`, and `webcrypto` is the global one. There are no ciphers behind it, no key derivation and no md5, and each of those is refused by the name that was asked for.
+- `fs` and `fs/promises` read and will not write. A read that is not there fails the way node fails it, with `ENOENT` on an error that has `code`, `errno`, `syscall` and `path` on it, because that is what a library branches on.
+- `stream` is `Readable`, `Writable`, `Duplex`, `Transform` and `PassThrough` on top of the `events` emitter, with `pipe`, `pipeline`, `finished`, the async iterator and the bridges to and from a web stream. None of node's internals are under it, so a package that reaches past the public methods into `_readableState` finds nothing.
+- `process` is a global as well as a module, the way it is in upstream's runtime, so a package that sets something on one sees it through the other. `env` is the function's environment and is read only, `stdout` and `stderr` go to the log, `nextTick` is a microtask, and `chdir` and `exit` throw rather than pretending.
+- `os` answers about the machine the function is on the way a container does, `util.promisify` reads the custom symbol, `assert` throws an `AssertionError`, and `timers` and `timers/promises` are the globals under their node names.
+
+A built in nobody has written yet is refused when the module is resolved, by name, so `import "node:child_process"` says there is no `child_process` here rather than failing at the first call into it.
 
 ### A package's own files
 
@@ -1036,7 +1059,7 @@ Not present yet, and named rather than silently missing:
 - Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet. That also moves when the promise settles: upstream hands the response back when the headers arrive and this hands it back when the body is in, so a handler racing a slow answer against a clock sees the clock win here and the headers win there.
 - `MessageChannel` and `MessagePort`. Upstream has both and nothing here does, so a library that talks to itself over a port has nowhere to send. That is [#434](https://github.com/tamnd/zou/issues/434).
 - The rest of the file system. Reading a file the function's own `static_files` covers is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
-- Node built ins. `node:fs` and the rest are refused by name.
+- The rest of the node built ins. Nineteen of them are here and the section on packages says what each one covers, and one that is not, `node:child_process` among them, is refused by name when it is resolved.
 
 The rest of that list, and where each line stands, is [issue #369](https://github.com/tamnd/zou/issues/369).
 
