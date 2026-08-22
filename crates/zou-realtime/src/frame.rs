@@ -18,8 +18,9 @@
 //! `channel.send`. A server that only reads json hears silence from a
 //! current client and has no way to tell that is what happened.
 
-use serde::Serialize;
+use serde::{Serialize, Serializer, ser::SerializeMap};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 
 /// Which encoding this socket is speaking, from `vsn` on the connect
 /// url.
@@ -195,7 +196,7 @@ impl Frame {
             &self.reference,
             &self.topic,
             &self.event,
-            &self.payload,
+            &Ordered(&self.payload),
         )
     }
 
@@ -222,10 +223,77 @@ impl Frame {
 
 /// One socket's part of a change: the ids of its own subscriptions this
 /// answers, and the row, which is everybody's.
+///
+/// The two names are in the order they are written in, which is the
+/// order a struct is always serialized in. The row inside goes through
+/// `Ordered` for the reason that type gives.
 #[derive(Serialize)]
 struct Change<'a> {
+    #[serde(serialize_with = "ordered")]
     data: &'a Value,
     ids: &'a [u64],
+}
+
+fn ordered<S: Serializer>(value: &&Value, serializer: S) -> Result<S::Ok, S::Error> {
+    Ordered(value).serialize(serializer)
+}
+
+/// A json value whose object keys come out in one order whatever the
+/// build is doing.
+///
+/// `serde_json` has a `preserve_order` feature. With it off a
+/// `Value::Object` is a `BTreeMap` and the keys are written sorted, and
+/// with it on it is an `IndexMap` and they are written in the order
+/// something happened to insert them. Nothing about a json object's
+/// meaning changes either way and no client reads one differently, but
+/// the feature is not ours to decide: anything else in the workspace
+/// can turn it on, and cargo turns it on for everybody when it does.
+/// `zou-deno` does, so `--features zou-deno/isolate` used to change the
+/// bytes this crate puts on a socket, which makes a recording of our
+/// frames a fact about a build rather than about the source.
+///
+/// So the frames are written sorted on purpose rather than by accident.
+/// That is also the order upstream has: phoenix builds these payloads
+/// as maps with atom keys, and a small map in erlang iterates in term
+/// order, which for atoms is their name, so a recording of a real
+/// `phx_reply` has `response` before `status` the same way this does.
+///
+/// In the build we ship the keys are sorted before this looks at them,
+/// so it hands the value straight to serde and costs one atomic load.
+struct Ordered<'a>(&'a Value);
+
+impl Serialize for Ordered<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if sorted_already() {
+            return self.0.serialize(serializer);
+        }
+        match self.0 {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort_unstable();
+                let mut out = serializer.serialize_map(Some(keys.len()))?;
+                for key in keys {
+                    out.serialize_entry(key, &Ordered(&map[key]))?;
+                }
+                out.end()
+            }
+            Value::Array(items) => serializer.collect_seq(items.iter().map(Ordered)),
+            plain => plain.serialize(serializer),
+        }
+    }
+}
+
+/// A value printed with its keys in that order, for the places that
+/// carry json as text rather than serializing it into something.
+fn json_text(value: &Value) -> String {
+    serde_json::to_string(&Ordered(value)).expect("a value is json")
+}
+
+/// Whether the `serde_json` in this build writes an object's keys
+/// sorted, which is what asking it to write one says.
+fn sorted_already() -> bool {
+    static SORTED: OnceLock<bool> = OnceLock::new();
+    *SORTED.get_or_init(|| json!({"b": 0, "a": 0}).to_string().starts_with(r#"{"a""#))
 }
 
 /// The five fields, in the shape `vsn` says, with nothing copied.
@@ -258,8 +326,9 @@ fn encoded<P: Serialize>(
 
 /// The five fields as version 1.0.0 names them, borrowed.
 ///
-/// The order is the order `serde_json` puts an object's keys in, which
-/// is alphabetical, so that this says the same bytes as the `Value`
+/// The names are written in the order they are declared in, which is
+/// what a struct does whatever `serde_json` has been built with. They
+/// are declared sorted so that this says the same bytes as the `Value`
 /// this replaced.
 #[derive(Serialize)]
 struct Named<'a, P> {
@@ -436,8 +505,11 @@ impl BinaryBroadcast {
             map.remove("event");
             map.remove("payload");
         }
+        // Through `Ordered`, so a push that came up as json goes down
+        // as the same bytes in every build rather than in whichever
+        // order this one happened to keep the client's fields in.
         let meta = match meta.as_object() {
-            Some(map) if !map.is_empty() => meta.to_string(),
+            Some(map) if !map.is_empty() => json_text(&meta),
             _ => String::new(),
         };
         Some(BinaryBroadcast {
@@ -447,7 +519,7 @@ impl BinaryBroadcast {
             event,
             meta,
             encoding: Encoding::Json,
-            payload: payload.to_string().into_bytes(),
+            payload: json_text(&payload).into_bytes(),
         })
     }
 }
@@ -485,6 +557,53 @@ mod tests {
             Frame::ok(&frame).encode(Vsn::V2),
             r#"[null,"7","phoenix","phx_reply",{"response":{},"status":"ok"}]"#
         );
+    }
+
+    // The payloads below are written with their keys out of order on
+    // purpose. In a build without `preserve_order` there is no way to
+    // hold an object unsorted and these say nothing, and in a build
+    // with it they are the whole point: they are what a client's own
+    // ordering, or the order `json!` was written in, looks like by the
+    // time it reaches the socket.
+    #[test]
+    fn a_frame_says_the_same_bytes_whatever_serde_json_was_built_with() {
+        let frame = Frame::push(
+            "realtime:room",
+            "presence_state",
+            json!({"u2": {"metas": []}, "u1": {"metas": [{"phx_ref": "1", "at": "noon"}]}}),
+        );
+        assert_eq!(
+            frame.encode(Vsn::V2),
+            r#"[null,null,"realtime:room","presence_state",{"u1":{"metas":[{"at":"noon","phx_ref":"1"}]},"u2":{"metas":[]}}]"#
+        );
+        assert_eq!(
+            frame.encode(Vsn::V1),
+            r#"{"event":"presence_state","join_ref":null,"payload":{"u1":{"metas":[{"at":"noon","phx_ref":"1"}]},"u2":{"metas":[]}},"ref":null,"topic":"realtime:room"}"#
+        );
+    }
+
+    #[test]
+    fn a_changed_row_is_written_the_same_way() {
+        assert_eq!(
+            Frame::changed(
+                Vsn::V2,
+                "realtime:room",
+                &[8],
+                &json!({"type": "INSERT", "record": {"id": 1}, "table": "todos"}),
+            ),
+            r#"[null,null,"realtime:room","postgres_changes",{"data":{"record":{"id":1},"table":"todos","type":"INSERT"},"ids":[8]}]"#
+        );
+    }
+
+    #[test]
+    fn a_json_push_carries_the_same_bytes_into_the_binary_broadcast() {
+        let frame = Frame::decode(
+            r#"["5","6","realtime:room","broadcast",{"type":"broadcast","event":"cursor","payload":{"y":2,"x":1},"seq":3,"id":"a"}]"#,
+        )
+        .unwrap();
+        let push = BinaryBroadcast::from_frame(&frame).unwrap();
+        assert_eq!(push.payload, br#"{"x":1,"y":2}"#);
+        assert_eq!(push.meta, r#"{"id":"a","seq":3}"#);
     }
 
     #[test]
