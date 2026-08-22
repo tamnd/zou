@@ -118,16 +118,22 @@ fn the_backend_answers_what_the_parser_expects_it_to() {
     // before the backend starts. This is issue #548: the pages a one
     // shot session writes would be shadowed by the newest run on the
     // next attach, because nothing here pushes its wal into the shared
-    // log for the chain to replay. The capture is composed by hand
-    // rather than taken, since what the refusal reads is the count in
-    // the manifest and nothing else.
+    // log for the chain to replay.
+    //
+    // The manifest is written here rather than captured. initdb leaves
+    // none at all, which is itself the bootstrap window the two
+    // sessions above just wrote through, and what the refusal reads is
+    // the count of checkpoints in the manifest and nothing else.
     let layout = zou_store::layout::TenantLayout::new("local");
     let backing = zou_store::open_store(store.to_str().unwrap()).expect("open the store");
-    let (data, _) = backing
-        .get(&layout.manifest())
-        .expect("read the manifest")
-        .expect("initdb left one");
-    let mut manifest = zou_store::Manifest::from_json(&data).expect("parse the manifest");
+    assert!(
+        backing
+            .get(&layout.manifest())
+            .expect("read the manifest")
+            .is_none(),
+        "initdb leaves no manifest, which is why the write above held"
+    );
+    let mut manifest = zou_store::Manifest::new("local", 18);
     manifest
         .checkpoints
         .push(zou_store::manifest::CheckpointRef {
@@ -138,7 +144,7 @@ fn the_backend_answers_what_the_parser_expects_it_to() {
         });
     backing
         .put(&layout.manifest(), &manifest.to_json())
-        .expect("write the manifest back");
+        .expect("write the manifest");
     let refused = session()
         .writable()
         .run("insert into t values (8);")
