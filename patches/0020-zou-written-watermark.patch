@@ -1,0 +1,383 @@
+Carry a written watermark in the fork length.
+
+A block object that the store does not have reads as zeros, and zeros
+are the right answer for a block postgres extended and never wrote:
+that is a hole in a file and a new and empty page is what md gives
+back for one. They are also what a page that went missing reads as, so
+a table that lost a block comes up short by exactly the rows it held
+and nothing anywhere says a word.
+
+Telling the two apart needs to know which blocks have definitely had a
+page reach the store. That is what this adds: dense, a block count
+every block below which has been written, and filled, a bitmap of the
+64 blocks above it. The pair rides in the fork's SIZE object, which
+grows from four bytes to sixteen, and a four byte object still reads
+as a fork claiming nothing, which is what a store written before this
+has and what keeps it readable.
+
+The shared relsize table is where the watermark has to live while the
+cluster runs, because an ordinary page writeback is the one event that
+proves a block was written and it settles no length. It has nowhere
+else to leave the fact, so the table takes it and the checkpoint hands
+both halves to the store together.
+
+The window is there because postgres extends a relation in runs and
+the backends that take the blocks write them back in whatever order
+the buffer pool evicts them. Waiting for block dense itself would
+stall the watermark on the one block of a run that happened to be used
+last.
+
+Nothing here is exact and nothing here has to be. A watermark behind
+the truth costs detection of a lost page and never accuses a healthy
+fork, so a fresh entry seeds from what the store last said, a write
+too far ahead of dense to fit the window is dropped, and the page
+service path claims nothing at all, because its checkpointer puts are
+elided and a claim over an elided put would have the fork vouch for
+objects nobody wrote.
+
+See zou #546.
+
+--- a/src/backend/storage/smgr/zou_smgr.c
++++ b/src/backend/storage/smgr/zou_smgr.c
+@@ -43,7 +43,7 @@
+ extern int	zou_smgr_exists(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+ 							int32 *out);
+ extern int	zou_smgr_nblocks(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+-							 uint32 *out);
++							 uint32 *out, uint32 *dense, uint64 *filled);
+ extern int	zou_smgr_read(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+ 						  uint32 blk, uint8 *buf, uint64 durable_lsn);
+ extern int	zou_smgr_readv(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+@@ -61,7 +61,7 @@
+ 								uint32 fork, uint32 blk, uint32 count,
+ 								int32 defer_size);
+ extern int	zou_smgr_put_size(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+-							  uint32 nblocks);
++							  uint32 nblocks, uint32 dense, uint64 filled);
+ extern int	zou_smgr_truncate(uint32 spc, uint32 db, uint32 rel, uint32 fork,
+ 							  uint32 old_blocks, uint32 nblocks);
+ extern int	zou_smgr_unlink(uint32 spc, uint32 db, uint32 rel, uint32 fork);
+@@ -108,13 +108,64 @@
+ 	ForkNumber	forknum;
+ } ZouRelSizeKey;
+ 
++/*
++ * The written watermark, and why it rides here.
++ *
++ * A block object that is not in the store reads as zeros, which is
++ * right for a block that was extended and never written and is silent
++ * data loss for a block that is gone (zou #546). Telling them apart
++ * needs a record of which blocks have definitely had a page reach the
++ * store, and `dense` is it: every block below it has. `filled` covers
++ * the 64 blocks above `dense` as a bitmap, so a run of blocks extended
++ * together and written back in whatever order the buffer pool evicts
++ * them still carries `dense` along with it.
++ *
++ * It lives in this table because an ordinary page writeback is the one
++ * event that means a block was written and settles no length, so it
++ * has nowhere else to leave the fact. The checkpoint hands both halves
++ * to the store together, in the same object, with the length.
++ *
++ * Both halves only move forward, and `dense` moves only after the page
++ * below it is in the store. Nothing here has to be exact: a watermark
++ * behind the truth costs detection and never accuses a healthy fork,
++ * which is why a fresh entry starts at whatever the store last said
++ * and an update that cannot be represented is dropped rather than
++ * guessed.
++ */
++#define ZOU_DENSE_WINDOW 64
++
+ typedef struct ZouRelSizeEntry
+ {
+ 	ZouRelSizeKey key;
+ 	BlockNumber nblocks;
+ 	BlockNumber stored;			/* what the store holds, 0 when unknown */
++	BlockNumber dense;			/* every block below this has a page */
++	uint64		filled;			/* pages written in [dense, dense + 64) */
++	BlockNumber flushed;		/* the dense the store was last told */
+ } ZouRelSizeEntry;
+ 
++/*
++ * Walk dense over the prefix of the window that is set. Caller holds
++ * the table lock exclusively.
++ */
++static void
++zou_dense_walk(ZouRelSizeEntry *entry)
++{
++	int			steps = 0;
++
++	while (steps < ZOU_DENSE_WINDOW && (entry->filled & (UINT64CONST(1) << steps)) != 0)
++		steps++;
++	if (steps == 0)
++		return;
++	entry->dense += (BlockNumber) steps;
++	entry->filled = (steps >= ZOU_DENSE_WINDOW) ? 0 : (entry->filled >> steps);
++	if (entry->dense > entry->nblocks)
++	{
++		entry->dense = entry->nblocks;
++		entry->filled = 0;
++	}
++}
++
+ typedef struct ZouRelSizeCtl
+ {
+ 	int			tranche;
+@@ -211,7 +262,12 @@
+ 		grew = (nblocks > entry->nblocks &&
+ 				(mode == ZOU_RELSIZE_GROW || mode == ZOU_RELSIZE_EXTEND));
+ 		if (!found)
++		{
+ 			entry->stored = 0;
++			entry->dense = 0;
++			entry->filled = 0;
++			entry->flushed = 0;
++		}
+ 		if (!found || grew || mode == ZOU_RELSIZE_SET)
+ 		{
+ 			entry->nblocks = nblocks;
+@@ -225,10 +281,107 @@
+ 			 */
+ 			if (mode == ZOU_RELSIZE_GROW || mode == ZOU_RELSIZE_SET)
+ 				entry->stored = nblocks;
++			/* a fork cannot vouch for blocks it no longer has */
++			if (entry->dense > entry->nblocks)
++			{
++				entry->dense = entry->nblocks;
++				entry->filled = 0;
++				entry->flushed = Min(entry->flushed, entry->dense);
++			}
+ 		}
+ 	}
+ 	LWLockRelease(&ZouRelSize->lock);
+ 	return entry != NULL;
++}
++
++/*
++ * Seed the watermark of a fresh entry from what the store already knows.
++ *
++ * Without this a restart would start every fork at zero and stay there:
++ * the window only reaches 64 blocks past dense, so a writeback anywhere
++ * further along is forgotten, and dense would never move again for a
++ * relation that already has pages. The values come from the same read
++ * the length came from, so this costs nothing extra.
++ */
++static void
++zou_relsize_seed_dense(RelFileLocator locator, ForkNumber forknum,
++					   BlockNumber dense, uint64 filled)
++{
++	ZouRelSizeKey key = {0};
++	ZouRelSizeEntry *entry;
++
++	if (ZouRelSizeHash == NULL)
++		return;
++	key.locator = locator;
++	key.forknum = forknum;
++	LWLockAcquire(&ZouRelSize->lock, LW_EXCLUSIVE);
++	entry = hash_search(ZouRelSizeHash, &key, HASH_FIND, NULL);
++	if (entry != NULL && dense > entry->dense)
++	{
++		entry->dense = Min(dense, entry->nblocks);
++		entry->filled = filled;
++		/* the store already has this much, so it is not owed */
++		entry->flushed = entry->dense;
++		zou_dense_walk(entry);
++	}
++	LWLockRelease(&ZouRelSize->lock);
++}
++
++/*
++ * Record that pages for `nblocks` blocks from `blk` are in the store.
++ *
++ * Called after the write returns, never before: the whole value of the
++ * watermark is that a block below it is a block the store has, and a
++ * claim made ahead of the put would turn a crash in the middle of a
++ * writeback into a fork that accuses itself.
++ *
++ * A block too far past dense to fit the window is dropped. That costs
++ * the detection of that one block until dense walks over it and costs
++ * nothing else, which is the trade this whole structure is: 64 blocks
++ * of memory per fork is what a bulk extension needs and no more.
++ */
++static void
++zou_relsize_filled(RelFileLocator locator, ForkNumber forknum,
++				   BlockNumber blk, BlockNumber nblocks)
++{
++	ZouRelSizeKey key = {0};
++	ZouRelSizeEntry *entry;
++
++	if (ZouRelSizeHash == NULL)
++		return;
++
++	/*
++	 * With the page service on, a checkpointer run's puts are elided:
++	 * the pages go into layers and pg/ keeps whatever it held when the
++	 * session opened. Claiming those blocks here would have the fork
++	 * vouch for objects that were never written, and a later attach
++	 * with the service off would read the claim and refuse a page that
++	 * was never lost. The service owns this question on that path.
++	 */
++	if (zou_pageserve_on() == 1)
++		return;
++
++	key.locator = locator;
++	key.forknum = forknum;
++	LWLockAcquire(&ZouRelSize->lock, LW_EXCLUSIVE);
++	entry = hash_search(ZouRelSizeHash, &key, HASH_FIND, NULL);
++	if (entry != NULL)
++	{
++		for (BlockNumber i = 0; i < nblocks; i++)
++		{
++			BlockNumber b = blk + i;
++			BlockNumber off;
++
++			if (b < entry->dense || b >= entry->nblocks)
++				continue;
++			off = b - entry->dense;
++			if (off >= ZOU_DENSE_WINDOW)
++				continue;
++			entry->filled |= (UINT64CONST(1) << off);
++		}
++		zou_dense_walk(entry);
++	}
++	LWLockRelease(&ZouRelSize->lock);
+ }
+ 
+ /*
+@@ -244,10 +397,32 @@
+ {
+ 	ZouRelSizeKey key = {0};
+ 	ZouRelSizeEntry *entry;
++	BlockNumber dense = 0;
++	uint64		filled = 0;
++
++	/*
++	 * The watermark goes out with the length because they share the
++	 * object. Reading it here rather than taking it as an argument keeps
++	 * every caller of this ignorant of it: none of them raised it and
++	 * none of them has a reason to hold it.
++	 */
++	key.locator = locator;
++	key.forknum = forknum;
++	if (ZouRelSizeHash != NULL)
++	{
++		LWLockAcquire(&ZouRelSize->lock, LW_SHARED);
++		entry = hash_search(ZouRelSizeHash, &key, HASH_FIND, NULL);
++		if (entry != NULL)
++		{
++			dense = entry->dense;
++			filled = entry->filled;
++		}
++		LWLockRelease(&ZouRelSize->lock);
++	}
+ 
+ 	if (zou_smgr_put_size((uint32) locator.spcOid, (uint32) locator.dbOid,
+ 						  (uint32) locator.relNumber, (uint32) forknum,
+-						  (uint32) nblocks) != 0)
++						  (uint32) nblocks, (uint32) dense, filled) != 0)
+ 	{
+ 		LWLockRelease(&ZouRelSize->flushlock);
+ 		ereport(ERROR,
+@@ -256,12 +431,17 @@
+ 						locator.relNumber, forknum)));
+ 	}
+ 
+-	key.locator = locator;
+-	key.forknum = forknum;
++	if (ZouRelSizeHash == NULL)
++		return;
+ 	LWLockAcquire(&ZouRelSize->lock, LW_EXCLUSIVE);
+ 	entry = hash_search(ZouRelSizeHash, &key, HASH_FIND, NULL);
+-	if (entry != NULL && entry->stored < nblocks)
+-		entry->stored = nblocks;
++	if (entry != NULL)
++	{
++		if (entry->stored < nblocks)
++			entry->stored = nblocks;
++		if (entry->flushed < dense)
++			entry->flushed = dense;
++	}
+ 	LWLockRelease(&ZouRelSize->lock);
+ }
+ 
+@@ -322,9 +502,14 @@
+ {
+ 	if (ZouRelSizeHash == NULL)
+ 	{
++		/*
++		 * A zero watermark, because there is no table to have one in
++		 * and this caller has raised nothing. The store merges rather
++		 * than overwrites, so it keeps whatever it already knew.
++		 */
+ 		if (zou_smgr_put_size((uint32) locator.spcOid, (uint32) locator.dbOid,
+ 							  (uint32) locator.relNumber, (uint32) forknum,
+-							  (uint32) nblocks) != 0)
++							  (uint32) nblocks, 0, 0) != 0)
+ 			ereport(ERROR,
+ 					(errcode_for_file_access(),
+ 					 errmsg("zou smgr could not store the length of rel %u fork %d",
+@@ -368,7 +553,7 @@
+ 	hash_seq_init(&seq, ZouRelSizeHash);
+ 	while ((entry = hash_seq_search(&seq)) != NULL)
+ 	{
+-		if (entry->nblocks > entry->stored)
++		if (entry->nblocks > entry->stored || entry->dense > entry->flushed)
+ 			owed[nowed++] = *entry;
+ 	}
+ 	LWLockRelease(&ZouRelSize->lock);
+@@ -379,7 +564,7 @@
+ 	 */
+ 	for (int i = 0; i < nowed; i++)
+ 		zou_relsize_put(owed[i].key.locator, owed[i].key.forknum,
+-						owed[i].nblocks);
++						Max(owed[i].nblocks, owed[i].stored));
+ 	pfree(owed);
+ 	LWLockRelease(&ZouRelSize->flushlock);
+ 	elog(DEBUG1, "zou relsize flushed %d fork lengths", nowed);
+@@ -572,6 +757,8 @@
+ 	{
+ 		zou_relsize_note(reln->smgr_rlocator.locator, forknum,
+ 						 blocknum + 1, ZOU_RELSIZE_GROW);
++		zou_relsize_filled(reln->smgr_rlocator.locator, forknum,
++						   blocknum, 1);
+ 		return;
+ 	}
+ 	if (!zou_relsize_defer(reln->smgr_rlocator.locator, forknum,
+@@ -761,6 +948,14 @@
+ 							  (const uint8 *const *) buffers,
+ 							  (uint32) nblocks, skip),
+ 			  "writev", reln, forknum);
++	/*
++	 * After the call, and only for a run that reached the store. A
++	 * skipFsync run is still buffered on the Rust side and its drain
++	 * records itself when it lands.
++	 */
++	if (!skip)
++		zou_relsize_filled(reln->smgr_rlocator.locator, forknum,
++						   blocknum, nblocks);
+ }
+ 
+ void
+@@ -774,10 +969,13 @@
+ {
+ 	BlockNumber cached;
+ 	uint32		n = 0;
++	uint32		dense = 0;
++	uint64		filled = 0;
+ 
+ 	if (zou_relsize_lookup(reln, forknum, &cached))
+ 		return cached;
+-	zou_check(zou_smgr_nblocks(ZOU_LOCATOR(reln), (uint32) forknum, &n),
++	zou_check(zou_smgr_nblocks(ZOU_LOCATOR(reln), (uint32) forknum, &n,
++							   &dense, &filled),
+ 			  "nblocks", reln, forknum);
+ 
+ 	/*
+@@ -789,6 +987,8 @@
+ 	 */
+ 	zou_relsize_note(reln->smgr_rlocator.locator, forknum,
+ 					 (BlockNumber) n, ZOU_RELSIZE_SEED);
++	zou_relsize_seed_dense(reln->smgr_rlocator.locator, forknum,
++						   (BlockNumber) dense, filled);
+ 	return (BlockNumber) n;
+ }
+ 

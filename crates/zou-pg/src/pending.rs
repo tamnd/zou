@@ -221,16 +221,23 @@ pub(crate) fn flush_fork(
     };
     if let Some(new_size) = settled {
         let key = layout.pg_size(spc, db, rel, fk);
-        let current = match store.get(&key) {
-            Ok(Some((data, _))) => {
-                let bytes: [u8; 4] = data.as_slice().try_into().map_err(|_| ())?;
-                u32::from_le_bytes(bytes)
-            }
-            Ok(None) => 0,
+        let was = match store.get(&key) {
+            Ok(Some((data, _))) => zou_store::forksize::ForkSize::decode(&data).ok_or(())?,
+            Ok(None) => zou_store::forksize::ForkSize::default(),
             Err(_) => return Err(()),
         };
-        if new_size > current {
-            store.put(&key, &new_size.to_le_bytes()).map_err(|_| ())?;
+        let current = was.nblocks;
+        let mut marker = was;
+        // The pages above are in the store now, so the drain is one of
+        // the places that can vouch for a block. Grow first: a block is
+        // only claimed as written once the fork is long enough to hold
+        // it.
+        marker.grow(new_size);
+        for (blk, _) in pages {
+            marker.fill(*blk);
+        }
+        if marker != was {
+            store.put(&key, &marker.encode()).map_err(|_| ())?;
         }
         if let Some(cache) = cache {
             cache.save_size(fork, new_size.max(current));
@@ -322,7 +329,16 @@ mod tests {
             .get(&layout.pg_size(fork.0, fork.1, fork.2, fork.3))
             .unwrap()
             .expect("the drain wrote a size");
-        let n = u32::from_le_bytes(data.as_slice().try_into().unwrap());
-        assert_eq!(n, 6, "the highest block drained is inside the fork");
+        let marker = zou_store::forksize::ForkSize::decode(&data).expect("and it is a marker");
+        assert_eq!(
+            marker.nblocks, 6,
+            "the highest block drained is inside the fork"
+        );
+        // The blocks it drained are pages the store holds now, and the
+        // marker says so. Block 5 is past the hole at 3 and 4, so the
+        // watermark stops below it rather than vouching for blocks
+        // nobody wrote.
+        assert_eq!(marker.dense, 0, "block 0 was never written");
+        assert!(!marker.written(5));
     }
 }

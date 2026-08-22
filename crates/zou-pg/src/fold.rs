@@ -230,9 +230,9 @@ fn all_pages(
             let Some((data, _)) = store.get(&key).map_err(|e| format!("store: {e}"))? else {
                 continue;
             };
-            let n = <[u8; 4]>::try_from(data.as_slice())
-                .map(u32::from_le_bytes)
-                .map_err(|_| format!("bad SIZE object at {key}"))?;
+            let n = zou_store::forksize::ForkSize::decode(&data)
+                .map(|fs| fs.nblocks)
+                .ok_or_else(|| format!("bad SIZE object at {key}"))?;
             sizes.push((spc, db, rel, fork, n));
         } else if let Ok(blk) = u32::from_str_radix(parts[4], 16) {
             refs.push(BlockRef {
@@ -281,9 +281,9 @@ fn touched_sizes(
         else {
             continue;
         };
-        let n = <[u8; 4]>::try_from(data.as_slice())
-            .map(u32::from_le_bytes)
-            .map_err(|_| format!("bad SIZE object for {spc}/{db}/{rel}/{fork}"))?;
+        let n = zou_store::forksize::ForkSize::decode(&data)
+            .map(|fs| fs.nblocks)
+            .ok_or_else(|| format!("bad SIZE object for {spc}/{db}/{rel}/{fork}"))?;
         sizes.push((spc, db, rel, fork, n));
     }
     Ok(sizes)
