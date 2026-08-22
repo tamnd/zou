@@ -87,6 +87,11 @@ const MAX_CANCEL_KEYS: usize = 16 << 10;
 /// what a pooler is for.
 pub const POOL_PER_BANK: usize = 20;
 
+/// What a postmaster with no connections left to give says, as a
+/// sqlstate. Its own message for it names no setting, so this is where
+/// one is added.
+const TOO_MANY: &str = "53300";
+
 /// How long a client may hold a backend without either side saying
 /// anything. A transaction left open pins a backend, and a pooler whose
 /// backends are all pinned by clients that went to lunch is an outage
@@ -1319,6 +1324,37 @@ async fn connect(dsn: &str, params: &[(String, String)], route: &Route) -> Resul
     Ok(up)
 }
 
+/// What the tenant's postmaster said when it would not let this
+/// connection in, as the client's own end of it.
+///
+/// Mostly its own words, because the postmaster is the one that knows.
+/// One case is not: a postmaster out of connections says `sorry, too
+/// many clients already` and nothing about whose number it is, and the
+/// number is zou's rather than the operator's, so somebody who set
+/// nothing has nothing to look for. That cost an afternoon of a
+/// benchmark, so the sentence says which limit was hit and what moves
+/// it. The code goes through as the postmaster's own rather than as a
+/// connection failure, since a client that recognises it knows to back
+/// off and come again.
+fn refused(body: &[u8]) -> Stop {
+    let said =
+        field(body, b'M').unwrap_or_else(|| "the database refused the connection".to_string());
+    if field(body, b'C').as_deref() == Some(TOO_MANY) {
+        return Stop::Say {
+            code: TOO_MANY,
+            message: format!(
+                "{said}. This is the ceiling zou starts this project's postmaster with rather \
+                 than one of your own: it is `zou serve --max-connections`, and the pooler takes \
+                 up to {POOL_PER_BANK} of them for each role in use"
+            ),
+        };
+    }
+    Stop::Say {
+        code: "08006",
+        message: said,
+    }
+}
+
 /// Answer whatever the tenant's postgres asks for, and stop at the
 /// AuthenticationOk that ends the exchange.
 ///
@@ -1333,11 +1369,7 @@ async fn handshake(up: &mut TcpStream, password: &[u8], user: &str) -> Result<()
     loop {
         let (tag, body) = read_message(up, MAX_LOGIN).await?;
         if tag == b'E' {
-            return Err(Stop::Say {
-                code: "08006",
-                message: field(&body, b'M')
-                    .unwrap_or_else(|| "the database refused the connection".to_string()),
-            });
+            return Err(refused(&body));
         }
         if tag != b'R' || body.len() < 4 {
             return Err(Stop::Quiet(format!(
@@ -1567,6 +1599,9 @@ mod tests {
         /// Which connection each query arrived on, so a test can say
         /// two clients shared a backend or did not.
         opened: StdMutex<i32>,
+        /// A postmaster with no connections left, which answers every
+        /// startup with the one error this door rewrites.
+        full: std::sync::atomic::AtomicBool,
     }
 
     impl Fake {
@@ -1608,6 +1643,15 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(params(&body[4..]).ok().unwrap_or_default());
+            if self.full.load(std::sync::atomic::Ordering::Relaxed) {
+                let mut said = Vec::new();
+                said.extend_from_slice(b"SFATAL\0");
+                said.extend_from_slice(b"C53300\0");
+                said.extend_from_slice(b"Msorry, too many clients already\0");
+                said.push(0);
+                let _ = sock.write_all(&raw(b'E', &said)).await;
+                return;
+            }
             let pid = {
                 let mut opened = self.opened.lock().unwrap();
                 *opened += 1;
@@ -2574,5 +2618,51 @@ mod tests {
             md5_password(b"secret", b"zou", &[4, 3, 2, 1]),
             "a salt that does not change the digest is not a salt"
         );
+    }
+
+    /// A postmaster out of connections says so in words that name no
+    /// setting, and the number is zou's rather than the operator's, so
+    /// a person who set nothing has nothing to look for. This is the
+    /// sentence that tells them.
+    #[tokio::test]
+    async fn a_project_out_of_connections_says_whose_ceiling_it_hit() {
+        let (_dir, fake, _backend, at) = one_project().await;
+        fake.full.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut client = Client::open(&at).await;
+        let (tag, body) = client
+            .login(&[("user", "anon.acme-prod")], &key("anon"))
+            .await;
+        assert_eq!(tag, b'E', "the door should have refused this");
+        // The postmaster's own sqlstate rather than a connection
+        // failure, because a client that recognises it knows to wait
+        // and come again.
+        assert_eq!(field(&body, b'C').as_deref(), Some("53300"));
+        let said = field(&body, b'M').expect("a message");
+        assert!(
+            said.starts_with("sorry, too many clients already"),
+            "the postmaster's own words go first: {said}"
+        );
+        assert!(
+            said.contains("--max-connections"),
+            "and then the flag that moves it: {said}"
+        );
+    }
+
+    /// Everything else the postmaster refuses a login with is its own
+    /// business and goes through as it was said.
+    #[test]
+    fn any_other_refusal_is_passed_on_in_the_words_it_arrived_in() {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"SFATAL\0");
+        body.extend_from_slice(b"C28P01\0");
+        body.extend_from_slice(b"Mpassword authentication failed for user \"anon\"\0");
+        body.push(0);
+        match refused(&body) {
+            Stop::Say { code, message } => {
+                assert_eq!(code, "08006");
+                assert_eq!(message, "password authentication failed for user \"anon\"");
+            }
+            other => panic!("{other:?} is not what a refusal is"),
+        }
     }
 }

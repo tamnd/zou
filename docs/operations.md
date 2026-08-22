@@ -308,6 +308,12 @@ The room comes back on the next attach, or on the next sweep if no attach arrive
 `--shared-buffers` is per tenant and defaults to 16MB, small on purpose: the ceiling multiplies it, and the store backed page cache is the tier that is supposed to be doing the work.
 A node running a few large projects rather than a thousand small ones should raise it.
 
+`--max-connections` is the same trade on the same axis and defaults to 40 per tenant.
+Forty is one bank of the pooler at 20, the http door's own pool at 10, three postgres keeps back for a superuser, and a little room.
+It is also an arithmetic ceiling on write rate: forty concurrent commits at twenty five rows a transaction is a thousand rows a second and nothing left over, so a node doing serious write volume for a few projects should raise it and a node packed with a thousand quiet ones should not.
+Under the three numbers added up it is refused at the command line, since a project that cannot open the connections its own pooler wants is a project that stops rather than one that is slow.
+A project that runs out answers `53300` with the postmaster's own `sorry, too many clients already` and then a sentence saying the ceiling is this flag, because the postmaster's message names no setting and the setting is not the operator's.
+
 A postmaster that dies on its own detaches its tenant, so the next request attaches again instead of being routed at a database that is not there.
 One that was asked to stop does not, because something already did.
 Runtime directories are `<ref>-<n>` and never bare `<ref>`, so a detach followed immediately by an attach does not put a new postmaster in the directory the old one is still shutting down in.
