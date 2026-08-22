@@ -70,6 +70,8 @@ zou lambda s3://mybucket/tenants --ref demo
 
 `--ref` serves one project at every url it answers and brings it up before the first request rather than because of it, which is what Lambda, Cloud Run and Fly all want. The recipes for the three are in [docs/serverless.md](docs/serverless.md).
 
+Which of those doors is safe to expose is not obvious and the answer is different for each, so it is written down: what an attacker is assumed to be able to do, what is verified and where, what is encrypted and what is not, and what is deliberately not defended against, all in [docs/security.md](docs/security.md). A hole goes to [SECURITY.md](SECURITY.md) rather than to the issue tracker.
+
 Realtime is on the same url and the same key:
 
 ```js
