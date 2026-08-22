@@ -630,6 +630,32 @@ fn sockets() -> zou_ops::Gauge {
     )
 }
 
+/// The socket tiers this node is holding for projects it does not
+/// write, one per project rather than per socket: a tier is one hub and
+/// one link, and the link is a second one of these worth of work on the
+/// holder, which is the node with the write path on it.
+///
+/// It goes down as well as up. A gauge that only ever went up would say
+/// a node was holding a link for every project it had ever seen a
+/// socket for, which is what it did until an empty tier was given a
+/// life (#443), and it is the reading that says whether the sweep is
+/// keeping up on a node with a lot of projects moving through it.
+pub fn tier_built() {
+    tiers().inc();
+}
+
+pub fn tier_dropped() {
+    tiers().dec();
+}
+
+fn tiers() -> zou_ops::Gauge {
+    registry().gauge(
+        "zou_realtime_socket_tiers",
+        "projects this node serves sockets for and does not write",
+        &[],
+    )
+}
+
 /// The subscriber half of the pair above, moved by the change reader,
 /// since a subscriber's life is the reader's rather than the socket's:
 /// one arrives when a subscription is registered and goes when the

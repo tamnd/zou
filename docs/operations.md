@@ -35,6 +35,8 @@ They run from a tenth of a millisecond to five minutes, five edges to the decade
 `zou_realtime_sockets` and `zou_realtime_subscribers` are what a socket tier is sized on: how many sockets this node is holding, and how many of them asked for database changes.
 Two numbers rather than one because they cost different things: a socket is a connection, a task and whatever the client has not read yet, and a subscriber is that plus a place in the change reader and a policy check per row that matches it.
 On a fleet they do not add up to one machine's, and that is the honest shape rather than a rounding: a socket served away from the node holding its project is a socket there and a subscriber on the holder, because the row it may see is decided where the database is.
+`zou_realtime_socket_tiers` is the third of them and is counted per project rather than per socket: how many projects this node is serving sockets for and does not write, which is one hub and one link each and the same again on the holder.
+It goes down as well as up, so a node with a lot of projects moving through it reads as what it is holding now rather than as everything it has ever seen.
 
 Store numbers come from the counter file `ZOU_STORE_STATS` names rather than from counters of this process, and a scrape folds that file in as it reads it.
 That is deliberate: the file is shared memory, so the ops a postgres backend made in another process are in it, and counting in process would count the ones this process can see and miss the rest.
@@ -400,6 +402,11 @@ A message that crosses is counted once for the crossing and once for each socket
 A lease that moves while sockets are on it is noticed by the tier that was built from it, which rereads the lease every `MOVED` in `crates/zou-server/src/gateway.rs` and gaps its sockets when the answer is a different node.
 Five seconds against a busy lease of fifteen that is renewed well inside that, so a handover is published inside one lease and noticed inside one of these, and the clients reconnect and land on the tier the new holder is behind.
 The cost is one cached lease lookup per project this node holds sockets for, which is the lookup the front door already makes for every request for that project.
+
+The same loop is what lets a tier go: nobody on it and nothing sent to it for `EMPTY`, fifteen minutes, and it is dropped along with the hub and the link behind it, which is one less linked node on the holder as well.
+Fifteen is the number an idle attach gets and is set beside it for the same reason, a client that comes back weighed against holding the thing until it does, not because a tier costs what an attach costs.
+An embedder that knows its own clients better can say otherwise with `fleet_keeping`.
+Watch `zou_realtime_socket_tiers` for whether the sweep is keeping up on a node with a lot of projects passing through it.
 
 A broadcast between two sockets on the same away node goes to the holder and comes back, because one ordering is the whole reason there is one link.
 
