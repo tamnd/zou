@@ -1026,7 +1026,7 @@ pub fn run_queue(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::redo::RedoPoolConfig;
     use std::sync::atomic::AtomicUsize;
@@ -1037,7 +1037,7 @@ mod tests {
     use zou_store::shardmanifest::publish_layer;
     use zou_store::shards::{prune_lineage, split};
 
-    fn seed(store: &dyn CasStore, tenant_ref: &str) -> TenantLayout {
+    pub(crate) fn seed(store: &dyn CasStore, tenant_ref: &str) -> TenantLayout {
         let layout = TenantLayout::new(tenant_ref);
         store
             .put_if_absent(&layout.manifest(), &Manifest::new(tenant_ref, 18).to_json())
@@ -1078,7 +1078,7 @@ mod tests {
         desc.name()
     }
 
-    fn put_image(
+    pub(crate) fn put_image(
         store: &dyn CasStore,
         layout: &TenantLayout,
         shard: u16,
@@ -1740,7 +1740,7 @@ mod tests {
 
     /// A pool that cannot start a worker, for passes whose bases all
     /// come out of images and never ask redo for anything.
-    fn dead_pool() -> RedoPool {
+    pub(crate) fn dead_pool() -> RedoPool {
         RedoPool::new(RedoPoolConfig {
             postgres: "/nonexistent/postgres".into(),
             scratch_root: std::env::temp_dir(),

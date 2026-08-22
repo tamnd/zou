@@ -2207,4 +2207,78 @@ mod tests {
             "zero is the escape hatch: keep everything, retire nothing"
         );
     }
+
+    /// The window the pass is given is the window a snapshot is judged
+    /// by, which is the whole reason the horizon is not a setting: a
+    /// point in time recovery that can still name an old checkpoint
+    /// keeps the layers under it, and the same store with a shorter
+    /// promise lets them go.
+    #[test]
+    fn a_merge_leaves_what_a_snapshot_inside_the_window_still_names() {
+        use crate::compact::tests::{dead_pool, put_image, seed};
+        use zou_store::layer::{ImageEntry, LayerKey, PAGE_IMAGE_LEN};
+        use zou_store::manifest::{CheckpointKind, CheckpointRef, Manifest};
+
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        let image = |key, at| {
+            put_image(
+                &store,
+                &layout,
+                0,
+                &[ImageEntry {
+                    key,
+                    page: vec![0xAA; PAGE_IMAGE_LEN],
+                }],
+                at,
+            )
+        };
+        // Two sparse images, which is the pair a merge exists to fold:
+        // neither is droppable, each is the only base for its key.
+        image(LayerKey::page(1663, 5, 90, 0, 1), 0x100);
+        image(LayerKey::page(1663, 5, 90, 0, 2), 0x200);
+
+        // A history snapshot from a hundred seconds ago naming a
+        // checkpoint at the older image.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        let mut snap = Manifest::new("t", 18);
+        snap.checkpoints = vec![CheckpointRef {
+            id: "c-1".into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+            owner: None,
+        }];
+        store
+            .put(
+                &format!("{}0000000001-{}.json", layout.manifests_dir(), now - 100),
+                &snap.to_json(),
+            )
+            .expect("snapshot");
+
+        let pool = dead_pool();
+        let horizon = || {
+            PageShardManifest::load(&store, &layout.shard_manifest(0))
+                .expect("load")
+                .expect("a shard that has published")
+                .0
+                .horizon
+        };
+        merge_pass(&store, "t", &pool, false, 3600);
+        assert_eq!(
+            horizon(),
+            None,
+            "the snapshot is inside the hour and the restore it promises \
+             needs the image its checkpoint sits on"
+        );
+
+        merge_pass(&store, "t", &pool, false, 10);
+        let bought = horizon().expect("the snapshot has fallen out of the window");
+        assert!(
+            bought > Lsn(0x100) && bought < Lsn(0x200),
+            "up to the flush point and a byte under it, {bought}"
+        );
+    }
 }
