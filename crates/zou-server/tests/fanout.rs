@@ -377,8 +377,14 @@ async fn a_link_that_drops_and_comes_back_delivers_what_it_missed() {
     join(&mut away, "realtime:room", "{}").await;
     join(&mut here, "realtime:room", "{}").await;
 
-    // The link is up and the topic is carried, which is what the round
-    // trip proves and why it goes first.
+    // The link is up and the topic is carried, which nothing below is
+    // worth anything without. It has to be proved by a broadcast from
+    // the away socket rather than to it: a join is answered on the spot,
+    // so the holder learning about the topic is a frame still on its way
+    // up, and the up frame is behind it on the same ordered link.
+    broadcast(&mut away, "realtime:room", "cursor", r#"{"x":0}"#).await;
+    assert!(heard(&mut here).await.ends_with(r#"{"x":0}"#));
+    // And then the direction this test is about.
     broadcast(&mut here, "realtime:room", "cursor", r#"{"x":1}"#).await;
     assert!(heard(&mut away).await.ends_with(r#"{"x":1}"#));
 
