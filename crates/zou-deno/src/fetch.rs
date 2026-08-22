@@ -48,7 +48,7 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// `Deno/2.1.4 (variant; SupabaseEdgeRuntime/1.74.2)`, which is its own
 /// navigator string. This one has zou in the brackets and says the same
 /// thing about the surface.
-fn user_agent() -> &'static str {
+pub(crate) fn user_agent() -> &'static str {
     static AGENT: OnceLock<String> = OnceLock::new();
     AGENT.get_or_init(crate::isolate::user_agent)
 }

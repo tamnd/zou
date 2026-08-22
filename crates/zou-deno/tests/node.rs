@@ -361,3 +361,31 @@ fn the_smaller_built_ins_answer_the_way_a_package_expects() {
          a=1&a=2&b=c%20d | linux1 | héllo | AssertionError:ERR_ASSERTION:not the same | slept"
     );
 }
+
+/// A package here is a url rather than a directory somebody unpacked,
+/// so the path of a file beside a module is that file's url, and the
+/// reads take one. What this is under is `readFileSync(fileURLToPath(
+/// new URL('./x.wasm', import.meta.url)))`, which is how every wasm
+/// library finds its own wasm.
+#[test]
+fn the_path_of_a_file_beside_a_package_is_the_url_it_is_at() {
+    let said = served(
+        r#"
+        import { fileURLToPath } from "node:url";
+        const said = [
+          fileURLToPath("https://esm.sh/x@1/y.wasm"),
+          fileURLToPath(new URL("./z.ttf", "https://esm.sh/x@1/a/b.mjs")),
+        ];
+        try {
+          fileURLToPath("data:text/plain,hi");
+        } catch (why) {
+          said.push(why.code);
+        }
+        Deno.serve(() => new Response(said.join(" ")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "https://esm.sh/x@1/y.wasm https://esm.sh/x@1/a/z.ttf ERR_INVALID_URL_SCHEME"
+    );
+}

@@ -400,6 +400,19 @@ async fn op_zou_read_file(state: Rc<RefCell<OpState>>, #[string] name: String) -
     }
 }
 
+/// While a module is being evaluated, and gone once it is.
+///
+/// A synchronous read of a url serves the module cache and will not
+/// fetch, because a fetch on this thread is an isolate that has stopped
+/// answering anybody. That rule is right for a handler and wrong for
+/// the top of a module, where a package reads its own wasm out of the
+/// registry with `readFileSync` and there is nothing else for the
+/// isolate to be doing anyway: the module load either side of it is a
+/// blocking fetch on the same thread. So the marker says which of the
+/// two is happening, and it is a marker rather than a flag because the
+/// window it describes is exactly the one somebody put it in for.
+struct Loading;
+
 /// The same, for the two sync spellings, which upstream turns on for a
 /// worker with `useReadSyncFileAPI` and which a function serving a page
 /// out of its own directory usually reaches for.
@@ -407,7 +420,7 @@ async fn op_zou_read_file(state: Rc<RefCell<OpState>>, #[string] name: String) -
 #[serde]
 fn op_zou_read_file_sync(state: &mut OpState, #[string] name: String) -> Read {
     if elsewhere(&name) {
-        return match crate::module::bytes(&name, false) {
+        return match crate::module::bytes(&name, state.try_borrow::<Loading>().is_some()) {
             Ok(bytes) => Read::Bytes {
                 bytes: bytes.into(),
             },
@@ -880,6 +893,7 @@ async fn build(
     }
     .map_err(|e| format!("the prelude did not run: {e}"))?;
 
+    js.op_state().borrow_mut().put(Loading);
     let id = watch
         .timing(js.load_main_es_module(&specifier))
         .await
@@ -920,6 +934,7 @@ async fn build(
             .await
             .map_err(|e| why(&specifier, &watch, e))?
     };
+    js.op_state().borrow_mut().take::<Loading>();
 
     // `export default { fetch }` is one of the three ways upstream lets
     // a module say what to run, and the only one the module says by
