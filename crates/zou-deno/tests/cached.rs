@@ -58,6 +58,11 @@ fn a_warm_cache_is_a_cold_start_that_touches_nothing() {
     unsafe {
         std::env::set_var("ZOU_MODULE_CACHE", cache.path());
         std::env::set_var("ZOU_MODULE_CACHE_ONLY", "1");
+        // Nothing asked of the registry, so the url under which this
+        // writes the cache by hand is the url the loader looks under.
+        // Which build a package is served is a different question and
+        // has its own tests.
+        std::env::set_var("ZOU_MODULE_BUILD", "");
     }
     // A package as the registry would have served it, imports and all,
     // so what is exercised is the graph and not one file.
@@ -105,5 +110,6 @@ fn a_warm_cache_is_a_cold_start_that_touches_nothing() {
     unsafe {
         std::env::remove_var("ZOU_MODULE_CACHE");
         std::env::remove_var("ZOU_MODULE_CACHE_ONLY");
+        std::env::remove_var("ZOU_MODULE_BUILD");
     }
 }

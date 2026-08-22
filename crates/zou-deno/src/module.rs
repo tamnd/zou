@@ -42,10 +42,20 @@ use crate::imports::Imports;
 /// two specifiers every example is written with.
 const REGISTRY: &str = "https://esm.sh";
 
+/// Which of the registry's builds a package is asked for, as the query
+/// that asks for it, or nothing for whatever the registry serves by
+/// default. Overridable with `ZOU_MODULE_BUILD`, where an empty value
+/// is the registry's default, because a mirror that is not esm.sh has
+/// its own idea of what a query means.
+const BUILD: Option<&str> = Some("dev");
+
 /// Loads a function's modules, off the disk it was deployed onto and
 /// off the network for the ones that are not there.
 pub struct Disk {
     registry: String,
+    /// The query appended to a package's url, which is how the build is
+    /// asked for.
+    build: Option<String>,
     /// Where fetched modules live between runs.
     cache: PathBuf,
     /// Whether this server may fetch at all. A deployment that warmed
@@ -109,11 +119,39 @@ impl Disk {
             registry: named("ZOU_MODULE_REGISTRY")
                 .map(|it| it.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| REGISTRY.to_string()),
+            build: match std::env::var("ZOU_MODULE_BUILD") {
+                Ok(asked) => Some(asked).filter(|it| !it.is_empty()),
+                Err(_) => BUILD.map(str::to_string),
+            },
             cache: cache(),
             cached_only: named("ZOU_MODULE_CACHE_ONLY").is_some(),
             imports,
             read,
             landed: Landed::default(),
+        }
+    }
+
+    /// A package's url with the build asked for on it.
+    ///
+    /// esm.sh minifies what it serves, and a minified class is a class
+    /// with a one letter name. That is not cosmetic: a library that
+    /// reports `this.constructor.name`, brands an error or compares a
+    /// name reads differently here than it does on a runtime that
+    /// unpacks the tarball, and every one of those differences looks
+    /// like a runtime bug until somebody reads the bytes. The build
+    /// under `dev` is the same package unminified, which is the one
+    /// that carries the names the author wrote.
+    ///
+    /// A specifier that already asks the registry for something keeps
+    /// what it asked for, because `npm:x@1?target=es2020` is a real
+    /// line and the second query joins it rather than replacing it.
+    fn built(&self, url: String) -> String {
+        match &self.build {
+            None => url,
+            Some(build) => {
+                let joiner = if url.contains('?') { '&' } else { '?' };
+                format!("{url}{joiner}{build}")
+            }
         }
     }
 
@@ -189,10 +227,10 @@ impl ModuleLoader for Disk {
             .and_then(|imports| imports.resolve(specifier, referrer));
         let specifier: &str = mapped.as_deref().unwrap_or(specifier);
         if let Some(rest) = specifier.strip_prefix("npm:") {
-            return url(&format!("{}/{}", self.registry, bare(rest)));
+            return url(&self.built(format!("{}/{}", self.registry, bare(rest))));
         }
         if let Some(rest) = specifier.strip_prefix("jsr:") {
-            return url(&format!("{}/jsr/{}", self.registry, bare(rest)));
+            return url(&self.built(format!("{}/jsr/{}", self.registry, bare(rest))));
         }
         if let Some(rest) = specifier.strip_prefix("node:") {
             if crate::node::source(rest).is_none() {
@@ -710,6 +748,16 @@ mod tests {
             imports: None,
             read: Reads::default(),
             landed: Landed::default(),
+            build: BUILD.map(str::to_string),
+        }
+    }
+
+    /// The same loader with nothing asked of the registry, which is
+    /// what an operator pointing at a mirror gets.
+    fn plain() -> Disk {
+        Disk {
+            build: None,
+            ..loader()
         }
     }
 
@@ -722,15 +770,15 @@ mod tests {
     #[test]
     fn an_npm_specifier_becomes_a_url_on_the_registry() {
         let one = resolved("npm:@supabase/supabase-js@2", "file:///f/index.ts").unwrap();
-        assert_eq!(one.as_str(), "https://esm.sh/@supabase/supabase-js@2");
+        assert_eq!(one.as_str(), "https://esm.sh/@supabase/supabase-js@2?dev");
         let two = resolved("npm:zod@3.23.8/lib/index.js", "file:///f/index.ts").unwrap();
-        assert_eq!(two.as_str(), "https://esm.sh/zod@3.23.8/lib/index.js");
+        assert_eq!(two.as_str(), "https://esm.sh/zod@3.23.8/lib/index.js?dev");
     }
 
     #[test]
     fn a_jsr_specifier_says_jsr_on_the_way() {
         let one = resolved("jsr:@std/encoding@1/hex", "file:///f/index.ts").unwrap();
-        assert_eq!(one.as_str(), "https://esm.sh/jsr/@std/encoding@1/hex");
+        assert_eq!(one.as_str(), "https://esm.sh/jsr/@std/encoding@1/hex?dev");
     }
 
     /// The slash after the scheme is allowed and is not a second slash
@@ -738,9 +786,38 @@ mod tests {
     #[test]
     fn the_slash_a_registrys_own_build_writes_is_not_a_second_slash() {
         let one = resolved("npm:/drizzle-orm@0.29.1/pg-core", "file:///f/index.ts").unwrap();
-        assert_eq!(one.as_str(), "https://esm.sh/drizzle-orm@0.29.1/pg-core");
+        assert_eq!(
+            one.as_str(),
+            "https://esm.sh/drizzle-orm@0.29.1/pg-core?dev"
+        );
         let two = resolved("jsr:/@std/encoding@1/hex", "file:///f/index.ts").unwrap();
-        assert_eq!(two.as_str(), "https://esm.sh/jsr/@std/encoding@1/hex");
+        assert_eq!(two.as_str(), "https://esm.sh/jsr/@std/encoding@1/hex?dev");
+    }
+
+    /// A specifier that already asks the registry for something keeps
+    /// what it asked for, and the build joins the query rather than
+    /// starting a second one.
+    #[test]
+    fn a_specifier_that_already_has_a_query_keeps_it() {
+        let one = resolved("npm:preact@10.19.3?target=es2022", "file:///f/index.ts").unwrap();
+        assert_eq!(
+            one.as_str(),
+            "https://esm.sh/preact@10.19.3?target=es2022&dev"
+        );
+    }
+
+    /// Nothing asked for is nothing appended, so a mirror that has its
+    /// own idea of what a query means is served the bare url.
+    #[test]
+    fn a_registry_with_no_build_asked_of_it_is_left_alone() {
+        let url = plain()
+            .resolve(
+                "npm:@supabase/supabase-js@2",
+                "file:///f/index.ts",
+                ResolutionKind::Import,
+            )
+            .unwrap();
+        assert_eq!(url.as_str(), "https://esm.sh/@supabase/supabase-js@2");
     }
 
     /// A cdn that serves a module with no content type, which is one

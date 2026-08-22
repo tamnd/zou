@@ -51,7 +51,8 @@ fn registry() -> String {
                         true => "denonext",
                         false => "browser",
                     };
-                    let body = format!("export const built = \"{build}\";");
+                    let body =
+                        format!("export const built = \"{build}\";\nexport const asked = \"{path}\";");
                     format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/javascript\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{body}",
                         body.len()
@@ -117,6 +118,18 @@ fn a_build_the_registry_will_not_make_is_asked_for_again_as_the_one_it_will() {
     )
     .expect("an answer");
     assert_eq!(body(&served), "denonext");
+
+    // And what the registry was asked for carries the build, since a
+    // minified package is a package whose classes are called things
+    // like `I` and the unminified one is what the names come from.
+    let served = answered(
+        r#"
+        import { asked } from "npm:ordinary@1";
+        Deno.serve(() => new Response(asked));
+        "#,
+    )
+    .expect("an answer");
+    assert_eq!(body(&served), "/ordinary@1?dev");
 
     unsafe {
         std::env::remove_var("ZOU_MODULE_CACHE");

@@ -68,6 +68,11 @@ fn a_package_reads_a_file_of_its_own_from_beside_where_it_landed() {
     unsafe {
         std::env::set_var("ZOU_MODULE_CACHE", cache.path());
         std::env::set_var("ZOU_MODULE_CACHE_ONLY", "1");
+        // Nothing asked of the registry, so the url under which this
+        // writes the cache by hand is the url the loader looks under.
+        // Which build a package is served is a different question and
+        // has its own tests.
+        std::env::set_var("ZOU_MODULE_BUILD", "");
     }
     keep(
         cache.path(),
@@ -179,5 +184,6 @@ fn a_package_reads_a_file_of_its_own_from_beside_where_it_landed() {
     unsafe {
         std::env::remove_var("ZOU_MODULE_CACHE");
         std::env::remove_var("ZOU_MODULE_CACHE_ONLY");
+        std::env::remove_var("ZOU_MODULE_BUILD");
     }
 }
