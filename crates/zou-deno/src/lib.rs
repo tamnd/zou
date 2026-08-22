@@ -106,10 +106,12 @@
 //! packages as modules, esm.sh by default, and kept on disk after the
 //! first time. There is no node module resolution here and no CJS: what
 //! runs is the registry's build of the package. Which build that is
-//! depends on who the registry thinks is asking, and this asks as Deno,
-//! because the Deno build is the one a package author tested on a Deno
-//! runtime. What that build imports is `node:`, which is why the built
-//! ins in `node/` are here at all.
+//! depends on who the registry thinks is asking, and this asks as
+//! itself, which gets the build made for a browser: the corpus in
+//! `docs/functions.md` ran thirty two of forty functions that way and
+//! twenty five asking as Deno, and `fetch.rs` says what the seven are.
+//! That build still reaches for `node:buffer` and `node:process`, which
+//! is one of the reasons the built ins in `node/` are here.
 //!
 //! Typescript is real: `deno_ast` is the same swc transpiler Deno uses,
 //! so what runs is what would run there.

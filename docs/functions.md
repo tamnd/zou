@@ -571,7 +571,7 @@ What runs is the registry's build of the package rather than the tarball npm wou
 
 - Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
 - A package that reaches for a node built in runs if the built in is one of the ones below, and is refused by the name of the one it wanted if it is not.
-- The loader asks the registry as `Deno/2.1.4 (variant; zou/<version>)`, the same sentence `navigator.userAgent` reads, and that decides which build comes back. esm.sh serves a Deno agent the build it makes for Deno, which is the build a package author tested on a Deno runtime, and serves anything else the build it makes for a browser. What the Deno build imports is `node:`, which is the whole reason the built ins exist here.
+- The loader asks the registry as `zou-edge-runtime`, and that decides which build comes back. esm.sh serves a Deno agent the build it makes for Deno, which is the build a package author tested on a Deno runtime, and serves anything else the build it makes for a browser, with the platform bits stubbed out. The browser build is the one that links here, and the reason is measured rather than argued: the Supabase examples corpus, run on the same machine on the same afternoon against both, ran thirty two of forty functions asking as this and twenty five asking as Deno. The seven it costs are packages whose Deno build imports `node:child_process`, `node:diagnostics_channel` or `node:module`, and four of the seven want to start a process, which is not something a function here is ever going to do. What asking as itself costs is the other direction: a package whose browser build needs something a browser has and this does not, such as a `.wasm` esbuild will not bundle, is a 500 from the registry rather than a module.
 - `@supabase/supabase-js` runs. `createClient` builds its auth, storage, functions and realtime clients, and the realtime one is a `WebSocket`, which is why that had to exist before this line could say so.
 - `http:` is refused. A module arrives and is executed, so it arrives over https.
 - `data:` is not supported yet.
@@ -581,6 +581,7 @@ What runs is the registry's build of the package rather than the tarball npm wou
 ### Node built ins
 
 `node:` is a specifier here, and what it resolves to is javascript carried in the binary rather than anything on the network.
+A function may import one itself, and so may a package the registry served, which is the other reason they exist: the browser build of a package still reaches for `node:buffer` and `node:process` here and there.
 
 ```
 assert  buffer  crypto  events  fs  fs/promises  os  path  process
