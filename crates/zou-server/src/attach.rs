@@ -50,6 +50,21 @@ pub trait Backend: Send + Sync {
     /// safe to call for a ref that was never up, since a failed attach
     /// leaves nothing behind and is swept the same way.
     fn down(&self, tenant_ref: &str);
+
+    /// Called on a blocking thread when the entry says the project has
+    /// been deployed to since this attach was built, before the request
+    /// that noticed is answered. A backend that has nothing to pick up
+    /// leaves it alone.
+    ///
+    /// It is expected to put the new deployment where the requests
+    /// already go, rather than build a new front door, because the
+    /// front door is what the attach is. A backend that cannot do that
+    /// for some deployment can drop the tenant instead, and the next
+    /// request attaches it again.
+    fn refresh(&self, entry: &Tenant) -> Result<(), String> {
+        let _ = entry;
+        Ok(())
+    }
 }
 
 /// The default ceiling on tenants up at once. NFR-13 asks for a
@@ -84,6 +99,14 @@ struct Slot {
     /// neither budget will take it, which is what keeps a database from
     /// being stopped under a request that is still talking to it.
     busy: AtomicUsize,
+    /// Which deployment this attach was built from, out of the registry
+    /// entry it was built with. A request whose entry says a later one
+    /// is the request that pays for picking it up, and every other
+    /// request pays one relaxed load.
+    deployed: AtomicU64,
+    /// Held across a refresh so that two requests arriving together on
+    /// a project that was just deployed to do not both rebuild it.
+    refreshing: Mutex<()>,
 }
 
 impl Slot {
@@ -185,7 +208,38 @@ impl Attached {
         // the last one that should find it evicted when it gets there.
         let busy = Busy::of(slot.clone());
         let up = self.up(&slot, entry).await?;
+        self.caught_up(&slot, entry).await?;
         Ok(Hold { _busy: busy, up })
+    }
+
+    /// Pick up a deployment made since this attach was built.
+    ///
+    /// The comparison is the whole cost on a project nobody deployed
+    /// to, which is every project almost all of the time: one atomic
+    /// load against a number that came out of the registry entry the
+    /// node re-reads when its tenant cache expires anyway. Nothing here
+    /// asks the store for anything.
+    async fn caught_up(&self, slot: &Arc<Slot>, entry: &Tenant) -> Result<(), String> {
+        if slot.deployed.load(Ordering::Acquire) == entry.deployed {
+            return Ok(());
+        }
+        let _alone = slot.refreshing.lock().await;
+        // Again, because the request that was waiting on the lock is
+        // usually a second request for the same deployment.
+        if slot.deployed.load(Ordering::Acquire) == entry.deployed {
+            return Ok(());
+        }
+        let backend = self.backend.clone();
+        let entry = entry.clone();
+        let deployed = entry.deployed;
+        match tokio::task::spawn_blocking(move || backend.refresh(&entry)).await {
+            Ok(Ok(())) => {
+                slot.deployed.store(deployed, Ordering::Release);
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(format!("refresh: {e}")),
+        }
     }
 
     /// The router on its own, for a caller with no work to hold it
@@ -213,9 +267,14 @@ impl Attached {
         let backend = self.backend.clone();
         let entry = entry.clone();
         let tenant_ref = entry.tenant_ref.clone();
+        let deployed = entry.deployed;
+        let built_from = slot.clone();
         let up = slot
             .up
             .get_or_try_init(|| async move {
+                // What this attach is about to be built from, written
+                // where the next request will compare it.
+                built_from.deployed.store(deployed, Ordering::Release);
                 // Inside the cell, so what is timed is a cold attach
                 // and a warm request counts nothing at all. It is also
                 // the span worth having: the request that pays for a
@@ -311,6 +370,8 @@ impl Attached {
                     up: OnceCell::new(),
                     used: AtomicU64::new(0),
                     busy: AtomicUsize::new(0),
+                    deployed: AtomicU64::new(0),
+                    refreshing: Mutex::new(()),
                 })
             })
             .clone()
@@ -382,6 +443,9 @@ mod tests {
         ups: StdMutex<Vec<String>>,
         downs: StdMutex<Vec<String>>,
         fails: StdMutex<Vec<String>>,
+        /// Every deployment this backend was asked to pick up, in the
+        /// order it was asked.
+        refreshes: StdMutex<Vec<(String, u64)>>,
     }
 
     impl Fake {
@@ -396,6 +460,9 @@ mod tests {
         }
         fn downs(&self) -> Vec<String> {
             self.downs.lock().unwrap().clone()
+        }
+        fn refreshes(&self) -> Vec<(String, u64)> {
+            self.refreshes.lock().unwrap().clone()
         }
     }
 
@@ -416,6 +483,16 @@ mod tests {
         }
         fn down(&self, tenant_ref: &str) {
             self.downs.lock().unwrap().push(tenant_ref.to_string());
+        }
+        fn refresh(&self, entry: &Tenant) -> Result<(), String> {
+            if self.fails.lock().unwrap().contains(&entry.tenant_ref) {
+                return Err(format!("{} will not pick it up", entry.tenant_ref));
+            }
+            self.refreshes
+                .lock()
+                .unwrap()
+                .push((entry.tenant_ref.clone(), entry.deployed));
+            Ok(())
         }
     }
 
@@ -440,6 +517,67 @@ mod tests {
         }
         assert_eq!(fake.ups(), vec!["acme-prod"], "one attach, five requests");
         assert_eq!(attached.len().await, 1);
+    }
+
+    /// A project nobody deployed to, which is the case that has to cost
+    /// nothing: a thousand requests and the backend is never asked to
+    /// pick anything up.
+    #[tokio::test]
+    async fn a_project_that_was_not_deployed_to_is_never_rebuilt() {
+        let (fake, attached) = manager();
+        let mut entry = entry("acme-prod");
+        entry.deployed = 7;
+        for _ in 0..1000 {
+            let _ = attached.router(&entry).await.unwrap();
+        }
+        assert_eq!(fake.ups(), vec!["acme-prod"]);
+        assert!(
+            fake.refreshes().is_empty(),
+            "the attach was built from deployment 7 and the entry still says 7"
+        );
+    }
+
+    /// A deploy under a node that is already serving the project. The
+    /// entry the next request comes in with says a later deployment,
+    /// and the backend is asked to pick it up before that request is
+    /// answered, without the tenant being taken down.
+    #[tokio::test]
+    async fn a_deploy_under_a_running_node_is_picked_up_on_the_next_request() {
+        let (fake, attached) = manager();
+        let mut entry = entry("acme-prod");
+        let _ = attached.router(&entry).await.unwrap();
+        entry.deployed = 1;
+        let _ = attached.router(&entry).await.unwrap();
+        let _ = attached.router(&entry).await.unwrap();
+        entry.deployed = 2;
+        let _ = attached.router(&entry).await.unwrap();
+        assert_eq!(
+            fake.refreshes(),
+            vec![("acme-prod".to_string(), 1), ("acme-prod".to_string(), 2)],
+            "once per deployment, not once per request"
+        );
+        assert_eq!(fake.ups(), vec!["acme-prod"], "and never a second attach");
+        assert!(fake.downs().is_empty());
+    }
+
+    /// A backend that cannot pick a deployment up says so to the
+    /// request that noticed, and the one after it is asked again rather
+    /// than being served the old deployment quietly.
+    #[tokio::test]
+    async fn a_deployment_that_cannot_be_picked_up_is_not_written_off() {
+        let (fake, attached) = manager();
+        let mut entry = entry("acme-prod");
+        let _ = attached.router(&entry).await.unwrap();
+        entry.deployed = 1;
+        fake.fail("acme-prod");
+        let failed = attached.router(&entry).await;
+        assert_eq!(
+            failed.err().as_deref(),
+            Some("acme-prod will not pick it up")
+        );
+        fake.stop_failing();
+        let _ = attached.router(&entry).await.unwrap();
+        assert_eq!(fake.refreshes(), vec![("acme-prod".to_string(), 1)]);
     }
 
     #[tokio::test]
