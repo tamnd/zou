@@ -308,6 +308,12 @@ The room comes back on the next attach, or on the next sweep if no attach arrive
 `--shared-buffers` is per tenant and defaults to 16MB, small on purpose: the ceiling multiplies it, and the store backed page cache is the tier that is supposed to be doing the work.
 A node running a few large projects rather than a thousand small ones should raise it.
 
+`--max-connections` is the same trade on the same axis and defaults to 40 per tenant.
+Forty is one bank of the pooler at 20, the http door's own pool at 10, three postgres keeps back for a superuser, and a little room.
+It is also an arithmetic ceiling on write rate: forty concurrent commits at twenty five rows a transaction is a thousand rows a second and nothing left over, so a node doing serious write volume for a few projects should raise it and a node packed with a thousand quiet ones should not.
+Under the three numbers added up it is refused at the command line, since a project that cannot open the connections its own pooler wants is a project that stops rather than one that is slow.
+A project that runs out answers `53300` with the postmaster's own `sorry, too many clients already` and then a sentence saying the ceiling is this flag, because the postmaster's message names no setting and the setting is not the operator's.
+
 A postmaster that dies on its own detaches its tenant, so the next request attaches again instead of being routed at a database that is not there.
 One that was asked to stop does not, because something already did.
 Runtime directories are `<ref>-<n>` and never bare `<ref>`, so a detach followed immediately by an attach does not put a new postmaster in the directory the old one is still shutting down in.
@@ -332,6 +338,13 @@ An attach that is replaying is given as long as it keeps moving.
 A postmaster has sixty seconds to say it is accepting connections, and one that is still in redo says where it has got to every ten seconds, so every report with a newer LSN than the last one starts those sixty seconds again, up to ten minutes for the attach as a whole.
 Without that a project with an hour of WAL behind it is a project that cannot be attached at all rather than one that is slow to attach, because the postmaster killed at sixty seconds wrote nothing anybody would start from and its replacement begins at the same redo point with the same sixty seconds.
 A redo that reports the same LSN twice is stuck rather than slow and is killed on the spot, and so is one that is still going at the ten minutes, since leaving it be would let the retry start a second postmaster on a project that already has one.
+
+An attach that was given up on part way leaves its runtime directory behind, and the next attach of that project carries on from it.
+Crash recovery takes no restartpoints, so redo does begin where it began before; what the next attempt does not do again is restore the skeleton, replay the WAL ahead of it, or read a single page the last attempt already pulled out of the store into the tenant's page cache.
+On a remote store that is nearly all of the wall clock, and it is the difference between attempts that add up and seven identical attempts that all die in the same place.
+The directory is only reused while the project's manifest is byte for byte the one it was set aside with, because the page cache is keyed by block and holds no LSN, so anything that moved the store, a fold, a checkpoint, a shard split, or another node taking the lease, throws it away and starts over.
+A node holds at most eight of them at once and only for projects whose redo was moving when it was given up on; over that the newest is dropped rather than an older one, since an older one belongs to a project somebody is retrying.
+The lines to look for are `keeping <dir> so the next attach carries on from it` and `carrying on from the attach that was given up on`.
 
 What is left of a cold attach is the writes: recovery dirties every page it changed and the end of recovery checkpoint puts them back one at a time, which is where the rest of those ten minutes goes and is the storage engine's problem rather than this command's.
 

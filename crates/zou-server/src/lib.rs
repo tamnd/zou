@@ -510,7 +510,11 @@ impl App {
 }
 
 /// PostgREST's default db-pool size, a sane dev loop default here too.
-const POOL_SIZE: usize = 10;
+///
+/// Public because it is one of the three numbers that have to fit
+/// inside a tenant postmaster's `max_connections`, and the command line
+/// that sets that one has to be able to add them up.
+pub const POOL_SIZE: usize = 10;
 
 fn app_state(mut cfg: Config) -> Result<Arc<App>, String> {
     if cfg.schemas.is_empty() {

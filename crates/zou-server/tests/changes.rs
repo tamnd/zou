@@ -914,3 +914,169 @@ async fn nothing_is_read_once_the_last_subscriber_has_gone() {
     }
     panic!("the slot outlived the socket that needed it");
 }
+
+/// A lock somebody else is holding on the catalog behind
+/// `pg_publication_tables`.
+///
+/// Setting a subscription up is a read of that view and then, on a
+/// project's first subscriber, a wait for a replication slot. A test
+/// needs the setup to take a knowable length of time rather than
+/// however long this database feels like taking over a slot, and this
+/// is the lever: the catalog read waits on this lock, so the
+/// subscription is being set up for exactly as long as the test says.
+struct Locked {
+    client: tokio_postgres::Client,
+    held: tokio::task::JoinHandle<()>,
+}
+
+impl Locked {
+    async fn publication(dsn: &str) -> Locked {
+        let (client, connection) = dsn
+            .parse::<tokio_postgres::Config>()
+            .expect("a dsn")
+            .connect(tokio_postgres::NoTls)
+            .await
+            .expect("a connection");
+        let held = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute("begin; lock table pg_publication_rel in access exclusive mode")
+            .await
+            .expect("the catalog locks");
+        Locked { client, held }
+    }
+
+    async fn release(self) {
+        self.client
+            .batch_execute("rollback")
+            .await
+            .expect("it lets go");
+        self.held.abort();
+    }
+}
+
+/// The next frame on a socket, whichever kind it is.
+///
+/// The text reader the rest of this file uses will not do here: a
+/// broadcast to a 2.0.0 socket is binary, and a broadcast is what this
+/// is waiting for.
+async fn anything(socket: &mut Socket, within: Duration) -> Option<String> {
+    let message = tokio::time::timeout(within, socket.next()).await.ok()?;
+    match message
+        .expect("the socket is still open")
+        .expect("a message")
+    {
+        Message::Text(text) => Some(text.to_string()),
+        Message::Binary(bytes) => Some(String::from_utf8_lossy(&bytes).to_string()),
+        other => panic!("{other:?} is neither"),
+    }
+}
+
+/// The link is not a queue of one.
+///
+/// A holder used to answer a subscription in line: it stopped reading
+/// the link while it worked out what the subscriber had asked for,
+/// which is a catalog read and, on a project's first subscriber, a wait
+/// for the tap. Everything else behind that node's link waited for one
+/// client's join, and nothing about a broadcast for a different socket
+/// has anything to do with that client's tables.
+///
+/// So: a subscription is held up on purpose, and a broadcast from
+/// another socket on the same node has to cross while it is. The
+/// subscription is still unanswered when it does, which is what says
+/// the broadcast went past it rather than after it.
+#[tokio::test]
+async fn a_broadcast_crosses_the_link_while_a_subscription_is_being_set_up() {
+    let Some(dsn) = dsn() else { return };
+    if !logical(&dsn).await {
+        return;
+    }
+    let _alone = alone().lock().await;
+    settled(&dsn).await;
+    published(
+        &dsn,
+        "chg_inline",
+        "create table chg_inline (id int primary key);
+         grant select on chg_inline to anon, authenticated;",
+    )
+    .await;
+    let (holder, away) = two(&dsn).await;
+
+    // One socket on each node, on a topic that has nothing to do with
+    // the database, joined before anything is blocked so that their own
+    // frames are long since over the link.
+    let mut talking = connect(away).await;
+    let mut listening = connect(holder).await;
+    for socket in [&mut talking, &mut listening] {
+        send(
+            socket,
+            r#"["1","1","realtime:room","phx_join",{"config":{}}]"#,
+        )
+        .await;
+        let reply = next(socket).await;
+        assert_eq!(reply[4]["status"], "ok", "{reply}");
+    }
+    // And one that hears the other one, so that the link between them
+    // is known to be up before it is asked to carry anything under a
+    // deadline.
+    send(
+        &mut talking,
+        r#"["1","2","realtime:room","broadcast",{"type":"broadcast","event":"ping","payload":{"n":0}}]"#,
+    )
+    .await;
+    let first = anything(&mut listening, Duration::from_secs(10)).await;
+    assert!(
+        first.as_deref().is_some_and(|text| text.contains("ping")),
+        "the link does not carry a broadcast at all: {first:?}"
+    );
+
+    let locked = Locked::publication(&dsn).await;
+    let mut subscribing = connect(away).await;
+    send(
+        &mut subscribing,
+        &json!(["1", "1", "realtime:db", "phx_join", {
+            "config": {"postgres_changes": [
+                {"event": "*", "schema": "public", "table": "chg_inline"}
+            ]},
+            "access_token": token(ANA),
+        }])
+        .to_string(),
+    )
+    .await;
+    // Long enough that the frame is waiting on the lock rather than on
+    // the network.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    send(
+        &mut talking,
+        r#"["1","3","realtime:room","broadcast",{"type":"broadcast","event":"cursor","payload":{"n":1}}]"#,
+    )
+    .await;
+    let heard = anything(&mut listening, Duration::from_secs(3)).await;
+    assert!(
+        heard.as_deref().is_some_and(|text| text.contains("cursor")),
+        "the broadcast never crossed, because the link was stopped while a subscription for a \
+         different socket was being set up: {heard:?}"
+    );
+    // Which it went past rather than after: the join is still waiting
+    // on the lock this test is holding.
+    quiet(&mut subscribing).await;
+
+    locked.release().await;
+    // And then it is answered, and the reply comes before anything
+    // under it, which is the ordering that answering aside has to keep.
+    let reply = next(&mut subscribing).await;
+    assert_eq!(reply[4]["status"], "ok", "{reply}");
+    assert_eq!(reply[3], "phx_reply", "{reply}");
+    let system = next(&mut subscribing).await;
+    assert_eq!(system[3], "system", "{system}");
+    assert_eq!(system[4]["status"], "ok", "{system}");
+    tapping(&dsn).await;
+
+    // A row written the moment it is subscribed still arrives behind
+    // the reply, over the link, with a database behind it.
+    run(&dsn, "insert into chg_inline (id) values (1)").await;
+    let change = changed(&mut subscribing).await;
+    assert_eq!(change["data"]["record"]["id"], 1, "{change}");
+}
