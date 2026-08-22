@@ -836,10 +836,38 @@ The copy is v8's own serializer, which is what upstream's is too, so what it ref
 Two things a copy loses, both of them measured on a real `supabase start` rather than decided here.
 
 - A platform object arrives as an empty object. A `Blob`, a `File`, a `Headers`, a `URL`, a `Response` and a stream all keep what they hold where the serializer cannot see it, so the copy is `{}` rather than a copy or a refusal. A library cloning options with a `Blob` in them loses it on both servers.
-- A buffer named for transfer is copied and left where it was. `structuredClone(value, { transfer: [buf] })` reads the list and checks it and then does not act on it, so `buf` is still readable afterwards, where a browser and a newer Deno both leave it detached. The checking is not idle: an `ArrayBuffer` is the only transferable thing on either server, and a stream, a typed array or anything that is not an object in that list is refused by name.
+- A buffer named for transfer is copied and left where it was. `structuredClone(value, { transfer: [buf] })` reads the list and checks it and then does not act on it, so `buf` is still readable afterwards, where a browser and a newer Deno both leave it detached. The checking is not idle: an `ArrayBuffer` and a `MessagePort` are the transferable things on either server, and a stream, a typed array or anything that is not an object in that list is refused by name.
+A port is the one of the two that is really moved, and there is a section on it below.
 
 A class instance is a plain object afterwards, a getter becomes the value it returned, an error keeps its name and message and loses what was hung on it, and a hole in an array stays a hole.
 All of that is v8 rather than a choice, and all of it is the same on both servers.
+
+## A channel with two ports
+
+`MessageChannel` gives you two ports, and what is posted into one arrives at the other as a `message` event.
+
+```ts
+const channel = new MessageChannel()
+channel.port1.onmessage = (event) => console.log("heard", event.data)
+channel.port2.postMessage({ n: 1 })
+```
+
+There is one isolate here and no worker to be on the far side, so both ports are in the same call.
+The point of them is not the thread they cross but the queue they are, which is what a library uses when it wants a reader on one side and a writer on the other, and several of them make a channel on the way to something else whether or not they ever send anything across it.
+
+What arrives is a copy taken when it was posted, through the same serializer `structuredClone` uses, so the sender changing the object afterwards changes nothing that arrives and a value that cannot be copied throws a `DataCloneError` at the `postMessage` rather than later.
+
+The rest of it, all measured against the reference runtime.
+
+- Setting `onmessage` starts the port, and a handler set long after the messages were posted still sees them. `addEventListener("message", ...)` on its own does not start anything, and needs a `start()`. Setting `onmessage` to null starts nothing and does not stop a port that was already started.
+- A message is delivered ahead of a timer that was set before it, and a message a handler posts is delivered ahead of a timer that same handler sets. Two ports answering each other still let the timers through, one round of messages per turn of the loop, because the round after this one is booked before any handler runs.
+- `close()` throws away what was waiting and takes the other end with it. A message posted before the close and not yet delivered is gone, and posting into a closed port is quiet rather than an error.
+- A port named in a transfer list is really transferred: it arrives as a fresh port holding the same end, still holding whatever was posted to it before it was sent, and the port it came from reaches nobody afterwards without saying so. That works both through `structuredClone(port, { transfer: [port] })` and through `postMessage(data, [port])`, where the arrived port is in `event.ports`.
+- A port that is not in the transfer list is refused rather than arriving as an empty object the way a `Blob` does, with v8's own words, `DataCloneError: Unsupported object type`. A port in its own transfer list is `DataCloneError: Can not transfer self`.
+
+One difference from the reference, which is a difference in when rather than in what.
+A message posted from a call is delivered on the microtask queue, so a microtask queued after the `postMessage` runs after the message here and before it upstream.
+Everything else about the order is the same, including the two cases above that libraries actually race.
 
 ## crypto
 
@@ -1041,7 +1069,7 @@ What comes back has `read`, `write`, `close`, `closeWrite`, `localAddr`, `remote
 
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.connect`, `Deno.connectTls`, `Deno.startTls`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `MessageChannel`, `MessagePort`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.connect`, `Deno.connectTls`, `Deno.startTls`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
 
 `AbortSignal` is the whole of it: the three statics, `AbortSignal.abort`, `AbortSignal.timeout` and `AbortSignal.any`, as well as what a controller makes.
 `fetch` takes one and a `Request` carries one, and the section on giving up on a call says what that does and where it stops.
@@ -1070,7 +1098,6 @@ Not present yet, and named rather than silently missing:
 - The rest of `crypto.subtle`: key derivation, the asymmetric algorithms, and every key format other than `raw`.
 - Byte streams. There is no `new ReadableStream({ type: "bytes" })`, no BYOB reader and no `TextDecoderStream`.
 - Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet. That also moves when the promise settles: upstream hands the response back when the headers arrive and this hands it back when the body is in, so a handler racing a slow answer against a clock sees the clock win here and the headers win there.
-- `MessageChannel` and `MessagePort`. Upstream has both and nothing here does, so a library that talks to itself over a port has nowhere to send. That is [#434](https://github.com/tamnd/zou/issues/434).
 - The rest of the file system. Reading a file the function's own `static_files` covers is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
 - The rest of the node built ins. Nineteen of them are here and the section on packages says what each one covers, and one that is not, `node:child_process` among them, is refused by name when it is resolved.
 
