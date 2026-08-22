@@ -20,6 +20,8 @@ export interface CreateZouOptions {
   schemas?: string[];
   /** The role a request with no key of its own runs as. Default anon. */
   anonRole?: string;
+  /** Whether a select may aggregate. Default true, false is what supabase start does. */
+  aggregates?: boolean;
   /** shared_buffers for the child postmaster. */
   sharedBuffers?: string;
   /** Branch the machine's template instead of running initdb. */

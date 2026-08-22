@@ -103,6 +103,20 @@ pub struct Config {
     /// The first is the default when no profile header picks one;
     /// empty means just public, the fresh Supabase project shape.
     pub schemas: Vec<String>,
+    /// Whether the REST surface answers a select that aggregates,
+    /// PostgREST's db-aggregates-enabled. True here, which is what the
+    /// hosted platform does and what zou did before the switch existed.
+    ///
+    /// Upstream defaults it off and the Supabase CLI never turns it
+    /// on, so `supabase start` refuses `select=total.sum()` with
+    /// PGRST123 while a hosted project answers it. That leaves no
+    /// single behaviour that matches both, and this takes the hosted
+    /// one: it is the surface a project ships against, an application
+    /// that works here works in production, and the reason upstream
+    /// turned it off, an unbounded aggregate reading a whole table, is
+    /// a reason to be able to turn it off rather than to be off. See
+    /// #555.
+    pub aggregates: bool,
     /// The role a request with no role of its own runs as, PostgREST's
     /// db-anon-role. Supabase names it `anon` and so does this by
     /// default. It is not only the fallback: it is also how a refusal
@@ -313,6 +327,7 @@ impl Default for Config {
             rate: None,
             jwks: None,
             schemas: Vec::new(),
+            aggregates: true,
             anon_role: "anon".to_string(),
             exposed_roles: Vec::new(),
             external_url: None,

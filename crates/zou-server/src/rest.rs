@@ -384,6 +384,21 @@ fn invalid_body(message: impl Into<String>) -> RestError {
     }
 }
 
+/// An aggregate asked of a surface that has them switched off,
+/// PostgREST's PGRST123. Upstream raises it after the select parses,
+/// so the grammar still answers first and a query with both a typo and
+/// a sum in it is told about the typo.
+fn aggregates_off() -> RestError {
+    RestError {
+        status: StatusCode::BAD_REQUEST,
+        code: "PGRST123".to_string(),
+        message: "Use of aggregate functions is not allowed".to_string(),
+        details: None,
+        hint: None,
+        headers: None,
+    }
+}
+
 /// Preferences the request asked for that nobody has, refused
 /// because it also asked to be told, PostgREST's PGRST122. The
 /// details name them in the order the header listed them.
@@ -831,6 +846,22 @@ fn parse_query(table: &str, raw: Option<&str>) -> Result<(Query, Extras), RestEr
     }
     window(&mut q, &limits, &offsets)?;
     Ok((q, extras))
+}
+
+/// Refuse a query that aggregates when this surface has aggregates
+/// off, which is PostgREST's db-aggregates-enabled and #555.
+///
+/// It reads the whole select tree rather than its top level, because
+/// `select=id,orders(count())` aggregates as much as `select=count()`
+/// does and upstream refuses both. It is asked after the query string
+/// has parsed and before anything is planned, so a bad grammar still
+/// answers first and nothing has reached the database when the answer
+/// is no.
+fn refuse_aggregates(cfg: &Config, q: &Query) -> Result<(), RestError> {
+    match cfg.aggregates || !select::aggregates(&q.select) {
+        true => Ok(()),
+        false => Err(aggregates_off()),
+    }
 }
 
 /// The limits and offsets of one query string turned into the ones
@@ -2200,6 +2231,7 @@ async fn read(
     req: &Parts,
 ) -> Result<Response, RestError> {
     let (mut q, _) = parse_query(table, req.uri.query())?;
+    refuse_aggregates(&app.cfg, &q)?;
     apply_range(&mut q, &req.method, &req.headers);
     let mut prefer = parse_prefer(&req.headers);
 
@@ -2468,6 +2500,7 @@ async fn write(
     // getSchema order, so PGRST106 beats a bad body.
     let (schema, negotiated) = profile(&app.cfg.schemas, method, &req.headers)?;
     let (mut q, extras) = parse_query(table, req.uri.query())?;
+    refuse_aggregates(&app.cfg, &q)?;
 
     // A PUT names one row, so a window over it is a contradiction and
     // upstream refuses it while it is still reading the request, ahead
@@ -3134,6 +3167,7 @@ async fn invoke(
     // wrong is answered about the half the client wrote first.
     let joined = residual.join("&");
     let (query, extras) = parse_query(func, (!joined.is_empty()).then_some(joined.as_str()))?;
+    refuse_aggregates(&app.cfg, &query)?;
 
     // What the body says, which is the content type and then the
     // bytes. A form is argument pairs the same way a query string
