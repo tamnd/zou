@@ -289,6 +289,16 @@ Nothing is resolved per request, `--domain` has nothing left to name and is refu
 `ZOU_REF` sets it and `ZOU_TARGET` sets the store, for a platform that configures a container with variables rather than a command line.
 That is the shape a function or a container per project wants, and the Lambda, Cloud Run and Fly recipes are in [serverless.md](serverless.md).
 
+`--advertise http://10.0.0.4:54321` is what makes a node one of several rather than the only one.
+Without it a node believes every project on the store is its own, which is exactly true when there is one node and is why it is the default.
+With it the node publishes that address into every lease it takes, reads the lease before it attaches anything, and forwards a request for a project somebody else is writing to whoever is writing it instead of starting a second postmaster on the same data.
+A socket for that project is not forwarded, because an upgrade is not a request and an answer: it is served here on this node's own hub with one link to the writer behind it, and nothing is attached or leased for it.
+`--node iad-3` is what the node is called, which is the name it takes leases under and the name its peers see.
+It defaults to the hostname, which is right for a box and wrong for a container that gets a new one every deploy, so anything scheduled should say it.
+`ZOU_NODE_ID` and `ZOU_NODE_ENDPOINT` set the same two for a platform that configures with variables.
+`--ref` and `--advertise` are refused together: one project on this node is the other answer to the same question, and the door `--ref` builds has no forwarding in it.
+Reading a project this node does not hold, rather than forwarding it, waits on the lazy hydrate work ([#39](https://github.com/tamnd/zou/issues/39)), so there is no switch for it yet.
+
 Nothing is running until a request names a project.
 The first one for a cold tenant restores its runtime directory out of that tenant's own prefix and starts a postmaster on loopback with a private socket directory, and both are thrown away when it is let go of.
 `--max-attached` is how many are up at once and `--idle-secs` is how long an untouched one stays up, both defaulting to what the attach manager uses, and the sweep that enforces the second runs on a timer at a quarter of it, because a node that has gone quiet is exactly the node with no requests to notice on.

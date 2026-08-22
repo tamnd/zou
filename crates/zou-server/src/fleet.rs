@@ -35,6 +35,14 @@ pub struct Doors {
     pub routing: Routing,
     pub registry: Arc<Registry>,
     pub attached: Arc<Attached>,
+    /// What this node does with a project another node is writing.
+    ///
+    /// None is a node that believes every project on the store is its
+    /// own, which is true of one node and is what every deployment was
+    /// until a node could be told its own name and address. Set, and a
+    /// request for somebody else's project is forwarded to them and a
+    /// socket for it is served here on a link to them.
+    pub forwarding: Option<Arc<crate::forward::Forwarding>>,
     /// The http front door, on one port or on several. Several is the
     /// same api answering on every one of them, which a node published
     /// at more than one port needs, and which a load generator needs for
@@ -143,7 +151,9 @@ impl Doors {
                 );
                 crate::gateway::only(only, self.registry, self.attached)
             }
-            None => crate::gateway::gateway(self.routing, self.registry, self.attached),
+            None => {
+                crate::gateway::fleet(self.routing, self.registry, self.attached, self.forwarding)
+            }
         };
         serve_http(ports, front).await
     }

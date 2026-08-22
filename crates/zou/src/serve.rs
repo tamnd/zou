@@ -41,7 +41,7 @@ use zou_store::layout::TenantLayout;
 use zou_store::registry::Tenant;
 use zou_store::{CasStore, Manifest, open_store};
 
-pub const USAGE: &str = "usage: zou serve <target> [--ref <ref>] [--http <n[,n...]>] [--pg <n>] [--pool <n>] [--pg-tls-cert <file> --pg-tls-key <file>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>]";
+pub const USAGE: &str = "usage: zou serve <target> [--ref <ref>] [--http <n[,n...]>] [--pg <n>] [--pool <n>] [--pg-tls-cert <file> --pg-tls-key <file>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>] [--node <id>] [--advertise <url>]";
 
 pub const LAMBDA_USAGE: &str = "usage: zou lambda <target> [--ref <ref>] [--pg-bin <dir>] [--runtime <dir>] [--shared-buffers <size>] [--passthrough <size>]";
 
@@ -168,6 +168,16 @@ pub struct Args {
     /// Whether the door is the lambda runtime api instead of a port,
     /// which is `zou lambda` and nothing else.
     pub lambda: bool,
+    /// What this node is called, which is the name it takes leases
+    /// under and the name its peers see on them. None is the hostname,
+    /// which is right for a box and wrong for a container that gets a
+    /// new one every deploy, so a fleet should say it.
+    pub node: Option<String>,
+    /// The address other nodes reach this one at, published into every
+    /// lease this node takes. None, the default, and there is no
+    /// forwarding at all: this node believes every project on the store
+    /// is its own, which is exactly true of one node.
+    pub advertise: Option<String>,
 }
 
 /// A node that collects on a timer.
@@ -210,6 +220,10 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
     let mut gc_every = None;
     let mut policy = gc::Policy::default();
     let mut only = std::env::var("ZOU_REF").ok().filter(|r| !r.is_empty());
+    let mut node = std::env::var("ZOU_NODE_ID").ok().filter(|n| !n.is_empty());
+    let mut advertise = std::env::var("ZOU_NODE_ENDPOINT")
+        .ok()
+        .filter(|at| !at.is_empty());
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
         if lambda
@@ -226,6 +240,7 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
                     | "--max-attached"
                     | "--idle-secs"
                     | "--gc-every"
+                    | "--advertise"
             )
         {
             return Err(format!(
@@ -234,6 +249,8 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
         }
         match arg.as_str() {
             "--ref" => only = Some(need(&mut it, "--ref")?.clone()),
+            "--node" => node = Some(need(&mut it, "--node")?.clone()),
+            "--advertise" => advertise = Some(need(&mut it, "--advertise")?.clone()),
             "--pg-bin" => pg_bin = Some(PathBuf::from(need(&mut it, "--pg-bin")?)),
             "--runtime" => runtime = Some(PathBuf::from(need(&mut it, "--runtime")?)),
             "--http" => (http, http_more) = ports(&mut it, "--http")?,
@@ -359,6 +376,25 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
         }
         None => None,
     };
+    // A fleet is two nodes that can reach each other, so an address
+    // with no name behind it is half of one: the lease would say where
+    // to send a request and this node would not recognise its own,
+    // which is a node forwarding every project it holds to itself.
+    // Rather than refuse, name it after the box, which is right for a
+    // box and is why a container should say --node instead.
+    let node = match (&advertise, node) {
+        (_, Some(node)) => Some(node),
+        (Some(_), None) => Some(hostname()),
+        (None, None) => None,
+    };
+    // One project and a fleet are two different answers to the same
+    // question, and a node given both would take the second silently:
+    // --ref builds a door with no forwarding in it at all.
+    if advertise.is_some() && only.is_some() {
+        return Err(
+            "--ref serves one project on this node, so there is nothing to forward and --advertise has no one to say it to".to_string(),
+        );
+    }
     let pg_bin = install::pg_bin(pg_bin);
     let runtime = runtime
         .unwrap_or_else(|| std::env::temp_dir().join(format!("zou-serve-{}", std::process::id())));
@@ -382,7 +418,25 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
         gc,
         only,
         lambda,
+        node,
+        advertise,
     })
+}
+
+/// What this box calls itself, for a node that was not told.
+fn hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .ok()
+        .or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "node".to_string())
 }
 
 /// A number of bytes, written the way a person writes one: plain, or
@@ -665,6 +719,14 @@ struct Postmasters {
     /// into any of those databases to delete a year of refresh events
     /// by hand.
     audit: zou_server::audit::Settings,
+    /// What this node is called and where it is reached, handed to
+    /// every postmaster it starts because the lease is taken inside
+    /// postgres and the lease is where both of these have to end up.
+    /// None and None is one node, which takes leases under a name it
+    /// makes up from its host and its data directory and publishes no
+    /// address at all.
+    node: Option<String>,
+    endpoint: Option<String>,
     store: Arc<dyn CasStore>,
     state: Arc<State>,
 }
@@ -887,6 +949,8 @@ impl Backend for Postmasters {
             .env("ZOU_TARGET", &self.target)
             .env("ZOU_TENANT", &tenant_ref)
             .env("ZOU_PAGE_CACHE", &pagecache)
+            .envs(self.node.iter().map(|id| ("ZOU_NODE_ID", id)))
+            .envs(self.endpoint.iter().map(|at| ("ZOU_NODE_ENDPOINT", at)))
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -1348,6 +1412,8 @@ pub fn run(args: &Args) -> Result<(), String> {
             ttl: PASSTHROUGH_TTL,
         }),
         http: args.http,
+        node: args.node.clone(),
+        endpoint: args.advertise.clone(),
         realtime: zou_server::realtime::limits_from_env()?,
         audit: zou_server::audit::from_env()?,
         store,
@@ -1477,6 +1543,31 @@ pub fn run(args: &Args) -> Result<(), String> {
         std::thread::spawn(move || collect(&*store, gc));
     }
 
+    // What this node does with a project another node writes. Built
+    // from the address rather than from the name, because the name is
+    // only half of it: a node that knows what it is called and not
+    // where it is reached can recognise its own lease and can do
+    // nothing at all about anybody else's.
+    let forwarding = match (&args.advertise, &args.node) {
+        (Some(at), Some(id)) => {
+            let holder = zou_pg::holder_named(id);
+            log::info!(
+                "this node is {holder}, reached at {at}, and forwards what it does not hold"
+            );
+            Some(Arc::new(zou_server::forward::Forwarding::new(
+                holder,
+                zou_server::forward::Holders::new(Arc::new(zou_server::forward::StorePeers::new(
+                    Arc::clone(&backend.store),
+                ))),
+                Arc::new(zou_server::forward::Http::default()),
+            )))
+        }
+        _ => {
+            log::info!("no --advertise, so this node writes every project it is asked for");
+            None
+        }
+    };
+
     unsafe {
         let handler = on_signal as extern "C" fn(libc::c_int) as usize;
         libc::signal(libc::SIGINT, handler);
@@ -1485,6 +1576,7 @@ pub fn run(args: &Args) -> Result<(), String> {
 
     let doors = Doors {
         only: args.only.clone(),
+        forwarding,
         routing: Routing {
             domains: args.domains.clone(),
             path_prefix: args.path_prefix,
@@ -1678,6 +1770,81 @@ mod tests {
             args.gc.is_none(),
             "a node does not collect unless it was asked to"
         );
+    }
+
+    /// A node is one node until it is told where to find the others,
+    /// and until then it writes whatever it is asked for, which is what
+    /// every deployment did before this and is still right for most of
+    /// them.
+    #[test]
+    fn a_node_forwards_nothing_until_it_has_an_address() {
+        let args = parse(&argv(&["s3://bucket/fleet"])).unwrap();
+        assert_eq!(args.advertise, None);
+        assert_eq!(args.node, None, "and takes leases under a name it made up");
+    }
+
+    /// An address with no name behind it is a node that would forward
+    /// its own projects to itself, so it gets one. Saying --node is
+    /// still the right thing for anything whose hostname is a deploy
+    /// artefact.
+    #[test]
+    fn an_advertised_node_is_named_even_when_nobody_named_it() {
+        let args = parse(&argv(&[
+            "s3://bucket/fleet",
+            "--advertise",
+            "http://10.0.0.4:54321",
+        ]))
+        .unwrap();
+        assert_eq!(args.advertise.as_deref(), Some("http://10.0.0.4:54321"));
+        assert!(args.node.is_some_and(|id| !id.is_empty()));
+    }
+
+    #[test]
+    fn a_named_node_keeps_the_name_it_was_given() {
+        let args = parse(&argv(&[
+            "s3://bucket/fleet",
+            "--node",
+            "iad-3",
+            "--advertise",
+            "http://10.0.0.4:54321",
+        ]))
+        .unwrap();
+        assert_eq!(args.node.as_deref(), Some("iad-3"));
+    }
+
+    /// One project on this node and a fleet are two answers to the same
+    /// question. The door --ref builds has no forwarding in it, so a
+    /// node given both would take the second silently and forward
+    /// nothing.
+    #[test]
+    fn one_project_and_a_fleet_would_disagree() {
+        let stop = parse(&argv(&[
+            "./fleet",
+            "--ref",
+            "acme-prod",
+            "--advertise",
+            "http://10.0.0.4:54321",
+        ]))
+        .unwrap_err();
+        assert!(stop.contains("--advertise"), "{stop}");
+    }
+
+    /// A function is reached by whoever invokes it and holds one
+    /// project, so there is nobody to publish an address to.
+    #[test]
+    fn a_function_has_nowhere_to_advertise() {
+        let stop = parse_lambda(&argv(
+            [
+                "s3://bucket/fleet",
+                "--ref",
+                "acme-prod",
+                "--advertise",
+                "http://10.0.0.4:54321",
+            ]
+            .as_slice(),
+        ))
+        .unwrap_err();
+        assert!(stop.contains("--advertise"), "{stop}");
     }
 
     #[test]
@@ -2018,6 +2185,8 @@ mod tests {
 
     fn node(realtime: zou_server::realtime::Limits) -> Postmasters {
         Postmasters {
+            node: None,
+            endpoint: None,
             audit: zou_server::audit::Settings::default(),
             target: "s3://bucket/fleet".to_string(),
             pg_bin: PathBuf::from("/nonexistent"),

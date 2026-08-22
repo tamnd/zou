@@ -1689,7 +1689,7 @@ fn wal_holder() -> String {
     if let Ok(id) = std::env::var("ZOU_NODE_ID")
         && !id.is_empty()
     {
-        return format!("pg-wal-{id}");
+        return holder_named(&id);
     }
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
@@ -1712,6 +1712,31 @@ fn wal_holder() -> String {
         digest = digest.wrapping_mul(0x100_0000_01b3);
     }
     format!("pg-wal-{host}-{digest:016x}")
+}
+
+/// The lease holder string a node with a name of its own writes.
+///
+/// Public because the node has to recognise its own lease from outside
+/// the postmaster that took it. The front door reads the manifest and
+/// compares the holder against itself, and a node that guessed at this
+/// prefix would forward every one of its own projects to itself and
+/// answer 508 on the second hop. There is one spelling and it is here.
+pub fn holder_named(id: &str) -> String {
+    format!("pg-wal-{id}")
+}
+
+/// The address other nodes reach this one at, as the node's environment
+/// gave it.
+///
+/// Written into the lease beside the holder, because the holder is a
+/// name and a name is not something a peer can send a request to. None
+/// on every deployment that is one node, which is every embedded build,
+/// every one shot command and `zou serve` without `--advertise`, and
+/// the lease says nothing rather than saying somewhere wrong.
+fn wal_endpoint() -> Option<String> {
+    std::env::var("ZOU_NODE_ENDPOINT")
+        .ok()
+        .filter(|at| !at.is_empty())
 }
 
 /// A lap timer for a path worth reporting on. It keeps the phase names
@@ -1809,7 +1834,19 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     }
     laps.lap("manifest");
     let holder = wal_holder();
-    let held = match lease::acquire(&*store, &layout, &holder, WAL_LEASE_TTL_SECS, now_unix()) {
+    // The address goes in with the lease rather than after it, because
+    // the window between is a window in which another node reads a
+    // holder it cannot reach and refuses the request.
+    let endpoint = wal_endpoint();
+    let at = endpoint.as_deref();
+    let held = match lease::acquire_at(
+        &*store,
+        &layout,
+        &holder,
+        at,
+        WAL_LEASE_TTL_SECS,
+        now_unix(),
+    ) {
         Ok(held) => held,
         // Skew belongs on this arm with Held. It is the same refusal
         // with a diagnosis attached, and it is the case an operator is
@@ -1825,7 +1862,14 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             log::warn!("zou_wal_open: stealing the writer lease from {other}");
             let mut races = 0;
             loop {
-                match lease::steal(&*store, &layout, &holder, WAL_LEASE_TTL_SECS, now_unix()) {
+                match lease::steal_at(
+                    &*store,
+                    &layout,
+                    &holder,
+                    at,
+                    WAL_LEASE_TTL_SECS,
+                    now_unix(),
+                ) {
                     Ok(held) => break held,
                     Err(lease::LeaseError::Raced) if races < 8 => races += 1,
                     Err(e) => {
@@ -2566,6 +2610,19 @@ mod tests {
     use super::*;
     use std::ffi::CString;
     use zou_store::LocalFsStore;
+
+    /// The two sides of a fleet's one string. A postmaster takes the
+    /// lease under this and the front door recognises its own by
+    /// comparing against it, so a node whose two halves spelled it
+    /// differently would forward every project it holds to itself and
+    /// answer 508 on the second hop.
+    #[test]
+    fn a_named_node_takes_its_lease_under_the_name_the_front_door_looks_for() {
+        assert_eq!(holder_named("iad-3"), "pg-wal-iad-3");
+        unsafe { std::env::set_var("ZOU_NODE_ID", "iad-3") };
+        assert_eq!(wal_holder(), holder_named("iad-3"));
+        unsafe { std::env::remove_var("ZOU_NODE_ID") };
+    }
 
     /// The report names every phase in the order it ran, which is the
     /// only part of it a reader can rely on: the milliseconds are
