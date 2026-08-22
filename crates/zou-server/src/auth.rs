@@ -2093,6 +2093,53 @@ fn expired<T>(msg: &str) -> Result<T, Error> {
     Err(refused(StatusCode::FORBIDDEN, "otp_expired", msg))
 }
 
+/// What upstream calls an invitation that cannot be acted on. A token
+/// nobody issued, one that has already been spent and one that is too
+/// old are all this, because to somebody holding a bad token they are
+/// the same fact and telling them apart would tell a stranger which
+/// addresses have been invited.
+const INVITE_NOT_FOUND: &str = "invite_not_found";
+
+fn not_invited<T>() -> Result<T, Error> {
+    Err(refused(
+        StatusCode::NOT_FOUND,
+        INVITE_NOT_FOUND,
+        "Invite not found",
+    ))
+}
+
+/// The account an invitation was issued to, and the address it was
+/// issued at.
+///
+/// The token is the same token_hash a followed invitation link carries,
+/// so this is the mail link path's own lookup and the mail link path's
+/// own idea of too old, with the invitation's error shape on it rather
+/// than the link's.
+async fn invited(sess: &sql::Session, token: &str) -> Result<(String, String), Error> {
+    let sql = format!(
+        "select t.user_id::text, coalesce(u.email, ''),
+                coalesce(u.confirmation_sent_at > now() - interval '{OTP_EXP} seconds', false),
+                coalesce(u.banned_until > now(), false)
+           from auth.one_time_tokens t
+           join auth.users u on u.id = t.user_id
+          where t.token_hash = $1
+            and t.token_type::text = 'confirmation_token'
+            and u.deleted_at is null
+          limit 1"
+    );
+    let rows = sess.query(&sql, &[&token]).await?;
+    let Some(row) = rows.first() else {
+        return not_invited();
+    };
+    if row.get::<_, bool>(3) {
+        return banned();
+    }
+    if !row.get::<_, bool>(2) {
+        return not_invited();
+    }
+    Ok((row.get(0), row.get(1)))
+}
+
 fn banned<T>() -> Result<T, Error> {
     Err(refused(
         StatusCode::FORBIDDEN,
@@ -4575,8 +4622,43 @@ async fn sending_off(
     let challenge = field(query, "code_challenge");
     let method = field(query, "code_challenge_method");
     validate_pkce(method, challenge)?;
-    let state = new_flow(pool, &provider.name, challenge, method, referrer, target).await?;
+    // Asked here and not only at the callback, so somebody who was
+    // handed a stale invitation finds out before they have signed in to
+    // a provider on the strength of it. It takes nothing and spends
+    // nothing: the invitation is still there to be followed by mail.
+    let invite = field(query, "invite_token");
+    check_invite(pool, invite).await?;
+    let state = new_flow(
+        pool,
+        &provider.name,
+        challenge,
+        method,
+        referrer,
+        target,
+        invite,
+    )
+    .await?;
     Ok(provider.authorize_url(&callback_url(app, provider), &state, field(query, "scopes")))
+}
+
+/// Look the invitation up and throw the answer away, which is all an
+/// /authorize wants of it. No token at all is the ordinary case and is
+/// not an invitation being refused.
+async fn check_invite(pool: &Pool, invite: &str) -> Result<(), Error> {
+    if invite.is_empty() {
+        return Ok(());
+    }
+    let sess = pool.admin().await?;
+    match invited(&sess, invite).await {
+        Ok(_) => {
+            sess.commit().await?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = sess.rollback().await;
+            Err(e)
+        }
+    }
 }
 
 /// Where the provider sends the person back: whatever this provider was
@@ -4629,6 +4711,7 @@ fn validate_pkce(method: &str, challenge: &str) -> Result<(), Error> {
 /// too: the row is what says which provider a callback belongs to and
 /// where its answer should land, neither of which can be taken from the
 /// callback request itself without trusting it.
+#[allow(clippy::too_many_arguments)]
 async fn new_flow(
     pool: &Pool,
     provider: &str,
@@ -4636,6 +4719,7 @@ async fn new_flow(
     method: &str,
     referrer: &str,
     target: &str,
+    invite: &str,
 ) -> Result<String, Error> {
     let method = method.to_ascii_lowercase();
     let sess = pool.admin().await?;
@@ -4644,7 +4728,7 @@ async fn new_flow(
             "insert into auth.flow_state
                  (id, auth_code, code_challenge, code_challenge_method,
                   provider_type, authentication_method, referrer,
-                  linking_target_id, created_at, updated_at)
+                  linking_target_id, invite_token, created_at, updated_at)
              select gen_random_uuid(),
                     case when $1::text = '' then null
                          else gen_random_uuid()::text end,
@@ -4652,9 +4736,10 @@ async fn new_flow(
                     case when $1::text = '' then null
                          else $2::text::auth.code_challenge_method end,
                     $3::text, 'oauth', $4::text,
-                    nullif($5::text, '')::uuid, now(), now()
+                    nullif($5::text, '')::uuid, nullif($6::text, ''),
+                    now(), now()
              returning id::text",
-            &[&challenge, &method, &provider, &referrer, &target],
+            &[&challenge, &method, &provider, &referrer, &target, &invite],
         )
         .await;
     let rows = match found {
@@ -4683,6 +4768,9 @@ struct Flow {
     /// ordinary sign in, where the account is whatever the identity
     /// turns out to belong to.
     target: String,
+    /// The invitation this sign in is accepting, when the /authorize
+    /// carried one. Empty is everything else.
+    invite: String,
 }
 
 /// GET /auth/v1/callback, where the provider sends the person back.
@@ -4919,7 +5007,8 @@ async fn load_flow(pool: &Pool, state: &str) -> Result<Flow, Error> {
                     coalesce(linking_target_id::text, ''),
                     exists (select 1 from auth.users u
                              where u.id = f.linking_target_id
-                               and u.deleted_at is null)
+                               and u.deleted_at is null),
+                    coalesce(invite_token, '')
                from auth.flow_state f where id = $1::text::uuid",
             &[&state, &FLOW_TTL],
         )
@@ -4962,6 +5051,7 @@ fn read_flow(row: Option<&tokio_postgres::Row>) -> Result<Flow, Error> {
         },
         auth_code: row.get(5),
         target: row.get(8),
+        invite: row.get(10),
     };
     // A spent PKCE flow is one whose callback already ran, with the
     // code waiting to be traded. Running it again would issue a second
@@ -5050,12 +5140,21 @@ async fn settle(
     post: &Post<'_>,
     mint: &Mint<'_>,
 ) -> Result<Landed, Error> {
-    // A flow that names a target is a manual link: the account is
-    // already known and the question is only whether this identity may
-    // join it. Everything after this point is the same either way.
-    let attached = match flow.target.is_empty() {
-        true => attach(sess, &provider.name, person, post, app.cfg.disable_signup).await?,
-        false => link_to(sess, &flow.target, &provider.name, person, post, &mint.ip).await?,
+    // Two of the three ways in name the account before the provider
+    // says anything. A flow with a target is a manual link, started by
+    // somebody signed in to that account; a flow with an invitation is
+    // that invitation being accepted. Only the third asks who this
+    // identity belongs to. Upstream's order, which matters when a
+    // client sends both: the target wins, because the session behind it
+    // is a stronger statement than a token in a link.
+    //
+    // Everything after this point is the same whichever it was.
+    let attached = match (flow.target.is_empty(), flow.invite.is_empty()) {
+        (false, _) => link_to(sess, &flow.target, &provider.name, person, post, &mint.ip).await?,
+        (true, false) => {
+            accept_invite(sess, &flow.invite, &provider.name, person, &mint.ip).await?
+        }
+        (true, true) => attach(sess, &provider.name, person, post, app.cfg.disable_signup).await?,
     };
     let user_id = match attached {
         Attached::User(id) => id,
@@ -5427,6 +5526,77 @@ async fn attach(
     )
     .await?;
     Ok(Attached::Unverified("provider_email_needs_verification"))
+}
+
+/// Accept an invitation by signing in through a provider instead of
+/// following the link, upstream's processInvite.
+///
+/// The account exists already, so this is neither a signup nor the
+/// address matching path: the token says which account, and the
+/// identity the provider vouched for joins that one. Nothing here
+/// consults linking rules, because the invitation is the decision and
+/// it was made by whoever sent it.
+///
+/// The address still has to agree, which is upstream's rule and worth
+/// keeping. An invitation is addressed to a person at a place, and a
+/// token that would attach any identity at all to the invited account
+/// would leave the mail it was sent in as the only thing between a
+/// forwarded link and somebody else's grant.
+async fn accept_invite(
+    sess: &sql::Session,
+    invite: &str,
+    provider: &str,
+    person: &crate::oauth::Person,
+    ip: &str,
+) -> Result<Attached, Error> {
+    let (user_id, address) = invited(sess, invite).await?;
+    if address != person.email.to_ascii_lowercase() {
+        return Err(refused(
+            StatusCode::BAD_REQUEST,
+            INVITE_NOT_FOUND,
+            "Invited email does not match emails from external provider",
+        ));
+    }
+    // Upstream reaches the unique index here and answers 500. This is
+    // the answer the manual link path gives to the same question, which
+    // is a sentence about what happened rather than one about the
+    // database.
+    let held = sess
+        .query(
+            "select user_id::text from auth.identities
+              where provider_id = $1 and provider = $2",
+            &[&person.sub, &provider],
+        )
+        .await?;
+    if let Some(row) = held.first() {
+        let owner: String = row.get(0);
+        return Err(refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "identity_already_exists",
+            match owner == user_id {
+                true => "Identity is already linked",
+                false => "Identity is already linked to another user",
+            },
+        ));
+    }
+    new_identity(sess, &user_id, provider, person).await?;
+    providers_of(sess, &user_id).await?;
+    merge_claims(sess, &user_id, &person.claims).await?;
+    audit::record(
+        sess,
+        Actor::Account(&user_id),
+        Action::InviteAccepted,
+        ip,
+        Some(serde_json::json!({ "provider": provider })),
+    )
+    .await?;
+    // Confirmed rather than left to prove the address again: the
+    // invitation was sent to that address and somebody read it, which
+    // is the same proof a followed link is. The token goes with it, so
+    // the invitation cannot be accepted a second time.
+    confirm_address(sess, &user_id, false).await?;
+    forget_tokens(sess, &user_id).await?;
+    Ok(Attached::User(user_id))
 }
 
 /// Attach this identity to an account that already exists and whose
