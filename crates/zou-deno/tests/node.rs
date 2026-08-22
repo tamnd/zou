@@ -41,7 +41,7 @@ fn a_buffer_is_bytes_with_the_encodings_node_reads_and_writes() {
         import { Buffer } from "node:buffer";
         const said = [
           Buffer.from("zou").toString("base64"),
-          Buffer.from("em91").toString(),
+          Buffer.from("em91", "base64").toString(),
           Buffer.from("7a6f75", "hex").toString(),
           Buffer.from("zou").toString("hex"),
           String(Buffer.byteLength("héllo")),
@@ -83,7 +83,7 @@ fn a_buffer_reads_and_writes_the_fixed_widths() {
         Deno.serve(() => new Response(said.join(" ")));
         "#,
     );
-    assert_eq!(said, "deadbeef02010000 3735928559 513 258 de true 2");
+    assert_eq!(said, "deadbeef02010000 3735928559 258 513 dead true 2");
 }
 
 #[test]

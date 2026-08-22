@@ -69,6 +69,7 @@
 
   const ENCODING = Symbol("encoding");
   const KEEP_BOM = Symbol("ignoreBOM");
+  const HELD = Symbol("held");
 
   /// Two bytes at a time, in chunks, because `String.fromCharCode` of a
   /// million arguments is a stack that has run out rather than a string.
@@ -100,15 +101,38 @@
       }
       this[ENCODING] = encoding;
       this[KEEP_BOM] = Boolean(options && options.ignoreBOM);
+      this[HELD] = null;
     }
     get encoding() {
       return this[ENCODING];
     }
-    decode(input) {
-      if (input === undefined) {
+    // `stream: true` is what makes a decoder usable on a body arriving
+    // in chunks: a character whose bytes straddle two of them is held
+    // until the rest of it turns up rather than being decoded into the
+    // replacement character. Without it, decoding a chunked response a
+    // piece at a time quietly corrupts every multi byte character that
+    // lands on a boundary, which is not something the caller can see.
+    decode(input, options) {
+      const streaming = Boolean(options && options.stream);
+      let bytes = input === undefined ? EMPTY : bytesOf(input);
+      const held = this[HELD];
+      if (held !== null) {
+        const both = new Uint8Array(held.length + bytes.length);
+        both.set(held);
+        both.set(bytes, held.length);
+        bytes = both;
+        this[HELD] = null;
+      }
+      if (streaming) {
+        const cut = whole(bytes, this[ENCODING]);
+        if (cut < bytes.length) {
+          this[HELD] = bytes.slice(cut);
+          bytes = bytes.subarray(0, cut);
+        }
+      }
+      if (bytes.length === 0) {
         return "";
       }
-      const bytes = bytesOf(input);
       if (this[ENCODING] === "utf-8") {
         return core.decode(bytes);
       }
@@ -118,6 +142,34 @@
       // handed the bytes as they are.
       return this[KEEP_BOM] || !text.startsWith("\uFEFF") ? text : text.slice(1);
     }
+  }
+
+  const EMPTY = new Uint8Array(0);
+
+  /// How much of these bytes is characters that are all here, for a
+  /// decoder that has been told more is coming.
+  ///
+  /// utf-8 says how long a character is in its first byte, so the only
+  /// question is whether the last one started and did not finish. utf-16
+  /// is two bytes at a time, and a lone surrogate at the end is left to
+  /// be decoded as one rather than held, which is what a decoder does
+  /// with an unpaired one anyway.
+  function whole(bytes, encoding) {
+    const end = bytes.length;
+    if (encoding !== "utf-8") {
+      return end - (end % 2);
+    }
+    for (let back = 1; back <= 3 && back <= end; back += 1) {
+      const byte = bytes[end - back];
+      if (byte < 0x80) {
+        return end;
+      }
+      if (byte >= 0xc0) {
+        const needs = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : 2;
+        return back < needs ? end - back : end;
+      }
+    }
+    return end;
   }
 
   const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
