@@ -1362,11 +1362,47 @@ pub extern "C" fn zou_smgr_put_size(spc: u32, db: u32, rel: u32, fork: u32, nblo
     })
 }
 
+/// Postgres for "nobody has said how long this fork is", which is what
+/// `InvalidBlockNumber` means on the way in.
+const UNKNOWN_BLOCKS: u32 = u32::MAX;
+
+/// How many block objects a truncate is willing to name rather than ask
+/// the store about.
+///
+/// Naming them costs a delete per block whether or not the object is
+/// there, and asking costs a list of the fork's whole prefix, which is
+/// one round trip on a short fork and a page of results per thousand
+/// keys on a long one. Under a few megabytes of tail the names win and
+/// the deletes go out together; above it the list is the cheaper
+/// question and the misses stop being free.
+const SWEEP_BY_NAME: u32 = 512;
+
 /// Shrink the fork to `nblocks`, deleting block objects past the new end
 /// so a later re-extend cannot resurrect stale pages.
+///
+/// `old_blocks` is where postgres believes the fork ends, or
+/// [`UNKNOWN_BLOCKS`]. It is allowed to be ahead of the SIZE object,
+/// since an extension may still be sitting in the page cache or the
+/// pending buffer, which is the direction that keeps the sweep whole:
+/// everything the cluster ever wrote is at or under it.
 #[unsafe(no_mangle)]
-pub extern "C" fn zou_smgr_truncate(spc: u32, db: u32, rel: u32, fork: u32, nblocks: u32) -> i32 {
+pub extern "C" fn zou_smgr_truncate(
+    spc: u32,
+    db: u32,
+    rel: u32,
+    fork: u32,
+    old_blocks: u32,
+    nblocks: u32,
+) -> i32 {
     with_shim(|shim| {
+        // The same early exit md takes. A replica restarting from a
+        // restartpoint below a truncate replays it against a fork that
+        // is already the shorter length, and asks for a fork longer
+        // than the one that is there. Writing that length would claim
+        // blocks nothing ever wrote.
+        if old_blocks != UNKNOWN_BLOCKS && nblocks >= old_blocks {
+            return ZOU_OK;
+        }
         if let Ok(mut slot) = shim.pending.lock() {
             slot.truncate((spc, db, rel, fork), nblocks);
         } else {
@@ -1379,14 +1415,26 @@ pub extern "C" fn zou_smgr_truncate(spc: u32, db: u32, rel: u32, fork: u32, nblo
         if write_size(shim, spc, db, rel, fork, nblocks).is_err() {
             return ZOU_ERR_STORE;
         }
-        let prefix = format!("{}/", shim.layout.pg_fork_prefix(spc, db, rel, fork));
-        let Ok(keys) = shim.store.list(&prefix) else {
-            return ZOU_ERR_STORE;
+        // A short tail is named rather than looked up. Postgres has
+        // just said where the fork ended, so every block object past
+        // the new end is one of these keys, and a key that was never
+        // written deletes as a no op. That is the list gone from the
+        // startup process, where it was three of them per Storage
+        // TRUNCATE record and each one waited for the last (zou #382).
+        let named = old_blocks != UNKNOWN_BLOCKS && old_blocks - nblocks <= SWEEP_BY_NAME;
+        let doomed: Vec<String> = if named {
+            (nblocks..old_blocks)
+                .map(|blk| shim.layout.pg_block(spc, db, rel, fork, blk))
+                .collect()
+        } else {
+            let prefix = format!("{}/", shim.layout.pg_fork_prefix(spc, db, rel, fork));
+            let Ok(keys) = shim.store.list(&prefix) else {
+                return ZOU_ERR_STORE;
+            };
+            keys.into_iter()
+                .filter(|key| block_index(key).is_some_and(|idx| idx >= nblocks))
+                .collect()
         };
-        let doomed: Vec<String> = keys
-            .into_iter()
-            .filter(|key| block_index(key).is_some_and(|idx| idx >= nblocks))
-            .collect();
         if pending::for_each_parallel(&doomed, |key| shim.store.delete(key).is_ok()) {
             ZOU_OK
         } else {
@@ -2742,7 +2790,7 @@ mod tests {
         assert_eq!(zou_smgr_put_size(spc, db, rel, fork, 10), ZOU_OK);
 
         // Truncate drops the tail blocks for real.
-        assert_eq!(zou_smgr_truncate(spc, db, rel, fork, 1), ZOU_OK);
+        assert_eq!(zou_smgr_truncate(spc, db, rel, fork, 10, 1), ZOU_OK);
         assert_eq!(
             unsafe { zou_smgr_nblocks(spc, db, rel, fork, &mut n) },
             ZOU_OK
@@ -2868,6 +2916,53 @@ mod tests {
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0), "no cache after unlink");
+
+        // The three shapes of a truncate's sweep, on a fork of its own.
+        let (rel3, shim) = (16401, SHIM.get().unwrap());
+        assert_eq!(zou_smgr_create(spc, db, rel3, fork), ZOU_OK);
+        for blk in 0u32..4 {
+            let page = [0x11; ZOU_PAGE_SIZE];
+            assert_eq!(
+                unsafe { zou_smgr_extend(spc, db, rel3, fork, blk, page.as_ptr(), 0) },
+                ZOU_OK
+            );
+        }
+        let blocks = |shim: &Shim| -> usize {
+            let prefix = format!("{}/", shim.layout.pg_fork_prefix(spc, db, rel3, fork));
+            shim.store
+                .list(&prefix)
+                .unwrap()
+                .into_iter()
+                .filter(|key| block_index(key).is_some())
+                .count()
+        };
+        // A short tail is named rather than listed, and a name nothing
+        // ever wrote deletes as a no op. That is the case a fork whose
+        // pages were elided is in for most of its keys.
+        shim.store
+            .delete(&shim.layout.pg_block(spc, db, rel3, fork, 2))
+            .unwrap();
+        assert_eq!(zou_smgr_truncate(spc, db, rel3, fork, 4, 1), ZOU_OK);
+        assert_eq!(blocks(shim), 1, "block 0 and nothing above it");
+
+        // A truncate asking for a fork longer than the one that is
+        // there does nothing at all, which is what md does and what a
+        // replica replaying from a restartpoint below the truncate
+        // sends.
+        assert_eq!(zou_smgr_truncate(spc, db, rel3, fork, 1, 5), ZOU_OK);
+        assert_eq!(
+            unsafe { zou_smgr_nblocks(spc, db, rel3, fork, &mut n) },
+            ZOU_OK
+        );
+        assert_eq!(n, 1, "the shorter length stands");
+
+        // With no length to work from the sweep asks the store, which
+        // is the path a long tail takes too.
+        assert_eq!(
+            zou_smgr_truncate(spc, db, rel3, fork, UNKNOWN_BLOCKS, 0),
+            ZOU_OK
+        );
+        assert_eq!(blocks(shim), 0);
     }
 
     /// One test for the WAL side too, the pipe is its own process global.
