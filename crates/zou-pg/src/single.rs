@@ -13,7 +13,10 @@
 //! publishes, so a write reaches the block objects and no further, and
 //! a store with a checkpoint in it shadows those objects on the next
 //! attach. The spike's write survived because it ran against a store
-//! that had never been captured.
+//! that had never been captured. Asking for a writable session against
+//! a store that has been captured is an error before the backend
+//! starts, rather than a statement that succeeds and a change nobody
+//! can find.
 //!
 //! It is an internal tool and never a serving path, which is the other
 //! half of that decision. One session per process is the design rather
@@ -103,7 +106,8 @@ impl Session {
         self
     }
 
-    /// Let this session write, which it may not by default.
+    /// Let this session write, which it may not by default, and which
+    /// it may not at all against a store that has been captured.
     ///
     /// The default is read only because of where a write from here
     /// goes. There is no postmaster, so there is no wal pusher and no
@@ -117,9 +121,14 @@ impl Session {
     /// process exited 0, and the change is not in the database. See
     /// #548.
     ///
-    /// Where it does hold is a store with no checkpoint yet, which is
-    /// the bootstrap window between initdb and the first capture, and
-    /// that is what this is for. Anywhere else, write through a server.
+    /// So this asks rather than declares. [`Session::run`] reads the
+    /// manifest of the store this session's environment names before it
+    /// spawns anything, and a store that already holds a checkpoint is
+    /// an error there instead of a write nobody can find later. The one
+    /// window where a write from here holds is the store between initdb
+    /// and its first capture, which has no run to shadow it and no
+    /// chain to answer with, and that is what this is for. Anywhere
+    /// else, write through a server.
     pub fn writable(mut self) -> Self {
         self.writable = true;
         self
@@ -143,6 +152,9 @@ impl Session {
     /// one the backend recovered from and carried on past, because a
     /// maintenance run that half worked is not a run that worked.
     pub fn run(&self, sql: &str) -> Result<Vec<Rows>, String> {
+        if self.writable {
+            captured(self.var("ZOU_TARGET"), self.var("ZOU_TENANT"))?;
+        }
         let mut cmd = Command::new(&self.postgres);
         cmd.arg("--single").arg("-D").arg(&self.pgdata);
         if !self.writable {
@@ -194,6 +206,63 @@ impl Session {
         }
         Ok(parse(&String::from_utf8_lossy(&out.stdout)))
     }
+
+    /// What this session sets `key` to, or nothing if it does not set
+    /// it. The backend reads its store out of its own environment, so
+    /// the answer to which store a write would land in is here and not
+    /// in the parent's environment.
+    fn var(&self, key: &str) -> Option<&str> {
+        self.env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.to_str())
+    }
+}
+
+/// The tenant a session works on when its environment does not name
+/// one, which is the same default the storage manager takes.
+const DEFAULT_TENANT: &str = "local";
+
+/// Refuse a writable session against a store that has been captured.
+///
+/// This is #548 in one function. A one shot backend has no pusher and
+/// no publishing checkpointer, so what it writes stops at the block
+/// objects, and the first checkpoint in the manifest is the thing that
+/// shadows them on the next attach: the chain rebuilds each page from
+/// the newest run and the wal after it, and that wal never left the
+/// session's own pg_wal. Before that first capture there is no run to
+/// shadow anything, which is why bootstrap writes this way and gets to
+/// keep what it wrote.
+///
+/// So the manifest answers the question, and it answers it before the
+/// backend starts rather than after it has committed. A target nobody
+/// named is a plain cluster with no store behind it and nothing to
+/// lose. A manifest that is not there yet is the same window initdb
+/// runs in. Anything else that cannot be read is a refusal too: a store
+/// that will not say whether it has been captured is not one to write
+/// to blind.
+fn captured(target: Option<&str>, tenant: Option<&str>) -> Result<(), String> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let tenant = tenant.unwrap_or(DEFAULT_TENANT);
+    let store = zou_store::open_store(target).map_err(|e| format!("open {target}: {e}"))?;
+    let key = zou_store::layout::TenantLayout::new(tenant).manifest();
+    let Some((data, _)) = store.get(&key).map_err(|e| format!("store: {e}"))? else {
+        return Ok(());
+    };
+    let manifest = zou_store::Manifest::from_json(&data).map_err(|e| format!("manifest: {e}"))?;
+    if manifest.checkpoints.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "a one shot backend may not write to {target} tenant {tenant}: it has {} checkpoints, \
+         and with no postmaster there is no pusher to land this session's wal in the shared log \
+         and no capture to record it, so the pages would be shadowed by the newest run on the \
+         next attach and the write would be gone. Write through a server, see zou #548",
+        manifest.checkpoints.len()
+    ))
 }
 
 /// The ERROR, FATAL and PANIC lines out of a backend's stderr, without
@@ -321,6 +390,58 @@ fn field(line: &str) -> Option<(usize, &str, Option<&str>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use zou_store::layout::TenantLayout;
+    use zou_store::manifest::{CheckpointKind, CheckpointRef};
+    use zou_store::{Lsn, Manifest, open_store};
+
+    /// A store under `dir` holding a manifest for `tenant` with
+    /// `checkpoints` captures in it.
+    fn store_with(dir: &Path, tenant: &str, checkpoints: usize) {
+        let store = open_store(dir.to_str().unwrap()).unwrap();
+        let mut m = Manifest::new(tenant, 18);
+        for i in 0..checkpoints {
+            m.checkpoints.push(CheckpointRef {
+                id: format!("c{i}"),
+                lsn: Lsn(0x100 + i as u64),
+                kind: CheckpointKind::Full,
+                owner: None,
+            });
+        }
+        store
+            .put(&TenantLayout::new(tenant).manifest(), &m.to_json())
+            .unwrap();
+    }
+
+    #[test]
+    fn a_writable_session_is_refused_by_a_store_that_has_been_captured() {
+        let dir = tempfile::tempdir().unwrap();
+        store_with(dir.path(), "local", 3);
+        let target = dir.path().to_str().unwrap();
+        let said = captured(Some(target), None).expect_err("a captured store refuses");
+        // The count is in the message because the person reading it is
+        // deciding whether this store is the bootstrap window or a
+        // database, and that is the number that says which.
+        assert!(said.contains("3 checkpoints"), "{said}");
+        assert!(said.contains("#548"), "{said}");
+        // A tenant of its own, since one tenant having been captured
+        // says nothing about the next.
+        captured(Some(target), Some("other")).expect("a tenant with no manifest is the window");
+    }
+
+    #[test]
+    fn the_window_a_bootstrap_writes_in_is_still_open() {
+        let dir = tempfile::tempdir().unwrap();
+        store_with(dir.path(), "local", 0);
+        let target = dir.path().to_str().unwrap();
+        // A manifest with no capture in it is initdb's store: nothing
+        // has been folded, so there is no run to shadow what this
+        // writes and the block objects are the whole of the answer.
+        captured(Some(target), Some("local")).expect("an uncaptured store lets a write through");
+        // And a session with no store behind it at all is a plain
+        // cluster on local files, which was never this issue.
+        captured(None, None).expect("no target is no store");
+    }
 
     /// What the backend prints for
     /// `select 1 as one, null::text as n, 'x y' as s;`, verbatim.
