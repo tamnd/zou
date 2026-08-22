@@ -10,8 +10,8 @@
 //! The second job is everything a function imports that is not beside
 //! it. `npm:` and `jsr:` are what the examples are written with, and
 //! neither is resolved the way Deno resolves it: there is no node
-//! module resolution here, no `package.json` walk, no CJS and no node
-//! built ins. Both are rewritten to a url on a registry that serves
+//! module resolution here, no `package.json` walk and no CJS. Both are
+//! rewritten to a url on a registry that serves
 //! packages as modules, `esm.sh` by default, and from there a package
 //! is an ordinary graph of `https:` imports that this loader has to
 //! handle anyway. What that costs is written down in
@@ -195,9 +195,12 @@ impl ModuleLoader for Disk {
             return url(&format!("{}/jsr/{}", self.registry, bare(rest)));
         }
         if let Some(rest) = specifier.strip_prefix("node:") {
-            return Err(JsErrorBox::type_error(format!(
-                "there is no node built in {rest} here, so node:{rest} cannot be imported"
-            )));
+            if crate::node::source(rest).is_none() {
+                return Err(JsErrorBox::type_error(format!(
+                    "there is no node built in {rest} here, so node:{rest} cannot be imported"
+                )));
+            }
+            return url(&format!("node:{rest}"));
         }
         // Plaintext means what arrives is whatever the network decided
         // it was, and what arrives is executed. https or nothing.
@@ -239,6 +242,11 @@ impl ModuleLoader for Disk {
     ) -> ModuleLoadResponse {
         if declaration(specifier) {
             return ModuleLoadResponse::Sync(nothing(specifier));
+        }
+        // A node built in is javascript this binary carries, so it is
+        // answered here and never fetched, cached or timed.
+        if specifier.scheme() == "node" {
+            return ModuleLoadResponse::Sync(builtin(specifier));
         }
         if specifier.scheme() == "file" {
             if let Ok(path) = specifier.to_file_path() {
@@ -310,6 +318,26 @@ fn nothing(specifier: &ModuleSpecifier) -> Result<ModuleSource, JsErrorBox> {
     Ok(ModuleSource::new(
         ModuleType::JavaScript,
         ModuleSourceCode::String(deno_core::FastString::from_static("")),
+        specifier,
+        None,
+    ))
+}
+
+/// A node built in, out of this binary.
+///
+/// Resolution has already said there is one under this name, so a
+/// missing source here is a bug rather than a function's mistake, and
+/// it still says which name it was rather than panicking in a loader.
+fn builtin(specifier: &ModuleSpecifier) -> Result<ModuleSource, JsErrorBox> {
+    let name = specifier.path();
+    let text = crate::node::source(name).ok_or_else(|| {
+        JsErrorBox::type_error(format!(
+            "there is no node built in {name} here, so node:{name} cannot be imported"
+        ))
+    })?;
+    Ok(ModuleSource::new(
+        ModuleType::JavaScript,
+        ModuleSourceCode::String(deno_core::FastString::from_static(text)),
         specifier,
         None,
     ))
@@ -741,15 +769,40 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_and_node_and_data_are_refused_by_name() {
+    fn plaintext_and_data_are_refused_by_name() {
         for (specifier, said) in [
             ("http://example.com/a.js", "over https"),
-            ("node:fs", "no node built in fs"),
             ("data:text/javascript,1", "not supported yet"),
         ] {
             let refused = resolved(specifier, "file:///f/index.ts").unwrap_err();
             assert!(refused.contains(said), "{specifier} said {refused}");
         }
+    }
+
+    /// A built in this runtime has resolves to itself, and one it does
+    /// not have is a sentence naming it rather than a module that will
+    /// fail somewhere further in.
+    #[test]
+    fn a_node_built_in_resolves_to_itself_and_the_rest_are_refused_by_name() {
+        let held = resolved("node:path", "file:///f/index.ts").unwrap();
+        assert_eq!(held.as_str(), "node:path");
+        let sub = resolved("node:fs/promises", "file:///f/index.ts").unwrap();
+        assert_eq!(sub.as_str(), "node:fs/promises");
+        let refused = resolved("node:child_process", "file:///f/index.ts").unwrap_err();
+        assert!(
+            refused.contains("no node built in child_process"),
+            "{refused}"
+        );
+    }
+
+    /// And the source is the one this binary carries, off no network.
+    #[test]
+    fn a_node_built_in_is_loaded_out_of_the_binary() {
+        let loaded = builtin(&spec("node:events")).unwrap();
+        let ModuleSourceCode::String(code) = loaded.code else {
+            panic!("a built in is text");
+        };
+        assert!(code.as_str().contains("class EventEmitter"));
     }
 
     #[test]

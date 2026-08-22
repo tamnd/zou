@@ -3276,6 +3276,192 @@
   };
 
   // ---------------------------------------------------------------
+  // process
+  //
+  // A global rather than only a module, because that is what upstream's
+  // runtime has: Deno puts `process` on the global and a package that
+  // reads `process.env.NODE_ENV` at the top of a module gets an answer
+  // there instead of a ReferenceError. `node:process` is this object
+  // and not a second one, so a function that sets something on it sees
+  // it whichever way it reached it.
+  //
+  // The version is the node a package should believe it is running on
+  // when it branches on one, which is what the number is for: it is
+  // checked far more often than it is printed.
+
+  const environment = new Proxy(
+    {},
+    {
+      get(_target, name) {
+        return typeof name === "string" ? env.get(name) : undefined;
+      },
+      has(_target, name) {
+        return typeof name === "string" && env.has(name);
+      },
+      set() {
+        throw new TypeError("the environment of a function is read only");
+      },
+      deleteProperty() {
+        throw new TypeError("the environment of a function is read only");
+      },
+      ownKeys() {
+        return Reflect.ownKeys(env.toObject());
+      },
+      getOwnPropertyDescriptor(_target, name) {
+        const value = typeof name === "string" ? env.get(name) : undefined;
+        return value === undefined
+          ? undefined
+          : { value, writable: false, enumerable: true, configurable: true };
+      },
+    },
+  );
+
+  /// A writer that goes to the console, because there is no file
+  /// descriptor here to hand anybody. A package that writes a log line
+  /// through `process.stdout` gets a log line.
+  function writer(to) {
+    let held = "";
+    return {
+      write(chunk) {
+        held += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+        // A line at a time, so a package writing "a" then "b\n" makes
+        // one line rather than two.
+        const lines = held.split("\n");
+        held = lines.pop();
+        for (const line of lines) {
+          to(line);
+        }
+        return true;
+      },
+      end() {},
+      on() {
+        return this;
+      },
+      once() {
+        return this;
+      },
+      removeListener() {
+        return this;
+      },
+      isTTY: false,
+      columns: 80,
+      fd: to === console.error ? 2 : 1,
+    };
+  }
+
+  const NODE = "20.11.1";
+
+  const process = {
+    env: environment,
+    argv: ["node", "index"],
+    argv0: "node",
+    execPath: "/usr/local/bin/node",
+    platform: "linux",
+    arch: "x86_64",
+    pid: 1,
+    ppid: 0,
+    title: "zou",
+    version: `v${NODE}`,
+    versions: { node: NODE, v8: "0.0.0" },
+    release: { name: "node" },
+    browser: false,
+    exitCode: undefined,
+    // Node runs these before promises rather than after, which nothing
+    // here can offer: a microtask is the closest thing this event loop
+    // has and the ordering difference has not been worth an op.
+    nextTick(work, ...args) {
+      queueMicrotask(() => work(...args));
+    },
+    cwd() {
+      return "/";
+    },
+    chdir() {
+      throw new TypeError("a function may not change the directory it runs in");
+    },
+    exit() {
+      throw new TypeError("a function may not exit the process it is running in");
+    },
+    // The listener half is a no op that returns the object: nothing
+    // here emits `exit` or `beforeExit`, and a package registering for
+    // one should not crash for having asked.
+    on() {
+      return process;
+    },
+    once() {
+      return process;
+    },
+    off() {
+      return process;
+    },
+    addListener() {
+      return process;
+    },
+    removeListener() {
+      return process;
+    },
+    removeAllListeners() {
+      return process;
+    },
+    emit() {
+      return false;
+    },
+    listeners() {
+      return [];
+    },
+    emitWarning(warning) {
+      console.warn(warning);
+    },
+    uptime() {
+      return (Date.now() - started) / 1000;
+    },
+    hrtime: Object.assign(
+      function hrtime(since) {
+        const now = performance.now() * 1e6;
+        const nanoseconds = since ? now - (since[0] * 1e9 + since[1]) : now;
+        return [Math.floor(nanoseconds / 1e9), Math.floor(nanoseconds % 1e9)];
+      },
+      {
+        bigint() {
+          return BigInt(Math.floor(performance.now() * 1e6));
+        },
+      },
+    ),
+    memoryUsage() {
+      return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 };
+    },
+    stdout: writer(console.log),
+    stderr: writer(console.error),
+    stdin: {
+      read() {
+        return null;
+      },
+      on() {
+        return this;
+      },
+      setEncoding() {
+        return this;
+      },
+      resume() {
+        return this;
+      },
+      pause() {
+        return this;
+      },
+      isTTY: false,
+      fd: 0,
+    },
+    getuid() {
+      return 0;
+    },
+    getgid() {
+      return 0;
+    },
+    umask() {
+      return 0o022;
+    },
+  };
+
+  // ---------------------------------------------------------------
   // Reading a static file
   //
   // The four spellings Deno has, over the two ops that do the reading.
@@ -3798,10 +3984,17 @@
     fetch,
     navigator,
     performance,
+    process,
     queueMicrotask,
     setInterval,
     setTimeout,
     structuredClone,
+    // The two node names for a timer of no length, which upstream's
+    // runtime has on the global as well. A package built for node
+    // calls one of them at the bottom of a promise chain often enough
+    // that being without them is a ReferenceError in library code.
+    setImmediate: (work, ...args) => setTimeout(() => work(...args), 0),
+    clearImmediate: clearTimer,
   });
   // The global is itself an event target, which is not decoration: a
   // library calls the bare `addEventListener` at the top of a module

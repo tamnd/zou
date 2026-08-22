@@ -58,16 +58,19 @@ fn user_agent() -> &'static str {
 ///
 /// esm.sh reads this header and answers a different build depending on
 /// it. A Deno agent is served the `denonext` build, which is the one
-/// upstream runs and which imports `node:process` and `node:buffer` for
-/// a line or two, and there are no node built ins here: asking for it
-/// took the whole corpus from twenty seven functions running to
-/// twenty one. Anything else is served a build for a browser, which is
-/// the one that runs here.
+/// upstream runs and which imports `node:process` and `node:buffer`.
+/// Anything else is served a build for a browser, with the platform
+/// bits stubbed out.
 ///
-/// So this name is a statement about what this runtime can link rather
-/// than about what it is compatible with, and the day the node built
-/// ins arrive it should become the other one.
-const LOADER: &str = "zou-edge-runtime";
+/// This asked as `zou-edge-runtime` for as long as there were no node
+/// built ins here, because asking as Deno took the corpus from twenty
+/// eight functions running to twenty one. Now that there are, it asks
+/// as Deno, which is the build the package author tested on a Deno
+/// runtime rather than the fallback: the measurement is in
+/// `docs/functions.md` and it was run rather than argued about.
+fn loader() -> &'static str {
+    user_agent()
+}
 
 #[derive(serde::Deserialize)]
 pub struct Sent {
@@ -170,7 +173,7 @@ pub(crate) fn agent() -> &'static ureq::Agent {
             // The loader's, because the loader is the one that does not
             // name a header of its own. A call from a function has
             // `user_agent()` put on it below.
-            .user_agent(LOADER)
+            .user_agent(loader())
             .build()
             .into()
     })
