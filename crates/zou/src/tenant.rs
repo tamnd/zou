@@ -162,6 +162,13 @@ fn info(store: &dyn CasStore, tenant_ref: &str) -> Result<(), String> {
         true => say!("hosts: none besides its own label"),
         false => say!("hosts: {}", entry.hosts.join(", ")),
     }
+    // The number a node compares against the deployment it is serving,
+    // so a person watching a deploy reach a fleet has both halves of
+    // the comparison in front of them.
+    match entry.deployed {
+        0 => say!("no functions deployed"),
+        n => say!("deployments {n}"),
+    }
     match has_database(store, tenant_ref)? {
         true => say!("database at {}", TenantLayout::new(tenant_ref).prefix()),
         false => say!("no database yet"),

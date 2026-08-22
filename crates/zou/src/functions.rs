@@ -458,6 +458,19 @@ fn deploy(args: &Deploy) -> Result<(), String> {
     for name in &published.names {
         say!("  /functions/v1/{name}");
     }
+    // Last, and after the deployment is the one in the store: this is
+    // what a node serving the project already reads to find out that
+    // there is something new to pick up, and it must never name a
+    // deployment that is not there yet.
+    //
+    // A project with no registry entry is a target somebody is
+    // deploying to without a fleet in front of it, which is the laptop
+    // case and every test. There is no node to tell.
+    match zou_store::registry::note_deploy(store.as_ref(), &bound.tenant) {
+        Ok(deployed) => log::debug!("{}: deployment {deployed}", bound.tenant),
+        Err(zou_store::registry::RegistryError::Missing { .. }) => {}
+        Err(e) => say!("deployed, but a node serving this project may not notice: {e}"),
+    }
     Ok(())
 }
 

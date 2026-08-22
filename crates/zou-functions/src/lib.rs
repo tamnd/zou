@@ -497,6 +497,38 @@ impl Registry {
             functions.into_iter().map(|f| (f.name.clone(), f)).collect();
     }
 
+    /// Serve what another registry was built to serve, from now on.
+    ///
+    /// A node picking up a redeploy under a project it is already
+    /// serving builds the whole thing again, out of the bundle it just
+    /// materialized and the secrets that came with it, and then this
+    /// puts it where the requests are. Both halves move together on
+    /// purpose: a deploy can change what is served and what it runs
+    /// with in one act, and a request in the middle gets the whole of
+    /// one deployment or the whole of the other.
+    ///
+    /// The registry a caller is holding is the same object afterwards,
+    /// which is what makes this possible at all: the router in front of
+    /// a project has an `Arc` of it, and rebuilding the router would
+    /// mean detaching the project and starting its database again.
+    pub fn adopt(&self, other: &Registry) {
+        let served = other
+            .served
+            .read()
+            .expect("a listing is only ever swapped whole")
+            .clone();
+        let runtime = other.runtime();
+        let mut ours = self
+            .served
+            .write()
+            .expect("a listing is only ever swapped whole");
+        *ours = served;
+        *self
+            .runtime
+            .write()
+            .expect("a runtime is only ever swapped whole") = runtime;
+    }
+
     /// Run them on this from now on, which is a dev loop noticing that
     /// what a function runs with changed.
     ///
@@ -634,6 +666,32 @@ mod tests {
         })));
         let found = registry.lookup("hello").expect("still served");
         let answer = registry.invoke(&found, call()).expect("handler answered");
+        assert_eq!(answer.bytes(), b"second");
+    }
+
+    /// A redeploy under a node that is already serving the project.
+    /// The registry the router is holding is the one that answers
+    /// afterwards, and both halves moved: the listing and the runtime
+    /// come from the deployment that was just built.
+    #[test]
+    fn a_whole_deployment_can_be_moved_into_the_registry_that_is_serving() {
+        let serving = Registry::hosted(Hosted::new().at("hello", |_| {
+            Ok(Answer::new("text/plain", b"first".to_vec()))
+        }));
+        let built = Registry::hosted(
+            Hosted::new()
+                .at("hello", |_| {
+                    Ok(Answer::new("text/plain", b"second".to_vec()))
+                })
+                .at("open", |_| Ok(Answer::new("text/plain", b"new".to_vec()))),
+        );
+        serving.adopt(&built);
+        assert_eq!(
+            serving.names(),
+            vec!["hello".to_string(), "open".to_string()]
+        );
+        let found = serving.lookup("hello").expect("still served");
+        let answer = serving.invoke(&found, call()).expect("handler answered");
         assert_eq!(answer.bytes(), b"second");
     }
 

@@ -171,9 +171,17 @@ A deployment that cannot be read is logged and the project comes up without it, 
 
 `SUPABASE_URL` inside a deployed function is the project's own url, `https://<ref>.<domain>` on a node that was given a domain, and not the address of the machine it happens to be running on.
 
-A deployment is read when the project is attached, so a redeploy is picked up the next time that happens rather than under a node that is already holding the project up.
-On a node that lets go of idle projects, which is the default, that is the next request after the project has been quiet.
-Making a redeploy visible to a node that is already serving the project is a poll or a push and both cost something at a thousand projects, so it is written down here rather than guessed at.
+A redeploy is picked up by a node that is already serving the project, on the next request, without the project being detached and without its database being touched.
+
+How it knows is a counter on the project's registry entry, `deployed`, which `zou functions deploy` raises with a compare and swap once the new deployment is the one in the store.
+A node resolves a request through that entry already, out of a cache with a sixty second life, so a project nobody deployed to costs no store request at all and one atomic load per request.
+That is the reason it is a counter on an object already being read rather than a poll of the deployment or a message to every node: at a thousand projects per node, a poll is a thousand store requests a minute for a question whose answer is almost always no.
+The cost of the sixty seconds is that a deploy can take up to that long to be seen by a node whose cache is warm, and no longer.
+
+Picking it up is the deployment being materialized again, into a directory of its own beside the one it replaces, and moved into the registry the project's front door is already holding.
+The front door is not rebuilt, so no session talking to the database notices anything, and a call already inside an isolate finishes on the deployment it started on.
+One generation of files is kept behind the current one for that reason, and the one before that is removed.
+The exception is a project that had nothing deployed to it when the node brought it up: there is no functions door in front of it to move a deployment into, so the node lets go of the project instead and the request after that one attaches it with what was deployed.
 
 ## Serving what was deployed
 

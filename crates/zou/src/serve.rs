@@ -448,6 +448,20 @@ fn ports(it: &mut std::slice::Iter<'_, String>, flag: &str) -> Result<(u16, Vec<
 struct Live {
     pid: u32,
     dir: PathBuf,
+    /// The port its postmaster is listening on, because a deployment
+    /// picked up later is told the same database url the one it
+    /// replaces was told.
+    port: u16,
+    /// What is answering under `/functions/v1` for this project, or
+    /// None for a project that had nothing deployed to it when this
+    /// node brought it up. A handle to the same object the router is
+    /// holding, which is what lets a deployment be swapped in without
+    /// the front door being rebuilt.
+    functions: Option<Arc<zou_functions::Registry>>,
+    /// How many deployments this attach has materialized, so the next
+    /// one writes its files somewhere the last one's are not being read
+    /// from.
+    edge: u64,
 }
 
 /// A postmaster that has been asked to leave and has not gone yet.
@@ -588,6 +602,17 @@ impl State {
             return;
         }
         log::warn!("{tenant_ref}: postmaster {why}, detaching");
+        self.let_go(tenant_ref);
+    }
+
+    /// Tell the attach manager to drop a tenant, from a thread that is
+    /// not the attach manager's and is not async.
+    ///
+    /// Nothing waits for it. The caller is either a postmaster's own
+    /// supervising thread or a request that has found the attach is
+    /// the wrong shape for what is deployed now, and neither of them
+    /// should be inside somebody else's shutdown.
+    fn let_go(&self, tenant_ref: &str) {
         let Some(attached) = self.attached.lock().expect("the attach manager").upgrade() else {
             return;
         };
@@ -595,7 +620,8 @@ impl State {
         std::thread::spawn(move || {
             // detach is async and this thread is not, so it gets a
             // runtime of its own for the one call. It happens when a
-            // database dies, which is rare enough to be worth nothing.
+            // database dies or a project is deployed to, which is rare
+            // enough to be worth nothing.
             let rt = match tokio::runtime::Builder::new_current_thread().build() {
                 Ok(rt) => rt,
                 Err(e) => return log::error!("detach {tenant_ref}: {e}"),
@@ -690,18 +716,35 @@ impl Postmasters {
     fn functions(
         &self,
         entry: &Tenant,
-        dir: &Path,
+        edge: &Path,
         pg_port: u16,
     ) -> Option<Arc<zou_functions::Registry>> {
-        let tenant_ref = &entry.tenant_ref;
-        let found = match crate::bundle::materialize(&*self.store, tenant_ref, &dir.join("edge")) {
-            Ok(found) => found?,
+        match self.deployment(entry, edge, pg_port) {
+            Ok(built) => built,
             Err(e) => {
-                log::error!("{tenant_ref}: {e}");
-                return None;
+                log::error!("{}: {e}", entry.tenant_ref);
+                None
             }
+        }
+    }
+
+    /// The same thing for a caller that has a deployment already and
+    /// cannot treat a failure as an absence.
+    ///
+    /// `Ok(None)` is a project with nothing deployed to it, which is
+    /// most of them, and an error is a deployment that is there and
+    /// would not load.
+    fn deployment(
+        &self,
+        entry: &Tenant,
+        edge: &Path,
+        pg_port: u16,
+    ) -> Result<Option<Arc<zou_functions::Registry>>, String> {
+        let tenant_ref = &entry.tenant_ref;
+        let Some((project, layout)) = crate::bundle::materialize(&*self.store, tenant_ref, edge)?
+        else {
+            return Ok(None);
         };
-        let (project, layout) = found;
         let secret = entry.jwt_secret.as_bytes();
         let mint = |role: &str| zou_server::jwt::mint(&zou_server::jwt::key_claims(role), secret);
         // The url a function is told its project is at, which is the
@@ -718,26 +761,15 @@ impl Postmasters {
         // can collide there, because `SUPABASE_` is the one prefix a
         // project is not allowed to set, but the stack is written this
         // way round so reading it does not depend on knowing that.
-        let mut env = match self.secrets(tenant_ref) {
-            Ok(secrets) => secrets,
-            Err(e) => {
-                log::error!("{tenant_ref}: {e}");
-                return None;
-            }
-        };
+        let mut env = self.secrets(tenant_ref)?;
         env.extend(crate::functions::env_at(
             &url,
             &mint("anon"),
             &mint("service_role"),
             &format!("postgresql://{SUPERUSER}@127.0.0.1:{pg_port}/postgres"),
         ));
-        match crate::functions::registry(&project, &layout, env) {
-            Ok(registry) => registry,
-            Err(e) => {
-                log::error!("{tenant_ref}: deployed functions: {e}");
-                None
-            }
-        }
+        crate::functions::registry(&project, &layout, env)
+            .map_err(|e| format!("deployed functions: {e}"))
     }
 
     /// What this project's functions are told, out of the sealed object
@@ -950,15 +982,20 @@ impl Backend for Postmasters {
             ));
         }
         boot.lap("recovery");
-        let functions = self.functions(entry, &dir, port);
+        let functions = self.functions(entry, &dir.join("edge-0"), port);
         if functions.is_some() {
             boot.lap("functions");
         }
-        self.state
-            .live
-            .lock()
-            .expect("the live map")
-            .insert(tenant_ref.clone(), Live { pid, dir });
+        self.state.live.lock().expect("the live map").insert(
+            tenant_ref.clone(),
+            Live {
+                pid,
+                dir,
+                port,
+                functions: functions.clone(),
+                edge: 0,
+            },
+        );
         log::info!(
             "{tenant_ref}: attached in {}, {}",
             crate::boot::ms(boot.total()),
@@ -987,6 +1024,77 @@ impl Backend for Postmasters {
         log::info!("{tenant_ref}: detaching");
         self.state.leaving(tenant_ref, live.pid);
         stop(live.pid);
+    }
+
+    /// A deploy under a project this node is already serving.
+    ///
+    /// The database is left exactly where it is. What changes is what
+    /// answers under `/functions/v1`, and it changes by the new
+    /// deployment being moved into the registry the router is already
+    /// holding, so nothing in front of it is rebuilt and no session
+    /// talking to the database notices anything at all.
+    ///
+    /// The files land in a directory of their own rather than over the
+    /// ones the deployment being replaced was read out of, because an
+    /// isolate that is running reads its own files as it goes. One
+    /// generation back is kept for the same reason, which bounds what a
+    /// project that is deployed to all day leaves on the node at two
+    /// deployments.
+    fn refresh(&self, entry: &Tenant) -> Result<(), String> {
+        let tenant_ref = &entry.tenant_ref;
+        let (dir, port, serving, edge) = {
+            let live = self.state.live.lock().expect("the live map");
+            // Gone between the entry being read and here, which is a
+            // detach. The next request attaches it with the deployment
+            // the entry names.
+            let Some(one) = live.get(tenant_ref) else {
+                return Ok(());
+            };
+            (one.dir.clone(), one.port, one.functions.clone(), one.edge)
+        };
+        let Some(serving) = serving else {
+            // Nothing to move a deployment into: this project had none
+            // when it came up, so its front door was built without the
+            // functions door in it. Letting go of the tenant is the
+            // whole of the fix, and the request after this one attaches
+            // it again with the deployment that was just made.
+            log::info!(
+                "{tenant_ref}: deployed to, and this node brought it up with no functions, detaching"
+            );
+            self.state.let_go(tenant_ref);
+            return Ok(());
+        };
+        let next = edge + 1;
+        let built = self.deployment(entry, &dir.join(format!("edge-{next}")), port)?;
+        match built {
+            Some(built) => {
+                serving.adopt(&built);
+                log::info!(
+                    "{tenant_ref}: picked up deployment {}, serving {}",
+                    entry.deployed,
+                    serving.names().join(", ")
+                );
+            }
+            // Deployed to and there is nothing there, which is a
+            // project whose last function was deleted. Every name
+            // answers the 404 upstream answers.
+            None => {
+                serving.reload(Vec::new());
+                log::info!(
+                    "{tenant_ref}: picked up deployment {}, serving nothing",
+                    entry.deployed
+                );
+            }
+        }
+        let mut live = self.state.live.lock().expect("the live map");
+        if let Some(one) = live.get_mut(tenant_ref) {
+            one.edge = next;
+        }
+        drop(live);
+        if next >= 2 {
+            let _ = fs::remove_dir_all(dir.join(format!("edge-{}", next - 2)));
+        }
+        Ok(())
     }
 }
 
@@ -1806,6 +1914,9 @@ mod tests {
             Live {
                 pid: 4242,
                 dir: PathBuf::from("/tmp/none"),
+                port: 5432,
+                functions: None,
+                edge: 0,
             },
         );
         // A pid the map does not name is a postmaster something already

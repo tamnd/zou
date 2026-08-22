@@ -122,6 +122,27 @@ pub struct Tenant {
     pub s3_access_key: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub s3_secret_key: String,
+    /// How many times something has been deployed under
+    /// `/functions/v1` for this project.
+    ///
+    /// A counter rather than a time or a digest, because the only
+    /// question anybody asks of it is whether it is the number they
+    /// built with. A node holding this project reads the entry every
+    /// time its cache of it expires, which is a read it is making
+    /// anyway, and a number it has not seen before is a deploy that
+    /// happened while it was serving. See `zou functions deploy` for
+    /// the other end of it.
+    ///
+    /// Zero is a project nobody has deployed to, and also a project
+    /// whose entry was written before this field existed, which are
+    /// the same thing to a reader: the first deploy after either is a
+    /// number nobody built with.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deployed: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 impl Tenant {
@@ -134,6 +155,7 @@ impl Tenant {
             hosts: Vec::new(),
             s3_access_key: String::new(),
             s3_secret_key: String::new(),
+            deployed: 0,
         }
     }
 
@@ -414,6 +436,45 @@ pub fn set_s3(
     Ok(())
 }
 
+/// Say that something new is deployed under `/functions/v1`, and
+/// answer with the number it is now on.
+///
+/// This is the whole of how a node holding the project finds out. It
+/// re-reads this entry when its cache of it expires, which it does
+/// anyway to pick up a rotated secret or a new host, so a deploy costs
+/// no request that was not already being made and an idle project costs
+/// nothing at all. What it buys is that the node compares a number it
+/// built with against a number it just read, and a redeploy is picked
+/// up while the project stays attached rather than the next time it
+/// happens to be attached from cold.
+///
+/// Compare and swapped rather than written, because two people
+/// deploying at once would otherwise leave the entry on one increment
+/// instead of two, and a node that had built with the number in the
+/// middle would never see a change. A few attempts and then the error,
+/// since the alternative is a deploy that says it worked and cannot be
+/// seen.
+pub fn note_deploy(store: &dyn CasStore, tenant_ref: &str) -> Result<u64, RegistryError> {
+    const ATTEMPTS: usize = 5;
+    for _ in 0..ATTEMPTS {
+        let Some((data, version)) = store.get(&entry_key(tenant_ref))? else {
+            return Err(RegistryError::Missing {
+                tenant_ref: tenant_ref.to_string(),
+            });
+        };
+        let mut entry = Tenant::from_json(tenant_ref, &data)?;
+        entry.deployed += 1;
+        match store.put_if_match(&entry_key(tenant_ref), &entry.to_json(), Some(&version)) {
+            Ok(_) => return Ok(entry.deployed),
+            Err(CasError::Conflict { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(RegistryError::Store(CasError::Conflict {
+        key: entry_key(tenant_ref),
+    }))
+}
+
 /// Which tenant a hostname belongs to, in one GET. This is the routing
 /// path for every project on its own domain.
 pub fn host_ref(store: &dyn CasStore, host: &str) -> Result<Option<String>, RegistryError> {
@@ -511,6 +572,45 @@ mod tests {
         );
         let err = set_s3(&store, "nobody", "a", "b").unwrap_err();
         assert!(matches!(err, RegistryError::Missing { .. }));
+    }
+
+    /// What a node compares against what it is serving. It counts up
+    /// and it is on the entry the node reads to route, which is the
+    /// whole design: no second object and no poll.
+    #[test]
+    fn a_deploy_is_counted_where_a_node_is_already_looking() {
+        let store = MemStore::new();
+        create(&store, &tenant("acme-prod")).unwrap();
+        assert_eq!(
+            get(&store, "acme-prod").unwrap().unwrap().deployed,
+            0,
+            "a project nobody has deployed to"
+        );
+        assert_eq!(note_deploy(&store, "acme-prod").unwrap(), 1);
+        assert_eq!(note_deploy(&store, "acme-prod").unwrap(), 2);
+        assert_eq!(get(&store, "acme-prod").unwrap().unwrap().deployed, 2);
+        // The rest of the entry is untouched, which matters because a
+        // deploy is run from a laptop against an entry a fleet owns.
+        assert_eq!(
+            get(&store, "acme-prod").unwrap().unwrap().jwt_secret,
+            tenant("acme-prod").jwt_secret
+        );
+        let err = note_deploy(&store, "nobody").unwrap_err();
+        assert!(matches!(err, RegistryError::Missing { .. }));
+    }
+
+    #[test]
+    fn an_entry_written_before_deploys_were_counted_reads_as_none() {
+        let store = MemStore::new();
+        let older = br#"{"format":1,"ref":"acme-prod","created_unix":1,"jwt_secret":"s"}"#;
+        store.put(&entry_key("acme-prod"), older).unwrap();
+        assert_eq!(get(&store, "acme-prod").unwrap().unwrap().deployed, 0);
+        assert!(
+            !String::from_utf8(tenant("acme-prod").to_json())
+                .unwrap()
+                .contains("deployed"),
+            "and an entry nobody has deployed to does not carry the field either"
+        );
     }
 
     #[test]

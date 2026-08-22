@@ -347,6 +347,8 @@ fn evict(seen: &mut HashMap<String, Cached>, capacity: usize, now: Instant) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zou_store::cas::CasError;
     use zou_store::open_store;
 
     fn hosts(domains: &[&str]) -> Routing {
@@ -535,6 +537,58 @@ mod tests {
             cache.get("acme-prod").await.unwrap().unwrap().jwt_secret,
             "second"
         );
+    }
+
+    /// What a project costs the store while nobody is deploying to it.
+    ///
+    /// The deployment counter a node compares against what it is
+    /// serving rides on this entry, so this is also the price of
+    /// noticing a redeploy: one GET per project per ttl, whatever the
+    /// request rate, and nothing per request. It is asserted rather
+    /// than reasoned about because the other designs for the same
+    /// feature, a poll of the deployment or a second object beside it,
+    /// are exactly this number times two.
+    #[tokio::test]
+    async fn an_idle_project_costs_one_store_read_a_ttl_however_busy_it_is() {
+        let (_d, store) = store();
+        register(store.as_ref(), "acme-prod", "first");
+        let counted = Arc::new(Counted {
+            inner: store,
+            gets: AtomicUsize::new(0),
+        });
+        let cache = Registry::new(counted.clone());
+        for _ in 0..1000 {
+            let entry = cache.get("acme-prod").await.unwrap().expect("registered");
+            assert_eq!(entry.deployed, 0, "nobody deployed to it");
+        }
+        assert_eq!(counted.gets.load(Ordering::Relaxed), 1);
+    }
+
+    /// A store that says how many objects were read through it.
+    struct Counted {
+        inner: Arc<dyn CasStore>,
+        gets: AtomicUsize,
+    }
+
+    impl CasStore for Counted {
+        fn get(&self, key: &str) -> Result<Option<(Vec<u8>, zou_store::Version)>, CasError> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(key)
+        }
+        fn put_if_match(
+            &self,
+            key: &str,
+            data: &[u8],
+            expected: Option<&zou_store::Version>,
+        ) -> Result<zou_store::Version, CasError> {
+            self.inner.put_if_match(key, data, expected)
+        }
+        fn delete(&self, key: &str) -> Result<(), CasError> {
+            self.inner.delete(key)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, CasError> {
+            self.inner.list(prefix)
+        }
     }
 
     #[tokio::test]
