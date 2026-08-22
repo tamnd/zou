@@ -753,7 +753,7 @@ What that means in practice, written down because a difference from Deno is a di
 - The `user-agent`, when the function does not set one, is the string `navigator.userAgent` says: `Deno/2.1.4 (variant; zou/<version>)`. That is what upstream sends, measured by having a function on a real `supabase start` fetch an echo, where it read back `Deno/2.1.4 (variant; SupabaseEdgeRuntime/1.74.2)`, which is that runtime's own navigator string. It is not only politeness: a registry serves a different build of a package depending on this header, so a function fetching a module at runtime gets the same one it would have got upstream.
 - `http:` and `https:` and nothing else. `file:`, `data:` and a string that is not a url each throw a `TypeError` saying which.
 - A request that could not be made at all throws `TypeError: error sending request for url (<url>): <why>`, which is the sentence Deno throws. A 404 or a 500 is an answer and not a throw.
-- A signal ends the waiting and not the connection, which is the one difference here a function can see from the outside. See below.
+- A signal ends the connection as well as the waiting, including one the call was handed out of the pool rather than opened. See below.
 
 ### Giving up on a call
 
@@ -774,11 +774,10 @@ Deno.serve(async () => {
 The reasons are the ones a library branches on, and they are the strings a real `supabase start` was measured throwing: a caller that gave up gets `AbortError: The signal has been aborted`, a clock that ran out gets `TimeoutError: Signal timed out.`, and a signal aborted with a reason of its own throws that reason unchanged.
 A signal that was already aborted is a call that is never made.
 
-The difference from upstream is what happens to the connection.
-The call is on a blocking thread inside a client with no handle to it, so an abort rejects the promise and drops the answer while the request runs to its own end.
-Upstream tears the socket down: the same probe against a slow server on a real `supabase start` left it with a broken pipe, and against zou it left it writing an answer nobody reads.
-Nothing a function can observe differs, and what differs is the other end and the thread, which is held for as long as the call would have taken or thirty seconds, whichever is sooner.
-That is [#432](https://github.com/tamnd/zou/issues/432) rather than the way it stays.
+An abort ends the connection and not only the waiting.
+The socket is shut down under the thread that was reading it, so the read comes back instead of waiting, the thread is not held for the rest of a call nobody wants, and the server on the other end reads the end of the stream rather than writing an answer into one.
+That includes a call made on a connection it was handed rather than one it opened: connections are kept between calls, so the second call to a host is usually on the first call's socket, and it is the socket the call is using that comes down.
+The one case that is still the waiting alone is a call tunnelled through a CONNECT proxy, which is a socket the client opens for itself and nothing here configures.
 
 What a function may reach is not restricted.
 It can call a metadata endpoint on the machine it is running on, the same as upstream's runtime can and the same as `pg_net` can from inside the database.
