@@ -13,6 +13,12 @@
 //! does not, so a function that wants somebody else's body a chunk at a
 //! time is waiting on a client that can be read as it arrives.
 //!
+//! A signal ends both halves of a call. It stops the op awaiting the
+//! answer, and it shuts the socket down under the thread reading it, so
+//! that the server hears about it and the thread comes back. The socket
+//! is reachable at all because of `hangup`, which is where the client's
+//! own TCP transport would otherwise be.
+//!
 //! What a function may reach is not restricted. It can call a metadata
 //! endpoint on the machine it is running on, the same as upstream's
 //! runtime can and the same as `pg_net` can from inside the database.
@@ -105,8 +111,15 @@ pub struct Received {
 /// because a narrow window is still a window.
 #[derive(Default)]
 pub(crate) struct Calls {
-    waiting: HashMap<u32, oneshot::Sender<()>>,
+    waiting: HashMap<u32, Waiting>,
     ended: HashSet<u32>,
+}
+
+/// A call in flight: the way to stop the op awaiting it, and the way to
+/// stop the connection under it, which are two different threads' jobs.
+struct Waiting {
+    tell: oneshot::Sender<()>,
+    ticket: u64,
 }
 
 /// One call out, awaited by the handler that asked for it.
@@ -124,20 +137,27 @@ pub async fn op_zou_fetch(
 ) -> Result<Received, JsErrorBox> {
     let body = body.to_vec();
     let (tell, told) = oneshot::channel();
+    let ticket = crate::hangup::Ticket::new();
     {
         let mut state = state.borrow_mut();
         let calls = state.borrow_mut::<Calls>();
         if calls.ended.remove(&id) {
             return Err(JsErrorBox::type_error("the call was ended before it began"));
         }
-        calls.waiting.insert(id, tell);
+        calls.waiting.insert(
+            id,
+            Waiting {
+                tell,
+                ticket: ticket.id(),
+            },
+        );
     }
-    // Whichever comes first. Dropping the handle on an abort lets the
-    // blocking thread finish on its own with nobody to hand its answer
-    // to, which is the honest state of this: the request goes out and
-    // is read to its end, and what an abort ends is the waiting.
+    // Whichever comes first. An abort has already shut the socket down
+    // by the time this side hears about it, so the blocking thread is
+    // on its way out with an error nobody wants rather than reading an
+    // answer nobody wants.
     let answer = tokio::select! {
-        done = tokio::task::spawn_blocking(move || call(sent, body)) => done
+        done = tokio::task::spawn_blocking(move || ticket.during(|| call(sent, body))) => done
             .map_err(|e| JsErrorBox::type_error(format!("the call could not be started: {e}")))?,
         _ = told => Err(JsErrorBox::type_error("the call was ended")),
     };
@@ -147,6 +167,10 @@ pub async fn op_zou_fetch(
 
 /// A call nobody is waiting for any more.
 ///
+/// Both halves of it end here: the op stops awaiting, and the socket
+/// the call is on is shut down under the thread reading it, so the
+/// server is told that nobody wants what it is building.
+///
 /// Nothing is reported back. A signal that fired after the answer
 /// arrived has nothing to end, and telling the caller so would be
 /// telling it about a race it already won.
@@ -154,8 +178,9 @@ pub async fn op_zou_fetch(
 pub fn op_zou_fetch_abort(state: &mut OpState, #[smi] id: u32) {
     let calls = state.borrow_mut::<Calls>();
     match calls.waiting.remove(&id) {
-        Some(tell) => {
-            let _ = tell.send(());
+        Some(waiting) => {
+            crate::hangup::hangup(waiting.ticket);
+            let _ = waiting.tell.send(());
         }
         None => {
             calls.ended.insert(id);
@@ -170,7 +195,7 @@ pub fn op_zou_fetch_abort(state: &mut OpState, #[smi] id: u32) {
 pub(crate) fn agent() -> &'static ureq::Agent {
     static AGENTS: OnceLock<ureq::Agent> = OnceLock::new();
     AGENTS.get_or_init(|| {
-        ureq::Agent::config_builder()
+        let config = ureq::Agent::config_builder()
             // A 404 is an answer a handler is entitled to read, not a
             // transport failure, which is what `fetch` means by only
             // rejecting when the request could not be made at all.
@@ -180,8 +205,11 @@ pub(crate) fn agent() -> &'static ureq::Agent {
             // name a header of its own. A call from a function has
             // `user_agent()` put on it below.
             .user_agent(loader())
-            .build()
-            .into()
+            .build();
+        // Built by hand rather than by the client's own default,
+        // because the socket a call is on has to be reachable by the
+        // signal that ends the call. `hangup` is the whole of why.
+        crate::hangup::agent(config)
     })
 }
 
