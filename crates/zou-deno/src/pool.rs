@@ -209,11 +209,19 @@ fn work(
             job.held,
         ));
         if matches!(out, Err(Failed::Limit(_))) || ready.as_ref().is_some_and(Ready::spent) {
+            if let Some(ready) = ready.as_mut() {
+                tokio.block_on(ready.ending());
+            }
             ready = None;
         }
         // A caller that has given up on the answer is not a reason to
         // stop being a worker.
         let _ = job.done.send(out);
+    }
+    // The other end of a worker's life, and the ordinary one: nobody
+    // called for a minute, or the pool was dropped.
+    if let Some(ready) = ready.as_mut() {
+        tokio.block_on(ready.ending());
     }
 }
 
@@ -250,6 +258,9 @@ async fn once(
 ) -> Result<(), Failed> {
     let specifier = &source.specifier;
     if slot.as_ref().is_some_and(Ready::stale) {
+        if let Some(ready) = slot.as_mut() {
+            ready.ending().await;
+        }
         *slot = None;
     }
     let call = async {

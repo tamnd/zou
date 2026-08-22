@@ -504,6 +504,10 @@ pub struct Isolate {
 /// the environment does not.
 const EXECUTION_ID: &str = "SB_EXECUTION_ID";
 
+/// How long a retiring isolate lets its own `beforeunload` and `unload`
+/// listeners finish what they started.
+const GOODBYE: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl Isolate {
     pub fn new() -> Isolate {
         Isolate::with_env(Vec::new())
@@ -729,7 +733,11 @@ pub(crate) async fn once_off(
     let named = source.specifier.to_string();
     let call = async move {
         let mut ready = Ready::new(source, limits, debugger, owned).await?;
-        ready.once(held).await
+        // One isolate per call here, so the end of the call is the end
+        // of the isolate and the function is told so.
+        let ran = ready.once(held).await;
+        ready.ending().await;
+        ran
     };
     match tokio::time::timeout(limits.wall, call).await {
         Ok(ran) => ran,
@@ -811,6 +819,52 @@ impl Ready {
     /// expression between two calls is asking the isolate and not the
     /// function, and none of it should start a timer the function left
     /// behind or resolve a promise nobody is waiting for.
+    /// The end of this isolate, said into it before it goes.
+    ///
+    /// `beforeunload` with `termination` on it and then `unload`, which
+    /// is upstream's pair and its order. This is the ordinary end of a
+    /// worker: it has been idle for a minute, or a file it was built out
+    /// of moved, or it is not fit for another call. A worker that
+    /// reached a limit is not told, because a terminated isolate cannot
+    /// run the listener and because it was already told a limit was
+    /// near, which is what the warning is for.
+    ///
+    /// Whatever the listeners started gets a second, which is a number
+    /// this project picked: the thing a `beforeunload` listener does is
+    /// write somewhere, and a write that has not gone in a second is
+    /// not going to be waited for by a worker that is already leaving.
+    pub(crate) async fn ending(&mut self) {
+        if self.spent() {
+            return;
+        }
+        let Some(notify) = self
+            .js
+            .op_state()
+            .borrow()
+            .try_borrow::<limits::Lifecycle>()
+            .map(limits::Lifecycle::notify)
+        else {
+            return;
+        };
+        {
+            let context = self.js.main_context();
+            let isolate = &mut *self.js.v8_isolate();
+            v8::scope_with_context!(let scope, isolate, context);
+            limits::Lifecycle::tell(
+                &notify,
+                scope,
+                "beforeunload",
+                Some(limits::Warning::Termination),
+            );
+            limits::Lifecycle::tell(&notify, scope, "unload", None);
+        }
+        let _ = tokio::time::timeout(
+            GOODBYE,
+            self.js.run_event_loop(PollEventLoopOptions::default()),
+        )
+        .await;
+    }
+
     pub(crate) fn served(&mut self) {
         let inspector = self.js.inspector();
         let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
@@ -955,7 +1009,7 @@ async fn build(
         ),
     };
 
-    let (entry, exported, drain) = {
+    let (entry, exported, drain, lifecycle) = {
         let context = js.main_context();
         let isolate = &mut *js.v8_isolate();
         v8::scope_with_context!(let scope, isolate, context);
@@ -964,7 +1018,7 @@ async fn build(
             .try_into()
             .map_err(|_| "the prelude did not end in its entry points".to_string())?;
         let mut held = Vec::new();
-        for at in [0, 1] {
+        for at in [0, 1, 2] {
             let value = pair
                 .get_index(scope, at)
                 .ok_or_else(|| format!("the prelude's entry point {at} is missing"))?;
@@ -973,7 +1027,8 @@ async fn build(
                 .map_err(|_| format!("the prelude's entry point {at} is not a function"))?;
             held.push(v8::Global::new(scope, function));
         }
-        let drain = held.pop().expect("two of them");
+        let lifecycle = held.pop().expect("three of them");
+        let drain = held.pop().expect("three of them");
         // A module namespace answers for a name it does not export with
         // undefined rather than by failing, which is exactly what the
         // prelude wants to be told about a module that has no default.
@@ -988,11 +1043,17 @@ async fn build(
             }
         };
         (
-            held.pop().expect("two of them"),
+            held.pop().expect("three of them"),
             v8::Global::new(scope, exported),
             drain,
+            lifecycle,
         )
     };
+    // The watchdog reaches this one from another thread, so it lives
+    // where an interrupt can find it rather than in this struct.
+    js.op_state()
+        .borrow_mut()
+        .put(limits::Lifecycle::new(lifecycle));
     drop(watchdog);
     Ok(Ready {
         js,

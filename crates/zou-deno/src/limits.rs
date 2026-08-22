@@ -17,6 +17,17 @@
 //! the head of a streamed answer has already gone out truncates the
 //! body instead, because there is no status code left to change.
 //!
+//! # Being near one of them is something the function is told
+//!
+//! At ninety percent of each of the three, the function is sent a
+//! `beforeunload` event with the reason on it, which is its last
+//! chance to write down where it got to. Ninety percent is upstream's
+//! number for all three and it is a flag there; it is not a flag here.
+//! What that event costs is an interrupt from the watchdog thread and
+//! a task handed to the event loop, so a function that never gives the
+//! loop a turn is never told, which is the same in both runtimes and
+//! for the same reason.
+//!
 //! # The three of them are stopped in two different ways
 //!
 //! Memory is v8's own, and then it is not. The isolate is created with
@@ -88,11 +99,14 @@ impl Default for Limits {
             memory: 256 * MIB,
             wall: Duration::from_secs(400),
             // Upstream's hard limit. Its soft limit of one second is
-            // not here, because what upstream does with it is dispatch
-            // `beforeunload` into the function at ninety percent of it
-            // and this runtime has no such event yet. A function that
-            // burns a second and a half and then answers is answered
-            // there and is answered here.
+            // not here. What upstream does with the soft limit is
+            // retire the worker early, which is a decision about a pool
+            // of workers rather than about a call, and the pool here
+            // decides it a different way. `beforeunload` is not the
+            // soft limit and never was: upstream dispatches it at
+            // ninety percent of the hard limit, which is what this
+            // does. A function that burns a second and a half and then
+            // answers is answered there and is answered here.
             cpu: Duration::from_secs(2),
             background: Duration::from_secs(30),
         }
@@ -132,6 +146,156 @@ pub enum Reached {
     Cpu,
 }
 
+/// Why a function is being told it is about to stop.
+///
+/// The words are upstream's and they are what a listener reads off
+/// `detail.reason`, so they are spelled its way and not this project's:
+/// `wall_clock` and not `wall`. `early_drop` is upstream's fifth and is
+/// not here, because it names a worker being retired while it still has
+/// requests in flight and this pool retires a worker between calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Warning {
+    Cpu,
+    Memory,
+    WallClock,
+    Termination,
+}
+
+impl Warning {
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Warning::Cpu => "cpu",
+            Warning::Memory => "memory",
+            Warning::WallClock => "wall_clock",
+            Warning::Termination => "termination",
+        }
+    }
+
+    /// Which bit of the warned mask this one is, so that a watchdog
+    /// looking every ten milliseconds says each of them once.
+    fn bit(self) -> u8 {
+        match self {
+            Warning::Cpu => 1,
+            Warning::Memory => 2,
+            Warning::WallClock => 4,
+            Warning::Termination => 8,
+        }
+    }
+}
+
+/// How much of a limit a function may use before it is told it is
+/// about to lose the rest of it.
+///
+/// Ninety percent is upstream's default for all three of them, and all
+/// three are a flag there: `dispatch-beforeunload-cpu-ratio`,
+/// `-wall-clock-ratio` and `-memory-ratio`, each of which takes a
+/// percentage under a hundred and each of which ships as 90. They are
+/// not flags here, because a function that wants a different number
+/// wants a different limit.
+const NEAR: u32 = 90;
+
+/// Ninety percent of a duration, which is where the warning goes.
+fn near(whole: Duration) -> Duration {
+    whole / 100 * NEAR
+}
+
+/// The same of a number of bytes.
+fn near_bytes(whole: usize) -> usize {
+    whole / 100 * NEAR as usize
+}
+
+/// Ask the isolate to tell the function, if it is still there to ask.
+fn tell(handle: &v8::IsolateHandle, why: Warning) {
+    let asked = Box::into_raw(Box::new(why)) as *mut c_void;
+    if !handle.request_interrupt(warn, asked) {
+        drop(unsafe { Box::from_raw(asked as *mut Warning) });
+    }
+}
+
+/// The prelude's own dispatcher, kept where an interrupt can find it.
+///
+/// It is in the op state rather than beside the isolate because the
+/// thread that decides a warning is due is the watchdog, and the only
+/// thing the watchdog holds is the isolate's thread safe handle.
+pub(crate) struct Lifecycle {
+    notify: v8::Global<v8::Function>,
+}
+
+impl Lifecycle {
+    pub(crate) fn new(notify: v8::Global<v8::Function>) -> Lifecycle {
+        Lifecycle { notify }
+    }
+
+    /// The dispatcher itself, for a caller that has a scope of its own
+    /// and does not need an interrupt to reach the isolate.
+    pub(crate) fn notify(&self) -> v8::Global<v8::Function> {
+        self.notify.clone()
+    }
+
+    /// Tell the function something about its own life, on the isolate's
+    /// own thread and inside a scope somebody else owns.
+    ///
+    /// A throw out of a listener is caught here and goes no further: the
+    /// event loop's scope is not somewhere an exception may be left, and
+    /// a function that throws while being told it is about to stop is
+    /// still about to stop.
+    pub(crate) fn tell(
+        notify: &v8::Global<v8::Function>,
+        scope: &mut v8::PinScope<'_, '_>,
+        kind: &str,
+        why: Option<Warning>,
+    ) {
+        let notify = v8::Local::new(scope, notify);
+        let Some(kind) = v8::String::new(scope, kind) else {
+            return;
+        };
+        let why = match why {
+            None => v8::undefined(scope).into(),
+            Some(why) => match v8::String::new(scope, why.word()) {
+                Some(word) => word.into(),
+                None => v8::undefined(scope).into(),
+            },
+        };
+        let recv = v8::undefined(scope).into();
+        v8::tc_scope!(let caught, scope);
+        notify.call(caught, recv, &[kind.into(), why]);
+    }
+}
+
+/// Tell the function what is about to happen to it, from a thread that
+/// is not the isolate's.
+///
+/// This is an interrupt because there is nothing else: the isolate is
+/// inside its own event loop and nobody out here has a scope. What the
+/// interrupt does is not run javascript, which would be running it at
+/// whatever point in the function v8 happened to stop, but hand a task
+/// to the event loop, which runs it at a point deno_core chose. It is
+/// the same shape upstream uses, and it means a function that never
+/// gives the loop a turn is never told, which is written down rather
+/// than pretended away: such a function reaches the hard limit in the
+/// same tight loop that kept it from hearing about the soft one.
+unsafe extern "C" fn warn(mut raw: v8::UnsafeRawIsolatePtr, asked: *mut c_void) {
+    let why = *unsafe { Box::from_raw(asked as *mut Warning) };
+    let isolate = unsafe { v8::Isolate::ref_from_raw_isolate_ptr_mut(&mut raw) };
+    let state = deno_core::JsRuntime::op_state_from(isolate);
+    // An interrupt lands between two pieces of javascript rather than
+    // inside an op, so this is free. It is asked rather than taken
+    // because a panic in here would be an aborted process.
+    let Ok(state) = state.try_borrow() else {
+        return;
+    };
+    let (Some(lifecycle), Some(spawner)) = (
+        state.try_borrow::<Lifecycle>(),
+        state.try_borrow::<deno_core::V8TaskSpawner>(),
+    ) else {
+        return;
+    };
+    let notify = lifecycle.notify.clone();
+    spawner.clone().spawn(move |scope| {
+        Lifecycle::tell(&notify, scope, "beforeunload", Some(why));
+    });
+}
+
 const NOTHING: u8 = 0;
 const MEMORY: u8 = 1;
 const WALL: u8 = 2;
@@ -159,6 +323,10 @@ pub(crate) struct Watch {
     /// zero when nothing is running.
     entered: AtomicU64,
     hit: AtomicU8,
+    /// Which warnings have already gone into the function, one bit
+    /// each, because the watchdog looks a hundred times a second and a
+    /// function is told about a limit once.
+    warned: AtomicU8,
     /// Bytes of array buffer the function has out, which is not on the
     /// heap v8 was given a limit for.
     buffers: AtomicUsize,
@@ -174,6 +342,7 @@ impl Watch {
             spent: AtomicU64::new(0),
             entered: AtomicU64::new(0),
             hit: AtomicU8::new(NOTHING),
+            warned: AtomicU8::new(0),
             buffers: AtomicUsize::new(0),
             collecting: std::sync::atomic::AtomicBool::new(false),
             limits,
@@ -215,9 +384,24 @@ impl Watch {
     /// The clocks start again, which is what an isolate kept between
     /// calls needs: a call's cpu and wall are its own, and the memory
     /// is not, because the memory is still there.
+    ///
+    /// The warnings start again with them, and the cpu and wall ones
+    /// have to: they are about a limit that has just been given back.
+    /// The memory one goes too, which is a choice rather than a
+    /// consequence, because a function told once that it was near the
+    /// limit and then called ten more times without ever collecting
+    /// would otherwise be told once in its life.
     pub(crate) fn restart(&self) {
         self.spent.store(0, Ordering::Release);
         self.entered.store(0, Ordering::Release);
+        self.warned.store(0, Ordering::Release);
+    }
+
+    /// Whether this warning is this call's first, which is the only one
+    /// that is sent.
+    fn first(&self, warning: Warning) -> bool {
+        let bit = warning.bit();
+        self.warned.fetch_or(bit, Ordering::AcqRel) & bit == 0
     }
 
     /// Buffer bytes handed out, and the total afterwards.
@@ -355,7 +539,9 @@ pub(crate) struct Watchdog {
 pub(crate) fn watch(handle: v8::IsolateHandle, watch: Arc<Watch>, limits: Limits) -> Watchdog {
     let (over, until) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let deadline = Instant::now() + limits.wall;
+        let started = Instant::now();
+        let deadline = started + limits.wall;
+        let warning = started + near(limits.wall);
         loop {
             match until.recv_timeout(TICK) {
                 // The call is over, whichever way it went.
@@ -383,7 +569,27 @@ pub(crate) fn watch(handle: v8::IsolateHandle, watch: Arc<Watch>, limits: Limits
                     return;
                 }
             }
-            let over = if Instant::now() >= deadline {
+            // Near a limit is a warning and not a stop, so all three are
+            // asked about before any of them ends the call, and the
+            // function gets whatever is left of its budget to act on
+            // what it was told.
+            let now = Instant::now();
+            for near in [
+                (now >= warning, Warning::WallClock),
+                (watch.cpu() >= near(limits.cpu), Warning::Cpu),
+                (
+                    watch.buffered() >= near_bytes(limits.memory),
+                    Warning::Memory,
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(yes, which)| yes.then_some(which))
+            {
+                if watch.first(near) {
+                    tell(&handle, near);
+                }
+            }
+            let over = if now >= deadline {
                 WALL
             } else if watch.cpu() >= limits.cpu {
                 CPU
