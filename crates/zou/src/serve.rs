@@ -41,9 +41,9 @@ use zou_store::layout::TenantLayout;
 use zou_store::registry::Tenant;
 use zou_store::{CasStore, Manifest, open_store};
 
-pub const USAGE: &str = "usage: zou serve <target> [--ref <ref>] [--http <n[,n...]>] [--pg <n>] [--pool <n>] [--pg-tls-cert <file> --pg-tls-key <file>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>] [--node <id>] [--advertise <url>]";
+pub const USAGE: &str = "usage: zou serve <target> [--ref <ref>] [--http <n[,n...]>] [--pg <n>] [--pool <n>] [--pg-tls-cert <file> --pg-tls-key <file>] [--ops <n>] [--domain <suffix>] [--no-path-prefix] [--pg-bin <dir>] [--runtime <dir>] [--max-attached <n>] [--idle-secs <n>] [--shared-buffers <size>] [--max-connections <n>] [--passthrough <size>] [--gc-every <duration>] [--gc-window <duration>] [--gc-retention <duration>] [--node <id>] [--advertise <url>]";
 
-pub const LAMBDA_USAGE: &str = "usage: zou lambda <target> [--ref <ref>] [--pg-bin <dir>] [--runtime <dir>] [--shared-buffers <size>] [--passthrough <size>]";
+pub const LAMBDA_USAGE: &str = "usage: zou lambda <target> [--ref <ref>] [--pg-bin <dir>] [--runtime <dir>] [--shared-buffers <size>] [--max-connections <n>] [--passthrough <size>]";
 
 /// How long a tenant's postmaster has to say it is accepting
 /// connections. A cold attach is meant to be under half a second and
@@ -113,7 +113,25 @@ const PASSTHROUGH_TTL: Duration = Duration::from_secs(900);
 /// Connections one tenant's postmaster will take. The pooler's own
 /// ceiling is twenty per project and role, so this is that plus room
 /// for the http door's pool and a person with psql open.
+///
+/// A node running a few large projects should raise it with
+/// `--max-connections`, for the reason written above `SHARED_BUFFERS`:
+/// the ceiling on attached tenants multiplies whatever this is, so the
+/// default is sized for a packed node rather than a busy one.
 const MAX_CONNECTIONS: u32 = 40;
+
+/// The fewest a postmaster can be told to take.
+///
+/// One bank of the pooler is [`zou_server::wire::POOL_PER_BANK`], the
+/// http door's own pool is [`zou_server::POOL_SIZE`], and postgres
+/// keeps three back for a superuser. Under the three of them added up
+/// there is a set of clients that each hold what they have and wait for
+/// what they cannot get, which is a project that stops rather than a
+/// project that is slow. So it is refused at the command line, where
+/// there is somebody to read the sentence, rather than found later by a
+/// client being told there are too many of it.
+const LEAST_CONNECTIONS: u32 =
+    zou_server::wire::POOL_PER_BANK as u32 + zou_server::POOL_SIZE as u32 + 3;
 
 /// Set by the signal handler, drained by the loop that waits.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -152,6 +170,11 @@ pub struct Args {
     pub max_attached: usize,
     pub idle: Duration,
     pub shared_buffers: String,
+    /// Connections one tenant's postmaster will take. A node running a
+    /// few large projects wants more of these than a node running a
+    /// thousand small ones, which is the same reasoning that sets
+    /// `shared_buffers` above.
+    pub max_connections: u32,
     /// The smallest object this node hands out a store url for instead
     /// of serving. None, the default, and it serves every byte itself.
     pub passthrough: Option<u64>,
@@ -216,6 +239,7 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
     let mut max_attached = zou_server::attach::MAX_ATTACHED;
     let mut idle = zou_server::attach::IDLE;
     let mut shared_buffers = SHARED_BUFFERS.to_string();
+    let mut max_connections = MAX_CONNECTIONS;
     let mut passthrough = None;
     let mut gc_every = None;
     let mut policy = gc::Policy::default();
@@ -277,6 +301,22 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
                 idle = Duration::from_secs(secs);
             }
             "--shared-buffers" => shared_buffers = need(&mut it, "--shared-buffers")?.clone(),
+            "--max-connections" => {
+                let raw = need(&mut it, "--max-connections")?;
+                max_connections = raw.parse().map_err(|_| {
+                    format!("bad connection ceiling {raw:?}, write a whole number of connections")
+                })?;
+                if max_connections < LEAST_CONNECTIONS {
+                    return Err(format!(
+                        "--max-connections {max_connections} is fewer than one project needs to \
+                         serve one client: the pooler opens up to {} backends for a role, the \
+                         http door's own pool is {}, and postgres keeps 3 back for a superuser, \
+                         so {LEAST_CONNECTIONS} is the floor",
+                        zou_server::wire::POOL_PER_BANK,
+                        zou_server::POOL_SIZE,
+                    ));
+                }
+            }
             "--passthrough" => passthrough = Some(size(need(&mut it, "--passthrough")?)?),
             "--gc-every" => {
                 gc_every = Some(Duration::from_secs(crate::gc::secs(need(
@@ -414,6 +454,7 @@ fn parse_as(argv: &[String], lambda: bool) -> Result<Args, String> {
         max_attached,
         idle,
         shared_buffers,
+        max_connections,
         passthrough,
         gc,
         only,
@@ -691,6 +732,7 @@ struct Postmasters {
     pg_bin: PathBuf,
     runtime: PathBuf,
     shared_buffers: String,
+    max_connections: u32,
     /// The serve domain a tenant's own url is built from, so that the
     /// links in its confirmation mail point at the project and not at
     /// this node. None and nothing is set, which is the honest answer
@@ -938,7 +980,7 @@ impl Backend for Postmasters {
             .args(["-c", &format!("max_replication_slots={}", zou_pg::SLOTS)])
             .args(["-c", &format!("max_wal_senders={}", zou_pg::SLOTS)])
             .args(["-c", &format!("shared_buffers={}", self.shared_buffers)])
-            .args(["-c", &format!("max_connections={MAX_CONNECTIONS}")])
+            .args(["-c", &format!("max_connections={}", self.max_connections)])
             // How a replaying postmaster keeps its attach alive. Named
             // here rather than left to the default because the deadline
             // below counts on it.
@@ -1406,6 +1448,7 @@ pub fn run(args: &Args) -> Result<(), String> {
         pg_bin: args.pg_bin.clone(),
         runtime: args.runtime.clone(),
         shared_buffers: args.shared_buffers.clone(),
+        max_connections: args.max_connections,
         domain: args.domains.first().cloned(),
         passthrough: args.passthrough.map(|min_bytes| Passthrough {
             min_bytes,
@@ -1874,6 +1917,8 @@ mod tests {
             "30",
             "--shared-buffers",
             "64MB",
+            "--max-connections",
+            "200",
             "--passthrough",
             "8MB",
             "--gc-every",
@@ -1896,12 +1941,46 @@ mod tests {
         assert_eq!(args.max_attached, 64);
         assert_eq!(args.idle, Duration::from_secs(30));
         assert_eq!(args.shared_buffers, "64MB");
+        assert_eq!(args.max_connections, 200);
         assert_eq!(args.passthrough, Some(8 * 1024 * 1024));
         let gc = args.gc.expect("a node that was told to collect");
         assert_eq!(gc.every, Duration::from_secs(6 * 60 * 60));
         assert_eq!(gc.policy.window_secs, 2 * 24 * 60 * 60);
         assert_eq!(gc.policy.retention_secs, 30 * 24 * 60 * 60);
         assert!(!gc.policy.dry_run, "a node that sweeps for real");
+    }
+
+    /// A node running a few large projects wants more connections a
+    /// project than a node running a thousand small ones, and until
+    /// there was a flag the only way to find out there was a number at
+    /// all was to read the source.
+    #[test]
+    fn a_project_takes_forty_connections_unless_a_node_says_otherwise() {
+        let args = parse(&argv(&["./fleet"])).unwrap();
+        assert_eq!(args.max_connections, MAX_CONNECTIONS);
+        let args = parse(&argv(&["./fleet", "--max-connections", "500"])).unwrap();
+        assert_eq!(args.max_connections, 500);
+        assert!(parse(&argv(&["./fleet", "--max-connections"])).is_err());
+        assert!(parse(&argv(&["./fleet", "--max-connections", "lots"])).is_err());
+    }
+
+    /// A ceiling under what one project needs to serve one client is a
+    /// project that stops rather than a project that is slow, and the
+    /// place to say so is the command line, where somebody is reading.
+    #[test]
+    fn a_ceiling_the_pooler_cannot_fit_under_is_refused() {
+        let said = parse(&argv(&["./fleet", "--max-connections", "10"])).unwrap_err();
+        assert!(said.contains("--max-connections 10"), "{said}");
+        assert!(said.contains(&LEAST_CONNECTIONS.to_string()), "{said}");
+        assert!(
+            parse(&argv(&[
+                "./fleet",
+                "--max-connections",
+                &LEAST_CONNECTIONS.to_string()
+            ]))
+            .is_ok(),
+            "the floor itself is allowed"
+        );
     }
 
     /// Retention written on a node that never sweeps is a promise
@@ -2192,6 +2271,7 @@ mod tests {
             pg_bin: PathBuf::from("/nonexistent"),
             runtime: PathBuf::from("/nonexistent"),
             shared_buffers: "128MB".to_string(),
+            max_connections: MAX_CONNECTIONS,
             domain: None,
             passthrough: None,
             http: 54321,
