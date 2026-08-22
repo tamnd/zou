@@ -124,12 +124,20 @@ jobs:
         run: |
           set -e
           psql -h 127.0.0.1 -U postgres -c "alter system set wal_level = logical"
+          # A tap is a replication slot of its own, and the suites run
+          # in parallel, so the stock ten is fewer than one test file
+          # holds at once and one of them fails with all replication
+          # slots are in use. Both settings, since a slot being read
+          # needs a wal sender too.
+          psql -h 127.0.0.1 -U postgres -c "alter system set max_replication_slots = 64"
+          psql -h 127.0.0.1 -U postgres -c "alter system set max_wal_senders = 64"
           docker restart "$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -1)"
           for _ in $(seq 1 30); do
             pg_isready -h 127.0.0.1 -U postgres && break
             sleep 2
           done
           test "$(psql -h 127.0.0.1 -U postgres -tAc 'show wal_level')" = logical
+          test "$(psql -h 127.0.0.1 -U postgres -tAc 'show max_replication_slots')" = 64
       - name: Run the pool leak, rls contract, rls attack, and auth tests
         env:
           ZOU_PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=zou-pool-tests dbname=postgres
@@ -839,12 +847,20 @@ jobs:
         run: |
           set -e
           psql -h 127.0.0.1 -U postgres -c "alter system set wal_level = logical"
+          # A tap is a replication slot of its own, and the suites run
+          # in parallel, so the stock ten is fewer than one test file
+          # holds at once and one of them fails with all replication
+          # slots are in use. Both settings, since a slot being read
+          # needs a wal sender too.
+          psql -h 127.0.0.1 -U postgres -c "alter system set max_replication_slots = 64"
+          psql -h 127.0.0.1 -U postgres -c "alter system set max_wal_senders = 64"
           docker restart "$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -1)"
           for _ in $(seq 1 30); do
             pg_isready -h 127.0.0.1 -U postgres && break
             sleep 2
           done
           test "$(psql -h 127.0.0.1 -U postgres -tAc 'show wal_level')" = logical
+          test "$(psql -h 127.0.0.1 -U postgres -tAc 'show max_replication_slots')" = 64
       - name: Fetch the suites
         run: |
           git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance
@@ -1165,12 +1181,20 @@ jobs:
         run: |
           set -e
           psql -h 127.0.0.1 -U postgres -c "alter system set wal_level = logical"
+          # A tap is a replication slot of its own, and the suites run
+          # in parallel, so the stock ten is fewer than one test file
+          # holds at once and one of them fails with all replication
+          # slots are in use. Both settings, since a slot being read
+          # needs a wal sender too.
+          psql -h 127.0.0.1 -U postgres -c "alter system set max_replication_slots = 64"
+          psql -h 127.0.0.1 -U postgres -c "alter system set max_wal_senders = 64"
           docker restart "$(docker ps --filter ancestor=postgres:18 --format '{{.ID}}' | head -1)"
           for _ in $(seq 1 30); do
             pg_isready -h 127.0.0.1 -U postgres && break
             sleep 2
           done
           test "$(psql -h 127.0.0.1 -U postgres -tAc 'show wal_level')" = logical
+          test "$(psql -h 127.0.0.1 -U postgres -tAc 'show max_replication_slots')" = 64
       - name: Fetch the suites
         run: |
           git clone -q https://github.com/tamnd/zou-conformance /tmp/zou-conformance

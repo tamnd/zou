@@ -178,6 +178,11 @@ fn over_a_private_postmaster<T>(
         // contract creates is for. On from the first boot so that no
         // later restart has to change it.
         .args(["-c", "wal_level=logical"])
+        // The same slot count the servers run with, since a
+        // postmaster refuses to start when it finds more slots on disk
+        // than it allows and this is the boot that writes the pgdata.
+        .args(["-c", &format!("max_replication_slots={}", zou_pg::SLOTS)])
+        .args(["-c", &format!("max_wal_senders={}", zou_pg::SLOTS)])
         .env("ZOU_TARGET", target)
         .env("ZOU_TENANT", tenant_ref)
         .env("ZOU_PAGE_CACHE", pagecache)
