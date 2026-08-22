@@ -17,7 +17,7 @@ A local user who can read `/proc`, the runtime directory or the node's environme
 
 ## The doors
 
-A `zou serve` node opens up to four listeners, and they are not equally safe to expose.
+A node opens several listeners and they are not equally safe to expose.
 The ports and their flags are in [operations.md](operations.md); what matters here is which side of the boundary each one belongs on.
 
 **The http front door is public.**
@@ -40,7 +40,7 @@ It is a separate listener rather than two routes on the api port because a scrap
 **The functions inspector is loopback and nothing else.**
 A debugger session evaluates arbitrary javascript inside an isolate holding the project's secrets, so it is a shell on the process rather than a view of it, and [functions.md](functions.md) says so where the flag is documented.
 
-The fifth door is not a listener.
+The last door is not a listener at all.
 It is the object store, and it is dealt with below.
 
 ## What is verified, and where
