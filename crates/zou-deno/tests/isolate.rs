@@ -326,12 +326,13 @@ fn a_function_may_import_the_files_beside_it() {
 
 /// The three that are refused before a request is made, which is why
 /// this test needs no network: `npm:` and `jsr:` are fetched and are
-/// tested in `registry.rs`.
+/// tested in `registry.rs`. The node built in named here is one nobody
+/// has written, since the ones that are written are served.
 #[test]
 fn a_specifier_this_runtime_does_not_serve_says_so_by_name() {
     for (specifier, said) in [
         ("http://esm.sh/zod", "over https"),
-        ("node:fs", "no node built in fs"),
+        ("node:child_process", "no node built in child_process"),
         ("data:text/javascript,1", "the data: specifier"),
     ] {
         let source = format!(r#"import "{specifier}"; Deno.serve(() => new Response("no"));"#);
@@ -708,6 +709,51 @@ fn text_decodes_out_of_utf_16_in_both_orders() {
         said["refused"],
         "the encoding label provided ('latin1') is not supported"
     );
+}
+
+/// A decoder told more is coming holds the character that straddles
+/// two chunks, which is what makes one usable on a body arriving in
+/// pieces. Without it every multi byte character landing on a chunk
+/// boundary quietly becomes replacement characters.
+#[test]
+fn a_decoder_holds_the_character_that_straddles_two_chunks() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const bytes = new TextEncoder().encode("héllo");
+            const split = new TextDecoder();
+            const first = split.decode(bytes.subarray(0, 2), { stream: true });
+            const rest = split.decode(bytes.subarray(2), { stream: true });
+            const wide = new TextEncoder().encode("a😀b");
+            const four = new TextDecoder();
+            const cut = four.decode(wide.subarray(0, 3), { stream: true });
+            // And a decoder that was not told is the one that was here
+            // before: it decodes what it was given, boundary and all.
+            const blind = new TextDecoder().decode(bytes.subarray(0, 2));
+            const wideEnd = new TextDecoder("utf-16le");
+            const odd = wideEnd.decode(new Uint8Array([0x68, 0x00, 0xe9]), { stream: true });
+            return Response.json({
+                first,
+                rest,
+                cut,
+                rejoined: cut + four.decode(wide.subarray(3), { stream: true }),
+                blind,
+                flushed: split.decode(),
+                odd,
+                oddRest: wideEnd.decode(new Uint8Array([0x00])),
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["first"], "h");
+    assert_eq!(said["rest"], "\u{e9}llo");
+    assert_eq!(said["cut"], "a");
+    assert_eq!(said["rejoined"], "a\u{1f600}b");
+    assert_eq!(said["blind"], "h\u{fffd}");
+    assert_eq!(said["flushed"], "");
+    assert_eq!(said["odd"], "h");
+    assert_eq!(said["oddRest"], "\u{e9}");
 }
 
 #[test]

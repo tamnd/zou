@@ -32,8 +32,11 @@
 //! - A timer only fires while there is a call for it to fire in,
 //!   which is until the answer plus whatever `EdgeRuntime.waitUntil`
 //!   is still waiting for, and thirty seconds is the ceiling on that.
-//! - There are no node built ins, so `node:` is refused by name and a
-//!   package that reaches for one will not run.
+//! - The node built ins are the part of each one a package reaches
+//!   for, not node's: `node:fs` reads and will not write, `node:crypto`
+//!   is a hash, an hmac and randomness with no ciphers behind it, and a
+//!   stream has none of the internals a package can reach into. A built
+//!   in nobody has written yet is refused by name.
 //! - A socket is tcp. A unix socket is a file on the host rather than
 //!   somewhere on the network, so `transport: unix` is refused by name.
 //! - A `TextDecoder` decodes utf-8 and utf-16 and none of the legacy
@@ -102,7 +105,13 @@
 //! `npm:` and `jsr:` specifiers are fetched from a registry that serves
 //! packages as modules, esm.sh by default, and kept on disk after the
 //! first time. There is no node module resolution here and no CJS: what
-//! runs is the registry's build of the package.
+//! runs is the registry's build of the package. Which build that is
+//! depends on who the registry thinks is asking, and this asks as
+//! itself, which gets the build made for a browser: the corpus in
+//! `docs/functions.md` ran thirty two of forty functions that way and
+//! twenty five asking as Deno, and `fetch.rs` says what the seven are.
+//! That build still reaches for `node:buffer` and `node:process`, which
+//! is one of the reasons the built ins in `node/` are here.
 //!
 //! Typescript is real: `deno_ast` is the same swc transpiler Deno uses,
 //! so what runs is what would run there.
@@ -123,6 +132,8 @@ mod isolate;
 mod limits;
 #[cfg(feature = "isolate")]
 mod module;
+#[cfg(feature = "isolate")]
+mod node;
 #[cfg(feature = "isolate")]
 mod pool;
 #[cfg(feature = "isolate")]

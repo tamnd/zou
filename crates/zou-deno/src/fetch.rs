@@ -58,16 +58,25 @@ fn user_agent() -> &'static str {
 ///
 /// esm.sh reads this header and answers a different build depending on
 /// it. A Deno agent is served the `denonext` build, which is the one
-/// upstream runs and which imports `node:process` and `node:buffer` for
-/// a line or two, and there are no node built ins here: asking for it
-/// took the whole corpus from twenty seven functions running to
-/// twenty one. Anything else is served a build for a browser, which is
-/// the one that runs here.
+/// upstream runs and which imports `node:process` and `node:buffer`.
+/// Anything else is served a build for a browser, with the platform
+/// bits stubbed out.
 ///
-/// So this name is a statement about what this runtime can link rather
-/// than about what it is compatible with, and the day the node built
-/// ins arrive it should become the other one.
-const LOADER: &str = "zou-edge-runtime";
+/// Asking as Deno would be the better build in principle, since it is
+/// the one a package author tested on a Deno runtime. It is not the
+/// better build here yet, and the number is the reason: the same
+/// corpus on the same machine on the same afternoon ran thirty two of
+/// forty functions asking as this and twenty five asking as Deno. The
+/// seven it costs are packages whose Deno build imports
+/// `node:child_process`, `node:diagnostics_channel` or `node:module`,
+/// and the browser build has those stubbed out by the registry.
+/// Four of the seven want to start a process, which is not something
+/// this will ever have, so the flip waits on a built in that refuses
+/// the way the registry's stub does rather than on more of them
+/// existing. `docs/functions.md` has the rest of the measurement.
+fn loader() -> &'static str {
+    "zou-edge-runtime"
+}
 
 #[derive(serde::Deserialize)]
 pub struct Sent {
@@ -170,7 +179,7 @@ pub(crate) fn agent() -> &'static ureq::Agent {
             // The loader's, because the loader is the one that does not
             // name a header of its own. A call from a function has
             // `user_agent()` put on it below.
-            .user_agent(LOADER)
+            .user_agent(loader())
             .build()
             .into()
     })

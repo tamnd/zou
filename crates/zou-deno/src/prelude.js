@@ -69,6 +69,7 @@
 
   const ENCODING = Symbol("encoding");
   const KEEP_BOM = Symbol("ignoreBOM");
+  const HELD = Symbol("held");
 
   /// Two bytes at a time, in chunks, because `String.fromCharCode` of a
   /// million arguments is a stack that has run out rather than a string.
@@ -100,15 +101,38 @@
       }
       this[ENCODING] = encoding;
       this[KEEP_BOM] = Boolean(options && options.ignoreBOM);
+      this[HELD] = null;
     }
     get encoding() {
       return this[ENCODING];
     }
-    decode(input) {
-      if (input === undefined) {
+    // `stream: true` is what makes a decoder usable on a body arriving
+    // in chunks: a character whose bytes straddle two of them is held
+    // until the rest of it turns up rather than being decoded into the
+    // replacement character. Without it, decoding a chunked response a
+    // piece at a time quietly corrupts every multi byte character that
+    // lands on a boundary, which is not something the caller can see.
+    decode(input, options) {
+      const streaming = Boolean(options && options.stream);
+      let bytes = input === undefined ? EMPTY : bytesOf(input);
+      const held = this[HELD];
+      if (held !== null) {
+        const both = new Uint8Array(held.length + bytes.length);
+        both.set(held);
+        both.set(bytes, held.length);
+        bytes = both;
+        this[HELD] = null;
+      }
+      if (streaming) {
+        const cut = whole(bytes, this[ENCODING]);
+        if (cut < bytes.length) {
+          this[HELD] = bytes.slice(cut);
+          bytes = bytes.subarray(0, cut);
+        }
+      }
+      if (bytes.length === 0) {
         return "";
       }
-      const bytes = bytesOf(input);
       if (this[ENCODING] === "utf-8") {
         return core.decode(bytes);
       }
@@ -118,6 +142,34 @@
       // handed the bytes as they are.
       return this[KEEP_BOM] || !text.startsWith("\uFEFF") ? text : text.slice(1);
     }
+  }
+
+  const EMPTY = new Uint8Array(0);
+
+  /// How much of these bytes is characters that are all here, for a
+  /// decoder that has been told more is coming.
+  ///
+  /// utf-8 says how long a character is in its first byte, so the only
+  /// question is whether the last one started and did not finish. utf-16
+  /// is two bytes at a time, and a lone surrogate at the end is left to
+  /// be decoded as one rather than held, which is what a decoder does
+  /// with an unpaired one anyway.
+  function whole(bytes, encoding) {
+    const end = bytes.length;
+    if (encoding !== "utf-8") {
+      return end - (end % 2);
+    }
+    for (let back = 1; back <= 3 && back <= end; back += 1) {
+      const byte = bytes[end - back];
+      if (byte < 0x80) {
+        return end;
+      }
+      if (byte >= 0xc0) {
+        const needs = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : 2;
+        return back < needs ? end - back : end;
+      }
+    }
+    return end;
   }
 
   const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -3276,6 +3328,192 @@
   };
 
   // ---------------------------------------------------------------
+  // process
+  //
+  // A global rather than only a module, because that is what upstream's
+  // runtime has: Deno puts `process` on the global and a package that
+  // reads `process.env.NODE_ENV` at the top of a module gets an answer
+  // there instead of a ReferenceError. `node:process` is this object
+  // and not a second one, so a function that sets something on it sees
+  // it whichever way it reached it.
+  //
+  // The version is the node a package should believe it is running on
+  // when it branches on one, which is what the number is for: it is
+  // checked far more often than it is printed.
+
+  const environment = new Proxy(
+    {},
+    {
+      get(_target, name) {
+        return typeof name === "string" ? env.get(name) : undefined;
+      },
+      has(_target, name) {
+        return typeof name === "string" && env.has(name);
+      },
+      set() {
+        throw new TypeError("the environment of a function is read only");
+      },
+      deleteProperty() {
+        throw new TypeError("the environment of a function is read only");
+      },
+      ownKeys() {
+        return Reflect.ownKeys(env.toObject());
+      },
+      getOwnPropertyDescriptor(_target, name) {
+        const value = typeof name === "string" ? env.get(name) : undefined;
+        return value === undefined
+          ? undefined
+          : { value, writable: false, enumerable: true, configurable: true };
+      },
+    },
+  );
+
+  /// A writer that goes to the console, because there is no file
+  /// descriptor here to hand anybody. A package that writes a log line
+  /// through `process.stdout` gets a log line.
+  function writer(to) {
+    let held = "";
+    return {
+      write(chunk) {
+        held += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
+        // A line at a time, so a package writing "a" then "b\n" makes
+        // one line rather than two.
+        const lines = held.split("\n");
+        held = lines.pop();
+        for (const line of lines) {
+          to(line);
+        }
+        return true;
+      },
+      end() {},
+      on() {
+        return this;
+      },
+      once() {
+        return this;
+      },
+      removeListener() {
+        return this;
+      },
+      isTTY: false,
+      columns: 80,
+      fd: to === console.error ? 2 : 1,
+    };
+  }
+
+  const NODE = "20.11.1";
+
+  const process = {
+    env: environment,
+    argv: ["node", "index"],
+    argv0: "node",
+    execPath: "/usr/local/bin/node",
+    platform: "linux",
+    arch: "x86_64",
+    pid: 1,
+    ppid: 0,
+    title: "zou",
+    version: `v${NODE}`,
+    versions: { node: NODE, v8: "0.0.0" },
+    release: { name: "node" },
+    browser: false,
+    exitCode: undefined,
+    // Node runs these before promises rather than after, which nothing
+    // here can offer: a microtask is the closest thing this event loop
+    // has and the ordering difference has not been worth an op.
+    nextTick(work, ...args) {
+      queueMicrotask(() => work(...args));
+    },
+    cwd() {
+      return "/";
+    },
+    chdir() {
+      throw new TypeError("a function may not change the directory it runs in");
+    },
+    exit() {
+      throw new TypeError("a function may not exit the process it is running in");
+    },
+    // The listener half is a no op that returns the object: nothing
+    // here emits `exit` or `beforeExit`, and a package registering for
+    // one should not crash for having asked.
+    on() {
+      return process;
+    },
+    once() {
+      return process;
+    },
+    off() {
+      return process;
+    },
+    addListener() {
+      return process;
+    },
+    removeListener() {
+      return process;
+    },
+    removeAllListeners() {
+      return process;
+    },
+    emit() {
+      return false;
+    },
+    listeners() {
+      return [];
+    },
+    emitWarning(warning) {
+      console.warn(warning);
+    },
+    uptime() {
+      return (Date.now() - started) / 1000;
+    },
+    hrtime: Object.assign(
+      function hrtime(since) {
+        const now = performance.now() * 1e6;
+        const nanoseconds = since ? now - (since[0] * 1e9 + since[1]) : now;
+        return [Math.floor(nanoseconds / 1e9), Math.floor(nanoseconds % 1e9)];
+      },
+      {
+        bigint() {
+          return BigInt(Math.floor(performance.now() * 1e6));
+        },
+      },
+    ),
+    memoryUsage() {
+      return { rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 };
+    },
+    stdout: writer(console.log),
+    stderr: writer(console.error),
+    stdin: {
+      read() {
+        return null;
+      },
+      on() {
+        return this;
+      },
+      setEncoding() {
+        return this;
+      },
+      resume() {
+        return this;
+      },
+      pause() {
+        return this;
+      },
+      isTTY: false,
+      fd: 0,
+    },
+    getuid() {
+      return 0;
+    },
+    getgid() {
+      return 0;
+    },
+    umask() {
+      return 0o022;
+    },
+  };
+
+  // ---------------------------------------------------------------
   // Reading a static file
   //
   // The four spellings Deno has, over the two ops that do the reading.
@@ -3798,10 +4036,17 @@
     fetch,
     navigator,
     performance,
+    process,
     queueMicrotask,
     setInterval,
     setTimeout,
     structuredClone,
+    // The two node names for a timer of no length, which upstream's
+    // runtime has on the global as well. A package built for node
+    // calls one of them at the bottom of a promise chain often enough
+    // that being without them is a ReferenceError in library code.
+    setImmediate: (work, ...args) => setTimeout(() => work(...args), 0),
+    clearImmediate: clearTimer,
   });
   // The global is itself an event target, which is not decoration: a
   // library calls the bare `addEventListener` at the top of a module
