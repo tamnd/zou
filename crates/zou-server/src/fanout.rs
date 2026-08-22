@@ -167,6 +167,18 @@ const WATCHING: Duration = Duration::from_secs(8);
 /// refcount rather than a copy.
 const KEPT: usize = 1024;
 
+/// The most rows held behind one subscriber's reply before the rest are
+/// dropped and it is told there was a gap.
+///
+/// A subscription is set up off the link, so its rows queue here rather
+/// than the whole link waiting for it. A queue needs a bottom: the
+/// setup waits up to five seconds for the tap on a project's first
+/// subscriber, and a busy table puts a lot of rows in five seconds.
+/// Over this many, that one subscriber is gapped, which is the same
+/// answer it gets when its own queue overflows and the same one the
+/// whole link gets when it is not drained.
+const BEHIND: usize = 1024;
+
 /// How often a node tells the holder its four budget numbers, and so
 /// how stale the numbers a node refuses against can be.
 ///
@@ -1178,6 +1190,17 @@ struct Ashore {
     /// was decided for, and the node it goes to does the fan out, which
     /// is where the sockets are.
     changes: Arc<Shared>,
+    /// Subscriptions being set up off this link, by the socket that
+    /// asked for one.
+    ///
+    /// A watch frame is answered aside rather than in line, because
+    /// setting one up is a publication read and, on a project's first
+    /// subscriber, a wait for the tap, and a link that stopped reading
+    /// for that would stop reading for every other socket behind it.
+    /// What has to stay true is narrower than the whole link: the reply
+    /// for a subscription goes before any row under it. So the rows for
+    /// that one socket wait here and follow its reply in order.
+    pending: HashMap<u64, Behind>,
     /// What has gone down this link, so that a hole in it is something
     /// the other end can see.
     seq: u64,
@@ -1237,6 +1260,45 @@ impl Dropped {
     }
 }
 
+/// One socket's rows, waiting for the subscription they belong under
+/// to be answered.
+#[derive(Default)]
+struct Behind {
+    /// Watch frames from this socket that have not been answered yet.
+    ///
+    /// More than one is a client joining two channels at once, and the
+    /// rows wait for the last of them rather than the first: the
+    /// bindings a second watch makes are live before its reply the same
+    /// way the first one's were, so letting rows through in between
+    /// would be the thing this is here to stop.
+    asking: usize,
+    rows: Vec<Feed>,
+    /// Whether more came in than were worth keeping, in which case what
+    /// follows the reply is a gap rather than the rest of them.
+    gapped: bool,
+}
+
+impl Behind {
+    /// Keep a row, or note that this subscriber has lost some.
+    fn hold(&mut self, row: Feed) {
+        if self.rows.len() < BEHIND {
+            self.rows.push(row);
+        } else {
+            self.gapped = true;
+        }
+    }
+}
+
+/// A subscription that finished being set up off the link, on its way
+/// back to the loop that owns the socket.
+struct Aside {
+    /// The question it answers, in the numbers that link uses.
+    id: u64,
+    /// And the socket that asked, so that its rows can follow.
+    theirs: u64,
+    answered: Result<Value, String>,
+}
+
 /// One socket on the far end.
 struct Held {
     /// What it is called on this hub.
@@ -1259,6 +1321,8 @@ struct Held {
 enum Woke {
     Hub(Heard),
     Changed(Option<(u64, Feed)>),
+    /// A subscription that finished being set up off the link.
+    Answered(Option<Aside>),
 }
 
 async fn holding(mut socket: WebSocket, app: &Arc<App>) {
@@ -1268,6 +1332,10 @@ async fn holding(mut socket: WebSocket, app: &Arc<App>) {
     let Some((mut node, mut rows)) = greeted(&mut socket, app).await else {
         return;
     };
+    // Where a subscription set up off the link comes back to be
+    // answered. This end holds the sender in `aside` for the life of
+    // the loop, so the receiver never closes on its own.
+    let (aside, mut asides) = mpsc::channel::<Aside>(QUEUE);
     loop {
         let woke = if node.carrying.is_empty() {
             // Waiting on an empty set of receivers would be a future
@@ -1276,12 +1344,14 @@ async fn holding(mut socket: WebSocket, app: &Arc<App>) {
             tokio::select! {
                 message = socket.recv() => Woke::Hub(Heard::Client(message)),
                 row = rows.recv() => Woke::Changed(row),
+                answered = asides.recv() => Woke::Answered(answered),
             }
         } else {
             tokio::select! {
                 message = socket.recv() => Woke::Hub(Heard::Client(message)),
                 fanned = next_delivery(&mut node.carrying) => Woke::Hub(fanned),
                 row = rows.recv() => Woke::Changed(row),
+                answered = asides.recv() => Woke::Answered(answered),
             }
         };
         let carry_on = match woke {
@@ -1289,54 +1359,24 @@ async fn holding(mut socket: WebSocket, app: &Arc<App>) {
             // happened, against the claims in the token that socket is
             // running on, so what crosses is a row decided for exactly
             // one subscriber and the node it goes to filters nothing.
-            Woke::Changed(Some((
-                named,
-                Feed::Change {
-                    ids,
-                    data,
-                    commit_ts,
-                    read,
-                    queued,
-                },
-            ))) => {
-                let head = json!({
-                    "down": "changed",
-                    "socket": named,
-                    "ids": ids,
-                    "data": *data,
-                    "commit_ts": commit_ts,
-                    // How long ago this node read it, rather than when,
-                    // because the other end has its own clock and no way
-                    // to read this one. It is the crossing that this
-                    // makes countable: the latency a client sees is
-                    // measured from the read and the read happened here.
-                    "waited": read.elapsed().as_micros() as u64,
-                    // And how long ago the reader here finished deciding
-                    // it, said the same way and for the same reason. The
-                    // stage it starts is everything after the decision,
-                    // which away is a queue, a link, a crossing and a
-                    // socket rather than only the first and the last, so
-                    // it has to carry the crossing to mean anything.
-                    "decided": queued.elapsed().as_micros() as u64,
-                });
-                down(&mut node, &mut socket, head, Vec::new()).await
-            }
-            // The reader has stopped sending rows to one subscriber, or
-            // to all of them.
-            Woke::Changed(Some((named, Feed::Gap))) => {
-                down(
-                    &mut node,
-                    &mut socket,
-                    json!({"down": "gapped", "socket": named}),
-                    Vec::new(),
-                )
-                .await
-            }
+            //
+            // Unless that socket is in the middle of subscribing, in
+            // which case the row waits for the reply it belongs behind.
+            Woke::Changed(Some((named, row))) => match node.pending.get_mut(&named) {
+                Some(behind) => {
+                    behind.hold(row);
+                    true
+                }
+                None => crossed(&mut node, &mut socket, named, row).await,
+            },
             // This end holds a sender for as long as the link is up, so
             // this is not something that happens. Ending the link is the
             // safe answer to it anyway: the node redials and its sockets
             // are told there was a gap.
             Woke::Changed(None) => false,
+            Woke::Answered(Some(aside)) => replied(&mut node, &mut socket, aside).await,
+            // Same again: `aside` is held here for the life of the loop.
+            Woke::Answered(None) => false,
             Woke::Hub(Heard::Client(None) | Heard::Client(Some(Ok(Message::Close(_))))) => false,
             Woke::Hub(Heard::Client(Some(Err(e)))) => {
                 log::debug!("realtime: a link went, {e}");
@@ -1344,7 +1384,7 @@ async fn holding(mut socket: WebSocket, app: &Arc<App>) {
             }
             Woke::Hub(Heard::Client(Some(Ok(Message::Binary(bytes))))) => {
                 match Wire::decode(&bytes) {
-                    Some(frame) => asked(app, &mut node, frame, &mut socket).await,
+                    Some(frame) => asked(app, &mut node, frame, &mut socket, &aside).await,
                     None => {
                         log::warn!("realtime: a link sent something that is not a frame");
                         false
@@ -1461,6 +1501,7 @@ async fn greeted(
                 theirs: HashMap::new(),
                 carrying: HashMap::new(),
                 changes,
+                pending: HashMap::new(),
                 seq: 0,
                 kept: VecDeque::new(),
             },
@@ -1495,6 +1536,22 @@ async fn greeted(
         return None;
     }
     node.link = link;
+    // A subscription that was being set up when the old link dropped is
+    // answered into a channel nobody is reading any more, so its reply
+    // never comes and the rows waiting behind it would wait forever.
+    // The socket that asked hears its question time out and asks again;
+    // what is owed here is the rows, and the honest answer for rows
+    // that are being dropped is the same gap the reader sends when it
+    // drops some itself.
+    for (theirs, behind) in std::mem::take(&mut node.pending) {
+        if behind.rows.is_empty() && !behind.gapped {
+            continue;
+        }
+        if !crossed(&mut node, socket, theirs, Feed::Gap).await {
+            keep(app, link, Kept { node, rows });
+            return None;
+        }
+    }
     Some((node, rows))
 }
 
@@ -1605,8 +1662,94 @@ async fn down(node: &mut Ashore, socket: &mut WebSocket, mut head: Value, body: 
     socket.send(Message::Binary(bytes)).await.is_ok()
 }
 
+/// One row down the link, for one of the far node's sockets. False ends
+/// it.
+///
+/// The check already happened, against the claims in the token that
+/// socket is running on, so what crosses is a row decided for exactly
+/// one subscriber and the node it goes to filters nothing.
+async fn crossed(node: &mut Ashore, socket: &mut WebSocket, named: u64, row: Feed) -> bool {
+    let head = match row {
+        Feed::Change {
+            ids,
+            data,
+            commit_ts,
+            read,
+            queued,
+        } => json!({
+            "down": "changed",
+            "socket": named,
+            "ids": ids,
+            "data": *data,
+            "commit_ts": commit_ts,
+            // How long ago this node read it, rather than when, because
+            // the other end has its own clock and no way to read this
+            // one. It is the crossing that this makes countable: the
+            // latency a client sees is measured from the read and the
+            // read happened here.
+            "waited": read.elapsed().as_micros() as u64,
+            // And how long ago the reader here finished deciding it,
+            // said the same way and for the same reason. The stage it
+            // starts is everything after the decision, which away is a
+            // queue, a link, a crossing and a socket rather than only
+            // the first and the last, so it has to carry the crossing
+            // to mean anything. A row held behind a reply is held
+            // inside this, which is the point of measuring it here.
+            "decided": queued.elapsed().as_micros() as u64,
+        }),
+        // The reader has stopped sending rows to one subscriber, or to
+        // all of them.
+        Feed::Gap => json!({"down": "gapped", "socket": named}),
+    };
+    down(node, socket, head, Vec::new()).await
+}
+
+/// A subscription answered off the link, and then the rows that were
+/// waiting for it.
+///
+/// The reply first and what it belongs to after, in the order the
+/// reader decided them, which is the whole of what answering aside has
+/// to keep: a client is never handed a row on a subscription nobody
+/// told it about.
+async fn replied(node: &mut Ashore, socket: &mut WebSocket, aside: Aside) -> bool {
+    if !answer(node, socket, aside.id, aside.answered).await {
+        return false;
+    }
+    let Some(behind) = node.pending.get_mut(&aside.theirs) else {
+        return true;
+    };
+    behind.asking = behind.asking.saturating_sub(1);
+    if behind.asking > 0 {
+        // Another channel on the same socket is still being set up and
+        // its bindings are live already, so the rows keep waiting.
+        return true;
+    }
+    let behind = node
+        .pending
+        .remove(&aside.theirs)
+        .expect("it is still there");
+    for row in behind.rows {
+        if !crossed(node, socket, aside.theirs, row).await {
+            return false;
+        }
+    }
+    if behind.gapped {
+        log::warn!(
+            "realtime: more rows arrived for one subscriber than were worth holding while its subscription was set up, so it is told there was a gap"
+        );
+        return crossed(node, socket, aside.theirs, Feed::Gap).await;
+    }
+    true
+}
+
 /// One frame from a node. False ends the link.
-async fn asked(app: &Arc<App>, node: &mut Ashore, frame: Wire, socket: &mut WebSocket) -> bool {
+async fn asked(
+    app: &Arc<App>,
+    node: &mut Ashore,
+    frame: Wire,
+    socket: &mut WebSocket,
+    aside: &mpsc::Sender<Aside>,
+) -> bool {
     match frame.up() {
         // The handshake happened before this loop started. A second one
         // is a node saying hello twice, which changes nothing here.
@@ -1747,12 +1890,17 @@ async fn asked(app: &Arc<App>, node: &mut Ashore, frame: Wire, socket: &mut WebS
         // token on this frame, because the thing that decides what it
         // may see of a row is a select of that row as them.
         //
-        // Answered in line, like every other question on this link, so
-        // the reply is in front of any row for it: the client is told
-        // which id belongs to which subscription before it is sent
-        // anything under one. The cost of that is the link waiting on a
-        // database while it is set up, which is a publication read, and
-        // on the very first subscription a wait for the tap.
+        // Registered in line and answered aside. Registering is what
+        // gives the subscriber the ids the reply carries and it costs
+        // nothing; everything slow about it is a publication read and,
+        // on the very first subscription, a wait for the tap, and a
+        // link that waited for those would stop reading for every other
+        // socket behind it.
+        //
+        // The one ordering that matters is kept without the wait: this
+        // socket's rows are held from here until the reply has gone, so
+        // the client is still told which id belongs to which
+        // subscription before it is sent anything under one.
         "watch" => {
             let Some(id) = frame.number("id") else {
                 return true;
@@ -1766,19 +1914,34 @@ async fn asked(app: &Arc<App>, node: &mut Ashore, frame: Wire, socket: &mut WebS
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let answered = match who(app, frame.text("token")) {
-                Ok(who) => match subscriber(app, node, theirs, &who) {
-                    Some(listener) => crate::realtime::subscribed_on(app, listener, &wants)
-                        .await
-                        .map(|watched| json!({"ids": watched.ids, "refused": watched.refused})),
-                    // A frame for a socket this link never announced,
-                    // which is one queued on the node before a reconnect
-                    // and sent to a holder that knows nothing about it.
-                    None => Err("this link does not have that socket".to_string()),
-                },
-                Err(why) => Err(why),
+            let who = match who(app, frame.text("token")) {
+                Ok(who) => who,
+                Err(why) => return answer(node, socket, id, Err(why)).await,
             };
-            return answer(node, socket, id, answered).await;
+            let Some(listener) = subscriber(app, node, theirs, &who) else {
+                // A frame for a socket this link never announced, which
+                // is one queued on the node before a reconnect and sent
+                // to a holder that knows nothing about it.
+                let why = "this link does not have that socket".to_string();
+                return answer(node, socket, id, Err(why)).await;
+            };
+            node.pending.entry(theirs).or_default().asking += 1;
+            let app = Arc::clone(app);
+            let aside = aside.clone();
+            tokio::spawn(async move {
+                let answered = crate::realtime::subscribed_on(&app, listener, &wants)
+                    .await
+                    .map(|watched| json!({"ids": watched.ids, "refused": watched.refused}));
+                // The link went while this was being set up, which the
+                // socket that asked hears as its question timing out.
+                let _ = aside
+                    .send(Aside {
+                        id,
+                        theirs,
+                        answered,
+                    })
+                    .await;
+            });
         }
         "unwatch" => {
             let ids = frame.head.get("ids").and_then(Value::as_array);
@@ -1998,6 +2161,7 @@ mod tests {
             theirs: HashMap::new(),
             carrying: HashMap::new(),
             changes,
+            pending: HashMap::new(),
             seq: 0,
             kept: VecDeque::new(),
         };
