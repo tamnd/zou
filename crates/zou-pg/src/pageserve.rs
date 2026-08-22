@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zou_log::{CatchUp, CatchUpCursor, ConsolidateError, TeeFilter, WalMedia, catch_up_resuming};
 use zou_store::CasStore;
@@ -105,6 +105,35 @@ const FOLD_EVERY: Duration = Duration::from_secs(60);
 /// chain a read walks is short enough that rebuilding the pages the
 /// debt touches costs more than reading through it.
 const FOLD_DEBT_FLOOR: u64 = 128 << 20;
+
+/// How far back a shard keeps answering, in seconds, unless the
+/// deployment says otherwise.
+///
+/// Zero turns the merge fold off and the store keeps every image and
+/// every record forever, which is what it did before there was a
+/// horizon at all. It is the escape hatch rather than the setting
+/// anybody wants: the disk a soak needs then is the whole write volume
+/// of the soak.
+const RETENTION: &str = "ZOU_PAGE_RETENTION_SECS";
+
+/// The cadence of the merge fold for a given retention window.
+///
+/// A shard holds the window plus however long it has been since the
+/// last merge, so this is what the overshoot costs: an eighth of the
+/// window is at most twelve percent more history than was asked for,
+/// which is a cheap price for running the expensive pass eight times
+/// per window instead of continuously.
+///
+/// The floor is the ordinary fold cadence. A merge reads every layer
+/// below the horizon to learn its keys, so running it more often than
+/// the cheap pass would be backwards. The soak scenario's ten minute
+/// window is above the floor and gets one every seventy five seconds.
+fn merge_every(retention_secs: u64) -> Option<Duration> {
+    match retention_secs {
+        0 => None,
+        secs => Some(Duration::from_secs((secs / 8).max(FOLD_EVERY.as_secs()))),
+    }
+}
 
 /// One read request as the driver sees it: a run of blocks of one
 /// fork, the lsn the reader needs covered, and the channel the pages
@@ -969,11 +998,36 @@ fn fold_loop(
     data_checksums: bool,
 ) {
     let tenant_ref = layout.tenant_ref().to_string();
+    let retention = zou_store::setting::number_or(
+        RETENTION,
+        "a whole number of seconds",
+        crate::gc::DEFAULT_RETENTION_SECS,
+    );
+    let cadence = merge_every(retention);
+    match cadence {
+        Some(every) => log::info!(
+            "zou pageserve: keeping {retention}s of page history, merging every {}s",
+            every.as_secs(),
+        ),
+        None => log::info!(
+            "zou pageserve: {RETENTION} is zero, so page history is kept and never retired"
+        ),
+    }
     let mut due = Instant::now() + FOLD_EVERY;
+    let mut merge_due = cadence.map(|every| Instant::now() + every);
     loop {
         std::thread::sleep(Duration::from_millis(200));
         if stop.load(Ordering::Acquire) {
             return;
+        }
+        if merge_due.is_some_and(|at| Instant::now() >= at) {
+            merge_pass(&*store, &tenant_ref, &pool, data_checksums, retention);
+            merge_due = cadence.map(|every| Instant::now() + every);
+            // A merge has just rewritten everything a fold would have
+            // looked at, so the debt it would read is the debt this
+            // pass left behind rather than one it has not seen.
+            due = Instant::now() + FOLD_EVERY;
+            continue;
         }
         if Instant::now() < due {
             continue;
@@ -1013,6 +1067,60 @@ fn fold_loop(
         // From the end of the work, not the start of it: a fold that
         // took longer than the cadence has already had its turn.
         due = Instant::now() + FOLD_EVERY;
+    }
+}
+
+/// One merge fold: work out where the horizon is right now and buy it.
+///
+/// The horizon is not the caller's to choose. A branch or a restore
+/// names an old lsn through a checkpoint, and a point in time restore
+/// names one through a history snapshot gc has not expired, so
+/// [`crate::compact::horizon_for`] takes the oldest lsn anything still
+/// pins under the same retention window gc uses and that is the
+/// ceiling. Retiring above it would leave the operation that named it
+/// reading half a chain.
+///
+/// Every failure here is a warning and a return. The store is exactly
+/// as correct after a merge that did not happen as before it, the only
+/// cost is disk, and taking a page service down over a pass that could
+/// not read a manifest would trade a bill for an outage.
+fn merge_pass(
+    store: &dyn CasStore,
+    tenant_ref: &str,
+    pool: &RedoPool,
+    data_checksums: bool,
+    retention_secs: u64,
+) {
+    let now_unix = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(since) => since.as_secs(),
+        Err(e) => {
+            log::warn!("zou pageserve: merge: the clock is before the epoch: {e}");
+            return;
+        }
+    };
+    let at = match crate::compact::horizon_for(store, tenant_ref, now_unix, retention_secs) {
+        Ok(at) => at,
+        Err(e) => {
+            log::warn!("zou pageserve: merge: horizon: {e}");
+            return;
+        }
+    };
+    let started = Instant::now();
+    match crate::compact::merge_to_horizon(store, tenant_ref, 0, at, pool, data_checksums) {
+        Ok(Some(out)) => log::info!(
+            "zou pageserve: merged to {}, retired {} layers into {} in {:.0}s, {} MB to {} MB, imaged {} pages, left {} keys nobody could base in {} layers",
+            out.horizon,
+            out.retired,
+            out.outputs,
+            started.elapsed().as_secs_f64(),
+            out.bytes_before >> 20,
+            out.bytes_after >> 20,
+            out.imaged,
+            out.unbased,
+            out.pinned,
+        ),
+        Ok(None) => log::debug!("zou pageserve: merge found nothing below the horizon to retire"),
+        Err(e) => log::warn!("zou pageserve: merge: {e}"),
     }
 }
 
@@ -2068,6 +2176,109 @@ mod tests {
         assert!(
             worth_folding(4 * (1u64 << 30)),
             "however big the tenant underneath it is"
+        );
+    }
+
+    /// The cadence is a fraction of the window, so what a shard holds
+    /// over what was asked for is bounded by the fraction rather than
+    /// by how long the node has been up.
+    #[test]
+    fn the_merge_runs_eight_times_a_window_and_never_faster_than_the_fold() {
+        let week = 7 * 24 * 60 * 60;
+        assert_eq!(
+            merge_every(week),
+            Some(Duration::from_secs(week / 8)),
+            "the default window buys a merge about every twenty one hours"
+        );
+        assert_eq!(
+            merge_every(600),
+            Some(Duration::from_secs(75)),
+            "and the soak scenario's ten minutes buys one every seventy five seconds"
+        );
+        assert_eq!(
+            merge_every(120),
+            Some(FOLD_EVERY),
+            "under that the floor holds, since the expensive pass does not \
+             run faster than the cheap one"
+        );
+        assert_eq!(
+            merge_every(0),
+            None,
+            "zero is the escape hatch: keep everything, retire nothing"
+        );
+    }
+
+    /// The window the pass is given is the window a snapshot is judged
+    /// by, which is the whole reason the horizon is not a setting: a
+    /// point in time recovery that can still name an old checkpoint
+    /// keeps the layers under it, and the same store with a shorter
+    /// promise lets them go.
+    #[test]
+    fn a_merge_leaves_what_a_snapshot_inside_the_window_still_names() {
+        use crate::compact::tests::{dead_pool, put_image, seed};
+        use zou_store::layer::{ImageEntry, LayerKey, PAGE_IMAGE_LEN};
+        use zou_store::manifest::{CheckpointKind, CheckpointRef, Manifest};
+
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        let image = |key, at| {
+            put_image(
+                &store,
+                &layout,
+                0,
+                &[ImageEntry {
+                    key,
+                    page: vec![0xAA; PAGE_IMAGE_LEN],
+                }],
+                at,
+            )
+        };
+        // Two sparse images, which is the pair a merge exists to fold:
+        // neither is droppable, each is the only base for its key.
+        image(LayerKey::page(1663, 5, 90, 0, 1), 0x100);
+        image(LayerKey::page(1663, 5, 90, 0, 2), 0x200);
+
+        // A history snapshot from a hundred seconds ago naming a
+        // checkpoint at the older image.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        let mut snap = Manifest::new("t", 18);
+        snap.checkpoints = vec![CheckpointRef {
+            id: "c-1".into(),
+            lsn: Lsn(0x100),
+            kind: CheckpointKind::Full,
+            owner: None,
+        }];
+        store
+            .put(
+                &format!("{}0000000001-{}.json", layout.manifests_dir(), now - 100),
+                &snap.to_json(),
+            )
+            .expect("snapshot");
+
+        let pool = dead_pool();
+        let horizon = || {
+            PageShardManifest::load(&store, &layout.shard_manifest(0))
+                .expect("load")
+                .expect("a shard that has published")
+                .0
+                .horizon
+        };
+        merge_pass(&store, "t", &pool, false, 3600);
+        assert_eq!(
+            horizon(),
+            None,
+            "the snapshot is inside the hour and the restore it promises \
+             needs the image its checkpoint sits on"
+        );
+
+        merge_pass(&store, "t", &pool, false, 10);
+        let bought = horizon().expect("the snapshot has fallen out of the window");
+        assert!(
+            bought > Lsn(0x100) && bought < Lsn(0x200),
+            "up to the flush point and a byte under it, {bought}"
         );
     }
 }
