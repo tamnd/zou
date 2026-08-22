@@ -1146,8 +1146,17 @@ struct Kept {
 pub struct Dropped(Mutex<HashMap<u64, Kept>>);
 
 impl Dropped {
-    fn keep(&self, link: u64, kept: Kept) {
-        self.0.lock().expect("the dropped links").insert(link, kept);
+    /// Hold what a link left, and hand back anything that was already
+    /// being held under the same name.
+    ///
+    /// Which happens when a link goes half open: the holder never saw
+    /// the far end drop, the node gave up on it and dialled again under
+    /// the same name, and both connections end sooner or later. Only one
+    /// of the two can be held under that name, and what matters is that
+    /// the other is given back rather than left as a room full of people
+    /// who are not there.
+    fn keep(&self, link: u64, kept: Kept) -> Option<Kept> {
+        self.0.lock().expect("the dropped links").insert(link, kept)
     }
 
     fn take(&self, link: u64) -> Option<Kept> {
@@ -1445,7 +1454,12 @@ fn replayable(node: &Ashore, seen: u64) -> bool {
 /// Hold what a link left behind, and give it back if it does not come
 /// for it.
 fn keep(app: &Arc<App>, link: u64, kept: Kept) {
-    app.links.keep(link, kept);
+    if let Some(stale) = app.links.keep(link, kept) {
+        log::warn!(
+            "realtime: link {link} was already being held, which is one connection of it having gone half open, so the one it displaces is given back"
+        );
+        release(app, stale.node);
+    }
     let app = Arc::downgrade(app);
     tokio::spawn(async move {
         tokio::time::sleep(GRACE).await;
