@@ -256,6 +256,30 @@ impl Sender for Inbox {
     }
 }
 
+/// No sender at all: every message is an error at the point it would
+/// have been sent.
+///
+/// What a served project gets when it asks for mail on a node that has
+/// no mail server configured. The dev inbox would be worse here and not
+/// better: it answers the sign up with a 200 and keeps the link in the
+/// memory of a process nobody reading their mail has access to, so the
+/// person waits for a mail that was never going anywhere. Failing says
+/// the same thing at the door, where somebody can act on it.
+pub struct Nowhere;
+
+impl Sender for Nowhere {
+    fn deliver(&self, mail: &Mail) -> Result<(), String> {
+        Err(format!(
+            "no mail server is configured on this node, so {} to {} was not sent. Set ZOU_SMTP_HOST and ZOU_SMTP_ADMIN_EMAIL on the node, or turn confirmations off for this project with `zou tenant <target> auth <ref> --confirm-email off`",
+            mail.subject, mail.to
+        ))
+    }
+
+    fn describe(&self) -> String {
+        "no mail server".to_string()
+    }
+}
+
 /// What a template can refer to. These are GoTrue's names, and a
 /// project's own templates are written against them.
 #[derive(Default)]

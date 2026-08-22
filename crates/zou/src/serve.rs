@@ -894,6 +894,18 @@ struct Postmasters {
     /// into any of those databases to delete a year of refresh events
     /// by hand.
     audit: zou_server::audit::Settings,
+    /// Who carries the mail for every project on this node, read once
+    /// from the node's environment. None is a node with no mail server,
+    /// and a project on one that asks for a confirmation is refused at
+    /// the sign up rather than answered with a 200 and a link nobody
+    /// can read. See `zou_server::mail::Nowhere`.
+    sender: Option<Arc<dyn zou_server::mail::Sender>>,
+    /// Templates and rate limits for that mail, read once for the same
+    /// reason. Per node rather than per project: what a project wants
+    /// its confirmation mail to say belongs in the registry entry and
+    /// is not there yet, so for now every project on a node sends the
+    /// node's wording.
+    mail: zou_server::mail::Settings,
     /// What this node is called and where it is reached, handed to
     /// every postmaster it starts because the lease is taken inside
     /// postgres and the lease is where both of these have to end up.
@@ -1372,6 +1384,17 @@ impl Postmasters {
         functions: Option<Arc<zou_functions::Registry>>,
     ) -> Config {
         let tenant_ref = &entry.tenant_ref;
+        // Nothing said about this project is the same as a project that
+        // asked for nothing: a sign up confirms itself and the links go
+        // to the node's own url. Anything stricter would make every
+        // entry written before this field existed a project whose sign
+        // ups stopped working the day the node was upgraded.
+        let auth = entry.auth.clone().unwrap_or_default();
+        if auth.confirm_email && self.sender.is_none() {
+            log::warn!(
+                "{tenant_ref}: asks for a confirmed email and this node has no mail server, so a sign up will be refused rather than left waiting. Set ZOU_SMTP_HOST and ZOU_SMTP_ADMIN_EMAIL, or `zou tenant <target> auth {tenant_ref} --confirm-email off`"
+            );
+        }
         Config {
             jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
             // The project signs its access tokens with its own key and
@@ -1418,6 +1441,27 @@ impl Postmasters {
                 .map(|(access, secret)| zou_server::s3::Credentials::new(access, secret)),
             realtime: self.realtime,
             audit: self.audit.clone(),
+            // Autoconfirm is the opposite question to the one the
+            // registry asks, and the registry asks the one a person
+            // means: whether the address is proved before the account
+            // works.
+            mailer_autoconfirm: !auth.confirm_email,
+            // Where a confirmation link lands, and the only redirect
+            // target trusted without being listed. A project with a
+            // front end of its own says so here; one that says nothing
+            // gets the node's own url for it, which is where its api
+            // is and is at least somewhere that exists.
+            site_url: auth.site_url.clone().or_else(|| {
+                self.domain
+                    .as_ref()
+                    .map(|domain| format!("https://{tenant_ref}.{domain}"))
+            }),
+            sender: self.sender.clone(),
+            mail: self.mail.clone(),
+            // Not the dev inbox. A person reading their mail cannot
+            // reach this node's log, so mail kept there is mail lost
+            // and reported as sent.
+            dev_inbox: false,
             ..Config::default()
         }
     }
@@ -1612,6 +1656,9 @@ pub fn run(args: &Args) -> Result<(), String> {
         endpoint: args.advertise.clone(),
         realtime: zou_server::realtime::limits_from_env()?,
         audit: zou_server::audit::from_env()?,
+        sender: zou_server::smtp::from_env()?
+            .map(|smtp| Arc::new(smtp) as Arc<dyn zou_server::mail::Sender>),
+        mail: zou_server::mail::settings_from_env()?,
         store,
         state: Arc::new(State {
             dying: Mutex::new(HashMap::new()),
@@ -2556,6 +2603,8 @@ mod tests {
             node: None,
             endpoint: None,
             audit: zou_server::audit::Settings::default(),
+            sender: None,
+            mail: zou_server::mail::Settings::default(),
             target: "s3://bucket/fleet".to_string(),
             pg_bin: PathBuf::from("/nonexistent"),
             runtime: PathBuf::from("/nonexistent"),
@@ -2595,5 +2644,86 @@ mod tests {
             Some("acme-prod"),
             "the project is still itself"
         );
+    }
+
+    fn a_tenant(tenant_ref: &str) -> Tenant {
+        Tenant::new(
+            tenant_ref,
+            "super-secret-jwt-token-with-at-least-32-characters-long",
+            1,
+        )
+    }
+
+    /// The reported bug: a node built every project's config from the
+    /// default, which asks for a confirmation, and had no mailer to
+    /// send it with, so a browser sign up answered 200 and ended
+    /// nowhere. Nothing said about a project means the sign up
+    /// confirms itself.
+    #[test]
+    fn a_project_nobody_set_anything_on_confirms_its_own_sign_ups() {
+        let cfg = node(Default::default()).config(&a_tenant("acme-prod"), 5433, None);
+        assert!(cfg.mailer_autoconfirm);
+        assert_eq!(cfg.site_url, None, "no domain, so nothing to point at");
+        assert!(
+            !cfg.dev_inbox,
+            "and a node is not the dev loop, so mail nobody can read is an error"
+        );
+    }
+
+    /// Two projects on one node, which is what the registry field is
+    /// for: a fleet variable can only say one thing.
+    #[test]
+    fn two_projects_on_one_node_ask_for_different_things() {
+        let mut backend = node(Default::default());
+        backend.domain = Some("zou.example".to_string());
+        backend.sender = Some(Arc::new(zou_server::mail::Inbox::default()));
+
+        let mut strict = a_tenant("acme-prod");
+        strict.auth = Some(zou_store::registry::TenantAuth {
+            confirm_email: true,
+            site_url: Some("https://acme.example".to_string()),
+        });
+        let cfg = backend.config(&strict, 5433, None);
+        assert!(!cfg.mailer_autoconfirm);
+        assert_eq!(cfg.site_url.as_deref(), Some("https://acme.example"));
+
+        let cfg = backend.config(&a_tenant("acme-staging"), 5434, None);
+        assert!(cfg.mailer_autoconfirm);
+        assert_eq!(
+            cfg.site_url.as_deref(),
+            Some("https://acme-staging.zou.example"),
+            "a project with no site url of its own gets the one it is reached at"
+        );
+    }
+
+    /// A project asking for a confirmation on a node that cannot send
+    /// one. The sign up has to fail where it was asked for, and it does
+    /// because the node hands the server no sender and the server with
+    /// no sender and no dev inbox errors on delivery.
+    #[test]
+    fn a_confirmation_on_a_node_with_no_mailer_is_an_error_and_not_a_200() {
+        use zou_server::mail::Sender;
+
+        let mut strict = a_tenant("acme-prod");
+        strict.auth = Some(zou_store::registry::TenantAuth {
+            confirm_email: true,
+            site_url: None,
+        });
+        let cfg = node(Default::default()).config(&strict, 5433, None);
+        assert!(!cfg.mailer_autoconfirm);
+        assert!(cfg.sender.is_none());
+        assert!(!cfg.dev_inbox);
+
+        let nowhere = zou_server::mail::Nowhere;
+        let err = nowhere
+            .deliver(&zou_server::mail::Mail {
+                to: "someone@example.com".to_string(),
+                subject: "Confirm your signup".to_string(),
+                body: String::new(),
+                template: "confirmation".to_string(),
+                at: 1,
+            })
+            .expect_err("it does not pretend to have sent it");
+        assert!(err.contains("no mail server"), "{err}");
     }
 }
