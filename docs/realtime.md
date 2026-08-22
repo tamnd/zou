@@ -236,6 +236,12 @@ What is counted goes into a bucket per five seconds, twelve of them are kept, an
 The per socket track window is the one exception, a plain sliding window of the last thirty seconds, because five calls is a small enough number that a bucket boundary would be most of the answer.
 A message costs the send and every delivery of it, so one broadcast to a hundred sockets is a hundred and one messages, which is the arithmetic that makes a hundred a second a real number rather than a generous one.
 
+All four project numbers are the project's on a fleet as well as on one server.
+A node that holds sockets for a project it does not own says what it has up its link once a second, the holder adds every node's up, and what comes back down is the project less that node's own share, which the node adds its live numbers back on to before refusing anything.
+So two hundred sockets is two hundred across the fleet rather than two hundred per server, and a project cannot buy itself more of any of these by being spread over more nodes.
+It is a second stale by construction and that is the intended trade: these are averages over a minute already, and a number a second old stops a project running away just as well as an exact one would, without a round trip on the path of every join.
+See [operations.md](operations.md) for what a node does when it cannot reach its holder.
+
 The http broadcast endpoints report the same budget on every answer.
 
 ```

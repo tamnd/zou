@@ -14,7 +14,7 @@
 //! only sending never blocks on a reader.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::Path;
@@ -78,6 +78,67 @@ impl Tokens for ProjectTokens {
     }
 }
 
+/// What one server has, said in the four numbers the budgets are kept
+/// in, which is what a node sends up its fan out link and what the
+/// holder sends back down.
+///
+/// Sockets is a count and the other three are rates, because that is
+/// what the meters behind them answer. All four are small enough to
+/// put on a frame a second without anybody noticing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Tally {
+    pub sockets: u64,
+    pub joins: f64,
+    pub events: f64,
+    pub presence: f64,
+}
+
+impl Tally {
+    fn plus(self, other: Tally) -> Tally {
+        Tally {
+            sockets: self.sockets + other.sockets,
+            joins: self.joins + other.joins,
+            events: self.events + other.events,
+            presence: self.presence + other.presence,
+        }
+    }
+
+    /// Everything but one node's own share of it, which is what that
+    /// node is told so that it can add its own live numbers back on.
+    /// Clamped at zero: a report that is a second older than the total
+    /// it is being taken out of can be larger than its share of it.
+    fn less(self, theirs: Tally) -> Tally {
+        Tally {
+            sockets: self.sockets.saturating_sub(theirs.sockets),
+            joins: (self.joins - theirs.joins).max(0.0),
+            events: (self.events - theirs.events).max(0.0),
+            presence: (self.presence - theirs.presence).max(0.0),
+        }
+    }
+
+    pub fn frame(&self) -> serde_json::Map<String, Value> {
+        let mut head = serde_json::Map::new();
+        head.insert("sockets".into(), json!(self.sockets));
+        head.insert("joins".into(), json!(self.joins));
+        head.insert("events".into(), json!(self.events));
+        head.insert("presence".into(), json!(self.presence));
+        head
+    }
+
+    pub fn of_frame(head: &Value) -> Tally {
+        let rate = |name: &str| head.get(name).and_then(Value::as_f64).unwrap_or_default();
+        Tally {
+            sockets: head
+                .get("sockets")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
+            joins: rate("joins"),
+            events: rate("events"),
+            presence: rate("presence"),
+        }
+    }
+}
+
 /// What this project is allowed and what it has spent.
 ///
 /// One of these per server, which is one per project: upstream keeps
@@ -86,6 +147,15 @@ impl Tokens for ProjectTokens {
 /// for itself, how many channels it holds, how big a message is, and
 /// how often it has tracked, are not here, because a session answers
 /// those without asking anybody.
+///
+/// The meters below count what happened on this server, which on a
+/// fleet is a share of the project rather than the project. So each
+/// node says its own four numbers up its link once a second, the
+/// holder adds them up, and what comes back down is everybody else's;
+/// every refusal here is then this server's live numbers plus that.
+/// A second stale is not exact, and does not need to be: these are
+/// rolling averages already, and a number a second old still stops a
+/// project running away, which is the whole of what they are for.
 pub struct Quota {
     pub limits: Limits,
     /// How many sockets are connected right now.
@@ -99,6 +169,18 @@ pub struct Quota {
     /// message budget, so this is a second meter and not more counts
     /// on `events`.
     presence: Meter,
+    /// What the rest of the project has, as of the last time it said.
+    ///
+    /// On a node this is the one number the holder sent down. On the
+    /// holder it is the sum of what every linked node last reported,
+    /// kept here so that the hot path is a lock on a small map rather
+    /// than a walk of the fleet. A server with no links either way
+    /// leaves it empty, and then all of this is arithmetic on zero.
+    elsewhere: Mutex<Tally>,
+    /// What each linked node last said, which the holder needs one by
+    /// one rather than added up: a node has to be told everybody's but
+    /// its own, or its own sockets are counted against it twice.
+    nodes: Mutex<HashMap<u64, Tally>>,
 }
 
 impl Quota {
@@ -109,6 +191,8 @@ impl Quota {
             joins: Meter::new(),
             events: Meter::new(),
             presence: Meter::new(),
+            elsewhere: Mutex::new(Tally::default()),
+            nodes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -118,33 +202,100 @@ impl Quota {
         self.events.count(1 + reached as u64);
     }
 
-    /// Events this project spent somewhere this process cannot see.
-    ///
-    /// The budget is the project's rather than a node's, and a project
-    /// whose sockets are on other nodes has most of its deliveries
-    /// happening on them. Each node counts what a message reached
-    /// there and says so up its link, and this is where that lands.
+    /// Events spent relaying a message the holder sent to the sockets
+    /// on this node, which is the send counted once more where the
+    /// deliveries actually happened.
     pub fn spent(&self, events: u64) {
         self.events.count(events);
+    }
+
+    /// This server's own four numbers, which is what goes up a link.
+    pub fn mine(&self) -> Tally {
+        Tally {
+            sockets: self.sockets.now(),
+            joins: self.joins.per_second(),
+            events: self.events.per_second(),
+            presence: self.presence.per_second(),
+        }
+    }
+
+    /// The rest of the project, as last heard.
+    fn others(&self) -> Tally {
+        *self.elsewhere.lock().expect("the fleet tally")
+    }
+
+    /// A node said what it has. Records it, and answers with what that
+    /// node should be refusing against on top of its own: this
+    /// server's live numbers plus every other node's last report.
+    pub fn reported(&self, link: u64, theirs: Tally) -> Tally {
+        let total = {
+            let mut nodes = self.nodes.lock().expect("the fleet tally");
+            nodes.insert(link, theirs);
+            nodes
+                .values()
+                .fold(Tally::default(), |all, one| all.plus(*one))
+        };
+        *self.elsewhere.lock().expect("the fleet tally") = total;
+        self.mine().plus(total).less(theirs)
+    }
+
+    /// The holder answered with the project's numbers less this
+    /// node's own.
+    pub fn told(&self, theirs: Tally) {
+        *self.elsewhere.lock().expect("the fleet tally") = theirs;
+    }
+
+    /// A node's link is gone for good and what it was holding has been
+    /// given back, so its share of the project goes with it.
+    pub fn forget(&self, link: u64) {
+        let mut nodes = self.nodes.lock().expect("the fleet tally");
+        nodes.remove(&link);
+        let total = nodes
+            .values()
+            .fold(Tally::default(), |all, one| all.plus(*one));
+        drop(nodes);
+        *self.elsewhere.lock().expect("the fleet tally") = total;
+    }
+
+    /// This node cannot reach the holder, so it no longer knows what
+    /// the rest of the project has and stops pretending to. Refusing
+    /// against numbers from a fleet it has been cut off from would
+    /// have a partitioned node turning every socket away for as long
+    /// as the partition lasts.
+    pub fn alone(&self) {
+        *self.elsewhere.lock().expect("the fleet tally") = Tally::default();
     }
 
     /// The messages a second this project is moving, which is what the
     /// http broadcast endpoints report in their headers.
     pub fn events_per_second(&self) -> f64 {
-        self.events.per_second()
+        self.events.per_second() + self.others().events
     }
 
     /// Whether another socket would be one too many.
     fn full(&self) -> bool {
-        self.sockets.full(self.limits.concurrent_users)
+        match self.limits.concurrent_users {
+            0 => false,
+            limit => self.sockets.now() + self.others().sockets >= limit,
+        }
     }
 
     /// Whether the project is joining channels faster than it may,
     /// which is asked at the handshake as well as at each join because
     /// upstream asks it in both places.
     fn joining_too_fast(&self) -> bool {
-        self.joins.over(self.limits.joins_per_second)
+        over(
+            self.joins.per_second() + self.others().joins,
+            self.limits.joins_per_second,
+        )
     }
+}
+
+/// At the limit is over it, and zero is no limit, which is the
+/// comparison [`Meter::over`] makes and the one these keep now that
+/// the fleet's share is added on before the asking.
+fn over(rate: f64, limit: u64) -> bool {
+    limit > 0 && rate >= limit as f64
 }
 
 impl Counters for Quota {
@@ -157,11 +308,14 @@ impl Counters for Quota {
     }
 
     fn over_events(&self) -> bool {
-        self.events.over(self.limits.events_per_second)
+        over(self.events_per_second(), self.limits.events_per_second)
     }
 
     fn presence(&self) -> bool {
-        if self.presence.over(self.limits.presence_events_per_second) {
+        if over(
+            self.presence.per_second() + self.others().presence,
+            self.limits.presence_events_per_second,
+        ) {
             return false;
         }
         self.presence.count(1);
@@ -1425,6 +1579,96 @@ fn query(uri: &Uri, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The holder tells each node what the project has less that
+    /// node's own share of it, so that a node adding its live numbers
+    /// back on lands on the project rather than on its own sockets
+    /// counted twice.
+    #[test]
+    fn a_node_is_told_the_project_without_its_own_share_of_it() {
+        let quota = Quota::new(Limits {
+            concurrent_users: 10,
+            ..Limits::none()
+        });
+        for _ in 0..3 {
+            quota.sockets.joined();
+        }
+        let one = quota.reported(
+            1,
+            Tally {
+                sockets: 4,
+                ..Tally::default()
+            },
+        );
+        assert_eq!(one.sockets, 3, "the holder's own three, and no other node");
+        let two = quota.reported(
+            2,
+            Tally {
+                sockets: 2,
+                ..Tally::default()
+            },
+        );
+        assert_eq!(two.sockets, 7, "the holder's three and link one's four");
+        // And the holder itself refuses against all nine of them.
+        assert_eq!(quota.others().sockets, 6);
+        assert!(!quota.full());
+        quota.sockets.joined();
+        assert!(
+            quota.full(),
+            "three plus one plus six is the ten it may have"
+        );
+
+        // A link that is given up takes its share with it.
+        quota.forget(1);
+        assert_eq!(quota.others().sockets, 2);
+        assert!(!quota.full());
+    }
+
+    /// A node refuses against what the holder last told it, and against
+    /// nothing but its own numbers once it can no longer be told.
+    #[test]
+    fn a_node_refuses_against_the_project_until_it_is_cut_off() {
+        let quota = Quota::new(Limits {
+            concurrent_users: 4,
+            ..Limits::none()
+        });
+        quota.sockets.joined();
+        assert!(!quota.full());
+        quota.told(Tally {
+            sockets: 3,
+            ..Tally::default()
+        });
+        assert!(quota.full(), "one here and three elsewhere is the four");
+        quota.alone();
+        assert!(!quota.full(), "a node nobody can reach knows only its own");
+    }
+
+    /// The three rates work the same way the count does, which is the
+    /// half of this that the http headers read.
+    #[test]
+    fn the_rates_are_the_projects_and_not_this_servers_share() {
+        let quota = Quota::new(Limits {
+            events_per_second: 100,
+            joins_per_second: 10,
+            presence_events_per_second: 10,
+            ..Limits::none()
+        });
+        quota.told(Tally {
+            joins: 9.0,
+            events: 99.5,
+            presence: 9.0,
+            ..Tally::default()
+        });
+        assert!(!quota.over_events());
+        assert!(quota.join(), "under by half a message either way");
+        assert!(quota.presence());
+        quota.spent(60);
+        assert!(
+            quota.over_events(),
+            "the events elsewhere plus the ones here is over the hundred"
+        );
+        assert!(quota.events_per_second() >= 100.0);
+    }
 
     #[test]
     fn the_version_comes_off_the_connect_url() {

@@ -41,6 +41,17 @@
 //! missed, in order, with nothing closed. Past either, it is told, and
 //! then the gap is the honest answer again.
 //!
+//! The project's budgets cross it too, in both directions. Every meter
+//! behind them counts what happened on one server, which on a fleet is
+//! a share of the project rather than the project, so a node says its
+//! four numbers up every [`TALLY`], the holder adds every node's up,
+//! and the answer that comes back is the project less that node's own
+//! share. A node refusing a socket then adds its live numbers back on
+//! and refuses against the project. It is a second stale and meant to
+//! be: these are averages over a minute, and a round trip on the path
+//! of every join to make a rate exact would cost more than the rate is
+//! worth.
+//!
 //! What does not cross this link is a row the socket may not see. The
 //! two questions only the holder can answer, whether a private
 //! channel's policies allow this socket and what a subscriber may see
@@ -72,7 +83,7 @@ use crate::{App, AuthContext, json_body};
 /// and a holder on different releases is an ordinary thing during a
 /// rollout, and the honest failure is a link that refuses to open
 /// rather than one that opens and misreads a frame.
-const VERSION: u64 = 1;
+const VERSION: u64 = 2;
 
 /// What the other end said it speaks, or `Err` with the number it said
 /// when that is not this one.
@@ -155,6 +166,17 @@ const WATCHING: Duration = Duration::from_secs(8);
 /// A frame is kept as the bytes that went out, so keeping one costs a
 /// refcount rather than a copy.
 const KEPT: usize = 1024;
+
+/// How often a node tells the holder its four budget numbers, and so
+/// how stale the numbers a node refuses against can be.
+///
+/// A second, because the budgets it feeds are rolling averages over a
+/// minute and a second of lag on a minute of window is not a number
+/// anybody can tell apart from the true one. Shorter would be a frame
+/// a second per node per tenant for no gain; much longer and a project
+/// that goes from nothing to a runaway gets a few extra seconds of
+/// runway on every node at once.
+const TALLY: Duration = Duration::from_secs(1);
 
 /// How long the holder waits for a link that dropped before giving back
 /// what it was holding for it.
@@ -806,6 +828,7 @@ async fn dialling(app: Weak<App>, away: Arc<Away>, mut queue: mpsc::Receiver<Vec
         // is told at once rather than half a minute later.
         if !ever {
             away.gapped();
+            alone(&app);
         } else {
             let since = *went.get_or_insert_with(Instant::now);
             if !told && since.elapsed() >= GRACE {
@@ -816,11 +839,23 @@ async fn dialling(app: Weak<App>, away: Arc<Away>, mut queue: mpsc::Receiver<Vec
                     GRACE.as_secs(),
                 );
                 away.gapped();
+                alone(&app);
                 told = true;
             }
         }
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(MOST);
+    }
+}
+
+/// This node has stopped hearing what the rest of the project has, so
+/// it goes back to refusing against nothing but its own numbers. The
+/// alternative is a node that was cut off while the fleet was busy
+/// turning away every socket that arrives for as long as it stays cut
+/// off, which is a partition made worse rather than survived.
+fn alone(app: &Weak<App>) {
+    if let Some(app) = app.upgrade() {
+        app.quota.alone();
     }
 }
 
@@ -856,8 +891,31 @@ async fn carried(
     {
         return;
     }
+    // The first tick is immediate, so a link that has just opened says
+    // what this node has before it has to refuse anything against a
+    // total it does not know yet.
+    let mut tally = tokio::time::interval(TALLY);
     loop {
         tokio::select! {
+            _ = tally.tick() => {
+                let Some(app) = app.upgrade() else { return };
+                let mut head = app.quota.mine().frame();
+                head.insert("up".into(), json!("meter"));
+                // Straight onto the writer rather than through the
+                // queue. A budget number that waited behind a backlog
+                // is a budget number about the wrong second, and the
+                // queue being full would otherwise gap every socket
+                // here over a frame nothing was waiting on.
+                if writer
+                    .send(tokio_tungstenite::tungstenite::Message::Binary(
+                        Wire::of(Value::Object(head)).encode().into(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
             going = queue.recv() => {
                 let Some(bytes) = going else { return };
                 if writer
@@ -986,11 +1044,10 @@ async fn took(app: &Arc<App>, away: &Arc<Away>, frame: Wire) -> bool {
             let reached = app.hub.relay(from, sent);
             if reached > 0 {
                 // Counted here because this is the only node that knows
-                // it, and told to the holder because the budget is the
-                // project's rather than this node's.
+                // it. It reaches the project's number the same way
+                // everything else on this node does, in the meter frame
+                // that goes up once a second.
                 app.quota.spent(reached as u64);
-                away.tell(Wire::of(json!({"up": "spent", "events": reached})))
-                    .await;
             }
         }
         // A row for one subscriber here, already checked against that
@@ -1041,6 +1098,12 @@ async fn took(app: &Arc<App>, away: &Arc<Away>, frame: Wire) -> bool {
             }
         }
         "gap" => away.gapped(),
+        // The project less this node's own share of it, which is what
+        // every budget here is asked against from now until the next
+        // one of these arrives a second later.
+        "budget" => app
+            .quota
+            .told(crate::realtime::Tally::of_frame(&frame.head)),
         other => log::debug!("realtime: the holder sent a {other} frame, which this node ignores"),
     }
     true
@@ -1482,6 +1545,10 @@ fn keep(app: &Arc<App>, link: u64, kept: Kept) {
 /// there, and one that left its subscribers behind would be a policy
 /// check per changed row for nobody.
 fn release(app: &Arc<App>, node: Ashore) {
+    // Its share of the project goes with it, or a node that left would
+    // go on being counted against the project's budgets forever and a
+    // fleet that shrank would eventually refuse everything.
+    app.quota.forget(node.link);
     for socket in node.sockets.values() {
         for topic in &socket.tracking {
             app.hub.untrack(socket.id, topic);
@@ -1742,10 +1809,17 @@ async fn asked(app: &Arc<App>, node: &mut Ashore, frame: Wire, socket: &mut WebS
                 }
             }
         }
-        // What a node spent of the project's budget on the messages it
-        // was handed, which is the one number it knows and this one
-        // does not.
-        "spent" => app.quota.spent(frame.number("events").unwrap_or_default()),
+        // What a node has, said once a second: the sockets on it and
+        // the three rates it is spending. The holder adds every node's
+        // up and answers with the project less this node's own share,
+        // which is what that node refuses against on top of its live
+        // numbers. See [`crate::realtime::Quota`].
+        "meter" => {
+            let theirs = crate::realtime::Tally::of_frame(&frame.head);
+            let mut head = app.quota.reported(node.link, theirs).frame();
+            head.insert("down".into(), json!("budget"));
+            return down(node, socket, Value::Object(head), Vec::new()).await;
+        }
         other => log::debug!("realtime: a node sent a {other} frame, which the holder ignores"),
     }
     true
