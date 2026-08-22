@@ -2466,7 +2466,7 @@
           // whatever set it has returned. Deno's answer is to end the
           // process, which here would be to lose an answer that is
           // already written, so this says so and the call goes on.
-          console.error(thrown);
+          reported(thrown);
         }
       }
       timers.delete(id);
@@ -2497,7 +2497,7 @@
       try {
         callback();
       } catch (thrown) {
-        console.error(thrown);
+        reported(thrown);
       }
     });
   }
@@ -2828,6 +2828,18 @@
     }
   }
 
+  /// The event a promise nobody caught is reported as. `promise` is the
+  /// one that rejected and `reason` is what it rejected with, and
+  /// calling `preventDefault` on it is how a listener says it has
+  /// dealt with it and the runtime should not.
+  class PromiseRejectionEvent extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.promise = init.promise ?? null;
+      this.reason = init.reason;
+    }
+  }
+
   /// An event with something of the caller's on it, which is how a
   /// library that emits its own events hands anything over.
   class CustomEvent extends Event {
@@ -2853,7 +2865,7 @@
       try {
         target[named].call(target, event);
       } catch (thrown) {
-        console.error(thrown);
+        reported(thrown);
       }
     }
     // A copy, because a listener is allowed to add or remove one while
@@ -2874,7 +2886,7 @@
       } catch (thrown) {
         // One listener that throws is not the rest of them, and there
         // is nobody above this to catch it either way.
-        console.error(thrown);
+        reported(thrown);
       }
     }
     return !event.defaultPrevented;
@@ -2937,6 +2949,70 @@
 
     dispatchEvent(event) {
       return fires(this ?? globalThis, event);
+    }
+  }
+
+  /// Report the exception, which is the html spec's name for what
+  /// happens to a throw with nobody left above it to catch it: a timer
+  /// callback, a microtask, an event listener. The web dispatches an
+  /// `error` event on the global first and only writes it out if
+  /// nobody prevented the default, so a function that wants to send
+  /// its own crashes somewhere has a place to stand.
+  ///
+  /// Deno's answer to an unreported one is to end the process. Here it
+  /// is written to stderr and the call goes on, because by the time
+  /// one of these fires the answer is usually already written and
+  /// losing it would be worse than the throw.
+  let reporting = false;
+
+  function reported(thrown) {
+    // A listener for `error` that throws is reported the same way,
+    // which without this is the same listener again and again. The one
+    // that threw is written out and that is the end of it.
+    if (reporting) {
+      console.error(thrown);
+      return;
+    }
+    const event = new ErrorEvent("error", {
+      cancelable: true,
+      message: String(thrown?.message ?? thrown),
+      error: thrown,
+    });
+    reporting = true;
+    let prevented = false;
+    try {
+      prevented = !fires(globalThis, event);
+    } finally {
+      reporting = false;
+    }
+    if (!prevented) {
+      console.error(thrown);
+    }
+  }
+
+  /// The events the host dispatches into a function about the
+  /// function's own life, which is the one part of the event surface
+  /// nothing inside the isolate can cause.
+  ///
+  /// `beforeunload` carries why on `detail.reason`, which is upstream's
+  /// shape and one of `cpu`, `memory`, `wall_clock`, `early_drop` or
+  /// `termination`. It is cancelable in the sense that the event says
+  /// so, and preventing the default changes nothing: a limit reached is
+  /// not a decision a function gets a vote on. What it is for is the
+  /// last chance to write something down.
+  function lifecycle(kind, reason) {
+    switch (kind) {
+      case "beforeunload":
+        fires(
+          globalThis,
+          new CustomEvent("beforeunload", {
+            cancelable: true,
+            detail: { reason: reason ?? null },
+          }),
+        );
+        return;
+      default:
+        fires(globalThis, new Event(kind));
     }
   }
 
@@ -4012,6 +4088,7 @@
     Event,
     EventTarget,
     MessageEvent,
+    PromiseRejectionEvent,
     WebSocket,
     File,
     FormData,
@@ -4066,6 +4143,39 @@
   listens(globalThis);
   globalThis.self = globalThis;
   globalThis.window = globalThis;
+
+  // A promise that rejected with nobody to catch it. deno_core asks
+  // this before it does the thing it does otherwise, which is to raise
+  // an error nothing can catch and stop the isolate, and answering
+  // true is saying the rejection has been dealt with.
+  //
+  // It is dealt with when a listener says so by preventing the
+  // default, which is the web's rule and upstream's. Otherwise it is
+  // written out here and the call is allowed to go on: a rejected
+  // promise in some library's retry loop is not a reason to lose an
+  // answer that is already written.
+  core.setUnhandledPromiseRejectionHandler((promise, reason) => {
+    const event = new PromiseRejectionEvent("unhandledrejection", {
+      cancelable: true,
+      promise,
+      reason,
+    });
+    if (!fires(globalThis, event)) {
+      return true;
+    }
+    console.error("uncaught promise rejection:", reason);
+    return true;
+  });
+
+  // The other side of it: a promise that was rejected long enough for
+  // the runtime to have given up on it and then caught after all.
+  core.setHandledPromiseRejectionHandler((promise, reason) => {
+    fires(globalThis, new PromiseRejectionEvent("rejectionhandled", { promise, reason }));
+  });
+
+  // What deno_core does with a throw out of a microtask, which is the
+  // one report path it owns rather than the prelude.
+  core.setReportExceptionCallback(reported);
 
   Object.assign(Deno, {
     serve,
@@ -4200,8 +4310,10 @@
     throw new TypeError("a response body stream may only enqueue buffers");
   }
 
-  // Two of them: the call, and whatever the call left running. The
-  // host calls the first, takes the answer, and only then calls the
-  // second, which is the whole of what `waitUntil` means.
-  return [run, drain];
+  // Three of them: the call, whatever the call left running, and the
+  // events the host tells the function about its own life. The host
+  // calls the first, takes the answer, and only then calls the second,
+  // which is the whole of what `waitUntil` means. The third it calls
+  // whenever it has something to say.
+  return [run, drain, lifecycle];
 })(globalThis);
