@@ -1965,6 +1965,67 @@
   }
 
   // ---------------------------------------------------------------
+  // wasm from a response
+  //
+  // Here rather than beside the rest of WebAssembly, which is v8's and
+  // needs nothing from anybody, because the two streaming calls are
+  // the two that take a Response and so are the two this has to write.
+  //
+  // v8's own instantiateStreaming asks the embedder for the bytes
+  // through a callback, deno_core forwards that to a javascript
+  // handler, and a runtime that never set one aborts the process the
+  // moment a function reaches the call. Not throws, aborts: every
+  // function on the node after it answers nothing, from three lines of
+  // one tenant's code. See #592.
+  //
+  // So the call never reaches v8's. Read the response, hand the bytes
+  // to the call that takes bytes. That is not streaming, and a module
+  // is compiled after it arrives rather than while it does, which
+  // costs a copy of the module and nothing else. What a package wants
+  // here is for the call to work.
+
+  /// The bytes behind whatever a streaming call was handed, with the
+  /// checks the spec puts before them.
+  ///
+  /// A promise is awaited first because both calls take either, which
+  /// is the whole reason `instantiateStreaming(fetch(url))` reads the
+  /// way it does. The content type is a real requirement rather than
+  /// politeness: a server that answers a wasm url with an html error
+  /// page is the ordinary failure here, and without the check it
+  /// arrives as a compile error about a magic number.
+  async function wasmBytes(source, called) {
+    const response = await source;
+    if (!(response instanceof Response)) {
+      throw new TypeError(`WebAssembly.${called} takes a Response or a promise of one`);
+    }
+    const type = (response.headers.get("content-type") || "").split(";")[0].trim();
+    if (type.toLowerCase() !== "application/wasm") {
+      throw new TypeError(
+        `WebAssembly.${called} needs a response of type application/wasm, this one is ${
+          type || "of no type"
+        }`,
+      );
+    }
+    if (!response.ok) {
+      throw new TypeError(
+        `WebAssembly.${called} got ${response.status} from ${response.url || "the response"}`,
+      );
+    }
+    return await response.arrayBuffer();
+  }
+
+  WebAssembly.compileStreaming = async function compileStreaming(source) {
+    return await WebAssembly.compile(await wasmBytes(source, "compileStreaming"));
+  };
+
+  WebAssembly.instantiateStreaming = async function instantiateStreaming(source, imports) {
+    return await WebAssembly.instantiate(
+      await wasmBytes(source, "instantiateStreaming"),
+      imports,
+    );
+  };
+
+  // ---------------------------------------------------------------
   // crypto
   //
   // Randomness is the operating system's and a hash is the host's, so

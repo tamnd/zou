@@ -785,6 +785,21 @@ What a function may reach is not restricted.
 It can call a metadata endpoint on the machine it is running on, the same as upstream's runtime can and the same as `pg_net` can from inside the database.
 A function is the project's own code, and the way to keep it off the local network is a network the server is not on.
 
+### Wasm from a response
+
+`WebAssembly.instantiateStreaming` and `WebAssembly.compileStreaming` take a `Response`, or a promise of one, which is why a wasm package is usually loaded by handing one of them a `fetch`.
+
+```ts
+const { instance } = await WebAssembly.instantiateStreaming(fetch(url))
+```
+
+Both work here and neither streams.
+The response is read, and the bytes go to `WebAssembly.instantiate` or `WebAssembly.compile`, so the module is compiled after it has arrived rather than while it is arriving.
+That costs a copy of the module and is invisible to the caller, which is the trade: what a package wants from these is for the call to work.
+
+The checks the spec puts in front of them are here.
+A response whose `content-type` is not `application/wasm` is a `TypeError` naming what it was, which is the ordinary failure when a url that used to serve a module now serves an error page, and something that is not a response at all is a `TypeError` naming the call.
+
 ## URL
 
 `URL` and `URLSearchParams`, which is how a handler routes on a path and reads a query.
