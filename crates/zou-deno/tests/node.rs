@@ -389,3 +389,136 @@ fn the_path_of_a_file_beside_a_package_is_the_url_it_is_at() {
         "https://esm.sh/x@1/y.wasm https://esm.sh/x@1/a/z.ttf ERR_INVALID_URL_SCHEME"
     );
 }
+
+#[test]
+fn a_diagnostics_channel_publishes_to_whoever_joined_it() {
+    let said = served(
+        r#"
+        import dc, { channel, hasSubscribers, tracingChannel } from "node:diagnostics_channel";
+        const heard = [];
+        const one = channel("zou:test");
+        const said = [];
+        // Nobody is listening, which is the case a library checks for
+        // before it builds a message it would throw away.
+        said.push(String(one.hasSubscribers), String(hasSubscribers("zou:test")));
+        one.subscribe((message, name) => heard.push(`${name}=${message.n}`));
+        // The same name is the same channel, which is what makes a
+        // subscriber registered anywhere hear a publish from anywhere.
+        said.push(String(channel("zou:test") === one));
+        dc.channel("zou:test").publish({ n: 1 });
+        said.push(String(one.hasSubscribers), heard.join(","));
+
+        // A subscriber that throws does not reach the publisher and
+        // does not stop the one after it.
+        const two = channel("zou:throws");
+        two.subscribe(() => { throw new Error("no"); });
+        two.subscribe(() => heard.push("after"));
+        two.publish({});
+        said.push(heard.at(-1));
+
+        // The tracing wrapper, which is five channels under one name.
+        const traced = tracingChannel("zou:traced");
+        const seen = [];
+        traced.subscribe({
+          start: () => seen.push("start"),
+          end: () => seen.push("end"),
+          error: () => seen.push("error"),
+        });
+        said.push(String(traced.traceSync(() => 7)));
+        said.push(seen.join(","));
+
+        Deno.serve(() => new Response(said.join(" ")));
+        "#,
+    );
+    assert_eq!(said, "false false true true zou:test=1 after 7 start,end");
+}
+
+#[test]
+fn a_created_require_serves_the_built_ins_and_names_what_it_cannot() {
+    let said = served(
+        r#"
+        import { createRequire, builtinModules, isBuiltin } from "node:module";
+        const require = createRequire(import.meta.url);
+        const said = [];
+        said.push(String(isBuiltin("node:path")), String(isBuiltin("fs")), String(isBuiltin("react")));
+        said.push(String(builtinModules.includes("crypto")));
+        // The same module a require of it on node would give: the
+        // default export, which is where a shim puts what CJS reads.
+        const path = require("node:path");
+        said.push(path.join("a", "b"));
+        said.push(require("path").basename("/a/b.txt"));
+        said.push(require.resolve("node:os"));
+        try {
+          require("some-package");
+          said.push("no error");
+        } catch (e) {
+          said.push(e.message.split(".")[0]);
+        }
+        Deno.serve(() => new Response(said.join(" ")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "true true false true a/b b.txt node:os Cannot find module 'some-package'"
+    );
+}
+
+/// The three that are here so that a package can import them and not
+/// reach them, which is the whole of what they are for.
+#[test]
+fn a_process_a_thread_and_a_fork_are_importable_and_refuse_when_called() {
+    let said = served(
+        r#"
+        import { spawn, execSync, ChildProcess } from "node:child_process";
+        import { Worker, isMainThread, threadId, receiveMessageOnPort } from "node:worker_threads";
+        import cluster from "node:cluster";
+        const said = [];
+        // Importing is the point. Nothing above this line threw.
+        said.push(String(typeof spawn), String(isMainThread), String(threadId), String(cluster.isPrimary));
+        said.push(String(receiveMessageOnPort()));
+        for (const [name, call] of [
+          ["spawn", () => spawn("ls")],
+          ["execSync", () => execSync("ls")],
+          ["ChildProcess", () => new ChildProcess()],
+          ["Worker", () => new Worker("./w.js")],
+          ["fork", () => cluster.fork()],
+        ]) {
+          try {
+            call();
+            said.push(`${name} did not refuse`);
+          } catch (e) {
+            said.push(`${name}:${e.constructor.name}`);
+          }
+        }
+        Deno.serve(() => new Response(said.join(" ")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "function true 0 true undefined \
+         spawn:TypeError execSync:TypeError ChildProcess:TypeError Worker:TypeError fork:TypeError"
+    );
+}
+
+/// And what the refusal actually says, since a sentence naming the
+/// reason is the difference between a package author reading this and
+/// filing a bug about a missing module.
+#[test]
+fn the_refusal_says_a_function_has_no_processes() {
+    let said = served(
+        r#"
+        import { spawn } from "node:child_process";
+        let message = "no error";
+        try {
+          spawn("ls");
+        } catch (e) {
+          message = e.message;
+        }
+        Deno.serve(() => new Response(message));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "a function has no processes to start, so node:child_process spawn cannot work here"
+    );
+}

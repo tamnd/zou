@@ -30,10 +30,21 @@ pub fn source(name: &str) -> Option<&'static str> {
     Some(match name {
         "assert" => include_str!("node/assert.js"),
         "buffer" => include_str!("node/buffer.js"),
+        // A function does not get a process, a thread or a fork, and
+        // these three say so from every call that would need one. They
+        // are here rather than absent because a package that imports
+        // one at the top and calls it in a branch nobody takes runs
+        // fine against a stub and not at all against a refused import,
+        // which was the difference on seven of the forty in the
+        // examples corpus.
+        "child_process" => include_str!("node/child_process.js"),
+        "cluster" => include_str!("node/cluster.js"),
         "crypto" => include_str!("node/crypto.js"),
+        "diagnostics_channel" => include_str!("node/diagnostics_channel.js"),
         "events" => include_str!("node/events.js"),
         "fs" => include_str!("node/fs.js"),
         "fs/promises" => include_str!("node/fs_promises.js"),
+        "module" => include_str!("node/module.js"),
         "os" => include_str!("node/os.js"),
         // The three names for the same file: node's `path` is posix
         // here, because the host a function runs on is, and asking for
@@ -51,6 +62,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "url" => include_str!("node/url.js"),
         "util" => include_str!("node/util.js"),
         "util/types" => include_str!("node/util_types.js"),
+        "worker_threads" => include_str!("node/worker_threads.js"),
         _ => return None,
     })
 }
@@ -78,12 +90,23 @@ mod tests {
         assert!(source("util/types").is_some());
     }
 
+    /// The seven functions the examples corpus lost when it asked the
+    /// registry as Deno, which is what these three are for.
+    #[test]
+    fn the_built_ins_a_deno_build_imports_are_here_too() {
+        for name in ["child_process", "diagnostics_channel", "module"] {
+            assert!(source(name).is_some(), "node:{name}");
+        }
+    }
+
     /// A built in nobody has written yet is nothing, and the caller
-    /// turns that into a sentence naming it.
+    /// turns that into a sentence naming it. The ones that are here
+    /// and refuse from every call are a different thing: a package can
+    /// import those and not reach them.
     #[test]
     fn a_built_in_that_is_not_here_is_not_pretended_to_be() {
-        assert!(source("child_process").is_none());
-        assert!(source("worker_threads").is_none());
+        assert!(source("dgram").is_none());
+        assert!(source("v8").is_none());
         assert!(source("path/nonsense").is_none());
     }
 }
