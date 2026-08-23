@@ -15,7 +15,7 @@
 //! unset.
 
 use tokio_postgres::NoTls;
-use zou_server::sql::Pool;
+use zou_server::sql::{Pool, with_database};
 
 fn dsn() -> Option<String> {
     match std::env::var("ZOU_PG_TEST_DSN") {
@@ -40,20 +40,10 @@ async fn raw(dsn: &str) -> tokio_postgres::Client {
     client
 }
 
-/// Point a keyword and value dsn at another database. A url form dsn
-/// gets None and the caller skips rather than a mangled string that
-/// would connect somewhere unintended.
-fn with_dbname(dsn: &str, db: &str) -> Option<String> {
-    if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
-        return None;
-    }
-    Some(format!("{dsn} dbname={db}"))
-}
-
 /// A database nobody has opened yet, dropped first so a run that died
 /// halfway does not decide the next one.
-async fn scratch(dsn: &str, name: &str) -> Option<String> {
-    let target = with_dbname(dsn, name)?;
+async fn scratch(dsn: &str, name: &str) -> String {
+    let target = with_database(dsn, name);
     let admin = raw(dsn).await;
     admin
         .batch_execute(&format!("drop database if exists {name} with (force)"))
@@ -63,7 +53,7 @@ async fn scratch(dsn: &str, name: &str) -> Option<String> {
         .batch_execute(&format!("create database {name}"))
         .await
         .expect("create scratch");
-    Some(target)
+    target
 }
 
 /// Whether a role may do something to a table, asked of postgres
@@ -109,10 +99,7 @@ async fn roles(client: &tokio_postgres::Client) {
 #[tokio::test]
 async fn a_new_table_in_public_is_readable_by_nobody_who_came_through_the_api() {
     let Some(dsn) = dsn() else { return };
-    let Some(fresh) = scratch(&dsn, "zou_public_grants_new").await else {
-        eprintln!("skipping: needs a keyword and value dsn");
-        return;
-    };
+    let fresh = scratch(&dsn, "zou_public_grants_new").await;
 
     // A checkout is what bootstraps the database.
     let pool = Pool::new(&fresh, 2).expect("scratch dsn parses");
@@ -146,10 +133,7 @@ async fn a_new_table_in_public_is_readable_by_nobody_who_came_through_the_api() 
 #[tokio::test]
 async fn a_project_that_grants_a_table_gets_a_table_the_api_can_read() {
     let Some(dsn) = dsn() else { return };
-    let Some(fresh) = scratch(&dsn, "zou_public_grants_asked").await else {
-        eprintln!("skipping: needs a keyword and value dsn");
-        return;
-    };
+    let fresh = scratch(&dsn, "zou_public_grants_asked").await;
 
     let pool = Pool::new(&fresh, 2).expect("scratch dsn parses");
     let sess = pool.unscoped().await.expect("unscoped on scratch");
@@ -175,10 +159,7 @@ async fn a_project_that_grants_a_table_gets_a_table_the_api_can_read() {
 #[tokio::test]
 async fn a_database_an_older_zou_opened_stops_handing_out_new_tables() {
     let Some(dsn) = dsn() else { return };
-    let Some(fresh) = scratch(&dsn, "zou_public_grants_older").await else {
-        eprintln!("skipping: needs a keyword and value dsn");
-        return;
-    };
+    let fresh = scratch(&dsn, "zou_public_grants_older").await;
 
     {
         let old = raw(&fresh).await;

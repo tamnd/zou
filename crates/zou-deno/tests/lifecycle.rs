@@ -166,14 +166,20 @@ fn a_function_near_the_cpu_limit_is_told_before_it_is_stopped() {
     assert_eq!(body(&answer), "cpu");
 }
 
-/// The pair at the end, in upstream's order: `beforeunload` with
-/// `termination` on it and then `unload`.
+/// The pair at the end: `beforeunload` with `termination` on it, and
+/// `unload`.
 ///
 /// The answer has already gone by then, so the function says what it
 /// was told down a socket instead. `OneShot` because that is the policy
 /// under which the end of the call is the end of the isolate; a kept
 /// isolate is told the same thing a minute later, which is not a wait a
 /// test should have.
+///
+/// Both of them, rather than one and then the other. The events are
+/// dispatched in upstream's order, but neither `told` is awaited, so
+/// what arrives first is whichever of two connections opened
+/// microseconds apart the accept loop happened to take, which is not
+/// something this end decides. See #626.
 #[test]
 fn a_function_whose_isolate_is_going_away_is_told_twice() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("a port");
@@ -212,14 +218,14 @@ fn a_function_whose_isolate_is_going_away_is_told_twice() {
         .expect("an answer");
     assert_eq!(body(&answer), "answered");
 
-    let first = said
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the function was told it was going");
-    let second = said
-        .recv_timeout(Duration::from_secs(10))
-        .expect("and then that it had gone");
-    assert_eq!(first, "/beforeunload-termination");
-    assert_eq!(second, "/unload");
+    let mut told = vec![
+        said.recv_timeout(Duration::from_secs(10))
+            .expect("the function was told it was going"),
+        said.recv_timeout(Duration::from_secs(10))
+            .expect("and that it had gone"),
+    ];
+    told.sort();
+    assert_eq!(told, ["/beforeunload-termination", "/unload"]);
 }
 
 /// A function that has none of these listeners is the ordinary case and

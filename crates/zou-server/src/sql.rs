@@ -630,6 +630,48 @@ const REFRESH: std::time::Duration = std::time::Duration::from_secs(10);
 /// story, and it is the delay between running one and seeing it.
 const SETTLED: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The same dsn pointed at another database on the same server.
+///
+/// There are two spellings of a dsn and both are ordinary. A caller
+/// that has to open a second database, which is anything that creates
+/// a scratch one and then connects to it, gets whichever spelling the
+/// operator wrote and has no business caring which. Handled separately
+/// this comes out wrong in a way that looks like a missing database:
+/// url surgery on `dbname=postgres` finds no path to cut and yields
+/// `dbname=postgres/scratch`, and appending `dbname=scratch` to a url
+/// yields a host nobody has.
+///
+/// A keyword and value dsn has its `dbname` replaced, or gains one when
+/// it had none, which is legal and means the database named after the
+/// user. A url has its path replaced and keeps its query, since that is
+/// where `sslmode` and the rest of the connection lives.
+pub fn with_database(dsn: &str, database: &str) -> String {
+    if !dsn.contains("://") {
+        let mut out: Vec<&str> = dsn
+            .split_whitespace()
+            .filter(|word| !word.starts_with("dbname="))
+            .collect();
+        let named = format!("dbname={database}");
+        out.push(&named);
+        return out.join(" ");
+    }
+    let (head, query) = match dsn.split_once('?') {
+        Some((head, query)) => (head, Some(query)),
+        None => (dsn, None),
+    };
+    // Past the scheme, so the first slash found is the one before the
+    // database rather than either of the two in `postgres://`.
+    let after_scheme = head.find("//").map(|at| at + 2).unwrap_or(0);
+    let base = match head[after_scheme..].find('/') {
+        Some(at) => &head[..after_scheme + at],
+        None => head,
+    };
+    match query {
+        Some(query) => format!("{base}/{database}?{query}"),
+        None => format!("{base}/{database}"),
+    }
+}
+
 impl Pool {
     /// Parse the dsn now, dial nothing. `max` caps the number of live
     /// connections, checkouts past it wait their turn.
@@ -1179,3 +1221,53 @@ impl Session {
 // closes the connection and ends its spawned task. An unfinished
 // transaction dies with it, which is exactly the leak containment the
 // module doc promises.
+
+#[cfg(test)]
+mod tests {
+    use super::with_database;
+
+    /// The two spellings, and what each of them has to come out as.
+    ///
+    /// This lived in a live suite that skips itself without a database,
+    /// which is how it hid: nobody looked at what it produced until the
+    /// whole workspace was pointed at a real postgres. See #582.
+    #[test]
+    fn a_second_database_is_named_in_whichever_way_the_dsn_was_written() {
+        assert_eq!(
+            with_database("postgres://postgres@127.0.0.1:5432/postgres", "scratch"),
+            "postgres://postgres@127.0.0.1:5432/scratch"
+        );
+        assert_eq!(
+            with_database(
+                "postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable",
+                "scratch"
+            ),
+            "postgres://postgres@127.0.0.1:5432/scratch?sslmode=disable"
+        );
+        assert_eq!(
+            with_database(
+                "host=127.0.0.1 port=5432 user=postgres dbname=postgres",
+                "scratch"
+            ),
+            "host=127.0.0.1 port=5432 user=postgres dbname=scratch"
+        );
+        // No database named at all is legal: postgres falls back to the
+        // user's name, and the replacement has nothing to replace.
+        assert_eq!(
+            with_database("host=127.0.0.1 user=postgres", "scratch"),
+            "host=127.0.0.1 user=postgres dbname=scratch"
+        );
+        // A url with no database either, which is the same case one
+        // spelling along.
+        assert_eq!(
+            with_database("postgresql://postgres@127.0.0.1:5432", "scratch"),
+            "postgresql://postgres@127.0.0.1:5432/scratch"
+        );
+        // A password with a slash in it lives in the userinfo, before
+        // the host, and is not the path separator this is looking for.
+        assert_eq!(
+            with_database("postgres://postgres:a%2Fb@127.0.0.1/postgres", "scratch"),
+            "postgres://postgres:a%2Fb@127.0.0.1/scratch"
+        );
+    }
+}

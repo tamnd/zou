@@ -194,7 +194,7 @@ fn cut_at(manifest: &Manifest) -> Option<Lsn> {
 /// Which shards would leave a child with no floor, worst first.
 ///
 /// The answer to a shard on this list is a fold. Everything else about
-/// it is the same question [`why_layerless`] asks and is answered off
+/// it is the same question `why_layerless` asks and is answered off
 /// the same objects.
 pub fn floorless(
     store: &dyn CasStore,
@@ -220,7 +220,7 @@ pub fn floorless(
     Ok(want)
 }
 
-/// The same question [`why_layerless`] answers, asked by a caller that
+/// The same question `why_layerless` answers, asked by a caller that
 /// is going to call [`fold_for_branch`] first.
 ///
 /// A source with no floor is not unbranchable to such a caller, it is a

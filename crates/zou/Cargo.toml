@@ -52,6 +52,10 @@ webpki-roots = { workspace = true }
 # sink that takes it takes bytes.
 bytes = "1"
 tempfile = { workspace = true }
+# The live suites open a scratch database and need the dsn that reaches
+# it. The binary only links the server on unix, but a test that names
+# the helper has to compile everywhere the tests are built.
+zou-server = { path = "../zou-server" }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
