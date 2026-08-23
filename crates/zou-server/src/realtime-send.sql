@@ -27,8 +27,10 @@
 -- the schema file next to it. A database that has been served by an
 -- older zou already has realtime.messages in it, so the fresh only
 -- guard would mean it never sees any of this. Everything here is
--- create or replace and a trigger that is dropped first, so applying
--- it to a database that has it already is a few catalog writes.
+-- create or replace, and the one thing that cannot be, the trigger,
+-- is written only when the catalog does not already hold it, so
+-- applying this to a database that has it already is a few catalog
+-- writes and no lock on a table anybody is using.
 
 -- Upstream's three, and the reason the whole block is guarded: on a
 -- database that came from a real Supabase project these already exist
@@ -192,13 +194,50 @@ begin
         end
         $body$
     $fn$;
-    drop trigger if exists zou_realtime_sent on realtime.messages;
-    -- Broadcast only, and after the insert. Presence rows in this
-    -- table are what a policy probe writes and nothing else, and a
-    -- probe is a question rather than a message.
-    create trigger zou_realtime_sent after insert on realtime.messages
-        for each row when (new.extension = 'broadcast')
-        execute function zou.realtime_sent();
+    -- Look before writing. Both the drop and the create take an
+    -- AccessExclusiveLock on realtime.messages, which is the table
+    -- every realtime.send writes into, so a node booting into a busy
+    -- project waits behind the traffic and two of them arriving at
+    -- once deadlock. The advisory lock the bootstrap takes is no help,
+    -- because what this races is not another bootstrap, it is a
+    -- session holding a row lock and keeping it. The trigger is
+    -- already right on all but the first boot, since it is the same
+    -- text every release ships, so ask the catalog and do nothing when
+    -- it matches. A boot that does change something still pays the
+    -- lock, which is the boot that has to.
+    --
+    -- Compared against what pg_get_triggerdef prints rather than
+    -- against the parts, because that one string covers the timing,
+    -- the level, the when clause and the function together, and a
+    -- release that changes any of them changes it. If some future
+    -- postgres prints it differently the comparison fails, this
+    -- rewrites the trigger on every boot, and that is where this
+    -- started.
+    if not exists (
+        select 1
+        from pg_trigger t
+        join pg_class c on c.oid = t.tgrelid
+        join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = 'realtime'
+          and c.relname = 'messages'
+          and t.tgname = 'zou_realtime_sent'
+          and not t.tgisinternal
+          -- Origin, meaning enabled. A trigger somebody turned off is
+          -- not one to leave alone.
+          and t.tgenabled = 'O'
+          and pg_get_triggerdef(t.oid) = 'CREATE TRIGGER zou_realtime_sent'
+              || ' AFTER INSERT ON realtime.messages FOR EACH ROW'
+              || ' WHEN ((new.extension = ''broadcast''::text))'
+              || ' EXECUTE FUNCTION zou.realtime_sent()'
+    ) then
+        drop trigger if exists zou_realtime_sent on realtime.messages;
+        -- Broadcast only, and after the insert. Presence rows in this
+        -- table are what a policy probe writes and nothing else, and a
+        -- probe is a question rather than a message.
+        create trigger zou_realtime_sent after insert on realtime.messages
+            for each row when (new.extension = 'broadcast')
+            execute function zou.realtime_sent();
+    end if;
 exception when insufficient_privilege then
     raise warning 'zou: no trigger on realtime.messages, database sends will not be delivered: %', sqlerrm;
 end
