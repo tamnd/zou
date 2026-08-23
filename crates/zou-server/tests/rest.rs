@@ -4196,3 +4196,149 @@ async fn a_surface_with_aggregates_off_refuses_them_and_serves_everything_else()
         r#"[{"id":1,"total":10},{"id":2,"total":32}]"#
     );
 }
+
+/// A media type handler is an aggregate the schema declared over a
+/// domain named after a media type, and the request that asks for
+/// that name gets whatever the aggregate built.
+///
+/// Four of them here, which is the whole of the feature: one written
+/// for this table, one written for every table, one that answers
+/// under any name at all and hands back bytes, and a function that
+/// does the same for a single value.
+#[tokio::test]
+async fn a_media_type_handler_renders_the_rows_the_way_the_schema_says() {
+    let Some(dsn) = dsn() else { return };
+    seed(
+        &dsn,
+        &[
+            "drop table if exists zou_rest_mt, zou_rest_any cascade",
+            "drop domain if exists \"zou/tsv\", \"zou/out\", \"*/*\" cascade",
+            "create table zou_rest_mt (id int primary key, name text)",
+            "create table zou_rest_any (id int primary key)",
+            "insert into zou_rest_mt values (1, 'ann'), (2, 'bob')",
+            "insert into zou_rest_any values (1), (2)",
+            "create domain \"zou/tsv\" as text",
+            "create function zou_rest_tsv_trans (state text, next zou_rest_mt) \
+             returns \"zou/tsv\" as $$ \
+               select (state || next.id::text || E'\\t' || next.name || E'\\n')::\"zou/tsv\" \
+             $$ language sql",
+            "create aggregate zou_rest_tsv_agg (zou_rest_mt) \
+             (initcond = '', stype = \"zou/tsv\", sfunc = zou_rest_tsv_trans)",
+            "create domain \"zou/out\" as text",
+            "create function zou_rest_out_trans (state text, next anyelement) \
+             returns \"zou/out\" as $$ \
+               select (state || next::text || E'\\n')::\"zou/out\" \
+             $$ language sql",
+            "create aggregate zou_rest_out_agg (anyelement) \
+             (initcond = '', stype = \"zou/out\", sfunc = zou_rest_out_trans)",
+            "create domain \"*/*\" as bytea",
+            "create function zou_rest_any_trans (state \"*/*\", next zou_rest_any) \
+             returns \"*/*\" as $$ \
+               select (state || next.id::text::bytea)::\"*/*\" \
+             $$ language sql",
+            "create aggregate zou_rest_any_agg (zou_rest_any) \
+             (initcond = 'rows:', stype = \"*/*\", sfunc = zou_rest_any_trans)",
+            "create function zou_rest_any_mt () returns \"*/*\" \
+             as $$ select 'any'::\"*/*\" $$ language sql",
+            "create function zou_rest_some_mt () returns \"*/*\" as $$ \
+             begin \
+               perform set_config('response.headers', \
+                 json_build_array(json_build_object('Content-Type', 'app/chico'))::text, true); \
+               return 'chico'::bytea::\"*/*\"; \
+             end $$ language plpgsql",
+        ],
+    )
+    .await;
+    let ask = |uri: &str, accept: &str| {
+        Request::builder()
+            .uri(uri.to_string())
+            .header("apikey", anon_key())
+            .header("accept", accept.to_string())
+            .body(Body::empty())
+            .unwrap()
+    };
+    let app = app(&dsn);
+
+    // The handler written for this table, which renders the rows the
+    // select asked for and counts them for Content-Range.
+    let res = app
+        .clone()
+        .oneshot(ask("/rest/v1/zou_rest_mt?order=id", "zou/tsv"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "zou/tsv");
+    assert_eq!(res.headers()["content-range"], "0-1/*");
+    assert_eq!(body_text(res).await, "1\tann\n2\tbob\n");
+
+    // The handler written for every table, which is what anyelement
+    // means, and it renders whatever columns the select left.
+    let res = app
+        .clone()
+        .oneshot(ask("/rest/v1/zou_rest_mt?select=id&order=id", "zou/out"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "zou/out");
+    assert_eq!(body_text(res).await, "(1)\n(2)\n");
+
+    // A handler for this table beats a handler for every table, and
+    // both are asked before anything built in. Nothing declared a
+    // handler for json, so json is still json.
+    let res = app
+        .clone()
+        .oneshot(ask("/rest/v1/zou_rest_mt?order=id", "application/json"))
+        .await
+        .unwrap();
+    assert_eq!(
+        body_text(res).await,
+        r#"[{"id":1,"name":"ann"},{"id":2,"name":"bob"}]"#
+    );
+
+    // A name nobody declared and nothing here writes is still a 406.
+    let res = app
+        .clone()
+        .oneshot(ask("/rest/v1/zou_rest_mt", "zou/nothing"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_ACCEPTABLE);
+
+    // The star domain answers under every name, the star included,
+    // and says octet-stream about it because the aggregate said
+    // nothing.
+    for accept in ["*/*", "app/bingo", "image/boingo"] {
+        let res = app
+            .clone()
+            .oneshot(ask("/rest/v1/zou_rest_any?order=id", accept))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()["content-type"], "application/octet-stream");
+        assert_eq!(body_text(res).await, "rows:12");
+    }
+
+    // A function declaring the same domain is the single value
+    // version of it, and the bytes go out as bytes rather than as the
+    // hex literal a bytea writes itself as.
+    let res = app
+        .clone()
+        .oneshot(ask("/rest/v1/rpc/zou_rest_any_mt", "app/bingo"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "application/octet-stream");
+    assert_eq!(res.headers()["content-range"], "0-0/*");
+    assert_eq!(body_text(res).await, "any");
+
+    // And what the function says through response.headers is what the
+    // content type ends up being, which is how one function answers
+    // several media types.
+    let res = app
+        .clone()
+        .oneshot(ask("/rest/v1/rpc/zou_rest_some_mt", "app/chico"))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()["content-type"], "app/chico");
+    assert_eq!(body_text(res).await, "chico");
+}
