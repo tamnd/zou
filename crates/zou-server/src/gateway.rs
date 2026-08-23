@@ -30,7 +30,7 @@ use axum::routing::any;
 use tower::ServiceExt as _;
 use zou_store::registry::Tenant;
 
-use crate::attach::Attached;
+use crate::attach::{Attached, Carried};
 use crate::forward::{Forwarding, Where, upgrading};
 use crate::tenant::{Found, Registry, Routing};
 
@@ -427,7 +427,21 @@ async fn dispatch(State(front): State<Arc<Front>>, mut req: Request<Body>) -> Re
     let (router, _held) = match sockets {
         Some(router) => (router, None),
         None => match front.attached.hold(&entry).await {
-            Ok(held) => (held.router(), Some(held)),
+            Ok(held) => {
+                let router = held.router();
+                // An upgrade is answered long before it is finished, so
+                // the hold goes with the request rather than ending
+                // with the dispatch that made the answer. Whoever takes
+                // the socket takes it, and a handler that does not is a
+                // request like any other: the count goes when the
+                // request does.
+                if upgrading(req.headers()) {
+                    req.extensions_mut().insert(Carried::of(held));
+                    (router, None)
+                } else {
+                    (router, Some(held))
+                }
+            }
             Err(e) => {
                 log::warn!("attach {}: {e}", found.tenant_ref);
                 return unavailable("the database for this project could not be started");

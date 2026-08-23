@@ -478,6 +478,12 @@ pub async fn websocket(
     uri: Uri,
     headers: HeaderMap,
     upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+    // What kept the project attached while the handshake was answered.
+    // It is an option because a socket does not always arrive through
+    // the gateway: an embedded server has one tenant and nothing to
+    // evict it, and the fan out tier serves sockets for projects it
+    // deliberately never attaches.
+    carried: Option<axum::Extension<crate::attach::Carried>>,
 ) -> Response {
     let Ok(upgrade) = upgrade else {
         // A plain GET of a websocket url. Upstream's gateway answers
@@ -557,6 +563,11 @@ pub async fn websocket(
         app.quota.sockets.joined();
         crate::ops::socket_joined();
         let _connected = Connected(Arc::clone(&app.quota));
+        // Moved in rather than dropped with the handshake: this socket
+        // reads from the project's database for as long as it lives,
+        // and a node at its ceiling would otherwise be free to stop the
+        // postmaster underneath it. See #574.
+        let _held = carried;
         let budget = Budget {
             limits: app.quota.limits,
             counters: Arc::clone(&app.quota) as Arc<dyn Counters>,
