@@ -586,9 +586,10 @@ What runs is the registry's build of the package rather than the tarball npm wou
 A function may import one itself, and so may a package the registry served, which is the other reason they exist: the browser build of a package still reaches for `node:buffer` and `node:process` here and there.
 
 ```
-assert  buffer  crypto  events  fs  fs/promises  os  path  process
-querystring  stream  stream/promises  stream/web  string_decoder
-timers  timers/promises  url  util  util/types
+assert  buffer  child_process  cluster  crypto  diagnostics_channel
+events  fs  fs/promises  module  os  path  process  querystring
+stream  stream/promises  stream/web  string_decoder  timers
+timers/promises  url  util  util/types  worker_threads
 ```
 
 `path/posix` and `path/win32` are the same module as `path`, which is posix, because there is one file system here and it has one separator.
@@ -601,8 +602,13 @@ What each one is is the part of it a package reaches for and not node's whole su
 - `stream` is `Readable`, `Writable`, `Duplex`, `Transform` and `PassThrough` on top of the `events` emitter, with `pipe`, `pipeline`, `finished`, the async iterator and the bridges to and from a web stream. None of node's internals are under it, so a package that reaches past the public methods into `_readableState` finds nothing.
 - `process` is a global as well as a module, the way it is in upstream's runtime, so a package that sets something on one sees it through the other. `env` is the function's environment and is read only, `stdout` and `stderr` go to the log, `nextTick` is a microtask, and `chdir` and `exit` throw rather than pretending.
 - `os` answers about the machine the function is on the way a container does, `util.promisify` reads the custom symbol, `assert` throws an `AssertionError`, and `timers` and `timers/promises` are the globals under their node names.
+- `diagnostics_channel` is a real one: named channels, subscribers, `publish`, `hasSubscribers` and the tracing channel wrapper. Nothing here subscribes to anything, so a library instrumenting itself through it publishes into channels nobody is on, which is what it is for.
+- `module` is `createRequire`, `builtinModules` and `isBuiltin`. There is no CJS here, so the require it hands back serves the built ins and names anything else as a module it cannot find, which is the answer a package feature detecting its way onto node is asking for.
+- `child_process`, `worker_threads` and `cluster` import and then refuse. Every call that would need a process, a thread or a fork throws with a sentence saying a function has none, and the parts that can be true are: `isMainThread` is true, `isPrimary` is true, and `worker_threads` hands back the platform's own `MessageChannel`.
 
-A built in nobody has written yet is refused when the module is resolved, by name, so `import "node:child_process"` says there is no `child_process` here rather than failing at the first call into it.
+Those last three are worth a word, because a module that exists and throws looks like the worse of the two options and is not.
+A package that imports one at the top and calls into it in a branch nobody takes runs perfectly well against a stub and does not load at all against an import that is refused, and that shape is the difference between the two registry builds on seven of the forty functions in the examples corpus.
+A built in nobody has written is still refused when the module is resolved, by name, so `import "node:dgram"` says there is no `dgram` here rather than failing at the first call into it.
 
 ### A package's own files
 

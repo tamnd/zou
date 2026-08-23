@@ -892,11 +892,8 @@ mod tests {
         assert_eq!(held.as_str(), "node:path");
         let sub = resolved("node:fs/promises", "file:///f/index.ts").unwrap();
         assert_eq!(sub.as_str(), "node:fs/promises");
-        let refused = resolved("node:child_process", "file:///f/index.ts").unwrap_err();
-        assert!(
-            refused.contains("no node built in child_process"),
-            "{refused}"
-        );
+        let refused = resolved("node:dgram", "file:///f/index.ts").unwrap_err();
+        assert!(refused.contains("no node built in dgram"), "{refused}");
     }
 
     /// And the source is the one this binary carries, off no network.
