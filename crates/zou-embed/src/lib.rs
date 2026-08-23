@@ -1155,13 +1155,16 @@ fn start(
         .env("ZOU_TENANT", tenant)
         .env("ZOU_PAGE_CACHE", pagecache)
         // A branch off the page layers needs an image layer at or
-        // below the cut, and the background fold cuts one after 128 MB
-        // of delta debt. A template is a fresh initdb and a couple of
-        // thousand rows, so it would never earn one, and every fixture
-        // cut off it would be refused. The embedded library is the
-        // branching product surface, so it stays on the object path
-        // until a branch can ask for that fold rather than wait for
-        // it, which is #579.
+        // below the cut, which a template is far too small to earn on
+        // its own, and it needs the child to be able to read the size
+        // of a relation it inherited. The first of those a branch can
+        // now ask for by name, see branching::fold_for_branch. The
+        // second has no answer on this path yet: fork lengths live in
+        // the object path's capture index and a child of a page
+        // service tenant has neither its own SIZE objects nor a chain
+        // that carries them, so it fails on pg_authid before it can
+        // authenticate. The embedded library is the branching product
+        // surface, so it stays on the object path until #623 lands.
         .env("ZOU_PAGESERVE", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());

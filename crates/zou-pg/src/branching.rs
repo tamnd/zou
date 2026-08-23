@@ -19,6 +19,7 @@
 //! the removal itself, which `zou branch delete` needs for a child that
 //! did serve and is no longer wanted.
 
+use crate::redo::RedoPool;
 use zou_store::layer::LayerKind;
 use zou_store::layermap::LayerDesc;
 use zou_store::layout::TenantLayout;
@@ -154,15 +155,8 @@ fn why_layerless(
     layout: &TenantLayout,
     manifest: &Manifest,
 ) -> Result<Option<String>, String> {
-    // A child names its cut. A source has not been cut yet, so the
-    // question is asked at the newest checkpoint, which is where a
-    // head branch of it would land.
-    let at = match manifest.branch_of.as_ref().map(|b| b.at_lsn) {
-        Some(at) => at,
-        None => match manifest.checkpoints.last().map(|c| c.lsn) {
-            Some(lsn) => lsn,
-            None => return Ok(Some(NO_CHECKPOINT.to_string())),
-        },
+    let Some(at) = cut_at(manifest) else {
+        return Ok(Some(NO_CHECKPOINT.to_string()));
     };
     for shard in 0..manifest.shards as u16 {
         let key = layout.shard_manifest(shard);
@@ -183,6 +177,136 @@ fn why_layerless(
         }
     }
     Ok(None)
+}
+
+/// Where a branch of this manifest would cut, which is the point every
+/// shard needs an image at or below.
+///
+/// A child names its cut. A source has not been cut yet, so the answer
+/// is its newest checkpoint, which is where a head branch of it lands.
+fn cut_at(manifest: &Manifest) -> Option<Lsn> {
+    match manifest.branch_of.as_ref().map(|b| b.at_lsn) {
+        Some(at) => Some(at),
+        None => manifest.checkpoints.last().map(|c| c.lsn),
+    }
+}
+
+/// Which shards would leave a child with no floor, worst first.
+///
+/// The answer to a shard on this list is a fold. Everything else about
+/// it is the same question [`why_layerless`] asks and is answered off
+/// the same objects.
+pub fn floorless(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    manifest: &Manifest,
+) -> Result<Vec<u16>, String> {
+    let Some(at) = cut_at(manifest) else {
+        return Err(NO_CHECKPOINT.to_string());
+    };
+    let mut want = Vec::new();
+    for shard in 0..manifest.shards as u16 {
+        let loaded = PageShardManifest::load(store, &layout.shard_manifest(shard))
+            .map_err(|e| format!("shard {shard}: {e}"))?;
+        match loaded {
+            Some((shard_manifest, _)) if has_image_at_or_below(&shard_manifest, at)? => {}
+            // A shard that has published nothing has nothing to fold
+            // either. It is still floorless and the caller is still
+            // told, since a fold that quietly skipped it would leave a
+            // branch that fails on its first page read.
+            _ => want.push(shard),
+        }
+    }
+    Ok(want)
+}
+
+/// The same question [`why_layerless`] answers, asked by a caller that
+/// is going to call [`fold_for_branch`] first.
+///
+/// A source with no floor is not unbranchable to such a caller, it is a
+/// source with a fold to cut, and answering no would have a host
+/// refusing to offer branching for a database that branches fine. What
+/// is still no is a shard with no floor and nothing of its own to make
+/// one out of: a shard that has published nothing at all, or one still
+/// riding somebody else's layers, where the fold has nothing to fold.
+pub fn why_unbranchable_after_fold(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    manifest: &Manifest,
+) -> Result<Option<String>, String> {
+    if cut_at(manifest).is_none() {
+        return Ok(Some(NO_CHECKPOINT.to_string()));
+    }
+    for shard in floorless(store, layout, manifest)? {
+        let own = PageShardManifest::load(store, &layout.shard_manifest(shard))
+            .map_err(|e| format!("shard {shard}: {e}"))?;
+        let has_own = own.is_some_and(|(m, _)| !m.layers.is_empty());
+        if !has_own {
+            return Ok(Some(format!(
+                "page shard {shard} has published nothing yet, so there is no image to serve \
+                 inherited pages from and nothing to fold one out of"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+/// Cut the folds a branch of this source needs, rather than wait for
+/// the background one to earn them.
+///
+/// Compaction cuts an image on its own after enough delta debt, which
+/// is the right rule for a database that has been running for a while
+/// and no rule at all for a young one. A template is a fresh initdb and
+/// a couple of thousand rows: it would never earn a fold, so every
+/// branch of it would be refused for want of something the source was
+/// never going to produce. This is the same fold asked for by name.
+///
+/// The cost is one merge per shard that has no image at or below the
+/// cut, and it is paid where it belongs: once, by whoever seals the
+/// thing that is going to be branched, rather than once per branch.
+/// A shard that already has a floor is not touched.
+///
+/// The count is how many shards were folded, which is zero on a source
+/// that was already branchable.
+pub fn fold_for_branch(
+    store: &dyn CasStore,
+    tenant_ref: &str,
+    manifest: &Manifest,
+    pool: &RedoPool,
+    data_checksums: bool,
+) -> Result<usize, String> {
+    let layout = TenantLayout::new(tenant_ref);
+    let at = cut_at(manifest).ok_or_else(|| NO_CHECKPOINT.to_string())?;
+    let mut folded = 0;
+    for shard in floorless(store, &layout, manifest)? {
+        // One shard at a time, for the reason the offline fold gives:
+        // a merge holds an image in memory while it fills.
+        let out =
+            crate::compact::merge_to_horizon(store, tenant_ref, shard, at, pool, data_checksums)
+                .map_err(|e| format!("shard {shard}: {e}"))?;
+        match out {
+            Some(out) => {
+                log::debug!(
+                    "fold for branch: shard {shard} imaged {} pages at {}",
+                    out.imaged,
+                    out.horizon
+                );
+                folded += 1;
+            }
+            // Nothing below the horizon to fold, which on a shard with
+            // no floor means the layers it would have folded are
+            // somebody else's. Saying so beats a branch that is refused
+            // later for a reason that reads like a bug.
+            None => {
+                return Err(format!(
+                    "page shard {shard} has no image at or below {:#x} and nothing of its own to \
+                     fold into one, so a branch of {tenant_ref} would not serve",
+                    at.0
+                ));
+            }
+        }
+    }
+    Ok(folded)
 }
 
 /// Whether a shard carries an image the child can stand on, which is
@@ -314,6 +438,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(why.contains("no image layer at or below 0x100"), "{why}");
+    }
+
+    /// The shards a fold has to touch are the ones with no floor, and
+    /// the ones that have one are left alone, which is what keeps a
+    /// branch of a sealed template free.
+    #[test]
+    fn only_the_shards_with_no_floor_are_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let layout = TenantLayout::new("pr-1");
+        let (lo, hi) = whole();
+        publish(
+            &store,
+            &layout,
+            vec![entry(LayerDesc::delta(lo, hi, Lsn(0x10), Lsn(0x100)))],
+        );
+        assert_eq!(floorless(&store, &layout, &child(Lsn(0x100))).unwrap(), [0]);
+
+        publish(
+            &store,
+            &layout,
+            vec![entry(LayerDesc::image(lo, hi, Lsn(0x80)))],
+        );
+        assert!(
+            floorless(&store, &layout, &child(Lsn(0x100)))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A shard with deltas and no image is a fold waiting to happen, so
+    /// a caller that folds is told yes where a caller that does not is
+    /// told to fold first. A shard with nothing at all is no to both.
+    #[test]
+    fn a_shard_with_something_to_fold_is_branchable_to_a_caller_that_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let layout = TenantLayout::new("pr-1");
+        let (lo, hi) = whole();
+
+        let why = why_unbranchable_after_fold(&store, &layout, &child(Lsn(0x100)))
+            .unwrap()
+            .unwrap();
+        assert!(why.contains("nothing to fold one out of"), "{why}");
+
+        publish(
+            &store,
+            &layout,
+            vec![entry(LayerDesc::delta(lo, hi, Lsn(0x10), Lsn(0x100)))],
+        );
+        assert!(
+            why_unbranchable_after_fold(&store, &layout, &child(Lsn(0x100)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            why_layerless(&store, &layout, &child(Lsn(0x100)))
+                .unwrap()
+                .is_some(),
+            "and a caller that does not fold is still told to"
+        );
     }
 
     /// Asked of a source rather than a child, the cut is the newest
