@@ -332,7 +332,7 @@ fn a_function_may_import_the_files_beside_it() {
 fn a_specifier_this_runtime_does_not_serve_says_so_by_name() {
     for (specifier, said) in [
         ("http://esm.sh/zod", "over https"),
-        ("node:child_process", "no node built in child_process"),
+        ("node:dgram", "no node built in dgram"),
         ("data:text/javascript,1", "the data: specifier"),
     ] {
         let source = format!(r#"import "{specifier}"; Deno.serve(() => new Response("no"));"#);
