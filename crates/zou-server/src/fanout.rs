@@ -35,8 +35,8 @@
 //! usually a link that comes back a second later, and gapping a hundred
 //! thousand sockets because two servers lost a tcp connection is a
 //! reconnect storm this end asked for. So the holder keeps the last
-//! [`KEPT`] frames it sent per link and everything that link's sockets
-//! held, for [`GRACE`]; a node names its link and says which number it
+//! `KEPT` frames it sent per link and everything that link's sockets
+//! held, for `GRACE`; a node names its link and says which number it
 //! got to; and a link that comes back inside both is given what it
 //! missed, in order, with nothing closed. Past either, it is told, and
 //! then the gap is the honest answer again.
@@ -44,7 +44,7 @@
 //! The project's budgets cross it too, in both directions. Every meter
 //! behind them counts what happened on one server, which on a fleet is
 //! a share of the project rather than the project, so a node says its
-//! four numbers up every [`TALLY`], the holder adds every node's up,
+//! four numbers up every `TALLY`, the holder adds every node's up,
 //! and the answer that comes back is the project less that node's own
 //! share. A node refusing a socket then adds its live numbers back on
 //! and refuses against the project. It is a second stale and meant to
@@ -1227,7 +1227,7 @@ struct Kept {
 ///
 /// One per project rather than one per node, because the node it
 /// belongs to is by definition not connected. Bounded by the fleet: one
-/// entry per node that dropped, each let go [`GRACE`] after it did.
+/// entry per node that dropped, each let go `GRACE` after it did.
 #[derive(Default)]
 pub struct Dropped(Mutex<HashMap<u64, Kept>>);
 

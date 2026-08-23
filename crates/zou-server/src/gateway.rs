@@ -128,7 +128,7 @@ pub fn fleet(
 /// The same, saying how long a socket tier nobody is on is kept before
 /// it is dropped.
 ///
-/// [`EMPTY`] is what `fleet` uses and is the number to want. This is
+/// `EMPTY` is what `fleet` uses and is the number to want. This is
 /// for an embedder that knows something about its own clients that the
 /// default cannot, and for the test that proves an empty tier goes,
 /// which cannot wait a quarter of an hour to watch one.
