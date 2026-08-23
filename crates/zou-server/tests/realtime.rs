@@ -919,3 +919,118 @@ async fn a_project_with_no_budget_reports_none() {
     assert_eq!(status, 202, "{body}");
     assert_eq!(rate, vec!["", "", ""]);
 }
+
+/// A socket keeps its project attached for as long as it is connected.
+///
+/// A request holds its tenant until the answer is written, which for an
+/// upgrade is the moment the 101 goes out and the connection starts
+/// being useful. From there the socket used to hold nothing, so a node
+/// at its ceiling was free to stop the postmaster its subscriptions
+/// read from. The ceiling here is one project and the second project is
+/// asked for while the first one has a socket on it, so the sweep has
+/// every reason to take the first and must not. See #574.
+#[tokio::test]
+async fn a_socket_keeps_its_project_attached_for_as_long_as_it_lives() {
+    use std::sync::{Arc, Mutex};
+    use zou_server::attach::{Attached, Backend};
+    use zou_server::gateway::gateway;
+    use zou_server::tenant::{Registry, Routing};
+    use zou_store::registry::{self, Tenant};
+    use zou_store::{CasStore, open_store};
+
+    fn secret(tenant_ref: &str) -> String {
+        format!("{tenant_ref}-secret-of-at-least-32-characters-long")
+    }
+
+    /// A backend that writes down who it was told to stop, which is the
+    /// whole question here.
+    #[derive(Default)]
+    struct Fake {
+        downs: Mutex<Vec<String>>,
+    }
+
+    impl Backend for Fake {
+        fn up(&self, entry: &Tenant) -> Result<Config, String> {
+            Ok(Config {
+                jwt_secret: entry.jwt_secret.as_bytes().to_vec(),
+                ..Config::default()
+            })
+        }
+        fn down(&self, tenant_ref: &str) {
+            self.downs.lock().unwrap().push(tenant_ref.to_string());
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("a directory");
+    let store: Arc<dyn CasStore> =
+        Arc::from(open_store(&dir.path().to_string_lossy()).expect("a store opens"));
+    for tenant_ref in ["acme-prod", "beta-co"] {
+        registry::create(
+            store.as_ref(),
+            &Tenant::new(tenant_ref, &secret(tenant_ref), 1),
+        )
+        .expect("it registers");
+    }
+    let backend = Arc::new(Fake::default());
+    let attached = Arc::new(
+        Attached::new(backend.clone()).with_budget(1, std::time::Duration::from_millis(1)),
+    );
+    let front = gateway(
+        Routing {
+            domains: Vec::new(),
+            path_prefix: true,
+        },
+        Arc::new(Registry::new(store)),
+        attached.clone(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let at = listener.local_addr().expect("the port");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, front).await;
+    });
+
+    let url = |tenant_ref: &str| {
+        format!(
+            "ws://{at}/{tenant_ref}/realtime/v1/websocket?apikey={}&vsn=2.0.0",
+            jwt::mint(&jwt::key_claims("anon"), secret(tenant_ref).as_bytes())
+        )
+    };
+    let mut socket = open(&url("acme-prod")).await;
+    assert_eq!(join(&mut socket, "realtime:room").await[4]["status"], "ok");
+
+    // The other project, which puts the node one over a ceiling of one,
+    // and then the idle sweep on top, which is the other budget and has
+    // the same reason to pass over a tenant somebody is inside.
+    let _other = open(&url("beta-co")).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    attached.sweep().await;
+    assert!(
+        !backend
+            .downs
+            .lock()
+            .unwrap()
+            .contains(&"acme-prod".to_string()),
+        "the project with a socket on it was stopped: {:?}",
+        backend.downs.lock().unwrap()
+    );
+    // And it is still a working socket rather than one that survived on
+    // paper, so it answers when spoken to.
+    send(&mut socket, r#"["1","2","phoenix","heartbeat",{}]"#).await;
+    let beat = next_json(&mut socket).await;
+    assert_eq!(beat[4]["status"], "ok", "{beat}");
+
+    // Gone once the socket is, since a hold that never ends is a leak
+    // rather than a fix.
+    drop(socket);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    attached.sweep().await;
+    assert!(
+        backend
+            .downs
+            .lock()
+            .unwrap()
+            .contains(&"acme-prod".to_string()),
+        "the hold outlived the socket: {:?}",
+        backend.downs.lock().unwrap()
+    );
+}

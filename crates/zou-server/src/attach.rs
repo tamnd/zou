@@ -143,6 +143,23 @@ impl Hold {
     }
 }
 
+/// A hold a request leaves behind for whatever outlives it.
+///
+/// A websocket is answered and then starts being useful, so the work
+/// is not over when dispatch returns and the hold must not end there
+/// either. The upgrade cannot be handed a `Hold` by value, because the
+/// request it rides on is dispatched through a router and what a
+/// router carries has to be cloneable, so it rides as a count instead
+/// and the last clone to go is what lets the tenant be evicted.
+#[derive(Clone)]
+pub struct Carried(#[allow(dead_code)] Arc<Hold>);
+
+impl Carried {
+    pub fn of(hold: Hold) -> Carried {
+        Carried(Arc::new(hold))
+    }
+}
+
 /// The counting half of [`Hold`], taken before the attach so that a
 /// tenant being built is as safe from eviction as one being used, and
 /// so that an attach that failed lets go on the way out.
