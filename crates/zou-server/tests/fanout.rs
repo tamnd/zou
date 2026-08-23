@@ -59,6 +59,26 @@ fn anon_key() -> String {
     jwt::mint(&jwt::key_claims("anon"), SECRET)
 }
 
+/// An address that takes a connection and then drops it, which is a
+/// link that will never open and is the same answer on every machine.
+///
+/// Naming a port nothing listens on is the obvious way to ask for this
+/// and it is not the same question everywhere. A connect to a closed
+/// port is refused at once on linux and on macos, and on WSL2 it sits
+/// there long enough that a five second wait says nothing about the
+/// server under test. Failing the handshake instead of the connect
+/// takes the host's opinion out of it. See #575 and #588.
+async fn deaf() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let at = listener.local_addr().expect("the port");
+    tokio::spawn(async move {
+        while let Ok((connection, _)) = listener.accept().await {
+            drop(connection);
+        }
+    });
+    at
+}
+
 /// A tcp proxy that can be cut and mended, so that the link between two
 /// servers can drop without either of them going.
 ///
@@ -348,12 +368,12 @@ async fn a_subscription_is_answered_by_the_node_with_the_database() {
 
 #[tokio::test]
 async fn a_socket_whose_node_cannot_reach_the_holder_is_told_rather_than_left_quiet() {
-    // Port 1 answers nothing on any machine this runs on, so the link
-    // never opens. What a socket must not get out of that is a channel
-    // that joins and stays silent: it is told there is a gap the same
-    // way a subscriber the change reader dropped is, and a client that
-    // is closed on reconnects and rejoins.
-    let node = serving(Some("127.0.0.1:1".parse().expect("an address"))).await;
+    // A holder that answers a connect and then says nothing, so the
+    // link never opens. What a socket must not get out of that is a
+    // channel that joins and stays silent: it is told there is a gap the
+    // same way a subscriber the change reader dropped is, and a client
+    // that is closed on reconnects and rejoins.
+    let node = serving(Some(deaf().await)).await;
     let mut away = connect(node).await;
     let closed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
