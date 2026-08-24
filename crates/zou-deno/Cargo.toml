@@ -54,7 +54,12 @@ rustls = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 # An import map is json, and a `deno.jsonc` is json with the comments
 # taken out first. Already in the tree underneath deno_core.
-serde_json = { workspace = true, optional = true }
+# `preserve_order`, because the order of the conditions in a package's
+# `exports` is what decides which build runs and a map that sorts its
+# keys would quietly pick `default` over `deno` every time. It is
+# already on in this tree through another crate, and naming it here is
+# the difference between that being true and that being relied on.
+serde_json = { workspace = true, features = ["preserve_order"], optional = true }
 # `crypto.subtle.digest` has four hashes and this is the one of them
 # that is not sha2. It is already in the tree.
 sha1 = { workspace = true, optional = true }
