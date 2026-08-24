@@ -321,6 +321,12 @@ impl ModuleLoader for Disk {
             return answer;
         }
         if let Some(rest) = specifier.strip_prefix("jsr:") {
+            if self.npm == Npm::Tarball {
+                // Left as it is for the same reason an `npm:` specifier
+                // is: which version a range means is two http requests
+                // away and this call may not wait for them.
+                return url(&format!("jsr:{}", bare(rest)));
+            }
             return url(&self.built(format!("{}/jsr/{}", self.registry, bare(rest))));
         }
         // The one specifier this runtime writes itself, in the module
@@ -405,6 +411,37 @@ impl ModuleLoader for Disk {
                 })
                 .await
                 .map_err(|e| JsErrorBox::generic(format!("{asked} could not be unpacked: {e}")))?
+            }));
+        }
+        // A jsr package is typescript and nothing else, so once the two
+        // lookups have said which file the specifier means, it is an
+        // ordinary module off a url and goes through the same cache
+        // everything else does. The redirect is what makes the relative
+        // imports inside it resolve against jsr.io rather than against
+        // the `jsr:` specifier somebody wrote.
+        if specifier.scheme() == "jsr" && self.npm == Npm::Tarball {
+            let asked = specifier.clone();
+            let cache = self.cache.clone();
+            let cached_only = self.cached_only;
+            let landed = Rc::clone(&self.landed);
+            return ModuleLoadResponse::Async(Box::pin(async move {
+                let fetched = tokio::task::spawn_blocking({
+                    let asked = asked.clone();
+                    move || {
+                        let found = crate::jsr::entry(asked.path()).map_err(|why| {
+                            JsErrorBox::type_error(format!("{asked} could not be resolved: {why}"))
+                        })?;
+                        let file = ModuleSpecifier::parse(&found)
+                            .map_err(|e| JsErrorBox::type_error(format!("{found}: {e}")))?;
+                        held(&cache, cached_only, &file)
+                    }
+                })
+                .await
+                .map_err(|e| JsErrorBox::generic(format!("{asked} could not be fetched: {e}")))??;
+                landed
+                    .borrow_mut()
+                    .insert(asked.to_string(), fetched.url.clone());
+                remote(&asked, fetched)
             }));
         }
         if specifier.scheme() == "file" {
@@ -1327,6 +1364,35 @@ mod tests {
         // manifest at all.
         let refused = disk.resolve("left-pad", referrer.as_str(), ResolutionKind::Import);
         assert!(refused.is_err(), "{refused:?}");
+    }
+
+    /// A `jsr:` specifier is left alone under the tarball knob, because
+    /// the file it means is two http requests away and this call has no
+    /// thread to wait on either of them.
+    #[test]
+    fn a_jsr_specifier_under_the_tarball_knob_waits_for_the_load() {
+        let disk = Disk {
+            npm: Npm::Tarball,
+            ..loader()
+        };
+        let one = disk
+            .resolve(
+                "jsr:@std/encoding@1/hex",
+                "file:///f/index.ts",
+                ResolutionKind::Import,
+            )
+            .expect("a specifier");
+        assert_eq!(one.as_str(), "jsr:@std/encoding@1/hex");
+        // And the slash a package's own imports carry after the scheme
+        // comes off here, the same as it does for npm.
+        let two = disk
+            .resolve(
+                "jsr:/@std/encoding@1",
+                "file:///f/index.ts",
+                ResolutionKind::Import,
+            )
+            .expect("a specifier");
+        assert_eq!(two.as_str(), "jsr:@std/encoding@1");
     }
 
     /// The three things the environment can say about who to ask as.

@@ -149,6 +149,26 @@ fn a_real_package_off_the_registry_runs_out_of_its_own_tarball() {
     assert_eq!(answered(&function), r#"{"ONE":"1","TWO":"two"}"#);
 }
 
+/// A jsr package, which is the other half of the knob: two lookups on
+/// jsr.io and then the typescript it publishes, read the way any other
+/// module off a url is read. Ignored because it fetches.
+#[test]
+#[ignore]
+fn a_jsr_package_is_the_typescript_it_publishes() {
+    let cache = tempfile::tempdir().expect("a temporary directory");
+    unsafe {
+        std::env::set_var("ZOU_MODULE_CACHE", cache.path());
+        std::env::set_var("ZOU_NPM", "tarball");
+    }
+    let (_dir, function) = deployed(
+        r#"
+        import { encodeHex } from "jsr:@std/encoding@^1/hex";
+        Deno.serve(() => new Response(encodeHex(new Uint8Array([255, 0, 16]))));
+        "#,
+    );
+    assert_eq!(answered(&function), "ff0010");
+}
+
 /// The package every function in the examples corpus imports, off its
 /// own tarball rather than off a registry's build of it. Ignored for
 /// the same reason: it fetches, this time a graph of them.
