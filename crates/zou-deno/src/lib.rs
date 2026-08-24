@@ -119,6 +119,8 @@
 #[cfg(not(feature = "isolate"))]
 mod absent;
 #[cfg(feature = "isolate")]
+mod cjs;
+#[cfg(feature = "isolate")]
 mod crypto;
 #[cfg(feature = "isolate")]
 mod fetch;
