@@ -52,6 +52,12 @@ pub fn source(name: &str) -> Option<&'static str> {
         "events" => include_str!("node/events.js"),
         "fs" => include_str!("node/fs.js"),
         "fs/promises" => include_str!("node/fs_promises.js"),
+        // The client half of each, over the same http client `fetch`
+        // goes through. The server half is a refusal at `listen`,
+        // because the socket a function is answered on belongs to the
+        // server that called it.
+        "http" => include_str!("node/http.js"),
+        "https" => include_str!("node/https.js"),
         "module" => include_str!("node/module.js"),
         "os" => include_str!("node/os.js"),
         // The three names for the same file: node's `path` is posix
@@ -100,6 +106,8 @@ pub const NAMES: &[&str] = &[
     "events",
     "fs",
     "fs/promises",
+    "http",
+    "https",
     "module",
     "os",
     "path",
@@ -297,7 +305,6 @@ mod tests {
         for name in super::NAMES {
             assert!(super::core(name), "node:{name} is not on the core list");
         }
-        assert!(super::core("http"), "node has http and this does not");
         assert!(super::core("net"), "node has net and this does not");
         assert!(!super::core("lodash"));
         assert!(!super::core("node:os"), "the prefix is taken off first");

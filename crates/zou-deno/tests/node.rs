@@ -737,3 +737,142 @@ fn v8_writes_a_value_out_as_bytes_and_reads_it_back() {
         "true|true|1|true|2|true|through the class|true|node:v8 getHeapStatistics is about the isolate, which a function does not own"
     );
 }
+
+/// A request through `node:http`, against a listener in a thread beside
+/// it, because what is being tested is a call that leaves the isolate:
+/// the options node's api takes, turned into a request the host's http
+/// client makes, and the answer read back through node's names for it.
+#[test]
+fn http_makes_a_request_and_reads_the_answer_back_with_nodes_names() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("an address").port();
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writing = std::sync::Arc::clone(&heard);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = match stream {
+                Ok(stream) => stream,
+                Err(_) => return,
+            };
+            // Until the headers and whatever body was promised have
+            // both arrived, because a client is free to write them in
+            // as many pieces as it likes.
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+            let mut asked = Vec::new();
+            let mut got = [0u8; 4096];
+            loop {
+                match std::io::Read::read(&mut stream, &mut got) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => asked.extend_from_slice(&got[..read]),
+                }
+                let said = String::from_utf8_lossy(&asked).to_string();
+                let head = match said.find("\r\n\r\n") {
+                    Some(at) => at + 4,
+                    None => continue,
+                };
+                let wants = said
+                    .to_lowercase()
+                    .split("\r\n")
+                    .find_map(|line| line.strip_prefix("content-length: ").map(str::to_string))
+                    .and_then(|it| it.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if asked.len() >= head + wants {
+                    break;
+                }
+            }
+            writing
+                .lock()
+                .expect("the log")
+                .push(String::from_utf8_lossy(&asked).to_string());
+            let body = "one\ntwo";
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                format!(
+                    "HTTP/1.1 201 Created\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nx-said: here\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+
+    let said = served(&format!(
+        r#"
+        import http from "node:http";
+        const seen = [];
+
+        const answer = await new Promise((resolve, reject) => {{
+          const call = http.request(
+            {{ hostname: "127.0.0.1", port: {port}, path: "/where", method: "POST", headers: {{ "x-asked": "yes" }} }},
+            (response) => {{
+              const parts = [];
+              response.on("data", (chunk) => parts.push(chunk));
+              response.on("end", () => resolve({{ response, body: parts.join("") }}));
+            }},
+          );
+          call.on("error", reject);
+          call.setHeader("x-late", "also");
+          call.write("a body");
+          call.end();
+        }});
+        seen.push(String(answer.response.statusCode));
+        seen.push(answer.response.statusMessage);
+        seen.push(answer.response.headers["x-said"]);
+        seen.push(answer.body.split("\n").join("+"));
+
+        // The other spelling, which is a url and a get with no body.
+        const second = await new Promise((resolve, reject) => {{
+          http.get(`http://127.0.0.1:{port}/again`, (response) => {{
+            response.on("data", () => {{}});
+            response.on("end", () => resolve(response.statusCode));
+          }}).on("error", reject);
+        }});
+        seen.push(String(second));
+
+        // And the server this runtime will not give out.
+        try {{
+          http.createServer(() => {{}}).listen(8080);
+          seen.push("no error");
+        }} catch (e) {{
+          seen.push(e.message);
+        }}
+
+        Deno.serve(() => new Response(seen.join("|")));
+        "#
+    ));
+    assert_eq!(
+        said,
+        "201|Created|here|one+two|201|a function is answered on the server's own socket, so node:http createServer has no port to listen on"
+    );
+    let heard = heard.lock().expect("the log").join("\n");
+    assert!(heard.contains("POST /where HTTP/1.1"), "{heard}");
+    assert!(heard.contains("x-asked: yes"), "{heard}");
+    assert!(heard.contains("x-late: also"), "{heard}");
+    assert!(heard.contains("a body"), "{heard}");
+    assert!(heard.contains("GET /again HTTP/1.1"), "{heard}");
+}
+
+/// The other module, which is the same one with the other default.
+/// Nothing is sent here, because a request is sent when its body is
+/// ended and this one never is: what is being checked is which url the
+/// options were turned into.
+#[test]
+fn https_is_http_with_the_other_protocol_in_front_of_it() {
+    let said = served(
+        r#"
+        import https from "node:https";
+        import http from "node:http";
+        const seen = [];
+
+        seen.push(https.request({ hostname: "example.test", path: "/one" }).protocol);
+        seen.push(http.request({ hostname: "example.test", path: "/one" }).protocol);
+        // A url that says which it is keeps it.
+        seen.push(https.request("http://example.test/two").protocol);
+        seen.push(String(https.Agent === http.Agent));
+        seen.push(String(https.STATUS_CODES[404]));
+
+        Deno.serve(() => new Response(seen.join("|")));
+        "#,
+    );
+    assert_eq!(said, "https:|http:|http:|true|Not Found");
+}

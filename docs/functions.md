@@ -594,8 +594,8 @@ A function may import one itself, and so may a package the registry served, whic
 
 ```
 assert  async_hooks  buffer  child_process  cluster  crypto
-diagnostics_channel  events  fs  fs/promises  module  os  path
-process  querystring  readline  readline/promises  stream
+diagnostics_channel  events  fs  fs/promises  http  https  module
+os  path  process  querystring  readline  readline/promises  stream
 stream/promises  stream/web  string_decoder  timers  timers/promises
 url  util  util/types  v8  worker_threads  zlib
 ```
@@ -615,6 +615,7 @@ What each one is is the part of it a package reaches for and not node's whole su
 - `async_hooks` is `AsyncLocalStorage`, and it is the one built in here that is a runtime feature rather than a translation. A store set before an await is still there after it, on that chain and not on whoever else ran in between, because the value is carried by the thing that resumes a continuation. `run`, `getStore`, `enterWith`, `exit`, `bind` and `snapshot` are all there, and so is `AsyncResource`. The hooks half is not: `createHook` gives back a hook whose callbacks never fire, because nothing here reports when a promise is made or collected.
 - `zlib` is the real thing rather than a translation. gzip, deflate and raw deflate, their three inflates, and `unzip`, which reads its own framing, in all three of node's shapes: the synchronous call, the callback and the stream. The deflate underneath is the one this binary already carries for opening a package tarball, held as a job with an id so a stream fed a chunk at a time comes out as one gzip and not a hundred. Brotli is a different algorithm and refuses by name.
 - `readline` is a stream cut into lines, read through the `line` event, the async iterator or `question`, which is answered by the next line rather than by somebody typing. There is no tty in a function, so the terminal half of node's module is not here: `cursorTo` and the rest answer false, and there is no history, no completer and no key events.
+- `http` and `https` are the client half, over the same http client `fetch` goes through: `request` and `get` in the shapes node takes them, a request that is a writable and sends when it is ended, and a response that is a readable with `statusCode`, `headers` and `rawHeaders` on it. What is lost against node's is the socket underneath, so there is no pool a caller can size, no `socket` event with a real socket on it, and no upgrade. The server half cannot exist here, because a function is answered on the socket the server that called it already owns, so `createServer` gives back a server that refuses when it is asked to listen.
 - `v8` is `serialize` and `deserialize`, over the same serializer `structuredClone` goes through, because there is one and it belongs to the engine. What survives a trip through it is what survives a clone, and the bytes carry v8's version in front of them, which is worth knowing before writing them anywhere they outlive the process. The rest of node's module is about the isolate a program is running inside, and a function does not own the one it is in, so heap statistics, flags and snapshots refuse by name.
 - `child_process`, `worker_threads` and `cluster` import and then refuse. Every call that would need a process, a thread or a fork throws with a sentence saying a function has none, and the parts that can be true are: `isMainThread` is true, `isPrimary` is true, and `worker_threads` hands back the platform's own `MessageChannel`.
 
