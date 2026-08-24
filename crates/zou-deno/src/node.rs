@@ -59,6 +59,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "http" => include_str!("node/http.js"),
         "https" => include_str!("node/https.js"),
         "module" => include_str!("node/module.js"),
+        "net" => include_str!("node/net.js"),
         "os" => include_str!("node/os.js"),
         // The three names for the same file: node's `path` is posix
         // here, because the host a function runs on is, and asking for
@@ -109,6 +110,7 @@ pub const NAMES: &[&str] = &[
     "http",
     "https",
     "module",
+    "net",
     "os",
     "path",
     "path/posix",
@@ -305,7 +307,7 @@ mod tests {
         for name in super::NAMES {
             assert!(super::core(name), "node:{name} is not on the core list");
         }
-        assert!(super::core("net"), "node has net and this does not");
+        assert!(super::core("tls"), "node has tls and this does not");
         assert!(!super::core("lodash"));
         assert!(!super::core("node:os"), "the prefix is taken off first");
     }
@@ -313,7 +315,7 @@ mod tests {
     #[test]
     fn a_built_in_that_is_not_here_is_not_pretended_to_be() {
         assert!(source("dgram").is_none());
-        assert!(source("net").is_none());
+        assert!(source("tls").is_none());
         assert!(source("path/nonsense").is_none());
     }
 }

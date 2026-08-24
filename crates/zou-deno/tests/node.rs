@@ -876,3 +876,83 @@ fn https_is_http_with_the_other_protocol_in_front_of_it() {
     );
     assert_eq!(said, "https:|http:|http:|true|Not Found");
 }
+
+/// A socket with node's names on it, against a listener in a thread
+/// beside the isolate. The server here says back whatever it was told,
+/// with `pong` in front, so what the test proves is that a write and
+/// the read that answers it are the same connection.
+#[test]
+fn net_opens_a_socket_and_writes_and_reads_the_answer() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("an address").port();
+    std::thread::spawn(move || {
+        let mut stream = match listener.incoming().next() {
+            Some(Ok(stream)) => stream,
+            _ => return,
+        };
+        let mut got = [0u8; 1024];
+        loop {
+            let read = match std::io::Read::read(&mut stream, &mut got) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => read,
+            };
+            let said = String::from_utf8_lossy(&got[..read]).to_string();
+            if std::io::Write::write_all(&mut stream, format!("pong {said}").as_bytes()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let said = served(&format!(
+        r#"
+        import net from "node:net";
+        const seen = [];
+
+        const socket = net.createConnection({{ port: {port}, host: "127.0.0.1" }});
+        const heard = [];
+        socket.on("data", (chunk) => heard.push(String(chunk)));
+        await new Promise((resolve, reject) => {{
+          socket.on("connect", resolve);
+          socket.on("error", reject);
+        }});
+        seen.push(String(socket.remotePort === {port}));
+        socket.write("one");
+        await new Promise((resolve) => socket.once("data", resolve));
+        socket.write("two");
+        await new Promise((resolve) => socket.once("data", resolve));
+        seen.push(heard.join("|"));
+        // A half close, which the other end reads as the end of the
+        // conversation and answers by hanging up.
+        const ended = new Promise((resolve) => socket.on("end", resolve));
+        const gone = new Promise((resolve) => socket.on("close", resolve));
+        socket.end();
+        await ended;
+        await gone;
+        seen.push(String(socket.destroyed));
+
+        seen.push(`${{net.isIP("127.0.0.1")}}${{net.isIP("::1")}}${{net.isIP("nope")}}`);
+
+        try {{
+          net.createServer(() => {{}}).listen(8080);
+          seen.push("no error");
+        }} catch (e) {{
+          seen.push(e.message);
+        }}
+
+        // A unix socket is a file on the host, which is the one thing
+        // this will not open.
+        try {{
+          net.createConnection({{ path: "/tmp/where.sock" }});
+          seen.push("no error");
+        }} catch (e) {{
+          seen.push(e.message);
+        }}
+
+        Deno.serve(() => new Response(seen.join(" ")));
+        "#
+    ));
+    assert_eq!(
+        said,
+        "true pong one|pong two true 460 a function is answered on the server's own socket, so node:net createServer has no port to listen on node:net may only open a tcp connection, and a path is a unix socket, which is a file on the host"
+    );
+}
