@@ -32,6 +32,11 @@
 pub fn source(name: &str) -> Option<&'static str> {
     Some(match name {
         "assert" => include_str!("node/assert.js"),
+        // The one built in here that is a runtime feature rather than
+        // a translation: a store that follows a value through a
+        // promise chain, which only the thing that resumes a
+        // continuation can carry.
+        "async_hooks" => include_str!("node/async_hooks.js"),
         "buffer" => include_str!("node/buffer.js"),
         // A function does not get a process, a thread or a fork, and
         // these three say so from every call that would need one. They
@@ -85,6 +90,7 @@ pub fn source(name: &str) -> Option<&'static str> {
 /// can think of, and what asks is the registry below.
 pub const NAMES: &[&str] = &[
     "assert",
+    "async_hooks",
     "buffer",
     "child_process",
     "cluster",

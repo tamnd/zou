@@ -635,3 +635,53 @@ fn readline_cuts_an_input_into_lines_however_the_caller_reads_them() {
     );
     assert_eq!(said, "one+two+three|a+b+c|yes|well? ");
 }
+
+/// The store that survives an await, which is the whole of why this
+/// built in is here: two chains started one after the other each keep
+/// their own request through a timer, and neither of them can see the
+/// other's or the one the top level never had.
+#[test]
+fn an_async_local_storage_follows_a_chain_through_its_awaits() {
+    let said = served(
+        r#"
+        import { AsyncLocalStorage, AsyncResource, executionAsyncId } from "node:async_hooks";
+        const held = new AsyncLocalStorage();
+        const beside = new AsyncLocalStorage();
+        const seen = [];
+
+        async function work(name) {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          seen.push(`${name}:${held.getStore()?.id}`);
+          await new Promise((resolve) => setTimeout(resolve, 1));
+          seen.push(`${name}:${held.getStore()?.id}:${beside.getStore() ?? "none"}`);
+          return held.getStore()?.id;
+        }
+
+        const both = [
+          held.run({ id: "first" }, () => work("one")),
+          held.run({ id: "second" }, () => work("two")),
+        ];
+        seen.push(`top:${held.getStore() ?? "none"}`);
+        seen.push((await Promise.all(both)).join("+"));
+
+        // A callback handed away and called later, from nowhere in
+        // particular, still runs where it was made.
+        const later = held.run({ id: "third" }, () => AsyncLocalStorage.bind(() => held.getStore().id));
+        seen.push(later());
+
+        // And one that says the chain is not inside it any more.
+        seen.push(held.run({ id: "fourth" }, () => held.exit(() => String(held.getStore()))));
+
+        // A resource, which is the same context with an id on it.
+        const resource = held.run({ id: "fifth" }, () => new AsyncResource("thing"));
+        seen.push(resource.runInAsyncScope(() => `${held.getStore().id}:${executionAsyncId() === resource.asyncId()}`));
+        seen.push(String(executionAsyncId()));
+
+        Deno.serve(() => new Response(seen.join("|")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "top:none|one:first|two:second|one:first:none|two:second:none|first+second|third|undefined|fifth:true|1"
+    );
+}
