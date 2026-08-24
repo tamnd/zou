@@ -260,20 +260,33 @@ fn hex(text: &str) -> Option<Vec<u8>> {
 /// one finds the directory already there and is happy; one that loses
 /// the race to move its own copy into place throws that copy away,
 /// since the two are the same bytes from the same digest.
+///
+/// The name nothing reads has to be different for every unpack and not
+/// only for every process. A graph the size of a real function has a
+/// dozen loads in the air at once and two of them wanting the same
+/// package is the ordinary case, so two threads here are two calls with
+/// the same `into`: sharing a partial means one of them clears the
+/// directory the other is still writing into, and what the caller sees
+/// is the package failing to unpack with no such file. The count is what
+/// keeps them apart, the same way it does for a fetched module.
 fn put(tarball: &[u8], into: &Path) -> std::io::Result<()> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let parent = into
         .parent()
         .ok_or_else(|| std::io::Error::other("a package with nowhere to go"))?;
     fs::create_dir_all(parent)?;
+    let count = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let partial = parent.join(format!(
-        ".{}.{}.partial",
+        ".{}.{count}.{}.partial",
         std::process::id(),
         into.file_name()
             .and_then(|it| it.to_str())
             .unwrap_or("package")
     ));
-    let _ = fs::remove_dir_all(&partial);
-    crate::tarball::unpack(tarball, &partial)?;
+    if let Err(e) = crate::tarball::unpack(tarball, &partial) {
+        let _ = fs::remove_dir_all(&partial);
+        return Err(e);
+    }
     match fs::rename(&partial, into) {
         Ok(()) => Ok(()),
         Err(e) => {
@@ -435,6 +448,42 @@ mod tests {
             at("https://registry.npmjs.org", "@supabase/supabase-js"),
             "https://registry.npmjs.org/@supabase%2fsupabase-js"
         );
+    }
+
+    /// Eight threads unpacking the same package onto the same place at
+    /// once, which is what a graph of any size does. Every one of them
+    /// has to come back with the whole package: a directory that is
+    /// half there is the failure this is for, and it showed up in the
+    /// corpus run as a package that could not be unpacked with no such
+    /// file, which is one thread clearing the directory another was
+    /// still writing into.
+    #[test]
+    fn the_same_package_unpacked_by_everybody_at_once_arrives_whole() {
+        let cache = tempfile::tempdir().expect("a temporary cache");
+        let into = cache.path().join("npm").join("one").join("1.0.0");
+        let at = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tarball-ustar.tgz");
+        let tarball = fs::read(&at).expect("the recorded tarball");
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (tarball, into) = (tarball.as_slice(), into.as_path());
+                scope.spawn(move || {
+                    put(tarball, into).expect("the package unpacks");
+                    assert_eq!(
+                        fs::read_to_string(into.join("index.js")).expect("the code"),
+                        "export const one = 1;\n"
+                    );
+                });
+            }
+        });
+        assert!(into.join("package.json").is_file());
+        assert!(into.join("lib/deep/deeper.js").is_file());
+        // And nothing is left beside it under the name nothing reads.
+        let beside: Vec<_> = fs::read_dir(into.parent().expect("a directory"))
+            .expect("the directory")
+            .filter_map(|it| it.ok())
+            .map(|it| it.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(beside, vec!["1.0.0".to_string()], "{beside:?}");
     }
 
     /// The whole of it, against the real registry: ask for a range, get
