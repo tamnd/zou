@@ -101,17 +101,18 @@ reset role;
 /// The grants the server's own bootstrap gives the public schema. A
 /// reset drops that schema, so the same grants go back on afterwards,
 /// otherwise the api roles would find a schema they cannot see.
+///
+/// Word for word the stance the bootstrap plants in
+/// `crates/zou-server/src/sql.rs`: the schema is visible and a table
+/// made in it afterwards is readable and writable by nobody who comes
+/// in through the api, because a project grants what it means to
+/// expose. Anything wider here would mean a reset quietly opened every
+/// table the migrations go on to create.
 const PUBLIC_GRANTS: &str = "
 grant usage on schema public to anon, authenticated, service_role;
-grant all on all tables in schema public to anon, authenticated, service_role;
-grant all on all sequences in schema public to anon, authenticated, service_role;
-grant all on all functions in schema public to anon, authenticated, service_role;
 alter default privileges in schema public
-    grant all on tables to anon, authenticated, service_role;
-alter default privileges in schema public
-    grant all on sequences to anon, authenticated, service_role;
-alter default privileges in schema public
-    grant all on functions to anon, authenticated, service_role;
+    grant references, trigger, truncate, maintain
+    on tables to anon, authenticated, service_role;
 ";
 
 #[derive(Default)]

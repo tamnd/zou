@@ -266,16 +266,24 @@ jobs:
             build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select 1' >/dev/null 2>&1 && break
             sleep 1
           done
+          # What this waits for is the source being branchable, asked of
+          # the same code the branch itself asks, which is a line zou
+          # info prints. Reading it off the shape of the checkpoint list
+          # was wrong twice over: a store bootstrapped since #571 carries
+          # a full underneath genesis, written when the private
+          # postmaster the contract is applied over shut down, and a full
+          # capture on the layer path does not say the page shards came
+          # out of the fold with an image under the cut.
           for i in $(seq 1 12); do
             build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -c "insert into devt select g from generate_series(1,2000) g" -c checkpoint >/dev/null
             sleep 3
-            target/release/zou info /tmp/zou-dev-store | grep -qE '^  [0-9a-f]{16} full at ' && break
+            target/release/zou info /tmp/zou-dev-store | grep -qx 'branch: ready' && break
           done
           ROWS=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select count(*) from devt')
           kill -INT "$DEV3"
           wait "$DEV3"
           target/release/zou info /tmp/zou-dev-store | tee /tmp/zou-folded.txt
-          grep -qE '^  [0-9a-f]{16} full at ' /tmp/zou-folded.txt
+          grep -qx 'branch: ready' /tmp/zou-folded.txt
           target/release/zou branch /tmp/zou-dev-store create local dev2
           # And the branch serves, on its own ports, with the rows the
           # source had at the branch point and none of its own leaking
@@ -355,8 +363,17 @@ jobs:
           "$ZOU" status -o json | grep -q '"project_id":"smoke"'
           "$ZOU" migration new "add widgets" | tee /tmp/zou-migration.txt
           grep -q "supabase/migrations/[0-9]\{14\}_add_widgets.sql" /tmp/zou-migration.txt
+          # The grants are part of the migration because a table in
+          # public arrives readable by nobody who comes in through the
+          # api, which is the stance upstream takes and the one zou
+          # takes since crates/zou-server/src/sql.rs stopped handing
+          # every future table to all three roles. A project says what
+          # it means to expose, so this one says it.
           cat > "$(cat /tmp/zou-migration.txt)" <<'SQL'
           create table public.widgets (id bigserial primary key, name text not null);
+          grant select on public.widgets to anon;
+          grant select, insert on public.widgets to service_role;
+          grant usage on sequence public.widgets_id_seq to service_role;
           SQL
           cat > /tmp/zou-proj/supabase/seed.sql <<'SQL'
           insert into public.widgets (name) values ('from the seed');
@@ -365,10 +382,23 @@ jobs:
           "$ZOU" db push | tee /tmp/zou-push.txt
           grep -q "1 applied, 0 were already there" /tmp/zou-push.txt
           "$ZOU" db push | grep -q "nothing to apply"
+          # Keep the last status and the last body. A loop that runs out
+          # with the body thrown away cannot say whether this was a
+          # schema cache that never reloaded or a server that was not
+          # answering, and that is the whole question when it happens.
+          served=
           for i in $(seq 1 30); do
-            curl -sf "$API_URL/rest/v1/widgets" -H "apikey: $ANON_KEY" >/tmp/zou-empty.json && break
+            code=$(curl -s -o /tmp/zou-empty.json -w '%{http_code}' \
+              "$API_URL/rest/v1/widgets" -H "apikey: $ANON_KEY")
+            [ "$code" = 200 ] && served=1 && break
             sleep 1
           done
+          if [ -z "$served" ]; then
+            echo "rest never served widgets in 30 s, last status $code, body:"
+            cat /tmp/zou-empty.json
+            tail -100 /tmp/zou-proj.log
+            exit 1
+          fi
           grep -qx '\[\]' /tmp/zou-empty.json
           curl -sf -X POST "$API_URL/rest/v1/widgets" -H "apikey: $SERVICE_ROLE_KEY" \
             -H 'Content-Type: application/json' -d '{"name":"typed in by hand"}'
