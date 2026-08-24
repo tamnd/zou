@@ -656,6 +656,39 @@ fn get(
         .map_err(|e| JsErrorBox::type_error(format!("{asked} could not be fetched: {e}")))
 }
 
+/// One url off the network, as bytes, with no cache in the way.
+///
+/// The module cache is keyed by url and keeps what it fetched forever,
+/// which is right for a module at a version and wrong for a document
+/// that answers differently tomorrow. A packument is the second kind,
+/// and a tarball is fetched once and then kept as the unpacked package
+/// rather than as bytes, so neither wants the cache.
+pub(crate) fn fetched(url: &str, accept: Option<&str>) -> Result<Vec<u8>, String> {
+    let asked = ModuleSpecifier::parse(url).map_err(|e| format!("{url}: {e}"))?;
+    let mut request = ureq::http::Request::get(asked.as_str());
+    if let Some(accept) = accept {
+        request = request.header(ureq::http::header::ACCEPT, accept);
+    }
+    let request = request.body(()).map_err(|e| format!("{url}: {e}"))?;
+    let answer = crate::fetch::agent()
+        .run(request)
+        .map_err(|e| format!("{url} could not be fetched: {e}"))?;
+    let status = answer.status();
+    if !status.is_success() {
+        return Err(format!(
+            "{url} answered {} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or_default()
+        ));
+    }
+    answer
+        .into_body()
+        .with_config()
+        .limit(u64::MAX)
+        .read_to_vec()
+        .map_err(|e| format!("{url} stopped early: {e}"))
+}
+
 /// Who the registry is asked as, out of what the environment said.
 ///
 /// Nobody, ordinarily, which is what gets the browser build and is the

@@ -141,6 +141,8 @@ mod npm;
 #[cfg(feature = "isolate")]
 mod pool;
 #[cfg(feature = "isolate")]
+mod registry;
+#[cfg(feature = "isolate")]
 mod socket;
 #[cfg(feature = "isolate")]
 mod tarball;
