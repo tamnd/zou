@@ -691,9 +691,16 @@ mod tests {
         let holder = elsewhere(Some("http://10.0.0.4:8000"), Some(now_unix() - 4));
         let (_peers, _peer, forwarding) = front(Some(holder));
         let forwarding = forwarding.with_stale_reads(true);
-        assert_eq!(
-            decide(&forwarding, "GET", &[]).await.0,
-            Where::Stale { behind: 4 }
+        // The clock can tick between the timestamp above and the
+        // answer, so the lag is asked for as a range. What is under
+        // test is that a read this old is served here and carries how
+        // old it is, not which side of a tick the run landed on.
+        let Where::Stale { behind } = decide(&forwarding, "GET", &[]).await.0 else {
+            panic!("a read four seconds behind is served here");
+        };
+        assert!(
+            (4..=6).contains(&behind),
+            "four seconds behind, said as {behind}"
         );
         // And a write is still a write.
         assert!(matches!(
@@ -738,9 +745,13 @@ mod tests {
             ),
             "nine seconds behind is more than two"
         );
-        assert_eq!(
-            decide(&forwarding, "GET", &[(MAX_STALENESS, "30")]).await.0,
-            Where::Stale { behind: 9 }
+        let Where::Stale { behind } = decide(&forwarding, "GET", &[(MAX_STALENESS, "30")]).await.0
+        else {
+            panic!("thirty seconds is more than nine");
+        };
+        assert!(
+            (9..=11).contains(&behind),
+            "nine seconds behind, said as {behind}"
         );
         assert!(
             matches!(
