@@ -553,12 +553,17 @@ fn read_size_store(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32) -> Resul
 
 /// The fork size for the read side: the tenant's own SIZE object when
 /// one exists, an own extend, truncate, or create always writes it
-/// eagerly, and otherwise the chain's folded sizes, but only on a
-/// branch. A branch inherits forks that have no SIZE under its own
-/// prefix, the s lines of the owner's folds are the only place their
-/// lengths live. An unbranched tenant's own prefix is complete, its
-/// absent SIZE means the fork does not exist and the chain would
-/// resurrect just dropped relations until the next fold names them.
+/// eagerly, and otherwise the inherited length, but only on a branch.
+/// A branch inherits forks that have no SIZE under its own prefix. An
+/// unbranched tenant's own prefix is complete, its absent SIZE means
+/// the fork does not exist, and asking anything else would resurrect
+/// just dropped relations.
+///
+/// Where an inherited length lives depends on how the branch was cut.
+/// Off a checkpoint chain it is an s line in the owner's folds, which
+/// the chain reader answers from. Off the layer rule there are no
+/// folds, the length is a relsize key in the layers, and the page
+/// service is what folds those.
 fn read_size_chained(
     shim: &Shim,
     spc: u32,
@@ -577,17 +582,27 @@ fn read_size_chained(
         }
         return Ok(Some(fs));
     }
-    let chained = with_reader(shim, |rd| {
-        if rd.branched() {
-            rd.fork_size(spc, db, rel, fork)
-        } else {
-            None
+    let branched = with_reader(shim, |rd| rd.branched())?.unwrap_or(false);
+    let chained = match (branched, &shim.pageserve) {
+        (false, _) => None,
+        // Zero reads as no answer rather than as an empty fork. The
+        // layers hold relsize keys for relations that have since been
+        // dropped, and a fork of no blocks that is genuinely there
+        // was truncated on this branch, which writes the own SIZE
+        // eagerly and so never reaches here.
+        (true, Some(client)) => Some(
+            client
+                .get_size(spc, db, rel, fork, 0)
+                .map_err(|e| log::error!("zou_smgr_nblocks: {spc}/{db}/{rel}.{fork}: {e}"))?,
+        )
+        .filter(|n| *n > 0),
+        (true, None) => {
+            with_reader(shim, |rd| rd.fork_size(spc, db, rel, fork)).map(Option::flatten)?
         }
-    })
-    .map(Option::flatten)?;
-    // A length folded into the chain, or one only this process's
-    // pending buffer knows about. Neither says anything about which
-    // blocks have pages, so both come back with nothing claimed.
+    };
+    // An inherited length, or one only this process's pending buffer
+    // knows about. Neither says anything about which blocks have
+    // pages, so both come back with nothing claimed.
     Ok(match (chained, pending) {
         (Some(n), Some(p)) => Some(ForkSize::plain(n.max(p))),
         (n, p) => n.or(p).map(ForkSize::plain),

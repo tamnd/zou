@@ -35,6 +35,17 @@ impl PageClient {
     ) -> Result<Vec<Vec<u8>>, String> {
         Err("the page service needs unix sockets".to_string())
     }
+
+    pub fn get_size(
+        &self,
+        _spc: u32,
+        _db: u32,
+        _rel: u32,
+        _fork: u32,
+        _lsn: u64,
+    ) -> Result<u32, String> {
+        Err("the page service needs unix sockets".to_string())
+    }
 }
 
 /// Same shape as the unix build so the start path type checks.
