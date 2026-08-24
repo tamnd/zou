@@ -151,6 +151,8 @@ mod tarball;
 #[cfg(feature = "isolate")]
 mod timer;
 #[cfg(feature = "isolate")]
+mod tree;
+#[cfg(feature = "isolate")]
 mod url;
 #[cfg(feature = "isolate")]
 mod websocket;
