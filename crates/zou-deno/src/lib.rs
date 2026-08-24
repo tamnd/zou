@@ -143,6 +143,8 @@ mod pool;
 #[cfg(feature = "isolate")]
 mod registry;
 #[cfg(feature = "isolate")]
+mod resolve;
+#[cfg(feature = "isolate")]
 mod socket;
 #[cfg(feature = "isolate")]
 mod tarball;
