@@ -536,7 +536,9 @@ fn inside(
     landed: &ModuleSpecifier,
     reached: &crate::tree::Reached,
 ) -> Result<ModuleSource, JsErrorBox> {
-    if crate::cjs::kind(&reached.at, &reached.root) == crate::cjs::Kind::Script
+    let text = std::fs::read_to_string(&reached.at)
+        .map_err(|e| JsErrorBox::generic(format!("read {}: {e}", reached.at.display())))?;
+    if crate::cjs::language(&reached.at, &text) == crate::cjs::Kind::Script
         && reached.at.extension().and_then(|it| it.to_str()) != Some("json")
     {
         // A name it could not read is a name that will be `undefined`
@@ -552,8 +554,6 @@ fn inside(
             None,
         ));
     }
-    let text = std::fs::read_to_string(&reached.at)
-        .map_err(|e| JsErrorBox::generic(format!("read {}: {e}", reached.at.display())))?;
     let media = deno_ast::MediaType::from_specifier(landed);
     source(asked, landed, text, media)
 }

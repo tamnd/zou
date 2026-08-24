@@ -47,16 +47,20 @@ pub(crate) enum Kind {
 const DEEP: usize = 8;
 
 /// Which language a file in a package is, by the rules node reads it
-/// with: the extension when the extension says, and the package's
-/// `type` when it does not.
-pub(crate) fn kind(at: &Path, root: &Path) -> Kind {
+/// with: the extension when the extension says, and the nearest
+/// `package.json` above it when it does not.
+///
+/// Nearest and not the package's own, which is the difference between
+/// this and `rooted`. A package ships manifests that name nothing and
+/// exist only to say how to read one directory: a `dist/package.json`
+/// holding `{"type": "module"}` under a package whose own manifest says
+/// nothing is a real and common shape, and node reads the files in that
+/// directory as modules because of it.
+pub(crate) fn kind(at: &Path) -> Kind {
     match at.extension().and_then(|it| it.to_str()) {
         Some("mjs") | Some("mts") => Kind::Module,
         Some("cjs") | Some("cts") => Kind::Script,
-        _ => match crate::resolve::manifest(root)
-            .ok()
-            .and_then(|it| it.get("type").and_then(|it| it.as_str()).map(String::from))
-        {
+        _ => match typed(at) {
             Some(said) if said == "module" => Kind::Module,
             // No `type` at all is commonjs, which is the default node
             // has kept for compatibility and which most of npm relies
@@ -64,6 +68,73 @@ pub(crate) fn kind(at: &Path, root: &Path) -> Kind {
             _ => Kind::Script,
         },
     }
+}
+
+/// What the nearest manifest above a file says its directory is written
+/// in, which is `None` when the nearest one says nothing.
+///
+/// Nearest wins even when it is silent: a `dist/package.json` with a
+/// `main` in it and no `type` under a package whose own manifest says
+/// `"type": "module"` makes that directory commonjs, which is node's
+/// rule and a shape packages use on purpose.
+fn typed(at: &Path) -> Option<String> {
+    let mut walking = at.parent();
+    while let Some(directory) = walking {
+        if directory.join("package.json").is_file() {
+            return crate::resolve::manifest(directory)
+                .ok()?
+                .get("type")
+                .and_then(|it| it.as_str())
+                .map(String::from);
+        }
+        walking = directory.parent();
+    }
+    None
+}
+
+/// Which language a file is, having read it.
+///
+/// The rules above are what node decides with and they are enough for
+/// node, because node fails loudly on a file whose language it got
+/// wrong and a package author fixes it. A package that ships an es
+/// module in a `.js` under a manifest that says nothing is broken on
+/// node, and is nevertheless published, and there is no author here to
+/// tell.
+///
+/// So a file the rules call a script is asked one more question, which
+/// is whether it parses as one. `export` at the top level of something
+/// this ran through `new Function` is a `SyntaxError` with nothing on
+/// this side of it to explain what happened, and three names in the
+/// examples corpus stopped there.
+pub(crate) fn language(at: &Path, text: &str) -> Kind {
+    let said = kind(at);
+    if said == Kind::Module {
+        return said;
+    }
+    match script(at, text) {
+        Some(false) => Kind::Module,
+        // Unreadable is left as the rules said, since a file that will
+        // not parse at all is a failure either way and the one the
+        // rules chose is the one with the better sentence on it.
+        _ => Kind::Script,
+    }
+}
+
+/// Whether a file's source is a script, or nothing when it will not
+/// parse.
+fn script(at: &Path, text: &str) -> Option<bool> {
+    let specifier = deno_core::ModuleSpecifier::from_file_path(at).ok()?;
+    let media = deno_ast::MediaType::from_specifier(&specifier);
+    let parsed = deno_ast::parse_program(deno_ast::ParseParams {
+        specifier,
+        text: text.into(),
+        media_type: media,
+        capture_tokens: false,
+        scope_analysis: false,
+        maybe_syntax: None,
+    })
+    .ok()?;
+    Some(parsed.compute_is_script())
 }
 
 /// What a script assigns to its exports, and what it hands off to
@@ -284,6 +355,19 @@ pub(crate) fn op_zou_cjs_read(
     }
     let text = std::fs::read_to_string(&at)
         .map_err(|e| JsErrorBox::type_error(format!("{}: {e}", at.display())))?;
+    // A require of an es module is a thing node itself only started
+    // answering recently and this does not answer at all. What it used
+    // to do here was hand the module to `new Function` and let v8 say
+    // `Unexpected token 'export'`, which names neither the file nor what
+    // is wrong with requiring it.
+    if at.extension().and_then(|it| it.to_str()) != Some("json")
+        && language(&at, &text) == Kind::Module
+    {
+        return Err(JsErrorBox::type_error(format!(
+            "{} is an es module, and a require of one has no answer here: import it instead",
+            at.display()
+        )));
+    }
     Ok(Script {
         data: at.extension().and_then(|it| it.to_str()) == Some("json"),
         path: at.to_string_lossy().to_string(),
@@ -433,29 +517,17 @@ mod tests {
     fn which_language_a_file_is_written_in_is_the_extension_then_the_manifest() {
         let root = tempfile::tempdir().expect("a package");
         std::fs::write(root.path().join("package.json"), r#"{"name": "a"}"#).expect("a manifest");
-        assert_eq!(
-            kind(&root.path().join("index.js"), root.path()),
-            Kind::Script
-        );
-        assert_eq!(
-            kind(&root.path().join("index.mjs"), root.path()),
-            Kind::Module
-        );
+        assert_eq!(kind(&root.path().join("index.js")), Kind::Script);
+        assert_eq!(kind(&root.path().join("index.mjs")), Kind::Module);
         std::fs::write(
             root.path().join("package.json"),
             r#"{"name": "a", "type": "module"}"#,
         )
         .expect("a manifest");
-        assert_eq!(
-            kind(&root.path().join("index.js"), root.path()),
-            Kind::Module
-        );
+        assert_eq!(kind(&root.path().join("index.js")), Kind::Module);
         // The extension still wins over what the manifest says, which
         // is how a package ships one file of each.
-        assert_eq!(
-            kind(&root.path().join("legacy.cjs"), root.path()),
-            Kind::Script
-        );
+        assert_eq!(kind(&root.path().join("legacy.cjs")), Kind::Script);
     }
 
     #[test]
@@ -486,6 +558,65 @@ mod tests {
         // for its default and for whatever is on it.
         let bare = wrapper("file:///a/index.js", &[]);
         assert!(!bare.contains("export const"), "{bare}");
+    }
+
+    /// The nearest manifest and not the package's own, which is the
+    /// shape a package ships when it publishes both languages out of
+    /// one tree.
+    #[test]
+    fn the_manifest_that_decides_a_file_is_the_nearest_one_above_it() {
+        let root = tempfile::tempdir().expect("a package");
+        std::fs::write(root.path().join("package.json"), r#"{"name": "a"}"#).expect("a manifest");
+        let esm = root.path().join("esm");
+        std::fs::create_dir_all(&esm).expect("a directory");
+        std::fs::write(esm.join("package.json"), r#"{"type": "module"}"#).expect("a manifest");
+        assert_eq!(kind(&esm.join("index.js")), Kind::Module);
+        assert_eq!(kind(&root.path().join("index.js")), Kind::Script);
+
+        // And the other way round, which is the one that catches a
+        // reader that only looks for a `type` and keeps walking: a
+        // silent manifest under a package that says module makes its
+        // own directory commonjs.
+        let root = tempfile::tempdir().expect("a package");
+        std::fs::write(
+            root.path().join("package.json"),
+            r#"{"name": "a", "type": "module"}"#,
+        )
+        .expect("a manifest");
+        let dist = root.path().join("dist");
+        std::fs::create_dir_all(&dist).expect("a directory");
+        std::fs::write(dist.join("package.json"), r#"{"main": "./index.js"}"#).expect("a manifest");
+        assert_eq!(kind(&dist.join("index.js")), Kind::Script);
+        assert_eq!(kind(&root.path().join("index.js")), Kind::Module);
+    }
+
+    /// A package that ships an es module in a `.js` under a manifest
+    /// that says nothing is broken on node too, and is published all the
+    /// same, and there is nobody here to tell.
+    #[test]
+    fn a_file_the_rules_call_a_script_that_will_not_run_as_one_is_a_module() {
+        let root = tempfile::tempdir().expect("a package");
+        std::fs::write(root.path().join("package.json"), r#"{"name": "a"}"#).expect("a manifest");
+        let at = root.path().join("index.js");
+        assert_eq!(
+            language(&at, "export const one = 1;\n"),
+            Kind::Module,
+            "an export at the top level is not a script"
+        );
+        assert_eq!(
+            language(&at, "import x from './x.js';\nmodule.exports = x;\n"),
+            Kind::Module,
+            "nor is an import"
+        );
+        assert_eq!(
+            language(&at, "exports.one = 1;\n"),
+            Kind::Script,
+            "and a script is still a script"
+        );
+        // Something that will not parse at all is left where the rules
+        // put it, since the failure is the same either way and the
+        // rules' sentence is the better one.
+        assert_eq!(language(&at, "this is not javascript ((("), Kind::Script);
     }
 
     #[test]
@@ -530,12 +661,7 @@ mod tests {
         let cache = tempfile::tempdir().expect("a temporary cache");
         let tree = Tree::at(cache.path());
         let entry = tree.entry("dotenv", "^16.0.0", ".").expect("a package");
-        assert_eq!(
-            kind(&entry.at, &entry.root),
-            Kind::Script,
-            "{}",
-            entry.at.display()
-        );
+        assert_eq!(kind(&entry.at), Kind::Script, "{}", entry.at.display());
         let found = names(&tree, &entry).expect("the names");
         for wanted in ["config", "parse"] {
             assert!(
