@@ -42,9 +42,14 @@ export ZOU_PAGESERVE
 STATS=$RUNDIR/store-stats
 ZOU_STORE_STATS=${ZOU_STORE_STATS:-$STATS}
 export ZOU_STORE_STATS
-"$PG"/initdb -D "$DATADIR" --set io_method=sync --set full_page_writes=off >/dev/null
+# initdb and the bootstrap are tools, not a server. The page service is
+# a background worker inside postgres, so nothing is listening on its
+# socket while these run and asking them to read that way is asking for
+# a connect failure on the first catalog page. Every other tool in the
+# tree pins the object path for the same reason.
+ZOU_PAGESERVE=0 "$PG"/initdb -D "$DATADIR" --set io_method=sync --set full_page_writes=off >/dev/null
 REDO=$("$PG"/pg_controldata -D "$DATADIR" | grep "REDO location" | awk '{print $NF}')
-"$BOOTSTRAP" "$TARGET" "$DATADIR" --redo "$REDO" >/dev/null
+ZOU_PAGESERVE=0 "$BOOTSTRAP" "$TARGET" "$DATADIR" --redo "$REDO" >/dev/null
 "$PG"/pg_ctl -D "$DATADIR" -l "$LOG" -o "-p $PORT -k $SOCK" start >/dev/null
 
 echo "target: $TARGET"
