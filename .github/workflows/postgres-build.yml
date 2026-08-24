@@ -266,22 +266,25 @@ jobs:
             build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select 1' >/dev/null 2>&1 && break
             sleep 1
           done
-          # The full capture this waits for is one a fold packed down
-          # from these writes, and it is the one above genesis: a store
-          # bootstrapped since #571 already carries a full underneath
-          # it, from the private postmaster the contract is applied
-          # over, and a grep that matches anywhere in the list stops on
-          # that one and asks for a branch the source cannot serve yet.
+          # What this waits for is the newest full capture being one a
+          # fold packed down rather than genesis, which is the rule the
+          # branch itself holds. A store bootstrapped since #571 carries
+          # a full underneath genesis too, written when the private
+          # postmaster the contract is applied over shut down, so a grep
+          # that matches anywhere in the list stops on that one and asks
+          # for a branch the source cannot serve. A fold down can also
+          # collapse the list to a single full and take genesis out of
+          # it, so the newest line is the one to read either way.
           for i in $(seq 1 12); do
             build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -c "insert into devt select g from generate_series(1,2000) g" -c checkpoint >/dev/null
             sleep 3
-            target/release/zou info /tmp/zou-dev-store | sed -n '/genesis full at /,$p' | grep -qE '^  [0-9a-f]{16} full at ' && break
+            target/release/zou info /tmp/zou-dev-store | grep -E '^  [^ ]+ full at ' | tail -1 | grep -qE '^  [0-9a-f]{16} full at ' && break
           done
           ROWS=$(build/pg/bin/psql -h 127.0.0.1 -p 5614 -U postgres -d postgres -Atc 'select count(*) from devt')
           kill -INT "$DEV3"
           wait "$DEV3"
           target/release/zou info /tmp/zou-dev-store | tee /tmp/zou-folded.txt
-          sed -n '/genesis full at /,$p' /tmp/zou-folded.txt | grep -qE '^  [0-9a-f]{16} full at '
+          grep -E '^  [^ ]+ full at ' /tmp/zou-folded.txt | tail -1 | grep -qE '^  [0-9a-f]{16} full at '
           target/release/zou branch /tmp/zou-dev-store create local dev2
           # And the branch serves, on its own ports, with the rows the
           # source had at the branch point and none of its own leaking
