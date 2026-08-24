@@ -87,13 +87,12 @@ for _ in $(seq 1 12); do
     PSQL -c "insert into settling(pad) select repeat('x', 80) from generate_series(1, 2000)"
     PSQL -c "checkpoint"
     sleep 2
-    # The newest full capture, not any of them. A fresh store carries a
-    # hex named one under genesis, written when the postmaster the
-    # contract was applied over shut down, so "is there a hex named
-    # full anywhere" is true before a single row has been written and
-    # this loop would fall straight through it.
-    if "$ZOU" info "$STORE" | grep -E '^  [^ ]+ full at ' | tail -1 |
-        grep -qE '^  [0-9a-f]{16} full at '; then
+    # The question asked of the same code the branch below asks it of,
+    # rather than guessed at from the shape of the checkpoint list. A
+    # capture being full says the fold ran; it does not say the page
+    # shards came out of it with an image layer under the cut, and on
+    # the layer path that is what the child needs.
+    if "$ZOU" info "$STORE" | grep -qx "branch: ready"; then
         SETTLED=yes
         break
     fi

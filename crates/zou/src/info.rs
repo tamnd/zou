@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use zou_log::{ShardManifest, WalMedia, stream_end};
+use zou_pg::branching::ReadPath;
 use zou_store::layout::TenantLayout;
 use zou_store::manifest::CheckpointKind;
 use zou_store::{CasStore, Manifest, PrefixStore, open_store, tenant_id};
@@ -83,6 +84,19 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     if let Some(f) = manifest.folded_upto {
         say!("folded upto {:#X}", f.0);
     }
+    // Whether a branch of this would serve, which is the one thing
+    // about a store somebody is about to branch that they cannot read
+    // off the lines above. A capture being full says the fold ran; it
+    // does not say the page shards came out of it with a floor under
+    // the cut, and on the layer path that is what a child needs. Asked
+    // the way `zou branch create` asks it, so a store this calls ready
+    // is a store that branches.
+    match zou_pg::branching::why_unbranchable(&*store, &layout, &manifest, ReadPath::current()) {
+        Ok(None) => say!("branch: ready"),
+        Ok(Some(why)) => say!("branch: not yet, {why}"),
+        Err(e) => say!("branch: cannot tell, {e}"),
+    }
+
     let logs: Arc<dyn CasStore> =
         Arc::new(PrefixStore::over(Arc::clone(&store), &layout.log_prefix()));
     let media = WalMedia::single(Arc::clone(&logs));
