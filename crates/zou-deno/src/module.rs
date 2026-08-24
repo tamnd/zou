@@ -656,6 +656,21 @@ fn get(
         .map_err(|e| JsErrorBox::type_error(format!("{asked} could not be fetched: {e}")))
 }
 
+/// Who the registry is asked as, out of what the environment said.
+///
+/// Nobody, ordinarily, which is what gets the browser build and is the
+/// build the examples corpus is measured on. `ZOU_MODULE_AGENT` names
+/// somebody else so the other build can be asked for and counted
+/// without a binary built to do it, and `deno` is the spelling for the
+/// runtime's own agent, since writing the whole string out by hand is
+/// a way to measure the wrong thing and not notice.
+fn asked_as(said: Option<String>, own: &str) -> Option<String> {
+    said.map(|it| match it.eq_ignore_ascii_case("deno") {
+        true => own.to_string(),
+        false => it,
+    })
+}
+
 /// One module off the network, with the client the rest of this crate
 /// calls out with.
 ///
@@ -670,8 +685,9 @@ fn get(
 /// ins are here, and the modules it re exports name the build in their
 /// own path, so the rest of the graph arrives without asking twice.
 fn fetch(asked: &ModuleSpecifier) -> Result<Fetched, JsErrorBox> {
-    let answer = get(asked, None)?;
-    let answer = match answer.status().is_server_error() {
+    let as_who = asked_as(named("ZOU_MODULE_AGENT"), crate::fetch::user_agent());
+    let answer = get(asked, as_who.as_deref())?;
+    let answer = match answer.status().is_server_error() && as_who.is_none() {
         true => get(asked, Some(crate::fetch::user_agent()))?,
         false => answer,
     };
@@ -1011,5 +1027,22 @@ mod tests {
         assert_eq!(held.url, "https://esm.sh/a@1.2.3/es2022/a.mjs");
         assert_eq!(held.own, None);
         assert_eq!(held.body, b"export default 1;");
+    }
+
+    /// The three things the environment can say about who to ask as.
+    ///
+    /// The one worth a test is `deno`, because a corpus measured with
+    /// the literal string mistyped is a corpus measured on the browser
+    /// build while its column header says otherwise.
+    #[test]
+    fn who_the_registry_is_asked_as_is_nobody_unless_the_environment_says() {
+        let own = "Deno/2.1.4 (variant; zou/0.0.1)";
+        assert_eq!(super::asked_as(None, own), None);
+        assert_eq!(super::asked_as(Some("deno".into()), own), Some(own.into()));
+        assert_eq!(super::asked_as(Some("Deno".into()), own), Some(own.into()));
+        assert_eq!(
+            super::asked_as(Some("a mirror's own client".into()), own),
+            Some("a mirror's own client".into())
+        );
     }
 }

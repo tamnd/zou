@@ -649,6 +649,7 @@ Everything fetched is kept on disk, keyed by url, so only the first cold start p
 - `ZOU_MODULE_CACHE_ONLY=1` means this server does not fetch. A module that is not in the cache is refused by name rather than reached for, which is what a deployment that warmed its cache somewhere else wants.
 - `ZOU_MODULE_REGISTRY` points `npm:` and `jsr:` at a mirror instead of esm.sh.
 - `ZOU_MODULE_BUILD` is the query a package is asked for with, `dev` by default, and empty for whatever the registry serves without being asked. A cache is keyed by the url, so a cache warmed one way and read the other way fetches again rather than serving the other build.
+- `ZOU_MODULE_AGENT` is who the registry is asked as, and is nobody by default. esm.sh reads the user agent and serves a different build for it, a browser one that stubs the platform out and a Deno one that imports `node:`, and which of the two runs more of somebody's code is a thing to measure rather than to assume. `ZOU_MODULE_AGENT=deno` is the runtime's own agent without writing the string out, and any other value is sent as it stands. Setting it also turns the 5xx fallback off, since the fallback is the ask this replaces.
 
 ## Import maps
 
