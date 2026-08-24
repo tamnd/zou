@@ -335,7 +335,7 @@ pub(crate) fn op_zou_cjs_resolve(
 /// dependency out of it would be answering out of a manifest that
 /// declares nothing. A file with no manifest above it at all is its own
 /// island, which is what a script beside a function's `index.ts` is.
-fn rooted(at: &Path) -> std::path::PathBuf {
+pub(crate) fn rooted(at: &Path) -> std::path::PathBuf {
     let mut walking = at.parent();
     while let Some(directory) = walking {
         let manifest = directory.join("package.json");
