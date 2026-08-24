@@ -249,8 +249,37 @@ impl Disk {
             return Some(url(&format!("node:{specifier}")));
         }
         let (name, sub) = crate::tree::split(specifier);
-        let want = crate::tree::declared(&root, &name)?;
+        // A package under its own name is this package, and the file it
+        // means comes out of this package's own `exports`. It is on the
+        // disk already, so unlike a dependency there is nothing to wait
+        // for and the answer is a path.
+        if crate::tree::itself(&root, &name) {
+            let tree = crate::tree::Tree::at(&self.cache);
+            let from = crate::tree::Reached { at, root };
+            return Some(match tree.resolve(specifier, &from) {
+                Ok(reached) => ModuleSpecifier::from_file_path(&reached.at).map_err(|()| {
+                    JsErrorBox::type_error(format!("{} is not a path", reached.at.display()))
+                }),
+                Err(why) => Err(JsErrorBox::type_error(format!(
+                    "{specifier} in {referrer}: {why}"
+                ))),
+            });
+        }
         let tail = sub.trim_start_matches('.');
+        // A name that is not a built in, not this package and not
+        // anything this package declared is refused here, naming both
+        // sides of it. Handing it back unanswered would let it fall
+        // through to a resolver that has never heard of packages, and
+        // what that says is that a bare name is not a relative path,
+        // which is true and is no help to anybody.
+        let want = match crate::tree::declared(&root, &name) {
+            Some(want) => want,
+            None => {
+                return Some(Err(JsErrorBox::type_error(format!(
+                    "{specifier} in {referrer}: {name} is imported here and this package does not depend on it"
+                ))));
+            }
+        };
         Some(url(&format!("npm:{name}@{want}{tail}")))
     }
 
@@ -319,6 +348,15 @@ impl ModuleLoader for Disk {
             }
             return url(&self.built(format!("{}/{}", self.registry, bare(rest))));
         }
+        // The one specifier this runtime writes itself, in the module
+        // that stands in for a commonjs script: the built ins, gathered
+        // where that script's require can reach them. A function that
+        // writes it by hand gets the same module, which is a map of
+        // things it can already import by name.
+        if specifier == BUILTINS {
+            return url(BUILTINS);
+        }
+
         // A specifier written inside a package that was unpacked out of
         // a tarball, which is the one place a bare name is not a name
         // for this function to resolve: `lodash` inside a package means
@@ -336,14 +374,6 @@ impl ModuleLoader for Disk {
                 return url(&format!("jsr:{}", bare(rest)));
             }
             return url(&self.built(format!("{}/jsr/{}", self.registry, bare(rest))));
-        }
-        // The one specifier this runtime writes itself, in the module
-        // that stands in for a commonjs script: the built ins, gathered
-        // where that script's require can reach them. A function that
-        // writes it by hand gets the same module, which is a map of
-        // things it can already import by name.
-        if specifier == BUILTINS {
-            return url(BUILTINS);
         }
         if let Some(rest) = specifier.strip_prefix("node:") {
             if crate::node::source(rest).is_none() {
@@ -1411,6 +1441,38 @@ mod tests {
         // to say about.
         let refused = disk.resolve("lodash", referrer.as_str(), ResolutionKind::Import);
         assert!(refused.is_err(), "{refused:?}");
+    }
+
+    /// A package that imports its own name is importing itself, and the
+    /// file that means is on the disk already, so the answer is a path
+    /// rather than an `npm:` specifier to go and fetch.
+    #[test]
+    fn a_bare_name_that_is_this_package_is_this_package() {
+        let cache = tempfile::tempdir().expect("a temporary cache");
+        let root = cache.path().join("npm").join("asks").join("1.0.0");
+        std::fs::create_dir_all(root.join("shims")).expect("a package");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name": "asks", "version": "1.0.0",
+                "exports": {".": "./index.js", "./shim": "./shims/auto.js"}}"#,
+        )
+        .expect("a manifest");
+        std::fs::write(root.join("index.js"), "").expect("a file");
+        std::fs::write(root.join("shims/auto.js"), "").expect("a file");
+        let disk = Disk {
+            npm: Npm::Tarball,
+            cache: cache.path().to_path_buf(),
+            ..loader()
+        };
+        let referrer =
+            ModuleSpecifier::from_file_path(root.join("shims/index.mjs")).expect("a url");
+        let answer = disk
+            .resolve("asks/shim", referrer.as_str(), ResolutionKind::Import)
+            .expect("a specifier");
+        assert_eq!(
+            answer,
+            ModuleSpecifier::from_file_path(root.join("shims/auto.js")).expect("a url")
+        );
     }
 
     /// A `jsr:` specifier is left alone under the tarball knob, because
