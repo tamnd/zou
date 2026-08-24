@@ -53,6 +53,7 @@ fn tight(cpu: Duration) -> Limits {
         memory: 64 * 1024 * 1024,
         wall: Duration::from_secs(30),
         cpu,
+        boot: Duration::from_secs(30),
         background: Duration::from_secs(30),
     }
 }

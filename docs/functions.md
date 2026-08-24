@@ -267,6 +267,7 @@ It is what the hosted service does and what upstream's own config file calls the
 
 A kept isolate is not a kept call.
 The clocks start again for each call, the request is the one that arrived, and `SB_EXECUTION_ID` is that invocation's own rather than the one the isolate was built for.
+Getting the modules onto the isolate has a clock of its own, thirty seconds of cpu, and it is not the two seconds a call gets: reading the graph, unpacking the packages under it and parsing every commonjs file in them happens once, and every call after the first one has it free, so charging it to whichever call was first would charge one caller for what the rest are given. It is a budget rather than an absence of one, because the top of a module is the function's own code and a loop there is a loop.
 What is not reset is memory, which belongs to the isolate for as long as it lives, so a function that leaks reaches the memory limit eventually rather than never.
 
 Three things end a kept isolate, and none of them is a handler that threw.

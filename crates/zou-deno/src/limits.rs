@@ -83,6 +83,21 @@ pub struct Limits {
     pub wall: Duration,
     /// How long the call may spend running, as opposed to waiting.
     pub cpu: Duration,
+    /// How long getting the function's modules onto the isolate may
+    /// spend running, which is a different budget from the one a call
+    /// gets and is spent before any call has been delivered.
+    ///
+    /// Loading a graph is the deployment's work rather than the
+    /// request's: a function's modules are read, its packages are
+    /// unpacked, and every commonjs file in them is parsed for the
+    /// names it exports. None of that happens twice, and a pooled
+    /// isolate on its second call has already paid all of it, so
+    /// charging it to whichever call was first is charging one caller
+    /// for what every later one gets free.
+    ///
+    /// It is a budget and not nothing, because the top of a module is
+    /// the function's own code and a loop there is a loop.
+    pub boot: Duration,
     /// How long work left behind with `EdgeRuntime.waitUntil` may go on
     /// after the caller has been answered.
     pub background: Duration,
@@ -93,7 +108,7 @@ pub struct Limits {
 const MIB: usize = 1024 * 1024;
 
 impl Default for Limits {
-    /// Upstream's three, and this project's fourth.
+    /// Upstream's three, and this project's other two.
     fn default() -> Limits {
         Limits {
             memory: 256 * MIB,
@@ -108,6 +123,21 @@ impl Default for Limits {
             // does. A function that burns a second and a half and then
             // answers is answered there and is answered here.
             cpu: Duration::from_secs(2),
+            // Thirty seconds, which is not upstream's because upstream
+            // has no such number: a function there arrives as a bundle
+            // with its modules already in it, and a function here goes
+            // and gets them. What that costs was measured on the
+            // examples corpus with `ZOU_NPM=tarball`, cold cache, on
+            // one laptop: supabase-js 0.75s of cpu across nine
+            // packages, stripe 3.3s across twenty three, elevenlabs
+            // 7.7s across forty one. Warm, with no network in it at
+            // all, elevenlabs is still 2.6s, because a package of
+            // three thousand commonjs files is three thousand files to
+            // read and parse whatever else is true. Thirty seconds is
+            // room for the worst of those on a machine several times
+            // slower than the one they were measured on, and it is
+            // still a number a loop at the top of a module reaches.
+            boot: Duration::from_secs(30),
             background: Duration::from_secs(30),
         }
     }
@@ -132,6 +162,7 @@ impl Limits {
         Limits {
             wall: day,
             cpu: day,
+            boot: day,
             background: day,
             ..self
         }
@@ -332,6 +363,10 @@ pub(crate) struct Watch {
     buffers: AtomicUsize,
     /// Whether a collection has been asked for and not yet happened.
     collecting: std::sync::atomic::AtomicBool,
+    /// The cpu budget being spent, in nanoseconds, which is the boot
+    /// budget while the modules are being loaded and the call's budget
+    /// from the first call onwards.
+    allowed: AtomicU64,
     limits: Limits,
 }
 
@@ -345,6 +380,10 @@ impl Watch {
             warned: AtomicU8::new(0),
             buffers: AtomicUsize::new(0),
             collecting: std::sync::atomic::AtomicBool::new(false),
+            // An isolate begins by loading its modules, so the budget
+            // it begins with is the one that pays for that. `restart`
+            // is what turns it into a call's.
+            allowed: AtomicU64::new(limits.boot.as_nanos() as u64),
             limits,
         })
     }
@@ -370,6 +409,12 @@ impl Watch {
             .fetch_add(now.saturating_sub(started), Ordering::AcqRel);
     }
 
+    /// The cpu budget in force, which is the boot one until the first
+    /// call starts and the call's one after that.
+    pub(crate) fn allowed(&self) -> Duration {
+        Duration::from_nanos(self.allowed.load(Ordering::Acquire))
+    }
+
     /// Time spent running, including the poll that is running now,
     /// which is the whole reason this is readable from another thread.
     pub(crate) fn cpu(&self) -> Duration {
@@ -392,6 +437,8 @@ impl Watch {
     /// limit and then called ten more times without ever collecting
     /// would otherwise be told once in its life.
     pub(crate) fn restart(&self) {
+        self.allowed
+            .store(self.limits.cpu.as_nanos() as u64, Ordering::Release);
         self.spent.store(0, Ordering::Release);
         self.entered.store(0, Ordering::Release);
         self.warned.store(0, Ordering::Release);
@@ -463,7 +510,7 @@ impl Watch {
             ),
             Reached::Cpu => format!(
                 "it spent more than the {:?} of cpu time it is allowed",
-                self.limits.cpu
+                self.allowed()
             ),
         }
     }
@@ -576,7 +623,7 @@ pub(crate) fn watch(handle: v8::IsolateHandle, watch: Arc<Watch>, limits: Limits
             let now = Instant::now();
             for near in [
                 (now >= warning, Warning::WallClock),
-                (watch.cpu() >= near(limits.cpu), Warning::Cpu),
+                (watch.cpu() >= near(watch.allowed()), Warning::Cpu),
                 (
                     watch.buffered() >= near_bytes(limits.memory),
                     Warning::Memory,
@@ -591,7 +638,7 @@ pub(crate) fn watch(handle: v8::IsolateHandle, watch: Arc<Watch>, limits: Limits
             }
             let over = if now >= deadline {
                 WALL
-            } else if watch.cpu() >= limits.cpu {
+            } else if watch.cpu() >= watch.allowed() {
                 CPU
             } else {
                 continue;
@@ -819,6 +866,13 @@ mod tests {
         assert!(watch.record(CPU));
         assert!(!watch.record(WALL), "the second one changes nothing");
         assert_eq!(watch.reached(), Some(Reached::Cpu));
+        // A watch that has not had a call yet is still loading the
+        // modules, and the budget it names is the one it is spending.
+        assert_eq!(
+            watch.sentence(Reached::Cpu),
+            "it spent more than the 30s of cpu time it is allowed"
+        );
+        watch.restart();
         assert_eq!(
             watch.sentence(Reached::Cpu),
             "it spent more than the 2s of cpu time it is allowed"
