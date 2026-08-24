@@ -168,22 +168,46 @@ impl<In: Transport> Connector<In> for Watched {
 /// timeouts. This gives each of them the same budget and lets the
 /// call's own global timeout be the ceiling, which is a shorter thing to
 /// read and the same answer for the one address a host usually has.
+///
+/// An address that could not be opened is a reason to try the next one,
+/// whatever the reason was. This used to move on only after a refusal,
+/// on the grounds that anything else would say the same thing again,
+/// which is true of the address and not of the host: a name with an
+/// AAAA and an A record, on a box with a v6 default route and no v6
+/// reachability, answers `Network is unreachable` for the first and
+/// serves the whole graph off the second. That was every function in
+/// the examples corpus answering 500 on a box where `curl` to the same
+/// url was a 200, and it is what most of WSL looks like. See #632.
 fn dial(details: &ConnectionDetails) -> Result<TcpStream, Error> {
     let each = details.timeout.not_zero().map(|when| *when);
-    let mut refused = None;
-    for addr in &details.addrs {
-        match one(*addr, each, details.config.no_delay()) {
-            Ok(stream) => return Ok(stream),
-            // The next address is worth a try. Anything else is not:
-            // whatever it was will be whatever it is again.
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => refused = Some(e),
-            Err(e) if timed_out(&e) => return Err(Error::Timeout(details.timeout.reason)),
-            Err(e) => return Err(Error::Io(e)),
+    let nodelay = details.config.no_delay();
+    first(&details.addrs, |addr| one(addr, each, nodelay)).map_err(|e| match timed_out(&e) {
+        // A timeout is the exception, because the budget it spent
+        // is the call's own and the addresses are sharing it.
+        true => Error::Timeout(details.timeout.reason),
+        false => Error::Io(e),
+    })
+}
+
+/// The walk itself, over whatever opening one address means.
+///
+/// What comes back when none of them worked is what the last one said,
+/// since a caller reading it is trying to find out why nothing worked
+/// and an invented refusal is a worse answer than a real unreachable.
+fn first<T>(
+    addrs: &[SocketAddr],
+    mut open: impl FnMut(SocketAddr) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut said = None;
+    for addr in addrs {
+        match open(*addr) {
+            Ok(opened) => return Ok(opened),
+            Err(e) if timed_out(&e) => return Err(e),
+            Err(e) => said = Some(e),
         }
     }
-    Err(Error::Io(refused.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::ConnectionRefused, "Connection refused")
-    })))
+    Err(said
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, "Connection refused")))
 }
 
 fn one(addr: SocketAddr, within: Option<Duration>, nodelay: bool) -> io::Result<TcpStream> {
@@ -318,5 +342,62 @@ impl fmt::Debug for Socket {
         f.debug_struct("Socket")
             .field("addr", &self.stream.peer_addr().ok())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::net::SocketAddr;
+
+    use super::first;
+
+    fn addrs() -> Vec<SocketAddr> {
+        vec![
+            "[2606:4700:20::ac43:46de]:443".parse().unwrap(),
+            "172.67.70.222:443".parse().unwrap(),
+        ]
+    }
+
+    /// The box the examples corpus was measured on: a v6 default route
+    /// with nothing behind it, and esm.sh's v6 address first. Every
+    /// function answered 500 and every one of them could have been
+    /// served off the second address. See #632.
+    #[test]
+    fn an_address_this_box_cannot_reach_is_not_the_end_of_the_list() {
+        let mut tried = Vec::new();
+        let opened = first(&addrs(), |addr| {
+            tried.push(addr);
+            match addr.is_ipv6() {
+                true => Err(io::Error::from_raw_os_error(101)),
+                false => Ok("a socket"),
+            }
+        });
+        assert_eq!(opened.unwrap(), "a socket");
+        assert_eq!(tried, addrs(), "both, in the order they were given");
+    }
+
+    /// A timeout is the one failure that ends the walk, because what it
+    /// spent is the call's own budget rather than this address's.
+    #[test]
+    fn an_address_that_ran_out_of_time_spent_the_budget_the_next_one_needed() {
+        let mut tried = 0;
+        let refused = first(&addrs(), |_| {
+            tried += 1;
+            Err::<(), _>(io::Error::from(io::ErrorKind::TimedOut))
+        });
+        assert_eq!(tried, 1);
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// And when none of them worked, what comes back is what the last
+    /// one said rather than a sentence nobody's network produced.
+    #[test]
+    fn the_reason_reported_is_the_last_real_one() {
+        let refused = first(&addrs(), |addr| match addr.is_ipv6() {
+            true => Err::<(), _>(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            false => Err(io::Error::from_raw_os_error(101)),
+        });
+        assert_eq!(refused.unwrap_err().raw_os_error(), Some(101));
     }
 }
