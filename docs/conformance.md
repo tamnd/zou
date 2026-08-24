@@ -130,7 +130,11 @@ db-schemas = "conformance,public"
 db-anon-role = "anon"
 jwt-secret = "super-secret-jwt-token-with-at-least-32-characters-long"
 server-port = 3999
+db-aggregates-enabled = true
 ```
+
+The last line is the one setting here that is not PostgREST's default, and both suites need it now that the rest suite has aggregate cases of its own.
+The argument for it is the same in both places and it is written out under the derived suite below.
 
 ```
 cargo run -p zou-conformance -- diff --suite rest \
