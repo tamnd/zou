@@ -235,6 +235,10 @@ jobs:
           jwt-secret = "$ZOU_CONFORMANCE_SECRET"
           server-port = 3999
           db-pool = 4
+          # The same line the upstream config below carries, and for the
+          # same reason: this suite has aggregate cases now and zou has
+          # no switch that turns them off.
+          db-aggregates-enabled = true
           CONF
           psql "$ZOU_CONFORMANCE_DSN" -v ON_ERROR_STOP=1 -f /tmp/zou-conformance/suites/rest/setup.sql
           /tmp/postgrest /tmp/rest.conf &

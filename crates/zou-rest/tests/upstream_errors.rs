@@ -13,7 +13,7 @@
 //! server sends carries the two halves in different fields.
 //!
 //! Four doctests are left out on purpose, all of them inputs zou reads
-//! where upstream refuses:
+//! where the doctest refuses:
 //!
 //!   - `id,clients(name[])` and `*!hint`, where a bare name may hold
 //!     bytes upstream's identifier rule has no room for
@@ -23,6 +23,16 @@
 //! and two more where zou refuses the same input somewhere else, so
 //! the position and the words are its own: `pOrder "clients(name,id)"`
 //! and `pSpreadRelationSelect "alias:...rel(*)"`.
+//!
+//! All six are cases in the rest suite now, asked of a running server
+//! rather than of a parser, and two of them turned out not to be what
+//! the doctest suggests. A PostgREST 16.1 answers `select=*!hint` with
+//! every column, and it answers a json path on the name of a spread
+//! embed with the table's own columns, having dropped the spread. So
+//! the shape a doctest refuses is not always the shape the server
+//! refuses, and what the suite records is the server. The five places
+//! the two ends really do differ are in that suite's known.json, with
+//! #167 on each of them.
 
 use zou_rest::{filter, order, select};
 
