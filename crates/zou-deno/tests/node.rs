@@ -685,3 +685,55 @@ fn an_async_local_storage_follows_a_chain_through_its_awaits() {
         "top:none|one:first|two:second|one:first:none|two:second:none|first+second|third|undefined|fifth:true|1"
     );
 }
+
+/// A value written out as bytes and read back, which is what a package
+/// asking for `node:v8` wants: the same serializer a clone goes
+/// through, so the shapes that survive one survive the other.
+#[test]
+fn v8_writes_a_value_out_as_bytes_and_reads_it_back() {
+    let said = served(
+        r#"
+        import v8 from "node:v8";
+        const seen = [];
+
+        const value = { when: new Date(0), held: new Map([["a", 1]]), big: 7n, bytes: new Uint8Array([1, 2]) };
+        value.itself = value;
+        const bytes = v8.serialize(value);
+        seen.push(String(bytes.length > 0));
+        const back = v8.deserialize(bytes);
+        seen.push(String(back.when instanceof Date && back.when.getTime() === 0));
+        seen.push(String(back.held.get("a")));
+        seen.push(String(back.big === 7n));
+        seen.push(String(back.bytes[1]));
+        seen.push(String(back.itself === back));
+
+        // The classes, which are the same two functions with somewhere
+        // for a subclass to hang its hooks.
+        const writer = new v8.DefaultSerializer();
+        writer.writeValue({ said: "through the class" });
+        const reader = new v8.DefaultDeserializer(writer.releaseBuffer());
+        reader.readHeader();
+        seen.push(reader.readValue().said);
+
+        // What cannot be written, and what a function does not own.
+        try {
+          v8.serialize(() => 1);
+          seen.push("no error");
+        } catch (e) {
+          seen.push(String(e instanceof Error));
+        }
+        try {
+          v8.getHeapStatistics();
+          seen.push("no error");
+        } catch (e) {
+          seen.push(e.message);
+        }
+
+        Deno.serve(() => new Response(seen.join("|")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "true|true|1|true|2|true|through the class|true|node:v8 getHeapStatistics is about the isolate, which a function does not own"
+    );
+}
