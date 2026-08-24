@@ -101,6 +101,10 @@ fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
                 } catch (why) {
                   exports.missing = String(why.message ?? why);
                 }
+                // node's other name for the global object, which a
+                // package built for both node and a browser reads to
+                // find out which of the two it is running on.
+                exports.global = global === globalThis;
                 "#,
             ),
         ],
@@ -142,20 +146,21 @@ fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
     );
     let (_dir, function) = deployed(
         r#"
-        import greeter, { greet, where, missing } from "npm:greeter@^1.0.0";
+        import greeter, { greet, where, missing, global as named } from "npm:greeter@^1.0.0";
         import { base } from "npm:esmy@1";
         Deno.serve(() => Response.json({
           said: greet("world"),
           where,
           base,
           missing,
+          global: named,
           default: typeof greeter.greet,
         }));
         "#,
     );
     assert_eq!(
         answered(&function),
-        r#"{"said":"HELLO WORLD","where":"index.js","base":"two.js","missing":"node:dgram is a node built in this runtime does not have","default":"function"}"#
+        r#"{"said":"HELLO WORLD","where":"index.js","base":"two.js","missing":"node:dgram is a node built in this runtime does not have","global":true,"default":"function"}"#
     );
 }
 

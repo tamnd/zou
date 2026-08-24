@@ -4466,12 +4466,21 @@
     // variables stay inside it and the five names node gives a module
     // are the five it can see. The newline is for a file that ends in a
     // comment with no line break after it.
+    //
+    // `global` is the sixth, and it is here rather than on the global
+    // object because that is where node has it and where Deno has it:
+    // node's `global` is the global object under its other name, and a
+    // package that ships one build for node and one for a browser
+    // decides which of the two it is by asking whether the name exists.
+    // A function's own module is not node code and does not get it; a
+    // script out of a package is, and does.
     const run = new Function(
       "exports",
       "require",
       "module",
       "__filename",
       "__dirname",
+      "global",
       `${script.text}\n`,
     );
     run.call(
@@ -4481,6 +4490,7 @@
       module,
       script.path,
       dirOf(script.path),
+      globalThis,
     );
     module.loaded = true;
     return module;
