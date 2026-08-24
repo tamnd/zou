@@ -136,7 +136,7 @@ impl Tree {
     }
 
     /// Somebody else's package, as the asking package's manifest names
-    /// it.
+    /// it, or this one under its own name.
     fn other(
         &self,
         from: &Path,
@@ -144,6 +144,14 @@ impl Tree {
         sub: &str,
         conditions: &[&str],
     ) -> Result<Reached, String> {
+        if itself(from, name) {
+            let at = resolve::file(from, sub, conditions)
+                .map_err(|why| format!("{name}{}: {why}", sub.trim_start_matches('.')))?;
+            return Ok(Reached {
+                at,
+                root: from.to_path_buf(),
+            });
+        }
         let want = declared(from, name).ok_or_else(|| {
             format!("{name} is imported here and this package does not depend on it")
         })?;
@@ -160,6 +168,27 @@ impl Tree {
         let at = resolve::file(&root, sub, resolve::CONDITIONS)?;
         Ok(Reached { at, root })
     }
+}
+
+/// Whether a bare name is the name of the package that wrote it, which
+/// node calls a self reference and allows only for a package that has
+/// an `exports` map.
+///
+/// A package uses it to reach its own files through its own front door
+/// rather than by counting `../` out of wherever the file happens to
+/// sit, and the `exports` map is what makes that a front door: a
+/// package without one has nothing to be reached through, and node
+/// refuses the name rather than guessing at a path.
+///
+/// `openai` is the one in the corpus. `_shims/index.mjs` imports
+/// `openai/_shims/auto/runtime`, which is the entry in its own
+/// `exports` that picks the shim for whichever runtime is reading it.
+pub(crate) fn itself(root: &Path, name: &str) -> bool {
+    let Ok(manifest) = resolve::manifest(root) else {
+        return false;
+    };
+    manifest.get("exports").is_some()
+        && manifest.get("name").and_then(|it| it.as_str()) == Some(name)
 }
 
 /// What a package's manifest says a name is, out of the three places it
@@ -477,6 +506,63 @@ mod tests {
             .tree()
             .resolve("c", &at(&root, "index.js"))
             .expect_err("undeclared is not the same as installed");
+        assert!(said.contains("does not depend on it"), "{said}");
+    }
+
+    /// node's self reference: a package with an `exports` map may
+    /// import itself by name, which is how `openai` picks between the
+    /// two runtime shims it ships. The subpath goes through the same
+    /// map an outsider's import of it would, so a file the package does
+    /// not export is not reachable this way either.
+    #[test]
+    fn a_package_may_import_itself_by_name_if_it_says_what_it_exports() {
+        let cache = Cache::new();
+        let manifest = r#"{"name": "a", "version": "1.0.0",
+            "exports": {".": "./index.js", "./shim": "./shims/auto.js"}}"#;
+        let root = cache.with(
+            "a",
+            "1.0.0",
+            manifest,
+            &[
+                ("index.js", ""),
+                ("shims/auto.js", ""),
+                ("shims/inner.js", ""),
+            ],
+        );
+        let tree = cache.tree();
+        let reached = tree
+            .resolve("a/shim", &at(&root, "shims/index.js"))
+            .expect("its own name is itself");
+        assert_eq!(reached.at, root.join("shims/auto.js"));
+        assert_eq!(reached.root, root);
+        assert_eq!(
+            tree.resolve("a", &at(&root, "index.js"))
+                .expect("the package itself")
+                .at,
+            root.join("index.js")
+        );
+        let said = tree
+            .resolve("a/shims/inner.js", &at(&root, "index.js"))
+            .expect_err("a file it does not export is not exported to itself either");
+        assert!(said.contains("does not export"), "{said}");
+    }
+
+    /// And a package without an `exports` map has no front door, so its
+    /// own name is a dependency it never declared, which is what node
+    /// says about it too.
+    #[test]
+    fn a_package_with_nothing_exported_does_not_import_itself() {
+        let cache = Cache::new();
+        let root = cache.with(
+            "a",
+            "1.0.0",
+            r#"{"name": "a", "main": "./index.js"}"#,
+            &[("index.js", "")],
+        );
+        let said = cache
+            .tree()
+            .resolve("a", &at(&root, "index.js"))
+            .expect_err("no exports, no self reference");
         assert!(said.contains("does not depend on it"), "{said}");
     }
 
