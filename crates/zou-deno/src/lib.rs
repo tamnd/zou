@@ -137,6 +137,8 @@ mod module;
 #[cfg(feature = "isolate")]
 mod node;
 #[cfg(feature = "isolate")]
+mod npm;
+#[cfg(feature = "isolate")]
 mod pool;
 #[cfg(feature = "isolate")]
 mod socket;
