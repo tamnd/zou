@@ -163,27 +163,27 @@ impl<In: Transport> Connector<In> for Watched {
 
 /// The first address that answers.
 ///
-/// The client's own connector splits the budget between the addresses a
-/// name resolved to so that a host with four of them cannot spend four
-/// timeouts. This gives each of them the same budget and lets the
-/// call's own global timeout be the ceiling, which is a shorter thing to
-/// read and the same answer for the one address a host usually has.
-///
 /// An address that could not be opened is a reason to try the next one,
-/// whatever the reason was. This used to move on only after a refusal,
-/// on the grounds that anything else would say the same thing again,
-/// which is true of the address and not of the host: a name with an
-/// AAAA and an A record, on a box with a v6 default route and no v6
-/// reachability, answers `Network is unreachable` for the first and
-/// serves the whole graph off the second. That was every function in
-/// the examples corpus answering 500 on a box where `curl` to the same
-/// url was a 200, and it is what most of WSL looks like. See #632.
+/// whatever the reason was, and however long it took to say so. This
+/// used to move on only after a refusal, on the grounds that anything
+/// else would say the same thing again, which is true of the address
+/// and not of the host: a name with an AAAA and an A record, on a box
+/// with a v6 default route and nothing behind it, does not answer for
+/// the first address and serves the whole graph off the second.
+///
+/// So the budget is split between them, which is what the client's own
+/// connector does and what this stopped doing when it took the socket
+/// over. Handing the first address the whole of it is the same bug in
+/// slower clothes: a route that blackholes rather than refuses spends
+/// every second the call had and the address that works is never
+/// reached. Both shapes were on the box the examples corpus was
+/// measured on, and both were every function answering 500 while curl
+/// to the same url was a 200. See #632.
 fn dial(details: &ConnectionDetails) -> Result<TcpStream, Error> {
-    let each = details.timeout.not_zero().map(|when| *when);
+    let between = details.addrs.len().max(1) as u32;
+    let each = details.timeout.not_zero().map(|when| *when / between);
     let nodelay = details.config.no_delay();
     first(&details.addrs, |addr| one(addr, each, nodelay)).map_err(|e| match timed_out(&e) {
-        // A timeout is the exception, because the budget it spent
-        // is the call's own and the addresses are sharing it.
         true => Error::Timeout(details.timeout.reason),
         false => Error::Io(e),
     })
@@ -202,7 +202,6 @@ fn first<T>(
     for addr in addrs {
         match open(*addr) {
             Ok(opened) => return Ok(opened),
-            Err(e) if timed_out(&e) => return Err(e),
             Err(e) => said = Some(e),
         }
     }
@@ -377,17 +376,23 @@ mod tests {
         assert_eq!(tried, addrs(), "both, in the order they were given");
     }
 
-    /// A timeout is the one failure that ends the walk, because what it
-    /// spent is the call's own budget rather than this address's.
+    /// A route that blackholes rather than refuses is the same bug
+    /// wearing slower clothes, so an address that ran out of its share
+    /// of the budget is not the end of the list either. What bounds the
+    /// share is `dial`, which divides the call's budget by the number
+    /// of addresses before the walk starts.
     #[test]
-    fn an_address_that_ran_out_of_time_spent_the_budget_the_next_one_needed() {
-        let mut tried = 0;
-        let refused = first(&addrs(), |_| {
-            tried += 1;
-            Err::<(), _>(io::Error::from(io::ErrorKind::TimedOut))
+    fn an_address_that_ran_out_of_its_share_is_not_the_end_of_it_either() {
+        let mut tried = Vec::new();
+        let opened = first(&addrs(), |addr| {
+            tried.push(addr);
+            match addr.is_ipv6() {
+                true => Err(io::Error::from(io::ErrorKind::TimedOut)),
+                false => Ok("a socket"),
+            }
         });
-        assert_eq!(tried, 1);
-        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(opened.unwrap(), "a socket");
+        assert_eq!(tried, addrs());
     }
 
     /// And when none of them worked, what comes back is what the last
