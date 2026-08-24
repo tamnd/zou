@@ -133,6 +133,8 @@ mod inspector;
 #[cfg(feature = "isolate")]
 mod isolate;
 #[cfg(feature = "isolate")]
+mod jsr;
+#[cfg(feature = "isolate")]
 mod limits;
 #[cfg(feature = "isolate")]
 mod module;
