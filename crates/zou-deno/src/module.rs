@@ -240,6 +240,19 @@ impl Disk {
                 ))),
             });
         }
+        // A specifier that names a scheme is not a bare name and was
+        // never this package's business: `jsr:@supabase/supabase-js@2`
+        // and `https://esm.sh/react@18.2.0` are both real lines inside
+        // published packages, and neither is in anybody's manifest
+        // because neither is a dependency in the sense a manifest
+        // means. Handing them back unanswered puts them through the
+        // same arms an `index.ts` writing them would take. Without
+        // this the name split off the front is `jsr:@supabase`, and
+        // the refusal is a sentence about a manifest that could not
+        // have mentioned it.
+        if schemed(specifier) {
+            return None;
+        }
         // A core module before the manifest, because node resolves a
         // bare name that is one to the built in without asking, and a
         // package does not declare a dependency on `os`. A name node has
@@ -528,6 +541,27 @@ impl ModuleLoader for Disk {
 /// took the whole graph down with it.
 fn bare(rest: &str) -> &str {
     rest.trim_start_matches('/')
+}
+
+/// Whether a specifier names a scheme, which is what separates a url
+/// from a bare package name.
+///
+/// The rule is the url standard's own: letters, digits, `+`, `-` and
+/// `.` after a first letter, up to a colon. A package name cannot hold
+/// a colon, so nothing that is a name is read as a scheme here, and
+/// `jsr:`, `node:`, `https:` and `data:` all are.
+fn schemed(specifier: &str) -> bool {
+    let Some(scheme) = specifier.split(':').next().filter(|it| !it.is_empty()) else {
+        return false;
+    };
+    if scheme.len() == specifier.len() {
+        return false;
+    }
+    let mut letters = scheme.chars();
+    letters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && letters.all(|it| it.is_ascii_alphanumeric() || it == '+' || it == '-' || it == '.')
 }
 
 /// One package out of the npm registry, unpacked, as the module the
@@ -1502,6 +1536,78 @@ mod tests {
             )
             .expect("a specifier");
         assert_eq!(two.as_str(), "jsr:@std/encoding@1");
+    }
+
+    /// A published package writes urls of its own, and a url is not a
+    /// dependency: `@supabase/server` imports
+    /// `jsr:@supabase/supabase-js@2/cors` and `@react-email/render`
+    /// imports `https://esm.sh/react@18.2.0`, and neither name is in
+    /// anybody's manifest because neither could be. Reading them as
+    /// bare names split `jsr:@supabase` off the front and refused it
+    /// for not being declared, which took eleven of the forty examples
+    /// down under the tarball knob.
+    #[test]
+    fn a_url_written_inside_a_package_is_a_url_and_not_a_dependency() {
+        let cache = tempfile::tempdir().expect("a temporary cache");
+        let root = cache.path().join("npm").join("asks").join("1.0.0");
+        std::fs::create_dir_all(&root).expect("a package");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name": "asks", "version": "1.0.0"}"#,
+        )
+        .expect("a manifest");
+        std::fs::write(root.join("index.js"), "").expect("a file");
+        let disk = Disk {
+            npm: Npm::Tarball,
+            cache: cache.path().to_path_buf(),
+            ..loader()
+        };
+        let referrer = ModuleSpecifier::from_file_path(root.join("index.js")).expect("a url");
+        let jsr = disk
+            .resolve(
+                "jsr:@supabase/supabase-js@2/cors",
+                referrer.as_str(),
+                ResolutionKind::Import,
+            )
+            .expect("a specifier");
+        assert_eq!(jsr.as_str(), "jsr:@supabase/supabase-js@2/cors");
+        let https = disk
+            .resolve(
+                "https://esm.sh/react@18.2.0",
+                referrer.as_str(),
+                ResolutionKind::Import,
+            )
+            .expect("a specifier");
+        assert_eq!(https.as_str(), "https://esm.sh/react@18.2.0");
+        let node = disk
+            .resolve("node:buffer", referrer.as_str(), ResolutionKind::Import)
+            .expect("a specifier");
+        assert_eq!(node.as_str(), "node:buffer");
+        // And an npm specifier written out in full is the registry's
+        // question rather than this package's, the same as it is
+        // anywhere else.
+        let npm = disk
+            .resolve("npm:lodash@4", referrer.as_str(), ResolutionKind::Import)
+            .expect("a specifier");
+        assert_eq!(npm.as_str(), "npm:lodash@4");
+        // A bare name is still read against the manifest, which is what
+        // this package has none of.
+        let refused = disk.resolve("lodash", referrer.as_str(), ResolutionKind::Import);
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
+    #[test]
+    fn a_scheme_is_letters_before_a_colon_and_a_package_name_has_none() {
+        assert!(schemed("jsr:@supabase/supabase-js@2"));
+        assert!(schemed("https://esm.sh/react@18.2.0"));
+        assert!(schemed("node:buffer"));
+        assert!(schemed("data:text/javascript,0"));
+        assert!(!schemed("@supabase/supabase-js"));
+        assert!(!schemed("lodash"));
+        assert!(!schemed("lodash/fp"));
+        assert!(!schemed(""));
+        assert!(!schemed(":"));
+        assert!(!schemed("9lives:x"), "a scheme starts with a letter");
     }
 
     /// The three things the environment can say about who to ask as.
