@@ -3442,6 +3442,7 @@ fn small() -> Limits {
         memory: 64 * 1024 * 1024,
         wall: std::time::Duration::from_secs(30),
         cpu: std::time::Duration::from_secs(20),
+        boot: std::time::Duration::from_secs(20),
         background: std::time::Duration::from_secs(30),
     }
 }
@@ -3632,6 +3633,53 @@ fn a_function_that_waits_is_not_charged_for_waiting() {
         )
         .expect("a second and a half of waiting is not half a second of cpu");
     assert_eq!(body(&answer), "awake");
+}
+
+/// Getting the modules onto the isolate is spent against its own
+/// budget, because it happens once and every call after the first one
+/// gets it free. A module that burns more than a call is allowed and
+/// then answers is a function that works.
+#[test]
+fn what_loading_the_modules_costs_is_not_the_first_calls_to_pay() {
+    let deployed = deployed(
+        r#"
+        const until = Date.now() + 300;
+        while (Date.now() < until) {}
+        Deno.serve(() => new Response("loaded"));
+        "#,
+    );
+    let answer = Isolate::new()
+        .with_limits(Limits {
+            cpu: std::time::Duration::from_millis(100),
+            boot: std::time::Duration::from_secs(20),
+            ..small()
+        })
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect("a module that took longer than a call may take");
+    assert_eq!(body(&answer), "loaded");
+}
+
+/// It is a budget and not an absence of one, and the sentence names
+/// the budget that was actually being spent rather than the call's.
+#[test]
+fn a_module_that_never_finishes_loading_is_stopped_by_its_own_budget() {
+    let why = stopped(
+        Limits {
+            boot: std::time::Duration::from_millis(300),
+            ..small()
+        },
+        r#"
+        for (;;) {}
+        Deno.serve(() => new Response("never"));
+        "#,
+    );
+    let Failed::Limit(said) = why else {
+        panic!("a limit, and got {why:?}");
+    };
+    assert!(said.contains("300ms of cpu time"), "{said}");
 }
 
 /// A limit reached after the head of the answer has gone out cannot
