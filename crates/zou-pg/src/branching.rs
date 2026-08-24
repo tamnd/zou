@@ -287,8 +287,9 @@ pub fn fold_for_branch(
         match out {
             Some(out) => {
                 log::debug!(
-                    "fold for branch: shard {shard} imaged {} pages at {}",
+                    "fold for branch: shard {shard} imaged {} pages and {} fork lengths at {}",
                     out.imaged,
+                    out.sized,
                     out.horizon
                 );
                 folded += 1;

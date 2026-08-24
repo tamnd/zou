@@ -70,6 +70,15 @@ pub struct RelTag {
     pub rel: u32,
 }
 
+/// One truncate event: the relation, and how many blocks of its main
+/// fork survive. `u32::MAX` means the record did not touch the main
+/// fork at all, only vm or fsm.
+pub type Trunc = (RelTag, u32);
+
+/// One block reference with whether redo can build its page from
+/// nothing: the record initializes the page or carries a full image.
+pub type InitRef = (BlockRef, bool);
+
 /// What a scan produced: the blocks the records touch, the relations
 /// smgr create records recreated, the truncate events with their main
 /// fork cutoff, and where the next scan should resume, the end of the
@@ -571,7 +580,11 @@ pub struct WalRecord {
 }
 
 impl WalRecord {
-    fn parse_refs(&self) -> Result<(Vec<(BlockRef, bool)>, bool), String> {
+    fn parse_refs(&self) -> Result<(Vec<InitRef>, bool), String> {
+        self.parse_all().map(|(refs, _, image)| (refs, image))
+    }
+
+    fn parse_all(&self) -> Result<(Vec<InitRef>, Vec<Trunc>, bool), String> {
         let mut refs = Vec::new();
         let mut rels = Vec::new();
         let mut truncs = Vec::new();
@@ -590,13 +603,24 @@ impl WalRecord {
             // one record's bytes with no stream around them.
             ScanErr::Truncated | ScanErr::Aborted => "record header items overrun".to_string(),
         })?;
-        Ok((refs, image))
+        Ok((refs, truncs, image))
     }
 
     /// The blocks this record references, parsed from its header items.
     pub fn block_refs(&self) -> Result<Vec<BlockRef>, String> {
         self.parse_refs()
             .map(|(refs, _)| refs.into_iter().map(|(r, _)| r).collect())
+    }
+
+    /// The blocks this record references and the main fork cutoffs it
+    /// carries, in one parse. Ingest wants both of a record and the
+    /// parse is the expensive half, so asking twice would double the
+    /// cost of the loop that reads every record in the stream. A
+    /// cutoff of `u32::MAX` is a truncate that left the main fork
+    /// alone, see [`ScanOut::truncs`].
+    pub fn refs_and_truncs(&self) -> Result<(Vec<BlockRef>, Vec<Trunc>), String> {
+        self.parse_all()
+            .map(|(refs, truncs, _)| (refs.into_iter().map(|(r, _)| r).collect(), truncs))
     }
 
     /// Whether any block reference in this record carries a full page

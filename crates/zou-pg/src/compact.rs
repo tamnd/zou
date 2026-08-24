@@ -62,8 +62,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use zou_store::bloom::Bloom;
 use zou_store::cas::{CasError, CasStore};
 use zou_store::layer::{
-    DeltaBuilder, ImageBuilder, KEY_PAGE, LayerBuildError, LayerDecodeError, LayerKey, LayerKind,
-    delta_cursor, image_cursor,
+    DeltaBuilder, ImageBuilder, KEY_PAGE, KEY_RELSIZE, LayerBuildError, LayerDecodeError, LayerKey,
+    LayerKind, PAGE_IMAGE_LEN, delta_cursor, image_cursor,
 };
 use zou_store::layermap::{LayerDesc, LayerMap};
 use zou_store::layout::TenantLayout;
@@ -76,6 +76,7 @@ use zou_store::shards::{ShardError, load_serving_descs, shard_of};
 
 use crate::getpage::{GetPageError, MAX_GETPAGE_BATCH, PageService};
 use crate::redo::RedoPool;
+use crate::relsize;
 
 /// Compression block size for rebuilt layers, the format's read unit.
 const BLOCK_TARGET: usize = 256 * 1024;
@@ -610,6 +611,8 @@ pub struct MergeOutcome {
     pub outputs: usize,
     /// Pages the merged image holds.
     pub imaged: usize,
+    /// Relation fork lengths it holds, one per fork the shard sees.
+    pub sized: usize,
     /// Keys nobody could build a page for at the horizon. Their layers
     /// stay listed, because dropping them would lose the only copy of
     /// their history.
@@ -828,9 +831,11 @@ pub fn merge_to_horizon(
     };
 
     // Non page keys have no page to materialize, so they are unbased by
-    // construction and their layers stay. Nothing writes them yet; when
-    // something does, this is the line that keeps them safe until the
-    // merge learns how to carry them.
+    // construction and their layers stay. Ingest writes relsize keys
+    // now, and this line is what keeps their history whole until the
+    // merge learns to cut an image of one: a fold that dropped their
+    // layers would take the lengths with them and a branch would be
+    // unable to say how long anything is.
     let mut unbased: BTreeSet<LayerKey> = keys
         .iter()
         .filter(|k| k.kind != KEY_PAGE)
@@ -841,6 +846,17 @@ pub fn merge_to_horizon(
         .filter(|k| k.kind == KEY_PAGE)
         .copied()
         .collect();
+    // Relation sizes do get carried, so they come back out of the
+    // unbased set. Every layer holds some, so leaving them unbased
+    // would pin every layer and a merge would retire nothing.
+    let size_keys: Vec<LayerKey> = keys
+        .iter()
+        .filter(|k| k.kind == KEY_RELSIZE)
+        .copied()
+        .collect();
+    for k in &size_keys {
+        unbased.remove(k);
+    }
     drop(keys);
     let map = LayerMap::new(descs.clone()).map_err(PageShardError::from)?;
     let frozen_bases = AtomicUsize::new(0);
@@ -883,6 +899,30 @@ pub fn merge_to_horizon(
                 publish(bytes, &footer)?;
                 builder = ImageBuilder::new(at, BLOCK_TARGET);
             }
+        }
+    }
+    // Sizes after the pages, because a relsize key sorts after every
+    // page key and an image builder takes its entries in order. The
+    // image of one is the folded answer written as a single Set record
+    // and padded to the stride the image format fixes; the padding is
+    // zeros and the block codec compresses it back to nothing.
+    let mut sized = 0;
+    for key in &size_keys {
+        let fork = relsize::ForkRef {
+            spc: key.spc,
+            db: key.db,
+            rel: key.rel,
+            fork: key.fork,
+        };
+        let n = svc.rel_size(&map, &mem, fork, at.0)?;
+        let mut page = vec![0u8; PAGE_IMAGE_LEN];
+        page[..relsize::REC_LEN].copy_from_slice(&relsize::SizeRec::Set(n).encode());
+        builder.push(*key, &page)?;
+        sized += 1;
+        if builder.bytes() >= MERGE_TARGET_BYTES {
+            let (bytes, footer) = builder.finish()?;
+            publish(bytes, &footer)?;
+            builder = ImageBuilder::new(at, BLOCK_TARGET);
         }
     }
     if !builder.is_empty() {
@@ -936,6 +976,7 @@ pub fn merge_to_horizon(
         retired: retire.len(),
         outputs: add.len(),
         imaged,
+        sized,
         unbased: unbased.len(),
         pinned,
         bytes_before,
@@ -1877,6 +1918,68 @@ pub(crate) mod tests {
             merge_to_horizon(&store, "t", 0, Lsn(0x250), &pool, false)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// Relation lengths get folded like pages do. If they did not, the
+    /// layer holding them would pin itself on every pass and a merge
+    /// would retire nothing at all, which is the whole point of the
+    /// pass. The image of a length is a Set record padded to the image
+    /// stride, and a read after the fold gets the same number.
+    #[test]
+    fn a_merge_carries_the_fork_lengths_and_still_retires() {
+        let store = MemStore::default();
+        let layout = seed(&store, "t");
+        let page = LayerKey::page(1663, 5, 90, 0, 1);
+        let size = LayerKey::relsize(1663, 5, 90, 0);
+        put_image(
+            &store,
+            &layout,
+            0,
+            &[ImageEntry {
+                key: page,
+                page: vec![0xAA; BLCKSZ],
+            }],
+            0x100,
+        );
+        put_delta(
+            &store,
+            &layout,
+            0,
+            &mut [
+                DeltaEntry {
+                    key: size,
+                    lsn: Lsn(0x110),
+                    record: relsize::SizeRec::Grow(9).encode().to_vec(),
+                },
+                DeltaEntry {
+                    key: size,
+                    lsn: Lsn(0x120),
+                    record: relsize::SizeRec::Set(4).encode().to_vec(),
+                },
+            ],
+            0x300,
+        );
+
+        let pool = dead_pool();
+        let out = merge_to_horizon(&store, "t", 0, Lsn(0x200), &pool, false)
+            .unwrap()
+            .expect("everything is below the horizon");
+        assert_eq!((out.imaged, out.sized), (1, 1));
+        assert_eq!((out.unbased, out.pinned), (0, 0));
+        assert_eq!(out.retired, 2, "the image and the run of lengths both go");
+
+        let (m, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let reader = LayerReader::new(&store, layout.shard_prefix(0));
+        let map = m.layer_map().unwrap();
+        let mem = Memtable::new();
+        let got = reader.reconstruct(&map, &mem, &size, Lsn(0x400)).unwrap();
+        assert_eq!(
+            relsize::fold(got.base.as_deref(), &got.records).unwrap(),
+            4,
+            "the truncate is what the folded image remembers"
         );
     }
 

@@ -42,6 +42,7 @@ mod pagesvc;
 pub mod pending;
 pub mod reader;
 pub mod redo;
+pub mod relsize;
 pub mod restore;
 pub mod single;
 pub mod walscan;

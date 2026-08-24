@@ -47,6 +47,7 @@ use zou_store::memtable::Memtable;
 use zou_store::pageread::{LayerReader, ReadError, Reconstruction};
 
 use crate::redo::{RedoPool, RedoRequest, page_checksum};
+use crate::relsize;
 use crate::walscan::{self, BlockRef};
 
 /// Most pages one GetPage batch serves, matching the smgr's vectored
@@ -74,6 +75,8 @@ pub enum GetPageError {
     BareChain { blk: BlockRef, first_lsn: u64 },
     #[error("redo: {0}")]
     Redo(String),
+    #[error("relation size: {0}")]
+    Size(String),
     #[error(transparent)]
     Read(#[from] ReadError),
 }
@@ -164,6 +167,25 @@ impl<'a> PageService<'a> {
             .get_pages(map, mem, &[blk], at)?
             .pop()
             .expect("one block in, one page out"))
+    }
+
+    /// How many blocks one relation fork holds as of `at`, the answer
+    /// smgr nblocks wants. Read out of the layers like a page, folded
+    /// like a size: no redo, no base image needed, and nothing read
+    /// from the parent's `pg/` prefix, so a branch gets the same
+    /// answer as the tenant it was cut from.
+    ///
+    /// A fork nothing ever extended is zero blocks long, which is what
+    /// the stock smgr says about a relation with no file.
+    pub fn rel_size(
+        &self,
+        map: &LayerMap,
+        mem: &Memtable,
+        fork: relsize::ForkRef,
+        at: u64,
+    ) -> Result<u32, GetPageError> {
+        let r = self.reader.reconstruct(map, mem, &fork.key(), Lsn(at))?;
+        relsize::fold(r.base.as_deref(), &r.records).map_err(GetPageError::Size)
     }
 
     /// Materialize `blocks` as of `at`, in order, as one redo batch.

@@ -62,6 +62,16 @@ impl Memtable {
             .map(|(&(_, lsn), record)| (lsn, record.as_slice()))
     }
 
+    /// Every entry in flush order, leaving the table alone. A read
+    /// wants [`Self::records_for`]; this is for a caller that needs to
+    /// see the whole table without emptying it, like a test asserting
+    /// what an ingest indexed and under which kinds of key.
+    pub fn iter(&self) -> impl Iterator<Item = (LayerKey, Lsn, &[u8])> {
+        self.entries
+            .iter()
+            .map(|(&(key, lsn), record)| (key, lsn, record.as_slice()))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

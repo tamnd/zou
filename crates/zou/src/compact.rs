@@ -245,12 +245,13 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
         match merge_to_horizon(&*store, tenant_ref, job.shard, at, &pool, data_checksums) {
             Ok(Some(out)) if args.json => rows.push(fold_row(job.shard, &out)),
             Ok(Some(out)) => say!(
-                "shard {}: {} layers retired into {} at {}, {} pages imaged, {} keys with no base kept {} layers alive, {} to {} bytes",
+                "shard {}: {} layers retired into {} at {}, {} pages and {} fork lengths imaged, {} keys with no base kept {} layers alive, {} to {} bytes",
                 job.shard,
                 out.retired,
                 out.outputs,
                 out.horizon,
                 out.imaged,
+                out.sized,
                 out.unbased,
                 out.pinned,
                 out.bytes_before,
@@ -289,12 +290,13 @@ fn fold(target: &str, tenant_ref: &str, argv: &[String]) -> Result<(), String> {
 /// fold is there to hold down.
 fn fold_row(shard: u16, out: &MergeOutcome) -> String {
     format!(
-        "{{\"shard\":{},\"horizon\":\"{}\",\"retired\":{},\"outputs\":{},\"imaged\":{},\"unbased\":{},\"pinned\":{},\"bytes_before\":{},\"bytes_after\":{}}}",
+        "{{\"shard\":{},\"horizon\":\"{}\",\"retired\":{},\"outputs\":{},\"imaged\":{},\"sized\":{},\"unbased\":{},\"pinned\":{},\"bytes_before\":{},\"bytes_after\":{}}}",
         shard,
         out.horizon,
         out.retired,
         out.outputs,
         out.imaged,
+        out.sized,
         out.unbased,
         out.pinned,
         out.bytes_before,
@@ -362,6 +364,7 @@ mod tests {
             retired: 12,
             outputs: 2,
             imaged: 3400,
+            sized: 41,
             unbased: 1,
             pinned: 1,
             bytes_before: 136_770_905,

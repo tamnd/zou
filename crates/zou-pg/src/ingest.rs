@@ -32,10 +32,16 @@
 //! need record aligned frames or a sealed WAL range read, and until
 //! then a gap is a loud [`IngestError::Gap`].
 //!
-//! Relation size tracking (the relsize keys the read path already
-//! understands) rides with the GetPage box: sizes answer smgr nblocks
-//! calls, which is the page service's contract, not the ingest loop's.
+//! Relation sizes ride the same walk. Every block reference says the
+//! fork is at least one block past it, and every truncate says how
+//! long the main fork is left, so the two facts the WAL has about a
+//! length are already in front of this loop. They go into the
+//! memtable under [`LayerKey::relsize`] as the records
+//! [`crate::relsize`] describes, and a read folds the chain. Inferring
+//! the length from the highest block with records instead would be
+//! wrong the moment anything truncates.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use zou_log::{ConsolidateError, TeeEvent};
@@ -47,7 +53,9 @@ use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
 use zou_store::memtable::Memtable;
 use zou_store::shardmanifest::{self, LayerEntry, PageShardError};
+use zou_store::shards;
 
+use crate::relsize;
 use crate::walscan::{self, WalWindow};
 
 /// Flush when the memtable holds this many record bytes.
@@ -69,6 +77,10 @@ pub const SMALL_TENANT_FLOOR: usize = 8 << 20;
 /// Block target handed to [`build_delta`], the layer codec's unit of
 /// fetch and checksum.
 pub const DELTA_BLOCK_TARGET: usize = 256 << 10;
+
+/// The main fork, the only one an smgr truncate record names a cutoff
+/// for. The vm and fsm cutoffs it also carries are not in the record.
+const MAIN_FORK: u8 = 0;
 
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
@@ -256,22 +268,73 @@ impl ShardIngest {
     /// this shard. A record touching two of our blocks lands under
     /// both keys: reconstruction looks records up by key, and a few
     /// duplicated bytes in a delta layer beat a second lookup path.
+    ///
+    /// The same walk feeds the relsize keys, see [`crate::relsize`].
+    /// A block reference says the fork reaches at least one past the
+    /// block, and a truncate says exactly how long the main fork is
+    /// left. Those are the only two things the WAL says about a
+    /// length, and between them they are enough to answer nblocks
+    /// without going near the parent's `pg/` prefix.
     fn index_record(&mut self, record: &walscan::WalRecord) -> Result<(), IngestError> {
-        let refs = record.block_refs().map_err(IngestError::Wal)?;
+        let (refs, truncs) = record.refs_and_truncs().map_err(IngestError::Wal)?;
+        // One record can touch several blocks of one fork, and the
+        // memtable holds one value per key and lsn, so the floors
+        // collapse to the highest block before they are written.
+        let mut grew: BTreeMap<relsize::ForkRef, u32> = BTreeMap::new();
         for r in &refs {
+            let fork = r.fork as u8;
             let stripe = StripeRef {
                 relfilenode: r.rel,
-                fork: r.fork as u8,
+                fork,
                 block: r.blk,
             };
+            let end = r.blk.saturating_add(1);
+            grew.entry(relsize::ForkRef {
+                spc: r.spc,
+                db: r.db,
+                rel: r.rel,
+                fork,
+            })
+            .and_modify(|n| *n = (*n).max(end))
+            .or_insert(end);
             if stripe.page_shard(self.cfg.shard_count) != self.cfg.shard {
                 continue;
             }
-            let key = LayerKey::page(r.spc, r.db, r.rel, r.fork as u8, r.blk);
+            let key = LayerKey::page(r.spc, r.db, r.rel, fork, r.blk);
             self.mem.insert(key, Lsn(record.lsn), record.bytes.clone());
             self.first_insert.get_or_insert_with(Instant::now);
         }
+        for (fork, end) in grew {
+            self.insert_size(record.lsn, fork, relsize::SizeRec::Grow(end));
+        }
+        for (tag, cut) in truncs {
+            // MAX is the scanner's way of saying the record hit vm or
+            // fsm only, so the main fork kept every block it had.
+            if cut == u32::MAX {
+                continue;
+            }
+            let fork = relsize::ForkRef {
+                spc: tag.spc,
+                db: tag.db,
+                rel: tag.rel,
+                fork: MAIN_FORK,
+            };
+            self.insert_size(record.lsn, fork, relsize::SizeRec::Set(cut));
+        }
         Ok(())
+    }
+
+    /// Write one relsize record, if its key lands on this shard. The
+    /// key hashes with block zero, which parks a fork's length beside
+    /// its first stripe, so it is not always this shard even when the
+    /// block that grew was.
+    fn insert_size(&mut self, lsn: u64, fork: relsize::ForkRef, rec: relsize::SizeRec) {
+        let key = fork.key();
+        if u32::from(shards::shard_of(&key, self.cfg.shard_count)) != self.cfg.shard {
+            return;
+        }
+        self.mem.insert(key, Lsn(lsn), rec.encode().to_vec());
+        self.first_insert.get_or_insert_with(Instant::now);
     }
 
     /// Whether a flush is due, with the age measured by the wall
@@ -400,6 +463,38 @@ mod tests {
         IngestConfig::new(TENANT, shard, 2)
     }
 
+    /// Entries under page keys, which is what the counting assertions
+    /// below are about. The relsize keys the same walk writes are
+    /// counted separately where they are the point.
+    fn pages(ingest: &ShardIngest) -> usize {
+        ingest
+            .memtable()
+            .iter()
+            .filter(|(k, _, _)| k.kind == zou_store::layer::KEY_PAGE)
+            .count()
+    }
+
+    /// The size one fork reads as, folded out of the memtable alone.
+    fn size_of(ingest: &ShardIngest, rel: u32, fork: u8) -> u32 {
+        let key = LayerKey::relsize(1663, 5, rel, fork);
+        let records: Vec<(Lsn, Vec<u8>)> = ingest
+            .memtable()
+            .records_for(&key, Lsn(0), Lsn(u64::MAX))
+            .map(|(lsn, r)| (lsn, r.to_vec()))
+            .collect();
+        relsize::fold(None, &records).unwrap()
+    }
+
+    /// An xl_smgr_truncate body: surviving blocks, then the locator,
+    /// then the fork flags.
+    fn trunc_body(nblocks: u32, rel: u32, flags: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        for v in [nblocks, 1663, 5, rel, flags] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out
+    }
+
     #[test]
     fn records_index_under_their_keys_and_foreign_stripes_stay_out() {
         let (mine, theirs) = (rel_on(0), rel_on(1));
@@ -419,10 +514,12 @@ mod tests {
             .records_for(&key, Lsn(0), Lsn(u64::MAX))
             .collect();
         assert_eq!(records.len(), 2, "both records touching our block land");
+        assert_eq!(pages(&ingest), 2, "the foreign stripe's records stay out");
+        assert_eq!(size_of(&ingest, mine, 0), 4, "block three means four long");
         assert_eq!(
-            ingest.memtable().len(),
-            2,
-            "the foreign stripe's records stay out"
+            size_of(&ingest, theirs, 0),
+            0,
+            "the foreign fork's length is the other shard's to keep"
         );
     }
 
@@ -443,12 +540,12 @@ mod tests {
         for f in &frames {
             ingest.apply_frames(std::slice::from_ref(f)).unwrap();
         }
-        assert_eq!(ingest.memtable().len(), 2);
+        assert_eq!(pages(&ingest), 2);
         assert_eq!(ingest.applied(), wal.pos());
 
         // A full catch up replay overlaps everything already applied.
         ingest.apply_frames(&frames).unwrap();
-        assert_eq!(ingest.memtable().len(), 2, "the watermark drops replays");
+        assert_eq!(pages(&ingest), 2, "the watermark drops replays");
 
         // A frame past the buffered end means missing bytes.
         let err = ingest
@@ -479,7 +576,7 @@ mod tests {
 
         let mut ingest = ShardIngest::new(cfg(0), WAL_BASE);
         ingest.apply_frames(&[frame(base, &bytes[..cut])]).unwrap();
-        assert_eq!(ingest.memtable().len(), 2, "the third record is partial");
+        assert_eq!(pages(&ingest), 2, "the third record is partial");
         assert_eq!(ingest.seen(), base + cut as u64);
         assert!(ingest.applied() < ingest.seen());
 
@@ -488,7 +585,70 @@ mod tests {
             .unwrap();
         assert_eq!(ingest.applied(), wal.pos());
         assert_eq!(ingest.seen(), wal.pos());
-        assert_eq!(ingest.memtable().len(), 3);
+        assert_eq!(pages(&ingest), 3);
+    }
+
+    /// The two facts the WAL has about a length, on one fork: a block
+    /// reference is a floor, a truncate is the answer. Reading the
+    /// high water mark of the block references instead would say seven
+    /// here, and seven is a page past the end of the relation.
+    #[test]
+    fn a_truncate_shortens_the_fork_and_growth_resumes() {
+        let mine = rel_on(0);
+        let mut wal = Builder::new(WAL_BASE);
+        wal.record(&[(blk(mine, 6), false)], b"grow");
+        wal.record_with(&[], &trunc_body(3, mine, 1), 0x20, 2);
+        let mut ingest = ShardIngest::new(cfg(0), WAL_BASE);
+        let (base, bytes) = wal.stream();
+        ingest.apply_frames(&[frame(base, bytes)]).unwrap();
+        assert_eq!(size_of(&ingest, mine, 0), 3);
+
+        wal.record(&[(blk(mine, 3), false)], b"again");
+        let (base, bytes) = wal.stream();
+        ingest.apply_frames(&[frame(base, bytes)]).unwrap();
+        assert_eq!(size_of(&ingest, mine, 0), 4, "the fork grew back by one");
+    }
+
+    /// A truncate that only took the vm or the fsm leaves the main
+    /// fork alone, and the scanner says so with a MAX cutoff. Writing
+    /// that down would read as four billion blocks.
+    #[test]
+    fn a_truncate_that_missed_the_main_fork_writes_nothing() {
+        let mine = rel_on(0);
+        let mut wal = Builder::new(WAL_BASE);
+        wal.record(&[(blk(mine, 6), false)], b"grow");
+        wal.record_with(&[], &trunc_body(0, mine, 2), 0x20, 2);
+        let mut ingest = ShardIngest::new(cfg(0), WAL_BASE);
+        let (base, bytes) = wal.stream();
+        ingest.apply_frames(&[frame(base, bytes)]).unwrap();
+        assert_eq!(size_of(&ingest, mine, 0), 7);
+    }
+
+    /// One record touching several blocks of one fork writes one
+    /// floor, the highest. The memtable holds one value per key and
+    /// lsn, so anything else would depend on which block came last.
+    #[test]
+    fn one_record_over_many_blocks_writes_one_floor() {
+        let mine = rel_on(0);
+        let mut wal = Builder::new(WAL_BASE);
+        wal.record(
+            &[
+                (blk(mine, 5), false),
+                (blk(mine, 9), true),
+                (blk(mine, 2), true),
+            ],
+            b"multi",
+        );
+        let mut ingest = ShardIngest::new(cfg(0), WAL_BASE);
+        let (base, bytes) = wal.stream();
+        ingest.apply_frames(&[frame(base, bytes)]).unwrap();
+        assert_eq!(size_of(&ingest, mine, 0), 10);
+        let sizes = ingest
+            .memtable()
+            .iter()
+            .filter(|(k, _, _)| k.kind == zou_store::layer::KEY_RELSIZE)
+            .count();
+        assert_eq!(sizes, 1, "one record, one floor");
     }
 
     #[test]
@@ -587,6 +747,96 @@ mod tests {
         );
         assert!(got.base.is_none(), "no image layer yet");
         assert_eq!(got.layers_touched, 1);
+    }
+
+    /// The size a branch will ask for has to survive the flush, which
+    /// means the relsize records go into the delta layer with the
+    /// pages and read back out of it with no memtable behind them.
+    /// This is the read a fresh connection makes of pg_authid before
+    /// it can authenticate, so nothing works until it does.
+    #[test]
+    fn a_flushed_layer_still_knows_how_long_the_fork_is() {
+        let mine = rel_on(0);
+        let mut wal = Builder::new(WAL_BASE);
+        wal.record(&[(blk(mine, 11), false)], &[1; 50]);
+        wal.record_with(&[], &trunc_body(5, mine, 1), 0x20, 2);
+        let (base, bytes) = wal.stream();
+
+        let store = MemStore::default();
+        let layout = TenantLayout::new("t");
+        let mut ingest = ShardIngest::new(cfg(0), WAL_BASE);
+        ingest.apply_frames(&[frame(base, bytes)]).unwrap();
+        ingest.flush(&store, &layout).unwrap().unwrap();
+        assert!(ingest.memtable().is_empty());
+
+        let (manifest, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let map = manifest.layer_map().unwrap();
+        let svc = crate::getpage::PageService::new(&store, layout.shard_prefix(0), None, false);
+        let fork = relsize::ForkRef {
+            spc: 1663,
+            db: 5,
+            rel: mine,
+            fork: 0,
+        };
+        assert_eq!(
+            svc.rel_size(&map, &Memtable::new(), fork, u64::MAX)
+                .unwrap(),
+            5
+        );
+        // A fork nothing extended is no blocks long, the same answer
+        // the stock smgr gives for a relation with no file.
+        let absent = relsize::ForkRef {
+            rel: mine + 1,
+            ..fork
+        };
+        assert_eq!(
+            svc.rel_size(&map, &Memtable::new(), absent, u64::MAX)
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A read below the truncate sees the fork at its old length. That
+    /// is what makes this a key in the layers rather than a number in
+    /// a manifest: a branch cut at an older lsn asks the same question
+    /// and has to get the older answer.
+    #[test]
+    fn a_size_read_at_an_older_lsn_predates_the_truncate() {
+        let mine = rel_on(0);
+        let mut wal = Builder::new(WAL_BASE);
+        wal.record(&[(blk(mine, 11), false)], &[1; 50]);
+        wal.record_with(&[], &trunc_body(5, mine, 1), 0x20, 2);
+        let (base, bytes) = wal.stream();
+        // The lsn to read at is the truncate's own, a byte short of
+        // it: a record's lsn starts past any page header, so the write
+        // position where it was appended is not it.
+        let walked =
+            walscan::read_records(&WalWindow::from_raw(base, bytes.to_vec()), WAL_BASE, None)
+                .unwrap();
+        let before = walked.records[1].lsn - 1;
+
+        let store = MemStore::default();
+        let layout = TenantLayout::new("t");
+        let mut ingest = ShardIngest::new(cfg(0), WAL_BASE);
+        ingest.apply_frames(&[frame(base, bytes)]).unwrap();
+        ingest.flush(&store, &layout).unwrap().unwrap();
+
+        let (manifest, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let map = manifest.layer_map().unwrap();
+        let svc = crate::getpage::PageService::new(&store, layout.shard_prefix(0), None, false);
+        let fork = relsize::ForkRef {
+            spc: 1663,
+            db: 5,
+            rel: mine,
+            fork: 0,
+        };
+        let mem = Memtable::new();
+        assert_eq!(svc.rel_size(&map, &mem, fork, before).unwrap(), 12);
+        assert_eq!(svc.rel_size(&map, &mem, fork, u64::MAX).unwrap(), 5);
     }
 
     #[test]
