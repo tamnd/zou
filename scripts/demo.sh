@@ -12,6 +12,15 @@ cd "$(dirname "$0")/.."
 PORT="${ZOU_DEMO_PORT:-5488}"
 PG_BIN="${ZOU_PG_BIN:-build/pg/bin}"
 
+# The second act branches, and a branch reads whatever the read path
+# this build uses would read: page runs out of a folded capture on the
+# object path, image layers out of the page shards on the other. The
+# dev server below is told to serve the object path, so every zou in
+# this script has to agree with it, and the flag only speaks to the
+# server. Without this the branch asks the page service's question of a
+# store that never ran one and refuses a branch that would have served.
+export ZOU_PAGESERVE=0
+
 say() { printf '\n== %s\n' "$*"; }
 
 say "act one: the object layer on a local directory"
