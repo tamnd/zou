@@ -13,7 +13,7 @@ authors.workspace = true
 # second, so `cargo test --workspace` on a machine that only cares about
 # the database never downloads V8 or builds swc.
 default = []
-isolate = ["dep:aes", "dep:aes-gcm", "dep:cbc", "dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:futures-util", "dep:getrandom", "dep:hmac", "dep:log", "dep:p256", "dep:rustls", "dep:serde", "dep:serde_json", "dep:sha1", "dep:sha2", "dep:tokio", "dep:tokio-rustls", "dep:tokio-tungstenite", "dep:ureq", "dep:webpki-roots"]
+isolate = ["dep:aes", "dep:aes-gcm", "dep:cbc", "dep:deno_ast", "dep:deno_core", "dep:deno_error", "dep:flate2", "dep:futures-util", "dep:getrandom", "dep:hmac", "dep:log", "dep:p256", "dep:rustls", "dep:serde", "dep:serde_json", "dep:sha1", "dep:sha2", "dep:tokio", "dep:tokio-rustls", "dep:tokio-tungstenite", "dep:ureq", "dep:webpki-roots"]
 
 [dependencies]
 zou-functions = { path = "../zou-functions" }
@@ -26,6 +26,10 @@ cbc = { workspace = true, optional = true }
 deno_ast = { version = "0.53", features = ["transpiling"], optional = true }
 deno_core = { version = "0.410", optional = true }
 deno_error = { version = "0.7", optional = true }
+# What a package arrives inside of. The tar underneath the gzip is read
+# in this crate, since a package needs the reading of tar and none of
+# the ownership, permissions or links the format also carries.
+flate2 = { workspace = true, optional = true }
 # `crypto.getRandomValues`, from the operating system and not from here.
 getrandom = { workspace = true, optional = true }
 # The same signing the server does for its own tokens, reached through
