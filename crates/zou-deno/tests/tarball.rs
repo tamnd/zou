@@ -11,9 +11,18 @@
 //!
 //! One test binary, because it sets the environment the loader reads.
 //! The first test writes the packages by hand and touches no network at
-//! all. The second is ignored, because it fetches a real package off the
-//! real registry, and an ignored test runs in its own pass, so the two
-//! are never in this process at the same time.
+//! all. The rest are ignored, because they fetch real packages off the
+//! real registry, and an ignored test runs in a pass of its own, so the
+//! hand written cache and the fetched one are never in this process at
+//! the same time.
+//!
+//! The fetching ones do run beside each other, though, so they share
+//! one cache rather than each setting the variable to a directory of
+//! its own: the loader reads that variable on every resolve and on
+//! every require, and the last writer of it was deciding what the
+//! others were allowed to read. A cache is keyed by package and version
+//! and holds any number of packages, which is what makes sharing one
+//! the honest fix rather than a way of hiding the race.
 
 #![cfg(feature = "isolate")]
 
@@ -31,6 +40,25 @@ fn package(cache: &Path, name: &str, version: &str, files: &[(&str, &str)]) {
         std::fs::create_dir_all(at.parent().expect("a directory")).expect("the package directory");
         std::fs::write(&at, body).expect("the file");
     }
+}
+
+/// The cache the fetching tests share, made once and pointed at once.
+///
+/// Every test that fetches calls this before it does anything else, so
+/// the one thread that wins the initialisation sets the variables while
+/// the others are still waiting on it and nothing is reading them yet.
+fn fetching() {
+    static CACHE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        let cache = tempfile::tempdir().expect("a temporary directory");
+        // Safety: no other thread in this binary is past this call yet,
+        // since every one of them goes through this lock first.
+        unsafe {
+            std::env::set_var("ZOU_MODULE_CACHE", cache.path());
+            std::env::set_var("ZOU_NPM", "tarball");
+        }
+        cache
+    });
 }
 
 fn deployed(source: &str) -> (tempfile::TempDir, Function) {
@@ -65,9 +93,9 @@ fn answered(function: &Function) -> String {
 #[test]
 fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
     let cache = tempfile::tempdir().expect("a temporary directory");
-    // Safety: the other test in this binary is ignored, so it runs in
-    // its own pass and there is no other thread here to read the
-    // environment while it is being set.
+    // Safety: every other test in this binary is ignored, so they run
+    // in a pass of their own and there is no other thread here to read
+    // the environment while it is being set.
     unsafe {
         std::env::set_var("ZOU_MODULE_CACHE", cache.path());
         std::env::set_var("ZOU_NPM", "tarball");
@@ -170,13 +198,7 @@ fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
 #[test]
 #[ignore]
 fn a_real_package_off_the_registry_runs_out_of_its_own_tarball() {
-    let cache = tempfile::tempdir().expect("a temporary directory");
-    // Safety: an ignored test runs in a pass of its own, so nothing
-    // else in this binary is running while this is set.
-    unsafe {
-        std::env::set_var("ZOU_MODULE_CACHE", cache.path());
-        std::env::set_var("ZOU_NPM", "tarball");
-    }
+    fetching();
     let (_dir, function) = deployed(
         r#"
         import { parse } from "npm:dotenv@^16.0.0";
@@ -192,11 +214,7 @@ fn a_real_package_off_the_registry_runs_out_of_its_own_tarball() {
 #[test]
 #[ignore]
 fn a_jsr_package_is_the_typescript_it_publishes() {
-    let cache = tempfile::tempdir().expect("a temporary directory");
-    unsafe {
-        std::env::set_var("ZOU_MODULE_CACHE", cache.path());
-        std::env::set_var("ZOU_NPM", "tarball");
-    }
+    fetching();
     let (_dir, function) = deployed(
         r#"
         import { encodeHex } from "jsr:@std/encoding@^1/hex";
@@ -212,11 +230,7 @@ fn a_jsr_package_is_the_typescript_it_publishes() {
 #[test]
 #[ignore]
 fn the_client_every_example_imports_runs_out_of_its_tarball() {
-    let cache = tempfile::tempdir().expect("a temporary directory");
-    unsafe {
-        std::env::set_var("ZOU_MODULE_CACHE", cache.path());
-        std::env::set_var("ZOU_NPM", "tarball");
-    }
+    fetching();
     let (_dir, function) = deployed(
         r#"
         import { createClient } from "npm:@supabase/supabase-js@2";
