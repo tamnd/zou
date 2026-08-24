@@ -72,6 +72,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "url" => include_str!("node/url.js"),
         "util" => include_str!("node/util.js"),
         "util/types" => include_str!("node/util_types.js"),
+        "v8" => include_str!("node/v8.js"),
         "worker_threads" => include_str!("node/worker_threads.js"),
         // The one built in here that is a real implementation rather
         // than a translation: the deflate is rust, because this binary
@@ -117,6 +118,7 @@ pub const NAMES: &[&str] = &[
     "url",
     "util",
     "util/types",
+    "v8",
     "worker_threads",
     "zlib",
 ];
@@ -296,7 +298,7 @@ mod tests {
             assert!(super::core(name), "node:{name} is not on the core list");
         }
         assert!(super::core("http"), "node has http and this does not");
-        assert!(super::core("zlib"));
+        assert!(super::core("net"), "node has net and this does not");
         assert!(!super::core("lodash"));
         assert!(!super::core("node:os"), "the prefix is taken off first");
     }
@@ -304,7 +306,7 @@ mod tests {
     #[test]
     fn a_built_in_that_is_not_here_is_not_pretended_to_be() {
         assert!(source("dgram").is_none());
-        assert!(source("v8").is_none());
+        assert!(source("net").is_none());
         assert!(source("path/nonsense").is_none());
     }
 }
