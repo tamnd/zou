@@ -40,8 +40,16 @@ pub(crate) enum Found {
 /// The conditions this runtime satisfies, most specific first.
 ///
 /// `import` rather than `require` because a specifier being resolved
-/// here came from an `import`; the require side belongs with CJS.
+/// here came from an `import`; the require side is `REQUIRE` below.
 pub(crate) const CONDITIONS: &[&str] = &["deno", "node", "import", "default"];
+
+/// The same list for a specifier that came out of a `require`.
+///
+/// Which build of a package runs turns on this one word: a package with
+/// both in its `exports` ships the module under `import` and the script
+/// under `require`, and handing a script's require the module build is
+/// how a package ends up with `undefined` where its exports should be.
+pub(crate) const REQUIRE: &[&str] = &["deno", "node", "require", "default"];
 
 /// Which file in a package a subpath means.
 ///

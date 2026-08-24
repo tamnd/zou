@@ -4658,3 +4658,145 @@ fn a_port_is_transferred_or_refused_by_name() {
     assert_eq!(said["inside"], "DataCloneError: Unsupported object type");
     assert_eq!(said["itself"], "DataCloneError: Can not transfer self");
 }
+
+/// A commonjs script, run the way the module that stands in for one
+/// runs it: the built ins imported first, then the script, then what it
+/// put on its exports.
+///
+/// Everything a script is given is in here: `require` of a built in, of
+/// a file beside it, and of a json file, plus the two names node hands
+/// a script for where it is.
+#[test]
+fn a_script_runs_with_the_five_names_node_gives_one() {
+    let deployed = written(&[
+        (
+            "index.ts",
+            r#"
+            import "zou:node";
+            const module = globalThis.__zouRequire(new URL("./thing.js", import.meta.url).href);
+            Deno.serve(() => Response.json(module.exports));
+            "#,
+        ),
+        (
+            "thing.js",
+            r#"
+            const path = require("path");
+            exports.joined = path.join("a", "b");
+            exports.borrowed = require("./other.js").value;
+            exports.named = require("./data.json").name;
+            exports.here = __filename.endsWith("/thing.js");
+            exports.beside = __dirname === path.dirname(__filename);
+            exports.itself = module.exports === exports;
+            "#,
+        ),
+        ("other.js", "module.exports = { value: 7 };\n"),
+        ("data.json", r#"{"name": "zou"}"#),
+    ]);
+    let answer = Isolate::new()
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect("an answer");
+    assert_eq!(
+        body(&answer),
+        r#"{"joined":"a/b","borrowed":7,"named":"zou","here":true,"beside":true,"itself":true}"#
+    );
+}
+
+/// Two scripts that require each other, which is a shape real packages
+/// have and which node answers by handing back what has been set so
+/// far. A runtime without that answer runs one of them twice or spins.
+#[test]
+fn two_scripts_that_require_each_other_both_finish() {
+    let deployed = written(&[
+        (
+            "index.ts",
+            r#"
+            import "zou:node";
+            const module = globalThis.__zouRequire(new URL("./one.js", import.meta.url).href);
+            Deno.serve(() => Response.json(module.exports));
+            "#,
+        ),
+        (
+            "one.js",
+            r#"
+            exports.name = "one";
+            const two = require("./two.js");
+            exports.sawFromTwo = two.sawFromOne;
+            "#,
+        ),
+        (
+            "two.js",
+            r#"
+            const one = require("./one.js");
+            exports.sawFromOne = one.name;
+            "#,
+        ),
+    ]);
+    let answer = Isolate::new()
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect("an answer");
+    assert_eq!(body(&answer), r#"{"name":"one","sawFromTwo":"one"}"#);
+}
+
+/// A require is not a way to read the disk. The two places it reads are
+/// the module cache and the function's own directory, which are the two
+/// places an import already reads, and anywhere else is a sentence
+/// saying so.
+#[test]
+fn a_require_of_somewhere_else_on_the_disk_is_refused() {
+    let answer = answered(
+        r#"
+        import "zou:node";
+        Deno.serve(() => {
+          try {
+            globalThis.__zouRequire("file:///etc/hosts");
+            return new Response("read it");
+          } catch (why) {
+            return new Response(String(why.message ?? why));
+          }
+        });
+        "#,
+    );
+    assert!(
+        body(&answer).contains("nor in this function's own directory"),
+        "{}",
+        body(&answer)
+    );
+}
+
+/// The built ins arrive as one module, so that a script asking for one
+/// in the middle of running has an answer already. A name this runtime
+/// does not have says which name it was.
+#[test]
+fn a_built_in_this_runtime_does_not_have_is_named_in_the_refusal() {
+    let deployed = written(&[
+        (
+            "index.ts",
+            r#"
+            import "zou:node";
+            const url = new URL("./thing.js", import.meta.url).href;
+            Deno.serve(() => {
+              try {
+                globalThis.__zouRequire(url);
+                return new Response("ran");
+              } catch (why) {
+                return new Response(String(why.message ?? why));
+              }
+            });
+            "#,
+        ),
+        ("thing.js", r#"exports.it = require("node:dgram");"#),
+    ]);
+    let answer = Isolate::new()
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect("an answer");
+    assert!(body(&answer).contains("dgram"), "{}", body(&answer));
+}

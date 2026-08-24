@@ -16,14 +16,20 @@
 //! Deno uses for it, and a name it guessed wrong is a name that is
 //! `undefined` rather than a module that will not compile.
 //!
-//! What is here is the reading and the module text it produces. Running
-//! the script is the loader's half and arrives with it.
+//! What is here is both halves of it: the reading, the module text it
+//! produces, and the two ops that text's `require` runs on. What is not
+//! here is the loader deciding to produce that text at all, which is
+//! the last piece and arrives with the change that makes an `npm:`
+//! import mean the tarball rather than a url on a registry.
 
-// The caller is that half.
+// The caller of the reading is that change.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
 use std::path::Path;
+
+use deno_core::{OpState, op2};
+use deno_error::JsErrorBox;
 
 use crate::tree::{Reached, Tree};
 
@@ -141,7 +147,7 @@ fn walk(
         if spec.starts_with("node:") {
             continue;
         }
-        let Ok(next) = tree.resolve(&spec, from) else {
+        let Ok(next) = tree.required(&spec, from) else {
             continue;
         };
         walk(tree, &next, found, seen, left - 1)?;
@@ -216,6 +222,12 @@ fn usable(name: &str) -> bool {
 /// through the default.
 pub(crate) fn wrapper(url: &str, names: &[String]) -> String {
     let mut module = String::new();
+    // First, because the script it is about to run may call `require`
+    // for a built in before it does anything else, and an import that
+    // is written first is evaluated first.
+    module.push_str("import \"");
+    module.push_str(crate::module::BUILTINS);
+    module.push_str("\";\n");
     module.push_str("const module = globalThis.__zouRequire(");
     module.push_str(&json(url));
     module.push_str(");\nexport default module.exports;\n");
@@ -231,6 +243,121 @@ pub(crate) fn wrapper(url: &str, names: &[String]) -> String {
 /// escaping.
 fn json(text: &str) -> String {
     serde_json::Value::String(text.to_string()).to_string()
+}
+
+/// One script, as the thing javascript needs to run one.
+#[derive(serde::Serialize)]
+pub(crate) struct Script {
+    /// The source, which the require wraps in a function and calls.
+    text: String,
+    /// Whether it is data rather than code. A json file is required all
+    /// the time, by every package that reads its own version number out
+    /// of its manifest, and what a require of one hands back is the
+    /// parsed value.
+    data: bool,
+    /// The file itself, since a script is handed `__filename` and works
+    /// out `__dirname` from it.
+    path: String,
+}
+
+/// The source of the file a require landed on.
+///
+/// Two places on the disk are readable this way and no others: the
+/// module cache, where a package that was fetched was unpacked, and the
+/// directory the function was deployed into. Both are places the module
+/// loader would already read a file out of, so nothing is reachable
+/// through a require that was not reachable through an import, which is
+/// the whole rule.
+#[op2]
+#[serde]
+pub(crate) fn op_zou_cjs_read(
+    state: &mut OpState,
+    #[string] url: String,
+) -> Result<Script, JsErrorBox> {
+    let at = file(&url)?;
+    let root = &state.borrow::<crate::isolate::Owned>().root;
+    if !at.starts_with(crate::module::cache()) && !at.starts_with(root) {
+        return Err(JsErrorBox::type_error(format!(
+            "{} is neither in the module cache nor in this function's own directory, so it is not a script this function can require",
+            at.display()
+        )));
+    }
+    let text = std::fs::read_to_string(&at)
+        .map_err(|e| JsErrorBox::type_error(format!("{}: {e}", at.display())))?;
+    Ok(Script {
+        data: at.extension().and_then(|it| it.to_str()) == Some("json"),
+        path: at.to_string_lossy().to_string(),
+        text,
+    })
+}
+
+/// What a specifier inside a script means, as the url of the file it
+/// landed on, or as `node:` and a name for a built in.
+///
+/// The resolution is the same one an import goes through, asked under
+/// the require conditions, so a package that ships two builds hands the
+/// script the build it wrote for a script.
+#[op2]
+#[string]
+pub(crate) fn op_zou_cjs_resolve(
+    #[string] spec: String,
+    #[string] from: String,
+) -> Result<String, JsErrorBox> {
+    let name = spec.strip_prefix("node:").unwrap_or(&spec);
+    if crate::node::source(name).is_some() {
+        return Ok(format!("node:{name}"));
+    }
+    if spec.starts_with("node:") {
+        return Err(JsErrorBox::type_error(format!(
+            "there is no node built in {name} here, so require(\"{spec}\") has no answer"
+        )));
+    }
+    let at = file(&from)?;
+    let asking = Reached {
+        root: rooted(&at),
+        at,
+    };
+    let tree = Tree::at(&crate::module::cache());
+    let reached = tree
+        .required(&spec, &asking)
+        .map_err(|why| JsErrorBox::type_error(format!("require(\"{spec}\"): {why}")))?;
+    deno_core::ModuleSpecifier::from_file_path(&reached.at)
+        .map(|it| it.to_string())
+        .map_err(|()| JsErrorBox::type_error(format!("{} is not a path", reached.at.display())))
+}
+
+/// The package a file belongs to, which is the nearest manifest above
+/// it that names a package.
+///
+/// Nearest and named, because a package ships manifests that are not
+/// its own: a `dist/package.json` saying `{"type": "module"}` is a
+/// package telling node how to read one directory, and answering a
+/// dependency out of it would be answering out of a manifest that
+/// declares nothing. A file with no manifest above it at all is its own
+/// island, which is what a script beside a function's `index.ts` is.
+fn rooted(at: &Path) -> std::path::PathBuf {
+    let mut walking = at.parent();
+    while let Some(directory) = walking {
+        let manifest = directory.join("package.json");
+        if manifest.is_file()
+            && crate::resolve::manifest(directory)
+                .ok()
+                .and_then(|it| it.get("name").cloned())
+                .is_some()
+        {
+            return directory.to_path_buf();
+        }
+        walking = directory.parent();
+    }
+    at.parent().unwrap_or(at).to_path_buf()
+}
+
+/// A file url as the file it names.
+fn file(url: &str) -> Result<std::path::PathBuf, JsErrorBox> {
+    deno_core::ModuleSpecifier::parse(url)
+        .ok()
+        .and_then(|it| it.to_file_path().ok())
+        .ok_or_else(|| JsErrorBox::type_error(format!("{url} is not a file this can be read from")))
 }
 
 #[cfg(test)]
@@ -339,6 +466,7 @@ mod tests {
     #[test]
     fn the_module_that_stands_in_for_a_script_runs_it_and_hands_back_what_it_set() {
         let text = wrapper("file:///a/index.js", &["one".into(), "two".into()]);
+        assert!(text.contains(r#"import "zou:node";"#), "{text}");
         assert!(
             text.contains(r#"__zouRequire("file:///a/index.js")"#),
             "{text}"
