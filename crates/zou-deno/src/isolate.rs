@@ -29,7 +29,9 @@ use zou_functions::Policy;
 
 use crate::inspector::Inspector;
 use crate::limits::{Limits, Watch};
-use crate::{cjs, crypto, fetch, inspector, limits, module, pool, socket, timer, url, websocket};
+use crate::{
+    cjs, crypto, fetch, inspector, limits, module, pool, socket, timer, url, websocket, zlib,
+};
 
 /// What the isolate has whether or not a call is in it: the function's
 /// environment and the files it may read.
@@ -483,7 +485,11 @@ deno_core::extension!(
         websocket::op_zou_ws_send_text,
         websocket::op_zou_ws_send_bytes,
         websocket::op_zou_ws_close,
-        websocket::op_zou_ws_drop
+        websocket::op_zou_ws_drop,
+        zlib::op_zou_zlib_open,
+        zlib::op_zou_zlib_write,
+        zlib::op_zou_zlib_end,
+        zlib::op_zou_zlib_drop
     ]
 );
 
@@ -947,6 +953,7 @@ async fn build(
         .put(websocket::Sockets::default());
     js.op_state().borrow_mut().put(socket::Streams::default());
     js.op_state().borrow_mut().put(fetch::Calls::default());
+    js.op_state().borrow_mut().put(zlib::Jobs::default());
 
     // The prelude is the value of its own last expression, so the two
     // entry points are held here and never on an object the function
