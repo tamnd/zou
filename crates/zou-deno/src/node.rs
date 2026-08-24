@@ -101,6 +101,83 @@ pub const NAMES: &[&str] = &[
     "worker_threads",
 ];
 
+/// Every name node itself carries a built in under, whether or not this
+/// runtime has one.
+///
+/// This is a different list from `NAMES` and it is a different question.
+/// `NAMES` is what this binary can answer with. This is what counts as a
+/// core module at all, and the rule it exists for is node's: a bare
+/// specifier that names a core module is the core module, without the
+/// package's manifest being asked about it. `import os from 'os'` is a
+/// real line in `postgres/src/index.js`, and no package declares a
+/// dependency on `os` because there is nothing to declare.
+///
+/// So a name on this list and not on the other one is a refusal by name,
+/// which is the honest answer, rather than a sentence about a manifest
+/// that was never going to mention it.
+pub const CORE: &[&str] = &[
+    "assert",
+    "assert/strict",
+    "async_hooks",
+    "buffer",
+    "child_process",
+    "cluster",
+    "console",
+    "constants",
+    "crypto",
+    "dgram",
+    "diagnostics_channel",
+    "dns",
+    "dns/promises",
+    "domain",
+    "events",
+    "fs",
+    "fs/promises",
+    "http",
+    "http2",
+    "https",
+    "inspector",
+    "inspector/promises",
+    "module",
+    "net",
+    "os",
+    "path",
+    "path/posix",
+    "path/win32",
+    "perf_hooks",
+    "process",
+    "punycode",
+    "querystring",
+    "readline",
+    "readline/promises",
+    "repl",
+    "stream",
+    "stream/consumers",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "sys",
+    "timers",
+    "timers/promises",
+    "tls",
+    "trace_events",
+    "tty",
+    "url",
+    "util",
+    "util/types",
+    "v8",
+    "vm",
+    "wasi",
+    "worker_threads",
+    "zlib",
+];
+
+/// Whether a bare name is a core module, which decides whether it is one
+/// at all rather than whether this runtime has it.
+pub fn core(name: &str) -> bool {
+    CORE.contains(&name)
+}
+
 /// A module that puts every built in where a `require` can reach it.
 ///
 /// A script cannot `import`. It calls `require("path")` in the middle of
@@ -187,6 +264,21 @@ mod tests {
             );
         }
         assert!(module.contains("globalThis.__zouBuiltins"), "{module}");
+    }
+
+    /// Everything this carries is a core module, and core is the larger
+    /// list of the two. A name that fell off the larger one would be a
+    /// bare `import os from 'os'` inside a package looking for a
+    /// dependency named os, which is the bug #643 is.
+    #[test]
+    fn what_this_carries_is_a_subset_of_what_node_calls_core() {
+        for name in super::NAMES {
+            assert!(super::core(name), "node:{name} is not on the core list");
+        }
+        assert!(super::core("http"), "node has http and this does not");
+        assert!(super::core("zlib"));
+        assert!(!super::core("lodash"));
+        assert!(!super::core("node:os"), "the prefix is taken off first");
     }
 
     #[test]
