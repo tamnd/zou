@@ -304,7 +304,13 @@ pub(crate) fn op_zou_cjs_resolve(
     #[string] from: String,
 ) -> Result<String, JsErrorBox> {
     let name = spec.strip_prefix("node:").unwrap_or(&spec);
-    if crate::node::source(name).is_some() {
+    // A core module wins over anything a package declares, which is
+    // node's rule and the reason `require("events")` inside a package
+    // that depends on the npm package of that name is still the built
+    // in. A name node has and this does not is answered as `node:` all
+    // the same, so the refusal names the built in that is missing
+    // rather than a manifest that was never going to mention it.
+    if crate::node::source(name).is_some() || crate::node::core(name) {
         return Ok(format!("node:{name}"));
     }
     if spec.starts_with("node:") {

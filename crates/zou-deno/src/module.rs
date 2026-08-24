@@ -240,6 +240,14 @@ impl Disk {
                 ))),
             });
         }
+        // A core module before the manifest, because node resolves a
+        // bare name that is one to the built in without asking, and a
+        // package does not declare a dependency on `os`. A name node has
+        // and this does not still answers `node:`, so the refusal names
+        // the built in rather than the manifest.
+        if crate::node::core(specifier) {
+            return Some(url(&format!("node:{specifier}")));
+        }
         let (name, sub) = crate::tree::split(specifier);
         let want = crate::tree::declared(&root, &name)?;
         let tail = sub.trim_start_matches('.');
@@ -1363,6 +1371,45 @@ mod tests {
         // at, which is the tree's rule and is why this asks the
         // manifest at all.
         let refused = disk.resolve("left-pad", referrer.as_str(), ResolutionKind::Import);
+        assert!(refused.is_err(), "{refused:?}");
+    }
+
+    /// A bare core module name inside a package is the core module,
+    /// whether or not this runtime carries one under that name. Node's
+    /// rule, and the reason `postgres/src/index.js` can write `import os
+    /// from 'os'` without declaring a dependency on os.
+    #[test]
+    fn a_bare_core_module_name_inside_a_package_is_the_built_in() {
+        let cache = tempfile::tempdir().expect("a temporary cache");
+        let root = cache.path().join("npm").join("asks").join("1.0.0");
+        std::fs::create_dir_all(&root).expect("a package");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name": "asks", "version": "1.0.0"}"#,
+        )
+        .expect("a manifest");
+        std::fs::write(root.join("index.js"), "import os from 'os';\n").expect("a file");
+        let disk = Disk {
+            npm: Npm::Tarball,
+            cache: cache.path().to_path_buf(),
+            ..loader()
+        };
+        let referrer = ModuleSpecifier::from_file_path(root.join("index.js")).expect("a url");
+        let answer = disk
+            .resolve("os", referrer.as_str(), ResolutionKind::Import)
+            .expect("a specifier");
+        assert_eq!(answer.as_str(), "node:os");
+        // A name node has and this does not is answered the same way, so
+        // that the refusal names the built in rather than a manifest
+        // that was never going to mention it.
+        let answer = disk
+            .resolve("http", referrer.as_str(), ResolutionKind::Import)
+            .expect("a specifier");
+        assert_eq!(answer.as_str(), "node:http");
+        // And a bare name that is not a core module is still the
+        // manifest's business, which this package's manifest has nothing
+        // to say about.
+        let refused = disk.resolve("lodash", referrer.as_str(), ResolutionKind::Import);
         assert!(refused.is_err(), "{refused:?}");
     }
 

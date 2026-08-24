@@ -59,8 +59,9 @@ fn answered(function: &Function) -> String {
 
 /// The whole of it, off a cache written by hand: a package that ships
 /// commonjs, a dependency reached by the range the package declared, a
-/// built in asked for in the middle of a script, and both the named
-/// export and the default an importer of a script asks for.
+/// built in asked for in the middle of a script under the bare name
+/// node lets a package use for one, and both the named export and the
+/// default an importer of a script asks for.
 #[test]
 fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
     let cache = tempfile::tempdir().expect("a temporary directory");
@@ -88,11 +89,39 @@ fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
             (
                 "index.js",
                 r#"
-                const path = require("node:path");
+                const path = require("path");
                 const shouty = require("shouty");
                 exports.greet = (who) => shouty.shout(`hello ${who}`);
                 exports.where = path.basename(__filename);
+                // A core module node has and this does not, asked for
+                // the way a package that ships two implementations of
+                // something asks: in a try, to find out.
+                try {
+                  require("dgram");
+                } catch (why) {
+                  exports.missing = String(why.message ?? why);
+                }
                 "#,
+            ),
+        ],
+    );
+    package(
+        cache.path(),
+        "esmy",
+        "1.0.0",
+        &[
+            (
+                "package.json",
+                r#"{
+                  "name": "esmy",
+                  "version": "1.0.0",
+                  "type": "module",
+                  "exports": { ".": "./mod.js" }
+                }"#,
+            ),
+            (
+                "mod.js",
+                "import path from \"path\";\nexport const base = path.basename(\"/one/two.js\");\n",
             ),
         ],
     );
@@ -113,17 +142,20 @@ fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
     );
     let (_dir, function) = deployed(
         r#"
-        import greeter, { greet, where } from "npm:greeter@^1.0.0";
+        import greeter, { greet, where, missing } from "npm:greeter@^1.0.0";
+        import { base } from "npm:esmy@1";
         Deno.serve(() => Response.json({
           said: greet("world"),
           where,
+          base,
+          missing,
           default: typeof greeter.greet,
         }));
         "#,
     );
     assert_eq!(
         answered(&function),
-        r#"{"said":"HELLO WORLD","where":"index.js","default":"function"}"#
+        r#"{"said":"HELLO WORLD","where":"index.js","base":"two.js","missing":"node:dgram is a node built in this runtime does not have","default":"function"}"#
     );
 }
 
