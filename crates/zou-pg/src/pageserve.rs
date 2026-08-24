@@ -24,6 +24,14 @@
 //! reads name the replay position instead, since the startup process
 //! knows the lsn it needs better than any watermark does.
 //!
+//! A request asks for a run of blocks of one fork, or, with a block
+//! count of zero, for the fork's length. Zero used to be a protocol
+//! error that dropped the connection, so no client in the field sends
+//! it and the two shapes can share one request header. A length comes
+//! back as four bytes behind the same ok status, and since a client
+//! knows what it asked for the two answers never have to be told
+//! apart on the wire.
+//!
 //! An ingest error freezes the applied watermark. Waiting requests
 //! then time out and read as errors at the smgr, loud and safe: with
 //! eager page puts elided there is no stale fallback worth serving.
@@ -135,19 +143,34 @@ fn merge_every(retention_secs: u64) -> Option<Duration> {
     }
 }
 
-/// One read request as the driver sees it: a run of blocks of one
-/// fork, the lsn the reader needs covered, and the channel the pages
-/// go back on.
+/// What a request wants of one fork. A batch of blocks is the wire
+/// request with a block count on it; a block count of zero is a size
+/// request, which used to be a protocol error and so is a shape no
+/// client in the field ever sends.
+enum Want {
+    Pages(Vec<u32>),
+    Size,
+}
+
+/// What one request gets back, matching what it asked for.
+enum Answer {
+    Pages(Vec<Vec<u8>>),
+    Size(u32),
+}
+
+/// One read request as the driver sees it: one fork, what is wanted of
+/// it, the lsn the reader needs covered, and the channel the answer
+/// goes back on.
 struct GetReq {
     spc: u32,
     db: u32,
     rel: u32,
     fork: u32,
-    blks: Vec<u32>,
+    want: Want,
     lsn: u64,
     arrived: Instant,
     deadline: Instant,
-    reply: SyncSender<Result<Vec<Vec<u8>>, String>>,
+    reply: SyncSender<Result<Answer, String>>,
 }
 
 /// The client half, one per backend process. A connection is opened
@@ -181,17 +204,54 @@ impl PageClient {
         if blks.is_empty() || blks.len() > MAX_GETPAGE_BATCH {
             return Err(format!("bad batch of {} blocks", blks.len()));
         }
+        let head = Head {
+            spc,
+            db,
+            rel,
+            fork,
+            lsn,
+        };
+        self.ask(|sock| round_trip(sock, head, blks))
+    }
+
+    /// How many blocks long the fork is as of `lsn`, folded out of the
+    /// layers. This is the answer `smgr nblocks` needs on a branch,
+    /// where the parent's `pg/` prefix says nothing about what the
+    /// branch has done since.
+    pub fn get_size(
+        &self,
+        spc: u32,
+        db: u32,
+        rel: u32,
+        fork: u32,
+        lsn: u64,
+    ) -> Result<u32, String> {
+        let head = Head {
+            spc,
+            db,
+            rel,
+            fork,
+            lsn,
+        };
+        self.ask(|sock| round_trip_size(sock, head))
+    }
+
+    /// Run one exchange on the kept connection, with one retry on a
+    /// fresh one: the server restarts with its worker and an idle
+    /// connection can be the stale half of the previous incarnation. A
+    /// server side error is not a transport error and does not retry.
+    fn ask<T>(
+        &self,
+        exchange: impl Fn(&mut UnixStream) -> std::io::Result<T>,
+    ) -> Result<T, String> {
         let mut conn = self.conn.lock().map_err(|_| "client mutex poisoned")?;
-        // One retry with a fresh connection: the server restarts with
-        // its worker and an idle connection can be the stale half of
-        // the previous incarnation.
         for attempt in 0..2 {
             if conn.is_none() {
                 *conn = Some(self.connect()?);
             }
             let sock = conn.as_mut().expect("connected above");
-            match round_trip(sock, spc, db, rel, fork, blks, lsn) {
-                Ok(pages) => return Ok(pages),
+            match exchange(sock) {
+                Ok(got) => return Ok(got),
                 Err(e) if e.kind() == ErrorKind::Other => {
                     // The server answered with its own error text, the
                     // connection is still in protocol.
@@ -241,37 +301,56 @@ impl PageClient {
     }
 }
 
-fn round_trip(
-    sock: &mut UnixStream,
+/// The fixed part of every request: which fork, and as of when.
+#[derive(Clone, Copy)]
+struct Head {
     spc: u32,
     db: u32,
     rel: u32,
     fork: u32,
-    blks: &[u32],
     lsn: u64,
-) -> std::io::Result<Vec<Vec<u8>>> {
-    let mut req = Vec::with_capacity(32 + 4 * blks.len());
-    req.extend_from_slice(&MAGIC.to_le_bytes());
-    req.extend_from_slice(&lsn.to_le_bytes());
-    for v in [spc, db, rel, fork, blks.len() as u32] {
-        req.extend_from_slice(&v.to_le_bytes());
+}
+
+impl Head {
+    /// The 32 byte header, with the block count a caller is about to
+    /// send that many block numbers for. Zero of them asks for the
+    /// fork's length instead.
+    fn bytes(&self, n: usize) -> Vec<u8> {
+        let mut req = Vec::with_capacity(32 + 4 * n);
+        req.extend_from_slice(&MAGIC.to_le_bytes());
+        req.extend_from_slice(&self.lsn.to_le_bytes());
+        for v in [self.spc, self.db, self.rel, self.fork, n as u32] {
+            req.extend_from_slice(&v.to_le_bytes());
+        }
+        req
     }
+}
+
+/// The status word, turning a server side refusal into an error
+/// carrying its text. Everything after it is the answer's own shape.
+fn read_status(sock: &mut UnixStream) -> std::io::Result<()> {
+    let mut status = [0u8; 4];
+    sock.read_exact(&mut status)?;
+    if u32::from_le_bytes(status) == 0 {
+        return Ok(());
+    }
+    let mut len = [0u8; 4];
+    sock.read_exact(&mut len)?;
+    let len = u32::from_le_bytes(len).min(64 << 10) as usize;
+    let mut msg = vec![0u8; len];
+    sock.read_exact(&mut msg)?;
+    Err(std::io::Error::other(
+        String::from_utf8_lossy(&msg).to_string(),
+    ))
+}
+
+fn round_trip(sock: &mut UnixStream, head: Head, blks: &[u32]) -> std::io::Result<Vec<Vec<u8>>> {
+    let mut req = head.bytes(blks.len());
     for b in blks {
         req.extend_from_slice(&b.to_le_bytes());
     }
     sock.write_all(&req)?;
-    let mut status = [0u8; 4];
-    sock.read_exact(&mut status)?;
-    if u32::from_le_bytes(status) != 0 {
-        let mut len = [0u8; 4];
-        sock.read_exact(&mut len)?;
-        let len = u32::from_le_bytes(len).min(64 << 10) as usize;
-        let mut msg = vec![0u8; len];
-        sock.read_exact(&mut msg)?;
-        return Err(std::io::Error::other(
-            String::from_utf8_lossy(&msg).to_string(),
-        ));
-    }
+    read_status(sock)?;
     let mut pages = Vec::with_capacity(blks.len());
     for _ in blks {
         let mut page = vec![0u8; BLCKSZ];
@@ -279,6 +358,14 @@ fn round_trip(
         pages.push(page);
     }
     Ok(pages)
+}
+
+fn round_trip_size(sock: &mut UnixStream, head: Head) -> std::io::Result<u32> {
+    sock.write_all(&head.bytes(0))?;
+    read_status(sock)?;
+    let mut n = [0u8; 4];
+    sock.read_exact(&mut n)?;
+    Ok(u32::from_le_bytes(n))
 }
 
 /// Everything the server needs to run. `redo` is optional only for
@@ -401,26 +488,31 @@ fn connection(mut sock: UnixStream, tx: Sender<GetReq>, stop: Arc<AtomicBool>) {
             *w = u32::from_le_bytes(head[12 + 4 * i..16 + 4 * i].try_into().expect("4 bytes"));
         }
         let [spc, db, rel, fork, n] = words;
-        if n == 0 || n as usize > MAX_GETPAGE_BATCH {
+        if n as usize > MAX_GETPAGE_BATCH {
             return;
         }
-        let mut raw = vec![0u8; 4 * n as usize];
-        if sock.read_exact(&mut raw).is_err() {
-            return;
-        }
-        let blks: Vec<u32> = raw
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes(*c))
-            .collect();
+        let want = if n == 0 {
+            Want::Size
+        } else {
+            let mut raw = vec![0u8; 4 * n as usize];
+            if sock.read_exact(&mut raw).is_err() {
+                return;
+            }
+            Want::Pages(
+                raw.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
+                    .collect(),
+            )
+        };
         let (reply_tx, reply_rx) = sync_channel(1);
         let req = GetReq {
             spc,
             db,
             rel,
             fork,
-            blks,
+            want,
             lsn,
             arrived: Instant::now(),
             deadline: Instant::now() + WAIT_CAP,
@@ -443,7 +535,8 @@ fn connection(mut sock: UnixStream, tx: Sender<GetReq>, stop: Arc<AtomicBool>) {
             Err(RecvTimeoutError::Disconnected) => Err("page service driver is gone".to_string()),
         };
         let ok = match answer {
-            Ok(pages) => respond_pages(&mut sock, &pages).is_ok(),
+            Ok(Answer::Pages(pages)) => respond_pages(&mut sock, &pages).is_ok(),
+            Ok(Answer::Size(n)) => respond_size(&mut sock, n).is_ok(),
             Err(e) => respond_err(&mut sock, &e).is_ok(),
         };
         if !ok {
@@ -458,6 +551,15 @@ fn respond_pages(sock: &mut UnixStream, pages: &[Vec<u8>]) -> std::io::Result<()
         sock.write_all(page)?;
     }
     Ok(())
+}
+
+/// The answer to a size request: the same ok status, then the block
+/// count. A client that asked for pages never sees this and a client
+/// that asked for a size never sees pages, so the two share a status
+/// word without ambiguity.
+fn respond_size(sock: &mut UnixStream, n: u32) -> std::io::Result<()> {
+    sock.write_all(&0u32.to_le_bytes())?;
+    sock.write_all(&n.to_le_bytes())
 }
 
 fn respond_err(sock: &mut UnixStream, msg: &str) -> std::io::Result<()> {
@@ -1243,19 +1345,32 @@ fn serve(
     at: u64,
     last: bool,
 ) -> Served {
-    let refs: Vec<BlockRef> = req
-        .blks
-        .iter()
-        .map(|&blk| BlockRef {
-            spc: req.spc,
-            db: req.db,
-            rel: req.rel,
-            fork: req.fork,
-            blk,
-        })
-        .collect();
-    let answer = match service.get_pages(map, mem, &refs, at) {
-        Ok(pages) => Ok(pages),
+    let got = match &req.want {
+        Want::Pages(blks) => {
+            let refs: Vec<BlockRef> = blks
+                .iter()
+                .map(|&blk| BlockRef {
+                    spc: req.spc,
+                    db: req.db,
+                    rel: req.rel,
+                    fork: req.fork,
+                    blk,
+                })
+                .collect();
+            service.get_pages(map, mem, &refs, at).map(Answer::Pages)
+        }
+        Want::Size => {
+            let fork = crate::relsize::ForkRef {
+                spc: req.spc,
+                db: req.db,
+                rel: req.rel,
+                fork: req.fork as u8,
+            };
+            service.rel_size(map, mem, fork, at).map(Answer::Size)
+        }
+    };
+    let answer = match got {
+        Ok(answer) => Ok(answer),
         Err(GetPageError::Read(ReadError::Missing { name })) if !last => {
             return Served::Stale { layer: name };
         }
@@ -1313,6 +1428,69 @@ mod tests {
             .expect("served");
         assert_eq!(pages[0], page, "the frozen image came back whole");
         assert_eq!(pages[1], vec![0u8; BLCKSZ], "an absent block is zeros");
+        srv.stop();
+    }
+
+    /// The other request shape: a block count of zero asks how long
+    /// the fork is, and the answer folds the relsize keys the layers
+    /// carry, the same ones compaction images.
+    #[test]
+    fn a_size_comes_back_over_the_socket() {
+        use zou_store::layer::{ImageBuilder, LayerKey};
+        use zou_store::layermap::LayerDesc;
+        use zou_store::shardmanifest::{LayerEntry, publish_layer};
+
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        let mut images = ImageBuilder::new(Lsn(100), 8192);
+        let mut sized = vec![0u8; BLCKSZ];
+        sized[..crate::relsize::REC_LEN]
+            .copy_from_slice(&crate::relsize::SizeRec::Set(12).encode());
+        images
+            .push(LayerKey::page(1663, 5, 2000, 0, 3), &vec![7u8; BLCKSZ])
+            .expect("image pushes");
+        images
+            .push(LayerKey::relsize(1663, 5, 2000, 0), &sized)
+            .expect("image pushes");
+        let (bytes, footer) = images.finish().expect("image layer builds");
+        let desc = LayerDesc::from_footer(&footer, bytes.len() as u64);
+        store
+            .put(
+                &format!("{}{}", layout.shard_prefix(0), desc.name()),
+                &bytes,
+            )
+            .expect("layer lands");
+        publish_layer(
+            &*store,
+            &layout.shard_manifest(0),
+            0,
+            &LayerEntry {
+                name: desc.name(),
+                size: bytes.len() as u64,
+                owner: None,
+                upto: None,
+            },
+            footer.max_lsn,
+        )
+        .expect("published");
+
+        let sock = sock_path("size.sock");
+        let mut srv = server(Arc::clone(&store), sock.clone());
+        let client = PageClient::new(sock);
+        assert_eq!(
+            client.get_size(1663, 5, 2000, 0, 0).expect("served"),
+            12,
+            "the imaged length is what the fork is"
+        );
+        assert_eq!(
+            client.get_size(1663, 5, 2000, 1, 0).expect("served"),
+            0,
+            "a fork nothing ever wrote is no blocks long"
+        );
+        // The connection is still in protocol afterwards, which is
+        // the thing a shared status word could have broken.
+        let pages = client.get_pages(1663, 5, 2000, 0, &[3], 0).expect("served");
+        assert_eq!(pages[0], vec![7u8; BLCKSZ]);
         srv.stop();
     }
 
@@ -2063,7 +2241,7 @@ mod tests {
             db: 5,
             rel: 2000,
             fork: 0,
-            blks: vec![3],
+            want: Want::Pages(vec![3]),
             lsn: 0,
             arrived: Instant::now(),
             deadline: Instant::now() + WAIT_CAP,
@@ -2079,10 +2257,13 @@ mod tests {
             &req,
             200,
         );
-        let pages = answers
+        let answer = answers
             .recv()
             .expect("the driver replied")
             .expect("the read survived the collected layer");
+        let Answer::Pages(pages) = answer else {
+            panic!("a page request is answered with pages");
+        };
         assert_eq!(pages[0], page, "the image served the page");
         assert!(
             !map.layers().iter().any(|d| d.name() == gone),
