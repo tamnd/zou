@@ -564,10 +564,15 @@ import { z } from "npm:zod@3.23.8"
 import { encodeHex } from "jsr:@std/encoding@1/hex"
 ```
 
-They are not resolved the way Deno resolves them.
-There is no node module resolution here, no `package.json` walk and no CJS.
+By default they are not resolved the way Deno resolves them.
 Both specifiers are rewritten to a url on a registry that serves packages as modules, `esm.sh` by default, and from there a package is an ordinary graph of `https:` imports.
 What runs is the registry's build of the package rather than the tarball npm would have unpacked, which is worth knowing before reporting a difference in behaviour to a package's author.
+
+`ZOU_NPM=tarball` is the other answer, and it is the one Deno gives.
+An `npm:` specifier then means the tarball npm publishes: the package is fetched off the npm registry, its integrity checked, unpacked under the module cache, and resolved with node's own rules, so `exports` decides which file a subpath is, `dependencies` decides what a bare name inside the package means, and a package that ships commonjs is run as commonjs, `require`, `module.exports` and all.
+Two versions of the same package are two directories rather than one guess, and a package that imports something it never declared is refused rather than resolved by accident.
+`jsr:` still goes to the registry either way.
+This is newer than the other answer and is off by default until the examples corpus says it runs more code, which is the only thing that decides it.
 
 - Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
 - A package that reaches for a node built in runs if the built in is one of the ones below, and is refused by the name of the one it wanted if it is not.
@@ -648,6 +653,7 @@ Everything fetched is kept on disk, keyed by url, so only the first cold start p
 - `ZOU_MODULE_CACHE` is where, and defaults to `$XDG_CACHE_HOME/zou/modules` or `~/.cache/zou/modules`.
 - `ZOU_MODULE_CACHE_ONLY=1` means this server does not fetch. A module that is not in the cache is refused by name rather than reached for, which is what a deployment that warmed its cache somewhere else wants.
 - `ZOU_MODULE_REGISTRY` points `npm:` and `jsr:` at a mirror instead of esm.sh.
+- `ZOU_NPM=tarball` makes an `npm:` import mean the tarball off the npm registry, unpacked under `<cache>/npm/<name>/<version>` and resolved the way node resolves one, instead of a url on esm.sh. `ZOU_NPM_REGISTRY` points that at a mirror of npm instead of `https://registry.npmjs.org`.
 - `ZOU_MODULE_BUILD` is the query a package is asked for with, `dev` by default, and empty for whatever the registry serves without being asked. A cache is keyed by the url, so a cache warmed one way and read the other way fetches again rather than serving the other build.
 - `ZOU_MODULE_AGENT` is who the registry is asked as, and is nobody by default. esm.sh reads the user agent and serves a different build for it, a browser one that stubs the platform out and a Deno one that imports `node:`, and which of the two runs more of somebody's code is a thing to measure rather than to assume. `ZOU_MODULE_AGENT=deno` is the runtime's own agent without writing the string out, and any other value is sent as it stands. Setting it also turns the 5xx fallback off, since the fallback is the ask this replaces.
 

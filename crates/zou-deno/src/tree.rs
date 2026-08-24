@@ -172,7 +172,7 @@ impl Tree {
 /// and following it is a guess, but the alternative is refusing a great
 /// deal of code that works, so the guess is made and the range is the
 /// one the package named.
-fn declared(root: &Path, name: &str) -> Option<String> {
+pub(crate) fn declared(root: &Path, name: &str) -> Option<String> {
     let manifest = resolve::manifest(root).ok()?;
     ["dependencies", "optionalDependencies", "peerDependencies"]
         .iter()
@@ -226,7 +226,7 @@ fn around(at: &Path) -> Option<PathBuf> {
 }
 
 /// A specifier into the package it names and the subpath after it.
-fn split(spec: &str) -> (String, String) {
+pub(crate) fn split(spec: &str) -> (String, String) {
     let parts: Vec<&str> = spec.splitn(4, '/').collect();
     let (name, rest) = match spec.starts_with('@') {
         true => (

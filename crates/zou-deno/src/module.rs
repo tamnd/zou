@@ -8,15 +8,21 @@
 //! there rather than a second interpretation of the language.
 //!
 //! The second job is everything a function imports that is not beside
-//! it. `npm:` and `jsr:` are what the examples are written with, and
-//! neither is resolved the way Deno resolves it: there is no node
-//! module resolution here, no `package.json` walk and no CJS. Both are
-//! rewritten to a url on a registry that serves
-//! packages as modules, `esm.sh` by default, and from there a package
-//! is an ordinary graph of `https:` imports that this loader has to
-//! handle anyway. What that costs is written down in
-//! `docs/functions.md`: what runs is the registry's build of the
-//! package rather than the tarball npm would have unpacked.
+//! it. `npm:` and `jsr:` are what the examples are written with, and by
+//! default neither is resolved the way Deno resolves it: both are
+//! rewritten to a url on a registry that serves packages as modules,
+//! `esm.sh` by default, and from there a package is an ordinary graph
+//! of `https:` imports that this loader has to handle anyway. What that
+//! costs is written down in `docs/functions.md`: what runs is the
+//! registry's build of the package rather than the tarball npm would
+//! have unpacked.
+//!
+//! `ZOU_NPM=tarball` is the other answer, and it is Deno's: an `npm:`
+//! specifier is the tarball, unpacked under the cache and resolved with
+//! node's rules, commonjs and all. Which of the two runs more of other
+//! people's code is a question for the corpus rather than for an
+//! argument, so both are here and the corpus decides which is the
+//! default.
 //!
 //! Anything fetched is kept on disk, keyed by url, so a second cold
 //! start does not repeat the first one's downloads and a deployment can
@@ -55,10 +61,29 @@ const BUILD: Option<&str> = Some("dev");
 /// of a script needs its answer to be a value already.
 pub(crate) const BUILTINS: &str = "zou:node";
 
+/// What an `npm:` specifier means to this loader.
+///
+/// Two answers, because they are two different runtimes to be. A
+/// registry that serves packages as modules is one https graph and no
+/// node in it, which is what this has always done. The tarball is what
+/// npm publishes and what node runs: node module resolution, the
+/// package's own `exports`, and commonjs where the package ships
+/// commonjs. The second is the one Deno is, and the corpus is what says
+/// when it becomes the default here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Npm {
+    /// The package's build on esm.sh or a mirror of it.
+    Registry,
+    /// The tarball off the npm registry, unpacked and resolved.
+    Tarball,
+}
+
 /// Loads a function's modules, off the disk it was deployed onto and
 /// off the network for the ones that are not there.
 pub struct Disk {
     registry: String,
+    /// Which of the two an `npm:` specifier is, out of `ZOU_NPM`.
+    npm: Npm,
     /// The query appended to a package's url, which is how the build is
     /// asked for.
     build: Option<String>,
@@ -129,6 +154,10 @@ impl Disk {
                 Ok(asked) => Some(asked).filter(|it| !it.is_empty()),
                 Err(_) => BUILD.map(str::to_string),
             },
+            npm: match named("ZOU_NPM").as_deref() {
+                Some("tarball") => Npm::Tarball,
+                _ => Npm::Registry,
+            },
             cache: cache(),
             cached_only: named("ZOU_MODULE_CACHE_ONLY").is_some(),
             imports,
@@ -176,6 +205,47 @@ impl Disk {
     /// import.meta.resolve('npm:@imagemagick/magick-wasm@^0'))` is a
     /// real line in a real function, and a version range is not a
     /// directory to resolve anything against.
+    /// A specifier as one file inside a tree of unpacked packages
+    /// resolves it, or nothing when the file doing the asking is not in
+    /// that tree.
+    ///
+    /// A path stays a path, since the file it names is already on the
+    /// disk. A bare name becomes an `npm:` specifier carrying the range
+    /// the asking package declared, so that fetching whatever answers
+    /// it happens in the load, where there is a thread to wait on:
+    /// resolution here is synchronous and is on the isolate's own
+    /// thread.
+    fn inside(&self, specifier: &str, referrer: &str) -> Option<ModuleResolveResponse> {
+        let at = ModuleSpecifier::parse(referrer).ok()?.to_file_path().ok()?;
+        if !at.starts_with(self.cache.join("npm")) {
+            return None;
+        }
+        let root = crate::cjs::rooted(&at);
+        if specifier.starts_with('.') || specifier.starts_with('/') || specifier.starts_with('#') {
+            let tree = crate::tree::Tree::at(&self.cache);
+            let from = crate::tree::Reached { at, root };
+            let reached = match tree.resolve(specifier, &from) {
+                Ok(reached) => reached,
+                Err(why) => {
+                    return Some(Err(JsErrorBox::type_error(format!(
+                        "{specifier} in {referrer}: {why}"
+                    ))));
+                }
+            };
+            return Some(match ModuleSpecifier::from_file_path(&reached.at) {
+                Ok(it) => Ok(it),
+                Err(()) => Err(JsErrorBox::type_error(format!(
+                    "{} is not a path",
+                    reached.at.display()
+                ))),
+            });
+        }
+        let (name, sub) = crate::tree::split(specifier);
+        let want = crate::tree::declared(&root, &name)?;
+        let tail = sub.trim_start_matches('.');
+        Some(url(&format!("npm:{name}@{want}{tail}")))
+    }
+
     fn moved(&self, asked: ModuleSpecifier) -> ModuleSpecifier {
         let landed = self.landed.borrow();
         match landed.get(asked.as_str()) {
@@ -233,7 +303,22 @@ impl ModuleLoader for Disk {
             .and_then(|imports| imports.resolve(specifier, referrer));
         let specifier: &str = mapped.as_deref().unwrap_or(specifier);
         if let Some(rest) = specifier.strip_prefix("npm:") {
+            if self.npm == Npm::Tarball {
+                // Left as it is, because working out which version of
+                // the package that means is a question for the
+                // registry and this call may not wait for one.
+                return url(&format!("npm:{}", bare(rest)));
+            }
             return url(&self.built(format!("{}/{}", self.registry, bare(rest))));
+        }
+        // A specifier written inside a package that was unpacked out of
+        // a tarball, which is the one place a bare name is not a name
+        // for this function to resolve: `lodash` inside a package means
+        // whatever that package's manifest said it depends on.
+        if self.npm == Npm::Tarball
+            && let Some(answer) = self.inside(specifier, referrer)
+        {
+            return answer;
         }
         if let Some(rest) = specifier.strip_prefix("jsr:") {
             return url(&self.built(format!("{}/jsr/{}", self.registry, bare(rest))));
@@ -308,10 +393,30 @@ impl ModuleLoader for Disk {
         if specifier.scheme() == "node" {
             return ModuleLoadResponse::Sync(builtin(specifier));
         }
+        if specifier.scheme() == "npm" && self.npm == Npm::Tarball {
+            let asked = specifier.clone();
+            let cache = self.cache.clone();
+            return ModuleLoadResponse::Async(Box::pin(async move {
+                // On a blocking thread, because what this does is fetch
+                // a tarball and write a package to the disk.
+                tokio::task::spawn_blocking({
+                    let asked = asked.clone();
+                    move || package(&cache, &asked)
+                })
+                .await
+                .map_err(|e| JsErrorBox::generic(format!("{asked} could not be unpacked: {e}")))?
+            }));
+        }
         if specifier.scheme() == "file" {
             if let Ok(path) = specifier.to_file_path() {
                 let when = mtime(&path);
-                self.read.borrow_mut().push((path, when));
+                self.read.borrow_mut().push((path.clone(), when));
+                // A file inside an unpacked package may be a script
+                // rather than a module, and a script is served as the
+                // module that stands in for it.
+                if self.npm == Npm::Tarball && path.starts_with(self.cache.join("npm")) {
+                    return ModuleLoadResponse::Sync(served(&self.cache, specifier, &path));
+                }
             }
             return ModuleLoadResponse::Sync(read(specifier));
         }
@@ -348,6 +453,90 @@ impl ModuleLoader for Disk {
 /// took the whole graph down with it.
 fn bare(rest: &str) -> &str {
     rest.trim_start_matches('/')
+}
+
+/// One package out of the npm registry, unpacked, as the module the
+/// specifier named.
+fn package(cache: &Path, asked: &ModuleSpecifier) -> Result<ModuleSource, JsErrorBox> {
+    let (name, want, sub) = parts(asked.path());
+    let tree = crate::tree::Tree::at(cache);
+    let reached = tree
+        .entry(&name, &want, &sub)
+        .map_err(|why| JsErrorBox::type_error(format!("{asked}: {why}")))?;
+    let at = ModuleSpecifier::from_file_path(&reached.at)
+        .map_err(|()| JsErrorBox::type_error(format!("{} is not a path", reached.at.display())))?;
+    inside(&tree, asked, &at, &reached)
+}
+
+/// A file inside a package that is already on the disk.
+fn served(cache: &Path, asked: &ModuleSpecifier, at: &Path) -> Result<ModuleSource, JsErrorBox> {
+    let tree = crate::tree::Tree::at(cache);
+    let reached = crate::tree::Reached {
+        at: at.to_path_buf(),
+        root: crate::cjs::rooted(at),
+    };
+    inside(&tree, asked, asked, &reached)
+}
+
+/// One file out of a package, in whichever of the two languages it is
+/// written in.
+///
+/// A module is served as itself. A script is served as the module that
+/// stands in for it, which runs it and hands back what it assigned,
+/// with the names read out of its source so that an `import { thing }`
+/// of it compiles.
+fn inside(
+    tree: &crate::tree::Tree,
+    asked: &ModuleSpecifier,
+    landed: &ModuleSpecifier,
+    reached: &crate::tree::Reached,
+) -> Result<ModuleSource, JsErrorBox> {
+    if crate::cjs::kind(&reached.at, &reached.root) == crate::cjs::Kind::Script
+        && reached.at.extension().and_then(|it| it.to_str()) != Some("json")
+    {
+        // A name it could not read is a name that will be `undefined`
+        // rather than a module that will not load, so a reading that
+        // failed altogether is still worth serving the default for.
+        let names = crate::cjs::names(tree, reached).unwrap_or_default();
+        let text = crate::cjs::wrapper(landed.as_str(), &names);
+        return Ok(ModuleSource::new_with_redirect(
+            ModuleType::JavaScript,
+            ModuleSourceCode::String(text.into()),
+            asked,
+            landed,
+            None,
+        ));
+    }
+    let text = std::fs::read_to_string(&reached.at)
+        .map_err(|e| JsErrorBox::generic(format!("read {}: {e}", reached.at.display())))?;
+    let media = deno_ast::MediaType::from_specifier(landed);
+    source(asked, landed, text, media)
+}
+
+/// What is written after `npm:`: the package, the range asked of it,
+/// and the subpath into it.
+fn parts(rest: &str) -> (String, String, String) {
+    let rest = rest.trim_start_matches('/');
+    let mut segments = rest.split('/');
+    let mut named = segments.next().unwrap_or_default().to_string();
+    // A scoped package is two segments before anything else starts.
+    if named.starts_with('@')
+        && let Some(next) = segments.next()
+    {
+        named = format!("{named}/{next}");
+    }
+    let sub: Vec<&str> = segments.collect();
+    let (name, want) = match named.rfind('@') {
+        Some(cut) if cut > 0 => (named[..cut].to_string(), named[cut + 1..].to_string()),
+        // No range at all, which the tree reads as any version and the
+        // registry answers with whatever `latest` is.
+        _ => (named, String::new()),
+    };
+    let sub = match sub.is_empty() {
+        true => ".".to_string(),
+        false => format!("./{}", sub.join("/")),
+    };
+    (name, want, sub)
 }
 
 fn url(text: &str) -> ModuleResolveResponse {
@@ -814,6 +1003,7 @@ mod tests {
     fn loader() -> Disk {
         Disk {
             registry: REGISTRY.to_string(),
+            npm: Npm::Registry,
             cache: PathBuf::from("/nowhere"),
             cached_only: true,
             imports: None,
@@ -1082,6 +1272,61 @@ mod tests {
         assert_eq!(held.url, "https://esm.sh/a@1.2.3/es2022/a.mjs");
         assert_eq!(held.own, None);
         assert_eq!(held.body, b"export default 1;");
+    }
+
+    /// What is written after `npm:`, taken apart. The awkward ones are
+    /// a scope, which is two segments before the version, and a package
+    /// with no version at all.
+    #[test]
+    fn a_specifier_is_a_package_a_range_and_a_subpath() {
+        assert_eq!(
+            parts("zod@3.23.8"),
+            ("zod".into(), "3.23.8".into(), ".".into())
+        );
+        assert_eq!(
+            parts("@supabase/supabase-js@2"),
+            ("@supabase/supabase-js".into(), "2".into(), ".".into())
+        );
+        assert_eq!(
+            parts("drizzle-orm@0.29.1/pg-core"),
+            ("drizzle-orm".into(), "0.29.1".into(), "./pg-core".into())
+        );
+        assert_eq!(parts("/ms"), ("ms".into(), String::new(), ".".into()));
+        assert_eq!(
+            parts("@std/one@^1/deep/inside"),
+            ("@std/one".into(), "^1".into(), "./deep/inside".into())
+        );
+    }
+
+    /// A bare name inside a package is the range that package declared,
+    /// carried on an `npm:` specifier so that the fetching happens in
+    /// the load rather than here, where there is no thread to wait on.
+    #[test]
+    fn a_bare_name_inside_a_package_becomes_the_range_that_package_declared() {
+        let cache = tempfile::tempdir().expect("a temporary cache");
+        let root = cache.path().join("npm").join("asks").join("1.0.0");
+        std::fs::create_dir_all(&root).expect("a package");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name": "asks", "version": "1.0.0", "dependencies": {"lodash": "^4.17.0"}}"#,
+        )
+        .expect("a manifest");
+        std::fs::write(root.join("index.js"), "require('lodash');\n").expect("a file");
+        let disk = Disk {
+            npm: Npm::Tarball,
+            cache: cache.path().to_path_buf(),
+            ..loader()
+        };
+        let referrer = ModuleSpecifier::from_file_path(root.join("index.js")).expect("a url");
+        let answer = disk
+            .resolve("lodash", referrer.as_str(), ResolutionKind::Import)
+            .expect("a specifier");
+        assert_eq!(answer.as_str(), "npm:lodash@^4.17.0");
+        // And a name it never declared is refused rather than guessed
+        // at, which is the tree's rule and is why this asks the
+        // manifest at all.
+        let refused = disk.resolve("left-pad", referrer.as_str(), ResolutionKind::Import);
+        assert!(refused.is_err(), "{refused:?}");
     }
 
     /// The three things the environment can say about who to ask as.
