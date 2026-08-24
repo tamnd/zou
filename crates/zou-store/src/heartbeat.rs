@@ -471,7 +471,14 @@ mod tests {
     #[test]
     fn transient_store_failures_are_retried_within_the_ttl() {
         let (_d, store, layout) = setup();
-        let held = lease::acquire(&*store, &layout, "node-a", 3, now_unix()).unwrap();
+        // The lease already in the manifest is a long one, and the
+        // heartbeat renews on a short one. Giving up honestly past the
+        // expiry is the other test's subject, and it is what a loaded
+        // runner would make this one do instead: a machine that does
+        // not schedule the retry for three seconds is a machine where
+        // the retry is right to stop, so a lease that outlives any
+        // stall is what leaves only the retry in question here.
+        let held = lease::acquire(&*store, &layout, "node-a", 30, now_unix()).unwrap();
         let initial_expiry = held.expires_unix;
         let held = Arc::new(Mutex::new(held));
 
@@ -480,14 +487,30 @@ mod tests {
             failures_left: AtomicU32::new(2),
         });
         let hb = Heartbeat::spawn(
-            flaky as Arc<dyn CasStore>,
+            Arc::clone(&flaky) as Arc<dyn CasStore>,
             layout.clone(),
             Arc::clone(&held),
             3,
         );
-        std::thread::sleep(Duration::from_millis(2500));
+        // Wait for the renewal rather than for the clock, the same way
+        // the steal test above does: two refusals and a success is a
+        // second and a half on a quiet machine and however long the
+        // runner feels like on a busy one.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while held.lock().unwrap().expires_unix == initial_expiry {
+            assert!(!hb.lost(), "gave up on a transient outage");
+            assert!(
+                Instant::now() < deadline,
+                "no renewal got through the outage in 20 s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(!hb.lost(), "gave up on a transient outage");
-        assert!(held.lock().unwrap().expires_unix > initial_expiry);
+        assert_eq!(
+            flaky.failures_left.load(Ordering::Acquire),
+            0,
+            "the renewal that landed never met the outage"
+        );
         hb.detach().unwrap();
     }
 
