@@ -364,8 +364,17 @@ jobs:
           "$ZOU" status -o json | grep -q '"project_id":"smoke"'
           "$ZOU" migration new "add widgets" | tee /tmp/zou-migration.txt
           grep -q "supabase/migrations/[0-9]\{14\}_add_widgets.sql" /tmp/zou-migration.txt
+          # The grants are part of the migration because a table in
+          # public arrives readable by nobody who comes in through the
+          # api, which is the stance upstream takes and the one zou
+          # takes since crates/zou-server/src/sql.rs stopped handing
+          # every future table to all three roles. A project says what
+          # it means to expose, so this one says it.
           cat > "$(cat /tmp/zou-migration.txt)" <<'SQL'
           create table public.widgets (id bigserial primary key, name text not null);
+          grant select on public.widgets to anon;
+          grant select, insert on public.widgets to service_role;
+          grant usage on sequence public.widgets_id_seq to service_role;
           SQL
           cat > /tmp/zou-proj/supabase/seed.sql <<'SQL'
           insert into public.widgets (name) values ('from the seed');
