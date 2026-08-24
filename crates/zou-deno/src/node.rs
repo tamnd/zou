@@ -67,6 +67,74 @@ pub fn source(name: &str) -> Option<&'static str> {
     })
 }
 
+/// Every name this runtime has a built in under.
+///
+/// The list is here as well as in the match because something has to be
+/// able to say what the whole set is without asking about each name it
+/// can think of, and what asks is the registry below.
+pub const NAMES: &[&str] = &[
+    "assert",
+    "buffer",
+    "child_process",
+    "cluster",
+    "crypto",
+    "diagnostics_channel",
+    "events",
+    "fs",
+    "fs/promises",
+    "module",
+    "os",
+    "path",
+    "path/posix",
+    "path/win32",
+    "process",
+    "querystring",
+    "stream",
+    "stream/promises",
+    "stream/web",
+    "string_decoder",
+    "timers",
+    "timers/promises",
+    "url",
+    "util",
+    "util/types",
+    "worker_threads",
+];
+
+/// A module that puts every built in where a `require` can reach it.
+///
+/// A script cannot `import`. It calls `require("path")` in the middle of
+/// running, and the answer has to already be a value by then, which for
+/// an es module means it was imported before the script started. So the
+/// module that stands in for a script imports this one first, and this
+/// one imports all of them and leaves them in a map the require reads.
+///
+/// All of them rather than the ones the script asks for, because what a
+/// script asks for is decided while it runs: a `require` inside a branch
+/// or built out of a variable is ordinary code in a package that ships
+/// two implementations of something. Reading the graph to guess at the
+/// set would be a guess that is wrong exactly where it matters, so the
+/// price is paid once instead: these modules are small, this binary
+/// carries them, and only a function that imports a commonjs package
+/// pays it at all.
+///
+/// The value under each name is the default export, because a built in
+/// here is written as an es module whose default is the object node
+/// hands a `require`, and the namespace around it is the shape an
+/// `import` wants rather than the one a script wants.
+pub fn registry() -> String {
+    let mut text = String::from("// Generated: every node built in, for a script's require.\n");
+    for (nth, name) in NAMES.iter().enumerate() {
+        text.push_str(&format!("import * as m{nth} from \"node:{name}\";\n"));
+    }
+    text.push_str("globalThis.__zouBuiltins = new Map([\n");
+    for (nth, name) in NAMES.iter().enumerate() {
+        text.push_str(&format!("  [\"node:{name}\", m{nth}.default ?? m{nth}],\n"));
+    }
+    text.push_str("]);\n");
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::source;
@@ -103,6 +171,24 @@ mod tests {
     /// turns that into a sentence naming it. The ones that are here
     /// and refuse from every call are a different thing: a package can
     /// import those and not reach them.
+    /// The list and the match are two spellings of the same set, and a
+    /// name in one and not the other is a module that is imported and
+    /// never arrives.
+    #[test]
+    fn every_name_on_the_list_is_a_built_in_this_binary_carries() {
+        for name in super::NAMES {
+            assert!(source(name).is_some(), "node:{name}");
+        }
+        let module = super::registry();
+        for name in super::NAMES {
+            assert!(
+                module.contains(&format!("\"node:{name}\"")),
+                "node:{name} is not in the registry"
+            );
+        }
+        assert!(module.contains("globalThis.__zouBuiltins"), "{module}");
+    }
+
     #[test]
     fn a_built_in_that_is_not_here_is_not_pretended_to_be() {
         assert!(source("dgram").is_none());

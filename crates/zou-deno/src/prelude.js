@@ -4404,6 +4404,95 @@
   MessageChannel.prototype[Symbol.toStringTag] = "MessageChannel";
 
   // ---------------------------------------------------------------
+  // require, which is how an npm package that is still a script runs
+
+  // Every script this call has run, by the url it was read from, so a
+  // package required twice is one object and a package that requires
+  // itself in a circle gets what has been set so far rather than a
+  // second run. Node's module cache, and the same rule: a script runs
+  // once and its exports are shared.
+  const scripts = new Map();
+
+  // A script asks for a built in by name, and the answer has to be a
+  // value already, because a script cannot wait. The module that stands
+  // in for the script imports them all before it starts, which is what
+  // leaves them here.
+  function builtin(name) {
+    const held = globalThis.__zouBuiltins;
+    const found = held === undefined ? undefined : held.get(name);
+    if (found === undefined) {
+      throw new Error(`${name} is a node built in this runtime does not have`);
+    }
+    return found;
+  }
+
+  // The path a file url names, since a script is handed `__filename`
+  // and works `__dirname` out of it, and neither is a url in node.
+  function dirOf(path) {
+    const cut = path.lastIndexOf("/");
+    return cut <= 0 ? "/" : path.slice(0, cut);
+  }
+
+  function ran(url) {
+    const already = scripts.get(url);
+    if (already !== undefined) {
+      return already;
+    }
+    const script = ops.op_zou_cjs_read(url);
+    // In the map before it runs, so that a script requiring something
+    // that requires it back gets the half built exports object instead
+    // of running a second copy of it. That is node's answer to a cycle
+    // and packages are written against it.
+    const module = { id: script.path, filename: script.path, exports: {}, loaded: false };
+    scripts.set(url, module);
+    if (script.data) {
+      module.exports = JSON.parse(script.text);
+      module.loaded = true;
+      return module;
+    }
+    const require = (spec) => {
+      const to = ops.op_zou_cjs_resolve(String(spec), url);
+      return to.startsWith("node:") ? builtin(to) : ran(to).exports;
+    };
+    // The two of these that packages actually call. `resolve` answers
+    // with a path because that is what node answers with, and a script
+    // that has one usually reads a file beside it.
+    require.resolve = (spec) => {
+      const to = ops.op_zou_cjs_resolve(String(spec), url);
+      return to.startsWith("node:") ? to : ops.op_zou_cjs_read(to).path;
+    };
+    require.cache = scripts;
+    // A `new Function` rather than an eval, so the script's own
+    // variables stay inside it and the five names node gives a module
+    // are the five it can see. The newline is for a file that ends in a
+    // comment with no line break after it.
+    const run = new Function(
+      "exports",
+      "require",
+      "module",
+      "__filename",
+      "__dirname",
+      `${script.text}\n`,
+    );
+    run.call(
+      module.exports,
+      module.exports,
+      require,
+      module,
+      script.path,
+      dirOf(script.path),
+    );
+    module.loaded = true;
+    return module;
+  }
+
+  // What the module standing in for a script calls. It is on the global
+  // because the module is text this runtime generated and there is
+  // nowhere else for generated text to look, which is also why the name
+  // says whose it is.
+  globalThis.__zouRequire = ran;
+
+  // ---------------------------------------------------------------
   // What the module sees
 
   const EdgeRuntime = { waitUntil };

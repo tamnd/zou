@@ -49,6 +49,12 @@ const REGISTRY: &str = "https://esm.sh";
 /// its own idea of what a query means.
 const BUILD: Option<&str> = Some("dev");
 
+/// The module that holds every node built in, which is the only
+/// specifier this runtime invents. It is written into the module that
+/// stands in for a commonjs script, because a `require` in the middle
+/// of a script needs its answer to be a value already.
+pub(crate) const BUILTINS: &str = "zou:node";
+
 /// Loads a function's modules, off the disk it was deployed onto and
 /// off the network for the ones that are not there.
 pub struct Disk {
@@ -194,7 +200,7 @@ fn named(variable: &str) -> Option<String> {
 /// Where fetched modules live between runs, which is one answer for the
 /// whole process: a loader and a `Deno.readFile` of a url are looking in
 /// the same place for the same bytes.
-fn cache() -> PathBuf {
+pub(crate) fn cache() -> PathBuf {
     named("ZOU_MODULE_CACHE").map_or_else(ordinary, PathBuf::from)
 }
 
@@ -231,6 +237,14 @@ impl ModuleLoader for Disk {
         }
         if let Some(rest) = specifier.strip_prefix("jsr:") {
             return url(&self.built(format!("{}/jsr/{}", self.registry, bare(rest))));
+        }
+        // The one specifier this runtime writes itself, in the module
+        // that stands in for a commonjs script: the built ins, gathered
+        // where that script's require can reach them. A function that
+        // writes it by hand gets the same module, which is a map of
+        // things it can already import by name.
+        if specifier == BUILTINS {
+            return url(BUILTINS);
         }
         if let Some(rest) = specifier.strip_prefix("node:") {
             if crate::node::source(rest).is_none() {
@@ -280,6 +294,14 @@ impl ModuleLoader for Disk {
     ) -> ModuleLoadResponse {
         if declaration(specifier) {
             return ModuleLoadResponse::Sync(nothing(specifier));
+        }
+        if specifier.as_str() == BUILTINS {
+            return ModuleLoadResponse::Sync(Ok(ModuleSource::new(
+                ModuleType::JavaScript,
+                ModuleSourceCode::String(crate::node::registry().into()),
+                specifier,
+                None,
+            )));
         }
         // A node built in is javascript this binary carries, so it is
         // answered here and never fetched, cached or timed.

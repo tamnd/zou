@@ -99,6 +99,17 @@ impl Tree {
     /// it, `node:` or `https:` or `npm:`, belongs to the loader above
     /// this and is not answered here.
     pub(crate) fn resolve(&self, spec: &str, from: &Reached) -> Result<Reached, String> {
+        self.under(spec, from, resolve::CONDITIONS)
+    }
+
+    /// The same question asked from a `require`, which differs by one
+    /// word in the conditions and by which build of the package that
+    /// word picks.
+    pub(crate) fn required(&self, spec: &str, from: &Reached) -> Result<Reached, String> {
+        self.under(spec, from, resolve::REQUIRE)
+    }
+
+    fn under(&self, spec: &str, from: &Reached, conditions: &[&str]) -> Result<Reached, String> {
         if spec.starts_with("./") || spec.starts_with("../") || spec.starts_with('/') {
             let beside = from.at.parent().unwrap_or(&from.root);
             let at = walk(beside, spec);
@@ -112,26 +123,32 @@ impl Tree {
             };
         }
         if spec.starts_with('#') {
-            return match resolve::own(&from.root, spec, resolve::CONDITIONS)? {
+            return match resolve::own(&from.root, spec, conditions)? {
                 Found::File(at) => Ok(Reached {
                     at,
                     root: from.root.clone(),
                 }),
-                Found::Package { name, sub } => self.other(&from.root, &name, &sub),
+                Found::Package { name, sub } => self.other(&from.root, &name, &sub, conditions),
             };
         }
         let (name, sub) = split(spec);
-        self.other(&from.root, &name, &sub)
+        self.other(&from.root, &name, &sub, conditions)
     }
 
     /// Somebody else's package, as the asking package's manifest names
     /// it.
-    fn other(&self, from: &Path, name: &str, sub: &str) -> Result<Reached, String> {
+    fn other(
+        &self,
+        from: &Path,
+        name: &str,
+        sub: &str,
+        conditions: &[&str],
+    ) -> Result<Reached, String> {
         let want = declared(from, name).ok_or_else(|| {
             format!("{name} is imported here and this package does not depend on it")
         })?;
         let root = self.package(name, &want)?;
-        let at = resolve::file(&root, sub, resolve::CONDITIONS)
+        let at = resolve::file(&root, sub, conditions)
             .map_err(|why| format!("{name}{}: {why}", sub.trim_start_matches('.')))?;
         Ok(Reached { at, root })
     }
@@ -270,6 +287,39 @@ mod tests {
             at: root.join(named),
             root: root.to_path_buf(),
         }
+    }
+
+    /// The build of a package a `require` gets, which is not always the
+    /// build an `import` gets. A package with both in its `exports`
+    /// ships two files, and handing a script the module build is how
+    /// the require of it comes back empty.
+    #[test]
+    fn a_require_and_an_import_of_the_same_package_are_two_files() {
+        let cache = Cache::new();
+        cache.with(
+            "both",
+            "1.0.0",
+            r#"{"name": "both", "version": "1.0.0", "exports": {".": {"require": "./index.cjs", "import": "./index.mjs"}}}"#,
+            &[
+                ("index.cjs", "module.exports = 1;\n"),
+                ("index.mjs", "export default 1;\n"),
+            ],
+        );
+        cache.with(
+            "asks",
+            "1.0.0",
+            r#"{"name": "asks", "version": "1.0.0", "dependencies": {"both": "1.0.0"}}"#,
+            &[("index.js", "require('both');\n")],
+        );
+        let tree = Tree::at(cache.at.path());
+        let from = Reached {
+            at: cache.at.path().join("npm/asks/1.0.0/index.js"),
+            root: cache.at.path().join("npm/asks/1.0.0"),
+        };
+        let imported = tree.resolve("both", &from).expect("the module build");
+        assert!(imported.at.ends_with("index.mjs"), "{imported:?}");
+        let required = tree.required("both", &from).expect("the script build");
+        assert!(required.at.ends_with("index.cjs"), "{required:?}");
     }
 
     #[test]

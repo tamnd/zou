@@ -29,7 +29,7 @@ use zou_functions::Policy;
 
 use crate::inspector::Inspector;
 use crate::limits::{Limits, Watch};
-use crate::{crypto, fetch, inspector, limits, module, pool, socket, timer, url, websocket};
+use crate::{cjs, crypto, fetch, inspector, limits, module, pool, socket, timer, url, websocket};
 
 /// What the isolate has whether or not a call is in it: the function's
 /// environment and the files it may read.
@@ -43,6 +43,10 @@ use crate::{crypto, fetch, inspector, limits, module, pool, socket, timer, url, 
 /// would not find one.
 pub(crate) struct Owned {
     env: Vec<(String, String)>,
+    /// The directory the function was deployed into, which is the one
+    /// place on this disk besides the module cache that a `require` is
+    /// allowed to read a script out of.
+    pub(crate) root: std::path::PathBuf,
     /// The files this function may read, which is its `static_files`
     /// and nothing else on the disk.
     statics: zou_functions::Statics,
@@ -449,6 +453,8 @@ deno_core::extension!(
         op_zou_agent,
         op_zou_read_file,
         op_zou_read_file_sync,
+        cjs::op_zou_cjs_read,
+        cjs::op_zou_cjs_resolve,
         crypto::op_zou_random,
         crypto::op_zou_digest,
         crypto::op_zou_sign,
@@ -660,6 +666,10 @@ impl Runtime for Isolate {
         env.push((EXECUTION_ID.to_string(), call.execution_id.clone()));
         let owned = Owned {
             env,
+            root: entrypoint
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_default(),
             statics: zou_functions::Statics::of(function),
         };
         let held = Held {
