@@ -16,9 +16,12 @@
 //! a file and refuse to write one, and a built in that is not in this
 //! list is a sentence saying so rather than a module that half works.
 //!
-//! A shim is javascript and not rust because every one of them is a
-//! translation between two javascript shapes, and there is nothing for
-//! the host to do in any of it.
+//! A shim is javascript and not rust because almost every one of them
+//! is a translation between two javascript shapes, and there is
+//! nothing for the host to do in any of it. `zlib` is the exception:
+//! the deflate is rust, because this binary already carries one for
+//! opening a package tarball, and the javascript in front of it is
+//! the three shapes node offers it in.
 
 /// The source of a node built in, or nothing if this runtime has no
 /// such module.
@@ -53,6 +56,8 @@ pub fn source(name: &str) -> Option<&'static str> {
         "path" | "path/posix" | "path/win32" => include_str!("node/path.js"),
         "process" => include_str!("node/process.js"),
         "querystring" => include_str!("node/querystring.js"),
+        "readline" => include_str!("node/readline.js"),
+        "readline/promises" => include_str!("node/readline_promises.js"),
         "stream" => include_str!("node/stream.js"),
         "stream/promises" => include_str!("node/stream_promises.js"),
         "stream/web" => include_str!("node/stream_web.js"),
@@ -63,6 +68,12 @@ pub fn source(name: &str) -> Option<&'static str> {
         "util" => include_str!("node/util.js"),
         "util/types" => include_str!("node/util_types.js"),
         "worker_threads" => include_str!("node/worker_threads.js"),
+        // The one built in here that is a real implementation rather
+        // than a translation: the deflate is rust, because this binary
+        // already has one for opening a package tarball and a second
+        // one written in javascript would be slower and wrong in its
+        // own ways.
+        "zlib" => include_str!("node/zlib.js"),
         _ => return None,
     })
 }
@@ -89,6 +100,8 @@ pub const NAMES: &[&str] = &[
     "path/win32",
     "process",
     "querystring",
+    "readline",
+    "readline/promises",
     "stream",
     "stream/promises",
     "stream/web",
@@ -99,6 +112,7 @@ pub const NAMES: &[&str] = &[
     "util",
     "util/types",
     "worker_threads",
+    "zlib",
 ];
 
 /// Every name node itself carries a built in under, whether or not this

@@ -522,3 +522,116 @@ fn the_refusal_says_a_function_has_no_processes() {
         "a function has no processes to start, so node:child_process spawn cannot work here"
     );
 }
+
+/// The round trip, in all three shapes: a synchronous call, a call with
+/// a callback, and a stream handed one chunk at a time. The stream is
+/// the one that matters, because the whole reason the compression is a
+/// job with an id is that a transform cannot compress each chunk on
+/// its own and call the result a gzip.
+#[test]
+fn zlib_compresses_and_decompresses_in_the_three_shapes_node_offers() {
+    let said = served(
+        r#"
+        import zlib from "node:zlib";
+        import { Buffer } from "node:buffer";
+        import { promisify } from "node:util";
+        const seen = [];
+
+        const small = zlib.gzipSync("hello hello hello hello hello hello");
+        seen.push(small[0] === 0x1f && small[1] === 0x8b ? "gzip" : "not gzip");
+        seen.push(String(small.length < 35));
+        seen.push(zlib.gunzipSync(small).toString());
+
+        // Every framing, and the one that reads its own framing.
+        seen.push(zlib.inflateSync(zlib.deflateSync("deflate")).toString());
+        seen.push(zlib.inflateRawSync(zlib.deflateRawSync("raw")).toString());
+        seen.push(zlib.unzipSync(zlib.gzipSync("unzip gz")).toString());
+        seen.push(zlib.unzipSync(zlib.deflateSync("unzip zl")).toString());
+
+        const back = await promisify(zlib.gzip)("callback");
+        seen.push(zlib.gunzipSync(back).toString());
+
+        // A stream, fed in pieces, and read back through the other one.
+        const gzipping = zlib.createGzip();
+        const parts = [];
+        gzipping.on("data", (chunk) => parts.push(chunk));
+        const done = new Promise((resolve) => gzipping.on("end", resolve));
+        for (const piece of ["one ", "two ", "three"]) {
+          gzipping.write(piece);
+        }
+        gzipping.end();
+        await done;
+        const whole = Buffer.concat(parts);
+        seen.push(String(parts.length >= 1));
+        seen.push(zlib.gunzipSync(whole).toString());
+
+        // A body that is not a gzip at all.
+        try {
+          zlib.gunzipSync(new Uint8Array([1, 2, 3, 4]));
+          seen.push("no error");
+        } catch (e) {
+          seen.push(e.code);
+        }
+
+        // And brotli, which this runtime does not have.
+        try {
+          zlib.brotliCompressSync("x");
+          seen.push("no error");
+        } catch (e) {
+          seen.push(e.message);
+        }
+
+        Deno.serve(() => new Response(seen.join("|")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "gzip|true|hello hello hello hello hello hello|deflate|raw|unzip gz|unzip zl|callback|true|one two three|Z_DATA_ERROR|node:zlib brotliCompressSync is brotli, which this runtime does not have"
+    );
+}
+
+/// A stream cut into lines, in the three ways a caller reads them: the
+/// event, the iterator and the question. The input here is a web
+/// stream, because that is what a body is in this runtime, and the
+/// last line has no newline after it, because a file usually does not.
+#[test]
+fn readline_cuts_an_input_into_lines_however_the_caller_reads_them() {
+    let said = served(
+        r#"
+        import readline from "node:readline";
+        import { createInterface } from "node:readline/promises";
+        import { Readable } from "node:stream";
+        const seen = [];
+
+        const heard = [];
+        const first = readline.createInterface({
+          input: new Response("one\ntwo\r\nthree").body,
+        });
+        first.on("line", (line) => heard.push(line));
+        await new Promise((resolve) => first.on("close", resolve));
+        seen.push(heard.join("+"));
+
+        const out = [];
+        const second = readline.createInterface({ input: Readable.from(["a\nb", "\nc\n"]) });
+        for await (const line of second) {
+          out.push(line);
+        }
+        seen.push(out.join("+"));
+
+        // A question, answered by the next line, and the output it was
+        // written to.
+        const written = [];
+        const third = createInterface({
+          input: Readable.from(["yes\nno\n"]),
+          output: { write: (text) => written.push(text) },
+        });
+        const answer = await third.question("well? ");
+        seen.push(answer);
+        seen.push(written.join(""));
+        third.close();
+
+        Deno.serve(() => new Response(seen.join("|")));
+        "#,
+    );
+    assert_eq!(said, "one+two+three|a+b+c|yes|well? ");
+}

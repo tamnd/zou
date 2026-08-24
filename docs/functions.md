@@ -595,8 +595,9 @@ A function may import one itself, and so may a package the registry served, whic
 ```
 assert  buffer  child_process  cluster  crypto  diagnostics_channel
 events  fs  fs/promises  module  os  path  process  querystring
-stream  stream/promises  stream/web  string_decoder  timers
-timers/promises  url  util  util/types  worker_threads
+readline  readline/promises  stream  stream/promises  stream/web
+string_decoder  timers  timers/promises  url  util  util/types
+worker_threads  zlib
 ```
 
 `path/posix` and `path/win32` are the same module as `path`, which is posix, because there is one file system here and it has one separator.
@@ -611,6 +612,8 @@ What each one is is the part of it a package reaches for and not node's whole su
 - `os` answers about the machine the function is on the way a container does, `util.promisify` reads the custom symbol, `assert` throws an `AssertionError`, and `timers` and `timers/promises` are the globals under their node names.
 - `diagnostics_channel` is a real one: named channels, subscribers, `publish`, `hasSubscribers` and the tracing channel wrapper. Nothing here subscribes to anything, so a library instrumenting itself through it publishes into channels nobody is on, which is what it is for.
 - `module` is `createRequire`, `builtinModules` and `isBuiltin`. There is no CJS here, so the require it hands back serves the built ins and names anything else as a module it cannot find, which is the answer a package feature detecting its way onto node is asking for.
+- `zlib` is the real thing rather than a translation. gzip, deflate and raw deflate, their three inflates, and `unzip`, which reads its own framing, in all three of node's shapes: the synchronous call, the callback and the stream. The deflate underneath is the one this binary already carries for opening a package tarball, held as a job with an id so a stream fed a chunk at a time comes out as one gzip and not a hundred. Brotli is a different algorithm and refuses by name.
+- `readline` is a stream cut into lines, read through the `line` event, the async iterator or `question`, which is answered by the next line rather than by somebody typing. There is no tty in a function, so the terminal half of node's module is not here: `cursorTo` and the rest answer false, and there is no history, no completer and no key events.
 - `child_process`, `worker_threads` and `cluster` import and then refuse. Every call that would need a process, a thread or a fork throws with a sentence saying a function has none, and the parts that can be true are: `isMainThread` is true, `isPrimary` is true, and `worker_threads` hands back the platform's own `MessageChannel`.
 
 Those last three are worth a word, because a module that exists and throws looks like the worse of the two options and is not.

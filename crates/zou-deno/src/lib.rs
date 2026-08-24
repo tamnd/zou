@@ -160,6 +160,8 @@ mod tree;
 mod url;
 #[cfg(feature = "isolate")]
 mod websocket;
+#[cfg(feature = "isolate")]
+mod zlib;
 
 #[cfg(feature = "isolate")]
 pub use isolate::Isolate;
