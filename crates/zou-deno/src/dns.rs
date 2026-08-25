@@ -93,7 +93,7 @@ pub enum Found {
 /// This is `getaddrinfo` and not a query, which is the difference that
 /// matters: `localhost`, a name in `/etc/hosts` and a search domain are
 /// all things the resolver library knows and the wire does not.
-#[op2(async(lazy))]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_zou_dns_lookup(#[string] hostname: String) -> Looked {
     // The port is not part of the question and nothing is opened here,
@@ -139,7 +139,7 @@ pub async fn op_zou_dns_lookup(#[string] hostname: String) -> Looked {
 /// The records of one type a name has, asked on the wire.
 ///
 /// `server` is the resolver the caller named, empty for the host's own.
-#[op2(async(lazy))]
+#[op2(async(lazy), fast)]
 #[serde]
 pub async fn op_zou_dns_resolve(
     #[string] name: String,
