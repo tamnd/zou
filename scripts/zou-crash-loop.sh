@@ -35,17 +35,59 @@ start() {
 		-o "-p $PORT -k $SOCK -c listen_addresses=''" start
 }
 
+# Two spaces in front of whatever came out of something else, so a dump
+# of a log or a lease reads as part of the line that introduced it.
+indent() { sed 's/^/  /'; }
+
+# The lease as the store has it, which is the one question a write that
+# will not go through is about. `zou info` reads the manifest and takes
+# nothing, so it is safe to ask this of a store somebody is writing to.
+lease_now() {
+	if [ -x "$ZOU_BIN/zou" ]; then
+		"$ZOU_BIN/zou" info "$ZOU_TARGET" "${ZOU_TENANT:-local}" 2>&1 |
+			grep -E "^(ref|lease)" || true
+	else
+		echo "no $ZOU_BIN/zou here to read the lease with"
+	fi
+}
+
 # Writes block until the pusher holds the lease, which after a kill -9
 # means waiting out the previous incarnation's TTL. Probe until a real
 # commit gets through so the load phase measures load, not lease waits.
+#
+# It says why it is still waiting rather than only that it gave up. Both
+# halves of that are the point of zou #503: the wait ran out twice on CI
+# and the only thing in the log was that it had, so nobody could tell
+# whether the takeover was never tried or tried and refused. The probe's
+# own answer names which, the lease says who is holding it and until
+# when, and the postmaster log has whatever `zou_wal_open` said on its
+# way past.
 wait_writable() {
-	for _ in $(seq 1 120); do
-		if q "insert into probe values(1)" >/dev/null 2>&1; then
+	# Local because the loop below has a `last` of its own, holding the
+	# last acked ledger id, and a probe's error message is not an id.
+	local tries=${1:-120}
+	local last=
+	local n
+	for n in $(seq 1 "$tries"); do
+		if last=$(q "insert into probe values(1)" 2>&1); then
 			return 0
+		fi
+		# Every ten seconds and not every one: the normal case is a
+		# wait of one ttl, and fifteen lines of it would bury the run
+		# they are part of.
+		if [ $((n % 10)) -eq 0 ]; then
+			say "still not writable after ${n}s: $(echo "$last" | tr '\n' ' ')"
+			say "  lease: $(lease_now | tr '\n' ' ')"
 		fi
 		sleep 1
 	done
-	say "FAIL: server never became writable"
+	say "FAIL: server never became writable after ${tries}s"
+	say "the probe's last answer:"
+	printf '%s\n' "$last" | indent
+	say "the lease as the store has it:"
+	lease_now | indent
+	say "the last 40 lines of $PGDATA.log:"
+	tail -40 "$PGDATA.log" 2>&1 | indent
 	exit 1
 }
 
