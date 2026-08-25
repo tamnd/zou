@@ -127,9 +127,34 @@ export function createReadStream(path, options) {
   return made;
 }
 
+/// The path back, the same answer `node:fs/promises` gives: nothing
+/// here follows a link, because a function's filesystem is the files
+/// deployed beside it under the names it was given.
+export function realpathSync(path) {
+  return String(path);
+}
+
+export function realpath(path, options, back) {
+  const answer = typeof options === "function" ? options : back;
+  answer(null, String(path));
+}
+
+realpath.native = realpath;
+realpathSync.native = realpathSync;
+
 function readOnly(name) {
   return function () {
     throw new TypeError(`the filesystem a function runs on is read only, so node:fs ${name} cannot work here`);
+  };
+}
+
+/// The other half of what is missing, which is not about writing. A
+/// function reads the files deployed beside it and that is the whole of
+/// its filesystem, so a call that wants to walk one has nothing to walk
+/// rather than something it is not allowed to touch.
+function nothingToRead(name) {
+  return function () {
+    throw new TypeError(`a function reads the files deployed beside it, so node:fs ${name} has nothing to work on here`);
   };
 }
 
@@ -139,58 +164,169 @@ export const appendFile = readOnly("appendFile");
 export const appendFileSync = readOnly("appendFileSync");
 export const mkdir = readOnly("mkdir");
 export const mkdirSync = readOnly("mkdirSync");
+export const mkdtemp = readOnly("mkdtemp");
+export const mkdtempSync = readOnly("mkdtempSync");
 export const rm = readOnly("rm");
 export const rmSync = readOnly("rmSync");
+export const rmdir = readOnly("rmdir");
+export const rmdirSync = readOnly("rmdirSync");
 export const unlink = readOnly("unlink");
 export const unlinkSync = readOnly("unlinkSync");
 export const rename = readOnly("rename");
 export const renameSync = readOnly("renameSync");
+export const copyFile = readOnly("copyFile");
+export const copyFileSync = readOnly("copyFileSync");
+export const cp = readOnly("cp");
+export const cpSync = readOnly("cpSync");
+export const chmod = readOnly("chmod");
+export const chmodSync = readOnly("chmodSync");
+export const chown = readOnly("chown");
+export const chownSync = readOnly("chownSync");
+export const lchmod = readOnly("lchmod");
+export const lchmodSync = readOnly("lchmodSync");
+export const lchown = readOnly("lchown");
+export const lchownSync = readOnly("lchownSync");
+export const utimes = readOnly("utimes");
+export const utimesSync = readOnly("utimesSync");
+export const lutimes = readOnly("lutimes");
+export const lutimesSync = readOnly("lutimesSync");
+export const link = readOnly("link");
+export const linkSync = readOnly("linkSync");
+export const symlink = readOnly("symlink");
+export const symlinkSync = readOnly("symlinkSync");
+export const truncate = readOnly("truncate");
+export const truncateSync = readOnly("truncateSync");
+export const ftruncate = readOnly("ftruncate");
+export const ftruncateSync = readOnly("ftruncateSync");
 export const createWriteStream = readOnly("createWriteStream");
-export const readdir = readOnly("readdir");
-export const readdirSync = readOnly("readdirSync");
-export const watch = readOnly("watch");
 export const openSync = readOnly("openSync");
 export const open = readOnly("open");
+export const write = readOnly("write");
+export const writeSync = readOnly("writeSync");
+
+export const readdir = nothingToRead("readdir");
+export const readdirSync = nothingToRead("readdirSync");
+export const opendir = nothingToRead("opendir");
+export const opendirSync = nothingToRead("opendirSync");
+export const readlink = nothingToRead("readlink");
+export const readlinkSync = nothingToRead("readlinkSync");
+export const statfs = nothingToRead("statfs");
+export const statfsSync = nothingToRead("statfsSync");
+export const watch = nothingToRead("watch");
+export const watchFile = nothingToRead("watchFile");
+export const glob = nothingToRead("glob");
+export const globSync = nothingToRead("globSync");
+
+/// A descriptor is what `open` would have handed back, and nothing here
+/// hands one out, so the calls that take one have none to be given.
+export const close = nothingToRead("close");
+export const closeSync = nothingToRead("closeSync");
+export const read = nothingToRead("read");
+export const readSync = nothingToRead("readSync");
+export const fstat = nothingToRead("fstat");
+export const fstatSync = nothingToRead("fstatSync");
+
+/// A watcher nobody set up has nothing to take down, which is a call
+/// that does nothing rather than one that refuses.
+export function unwatchFile() {}
 
 export const constants = {
   F_OK: 0,
   R_OK: 4,
   W_OK: 2,
   X_OK: 1,
+  COPYFILE_EXCL: 1,
+  COPYFILE_FICLONE: 2,
+  COPYFILE_FICLONE_FORCE: 4,
+  O_RDONLY: 0,
+  O_WRONLY: 1,
+  O_RDWR: 2,
+  O_CREAT: 64,
+  O_EXCL: 128,
+  O_TRUNC: 512,
+  O_APPEND: 1024,
 };
 
 export { promises };
 
 export default {
-  readFile,
-  readFileSync,
-  exists,
-  existsSync,
   access,
   accessSync,
-  stat,
-  statSync,
-  lstat,
-  lstatSync,
-  createReadStream,
-  createWriteStream,
-  writeFile,
-  writeFileSync,
   appendFile,
   appendFileSync,
+  chmod,
+  chmodSync,
+  chown,
+  chownSync,
+  close,
+  closeSync,
+  constants,
+  copyFile,
+  copyFileSync,
+  cp,
+  cpSync,
+  createReadStream,
+  createWriteStream,
+  exists,
+  existsSync,
+  fstat,
+  fstatSync,
+  ftruncate,
+  ftruncateSync,
+  glob,
+  globSync,
+  lchmod,
+  lchmodSync,
+  lchown,
+  lchownSync,
+  link,
+  linkSync,
+  lstat,
+  lstatSync,
+  lutimes,
+  lutimesSync,
   mkdir,
   mkdirSync,
-  rm,
-  rmSync,
-  unlink,
-  unlinkSync,
-  rename,
-  renameSync,
-  readdir,
-  readdirSync,
-  watch,
+  mkdtemp,
+  mkdtempSync,
   open,
   openSync,
-  constants,
+  opendir,
+  opendirSync,
   promises,
+  read,
+  readFile,
+  readFileSync,
+  readSync,
+  readdir,
+  readdirSync,
+  readlink,
+  readlinkSync,
+  realpath,
+  realpathSync,
+  rename,
+  renameSync,
+  rm,
+  rmSync,
+  rmdir,
+  rmdirSync,
+  stat,
+  statSync,
+  statfs,
+  statfsSync,
+  symlink,
+  symlinkSync,
+  truncate,
+  truncateSync,
+  unlink,
+  unlinkSync,
+  unwatchFile,
+  utimes,
+  utimesSync,
+  watch,
+  watchFile,
+  write,
+  writeFile,
+  writeFileSync,
+  writeSync,
 };

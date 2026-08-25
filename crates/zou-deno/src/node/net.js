@@ -55,9 +55,16 @@ export class Socket extends Duplex {
     return this;
   }
 
+  /// How the connection is made, which is the one thing `node:tls`
+  /// changes about a socket: the same names, the same streams, the
+  /// same half close, and a handshake in front of the first byte.
+  _open(options) {
+    return Deno.connect({ hostname: options.host, port: options.port });
+  }
+
   async #open(options) {
     try {
-      const conn = await Deno.connect({ hostname: options.host, port: options.port });
+      const conn = await this._open(options);
       if (this.#closed) {
         conn.close();
         return;

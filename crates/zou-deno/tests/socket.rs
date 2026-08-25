@@ -365,3 +365,73 @@ fn there_is_a_ceiling_on_how_many_sockets_one_function_holds() {
         "256 a function may hold 256 sockets open at once, and this one already holds that many"
     );
 }
+
+/// `node:tls`, which is the same handshake with node's names on it. The
+/// certificate goes in as `ca`, the way a package hands one over, and
+/// what comes back is a socket a package can write a line to and read
+/// the answer off, plus the two fields it reads to find out that it is
+/// talking over tls at all.
+#[test]
+fn node_tls_connects_and_talks_over_the_handshake() {
+    let port = talking_tls();
+    let cert = String::from_utf8_lossy(CERT).to_string();
+    let answer = answered(&format!(
+        r#"
+        import tls from "node:tls";
+        const seen = [];
+
+        const socket = tls.connect({{ port: {port}, host: "localhost", ca: {cert:?} }});
+        const heard = [];
+        socket.on("data", (chunk) => heard.push(String(chunk).trim()));
+        await new Promise((resolve, reject) => {{
+          socket.on("secureConnect", resolve);
+          socket.on("error", reject);
+        }});
+        seen.push(`${{socket.encrypted}} ${{socket.authorized}} ${{socket.servername}}`);
+        socket.write("over node tls\n");
+        await new Promise((resolve) => socket.once("data", resolve));
+        seen.push(heard.join("|"));
+        socket.destroy();
+
+        Deno.serve(() => new Response(seen.join(" ")));
+        "#
+    ));
+    assert_eq!(body(&answer), "true true localhost pong over node tls");
+}
+
+/// The refusals, which are the two things this module will not do: a
+/// certificate nobody signed for is still refused when the options ask
+/// for it not to be, and a socket that is already open cannot have tls
+/// put on it here.
+#[test]
+fn node_tls_checks_the_certificate_and_will_not_upgrade_a_socket() {
+    let port = talking_tls();
+    let answer = answered(&format!(
+        r#"
+        import tls from "node:tls";
+        import net from "node:net";
+        const seen = [];
+
+        const socket = tls.connect({{ port: {port}, host: "localhost", rejectUnauthorized: false }});
+        seen.push(await new Promise((resolve) => socket.on("error", (why) => resolve(why.message))));
+
+        try {{
+          tls.connect({{ socket: new net.Socket() }});
+          seen.push("no error");
+        }} catch (why) {{
+          seen.push(why.message);
+        }}
+
+        Deno.serve(() => new Response(seen.join(" | ")));
+        "#
+    ));
+    let said = body(&answer);
+    assert!(
+        said.contains("rejectUnauthorized false does not turn that off"),
+        "{said}"
+    );
+    assert!(
+        said.contains("a socket that is already open cannot be upgraded"),
+        "{said}"
+    );
+}
