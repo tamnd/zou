@@ -428,7 +428,11 @@ fn pg_objects(
             out.push((LayerKey::relsize(spc, db, rel, fork), Seed::Size(n)));
             continue;
         }
-        let Ok(blk) = parts[4].parse::<u32>() else {
+        // Hex, the way the key is written. Decimal read the first ten
+        // blocks of every fork correctly and dropped every one after
+        // that, which is a seed that looks complete and leaves a
+        // branch with no base under the eleventh page of pg_class.
+        let Ok(blk) = u32::from_str_radix(parts[4], 16) else {
             continue;
         };
         out.push((LayerKey::page(spc, db, rel, fork, blk), Seed::Page(key)));
@@ -538,12 +542,19 @@ pub fn fold_for_branch(
     let caught = catch_up_shard(store, tenant_ref)?;
     log::debug!("fold for branch: the shard is consistent through {caught:#x}");
     let store: &dyn CasStore = &**store;
+    // Asked before the seed rather than after it, because the seed is
+    // itself an image at the bottom of the store and would answer the
+    // question for every shard. A shard whose deltas hold pages the
+    // base never had still needs its merge, and skipping it left a
+    // child that came up and died on the first page written after the
+    // page service took over the writes.
+    let want = floorless(store, &layout, manifest)?;
     // Before the merge, so the images it cuts carry the lengths too
     // and the seeded layer is retired along with everything else.
     let seeded = seed_base(store, tenant_ref, manifest)?;
     log::debug!("fold for branch: seeded {seeded} entries from the pg objects");
     let mut folded = 0;
-    for shard in floorless(store, &layout, manifest)? {
+    for shard in want {
         // One shard at a time, for the reason the offline fold gives:
         // a merge holds an image in memory while it fills.
         let out =
@@ -804,7 +815,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let layout = TenantLayout::new("prod");
-        for (rel, n) in [(1260u32, 2u32), (1255, 1)] {
+        for (rel, n) in [(1260u32, 12u32), (1255, 1)] {
             store
                 .put(
                     &layout.pg_size(1663, 5, rel, 0),
@@ -835,8 +846,8 @@ mod tests {
         });
         assert_eq!(
             seed_base(&store, "prod", &m).unwrap(),
-            5,
-            "3 pages, 2 sizes"
+            15,
+            "13 pages, 2 sizes"
         );
 
         let (shard, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
@@ -854,7 +865,7 @@ mod tests {
             };
             svc.rel_size(&map, &mem, fork, u64::MAX).unwrap()
         };
-        assert_eq!(ask(1260), Some(2));
+        assert_eq!(ask(1260), Some(12));
         assert_eq!(ask(1255), Some(1));
         assert_eq!(ask(2600), None, "a rel with no marker stays silent");
 
@@ -867,14 +878,16 @@ mod tests {
                     db: 5,
                     rel: 1260,
                     fork: 0,
-                    blk: 1,
+                    // Past the ninth, where a decimal reading of a
+                    // hex key stops finding anything.
+                    blk: 11,
                 }],
                 u64::MAX,
             )
             .unwrap();
         assert_eq!(
             page[0],
-            vec![1261u32 as u8; 8192],
+            vec![(1260u32 + 11) as u8; 8192],
             "the page came along too"
         );
 
