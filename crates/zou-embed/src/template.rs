@@ -26,7 +26,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zou_pg::branching::ReadPath;
@@ -284,7 +284,8 @@ fn raise(
 /// which is also where the cost belongs, once per template rather than
 /// once per fixture cut from it.
 fn fold(pg_bin: &Path, target: &str) -> Result<(), Error> {
-    let store = open_store(target).map_err(|e| Error::new(Kind::Store, e))?;
+    let store: Arc<dyn zou_store::CasStore> =
+        Arc::from(open_store(target).map_err(|e| Error::new(Kind::Store, e))?);
     let layout = TenantLayout::new(TEMPLATE);
     let Some((data, _)) = store
         .get(&layout.manifest())
@@ -309,7 +310,7 @@ fn fold(pg_bin: &Path, target: &str) -> Result<(), Error> {
         batches_per_worker: FOLD_BATCHES_PER_WORKER,
         data_checksums: checksums,
     });
-    zou_pg::branching::fold_for_branch(&*store, TEMPLATE, &manifest, &pool, checksums)
+    zou_pg::branching::fold_for_branch(&store, TEMPLATE, &manifest, &pool, checksums)
         .map(|_| ())
         .map_err(|e| Error::new(Kind::Store, e))
 }

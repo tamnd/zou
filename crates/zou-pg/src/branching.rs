@@ -20,7 +20,11 @@
 //! did serve and is no longer wanted.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use zou_log::{TeeFilter, WalMedia, catch_up_with};
+
+use crate::ingest::ShardIngest;
 use crate::redo::RedoPool;
 use crate::relsize;
 use zou_store::layer::{ImageBuilder, LayerKey, LayerKind, PAGE_IMAGE_LEN};
@@ -432,6 +436,66 @@ fn pg_objects(
     Ok(out)
 }
 
+/// Apply whatever sealed WAL the page shard has not ingested yet, so
+/// the shard is consistent through the end of the source's own log.
+///
+/// A branch cut leaves the child standing on
+/// `min(parent disk consistent lsn, branch point)` and then hands it a
+/// log that starts at the branch point, because that is where the
+/// child's recovery starts. When the parent's ingest stopped short of
+/// its own last checkpoint, those two numbers differ, and the records
+/// in between belong to a log the child has no copy of and cannot ask
+/// for. Its ingest reads the hole for what it is, refuses to apply
+/// past it, and every page read on the child fails. Closing it here
+/// costs the tail of one log, which on a source that has just been
+/// sealed is a checkpoint record or two.
+///
+/// The returned lsn is what the shard is consistent through, which is
+/// the anchor a child inherits.
+fn catch_up_shard(store: &Arc<dyn CasStore>, tenant_ref: &str) -> Result<u64, String> {
+    let layout = TenantLayout::new(tenant_ref);
+    let tenant = zou_store::layout::tenant_id(tenant_ref);
+    let Some((shard_manifest, _)) =
+        PageShardManifest::load(&**store, &layout.shard_manifest(0)).map_err(|e| e.to_string())?
+    else {
+        // Nothing ingested at all, so there is no anchor to advance
+        // and no child that could stand on one. `why_layerless` is the
+        // one that says so, in a sentence somebody can act on.
+        return Ok(0);
+    };
+    let mut ingest = ShardIngest::new(
+        crate::pagesvc::ingest_config(tenant),
+        shard_manifest.disk_consistent_lsn.0,
+    );
+    let media = WalMedia::single(crate::log_store(Arc::clone(store), &layout));
+    let filter = TeeFilter::Tenant(tenant);
+    catch_up_with::<String, _>(
+        &media,
+        crate::WAL_SHARD,
+        &filter,
+        Lsn(ingest.applied()),
+        |frame| {
+            ingest
+                .apply_frames(std::slice::from_ref(&frame))
+                .map_err(|e| format!("catching the shard up: {e}"))?;
+            // Bytes is the only reason that fires with a durable end
+            // of zero and no age, which is the one this wants: the
+            // memtable stays bounded on a long tail without a flush
+            // per frame on a short one.
+            if ingest.flush_reason(0, std::time::Duration::ZERO).is_some() {
+                ingest
+                    .flush(&**store, &layout)
+                    .map_err(|e| format!("flushing the catch up: {e}"))?;
+            }
+            Ok(())
+        },
+    )?;
+    ingest
+        .flush(&**store, &layout)
+        .map_err(|e| format!("flushing the catch up: {e}"))?;
+    Ok(ingest.applied())
+}
+
 /// Cut the folds a branch of this source needs, rather than wait for
 /// the background one to earn them.
 ///
@@ -450,7 +514,7 @@ fn pg_objects(
 /// The count is how many shards were folded, which is zero on a source
 /// that was already branchable.
 pub fn fold_for_branch(
-    store: &dyn CasStore,
+    store: &Arc<dyn CasStore>,
     tenant_ref: &str,
     manifest: &Manifest,
     pool: &RedoPool,
@@ -458,6 +522,12 @@ pub fn fold_for_branch(
 ) -> Result<usize, String> {
     let layout = TenantLayout::new(tenant_ref);
     let at = cut_at(manifest).ok_or_else(|| NO_CHECKPOINT.to_string())?;
+    // Before anything else, because the merge's horizon is bounded by
+    // the shard's own consistent point and a child's floor is bounded
+    // by the same number.
+    let caught = catch_up_shard(store, tenant_ref)?;
+    log::debug!("fold for branch: the shard is consistent through {caught:#x}");
+    let store: &dyn CasStore = &**store;
     // Before the merge, so the images it cuts carry the lengths too
     // and the seeded layer is retired along with everything else.
     let seeded = seed_base(store, tenant_ref, manifest)?;
