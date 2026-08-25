@@ -49,6 +49,12 @@ pub fn source(name: &str) -> Option<&'static str> {
         "cluster" => include_str!("node/cluster.js"),
         "crypto" => include_str!("node/crypto.js"),
         "diagnostics_channel" => include_str!("node/diagnostics_channel.js"),
+        // Two different questions about a name: what address it has,
+        // which is the host's own resolution, and what records its zone
+        // holds, which is a query put on the wire. A mail sender needs
+        // the second one, because an MX record is not an address.
+        "dns" => include_str!("node/dns.js"),
+        "dns/promises" => include_str!("node/dns_promises.js"),
         "events" => include_str!("node/events.js"),
         "fs" => include_str!("node/fs.js"),
         "fs/promises" => include_str!("node/fs_promises.js"),
@@ -111,6 +117,8 @@ pub const NAMES: &[&str] = &[
     "cluster",
     "crypto",
     "diagnostics_channel",
+    "dns",
+    "dns/promises",
     "events",
     "fs",
     "fs/promises",
