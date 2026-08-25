@@ -552,6 +552,65 @@ fn a_record_for_a_high_block_does_not_materialize_the_blocks_below_it() {
     );
 }
 
+/// Two pools under one scratch root at the same time, which is what a
+/// suite that branches from more than one test at once does: the page
+/// service holds one and every fold makes another. Worker numbers only
+/// count inside a pool, so both pools' first worker used to be `w0`
+/// under the same root, and postgres derives its sysv shared memory
+/// key from that path, so the second worker to start refused with
+/// "pre-existing shared memory block is still in use" and its pool saw
+/// a broken pipe (zou #675).
+#[test]
+fn two_pools_under_one_root_do_not_collide() {
+    let Ok(prefix) = std::env::var("ZOU_PG_PREFIX") else {
+        eprintln!("ZOU_PG_PREFIX not set, skipping the redo pool scratch root test");
+        return;
+    };
+    let postgres = PathBuf::from(prefix).join("bin").join("postgres");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("scratch");
+    let config = || RedoPoolConfig {
+        postgres: postgres.clone(),
+        scratch_root: root.clone(),
+        workers: 1,
+        batch_timeout: Duration::from_secs(30),
+        batches_per_worker: 8,
+        data_checksums: true,
+    };
+    let first = RedoPool::new(config());
+    let second = RedoPool::new(config());
+    let blk = BlockRef {
+        spc: 1663,
+        db: 5,
+        rel: 16384,
+        fork: 0,
+        blk: 0,
+    };
+    let image = marker_page(0xCD);
+    let record = image_record(blk, &image);
+    let lsn = WAL_SEGMENT_SIZE + 0x28;
+    for (which, pool) in [("first", &first), ("second", &second)] {
+        let pages = pool
+            .apply(&RedoRequest {
+                pages: &[],
+                records: &[(lsn, lsn + record.len() as u64 + 8, &record)],
+                gets: &[blk],
+            })
+            .unwrap_or_else(|e| panic!("the {which} pool's worker started and applied: {e}"));
+        assert_eq!(&pages[0][8..], &image[8..], "the {which} pool restored it");
+    }
+
+    // And each pool takes its own directory with it, so a run that
+    // makes one per branch does not leave a trail of them.
+    drop(first);
+    drop(second);
+    let left: Vec<_> = std::fs::read_dir(&root)
+        .expect("the root outlives the pools")
+        .map(|e| e.expect("an entry").file_name())
+        .collect();
+    assert!(left.is_empty(), "scratch left behind: {left:?}");
+}
+
 /// An empty heap page with a byte pattern where the tuples would go, so
 /// that a restored image is recognizable and postgres still considers
 /// the page well formed.
