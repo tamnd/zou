@@ -493,6 +493,16 @@ fn catch_up_shard(store: &Arc<dyn CasStore>, tenant_ref: &str) -> Result<u64, St
     ingest
         .flush(&**store, &layout)
         .map_err(|e| format!("flushing the catch up: {e}"))?;
+    // And say so even when the tail changed no page, which is the
+    // ordinary case for the last records a shutdown writes: a flush
+    // with an empty memtable publishes nothing, and the lsn left
+    // behind is the one a child would be anchored at.
+    zou_store::shardmanifest::advance_consistent(
+        &**store,
+        &layout.shard_manifest(0),
+        Lsn(ingest.applied()),
+    )
+    .map_err(|e| format!("advancing the shard: {e}"))?;
     Ok(ingest.applied())
 }
 
