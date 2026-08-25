@@ -361,16 +361,17 @@ const FOLD_BATCHES_PER_WORKER: u64 = 256;
 /// saying what it was waiting for rather than publishing a template
 /// that would hand somebody a database that cannot read pg_authid.
 ///
-/// The layer path has no waiting to do. Its fold is asked for by name
-/// once the postmaster is down, see [`fold`], so all this owes it is a
-/// checkpoint for the fold to cut at.
+/// The layer path packs its capture down by name once the postmaster
+/// is down, see [`fold`], so all it needs here is a checkpoint for the
+/// fold to cut at. It still has to see that checkpoint published,
+/// see [`settle_layers`].
 fn settle(dsn: &str, target: &str, path: ReadPath) -> Result<(), Error> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(io("tokio runtime"))?;
     if path == ReadPath::Layers {
-        return run(&rt, dsn, "checkpoint;", "settling the template");
+        return settle_layers(&rt, dsn, target);
     }
     for round in 0..30 {
         let statements = if round == 0 {
@@ -401,6 +402,102 @@ fn settle(dsn: &str, target: &str, path: ReadPath) -> Result<(), Error> {
         "no fold packed a full capture down while the template was being built, \
          so a branch of it would not serve",
     ))
+}
+
+/// Checkpoint until the tenant publishes a capture that carries the
+/// contract, on the layer path.
+///
+/// The fold that names a checkpoint runs on the pusher, and it can lose
+/// a race with pg_control: it reads a redo that is already past the
+/// point it was asked to fold at, gives up and says it will retry. The
+/// retry needs another checkpoint to hang itself on, and the seal is
+/// about to take the postmaster away. So this asks again rather than
+/// waits, and refuses to publish rather than seal a template whose
+/// newest capture predates the roles and the schemas, which is a
+/// database every fixture cut from it would fail to log into.
+fn settle_layers(rt: &tokio::runtime::Runtime, dsn: &str, target: &str) -> Result<(), Error> {
+    let redo = checkpoint_redo(rt, dsn)?;
+    let store = open_store(target).map_err(|e| Error::new(Kind::Store, e))?;
+    let layout = TenantLayout::new(TEMPLATE);
+    let at = Instant::now();
+    loop {
+        let Some((data, _)) = store
+            .get(&layout.manifest())
+            .map_err(|e| Error::new(Kind::Store, e.to_string()))?
+        else {
+            return Err(Error::new(
+                Kind::Store,
+                "the template wrote no manifest, so there is nothing to seal",
+            ));
+        };
+        let manifest =
+            Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+        if manifest.checkpoints.iter().any(|c| c.lsn.0 >= redo) {
+            log::debug!(
+                "template: the capture of {redo:#x} landed after {:?}",
+                at.elapsed()
+            );
+            return Ok(());
+        }
+        if at.elapsed() > SETTLE_WAIT {
+            let newest = manifest.checkpoints.last().map(|c| c.lsn.0).unwrap_or(0);
+            return Err(Error::new(
+                Kind::Store,
+                format!(
+                    "the checkpoint at {redo:#x} was not captured within {} seconds, the newest \
+                     capture is still {newest:#x}, so a branch of this template would be the \
+                     database as it stood before the tenant contract ran",
+                    SETTLE_WAIT.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(SETTLE_POLL);
+        run(rt, dsn, "checkpoint;", "settling the template")?;
+    }
+}
+
+/// How long the seal gives the pusher to publish the contract, which is
+/// generous because a build machine under a full workspace test run is
+/// the place this is slowest and a template is built once.
+const SETTLE_WAIT: Duration = Duration::from_secs(120);
+
+/// Between two checkpoints, long enough that a fold has a chance to
+/// finish rather than be raced by the next one.
+const SETTLE_POLL: Duration = Duration::from_millis(200);
+
+/// Checkpoint, and say where the checkpoint replays from, as the plain
+/// integer the manifest counts captures in.
+fn checkpoint_redo(rt: &tokio::runtime::Runtime, dsn: &str) -> Result<u64, Error> {
+    let dsn = dsn.to_string();
+    rt.block_on(async move {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(pg("connect"))?;
+        let pump = tokio::spawn(connection);
+        let out = async {
+            client
+                .simple_query("checkpoint")
+                .await
+                .map_err(pg("settling the template"))?;
+            let rows = client
+                .simple_query(
+                    "select pg_wal_lsn_diff(redo_lsn, '0/0')::bigint from pg_control_checkpoint()",
+                )
+                .await
+                .map_err(pg("the checkpoint position"))?;
+            rows.iter()
+                .find_map(|row| match row {
+                    tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0),
+                    _ => None,
+                })
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| Error::new(Kind::Postgres, "pg_control_checkpoint said nothing"))
+        }
+        .await;
+        drop(client);
+        let _ = pump.await;
+        out
+    })
 }
 
 /// One connection, one batch, and the connection closed behind it.
