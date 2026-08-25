@@ -459,26 +459,32 @@ fn pg_objects(
 fn catch_up_shard(store: &Arc<dyn CasStore>, tenant_ref: &str) -> Result<u64, String> {
     let layout = TenantLayout::new(tenant_ref);
     let tenant = zou_store::layout::tenant_id(tenant_ref);
-    let Some((shard_manifest, _)) =
-        PageShardManifest::load(&**store, &layout.shard_manifest(0)).map_err(|e| e.to_string())?
-    else {
-        // Nothing ingested at all, so there is no anchor to advance
-        // and no child that could stand on one. `why_layerless` is the
-        // one that says so, in a sentence somebody can act on.
-        return Ok(0);
-    };
-    let mut ingest = ShardIngest::new(
-        crate::pagesvc::ingest_config(tenant),
-        shard_manifest.disk_consistent_lsn.0,
-    );
+    let anchor = PageShardManifest::load(&**store, &layout.shard_manifest(0))
+        .map_err(|e| e.to_string())?
+        .map(|(m, _)| m.disk_consistent_lsn.0);
+    // Nothing published at all is not nothing to do. A source whose
+    // live service never got a poll in before the postmaster stopped
+    // has its whole session sitting in the sealed log and no layer
+    // anywhere, and a fold that shrugged at that left a source that
+    // cannot be branched for a reason nobody can act on. So the anchor
+    // is the oldest frame the log still holds, the same rule the live
+    // driver anchors a fresh shard by. Replaying records the seeded
+    // base already has is safe: redo skips a record whose lsn is at or
+    // below the page's own, which is exactly what those are.
+    let mut ingest = anchor.map(|at| ShardIngest::new(crate::pagesvc::ingest_config(tenant), at));
     let media = WalMedia::single(crate::log_store(Arc::clone(store), &layout));
     let filter = TeeFilter::Tenant(tenant);
     catch_up_with::<String, _>(
         &media,
         crate::WAL_SHARD,
         &filter,
-        Lsn(ingest.applied()),
+        Lsn(anchor.unwrap_or(0)),
         |frame| {
+            let ingest = ingest.get_or_insert_with(|| {
+                let start = frame.start_lsn.0;
+                log::debug!("fold for branch: anchoring a fresh shard at {start:#x}");
+                ShardIngest::new(crate::pagesvc::ingest_config(tenant), start)
+            });
             ingest
                 .apply_frames(std::slice::from_ref(&frame))
                 .map_err(|e| format!("catching the shard up: {e}"))?;
@@ -494,6 +500,12 @@ fn catch_up_shard(store: &Arc<dyn CasStore>, tenant_ref: &str) -> Result<u64, St
             Ok(())
         },
     )?;
+    let Some(mut ingest) = ingest else {
+        // No manifest and no frames: this source has never written
+        // anything a child could read. `why_layerless` says so in a
+        // sentence somebody can act on.
+        return Ok(0);
+    };
     ingest
         .flush(&**store, &layout)
         .map_err(|e| format!("flushing the catch up: {e}"))?;
