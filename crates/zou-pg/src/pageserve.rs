@@ -1282,13 +1282,20 @@ fn worth_folding(debt: u64) -> bool {
 ///
 /// The fallback reads the pg/ image of a block the layers do not
 /// cover, the objects frozen at the put elision flag day.
+///
+/// It attaches by tenant and shard rather than by prefix, because a
+/// branch's layer list names its parent's layers and a reader opened
+/// on a bare prefix refuses them: it has no way to know whose prefix
+/// to fetch an inherited layer from. Every read on a branched tenant
+/// went that way, which is a database that comes up and then cannot
+/// answer for a single catalog it did not write itself.
 fn page_service<'a>(
     store: &'a dyn CasStore,
     layout: &'a TenantLayout,
     pool: Option<&'a RedoPool>,
     data_checksums: bool,
 ) -> PageService<'a> {
-    PageService::new(store, layout.shard_prefix(0), pool, data_checksums).with_base_fallback(
+    PageService::for_shard(store, layout.tenant_ref(), 0, pool, data_checksums).with_base_fallback(
         move |blk: &BlockRef| match store
             .get(&layout.pg_block(blk.spc, blk.db, blk.rel, blk.fork, blk.blk))
         {
