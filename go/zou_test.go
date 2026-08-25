@@ -204,10 +204,14 @@ func TestAFixtureIsADatabasePerTest(t *testing.T) {
 	}
 }
 
-func TestADatabaseTooYoungToBranchSaysSo(t *testing.T) {
+func TestADatabaseOnlyJustOpenedAnswersForABranchEitherWay(t *testing.T) {
 	ready(t)
 	// The ordinary path: a store of its own, initdb, and nothing folded
-	// down yet.
+	// down yet. The two read paths do different things with that, so ask
+	// rather than assume. The layer path folds an image out of the base
+	// initdb wrote, so the branch opens and what is worth checking is
+	// that the child is a database of its own. The object path waits for
+	// a fold it has not had, so it refuses.
 	handle, err := zou.Open(zou.Options{})
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -219,7 +223,20 @@ func TestADatabaseTooYoungToBranchSaysSo(t *testing.T) {
 		t.Fatal(err)
 	}
 	if branchable {
-		t.Fatal("a database this young has nothing to branch from")
+		child, err := handle.Branch("too-soon")
+		if err != nil {
+			t.Fatalf("branch: %v", err)
+		}
+		defer child.Close()
+		if child.Tenant() != "too-soon" {
+			t.Fatalf("the child is %q", child.Tenant())
+		}
+		answer, err := child.Request("GET", "/rest/v1/",
+			[][2]string{{"apikey", child.AnonKey()}}, nil)
+		if err != nil || answer.Status != 200 {
+			t.Fatalf("the child answered %v %v", answer, err)
+		}
+		return
 	}
 	if _, err := handle.Branch("too-soon"); err == nil {
 		t.Fatal("the branch was allowed")

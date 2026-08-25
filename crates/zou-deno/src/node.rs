@@ -76,6 +76,13 @@ pub fn source(name: &str) -> Option<&'static str> {
         "string_decoder" => include_str!("node/string_decoder.js"),
         "timers" => include_str!("node/timers.js"),
         "timers/promises" => include_str!("node/timers_promises.js"),
+        // The socket the client half of `https` is built on in node,
+        // which here is the same socket `net` opens with the host's
+        // handshake in front of it.
+        "tls" => include_str!("node/tls.js"),
+        // Nothing a function runs on is a terminal, and this is the
+        // module that says so in the shape a logger asks the question.
+        "tty" => include_str!("node/tty.js"),
         "url" => include_str!("node/url.js"),
         "util" => include_str!("node/util.js"),
         "util/types" => include_str!("node/util_types.js"),
@@ -125,6 +132,8 @@ pub const NAMES: &[&str] = &[
     "string_decoder",
     "timers",
     "timers/promises",
+    "tls",
+    "tty",
     "url",
     "util",
     "util/types",
@@ -307,7 +316,7 @@ mod tests {
         for name in super::NAMES {
             assert!(super::core(name), "node:{name} is not on the core list");
         }
-        assert!(super::core("tls"), "node has tls and this does not");
+        assert!(super::core("http2"), "node has http2 and this does not");
         assert!(!super::core("lodash"));
         assert!(!super::core("node:os"), "the prefix is taken off first");
     }
@@ -315,7 +324,7 @@ mod tests {
     #[test]
     fn a_built_in_that_is_not_here_is_not_pretended_to_be() {
         assert!(source("dgram").is_none());
-        assert!(source("tls").is_none());
+        assert!(source("http2").is_none());
         assert!(source("path/nonsense").is_none());
     }
 }

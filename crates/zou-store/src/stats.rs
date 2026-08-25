@@ -45,6 +45,16 @@
 //! its predecessors after its own PUT returned, because the chain acks
 //! in order. `durable` is the whole of it from the append onwards, the
 //! number a committing backend is actually waiting for.
+//!
+//! Park time is the largest of the three phases on a loaded node and
+//! the least self explanatory, so it has two counters of its own.
+//! [`note_park_gap`] records how much WAL a parked read was ahead of
+//! ingest when it parked, which separates a service that is behind
+//! from one that is idle and being asked for a position nothing wrote.
+//! [`note_park_cause`] records whether the WAL it waited through wrote
+//! the pages it asked for at all, because a read waiting on somebody
+//! else's writes is waiting for nothing and wants a different read
+//! position rather than a faster ingest.
 
 use std::cell::Cell;
 use std::fs::{self, OpenOptions};
@@ -59,12 +69,13 @@ use crate::cas::{CasError, CasStore, Version};
 /// layout so a dump from a stale binary fails loudly instead of reading
 /// garbage.
 const MAGIC: u64 = u64::from_ne_bytes(*b"ZOUSTATS");
-const FORMAT: u64 = 4;
+const FORMAT: u64 = 5;
 
 pub const OP_NAMES: [&str; 6] = ["get", "get_range", "put_if_match", "put", "delete", "list"];
 pub const CLASS_NAMES: [&str; 7] = ["manifest", "wal", "chk", "shards", "page", "file", "other"];
 pub const TIER_NAMES: [&str; 4] = ["cache", "local", "store", "service"];
 pub const PHASE_NAMES: [&str; 3] = ["park", "read", "ingest"];
+pub const CAUSE_NAMES: [&str; 3] = ["touched", "untouched", "unclear"];
 pub const COMMIT_NAMES: [&str; 7] = [
     "push", "stage", "window", "dispatch", "put", "ack", "durable",
 ];
@@ -74,6 +85,7 @@ const CLASSES: usize = CLASS_NAMES.len();
 const TIERS: usize = TIER_NAMES.len();
 const PHASES: usize = PHASE_NAMES.len();
 const STEPS: usize = COMMIT_NAMES.len();
+const CAUSES: usize = CAUSE_NAMES.len();
 const BUCKETS: usize = 32;
 
 const HEADER: usize = 2;
@@ -83,7 +95,9 @@ const CONFLICT_SLOT: usize = ERROR_BASE + KINDS;
 const TIER_BASE: usize = CONFLICT_SLOT + 1;
 const PHASE_BASE: usize = TIER_BASE + TIERS * (2 + BUCKETS);
 const STEP_BASE: usize = PHASE_BASE + PHASES * (1 + BUCKETS);
-const SLOTS: usize = STEP_BASE + STEPS * (1 + BUCKETS);
+const CAUSE_BASE: usize = STEP_BASE + STEPS * (1 + BUCKETS);
+const GAP_BASE: usize = CAUSE_BASE + CAUSES;
+const SLOTS: usize = GAP_BASE + 1 + BUCKETS;
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -139,6 +153,12 @@ fn classify(key: &str) -> usize {
 fn bucket(elapsed: Duration) -> usize {
     let us = (elapsed.as_micros() as u64).max(1);
     (us.ilog2() as usize).min(BUCKETS - 1)
+}
+
+/// The same buckets, for a plain quantity rather than a duration:
+/// bucket b holds [2^b, 2^(b+1)), and zero lands in bucket 0.
+fn magnitude(n: u64) -> usize {
+    (n.max(1).ilog2() as usize).min(BUCKETS - 1)
 }
 
 /// The mapped counter file. Opening creates and sizes it if needed,
@@ -319,6 +339,51 @@ pub fn note_phase(phase: Phase, elapsed: Duration) {
         let p = phase as usize;
         c.add(phase_slot(p), 1);
         c.add(phase_slot(p) + 1 + bucket(elapsed), 1);
+    }
+}
+
+/// What a read that parked was actually waiting for, [`CAUSE_NAMES`]
+/// in enum form.
+///
+/// A backend asks for a page at the lsn its WAL pusher has made
+/// durable, which is a position for the whole tenant rather than for
+/// the page in hand. So a park is one of two things, and they want
+/// opposite fixes: WAL that wrote the pages asked for, which is a read
+/// waiting for its own writes and can only be made faster by ingesting
+/// faster, or WAL that wrote something else entirely, which is a read
+/// waiting for nothing and wants a per block position instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ParkCause {
+    /// The wal applied during the wait wrote at least one of the pages
+    /// the request asked for.
+    Touched,
+    /// It wrote none of them.
+    Untouched,
+    /// A flush emptied the memtable while the request waited, so the
+    /// evidence either way went to a layer and the wait is not
+    /// classified rather than guessed at.
+    Unclear,
+}
+
+/// Record what one park was waiting for. Called by the page service
+/// driver when a parked request finally runs.
+pub fn note_park_cause(cause: ParkCause) {
+    if let Some(c) = global() {
+        c.add(CAUSE_BASE + cause as usize, 1);
+    }
+}
+
+/// Record how far ahead of ingest a read was when it parked, in wal
+/// bytes, sampled once per request the first time it has to wait.
+///
+/// This is the other half of the park histogram. Park says how long
+/// the wait was, this says how much wal the wait was for, and the two
+/// together tell a service that is behind from a service that is idle
+/// and being asked for a position nothing has reached.
+pub fn note_park_gap(bytes: u64) {
+    if let Some(c) = global() {
+        c.add(GAP_BASE, 1);
+        c.add(GAP_BASE + 1 + magnitude(bytes), 1);
     }
 }
 
@@ -509,6 +574,26 @@ pub struct Snapshot {
     pub reads: Vec<TierSnapshot>,
     pub pagesvc: Vec<PhaseSnapshot>,
     pub commit: Vec<StepSnapshot>,
+    pub park_cause: Vec<CauseSnapshot>,
+    pub park_gap: GapSnapshot,
+}
+
+/// How many parked reads were waiting for wal that wrote the pages
+/// they asked for, and how many were not.
+#[derive(Debug, serde::Serialize)]
+pub struct CauseSnapshot {
+    pub cause: &'static str,
+    pub parks: u64,
+}
+
+/// How far ahead of ingest the reads that parked were, in wal bytes.
+#[derive(Debug, serde::Serialize)]
+pub struct GapSnapshot {
+    pub samples: u64,
+    pub p50_bytes: u64,
+    pub p95_bytes: u64,
+    pub p99_bytes: u64,
+    pub max_bytes: u64,
 }
 
 /// One step of the commit path, decoded. Samples rather than commits:
@@ -656,12 +741,35 @@ impl Snapshot {
                 buckets,
             });
         }
+        let park_cause = CAUSE_NAMES
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(cause, name)| CauseSnapshot {
+                cause: name,
+                parks: slot(CAUSE_BASE + cause),
+            })
+            .collect();
+        let gaps: Vec<u64> = (0..BUCKETS).map(|b| slot(GAP_BASE + 1 + b)).collect();
+        let samples = slot(GAP_BASE);
+        let park_gap = GapSnapshot {
+            samples,
+            p50_bytes: percentile(&gaps, samples, 0.50),
+            p95_bytes: percentile(&gaps, samples, 0.95),
+            p99_bytes: percentile(&gaps, samples, 0.99),
+            max_bytes: gaps
+                .iter()
+                .rposition(|&n| n > 0)
+                .map_or(0, |b| 1u64 << (b + 1)),
+        };
         Ok(Self {
             conflicts: slot(CONFLICT_SLOT),
             ops,
             reads,
             pagesvc,
             commit,
+            park_cause,
+            park_gap,
         })
     }
 
@@ -816,6 +924,36 @@ mod tests {
         }
         assert!(snap.pagesvc.iter().all(|p| p.calls == 0));
         assert!(snap.reads.iter().all(|t| t.calls == 0));
+    }
+
+    /// The park counters are the last two regions of the file, so they
+    /// are the ones a slot arithmetic mistake lands past the end of or
+    /// on top of the commit steps. The gap side also has to keep a park
+    /// with nothing outstanding apart from a park behind three
+    /// megabytes of wal, because those are the two answers the
+    /// histogram exists to tell apart.
+    #[test]
+    fn park_gaps_and_causes_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Counters::open(&dir.path().join("stats")).unwrap();
+        for _ in 0..9 {
+            counters.add(CAUSE_BASE + ParkCause::Untouched as usize, 1);
+        }
+        counters.add(CAUSE_BASE + ParkCause::Touched as usize, 1);
+        counters.add(GAP_BASE, 2);
+        counters.add(GAP_BASE + 1 + magnitude(0), 1);
+        counters.add(GAP_BASE + 1 + magnitude(3 << 20), 1);
+        let snap = Snapshot::read(&dir.path().join("stats")).unwrap();
+        let cause = |name: &str| snap.park_cause.iter().find(|c| c.cause == name).unwrap();
+        assert_eq!(cause("untouched").parks, 9);
+        assert_eq!(cause("touched").parks, 1);
+        assert_eq!(cause("unclear").parks, 0);
+        assert_eq!(snap.park_gap.samples, 2);
+        assert_eq!(snap.park_gap.p50_bytes, 2);
+        assert_eq!(snap.park_gap.p99_bytes, 4 << 20);
+        assert_eq!(snap.park_gap.max_bytes, 4 << 20);
+        assert!(snap.commit.iter().all(|s| s.samples == 0));
+        assert!(snap.pagesvc.iter().all(|p| p.calls == 0));
     }
 
     #[test]

@@ -595,8 +595,10 @@ pub unsafe extern "C" fn zou_checkpoint(zou: *const ZouHandle) -> c_int {
 /// Whether a branch of this database would serve, written to `out` as
 /// 1 or 0.
 ///
-/// It is 0 for a database young enough that no fold has packed a full
-/// page capture down yet, which is the one case [`zou_branch`] refuses.
+/// On the object path it is 0 for a database young enough that no fold
+/// has packed a full page capture down yet, which is the one case
+/// [`zou_branch`] refuses. On the layer path the branch folds an image
+/// of its own out of the base, so the answer is 1 from the start.
 ///
 /// # Safety
 ///
