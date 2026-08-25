@@ -65,6 +65,11 @@ use crate::walscan::BlockRef;
 
 const BLCKSZ: usize = 8192;
 
+/// The block count that means the layers hold nothing about the fork.
+/// This is postgres's InvalidBlockNumber, which no real length can
+/// be, so the wire does not need a second field to carry silence.
+const SIZE_UNKNOWN: u32 = u32::MAX;
+
 /// "ZPG1" little endian, the one and only protocol version.
 const MAGIC: u32 = 0x3147_505A;
 
@@ -155,7 +160,9 @@ enum Want {
 /// What one request gets back, matching what it asked for.
 enum Answer {
     Pages(Vec<Vec<u8>>),
-    Size(u32),
+    /// `None` is a fork the layers say nothing about, which goes on
+    /// the wire as [`SIZE_UNKNOWN`].
+    Size(Option<u32>),
 }
 
 /// One read request as the driver sees it: one fork, what is wanted of
@@ -217,7 +224,8 @@ impl PageClient {
     /// How many blocks long the fork is as of `lsn`, folded out of the
     /// layers. This is the answer `smgr nblocks` needs on a branch,
     /// where the parent's `pg/` prefix says nothing about what the
-    /// branch has done since.
+    /// branch has done since. `None` is silence rather than a length
+    /// of zero, see [`PageService::rel_size`].
     pub fn get_size(
         &self,
         spc: u32,
@@ -225,7 +233,7 @@ impl PageClient {
         rel: u32,
         fork: u32,
         lsn: u64,
-    ) -> Result<u32, String> {
+    ) -> Result<Option<u32>, String> {
         let head = Head {
             spc,
             db,
@@ -360,12 +368,12 @@ fn round_trip(sock: &mut UnixStream, head: Head, blks: &[u32]) -> std::io::Resul
     Ok(pages)
 }
 
-fn round_trip_size(sock: &mut UnixStream, head: Head) -> std::io::Result<u32> {
+fn round_trip_size(sock: &mut UnixStream, head: Head) -> std::io::Result<Option<u32>> {
     sock.write_all(&head.bytes(0))?;
     read_status(sock)?;
     let mut n = [0u8; 4];
     sock.read_exact(&mut n)?;
-    Ok(u32::from_le_bytes(n))
+    Ok(Some(u32::from_le_bytes(n)).filter(|&n| n != SIZE_UNKNOWN))
 }
 
 /// Everything the server needs to run. `redo` is optional only for
@@ -557,9 +565,9 @@ fn respond_pages(sock: &mut UnixStream, pages: &[Vec<u8>]) -> std::io::Result<()
 /// count. A client that asked for pages never sees this and a client
 /// that asked for a size never sees pages, so the two share a status
 /// word without ambiguity.
-fn respond_size(sock: &mut UnixStream, n: u32) -> std::io::Result<()> {
+fn respond_size(sock: &mut UnixStream, n: Option<u32>) -> std::io::Result<()> {
     sock.write_all(&0u32.to_le_bytes())?;
-    sock.write_all(&n.to_le_bytes())
+    sock.write_all(&n.unwrap_or(SIZE_UNKNOWN).to_le_bytes())
 }
 
 fn respond_err(sock: &mut UnixStream, msg: &str) -> std::io::Result<()> {
@@ -1274,13 +1282,20 @@ fn worth_folding(debt: u64) -> bool {
 ///
 /// The fallback reads the pg/ image of a block the layers do not
 /// cover, the objects frozen at the put elision flag day.
+///
+/// It attaches by tenant and shard rather than by prefix, because a
+/// branch's layer list names its parent's layers and a reader opened
+/// on a bare prefix refuses them: it has no way to know whose prefix
+/// to fetch an inherited layer from. Every read on a branched tenant
+/// went that way, which is a database that comes up and then cannot
+/// answer for a single catalog it did not write itself.
 fn page_service<'a>(
     store: &'a dyn CasStore,
     layout: &'a TenantLayout,
     pool: Option<&'a RedoPool>,
     data_checksums: bool,
 ) -> PageService<'a> {
-    PageService::new(store, layout.shard_prefix(0), pool, data_checksums).with_base_fallback(
+    PageService::for_shard(store, layout.tenant_ref(), 0, pool, data_checksums).with_base_fallback(
         move |blk: &BlockRef| match store
             .get(&layout.pg_block(blk.spc, blk.db, blk.rel, blk.fork, blk.blk))
         {
@@ -1479,13 +1494,13 @@ mod tests {
         let client = PageClient::new(sock);
         assert_eq!(
             client.get_size(1663, 5, 2000, 0, 0).expect("served"),
-            12,
+            Some(12),
             "the imaged length is what the fork is"
         );
         assert_eq!(
             client.get_size(1663, 5, 2000, 1, 0).expect("served"),
-            0,
-            "a fork nothing ever wrote is no blocks long"
+            None,
+            "a fork the layers hold nothing about is silence, not zero"
         );
         // The connection is still in protocol afterwards, which is
         // the thing a shared status word could have broken.

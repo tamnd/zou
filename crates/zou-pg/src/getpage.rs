@@ -175,17 +175,24 @@ impl<'a> PageService<'a> {
     /// from the parent's `pg/` prefix, so a branch gets the same
     /// answer as the tenant it was cut from.
     ///
-    /// A fork nothing ever extended is zero blocks long, which is what
-    /// the stock smgr says about a relation with no file.
+    /// `None` is a fork the layers say nothing at all about, which is
+    /// not the same as a fork of no blocks: one is silence and the
+    /// other is an answer. A caller with somewhere else to look wants
+    /// to be able to tell them apart.
     pub fn rel_size(
         &self,
         map: &LayerMap,
         mem: &Memtable,
         fork: relsize::ForkRef,
         at: u64,
-    ) -> Result<u32, GetPageError> {
+    ) -> Result<Option<u32>, GetPageError> {
         let r = self.reader.reconstruct(map, mem, &fork.key(), Lsn(at))?;
-        relsize::fold(r.base.as_deref(), &r.records).map_err(GetPageError::Size)
+        if r.base.is_none() && r.records.is_empty() {
+            return Ok(None);
+        }
+        relsize::fold(r.base.as_deref(), &r.records)
+            .map(Some)
+            .map_err(GetPageError::Size)
     }
 
     /// Materialize `blocks` as of `at`, in order, as one redo batch.

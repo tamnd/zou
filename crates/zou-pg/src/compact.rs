@@ -914,7 +914,12 @@ pub fn merge_to_horizon(
             rel: key.rel,
             fork: key.fork,
         };
-        let n = svc.rel_size(&map, &mem, fork, at.0)?;
+        // Silence here is a bloom false positive: the key is not
+        // really in any layer below the horizon, so there is nothing
+        // to image and nothing to lose by leaving it out.
+        let Some(n) = svc.rel_size(&map, &mem, fork, at.0)? else {
+            continue;
+        };
         let mut page = vec![0u8; PAGE_IMAGE_LEN];
         page[..relsize::REC_LEN].copy_from_slice(&relsize::SizeRec::Set(n).encode());
         builder.push(*key, &page)?;

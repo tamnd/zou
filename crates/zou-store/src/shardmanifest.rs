@@ -187,6 +187,38 @@ pub fn publish_layer(
     }
 }
 
+/// Advance `disk_consistent_lsn` with no layer to publish.
+///
+/// A stretch of WAL that changes no page still moves the point the
+/// shard is consistent through, and a flush cannot say so: with an
+/// empty memtable there is no layer to name and nothing is written at
+/// all. The tail of a sealed log is usually exactly that, a checkpoint
+/// record or two, and leaving the lsn behind it is what strands a
+/// child branched there with a log that starts past its anchor.
+///
+/// A max like [`publish_layer`]'s, so a racing flush never moves it
+/// back, and a no op when the manifest is already at or past `lsn`.
+pub fn advance_consistent(
+    store: &dyn CasStore,
+    key: &str,
+    lsn: Lsn,
+) -> Result<Option<PageShardManifest>, PageShardError> {
+    loop {
+        let Some((mut m, version)) = PageShardManifest::load(store, key)? else {
+            return Ok(None);
+        };
+        if m.disk_consistent_lsn >= lsn {
+            return Ok(Some(m));
+        }
+        m.disk_consistent_lsn = lsn;
+        match store.put_if_match(key, &m.encode(), Some(&version)) {
+            Ok(_) => return Ok(Some(m)),
+            Err(CasError::Conflict { .. }) | Err(CasError::AlreadyExists { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
 /// Compaction's atomic commit: retire the named input layers, list the
 /// outputs, and optionally stamp the coverage claim and the retention
 /// horizon, all in one CAS.
@@ -316,6 +348,26 @@ mod tests {
         assert_eq!(loaded, m);
         let map = loaded.layer_map().unwrap();
         assert_eq!(map.layers().len(), 2);
+    }
+
+    #[test]
+    fn the_consistent_point_moves_without_a_layer_and_never_backwards() {
+        let store = MemStore::default();
+        let key = "tenants/t/shards/0000/SHARD";
+        // Nothing published yet is nothing to advance, and not an
+        // error: a shard that has never ingested has no anchor at all.
+        assert!(advance_consistent(&store, key, Lsn(50)).unwrap().is_none());
+
+        let a = entry_from_built(&[1], &[10, 20]);
+        publish_layer(&store, key, 0, &a, Lsn(20)).unwrap();
+        // The tail of a log that changed no page: no layer to name,
+        // and the shard is still consistent through the end of it.
+        let m = advance_consistent(&store, key, Lsn(50)).unwrap().unwrap();
+        assert_eq!(m.disk_consistent_lsn, Lsn(50));
+        assert_eq!(m.layers, vec![a], "no layer was invented");
+
+        let m = advance_consistent(&store, key, Lsn(30)).unwrap().unwrap();
+        assert_eq!(m.disk_consistent_lsn, Lsn(50), "it only moves forward");
     }
 
     #[test]

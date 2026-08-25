@@ -19,13 +19,20 @@
 //! the removal itself, which `zou branch delete` needs for a child that
 //! did serve and is no longer wanted.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use zou_log::{TeeFilter, WalMedia, catch_up_with};
+
+use crate::ingest::ShardIngest;
 use crate::redo::RedoPool;
-use zou_store::layer::LayerKind;
+use crate::relsize;
+use zou_store::layer::{ImageBuilder, LayerKey, LayerKind, PAGE_IMAGE_LEN};
 use zou_store::layermap::LayerDesc;
 use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
-use zou_store::shardmanifest::PageShardManifest;
-use zou_store::{CasStore, Manifest};
+use zou_store::shardmanifest::{LayerEntry, PageShardManifest, publish_layer};
+use zou_store::{CasError, CasStore, Manifest, shards};
 
 /// Everything under a ref's prefix, and the count of what went.
 ///
@@ -53,9 +60,8 @@ pub fn discard(store: &dyn CasStore, tenant_ref: &str) -> Result<usize, String> 
 ///
 /// This is a caller's answer rather than something read out of the
 /// environment here, because the process asking is not always the
-/// process serving. The embedded library runs its postmasters with
-/// the page service pinned off whatever the ambient setting says, so
-/// it asks for [`ReadPath::Objects`] by name.
+/// process serving: a host that pins its postmasters to one path
+/// whatever the ambient setting says has to name the one it pinned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadPath {
     /// Pages come out of the page runs a fold packed into a capture.
@@ -229,6 +235,10 @@ pub fn floorless(
 /// is still no is a shard with no floor and nothing of its own to make
 /// one out of: a shard that has published nothing at all, or one still
 /// riding somebody else's layers, where the fold has nothing to fold.
+///
+/// The source's own `pg/` counts as something to fold, since that is
+/// what [`seed_base`] copies into the layers, and it is the whole of a
+/// database that has done nothing since initdb but write a little wal.
 pub fn why_unbranchable_after_fold(
     store: &dyn CasStore,
     layout: &TenantLayout,
@@ -237,11 +247,27 @@ pub fn why_unbranchable_after_fold(
     if cut_at(manifest).is_none() {
         return Ok(Some(NO_CHECKPOINT.to_string()));
     }
+    let mut base: Option<bool> = None;
     for shard in floorless(store, layout, manifest)? {
         let own = PageShardManifest::load(store, &layout.shard_manifest(shard))
             .map_err(|e| format!("shard {shard}: {e}"))?;
         let has_own = own.is_some_and(|(m, _)| !m.layers.is_empty());
-        if !has_own {
+        if has_own {
+            continue;
+        }
+        // Asked once and only when a shard needs the answer, because
+        // it is a list of the whole base and every other caller here
+        // is a single get.
+        let seedable = match base {
+            Some(seen) => seen,
+            None => {
+                let keys = store
+                    .list(&layout.pg_dir())
+                    .map_err(|e| format!("store: {e}"))?;
+                *base.insert(!keys.is_empty())
+            }
+        };
+        if !seedable {
             return Ok(Some(format!(
                 "page shard {shard} has published nothing yet, so there is no image to serve \
                  inherited pages from and nothing to fold one out of"
@@ -249,6 +275,270 @@ pub fn why_unbranchable_after_fold(
         }
     }
     Ok(None)
+}
+
+/// Block target for the seeded layers, the same one compaction hands
+/// its image builder.
+const SEED_BLOCK_TARGET: usize = 256 << 10;
+
+/// How much of an image to fill before publishing it and starting
+/// another, so a source with a large `pg/` does not build one layer
+/// the size of its whole base in memory.
+const SEED_TARGET_BYTES: usize = 64 << 20;
+
+/// Where a seeded image sits: under everything the layers hold, so
+/// every record above it still applies on top.
+///
+/// The objects it is built from are the base postgres wrote before
+/// the puts were elided, which is exactly what the live service reads
+/// as its fallback base today, and redo stamps each page with its
+/// record's lsn, so a record the base already contains is skipped
+/// rather than applied twice. Putting the seed at the bottom also
+/// means a fold's fresher image of the same key wins, which is the
+/// order that keeps a stale frozen object from masking a newer one.
+const SEED_LSN: Lsn = Lsn(1);
+
+/// What a seeded entry is built from: a page object under `pg/`, or a
+/// fork length read out of a SIZE marker.
+enum Seed {
+    Page(String),
+    Size(u32),
+}
+
+/// Copy the source's own base into the layers, where a child can read
+/// it.
+///
+/// A branch inherits layers and nothing else. It does not inherit the
+/// `pg/` prefix, and it must not: those are the parent's live base
+/// images, a truncate deletes them, and a child leaning on them would
+/// lose its floor the first time the parent dropped a table. But an
+/// initdb writes its catalogs to `pg/` and the WAL that follows only
+/// touches a few hundred of those pages, so the layers hold nothing
+/// about pg_database or pg_authid and a child comes up unable to find
+/// the database it was told to connect to.
+///
+/// So before a source is branched, everything under its `pg/` is
+/// imaged into its layers: the pages as pages, and the SIZE markers as
+/// the `Set` records a length reads back out of. The cost is one list
+/// and one get per object, paid once by whoever seals the thing that
+/// is going to be branched.
+///
+/// The count is entries written.
+pub fn seed_base(
+    store: &dyn CasStore,
+    tenant_ref: &str,
+    manifest: &Manifest,
+) -> Result<usize, String> {
+    let layout = TenantLayout::new(tenant_ref);
+    let shard_count = manifest.shards;
+    let mut by_shard: BTreeMap<u16, Vec<(LayerKey, Seed)>> = BTreeMap::new();
+    for (key, seed) in pg_objects(store, &layout)? {
+        let shard = shards::shard_of(&key, shard_count);
+        by_shard.entry(shard).or_default().push((key, seed));
+    }
+    let mut written = 0;
+    for (shard, mut entries) in by_shard {
+        entries.sort_by_key(|e| e.0);
+        entries.dedup_by(|a, b| a.0 == b.0);
+        let mut builder = ImageBuilder::new(SEED_LSN, SEED_BLOCK_TARGET);
+        for (key, seed) in &entries {
+            let page = match seed {
+                // A page that has gone since the listing is one this
+                // seed does not need: the object is only the base, and
+                // a relation dropped out from under us has no child
+                // that wants it.
+                Seed::Page(object) => match store.get(object).map_err(|e| format!("store: {e}"))? {
+                    Some((page, _)) if page.len() == PAGE_IMAGE_LEN => page,
+                    _ => continue,
+                },
+                Seed::Size(n) => {
+                    let mut page = vec![0u8; PAGE_IMAGE_LEN];
+                    page[..relsize::REC_LEN].copy_from_slice(&relsize::SizeRec::Set(*n).encode());
+                    page
+                }
+            };
+            builder
+                .push(*key, &page)
+                .map_err(|e| format!("shard {shard}: {e}"))?;
+            written += 1;
+            if builder.bytes() >= SEED_TARGET_BYTES {
+                publish_seed(store, &layout, shard, builder)?;
+                builder = ImageBuilder::new(SEED_LSN, SEED_BLOCK_TARGET);
+            }
+        }
+        if !builder.is_empty() {
+            publish_seed(store, &layout, shard, builder)?;
+        }
+    }
+    Ok(written)
+}
+
+/// Land one seeded image and list it on the shard.
+///
+/// The bytes go under a name derived from what is in them, so a second
+/// attempt after a crash writes the same object and adopting the one
+/// already there is the whole of the retry logic. The publish does not
+/// move the shard's flush point: this is history being filled in
+/// underneath, not anything new arriving.
+fn publish_seed(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    shard: u16,
+    builder: ImageBuilder,
+) -> Result<(), String> {
+    let (bytes, footer) = builder
+        .finish()
+        .map_err(|e| format!("shard {shard}: {e}"))?;
+    let desc = LayerDesc::from_footer(&footer, bytes.len() as u64);
+    let key = format!("{}{}", layout.shard_prefix(shard), desc.name());
+    match store.put_if_absent(&key, &bytes) {
+        Ok(_) => {}
+        Err(CasError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(format!("shard {shard}: {e}")),
+    }
+    publish_layer(
+        store,
+        &layout.shard_manifest(shard),
+        shard,
+        &LayerEntry {
+            name: desc.name(),
+            size: bytes.len() as u64,
+            owner: None,
+            upto: None,
+        },
+        SEED_LSN,
+    )
+    .map_err(|e| format!("shard {shard}: {e}"))?;
+    Ok(())
+}
+
+/// Everything under the tenant's own `pg/` prefix that a layer can
+/// hold: one key per page object and one per SIZE marker.
+///
+/// One list of the prefix, and the gets happen later, one at a time as
+/// the image is filled, so the whole base is never in memory at once.
+fn pg_objects(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+) -> Result<Vec<(LayerKey, Seed)>, String> {
+    let prefix = layout.pg_dir();
+    let mut out = Vec::new();
+    for key in store.list(&prefix).map_err(|e| format!("store: {e}"))? {
+        let rest = key.strip_prefix(&prefix).unwrap_or(&key);
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() != 5 {
+            continue;
+        }
+        let (Ok(spc), Ok(db), Ok(rel), Ok(fork)) = (
+            parts[0].parse::<u32>(),
+            parts[1].parse::<u32>(),
+            parts[2].parse::<u32>(),
+            parts[3].parse::<u8>(),
+        ) else {
+            continue;
+        };
+        if parts[4] == "SIZE" {
+            let Some((data, _)) = store.get(&key).map_err(|e| format!("store: {e}"))? else {
+                continue;
+            };
+            let n = zou_store::forksize::ForkSize::decode(&data)
+                .map(|fs| fs.nblocks)
+                .ok_or_else(|| format!("bad SIZE object at {key}"))?;
+            out.push((LayerKey::relsize(spc, db, rel, fork), Seed::Size(n)));
+            continue;
+        }
+        // Hex, the way the key is written. Decimal read the first ten
+        // blocks of every fork correctly and dropped every one after
+        // that, which is a seed that looks complete and leaves a
+        // branch with no base under the eleventh page of pg_class.
+        let Ok(blk) = u32::from_str_radix(parts[4], 16) else {
+            continue;
+        };
+        out.push((LayerKey::page(spc, db, rel, fork, blk), Seed::Page(key)));
+    }
+    Ok(out)
+}
+
+/// Apply whatever sealed WAL the page shard has not ingested yet, so
+/// the shard is consistent through the end of the source's own log.
+///
+/// A branch cut leaves the child standing on
+/// `min(parent disk consistent lsn, branch point)` and then hands it a
+/// log that starts at the branch point, because that is where the
+/// child's recovery starts. When the parent's ingest stopped short of
+/// its own last checkpoint, those two numbers differ, and the records
+/// in between belong to a log the child has no copy of and cannot ask
+/// for. Its ingest reads the hole for what it is, refuses to apply
+/// past it, and every page read on the child fails. Closing it here
+/// costs the tail of one log, which on a source that has just been
+/// sealed is a checkpoint record or two.
+///
+/// The returned lsn is what the shard is consistent through, which is
+/// the anchor a child inherits.
+pub fn catch_up_shard(store: &Arc<dyn CasStore>, tenant_ref: &str) -> Result<u64, String> {
+    let layout = TenantLayout::new(tenant_ref);
+    let tenant = zou_store::layout::tenant_id(tenant_ref);
+    let anchor = PageShardManifest::load(&**store, &layout.shard_manifest(0))
+        .map_err(|e| e.to_string())?
+        .map(|(m, _)| m.disk_consistent_lsn.0);
+    // Nothing published at all is not nothing to do. A source whose
+    // live service never got a poll in before the postmaster stopped
+    // has its whole session sitting in the sealed log and no layer
+    // anywhere, and a fold that shrugged at that left a source that
+    // cannot be branched for a reason nobody can act on. So the anchor
+    // is the oldest frame the log still holds, the same rule the live
+    // driver anchors a fresh shard by. Replaying records the seeded
+    // base already has is safe: redo skips a record whose lsn is at or
+    // below the page's own, which is exactly what those are.
+    let mut ingest = anchor.map(|at| ShardIngest::new(crate::pagesvc::ingest_config(tenant), at));
+    let media = WalMedia::single(crate::log_store(Arc::clone(store), &layout));
+    let filter = TeeFilter::Tenant(tenant);
+    catch_up_with::<String, _>(
+        &media,
+        crate::WAL_SHARD,
+        &filter,
+        Lsn(anchor.unwrap_or(0)),
+        |frame| {
+            let ingest = ingest.get_or_insert_with(|| {
+                let start = frame.start_lsn.0;
+                log::debug!("fold for branch: anchoring a fresh shard at {start:#x}");
+                ShardIngest::new(crate::pagesvc::ingest_config(tenant), start)
+            });
+            ingest
+                .apply_frames(std::slice::from_ref(&frame))
+                .map_err(|e| format!("catching the shard up: {e}"))?;
+            // Bytes is the only reason that fires with a durable end
+            // of zero and no age, which is the one this wants: the
+            // memtable stays bounded on a long tail without a flush
+            // per frame on a short one.
+            if ingest.flush_reason(0, std::time::Duration::ZERO).is_some() {
+                ingest
+                    .flush(&**store, &layout)
+                    .map_err(|e| format!("flushing the catch up: {e}"))?;
+            }
+            Ok(())
+        },
+    )?;
+    let Some(mut ingest) = ingest else {
+        // No manifest and no frames: this source has never written
+        // anything a child could read. `why_layerless` says so in a
+        // sentence somebody can act on.
+        return Ok(0);
+    };
+    ingest
+        .flush(&**store, &layout)
+        .map_err(|e| format!("flushing the catch up: {e}"))?;
+    // And say so even when the tail changed no page, which is the
+    // ordinary case for the last records a shutdown writes: a flush
+    // with an empty memtable publishes nothing, and the lsn left
+    // behind is the one a child would be anchored at.
+    zou_store::shardmanifest::advance_consistent(
+        &**store,
+        &layout.shard_manifest(0),
+        Lsn(ingest.applied()),
+    )
+    .map_err(|e| format!("advancing the shard: {e}"))?;
+    Ok(ingest.applied())
 }
 
 /// Cut the folds a branch of this source needs, rather than wait for
@@ -269,7 +559,7 @@ pub fn why_unbranchable_after_fold(
 /// The count is how many shards were folded, which is zero on a source
 /// that was already branchable.
 pub fn fold_for_branch(
-    store: &dyn CasStore,
+    store: &Arc<dyn CasStore>,
     tenant_ref: &str,
     manifest: &Manifest,
     pool: &RedoPool,
@@ -277,8 +567,25 @@ pub fn fold_for_branch(
 ) -> Result<usize, String> {
     let layout = TenantLayout::new(tenant_ref);
     let at = cut_at(manifest).ok_or_else(|| NO_CHECKPOINT.to_string())?;
+    // Before anything else, because the merge's horizon is bounded by
+    // the shard's own consistent point and a child's floor is bounded
+    // by the same number.
+    let caught = catch_up_shard(store, tenant_ref)?;
+    log::debug!("fold for branch: the shard is consistent through {caught:#x}");
+    let store: &dyn CasStore = &**store;
+    // Asked before the seed rather than after it, because the seed is
+    // itself an image at the bottom of the store and would answer the
+    // question for every shard. A shard whose deltas hold pages the
+    // base never had still needs its merge, and skipping it left a
+    // child that came up and died on the first page written after the
+    // page service took over the writes.
+    let want = floorless(store, &layout, manifest)?;
+    // Before the merge, so the images it cuts carry the lengths too
+    // and the seeded layer is retired along with everything else.
+    let seeded = seed_base(store, tenant_ref, manifest)?;
+    log::debug!("fold for branch: seeded {seeded} entries from the pg objects");
     let mut folded = 0;
-    for shard in floorless(store, &layout, manifest)? {
+    for shard in want {
         // One shard at a time, for the reason the offline fold gives:
         // a merge holds an image in memory while it fills.
         let out =
@@ -528,5 +835,95 @@ mod tests {
             owner: None,
         });
         assert!(why_layerless(&store, &layout, &m).unwrap().is_none());
+    }
+
+    /// A catalog initdb wrote and nothing has touched since lives
+    /// entirely under `pg/`, which a child does not inherit. Seeding
+    /// copies it into the layers, pages and length both, where a
+    /// branch can read it.
+    #[test]
+    fn the_pg_objects_become_layers_a_branch_can_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let layout = TenantLayout::new("prod");
+        for (rel, n) in [(1260u32, 12u32), (1255, 1)] {
+            store
+                .put(
+                    &layout.pg_size(1663, 5, rel, 0),
+                    &zou_store::forksize::ForkSize::plain(n).encode(),
+                )
+                .unwrap();
+            for blk in 0..n {
+                store
+                    .put(
+                        &layout.pg_block(1663, 5, rel, 0, blk),
+                        &vec![(rel + blk) as u8; 8192],
+                    )
+                    .unwrap();
+            }
+        }
+        // Not one of ours: the fs capture writes other objects under
+        // the same prefix and the walk has to step over them.
+        store
+            .put(&format!("{}nonsense", layout.pg_dir()), b"x")
+            .unwrap();
+
+        let mut m = Manifest::new("prod", 1);
+        m.checkpoints.push(CheckpointRef {
+            id: "c1".into(),
+            lsn: Lsn(0x400),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        assert_eq!(
+            seed_base(&store, "prod", &m).unwrap(),
+            15,
+            "13 pages, 2 sizes"
+        );
+
+        let (shard, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let map = shard.layer_map().unwrap();
+        let svc = crate::getpage::PageService::new(&store, layout.shard_prefix(0), None, false);
+        let mem = zou_store::memtable::Memtable::new();
+        let ask = |rel| {
+            let fork = relsize::ForkRef {
+                spc: 1663,
+                db: 5,
+                rel,
+                fork: 0,
+            };
+            svc.rel_size(&map, &mem, fork, u64::MAX).unwrap()
+        };
+        assert_eq!(ask(1260), Some(12));
+        assert_eq!(ask(1255), Some(1));
+        assert_eq!(ask(2600), None, "a rel with no marker stays silent");
+
+        let page = svc
+            .get_pages(
+                &map,
+                &mem,
+                &[crate::walscan::BlockRef {
+                    spc: 1663,
+                    db: 5,
+                    rel: 1260,
+                    fork: 0,
+                    // Past the ninth, where a decimal reading of a
+                    // hex key stops finding anything.
+                    blk: 11,
+                }],
+                u64::MAX,
+            )
+            .unwrap();
+        assert_eq!(
+            page[0],
+            vec![(1260u32 + 11) as u8; 8192],
+            "the page came along too"
+        );
+
+        // And it is a floor: a branch cut here has something to stand
+        // on, which is the whole reason the seed happens before one.
+        assert_eq!(why_layerless(&store, &layout, &m).unwrap(), None);
     }
 }

@@ -13,17 +13,24 @@
 //!
 //! The template has to be branchable, which is more than initdb'd. A
 //! tenant whose only capture is genesis makes a child that appears in
-//! every listing and dies on its first page read, so the build writes
-//! and checkpoints until a fold has packed a full capture down, and
-//! refuses to publish a template that would not serve.
+//! every listing and dies on its first page read, so the build does
+//! not finish until a fold has packed one down, and refuses to publish
+//! a template that would not serve.
+//!
+//! Getting that fold is the one place the two read paths differ. The
+//! object path earns it by writing and checkpointing until the
+//! background fold takes an interest. The layer path asks for it by
+//! name once the postmaster is down, which is both faster and the
+//! honest shape: a template is far too small to ever earn one.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zou_pg::branching::ReadPath;
+use zou_pg::redo::{RedoPool, RedoPoolConfig};
 use zou_store::layout::TenantLayout;
 use zou_store::{Manifest, open_store};
 
@@ -234,6 +241,11 @@ fn build(pg_bin: &Path, dir: &Path) -> Result<(), Error> {
 
 /// The database itself: initdb, then a postmaster over it until the
 /// fold has left something a branch can read.
+///
+/// Which fold that is depends on the read path. The object path earns
+/// one by writing, so the postmaster stays up for it. The layer path
+/// asks for one by name, and asks after the postmaster is down, so the
+/// memtable the shutdown flushed is in the layers the fold reads.
 fn raise(
     pg_bin: &Path,
     target: &str,
@@ -254,10 +266,66 @@ fn raise(
         None,
     )?;
     let dsn = format!("host=127.0.0.1 port={port} user={SUPERUSER} dbname=postgres");
-    let settled = contract(&dsn).and_then(|()| settle(&dsn, target));
+    let settled = contract(&dsn).and_then(|()| settle(&dsn, target, ReadPath::current()));
     let stopped = pg.stop();
     settled?;
-    stopped
+    stopped?;
+    if ReadPath::current() == ReadPath::Layers {
+        fold(pg_bin, target)?;
+    }
+    Ok(())
+}
+
+/// Cut the image a branch of this template will stand on.
+///
+/// A shard publishes an image of its own once it has enough delta debt
+/// to be worth one, and a template never will: it is an initdb and a
+/// few thousand rows. So the seal asks for the fold rather than waits,
+/// which is also where the cost belongs, once per template rather than
+/// once per fixture cut from it.
+fn fold(pg_bin: &Path, target: &str) -> Result<(), Error> {
+    fold_source(pg_bin, target, TEMPLATE)
+}
+
+/// The same fold, asked for by name of whichever tenant is about to be
+/// branched.
+///
+/// A template is the usual caller and the cheapest one, since it pays
+/// this once for every fixture that will ever be cut from it. But a
+/// database somebody opened themselves and then asked for a branch of
+/// is in the same position, small enough that its own shard will never
+/// decide an image is worth publishing, and the alternative is telling
+/// the caller to go and write a few hundred megabytes first.
+pub(crate) fn fold_source(pg_bin: &Path, target: &str, tenant: &str) -> Result<(), Error> {
+    let store: Arc<dyn zou_store::CasStore> =
+        Arc::from(open_store(target).map_err(|e| Error::new(Kind::Store, e))?);
+    let layout = TenantLayout::new(tenant);
+    let Some((data, _)) = store
+        .get(&layout.manifest())
+        .map_err(|e| Error::new(Kind::Store, e.to_string()))?
+    else {
+        return Err(Error::new(
+            Kind::Store,
+            format!("{tenant} wrote no manifest, so there is nothing to fold"),
+        ));
+    };
+    let manifest =
+        Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+    let checksums = zou_pg::restore::store_data_checksums(&*store, tenant)
+        .map_err(|e| Error::new(Kind::Store, e))?;
+    let pool = RedoPool::new(RedoPoolConfig {
+        postgres: pg_bin.join("postgres"),
+        scratch_root: std::env::temp_dir(),
+        // One template is one small shard's worth of work, and the
+        // build is already holding a machine somebody is waiting on.
+        workers: 1,
+        batch_timeout: FOLD_BATCH_TIMEOUT,
+        batches_per_worker: FOLD_BATCHES_PER_WORKER,
+        data_checksums: checksums,
+    });
+    zou_pg::branching::fold_for_branch(&store, tenant, &manifest, &pool, checksums)
+        .map(|_| ())
+        .map_err(|e| Error::new(Kind::Store, e))
 }
 
 /// The roles, the auth schema and the storage schema, put into the
@@ -288,19 +356,36 @@ fn contract(dsn: &str) -> Result<(), Error> {
     })
 }
 
+/// The same cap the page service gives a redo batch, since a fold
+/// asks for the same work in the same batches.
+const FOLD_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Batches a redo worker serves before the pool replaces it, which
+/// bounds postgres's invalid page tracking. A template's fold is far
+/// short of this, so it is a backstop rather than a rotation.
+const FOLD_BATCHES_PER_WORKER: u64 = 256;
+
 /// Write and checkpoint until a branch of this would serve.
 ///
 /// A capture of the pages as they are is what a child reads its
-/// inherited pages out of, and the fold that packs one down happens
-/// after a few checkpoints of writes rather than on request. So this
-/// gives it something to fold and waits, and gives up saying what it
-/// was waiting for rather than publishing a template that would hand
-/// somebody a database that cannot read pg_authid.
-fn settle(dsn: &str, target: &str) -> Result<(), Error> {
+/// inherited pages out of, and on the object path the fold that packs
+/// one down happens after a few checkpoints of writes rather than on
+/// request. So this gives it something to fold and waits, and gives up
+/// saying what it was waiting for rather than publishing a template
+/// that would hand somebody a database that cannot read pg_authid.
+///
+/// The layer path packs its capture down by name once the postmaster
+/// is down, see [`fold`], so all it needs here is a checkpoint for the
+/// fold to cut at. It still has to see that checkpoint published,
+/// see [`settle_layers`].
+fn settle(dsn: &str, target: &str, path: ReadPath) -> Result<(), Error> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(io("tokio runtime"))?;
+    if path == ReadPath::Layers {
+        return settle_layers(&rt, dsn, target);
+    }
     for round in 0..30 {
         let statements = if round == 0 {
             "create table public.zou_template_settling (pad text);
@@ -330,6 +415,102 @@ fn settle(dsn: &str, target: &str) -> Result<(), Error> {
         "no fold packed a full capture down while the template was being built, \
          so a branch of it would not serve",
     ))
+}
+
+/// Checkpoint until the tenant publishes a capture that carries the
+/// contract, on the layer path.
+///
+/// The fold that names a checkpoint runs on the pusher, and it can lose
+/// a race with pg_control: it reads a redo that is already past the
+/// point it was asked to fold at, gives up and says it will retry. The
+/// retry needs another checkpoint to hang itself on, and the seal is
+/// about to take the postmaster away. So this asks again rather than
+/// waits, and refuses to publish rather than seal a template whose
+/// newest capture predates the roles and the schemas, which is a
+/// database every fixture cut from it would fail to log into.
+fn settle_layers(rt: &tokio::runtime::Runtime, dsn: &str, target: &str) -> Result<(), Error> {
+    let redo = checkpoint_redo(rt, dsn)?;
+    let store = open_store(target).map_err(|e| Error::new(Kind::Store, e))?;
+    let layout = TenantLayout::new(TEMPLATE);
+    let at = Instant::now();
+    loop {
+        let Some((data, _)) = store
+            .get(&layout.manifest())
+            .map_err(|e| Error::new(Kind::Store, e.to_string()))?
+        else {
+            return Err(Error::new(
+                Kind::Store,
+                "the template wrote no manifest, so there is nothing to seal",
+            ));
+        };
+        let manifest =
+            Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+        if manifest.checkpoints.iter().any(|c| c.lsn.0 >= redo) {
+            log::debug!(
+                "template: the capture of {redo:#x} landed after {:?}",
+                at.elapsed()
+            );
+            return Ok(());
+        }
+        if at.elapsed() > SETTLE_WAIT {
+            let newest = manifest.checkpoints.last().map(|c| c.lsn.0).unwrap_or(0);
+            return Err(Error::new(
+                Kind::Store,
+                format!(
+                    "the checkpoint at {redo:#x} was not captured within {} seconds, the newest \
+                     capture is still {newest:#x}, so a branch of this template would be the \
+                     database as it stood before the tenant contract ran",
+                    SETTLE_WAIT.as_secs()
+                ),
+            ));
+        }
+        std::thread::sleep(SETTLE_POLL);
+        run(rt, dsn, "checkpoint;", "settling the template")?;
+    }
+}
+
+/// How long the seal gives the pusher to publish the contract, which is
+/// generous because a build machine under a full workspace test run is
+/// the place this is slowest and a template is built once.
+const SETTLE_WAIT: Duration = Duration::from_secs(120);
+
+/// Between two checkpoints, long enough that a fold has a chance to
+/// finish rather than be raced by the next one.
+const SETTLE_POLL: Duration = Duration::from_millis(200);
+
+/// Checkpoint, and say where the checkpoint replays from, as the plain
+/// integer the manifest counts captures in.
+fn checkpoint_redo(rt: &tokio::runtime::Runtime, dsn: &str) -> Result<u64, Error> {
+    let dsn = dsn.to_string();
+    rt.block_on(async move {
+        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .map_err(pg("connect"))?;
+        let pump = tokio::spawn(connection);
+        let out = async {
+            client
+                .simple_query("checkpoint")
+                .await
+                .map_err(pg("settling the template"))?;
+            let rows = client
+                .simple_query(
+                    "select pg_wal_lsn_diff(redo_lsn, '0/0')::bigint from pg_control_checkpoint()",
+                )
+                .await
+                .map_err(pg("the checkpoint position"))?;
+            rows.iter()
+                .find_map(|row| match row {
+                    tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0),
+                    _ => None,
+                })
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| Error::new(Kind::Postgres, "pg_control_checkpoint said nothing"))
+        }
+        .await;
+        drop(client);
+        let _ = pump.await;
+        out
+    })
 }
 
 /// One connection, one batch, and the connection closed behind it.
@@ -365,10 +546,7 @@ pub(crate) fn servable(target: &str, tenant: &str) -> Result<bool, Error> {
     };
     let manifest =
         Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
-    // Fixtures are served by a postmaster this crate starts, and it
-    // starts them with the page service pinned off, so the object
-    // path's rule is the one that decides.
-    zou_pg::branching::why_unbranchable(&*store, &layout, &manifest, ReadPath::Objects)
+    zou_pg::branching::why_unbranchable(&*store, &layout, &manifest, ReadPath::current())
         .map(|why| why.is_none())
         .map_err(|e| Error::new(Kind::Store, e))
 }
@@ -403,7 +581,7 @@ pub(crate) fn cut(target: &str, tenant: &str) -> Result<(), Error> {
     if proven {
         return Ok(());
     }
-    zou_pg::branching::refuse_unservable(&*store, TEMPLATE, tenant, &manifest, ReadPath::Objects)
+    zou_pg::branching::refuse_unservable(&*store, TEMPLATE, tenant, &manifest, ReadPath::current())
         .map_err(|e| Error::new(Kind::Store, e))?;
     PROVEN
         .lock()

@@ -792,7 +792,21 @@ impl Zou {
     /// same function, and it leaves nothing of the child behind.
     pub fn branch(&self, name: &str) -> Result<Zou, Error> {
         self.settle()?;
-        let store = open_store(&self.target).map_err(|e| Error::new(Kind::Store, e))?;
+        let store: Arc<dyn CasStore> =
+            Arc::from(open_store(&self.target).map_err(|e| Error::new(Kind::Store, e))?);
+        if zou_pg::branching::ReadPath::current() == zou_pg::branching::ReadPath::Layers {
+            // The child stands on the point its parent's shard is
+            // consistent through and starts its own log at the
+            // checkpoint it recovers from, so the two have to meet.
+            // The parent's live service gets there on its own
+            // eventually, on a flush rule about bytes and age that a
+            // fixture's worth of writes may never trip, and a branch
+            // taken before it does is a database that comes up and
+            // fails every page read on a gap in its log.
+            zou_pg::branching::catch_up_shard(&store, &self.tenant)
+                .map_err(|e| Error::new(Kind::Store, e))?;
+            self.fold_if_layerless(&*store)?;
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| Error::new(Kind::Store, "the clock is before 1970"))?
@@ -804,10 +818,10 @@ impl Zou {
             &self.tenant,
             name,
             &manifest,
-            // This crate serves through the object path whatever the
-            // ambient setting says, so that is the rule the child has
-            // to satisfy.
-            zou_pg::branching::ReadPath::Objects,
+            // Whichever path this process serves through, since that
+            // is the one the child will be read on and the two want
+            // different things out of the same manifest.
+            zou_pg::branching::ReadPath::current(),
         )
         .map_err(|e| Error::new(Kind::Store, e))?;
         Zou::open_inheriting(
@@ -844,6 +858,39 @@ impl Zou {
         )
     }
 
+    /// Pack an image down for the child to stand on, if the parent has
+    /// none at the point the child will be cut at.
+    ///
+    /// A branch inherits layers, and below the oldest image there is
+    /// nothing it may read, so every shard owes the child one image at
+    /// or below the cut. A shard publishes one of its own once it has
+    /// enough delta debt to be worth the work, which a database of a
+    /// few thousand rows never will, so a branch of one asks for the
+    /// fold rather than waits for it. A parent that already has an
+    /// image at the cut, which is every fixture branched from the
+    /// template, pays nothing here.
+    fn fold_if_layerless(&self, store: &dyn CasStore) -> Result<(), Error> {
+        let layout = TenantLayout::new(&self.tenant);
+        let Some((data, _)) = store
+            .get(&layout.manifest())
+            .map_err(|e| Error::new(Kind::Store, e.to_string()))?
+        else {
+            return Ok(());
+        };
+        let manifest =
+            Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+        let why = zou_pg::branching::why_unbranchable(
+            store,
+            &layout,
+            &manifest,
+            zou_pg::branching::ReadPath::Layers,
+        )
+        .map_err(|e| Error::new(Kind::Store, e))?;
+        let Some(why) = why else { return Ok(()) };
+        log::debug!("branch: folding an image for the child to stand on, {why}");
+        template::fold_source(&self.pg_bin, &self.target, &self.tenant)
+    }
+
     /// Whether a branch of this database would serve, which is the same
     /// question [`branch`](Zou::branch) asks after it has cut one.
     ///
@@ -862,14 +909,19 @@ impl Zou {
         };
         let manifest =
             Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
-        zou_pg::branching::why_unbranchable(
-            &*store,
-            &layout,
-            &manifest,
-            zou_pg::branching::ReadPath::Objects,
-        )
-        .map(|why| why.is_none())
-        .map_err(|e| Error::new(Kind::Store, e))
+        // On the layer path the branch folds its own image, so the
+        // question is whether there is something to fold one out of
+        // rather than whether one is already there. On the object path
+        // the fold happens on its own schedule and all a caller can do
+        // is wait for it.
+        let why = match zou_pg::branching::ReadPath::current() {
+            zou_pg::branching::ReadPath::Layers => {
+                zou_pg::branching::why_unbranchable_after_fold(&*store, &layout, &manifest)
+            }
+            path => zou_pg::branching::why_unbranchable(&*store, &layout, &manifest, path),
+        };
+        why.map(|why| why.is_none())
+            .map_err(|e| Error::new(Kind::Store, e))
     }
 
     /// Push everything committed so far into the store, so a branch or
@@ -1154,18 +1206,6 @@ fn start(
         .env("ZOU_TARGET", target)
         .env("ZOU_TENANT", tenant)
         .env("ZOU_PAGE_CACHE", pagecache)
-        // A branch off the page layers needs an image layer at or
-        // below the cut, which a template is far too small to earn on
-        // its own, and it needs the child to be able to read the size
-        // of a relation it inherited. The first of those a branch can
-        // now ask for by name, see branching::fold_for_branch. The
-        // second has no answer on this path yet: fork lengths live in
-        // the object path's capture index and a child of a page
-        // service tenant has neither its own SIZE objects nor a chain
-        // that carries them, so it fails on pg_authid before it can
-        // authenticate. The embedded library is the branching product
-        // surface, so it stays on the object path until #623 lands.
-        .env("ZOU_PAGESERVE", "0")
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if let Some(size) = shared_buffers {
