@@ -792,7 +792,20 @@ impl Zou {
     /// same function, and it leaves nothing of the child behind.
     pub fn branch(&self, name: &str) -> Result<Zou, Error> {
         self.settle()?;
-        let store = open_store(&self.target).map_err(|e| Error::new(Kind::Store, e))?;
+        let store: Arc<dyn CasStore> =
+            Arc::from(open_store(&self.target).map_err(|e| Error::new(Kind::Store, e))?);
+        if zou_pg::branching::ReadPath::current() == zou_pg::branching::ReadPath::Layers {
+            // The child stands on the point its parent's shard is
+            // consistent through and starts its own log at the
+            // checkpoint it recovers from, so the two have to meet.
+            // The parent's live service gets there on its own
+            // eventually, on a flush rule about bytes and age that a
+            // fixture's worth of writes may never trip, and a branch
+            // taken before it does is a database that comes up and
+            // fails every page read on a gap in its log.
+            zou_pg::branching::catch_up_shard(&store, &self.tenant)
+                .map_err(|e| Error::new(Kind::Store, e))?;
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| Error::new(Kind::Store, "the clock is before 1970"))?
@@ -804,10 +817,10 @@ impl Zou {
             &self.tenant,
             name,
             &manifest,
-            // This crate serves through the object path whatever the
-            // ambient setting says, so that is the rule the child has
-            // to satisfy.
-            zou_pg::branching::ReadPath::Objects,
+            // Whichever path this process serves through, since that
+            // is the one the child will be read on and the two want
+            // different things out of the same manifest.
+            zou_pg::branching::ReadPath::current(),
         )
         .map_err(|e| Error::new(Kind::Store, e))?;
         Zou::open_inheriting(
@@ -866,7 +879,7 @@ impl Zou {
             &*store,
             &layout,
             &manifest,
-            zou_pg::branching::ReadPath::Objects,
+            zou_pg::branching::ReadPath::current(),
         )
         .map(|why| why.is_none())
         .map_err(|e| Error::new(Kind::Store, e))

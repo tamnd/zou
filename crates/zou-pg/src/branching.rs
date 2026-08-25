@@ -60,9 +60,8 @@ pub fn discard(store: &dyn CasStore, tenant_ref: &str) -> Result<usize, String> 
 ///
 /// This is a caller's answer rather than something read out of the
 /// environment here, because the process asking is not always the
-/// process serving. The embedded library runs its postmasters with
-/// the page service pinned off whatever the ambient setting says, so
-/// it asks for [`ReadPath::Objects`] by name.
+/// process serving: a host that pins its postmasters to one path
+/// whatever the ambient setting says has to name the one it pinned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadPath {
     /// Pages come out of the page runs a fold packed into a capture.
@@ -456,7 +455,7 @@ fn pg_objects(
 ///
 /// The returned lsn is what the shard is consistent through, which is
 /// the anchor a child inherits.
-fn catch_up_shard(store: &Arc<dyn CasStore>, tenant_ref: &str) -> Result<u64, String> {
+pub fn catch_up_shard(store: &Arc<dyn CasStore>, tenant_ref: &str) -> Result<u64, String> {
     let layout = TenantLayout::new(tenant_ref);
     let tenant = zou_store::layout::tenant_id(tenant_ref);
     let anchor = PageShardManifest::load(&**store, &layout.shard_manifest(0))
