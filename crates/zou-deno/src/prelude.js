@@ -3457,16 +3457,17 @@
   // anybody could name. So the writes live here, in the isolate, and
   // they go when it does.
   //
-  // A deletion is a name in `gone` rather than a missing entry, because
-  // what is underneath does not go away and a delete has to hide it.
-  const own = new Map();
-  const gone = new Set();
+  // A deletion is a name in `hidden` rather than a missing entry,
+  // because what is underneath does not go away and a delete has to
+  // cover it.
+  const written = new Map();
+  const hidden = new Set();
 
   const env = {
     get(name) {
       const key = String(name);
-      if (gone.has(key)) return undefined;
-      if (own.has(key)) return own.get(key);
+      if (hidden.has(key)) return undefined;
+      if (written.has(key)) return written.get(key);
       const found = ops.op_zou_env_get(key);
       return found === null ? undefined : found;
     },
@@ -3484,18 +3485,18 @@
       if (said.includes("\0")) {
         throw new TypeError(`the value of ${key} may not contain a null byte`);
       }
-      gone.delete(key);
-      own.set(key, said);
+      hidden.delete(key);
+      written.set(key, said);
     },
     delete(name) {
       const key = String(name);
-      own.delete(key);
-      gone.add(key);
+      written.delete(key);
+      hidden.add(key);
     },
     toObject() {
       const all = ops.op_zou_env();
-      for (const key of gone) delete all[key];
-      for (const [key, value] of own) all[key] = value;
+      for (const key of hidden) delete all[key];
+      for (const [key, value] of written) all[key] = value;
       return all;
     },
   };
