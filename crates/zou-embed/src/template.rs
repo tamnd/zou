@@ -13,9 +13,15 @@
 //!
 //! The template has to be branchable, which is more than initdb'd. A
 //! tenant whose only capture is genesis makes a child that appears in
-//! every listing and dies on its first page read, so the build writes
-//! and checkpoints until a fold has packed a full capture down, and
-//! refuses to publish a template that would not serve.
+//! every listing and dies on its first page read, so the build does
+//! not finish until a fold has packed one down, and refuses to publish
+//! a template that would not serve.
+//!
+//! Getting that fold is the one place the two read paths differ. The
+//! object path earns it by writing and checkpointing until the
+//! background fold takes an interest. The layer path asks for it by
+//! name once the postmaster is down, which is both faster and the
+//! honest shape: a template is far too small to ever earn one.
 
 use std::collections::HashSet;
 use std::fs;
@@ -24,6 +30,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zou_pg::branching::ReadPath;
+use zou_pg::redo::{RedoPool, RedoPoolConfig};
 use zou_store::layout::TenantLayout;
 use zou_store::{Manifest, open_store};
 
@@ -234,6 +241,11 @@ fn build(pg_bin: &Path, dir: &Path) -> Result<(), Error> {
 
 /// The database itself: initdb, then a postmaster over it until the
 /// fold has left something a branch can read.
+///
+/// Which fold that is depends on the read path. The object path earns
+/// one by writing, so the postmaster stays up for it. The layer path
+/// asks for one by name, and asks after the postmaster is down, so the
+/// memtable the shutdown flushed is in the layers the fold reads.
 fn raise(
     pg_bin: &Path,
     target: &str,
@@ -254,10 +266,52 @@ fn raise(
         None,
     )?;
     let dsn = format!("host=127.0.0.1 port={port} user={SUPERUSER} dbname=postgres");
-    let settled = contract(&dsn).and_then(|()| settle(&dsn, target));
+    let settled = contract(&dsn).and_then(|()| settle(&dsn, target, ReadPath::current()));
     let stopped = pg.stop();
     settled?;
-    stopped
+    stopped?;
+    if ReadPath::current() == ReadPath::Layers {
+        fold(pg_bin, target)?;
+    }
+    Ok(())
+}
+
+/// Cut the image a branch of this template will stand on.
+///
+/// A shard publishes an image of its own once it has enough delta debt
+/// to be worth one, and a template never will: it is an initdb and a
+/// few thousand rows. So the seal asks for the fold rather than waits,
+/// which is also where the cost belongs, once per template rather than
+/// once per fixture cut from it.
+fn fold(pg_bin: &Path, target: &str) -> Result<(), Error> {
+    let store = open_store(target).map_err(|e| Error::new(Kind::Store, e))?;
+    let layout = TenantLayout::new(TEMPLATE);
+    let Some((data, _)) = store
+        .get(&layout.manifest())
+        .map_err(|e| Error::new(Kind::Store, e.to_string()))?
+    else {
+        return Err(Error::new(
+            Kind::Store,
+            "the template wrote no manifest, so there is nothing to fold",
+        ));
+    };
+    let manifest =
+        Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+    let checksums = zou_pg::restore::store_data_checksums(&*store, TEMPLATE)
+        .map_err(|e| Error::new(Kind::Store, e))?;
+    let pool = RedoPool::new(RedoPoolConfig {
+        postgres: pg_bin.join("postgres"),
+        scratch_root: std::env::temp_dir(),
+        // One template is one small shard's worth of work, and the
+        // build is already holding a machine somebody is waiting on.
+        workers: 1,
+        batch_timeout: FOLD_BATCH_TIMEOUT,
+        batches_per_worker: FOLD_BATCHES_PER_WORKER,
+        data_checksums: checksums,
+    });
+    zou_pg::branching::fold_for_branch(&*store, TEMPLATE, &manifest, &pool, checksums)
+        .map(|_| ())
+        .map_err(|e| Error::new(Kind::Store, e))
 }
 
 /// The roles, the auth schema and the storage schema, put into the
@@ -288,19 +342,35 @@ fn contract(dsn: &str) -> Result<(), Error> {
     })
 }
 
+/// The same cap the page service gives a redo batch, since a fold
+/// asks for the same work in the same batches.
+const FOLD_BATCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Batches a redo worker serves before the pool replaces it, which
+/// bounds postgres's invalid page tracking. A template's fold is far
+/// short of this, so it is a backstop rather than a rotation.
+const FOLD_BATCHES_PER_WORKER: u64 = 256;
+
 /// Write and checkpoint until a branch of this would serve.
 ///
 /// A capture of the pages as they are is what a child reads its
-/// inherited pages out of, and the fold that packs one down happens
-/// after a few checkpoints of writes rather than on request. So this
-/// gives it something to fold and waits, and gives up saying what it
-/// was waiting for rather than publishing a template that would hand
-/// somebody a database that cannot read pg_authid.
-fn settle(dsn: &str, target: &str) -> Result<(), Error> {
+/// inherited pages out of, and on the object path the fold that packs
+/// one down happens after a few checkpoints of writes rather than on
+/// request. So this gives it something to fold and waits, and gives up
+/// saying what it was waiting for rather than publishing a template
+/// that would hand somebody a database that cannot read pg_authid.
+///
+/// The layer path has no waiting to do. Its fold is asked for by name
+/// once the postmaster is down, see [`fold`], so all this owes it is a
+/// checkpoint for the fold to cut at.
+fn settle(dsn: &str, target: &str, path: ReadPath) -> Result<(), Error> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(io("tokio runtime"))?;
+    if path == ReadPath::Layers {
+        return run(&rt, dsn, "checkpoint;", "settling the template");
+    }
     for round in 0..30 {
         let statements = if round == 0 {
             "create table public.zou_template_settling (pad text);
@@ -365,10 +435,7 @@ pub(crate) fn servable(target: &str, tenant: &str) -> Result<bool, Error> {
     };
     let manifest =
         Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
-    // Fixtures are served by a postmaster this crate starts, and it
-    // starts them with the page service pinned off, so the object
-    // path's rule is the one that decides.
-    zou_pg::branching::why_unbranchable(&*store, &layout, &manifest, ReadPath::Objects)
+    zou_pg::branching::why_unbranchable(&*store, &layout, &manifest, ReadPath::current())
         .map(|why| why.is_none())
         .map_err(|e| Error::new(Kind::Store, e))
 }
@@ -403,7 +470,7 @@ pub(crate) fn cut(target: &str, tenant: &str) -> Result<(), Error> {
     if proven {
         return Ok(());
     }
-    zou_pg::branching::refuse_unservable(&*store, TEMPLATE, tenant, &manifest, ReadPath::Objects)
+    zou_pg::branching::refuse_unservable(&*store, TEMPLATE, tenant, &manifest, ReadPath::current())
         .map_err(|e| Error::new(Kind::Store, e))?;
     PROVEN
         .lock()
