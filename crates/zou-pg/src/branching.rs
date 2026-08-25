@@ -235,6 +235,10 @@ pub fn floorless(
 /// is still no is a shard with no floor and nothing of its own to make
 /// one out of: a shard that has published nothing at all, or one still
 /// riding somebody else's layers, where the fold has nothing to fold.
+///
+/// The source's own `pg/` counts as something to fold, since that is
+/// what [`seed_base`] copies into the layers, and it is the whole of a
+/// database that has done nothing since initdb but write a little wal.
 pub fn why_unbranchable_after_fold(
     store: &dyn CasStore,
     layout: &TenantLayout,
@@ -243,11 +247,27 @@ pub fn why_unbranchable_after_fold(
     if cut_at(manifest).is_none() {
         return Ok(Some(NO_CHECKPOINT.to_string()));
     }
+    let mut base: Option<bool> = None;
     for shard in floorless(store, layout, manifest)? {
         let own = PageShardManifest::load(store, &layout.shard_manifest(shard))
             .map_err(|e| format!("shard {shard}: {e}"))?;
         let has_own = own.is_some_and(|(m, _)| !m.layers.is_empty());
-        if !has_own {
+        if has_own {
+            continue;
+        }
+        // Asked once and only when a shard needs the answer, because
+        // it is a list of the whole base and every other caller here
+        // is a single get.
+        let seedable = match base {
+            Some(seen) => seen,
+            None => {
+                let keys = store
+                    .list(&layout.pg_dir())
+                    .map_err(|e| format!("store: {e}"))?;
+                *base.insert(!keys.is_empty())
+            }
+        };
+        if !seedable {
             return Ok(Some(format!(
                 "page shard {shard} has published nothing yet, so there is no image to serve \
                  inherited pages from and nothing to fold one out of"

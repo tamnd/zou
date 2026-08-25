@@ -258,6 +258,14 @@ fn a_branch_carries_what_the_parent_had_and_then_goes_its_own_way() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What a database that has only just been opened does when it is
+/// asked for a branch, which is not the same answer on the two paths.
+///
+/// The object path waits for a fold and has not had one, so it refuses
+/// and takes the child back off the store. The layer path folds the
+/// image itself out of the base the initdb wrote, so there is no such
+/// thing as a database too young to branch, and what is worth checking
+/// is that the child it hands back is a database rather than a shape.
 #[test]
 fn a_database_too_young_to_serve_a_branch_says_so_and_leaves_nothing_behind() {
     let Some(pg_bin) = pg_bin() else { return };
@@ -267,6 +275,18 @@ fn a_database_too_young_to_serve_a_branch_says_so_and_leaves_nothing_behind() {
         ..Options::dir(&dir)
     })
     .expect("open");
+    if zou_pg::branching::ReadPath::current() == zou_pg::branching::ReadPath::Layers {
+        let child = zou.branch("too-soon").expect("branch");
+        let anon = child.keys().anon.clone();
+        let answer = child
+            .request("GET", "/rest/v1/", &[("apikey", &anon)], b"")
+            .expect("request");
+        assert_eq!(answer.status, 200, "{}", body(&answer));
+        child.close().expect("close the child");
+        zou.close().expect("close");
+        let _ = std::fs::remove_dir_all(&dir);
+        return;
+    }
     assert!(!zou.branchable().expect("asking is cheap"));
     let Err(e) = zou.branch("too-soon") else {
         panic!("a database this young has no full capture to inherit");
