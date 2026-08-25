@@ -28,6 +28,10 @@
 //! Every worker gets its own scratch directory. The directory holds no
 //! data, but postgres derives its sysv shared memory keys from it, so
 //! sharing one across live workers would make their startups collide.
+//! Worker numbers are only unique inside a pool, so the pool puts its
+//! workers under a directory of its own named for this process and
+//! this pool: two pools under one scratch root, in one process or in
+//! two, are the same collision by another route (zou #675).
 //!
 //! Pages coming back carry whatever checksum the WAL images had, which
 //! after a few record applies is stale. A page service serving a
@@ -51,7 +55,9 @@ const BLCKSZ: usize = 8192;
 pub struct RedoPoolConfig {
     /// The patched postgres binary, the one `make pg-build` installs.
     pub postgres: PathBuf,
-    /// Parent for the per-worker scratch directories.
+    /// Where this pool puts its scratch directories. The pool makes
+    /// itself one below this, and the workers theirs below that, so
+    /// two pools sharing a root do not share a shared memory key.
     pub scratch_root: PathBuf,
     /// Most workers alive at once. Batches beyond that wait their turn.
     pub workers: usize,
@@ -106,6 +112,9 @@ struct PoolState {
 
 struct PoolShared {
     config: RedoPoolConfig,
+    /// This pool's own directory under the configured root, made on
+    /// the first spawn and removed when the pool goes.
+    scratch: PathBuf,
     epoch: Instant,
     state: Mutex<PoolState>,
     available: Condvar,
@@ -123,8 +132,18 @@ pub struct RedoPool {
 impl RedoPool {
     pub fn new(config: RedoPoolConfig) -> RedoPool {
         let workers = config.workers.max(1);
+        // Named for the process and the pool. The pid alone is not
+        // enough: a page service holds one pool while a fold in the
+        // same process makes another, and both would be pool zero.
+        static POOLS: AtomicU64 = AtomicU64::new(0);
+        let scratch = config.scratch_root.join(format!(
+            "zou-redo-{}-{}",
+            std::process::id(),
+            POOLS.fetch_add(1, Ordering::Relaxed)
+        ));
         let shared = Arc::new(PoolShared {
             config,
+            scratch,
             epoch: Instant::now(),
             state: Mutex::new(PoolState {
                 idle: Vec::new(),
@@ -270,7 +289,7 @@ impl RedoPool {
     }
 
     fn spawn(&self, id: usize) -> Result<Worker, String> {
-        let scratch = self.shared.config.scratch_root.join(format!("w{id}"));
+        let scratch = self.shared.scratch.join(format!("w{id}"));
         std::fs::create_dir_all(&scratch)
             .map_err(|err| format!("create scratch dir {scratch:?}: {err}"))?;
         let mut child = Command::new(&self.shared.config.postgres)
@@ -342,6 +361,11 @@ impl Drop for RedoPool {
             let _ = child.kill();
             let _ = child.wait();
         }
+        drop(slots);
+        // The workers are gone, so the directory is nobody's. It holds
+        // no data worth keeping and a run that made a pool per branch
+        // would otherwise leave one behind per branch.
+        let _ = std::fs::remove_dir_all(&self.shared.scratch);
     }
 }
 
