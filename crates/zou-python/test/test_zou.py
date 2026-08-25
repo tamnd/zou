@@ -175,15 +175,26 @@ class Embedded(unittest.TestCase):
                 # full capture down before it was published.
                 self.assertTrue(second.branchable())
 
-    def test_a_database_too_young_to_branch_says_so(self):
+    def test_a_database_only_just_opened_answers_for_a_branch_either_way(self):
         # The ordinary path: a store of its own, initdb, and nothing
-        # folded down yet.
+        # folded down yet. The two read paths do different things with
+        # that, so ask rather than assume. The layer path folds an image
+        # out of the base initdb wrote, so the branch opens and what is
+        # worth checking is that the child is a database of its own. The
+        # object path waits for a fold it has not had, so it refuses.
         with zoulib.create_zou() as zou:
-            self.assertFalse(zou.branchable())
-            with self.assertRaises(zoulib.ZouError) as refused:
-                zou.branch("too-soon")
-            self.assertEqual(refused.exception.code, "ZOU_STORE")
-            self.assertIn("cannot be branched yet", str(refused.exception))
+            if zou.branchable():
+                with zou.branch("too-soon") as child:
+                    self.assertEqual(child.tenant, "too-soon")
+                    answer = child.request(
+                        "GET", "/rest/v1/", {"apikey": child.anon_key}
+                    )
+                    self.assertEqual(answer.status, 200)
+            else:
+                with self.assertRaises(zoulib.ZouError) as refused:
+                    zou.branch("too-soon")
+                self.assertEqual(refused.exception.code, "ZOU_STORE")
+                self.assertIn("cannot be branched yet", str(refused.exception))
 
     def test_closing_twice_is_fine(self):
         zou = zoulib.create_fixture()

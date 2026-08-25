@@ -456,9 +456,11 @@ func (z *Zou) Branch(name string) (*Zou, error) {
 
 // Branchable says whether a branch of this database would serve yet.
 //
-// A database young enough that no fold has packed a full page capture
-// down cannot be branched, and a fixture can be from the moment it is
-// cut, because the template folded before it was published.
+// On the object path a database young enough that no fold has packed a
+// full page capture down cannot be branched, and a fixture can be from
+// the moment it is cut, because the template folded before it was
+// published. On the layer path the branch folds an image of its own out
+// of the base, so the answer is true from the start.
 func (z *Zou) Branchable() (bool, error) {
 	var out C.int
 	var message *C.char

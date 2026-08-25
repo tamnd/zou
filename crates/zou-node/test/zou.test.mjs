@@ -112,11 +112,25 @@ test("the same project goes on a port as well", { skip: !ready }, async (t) => {
   assert.deepEqual(await answer.json(), [{ id: 7 }]);
 });
 
-test("a database too young to branch says so", { skip: !ready }, async (t) => {
+test("a database only just opened answers for a branch either way", { skip: !ready }, async (t) => {
   const zou = await createZou();
   t.after(() => zou.close());
-  assert.equal(await zou.branchable(), false);
-  await assert.rejects(() => zou.branch("too-soon"), /cannot be branched yet/);
+
+  // The two read paths give different answers here, so ask rather than
+  // assume. The layer path folds an image out of the base initdb wrote,
+  // so a database is branchable from the start and what is worth
+  // checking is that the child is a database rather than a shape. The
+  // object path waits for a fold it has not had, so it refuses.
+  if (await zou.branchable()) {
+    const child = await zou.branch("too-soon");
+    t.after(() => child.close());
+    assert.equal(child.tenant, "too-soon");
+    const headers = { apikey: child.anonKey };
+    const answer = await child.fetch(`${child.url}/rest/v1/`, { headers });
+    assert.equal(answer.status, 200);
+  } else {
+    await assert.rejects(() => zou.branch("too-soon"), /cannot be branched yet/);
+  }
 });
 
 test("a fixture is a database per test rather than per suite", { skip: !ready }, async (t) => {
