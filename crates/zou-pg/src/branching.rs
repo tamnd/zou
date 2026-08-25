@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use crate::redo::RedoPool;
 use crate::relsize;
-use zou_store::layer::{DeltaEntry, LayerKind, build_delta};
+use zou_store::layer::{ImageBuilder, LayerKey, LayerKind, PAGE_IMAGE_LEN};
 use zou_store::layermap::LayerDesc;
 use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
@@ -254,109 +254,180 @@ pub fn why_unbranchable_after_fold(
     Ok(None)
 }
 
-/// Block target for the seeded layer, the same one ingest hands
-/// [`build_delta`]. A few thousand five byte records fit in one block
-/// either way, this is here so the codec is not asked to guess.
-const SEED_BLOCK_TARGET: usize = 64 << 10;
+/// Block target for the seeded layers, the same one compaction hands
+/// its image builder.
+const SEED_BLOCK_TARGET: usize = 256 << 10;
 
-/// Put a length in the layers for every fork the source has one for.
+/// How much of an image to fill before publishing it and starting
+/// another, so a source with a large `pg/` does not build one layer
+/// the size of its whole base in memory.
+const SEED_TARGET_BYTES: usize = 64 << 20;
+
+/// Where a seeded image sits: under everything the layers hold, so
+/// every record above it still applies on top.
 ///
-/// Ingest writes a relsize record when the WAL says a fork grew or was
-/// cut, which covers everything written since the layers began and
-/// nothing before it. A catalog that initdb wrote and nobody has
-/// touched since has its length only in the tenant's own SIZE marker,
-/// under the `pg/` prefix a child does not inherit, so a branch would
-/// come up and fail on `nblocks` of pg_authid before it could
-/// authenticate anybody.
+/// The objects it is built from are the base postgres wrote before
+/// the puts were elided, which is exactly what the live service reads
+/// as its fallback base today, and redo stamps each page with its
+/// record's lsn, so a record the base already contains is skipped
+/// rather than applied twice. Putting the seed at the bottom also
+/// means a fold's fresher image of the same key wins, which is the
+/// order that keeps a stale frozen object from masking a newer one.
+const SEED_LSN: Lsn = Lsn(1);
+
+/// What a seeded entry is built from: a page object under `pg/`, or a
+/// fork length read out of a SIZE marker.
+enum Seed {
+    Page(String),
+    Size(u32),
+}
+
+/// Copy the source's own base into the layers, where a child can read
+/// it.
 ///
-/// So before a source is branched, its markers are copied into the
-/// layers as `Set` records at the branch point. They are assignments
-/// and they sit at the newest lsn, so they win over the WAL derived
-/// records below them, which is right: the marker is what the source
-/// itself would answer, and it is being read with the source stopped.
+/// A branch inherits layers and nothing else. It does not inherit the
+/// `pg/` prefix, and it must not: those are the parent's live base
+/// images, a truncate deletes them, and a child leaning on them would
+/// lose its floor the first time the parent dropped a table. But an
+/// initdb writes its catalogs to `pg/` and the WAL that follows only
+/// touches a few hundred of those pages, so the layers hold nothing
+/// about pg_database or pg_authid and a child comes up unable to find
+/// the database it was told to connect to.
 ///
-/// The count is records written, which is zero on a source whose
-/// markers the layers already cover.
-pub fn seed_fork_sizes(
+/// So before a source is branched, everything under its `pg/` is
+/// imaged into its layers: the pages as pages, and the SIZE markers as
+/// the `Set` records a length reads back out of. The cost is one list
+/// and one get per object, paid once by whoever seals the thing that
+/// is going to be branched.
+///
+/// The count is entries written.
+pub fn seed_base(
     store: &dyn CasStore,
     tenant_ref: &str,
     manifest: &Manifest,
 ) -> Result<usize, String> {
     let layout = TenantLayout::new(tenant_ref);
-    let at = cut_at(manifest).ok_or_else(|| NO_CHECKPOINT.to_string())?;
     let shard_count = manifest.shards;
-    let mut by_shard: BTreeMap<u16, Vec<DeltaEntry>> = BTreeMap::new();
-    for (fork, n) in fork_markers(store, &layout)? {
-        let key = fork.key();
+    let mut by_shard: BTreeMap<u16, Vec<(LayerKey, Seed)>> = BTreeMap::new();
+    for (key, seed) in pg_objects(store, &layout)? {
         let shard = shards::shard_of(&key, shard_count);
-        by_shard.entry(shard).or_default().push(DeltaEntry {
-            key,
-            lsn: at,
-            record: relsize::SizeRec::Set(n).encode().to_vec(),
-        });
+        by_shard.entry(shard).or_default().push((key, seed));
     }
     let mut written = 0;
     for (shard, mut entries) in by_shard {
-        entries.sort_by_key(|e| (e.key, e.lsn));
-        let (bytes, footer) =
-            build_delta(&entries, SEED_BLOCK_TARGET).map_err(|e| format!("shard {shard}: {e}"))?;
-        let desc = LayerDesc::from_footer(&footer, bytes.len() as u64);
-        let key = format!("{}{}", layout.shard_prefix(shard), desc.name());
-        match store.put_if_absent(&key, &bytes) {
-            Ok(_) => {}
-            // The same markers built the same bytes under the same
-            // name on an earlier attempt, adopt them.
-            Err(CasError::AlreadyExists { .. }) => {}
-            Err(e) => return Err(format!("shard {shard}: {e}")),
+        entries.sort_by_key(|e| e.0);
+        entries.dedup_by(|a, b| a.0 == b.0);
+        let mut builder = ImageBuilder::new(SEED_LSN, SEED_BLOCK_TARGET);
+        for (key, seed) in &entries {
+            let page = match seed {
+                // A page that has gone since the listing is one this
+                // seed does not need: the object is only the base, and
+                // a relation dropped out from under us has no child
+                // that wants it.
+                Seed::Page(object) => match store.get(object).map_err(|e| format!("store: {e}"))? {
+                    Some((page, _)) if page.len() == PAGE_IMAGE_LEN => page,
+                    _ => continue,
+                },
+                Seed::Size(n) => {
+                    let mut page = vec![0u8; PAGE_IMAGE_LEN];
+                    page[..relsize::REC_LEN].copy_from_slice(&relsize::SizeRec::Set(*n).encode());
+                    page
+                }
+            };
+            builder
+                .push(*key, &page)
+                .map_err(|e| format!("shard {shard}: {e}"))?;
+            written += 1;
+            if builder.bytes() >= SEED_TARGET_BYTES {
+                publish_seed(store, &layout, shard, builder)?;
+                builder = ImageBuilder::new(SEED_LSN, SEED_BLOCK_TARGET);
+            }
         }
-        publish_layer(
-            store,
-            &layout.shard_manifest(shard),
-            shard,
-            &LayerEntry {
-                name: desc.name(),
-                size: bytes.len() as u64,
-                owner: None,
-                upto: None,
-            },
-            at,
-        )
-        .map_err(|e| format!("shard {shard}: {e}"))?;
-        written += entries.len();
+        if !builder.is_empty() {
+            publish_seed(store, &layout, shard, builder)?;
+        }
     }
     Ok(written)
 }
 
-/// Every fork the tenant's own `pg/` prefix has a SIZE marker for, and
-/// what it says. One list of the prefix and one get per marker, which
-/// is what the object path's fold pays for the same answer.
-fn fork_markers(
+/// Land one seeded image and list it on the shard.
+///
+/// The bytes go under a name derived from what is in them, so a second
+/// attempt after a crash writes the same object and adopting the one
+/// already there is the whole of the retry logic. The publish does not
+/// move the shard's flush point: this is history being filled in
+/// underneath, not anything new arriving.
+fn publish_seed(
     store: &dyn CasStore,
     layout: &TenantLayout,
-) -> Result<Vec<(relsize::ForkRef, u32)>, String> {
+    shard: u16,
+    builder: ImageBuilder,
+) -> Result<(), String> {
+    let (bytes, footer) = builder
+        .finish()
+        .map_err(|e| format!("shard {shard}: {e}"))?;
+    let desc = LayerDesc::from_footer(&footer, bytes.len() as u64);
+    let key = format!("{}{}", layout.shard_prefix(shard), desc.name());
+    match store.put_if_absent(&key, &bytes) {
+        Ok(_) => {}
+        Err(CasError::AlreadyExists { .. }) => {}
+        Err(e) => return Err(format!("shard {shard}: {e}")),
+    }
+    publish_layer(
+        store,
+        &layout.shard_manifest(shard),
+        shard,
+        &LayerEntry {
+            name: desc.name(),
+            size: bytes.len() as u64,
+            owner: None,
+            upto: None,
+        },
+        SEED_LSN,
+    )
+    .map_err(|e| format!("shard {shard}: {e}"))?;
+    Ok(())
+}
+
+/// Everything under the tenant's own `pg/` prefix that a layer can
+/// hold: one key per page object and one per SIZE marker.
+///
+/// One list of the prefix, and the gets happen later, one at a time as
+/// the image is filled, so the whole base is never in memory at once.
+fn pg_objects(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+) -> Result<Vec<(LayerKey, Seed)>, String> {
     let prefix = layout.pg_dir();
     let mut out = Vec::new();
     for key in store.list(&prefix).map_err(|e| format!("store: {e}"))? {
         let rest = key.strip_prefix(&prefix).unwrap_or(&key);
         let parts: Vec<&str> = rest.split('/').collect();
-        if parts.len() != 5 || parts[4] != "SIZE" {
+        if parts.len() != 5 {
             continue;
         }
         let (Ok(spc), Ok(db), Ok(rel), Ok(fork)) = (
-            parts[0].parse(),
-            parts[1].parse(),
-            parts[2].parse(),
-            parts[3].parse(),
+            parts[0].parse::<u32>(),
+            parts[1].parse::<u32>(),
+            parts[2].parse::<u32>(),
+            parts[3].parse::<u8>(),
         ) else {
             continue;
         };
-        let Some((data, _)) = store.get(&key).map_err(|e| format!("store: {e}"))? else {
+        if parts[4] == "SIZE" {
+            let Some((data, _)) = store.get(&key).map_err(|e| format!("store: {e}"))? else {
+                continue;
+            };
+            let n = zou_store::forksize::ForkSize::decode(&data)
+                .map(|fs| fs.nblocks)
+                .ok_or_else(|| format!("bad SIZE object at {key}"))?;
+            out.push((LayerKey::relsize(spc, db, rel, fork), Seed::Size(n)));
+            continue;
+        }
+        let Ok(blk) = parts[4].parse::<u32>() else {
             continue;
         };
-        let n = zou_store::forksize::ForkSize::decode(&data)
-            .map(|fs| fs.nblocks)
-            .ok_or_else(|| format!("bad SIZE object at {key}"))?;
-        out.push((relsize::ForkRef { spc, db, rel, fork }, n));
+        out.push((LayerKey::page(spc, db, rel, fork, blk), Seed::Page(key)));
     }
     Ok(out)
 }
@@ -389,8 +460,8 @@ pub fn fold_for_branch(
     let at = cut_at(manifest).ok_or_else(|| NO_CHECKPOINT.to_string())?;
     // Before the merge, so the images it cuts carry the lengths too
     // and the seeded layer is retired along with everything else.
-    let seeded = seed_fork_sizes(store, tenant_ref, manifest)?;
-    log::debug!("fold for branch: seeded {seeded} fork lengths from the markers");
+    let seeded = seed_base(store, tenant_ref, manifest)?;
+    log::debug!("fold for branch: seeded {seeded} entries from the pg objects");
     let mut folded = 0;
     for shard in floorless(store, &layout, manifest)? {
         // One shard at a time, for the reason the offline fold gives:
@@ -644,25 +715,33 @@ mod tests {
         assert!(why_layerless(&store, &layout, &m).unwrap().is_none());
     }
 
-    /// The markers are the only place a length lives for a catalog
-    /// initdb wrote and nothing has touched since, and a child does
-    /// not inherit the `pg/` prefix they sit under. Seeding copies
-    /// them into the layers, where a branch can read them.
+    /// A catalog initdb wrote and nothing has touched since lives
+    /// entirely under `pg/`, which a child does not inherit. Seeding
+    /// copies it into the layers, pages and length both, where a
+    /// branch can read it.
     #[test]
-    fn the_markers_become_lengths_the_layers_can_answer_from() {
+    fn the_pg_objects_become_layers_a_branch_can_read() {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalFsStore::new(dir.path());
         let layout = TenantLayout::new("prod");
-        for (rel, n) in [(1260u32, 3u32), (1255, 11)] {
+        for (rel, n) in [(1260u32, 2u32), (1255, 1)] {
             store
                 .put(
                     &layout.pg_size(1663, 5, rel, 0),
                     &zou_store::forksize::ForkSize::plain(n).encode(),
                 )
                 .unwrap();
+            for blk in 0..n {
+                store
+                    .put(
+                        &layout.pg_block(1663, 5, rel, 0, blk),
+                        &vec![(rel + blk) as u8; 8192],
+                    )
+                    .unwrap();
+            }
         }
-        // Not a marker: the fs capture writes other objects under the
-        // same prefix and the walk has to step over them.
+        // Not one of ours: the fs capture writes other objects under
+        // the same prefix and the walk has to step over them.
         store
             .put(&format!("{}nonsense", layout.pg_dir()), b"x")
             .unwrap();
@@ -674,7 +753,11 @@ mod tests {
             kind: CheckpointKind::Full,
             owner: None,
         });
-        assert_eq!(seed_fork_sizes(&store, "prod", &m).unwrap(), 2);
+        assert_eq!(
+            seed_base(&store, "prod", &m).unwrap(),
+            5,
+            "3 pages, 2 sizes"
+        );
 
         let (shard, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
             .unwrap()
@@ -691,8 +774,32 @@ mod tests {
             };
             svc.rel_size(&map, &mem, fork, u64::MAX).unwrap()
         };
-        assert_eq!(ask(1260), Some(3));
-        assert_eq!(ask(1255), Some(11));
+        assert_eq!(ask(1260), Some(2));
+        assert_eq!(ask(1255), Some(1));
         assert_eq!(ask(2600), None, "a rel with no marker stays silent");
+
+        let page = svc
+            .get_pages(
+                &map,
+                &mem,
+                &[crate::walscan::BlockRef {
+                    spc: 1663,
+                    db: 5,
+                    rel: 1260,
+                    fork: 0,
+                    blk: 1,
+                }],
+                u64::MAX,
+            )
+            .unwrap();
+        assert_eq!(
+            page[0],
+            vec![1261u32 as u8; 8192],
+            "the page came along too"
+        );
+
+        // And it is a floor: a branch cut here has something to stand
+        // on, which is the whole reason the seed happens before one.
+        assert_eq!(why_layerless(&store, &layout, &m).unwrap(), None);
     }
 }
