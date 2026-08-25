@@ -201,6 +201,9 @@ struct Shim {
     /// reads past the local tiers go to the page service socket and
     /// eager page puts are elided, see the pageserve module.
     pageserve: Option<pageserve::PageClient>,
+    /// Whether this tenant was branched, read off the manifest once.
+    /// See [`branched`].
+    branched: OnceLock<bool>,
 }
 
 static SHIM: OnceLock<Shim> = OnceLock::new();
@@ -405,6 +408,33 @@ fn with_reader<R>(
     }
 }
 
+/// Whether this tenant is a branch, which decides whether an absent
+/// SIZE means an inherited length to go looking for or a fork that
+/// does not exist.
+///
+/// One manifest read for the life of the process. It cannot change
+/// under us: a tenant is branched when it is created and no running
+/// database becomes a branch of something later.
+///
+/// A tenant with no manifest is not a branch. That is a store holding
+/// object bytes and nothing else, which is a legitimate way to run,
+/// and so is a read that fails: either way there is no parent whose
+/// lengths this could inherit.
+fn branched(shim: &Shim) -> bool {
+    *shim
+        .branched
+        .get_or_init(|| match shim.store.get(&shim.layout.manifest()) {
+            Ok(Some((data, _))) => zou_store::Manifest::from_json(&data)
+                .map(|m| m.branch_of.is_some())
+                .unwrap_or(false),
+            Ok(None) => false,
+            Err(e) => {
+                log::warn!("zou: reading the manifest to see if this is a branch: {e}");
+                false
+            }
+        })
+}
+
 fn chain_read(shim: &Shim, r: walscan::BlockRef, durable: u64) -> Result<Option<Vec<u8>>, ()> {
     with_reader(shim, |rd| rd.read(&*shim.store, r, durable)).map(Option::flatten)
 }
@@ -582,15 +612,23 @@ fn read_size_chained(
         }
         return Ok(Some(fs));
     }
-    let branched = with_reader(shim, |rd| rd.branched())?.unwrap_or(false);
-    let chained = match (branched, &shim.pageserve) {
-        (false, _) => None,
-        (true, Some(client)) => client
+    let chained = match &shim.pageserve {
+        // Whether this is a branch comes off the manifest rather than
+        // the reader, because attaching the reader on this path fails
+        // fatally: there is no full capture on a branch cut off the
+        // layers and there was never going to be one. Asking it first
+        // was a branch that died on nblocks of pg_authid with the
+        // service that could have answered sitting right there.
+        Some(client) if branched(shim) => client
             .get_size(spc, db, rel, fork, 0)
             .map_err(|e| log::error!("zou_smgr_nblocks: {spc}/{db}/{rel}.{fork}: {e}"))?,
-        (true, None) => {
-            with_reader(shim, |rd| rd.fork_size(spc, db, rel, fork)).map(Option::flatten)?
-        }
+        Some(_) => None,
+        None => match with_reader(shim, |rd| rd.branched())?.unwrap_or(false) {
+            true => {
+                with_reader(shim, |rd| rd.fork_size(spc, db, rel, fork)).map(Option::flatten)?
+            }
+            false => None,
+        },
     };
     // An inherited length, or one only this process's pending buffer
     // knows about. Neither says anything about which blocks have
@@ -712,6 +750,7 @@ pub unsafe extern "C" fn zou_pg_init(target: *const c_char) -> i32 {
             pending: Mutex::new(pending::Pending::default()),
             cache: pagecache::PageCache::from_env(),
             pageserve: pageserve_on().then(|| pageserve::PageClient::new(pageserve_socket())),
+            branched: OnceLock::new(),
         });
         ZOU_OK
     })
