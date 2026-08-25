@@ -123,6 +123,8 @@ mod cjs;
 #[cfg(feature = "isolate")]
 mod crypto;
 #[cfg(feature = "isolate")]
+mod dns;
+#[cfg(feature = "isolate")]
 mod fetch;
 #[cfg(feature = "isolate")]
 mod hangup;

@@ -3961,6 +3961,62 @@
   }
 
   // ---------------------------------------------------------------
+  // Deno.resolveDns, and the address lookup underneath node:dns
+  //
+  // Two different things that both look like asking about a name. A
+  // lookup is the host's own resolution, the one every other program on
+  // the machine gets, so `localhost`, a line in `/etc/hosts` and a
+  // search domain all mean what they mean everywhere else. A resolve is
+  // a query put on the wire for records of one type, which is the only
+  // way to see an MX or a TXT at all.
+  //
+  // The lookup is not a Deno api because there is no Deno api for it,
+  // and inventing a name on `Deno` for something upstream does not have
+  // would be a function written against this runtime and no other. It
+  // is an internal instead, where `node:dns` can reach it and a
+  // function has no reason to.
+
+  const RECORDS = ["A", "AAAA", "CAA", "CNAME", "MX", "NS", "PTR", "SOA", "SRV", "TXT"];
+
+  /// A failure with the code node's dns errors carry, since a package
+  /// that catches one branches on the code rather than on the message.
+  function unresolved(answer) {
+    const Raised = answer.code === "ENOTFOUND" || answer.code === "ENODATA" ? NotFound : Error;
+    const wrong = new Raised(answer.why);
+    wrong.code = answer.code;
+    throw wrong;
+  }
+
+  async function resolveDns(query, recordType, options = {}) {
+    const kind = String(recordType ?? "").toUpperCase();
+    if (!RECORDS.includes(kind)) {
+      throw new TypeError(
+        `${recordType} is not a record type this runtime asks for, which are ${RECORDS.join(", ")}`,
+      );
+    }
+    const named = options?.nameServer;
+    // A v6 address has colons of its own, so it is the port that has to
+    // be told apart rather than the address.
+    const at = named?.ipAddr?.includes(":") && !named.ipAddr.startsWith("[")
+      ? `[${named.ipAddr}]`
+      : named?.ipAddr;
+    const server = named === undefined || named === null ? "" : `${at}:${named.port ?? 53}`;
+    const found = await ops.op_zou_dns_resolve(String(query), kind, server);
+    if (found.kind === "failed") {
+      unresolved(found);
+    }
+    return found.records;
+  }
+
+  globalThis.__zouLookup = async function lookup(hostname) {
+    const looked = await ops.op_zou_dns_lookup(String(hostname));
+    if (looked.kind === "failed") {
+      unresolved(looked);
+    }
+    return looked.addresses;
+  };
+
+  // ---------------------------------------------------------------
   // Deno.permissions
   //
   // A library asks this before it reaches for something it can do
@@ -4623,6 +4679,7 @@
     connect,
     connectTls,
     startTls,
+    resolveDns,
     // The two a function catching one of them by name is written
     // against, which is what makes a missing file and a file it may
     // not have two different things to it, the eight the older way of

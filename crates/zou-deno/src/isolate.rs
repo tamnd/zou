@@ -30,7 +30,7 @@ use zou_functions::Policy;
 use crate::inspector::Inspector;
 use crate::limits::{Limits, Watch};
 use crate::{
-    cjs, crypto, fetch, inspector, limits, module, pool, socket, timer, url, websocket, zlib,
+    cjs, crypto, dns, fetch, inspector, limits, module, pool, socket, timer, url, websocket, zlib,
 };
 
 /// What the isolate has whether or not a call is in it: the function's
@@ -466,6 +466,8 @@ deno_core::extension!(
         crypto::op_zou_ec_public,
         crypto::op_zou_encrypt,
         crypto::op_zou_decrypt,
+        dns::op_zou_dns_lookup,
+        dns::op_zou_dns_resolve,
         fetch::op_zou_fetch,
         fetch::op_zou_fetch_abort,
         timer::op_zou_sleep,
