@@ -3974,6 +3974,150 @@ fn performance_counts_from_when_the_isolate_started() {
     assert_eq!(said["fraction"], true);
 }
 
+/// A mark and a measure are recorded and read back. The buffer used to
+/// be absent, so a library that timed itself found no `mark` at all,
+/// and the whole of what it costs to have is a list in the isolate.
+#[test]
+fn what_a_function_marks_is_what_it_reads_back() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            performance.mark("start", { detail: { why: "the query" } });
+            await new Promise((done) => setTimeout(done, 20));
+            performance.mark("end");
+            const span = performance.measure("the query", "start", "end");
+            const byName = performance.getEntriesByName("the query");
+            const marks = performance.getEntriesByType("mark").map((e) => e.name);
+            const started = performance.getEntriesByName("start", "mark")[0];
+            performance.clearMarks("start");
+            return Response.json({
+                type: span.entryType,
+                name: span.name,
+                duration: span.duration,
+                startsAtTheMark: span.startTime === started.startTime,
+                detail: started.detail.why,
+                measures: byName.length,
+                marks,
+                left: performance.getEntriesByType("mark").map((e) => e.name),
+                all: performance.getEntries().length,
+                isEntry: span instanceof PerformanceEntry && span instanceof PerformanceMeasure,
+                json: JSON.stringify(performance.getEntriesByName("end")[0].toJSON()).includes("\"entryType\":\"mark\""),
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["type"], "measure");
+    assert_eq!(said["name"], "the query");
+    let duration = said["duration"].as_f64().expect("a number");
+    assert!(duration >= 15.0, "{duration}");
+    assert_eq!(said["measures"], 1);
+    assert_eq!(said["startsAtTheMark"], true);
+    // A mark carries whatever the library put on it, unchanged.
+    assert_eq!(said["detail"], "the query");
+    assert_eq!(said["marks"], serde_json::json!(["start", "end"]));
+    // A cleared mark is gone and the measure it was used for is not.
+    assert_eq!(said["left"], serde_json::json!(["end"]));
+    assert_eq!(said["all"], 2);
+    assert_eq!(said["isEntry"], true);
+    assert_eq!(said["json"], true);
+}
+
+/// The entry a nobody asked for. A measure between two names that were
+/// never marked is a mistake in the library rather than a zero, and the
+/// web says so with a `SyntaxError`.
+#[test]
+fn a_measure_between_marks_that_were_never_made_says_so() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => {
+            const said = [];
+            try {
+                performance.measure("nothing", "never marked");
+            } catch (e) {
+                said.push(e.name);
+            }
+            // A duration with both ends given is the other refusal.
+            try {
+                performance.measure("both", { start: 1, end: 2, duration: 3 });
+            } catch (e) {
+                said.push(e.constructor.name);
+            }
+            // Numbers are times, and a measure of them needs no marks.
+            const plain = performance.measure("plain", { start: 5, end: 12 });
+            // An entry is the runtime's to make.
+            try {
+                new PerformanceEntry("mine", "mark", 0, 0);
+            } catch (e) {
+                said.push(e.constructor.name);
+            }
+            return Response.json({
+                said,
+                start: plain.startTime,
+                duration: plain.duration,
+                types: PerformanceObserver.supportedEntryTypes,
+            });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said["said"],
+        serde_json::json!(["SyntaxError", "TypeError", "TypeError"])
+    );
+    assert_eq!(said["start"], 5.0);
+    assert_eq!(said["duration"], 7.0);
+    assert_eq!(said["types"], serde_json::json!(["mark", "measure"]));
+}
+
+/// An observer is told about what was recorded after it started
+/// watching, in a microtask rather than inside the call that recorded
+/// it, and `buffered` is how a library that set itself up late still
+/// sees the setup.
+#[test]
+fn an_observer_hears_about_what_was_recorded() {
+    let answer = answered(
+        r#"
+        Deno.serve(async () => {
+            const heard = [];
+            let insideTheCall = false;
+            const watcher = new PerformanceObserver((list) => {
+                heard.push(...list.getEntries().map((e) => `${e.entryType}:${e.name}`));
+            });
+            watcher.observe({ entryTypes: ["mark", "measure"] });
+            performance.mark("one");
+            insideTheCall = heard.length > 0;
+            performance.measure("two", "one");
+            await new Promise((done) => setTimeout(done, 5));
+
+            // A second observer that asks for what it missed.
+            const late = [];
+            const catching = new PerformanceObserver((list) => {
+                late.push(...list.getEntriesByType("mark").map((e) => e.name));
+            });
+            catching.observe({ type: "mark", buffered: true });
+            await new Promise((done) => setTimeout(done, 5));
+
+            watcher.disconnect();
+            catching.disconnect();
+            performance.mark("after the disconnect");
+            await new Promise((done) => setTimeout(done, 5));
+
+            return Response.json({ heard, late, insideTheCall });
+        });
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said["heard"],
+        serde_json::json!(["mark:one", "measure:two"])
+    );
+    assert_eq!(said["late"], serde_json::json!(["one"]));
+    // Not in the call that recorded it, which is what keeps a library
+    // that marks inside its own callback out of a loop.
+    assert_eq!(said["insideTheCall"], false);
+}
+
 /// `navigator` is the four properties upstream has and not a fifth,
 /// because a library feature detecting on `navigator.gpu` should find
 /// nothing rather than find something that is not there.
