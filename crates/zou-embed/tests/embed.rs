@@ -146,6 +146,11 @@ fn the_same_project_is_reachable_over_a_port_as_well() {
 /// has not done that yet and one that has been serving for a while did
 /// it long ago, so a test that wants a branch has to do the work the
 /// demo does.
+///
+/// On the layer path the branch folds its own image and this comes back
+/// on the first round, but the writes are what makes the test worth
+/// running either way: they are the parent's history the child has to
+/// carry.
 fn settle(zou: &Zou) {
     for _ in 0..20 {
         sql(

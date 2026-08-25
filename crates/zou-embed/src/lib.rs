@@ -805,6 +805,7 @@ impl Zou {
             // fails every page read on a gap in its log.
             zou_pg::branching::catch_up_shard(&store, &self.tenant)
                 .map_err(|e| Error::new(Kind::Store, e))?;
+            self.fold_if_layerless(&*store)?;
         }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -857,6 +858,39 @@ impl Zou {
         )
     }
 
+    /// Pack an image down for the child to stand on, if the parent has
+    /// none at the point the child will be cut at.
+    ///
+    /// A branch inherits layers, and below the oldest image there is
+    /// nothing it may read, so every shard owes the child one image at
+    /// or below the cut. A shard publishes one of its own once it has
+    /// enough delta debt to be worth the work, which a database of a
+    /// few thousand rows never will, so a branch of one asks for the
+    /// fold rather than waits for it. A parent that already has an
+    /// image at the cut, which is every fixture branched from the
+    /// template, pays nothing here.
+    fn fold_if_layerless(&self, store: &dyn CasStore) -> Result<(), Error> {
+        let layout = TenantLayout::new(&self.tenant);
+        let Some((data, _)) = store
+            .get(&layout.manifest())
+            .map_err(|e| Error::new(Kind::Store, e.to_string()))?
+        else {
+            return Ok(());
+        };
+        let manifest =
+            Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+        let why = zou_pg::branching::why_unbranchable(
+            store,
+            &layout,
+            &manifest,
+            zou_pg::branching::ReadPath::Layers,
+        )
+        .map_err(|e| Error::new(Kind::Store, e))?;
+        let Some(why) = why else { return Ok(()) };
+        log::debug!("branch: folding an image for the child to stand on, {why}");
+        template::fold_source(&self.pg_bin, &self.target, &self.tenant)
+    }
+
     /// Whether a branch of this database would serve, which is the same
     /// question [`branch`](Zou::branch) asks after it has cut one.
     ///
@@ -875,14 +909,19 @@ impl Zou {
         };
         let manifest =
             Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
-        zou_pg::branching::why_unbranchable(
-            &*store,
-            &layout,
-            &manifest,
-            zou_pg::branching::ReadPath::current(),
-        )
-        .map(|why| why.is_none())
-        .map_err(|e| Error::new(Kind::Store, e))
+        // On the layer path the branch folds its own image, so the
+        // question is whether there is something to fold one out of
+        // rather than whether one is already there. On the object path
+        // the fold happens on its own schedule and all a caller can do
+        // is wait for it.
+        let why = match zou_pg::branching::ReadPath::current() {
+            zou_pg::branching::ReadPath::Layers => {
+                zou_pg::branching::why_unbranchable_after_fold(&*store, &layout, &manifest)
+            }
+            path => zou_pg::branching::why_unbranchable(&*store, &layout, &manifest, path),
+        };
+        why.map(|why| why.is_none())
+            .map_err(|e| Error::new(Kind::Store, e))
     }
 
     /// Push everything committed so far into the store, so a branch or

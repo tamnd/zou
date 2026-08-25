@@ -284,21 +284,34 @@ fn raise(
 /// which is also where the cost belongs, once per template rather than
 /// once per fixture cut from it.
 fn fold(pg_bin: &Path, target: &str) -> Result<(), Error> {
+    fold_source(pg_bin, target, TEMPLATE)
+}
+
+/// The same fold, asked for by name of whichever tenant is about to be
+/// branched.
+///
+/// A template is the usual caller and the cheapest one, since it pays
+/// this once for every fixture that will ever be cut from it. But a
+/// database somebody opened themselves and then asked for a branch of
+/// is in the same position, small enough that its own shard will never
+/// decide an image is worth publishing, and the alternative is telling
+/// the caller to go and write a few hundred megabytes first.
+pub(crate) fn fold_source(pg_bin: &Path, target: &str, tenant: &str) -> Result<(), Error> {
     let store: Arc<dyn zou_store::CasStore> =
         Arc::from(open_store(target).map_err(|e| Error::new(Kind::Store, e))?);
-    let layout = TenantLayout::new(TEMPLATE);
+    let layout = TenantLayout::new(tenant);
     let Some((data, _)) = store
         .get(&layout.manifest())
         .map_err(|e| Error::new(Kind::Store, e.to_string()))?
     else {
         return Err(Error::new(
             Kind::Store,
-            "the template wrote no manifest, so there is nothing to fold",
+            format!("{tenant} wrote no manifest, so there is nothing to fold"),
         ));
     };
     let manifest =
         Manifest::from_json(&data).map_err(|e| Error::new(Kind::Store, e.to_string()))?;
-    let checksums = zou_pg::restore::store_data_checksums(&*store, TEMPLATE)
+    let checksums = zou_pg::restore::store_data_checksums(&*store, tenant)
         .map_err(|e| Error::new(Kind::Store, e))?;
     let pool = RedoPool::new(RedoPoolConfig {
         postgres: pg_bin.join("postgres"),
@@ -310,7 +323,7 @@ fn fold(pg_bin: &Path, target: &str) -> Result<(), Error> {
         batches_per_worker: FOLD_BATCHES_PER_WORKER,
         data_checksums: checksums,
     });
-    zou_pg::branching::fold_for_branch(&store, TEMPLATE, &manifest, &pool, checksums)
+    zou_pg::branching::fold_for_branch(&store, tenant, &manifest, &pool, checksums)
         .map(|_| ())
         .map_err(|e| Error::new(Kind::Store, e))
 }
