@@ -43,7 +43,7 @@ impl PageClient {
         _rel: u32,
         _fork: u32,
         _lsn: u64,
-    ) -> Result<u32, String> {
+    ) -> Result<Option<u32>, String> {
         Err("the page service needs unix sockets".to_string())
     }
 }

@@ -585,17 +585,9 @@ fn read_size_chained(
     let branched = with_reader(shim, |rd| rd.branched())?.unwrap_or(false);
     let chained = match (branched, &shim.pageserve) {
         (false, _) => None,
-        // Zero reads as no answer rather than as an empty fork. The
-        // layers hold relsize keys for relations that have since been
-        // dropped, and a fork of no blocks that is genuinely there
-        // was truncated on this branch, which writes the own SIZE
-        // eagerly and so never reaches here.
-        (true, Some(client)) => Some(
-            client
-                .get_size(spc, db, rel, fork, 0)
-                .map_err(|e| log::error!("zou_smgr_nblocks: {spc}/{db}/{rel}.{fork}: {e}"))?,
-        )
-        .filter(|n| *n > 0),
+        (true, Some(client)) => client
+            .get_size(spc, db, rel, fork, 0)
+            .map_err(|e| log::error!("zou_smgr_nblocks: {spc}/{db}/{rel}.{fork}: {e}"))?,
         (true, None) => {
             with_reader(shim, |rd| rd.fork_size(spc, db, rel, fork)).map(Option::flatten)?
         }

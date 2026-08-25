@@ -783,10 +783,11 @@ mod tests {
         assert_eq!(
             svc.rel_size(&map, &Memtable::new(), fork, u64::MAX)
                 .unwrap(),
-            5
+            Some(5)
         );
-        // A fork nothing extended is no blocks long, the same answer
-        // the stock smgr gives for a relation with no file.
+        // A fork nothing extended has no length in the layers at all.
+        // That is silence rather than zero, and the caller decides
+        // what to do with it.
         let absent = relsize::ForkRef {
             rel: mine + 1,
             ..fork
@@ -794,7 +795,7 @@ mod tests {
         assert_eq!(
             svc.rel_size(&map, &Memtable::new(), absent, u64::MAX)
                 .unwrap(),
-            0
+            None
         );
     }
 
@@ -835,8 +836,8 @@ mod tests {
             fork: 0,
         };
         let mem = Memtable::new();
-        assert_eq!(svc.rel_size(&map, &mem, fork, before).unwrap(), 12);
-        assert_eq!(svc.rel_size(&map, &mem, fork, u64::MAX).unwrap(), 5);
+        assert_eq!(svc.rel_size(&map, &mem, fork, before).unwrap(), Some(12));
+        assert_eq!(svc.rel_size(&map, &mem, fork, u64::MAX).unwrap(), Some(5));
     }
 
     #[test]

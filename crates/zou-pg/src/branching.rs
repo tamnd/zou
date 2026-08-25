@@ -19,13 +19,16 @@
 //! the removal itself, which `zou branch delete` needs for a child that
 //! did serve and is no longer wanted.
 
+use std::collections::BTreeMap;
+
 use crate::redo::RedoPool;
-use zou_store::layer::LayerKind;
+use crate::relsize;
+use zou_store::layer::{DeltaEntry, LayerKind, build_delta};
 use zou_store::layermap::LayerDesc;
 use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
-use zou_store::shardmanifest::PageShardManifest;
-use zou_store::{CasStore, Manifest};
+use zou_store::shardmanifest::{LayerEntry, PageShardManifest, publish_layer};
+use zou_store::{CasError, CasStore, Manifest, shards};
 
 /// Everything under a ref's prefix, and the count of what went.
 ///
@@ -251,6 +254,113 @@ pub fn why_unbranchable_after_fold(
     Ok(None)
 }
 
+/// Block target for the seeded layer, the same one ingest hands
+/// [`build_delta`]. A few thousand five byte records fit in one block
+/// either way, this is here so the codec is not asked to guess.
+const SEED_BLOCK_TARGET: usize = 64 << 10;
+
+/// Put a length in the layers for every fork the source has one for.
+///
+/// Ingest writes a relsize record when the WAL says a fork grew or was
+/// cut, which covers everything written since the layers began and
+/// nothing before it. A catalog that initdb wrote and nobody has
+/// touched since has its length only in the tenant's own SIZE marker,
+/// under the `pg/` prefix a child does not inherit, so a branch would
+/// come up and fail on `nblocks` of pg_authid before it could
+/// authenticate anybody.
+///
+/// So before a source is branched, its markers are copied into the
+/// layers as `Set` records at the branch point. They are assignments
+/// and they sit at the newest lsn, so they win over the WAL derived
+/// records below them, which is right: the marker is what the source
+/// itself would answer, and it is being read with the source stopped.
+///
+/// The count is records written, which is zero on a source whose
+/// markers the layers already cover.
+pub fn seed_fork_sizes(
+    store: &dyn CasStore,
+    tenant_ref: &str,
+    manifest: &Manifest,
+) -> Result<usize, String> {
+    let layout = TenantLayout::new(tenant_ref);
+    let at = cut_at(manifest).ok_or_else(|| NO_CHECKPOINT.to_string())?;
+    let shard_count = manifest.shards;
+    let mut by_shard: BTreeMap<u16, Vec<DeltaEntry>> = BTreeMap::new();
+    for (fork, n) in fork_markers(store, &layout)? {
+        let key = fork.key();
+        let shard = shards::shard_of(&key, shard_count);
+        by_shard.entry(shard).or_default().push(DeltaEntry {
+            key,
+            lsn: at,
+            record: relsize::SizeRec::Set(n).encode().to_vec(),
+        });
+    }
+    let mut written = 0;
+    for (shard, mut entries) in by_shard {
+        entries.sort_by_key(|e| (e.key, e.lsn));
+        let (bytes, footer) =
+            build_delta(&entries, SEED_BLOCK_TARGET).map_err(|e| format!("shard {shard}: {e}"))?;
+        let desc = LayerDesc::from_footer(&footer, bytes.len() as u64);
+        let key = format!("{}{}", layout.shard_prefix(shard), desc.name());
+        match store.put_if_absent(&key, &bytes) {
+            Ok(_) => {}
+            // The same markers built the same bytes under the same
+            // name on an earlier attempt, adopt them.
+            Err(CasError::AlreadyExists { .. }) => {}
+            Err(e) => return Err(format!("shard {shard}: {e}")),
+        }
+        publish_layer(
+            store,
+            &layout.shard_manifest(shard),
+            shard,
+            &LayerEntry {
+                name: desc.name(),
+                size: bytes.len() as u64,
+                owner: None,
+                upto: None,
+            },
+            at,
+        )
+        .map_err(|e| format!("shard {shard}: {e}"))?;
+        written += entries.len();
+    }
+    Ok(written)
+}
+
+/// Every fork the tenant's own `pg/` prefix has a SIZE marker for, and
+/// what it says. One list of the prefix and one get per marker, which
+/// is what the object path's fold pays for the same answer.
+fn fork_markers(
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+) -> Result<Vec<(relsize::ForkRef, u32)>, String> {
+    let prefix = layout.pg_dir();
+    let mut out = Vec::new();
+    for key in store.list(&prefix).map_err(|e| format!("store: {e}"))? {
+        let rest = key.strip_prefix(&prefix).unwrap_or(&key);
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() != 5 || parts[4] != "SIZE" {
+            continue;
+        }
+        let (Ok(spc), Ok(db), Ok(rel), Ok(fork)) = (
+            parts[0].parse(),
+            parts[1].parse(),
+            parts[2].parse(),
+            parts[3].parse(),
+        ) else {
+            continue;
+        };
+        let Some((data, _)) = store.get(&key).map_err(|e| format!("store: {e}"))? else {
+            continue;
+        };
+        let n = zou_store::forksize::ForkSize::decode(&data)
+            .map(|fs| fs.nblocks)
+            .ok_or_else(|| format!("bad SIZE object at {key}"))?;
+        out.push((relsize::ForkRef { spc, db, rel, fork }, n));
+    }
+    Ok(out)
+}
+
 /// Cut the folds a branch of this source needs, rather than wait for
 /// the background one to earn them.
 ///
@@ -277,6 +387,10 @@ pub fn fold_for_branch(
 ) -> Result<usize, String> {
     let layout = TenantLayout::new(tenant_ref);
     let at = cut_at(manifest).ok_or_else(|| NO_CHECKPOINT.to_string())?;
+    // Before the merge, so the images it cuts carry the lengths too
+    // and the seeded layer is retired along with everything else.
+    let seeded = seed_fork_sizes(store, tenant_ref, manifest)?;
+    log::debug!("fold for branch: seeded {seeded} fork lengths from the markers");
     let mut folded = 0;
     for shard in floorless(store, &layout, manifest)? {
         // One shard at a time, for the reason the offline fold gives:
@@ -528,5 +642,57 @@ mod tests {
             owner: None,
         });
         assert!(why_layerless(&store, &layout, &m).unwrap().is_none());
+    }
+
+    /// The markers are the only place a length lives for a catalog
+    /// initdb wrote and nothing has touched since, and a child does
+    /// not inherit the `pg/` prefix they sit under. Seeding copies
+    /// them into the layers, where a branch can read them.
+    #[test]
+    fn the_markers_become_lengths_the_layers_can_answer_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalFsStore::new(dir.path());
+        let layout = TenantLayout::new("prod");
+        for (rel, n) in [(1260u32, 3u32), (1255, 11)] {
+            store
+                .put(
+                    &layout.pg_size(1663, 5, rel, 0),
+                    &zou_store::forksize::ForkSize::plain(n).encode(),
+                )
+                .unwrap();
+        }
+        // Not a marker: the fs capture writes other objects under the
+        // same prefix and the walk has to step over them.
+        store
+            .put(&format!("{}nonsense", layout.pg_dir()), b"x")
+            .unwrap();
+
+        let mut m = Manifest::new("prod", 1);
+        m.checkpoints.push(CheckpointRef {
+            id: "c1".into(),
+            lsn: Lsn(0x400),
+            kind: CheckpointKind::Full,
+            owner: None,
+        });
+        assert_eq!(seed_fork_sizes(&store, "prod", &m).unwrap(), 2);
+
+        let (shard, _) = PageShardManifest::load(&store, &layout.shard_manifest(0))
+            .unwrap()
+            .unwrap();
+        let map = shard.layer_map().unwrap();
+        let svc = crate::getpage::PageService::new(&store, layout.shard_prefix(0), None, false);
+        let mem = zou_store::memtable::Memtable::new();
+        let ask = |rel| {
+            let fork = relsize::ForkRef {
+                spc: 1663,
+                db: 5,
+                rel,
+                fork: 0,
+            };
+            svc.rel_size(&map, &mem, fork, u64::MAX).unwrap()
+        };
+        assert_eq!(ask(1260), Some(3));
+        assert_eq!(ask(1255), Some(11));
+        assert_eq!(ask(2600), None, "a rel with no marker stays silent");
     }
 }
