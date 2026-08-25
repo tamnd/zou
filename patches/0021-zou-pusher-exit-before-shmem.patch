@@ -1,0 +1,55 @@
+Take the pusher off the store while it is still a process.
+
+The exit hook was registered with on_proc_exit, which runs after
+shmem_exit. By then ProcKill has handed this process's PGPROC back and
+MyProcNumber is INVALID_PROC_NUMBER, so the ConditionVariableBroadcast
+at the top of the hook is a broadcast without a proc number to speak
+for. It pushes a sentinel whose procno is -1, the wakeup list encodes
+empty as -1 too, and so proclist_is_empty says the list is empty while
+proclist_contains, reading the PGPROC one slot before the array, says
+the sentinel is still in it. That loop has no way out.
+
+What that costs is not one worker. The hook never reaches zou_wal_close,
+so the writer lease keeps being renewed by the heartbeat thread of a
+cluster that is gone, at a full core, for as long as the machine is up.
+A node restoring the same store gets a fresh holder id, is refused every
+second for a minute, and stops its own postmaster. That is the whole of
+zou #503: on the crash loop the takeover was tried and correctly
+refused, because the predecessor was still alive and still renewing.
+
+Registered with before_shmem_exit instead, the hook runs while the
+process still has a PGPROC, the broadcast is an ordinary broadcast, the
+store is closed and the lease released, and the next incarnation takes
+it without waiting at all.
+
+The page service's hook stays on on_proc_exit. It only stops threads in
+the shim and touches no shared memory.
+
+See zou #503.
+
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -311,6 +311,14 @@
+ 	 * Say so before the store goes, and wake everyone waiting on a
+ 	 * durable LSN. Nothing publishes one after this, so a waiter that
+ 	 * sleeps through the exit is a waiter that never wakes.
++	 *
++	 * This is a before_shmem_exit callback and has to stay one. A
++	 * condition variable is only safe to touch while this process still
++	 * has a PGPROC, and after shmem_exit its proc number is
++	 * INVALID_PROC_NUMBER, which is the same -1 an empty wakeup list
++	 * holds. A broadcast from there pushes a sentinel it can never see
++	 * leave and spins on that forever, at a full core, with the close
++	 * below never reached (zou #503).
+ 	 */
+ 	ZouWalShmem->pusher_pid = 0;
+ 	ConditionVariableBroadcast(&ZouWalShmem->durable_cv);
+@@ -454,7 +462,7 @@
+ 						 1000, PG_WAIT_EXTENSION);
+ 		ResetLatch(MyLatch);
+ 	}
+-	on_proc_exit(zou_wal_on_exit, (Datum) 0);
++	before_shmem_exit(zou_wal_on_exit, (Datum) 0);
+ 
+ 	/*
+ 	 * On a store that already holds WAL, restart right after its last
