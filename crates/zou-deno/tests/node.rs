@@ -956,3 +956,74 @@ fn net_opens_a_socket_and_writes_and_reads_the_answer() {
         "true pong one|pong two true 460 a function is answered on the server's own socket, so node:net createServer has no port to listen on node:net may only open a tcp connection, and a path is a unix socket, which is a file on the host"
     );
 }
+
+/// Nobody is watching a function, and this is the module that says so.
+/// What a logging package does with the answer is decide whether to
+/// colour its output, so the two questions it asks are `isatty` and how
+/// many colours the stream has, and both of them are no.
+#[test]
+fn tty_says_nothing_here_is_a_terminal() {
+    let said = served(
+        r#"
+        import tty, { isatty, ReadStream, WriteStream } from "node:tty";
+        const seen = [];
+
+        seen.push(`${isatty(0)}${isatty(1)}${isatty(2)}`);
+
+        const out = new WriteStream(1);
+        seen.push(`${out.isTTY} ${out.getColorDepth()} ${out.hasColors()} ${out.getWindowSize().join("x")}`);
+        // A cursor move on a stream nobody is looking at writes nothing
+        // and says it did, rather than putting an escape into a log.
+        seen.push(String(out.cursorTo(0, 0)));
+
+        const input = new ReadStream(0);
+        input.setRawMode(true);
+        seen.push(`${input.isTTY} ${input.isRaw}`);
+        seen.push(String(tty.isatty === isatty));
+
+        Deno.serve(() => new Response(seen.join(" | ")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "falsefalsefalse | false 1 false 80x24 | true | false true | true"
+    );
+}
+
+/// The names node's filesystem modules carry, which matter before
+/// anything is called: an `import { copyFile } from "node:fs/promises"`
+/// against a module without that export is a function that does not
+/// load at all, and the package doing it never meant to copy a file on
+/// this host. So the whole surface is here, and the ones that cannot
+/// work say which of the two reasons it is.
+#[test]
+fn the_filesystem_carries_every_name_and_refuses_by_which_reason() {
+    let said = served(
+        r#"
+        import { constants, copyFile, readdir, realpath } from "node:fs/promises";
+        import fs from "node:fs";
+        const seen = [];
+
+        seen.push(await realpath("/beside/me.txt"));
+        try {
+          await copyFile("/beside/me.txt", "/beside/copy.txt");
+        } catch (why) {
+          seen.push(why.message.includes("read only") ? "read only" : why.message);
+        }
+        try {
+          await readdir("/beside");
+        } catch (why) {
+          seen.push(why.message.includes("nothing to work on") ? "nothing to list" : why.message);
+        }
+        seen.push(`${constants.R_OK}${constants.COPYFILE_EXCL}`);
+        seen.push(fs.realpathSync("/beside/me.txt"));
+        seen.push(String(typeof fs.promises.mkdtemp));
+
+        Deno.serve(() => new Response(seen.join(" | ")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "/beside/me.txt | read only | nothing to list | 41 | /beside/me.txt | function"
+    );
+}
