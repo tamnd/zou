@@ -41,20 +41,20 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use zou_log::{CatchUp, CatchUpCursor, ConsolidateError, TeeFilter, WalMedia, catch_up_resuming};
 use zou_store::CasStore;
-use zou_store::layer::LayerKind;
+use zou_store::layer::{LayerKey, LayerKind};
 use zou_store::layermap::LayerMap;
 use zou_store::layout::TenantLayout;
 use zou_store::lsn::Lsn;
 use zou_store::memtable::Memtable;
 use zou_store::pageread::ReadError;
 use zou_store::shardmanifest::PageShardManifest;
-use zou_store::stats::{Phase, note_phase};
+use zou_store::stats::{ParkCause, Phase, note_park_cause, note_park_gap, note_phase};
 
 use crate::WAL_SHARD;
 use crate::getpage::{GetPageError, MAX_GETPAGE_BATCH, PageService};
@@ -177,8 +177,33 @@ struct GetReq {
     lsn: u64,
     arrived: Instant,
     deadline: Instant,
+    /// Where ingest stood when this request first parked, `None` while
+    /// it has never parked. A request is looked at once a poll while
+    /// it waits, and the wait is one thing however many times it is
+    /// looked at, so this is set on the first look and left alone.
+    parked_at: Option<ParkedAt>,
     reply: SyncSender<Result<Answer, String>>,
 }
+
+/// Where the service stood when a request parked: the lsn ingest had
+/// applied, and how many times it had flushed. The wal the request
+/// waits through is everything applied after that lsn, and the flush
+/// count is what says whether that wal is still in the memtable to be
+/// looked at when the wait ends.
+#[derive(Clone, Copy)]
+struct ParkedAt {
+    seen: u64,
+    flushes: u64,
+}
+
+/// How many times this process has published a layer. A park is
+/// classified by looking at the memtable for the wal it waited
+/// through, and a flush moves that wal out of the memtable, so the
+/// count is what tells a park that can be classified from one that
+/// cannot. A static rather than a local because the flush happens two
+/// calls deep inside a sink closure that owns the ingest for the
+/// length of a poll.
+static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// The client half, one per backend process. A connection is opened
 /// lazily, survives across calls, and is dropped and reopened once on
@@ -524,6 +549,7 @@ fn connection(mut sock: UnixStream, tx: Sender<GetReq>, stop: Arc<AtomicBool>) {
             lsn,
             arrived: Instant::now(),
             deadline: Instant::now() + WAIT_CAP,
+            parked_at: None,
             reply: reply_tx,
         };
         if tx.send(req).is_err() {
@@ -620,6 +646,46 @@ fn relax(cadence: Duration, worth_it: bool) -> Duration {
         POLL
     } else {
         (cadence * 2).min(IDLE_POLL)
+    }
+}
+
+/// What the wal a parked request waited through had to do with the
+/// pages it asked for. `from` is where the service stood when the
+/// request parked and `seen` where it stands now, so the wait was
+/// spent applying `(from.seen, seen]` and the question is whether any
+/// of that wrote a key the request wants.
+///
+/// A backend asks for a page at the lsn its own wal pusher has made
+/// durable, which is the newest thing anybody in the tenant wrote, so
+/// a read of a page nobody touched still waits for every write that
+/// landed before it. Counting the two apart is what says whether park
+/// time is ingest being slow or the read position being too coarse
+/// (zou #671).
+fn park_cause(mem: &Memtable, req: &GetReq, from: ParkedAt, seen: u64) -> ParkCause {
+    if FLUSHES.load(Ordering::Relaxed) != from.flushes {
+        return ParkCause::Unclear;
+    }
+    let touched = |key: LayerKey| {
+        mem.records_for(&key, Lsn(from.seen), Lsn(seen))
+            .next()
+            .is_some()
+    };
+    let hit = match &req.want {
+        Want::Pages(blks) => blks.iter().any(|&blk| {
+            touched(LayerKey::page(
+                req.spc,
+                req.db,
+                req.rel,
+                req.fork as u8,
+                blk,
+            ))
+        }),
+        Want::Size => touched(LayerKey::relsize(req.spc, req.db, req.rel, req.fork as u8)),
+    };
+    if hit {
+        ParkCause::Touched
+    } else {
+        ParkCause::Untouched
     }
 }
 
@@ -777,7 +843,7 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         let stalled = now.duration_since(advanced);
         let mut ready: Vec<GetReq> = Vec::new();
         let mut still: Vec<GetReq> = Vec::new();
-        for req in parked.drain(..) {
+        for mut req in parked.drain(..) {
             let need = if req.lsn == 0 { durable_seen } else { req.lsn };
             if covered(req.lsn, seen, durable_seen, probed) {
                 ready.push(req);
@@ -794,6 +860,13 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                 };
                 let _ = req.reply.send(Err(msg));
             } else {
+                if req.parked_at.is_none() {
+                    note_park_gap(need.saturating_sub(seen));
+                    req.parked_at = Some(ParkedAt {
+                        seen,
+                        flushes: FLUSHES.load(Ordering::Relaxed),
+                    });
+                }
                 still.push(req);
             }
         }
@@ -803,6 +876,9 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
             // Two samples, because they answer different questions:
             // parked is how long ingest kept the reader waiting, read
             // is what planning and reading the page actually cost.
+            if let Some(from) = req.parked_at {
+                note_park_cause(park_cause(mem, &req, from, seen));
+            }
             note_phase(Phase::Park, req.arrived.elapsed());
             let ran = Instant::now();
             serve_reloading(&service, &*store, &cfg.layout, &mut map, mem, &req, at);
@@ -827,6 +903,7 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                     .flush(&*store, &cfg.layout)
                     .map_err(|e| log::error!("zou pageserve: final flush: {e}"))
             {
+                FLUSHES.fetch_add(1, Ordering::Relaxed);
                 log::info!(
                     "zou pageserve: final flush, layer {} of {} bytes",
                     entry.name,
@@ -1041,6 +1118,7 @@ fn flush_if_due(
         .flush(&**store, layout)
         .map_err(|e| format!("flush: {e}"))?;
     if let Some(entry) = entry {
+        FLUSHES.fetch_add(1, Ordering::Relaxed);
         log::info!(
             "zou pageserve: flush, layer {} of {} bytes, applied {:#x}",
             entry.name,
@@ -2260,6 +2338,7 @@ mod tests {
             lsn: 0,
             arrived: Instant::now(),
             deadline: Instant::now() + WAIT_CAP,
+            parked_at: None,
             reply,
         };
         let service = page_service(&*store, &layout, None, false);
@@ -2284,6 +2363,64 @@ mod tests {
             !map.layers().iter().any(|d| d.name() == gone),
             "the map still names the layer that is gone"
         );
+    }
+
+    /// A backend asks at the lsn its pusher made durable, so a read of
+    /// a quiet page waits behind every write in the tenant. Telling
+    /// that wait from a read waiting for its own writes is the whole
+    /// point of the counter, so the two cases are checked against the
+    /// same memtable, and the case the memtable cannot answer for is
+    /// checked to say so rather than to guess.
+    #[test]
+    fn a_park_says_whether_the_wal_it_waited_for_wrote_the_pages_it_wanted() {
+        let mut mem = Memtable::new();
+        mem.insert(LayerKey::page(1663, 5, 2000, 0, 7), Lsn(150), vec![1; 8]);
+        let ask = |blk: u32| {
+            let (reply, _answers) = sync_channel(1);
+            GetReq {
+                spc: 1663,
+                db: 5,
+                rel: 2000,
+                fork: 0,
+                want: Want::Pages(vec![blk]),
+                lsn: 200,
+                arrived: Instant::now(),
+                deadline: Instant::now() + WAIT_CAP,
+                parked_at: None,
+                reply,
+            }
+        };
+        let from = ParkedAt {
+            seen: 100,
+            flushes: FLUSHES.load(Ordering::Relaxed),
+        };
+        assert_eq!(
+            park_cause(&mem, &ask(7), from, 200),
+            ParkCause::Touched,
+            "the wait was for a write to the page asked for"
+        );
+        assert_eq!(
+            park_cause(&mem, &ask(8), from, 200),
+            ParkCause::Untouched,
+            "block 8 was never written and still waited"
+        );
+
+        // Records at or below where the request parked are not what it
+        // waited for, they were already applied when it arrived.
+        let early = ParkedAt {
+            seen: 150,
+            flushes: from.flushes,
+        };
+        assert_eq!(park_cause(&mem, &ask(7), early, 200), ParkCause::Untouched);
+
+        // And a flush during the wait takes the evidence out of the
+        // memtable, which is not the same as there being none.
+        let stale = ParkedAt {
+            seen: 100,
+            flushes: from.flushes.wrapping_sub(1),
+        };
+        assert_eq!(park_cause(&mem, &ask(7), stale, 200), ParkCause::Unclear);
+        assert_eq!(park_cause(&mem, &ask(8), stale, 200), ParkCause::Unclear);
     }
 
     /// What the fold decides on. Deltas piled on top of an image are
