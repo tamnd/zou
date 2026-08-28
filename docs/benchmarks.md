@@ -65,25 +65,45 @@ That cost is a property of the v1 layout, so this row stays as the honest v1 num
 gamingpc (i9-13900K, 32 cores, 32 GB, Ubuntu under WSL2, stores on a local directory), 2026-08-28, pgbench scale 10, 4 clients, 300 s a phase, one box and one pgbench binary for every row.
 Neon is its own docker compose stack, which is a pageserver, three safekeepers, a storage broker and a MinIO, with a compute node on Postgres 16.9 because that is what the compose builds.
 Every other row is the vendored Postgres 18.4 with `io_method=sync` and `full_page_writes=off` and otherwise stock, which means 128MB of shared buffers everywhere.
+The per run numbers and the full phase counters are in tamnd/zou-bench `docs/results/2026-08-28.md`.
 
 | system | tpcb tps | tpcb avg lat | select tps | select avg lat | init |
 | --- | --- | --- | --- | --- | --- |
 | postgres 18, local disk | 720 | 5.552 ms | 71221 | 0.056 ms | 1 s |
-| zou, object path, localfs store | 331 | 12.099 ms | 59067 | 0.068 ms | 75 s |
-| zou, layer path, localfs store | 372 to 374 | 10.7 ms | 12789 to 13303 | 0.31 ms | 5 s |
+| zou, object path, localfs store | 331 to 343 | 11.652 to 12.099 ms | 58497 to 60259 | 0.066 to 0.068 ms | 74 to 76 s |
+| zou, layer path, localfs store | 366 to 374 | 10.686 to 10.921 ms | 12789 to 16609 | 0.241 to 0.313 ms | 4 to 6 s |
 | zou, layer path before #695 | 81 to 83 | 48.8 ms | 14118 to 14431 | 0.28 ms | 5 s |
 | neon, self hosted compose | 246 | 16.268 ms | 5855 | 0.683 ms | 4 s |
 
-The zou layer path rows are two runs each, which is why they are ranges, and the change between them is #695 alone.
-Reading the table: on the write mix the layer path is 1.5x Neon and 0.52x vanilla, and on the read only mix it is 2.2x Neon and 0.18x vanilla.
-The object path is the other way round, 1.3x Neon on writes and 0.83x vanilla on reads, because it serves a page from the local cache and the layer path asks a service for every page it does not have.
-That socket is the read only gap and nothing else: the store tier under the layer path answers in 16 us at p50 and the service tier answers in 1024, on the same box, for the same pages.
+The two zou rows are five runs on the object path and six on the layer path, taken alternately on two evenings, which is why they are ranges, and the only thing that changed between the two layer path rows is #695.
+One number in there is not a range, it is an outlier: the six layer select-only runs are 12789, 13094, 13101, 13111, 13303 and 16609, so five of them agree to three digits and the sixth does not, and nothing we changed between them explains it.
+Read the low end of that column until it reproduces.
+Against the outside systems: on the write mix the layer path is 1.5x Neon and about half of vanilla, on the read only mix it is 2.2x Neon and about a fifth of vanilla, and the object path is the other way round, 1.3x Neon on writes and 0.83x vanilla on reads.
 
-The init column is the other shape worth reading.
-75 s against 5 s is the object path writing a page object per page while the layer path writes wal and lets the service build pages behind it, and it is the same tradeoff from the other end.
+The two zou rows are not a fast path and a slow one, they are two prices, and the ratio between their tps columns means nothing without what each of them paid for it.
+So here is what they paid, from the store counters of one pair of runs, both legs on the same build, differenced at each phase boundary rather than rolled up over the run.
+`scripts/zou-bench.sh` prints these under each phase now, and leaves a copy of the counter file at every boundary so a finished run can be asked the rest.
 
-What #695 changed is one number: a read that arrives before ingest has caught up used to wait out a hundred millisecond poll, and 17277 of them did in a five minute run, none of them for a record that touched the page they had asked for.
-The counters and the rest of it are in #671.
+| phase | object path | layer path |
+| --- | --- | --- |
+| pgbench -i -s 10 | 76 s, 46227 page ops of 359.0 MiB, 338 wal ops of 14.3 MiB | 6 s, 31823 page ops of 23.5 MiB, 192 wal ops of 28.5 MiB, 302 shard ops of 264.7 MiB |
+| checkpoint | 12 s, 2145 page ops of 16.0 MiB | 0 s, 76 page ops of 33.1 KiB |
+| tpcb-like | 335 tps, 68131 page ops of 529.8 MiB, 227436 wal ops of 321.9 MiB, reads 30729 pages at 32 us p50 | 366 tps, 62968 page ops of 46.0 MiB, 110776 wal ops of 127.6 MiB, 6330 shard ops of 1.0 GiB, reads 43567 pages at 2048 us p50 |
+| select-only | 58497 tps, 3238099 page ops of 24.7 GiB, 818689 wal ops of 963.6 MiB, reads 3192386 pages at 16 us p50 | 16609 tps, 511063 page ops of 4.2 MiB, 80522 wal ops of 121.7 MiB, reads 908181 pages at 1024 us p50 |
+| shutdown | 16520 page ops of 128.7 MiB | 3 shard ops of 206.1 KiB, no page ops |
+
+A page op on the object path is a page: 24.7 GiB over 3238099 ops in the read only phase is 8192 bytes each, to the byte.
+A page op on the layer path is not: 4.2 MiB over 511063 ops is under nine bytes each, which is the relation length record filed under the same prefix, and the pages themselves stay inside the shard layer objects that the page service reads on the other side of the socket.
+So the read only phase moved 25 GB through the store on one path and 4 MB on the other, and the path that moved 25 GB is the one that finished 3.5x the transactions.
+The write phase is the same trade with the sign flipped: the object path writes 530 MiB of pages, the layer path writes 46 MiB of length records and pushes the change into wal instead, and there it is the layer path that ends up ahead.
+Load is where it is loudest, 76 s against 6 s and 359 MiB of pages against none, and shutdown is the object path paying its last 128.7 MiB of pages while the layer path pays nothing because it never had a dirty page to flush.
+
+Which one wins depends on the shape of the tenant rather than on the paths, so the two tps columns are not a ranking.
+A tenant that loads a lot, writes steadily, and reads a working set that fits in shared buffers wants the layer path: it loads in seconds instead of minutes, it is ahead on the write mix, and it only pays for a read when the buffer is missing.
+A tenant that writes rarely and reads widely wants the object path: a miss costs a 16 us store get there against a millisecond through the page service, and 3.2 million misses in five minutes is the whole difference between the two read only numbers.
+The scale 10 read only phase is that second shape at its most extreme, since the database is 160 MB and a miss is cheap for everybody, and it is the shape this table is worst at describing.
+
+The service tier p50 of 1024 us is what #671 and #697 are about, and it is a wait rather than work: #695 took the parked read poll from 100 ms to a millisecond, and what is left is a read position that is one lsn for the whole cluster instead of one per block.
 
 ## A thousand tenants on one node
 
