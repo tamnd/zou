@@ -46,6 +46,9 @@ pub struct Statics {
     root: PathBuf,
     /// The `static_files` patterns, absolute and tidied.
     patterns: Vec<String>,
+    /// Where the packages this function was built out of were unpacked,
+    /// when there is such a place.
+    packages: Option<PathBuf>,
 }
 
 impl Statics {
@@ -60,7 +63,29 @@ impl Statics {
                 .iter()
                 .map(|pattern| slashed(&tidy(pattern)))
                 .collect(),
+            packages: None,
         }
+    }
+
+    /// And everything under `cache`, which is where the packages this
+    /// function was built out of were unpacked.
+    ///
+    /// A package is published whole and a font, a wasm blob or a table
+    /// of country codes is as much of it as its javascript is.
+    /// `@vercel/og` reads a font out of its own `dist` directory while
+    /// it is loading, and a runtime that serves a package's modules and
+    /// refuses its files is drawing the line through the middle of one
+    /// thing.
+    ///
+    /// Nothing about this widens what a function itself can open. The
+    /// cache holds code this runtime fetched on the function's behalf
+    /// and put there, so a function reading out of it is reading what it
+    /// already imported, and the project's own directory is still
+    /// `static_files` and nothing else.
+    #[must_use]
+    pub fn and_the_packages(mut self, cache: &Path) -> Statics {
+        self.packages = Some(tidy(cache));
+        self
     }
 
     /// The file `name` means, if the patterns cover it.
@@ -77,6 +102,17 @@ impl Statics {
         };
         let shown = slashed(&whole);
         if self.patterns.iter().any(|pattern| matches(pattern, &shown)) {
+            return Ok(whole);
+        }
+        // After the patterns rather than before, because a project that
+        // globbed its own directory should be answered by its own
+        // pattern, and because the tidying above is what makes this
+        // prefix mean what it says.
+        if self
+            .packages
+            .as_ref()
+            .is_some_and(|cache| whole.starts_with(cache))
+        {
             return Ok(whole);
         }
         Err(format!(
@@ -296,5 +332,38 @@ mod tests {
         let why = statics.at("./index.html").expect_err("nothing is allowed");
         assert!(why.contains("hello"), "the refusal names the function");
         assert!(why.contains("static_files"), "and what would allow it");
+    }
+
+    /// A package is published whole, so a function that configured no
+    /// static files at all can still read a font out of a package it
+    /// imported, and still cannot read anything of the project's.
+    #[test]
+    #[cfg(unix)]
+    fn a_package_may_be_read_out_of_the_cache_it_was_unpacked_into() {
+        let statics = Statics::of(&function(&[])).and_the_packages(Path::new("/c/modules"));
+        assert!(
+            statics
+                .at("/c/modules/npm/@vercel/og/1.0.0/dist/noto-sans.ttf")
+                .is_ok()
+        );
+        // Not one directory up from it, and not by walking out of one.
+        assert!(statics.at("/c/secrets.env").is_err());
+        assert!(statics.at("/c/modules/../secrets.env").is_err());
+        assert!(statics.at("/p/functions/hello/index.html").is_err());
+    }
+
+    /// The cache does not become the place relative names start. A
+    /// function's own directory is still that, and a package reads its
+    /// own files by an absolute path built from `__dirname`.
+    #[test]
+    #[cfg(unix)]
+    fn the_cache_does_not_move_where_a_relative_name_begins() {
+        let statics = Statics::of(&function(&["/p/functions/hello/*.html"]))
+            .and_the_packages(Path::new("/c/modules"));
+        assert_eq!(
+            statics.at("./index.html"),
+            Ok(PathBuf::from("/p/functions/hello/index.html"))
+        );
+        assert!(statics.at("noto-sans.ttf").is_err());
     }
 }

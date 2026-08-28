@@ -678,7 +678,12 @@ impl Runtime for Isolate {
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_default(),
-            statics: zou_functions::Statics::of(function),
+            // The module cache goes in with the patterns because a
+            // package is published whole: `@vercel/og` reads a font out
+            // of its own directory while it is loading, and serving its
+            // javascript and refusing its font is a line through the
+            // middle of one package.
+            statics: zou_functions::Statics::of(function).and_the_packages(&crate::module::cache()),
         };
         let held = Held {
             call,
