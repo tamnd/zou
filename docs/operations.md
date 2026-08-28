@@ -487,6 +487,12 @@ A project nobody is connected to therefore used to read the store about 21 times
 The gap now doubles towards two seconds once the stream stops moving, so the same ninety seconds cost 243, and a frame arriving or a reader waiting on an lsn puts it straight back to 100 ms.
 What that spends is up to two seconds on the first read after a quiet spell, and only on a read that has to wait for the stream at all.
 
+What a read waits for is the position of the blocks it asked for, not the position of the cluster.
+A request carries both: the durable watermark the reader stands at, and the newest lsn any block in the run was last written back at, which the backend keeps in a shared memory table filled from its own writebacks.
+The second number is the one the service waits on, because everything above it changed some other block, so a reader of a table nobody has touched in an hour no longer waits behind commits another backend made a moment ago.
+The table is direct mapped and sized by `ZOU_LWLSN_ENTRIES`, 131072 entries by default and 0 to turn it off, and two blocks landing in the same slot cost a wait rather than a wrong answer: the older position folds into a floor that every forgotten block reads at, and the floor is at or above the last write of every block already written back.
+Recovery is the one reader that does not use it, since the startup process needs the page at exactly the position it is replaying rather than at a later one.
+
 The service holds two caches over the layers it reads and both of them are load bearing.
 Footers are cached whole, because a footer is a bloom filter and an index row per block and runs to megabytes on a large layer, so a reader that dropped them would refetch those megabytes on the next read of the same layer.
 Blocks are cached under a byte budget, 64 MB by default and `ZOU_BLOCK_CACHE_MB` to change it, because a block is 256 KB of entries and a page read wants one entry out of it: without the cache a sequential scan fetched the same block once per page in it, which measured 1.7 range GETs and 111 KB of store traffic for every 8 KB page served and read a table at about a megabyte a second.

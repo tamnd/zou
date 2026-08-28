@@ -48,14 +48,14 @@ fn smgr_reads_land_in_their_tiers() {
     let mut buf = [0u8; ZOU_PAGE_SIZE];
     for blk in 0u32..2 {
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel, fork, blk, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel, fork, blk, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == blk as u8 + 1));
     }
     // A zero extended block: store tier.
     assert_eq!(
-        unsafe { zou_smgr_read(spc, db, rel, fork, 3, buf.as_mut_ptr(), 0) },
+        unsafe { zou_smgr_read(spc, db, rel, fork, 3, buf.as_mut_ptr(), 0, 0) },
         ZOU_OK
     );
     assert!(buf.iter().all(|b| *b == 0));
@@ -65,7 +65,7 @@ fn smgr_reads_land_in_their_tiers() {
     let mut bufs = [[0u8; ZOU_PAGE_SIZE]; 4];
     let ptrs: Vec<*mut u8> = bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
     assert_eq!(
-        unsafe { zou_smgr_readv(spc, db, rel, fork, 0, ptrs.as_ptr(), 4, 0) },
+        unsafe { zou_smgr_readv(spc, db, rel, fork, 0, ptrs.as_ptr(), 4, 0, 0) },
         ZOU_OK
     );
     assert!(bufs[0].iter().all(|b| *b == 1));

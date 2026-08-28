@@ -16,8 +16,9 @@
 //!   every layer, the restart story
 //! - a partial flush: the tail of the WAL still sits in the memtable,
 //!   so reconstruction stitches layer records and memtable records
-//! - per block read lsns from the last written lsn cache serve the same
-//!   pages as a read at the very end of the WAL
+//! - per block read lsns, the positions the shim's last written lsn
+//!   table hands out, serve the same pages as a read at the very end
+//!   of the WAL
 //! - a compaction pass folds the runs into one delta plus a fresh image
 //!   and no page a reader gets moves an inch
 //! - a fold in the middle of the stream, on the boundary where the next
@@ -27,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use zou_pg::getpage::{LastWrittenLsn, MAX_GETPAGE_BATCH, PageService};
+use zou_pg::getpage::{MAX_GETPAGE_BATCH, PageService};
 use zou_pg::ingest::{IngestConfig, ShardIngest};
 use zou_pg::redo::{RedoPool, RedoPoolConfig, RedoRequest, page_checksum};
 use zou_pg::walscan::{BlockRef, WalRecord, WalWindow, read_records};
@@ -403,11 +404,17 @@ fn getpage_serves_what_redo_builds() {
         "index from layers plus memtable differs from direct redo"
     );
 
-    // Scenario three: reads at the per block lsns the last written lsn
-    // cache hands out serve the same pages as reads at the stream end.
-    let mut lw = LastWrittenLsn::new(1 << 16, wal_start);
+    // Scenario three: reads at per block lsns serve the same pages as
+    // reads at the stream end. The shim keeps these positions in shared
+    // memory off its own writebacks; here they come off the records,
+    // which is the same number by a different route, the end lsn of the
+    // last record that touched the block.
+    let mut lw: std::collections::HashMap<BlockRef, u64> = std::collections::HashMap::new();
     for record in &out.records {
-        lw.note_record(&record.block_refs().expect("well formed"), record.end_lsn);
+        for blk in record.block_refs().expect("well formed") {
+            let slot = lw.entry(blk).or_insert(wal_start);
+            *slot = (*slot).max(record.end_lsn);
+        }
     }
     let map = PageShardManifest::load(&store, &layout.shard_manifest(0))
         .expect("manifest loads")
@@ -417,7 +424,7 @@ fn getpage_serves_what_redo_builds() {
         .expect("map builds");
     let svc = PageService::new(&store, layout.shard_prefix(0), Some(&pool), true);
     for (index, blk) in heap_blocks.iter().enumerate().step_by(7) {
-        let at = lw.read_lsn(blk);
+        let at = lw.get(blk).copied().unwrap_or(wal_start);
         assert!(at >= wal_start && at <= wal_end, "cache lsn in range");
         let page = svc
             .get_page(&map, ingest.memtable(), *blk, at)
