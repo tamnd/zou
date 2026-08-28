@@ -1707,22 +1707,30 @@ fn timers_fire_in_the_order_their_delays_say() {
         r#"
         Deno.serve(() => new Promise((answer) => {
             const said = [];
-            // Every delay is measured back to one reading of the clock.
-            // A timer's deadline is set when `setTimeout` is called, so
-            // on a node busy enough to put ten milliseconds between two
+            // The three are set out of order on purpose, and every one
+            // of them is measured back to one reading of the clock and
+            // put a long way out.
+            //
+            // A deadline is fixed when `setTimeout` is called, so on a
+            // node busy enough to put twenty milliseconds between two
             // adjacent lines, a ten set late really is due after a
-            // thirty set early. That is what the deadlines are and not
-            // a runtime that got the order wrong, and it is not what
-            // this test is asking about.
+            // thirty set early, and one already in the past is clamped
+            // to now and loses the order entirely. Both are what the
+            // deadlines then are rather than a runtime that got them
+            // wrong, and neither is what this test is asking about. Two
+            // hundred milliseconds of room per line is more than that
+            // has ever been measured at.
             const from = performance.now();
             const at = (millis) => Math.max(0, millis - (performance.now() - from));
-            setTimeout(() => said.push("thirty"), at(30));
-            setTimeout(() => said.push("ten"), at(10));
-            setTimeout(() => said.push("twenty"), at(20));
-            setTimeout(() => said.push("zero"), at(0));
+            setTimeout(() => said.push("thirty"), at(230));
+            setTimeout(() => said.push("ten"), at(210));
+            setTimeout(() => said.push("twenty"), at(220));
+            // A plain zero, because a zero delay being a turn of the
+            // loop and not sooner is half of what this is here for.
+            setTimeout(() => said.push("zero"), 0);
             queueMicrotask(() => said.push("microtask"));
             said.push("now");
-            setTimeout(() => answer(Response.json(said)), at(60));
+            setTimeout(() => answer(Response.json(said)), at(400));
         }));
         "#,
     );
@@ -1738,12 +1746,12 @@ fn timers_fire_in_the_order_their_delays_say() {
 /// reaches by accident.
 ///
 /// The stall is a real one: a timer at one millisecond that holds the
-/// thread for sixty. Everything set after it is overdue by the time the
-/// loop turns again, so all three deadlines are reached at once and
-/// the order they run in is the runtime's to decide. Before there was
-/// one sleep for all the timers it was the host's, and under load that
-/// order was measured as thirty, ten, twenty, which is the order they
-/// were set in.
+/// thread for three hundred. Everything set after it is overdue by the
+/// time the loop turns again, so all three deadlines are reached at
+/// once and the order they run in is the runtime's to decide. Before
+/// there was one sleep for all the timers it was the host's, and under
+/// load that order was measured as thirty, ten, twenty, which is the
+/// order they were set in.
 #[test]
 fn a_stall_past_every_deadline_does_not_reorder_the_timers() {
     let answer = answered(
@@ -1752,20 +1760,20 @@ fn a_stall_past_every_deadline_does_not_reorder_the_timers() {
             const said = [];
             const from = performance.now();
             const at = (millis) => Math.max(0, millis - (performance.now() - from));
-            // The stall goes on first. A deadline that has already gone
-            // by is clamped to now, so a one set after a ten on a node
-            // that took ten milliseconds to get between the two lines
-            // is due after it, which is correct and is not the case
-            // this wants.
+            // The stall goes on first and the three it runs past are a
+            // long way out, for the reason the test above says: a
+            // deadline already in the past is clamped to now, and three
+            // clamped deadlines are in the order the lines were written
+            // rather than the order the delays asked for.
             setTimeout(() => {
-                const until = Date.now() + 60;
+                const until = Date.now() + 300;
                 while (Date.now() < until) {}
                 said.push("stalled");
             }, at(1));
-            setTimeout(() => said.push("thirty"), at(30));
-            setTimeout(() => said.push("ten"), at(10));
-            setTimeout(() => said.push("twenty"), at(20));
-            setTimeout(() => answer(Response.json(said)), at(300));
+            setTimeout(() => said.push("thirty"), at(230));
+            setTimeout(() => said.push("ten"), at(210));
+            setTimeout(() => said.push("twenty"), at(220));
+            setTimeout(() => answer(Response.json(said)), at(800));
         }));
         "#,
     );
