@@ -791,9 +791,11 @@ impl Zou {
     /// That is the same refusal `zou branch create` gives, out of the
     /// same function, and it leaves nothing of the child behind.
     pub fn branch(&self, name: &str) -> Result<Zou, Error> {
+        let at = std::time::Instant::now();
         self.settle()?;
         let store: Arc<dyn CasStore> =
             Arc::from(open_store(&self.target).map_err(|e| Error::new(Kind::Store, e))?);
+        log::debug!("branch: settled after {:?}", at.elapsed());
         if zou_pg::branching::ReadPath::current() == zou_pg::branching::ReadPath::Layers {
             // The child stands on the point its parent's shard is
             // consistent through and starts its own log at the
@@ -803,16 +805,22 @@ impl Zou {
             // fixture's worth of writes may never trip, and a branch
             // taken before it does is a database that comes up and
             // fails every page read on a gap in its log.
+            let at = std::time::Instant::now();
             zou_pg::branching::catch_up_shard(&store, &self.tenant)
                 .map_err(|e| Error::new(Kind::Store, e))?;
+            log::debug!("branch: the shard caught up in {:?}", at.elapsed());
+            let at = std::time::Instant::now();
             self.fold_if_layerless(&*store)?;
+            log::debug!("branch: the image question took {:?}", at.elapsed());
         }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| Error::new(Kind::Store, "the clock is before 1970"))?
             .as_secs();
+        let at = std::time::Instant::now();
         let manifest = zou_store::branch(&*store, &self.tenant, name, None, now)
             .map_err(|e| Error::new(Kind::Store, e.to_string()))?;
+        log::debug!("branch: the cut itself in {:?}", at.elapsed());
         zou_pg::branching::refuse_unservable(
             &*store,
             &self.tenant,
@@ -824,7 +832,8 @@ impl Zou {
             zou_pg::branching::ReadPath::current(),
         )
         .map_err(|e| Error::new(Kind::Store, e))?;
-        Zou::open_inheriting(
+        let at = std::time::Instant::now();
+        let child = Zou::open_inheriting(
             Options {
                 target: self.target.clone(),
                 tenant: name.to_string(),
@@ -855,7 +864,9 @@ impl Zou {
                 // that finds everything already there.
                 contracted: true,
             },
-        )
+        );
+        log::debug!("branch: the child opened in {:?}", at.elapsed());
+        child
     }
 
     /// Pack an image down for the child to stand on, if the parent has
@@ -980,7 +991,9 @@ impl Zou {
     /// A parent that has not been written to since its last fold is
     /// already past this and pays nothing.
     fn settle(&self) -> Result<(), Error> {
+        let checkpointing = std::time::Instant::now();
         let redo = self.checkpoint_redo()?;
+        log::debug!("branch: the checkpoint took {:?}", checkpointing.elapsed());
         let store = open_store(&self.target).map_err(|e| Error::new(Kind::Store, e))?;
         let layout = TenantLayout::new(&self.tenant);
         let at = std::time::Instant::now();
