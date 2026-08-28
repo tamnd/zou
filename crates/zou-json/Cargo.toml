@@ -1,0 +1,22 @@
+[package]
+name = "zou-json"
+description = "Parsing json somebody else wrote, with serde_json's private keys meaning nothing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# The thing this crate is for only happens when `raw_value` is on. The
+# shipped binary has it, because `axum` turns it on for anything that
+# serves json, but a `cargo test -p zou-json` resolves this crate's own
+# dependencies and would otherwise pass without testing anything.
+[dev-dependencies]
+serde_json = { workspace = true, features = ["raw_value"] }
+
+[lints]
+workspace = true

@@ -527,7 +527,7 @@ fn guc_status(raw: &str) -> Result<StatusCode, RestError> {
 /// element is one header, which is what makes a name repeated across
 /// elements a name sent twice.
 fn guc_headers(raw: &str) -> Result<Vec<(HeaderName, HeaderValue)>, RestError> {
-    let parsed: serde_json::Value = serde_json::from_str(raw).map_err(|_| bad_guc_headers())?;
+    let parsed: serde_json::Value = zou_json::from_str(raw).map_err(|_| bad_guc_headers())?;
     let list = parsed.as_array().ok_or_else(bad_guc_headers)?;
     let mut out = Vec::new();
     for item in list {
@@ -1547,7 +1547,7 @@ fn body_rows<'a>(
     }
     let text = std::str::from_utf8(bytes).map_err(|_| invalid_body("Empty or invalid json"))?;
     let v: serde_json::Value =
-        serde_json::from_str(text).map_err(|_| invalid_body("Empty or invalid json"))?;
+        zou_json::from_str(text).map_err(|_| invalid_body("Empty or invalid json"))?;
     let bulk = v.is_array();
     let rows = match v {
         serde_json::Value::Array(a) => a,
@@ -1822,7 +1822,7 @@ fn raised(message: &str, detail: Option<&str>) -> RestError {
             BODY_HINT,
         )
     };
-    let body = match serde_json::from_str::<serde_json::Value>(message) {
+    let body = match zou_json::from_str(message) {
         Ok(serde_json::Value::Object(body)) => body,
         _ => return bad_body(),
     };
@@ -1856,7 +1856,7 @@ fn raised(message: &str, detail: Option<&str>) -> RestError {
             ENVELOPE_HINT,
         )
     };
-    let envelope = match serde_json::from_str::<serde_json::Value>(detail) {
+    let envelope = match zou_json::from_str(detail) {
         Ok(serde_json::Value::Object(envelope)) => envelope,
         _ => return bad_envelope(),
     };
@@ -2868,8 +2868,7 @@ async fn write(
             );
             let mut res = status.into_response();
             if rows.len() == 1
-                && let Ok(row) =
-                    serde_json::from_str::<serde_json::Value>(&rows[0].get::<_, String>(0))
+                && let Ok(row) = zou_json::from_str(&rows[0].get::<_, String>(0))
             {
                 let mut pairs = Vec::new();
                 for col in &pk {
@@ -3297,8 +3296,8 @@ async fn invoke(
                     String::from_utf8(bytes.to_vec())
                         .map_err(|_| invalid_body("invalid utf-8 in the request body"))?
                 };
-                let v: serde_json::Value = serde_json::from_str(&text)
-                    .map_err(|_| invalid_body("Empty or invalid json"))?;
+                let v: serde_json::Value =
+                    zou_json::from_str(&text).map_err(|_| invalid_body("Empty or invalid json"))?;
                 // An array of objects calls the function once, on the
                 // first of them, which is what upstream's LIMIT 1 over
                 // the unpacked body comes to.

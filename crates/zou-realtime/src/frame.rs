@@ -151,8 +151,12 @@ impl Frame {
     /// client that hears nothing, and an array is not a valid v1
     /// message nor an object a valid v2 one, so there is nothing to be
     /// ambiguous about.
+    ///
+    /// Read through `zou_json` rather than `serde_json`, because this
+    /// is a client's text and `serde_json` reads an object whose first
+    /// key is one particular string as something other than an object.
     pub fn decode(text: &str) -> Option<Frame> {
-        let value: Value = serde_json::from_str(text).ok()?;
+        let value = zou_json::from_str(text).ok()?;
         match value {
             Value::Array(parts) => {
                 if parts.len() != 5 {
@@ -476,12 +480,12 @@ impl BinaryBroadcast {
     /// push as json and expects the answer in kind.
     pub fn as_frame(&self) -> Option<Frame> {
         let payload: Value = match self.encoding {
-            Encoding::Json => serde_json::from_slice(&self.payload).ok()?,
+            Encoding::Json => zou_json::from_slice(&self.payload).ok()?,
             Encoding::Binary => return None,
         };
         let mut body = json!({"type": "broadcast", "event": self.event, "payload": payload});
         if !self.meta.is_empty()
-            && let Ok(meta) = serde_json::from_str::<Value>(&self.meta)
+            && let Ok(meta) = zou_json::from_str(&self.meta)
         {
             body["meta"] = meta;
         }
@@ -593,6 +597,44 @@ mod tests {
             ),
             r#"[null,null,"realtime:room","postgres_changes",{"data":{"record":{"id":1},"table":"todos","type":"INSERT"},"ids":[8]}]"#
         );
+    }
+
+    // Found by the fuzzer. `serde_json` reads an object whose first key
+    // is its own private one as a raw value rather than as an object,
+    // and since keys are sorted on the way out, a dollar sign lands
+    // first: a payload that arrived beside an ordinary key left in the
+    // one position that means something else, and the frame no longer
+    // read back. Nothing about the key is special to a client, so it
+    // has to survive the round trip like any other.
+    #[test]
+    fn a_payload_key_serde_json_reserves_for_itself_is_just_a_key() {
+        let token = "$serde_json::private::RawValue";
+        for payload in [
+            json!({ token: "0" }),
+            json!({ token: 0, "a": 1 }),
+            json!({"nested": { token: ["x"] }}),
+        ] {
+            let frame = Frame::push("realtime:room", "broadcast", payload.clone());
+            for vsn in [Vsn::V1, Vsn::V2] {
+                let written = frame.encode(vsn);
+                let again = Frame::decode(&written)
+                    .unwrap_or_else(|| panic!("{written} was written here and did not read back"));
+                assert_eq!(again.payload, payload);
+            }
+        }
+    }
+
+    #[test]
+    fn a_broadcast_carrying_that_key_still_reaches_a_json_client() {
+        let token = "$serde_json::private::RawValue";
+        let frame = Frame::decode(&format!(
+            r#"["5","6","realtime:room","broadcast",{{"type":"broadcast","event":"cursor","payload":{{"{token}":"0"}},"{token}":"m"}}]"#
+        ))
+        .expect("a push");
+        let push = BinaryBroadcast::from_frame(&frame).expect("a broadcast");
+        let out = push.as_frame().expect("a json client reads it back");
+        assert_eq!(out.payload["payload"][token], json!("0"));
+        assert_eq!(out.payload["meta"][token], json!("m"));
     }
 
     #[test]

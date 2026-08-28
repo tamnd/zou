@@ -885,7 +885,7 @@ async fn look_up(sess: &Session, role: &str, id: &str) -> Result<Option<InProgre
     let Some(row) = rows.first() else {
         return Ok(None);
     };
-    let state: Value = serde_json::from_str(&row.get::<_, String>(4)).unwrap_or(Value::Null);
+    let state: Value = zou_json::from_str(&row.get::<_, String>(4)).unwrap_or(Value::Null);
     let metadata = state["metadata"]
         .as_array()
         .map(|pairs| {
