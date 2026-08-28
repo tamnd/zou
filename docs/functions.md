@@ -446,7 +446,10 @@ The local runtime sets it in the worker's environment when the worker is made, a
 Both are a uuid and both are set on every call, and the difference is only visible to a function that logs it or returns it, which is the case the conformance suite asks about and asserts on both sides.
 
 The environment this server process was started with is not in it, which matters because that environment is holding a database password and a function is somebody else's code.
-`Deno.env.set` and `Deno.env.delete` throw: these are a project's settings rather than a shell.
+`Deno.env.set` and `Deno.env.delete` work and reach nobody.
+What a function writes is laid over what it was handed, it reads back for the rest of the call, and it goes with the isolate: the node's own environment is untouched, and so is the next call.
+Upstream refuses both, measured against a real worker, and Deno allows both, so this sits between them for a reason a package makes plain.
+Three of the functions in the examples corpus assign to `process.env` while they are loading, one of them setting `NODE_ENV` before it reads it back, and refusing that is a function that does not load rather than a secret that stayed safe.
 
 ## Secrets
 
@@ -1110,7 +1113,7 @@ What comes back has `read`, `write`, `close`, `closeWrite`, `localAddr`, `remote
 
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `MessageChannel`, `MessagePort`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.connect`, `Deno.connectTls`, `Deno.startTls`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `MessageChannel`, `MessagePort`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `console`, `performance`, `navigator`, `Buffer`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.connect`, `Deno.connectTls`, `Deno.startTls`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
 
 `AbortSignal` is the whole of it: the three statics, `AbortSignal.abort`, `AbortSignal.timeout` and `AbortSignal.any`, as well as what a controller makes.
 `fetch` takes one and a `Request` carries one, and the section on giving up on a call says what that does and where it stops.
@@ -1133,6 +1136,10 @@ What it is for is a library deciding whether to reach for something it can do wi
 `env`, `net`, `read` and `hrtime` are granted, and `write`, `run`, `ffi` and `sys` are denied because none of the four is here at all.
 Upstream answers granted to all eight, and a worker there can no more start a process than one here can, so this is a deliberate difference: a library told granted and then handed a `TypeError` is worse off than one told no.
 Nothing here can be revoked, because a function's permissions are the runtime's rather than the function's, so `revoke` answers what `query` answers rather than pretending to take away something it is not enforcing.
+
+`Buffer` is a global, the one `node:buffer` exports rather than a second class with the same name, so a package that checks `instanceof` across the two is checking the same thing.
+This is a deliberate difference and it goes the other way from `Deno.permissions`. Deno has `Buffer` on the global and upstream's runtime does not, both measured rather than remembered, and what the difference costs upstream is a package that reads the name at the top of a module and does not load at all, puppeteer being the one in the examples corpus.
+The cost here is that a function feature detecting node by asking whether `Buffer` exists takes the node branch, and every call pays for one sixteen kilobyte module being read whether or not anything reaches for it.
 
 `navigator` is `userAgent`, `hardwareConcurrency`, `language` and `languages`, and nothing else, which is what upstream has. The user agent reads `Deno/2.1.4 (variant; zou/<version>)`, the same sentence upstream builds with its own name in the brackets, and the core count is 1 whatever the host has, because a function gets one thread.
 
