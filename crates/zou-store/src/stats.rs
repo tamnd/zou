@@ -7,7 +7,10 @@
 //! conflicts. The file is plain shared memory, so zou dev, initdb, and
 //! every postgres backend all add into the same totals and nobody has to
 //! flush anything on exit. [`Snapshot::read`] turns the file into json
-//! for the benchmark harness, `zou stats <file>` is the cli for it.
+//! for the benchmark harness, `zou stats <file>` is the cli for it, and
+//! [`Snapshot::read_since`] takes the difference against a copy of the
+//! file from earlier in the run, which is how a phase of a benchmark
+//! reports what it cost rather than what everything before it cost too.
 //!
 //! The costs this feeds are per-op: a put is a put whether it carried 8K
 //! or 8M, which is exactly how S3 bills, so counts and bytes are kept
@@ -129,11 +132,14 @@ const fn step_slot(step: usize) -> usize {
 /// [`CLASS_NAMES`]. Keys arrive with the tenants/ prefix still on, so
 /// substring checks against the layout's directory names are enough.
 /// The SHARD manifests classify with their layer objects, both live
-/// under shards/ and both are page service traffic.
+/// under shards/ and both are page service traffic. The wal is under
+/// `log/`, which is where the cell chain, its sealed segments and its
+/// round indexes all live, and `wal/` is the older layout that a store
+/// written before the rename still has in it.
 fn classify(key: &str) -> usize {
     if key.ends_with("MANIFEST") || key.contains("/manifests/") {
         0
-    } else if key.contains("/wal/") {
+    } else if key.contains("/log/") || key.contains("/wal/") {
         1
     } else if key.contains("/chk/") {
         2
@@ -628,24 +634,64 @@ fn percentile(buckets: &[u64], total: u64, q: f64) -> u64 {
     1u64 << BUCKETS
 }
 
+/// The counter slots of one file, header checked.
+fn slots(path: &Path) -> Result<Vec<u64>, String> {
+    let data = fs::read(path).map_err(|e| {
+        format!(
+            "read {}: {e}, a counter file exists only where ZOU_STORE_STATS pointed a running node, and `zou dev` logs the path it used on boot",
+            path.display()
+        )
+    })?;
+    if data.len() < SLOTS * 8 {
+        return Err(format!("{} is not a counter file", path.display()));
+    }
+    let slots: Vec<u64> = (0..SLOTS)
+        .map(|i| u64::from_ne_bytes(data[i * 8..i * 8 + 8].try_into().unwrap()))
+        .collect();
+    if slots[0] != MAGIC || slots[1] != FORMAT {
+        return Err(format!(
+            "{} is not a format {FORMAT} counter file",
+            path.display()
+        ));
+    }
+    Ok(slots)
+}
+
 impl Snapshot {
     pub fn read(path: &Path) -> Result<Self, String> {
-        let data = fs::read(path).map_err(|e| {
-            format!(
-                "read {}: {e}, a counter file exists only where ZOU_STORE_STATS pointed a running node, and `zou dev` logs the path it used on boot",
-                path.display()
-            )
-        })?;
-        if data.len() < SLOTS * 8 {
-            return Err(format!("{} is not a counter file", path.display()));
+        Ok(Self::decode(&slots(path)?))
+    }
+
+    /// The same file minus a copy of it taken earlier, which is what a
+    /// run needs to say what one phase cost rather than what the whole
+    /// run cost. Every slot in the file only ever goes up, so the
+    /// subtraction is the counters of the window between the two, right
+    /// down to the histograms: percentiles come out of the difference of
+    /// the buckets rather than of two sets of percentiles, which is the
+    /// only way to get them at all.
+    pub fn read_since(path: &Path, earlier: &Path) -> Result<Self, String> {
+        let now = slots(path)?;
+        let then = slots(earlier)?;
+        let mut delta = Vec::with_capacity(SLOTS);
+        for (i, (a, b)) in now.iter().zip(then.iter()).enumerate() {
+            if i < HEADER {
+                delta.push(*a);
+                continue;
+            }
+            let Some(d) = a.checked_sub(*b) else {
+                return Err(format!(
+                    "{} counted less than {} did, so they are not the same file at two times and the difference would be nonsense",
+                    path.display(),
+                    earlier.display()
+                ));
+            };
+            delta.push(d);
         }
-        let slot = |i: usize| u64::from_ne_bytes(data[i * 8..i * 8 + 8].try_into().unwrap());
-        if slot(0) != MAGIC || slot(1) != FORMAT {
-            return Err(format!(
-                "{} is not a format {FORMAT} counter file",
-                path.display()
-            ));
-        }
+        Ok(Self::decode(&delta))
+    }
+
+    fn decode(slots: &[u64]) -> Self {
+        let slot = |i: usize| slots[i];
         let mut ops = Vec::with_capacity(KINDS);
         for (kind, op) in OP_NAMES.iter().copied().enumerate() {
             let mut by_class = Vec::new();
@@ -762,7 +808,7 @@ impl Snapshot {
                 .rposition(|&n| n > 0)
                 .map_or(0, |b| 1u64 << (b + 1)),
         };
-        Ok(Self {
+        Self {
             conflicts: slot(CONFLICT_SLOT),
             ops,
             reads,
@@ -770,7 +816,7 @@ impl Snapshot {
             commit,
             park_cause,
             park_gap,
-        })
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -822,6 +868,15 @@ mod tests {
         assert_eq!(classify("tenants/a/MANIFEST"), 0);
         assert_eq!(classify("tenants/a/manifests/0-0.json"), 0);
         assert_eq!(classify("tenants/a/wal/0000000000000001/00.wal"), 1);
+        assert_eq!(classify("tenants/a/log/cellwal/0000/0000000000000ccb"), 1);
+        assert_eq!(
+            classify("tenants/a/log/cellwal-sealed/0000/0000000000000001-0000000000000064.seg"),
+            1
+        );
+        assert_eq!(
+            classify("tenants/a/log/cellwal-rounds/0000/00000001.idx"),
+            1
+        );
         assert_eq!(classify("tenants/a/chk/chk-1/INDEX"), 2);
         assert_eq!(classify("tenants/a/shards/0000/SHARD"), 3);
         assert_eq!(
@@ -1030,6 +1085,50 @@ mod tests {
         let snap = Snapshot::read(&counters).unwrap();
         let put = snap.ops.iter().find(|o| o.op == "put").unwrap();
         assert_eq!(put.count, 2);
+    }
+
+    /// One phase of a run is the counters at its end minus the counters
+    /// at its start, and the reason to take that difference in the
+    /// buckets rather than between two sets of percentiles is that a
+    /// fast phase after a slow one has to read as fast.
+    #[test]
+    fn a_snapshot_since_an_earlier_copy_is_the_window_between_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stats");
+        let counters = Counters::open(&path).unwrap();
+        let put = count_slot(Op::Put as usize, 4);
+        let hist = BUCKET_BASE + (Op::Put as usize) * BUCKETS;
+        for _ in 0..9 {
+            counters.add(put, 1);
+            counters.add(put + 1, 8192);
+            counters.add(hist + bucket(Duration::from_millis(50)), 1);
+        }
+        let mark = dir.path().join("mark");
+        fs::copy(&path, &mark).unwrap();
+        counters.add(put, 1);
+        counters.add(put + 1, 100);
+        counters.add(hist + bucket(Duration::from_micros(30)), 1);
+
+        let ops = |s: &Snapshot| {
+            let o = s.ops.iter().find(|o| o.op == "put").unwrap();
+            (o.count, o.bytes, o.p50_us)
+        };
+        let (count, bytes, p50) = ops(&Snapshot::read(&path).unwrap());
+        assert_eq!((count, bytes), (10, 73828));
+        assert!(
+            p50 >= 50_000,
+            "the whole run is nine slow puts and one fast"
+        );
+
+        let (count, bytes, p50) = ops(&Snapshot::read_since(&path, &mark).unwrap());
+        assert_eq!((count, bytes), (1, 100));
+        assert!(p50 < 64, "the window after the mark is the fast put alone");
+
+        // The other way round is an earlier file that counted more than
+        // the later one, which happens when the file was reset between
+        // the two and means the subtraction would wrap rather than say
+        // anything, so it is an error and not a number.
+        assert!(Snapshot::read_since(&mark, &path).is_err());
     }
 
     #[test]

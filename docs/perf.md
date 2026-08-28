@@ -2,6 +2,8 @@
 
 First numbers for the storage engine under pgbench, published so every later change has a baseline to beat.
 Run any leg yourself with `scripts/zou-bench.sh <target> [scale] [seconds]`, which does a fresh initdb, bootstraps the target, loads pgbench at the given scale, forces a checkpoint, and runs a tpcb-like and a select-only workload.
+Each phase prints what it cost the store underneath its own tps, out of the counters between that phase's start and its end, because a tps on its own says which bargain suited the scenario and not what the bargain was.
+The counter file is copied at every phase boundary into the run directory, so `zou stats <file> --since <earlier>` can ask a finished run anything those lines left out.
 
 ## Method
 
