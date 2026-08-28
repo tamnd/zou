@@ -2500,6 +2500,52 @@
   const timers = new Set();
   let nextTimer = 1;
 
+  // A timer that has fired does not run its callback there and then. It
+  // joins this queue, and the queue is drained in the order the timers
+  // were due.
+  //
+  // Every timer is a sleep of its own at the host, so four of them set
+  // for 0, 10, 20 and 30 milliseconds are four futures. While the
+  // isolate is keeping up, they come back one at a time and in order,
+  // and none of this shows. When the isolate is held up past all four
+  // deadlines, which is what a busy node looks like, all four are ready
+  // at once and which of them the host hands back first is the host's
+  // business: measured under load, the thirty came back before the ten.
+  // Firing them in that order is wrong however late they all are, and
+  // it is the kind of wrong that shows up as a retry that backed off
+  // less than the one before it.
+  const due = [];
+  let draining = false;
+
+  function fires(id, at, callback, args) {
+    due.push({ id, at, callback, args });
+    if (draining) {
+      return;
+    }
+    draining = true;
+    Promise.resolve().then(drain);
+  }
+
+  function drain() {
+    draining = false;
+    // By when each was due, and then by which was made first, which is
+    // the order two timers with the same deadline fire in and is what
+    // the ids already carry.
+    due.sort((one, other) => one.at - other.at || one.id - other.id);
+    const running = due.splice(0, due.length);
+    for (const timer of running) {
+      try {
+        timer.callback(...timer.args);
+      } catch (thrown) {
+        // A handler cannot catch this: by the time the timer fires,
+        // whatever set it has returned. Deno's answer is to end the
+        // process, which here would be to lose an answer that is
+        // already written, so this says so and the call goes on.
+        reported(thrown);
+      }
+    }
+  }
+
   function after(callback, delay, args, repeating) {
     if (typeof callback !== "function") {
       // Deno takes a string here and evaluates it. That is `eval` with
@@ -2513,6 +2559,10 @@
     const wait = Number(delay);
     (async () => {
       while (timers.has(id)) {
+        // Taken before the wait rather than after it, because what
+        // orders two overdue timers is when each was meant to run and
+        // not when the host got round to saying so.
+        const at = ops.op_zou_now() + wait;
         const fired = await ops.op_zou_sleep(id, wait);
         if (!fired || !timers.has(id)) {
           break;
@@ -2520,15 +2570,7 @@
         if (!repeating) {
           timers.delete(id);
         }
-        try {
-          callback(...args);
-        } catch (thrown) {
-          // A handler cannot catch this: by the time the timer fires,
-          // whatever set it has returned. Deno's answer is to end the
-          // process, which here would be to lose an answer that is
-          // already written, so this says so and the call goes on.
-          reported(thrown);
-        }
+        fires(id, at, callback, args);
       }
       timers.delete(id);
     })();

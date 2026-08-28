@@ -1724,6 +1724,41 @@ fn timers_fire_in_the_order_their_delays_say() {
     );
 }
 
+/// And the delays still decide when every one of them is already late,
+/// which is the case a busy node makes and the one the test above only
+/// reaches by accident.
+///
+/// The stall is a real one: a timer at one millisecond that holds the
+/// thread for sixty. Everything set after it is overdue by the time the
+/// loop turns again, so all three sleeps are ready at the host at once
+/// and the order they come back in is the host's rather than the
+/// deadlines'. Under load that order was measured as thirty, ten,
+/// twenty, which is the order they were set in.
+#[test]
+fn a_stall_past_every_deadline_does_not_reorder_the_timers() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => new Promise((answer) => {
+            const said = [];
+            setTimeout(() => said.push("thirty"), 30);
+            setTimeout(() => said.push("ten"), 10);
+            setTimeout(() => said.push("twenty"), 20);
+            setTimeout(() => {
+                const until = Date.now() + 60;
+                while (Date.now() < until) {}
+                said.push("stalled");
+            }, 1);
+            setTimeout(() => answer(Response.json(said)), 300);
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said,
+        serde_json::json!(["stalled", "ten", "twenty", "thirty"])
+    );
+}
+
 #[test]
 fn a_timer_that_was_cleared_does_not_fire_and_one_that_repeats_does() {
     let answer = answered(
