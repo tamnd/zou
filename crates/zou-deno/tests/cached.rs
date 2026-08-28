@@ -63,6 +63,9 @@ fn a_warm_cache_is_a_cold_start_that_touches_nothing() {
         // Which build a package is served is a different question and
         // has its own tests.
         std::env::set_var("ZOU_MODULE_BUILD", "");
+        // The registry path rather than the default, because this is
+        // a test about what the registry serves.
+        std::env::set_var("ZOU_NPM", "registry");
     }
     // A package as the registry would have served it, imports and all,
     // so what is exercised is the graph and not one file.

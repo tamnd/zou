@@ -8,21 +8,30 @@
 //! there rather than a second interpretation of the language.
 //!
 //! The second job is everything a function imports that is not beside
-//! it. `npm:` and `jsr:` are what the examples are written with, and by
-//! default neither is resolved the way Deno resolves it: both are
-//! rewritten to a url on a registry that serves packages as modules,
-//! `esm.sh` by default, and from there a package is an ordinary graph
-//! of `https:` imports that this loader has to handle anyway. What that
-//! costs is written down in `docs/functions.md`: what runs is the
-//! registry's build of the package rather than the tarball npm would
-//! have unpacked.
+//! it. `npm:` and `jsr:` are what the examples are written with, and
+//! both are resolved the way Deno resolves them: an `npm:` specifier is
+//! the tarball npm publishes, fetched, checked against the integrity
+//! the packument names, unpacked under the cache and resolved with
+//! node's own rules, commonjs and all, and a `jsr:` one is the files jsr
+//! publishes.
 //!
-//! `ZOU_NPM=tarball` is the other answer, and it is Deno's: an `npm:`
-//! specifier is the tarball, unpacked under the cache and resolved with
-//! node's rules, commonjs and all. Which of the two runs more of other
-//! people's code is a question for the corpus rather than for an
-//! argument, so both are here and the corpus decides which is the
-//! default.
+//! `ZOU_NPM=registry` is the other answer and it was the default until
+//! 2026-08-28. Both specifiers are rewritten to a url on a registry that
+//! serves packages as modules, `esm.sh` by default, and from there a
+//! package is an ordinary graph of `https:` imports that this loader has
+//! to handle anyway. What that costs is written down in
+//! `docs/functions.md`: what runs is the registry's build of the package
+//! rather than the tarball npm would have unpacked, and a build can be
+//! wrong in ways nobody on this side can fix.
+//!
+//! Which of the two runs more of other people's code was a question for
+//! the corpus rather than for an argument, so both are here and the
+//! corpus decided. It loaded 26 of the 40 Supabase examples on the
+//! tarball against 25 on either build esm.sh serves, and the names it is
+//! ahead by are ones neither build can serve: `@slack/web-api`, which
+//! esm.sh answers 500 for whichever build is asked, and the mcp sdk,
+//! which asks the registry's build of `zod/v4` for an export that build
+//! does not carry.
 //!
 //! Anything fetched is kept on disk, keyed by url, so a second cold
 //! start does not repeat the first one's downloads and a deployment can
@@ -65,11 +74,14 @@ pub(crate) const BUILTINS: &str = "zou:node";
 ///
 /// Two answers, because they are two different runtimes to be. A
 /// registry that serves packages as modules is one https graph and no
-/// node in it, which is what this has always done. The tarball is what
-/// npm publishes and what node runs: node module resolution, the
+/// node in it, which is what this used to do by default. The tarball is
+/// what npm publishes and what node runs: node module resolution, the
 /// package's own `exports`, and commonjs where the package ships
-/// commonjs. The second is the one Deno is, and the corpus is what says
-/// when it becomes the default here.
+/// commonjs. The second is the one Deno is, and the corpus is what said
+/// which becomes the default, which it did on 2026-08-28: the tarball
+/// loaded 26 of the 40 examples against 25 for either build the
+/// registry serves, and the names it is ahead by are ones no registry
+/// can serve at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Npm {
     /// The package's build on esm.sh or a mirror of it.
@@ -155,8 +167,8 @@ impl Disk {
                 Err(_) => BUILD.map(str::to_string),
             },
             npm: match named("ZOU_NPM").as_deref() {
-                Some("tarball") => Npm::Tarball,
-                _ => Npm::Registry,
+                Some("registry") | Some("esm") => Npm::Registry,
+                _ => Npm::Tarball,
             },
             cache: cache(),
             cached_only: named("ZOU_MODULE_CACHE_ONLY").is_some(),

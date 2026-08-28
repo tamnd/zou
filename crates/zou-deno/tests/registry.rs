@@ -10,13 +10,34 @@
 //! What is tested offline lives in `cached.rs`, which never reaches the
 //! network, and in `isolate.rs` for the specifiers that are refused
 //! before a request is made.
+//!
+//! Every test here pins `ZOU_NPM=registry`, which stopped being the
+//! default on 2026-08-28. The file is about what a registry serves and
+//! what this loader makes of it, and the tarball the default resolves to
+//! now is a different claim about a different server, tested in
+//! `tarball.rs`.
 
 #![cfg(feature = "isolate")]
 
 use zou_deno::Isolate;
 use zou_functions::{Answer, Call, Function, Runtime};
 
+/// The registry path, set once for this binary.
+///
+/// Every test in here goes through this before it builds an isolate, so
+/// the thread that wins the lock writes the variable while the others
+/// are still waiting on it and nobody is reading it yet.
+fn registry_path() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Safety: no other thread in this binary is past this call yet,
+        // since every one of them goes through this lock first.
+        unsafe { std::env::set_var("ZOU_NPM", "registry") };
+    });
+}
+
 fn answered(source: &str) -> Answer {
+    registry_path();
     let dir = tempfile::tempdir().expect("a temporary directory");
     std::fs::write(dir.path().join("index.ts"), source).expect("the function's file");
     let function = Function::new("hello", dir.path().join("index.ts"));
@@ -132,6 +153,7 @@ fn the_supabase_client_is_built_and_has_its_pieces() {
 #[test]
 #[ignore = "reaches the registry"]
 fn a_package_that_is_not_there_says_so_with_its_name() {
+    registry_path();
     let dir = tempfile::tempdir().expect("a temporary directory");
     std::fs::write(
         dir.path().join("index.ts"),

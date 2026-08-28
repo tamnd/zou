@@ -95,6 +95,9 @@ fn a_build_the_registry_will_not_make_is_asked_for_again_as_the_one_it_will() {
     unsafe {
         std::env::set_var("ZOU_MODULE_CACHE", cache.path());
         std::env::set_var("ZOU_MODULE_REGISTRY", registry());
+        // The registry path rather than the default, because this is
+        // a test about what the registry serves.
+        std::env::set_var("ZOU_NPM", "registry");
     }
 
     // The build for a browser is the one that is asked for, because
