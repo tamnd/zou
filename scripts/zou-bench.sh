@@ -4,7 +4,13 @@
 #
 # Usage: scripts/zou-bench.sh <target> [scale] [seconds]
 #
-# The target is a directory or an object store URL like s3://bucket/prefix.
+# The target is a directory or an object store URL like s3://bucket/prefix,
+# or the word none for the vanilla leg: the same postgres binary with
+# nothing to point the store shim at, so it writes its own files and the
+# store is out of it. That leg lives here rather than in a script of its
+# own because M1b asks for cpu seconds per thousand transactions within
+# 20 percent of vanilla, and a comparison whose two halves were produced
+# by two different scripts is partly a comparison of the scripts.
 # Credentials and the endpoint come from the usual AWS_ACCESS_KEY_ID,
 # AWS_SECRET_ACCESS_KEY, ZOU_S3_ENDPOINT, and ZOU_S3_REGION variables.
 # PG points at the postgres install, default build/pg/bin.
@@ -38,6 +44,11 @@ BOOTSTRAP=${BOOTSTRAP:-target/release/zou-bootstrap}
 PORT=${PORT:-54312}
 CLIENTS=${CLIENTS:-8}
 
+VANILLA=0
+if [ "$TARGET" = none ]; then
+    VANILLA=1
+fi
+
 RUNDIR=$(mktemp -d /tmp/zou-bench.XXXXXX)
 DATADIR=$RUNDIR/data
 SOCK=$RUNDIR/sock
@@ -53,23 +64,37 @@ stop() {
 }
 trap stop EXIT
 
-export ZOU_TARGET=$TARGET
-# The object path unless the caller asked for the other one. These
-# start postgres themselves, and the page service is a background
-# worker under it, so both paths run from here.
-ZOU_PAGESERVE=${ZOU_PAGESERVE:-0}
-export ZOU_PAGESERVE
 STATS=$RUNDIR/store-stats
-ZOU_STORE_STATS=${ZOU_STORE_STATS:-$STATS}
-export ZOU_STORE_STATS
+if [ "$VANILLA" = 1 ]; then
+    # Nothing to point the shim at, and nothing left in the environment
+    # to point it at either, since a leg that is supposed to be vanilla
+    # and inherited a ZOU_TARGET from the shell that launched it is the
+    # one measurement nobody would catch by reading the output.
+    unset ZOU_TARGET ZOU_PAGESERVE ZOU_STORE_STATS 2>/dev/null || true
+    # Kept as a plain variable rather than exported: the counter checks
+    # below read it and no file will ever appear at it, which is the
+    # right answer for a run with no store under it.
+    ZOU_STORE_STATS=$STATS
+else
+    export ZOU_TARGET=$TARGET
+    # The object path unless the caller asked for the other one. These
+    # start postgres themselves, and the page service is a background
+    # worker under it, so both paths run from here.
+    ZOU_PAGESERVE=${ZOU_PAGESERVE:-0}
+    export ZOU_PAGESERVE
+    ZOU_STORE_STATS=${ZOU_STORE_STATS:-$STATS}
+    export ZOU_STORE_STATS
+fi
 # initdb and the bootstrap are tools, not a server. The page service is
 # a background worker inside postgres, so nothing is listening on its
 # socket while these run and asking them to read that way is asking for
 # a connect failure on the first catalog page. Every other tool in the
 # tree pins the object path for the same reason.
 ZOU_PAGESERVE=0 "$PG"/initdb -D "$DATADIR" --set io_method=sync --set full_page_writes=off >/dev/null
-REDO=$("$PG"/pg_controldata -D "$DATADIR" | grep "REDO location" | awk '{print $NF}')
-ZOU_PAGESERVE=0 "$BOOTSTRAP" "$TARGET" "$DATADIR" --redo "$REDO" >/dev/null
+if [ "$VANILLA" = 0 ]; then
+    REDO=$("$PG"/pg_controldata -D "$DATADIR" | grep "REDO location" | awk '{print $NF}')
+    ZOU_PAGESERVE=0 "$BOOTSTRAP" "$TARGET" "$DATADIR" --redo "$REDO" >/dev/null
+fi
 "$PG"/pg_ctl -D "$DATADIR" -l "$LOG" -o "-p $PORT -k $SOCK" start >/dev/null
 
 ZOU=${ZOU_BIN:-target/release}/zou
@@ -89,9 +114,15 @@ if [ -r "$USAGE_SH" ] && [ -n "$POSTMASTER" ]; then
     SAMPLER=$!
 fi
 
-echo "target: $TARGET"
+if [ "$VANILLA" = 1 ]; then
+    echo "target: none, vanilla postgres writing its own files"
+else
+    echo "target: $TARGET"
+fi
 echo "rundir: $RUNDIR"
-echo "page service: $ZOU_PAGESERVE"
+if [ "$VANILLA" = 0 ]; then
+    echo "page service: $ZOU_PAGESERVE"
+fi
 
 # Which box this was, at the top of the run rather than in somebody's
 # memory. A tps is a number about a pair, a machine and a store, and
@@ -106,10 +137,10 @@ echo "page service: $ZOU_PAGESERVE"
 HARDWARE=$(dirname "$0")/zou-hardware.sh
 if [ -r "$HARDWARE" ]; then
     case $TARGET in
-    *://*) WHERE=$RUNDIR ;;
+    *://* | none) WHERE=$RUNDIR ;;
     *) WHERE=$TARGET ;;
     esac
-    if [ "${ZOU_BENCH_PROBE:-0}" = 1 ]; then
+    if [ "${ZOU_BENCH_PROBE:-0}" = 1 ] && [ "$VANILLA" = 0 ]; then
         sh "$HARDWARE" "$WHERE" "$TARGET" | sed 's/^/  /'
     else
         sh "$HARDWARE" "$WHERE" | sed 's/^/  /'
