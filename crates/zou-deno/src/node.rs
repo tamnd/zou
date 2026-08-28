@@ -72,6 +72,10 @@ pub fn source(name: &str) -> Option<&'static str> {
         // `path/win32` on it gets the same answer node gives a program
         // that asked for posix separators on a posix machine.
         "path" | "path/posix" | "path/win32" => include_str!("node/path.js"),
+        // The web's performance timeline under the name node put it
+        // behind. The objects are the global ones, which is what they
+        // are in node too, and this module is the import line.
+        "perf_hooks" => include_str!("node/perf_hooks.js"),
         "process" => include_str!("node/process.js"),
         "querystring" => include_str!("node/querystring.js"),
         "readline" => include_str!("node/readline.js"),
@@ -130,6 +134,7 @@ pub const NAMES: &[&str] = &[
     "path",
     "path/posix",
     "path/win32",
+    "perf_hooks",
     "process",
     "querystring",
     "readline",

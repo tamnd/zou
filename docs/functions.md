@@ -594,10 +594,11 @@ A function may import one itself, and so may a package the registry served, whic
 
 ```
 assert  async_hooks  buffer  child_process  cluster  crypto
-diagnostics_channel  events  fs  fs/promises  http  https  module
-net  os  path  process  querystring  readline  readline/promises
-stream  stream/promises  stream/web  string_decoder  timers
-timers/promises  url  util  util/types  v8  worker_threads  zlib
+diagnostics_channel  dns  dns/promises  events  fs  fs/promises
+http  https  module  net  os  path  perf_hooks  process
+querystring  readline  readline/promises  stream  stream/promises
+stream/web  string_decoder  timers  timers/promises  tls  tty
+url  util  util/types  v8  worker_threads  zlib
 ```
 
 `path/posix` and `path/win32` are the same module as `path`, which is posix, because there is one file system here and it has one separator.
@@ -612,6 +613,7 @@ What each one is is the part of it a package reaches for and not node's whole su
 - `os` answers about the machine the function is on the way a container does, `util.promisify` reads the custom symbol, `assert` throws an `AssertionError`, and `timers` and `timers/promises` are the globals under their node names.
 - `diagnostics_channel` is a real one: named channels, subscribers, `publish`, `hasSubscribers` and the tracing channel wrapper. Nothing here subscribes to anything, so a library instrumenting itself through it publishes into channels nobody is on, which is what it is for.
 - `module` is `createRequire`, `builtinModules` and `isBuiltin`. There is no CJS here, so the require it hands back serves the built ins and names anything else as a module it cannot find, which is the answer a package feature detecting its way onto node is asking for.
+- `perf_hooks` is the global `performance` and the entry classes under the name node put them behind, the same objects rather than copies, which is what they are in node too. What it does not have is the three that are about a node process rather than about timing: `monitorEventLoopDelay`, `createHistogram` and `timerify` refuse by name, and `nodeTiming` is absent because a function was called on a server that was already running and a row of zeroes dressed as phase times says less than the property not being there.
 - `async_hooks` is `AsyncLocalStorage`, and it is the one built in here that is a runtime feature rather than a translation. A store set before an await is still there after it, on that chain and not on whoever else ran in between, because the value is carried by the thing that resumes a continuation. `run`, `getStore`, `enterWith`, `exit`, `bind` and `snapshot` are all there, and so is `AsyncResource`. The hooks half is not: `createHook` gives back a hook whose callbacks never fire, because nothing here reports when a promise is made or collected.
 - `zlib` is the real thing rather than a translation. gzip, deflate and raw deflate, their three inflates, and `unzip`, which reads its own framing, in all three of node's shapes: the synchronous call, the callback and the stream. The deflate underneath is the one this binary already carries for opening a package tarball, held as a job with an id so a stream fed a chunk at a time comes out as one gzip and not a hundred. Brotli is a different algorithm and refuses by name.
 - `readline` is a stream cut into lines, read through the `line` event, the async iterator or `question`, which is answered by the next line rather than by somebody typing. There is no tty in a function, so the terminal half of node's module is not here: `cursorTo` and the rest answer false, and there is no history, no completer and no key events.
@@ -1122,7 +1124,9 @@ The global is one of them.
 That is the shape upstream was measured having, and it is not decoration: a library calls the bare `addEventListener` while a module is still being evaluated often enough that a runtime without one is a `ReferenceError` before the function has a handler.
 What is not there is anything dispatching to it. Nothing here fires `error` or `unhandledrejection`, so a library that reports crashes by listening on the global reports nothing, and a handler that throws is the log line further down instead.
 
-`performance` is `now()` and `timeOrigin`, which is a monotonic clock counting from the moment the isolate started, in milliseconds with a fraction. `mark` and `measure` are not here.
+`performance` is `now()` and `timeOrigin`, which is a monotonic clock counting from the moment the isolate started, in milliseconds with a fraction.
+`mark`, `measure`, `clearMarks`, `clearMeasures`, `getEntries`, `getEntriesByName` and `getEntriesByType` are here too, over a buffer that lives in the isolate and goes when it does, along with `PerformanceEntry`, `PerformanceMark`, `PerformanceMeasure`, `PerformanceObserver` and `PerformanceObserverEntryList`.
+The two entry types anything here records are `mark` and `measure`, which is what `PerformanceObserver.supportedEntryTypes` says: nothing in a function navigates, paints or loads a resource, so those types are never recorded rather than recorded empty.
 
 `Deno.permissions` is all six methods, `query`, `querySync`, `request`, `requestSync`, `revoke` and `revokeSync`, and a `PermissionStatus` that is an `EventTarget` with a `state` on it.
 What it is for is a library deciding whether to reach for something it can do without, which is what `@sentry/deno` does while its sdk is being set up.
@@ -1138,7 +1142,7 @@ Not present yet, and named rather than silently missing:
 - Byte streams. There is no `new ReadableStream({ type: "bytes" })`, no BYOB reader and no `TextDecoderStream`.
 - Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet. That also moves when the promise settles: upstream hands the response back when the headers arrive and this hands it back when the body is in, so a handler racing a slow answer against a clock sees the clock win here and the headers win there.
 - The rest of the file system. Reading a file the function's own `static_files` covers is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
-- The rest of the node built ins. Nineteen of them are here and the section on packages says what each one covers, and one that is not, `node:child_process` among them, is refused by name when it is resolved.
+- The rest of the node built ins. Thirty seven of them are here and the section on packages says what each one covers, and one that is not, `node:http2` and `node:dgram` among them, is refused by name when it is resolved.
 
 The rest of that list, and where each line stands, is [issue #369](https://github.com/tamnd/zou/issues/369).
 

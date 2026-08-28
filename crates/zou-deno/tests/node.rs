@@ -1027,3 +1027,41 @@ fn the_filesystem_carries_every_name_and_refuses_by_which_reason() {
         "/beside/me.txt | read only | nothing to list | 41 | /beside/me.txt | function"
     );
 }
+
+/// The performance timeline under the name node put it behind. The
+/// objects are the global ones rather than copies, which is what they
+/// are in node, so a package that marks through the module and a
+/// function that reads the buffer through the global are looking at
+/// one list. What is not here is the three that are about a node
+/// process rather than about timing.
+#[test]
+fn perf_hooks_is_the_performance_timeline_under_nodes_name() {
+    let said = served(
+        r#"
+        import perf, { performance as timed, PerformanceObserver, monitorEventLoopDelay, createHistogram, constants } from "node:perf_hooks";
+        const seen = [];
+
+        seen.push(`${timed === performance} ${PerformanceObserver === globalThis.PerformanceObserver}`);
+        timed.mark("from node");
+        seen.push(String(performance.getEntriesByName("from node", "mark").length));
+
+        for (const call of [monitorEventLoopDelay, createHistogram, perf.timerify]) {
+          try {
+            call();
+          } catch (why) {
+            seen.push(why.message.includes("node:perf_hooks") ? "named" : why.message);
+          }
+        }
+        seen.push(String(constants.NODE_PERFORMANCE_GC_MAJOR));
+        // Absent rather than a row of zeroes: a function was called on
+        // a server that was already running and never bootstrapped one.
+        seen.push(`${typeof timed.nodeTiming} ${typeof perf.PerformanceResourceTiming}`);
+
+        Deno.serve(() => new Response(seen.join(" | ")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "true true | 1 | named | named | named | 4 | undefined function"
+    );
+}

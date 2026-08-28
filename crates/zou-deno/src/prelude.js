@@ -2577,11 +2577,20 @@
   // isolate that is kept and called again keeps counting, which is what
   // the number means upstream too, where a worker is what holds it.
   //
-  // The entry buffer is not here: `mark`, `measure` and the
-  // `getEntries` family are absent rather than faked, because a
-  // library that finds them expects to be able to read back what it
-  // recorded, and an empty list is a worse answer than no method at
-  // all. `docs/functions.md` says so.
+  // The entry buffer is here and it is real. It used to be absent, on
+  // the grounds that a faked one hands back an empty list to a library
+  // that expected to read what it recorded, which is worse than no
+  // method at all. That was right about the fake and wrong about the
+  // choice: what a library does with `mark` and `measure` is time
+  // itself, the recording is a list in the isolate and there is
+  // nothing for the host to do in any of it. So it records, and what
+  // is read back is what was written.
+  //
+  // What is not here is the entry types a browser fills in on its own,
+  // `resource`, `navigation`, `paint` and the rest. Nothing here
+  // navigates or paints, and `PerformanceObserver.supportedEntryTypes`
+  // says which two types this is, which is the question a library asks
+  // before it observes.
 
   const started = Date.now();
 
@@ -2616,6 +2625,235 @@
     },
   };
 
+  // The brand on an entry the runtime made. `new PerformanceEntry()` is
+  // not a thing a program does on the web and it is not one here: an
+  // entry comes from a mark or a measure, and the guard is how the two
+  // constructors below tell their own call from anybody else's.
+  const recorded = Symbol("recorded by the runtime");
+
+  /// One thing that happened, with a name, a kind, when it started and
+  /// how long it took. Everything in the buffer is one of these.
+  class PerformanceEntry {
+    #name;
+    #entryType;
+    #startTime;
+    #duration;
+
+    constructor(guard, name, entryType, startTime, duration) {
+      if (guard !== recorded) {
+        throw new TypeError("Illegal constructor");
+      }
+      this.#name = name;
+      this.#entryType = entryType;
+      this.#startTime = startTime;
+      this.#duration = duration;
+    }
+
+    get name() {
+      return this.#name;
+    }
+
+    get entryType() {
+      return this.#entryType;
+    }
+
+    get startTime() {
+      return this.#startTime;
+    }
+
+    get duration() {
+      return this.#duration;
+    }
+
+    toJSON() {
+      return {
+        name: this.name,
+        entryType: this.entryType,
+        startTime: this.startTime,
+        duration: this.duration,
+      };
+    }
+  }
+
+  /// A moment. Constructible by hand, which is the web's rule and
+  /// Deno's: `new PerformanceMark("x")` is an entry that was never
+  /// recorded, and only `performance.mark` puts one in the buffer.
+  class PerformanceMark extends PerformanceEntry {
+    #detail;
+
+    constructor(name, options = {}) {
+      const start = options?.startTime === undefined ? ops.op_zou_now() : Number(options.startTime);
+      if (!(start >= 0)) {
+        throw new TypeError(`a mark cannot start at ${options?.startTime}, which is before the isolate did`);
+      }
+      super(recorded, String(name), "mark", start, 0);
+      this.#detail = options?.detail === undefined ? null : options.detail;
+    }
+
+    get detail() {
+      return this.#detail;
+    }
+
+    toJSON() {
+      return { ...super.toJSON(), detail: this.detail };
+    }
+  }
+
+  /// A span between two moments, which is the thing a library is
+  /// actually after when it marks twice.
+  class PerformanceMeasure extends PerformanceEntry {
+    #detail;
+
+    constructor(guard, name, startTime, duration, detail) {
+      super(guard, name, "measure", startTime, duration);
+      this.#detail = detail === undefined ? null : detail;
+    }
+
+    get detail() {
+      return this.#detail;
+    }
+
+    toJSON() {
+      return { ...super.toJSON(), detail: this.detail };
+    }
+  }
+
+  // Everything recorded so far, oldest first, which is the order every
+  // getter hands it back in.
+  const entries = [];
+
+  // The observers that are watching, and what each of them has been
+  // handed but not yet told about. A callback runs in a microtask
+  // rather than in the call that recorded the entry, so a library that
+  // marks inside its own observer callback does not reenter it.
+  const observers = new Set();
+
+  // How `record` reaches into an observer without putting the method on
+  // the class where a function could call it.
+  const handed = Symbol("an entry for an observer");
+
+  /// A time, from either a number or the name of a mark. A library
+  /// measures between two names far more often than between two
+  /// numbers, and the name means the most recent mark that had it.
+  function whenWas(what) {
+    if (typeof what === "number") {
+      if (!(what >= 0)) {
+        throw new TypeError(`${what} is not a time`);
+      }
+      return what;
+    }
+    const name = String(what);
+    for (let at = entries.length - 1; at >= 0; at -= 1) {
+      if (entries[at].entryType === "mark" && entries[at].name === name) {
+        return entries[at].startTime;
+      }
+    }
+    throw new DOMException(`nothing was marked ${JSON.stringify(name)}`, "SyntaxError");
+  }
+
+  /// Put an entry in the buffer and tell whoever is watching for its
+  /// kind.
+  function record(entry) {
+    entries.push(entry);
+    for (const observer of observers) {
+      observer[handed](entry);
+    }
+    return entry;
+  }
+
+  /// What an observer's callback is given: the entries since it last
+  /// ran, in the same three shapes the buffer itself answers in.
+  class PerformanceObserverEntryList {
+    #entries;
+
+    constructor(guard, list) {
+      if (guard !== recorded) {
+        throw new TypeError("Illegal constructor");
+      }
+      this.#entries = list;
+    }
+
+    getEntries() {
+      return this.#entries.slice();
+    }
+
+    getEntriesByName(name, type) {
+      const wanted = String(name);
+      return this.#entries.filter(
+        (entry) => entry.name === wanted && (type === undefined || entry.entryType === String(type)),
+      );
+    }
+
+    getEntriesByType(type) {
+      const wanted = String(type);
+      return this.#entries.filter((entry) => entry.entryType === wanted);
+    }
+  }
+
+  class PerformanceObserver {
+    // The two kinds anything here records. A library asks this before
+    // it observes, and the honest answer is short.
+    static supportedEntryTypes = ["mark", "measure"];
+
+    #callback;
+    #watching = new Set();
+    #queued = [];
+    #due = false;
+
+    constructor(callback) {
+      if (typeof callback !== "function") {
+        throw new TypeError("a PerformanceObserver is made with the function it calls");
+      }
+      this.#callback = callback;
+    }
+
+    observe(options = {}) {
+      const types = options.entryTypes ?? (options.type === undefined ? [] : [options.type]);
+      if (options.entryTypes !== undefined && options.type !== undefined) {
+        throw new TypeError("an observer watches either entryTypes or a single type, not both");
+      }
+      // `entryTypes` replaces what was being watched, a single `type`
+      // adds to it, which is the web's rule.
+      if (options.entryTypes !== undefined) {
+        this.#watching = new Set(Array.from(types, String));
+      } else {
+        for (const type of types) this.#watching.add(String(type));
+      }
+      observers.add(this);
+      // A buffered observer is told about what was recorded before it
+      // started watching, which is how a library that observes after
+      // its own setup still sees the setup.
+      if (options.buffered) {
+        for (const entry of entries) this[handed](entry);
+      }
+    }
+
+    disconnect() {
+      observers.delete(this);
+      this.#watching.clear();
+      this.#queued = [];
+    }
+
+    takeRecords() {
+      const held = this.#queued;
+      this.#queued = [];
+      return held;
+    }
+
+    [handed](entry) {
+      if (!this.#watching.has(entry.entryType)) return;
+      this.#queued.push(entry);
+      if (this.#due) return;
+      this.#due = true;
+      queueMicrotask(() => {
+        this.#due = false;
+        const held = this.takeRecords();
+        if (held.length === 0) return;
+        this.#callback(new PerformanceObserverEntryList(recorded, held), this);
+      });
+    }
+  }
+
   const performance = {
     get timeOrigin() {
       return started;
@@ -2623,10 +2861,77 @@
     now() {
       return ops.op_zou_now();
     },
+    mark(name, options) {
+      return record(new PerformanceMark(name, options));
+    },
+    measure(name, startOrOptions, endMark) {
+      let startTime;
+      let endTime;
+      let detail;
+      const options = typeof startOrOptions === "object" && startOrOptions !== null ? startOrOptions : null;
+      if (options) {
+        if (endMark !== undefined) {
+          throw new TypeError("a measure is given either an options object or an end mark, not both");
+        }
+        detail = options.detail;
+        if (options.start !== undefined) startTime = whenWas(options.start);
+        if (options.end !== undefined) endTime = whenWas(options.end);
+        if (options.duration !== undefined) {
+          const long = Number(options.duration);
+          if (startTime !== undefined && endTime !== undefined) {
+            throw new TypeError("a measure with a duration is given a start or an end, not both");
+          }
+          if (startTime === undefined && endTime === undefined) {
+            throw new TypeError("a measure with a duration is given a start or an end");
+          }
+          if (startTime === undefined) startTime = endTime - long;
+          else endTime = startTime + long;
+        }
+      } else {
+        if (startOrOptions !== undefined) startTime = whenWas(startOrOptions);
+        if (endMark !== undefined) endTime = whenWas(endMark);
+      }
+      // Missing ends mean the two the web fills in: nothing before the
+      // isolate started, and now.
+      if (startTime === undefined) startTime = 0;
+      if (endTime === undefined) endTime = ops.op_zou_now();
+      return record(new PerformanceMeasure(recorded, String(name), startTime, endTime - startTime, detail));
+    },
+    clearMarks(name) {
+      forget("mark", name);
+    },
+    clearMeasures(name) {
+      forget("measure", name);
+    },
+    getEntries() {
+      return entries.slice();
+    },
+    getEntriesByName(name, type) {
+      const wanted = String(name);
+      return entries.filter(
+        (entry) => entry.name === wanted && (type === undefined || entry.entryType === String(type)),
+      );
+    },
+    getEntriesByType(type) {
+      const wanted = String(type);
+      return entries.filter((entry) => entry.entryType === wanted);
+    },
     toJSON() {
       return { timeOrigin: started };
     },
   };
+
+  /// Drop one kind of entry, either all of them or the ones under a
+  /// name. In place, because the array is what every getter copies.
+  function forget(kind, name) {
+    const wanted = name === undefined ? undefined : String(name);
+    for (let at = entries.length - 1; at >= 0; at -= 1) {
+      const entry = entries[at];
+      if (entry.entryType === kind && (wanted === undefined || entry.name === wanted)) {
+        entries.splice(at, 1);
+      }
+    }
+  }
 
   // ---------------------------------------------------------------
   // Deno.serve and Deno.env
@@ -4619,6 +4924,11 @@
     MessageChannel,
     MessageEvent,
     MessagePort,
+    PerformanceEntry,
+    PerformanceMark,
+    PerformanceMeasure,
+    PerformanceObserver,
+    PerformanceObserverEntryList,
     PromiseRejectionEvent,
     WebSocket,
     File,
