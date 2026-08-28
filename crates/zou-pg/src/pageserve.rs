@@ -70,8 +70,15 @@ const BLCKSZ: usize = 8192;
 /// be, so the wire does not need a second field to carry silence.
 const SIZE_UNKNOWN: u32 = u32::MAX;
 
-/// "ZPG1" little endian, the one and only protocol version.
-const MAGIC: u32 = 0x3147_505A;
+/// "ZPG2" little endian. Version 1 carried one lsn per request, this
+/// one carries the block position beside it, and the two headers are
+/// different lengths, so a client and a server that disagree have to
+/// find out from the first word rather than from the block count.
+const MAGIC: u32 = 0x3247_505A;
+
+/// The request header: the magic, the two lsns, and five words of
+/// fork and count.
+const HEAD: usize = 40;
 
 /// How long the server holds a request whose lsn ingest has not
 /// reached, once ingest has stopped moving. A request fails loudly
@@ -199,6 +206,11 @@ struct GetReq {
     fork: u32,
     want: Want,
     lsn: u64,
+    /// The newest position any block of this request was written back
+    /// at, zero when the backend had nothing to say. Ingest being past
+    /// this is enough to answer, whatever `lsn` says, because
+    /// everything after it changed some other block.
+    since: u64,
     arrived: Instant,
     deadline: Instant,
     /// Where ingest stood when this request first parked, `None` while
@@ -248,6 +260,13 @@ impl PageClient {
     /// Fetch `blks` of one fork as of `lsn`. Zero means the latest
     /// durable state, see the module docs. Pages come back in request
     /// order, absent blocks as zeros.
+    ///
+    /// `since` is the newest position any of these blocks was written
+    /// back at, zero when the backend has nothing to say. It is a
+    /// smaller ask than `lsn` and usually a much smaller one: ingest
+    /// only has to be past it for the answer to be right, where `lsn`
+    /// is whatever the busiest writer in the tenant did last.
+    #[allow(clippy::too_many_arguments)]
     pub fn get_pages(
         &self,
         spc: u32,
@@ -256,6 +275,7 @@ impl PageClient {
         fork: u32,
         blks: &[u32],
         lsn: u64,
+        since: u64,
     ) -> Result<Vec<Vec<u8>>, String> {
         if blks.is_empty() || blks.len() > MAX_GETPAGE_BATCH {
             return Err(format!("bad batch of {} blocks", blks.len()));
@@ -266,6 +286,7 @@ impl PageClient {
             rel,
             fork,
             lsn,
+            since,
         };
         self.ask(|sock| round_trip(sock, head, blks))
     }
@@ -283,12 +304,16 @@ impl PageClient {
         fork: u32,
         lsn: u64,
     ) -> Result<Option<u32>, String> {
+        // A length is a property of the fork rather than of a block,
+        // so there is no block position to name and this one waits the
+        // way it always did.
         let head = Head {
             spc,
             db,
             rel,
             fork,
             lsn,
+            since: 0,
         };
         self.ask(|sock| round_trip_size(sock, head))
     }
@@ -366,16 +391,18 @@ struct Head {
     rel: u32,
     fork: u32,
     lsn: u64,
+    since: u64,
 }
 
 impl Head {
-    /// The 32 byte header, with the block count a caller is about to
+    /// The 40 byte header, with the block count a caller is about to
     /// send that many block numbers for. Zero of them asks for the
     /// fork's length instead.
     fn bytes(&self, n: usize) -> Vec<u8> {
-        let mut req = Vec::with_capacity(32 + 4 * n);
+        let mut req = Vec::with_capacity(HEAD + 4 * n);
         req.extend_from_slice(&MAGIC.to_le_bytes());
         req.extend_from_slice(&self.lsn.to_le_bytes());
+        req.extend_from_slice(&self.since.to_le_bytes());
         for v in [self.spc, self.db, self.rel, self.fork, n as u32] {
             req.extend_from_slice(&v.to_le_bytes());
         }
@@ -529,7 +556,7 @@ fn connection(mut sock: UnixStream, tx: Sender<GetReq>, stop: Arc<AtomicBool>) {
     if sock.set_read_timeout(Some(Duration::from_secs(1))).is_err() {
         return;
     }
-    let mut head = [0u8; 32];
+    let mut head = [0u8; HEAD];
     while !stop.load(Ordering::Acquire) {
         match sock.read_exact(&mut head) {
             Ok(()) => {}
@@ -540,9 +567,10 @@ fn connection(mut sock: UnixStream, tx: Sender<GetReq>, stop: Arc<AtomicBool>) {
             return;
         }
         let lsn = u64::from_le_bytes(head[4..12].try_into().expect("8 bytes"));
+        let since = u64::from_le_bytes(head[12..20].try_into().expect("8 bytes"));
         let mut words = [0u32; 5];
         for (i, w) in words.iter_mut().enumerate() {
-            *w = u32::from_le_bytes(head[12 + 4 * i..16 + 4 * i].try_into().expect("4 bytes"));
+            *w = u32::from_le_bytes(head[20 + 4 * i..24 + 4 * i].try_into().expect("4 bytes"));
         }
         let [spc, db, rel, fork, n] = words;
         if n as usize > MAX_GETPAGE_BATCH {
@@ -571,6 +599,7 @@ fn connection(mut sock: UnixStream, tx: Sender<GetReq>, stop: Arc<AtomicBool>) {
             fork,
             want,
             lsn,
+            since,
             arrived: Instant::now(),
             deadline: Instant::now() + WAIT_CAP,
             parked_at: None,
@@ -626,23 +655,6 @@ fn respond_err(sock: &mut UnixStream, msg: &str) -> std::io::Result<()> {
     sock.write_all(msg.as_bytes())
 }
 
-/// Whether a request can be served now.
-///
-/// An lsn names the durability watermark the reader already saw, so it
-/// is covered once the stream bytes reached it. Covered means the
-/// bytes, not `applied`: a watermark is usually a WAL page boundary
-/// with a record spilling over it, and any complete record ending at
-/// or below the watermark has been parsed once its bytes are in, so
-/// the page state at `applied` is the page state at the watermark.
-///
-/// Zero asks for the latest durable state instead, which is a question
-/// nobody can answer before a walk has reached the head of the stream.
-/// Answering it anyway hands back whatever ingest happens to hold, and
-/// for a service that has only just anchored that is the anchor. That
-/// is the first read a restarted node makes, from the startup process,
-/// and replaying a record onto a page missing everything since the
-/// anchor is a panic rather than an error (zou #329). So a zero waits
-/// for the probe.
 /// Whether a parked request has waited as long as waiting is worth.
 ///
 /// Not the same question as whether it has waited long enough. A
@@ -728,8 +740,37 @@ fn park_cause(mem: &Memtable, req: &GetReq, from: ParkedAt, seen: u64) -> ParkCa
     }
 }
 
-fn covered(lsn: u64, seen: u64, durable_seen: u64, probed: bool) -> bool {
-    if lsn == 0 {
+/// Whether a request can be served now.
+///
+/// `since` is the block's own position and answers this on its own
+/// when the backend knew one. The blocks in hand were last written
+/// there, so ingest being past it means the wal that has not been
+/// applied yet cannot contain a change to any of them, and the page it
+/// would build now is the page it would build after applying the rest.
+/// This is the whole point of carrying two positions: the other one is
+/// a tenant wide watermark, and waiting for it is waiting for somebody
+/// else's writes (zou #697).
+///
+/// Without one, an lsn names the durability watermark the reader
+/// already saw, so it is covered once the stream bytes reached it.
+/// Covered means the bytes, not `applied`: a watermark is usually a
+/// WAL page boundary with a record spilling over it, and any complete
+/// record ending at or below the watermark has been parsed once its
+/// bytes are in, so the page state at `applied` is the page state at
+/// the watermark.
+///
+/// Zero asks for the latest durable state instead, which is a question
+/// nobody can answer before a walk has reached the head of the stream.
+/// Answering it anyway hands back whatever ingest happens to hold, and
+/// for a service that has only just anchored that is the anchor. That
+/// is the first read a restarted node makes, from the startup process,
+/// and replaying a record onto a page missing everything since the
+/// anchor is a panic rather than an error (zou #329). So a zero waits
+/// for the probe.
+fn covered(lsn: u64, since: u64, seen: u64, durable_seen: u64, probed: bool) -> bool {
+    if since != 0 {
+        seen >= since
+    } else if lsn == 0 {
         probed && seen >= durable_seen
     } else {
         seen >= lsn
@@ -901,8 +942,12 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         let mut ready: Vec<GetReq> = Vec::new();
         let mut still: Vec<GetReq> = Vec::new();
         for mut req in parked.drain(..) {
-            let need = if req.lsn == 0 { durable_seen } else { req.lsn };
-            if covered(req.lsn, seen, durable_seen, probed) {
+            let need = match (req.since, req.lsn) {
+                (0, 0) => durable_seen,
+                (0, lsn) => lsn,
+                (since, _) => since,
+            };
+            if covered(req.lsn, req.since, seen, durable_seen, probed) {
                 ready.push(req);
             } else if hopeless(now >= req.deadline, stalled, frozen.is_some()) {
                 let secs = stalled.as_secs();
@@ -1580,7 +1625,7 @@ mod tests {
 
         let client = PageClient::new(sock);
         let pages = client
-            .get_pages(1663, 5, 2000, 0, &[3, 4], 0)
+            .get_pages(1663, 5, 2000, 0, &[3, 4], 0, 0)
             .expect("served");
         assert_eq!(pages[0], page, "the frozen image came back whole");
         assert_eq!(pages[1], vec![0u8; BLCKSZ], "an absent block is zeros");
@@ -1645,7 +1690,9 @@ mod tests {
         );
         // The connection is still in protocol afterwards, which is
         // the thing a shared status word could have broken.
-        let pages = client.get_pages(1663, 5, 2000, 0, &[3], 0).expect("served");
+        let pages = client
+            .get_pages(1663, 5, 2000, 0, &[3], 0, 0)
+            .expect("served");
         assert_eq!(pages[0], vec![7u8; BLCKSZ]);
         srv.stop();
     }
@@ -1665,7 +1712,7 @@ mod tests {
         std::thread::spawn(move || {
             // Nothing ever lands, the request must ride out its
             // deadline; the test only checks it does not serve.
-            let _ = client.get_pages(1663, 5, 2000, 0, &[0], 1 << 40);
+            let _ = client.get_pages(1663, 5, 2000, 0, &[0], 1 << 40, 0);
         });
         // Give the request time to arrive and park, then stop: the
         // stop path must reply to parked requests rather than strand
@@ -1759,15 +1806,15 @@ mod tests {
     fn a_zero_waits_for_the_probe_and_an_lsn_does_not() {
         let anchor = 0x69bf_9a58;
         assert!(
-            !covered(0, anchor, 0, false),
+            !covered(0, 0, anchor, 0, false),
             "the latest durable state is not the anchor just because that is all there is"
         );
         assert!(
-            covered(0, anchor, anchor, true),
+            covered(0, 0, anchor, anchor, true),
             "a walk that reached the head answers the question"
         );
         assert!(
-            !covered(0, anchor, anchor + 1, true),
+            !covered(0, 0, anchor, anchor + 1, true),
             "and a walk that found more still holds the read"
         );
 
@@ -1776,11 +1823,45 @@ mod tests {
         // cannot have passed an lsn without walking to it.
         let replay = 0x6f65_a108;
         assert!(
-            !covered(replay, anchor, 0, false),
+            !covered(replay, 0, anchor, 0, false),
             "the anchor is behind it"
         );
-        assert!(covered(replay, replay, 0, false), "ingest reached it");
-        assert!(covered(replay, replay + 1, 0, false), "and past it");
+        assert!(covered(replay, 0, replay, 0, false), "ingest reached it");
+        assert!(covered(replay, 0, replay + 1, 0, false), "and past it");
+    }
+
+    /// The point of #697. The durable watermark moves with every other
+    /// backend's commits, so a read that waits for it waits for writes
+    /// that cannot touch the blocks it asked for. A block position is
+    /// an upper bound on the last change to those blocks, so it is the
+    /// only thing worth waiting for, and it outranks both the other
+    /// arms.
+    #[test]
+    fn a_block_position_is_what_the_read_waits_for() {
+        let durable = 0x8000_0000;
+        let block = 0x4000_0000;
+
+        assert!(
+            covered(durable, block, block, 0, false),
+            "ingest past the block's own writes answers it"
+        );
+        assert!(
+            !covered(durable, block, block - 1, 0, false),
+            "and short of them it does not"
+        );
+        assert!(
+            covered(0, block, block, durable, false),
+            "a zero beside a block position needs no probe, the block says enough"
+        );
+
+        // The bound runs the other way too: a block written after the
+        // watermark the reader saw still waits for its own writes.
+        let ahead = durable + 0x1000;
+        assert!(
+            !covered(durable, ahead, durable, 0, false),
+            "the watermark being covered says nothing about this block"
+        );
+        assert!(covered(durable, ahead, ahead, 0, false), "its own does");
     }
 
     /// A backlog on the chain, cut into frames the way the sequencer
@@ -2324,7 +2405,9 @@ mod tests {
         let client = PageClient::new(sock);
 
         assert_eq!(
-            client.get_pages(1663, 5, 2000, 0, &[3], 0).expect("served")[0],
+            client
+                .get_pages(1663, 5, 2000, 0, &[3], 0, 0)
+                .expect("served")[0],
             page
         );
         let first = counting.ranges();
@@ -2335,7 +2418,9 @@ mod tests {
 
         for _ in 0..4 {
             assert_eq!(
-                client.get_pages(1663, 5, 2000, 0, &[3], 0).expect("served")[0],
+                client
+                    .get_pages(1663, 5, 2000, 0, &[3], 0, 0)
+                    .expect("served")[0],
                 page
             );
         }
@@ -2425,6 +2510,7 @@ mod tests {
             fork: 0,
             want: Want::Pages(vec![3]),
             lsn: 0,
+            since: 0,
             arrived: Instant::now(),
             deadline: Instant::now() + WAIT_CAP,
             parked_at: None,
@@ -2473,6 +2559,7 @@ mod tests {
                 fork: 0,
                 want: Want::Pages(vec![blk]),
                 lsn: 200,
+                since: 0,
                 arrived: Instant::now(),
                 deadline: Instant::now() + WAIT_CAP,
                 parked_at: None,

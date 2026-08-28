@@ -846,7 +846,10 @@ fn note_read(tier: stats::ReadTier, pages: u64, started: Instant) {
 /// written. `durable_lsn` is the wal pusher's published durable LSN at
 /// the moment of the call, zero when none is published; the chain
 /// reader uses it to skip its freshness barrier when the mirrored
-/// stream has not advanced.
+/// stream has not advanced. `written_lsn` is the newest position this
+/// block was written back at, zero when the shim has nothing to say,
+/// and it is what the page service waits for instead of the durable
+/// LSN: everything after it changed some other block.
 ///
 /// # Safety
 /// `buf` must be a valid pointer to ZOU_PAGE_SIZE writable bytes.
@@ -859,6 +862,7 @@ pub unsafe extern "C" fn zou_smgr_read(
     blk: u32,
     buf: *mut u8,
     durable_lsn: u64,
+    written_lsn: u64,
 ) -> i32 {
     with_shim(|shim| {
         if buf.is_null() {
@@ -884,7 +888,7 @@ pub unsafe extern "C" fn zou_smgr_read(
         // images before it. The v1 chain and pg/ cannot answer, eager
         // puts are elided so pg/ is stale for any block written since.
         if let Some(client) = &shim.pageserve {
-            match client.get_pages(spc, db, rel, fork, &[blk], durable_lsn) {
+            match client.get_pages(spc, db, rel, fork, &[blk], durable_lsn, written_lsn) {
                 Ok(pages) => {
                     out.copy_from_slice(&pages[0]);
                     if let Some(cache) = &shim.cache {
@@ -996,7 +1000,8 @@ fn lost(shim: &Shim, spc: u32, db: u32, rel: u32, fork: u32, blk: u32) -> bool {
 /// Read a run of `nblocks` pages starting at `blk` into `bufs`. Each
 /// page resolves like zou_smgr_read, buffered pages and the chain
 /// answer first, and whatever is left goes to pg/ as one batch of
-/// parallel gets.
+/// parallel gets. `written_lsn` covers the whole run, since the run is
+/// served together: it is the newest of its blocks' positions.
 ///
 /// # Safety
 /// `bufs` must point to `nblocks` valid pointers, each to
@@ -1011,6 +1016,7 @@ pub unsafe extern "C" fn zou_smgr_readv(
     bufs: *const *mut u8,
     nblocks: u32,
     durable_lsn: u64,
+    written_lsn: u64,
 ) -> i32 {
     with_shim(|shim| {
         if bufs.is_null() || nblocks == 0 {
@@ -1068,7 +1074,7 @@ pub unsafe extern "C" fn zou_smgr_readv(
         if let Some(client) = &shim.pageserve {
             if !misses.is_empty() {
                 let blks: Vec<u32> = misses.iter().map(|(_, b)| *b).collect();
-                match client.get_pages(spc, db, rel, fork, &blks, durable_lsn) {
+                match client.get_pages(spc, db, rel, fork, &blks, durable_lsn, written_lsn) {
                     Ok(pages) => {
                         for ((i, b), page) in misses.iter().zip(&pages) {
                             let out =
@@ -2971,7 +2977,7 @@ mod tests {
         let mut buf = [0u8; ZOU_PAGE_SIZE];
         for (blk, expect) in [(0u32, 1u8), (1, 0xAB), (2, 3)] {
             assert_eq!(
-                unsafe { zou_smgr_read(spc, db, rel, fork, blk, buf.as_mut_ptr(), 0) },
+                unsafe { zou_smgr_read(spc, db, rel, fork, blk, buf.as_mut_ptr(), 0, 0) },
                 ZOU_OK
             );
             assert!(buf.iter().all(|b| *b == expect), "block {blk}");
@@ -2985,7 +2991,7 @@ mod tests {
         );
         assert_eq!(n, 5);
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel, fork, 4, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel, fork, 4, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0));
@@ -3044,7 +3050,7 @@ mod tests {
         );
         assert_eq!(n, 1);
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel, fork, 0, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel, fork, 0, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 1));
@@ -3075,7 +3081,7 @@ mod tests {
         );
         assert_eq!(n, 4);
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel2, fork, 2, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel2, fork, 2, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0x42));
@@ -3094,7 +3100,7 @@ mod tests {
             ZOU_OK
         );
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel2, fork, 1, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel2, fork, 1, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0xEE));
@@ -3109,7 +3115,7 @@ mod tests {
         assert_eq!(n, 4);
         for (blk, expect) in [(0u32, 0x40u8), (1, 0xEE), (2, 0x42), (3, 0x43)] {
             assert_eq!(
-                unsafe { zou_smgr_read(spc, db, rel2, fork, blk, buf.as_mut_ptr(), 0) },
+                unsafe { zou_smgr_read(spc, db, rel2, fork, blk, buf.as_mut_ptr(), 0, 0) },
                 ZOU_OK
             );
             assert!(buf.iter().all(|b| *b == expect), "block {blk}");
@@ -3119,7 +3125,7 @@ mod tests {
         let mut out = [[0u8; ZOU_PAGE_SIZE]; 4];
         let mut outp: Vec<*mut u8> = out.iter_mut().map(|p| p.as_mut_ptr()).collect();
         assert_eq!(
-            unsafe { zou_smgr_readv(spc, db, rel2, fork, 0, outp.as_mut_ptr(), 4, 0) },
+            unsafe { zou_smgr_readv(spc, db, rel2, fork, 0, outp.as_mut_ptr(), 4, 0, 0) },
             ZOU_OK
         );
         for (blk, expect) in [(0usize, 0x40u8), (1, 0xEE), (2, 0x42), (3, 0x43)] {
@@ -3134,7 +3140,7 @@ mod tests {
         );
         for (blk, expect) in [(2u32, 0x50u8), (3, 0x51)] {
             assert_eq!(
-                unsafe { zou_smgr_read(spc, db, rel2, fork, blk, buf.as_mut_ptr(), 0) },
+                unsafe { zou_smgr_read(spc, db, rel2, fork, blk, buf.as_mut_ptr(), 0, 0) },
                 ZOU_OK
             );
             assert!(buf.iter().all(|b| *b == expect), "block {blk}");
@@ -3147,7 +3153,7 @@ mod tests {
             .delete(&shim.layout.pg_block(spc, db, rel2, fork, 2))
             .unwrap();
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel2, fork, 2, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel2, fork, 2, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK
         );
         assert!(
@@ -3159,7 +3165,7 @@ mod tests {
         // Unlink dropped the cached fork too, the read now zero fills
         // instead of resurrecting cached pages.
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel2, fork, 2, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel2, fork, 2, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0), "no cache after unlink");
@@ -3230,7 +3236,7 @@ mod tests {
         assert_eq!(zou_smgr_zeroextend(spc, db, rel4, fork, 1, 2, 0), ZOU_OK);
         for blk in [1u32, 2] {
             assert_eq!(
-                unsafe { zou_smgr_read(spc, db, rel4, fork, blk, buf.as_mut_ptr(), 0) },
+                unsafe { zou_smgr_read(spc, db, rel4, fork, blk, buf.as_mut_ptr(), 0, 0) },
                 ZOU_OK,
                 "block {blk} was extended and never written"
             );
@@ -3239,7 +3245,7 @@ mod tests {
         let mut out = [[0u8; ZOU_PAGE_SIZE]; 2];
         let mut outp: Vec<*mut u8> = out.iter_mut().map(|p| p.as_mut_ptr()).collect();
         assert_eq!(
-            unsafe { zou_smgr_readv(spc, db, rel4, fork, 1, outp.as_mut_ptr(), 2, 0) },
+            unsafe { zou_smgr_readv(spc, db, rel4, fork, 1, outp.as_mut_ptr(), 2, 0, 0) },
             ZOU_OK
         );
         assert!(out.iter().all(|p| p.iter().all(|b| *b == 0)));
@@ -3253,12 +3259,12 @@ mod tests {
         assert_eq!(fs.dense, 3);
         put_marker(shim, spc, db, rel4, fork, &fs).expect("the marker goes back");
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel4, fork, 2, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel4, fork, 2, buf.as_mut_ptr(), 0, 0) },
             ZOU_ERR_STORE,
             "a page below the watermark that no tier holds is gone"
         );
         assert_eq!(
-            unsafe { zou_smgr_readv(spc, db, rel4, fork, 1, outp.as_mut_ptr(), 2, 0) },
+            unsafe { zou_smgr_readv(spc, db, rel4, fork, 1, outp.as_mut_ptr(), 2, 0, 0) },
             ZOU_ERR_STORE,
             "and a run of them is refused as a run"
         );
@@ -3266,7 +3272,7 @@ mod tests {
         // of this. A refusal has to be about the block that is missing
         // and not about the fork.
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel4, fork, 0, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel4, fork, 0, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0x77));
@@ -3280,7 +3286,7 @@ mod tests {
         ahead.grow(5);
         put_marker(shim, spc, db, rel4, fork, &ahead).expect("the marker goes back");
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel4, fork, 4, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel4, fork, 4, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK
         );
         assert!(buf.iter().all(|b| *b == 0));
@@ -3291,7 +3297,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            unsafe { zou_smgr_read(spc, db, rel4, fork, 2, buf.as_mut_ptr(), 0) },
+            unsafe { zou_smgr_read(spc, db, rel4, fork, 2, buf.as_mut_ptr(), 0, 0) },
             ZOU_OK,
             "a store written before any of this is read the way it was"
         );

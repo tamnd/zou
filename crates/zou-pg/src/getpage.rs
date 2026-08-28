@@ -26,18 +26,15 @@
 //! not in redo. Every served page is restamped here, which is the
 //! caveat recorded back in the redo pool box.
 //!
-//! The last written lsn cache is the read your writes half. Serving a
-//! read at the newest WAL lsn would be correct but would make every
-//! read wait for ingest to catch up to writes that cannot possibly
-//! affect the block. [`LastWrittenLsn`] remembers, per block, the end
-//! lsn of the last record that touched it, so a read asks for exactly
-//! the lsn it needs: its own last write, or the cache's floor for a
-//! block with no tracked writes. The cache is bounded by generation
-//! rotation, and the floor absorbs the newest lsn of every dropped
-//! generation, so the answer never falls below a write it forgot.
+//! Read your writes is settled before a request gets here. A read
+//! names the lsn it needs and this code serves that lsn, no more: the
+//! per block position comes from the shim's own last written lsn table
+//! in shared memory, which is the only place that knows what a backend
+//! wrote back and when. Tracking the same thing again on this side out
+//! of the ingest stream would be a second answer built from less
+//! information, so there is one table and it lives next to the writes.
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 
 use zou_store::cas::CasStore;
 use zou_store::layer::LayerKey;
@@ -504,69 +501,6 @@ fn blame(at: u64, blocks: &[BlockRef], recons: &[Reconstruction]) -> String {
     format!("the batch read at {at:#x} of {}", said.join("; "))
 }
 
-/// The last written lsn per block, bounded. `note` on every ingested
-/// record, `read_lsn` to pick the lsn a GetPage should ask for.
-///
-/// Two generation rotation keeps it bounded without an lsn going
-/// missing: when the current generation fills, the previous one is
-/// dropped and its newest lsn folds into the floor, so a forgotten
-/// block reads at the floor, which is at or above its last write.
-/// Conservative in exactly one direction: a read may wait for more
-/// ingest than it strictly needed, never serve a page missing its own
-/// writes.
-pub struct LastWrittenLsn {
-    cap: usize,
-    floor: u64,
-    current: HashMap<BlockRef, u64>,
-    old: HashMap<BlockRef, u64>,
-}
-
-impl LastWrittenLsn {
-    /// `floor` is where tracking starts, the attach point: nothing is
-    /// known about older history, so untracked blocks read there.
-    pub fn new(cap: usize, floor: u64) -> Self {
-        LastWrittenLsn {
-            cap: cap.max(1),
-            floor,
-            current: HashMap::new(),
-            old: HashMap::new(),
-        }
-    }
-
-    /// Record that a WAL record ending at `end_lsn` touched `blk`.
-    pub fn note(&mut self, blk: BlockRef, end_lsn: u64) {
-        let slot = self.current.entry(blk).or_insert(0);
-        *slot = (*slot).max(end_lsn);
-        if self.current.len() >= self.cap {
-            if let Some(&max) = self.old.values().max() {
-                self.floor = self.floor.max(max);
-            }
-            self.old = std::mem::take(&mut self.current);
-        }
-    }
-
-    /// Every block a record touched, one call per ingested record.
-    pub fn note_record(&mut self, refs: &[BlockRef], end_lsn: u64) {
-        for &blk in refs {
-            self.note(blk, end_lsn);
-        }
-    }
-
-    /// The lsn a read of `blk` should ask for: its last tracked write,
-    /// or the floor when the cache never saw one.
-    pub fn read_lsn(&self, blk: &BlockRef) -> u64 {
-        self.current
-            .get(blk)
-            .or_else(|| self.old.get(blk))
-            .copied()
-            .unwrap_or(self.floor)
-    }
-
-    pub fn floor(&self) -> u64 {
-        self.floor
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,30 +901,6 @@ mod tests {
             matches!(err, GetPageError::BatchTooLarge { got } if got == 129),
             "{err}"
         );
-    }
-
-    #[test]
-    fn the_lw_cache_answers_read_your_writes_and_survives_rotation() {
-        let mut lw = LastWrittenLsn::new(4, 1000);
-        assert_eq!(lw.read_lsn(&blk(1, 1)), 1000, "untracked reads the floor");
-
-        lw.note(blk(1, 1), 1100);
-        lw.note(blk(1, 1), 1050);
-        assert_eq!(lw.read_lsn(&blk(1, 1)), 1100, "notes never move backwards");
-
-        // Push enough distinct blocks through to rotate twice.
-        for b in 2..12u32 {
-            lw.note(blk(1, b), 1000 + 100 * b as u64);
-        }
-        for b in 1..12u32 {
-            let want = if b == 1 { 1100 } else { 1000 + 100 * b as u64 };
-            assert!(
-                lw.read_lsn(&blk(1, b)) >= want,
-                "block {b} answered {} below its last write {want}",
-                lw.read_lsn(&blk(1, b))
-            );
-        }
-        assert!(lw.floor() >= 1100, "dropped generations raised the floor");
     }
 
     #[test]
