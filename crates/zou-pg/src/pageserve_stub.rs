@@ -24,6 +24,7 @@ impl PageClient {
         PageClient
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn get_pages(
         &self,
         _spc: u32,
@@ -32,6 +33,7 @@ impl PageClient {
         _fork: u32,
         _blks: &[u32],
         _lsn: u64,
+        _since: u64,
     ) -> Result<Vec<Vec<u8>>, String> {
         Err("the page service needs unix sockets".to_string())
     }
