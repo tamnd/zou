@@ -661,6 +661,7 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
             // client reconnects and resubscribes.
             Heard::Lagged(topic, missed) => {
                 log::warn!("realtime: a socket missed {missed} messages on {topic}, closing it");
+                crate::ops::socket_dropped("lagged");
                 break;
             }
             Heard::Changed(Some(Feed::Change {
@@ -680,11 +681,15 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
             // and reads the table, which is the only honest answer.
             Heard::Changed(Some(Feed::Gap)) => {
                 log::warn!("realtime: a socket missed database changes, closing it");
+                crate::ops::socket_dropped("gap");
                 break;
             }
             // The reader dropped this subscriber, which it does to one
             // that stopped reading rather than to one that is fine.
-            Heard::Changed(None) => break,
+            Heard::Changed(None) => {
+                crate::ops::socket_dropped("reader");
+                break;
+            }
         };
         if !act(
             &mut socket,
@@ -1182,7 +1187,7 @@ pub async fn broadcast(
 }
 
 async fn broadcasting(app: Arc<App>, auth: AuthContext, body: Bytes) -> Response {
-    let Ok(Value::Object(sent)) = serde_json::from_slice::<Value>(&body) else {
+    let Ok(Value::Object(sent)) = zou_json::from_slice(&body) else {
         return unprocessable(json!({"messages": ["is invalid"]}));
     };
     let Some(messages) = sent.get("messages") else {
@@ -1283,7 +1288,7 @@ async fn broadcasting_one(
         .unwrap_or_else(|| "application/json".into());
     let payload = match content_type.as_str() {
         "application/octet-stream" => (Encoding::Binary, body.to_vec()),
-        "application/json" | "" => match serde_json::from_slice::<Value>(&body) {
+        "application/json" | "" => match zou_json::from_slice(&body) {
             Ok(payload) => json_payload(&payload),
             Err(_) => return unprocessable(json!({"payload": ["is invalid"]})),
         },
@@ -1507,7 +1512,7 @@ enum Announced {
 
 /// Read one notification.
 fn announced(note: &str) -> Announced {
-    let Ok(Value::Object(note)) = serde_json::from_str::<Value>(note) else {
+    let Ok(Value::Object(note)) = zou_json::from_str(note) else {
         return Announced::Nothing;
     };
     if let Some(topic) = note.get("topic").and_then(Value::as_str) {

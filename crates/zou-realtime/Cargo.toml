@@ -12,8 +12,14 @@ log = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+zou-json = { path = "../zou-json" }
 
 [dev-dependencies]
+# The shipped binary has `raw_value` on, because `axum` turns it on,
+# and that is what makes a private key in a payload dangerous. Testing
+# this crate on its own resolves without it, so the round trip test
+# would pass on a build the bug cannot happen on.
+serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

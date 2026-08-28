@@ -37,6 +37,8 @@ Two numbers rather than one because they cost different things: a socket is a co
 On a fleet they do not add up to one machine's, and that is the honest shape rather than a rounding: a socket served away from the node holding its project is a socket there and a subscriber on the holder, because the row it may see is decided where the database is.
 `zou_realtime_socket_tiers` is the third of them and is counted per project rather than per socket: how many projects this node is serving sockets for and does not write, which is one hub and one link each and the same again on the holder.
 It goes down as well as up, so a node with a lot of projects moving through it reads as what it is holding now rather than as everything it has ever seen.
+`zou_realtime_sockets_dropped_total{reason}` is the other half of the sockets gauge: the gauge going down says people left, and this says the node sent them away because carrying on would have meant a client missing messages and not knowing it.
+`lagged` is a socket that fell further behind than its topic's backlog holds, which is either a client that stopped reading or a node fanning out faster than it can write, `gap` is the database change feed having lost its place, which is the reader's health rather than any socket's, and `reader` is the change reader letting a subscriber go.
 
 Store numbers come from the counter file `ZOU_STORE_STATS` names rather than from counters of this process, and a scrape folds that file in as it reads it.
 That is deliberate: the file is shared memory, so the ops a postgres backend made in another process are in it, and counting in process would count the ones this process can see and miss the rest.

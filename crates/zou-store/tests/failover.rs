@@ -193,23 +193,38 @@ fn a_clean_shutdown_hands_over_with_no_wait_at_all() {
         Arc::new(Mutex::new(held)),
         ttl(),
     );
+    // The takeover is asked to report what it would have slept rather
+    // than to sleep it. A clean handover has nothing to wait for, so
+    // the honest assertion is that it asked for none, and that is a
+    // sentence about the protocol. Timing the whole thing instead put
+    // a wall clock budget on a runner that is also running the four
+    // other tests in this binary, one of which sleeps out a TTL.
+    let asked = Mutex::new(Duration::ZERO);
+    let waiting = lease::Waiting {
+        now: &now_unix,
+        sleep: &|d| *asked.lock().expect("the recorder") += d,
+    };
     let stopped = Instant::now();
     hb.detach().expect("a clean release");
-    lease::takeover(
+    lease::takeover_with(
         &*store,
         &layout,
         "node-b",
         None,
         ttl(),
         Duration::from_secs(ttl() * 4),
+        &waiting,
     )
     .expect("nobody holds it");
     let rto = stopped.elapsed();
+    // Still printed, because what an operator reads is a duration.
     println!("failover rto after a clean detach: {} ms", rto.as_millis());
-    assert!(
-        rto < Duration::from_millis(500),
-        "a clean handover waited {} ms, which means it waited for something",
-        rto.as_millis()
+    let asked = *asked.lock().expect("the recorder");
+    assert_eq!(
+        asked,
+        Duration::ZERO,
+        "a clean handover asked to wait {} ms, which means it waited for something",
+        asked.as_millis()
     );
 }
 

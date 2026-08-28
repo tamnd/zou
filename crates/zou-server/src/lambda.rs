@@ -135,8 +135,8 @@ impl Api for Lambda {
             .limit(MAX_BODY as u64)
             .read_to_vec()
             .map_err(|e| format!("reading invocation {id}: {e}"))?;
-        let event = serde_json::from_slice(&body)
-            .map_err(|e| format!("invocation {id} is not json: {e}"))?;
+        let event =
+            zou_json::from_slice(&body).map_err(|e| format!("invocation {id} is not json: {e}"))?;
         Ok(Invocation { id, event })
     }
 

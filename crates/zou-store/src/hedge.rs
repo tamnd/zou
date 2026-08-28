@@ -14,9 +14,11 @@
 //! its version check would read the winner as a conflict, and reads
 //! have their own retry story in the backends. The delay tracks two
 //! times the median of recent winners, so the hedge fires on roughly
-//! the slowest tenth of PUTs and the extra request rate stays small.
-//! Every hedge is counted, so op counters and the cost simulation see
-//! the spend honestly.
+//! the slowest tenth of PUTs and the extra request rate stays small,
+//! and it never drops below what a second attempt costs to launch, so
+//! a store fast enough that a hedge cannot arrive in time does not pay
+//! for one. Every hedge is counted, so op counters and the cost
+//! simulation see the spend honestly.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,9 +37,23 @@ const WARMUP: usize = 16;
 /// delay follows the store through the day.
 const RING: usize = 128;
 
-/// The delay never drops below this, or a fast store would hedge
-/// almost every PUT for nothing.
-const MIN_DELAY: Duration = Duration::from_millis(1);
+/// The delay never drops below this.
+///
+/// It is not a latency budget, it is what a second attempt costs to
+/// arrive. Launching one is a thread and a scheduler round trip, and on
+/// a box with other work on it that is hundreds of microseconds at the
+/// median and milliseconds at the tail, measured on server2 at p50 106
+/// us and p90 2443 us over fifty samples. A floor under that hedges
+/// PUTs the second attempt cannot possibly beat, which is every PUT to
+/// a local store: it was a millisecond, and fifty inserts into a hash
+/// map paid up to fifteen hedges on a loaded box (#701).
+///
+/// So the floor says what the mechanism is for. An object store's p50
+/// PUT is tens of milliseconds and its tail is multiples of that, which
+/// is the curve a second request cuts. A store answering in under this
+/// has no tail worth a request, and duplicating its work would spend
+/// real PUTs, and real money on a real bucket, on the scheduler.
+const MIN_DELAY: Duration = Duration::from_millis(25);
 
 /// A store whose creation PUTs hedge their tail. Every other call
 /// passes straight through to the wrapped store.
@@ -138,13 +154,21 @@ impl CasStore for HedgedStore {
         let bytes: Arc<[u8]> = data.into();
         let key: Arc<str> = key.into();
         let (tx, rx) = mpsc::channel();
+        let (begun_tx, begun_rx) = mpsc::channel();
         let launch = || {
             let store = Arc::clone(&self.inner);
             let bytes = Arc::clone(&bytes);
             let key = Arc::clone(&key);
             let tx = tx.clone();
+            let begun = begun_tx.clone();
             thread::spawn(move || {
                 let start = Instant::now();
+                // The one number both sides of this use. The parent's
+                // patience is measured from here rather than from the
+                // spawn, and the winner it records is measured from
+                // here too, so the delay and the median it is derived
+                // from are the same clock.
+                let _ = begun.send(start);
                 let result = store.put_if_absent(&key, &bytes);
                 // The receiver may be gone because the other attempt
                 // already won; a loser's report has nowhere to go.
@@ -153,7 +177,14 @@ impl CasStore for HedgedStore {
         };
         launch();
 
-        let deadline = Instant::now() + delay;
+        // Waiting for the attempt to reach a core before starting the
+        // clock is the whole point. The delay floor is a millisecond
+        // and a thread on a busy box can sit unscheduled for several,
+        // so a deadline stamped in the caller spends its budget on the
+        // scheduler and then hedges a store that was never asked for
+        // anything. Every one of those is a second real PUT against a
+        // real bucket, counted as a hedge, which reads as a slow store.
+        let deadline = begun_rx.recv().unwrap_or_else(|_| Instant::now()) + delay;
         let mut outstanding = 1;
         let mut hedged = false;
         let mut fence = None;

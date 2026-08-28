@@ -102,16 +102,20 @@
 //! `fetch` is the client `zou-server` calls a database webhook with,
 //! behind an op, rather than a second HTTP stack linked in beside it.
 //!
-//! `npm:` and `jsr:` specifiers are fetched from a registry that serves
-//! packages as modules, esm.sh by default, and kept on disk after the
-//! first time. There is no node module resolution here and no CJS: what
-//! runs is the registry's build of the package. Which build that is
-//! depends on who the registry thinks is asking, and this asks as
-//! itself, which gets the build made for a browser: the corpus in
-//! `docs/functions.md` ran thirty two of forty functions that way and
-//! twenty five asking as Deno, and `fetch.rs` says what the seven are.
-//! That build still reaches for `node:buffer` and `node:process`, which
-//! is one of the reasons the built ins in `node/` are here.
+//! `npm:` and `jsr:` specifiers are resolved the way Deno resolves
+//! them, and what they resolve to is kept on disk after the first
+//! time. An `npm:` specifier is the tarball npm publishes, unpacked
+//! under the cache and resolved with node's own rules, commonjs and
+//! all, and a `jsr:` one is the files jsr publishes. `ZOU_NPM=registry`
+//! is the other answer and it was the default until 2026-08-28: both
+//! become urls on a registry that serves packages as modules, esm.sh
+//! by default, and what runs is that registry's build rather than the
+//! tarball. The corpus in `docs/functions.md` decided which of the two
+//! is the default, loading 26 of the 40 Supabase examples on the
+//! tarball against 25 on either build esm.sh serves, and `module.rs`
+//! says what the difference is made of.
+//! Either way a package reaches for `node:buffer` and `node:process`,
+//! which is one of the reasons the built ins in `node/` are here.
 //!
 //! Typescript is real: `deno_ast` is the same swc transpiler Deno uses,
 //! so what runs is what would run there.

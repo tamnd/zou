@@ -349,7 +349,10 @@ impl KeyLock {
             fs::create_dir_all(parent).map_err(|e| LocalFsStore::io(key, e))?;
         }
         let stale = stale_lock_age();
-        let deadline = Instant::now() + stale + Duration::from_secs(10);
+        let started = Instant::now();
+        let deadline = started + stale + Duration::from_secs(10);
+        let mut polls = 0u64;
+        let mut breaks = 0u64;
         loop {
             match fs::create_dir(&dir) {
                 Ok(()) => {
@@ -374,18 +377,30 @@ impl KeyLock {
                     // honoring it is a second of commit stall in a kill
                     // drill.
                     if lock_expired(&dir, stale) {
+                        breaks += 1;
                         break_stale_lock(&dir, stale);
-                        continue;
+                        // Both outcomes go round through the sleep
+                        // below. A break that worked leaves nothing to
+                        // wait for and losing 2 ms on it costs nothing,
+                        // and a break that failed is a lock this waiter
+                        // cannot remove, which retried without a sleep
+                        // is a hot spin that never reaches the deadline
+                        // check and so never gives up either.
                     }
                     if Instant::now() > deadline {
                         return Err(LocalFsStore::io(
                             key,
                             std::io::Error::new(
                                 std::io::ErrorKind::TimedOut,
-                                "gave up waiting for key lock",
+                                format!(
+                                    "gave up waiting for key lock after {:?}, {}",
+                                    started.elapsed(),
+                                    lock_report(&dir, polls, breaks)
+                                ),
                             ),
                         ));
                     }
+                    polls += 1;
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 Err(e) => return Err(LocalFsStore::io(key, e)),
@@ -528,6 +543,52 @@ fn break_stale_lock(dir: &Path, stale: Duration) {
     }
 }
 
+/// Whether the lock dir carries a stamp that is not this one, which is
+/// how a holder tells "my own release has not landed yet" from "a
+/// breaker handed this lock on and it is somebody else's now".
+fn lock_stamped_by_another(dir: &Path, mine: &str) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with("pid-") && name != mine
+    })
+}
+
+/// What a waiter could see about the lock it gave up on. A timeout that
+/// says nothing but timeout leaves the next one as hard to read as the
+/// last: a lock a live writer is inside, a lock standing with nobody
+/// inside it, and a name windows will not stat because a delete on it
+/// is still pending are three different bugs and they all print the
+/// same otherwise.
+fn lock_report(dir: &Path, polls: u64, breaks: u64) -> String {
+    let age = match fs::metadata(dir) {
+        Ok(meta) => match meta.modified().ok().and_then(|m| m.elapsed().ok()) {
+            Some(age) => format!("last touched {} ms ago", age.as_millis()),
+            None => "with no mtime this platform would give up".to_string(),
+        },
+        Err(e) => format!("that does not stat ({e})"),
+    };
+    let holders = match fs::read_dir(dir) {
+        Ok(entries) => {
+            let names: Vec<String> = entries
+                .flatten()
+                .take(4)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            if names.is_empty() {
+                "and carries no stamp".to_string()
+            } else {
+                format!("and carries {}", names.join(", "))
+            }
+        }
+        Err(e) => format!("and does not list ({e})"),
+    };
+    format!("{polls} polls and {breaks} break attempts against a lock dir {age} {holders}")
+}
+
 /// A tmp path no other writer of the same key can collide with, so even
 /// a lock protocol failure that lets two writers in cannot make one
 /// rename the other's half written bytes or fail on a vanished tmp. The
@@ -556,8 +617,30 @@ impl Drop for KeyLock {
         // the stamp name buys: before it, this line removed the thief's
         // stamp and the remove_dir below then deleted a lock somebody
         // else was inside.
-        let _ = fs::remove_file(self.dir.join(&self.stamp));
-        let _ = fs::remove_dir(&self.dir);
+        //
+        // The removal is retried for a moment because a delete is not
+        // final on windows until the last handle to the name closes,
+        // and a lock dir whose stamp is in that state is not empty yet,
+        // so the one shot version could return leaving the lock
+        // standing with nobody inside it. That is worse than a slow
+        // release: the key is then unwritable until some waiter sits
+        // out the whole stale age on it and breaks it. The window here
+        // is a hundredth of that age, and a stamp that is not ours ends
+        // it early because that lock is somebody else's.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let _ = fs::remove_file(self.dir.join(&self.stamp));
+            if fs::remove_dir(&self.dir).is_ok() {
+                return;
+            }
+            if lock_stamped_by_another(&self.dir, &self.stamp) || !self.dir.exists() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
 }
 
@@ -829,6 +912,77 @@ mod tests {
             thief.still_mine(),
             "the victim's release took the thief's lock with it"
         );
+    }
+
+    /// A release has to end with the lock gone even when the first
+    /// remove loses a race. On windows the thing it loses to is the
+    /// stamp, whose delete is pending until the last handle to the name
+    /// closes, so the dir is briefly not empty and remove_dir says so.
+    /// A release that gave up there would leave a lock nobody holds and
+    /// nobody can create, and every later writer of that key would sit
+    /// out the stale age before breaking it.
+    #[test]
+    fn a_release_that_cannot_remove_the_dir_yet_keeps_trying() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("slow");
+        let lock = path.with_extension("lock");
+        let held = KeyLock::acquire(&path, "slow").unwrap();
+
+        // Stands in for the pending delete: something in the dir that
+        // makes remove_dir fail and then goes away on its own.
+        let blocker = lock.join("not-a-stamp");
+        fs::File::create(&blocker).unwrap();
+        let clearer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            fs::remove_file(&blocker).unwrap();
+        });
+
+        drop(held);
+        clearer.join().unwrap();
+        assert!(!lock.exists(), "the release left the lock standing");
+    }
+
+    /// And it stops as soon as the lock is somebody else's, because a
+    /// stamp that is not ours means a breaker handed the key on while
+    /// this holder was still alive.
+    #[test]
+    fn a_release_leaves_a_lock_another_holder_stamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("taken");
+        let lock = path.with_extension("lock");
+        let held = KeyLock::acquire(&path, "taken").unwrap();
+        fs::File::create(lock.join("pid-1-999")).unwrap();
+
+        let started = Instant::now();
+        drop(held);
+        assert!(lock.exists(), "the release took a lock it no longer held");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the release waited on a lock that was not its own"
+        );
+        fs::remove_dir_all(&lock).unwrap();
+    }
+
+    /// What the give up says. The point of the message is that the next
+    /// windows flake arrives with the state that produced it, so the
+    /// three ways a wait can end are told apart from the log alone.
+    #[test]
+    fn the_give_up_message_carries_what_the_waiter_saw() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("wedged.lock");
+        fs::create_dir(&lock).unwrap();
+        fs::File::create(lock.join("pid-1-7")).unwrap();
+        let report = lock_report(&lock, 35, 2);
+        assert!(report.contains("35 polls"), "{report}");
+        assert!(report.contains("2 break attempts"), "{report}");
+        assert!(report.contains("last touched"), "{report}");
+        assert!(report.contains("pid-1-7"), "{report}");
+
+        // And a lock dir that is not there at all, which is the shape
+        // windows reports for a name whose delete is still pending.
+        fs::remove_dir_all(&lock).unwrap();
+        let report = lock_report(&lock, 1, 0);
+        assert!(report.contains("does not stat"), "{report}");
     }
 
     #[test]

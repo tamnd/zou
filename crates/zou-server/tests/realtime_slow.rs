@@ -35,7 +35,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpSocket};
+use tokio::net::TcpSocket;
 use tokio_tungstenite::tungstenite::Message;
 use zou_server::{Config, jwt, router};
 
@@ -54,6 +54,24 @@ const PAYLOAD: usize = 4096;
 const SENT: usize = 600;
 
 async fn serving() -> SocketAddr {
+    serving_with(None).await
+}
+
+/// A server, optionally with its own send buffer held down.
+///
+/// `None` is an ordinary node, which is what every test here wants
+/// except the one that has to make the hub decide something. That one
+/// pins both ends: pinning only the client's receive buffer measures
+/// the host, because a box whose default write buffer is a few
+/// megabytes holds everything a stuck socket has not read between the
+/// two kernels, the hub is never asked to hold anything, and a test
+/// that meant to watch its backlog policy watches `tcp_wmem` instead.
+///
+/// It goes on the listener because that is what an accepted connection
+/// inherits, and it is not the default here because a small write
+/// buffer is a slow socket for everybody: the tests about a fast
+/// reader beside a stuck one need the fast one to actually be fast.
+async fn serving_with(send_buffer: Option<u32>) -> SocketAddr {
     let app = router(Config {
         jwt_secret: SECRET.to_vec(),
         // The default budget is a hundred messages a second over a
@@ -67,12 +85,35 @@ async fn serving() -> SocketAddr {
         ..Config::default()
     })
     .expect("router builds");
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let socket = TcpSocket::new_v4().expect("a tcp socket");
+    if let Some(bytes) = send_buffer {
+        socket
+            .set_send_buffer_size(bytes)
+            .expect("a send buffer of our own choosing");
+    }
+    socket
+        .bind("127.0.0.1:0".parse().expect("a local address"))
+        .expect("a port");
+    let listener = socket.listen(1024).expect("a listener");
     let at = listener.local_addr().expect("the port");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
     at
+}
+
+/// How many sockets this node has closed for one reason, read off the
+/// scrape the way an operator would. The registry is process wide and
+/// the tests in this file share it, so what a test asserts on is the
+/// difference across its own run rather than the total.
+fn dropped(reason: &str) -> u64 {
+    let want = format!("zou_realtime_sockets_dropped_total{{reason=\"{reason}\"}} ");
+    zou_ops::metrics::registry()
+        .render()
+        .lines()
+        .find_map(|line| line.strip_prefix(&want))
+        .and_then(|n| n.trim().parse::<u64>().ok())
+        .unwrap_or_default()
 }
 
 fn anon_key() -> String {
@@ -268,7 +309,8 @@ async fn a_socket_that_stopped_reading_does_not_hold_up_the_one_beside_it() {
 /// once frames have been dropped, and the close is how it is told to.
 #[tokio::test]
 async fn a_socket_that_fell_behind_reads_a_prefix_and_then_a_close() {
-    let at = serving().await;
+    let at = serving_with(Some(2048)).await;
+    let dropped_before = dropped("lagged");
 
     let mut stuck = connect(at, Some(2048)).await;
     join(&mut stuck).await;
@@ -303,6 +345,16 @@ async fn a_socket_that_fell_behind_reads_a_prefix_and_then_a_close() {
     assert!(
         ended,
         "the stuck socket read all {SENT} and was never closed, so it never fell behind and this test is not testing anything"
+    );
+    // And the hub said so where an operator can see it. The registry is
+    // process wide and the other tests in this file drop sockets too,
+    // so this is not a claim about which socket was dropped, it is the
+    // wiring: every lag close goes through the one line that counts,
+    // and a node that stopped counting them would leave an operator
+    // watching a flat graph while clients were being sent away.
+    assert!(
+        dropped("lagged") > dropped_before,
+        "sockets were closed for falling behind and the node counted none of it"
     );
     assert!(
         seen < SENT,

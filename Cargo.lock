@@ -5483,6 +5483,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zou-json"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "zou-log"
 version = "0.0.1"
 dependencies = [
@@ -5546,6 +5554,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "zou-json",
 ]
 
 [[package]]
@@ -5589,6 +5598,7 @@ dependencies = [
  "webp",
  "webpki-roots 1.0.9",
  "zou-functions",
+ "zou-json",
  "zou-ops",
  "zou-realtime",
  "zou-rest",
