@@ -114,18 +114,6 @@ measure() {
 	rm -rf "$pgdata" "$sock" "$store" "$stats"
 	mkdir -p "$sock"
 
-	# The same settings all three ways, which is what makes the legs
-	# comparable: the question is where the time goes, not which leg
-	# was tuned. 6GB of shared buffers is what `zou dev` gives a 23GB
-	# box, which is where the numbers being requoted came from.
-	"$prefix"/bin/initdb -D "$pgdata" \
-		--set io_method=sync \
-		--set full_page_writes=off \
-		--set max_wal_size=1GB \
-		--set wal_level=logical \
-		--set shared_buffers=6GB \
-		--set fsync=on >"$WORK/initdb-$tag.log" 2>&1
-
 	unset ZOU_TARGET ZOU_TENANT ZOU_PAGESERVE ZOU_STORE_STATS 2>/dev/null || true
 	if [ "$leg" != pg ]; then
 		if [ "$leg" = fs ]; then
@@ -137,21 +125,50 @@ measure() {
 			# from.
 			target=$S3/$tag
 		fi
-		redo=$("$prefix"/bin/pg_controldata -D "$pgdata" |
-			awk '/REDO location/ {print $NF}')
-		"$prefix"/zou-bootstrap "$target" "$pgdata" --redo "$redo" \
-			>"$WORK/bootstrap-$tag.log" 2>&1
 		ZOU_TARGET=$target
 		ZOU_TENANT=local
 		# No page service: the object write path is what is under
 		# test, and reading through the service changes what the
-		# extension path costs.
+		# extension path costs. initdb has nothing to read through
+		# either way, it is one process on its own.
 		ZOU_PAGESERVE=0
-		ZOU_STORE_STATS=$stats
-		export ZOU_TARGET ZOU_TENANT ZOU_PAGESERVE ZOU_STORE_STATS
+		export ZOU_TARGET ZOU_TENANT ZOU_PAGESERVE
 	fi
 	# Vanilla is the same binary with nothing to point the shim at, so
 	# postgres writes its own files and the store is out of it.
+
+	# The same settings all three ways, which is what makes the legs
+	# comparable: the question is where the time goes, not which leg
+	# was tuned. 6GB of shared buffers is what `zou dev` gives a 23GB
+	# box, which is where the numbers being requoted came from.
+	#
+	# On a store leg this runs through the storage manager, with the
+	# environment above already set, because the genesis capture below
+	# does not upload relation pages: it uploads the rest of the data
+	# directory and takes the pages being there as given. A plain
+	# initdb and then a capture leaves a store with a skeleton and no
+	# relations in it, and the postmaster starts and the first backend
+	# to want pg_authid gets `zou smgr nblocks failed with -1 on rel
+	# 1260`, which is what every fs and s3 leg did until this line
+	# moved below the export.
+	"$prefix"/bin/initdb -D "$pgdata" \
+		--set io_method=sync \
+		--set full_page_writes=off \
+		--set max_wal_size=1GB \
+		--set wal_level=logical \
+		--set shared_buffers=6GB \
+		--set fsync=on >"$WORK/initdb-$tag.log" 2>&1
+
+	if [ "$leg" != pg ]; then
+		redo=$("$prefix"/bin/pg_controldata -D "$pgdata" |
+			awk '/REDO location/ {print $NF}')
+		"$prefix"/zou-bootstrap "$target" "$pgdata" --redo "$redo" \
+			>"$WORK/bootstrap-$tag.log" 2>&1
+		# Counted from here, so what the stats say is the measurement
+		# and not the cluster being made.
+		ZOU_STORE_STATS=$stats
+		export ZOU_STORE_STATS
+	fi
 
 	"$prefix"/bin/pg_ctl -D "$pgdata" -l "$log" \
 		-o "-p $PORT -k $sock -c listen_addresses=''" -w -t 300 start >/dev/null
