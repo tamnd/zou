@@ -622,6 +622,30 @@ pub fn socket_left() {
     sockets().dec();
 }
 
+/// A socket this node closed because carrying on with it would have
+/// meant a client missing messages and not knowing it.
+///
+/// Three reasons and they are worth telling apart. `lagged` is a socket
+/// that fell further behind than the topic's backlog holds, which says
+/// the client stopped reading or the node is fanning out faster than it
+/// can write. `gap` is the database change feed having lost its place,
+/// which is the reader's health rather than the socket's. `reader` is
+/// the change reader letting a subscriber go, which it does to one that
+/// stopped consuming.
+///
+/// This is the count an operator watches after a fan out change: the
+/// sockets gauge going down says people left, and this says the node
+/// sent them away.
+pub fn socket_dropped(reason: &'static str) {
+    registry()
+        .counter(
+            "zou_realtime_sockets_dropped_total",
+            "realtime sockets this node closed rather than carry on with a client that would be missing messages",
+            &[("reason", reason)],
+        )
+        .inc();
+}
+
 fn sockets() -> zou_ops::Gauge {
     registry().gauge(
         "zou_realtime_sockets",

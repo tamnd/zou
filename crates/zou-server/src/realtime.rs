@@ -661,6 +661,7 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
             // client reconnects and resubscribes.
             Heard::Lagged(topic, missed) => {
                 log::warn!("realtime: a socket missed {missed} messages on {topic}, closing it");
+                crate::ops::socket_dropped("lagged");
                 break;
             }
             Heard::Changed(Some(Feed::Change {
@@ -680,11 +681,15 @@ async fn run(mut socket: WebSocket, mut session: Session, app: &Arc<App>, tokens
             // and reads the table, which is the only honest answer.
             Heard::Changed(Some(Feed::Gap)) => {
                 log::warn!("realtime: a socket missed database changes, closing it");
+                crate::ops::socket_dropped("gap");
                 break;
             }
             // The reader dropped this subscriber, which it does to one
             // that stopped reading rather than to one that is fine.
-            Heard::Changed(None) => break,
+            Heard::Changed(None) => {
+                crate::ops::socket_dropped("reader");
+                break;
+            }
         };
         if !act(
             &mut socket,
