@@ -25,7 +25,9 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,9 +44,18 @@ pub(crate) const TEMPLATE: &str = "template";
 /// Written last, and the only thing that makes a directory a template.
 const READY: &str = "ready";
 
-/// How long a build somebody else is doing gets before it is assumed to
-/// have died with its lock still held.
+/// How long a lock goes without a sign of life before the build behind
+/// it is assumed to have died holding it.
+///
+/// This is a timeout on silence, not on the build. A build takes as
+/// long as the machine makes it take, and on a loaded one that is much
+/// longer than this: six minutes at load 11 and over sixteen at load
+/// 28 on the same box.
 const BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How often a builder says it is still there, well inside
+/// [`BUILD_TIMEOUT`] so that a live lock is never near looking dead.
+const HEARTBEAT: Duration = Duration::from_secs(5);
 
 /// Where templates live, unless the caller says otherwise.
 ///
@@ -112,7 +123,8 @@ pub(crate) fn ensure(pg_bin: &Path) -> Result<PathBuf, Error> {
     fs::create_dir_all(&root).map_err(io(format!("create {}", root.display())))?;
 
     let lock = dir.with_extension("lock");
-    let deadline = Instant::now() + BUILD_TIMEOUT;
+    let mut heard = beat(&lock);
+    let mut deadline = Instant::now() + BUILD_TIMEOUT;
     loop {
         match fs::OpenOptions::new()
             .write(true)
@@ -120,7 +132,9 @@ pub(crate) fn ensure(pg_bin: &Path) -> Result<PathBuf, Error> {
             .open(&lock)
         {
             Ok(_) => {
+                let alive = Alive::holding(&lock);
                 let built = build(pg_bin, &dir);
+                drop(alive);
                 let _ = fs::remove_file(&lock);
                 built?;
                 return Ok(scratch(dir.join("store")));
@@ -128,9 +142,19 @@ pub(crate) fn ensure(pg_bin: &Path) -> Result<PathBuf, Error> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 // Somebody else is building it, or somebody else died
                 // building it. Both look the same from here, and the
-                // difference is how old the lock is.
+                // difference is whether the lock is still being
+                // touched.
                 if dir.join(READY).is_file() {
                     return Ok(scratch(dir.join("store")));
+                }
+                let now = beat(&lock);
+                if now != heard {
+                    // A build that is getting on with it, however
+                    // slowly, is one to keep waiting for. Waiting is
+                    // bounded by the holder going quiet rather than by
+                    // how long the build takes (zou #718).
+                    heard = now;
+                    deadline = Instant::now() + BUILD_TIMEOUT;
                 }
                 if stale(&lock) {
                     let _ = fs::remove_file(&lock);
@@ -140,7 +164,7 @@ pub(crate) fn ensure(pg_bin: &Path) -> Result<PathBuf, Error> {
                     return Err(Error::new(
                         Kind::Io,
                         format!(
-                            "waited {}s for the template at {} and it never appeared",
+                            "waited {}s for the template at {} and whoever holds the lock said nothing in all that time",
                             BUILD_TIMEOUT.as_secs(),
                             dir.display()
                         ),
@@ -149,6 +173,66 @@ pub(crate) fn ensure(pg_bin: &Path) -> Result<PathBuf, Error> {
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(e) => return Err(io(format!("lock {}", lock.display()))(e)),
+        }
+    }
+}
+
+/// Touches the lock until it is dropped, so that the age of the lock is
+/// the age of the last sign of life rather than the age of the build.
+///
+/// Without this the mtime is written once, when the lock is created,
+/// and a build slower than [`BUILD_TIMEOUT`] has its own lock declared
+/// dead and removed by the next thread in. That thread then builds
+/// into the same directory as the first one, which is still using it
+/// (zou #718). A loaded machine is exactly where builds get that slow
+/// and exactly where two of them at once hurts most.
+struct Alive {
+    quiet: Arc<AtomicBool>,
+    beating: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Alive {
+    fn holding(lock: &Path) -> Alive {
+        Alive::every(lock, HEARTBEAT)
+    }
+
+    fn every(lock: &Path, interval: Duration) -> Alive {
+        let quiet = Arc::new(AtomicBool::new(false));
+        let done = Arc::clone(&quiet);
+        let lock = lock.to_path_buf();
+        let beating = std::thread::Builder::new()
+            .name("zou-template-lock".to_string())
+            .spawn(move || {
+                let mut last = Instant::now();
+                while !done.load(Ordering::Relaxed) {
+                    // Slept in slices so that dropping the guard is not
+                    // a wait for the next beat.
+                    std::thread::sleep(Duration::from_millis(50).min(interval));
+                    if last.elapsed() < interval {
+                        continue;
+                    }
+                    last = Instant::now();
+                    // A write, because the standard library has no
+                    // utimes, and never a create: once the lock is
+                    // gone it belongs to whoever takes it next. What
+                    // goes in the file is nothing. When it was last
+                    // written is the whole point.
+                    let _ = fs::OpenOptions::new()
+                        .write(true)
+                        .open(&lock)
+                        .and_then(|mut f| f.write_all(b"."));
+                }
+            })
+            .ok();
+        Alive { quiet, beating }
+    }
+}
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        self.quiet.store(true, Ordering::Relaxed);
+        if let Some(beating) = self.beating.take() {
+            let _ = beating.join();
         }
     }
 }
@@ -177,19 +261,37 @@ fn scratch(store: PathBuf) -> PathBuf {
     store
 }
 
-/// A lock older than a build could plausibly be is a lock over a build
-/// that died.
+/// When the holder of a lock last said it was still there, which is
+/// when the lock was made if it has said nothing since.
+fn beat(lock: &Path) -> Option<SystemTime> {
+    fs::metadata(lock).ok()?.modified().ok()
+}
+
+/// A lock nobody has touched for longer than a live builder ever goes
+/// quiet is a lock over a build that died.
 fn stale(lock: &Path) -> bool {
-    let Ok(meta) = fs::metadata(lock) else {
+    let Some(last) = beat(lock) else {
         return false;
     };
-    let Ok(modified) = meta.modified() else {
-        return false;
-    };
-    match SystemTime::now().duration_since(modified) {
-        Ok(age) => age > BUILD_TIMEOUT,
+    match SystemTime::now().duration_since(last) {
+        Ok(silence) => silence > BUILD_TIMEOUT,
         Err(_) => false,
     }
+}
+
+/// Where one attempt at a build assembles a template before it is
+/// published, which is nobody else's directory.
+///
+/// The pid alone was not enough: two threads of one process can both
+/// be building, which is the case the lock is meant to exclude and did
+/// not (zou #718), and the second one begins by removing the first
+/// one's work. A leftover from a dead process with the same pid is
+/// still removed on the way in, since the build starts by clearing the
+/// directory it is given.
+fn building_dir(dir: &Path) -> PathBuf {
+    static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    let attempt = ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    dir.with_extension(format!("building-{}-{attempt}", std::process::id()))
 }
 
 /// initdb once, write until a fold packs a full capture down, and only
@@ -201,7 +303,7 @@ fn build(pg_bin: &Path, dir: &Path) -> Result<(), Error> {
     // Built beside the final name and moved into place, so a build that
     // dies leaves rubbish rather than a template that is half a
     // database.
-    let building = dir.with_extension(format!("building-{}", std::process::id()));
+    let building = building_dir(dir);
     let _ = fs::remove_dir_all(&building);
     let store = building.join("store");
     let pgdata = building.join("pgdata");
@@ -625,6 +727,63 @@ mod tests {
         let e = identity(Path::new("/nowhere/at/all")).expect_err("there is no postgres there");
         assert_eq!(e.kind, Kind::Io);
         assert!(e.message.contains("/nowhere/at/all"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_lock_says_it_is_still_there_for_as_long_as_the_build_holds_it() {
+        let dir = std::env::temp_dir().join(format!("zou-template-beat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+        let lock = dir.join("template.lock");
+        fs::write(&lock, b"").expect("take the lock");
+        let made = beat(&lock).expect("a lock has an mtime");
+
+        let held = Alive::every(&lock, Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(300));
+        let during = beat(&lock).expect("still there");
+        assert!(
+            during > made,
+            "a build that is still going keeps saying so, so age stays small however long it takes"
+        );
+
+        drop(held);
+        let last = beat(&lock).expect("still there");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            beat(&lock),
+            Some(last),
+            "and once the build is done the lock goes quiet, so a dead one does look dead"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_heartbeat_does_not_bring_back_a_lock_somebody_else_now_holds() {
+        let dir = std::env::temp_dir().join(format!("zou-template-gone-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch");
+        let lock = dir.join("template.lock");
+        fs::write(&lock, b"").expect("take the lock");
+
+        let held = Alive::every(&lock, Duration::from_millis(20));
+        fs::remove_file(&lock).expect("release it");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !lock.exists(),
+            "the lock is whoever takes it next, not this"
+        );
+        drop(held);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn two_builds_at_once_do_not_assemble_the_template_in_one_directory() {
+        let dir = Path::new("/tmp/zou-templates/pg-0123456789abcdef");
+        assert_ne!(
+            building_dir(dir),
+            building_dir(dir),
+            "the second builder clears the directory it is given before it starts"
+        );
     }
 
     #[test]
