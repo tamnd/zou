@@ -6,9 +6,21 @@
 //! the pusher only starts once recovery finishes; instead it polls the
 //! durable WAL stream out of the store through [`catch_up_resuming`],
 //! which reads the same bytes the tee would have carried, just a poll
-//! interval later. That read is cursored and time sliced, because one
-//! thread does ingest and reads both: a poll that walks the whole tail
-//! is a read stall for everything queued behind it.
+//! interval later. That read is cursored and time sliced, because the
+//! driver owns ingest and the dispatch of every read: a poll that
+//! walks the whole tail is a read stall for everything queued behind
+//! it.
+//!
+//! Doing the read is somebody else's job. Serving one is a layer
+//! fetch and a redo, hundreds of microseconds at the median and
+//! milliseconds at the tail, and a driver that does them one after
+//! another is a queue rather than a service: at a few thousand reads a
+//! second that one thread is the p99 (zou #671). So a request found
+//! covered goes to a small pool instead, carrying the map it plans
+//! against and the records above that map for the keys it names, both
+//! taken here. Because the drain and the map reload a flush does also
+//! happen here, no read is ever handed the moment between them, where
+//! the records are in neither.
 //!
 //! Serving follows the reconstruction rule set: published layers and
 //! the live memtable carry every record since the anchor, and blocks
@@ -36,10 +48,12 @@
 //! then time out and read as errors at the smgr, loud and safe: with
 //! eager page puts elided there is no stale fallback worth serving.
 
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
@@ -461,6 +475,11 @@ pub struct ServerConfig {
     pub socket: PathBuf,
     pub data_checksums: bool,
     pub redo: Option<RedoPoolConfig>,
+    /// Threads that serve reads, `None` for whatever
+    /// `ZOU_PAGESERVE_READERS` says. A caller names it so a test can
+    /// run both shapes without an environment variable two tests on
+    /// two threads would share.
+    pub readers: Option<usize>,
 }
 
 pub struct PageServer {
@@ -777,10 +796,182 @@ fn covered(lsn: u64, since: u64, seen: u64, durable_seen: u64, probed: bool) -> 
     }
 }
 
-/// The driver: one thread that owns ingest and serves reads, so the
+/// The layer map as a reader sees it.
+///
+/// The driver is the only writer and it writes between reads rather
+/// than during one, so what a reader needs is a pointer it can copy
+/// and hold for as long as its read takes. A mutex around an `Arc` is
+/// that: the lock is held for a clone, and the map a reader is working
+/// from stays alive under it however many times the driver replaces
+/// the published one.
+type Published = Mutex<Arc<LayerMap>>;
+
+/// The current map, for a caller that is about to read from it.
+fn published(map: &Published) -> Arc<LayerMap> {
+    Arc::clone(&map.lock().expect("the published map"))
+}
+
+/// How many threads serve reads, `ZOU_PAGESERVE_READERS`.
+///
+/// Zero is the old shape, where the driver serves each ready request
+/// itself before it looks at the channel again. That is what the A/B
+/// on this is: one binary, one flag.
+fn reader_threads() -> usize {
+    zou_store::setting::number_or("ZOU_PAGESERVE_READERS", "a whole number of threads", 4usize)
+}
+
+/// One read on its way to a reader thread.
+///
+/// Everything it needs was taken on the driver thread at the moment
+/// the request was found covered: the map it plans against, and the
+/// records above that map for the keys it names. So a job carries the
+/// view the driver had, and that view stays true however far ingest
+/// moves on afterwards, because a record is written once at one lsn
+/// and a published layer is never rewritten in place.
+///
+/// A flush landing between the take and the read is therefore not a
+/// hole. The records this job holds are drained into a layer the map
+/// it holds does not name, so it reads them out of the memtable
+/// subset; a reader that goes on to reload the map for a retired
+/// layer may then see the same records twice, once out of the new
+/// layer and once out of the subset, and both times at the same lsn,
+/// which [`zou_store::pageread::LayerReader::reconstruct`] merges on.
+struct Job {
+    req: GetReq,
+    map: Arc<LayerMap>,
+    mem: Memtable,
+    at: u64,
+    queued: Instant,
+}
+
+/// The readers' inbox: one queue for the pool rather than a channel
+/// each, because a read is anything from a hundred microseconds to a
+/// few milliseconds and round robin puts a long one in front of the
+/// short one behind it.
+struct Inbox {
+    /// `None` once the driver has closed it, which is how a reader
+    /// blocked on the condvar learns there is nothing more coming.
+    jobs: Mutex<Option<VecDeque<Job>>>,
+    waiting: Condvar,
+}
+
+impl Inbox {
+    fn new() -> Inbox {
+        Inbox {
+            jobs: Mutex::new(Some(VecDeque::new())),
+            waiting: Condvar::new(),
+        }
+    }
+
+    fn push(&self, job: Job) {
+        let mut jobs = self.jobs.lock().expect("the inbox");
+        match jobs.as_mut() {
+            Some(queue) => queue.push_back(job),
+            // Closed, which only happens on the way out. Answer it
+            // here rather than dropping it, so the client reading the
+            // socket gets an error instead of a hang up.
+            None => {
+                let _ = job.req.reply.send(Err("page service stopping".to_string()));
+                return;
+            }
+        }
+        drop(jobs);
+        self.waiting.notify_one();
+    }
+
+    /// The next read, waiting for one, or `None` once the inbox is
+    /// closed and drained.
+    fn take(&self) -> Option<Job> {
+        let mut jobs = self.jobs.lock().expect("the inbox");
+        loop {
+            match jobs.as_mut()?.pop_front() {
+                Some(job) => return Some(job),
+                None => jobs = self.waiting.wait(jobs).expect("the inbox"),
+            }
+        }
+    }
+
+    /// Stop the readers, answering whatever is still in hand.
+    fn close(&self) {
+        let left = self.jobs.lock().expect("the inbox").take();
+        self.waiting.notify_all();
+        for job in left.into_iter().flatten() {
+            let _ = job.req.reply.send(Err("page service stopping".to_string()));
+        }
+    }
+}
+
+/// Closes the inbox on the way out of the driver, whichever way the
+/// driver leaves. Readers are scoped threads and the scope joins them,
+/// so a driver that returned without closing would hang there.
+struct CloseOnDrop<'a>(&'a Inbox);
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+/// One reader thread: take a read, do it, reply, take the next.
+fn read_loop(
+    inbox: &Inbox,
+    service: &PageService,
+    store: &dyn CasStore,
+    layout: &TenantLayout,
+    published_map: &Published,
+) {
+    while let Some(job) = inbox.take() {
+        // How long the handover took, which is the pool being too
+        // small for the offered rate when reads are slow and no one
+        // read is.
+        note_phase(Phase::Queue, job.queued.elapsed());
+        let ran = Instant::now();
+        serve_reloading(
+            service,
+            store,
+            layout,
+            published_map,
+            &job.map,
+            &job.mem,
+            &job.req,
+            job.at,
+        );
+        note_phase(Phase::Read, ran.elapsed());
+    }
+}
+
+/// The keys one request names, which is what its reader needs out of
+/// the memtable and all it needs.
+fn keys_of(req: &GetReq) -> Vec<LayerKey> {
+    match &req.want {
+        Want::Pages(blks) => blks
+            .iter()
+            .map(|&blk| LayerKey::page(req.spc, req.db, req.rel, req.fork as u8, blk))
+            .collect(),
+        Want::Size => vec![
+            crate::relsize::ForkRef {
+                spc: req.spc,
+                db: req.db,
+                rel: req.rel,
+                fork: req.fork as u8,
+            }
+            .key(),
+        ],
+    }
+}
+
+/// The driver: one thread that owns ingest and hands reads out, so the
 /// memtable never needs a lock. Ingest polls the store, requests
 /// arrive over the channel, and a request whose lsn is not covered
 /// yet waits in `parked` until ingest advances or its deadline hits.
+///
+/// A covered request is dispatched to the reader pool rather than
+/// served here, because serving it is a layer fetch and a redo and the
+/// driver owes the next request its dispatch. Dispatching from this
+/// thread is what makes that safe for free: the drain and the map
+/// reload a flush does both happen here too, so no reader is ever
+/// handed the moment in between, where the records are in neither
+/// (zou #671).
 fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> Result<(), String> {
     let store = Arc::clone(&cfg.store);
     let media = WalMedia::single(crate::log_store(Arc::clone(&store), &cfg.layout));
@@ -790,7 +981,9 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
 
     let ingest_cfg = ingest_config(cfg.tenant);
     let mut ingest: Option<ShardIngest> = None;
-    let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
+    let map: Published = Mutex::new(Arc::new(
+        LayerMap::new(Vec::new()).expect("an empty map builds"),
+    ));
     let mut durable_seen: u64 = 0;
     let mut frozen: Option<String> = None;
     let mut parked: Vec<GetReq> = Vec::new();
@@ -819,7 +1012,8 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
 
     match PageShardManifest::load(&*store, &cfg.layout.shard_manifest(0)) {
         Ok(Some((manifest, _))) => {
-            map = manifest.layer_map().map_err(|e| e.to_string())?;
+            *map.lock().expect("the published map") =
+                Arc::new(manifest.layer_map().map_err(|e| e.to_string())?);
             let at = manifest.disk_consistent_lsn.0;
             log::info!("zou pageserve: anchored at {at:#x} from the shard manifest");
             ingest = Some(ShardIngest::new(ingest_cfg.clone(), at));
@@ -852,176 +1046,221 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     let service = page_service(&*store, &cfg.layout, pool.as_deref(), cfg.data_checksums);
     let mut footers_held = 0;
 
-    loop {
-        // A poll that stopped on its slice has more waiting, so go
-        // straight back to it after the readers have had their turn
-        // rather than idling out the rest of the cadence. A reader
-        // waiting on an lsn holds the cadence down; only a service
-        // with nobody waiting and nothing arriving relaxes it.
-        let due = if parked.is_empty() {
-            cadence
-        } else {
-            parked_cadence
-        };
-        if frozen.is_none() && (behind || last_poll.elapsed() >= due) {
-            let was = (ingest.as_ref().map_or(0, ShardIngest::seen), durable_seen);
-            last_poll = Instant::now();
-            let polled = Instant::now();
-            let outcome = poll_ingest(
-                &store,
-                &cfg.layout,
-                &media,
-                &filter,
-                &ingest_cfg,
-                &mut ingest,
-                &mut map,
-                &mut durable_seen,
-                &mut cursor,
-                &mut progress,
-                polled + INGEST_SLICE,
-            );
-            // The serve loop is one thread, so this poll is latency
-            // every request behind it pays. Sample it whether or not
-            // there was anything to apply.
-            note_phase(Phase::Ingest, polled.elapsed());
-            progress.report(
-                ingest.as_ref().map_or(0, ShardIngest::applied),
-                ingest.as_ref().map_or(0, ShardIngest::seen),
-                durable_seen,
-                &cursor,
-            );
-            let moved = (ingest.as_ref().map_or(0, ShardIngest::seen), durable_seen) != was;
-            match outcome {
-                Ok(caught_up) => {
-                    behind = !caught_up;
-                    probed |= caught_up;
-                }
-                Err(e) => {
-                    // A hole in the stream would poison every later
-                    // delta; freeze and let waits fail loudly instead.
-                    log::error!("zou pageserve: ingest frozen: {e}");
-                    frozen = Some(e);
-                }
-            }
-            cadence = relax(cadence, moved || behind);
-            parked_cadence = relax_parked(parked_cadence, moved || behind);
+    // The readers, and the inbox the driver hands them work on.
+    // They are scoped rather than detached because everything they
+    // read through is borrowed from this frame: the service and its
+    // footer cache, the store behind it, and the published map.
+    let inbox = Inbox::new();
+    let readers = cfg.readers.unwrap_or_else(reader_threads);
+    std::thread::scope(|scope| {
+        let _close = CloseOnDrop(&inbox);
+        for i in 0..readers {
+            let (inbox, service, store, layout, map) =
+                (&inbox, &service, &*store, &cfg.layout, &map);
+            std::thread::Builder::new()
+                .name(format!("zou-pageread-{i}"))
+                .spawn_scoped(scope, move || read_loop(inbox, service, store, layout, map))
+                .map_err(|e| format!("reader thread: {e}"))?;
         }
-
-        // The wait on the channel is the loop's own floor, so it comes
-        // down with the cadence: a millisecond poll inside a ten
-        // millisecond sleep is a ten millisecond poll. It follows the
-        // climb back up as well, so a park that is going to be a long
-        // one is not a thousand wakeups a second for the length of it.
-        let idle = if parked.is_empty() {
-            CHANNEL_WAIT
-        } else {
-            parked_cadence.min(CHANNEL_WAIT)
-        };
-        match rx.recv_timeout(idle) {
-            Ok(req) => parked.push(req),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-        while let Ok(req) = rx.try_recv() {
-            parked.push(req);
-        }
-
-        let applied = ingest.as_ref().map_or(0, ShardIngest::applied);
-        let seen = ingest.as_ref().map_or(0, ShardIngest::seen);
-        let mem = ingest.as_ref().map_or(&empty_mem, ShardIngest::memtable);
-        let now = Instant::now();
-        if seen > watermark {
-            watermark = seen;
-            advanced = now;
-        }
-        // An idle service has a watermark that has not moved in hours,
-        // so the request's own deadline is the floor: every request
-        // gets its wait cap, and one waiting on a moving watermark
-        // gets as long as the catch up takes.
-        let stalled = now.duration_since(advanced);
-        let mut ready: Vec<GetReq> = Vec::new();
-        let mut still: Vec<GetReq> = Vec::new();
-        for mut req in parked.drain(..) {
-            let need = match (req.since, req.lsn) {
-                (0, 0) => durable_seen,
-                (0, lsn) => lsn,
-                (since, _) => since,
-            };
-            if covered(req.lsn, req.since, seen, durable_seen, probed) {
-                ready.push(req);
-            } else if hopeless(now >= req.deadline, stalled, frozen.is_some()) {
-                let secs = stalled.as_secs();
-                let msg = match &frozen {
-                    Some(e) => format!("ingest frozen: {e}"),
-                    None if req.lsn == 0 && !probed => {
-                        format!("ingest has not reached the head of the stream in {secs} seconds")
-                    }
-                    None => format!(
-                        "ingest saw {seen:#x} but never reached {need:#x}, and has not moved for {secs} seconds"
-                    ),
-                };
-                let _ = req.reply.send(Err(msg));
+        loop {
+            // A poll that stopped on its slice has more waiting, so go
+            // straight back to it after the readers have had their turn
+            // rather than idling out the rest of the cadence. A reader
+            // waiting on an lsn holds the cadence down; only a service
+            // with nobody waiting and nothing arriving relaxes it.
+            let due = if parked.is_empty() {
+                cadence
             } else {
-                if req.parked_at.is_none() {
-                    note_park_gap(need.saturating_sub(seen));
-                    req.parked_at = Some(ParkedAt {
-                        seen,
-                        flushes: FLUSHES.load(Ordering::Relaxed),
-                    });
-                }
-                still.push(req);
-            }
-        }
-        parked = still;
-        // Nobody waiting is where the next park starts from, so the
-        // climb a previous one made is not inherited by a reader that
-        // arrives an hour later.
-        if parked.is_empty() {
-            parked_cadence = PARKED_POLL;
-        }
-        for req in ready {
-            let at = if applied == 0 { u64::MAX } else { applied };
-            // Two samples, because they answer different questions:
-            // parked is how long ingest kept the reader waiting, read
-            // is what planning and reading the page actually cost.
-            if let Some(from) = req.parked_at {
-                note_park_cause(park_cause(mem, &req, from, seen));
-            }
-            note_phase(Phase::Park, req.arrived.elapsed());
-            let ran = Instant::now();
-            serve_reloading(&service, &*store, &cfg.layout, &mut map, mem, &req, at);
-            note_phase(Phase::Read, ran.elapsed());
-        }
-
-        // Flush and compaction retire layers under the reader. Holding
-        // their footers is holding a bloom filter per retired layer,
-        // so let them go once the map has stopped naming them.
-        let held = service.forget_unnamed(&map);
-        if held != footers_held {
-            footers_held = held;
-            log::debug!("zou pageserve: {held} layer footers cached");
-        }
-
-        if stop.load(Ordering::Acquire) {
-            for req in parked.drain(..) {
-                let _ = req.reply.send(Err("page service stopping".to_string()));
-            }
-            if let Some(ingest) = &mut ingest
-                && let Ok(Some(entry)) = ingest
-                    .flush(&*store, &cfg.layout)
-                    .map_err(|e| log::error!("zou pageserve: final flush: {e}"))
-            {
-                FLUSHES.fetch_add(1, Ordering::Relaxed);
-                log::info!(
-                    "zou pageserve: final flush, layer {} of {} bytes",
-                    entry.name,
-                    entry.size
+                parked_cadence
+            };
+            if frozen.is_none() && (behind || last_poll.elapsed() >= due) {
+                let was = (ingest.as_ref().map_or(0, ShardIngest::seen), durable_seen);
+                last_poll = Instant::now();
+                let polled = Instant::now();
+                let outcome = poll_ingest(
+                    &store,
+                    &cfg.layout,
+                    &media,
+                    &filter,
+                    &ingest_cfg,
+                    &mut ingest,
+                    &map,
+                    &mut durable_seen,
+                    &mut cursor,
+                    &mut progress,
+                    polled + INGEST_SLICE,
                 );
+                // The serve loop is one thread, so this poll is latency
+                // every request behind it pays. Sample it whether or not
+                // there was anything to apply.
+                note_phase(Phase::Ingest, polled.elapsed());
+                progress.report(
+                    ingest.as_ref().map_or(0, ShardIngest::applied),
+                    ingest.as_ref().map_or(0, ShardIngest::seen),
+                    durable_seen,
+                    &cursor,
+                );
+                let moved = (ingest.as_ref().map_or(0, ShardIngest::seen), durable_seen) != was;
+                match outcome {
+                    Ok(caught_up) => {
+                        behind = !caught_up;
+                        probed |= caught_up;
+                    }
+                    Err(e) => {
+                        // A hole in the stream would poison every later
+                        // delta; freeze and let waits fail loudly instead.
+                        log::error!("zou pageserve: ingest frozen: {e}");
+                        frozen = Some(e);
+                    }
+                }
+                cadence = relax(cadence, moved || behind);
+                parked_cadence = relax_parked(parked_cadence, moved || behind);
             }
-            return Ok(());
+
+            // The wait on the channel is the loop's own floor, so it comes
+            // down with the cadence: a millisecond poll inside a ten
+            // millisecond sleep is a ten millisecond poll. It follows the
+            // climb back up as well, so a park that is going to be a long
+            // one is not a thousand wakeups a second for the length of it.
+            let idle = if parked.is_empty() {
+                CHANNEL_WAIT
+            } else {
+                parked_cadence.min(CHANNEL_WAIT)
+            };
+            match rx.recv_timeout(idle) {
+                Ok(req) => parked.push(req),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            while let Ok(req) = rx.try_recv() {
+                parked.push(req);
+            }
+
+            let applied = ingest.as_ref().map_or(0, ShardIngest::applied);
+            let seen = ingest.as_ref().map_or(0, ShardIngest::seen);
+            let mem = ingest.as_ref().map_or(&empty_mem, ShardIngest::memtable);
+            let now = Instant::now();
+            if seen > watermark {
+                watermark = seen;
+                advanced = now;
+            }
+            // An idle service has a watermark that has not moved in hours,
+            // so the request's own deadline is the floor: every request
+            // gets its wait cap, and one waiting on a moving watermark
+            // gets as long as the catch up takes.
+            let stalled = now.duration_since(advanced);
+            let mut ready: Vec<GetReq> = Vec::new();
+            let mut still: Vec<GetReq> = Vec::new();
+            for mut req in parked.drain(..) {
+                let need = match (req.since, req.lsn) {
+                    (0, 0) => durable_seen,
+                    (0, lsn) => lsn,
+                    (since, _) => since,
+                };
+                if covered(req.lsn, req.since, seen, durable_seen, probed) {
+                    ready.push(req);
+                } else if hopeless(now >= req.deadline, stalled, frozen.is_some()) {
+                    let secs = stalled.as_secs();
+                    let msg = match &frozen {
+                        Some(e) => format!("ingest frozen: {e}"),
+                        None if req.lsn == 0 && !probed => {
+                            format!(
+                                "ingest has not reached the head of the stream in {secs} seconds"
+                            )
+                        }
+                        None => format!(
+                            "ingest saw {seen:#x} but never reached {need:#x}, and has not moved for {secs} seconds"
+                        ),
+                    };
+                    let _ = req.reply.send(Err(msg));
+                } else {
+                    if req.parked_at.is_none() {
+                        note_park_gap(need.saturating_sub(seen));
+                        req.parked_at = Some(ParkedAt {
+                            seen,
+                            flushes: FLUSHES.load(Ordering::Relaxed),
+                        });
+                    }
+                    still.push(req);
+                }
+            }
+            parked = still;
+            // Nobody waiting is where the next park starts from, so the
+            // climb a previous one made is not inherited by a reader that
+            // arrives an hour later.
+            if parked.is_empty() {
+                parked_cadence = PARKED_POLL;
+            }
+            for req in ready {
+                let at = if applied == 0 { u64::MAX } else { applied };
+                // Two samples, because they answer different questions:
+                // parked is how long ingest kept the reader waiting, read
+                // is what planning and reading the page actually cost.
+                if let Some(from) = req.parked_at {
+                    note_park_cause(park_cause(mem, &req, from, seen));
+                }
+                note_phase(Phase::Park, req.arrived.elapsed());
+                if readers == 0 {
+                    let ran = Instant::now();
+                    let current = published(&map);
+                    serve_reloading(
+                        &service,
+                        &*store,
+                        &cfg.layout,
+                        &map,
+                        &current,
+                        mem,
+                        &req,
+                        at,
+                    );
+                    note_phase(Phase::Read, ran.elapsed());
+                    continue;
+                }
+                // The map and the records above it, taken together on
+                // this thread, which is what makes them a view rather
+                // than two halves of one. The ceiling is the position
+                // the read will be served at, so the subset is a page's
+                // worth of records and not a copy of the table.
+                let mem = mem.subset(&keys_of(&req), Lsn(at));
+                inbox.push(Job {
+                    req,
+                    map: published(&map),
+                    mem,
+                    at,
+                    queued: Instant::now(),
+                });
+            }
+
+            // Flush and compaction retire layers under the reader. Holding
+            // their footers is holding a bloom filter per retired layer,
+            // so let them go once the map has stopped naming them.
+            let held = service.forget_unnamed(&published(&map));
+            if held != footers_held {
+                footers_held = held;
+                log::debug!("zou pageserve: {held} layer footers cached");
+            }
+
+            if stop.load(Ordering::Acquire) {
+                for req in parked.drain(..) {
+                    let _ = req.reply.send(Err("page service stopping".to_string()));
+                }
+                if let Some(ingest) = &mut ingest
+                    && let Ok(Some(entry)) = ingest
+                        .flush(&*store, &cfg.layout)
+                        .map_err(|e| log::error!("zou pageserve: final flush: {e}"))
+                {
+                    FLUSHES.fetch_add(1, Ordering::Relaxed);
+                    log::info!(
+                        "zou pageserve: final flush, layer {} of {} bytes",
+                        entry.name,
+                        entry.size
+                    );
+                }
+                return Ok(());
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// What went wrong inside a replay. The wal read and the applying
@@ -1140,7 +1379,7 @@ fn poll_ingest(
     filter: &TeeFilter,
     ingest_cfg: &IngestConfig,
     ingest: &mut Option<ShardIngest>,
-    map: &mut LayerMap,
+    map: &Published,
     durable_seen: &mut u64,
     cursor: &mut CatchUpCursor,
     progress: &mut Progress,
@@ -1216,7 +1455,7 @@ fn flush_if_due(
     store: &Arc<dyn CasStore>,
     layout: &TenantLayout,
     ingest: &mut ShardIngest,
-    map: &mut LayerMap,
+    map: &Published,
     durable_seen: u64,
 ) -> Result<(), String> {
     if ingest.flush_due(durable_seen).is_none() {
@@ -1240,17 +1479,23 @@ fn flush_if_due(
     Ok(())
 }
 
-/// Pick the shard manifest up into `map`, which is what serves reads
-/// back. False means there is no manifest yet, a shard that has never
-/// flushed, which is not a failure.
+/// Publish the shard manifest as the map reads plan against. False
+/// means there is no manifest yet, a shard that has never flushed,
+/// which is not a failure.
+///
+/// The reader that finds a retired layer calls this too, so the lock
+/// is held for the swap and not for the load: two threads that both
+/// missed publish the same manifest one after the other, which is a
+/// wasted load and not a wrong map.
 fn reload_map(
     store: &dyn CasStore,
     layout: &TenantLayout,
-    map: &mut LayerMap,
+    map: &Published,
 ) -> Result<bool, String> {
     match PageShardManifest::load(store, &layout.shard_manifest(0)) {
         Ok(Some((manifest, _))) => {
-            *map = manifest.layer_map().map_err(|e| e.to_string())?;
+            let fresh = manifest.layer_map().map_err(|e| e.to_string())?;
+            *map.lock().expect("the published map") = Arc::new(fresh);
             Ok(true)
         }
         Ok(None) => Ok(false),
@@ -1506,11 +1751,13 @@ fn page_service<'a>(
 /// on a miss, go ask it. A second miss is a real answer, the layer is
 /// named by the current manifest and genuinely gone, and it goes back
 /// to the reader as the error it is.
+#[allow(clippy::too_many_arguments)]
 fn serve_reloading(
     service: &PageService,
     store: &dyn CasStore,
     layout: &TenantLayout,
-    map: &mut LayerMap,
+    published_map: &Published,
+    map: &LayerMap,
     mem: &Memtable,
     req: &GetReq,
     at: u64,
@@ -1519,10 +1766,16 @@ fn serve_reloading(
         return;
     };
     log::info!("zou pageserve: layer {layer} is gone, reloading the map and reading again");
-    if let Err(e) = reload_map(store, layout, map) {
+    if let Err(e) = reload_map(store, layout, published_map) {
         log::warn!("zou pageserve: {e}");
     }
-    serve(service, map, mem, req, at, true);
+    // Against the published map rather than the one this read was
+    // handed, since the point of the reload is to get past a name the
+    // handed one still carries. The records come from the same subset
+    // either way: a flush that put them in a layer this map does name
+    // wrote them at the lsn they already have, and reconstruct merges
+    // on lsn.
+    serve(service, &published(published_map), mem, req, at, true);
 }
 
 /// What one serve attempt did: replied, or found the map naming a
@@ -1593,6 +1846,10 @@ mod tests {
     const WAL_BASE: u64 = 16 << 20;
 
     fn server(store: Arc<dyn CasStore>, sock: PathBuf) -> PageServer {
+        server_with(store, sock, None)
+    }
+
+    fn server_with(store: Arc<dyn CasStore>, sock: PathBuf, readers: Option<usize>) -> PageServer {
         spawn(ServerConfig {
             store,
             layout: TenantLayout::new("t"),
@@ -1600,6 +1857,7 @@ mod tests {
             socket: sock,
             data_checksums: false,
             redo: None,
+            readers,
         })
         .expect("server spawns")
     }
@@ -1630,6 +1888,44 @@ mod tests {
         assert_eq!(pages[0], page, "the frozen image came back whole");
         assert_eq!(pages[1], vec![0u8; BLCKSZ], "an absent block is zeros");
         srv.stop();
+    }
+
+    /// The pool is an A/B on one binary: `ZOU_PAGESERVE_READERS=0`
+    /// leaves the driver serving each read itself, which is the shape
+    /// everything before #671 had. Both answer the same, which is what
+    /// makes the flag a comparison rather than two servers. Several
+    /// clients at once, because one at a time never has two reads in
+    /// the pool and would say nothing about the handover.
+    #[test]
+    fn a_read_answers_the_same_whether_the_driver_serves_it_or_a_reader_does() {
+        for readers in [0usize, 1, 4] {
+            let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+            let layout = TenantLayout::new("t");
+            let page = vec![7u8; BLCKSZ];
+            store
+                .put(&layout.pg_block(1663, 5, 2000, 0, 3), &page)
+                .expect("seed page");
+            let sock = sock_path(&format!("readers-{readers}.sock"));
+            let mut srv = server_with(Arc::clone(&store), sock.clone(), Some(readers));
+
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let sock = sock.clone();
+                    let page = &page;
+                    scope.spawn(move || {
+                        let client = PageClient::new(sock);
+                        for _ in 0..8 {
+                            let pages = client
+                                .get_pages(1663, 5, 2000, 0, &[3, 4], 0, 0)
+                                .expect("served");
+                            assert_eq!(pages[0], *page, "{readers} readers: the frozen image");
+                            assert_eq!(pages[1], vec![0u8; BLCKSZ], "{readers} readers: zeros");
+                        }
+                    });
+                }
+            });
+            srv.stop();
+        }
     }
 
     /// The other request shape: a block count of zero asks how long
@@ -1985,7 +2281,9 @@ mod tests {
         cfg.small_floor = 0;
 
         let mut ingest = None;
-        let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
+        let map: Published = Mutex::new(Arc::new(
+            LayerMap::new(Vec::new()).expect("an empty map builds"),
+        ));
         let mut durable_seen = 0u64;
         let mut cursor = CatchUpCursor::default();
         let mut progress = Progress::default();
@@ -1998,7 +2296,7 @@ mod tests {
             &TeeFilter::Tenant(TENANT),
             &cfg,
             &mut ingest,
-            &mut map,
+            &map,
             &mut durable_seen,
             &mut cursor,
             &mut progress,
@@ -2107,11 +2405,13 @@ mod tests {
 
         let cfg = IngestConfig::new(TENANT, 0, 1);
         let mut ingest = None;
-        let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
+        let map: Published = Mutex::new(Arc::new(
+            LayerMap::new(Vec::new()).expect("an empty map builds"),
+        ));
         let mut durable_seen = 0u64;
         let mut cursor = CatchUpCursor::default();
         let mut progress = Progress::default();
-        let mut poll = |ingest: &mut _, map: &mut _, seen: &mut _, cursor: &mut _| {
+        let mut poll = |ingest: &mut _, map: &_, seen: &mut _, cursor: &mut _| {
             poll_ingest(
                 &counted,
                 &layout,
@@ -2129,7 +2429,7 @@ mod tests {
         };
 
         assert!(
-            poll(&mut ingest, &mut map, &mut durable_seen, &mut cursor),
+            poll(&mut ingest, &map, &mut durable_seen, &mut cursor),
             "one long slice catches up"
         );
         assert_eq!(
@@ -2142,7 +2442,7 @@ mod tests {
         // Nothing has moved: the manifest, the round check and the one
         // miss that says the head is where the cursor left it.
         let before = store.gets();
-        assert!(poll(&mut ingest, &mut map, &mut durable_seen, &mut cursor));
+        assert!(poll(&mut ingest, &map, &mut durable_seen, &mut cursor));
         let cost = store.gets() - before;
         assert!(
             cost <= 4,
@@ -2165,30 +2465,28 @@ mod tests {
 
         let cfg = IngestConfig::new(TENANT, 0, 1);
         let mut ingest = None;
-        let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
+        let map: Published = Mutex::new(Arc::new(
+            LayerMap::new(Vec::new()).expect("an empty map builds"),
+        ));
         let mut durable_seen = 0u64;
         let mut cursor = CatchUpCursor::default();
         let mut progress = Progress::default();
-        let poll = |ingest: &mut _,
-                    map: &mut _,
-                    seen: &mut _,
-                    cursor: &mut _,
-                    progress: &mut _,
-                    deadline| {
-            poll_ingest(
-                &store,
-                &layout,
-                &media,
-                &TeeFilter::Tenant(TENANT),
-                &cfg,
-                ingest,
-                map,
-                seen,
-                cursor,
-                progress,
-                deadline,
-            )
-        };
+        let poll =
+            |ingest: &mut _, map: &_, seen: &mut _, cursor: &mut _, progress: &mut _, deadline| {
+                poll_ingest(
+                    &store,
+                    &layout,
+                    &media,
+                    &TeeFilter::Tenant(TENANT),
+                    &cfg,
+                    ingest,
+                    map,
+                    seen,
+                    cursor,
+                    progress,
+                    deadline,
+                )
+            };
 
         // A deadline already gone stops on the segment it is in and
         // says it is not caught up. The first segment of a fresh chain
@@ -2198,7 +2496,7 @@ mod tests {
         for _ in 0..2 {
             let caught_up = poll(
                 &mut ingest,
-                &mut map,
+                &map,
                 &mut durable_seen,
                 &mut cursor,
                 &mut progress,
@@ -2215,7 +2513,7 @@ mod tests {
         let mut rounds = 0;
         while !poll(
             &mut ingest,
-            &mut map,
+            &map,
             &mut durable_seen,
             &mut cursor,
             &mut progress,
@@ -2304,7 +2602,9 @@ mod tests {
 
         let cfg = IngestConfig::new(TENANT, 0, 1);
         let mut ingest = None;
-        let mut map = LayerMap::new(Vec::new()).expect("an empty map builds");
+        let map: Published = Mutex::new(Arc::new(
+            LayerMap::new(Vec::new()).expect("an empty map builds"),
+        ));
         let mut durable_seen = 0u64;
         let mut cursor = CatchUpCursor::default();
         let mut progress = Progress::default();
@@ -2321,7 +2621,7 @@ mod tests {
                 &TeeFilter::Tenant(TENANT),
                 &cfg,
                 &mut ingest,
-                &mut map,
+                &map,
                 &mut durable_seen,
                 &mut cursor,
                 &mut progress,
@@ -2433,6 +2733,128 @@ mod tests {
         );
     }
 
+    /// A read is handed its map and its records on the driver thread
+    /// and runs on another one, so a flush can land in between: the
+    /// records go out of the memtable into a layer, and the map that
+    /// names the layer is published, all while the read is on its way.
+    /// It reads them out of the subset it was handed. And if it goes
+    /// on to reload the map, for a layer retired under it, it sees
+    /// them a second time out of the layer the flush wrote, at the
+    /// lsn they already had, which is where the two copies merge back
+    /// into one (zou #671).
+    #[test]
+    fn a_read_handed_out_before_a_flush_still_reads_what_the_flush_took() {
+        use crate::relsize::{ForkRef, SizeRec};
+        use zou_store::layer::build_delta;
+        use zou_store::layermap::LayerDesc;
+        use zou_store::shardmanifest::{LayerEntry, publish_layer};
+
+        let store: Arc<dyn CasStore> = Arc::new(MemStore::default());
+        let layout = TenantLayout::new("t");
+        let fork = ForkRef {
+            spc: 1663,
+            db: 5,
+            rel: 2000,
+            fork: 0,
+        };
+        let ask = || {
+            let (reply, answers) = sync_channel(1);
+            let req = GetReq {
+                spc: fork.spc,
+                db: fork.db,
+                rel: fork.rel,
+                fork: fork.fork as u32,
+                want: Want::Size,
+                lsn: 0,
+                since: 0,
+                arrived: Instant::now(),
+                deadline: Instant::now() + WAIT_CAP,
+                parked_at: None,
+                reply,
+            };
+            (req, answers)
+        };
+        let size = |answers: std::sync::mpsc::Receiver<Result<Answer, String>>| match answers
+            .recv()
+            .expect("the reader replied")
+            .expect("a size")
+        {
+            Answer::Size(size) => size,
+            Answer::Pages(_) => panic!("a size request is answered with a size"),
+        };
+
+        let mut mem = Memtable::new();
+        for (lsn, blocks) in [(100u64, 10u32), (150, 20)] {
+            mem.insert(
+                fork.key(),
+                Lsn(lsn),
+                SizeRec::Grow(blocks).encode().to_vec(),
+            );
+        }
+        let map: Published = Mutex::new(Arc::new(
+            LayerMap::new(Vec::new()).expect("an empty map builds"),
+        ));
+
+        // What the driver takes for one request, on the thread that
+        // owns both: the map it plans against and the records above it
+        // for the keys it names.
+        let (req, answers) = ask();
+        let held = published(&map);
+        let taken = mem.subset(&keys_of(&req), Lsn(200));
+
+        // The flush, in full: drained out of the memtable, written as
+        // a layer, published as the map every later read plans against.
+        let drained = mem.drain_sorted();
+        let (bytes, footer) = build_delta(&drained, 8192).expect("a delta layer builds");
+        let desc = LayerDesc::from_footer(&footer, bytes.len() as u64);
+        store
+            .put(
+                &format!("{}{}", layout.shard_prefix(0), desc.name()),
+                &bytes,
+            )
+            .expect("the layer lands");
+        publish_layer(
+            &*store,
+            &layout.shard_manifest(0),
+            0,
+            &LayerEntry {
+                name: desc.name(),
+                size: bytes.len() as u64,
+                owner: None,
+                upto: None,
+            },
+            footer.max_lsn,
+        )
+        .expect("published");
+        reload_map(&*store, &layout, &map).expect("the manifest reads");
+        assert!(
+            mem.is_empty(),
+            "the flush emptied the table it was taken from"
+        );
+
+        let service = page_service(&*store, &layout, None, false);
+        serve_reloading(&service, &*store, &layout, &map, &held, &taken, &req, 200);
+        assert_eq!(
+            size(answers),
+            Some(20),
+            "the read was handed the records before the flush took them"
+        );
+
+        // The same records reached this read twice, once out of the
+        // layer and once out of the subset. Two copies of one record
+        // is one record.
+        let (req, answers) = ask();
+        let now = published(&map);
+        serve(&service, &now, &taken, &req, 200, true);
+        assert_eq!(size(answers), Some(20), "the two copies merged on lsn");
+
+        // And a read that arrives after all of it, with nothing in
+        // hand, gets the same answer out of the layer alone.
+        let (req, answers) = ask();
+        serve(&service, &now, &Memtable::new(), &req, 200, true);
+        assert_eq!(size(answers), Some(20), "the layer carries them now");
+    }
+
     /// The read failure every restored node logged in the six hour run
     /// on server2: compaction retired a layer, gc collected the
     /// object, and the page service was still holding the map it
@@ -2487,7 +2909,7 @@ mod tests {
         let (manifest, _) = PageShardManifest::load(&*store, &manifest_key)
             .expect("manifest reads")
             .expect("both layers published");
-        let mut map = manifest.layer_map().expect("the map builds");
+        let map: Published = Mutex::new(Arc::new(manifest.layer_map().expect("the map builds")));
         swap_layers(
             &*store,
             &manifest_key,
@@ -2517,11 +2939,15 @@ mod tests {
             reply,
         };
         let service = page_service(&*store, &layout, None, false);
+        // The map the reader was handed, taken before the retirement,
+        // which is the way a reader holds one.
+        let held = published(&map);
         serve_reloading(
             &service,
             &*store,
             &layout,
-            &mut map,
+            &map,
+            &held,
             &Memtable::new(),
             &req,
             200,
@@ -2535,7 +2961,7 @@ mod tests {
         };
         assert_eq!(pages[0], page, "the image served the page");
         assert!(
-            !map.layers().iter().any(|d| d.name() == gone),
+            !published(&map).layers().iter().any(|d| d.name() == gone),
             "the map still names the layer that is gone"
         );
     }

@@ -256,8 +256,8 @@ const CENSUS: &[Format] = &[
         file: "crates/zou-store/src/stats.rs",
         konst: "FORMAT",
         reach: Reach::Local,
-        floor: 5,
-        ceiling: 5,
+        floor: 6,
+        ceiling: 6,
         // Counts, and only this machine's. A layout change throws the
         // file away rather than migrating it.
         frozen: "nothing, it is counters and it starts over",

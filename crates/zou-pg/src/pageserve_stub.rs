@@ -58,6 +58,7 @@ pub struct ServerConfig {
     pub socket: PathBuf,
     pub data_checksums: bool,
     pub redo: Option<RedoPoolConfig>,
+    pub readers: Option<usize>,
 }
 
 pub struct PageServer;

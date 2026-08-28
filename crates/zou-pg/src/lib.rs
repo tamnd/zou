@@ -2772,6 +2772,7 @@ pub unsafe extern "C" fn zou_pagesvc_start(target: *const c_char, data_checksums
             socket: pageserve_socket(),
             data_checksums: data_checksums != 0,
             redo,
+            readers: None,
         }) {
             Ok(server) => {
                 *slot = Some(server);
