@@ -598,10 +598,11 @@ A function may import one itself, and so may a package the registry served, whic
 ```
 assert  async_hooks  buffer  child_process  cluster  crypto
 diagnostics_channel  dns  dns/promises  events  fs  fs/promises
-http  https  module  net  os  path  perf_hooks  process
-querystring  readline  readline/promises  stream  stream/promises
-stream/web  string_decoder  timers  timers/promises  tls  tty
-url  util  util/types  v8  worker_threads  zlib
+http  http2  https  module  net  os  path  perf_hooks
+process  punycode  querystring  readline  readline/promises
+stream  stream/promises  stream/web  string_decoder  timers
+timers/promises  tls  tty  url  util  util/types  v8
+worker_threads  zlib
 ```
 
 `path/posix` and `path/win32` are the same module as `path`, which is posix, because there is one file system here and it has one separator.
@@ -623,6 +624,8 @@ What each one is is the part of it a package reaches for and not node's whole su
 - `http` and `https` are the client half, over the same http client `fetch` goes through: `request` and `get` in the shapes node takes them, a request that is a writable and sends when it is ended, and a response that is a readable with `statusCode`, `headers` and `rawHeaders` on it. What is lost against node's is the socket underneath, so there is no pool a caller can size, no `socket` event with a real socket on it, and no upgrade. The server half cannot exist here, because a function is answered on the socket the server that called it already owns, so `createServer` gives back a server that refuses when it is asked to listen.
 - `net` is a socket with node's names on it, over the `Deno.connect` this runtime already has, so it is a translation rather than a new capability and it draws the same line: tcp to somewhere on the network, and not a unix socket, which is a file on the host. A socket is a duplex, bytes arrive through `data` as they are read, and `end` is a half close rather than a hang up. `createServer` refuses at `listen` for the same reason http's does.
 - `v8` is `serialize` and `deserialize`, over the same serializer `structuredClone` goes through, because there is one and it belongs to the engine. What survives a trip through it is what survives a clone, and the bytes carry v8's version in front of them, which is worth knowing before writing them anywhere they outlive the process. The rest of node's module is about the isolate a program is running inside, and a function does not own the one it is in, so heap statistics, flags and snapshots refuse by name.
+- `punycode` is node's, which is RFC 3492 whole: `encode`, `decode`, `toASCII`, `toUnicode` and the `ucs2` pair. Node deprecated the module years ago and still ships it, and it is here for the same reason, because a package reaches it through a dependency that writes a domain into a url rather than by importing it itself.
+- `http2` exists and speaks no h2. A client library that supports it imports the module at the top, asks what it got and takes the http1 path when the server negotiated nothing better, so what such a package needs from here is the module being there: `constants`, `sensitiveHeaders` and `getDefaultSettings` answer, and `connect` and both `createServer` throw. An h2 request that is written as one has nowhere to go here, and `fetch` is the way to make one.
 - `child_process`, `worker_threads` and `cluster` import and then refuse. Every call that would need a process, a thread or a fork throws with a sentence saying a function has none, and the parts that can be true are: `isMainThread` is true, `isPrimary` is true, and `worker_threads` hands back the platform's own `MessageChannel`.
 
 Those last three are worth a word, because a module that exists and throws looks like the worse of the two options and is not.
@@ -1159,7 +1162,7 @@ Not present yet, and named rather than silently missing:
 - Byte streams. There is no `new ReadableStream({ type: "bytes" })`, no BYOB reader and no `TextDecoderStream`.
 - Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet. That also moves when the promise settles: upstream hands the response back when the headers arrive and this hands it back when the body is in, so a handler racing a slow answer against a clock sees the clock win here and the headers win there.
 - The rest of the file system. Reading a file the function's own `static_files` covers, plus a file belonging to a package it imported, is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
-- The rest of the node built ins. Thirty seven of them are here and the section on packages says what each one covers, and one that is not, `node:http2` and `node:dgram` among them, is refused by name when it is resolved.
+- The rest of the node built ins. Thirty nine of them are here and the section on packages says what each one covers, and one that is not, `node:dgram` and `node:vm` among them, is refused by name when it is resolved.
 
 The rest of that list, and where each line stands, is [issue #369](https://github.com/tamnd/zou/issues/369).
 

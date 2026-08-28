@@ -1065,3 +1065,90 @@ fn perf_hooks_is_the_performance_timeline_under_nodes_name() {
         "true true | 1 | named | named | named | 4 | undefined function"
     );
 }
+
+/// RFC 3492, which is one of the two built ins here that is an
+/// algorithm rather than a translation. The answers are the ones the
+/// library node vendored documents, because a package reaching this
+/// through a dependency is going to compare them against node's.
+#[test]
+fn punycode_is_the_rfc_and_the_domain_pair_on_top_of_it() {
+    let said = served(
+        r#"
+        import punycode, { encode, decode, toASCII, toUnicode, ucs2 } from "node:punycode";
+        const said = [
+          encode("mañana"),
+          encode("☃-⌘"),
+          decode("maana-pta"),
+          decode("--dqo34k"),
+          toASCII("mañana.com"),
+          toASCII("☃-⌘.com"),
+          toASCII("zou.dev"),
+          toUnicode("xn--maana-pta.com"),
+          toUnicode("xn----dqo34k.com"),
+          JSON.stringify(ucs2.decode("abc")),
+          ucs2.encode([0x1d306]),
+          // A mail address keeps its local part, and the ideographic
+          // full stop is a dot to IDNA and so to this.
+          toASCII("mañana@mañana。com"),
+          String(punycode.decode === decode),
+        ];
+        // The two ways a label is not punycode, which are different
+        // errors in node: something above ascii before the delimiter is
+        // not a basic code point, and the same thing after it is not a
+        // digit of the base 36 alphabet.
+        for (const bad of ["mañana-pta", "maana-ptaÿ"]) {
+          try {
+            decode(bad);
+          } catch (why) {
+            said.push(`${why.name}:${why.message}`);
+          }
+        }
+        Deno.serve(() => new Response(said.join(" | ")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        "maana-pta | --dqo34k | mañana | ☃-⌘ | xn--maana-pta.com | \
+         xn----dqo34k.com | zou.dev | mañana.com | ☃-⌘.com | [97,98,99] | \
+         𝌆 | mañana@xn--maana-pta.com | true | \
+         RangeError:Illegal input >= 0x80 (not a basic code point) | RangeError:Invalid input"
+    );
+}
+
+/// http2 is here to be imported and not to be used, which is the shape
+/// an http client that supports h2 asks about it in: read the
+/// constants at the top, and take the http1 path because nothing here
+/// negotiated anything else.
+#[test]
+fn http2_exists_so_a_client_that_checks_for_it_can_take_the_other_path() {
+    let said = served(
+        r#"
+        import http2, { constants, connect, sensitiveHeaders, getDefaultSettings } from "node:http2";
+        const said = [
+          constants.HTTP2_HEADER_PATH,
+          String(constants.NGHTTP2_CANCEL),
+          String(constants.HTTP_STATUS_TOO_MANY_REQUESTS),
+          typeof sensitiveHeaders,
+          String(getDefaultSettings().maxFrameSize),
+        ];
+        for (const call of [connect, http2.createServer, http2.createSecureServer]) {
+          try {
+            call();
+          } catch (why) {
+            said.push(why.message.includes("node:http2") ? "named" : why.message);
+          }
+        }
+        try {
+          new http2.ClientHttp2Session();
+        } catch (why) {
+          said.push(why.message.includes("http/2 sessions") ? "no session" : why.message);
+        }
+        said.push(String({} instanceof http2.Http2Stream));
+        Deno.serve(() => new Response(said.join(" | ")));
+        "#,
+    );
+    assert_eq!(
+        said,
+        ":path | 8 | 429 | symbol | 16384 | named | named | named | no session | false"
+    );
+}
