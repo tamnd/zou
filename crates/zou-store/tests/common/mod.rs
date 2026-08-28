@@ -203,6 +203,7 @@ fn concurrent_swappers_never_lose_an_update(store: Arc<dyn CasStore>, transient_
     let key = "contract/counter/obj";
     store.put_if_match(key, b"0", None).unwrap();
 
+    let started = std::time::Instant::now();
     let handles: Vec<_> = (0..THREADS)
         .map(|_| {
             let store = Arc::clone(&store);
@@ -230,8 +231,20 @@ fn concurrent_swappers_never_lose_an_update(store: Arc<dyn CasStore>, transient_
     for h in handles {
         h.join().unwrap();
     }
+    let took = started.elapsed();
 
     let (data, _) = store.get(key).unwrap().unwrap();
     let n: u64 = String::from_utf8(data).unwrap().parse().unwrap();
     assert_eq!(n as usize, THREADS * INCREMENTS);
+
+    // A backend that starves one of its waiters still gets the count
+    // right, it just gets there a minute later, so the count on its own
+    // calls that a pass. Two hundred swaps is under a second of work on
+    // any machine this runs on, and the bound is loose enough for a
+    // shared runner under load and tight enough that a waiter sitting
+    // out the localfs stale age reads as the failure it is.
+    assert!(
+        took < std::time::Duration::from_secs(30),
+        "the swappers took {took:?}, which is a lock protocol that starved somebody rather than slow io"
+    );
 }
