@@ -60,6 +60,31 @@ The 30 s buckets show the shape: tpcb did 53 transactions in its first half then
 Moving the fold off the commit path moved the stall, it did not remove it, because in the v1 store the fold has to read the entire wal and checkpoint history back through the object store to produce pages.
 That cost is a property of the v1 layout, so this row stays as the honest v1 number and the fix is the storage v2 redesign rather than another pusher patch.
 
+## pgbench scale 10, the two read paths against vanilla and Neon
+
+gamingpc (i9-13900K, 32 cores, 32 GB, Ubuntu under WSL2, stores on a local directory), 2026-08-28, pgbench scale 10, 4 clients, 300 s a phase, one box and one pgbench binary for every row.
+Neon is its own docker compose stack, which is a pageserver, three safekeepers, a storage broker and a MinIO, with a compute node on Postgres 16.9 because that is what the compose builds.
+Every other row is the vendored Postgres 18.4 with `io_method=sync` and `full_page_writes=off` and otherwise stock, which means 128MB of shared buffers everywhere.
+
+| system | tpcb tps | tpcb avg lat | select tps | select avg lat | init |
+| --- | --- | --- | --- | --- | --- |
+| postgres 18, local disk | 720 | 5.552 ms | 71221 | 0.056 ms | 1 s |
+| zou, object path, localfs store | 331 | 12.099 ms | 59067 | 0.068 ms | 75 s |
+| zou, layer path, localfs store | 372 to 374 | 10.7 ms | 12789 to 13303 | 0.31 ms | 5 s |
+| zou, layer path before #695 | 81 to 83 | 48.8 ms | 14118 to 14431 | 0.28 ms | 5 s |
+| neon, self hosted compose | 246 | 16.268 ms | 5855 | 0.683 ms | 4 s |
+
+The zou layer path rows are two runs each, which is why they are ranges, and the change between them is #695 alone.
+Reading the table: on the write mix the layer path is 1.5x Neon and 0.52x vanilla, and on the read only mix it is 2.2x Neon and 0.18x vanilla.
+The object path is the other way round, 1.3x Neon on writes and 0.83x vanilla on reads, because it serves a page from the local cache and the layer path asks a service for every page it does not have.
+That socket is the read only gap and nothing else: the store tier under the layer path answers in 16 us at p50 and the service tier answers in 1024, on the same box, for the same pages.
+
+The init column is the other shape worth reading.
+75 s against 5 s is the object path writing a page object per page while the layer path writes wal and lets the service build pages behind it, and it is the same tradeoff from the other end.
+
+What #695 changed is one number: a read that arrives before ingest has caught up used to wait out a hundred millisecond poll, and 17277 of them did in a five minute run, none of them for a record that touched the page they had asked for.
+The counters and the rest of it are in #671.
+
 ## A thousand tenants on one node
 
 gamingpc (i9-13900K, 32 GB, Ubuntu 26.04 under WSL2, store on a local directory), 2026-08-10, `zoubench fleet` with the node pinned to cpus 0-7 so the eight cores are the deployment and the traffic generator is not sharing them.
