@@ -88,8 +88,9 @@ fn answered(function: &Function) -> String {
 /// The whole of it, off a cache written by hand: a package that ships
 /// commonjs, a dependency reached by the range the package declared, a
 /// built in asked for in the middle of a script under the bare name
-/// node lets a package use for one, and both the named export and the
-/// default an importer of a script asks for.
+/// node lets a package use for one, both the named export and the
+/// default an importer of a script asks for, and a file the package
+/// ships that is not a module and is read from beside its entry.
 #[test]
 fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
     let cache = tempfile::tempdir().expect("a temporary directory");
@@ -135,6 +136,9 @@ fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
                 exports.global = global === globalThis;
                 "#,
             ),
+            // Not a module, and read as a file beside the entry, which
+            // is what a wasm library does with its `.wasm`.
+            ("beside.txt", "a file the package ships"),
         ],
     );
     package(
@@ -176,6 +180,19 @@ fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
         r#"
         import greeter, { greet, where, missing, global as named } from "npm:greeter@^1.0.0";
         import { base } from "npm:esmy@1";
+
+        // A package here is a directory and not a url, so what this
+        // answers has to be a place a file can sit beside.
+        const beside = new TextDecoder().decode(
+          await Deno.readFile(new URL("beside.txt", import.meta.resolve("npm:greeter@^1.0.0"))),
+        );
+        let unpacked = "resolved";
+        try {
+          import.meta.resolve("npm:nobody-fetched-this@1");
+        } catch (why) {
+          unpacked = why.message.includes("once it has been unpacked") ? "said so" : why.message;
+        }
+
         Deno.serve(() => Response.json({
           said: greet("world"),
           where,
@@ -183,12 +200,14 @@ fn a_package_is_the_files_it_publishes_and_the_names_they_set() {
           missing,
           global: named,
           default: typeof greeter.greet,
+          beside,
+          unpacked,
         }));
         "#,
     );
     assert_eq!(
         answered(&function),
-        r#"{"said":"HELLO WORLD","where":"index.js","base":"two.js","missing":"node:dgram is a node built in this runtime does not have","global":true,"default":"function"}"#
+        r#"{"said":"HELLO WORLD","where":"index.js","base":"two.js","missing":"node:dgram is a node built in this runtime does not have","global":true,"default":"function","beside":"a file the package ships","unpacked":"said so"}"#
     );
 }
 

@@ -63,6 +63,11 @@ pub fn source(name: &str) -> Option<&'static str> {
         // because the socket a function is answered on belongs to the
         // server that called it.
         "http" => include_str!("node/http.js"),
+        // Not an h2 client. A client library that supports h2 imports
+        // this at the top, asks what it got and takes the http1 path
+        // when the server negotiated nothing better, so what it needs
+        // from here is a module that exists and refuses at the call.
+        "http2" => include_str!("node/http2.js"),
         "https" => include_str!("node/https.js"),
         "module" => include_str!("node/module.js"),
         "net" => include_str!("node/net.js"),
@@ -77,6 +82,11 @@ pub fn source(name: &str) -> Option<&'static str> {
         // are in node too, and this module is the import line.
         "perf_hooks" => include_str!("node/perf_hooks.js"),
         "process" => include_str!("node/process.js"),
+        // Deprecated in node for years and still shipped there, which
+        // is why a package reaches it: not by writing the import but
+        // through a dependency that punycodes a domain before putting
+        // it in a url.
+        "punycode" => include_str!("node/punycode.js"),
         "querystring" => include_str!("node/querystring.js"),
         "readline" => include_str!("node/readline.js"),
         "readline/promises" => include_str!("node/readline_promises.js"),
@@ -127,6 +137,7 @@ pub const NAMES: &[&str] = &[
     "fs",
     "fs/promises",
     "http",
+    "http2",
     "https",
     "module",
     "net",
@@ -136,6 +147,7 @@ pub const NAMES: &[&str] = &[
     "path/win32",
     "perf_hooks",
     "process",
+    "punycode",
     "querystring",
     "readline",
     "readline/promises",
@@ -329,7 +341,7 @@ mod tests {
         for name in super::NAMES {
             assert!(super::core(name), "node:{name} is not on the core list");
         }
-        assert!(super::core("http2"), "node has http2 and this does not");
+        assert!(super::core("dgram"), "node has dgram and this does not");
         assert!(!super::core("lodash"));
         assert!(!super::core("node:os"), "the prefix is taken off first");
     }
@@ -337,7 +349,7 @@ mod tests {
     #[test]
     fn a_built_in_that_is_not_here_is_not_pretended_to_be() {
         assert!(source("dgram").is_none());
-        assert!(source("http2").is_none());
+        assert!(source("vm").is_none());
         assert!(source("path/nonsense").is_none());
     }
 }

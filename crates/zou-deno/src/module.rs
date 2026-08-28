@@ -303,6 +303,30 @@ impl Disk {
             None => asked,
         }
     }
+
+    /// An `npm:` specifier as the file the unpacked package answers it
+    /// with, for the one caller that needs a place rather than a name.
+    ///
+    /// The lookup is the same one a load does, minus the fetch, because
+    /// this is called on the isolate's own thread where there is
+    /// nothing to wait on. That is the one thing it cannot do: a
+    /// package nobody imported is not on the disk yet, and the answer
+    /// then is a sentence saying so rather than a specifier that will
+    /// fail as a base url three lines later.
+    fn unpacked(
+        &self,
+        asked: &ModuleSpecifier,
+    ) -> Result<ModuleSpecifier, deno_core::error::ModuleLoaderError> {
+        let (name, want, sub) = parts(asked.path());
+        let tree = crate::tree::Tree::at(&self.cache);
+        let reached = tree.entry(&name, &want, &sub).map_err(|why| {
+            JsErrorBox::type_error(format!(
+                "import.meta.resolve({asked}): {why}. A package is resolved to a file here once it has been unpacked, which is what importing it does"
+            ))
+        })?;
+        ModuleSpecifier::from_file_path(&reached.at)
+            .map_err(|()| JsErrorBox::type_error(format!("{} is not a path", reached.at.display())))
+    }
 }
 
 impl Default for Disk {
@@ -419,12 +443,24 @@ impl ModuleLoader for Disk {
     /// wants what the registry hands out for it, polyfill import and
     /// all. What a function does with this answer is different: it
     /// resolves a file beside it.
+    ///
+    /// So the answer has to be somewhere files sit next to each other,
+    /// and an `npm:` specifier is not: it is a name and a range, and
+    /// `new URL('magick.wasm', 'npm:@imagemagick/magick-wasm@^0')` is
+    /// the `TypeError: Invalid URL` a function got for asking. Under
+    /// the registry the redirect already moved it to a url. Under the
+    /// tarball the package is a directory, so this is where it becomes
+    /// the `file:` url of the module that specifier names, which is
+    /// also what node answers for the same line.
     fn import_meta_resolve(
         &self,
         specifier: &str,
         referrer: &str,
     ) -> Result<ModuleSpecifier, deno_core::error::ModuleLoaderError> {
         let asked = self.resolve(specifier, referrer, ResolutionKind::DynamicImport)?;
+        if self.npm == Npm::Tarball && asked.scheme() == "npm" {
+            return self.unpacked(&asked);
+        }
         Ok(self.moved(asked))
     }
 
