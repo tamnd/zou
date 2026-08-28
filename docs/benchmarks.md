@@ -105,6 +105,22 @@ The scale 10 read only phase is that second shape at its most extreme, since the
 
 The service tier p50 of 1024 us is what #671 and #697 are about, and it is a wait rather than work: #695 took the parked read poll from 100 ms to a millisecond, and what is left is a read position that is one lsn for the whole cluster instead of one per block.
 
+### One read position per block
+
+gamingpc, 2026-08-29, the same scale 10 and 4 clients and 300 s a phase, both legs on one binary back to back with `ZOU_LWLSN_ENTRIES` the only difference, so this is #697 against the code immediately before it rather than against another evening.
+
+| lwlsn table | tpcb tps | select tps | reads that waited for ingest | tpcb read p50 | select read p50 | service p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| on | 362 | 18992 | 2 of 1080956 | 512 us | 512 us | 8192 us |
+| off | 361 | 16129 | 30044 of 926211 | 2048 us | 512 us | 8192 us |
+
+The waits are gone, 30044 of them down to 2, which is what the change is for.
+The write mix does not move, because a writer waits for its own commit either way and 8 ms of that is the store PUT, and what it gets instead is the read half of the mix at a quarter of the latency.
+The read only phase gains 18% and lands above every layer path run before it, the 16609 outlier included.
+The service tier p99 does not move at all, and that is the honest headline: what is left is not a wait.
+Serving a read costs 128 us at p50 and 512 at p95 on this box, the select phase asks for 3462 of them a second, and one thread owns ingest and every read, so the tail is that thread's queue.
+The read position was one of two things in the way and this is the other one, which is what #671 stays open for.
+
 ## A thousand tenants on one node
 
 gamingpc (i9-13900K, 32 GB, Ubuntu 26.04 under WSL2, store on a local directory), 2026-08-10, `zoubench fleet` with the node pinned to cpus 0-7 so the eight cores are the deployment and the traffic generator is not sharing them.
