@@ -678,7 +678,12 @@ impl Runtime for Isolate {
                 .parent()
                 .map(std::path::Path::to_path_buf)
                 .unwrap_or_default(),
-            statics: zou_functions::Statics::of(function),
+            // The module cache goes in with the patterns because a
+            // package is published whole: `@vercel/og` reads a font out
+            // of its own directory while it is loading, and serving its
+            // javascript and refusing its font is a line through the
+            // middle of one package.
+            statics: zou_functions::Statics::of(function).and_the_packages(&crate::module::cache()),
         };
         let held = Held {
             call,
@@ -965,6 +970,43 @@ async fn build(
         js.execute_script("zou:prelude.js", include_str!("prelude.js"))
     }
     .map_err(|e| format!("the prelude did not run: {e}"))?;
+
+    // `Buffer`, which a package written for node reads without importing
+    // it because node has it as a real global.
+    //
+    // It is here rather than in the prelude because the implementation
+    // is `node:buffer` and that is an es module, so something has to
+    // evaluate it and a script cannot. A generated module is the
+    // shortest way to do that: it imports the one name and puts it
+    // where a package will look.
+    //
+    // Every call pays for it whether or not anything reaches for it,
+    // which is the honest cost of the alternative being a global that
+    // is there for some functions and not others. It is one module of
+    // sixteen kilobytes against a prelude of a hundred and eighty, and
+    // it carries no work of its own: what it costs is v8 reading it.
+    //
+    // Deno has `Buffer` on the global too, measured rather than
+    // guessed, and upstream's runtime does not. `docs/functions.md`
+    // says so and says why the difference is this way round: a package
+    // that reads the name and finds nothing is a function that does not
+    // load at all, and puppeteer is the one in the corpus.
+    {
+        let _running = watch.running();
+        let named = deno_core::ModuleSpecifier::parse("zou:buffer")
+            .map_err(|e| format!("zou:buffer is not a specifier: {e}"))?;
+        let id = js
+            .load_side_es_module_from_code(
+                &named,
+                "import { Buffer } from \"node:buffer\";\nglobalThis.Buffer = Buffer;\n",
+            )
+            .await
+            .map_err(|e| format!("the buffer global did not load: {e}"))?;
+        let evaluated = js.mod_evaluate(id);
+        js.with_event_loop_promise(evaluated, PollEventLoopOptions::default())
+            .await
+            .map_err(|e| format!("the buffer global did not run: {e}"))?;
+    }
 
     js.op_state().borrow_mut().put(Loading);
     let id = watch

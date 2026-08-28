@@ -4156,6 +4156,41 @@ fn a_navigator_says_what_the_function_is_running_on() {
     );
 }
 
+/// `Buffer` is a global, which is what node has and what a package
+/// written for node reads without importing anything. puppeteer is the
+/// one in the corpus and it was a ReferenceError at the top of a
+/// module, which is a function that does not load at all.
+///
+/// The one that comes through the module is the one on the global, not
+/// a second class with the same name, because a package that checks
+/// `instanceof` across the two is checking the same thing.
+#[test]
+fn buffer_is_a_global_the_way_a_package_written_for_node_expects() {
+    let answer = answered(
+        r#"
+        import { Buffer as imported } from "node:buffer";
+        const held = Buffer.from("zou", "utf8");
+        Deno.serve(() => Response.json({
+            kind: typeof Buffer,
+            same: imported === Buffer,
+            text: held.toString("base64"),
+            isView: held instanceof Uint8Array,
+            back: Buffer.from(held.toString("base64"), "base64").toString("utf8"),
+            // Read at the top of the module rather than in the call,
+            // which is where a package reads it.
+            atTheTop: held.length,
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(said["kind"], "function");
+    assert_eq!(said["same"], true);
+    assert_eq!(said["text"], "em91");
+    assert_eq!(said["isView"], true);
+    assert_eq!(said["back"], "zou");
+    assert_eq!(said["atTheTop"], 3);
+}
+
 /// The global is an event target, and a library that calls the bare
 /// `addEventListener` at the top of a module gets a listener rather
 /// than a ReferenceError.

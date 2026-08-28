@@ -446,7 +446,10 @@ The local runtime sets it in the worker's environment when the worker is made, a
 Both are a uuid and both are set on every call, and the difference is only visible to a function that logs it or returns it, which is the case the conformance suite asks about and asserts on both sides.
 
 The environment this server process was started with is not in it, which matters because that environment is holding a database password and a function is somebody else's code.
-`Deno.env.set` and `Deno.env.delete` throw: these are a project's settings rather than a shell.
+`Deno.env.set` and `Deno.env.delete` work and reach nobody.
+What a function writes is laid over what it was handed, it reads back for the rest of the call, and it goes with the isolate: the node's own environment is untouched, and so is the next call.
+Upstream refuses both, measured against a real worker, and Deno allows both, so this sits between them for a reason a package makes plain.
+Three of the functions in the examples corpus assign to `process.env` while they are loading, one of them setting `NODE_ENV` before it reads it back, and refusing that is a function that does not load rather than a secret that stayed safe.
 
 ## Secrets
 
@@ -659,6 +662,10 @@ That is what `@vercel/og` does, and on node it is a path because the package is 
 Here it is a url, so `fileURLToPath` of an `http:` or `https:` url answers with the url rather than throwing, and the read that follows takes it.
 A url that is neither a file nor http is still `ERR_INVALID_URL_SCHEME`, the way node spells it.
 
+With `ZOU_NPM=tarball` a package is a directory again, and that same line is a path again.
+Everything under the module cache is readable whatever the function's `static_files` say, so a package reads its own font, wasm blob or table of country codes the way it reads its own javascript, through `import.meta.url` if it is a module and through `__dirname` if it is a script.
+The project's own files are not widened by this and a relative name still starts at the function's directory: the cache holds what this runtime fetched on the function's behalf, and reading out of it is reading what the function already imported.
+
 Everything fetched is kept on disk, keyed by url, so only the first cold start pays for it.
 
 - `ZOU_MODULE_CACHE` is where, and defaults to `$XDG_CACHE_HOME/zou/modules` or `~/.cache/zou/modules`.
@@ -731,6 +738,7 @@ Deno.serve(async () => {
 `Deno.readFile`, `Deno.readTextFile` and the two `Sync` spellings of them are here, and they are the whole of the file system a function has.
 There is no writing, no listing a directory, no `Deno.open` and no stat.
 The same four calls read an `https:` url, which is a package reading a file of its own and is written down in the packages section rather than here: the patterns below are about the disk.
+A package unpacked from a tarball reads its own files off the disk instead, which is the paragraph after the patterns.
 
 A relative name starts at the directory the entrypoint is in, which is upstream's `servicePath`, so `./page.html` in `functions/hello/index.ts` is `functions/hello/page.html`.
 An absolute name and a `file:` url both work and are matched the same way.
@@ -748,8 +756,13 @@ Two errors, and they are Deno's own, so a function can tell them apart.
 - `Deno.errors.NotFound` for a file the patterns cover that is not there.
 - `Deno.errors.PermissionDenied` for a name nothing covers, with a message naming the function and saying `static_files`.
 
-A function that configures no `static_files` reads nothing, which is the same rule with an empty list rather than a special case.
+A function that configures no `static_files` reads nothing of the project's, which is the same rule with an empty list rather than a special case.
 That is deliberate and it is upstream's shape too: the process running these functions holds a database superuser connection and a JWT secret, and a function is somebody else's code.
+
+A package reads its own files, whatever the function configured.
+An import is unpacked into the module cache and everything under that cache is readable, because a package is published whole and a font, a wasm blob or a table of country codes is as much of it as its javascript is.
+`@vercel/og` reads a font out of its own `dist` directory while it is loading, and a runtime that serves a package's modules and refuses its files draws the line through the middle of one thing.
+This widens nothing about the project: the cache holds code this runtime fetched on the function's behalf and put there, a relative name still starts at the function's own directory rather than in the cache, and the project's own files are still `static_files` and nothing else.
 
 Static files are data rather than code, so editing one is not a reload.
 The next call reads the new bytes in the same kept isolate, which is what a page being edited during development should do.
@@ -1110,7 +1123,7 @@ What comes back has `read`, `write`, `close`, `closeWrite`, `localAddr`, `remote
 
 ## What a function can reach, and what it cannot
 
-Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `MessageChannel`, `MessagePort`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `console`, `performance`, `navigator`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.connect`, `Deno.connectTls`, `Deno.startTls`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
+Present: `Request`, `Response`, `Headers`, `fetch`, `URL`, `URLSearchParams`, `Blob`, `File`, `FormData`, `crypto`, `setTimeout`, `setInterval`, `clearTimeout`, `clearInterval`, `queueMicrotask`, `EdgeRuntime.waitUntil`, `WebSocket`, `EventTarget`, `Event`, `CustomEvent`, `MessageEvent`, `MessageChannel`, `MessagePort`, `CloseEvent`, `ErrorEvent`, `AbortController`, `AbortSignal`, `DOMException`, `ReadableStream`, `WritableStream`, `TransformStream`, `TextEncoder`, `TextDecoder`, `atob`, `btoa`, `structuredClone`, `console`, `performance`, `navigator`, `Buffer`, `Deno.serve`, `Deno.listen`, `Deno.serveHttp`, `Deno.connect`, `Deno.connectTls`, `Deno.startTls`, `Deno.env`, `Deno.readFile`, `Deno.readTextFile`, their two `Sync` spellings, `Deno.errors`, `Deno.build`, `Deno.version` and `Deno.permissions`.
 
 `AbortSignal` is the whole of it: the three statics, `AbortSignal.abort`, `AbortSignal.timeout` and `AbortSignal.any`, as well as what a controller makes.
 `fetch` takes one and a `Request` carries one, and the section on giving up on a call says what that does and where it stops.
@@ -1134,6 +1147,10 @@ What it is for is a library deciding whether to reach for something it can do wi
 Upstream answers granted to all eight, and a worker there can no more start a process than one here can, so this is a deliberate difference: a library told granted and then handed a `TypeError` is worse off than one told no.
 Nothing here can be revoked, because a function's permissions are the runtime's rather than the function's, so `revoke` answers what `query` answers rather than pretending to take away something it is not enforcing.
 
+`Buffer` is a global, the one `node:buffer` exports rather than a second class with the same name, so a package that checks `instanceof` across the two is checking the same thing.
+This is a deliberate difference and it goes the other way from `Deno.permissions`. Deno has `Buffer` on the global and upstream's runtime does not, both measured rather than remembered, and what the difference costs upstream is a package that reads the name at the top of a module and does not load at all, puppeteer being the one in the examples corpus.
+The cost here is that a function feature detecting node by asking whether `Buffer` exists takes the node branch, and every call pays for one sixteen kilobyte module being read whether or not anything reaches for it.
+
 `navigator` is `userAgent`, `hardwareConcurrency`, `language` and `languages`, and nothing else, which is what upstream has. The user agent reads `Deno/2.1.4 (variant; zou/<version>)`, the same sentence upstream builds with its own name in the brackets, and the core count is 1 whatever the host has, because a function gets one thread.
 
 Not present yet, and named rather than silently missing:
@@ -1141,7 +1158,7 @@ Not present yet, and named rather than silently missing:
 - The rest of `crypto.subtle`: key derivation, the asymmetric algorithms, and every key format other than `raw`.
 - Byte streams. There is no `new ReadableStream({ type: "bytes" })`, no BYOB reader and no `TextDecoderStream`.
 - Streaming the other way. A response body is sent as it is made, and a body coming back from `fetch` is still collected before the handler sees it, so a function that wants to read somebody else's answer a chunk at a time cannot yet. That also moves when the promise settles: upstream hands the response back when the headers arrive and this hands it back when the body is in, so a handler racing a slow answer against a clock sees the clock win here and the headers win there.
-- The rest of the file system. Reading a file the function's own `static_files` covers is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
+- The rest of the file system. Reading a file the function's own `static_files` covers, plus a file belonging to a package it imported, is all of it: there is no write, no directory listing, no `Deno.open` and no stat.
 - The rest of the node built ins. Thirty seven of them are here and the section on packages says what each one covers, and one that is not, `node:http2` and `node:dgram` among them, is refused by name when it is resolved.
 
 The rest of that list, and where each line stands, is [issue #369](https://github.com/tamnd/zou/issues/369).
