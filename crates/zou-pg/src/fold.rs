@@ -61,6 +61,15 @@ const FOLD_DOWN_FACTOR: u64 = 5;
 /// chain walk and a restore never touch more than five indexes.
 const MAX_DELTA_CHAIN: usize = 4;
 
+/// How long [`capture_wal_tail`] waits for the checkpoint record to
+/// reach the shared log before it gives the fold up. A pusher that is
+/// merely behind gets here; one that is gone does not come back.
+const WAL_TAIL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The ceiling on that wait's backoff, so a store having a bad minute
+/// is asked twice a second rather than a thousand times.
+const WAL_TAIL_NAP_MAX: std::time::Duration = std::time::Duration::from_millis(500);
+
 fn fold_down_factor() -> u64 {
     zou_store::setting::number_or(
         "ZOU_FOLD_DOWN_FACTOR",
@@ -531,6 +540,15 @@ fn pack_merged_full(
 /// endian start lsn. The record is written before the fold starts, but
 /// the pusher may not have shipped it yet, so this polls the shared log
 /// for a while; the fold runs on its own thread and can afford to wait.
+///
+/// The wait starts at a millisecond and doubles to half a second,
+/// because the two cases are far apart and a flat half second served
+/// only the far one. Usually the record is already there or is a
+/// millisecond behind, and a branch waits on this fold before it may
+/// cut, so half a second of nap was most of what a branch per test
+/// suite paid per test. A store having a bad minute is the other case
+/// and it still gets a minute, which is what 120 attempts half a second
+/// apart used to give it.
 fn capture_wal_tail(
     media: &WalMedia,
     tenant: u128,
@@ -543,10 +561,18 @@ fn capture_wal_tail(
         ));
     }
     let floor = redo & !(WAL_PAGE_SIZE - 1);
-    for attempt in 0..120u32 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(500));
+    let deadline = std::time::Instant::now() + WAL_TAIL_WAIT;
+    let mut nap = std::time::Duration::from_millis(1);
+    let mut first = true;
+    loop {
+        if !first {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(nap);
+            nap = (nap * 2).min(WAL_TAIL_NAP_MAX);
         }
+        first = false;
         let frames = catch_up(media, WAL_SHARD, &TeeFilter::Tenant(tenant), Lsn(floor))
             .map_err(|e| format!("wal catch up: {e}"))?;
         // Two pages of slack past the record's start cover its length

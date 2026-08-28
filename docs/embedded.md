@@ -126,11 +126,12 @@ fn a_todo_can_be_inserted() {
 ```
 
 `examples/per_test_branch.rs` is that, runnable, with the assertions the pattern stands on: each test sees the seed, sees nothing another test wrote, and takes its database off the store on the way out.
-On this laptop the seeded base costs 193 to 275 ms, template and schema included, and each test is 130 to 151 ms at p50 over four runs of ten tests, 243 to 337 at p90.
-That is roughly 30 ms of restore, 30 ms of postmaster, and 80 ms of waiting for the parent's checkpoint to be published, and the tenant contract is not in there at all because the branch inherits a database that already ran it.
-The spread between p50 and p90 is that last part: the fold runs on a thread of its own about 100 ms after the checkpoint, so a branch that asks just after one started waits for the next.
+On gamingpc, a 13th generation Core i9-13900K with 32 threads under WSL2 and nothing else running, the seeded base costs 131 to 152 ms once the machine's template is built, and each test is 42.8 to 52.7 ms at p50 over four alternating runs of ten tests on each read path, 52.7 to 92.3 at p90.
+The two read paths cost the same here, the layer path being a little ahead at p90 and the object path a little ahead nowhere.
+A test is about 39 ms of child, which is 2 ms of restore and 36 ms of postmaster, and about 13 ms of parent, which is a 3 ms checkpoint and a 10 ms wait for the fold to publish it, and the tenant contract is not in there at all because the branch inherits a database that already ran it.
+The postmaster is the floor and everything else is noise beside it, so a branch per test costs about what starting a postgres costs, which is the honest way to describe it.
 
-A branch per test is worth it when the migrations cost more than that, which is most projects with a real schema, and not worth it when the tests are happy on an empty database, where `Options::fixture()` on its own is 36 ms.
+A branch per test is worth it when the migrations cost more than that, which is most projects with a real schema, and not worth it when the tests are happy on an empty database, where `Options::fixture()` on its own is 36 ms on the laptop this line was measured on.
 
 ## Serving it to somebody else as well
 
