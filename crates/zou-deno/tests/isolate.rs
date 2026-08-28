@@ -1707,13 +1707,30 @@ fn timers_fire_in_the_order_their_delays_say() {
         r#"
         Deno.serve(() => new Promise((answer) => {
             const said = [];
-            setTimeout(() => said.push("thirty"), 30);
-            setTimeout(() => said.push("ten"), 10);
-            setTimeout(() => said.push("twenty"), 20);
+            // The three are set out of order on purpose, and every one
+            // of them is measured back to one reading of the clock and
+            // put a long way out.
+            //
+            // A deadline is fixed when `setTimeout` is called, so on a
+            // node busy enough to put twenty milliseconds between two
+            // adjacent lines, a ten set late really is due after a
+            // thirty set early, and one already in the past is clamped
+            // to now and loses the order entirely. Both are what the
+            // deadlines then are rather than a runtime that got them
+            // wrong, and neither is what this test is asking about. Two
+            // hundred milliseconds of room per line is more than that
+            // has ever been measured at.
+            const from = performance.now();
+            const at = (millis) => Math.max(0, millis - (performance.now() - from));
+            setTimeout(() => said.push("thirty"), at(230));
+            setTimeout(() => said.push("ten"), at(210));
+            setTimeout(() => said.push("twenty"), at(220));
+            // A plain zero, because a zero delay being a turn of the
+            // loop and not sooner is half of what this is here for.
             setTimeout(() => said.push("zero"), 0);
             queueMicrotask(() => said.push("microtask"));
             said.push("now");
-            setTimeout(() => answer(Response.json(said)), 60);
+            setTimeout(() => answer(Response.json(said)), at(400));
         }));
         "#,
     );
@@ -1721,6 +1738,49 @@ fn timers_fire_in_the_order_their_delays_say() {
     assert_eq!(
         said,
         serde_json::json!(["now", "microtask", "zero", "ten", "twenty", "thirty"])
+    );
+}
+
+/// And the delays still decide when every one of them is already late,
+/// which is the case a busy node makes and the one the test above only
+/// reaches by accident.
+///
+/// The stall is a real one: a timer at one millisecond that holds the
+/// thread for three hundred. Everything set after it is overdue by the
+/// time the loop turns again, so all three deadlines are reached at
+/// once and the order they run in is the runtime's to decide. Before
+/// there was one sleep for all the timers it was the host's, and under
+/// load that order was measured as thirty, ten, twenty, which is the
+/// order they were set in.
+#[test]
+fn a_stall_past_every_deadline_does_not_reorder_the_timers() {
+    let answer = answered(
+        r#"
+        Deno.serve(() => new Promise((answer) => {
+            const said = [];
+            const from = performance.now();
+            const at = (millis) => Math.max(0, millis - (performance.now() - from));
+            // The stall goes on first and the three it runs past are a
+            // long way out, for the reason the test above says: a
+            // deadline already in the past is clamped to now, and three
+            // clamped deadlines are in the order the lines were written
+            // rather than the order the delays asked for.
+            setTimeout(() => {
+                const until = Date.now() + 300;
+                while (Date.now() < until) {}
+                said.push("stalled");
+            }, at(1));
+            setTimeout(() => said.push("thirty"), at(230));
+            setTimeout(() => said.push("ten"), at(210));
+            setTimeout(() => said.push("twenty"), at(220));
+            setTimeout(() => answer(Response.json(said)), at(800));
+        }));
+        "#,
+    );
+    let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+    assert_eq!(
+        said,
+        serde_json::json!(["stalled", "ten", "twenty", "thirty"])
     );
 }
 
@@ -1909,9 +1969,18 @@ fn work_left_after_the_answer_does_not_keep_the_caller_waiting_for_it() {
     assert_eq!(body(&answer), "answered");
     // The answer is handed over while the work is still going, and the
     // call is not finished until the work is.
+    //
+    // Both of these are gaps rather than points on the clock. Making an
+    // isolate and evaluating a module is startup, it happens before the
+    // handler and before the two hundred milliseconds begin, and how
+    // long it takes is what the box was doing at the time. An answer
+    // that came back late because the box was busy and still came back
+    // with the whole job ahead of it is the behaviour this is here to
+    // protect, so measuring from before the isolate existed would call
+    // that a failure.
     assert!(
-        answered < std::time::Duration::from_millis(150),
-        "the caller waited for the background work: {answered:?}"
+        finished - answered >= std::time::Duration::from_millis(150),
+        "the caller waited for the background work: answered at {answered:?} of {finished:?}"
     );
     assert!(
         finished >= std::time::Duration::from_millis(200),
@@ -2350,6 +2419,12 @@ fn a_call_ends_when_the_signal_it_was_given_says_so() {
 /// Four of the five calls above are aborted and only four requests can
 /// have been in flight, so what this asserts is that the aborted ones
 /// still arrived rather than how many did.
+///
+/// The timeout is three hundred milliseconds against a route that
+/// sleeps for seven hundred and fifty. It was fifty, which is a fine
+/// number on a quiet box and is less than it takes to open a socket on
+/// a loaded one, and a request that never left is not the thing this
+/// is here to watch being given up on.
 #[test]
 fn a_call_that_was_given_up_on_had_already_gone_out() {
     let server = wire::start();
@@ -2357,7 +2432,7 @@ fn a_call_that_was_given_up_on_had_already_gone_out() {
         r#"
         Deno.serve(async () => {{
             try {{
-                await fetch("{slow}", {{ signal: AbortSignal.timeout(50) }});
+                await fetch("{slow}", {{ signal: AbortSignal.timeout(300) }});
                 return Response.json({{ threw: null }});
             }} catch (e) {{
                 return Response.json({{ threw: e.name }});
@@ -3682,18 +3757,26 @@ fn a_function_that_waits_is_not_charged_for_waiting() {
 /// budget, because it happens once and every call after the first one
 /// gets it free. A module that burns more than a call is allowed and
 /// then answers is a function that works.
+///
+/// A second against four hundred milliseconds rather than the three
+/// hundred against a hundred it started as. Cpu here is the time the
+/// isolate spent being polled, which counts a thread the operating
+/// system descheduled, so on a loaded box a handler that does nothing
+/// can still be charged for the time it was not running. The gap
+/// between the two numbers is what makes the test about the budget
+/// rather than about the box.
 #[test]
 fn what_loading_the_modules_costs_is_not_the_first_calls_to_pay() {
     let deployed = deployed(
         r#"
-        const until = Date.now() + 300;
+        const until = Date.now() + 1000;
         while (Date.now() < until) {}
         Deno.serve(() => new Response("loaded"));
         "#,
     );
     let answer = Isolate::new()
         .with_limits(Limits {
-            cpu: std::time::Duration::from_millis(100),
+            cpu: std::time::Duration::from_millis(400),
             boot: std::time::Duration::from_secs(20),
             ..small()
         })
@@ -4699,7 +4782,10 @@ fn a_message_arrives_as_a_copy_of_what_was_posted() {
 fn a_message_arrives_ahead_of_a_timer_and_a_handler_that_answers_waits_a_turn() {
     let answer = answered(
         r#"
-        const wait = (ms = 50) => new Promise((r) => setTimeout(r, ms));
+        // Long enough that a loaded node gets through the hops. What is
+        // being read is the order the turns came in, and a wait that is
+        // only just long enough on a quiet box measures the box.
+        const wait = (ms = 300) => new Promise((r) => setTimeout(r, ms));
         Deno.serve(async () => {
             const order = [];
             const first = new MessageChannel();

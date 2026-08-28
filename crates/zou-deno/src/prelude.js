@@ -2492,13 +2492,51 @@
   // ---------------------------------------------------------------
   // Timers
   //
-  // The sleeping is an op and the bookkeeping is here: which timers are
-  // still wanted, and the callback each one is for. A cleared timer is
-  // taken out of the set and cancelled at the host, so a timer set for
-  // an hour and cleared is not an hour of a future being held.
+  // The sleeping is an op and the bookkeeping is here: what each timer
+  // is due at, and the callback it is for. There is one sleep at the
+  // host for all of them, for the earliest deadline that has not been
+  // reached, and it is retuned whenever that deadline changes. A
+  // cleared timer is taken out of the map and the sleep is retuned
+  // without it, so a timer set for an hour and cleared is not an hour
+  // of a future being held.
+  //
+  // A sleep per timer is the shorter thing to write and it has an
+  // ordering it cannot fix. Four timers set for 0, 10, 20 and 30
+  // milliseconds would be four futures, and while the isolate is
+  // keeping up they come back one at a time and in order. When the
+  // isolate is held up past all four deadlines, which is what a busy
+  // node looks like, all four are ready at once and which one the host
+  // hands back first is the host's business: measured under load, the
+  // thirty came back before the ten. Firing them in that order is wrong
+  // however late they all are, and it is the kind of wrong that shows
+  // up as a retry that backed off less than the one before it.
+  //
+  // With one sleep the order is not the host's to decide. Whatever is
+  // due when it comes back runs here, earliest deadline first, and it
+  // runs inside the op's own turn rather than in a microtask of its
+  // own. That last part is not a detail: a callback put off to a
+  // microtask leaves the isolate with no op pending and nothing left to
+  // do, and a handler waiting on the timer that was about to resolve it
+  // is a promise the event loop has already decided nobody will settle.
 
-  const timers = new Set();
+  const timers = new Map();
   let nextTimer = 1;
+  // The id of the sleep that is outstanding, or zero.
+  let sleeper = 0;
+  // The deadline that sleep is for, so a retune that would ask for
+  // the same one again can be skipped.
+  let waking = Infinity;
+
+  // The number of milliseconds the host would sleep for, worked out
+  // here as well because the deadline is what orders the callbacks. A
+  // delay is a signed 32 bit integer in the sense web idl means it, so
+  // `| 0` is the whole of the rule: a number past the ceiling wraps
+  // rather than being refused, anything that is not a number at all is
+  // zero, and everything at or below zero is now.
+  function waits(millis) {
+    const wait = millis | 0;
+    return wait > 0 ? wait : 0;
+  }
 
   function after(callback, delay, args, repeating) {
     if (typeof callback !== "function") {
@@ -2509,30 +2547,93 @@
     }
     const id = nextTimer;
     nextTimer += 1;
-    timers.add(id);
-    const wait = Number(delay);
-    (async () => {
-      while (timers.has(id)) {
-        const fired = await ops.op_zou_sleep(id, wait);
-        if (!fired || !timers.has(id)) {
-          break;
-        }
-        if (!repeating) {
-          timers.delete(id);
-        }
-        try {
-          callback(...args);
-        } catch (thrown) {
-          // A handler cannot catch this: by the time the timer fires,
-          // whatever set it has returned. Deno's answer is to end the
-          // process, which here would be to lose an answer that is
-          // already written, so this says so and the call goes on.
-          reported(thrown);
-        }
-      }
-      timers.delete(id);
-    })();
+    const wait = waits(delay);
+    timers.set(id, { id, at: ops.op_zou_now() + wait, wait, callback, args, repeating });
+    wakes();
     return id;
+  }
+
+  // Point the one sleep at the earliest deadline there is.
+  function wakes() {
+    let earliest = Infinity;
+    for (const timer of timers.values()) {
+      if (timer.at < earliest) {
+        earliest = timer.at;
+      }
+    }
+    if (earliest === waking) {
+      return;
+    }
+    if (sleeper) {
+      ops.op_zou_clear(sleeper);
+      sleeper = 0;
+    }
+    waking = earliest;
+    if (earliest === Infinity) {
+      return;
+    }
+    // An id of its own rather than the timer's, because which timer the
+    // earliest deadline belongs to changes and the sleep is one thing.
+    const id = nextTimer;
+    nextTimer += 1;
+    sleeper = id;
+    (async () => {
+      // Rounded up, because the host sleeps in whole milliseconds and
+      // truncates what it is given: asking for 9.6 and being woken at 9
+      // is a timer that fired before its delay was up.
+      const wait = Math.ceil(Math.max(0, earliest - ops.op_zou_now()));
+      await ops.op_zou_sleep(id, wait);
+      if (sleeper !== id) {
+        // Retuned while this was sleeping, which is also how a cancel
+        // gets here. The sleep that replaced it is the one that counts.
+        return;
+      }
+      sleeper = 0;
+      waking = Infinity;
+      rings();
+    })();
+  }
+
+  // Run everything that is due, and go back to sleep for the rest.
+  function rings() {
+    const now = ops.op_zou_now();
+    const ready = [];
+    for (const timer of timers.values()) {
+      if (timer.at <= now) {
+        ready.push(timer);
+      }
+    }
+    // By when each was due, and then by which was made first, which is
+    // the order two timers with the same deadline fire in and is what
+    // the ids already carry.
+    ready.sort((one, other) => one.at - other.at || one.id - other.id);
+    for (const timer of ready) {
+      if (!timers.has(timer.id)) {
+        // Cleared by one of the callbacks that ran ahead of it in this
+        // same round, which is a timer that must not fire.
+        continue;
+      }
+      if (timer.repeating) {
+        timer.at = now + timer.wait;
+      } else {
+        timers.delete(timer.id);
+      }
+      try {
+        timer.callback(...timer.args);
+      } catch (thrown) {
+        // A handler cannot catch this: by the time the timer fires,
+        // whatever set it has returned. Deno's answer is to end the
+        // process, which here would be to lose an answer that is
+        // already written, so this says so and the call goes on.
+        reported(thrown);
+      }
+    }
+    // The host sleeps in whole milliseconds and the deadlines here are
+    // fractions of one, so a sleep can come back a fraction early and
+    // find nothing due. That is not a special case: there is a deadline
+    // that has not been reached, and this is the line that waits for
+    // it, the same as it does for the timers that were not due yet.
+    wakes();
   }
 
   function setTimeout(callback, delay = 0, ...args) {
@@ -2544,9 +2645,13 @@
   }
 
   function clearTimer(id) {
-    const held = Number(id);
-    if (timers.delete(held)) {
-      ops.op_zou_clear(held);
+    if (timers.delete(Number(id))) {
+      // Retuned rather than cancelled, because the sleep is for the
+      // earliest deadline of the timers there are and there may still
+      // be some. When there are none it is cancelled in there, which is
+      // what gives the hour back to a function that set a timer for an
+      // hour and changed its mind.
+      wakes();
     }
   }
 
