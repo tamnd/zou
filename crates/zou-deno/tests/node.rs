@@ -1092,10 +1092,16 @@ fn punycode_is_the_rfc_and_the_domain_pair_on_top_of_it() {
           toASCII("mañana@mañana。com"),
           String(punycode.decode === decode),
         ];
-        try {
-          decode("maana-ptaÿ");
-        } catch (why) {
-          said.push(`${why.name}:${why.message.split(":")[0]}`);
+        // The two ways a label is not punycode, which are different
+        // errors in node: something above ascii before the delimiter is
+        // not a basic code point, and the same thing after it is not a
+        // digit of the base 36 alphabet.
+        for (const bad of ["mañana-pta", "maana-ptaÿ"]) {
+          try {
+            decode(bad);
+          } catch (why) {
+            said.push(`${why.name}:${why.message}`);
+          }
         }
         Deno.serve(() => new Response(said.join(" | ")));
         "#,
@@ -1104,7 +1110,8 @@ fn punycode_is_the_rfc_and_the_domain_pair_on_top_of_it() {
         said,
         "maana-pta | --dqo34k | mañana | ☃-⌘ | xn--maana-pta.com | \
          xn----dqo34k.com | zou.dev | mañana.com | ☃-⌘.com | [97,98,99] | \
-         𝌆 | mañana@xn--maana-pta.com | true | RangeError:Illegal input >= 0x80 (not a basic code point)"
+         𝌆 | mañana@xn--maana-pta.com | true | \
+         RangeError:Illegal input >= 0x80 (not a basic code point) | RangeError:Invalid input"
     );
 }
 
