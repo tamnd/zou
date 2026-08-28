@@ -1282,3 +1282,63 @@ fn why(
         None => Failed::Threw(format!("{specifier}: {said}")),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The prelude is one scope, and a second declaration of a name is
+    /// not always an error there.
+    ///
+    /// A second `const` is a syntax error and shows up as every call
+    /// failing at once, which is loud enough to find. A second
+    /// `function` is not: the later declaration wins and the earlier one
+    /// is gone, so the caller of the earlier name silently gets the
+    /// wrong function. That is how a timer once came to call the event
+    /// dispatcher. This reads the declarations back out of the file so
+    /// that the next one is a failing test rather than an afternoon.
+    #[test]
+    fn no_two_things_in_the_prelude_are_called_the_same() {
+        let mut seen = std::collections::BTreeMap::new();
+        let mut clashed = Vec::new();
+        for (line, text) in include_str!("prelude.js").lines().enumerate() {
+            // Two spaces and no more: everything at the top level of the
+            // one IIFE is indented exactly that far, and anything deeper
+            // is inside a function and has a scope of its own.
+            let Some(rest) = text.strip_prefix("  ") else {
+                continue;
+            };
+            if rest.starts_with(' ') {
+                continue;
+            }
+            let Some((kind, rest)) = rest.split_once(' ') else {
+                continue;
+            };
+            if !matches!(kind, "const" | "let" | "var" | "function" | "class") {
+                continue;
+            }
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(first) = seen.insert(name.clone(), line + 1) {
+                clashed.push(format!(
+                    "{name} at line {first} and again at line {}",
+                    line + 1
+                ));
+            }
+        }
+        assert!(
+            seen.len() > 200,
+            "the prelude was read for names and hardly any were found, so the reading is wrong \
+             and not the file: {}",
+            seen.len()
+        );
+        assert!(
+            clashed.is_empty(),
+            "declared twice in the one scope: {}",
+            clashed.join(", ")
+        );
+    }
+}

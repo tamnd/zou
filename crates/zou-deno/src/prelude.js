@@ -2517,7 +2517,7 @@
   const due = [];
   let draining = false;
 
-  function fires(id, at, callback, args) {
+  function queues(id, at, callback, args) {
     due.push({ id, at, callback, args });
     if (draining) {
       return;
@@ -2570,7 +2570,7 @@
         if (!repeating) {
           timers.delete(id);
         }
-        fires(id, at, callback, args);
+        queues(id, at, callback, args);
       }
       timers.delete(id);
     })();
