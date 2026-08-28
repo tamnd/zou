@@ -92,6 +92,30 @@ const ANSWER_CAP: Duration = Duration::from_secs(300);
 /// out of the store instead of the tee.
 const POLL: Duration = Duration::from_millis(100);
 
+/// The cadence while somebody is parked.
+///
+/// A park is a read waiting for wal it has been told is durable, and
+/// the measurement on #671 says what it is waiting for: 17277 parks in
+/// a five minute run, none of them for a record that touched the page
+/// in hand, and a median gap of 4096 bytes between the lsn asked for
+/// and the lsn ingest held. Half a wal page. The wait was not volume
+/// and it was not the reader's own writes, it was the hundred
+/// millisecond poll, which is why park p99 was 131 ms and its max was
+/// the poll interval to the byte.
+///
+/// So the first look after a request parks is a millisecond later, and
+/// the interval doubles from there to POLL while polls keep coming
+/// back empty. A park that ends at the first look costs one extra read
+/// of the stream, and one that lasts the old hundred milliseconds
+/// costs seven, which is the price of not sleeping through the arrival
+/// of four kilobytes.
+const PARKED_POLL: Duration = Duration::from_millis(1);
+
+/// How long the loop waits on the request channel with nothing else
+/// to do. Also the ceiling on that wait while somebody is parked,
+/// since a poll cannot happen sooner than the sleep in front of it.
+const CHANNEL_WAIT: Duration = Duration::from_millis(10);
+
 /// What the cadence relaxes to once the stream has stopped moving.
 ///
 /// A poll is a shard manifest and a round index whether or not
@@ -649,6 +673,21 @@ fn relax(cadence: Duration, worth_it: bool) -> Duration {
     }
 }
 
+/// The same doubling for a service with readers waiting on it, between
+/// PARKED_POLL and POLL rather than between POLL and IDLE_POLL.
+///
+/// The ceiling is the old behaviour, so a park that outlives the climb
+/// costs what it always cost, and the floor is where every park starts
+/// because a reader that has just arrived is waiting for bytes its own
+/// backend watched go durable.
+fn relax_parked(cadence: Duration, worth_it: bool) -> Duration {
+    if worth_it {
+        PARKED_POLL
+    } else {
+        (cadence * 2).min(POLL)
+    }
+}
+
 /// What the wal a parked request waited through had to do with the
 /// pages it asked for. `from` is where the service stood when the
 /// request parked and `seen` where it stands now, so the wait was
@@ -718,6 +757,9 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
     // How long the driver waits between polls, POLL while the stream
     // is moving and doubling towards IDLE_POLL while it is not.
     let mut cadence = POLL;
+    // The same thing for a driver with somebody parked on it, which
+    // starts a millisecond after the park and doubles to POLL.
+    let mut parked_cadence = PARKED_POLL;
     let mut cursor = CatchUpCursor::default();
     let mut behind = false;
     // Whether a walk has ever reached the head of the stream. Until
@@ -773,9 +815,13 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
         // A poll that stopped on its slice has more waiting, so go
         // straight back to it after the readers have had their turn
         // rather than idling out the rest of the cadence. A reader
-        // waiting on an lsn holds the cadence at POLL; only a service
+        // waiting on an lsn holds the cadence down; only a service
         // with nobody waiting and nothing arriving relaxes it.
-        let due = if parked.is_empty() { cadence } else { POLL };
+        let due = if parked.is_empty() {
+            cadence
+        } else {
+            parked_cadence
+        };
         if frozen.is_none() && (behind || last_poll.elapsed() >= due) {
             let was = (ingest.as_ref().map_or(0, ShardIngest::seen), durable_seen);
             last_poll = Instant::now();
@@ -817,9 +863,20 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
                 }
             }
             cadence = relax(cadence, moved || behind);
+            parked_cadence = relax_parked(parked_cadence, moved || behind);
         }
 
-        match rx.recv_timeout(Duration::from_millis(10)) {
+        // The wait on the channel is the loop's own floor, so it comes
+        // down with the cadence: a millisecond poll inside a ten
+        // millisecond sleep is a ten millisecond poll. It follows the
+        // climb back up as well, so a park that is going to be a long
+        // one is not a thousand wakeups a second for the length of it.
+        let idle = if parked.is_empty() {
+            CHANNEL_WAIT
+        } else {
+            parked_cadence.min(CHANNEL_WAIT)
+        };
+        match rx.recv_timeout(idle) {
             Ok(req) => parked.push(req),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -871,6 +928,12 @@ fn drive(mut cfg: ServerConfig, rx: Receiver<GetReq>, stop: Arc<AtomicBool>) -> 
             }
         }
         parked = still;
+        // Nobody waiting is where the next park starts from, so the
+        // climb a previous one made is not inherited by a reader that
+        // arrives an hour later.
+        if parked.is_empty() {
+            parked_cadence = PARKED_POLL;
+        }
         for req in ready {
             let at = if applied == 0 { u64::MAX } else { applied };
             // Two samples, because they answer different questions:
@@ -1658,6 +1721,32 @@ mod tests {
             relax(POLL, false),
             POLL * 2,
             "doubling, so a fifth of a second of quiet costs a fifth of a second"
+        );
+    }
+
+    /// The park half of #671. A reader waiting on four kilobytes of
+    /// wal used to wait out the idle stream's poll for them, so the
+    /// climb starts a millisecond after the park and stops where the
+    /// old behaviour began.
+    #[test]
+    fn a_parked_reader_polls_from_a_millisecond() {
+        assert_eq!(
+            relax_parked(PARKED_POLL, false),
+            PARKED_POLL * 2,
+            "the same doubling, from a floor a hundred times lower"
+        );
+        let mut cadence = PARKED_POLL;
+        let mut polls = 0;
+        while cadence < POLL {
+            cadence = relax_parked(cadence, false);
+            polls += 1;
+        }
+        assert_eq!(cadence, POLL, "the climb stops at the old cadence");
+        assert_eq!(polls, 7, "and takes seven looks to get there");
+        assert_eq!(
+            relax_parked(POLL, true),
+            PARKED_POLL,
+            "wal arriving puts the next park back on the floor"
         );
     }
 
