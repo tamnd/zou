@@ -1132,6 +1132,36 @@ fn io_store(e: String) -> Error {
     Error::new(Kind::Store, e)
 }
 
+/// Let a hangup mean nothing to a child, the way it means nothing here.
+///
+/// A template build is one initdb holding a lock every other opener on
+/// the machine is waiting behind, and it runs long enough to be in
+/// flight when whatever the host process is attached to goes away. A
+/// hangup delivered to the process group killed one on a loaded box,
+/// taking the data directory out from under a bootstrap backend that
+/// was still writing into it, and the open that paid for it reported a
+/// missing `pg_wal` file. Nothing in this crate sends a hangup and
+/// initdb has no use for one: it is a program that finishes, and a
+/// postmaster is stopped here by name.
+///
+/// The disposition is set after the fork, so it belongs to the child
+/// alone and a host process that reloads its own config on a hangup
+/// goes on doing that. It survives the exec and every process initdb
+/// starts inherits it, which is what the bootstrap backend needed.
+fn deaf_to_hangup(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: what runs between the fork and the exec has to be async
+    // signal safe, and setting a disposition is one of the calls that
+    // is. It allocates nothing and takes no lock.
+    unsafe {
+        command.pre_exec(|| {
+            libc::signal(libc::SIGHUP, libc::SIG_IGN);
+            Ok(())
+        });
+    }
+}
+
 /// Make the database and capture it, the once.
 fn initdb(
     pg_bin: &Path,
@@ -1150,7 +1180,8 @@ fn initdb(
     if cleared > 0 {
         log::debug!("open: cleared {cleared} objects an unfinished open left");
     }
-    let out = Command::new(pg_bin.join("initdb"))
+    let mut command = Command::new(pg_bin.join("initdb"));
+    command
         .arg("-D")
         .arg(pgdata)
         .args(["-U", SUPERUSER])
@@ -1164,7 +1195,9 @@ fn initdb(
         .env("ZOU_PAGE_CACHE", pagecache)
         // initdb is standalone, there is no page service yet, and
         // unset means on.
-        .env("ZOU_PAGESERVE", "0")
+        .env("ZOU_PAGESERVE", "0");
+    deaf_to_hangup(&mut command);
+    let out = command
         .output()
         .map_err(|e| Error::new(Kind::Postgres, format!("initdb: {e}")))?;
     if !out.status.success() {
@@ -1296,6 +1329,46 @@ fn random_hex(bytes: usize) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether this process would already survive one, which a run
+    /// under `nohup` or `setsid` does. The bare half of the test below
+    /// proves nothing on such a box, so it is asked rather than
+    /// assumed, and asking with a null action reads the disposition
+    /// without setting it.
+    fn hangup_already_ignored() -> bool {
+        // SAFETY: a read of the current disposition into a zeroed
+        // struct we own, with no handler installed.
+        unsafe {
+            let mut current: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGHUP, std::ptr::null(), &mut current);
+            current.sa_sigaction == libc::SIG_IGN
+        }
+    }
+
+    #[test]
+    fn a_deafened_child_runs_on_through_a_hangup() {
+        if !hangup_already_ignored() {
+            let bare = Command::new("/bin/sh")
+                .args(["-c", "kill -HUP $$; echo alive"])
+                .output()
+                .expect("run sh");
+            assert!(
+                !bare.status.success(),
+                "a plain child already survives a hangup here, so the other half of this proves nothing"
+            );
+        }
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "kill -HUP $$; echo alive"]);
+        deaf_to_hangup(&mut command);
+        let out = command.output().expect("run sh");
+        assert!(
+            out.status.success(),
+            "the child died of a hangup it was meant to be deaf to: {:?}",
+            out.status
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "alive");
+    }
 
     #[test]
     fn an_ephemeral_handle_names_no_store_until_it_is_opened() {
