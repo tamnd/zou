@@ -17,6 +17,9 @@ The counter file is copied at every phase boundary into the run directory, so `z
 
 ## Hardware
 
+Every box these numbers come off, dated, with its disk and a measured latency and bandwidth probe to its store, is in [docs/hardware.md](hardware.md).
+`scripts/zou-bench.sh` prints the row at the top of every run, so a result and its machine travel together whether or not anybody remembers to look there.
+
 - Apple M4, 10 cores, 24 GB RAM, local NVMe, macOS.
 - MinIO runs in a podman container on the same machine, so its numbers include the real HTTP client and SigV4 signing but no network distance, which is exactly what the delay leg adds back.
 - Real S3: pending credentials, the column fills in as soon as a real bucket is available.

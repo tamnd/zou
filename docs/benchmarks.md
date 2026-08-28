@@ -3,6 +3,7 @@
 This page is the write up: what was measured, on what, and what it means.
 Which milestone claims those measurements have actually earned is one generated page in the harness repo, [tamnd/zou-bench `docs/dashboard.md`](https://github.com/tamnd/zou-bench/blob/main/docs/dashboard.md), where every row carries the line it has to beat, the run it was read from, and the milestone box it ticks.
 A claim nothing has measured yet is on that page saying so rather than left off it.
+Which box each row came off, dated, with its disk and a measured latency and bandwidth probe to its store, is in [docs/hardware.md](hardware.md).
 
 Recorded baselines for the commit latency harness.
 Reproduce with `cargo run --release -p zou-store --features s3,sqlite --example commit_latency -- [target]`.
