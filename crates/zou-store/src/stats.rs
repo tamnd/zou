@@ -29,11 +29,12 @@
 //! The service tier is where the read leaves the backend, so it says
 //! nothing about what the wait was made of. The page service reports
 //! its own side through [`note_phase`]: how long a request sat parked
-//! waiting for ingest to reach the LSN it asked for, how long the read
-//! itself took once it ran, and how long the driver spent in ingest
-//! rather than answering anybody. One serve loop does all three, so
-//! ingest time is read latency for every request queued behind it and
-//! the only way to see that is to measure it.
+//! waiting for ingest to reach the LSN it asked for, how long it then
+//! queued for a reader, how long the read itself took once it ran, and
+//! how long the driver spent in ingest rather than answering anybody.
+//! Ingest and the reads share a driver, so ingest time is read latency
+//! for every request behind it and the only way to see that is to
+//! measure it.
 //!
 //! The commit path reports the same way through [`note_commit`], and
 //! for the same reason: a commit that takes half a second is a number
@@ -72,12 +73,12 @@ use crate::cas::{CasError, CasStore, Version};
 /// layout so a dump from a stale binary fails loudly instead of reading
 /// garbage.
 const MAGIC: u64 = u64::from_ne_bytes(*b"ZOUSTATS");
-const FORMAT: u64 = 5;
+const FORMAT: u64 = 6;
 
 pub const OP_NAMES: [&str; 6] = ["get", "get_range", "put_if_match", "put", "delete", "list"];
 pub const CLASS_NAMES: [&str; 7] = ["manifest", "wal", "chk", "shards", "page", "file", "other"];
 pub const TIER_NAMES: [&str; 4] = ["cache", "local", "store", "service"];
-pub const PHASE_NAMES: [&str; 3] = ["park", "read", "ingest"];
+pub const PHASE_NAMES: [&str; 4] = ["park", "read", "ingest", "queue"];
 pub const CAUSE_NAMES: [&str; 3] = ["touched", "untouched", "unclear"];
 pub const COMMIT_NAMES: [&str; 7] = [
     "push", "stage", "window", "dispatch", "put", "ack", "durable",
@@ -262,6 +263,11 @@ pub enum Phase {
     /// The serve loop does this instead of answering, so it is
     /// somebody's read latency.
     Ingest,
+    /// From the driver handing a request to the readers to a reader
+    /// picking it up. Zero when the driver serves reads itself, and
+    /// otherwise the thing to look at when reads are slow and none of
+    /// them is: it is the pool being too small for the offered rate.
+    Queue,
 }
 
 /// One step of the commit path, [`COMMIT_NAMES`] in enum form. Each is

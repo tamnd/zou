@@ -62,6 +62,31 @@ impl Memtable {
             .map(|(&(_, lsn), record)| (lsn, record.as_slice()))
     }
 
+    /// The records for a few keys, as a table of their own.
+    ///
+    /// One read needs the records for the handful of keys it names and
+    /// nothing else, so this is a page's worth of bytes rather than a
+    /// copy of the table. The page service takes it on the thread that
+    /// owns the memtable and hands it to whichever thread does the
+    /// read, which is what lets a read run beside ingest instead of
+    /// behind it. What comes back is a fact about the table at the
+    /// moment it was taken and stays true however far ingest moves on
+    /// afterwards, since a record is written once at one lsn.
+    ///
+    /// Everything up to `upto`, with no floor, because the floor a read
+    /// applies is the image lsn its plan settles on and the plan is not
+    /// made yet. Reading past the floor costs the records between the
+    /// image and the position asked for, which is the same handful.
+    pub fn subset(&self, keys: &[LayerKey], upto: Lsn) -> Memtable {
+        let mut out = Memtable::new();
+        for key in keys {
+            for (lsn, record) in self.records_for(key, Lsn(0), upto) {
+                out.insert(*key, lsn, record.to_vec());
+            }
+        }
+        out
+    }
+
     /// Every entry in flush order, leaving the table alone. A read
     /// wants [`Self::records_for`]; this is for a caller that needs to
     /// see the whole table without emptying it, like a test asserting
@@ -129,6 +154,34 @@ mod tests {
             "the floor is excluded, the ceiling included, other keys invisible"
         );
         assert_eq!(mem.records_for(&k(3), Lsn(0), Lsn(100)).count(), 0);
+    }
+
+    #[test]
+    fn a_subset_is_the_keys_asked_for_and_reads_like_the_table_did() {
+        let mut mem = Memtable::new();
+        for block in [1u32, 2, 3] {
+            for lsn in [10u64, 20, 30] {
+                mem.insert(k(block), Lsn(lsn), vec![block as u8, lsn as u8]);
+            }
+        }
+        let taken = mem.subset(&[k(1), k(3)], Lsn(20));
+        assert_eq!(taken.len(), 4, "two keys, two lsns each under the ceiling");
+        for block in [1u32, 3] {
+            assert_eq!(
+                taken
+                    .records_for(&k(block), Lsn(0), Lsn(100))
+                    .collect::<Vec<_>>(),
+                mem.records_for(&k(block), Lsn(0), Lsn(20))
+                    .collect::<Vec<_>>(),
+                "block {block} reads out of the subset the way it read out of the table"
+            );
+        }
+        assert_eq!(taken.records_for(&k(2), Lsn(0), Lsn(100)).count(), 0);
+        // Which is the whole point: the reader holds this while ingest
+        // goes on filling and draining the table it came from.
+        mem.insert(k(1), Lsn(40), vec![9]);
+        mem.drain_sorted();
+        assert_eq!(taken.records_for(&k(1), Lsn(0), Lsn(100)).count(), 2);
     }
 
     #[test]
