@@ -1909,9 +1909,18 @@ fn work_left_after_the_answer_does_not_keep_the_caller_waiting_for_it() {
     assert_eq!(body(&answer), "answered");
     // The answer is handed over while the work is still going, and the
     // call is not finished until the work is.
+    //
+    // Both of these are gaps rather than points on the clock. Making an
+    // isolate and evaluating a module is startup, it happens before the
+    // handler and before the two hundred milliseconds begin, and how
+    // long it takes is what the box was doing at the time. An answer
+    // that came back late because the box was busy and still came back
+    // with the whole job ahead of it is the behaviour this is here to
+    // protect, so measuring from before the isolate existed would call
+    // that a failure.
     assert!(
-        answered < std::time::Duration::from_millis(150),
-        "the caller waited for the background work: {answered:?}"
+        finished - answered >= std::time::Duration::from_millis(150),
+        "the caller waited for the background work: answered at {answered:?} of {finished:?}"
     );
     assert!(
         finished >= std::time::Duration::from_millis(200),

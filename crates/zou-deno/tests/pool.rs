@@ -135,9 +135,14 @@ fn the_cold_start_is_paid_once() {
         cold >= Duration::from_millis(200),
         "the module's own two hundred milliseconds were not paid: {cold:?}"
     );
+    // Against the cold call rather than against a number, because what
+    // is being claimed is that the module's two hundred milliseconds
+    // were not paid twice. A busy box makes both calls slower together
+    // and leaves that difference where it is, and a fixed ceiling on
+    // the warm one turns the box's load into a failed assertion.
     assert!(
-        warm < Duration::from_millis(100),
-        "the second call built the module again: {warm:?}"
+        cold >= warm + Duration::from_millis(150),
+        "the second call built the module again: {warm:?} against a cold {cold:?}"
     );
 }
 
@@ -269,6 +274,12 @@ fn a_busy_isolate_does_not_make_the_next_caller_wait_for_it() {
         "#,
     );
     let runtime = Arc::new(kept());
+    // One call first, so what is timed below is two handlers and not
+    // two handlers plus however long this box takes to make an isolate
+    // and evaluate a module. The number the assertion leans on is the
+    // half second the handler sleeps for, and startup is neither part
+    // of that nor bounded by anything.
+    assert_eq!(said(&runtime, &deployed, "warm"), "slept");
     let started = Instant::now();
     let both: Vec<_> = ["one", "two"]
         .into_iter()
