@@ -158,6 +158,37 @@ async fn send(socket: &mut Socket, text: String) {
         .expect("the socket takes it");
 }
 
+/// Everything one client says to the room, at the speed of a client
+/// talking rather than of a memcpy.
+///
+/// The yield is the point of this existing. Nothing in this file has a
+/// thread of its own: the runtime is one thread, both ends of every
+/// socket are tasks on it, and the only thing that turns a broadcast
+/// into a delivery is the sending task giving the scheduler a turn. A
+/// `send` whose bytes fit in the kernel's write buffer finishes
+/// without giving one, and a machine with a few megabytes of
+/// `tcp_wmem` swallows this whole burst that way. Six hundred
+/// broadcasts then reach the hub before any socket has been polled
+/// once, and every subscriber in the room is past the backlog of 256,
+/// the ones reading as fast as they can be asked to along with the one
+/// that is not reading at all.
+///
+/// Which is a fact about the test and not about the server. A
+/// publisher nobody has been scheduled against is not a room, and a
+/// client cannot be behind a message that has not been offered to it
+/// yet. It is also why this only bit on some machines (zou #717): how
+/// much of a burst finishes without blocking is how big the write
+/// buffer is, and that is a property of the box.
+///
+/// The stuck socket falls as far behind as it ever did. It is not
+/// reading, so a turn is no use to it.
+async fn talk(socket: &mut Socket, count: usize) {
+    for n in 0..count {
+        send(socket, broadcast(n)).await;
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Join the room and wait for the reply, which is what
 /// `channel.subscribe()` does.
 async fn join(socket: &mut Socket) {
@@ -273,9 +304,7 @@ async fn a_socket_that_stopped_reading_does_not_hold_up_the_one_beside_it() {
     // Nothing reads `stuck` from here to the end of the test.
     let reader = reading(fast, SENT);
     let start = Instant::now();
-    for n in 0..SENT {
-        send(&mut sender, broadcast(n)).await;
-    }
+    talk(&mut sender, SENT).await;
     let sending = start.elapsed();
     let receiving = reader
         .await
@@ -440,9 +469,7 @@ async fn a_room_where_most_of_it_is_stuck_still_serves_the_one_that_is_not() {
     join(&mut sender).await;
 
     let reader = reading(fast, SENT);
-    for n in 0..SENT {
-        send(&mut sender, broadcast(n)).await;
-    }
+    talk(&mut sender, SENT).await;
     let took = reader
         .await
         .expect("the reader finishes")
