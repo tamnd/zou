@@ -7,7 +7,8 @@
 #   --after  <prefix>   the other one
 #   --legs   pg,fs,s3   which stores, default pg,fs
 #   --s3     <url>      the object store for the s3 leg, s3://bucket/prefix
-#   --zou    <path>     a zou binary, for `zou stats`, default none
+#   --zou    <path>     a zou binary, for `zou stats`, default none,
+#                       overridden by a `zou` in the side's own prefix
 #   --runs   <n>        rounds of every leg on both sides, default 3
 #   --seconds <n>       one measurement, default 45
 #   --clients <n>       connections, default 16
@@ -24,13 +25,23 @@
 #   git checkout <rev>
 #   make zou-pg-lib && ninja -C build/pg-build install
 #   cargo build --release -p zou-pg --bin zou-bootstrap
+#   cargo build --release -p zou --bin zou
 #   mkdir -p /tmp/ab-<side> && cp -R build/pg/. /tmp/ab-<side>/
 #   cp target/release/zou-bootstrap /tmp/ab-<side>/zou-bootstrap
+#   cp target/release/zou /tmp/ab-<side>/zou
 #
 # The lib matters and not only the binary: the store code runs inside
 # the postmaster, so a cargo build that did not go through
 # `ninja install` measures the old one and reports that the change did
 # nothing.
+#
+# The `zou` in the prefix matters for the same reason. A counter file
+# has the layout of the build that wrote it, and the two sides of an
+# A/B are by definition two builds, so the newer `zou stats` reads its
+# own side and answers `is not a counter file` on the other one. Each
+# side reading its own counters with its own binary is the only way
+# both columns come out. `--zou` is the fallback for a pair of prefixes
+# that do not carry one.
 #
 # Why this exists rather than a run of each side in turn. The write
 # numbers in #476 were taken on a box that was also running its owner's
@@ -81,8 +92,13 @@ case ",$LEGS," in
 *,s3,*) [ -n "$S3" ] || { echo "--legs s3 needs --s3" >&2; exit 2; } ;;
 esac
 
+# Kept once, because every measurement builds its own library path in
+# front of it and appending to the last one would grow a path per round.
+LD_BASE=${LD_LIBRARY_PATH:-}
+
 WORK=${WORK:-$(mktemp -d /tmp/zou-write-ab.XXXXXX)}
 mkdir -p "$WORK"
+RUNID=$(basename "$WORK")
 RESULTS=$WORK/results.tsv
 : >"$RESULTS"
 
@@ -114,6 +130,15 @@ measure() {
 	rm -rf "$pgdata" "$sock" "$store" "$stats"
 	mkdir -p "$sock"
 
+	# Each side loads its own libpq. An install copied away from the
+	# prefix it was configured with keeps that prefix in its rpath, and
+	# a bench that runs as a user who cannot read the build tree gets
+	# the system libpq instead, which on a box with an older postgres
+	# on it is `psql: undefined symbol: PQsendPipelineSync` in the
+	# middle of a round.
+	LD_LIBRARY_PATH=$prefix/lib/x86_64-linux-gnu:$prefix/lib${LD_BASE:+:$LD_BASE}
+	export LD_LIBRARY_PATH
+
 	unset ZOU_TARGET ZOU_TENANT ZOU_PAGESERVE ZOU_STORE_STATS 2>/dev/null || true
 	if [ "$leg" != pg ]; then
 		if [ "$leg" = fs ]; then
@@ -122,8 +147,12 @@ measure() {
 		else
 			# A prefix per measurement, since a store that already
 			# holds a run's wal is not the store the last one started
-			# from.
-			target=$S3/$tag
+			# from. The run's own name is in it as well, because the
+			# tags repeat between invocations and an initdb that finds
+			# yesterday's cluster under its prefix dies with
+			# `relation "pg_attrdef" already exists` rather than
+			# saying anything about the store.
+			target=$S3/$RUNID/$tag
 		fi
 		ZOU_TARGET=$target
 		ZOU_TENANT=local
@@ -195,8 +224,10 @@ measure() {
 	# The counter file outlives the store, because the four byte puts
 	# in it are the thing #476 said was stable across every run and
 	# the store itself is gigabytes nobody reads again.
-	if [ -n "$ZOU" ] && [ -f "$stats" ]; then
-		"$ZOU" stats "$stats" >"$stats.json" 2>/dev/null || true
+	zoubin=$ZOU
+	[ -x "$prefix/zou" ] && zoubin=$prefix/zou
+	if [ -n "$zoubin" ] && [ -f "$stats" ]; then
+		"$zoubin" stats "$stats" >"$stats.json" 2>/dev/null || true
 	fi
 	rm -rf "$pgdata" "$store"
 }
