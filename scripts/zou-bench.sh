@@ -67,6 +67,29 @@ echo "target: $TARGET"
 echo "rundir: $RUNDIR"
 echo "page service: $ZOU_PAGESERVE"
 
+# Which box this was, at the top of the run rather than in somebody's
+# memory. A tps is a number about a pair, a machine and a store, and
+# the pair is the half a result table leaves out: eight shared cores
+# against a MinIO on the same disk as the WAL and thirty two quiet ones
+# against a bucket are the same column and not the same measurement.
+#
+# The distance half needs a probe and a probe writes, so it is asked
+# for rather than assumed: ZOU_BENCH_PROBE=1 puts a latency and
+# bandwidth line beside the specs, which is what a result being
+# published wants and not what a run being iterated on wants.
+HARDWARE=$(dirname "$0")/zou-hardware.sh
+if [ -r "$HARDWARE" ]; then
+    case $TARGET in
+    *://*) WHERE=$RUNDIR ;;
+    *) WHERE=$TARGET ;;
+    esac
+    if [ "${ZOU_BENCH_PROBE:-0}" = 1 ]; then
+        sh "$HARDWARE" "$WHERE" "$TARGET" | sed 's/^/  /'
+    else
+        sh "$HARDWARE" "$WHERE" | sed 's/^/  /'
+    fi
+fi
+
 # A phase costs the counters at its end minus the counters at its start,
 # so every phase leaves a copy of the file behind for the next one. The
 # copies are kept under the run directory as well, named by the boundary

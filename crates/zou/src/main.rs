@@ -38,6 +38,7 @@ mod info;
 mod inspect;
 mod map;
 mod out;
+mod probe;
 mod schema;
 #[cfg(unix)]
 mod secrets;
@@ -80,6 +81,7 @@ fn usage() -> ExitCode {
     #[cfg(unix)]
     eprintln!("       {}", inbox::USAGE);
     eprintln!("       {}", map::USAGE);
+    eprintln!("       {}", probe::USAGE);
     #[cfg(unix)]
     eprintln!("       {}", secrets::USAGE);
     #[cfg(unix)]
@@ -166,6 +168,7 @@ fn main() -> ExitCode {
         Some("info") => simple(info::run(&argv[1..])),
         Some("inspect") => simple(inspect::run(&argv[1..])),
         Some("map") => simple(map::run(&argv[1..])),
+        Some("probe") => simple(probe::run(&argv[1..])),
         #[cfg(unix)]
         Some("secrets") => simple(secrets::run(&argv[1..])),
         #[cfg(unix)]
