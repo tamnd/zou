@@ -1752,14 +1752,19 @@ fn a_stall_past_every_deadline_does_not_reorder_the_timers() {
             const said = [];
             const from = performance.now();
             const at = (millis) => Math.max(0, millis - (performance.now() - from));
-            setTimeout(() => said.push("thirty"), at(30));
-            setTimeout(() => said.push("ten"), at(10));
-            setTimeout(() => said.push("twenty"), at(20));
+            // The stall goes on first. A deadline that has already gone
+            // by is clamped to now, so a one set after a ten on a node
+            // that took ten milliseconds to get between the two lines
+            // is due after it, which is correct and is not the case
+            // this wants.
             setTimeout(() => {
                 const until = Date.now() + 60;
                 while (Date.now() < until) {}
                 said.push("stalled");
             }, at(1));
+            setTimeout(() => said.push("thirty"), at(30));
+            setTimeout(() => said.push("ten"), at(10));
+            setTimeout(() => said.push("twenty"), at(20));
             setTimeout(() => answer(Response.json(said)), at(300));
         }));
         "#,
@@ -2406,6 +2411,12 @@ fn a_call_ends_when_the_signal_it_was_given_says_so() {
 /// Four of the five calls above are aborted and only four requests can
 /// have been in flight, so what this asserts is that the aborted ones
 /// still arrived rather than how many did.
+///
+/// The timeout is three hundred milliseconds against a route that
+/// sleeps for seven hundred and fifty. It was fifty, which is a fine
+/// number on a quiet box and is less than it takes to open a socket on
+/// a loaded one, and a request that never left is not the thing this
+/// is here to watch being given up on.
 #[test]
 fn a_call_that_was_given_up_on_had_already_gone_out() {
     let server = wire::start();
@@ -2413,7 +2424,7 @@ fn a_call_that_was_given_up_on_had_already_gone_out() {
         r#"
         Deno.serve(async () => {{
             try {{
-                await fetch("{slow}", {{ signal: AbortSignal.timeout(50) }});
+                await fetch("{slow}", {{ signal: AbortSignal.timeout(300) }});
                 return Response.json({{ threw: null }});
             }} catch (e) {{
                 return Response.json({{ threw: e.name }});
