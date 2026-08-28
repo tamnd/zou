@@ -138,13 +138,21 @@ impl CasStore for HedgedStore {
         let bytes: Arc<[u8]> = data.into();
         let key: Arc<str> = key.into();
         let (tx, rx) = mpsc::channel();
+        let (begun_tx, begun_rx) = mpsc::channel();
         let launch = || {
             let store = Arc::clone(&self.inner);
             let bytes = Arc::clone(&bytes);
             let key = Arc::clone(&key);
             let tx = tx.clone();
+            let begun = begun_tx.clone();
             thread::spawn(move || {
                 let start = Instant::now();
+                // The one number both sides of this use. The parent's
+                // patience is measured from here rather than from the
+                // spawn, and the winner it records is measured from
+                // here too, so the delay and the median it is derived
+                // from are the same clock.
+                let _ = begun.send(start);
                 let result = store.put_if_absent(&key, &bytes);
                 // The receiver may be gone because the other attempt
                 // already won; a loser's report has nowhere to go.
@@ -153,7 +161,14 @@ impl CasStore for HedgedStore {
         };
         launch();
 
-        let deadline = Instant::now() + delay;
+        // Waiting for the attempt to reach a core before starting the
+        // clock is the whole point. The delay floor is a millisecond
+        // and a thread on a busy box can sit unscheduled for several,
+        // so a deadline stamped in the caller spends its budget on the
+        // scheduler and then hedges a store that was never asked for
+        // anything. Every one of those is a second real PUT against a
+        // real bucket, counted as a hedge, which reads as a slow store.
+        let deadline = begun_rx.recv().unwrap_or_else(|_| Instant::now()) + delay;
         let mut outstanding = 1;
         let mut hedged = false;
         let mut fence = None;
