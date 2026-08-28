@@ -459,7 +459,7 @@ impl Twilio {
     /// upstream's reading and the right one: the person never got the
     /// code.
     pub fn read(reply: &Reply) -> Result<String, String> {
-        let body: serde_json::Value = serde_json::from_str(&reply.body)
+        let body: serde_json::Value = zou_json::from_str(&reply.body)
             .map_err(|e| format!("twilio sent something that is not json: {e}"))?;
         if reply.status != 200 && reply.status != 201 {
             return Err(format!(
@@ -617,7 +617,7 @@ impl TwilioVerify {
 /// Twilio saying no in its own words, which is the same shape the
 /// messaging api uses.
 fn judged(reply: &Reply, whose: &str) -> Result<serde_json::Value, String> {
-    let body: serde_json::Value = serde_json::from_str(&reply.body)
+    let body: serde_json::Value = zou_json::from_str(&reply.body)
         .map_err(|e| format!("{whose} sent something that is not json: {e}"))?;
     if reply.status / 100 != 2 {
         return Err(format!(
@@ -697,7 +697,7 @@ impl MessageBird {
     }
 
     pub fn read(reply: &Reply) -> Result<String, String> {
-        let body: serde_json::Value = serde_json::from_str(&reply.body)
+        let body: serde_json::Value = zou_json::from_str(&reply.body)
             .map_err(|e| format!("messagebird sent something that is not json: {e}"))?;
         if matches!(reply.status, 400 | 401 | 403 | 422) {
             let first = body
@@ -781,7 +781,7 @@ impl Vonage {
     /// message, so the status field is the only thing worth reading and
     /// `"0"` is the only value that means sent.
     pub fn read(reply: &Reply) -> Result<String, String> {
-        let body: serde_json::Value = serde_json::from_str(&reply.body)
+        let body: serde_json::Value = zou_json::from_str(&reply.body)
             .map_err(|e| format!("vonage sent something that is not json: {e}"))?;
         let Some(first) = body.get("messages").and_then(|m| m.get(0)) else {
             return Err("vonage error: no messages found in response".to_string());
@@ -847,7 +847,7 @@ impl TextLocal {
     }
 
     pub fn read(reply: &Reply) -> Result<String, String> {
-        let body: serde_json::Value = serde_json::from_str(&reply.body)
+        let body: serde_json::Value = zou_json::from_str(&reply.body)
             .map_err(|e| format!("textlocal sent something that is not json: {e}"))?;
         if text_of(&body, "status") != "success" {
             let first = body

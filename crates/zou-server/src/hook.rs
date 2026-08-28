@@ -211,7 +211,7 @@ pub(crate) async fn customize(
             "(root): Invalid type. Expected: object, but got: null".to_string(),
         ])));
     };
-    let Ok(out) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Ok(out) = zou_json::from_str(&raw) else {
         return Err(broken(UNREADABLE));
     };
     if let Some(refusal) = refused(&out) {

@@ -429,7 +429,7 @@ pub fn exchange(
         bearer: String::new(),
     };
     let answer = http.call(&ask)?;
-    let body: serde_json::Value = serde_json::from_str(&answer.body).map_err(|_| {
+    let body: serde_json::Value = zou_json::from_str(&answer.body).map_err(|_| {
         format!(
             "{} answered {}: {}",
             provider.name,
@@ -511,7 +511,7 @@ fn from_id_token(token: &str) -> Result<Person, String> {
         .ok_or("the id token is not a jwt".to_string())?;
     let bytes = base64ct::Base64UrlUnpadded::decode_vec(payload)
         .map_err(|e| format!("the id token payload is not base64url: {e}"))?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes)
+    let claims: serde_json::Value = zou_json::from_slice(&bytes)
         .map_err(|e| format!("the id token payload is not json: {e}"))?;
     let sub = text(&claims, "sub");
     if sub.is_empty() {
@@ -564,7 +564,7 @@ fn fetch(
             snippet(&answer.body)
         ));
     }
-    serde_json::from_str(&answer.body)
+    zou_json::from_str(&answer.body)
         .map_err(|e| format!("{provider} answered with something that is not json: {e}"))
 }
 

@@ -43,6 +43,7 @@ ureq = { workspace = true }
 webp = { workspace = true }
 webpki-roots = { workspace = true }
 zou-functions = { path = "../zou-functions" }
+zou-json = { path = "../zou-json" }
 zou-ops = { path = "../zou-ops" }
 zou-realtime = { path = "../zou-realtime" }
 zou-rest = { path = "../zou-rest" }
