@@ -1707,13 +1707,22 @@ fn timers_fire_in_the_order_their_delays_say() {
         r#"
         Deno.serve(() => new Promise((answer) => {
             const said = [];
-            setTimeout(() => said.push("thirty"), 30);
-            setTimeout(() => said.push("ten"), 10);
-            setTimeout(() => said.push("twenty"), 20);
-            setTimeout(() => said.push("zero"), 0);
+            // Every delay is measured back to one reading of the clock.
+            // A timer's deadline is set when `setTimeout` is called, so
+            // on a node busy enough to put ten milliseconds between two
+            // adjacent lines, a ten set late really is due after a
+            // thirty set early. That is what the deadlines are and not
+            // a runtime that got the order wrong, and it is not what
+            // this test is asking about.
+            const from = performance.now();
+            const at = (millis) => Math.max(0, millis - (performance.now() - from));
+            setTimeout(() => said.push("thirty"), at(30));
+            setTimeout(() => said.push("ten"), at(10));
+            setTimeout(() => said.push("twenty"), at(20));
+            setTimeout(() => said.push("zero"), at(0));
             queueMicrotask(() => said.push("microtask"));
             said.push("now");
-            setTimeout(() => answer(Response.json(said)), 60);
+            setTimeout(() => answer(Response.json(said)), at(60));
         }));
         "#,
     );
@@ -1730,25 +1739,28 @@ fn timers_fire_in_the_order_their_delays_say() {
 ///
 /// The stall is a real one: a timer at one millisecond that holds the
 /// thread for sixty. Everything set after it is overdue by the time the
-/// loop turns again, so all three sleeps are ready at the host at once
-/// and the order they come back in is the host's rather than the
-/// deadlines'. Under load that order was measured as thirty, ten,
-/// twenty, which is the order they were set in.
+/// loop turns again, so all three deadlines are reached at once and
+/// the order they run in is the runtime's to decide. Before there was
+/// one sleep for all the timers it was the host's, and under load that
+/// order was measured as thirty, ten, twenty, which is the order they
+/// were set in.
 #[test]
 fn a_stall_past_every_deadline_does_not_reorder_the_timers() {
     let answer = answered(
         r#"
         Deno.serve(() => new Promise((answer) => {
             const said = [];
-            setTimeout(() => said.push("thirty"), 30);
-            setTimeout(() => said.push("ten"), 10);
-            setTimeout(() => said.push("twenty"), 20);
+            const from = performance.now();
+            const at = (millis) => Math.max(0, millis - (performance.now() - from));
+            setTimeout(() => said.push("thirty"), at(30));
+            setTimeout(() => said.push("ten"), at(10));
+            setTimeout(() => said.push("twenty"), at(20));
             setTimeout(() => {
                 const until = Date.now() + 60;
                 while (Date.now() < until) {}
                 said.push("stalled");
-            }, 1);
-            setTimeout(() => answer(Response.json(said)), 300);
+            }, at(1));
+            setTimeout(() => answer(Response.json(said)), at(300));
         }));
         "#,
     );
@@ -3726,18 +3738,26 @@ fn a_function_that_waits_is_not_charged_for_waiting() {
 /// budget, because it happens once and every call after the first one
 /// gets it free. A module that burns more than a call is allowed and
 /// then answers is a function that works.
+///
+/// A second against four hundred milliseconds rather than the three
+/// hundred against a hundred it started as. Cpu here is the time the
+/// isolate spent being polled, which counts a thread the operating
+/// system descheduled, so on a loaded box a handler that does nothing
+/// can still be charged for the time it was not running. The gap
+/// between the two numbers is what makes the test about the budget
+/// rather than about the box.
 #[test]
 fn what_loading_the_modules_costs_is_not_the_first_calls_to_pay() {
     let deployed = deployed(
         r#"
-        const until = Date.now() + 300;
+        const until = Date.now() + 1000;
         while (Date.now() < until) {}
         Deno.serve(() => new Response("loaded"));
         "#,
     );
     let answer = Isolate::new()
         .with_limits(Limits {
-            cpu: std::time::Duration::from_millis(100),
+            cpu: std::time::Duration::from_millis(400),
             boot: std::time::Duration::from_secs(20),
             ..small()
         })
@@ -4743,7 +4763,10 @@ fn a_message_arrives_as_a_copy_of_what_was_posted() {
 fn a_message_arrives_ahead_of_a_timer_and_a_handler_that_answers_waits_a_turn() {
     let answer = answered(
         r#"
-        const wait = (ms = 50) => new Promise((r) => setTimeout(r, ms));
+        // Long enough that a loaded node gets through the hops. What is
+        // being read is the order the turns came in, and a wait that is
+        // only just long enough on a quiet box measures the box.
+        const wait = (ms = 300) => new Promise((r) => setTimeout(r, ms));
         Deno.serve(async () => {
             const order = [];
             const first = new MessageChannel();
