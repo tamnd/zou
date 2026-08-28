@@ -272,11 +272,18 @@ fn a_busy_isolate_does_not_make_the_next_caller_wait_for_it() {
     // and that is the same number as two calls that queued on a box
     // that is not. The overlap is the claim itself and it does not care
     // what the box was doing before either handler began.
+    //
+    // Two seconds and not half of one. The two callers are threads, and
+    // nothing makes them start together: under twelve spinners the
+    // second handler began three hundred milliseconds after the first
+    // had finished, which is a thread that was late rather than a call
+    // that was queued, and the assertion below cannot tell those apart.
+    // The sleep is what buys the room to be late in.
     let deployed = deployed(
         r#"
         Deno.serve(async () => {
           const from = Date.now();
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          await new Promise((resolve) => setTimeout(resolve, 2000));
           return Response.json({ from, to: Date.now() });
         });
         "#,
@@ -305,8 +312,8 @@ fn a_busy_isolate_does_not_make_the_next_caller_wait_for_it() {
         .collect();
     let (one, two) = (spans[0], spans[1]);
     assert!(
-        one.1 - one.0 >= 500 && two.1 - two.0 >= 500,
-        "a handler did not sleep for its half second: {spans:?}"
+        one.1 - one.0 >= 2000 && two.1 - two.0 >= 2000,
+        "a handler did not sleep for its two seconds: {spans:?}"
     );
     assert!(
         one.0 < two.1 && two.0 < one.1,
