@@ -265,22 +265,23 @@ fn an_isolate_whose_handler_threw_is_kept() {
 /// slowly too.
 #[test]
 fn a_busy_isolate_does_not_make_the_next_caller_wait_for_it() {
+    // Each handler says when it started and when it stopped, and the
+    // question is whether those two spans overlap. A total against a
+    // ceiling cannot answer it: two calls that really did run together
+    // take a second and a half on a box that is busy making isolates,
+    // and that is the same number as two calls that queued on a box
+    // that is not. The overlap is the claim itself and it does not care
+    // what the box was doing before either handler began.
     let deployed = deployed(
         r#"
         Deno.serve(async () => {
+          const from = Date.now();
           await new Promise((resolve) => setTimeout(resolve, 500));
-          return new Response("slept");
+          return Response.json({ from, to: Date.now() });
         });
         "#,
     );
     let runtime = Arc::new(kept());
-    // One call first, so what is timed below is two handlers and not
-    // two handlers plus however long this box takes to make an isolate
-    // and evaluate a module. The number the assertion leans on is the
-    // half second the handler sleeps for, and startup is neither part
-    // of that nor bounded by anything.
-    assert_eq!(said(&runtime, &deployed, "warm"), "slept");
-    let started = Instant::now();
     let both: Vec<_> = ["one", "two"]
         .into_iter()
         .map(|execution_id| {
@@ -290,17 +291,26 @@ fn a_busy_isolate_does_not_make_the_next_caller_wait_for_it() {
                 let answer = runtime
                     .invoke(&function, call(execution_id))
                     .expect("an answer");
-                body(&answer)
+                let said: serde_json::Value = serde_json::from_slice(answer.bytes()).expect("json");
+                (
+                    said["from"].as_i64().expect("a start"),
+                    said["to"].as_i64().expect("an end"),
+                )
             })
         })
         .collect();
-    for calling in both {
-        assert_eq!(calling.join().expect("the caller's thread"), "slept");
-    }
-    let took = started.elapsed();
+    let spans: Vec<(i64, i64)> = both
+        .into_iter()
+        .map(|calling| calling.join().expect("the caller's thread"))
+        .collect();
+    let (one, two) = (spans[0], spans[1]);
     assert!(
-        took < Duration::from_millis(900),
-        "the second call queued behind the first: {took:?}"
+        one.1 - one.0 >= 500 && two.1 - two.0 >= 500,
+        "a handler did not sleep for its half second: {spans:?}"
+    );
+    assert!(
+        one.0 < two.1 && two.0 < one.1,
+        "the second call queued behind the first: {spans:?}"
     );
 }
 
