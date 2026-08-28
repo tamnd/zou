@@ -22,6 +22,12 @@
 # was: the object path pays a put per page and a get per read and buys a
 # fast read with it, the layer path pays neither and buys a slow one.
 # Both halves belong beside the number.
+#
+# Each phase also prints what it cost the machine, memory and cpu,
+# sampled once a second by scripts/zou-usage.sh while the run happens.
+# Two M1b claims are about that and neither can be answered after the
+# fact: the shim's own footprint, and cpu seconds per thousand
+# transactions against vanilla.
 set -eu
 
 TARGET=$1
@@ -38,7 +44,13 @@ SOCK=$RUNDIR/sock
 LOG=$RUNDIR/server.log
 mkdir "$SOCK"
 
-stop() { "$PG"/pg_ctl -D "$DATADIR" stop -m fast >/dev/null 2>&1 || true; }
+SAMPLER=
+stop() {
+    "$PG"/pg_ctl -D "$DATADIR" stop -m fast >/dev/null 2>&1 || true
+    [ -n "$SAMPLER" ] && kill "$SAMPLER" 2>/dev/null
+    SAMPLER=
+    return 0
+}
 trap stop EXIT
 
 export ZOU_TARGET=$TARGET
@@ -62,6 +74,20 @@ ZOU_PAGESERVE=0 "$BOOTSTRAP" "$TARGET" "$DATADIR" --redo "$REDO" >/dev/null
 
 ZOU=${ZOU_BIN:-target/release}/zou
 MARK=$RUNDIR/mark
+
+# What the run costs in memory and cpu, sampled once a second for as
+# long as the postmaster is up. Two M1b claims need it, the shim's own
+# footprint and cpu seconds per thousand transactions, and neither can
+# be answered after the fact. The samples are timestamped and each
+# phase cuts its own window out of them, since a peak paid for during
+# the load is not a peak the select-only phase paid for.
+USAGE=$RUNDIR/usage
+USAGE_SH=$(dirname "$0")/zou-usage.sh
+POSTMASTER=$(head -1 "$DATADIR/postmaster.pid" 2>/dev/null || true)
+if [ -r "$USAGE_SH" ] && [ -n "$POSTMASTER" ]; then
+    sh "$USAGE_SH" "$POSTMASTER" "$USAGE" 1 >/dev/null 2>&1 &
+    SAMPLER=$!
+fi
 
 echo "target: $TARGET"
 echo "rundir: $RUNDIR"
@@ -96,12 +122,14 @@ fi
 # they were taken at, so a finished run can be asked anything the three
 # lines below leave out without being run again.
 BOUNDARY=0
+MARK_AT=$(date +%s)
 mark() {
     if [ -s "$ZOU_STORE_STATS" ]; then
         cp "$ZOU_STORE_STATS" "$MARK"
         BOUNDARY=$((BOUNDARY + 1))
         cp "$ZOU_STORE_STATS" "$RUNDIR/stats-$BOUNDARY-$1"
     fi
+    MARK_AT=$(date +%s)
 }
 
 # What the phase just printed cost the store. Best effort: a run against
@@ -111,6 +139,9 @@ cost() {
     if [ -s "$ZOU_STORE_STATS" ] && [ -s "$MARK" ] && [ -x "$ZOU" ]; then
         "$ZOU" stats "$ZOU_STORE_STATS" --since "$MARK" --brief 2>/dev/null |
             awk '{print "  " $0}' || true
+    fi
+    if [ -s "$USAGE" ]; then
+        sh "$USAGE_SH" --report "$USAGE" "$MARK_AT" "$(date +%s)" "${2:-0}" || true
     fi
     mark "$1"
 }
@@ -136,8 +167,15 @@ bench() {
         -T "$DURATION" -P 10 "$@" postgres 2>&1)
     tps=$(printf '%s\n' "$out" | awk '/^tps/ {printf "%.0f", $3}')
     lat=$(printf '%s\n' "$out" | awk '/latency average/ {print $4}')
+    # pgbench's own count rather than tps times duration, since the
+    # two differ by however long the last transaction took and the cpu
+    # figure divides by this.
+    txns=$(printf '%s\n' "$out" |
+        awk '/number of transactions actually processed/ {
+            split($NF, done, "/"); print done[1]
+        }')
     echo "$name, $CLIENTS clients, $DURATION s: $tps tps, $lat ms average latency"
-    cost "$name"
+    cost "$name" "${txns:-0}"
 }
 
 bench "tpcb-like"
@@ -152,6 +190,10 @@ echo "shutdown:"
 cost shutdown
 # After the stop, so the counters carry the whole run including whatever
 # the shutdown checkpoint cost.
+if [ -s "$USAGE" ]; then
+    echo "usage over the whole run:"
+    sh "$USAGE_SH" --report "$USAGE" || true
+fi
 if [ -s "$ZOU_STORE_STATS" ]; then
     echo "counters:"
     "$ZOU" stats "$ZOU_STORE_STATS"
