@@ -21,15 +21,22 @@ and a writeback flushes the block's wal first. That makes the page lsn
 at writeback time at or above the last record that touched it, which
 is what zouwritev and zouextend record here.
 
-The table is a direct mapped array in shared memory, sized by
-ZOU_LWLSN_ENTRIES and off entirely at zero, striped over sixteen
-lwlocks. Two blocks that collide take the newer of the two positions
-and the older one folds into a floor, so a block the table forgot
-reads at the floor, which is at or above its last write. That makes a
-collision cost a wait rather than a wrong answer, which is why there
-is no lru and no hash chain to walk. The floor is seeded once from
-GetFlushRecPtr, which is at or past the last change to every block
-already written back, for the same wal before data reason.
+The table is a direct mapped array of positions in shared memory with
+no keys in it, sized by ZOU_LWLSN_ENTRIES and off entirely at zero. A
+slot holds the newest position of every block that hashes to it, so
+two blocks sharing a slot cost a wait for each other's writes rather
+than a wrong answer, and they cost it to one block in nslots rather
+than to all of them. A slot at zero means nothing hashing there has
+been written back since startup, and those read at a floor seeded once
+from GetFlushRecPtr, which is at or past the last change to every
+block already written back, for the same wal before data reason.
+
+The keyless shape is the second attempt. The first kept a key per slot
+and folded an evicted block's position into the floor, and under a
+write heavy run the evicted positions are the ones written a moment
+ago, so the floor climbed to within a hair of the newest lsn and every
+read waited there. On gamingpc it measured the same as not having the
+table at all, 373 tps on the write mix and 12604 on the read one.
 
 Recovery is carved out. The startup process needs the page at exactly
 the position it is replaying, not at some later one, so ZouLwLsnRange
@@ -45,377 +52,269 @@ ZOU_PAGESERVE and the rest. zou #697.
 
 --- a/src/backend/storage/smgr/zou_smgr.c
 +++ b/src/backend/storage/smgr/zou_smgr.c
-@@ -26,7 +26,9 @@
- #include <fcntl.h>
- #include <unistd.h>
+@@ -625,25 +625,35 @@
+  * other block, so a page reconstructed anywhere at or after it is the
+  * page this read wants. This table is where that position is kept.
+  *
+- * It is a direct mapped cache rather than a hash with an LRU, because
+- * what a miss costs is a wait rather than a wrong answer and the
+- * simpler structure is easier to be sure of. A slot holds one block,
+- * an insert over a different block evicts it, and an eviction raises
+- * the floor to the LSN it dropped. A block with no slot of its own
+- * reads that floor, which says no block this table has forgotten was
+- * written after it, and is a true bound for the same reason the table
+- * is: a block is only written back by the buffer manager after the WAL
+- * that changed it is flushed, and a block still dirty in a buffer is
+- * read from the buffer rather than from here.
++ * It is a direct mapped array of positions with no keys in it. A slot
++ * holds the newest LSN of every block that has ever hashed to it, and
++ * a read of any of those blocks waits for that. Sharing a slot with a
++ * busier block costs a wait for somebody else's writes, which is what
++ * the whole cluster was doing before this existed, and it costs it to
++ * one block in nslots rather than to all of them.
+  *
+- * The floor starts unset, and unset means say nothing: the read falls
+- * back to the durable LSN it named before, which is the behaviour this
+- * cache is replacing. It is seeded once, on the first read that finds
+- * it unset, with the WAL flush position at that moment. Every block
+- * not in the table by then has been written back, and a write back
+- * flushes its WAL first, so the flush position is at or past the last
+- * change to any of them.
++ * The keyless shape is the second attempt and the first one is worth
++ * recording. It kept a key per slot and folded the position of an
++ * evicted block into a floor that every block without a slot read at.
++ * The floor is a maximum, evictions under a write heavy run carry the
++ * positions of blocks written a moment ago, so it climbed to within a
++ * hair of the newest LSN and every read waited there. Measured on
++ * gamingpc it was indistinguishable from not having the table: 373 tps
++ * on the write mix and 12604 on the read one, both inside the range of
++ * the runs before it.
+  *
++ * A slot at zero means no block that hashes there has been written
++ * back since this postmaster started, so the read falls back to the
++ * floor, which is seeded once with the WAL flush position at the first
++ * read. A write back flushes the block's WAL first, so that position
++ * is at or past the last change to every block written back before it,
++ * and nothing else can be in the store to read.
++ *
++ * Both of those rest on the same thing: a block still dirty in a
++ * buffer is read out of the buffer and never reaches this code at all,
++ * so the only blocks a read can ask for are blocks that have been
++ * written back.
++ *
+  * Recovery does not use any of this. The startup process reads a page
+  * to replay a record onto, and it needs that page at exactly the
+  * position it has replayed to rather than at the newest one available,
+@@ -655,40 +665,24 @@
+ 	ForkNumber	forknum;
+ 	BlockNumber blocknum;
+ } ZouLwLsnKey;
+-
+-typedef struct ZouLwLsnEntry
+-{
+-	ZouLwLsnKey key;
+-	XLogRecPtr	lsn;
+-} ZouLwLsnEntry;
  
-+#include "access/xlog.h"
- #include "access/zou_wal.h"
-+#include "common/hashfn.h"
- #include "miscadmin.h"
- #include "port/pg_iovec.h"
- #include "storage/aio.h"
-@@ -45,10 +47,11 @@
- extern int	zou_smgr_nblocks(uint32 spc, uint32 db, uint32 rel, uint32 fork,
- 							 uint32 *out, uint32 *dense, uint64 *filled);
- extern int	zou_smgr_read(uint32 spc, uint32 db, uint32 rel, uint32 fork,
--						  uint32 blk, uint8 *buf, uint64 durable_lsn);
-+						  uint32 blk, uint8 *buf, uint64 durable_lsn,
-+						  uint64 written_lsn);
- extern int	zou_smgr_readv(uint32 spc, uint32 db, uint32 rel, uint32 fork,
- 						   uint32 blk, uint8 **bufs, uint32 nblocks,
--						   uint64 durable_lsn);
-+						   uint64 durable_lsn, uint64 written_lsn);
- extern int	zou_smgr_write(uint32 spc, uint32 db, uint32 rel, uint32 fork,
- 						   uint32 blk, const uint8 *buf);
- extern int	zou_smgr_writev(uint32 spc, uint32 db, uint32 rel, uint32 fork,
-@@ -601,6 +604,269 @@
- 	LWLockAcquire(&ZouRelSize->lock, LW_EXCLUSIVE);
- 	(void) hash_search(ZouRelSizeHash, &key, HASH_REMOVE, NULL);
- 	LWLockRelease(&ZouRelSize->lock);
-+}
-+
-+/*
-+ * The last written LSN of a block, and why a read needs one.
-+ *
-+ * With the page service on, a read is served by ingest rather than by
-+ * the store, and ingest has to have applied far enough forward for the
-+ * answer to be the page the backend asked for. What the backend has
-+ * been naming so far is the WAL pusher's durable LSN, which is one
-+ * position for the whole cluster: the newest thing anybody in the
-+ * tenant wrote. So a read of a page nobody has touched in an hour
-+ * waits for whatever the busiest writer did a microsecond ago. The
-+ * measurement on zou #671 is that all of it is that: 17277 parks in a
-+ * five minute run, and not one of them was waiting for WAL that
-+ * touched the page it had been asked for.
-+ *
-+ * A block's own last written LSN is the position that actually
-+ * matters. Everything after it, however much there is, changed some
-+ * other block, so a page reconstructed anywhere at or after it is the
-+ * page this read wants. This table is where that position is kept.
-+ *
-+ * It is a direct mapped cache rather than a hash with an LRU, because
-+ * what a miss costs is a wait rather than a wrong answer and the
-+ * simpler structure is easier to be sure of. A slot holds one block,
-+ * an insert over a different block evicts it, and an eviction raises
-+ * the floor to the LSN it dropped. A block with no slot of its own
-+ * reads that floor, which says no block this table has forgotten was
-+ * written after it, and is a true bound for the same reason the table
-+ * is: a block is only written back by the buffer manager after the WAL
-+ * that changed it is flushed, and a block still dirty in a buffer is
-+ * read from the buffer rather than from here.
-+ *
-+ * The floor starts unset, and unset means say nothing: the read falls
-+ * back to the durable LSN it named before, which is the behaviour this
-+ * cache is replacing. It is seeded once, on the first read that finds
-+ * it unset, with the WAL flush position at that moment. Every block
-+ * not in the table by then has been written back, and a write back
-+ * flushes its WAL first, so the flush position is at or past the last
-+ * change to any of them.
-+ *
-+ * Recovery does not use any of this. The startup process reads a page
-+ * to replay a record onto, and it needs that page at exactly the
-+ * position it has replayed to rather than at the newest one available,
-+ * so it keeps naming the LSN it is replaying (zou #329).
-+ */
-+typedef struct ZouLwLsnKey
-+{
-+	RelFileLocator locator;
-+	ForkNumber	forknum;
-+	BlockNumber blocknum;
-+} ZouLwLsnKey;
-+
-+typedef struct ZouLwLsnEntry
-+{
-+	ZouLwLsnKey key;
-+	XLogRecPtr	lsn;
-+} ZouLwLsnEntry;
-+
-+/*
-+ * One lock per stripe of slots. A writeback of eight blocks and a read
-+ * of eight more are the two things that touch this table, both of them
-+ * on paths that already move 8 kB a block, so the lock is not what
-+ * this costs. Striping is here so that a busy pool is not serialized
-+ * through one LWLock on every buffer it evicts.
-+ */
-+#define ZOU_LWLSN_PARTITIONS 16
-+
-+/*
-+ * 128k blocks, 4 MB of shared memory, and it holds the last written
-+ * position of a gigabyte of pages. ZOU_LWLSN_ENTRIES tunes it and 0
-+ * turns the table off, which leaves every read naming the durable LSN
-+ * the way it did before this existed.
-+ */
-+#define ZOU_LWLSN_DEFAULT 131072
-+
-+typedef struct ZouLwLsnCtl
-+{
-+	int			tranche;
-+	int			nslots;
-+	pg_atomic_uint64 floor;
-+	LWLock		locks[ZOU_LWLSN_PARTITIONS];
-+} ZouLwLsnCtl;
-+
-+static ZouLwLsnCtl *ZouLwLsn = NULL;
-+static ZouLwLsnEntry *ZouLwLsnSlots = NULL;
-+
-+static int
-+zou_lwlsn_slots(void)
-+{
-+	const char *setting = getenv("ZOU_LWLSN_ENTRIES");
-+	int			n;
-+
-+	if (setting == NULL)
-+		return ZOU_LWLSN_DEFAULT;
-+	n = atoi(setting);
-+	return n > 0 ? n : 0;
-+}
-+
-+static inline uint32
-+zou_lwlsn_slot(const ZouLwLsnKey *key)
-+{
-+	return hash_bytes((const unsigned char *) key, sizeof(ZouLwLsnKey)) %
-+		(uint32) ZouLwLsn->nslots;
-+}
-+
-+static inline LWLock *
-+zou_lwlsn_lock(uint32 slot)
-+{
-+	return &ZouLwLsn->locks[slot % ZOU_LWLSN_PARTITIONS];
-+}
-+
-+/* Raise the floor to `lsn`, from however many backends at once. */
-+static void
-+zou_lwlsn_raise(XLogRecPtr lsn)
-+{
-+	uint64		was = pg_atomic_read_u64(&ZouLwLsn->floor);
-+
-+	while (was < (uint64) lsn)
-+	{
-+		if (pg_atomic_compare_exchange_u64(&ZouLwLsn->floor, &was,
-+										   (uint64) lsn))
-+			return;
-+	}
-+}
-+
-+Size
-+ZouLwLsnShmemSize(void)
-+{
-+	int			n = zou_lwlsn_slots();
-+
-+	if (n == 0)
-+		return 0;
-+	return add_size(MAXALIGN(sizeof(ZouLwLsnCtl)),
-+					mul_size(sizeof(ZouLwLsnEntry), (Size) n));
-+}
-+
-+void
-+ZouLwLsnShmemInit(void)
-+{
-+	int			n = zou_lwlsn_slots();
-+	bool		found;
-+
-+	if (n == 0)
-+		return;
-+	ZouLwLsn = (ZouLwLsnCtl *)
-+		ShmemInitStruct("zou lwlsn", sizeof(ZouLwLsnCtl), &found);
-+	if (!found)
-+	{
-+		ZouLwLsn->tranche = LWLockNewTrancheId();
-+		ZouLwLsn->nslots = n;
-+		pg_atomic_init_u64(&ZouLwLsn->floor, 0);
-+		for (int i = 0; i < ZOU_LWLSN_PARTITIONS; i++)
-+			LWLockInitialize(&ZouLwLsn->locks[i], ZouLwLsn->tranche);
-+	}
-+	LWLockRegisterTranche(ZouLwLsn->tranche, "zou_lwlsn");
-+
-+	ZouLwLsnSlots = (ZouLwLsnEntry *)
-+		ShmemInitStruct("zou lwlsn slots",
-+						mul_size(sizeof(ZouLwLsnEntry), (Size) n), &found);
-+	if (!found)
-+		memset(ZouLwLsnSlots, 0, sizeof(ZouLwLsnEntry) * (Size) n);
-+}
-+
-+/*
-+ * Say that this block was last changed at `lsn`.
-+ *
-+ * Called with the page in hand on the way out of the buffer pool, so
-+ * the LSN is the page's own. A page with no LSN was never WAL logged,
-+ * and one of those is written to the store eagerly rather than served
-+ * out of the stream, so there is nothing here for it to wait for and
-+ * nothing worth a slot.
-+ */
-+void
-+ZouLwLsnNote(RelFileLocator locator, ForkNumber forknum,
-+			 BlockNumber blocknum, XLogRecPtr lsn)
-+{
+ /*
+- * One lock per stripe of slots. A writeback of eight blocks and a read
+- * of eight more are the two things that touch this table, both of them
+- * on paths that already move 8 kB a block, so the lock is not what
+- * this costs. Striping is here so that a busy pool is not serialized
+- * through one LWLock on every buffer it evicts.
++ * 128k slots, a megabyte of shared memory, and it holds the last
++ * written position of a gigabyte of pages with no collisions to speak
++ * of. ZOU_LWLSN_ENTRIES tunes it and 0 turns the table off, which
++ * leaves every read naming the durable LSN the way it did before this
++ * existed, and is how the two are compared on one binary.
+  */
+-#define ZOU_LWLSN_PARTITIONS 16
+-
+-/*
+- * 128k blocks, 4 MB of shared memory, and it holds the last written
+- * position of a gigabyte of pages. ZOU_LWLSN_ENTRIES tunes it and 0
+- * turns the table off, which leaves every read naming the durable LSN
+- * the way it did before this existed.
+- */
+ #define ZOU_LWLSN_DEFAULT 131072
+ 
+ typedef struct ZouLwLsnCtl
+ {
+-	int			tranche;
+ 	int			nslots;
+ 	pg_atomic_uint64 floor;
+-	LWLock		locks[ZOU_LWLSN_PARTITIONS];
+ } ZouLwLsnCtl;
+ 
+ static ZouLwLsnCtl *ZouLwLsn = NULL;
+-static ZouLwLsnEntry *ZouLwLsnSlots = NULL;
++static pg_atomic_uint64 *ZouLwLsnSlots = NULL;
+ 
+ static int
+ zou_lwlsn_slots(void)
+@@ -703,28 +697,32 @@
+ }
+ 
+ static inline uint32
+-zou_lwlsn_slot(const ZouLwLsnKey *key)
++zou_lwlsn_slot(RelFileLocator locator, ForkNumber forknum,
++			   BlockNumber blocknum)
+ {
+-	return hash_bytes((const unsigned char *) key, sizeof(ZouLwLsnKey)) %
 +	ZouLwLsnKey key = {0};
-+	ZouLwLsnEntry *slot;
-+	uint32		at;
-+	LWLock	   *lock;
 +
-+	if (ZouLwLsnSlots == NULL || XLogRecPtrIsInvalid(lsn))
-+		return;
 +	key.locator = locator;
 +	key.forknum = forknum;
 +	key.blocknum = blocknum;
-+	at = zou_lwlsn_slot(&key);
-+	lock = zou_lwlsn_lock(at);
-+	slot = &ZouLwLsnSlots[at];
-+
-+	LWLockAcquire(lock, LW_EXCLUSIVE);
-+	if (memcmp(&slot->key, &key, sizeof(ZouLwLsnKey)) == 0)
-+	{
-+		/*
-+		 * Forward only. Two backends writing the same block back is one
-+		 * of them holding an older copy of the page, and the older LSN
-+		 * would let a read be served before the newer change arrived.
-+		 */
-+		if (slot->lsn < lsn)
-+			slot->lsn = lsn;
-+		LWLockRelease(lock);
-+		return;
-+	}
-+	if (!XLogRecPtrIsInvalid(slot->lsn))
-+		zou_lwlsn_raise(slot->lsn);
-+	slot->key = key;
-+	slot->lsn = lsn;
-+	LWLockRelease(lock);
-+}
-+
++	return hash_bytes((const unsigned char *) &key, sizeof(key)) %
+ 		(uint32) ZouLwLsn->nslots;
+ }
+ 
+-static inline LWLock *
+-zou_lwlsn_lock(uint32 slot)
+-{
+-	return &ZouLwLsn->locks[slot % ZOU_LWLSN_PARTITIONS];
+-}
+-
+-/* Raise the floor to `lsn`, from however many backends at once. */
+-static void
+-zou_lwlsn_raise(XLogRecPtr lsn)
 +/*
-+ * The newest position any of `nblocks` blocks from `blocknum` was
-+ * written at, or InvalidXLogRecPtr when the table has nothing to say
-+ * and the caller should keep naming the durable LSN.
-+ *
-+ * The newest rather than each, because the whole run is served
-+ * together, so the run waits for whichever of its blocks waits
-+ * longest.
++ * Move a position forward, from however many backends at once. Forward
++ * only: two backends writing the same block back is one of them
++ * holding an older copy of the page, and the older LSN would let a
++ * read be served before the newer change had arrived.
 + */
-+XLogRecPtr
-+ZouLwLsnRange(RelFileLocator locator, ForkNumber forknum,
-+			  BlockNumber blocknum, BlockNumber nblocks)
-+{
-+	ZouLwLsnKey key = {0};
-+	XLogRecPtr	floor;
-+	XLogRecPtr	newest = InvalidXLogRecPtr;
-+
-+	if (ZouLwLsnSlots == NULL || RecoveryInProgress())
-+		return InvalidXLogRecPtr;
-+	floor = (XLogRecPtr) pg_atomic_read_u64(&ZouLwLsn->floor);
-+	if (XLogRecPtrIsInvalid(floor))
-+	{
-+		/*
-+		 * The first read of the cluster seeds it. GetFlushRecPtr is at
-+		 * or past the last change to every block that has been written
-+		 * back, which is every block this table does not hold.
-+		 */
-+		zou_lwlsn_raise(GetFlushRecPtr(NULL));
-+		floor = (XLogRecPtr) pg_atomic_read_u64(&ZouLwLsn->floor);
-+		if (XLogRecPtrIsInvalid(floor))
-+			return InvalidXLogRecPtr;
-+	}
-+	key.locator = locator;
-+	key.forknum = forknum;
-+	for (BlockNumber i = 0; i < nblocks; i++)
-+	{
-+		ZouLwLsnEntry *slot;
-+		XLogRecPtr	mine;
-+		uint32		at;
-+		LWLock	   *lock;
-+
-+		key.blocknum = blocknum + i;
-+		at = zou_lwlsn_slot(&key);
-+		lock = zou_lwlsn_lock(at);
-+		slot = &ZouLwLsnSlots[at];
-+		LWLockAcquire(lock, LW_SHARED);
-+		mine = memcmp(&slot->key, &key, sizeof(ZouLwLsnKey)) == 0
-+			? slot->lsn : floor;
-+		LWLockRelease(lock);
-+		if (mine > newest)
-+			newest = mine;
-+	}
-+	return newest;
- }
++static void
++zou_lwlsn_raise(pg_atomic_uint64 *at, XLogRecPtr lsn)
+ {
+-	uint64		was = pg_atomic_read_u64(&ZouLwLsn->floor);
++	uint64		was = pg_atomic_read_u64(at);
  
- bool
-@@ -753,6 +1019,8 @@
- 							  (uint32) blocknum, (const uint8 *) buffer,
- 							  skip),
- 			  "extend", reln, forknum);
-+	ZouLwLsnNote(reln->smgr_rlocator.locator, forknum, blocknum,
-+				 PageGetLSN((const PageData *) buffer));
- 	if (!skip)
+ 	while (was < (uint64) lsn)
  	{
- 		zou_relsize_note(reln->smgr_rlocator.locator, forknum,
-@@ -805,7 +1073,10 @@
- 	zou_check(zou_smgr_readv(ZOU_LOCATOR(reln), (uint32) forknum,
- 							 (uint32) blocknum, (uint8 **) buffers,
- 							 (uint32) nblocks,
--							 (uint64) ZouWalReadLSN()),
-+							 (uint64) ZouWalReadLSN(),
-+							 (uint64) ZouLwLsnRange(reln->smgr_rlocator.locator,
-+													forknum, blocknum,
-+													nblocks)),
- 			  "readv", reln, forknum);
- }
- 
-@@ -862,7 +1133,9 @@
- 		pages[i] = staged + (Size) i * BLCKSZ;
- 	rc = zou_smgr_readv(ZOU_LOCATOR(reln), (uint32) forknum,
- 						(uint32) blocknum, pages, (uint32) nblocks,
--						(uint64) ZouWalReadLSN());
-+						(uint64) ZouWalReadLSN(),
-+						(uint64) ZouLwLsnRange(reln->smgr_rlocator.locator,
-+											   forknum, blocknum, nblocks));
- 	if (rc != 0)
- 	{
- 		pgaio_io_release(ioh);
-@@ -939,6 +1212,15 @@
- 		if (barrier != InvalidXLogRecPtr)
- 			ZouWalWaitForLSN(barrier);
+-		if (pg_atomic_compare_exchange_u64(&ZouLwLsn->floor, &was,
+-										   (uint64) lsn))
++		if (pg_atomic_compare_exchange_u64(at, &was, (uint64) lsn))
+ 			return;
  	}
-+	/*
-+	 * A page leaving the buffer pool is the one moment its last written
-+	 * position is known to anybody, so this is where a later read of it
-+	 * gets told what to wait for. Both paths, since which of them a
-+	 * cluster runs is not this table's business.
-+	 */
-+	for (BlockNumber i = 0; i < nblocks; i++)
-+		ZouLwLsnNote(reln->smgr_rlocator.locator, forknum, blocknum + i,
-+					 PageGetLSN((const PageData *) buffers[i]));
- 	/* the store may not hold these pages without a length past them */
- 	if (!skip)
- 		zou_relsize_cover(reln->smgr_rlocator.locator, forknum,
---- a/src/include/storage/zou_smgr.h
-+++ b/src/include/storage/zou_smgr.h
-@@ -59,4 +59,11 @@
- extern void ZouRelSizeShmemInit(void);
- extern void ZouRelSizeFlush(void);
+ }
+@@ -737,7 +735,7 @@
+ 	if (n == 0)
+ 		return 0;
+ 	return add_size(MAXALIGN(sizeof(ZouLwLsnCtl)),
+-					mul_size(sizeof(ZouLwLsnEntry), (Size) n));
++					mul_size(sizeof(pg_atomic_uint64), (Size) n));
+ }
  
-+extern Size ZouLwLsnShmemSize(void);
-+extern void ZouLwLsnShmemInit(void);
-+extern void ZouLwLsnNote(RelFileLocator locator, ForkNumber forknum,
-+						 BlockNumber blocknum, XLogRecPtr lsn);
-+extern XLogRecPtr ZouLwLsnRange(RelFileLocator locator, ForkNumber forknum,
-+								BlockNumber blocknum, BlockNumber nblocks);
-+
- #endif							/* ZOU_SMGR_H */
---- a/src/backend/storage/ipc/ipci.c
-+++ b/src/backend/storage/ipc/ipci.c
-@@ -147,6 +147,7 @@
- 	size = add_size(size, ApplyLauncherShmemSize());
- 	size = add_size(size, ZouWalShmemSize());
- 	size = add_size(size, ZouRelSizeShmemSize());
-+	size = add_size(size, ZouLwLsnShmemSize());
- 	size = add_size(size, BTreeShmemSize());
- 	size = add_size(size, SyncScanShmemSize());
- 	size = add_size(size, AsyncShmemSize());
-@@ -350,6 +351,7 @@
- 	ApplyLauncherShmemInit();
- 	ZouWalShmemInit();
- 	ZouRelSizeShmemInit();
-+	ZouLwLsnShmemInit();
- 	SlotSyncShmemInit();
+ void
+@@ -752,19 +750,16 @@
+ 		ShmemInitStruct("zou lwlsn", sizeof(ZouLwLsnCtl), &found);
+ 	if (!found)
+ 	{
+-		ZouLwLsn->tranche = LWLockNewTrancheId();
+ 		ZouLwLsn->nslots = n;
+ 		pg_atomic_init_u64(&ZouLwLsn->floor, 0);
+-		for (int i = 0; i < ZOU_LWLSN_PARTITIONS; i++)
+-			LWLockInitialize(&ZouLwLsn->locks[i], ZouLwLsn->tranche);
+ 	}
+-	LWLockRegisterTranche(ZouLwLsn->tranche, "zou_lwlsn");
  
- 	/*
+-	ZouLwLsnSlots = (ZouLwLsnEntry *)
++	ZouLwLsnSlots = (pg_atomic_uint64 *)
+ 		ShmemInitStruct("zou lwlsn slots",
+-						mul_size(sizeof(ZouLwLsnEntry), (Size) n), &found);
++						mul_size(sizeof(pg_atomic_uint64), (Size) n), &found);
+ 	if (!found)
+-		memset(ZouLwLsnSlots, 0, sizeof(ZouLwLsnEntry) * (Size) n);
++		for (int i = 0; i < n; i++)
++			pg_atomic_init_u64(&ZouLwLsnSlots[i], 0);
+ }
+ 
+ /*
+@@ -780,38 +775,10 @@
+ ZouLwLsnNote(RelFileLocator locator, ForkNumber forknum,
+ 			 BlockNumber blocknum, XLogRecPtr lsn)
+ {
+-	ZouLwLsnKey key = {0};
+-	ZouLwLsnEntry *slot;
+-	uint32		at;
+-	LWLock	   *lock;
+-
+ 	if (ZouLwLsnSlots == NULL || XLogRecPtrIsInvalid(lsn))
+ 		return;
+-	key.locator = locator;
+-	key.forknum = forknum;
+-	key.blocknum = blocknum;
+-	at = zou_lwlsn_slot(&key);
+-	lock = zou_lwlsn_lock(at);
+-	slot = &ZouLwLsnSlots[at];
+-
+-	LWLockAcquire(lock, LW_EXCLUSIVE);
+-	if (memcmp(&slot->key, &key, sizeof(ZouLwLsnKey)) == 0)
+-	{
+-		/*
+-		 * Forward only. Two backends writing the same block back is one
+-		 * of them holding an older copy of the page, and the older LSN
+-		 * would let a read be served before the newer change arrived.
+-		 */
+-		if (slot->lsn < lsn)
+-			slot->lsn = lsn;
+-		LWLockRelease(lock);
+-		return;
+-	}
+-	if (!XLogRecPtrIsInvalid(slot->lsn))
+-		zou_lwlsn_raise(slot->lsn);
+-	slot->key = key;
+-	slot->lsn = lsn;
+-	LWLockRelease(lock);
++	zou_lwlsn_raise(&ZouLwLsnSlots[zou_lwlsn_slot(locator, forknum, blocknum)],
++					lsn);
+ }
+ 
+ /*
+@@ -827,7 +794,6 @@
+ ZouLwLsnRange(RelFileLocator locator, ForkNumber forknum,
+ 			  BlockNumber blocknum, BlockNumber nblocks)
+ {
+-	ZouLwLsnKey key = {0};
+ 	XLogRecPtr	floor;
+ 	XLogRecPtr	newest = InvalidXLogRecPtr;
+ 
+@@ -839,30 +805,21 @@
+ 		/*
+ 		 * The first read of the cluster seeds it. GetFlushRecPtr is at
+ 		 * or past the last change to every block that has been written
+-		 * back, which is every block this table does not hold.
++		 * back, which is every block a slot at zero can stand for.
+ 		 */
+-		zou_lwlsn_raise(GetFlushRecPtr(NULL));
++		zou_lwlsn_raise(&ZouLwLsn->floor, GetFlushRecPtr(NULL));
+ 		floor = (XLogRecPtr) pg_atomic_read_u64(&ZouLwLsn->floor);
+ 		if (XLogRecPtrIsInvalid(floor))
+ 			return InvalidXLogRecPtr;
+ 	}
+-	key.locator = locator;
+-	key.forknum = forknum;
+ 	for (BlockNumber i = 0; i < nblocks; i++)
+ 	{
+-		ZouLwLsnEntry *slot;
+ 		XLogRecPtr	mine;
+-		uint32		at;
+-		LWLock	   *lock;
+ 
+-		key.blocknum = blocknum + i;
+-		at = zou_lwlsn_slot(&key);
+-		lock = zou_lwlsn_lock(at);
+-		slot = &ZouLwLsnSlots[at];
+-		LWLockAcquire(lock, LW_SHARED);
+-		mine = memcmp(&slot->key, &key, sizeof(ZouLwLsnKey)) == 0
+-			? slot->lsn : floor;
+-		LWLockRelease(lock);
++		mine = (XLogRecPtr) pg_atomic_read_u64(
++			&ZouLwLsnSlots[zou_lwlsn_slot(locator, forknum, blocknum + i)]);
++		if (XLogRecPtrIsInvalid(mine))
++			mine = floor;
+ 		if (mine > newest)
+ 			newest = mine;
+ 	}
