@@ -183,7 +183,13 @@ pub struct Attached {
     backend: Arc<dyn Backend>,
     max: usize,
     idle: Duration,
-    born: Instant,
+    /// The zero the per slot use marks are measured from. It is tokio's
+    /// clock rather than the standard one so that a test can hold the
+    /// idle window still: under `start_paused` a sleep moves this and
+    /// nothing else, which is the difference between asserting on an
+    /// interval and asserting that the machine got from one line to the
+    /// next fast enough. Outside a test the two are the same call.
+    born: tokio::time::Instant,
     /// Held only while the map is read or written, never across an
     /// attach: the attach itself is serialised per ref by that ref's
     /// own cell, so two requests for one cold tenant start one
@@ -198,7 +204,7 @@ impl Attached {
             backend,
             max: MAX_ATTACHED,
             idle: IDLE,
-            born: Instant::now(),
+            born: tokio::time::Instant::now(),
             slots: Mutex::new(HashMap::new()),
         }
     }
@@ -707,12 +713,19 @@ mod tests {
         assert_eq!(fake.downs(), vec!["one", "two"]);
     }
 
-    #[tokio::test]
+    /// Paused, because the assertion is about the idle window and not
+    /// about how long the runtime took to get from the sleep to the
+    /// sweep. On a loaded box that gap can be longer than the window
+    /// itself, and then a tenant touched a line ago is idle by its own
+    /// clock and the test fails for a reason that has nothing to do
+    /// with the sweep. Advancing the clock by hand is exact and costs
+    /// no wall time.
+    #[tokio::test(start_paused = true)]
     async fn an_idle_tenant_somebody_is_still_connected_to_stays() {
         let (fake, attached) = manager();
         let attached = attached.with_budget(MAX_ATTACHED, Duration::from_millis(20));
         let session = attached.hold(&entry("quiet")).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::advance(Duration::from_millis(30)).await;
         attached.sweep().await;
         assert!(
             fake.downs().is_empty(),
@@ -723,12 +736,15 @@ mod tests {
         assert_eq!(fake.downs(), vec!["quiet"]);
     }
 
-    #[tokio::test]
+    /// Same window, same reason for pausing, and this one had the race
+    /// twice over: the busy tenant is touched after the advance and has
+    /// to still be inside the window when the sweep reads it.
+    #[tokio::test(start_paused = true)]
     async fn an_idle_tenant_is_let_go_and_a_busy_one_is_not() {
         let (fake, attached) = manager();
         let attached = attached.with_budget(MAX_ATTACHED, Duration::from_millis(20));
         let _ = attached.router(&entry("quiet")).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::advance(Duration::from_millis(30)).await;
         let _ = attached.router(&entry("busy")).await.unwrap();
         attached.sweep().await;
         assert_eq!(fake.downs(), vec!["quiet"]);

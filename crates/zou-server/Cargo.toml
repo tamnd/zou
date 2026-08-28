@@ -56,7 +56,7 @@ env_logger = { workspace = true }
 # links and the format the door reads, so it brings nothing new with it.
 rcgen = "0.14"
 sha2 = { workspace = true }
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "test-util"] }
 tempfile = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 
