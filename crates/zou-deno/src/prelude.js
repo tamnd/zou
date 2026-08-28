@@ -3445,22 +3445,59 @@
     }
   }
 
+  // What the function has written to its own environment, over what it
+  // was started with.
+  //
+  // A write does not reach the host. The environment a node hands an
+  // isolate is a project's secrets with the server's own names over
+  // them, and none of that is a function's to change for anybody else.
+  // What it can change is what it reads back, which is what a package
+  // is doing when it sets `NODE_ENV` or its own key before it uses it,
+  // and refusing that was stricter than both node and Deno for no gain
+  // anybody could name. So the writes live here, in the isolate, and
+  // they go when it does.
+  //
+  // A deletion is a name in `hidden` rather than a missing entry,
+  // because what is underneath does not go away and a delete has to
+  // cover it.
+  const written = new Map();
+  const hidden = new Set();
+
   const env = {
     get(name) {
-      const found = ops.op_zou_env_get(String(name));
+      const key = String(name);
+      if (hidden.has(key)) return undefined;
+      if (written.has(key)) return written.get(key);
+      const found = ops.op_zou_env_get(key);
       return found === null ? undefined : found;
     },
     has(name) {
-      return ops.op_zou_env_get(String(name)) !== null;
+      return env.get(name) !== undefined;
     },
-    set() {
-      throw new TypeError("the environment of a function is read only");
+    set(name, value) {
+      const key = String(name);
+      // The two characters that would make the name unreadable to
+      // whoever parsed it back out, which is the check Deno makes.
+      if (key.includes("=") || key.includes("\0")) {
+        throw new TypeError(`the environment name ${JSON.stringify(key)} is not a name`);
+      }
+      const said = String(value);
+      if (said.includes("\0")) {
+        throw new TypeError(`the value of ${key} may not contain a null byte`);
+      }
+      hidden.delete(key);
+      written.set(key, said);
     },
-    delete() {
-      throw new TypeError("the environment of a function is read only");
+    delete(name) {
+      const key = String(name);
+      written.delete(key);
+      hidden.add(key);
     },
     toObject() {
-      return ops.op_zou_env();
+      const all = ops.op_zou_env();
+      for (const key of hidden) delete all[key];
+      for (const [key, value] of written) all[key] = value;
+      return all;
     },
   };
 
@@ -3487,11 +3524,15 @@
       has(_target, name) {
         return typeof name === "string" && env.has(name);
       },
-      set() {
-        throw new TypeError("the environment of a function is read only");
+      set(_target, name, value) {
+        if (typeof name !== "string") return false;
+        env.set(name, value);
+        return true;
       },
-      deleteProperty() {
-        throw new TypeError("the environment of a function is read only");
+      deleteProperty(_target, name) {
+        if (typeof name !== "string") return false;
+        env.delete(name);
+        return true;
       },
       ownKeys() {
         return Reflect.ownKeys(env.toObject());
@@ -3500,7 +3541,7 @@
         const value = typeof name === "string" ? env.get(name) : undefined;
         return value === undefined
           ? undefined
-          : { value, writable: false, enumerable: true, configurable: true };
+          : { value, writable: true, enumerable: true, configurable: true };
       },
     },
   );

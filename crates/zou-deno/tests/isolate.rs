@@ -281,21 +281,64 @@ fn the_execution_id_is_the_calls_and_not_the_projects() {
     assert_eq!(body(&answer), "the call's own");
 }
 
+/// A function may write to its own environment, and what it writes is
+/// its own: it reads back, it covers what was underneath, and it is
+/// gone with the isolate rather than reaching the node.
 #[test]
-fn the_environment_cannot_be_written_to() {
-    let answer = answered(
+fn the_environment_is_the_functions_to_write_to() {
+    let deployed = deployed(
         r#"
-        Deno.serve(() => {
-            try {
-                Deno.env.set("SUPABASE_URL", "mine now");
-                return new Response("it let me");
-            } catch (e) {
-                return new Response(e.message);
-            }
-        });
+        const seen = [];
+        Deno.env.set("MINE", "yes");
+        seen.push(Deno.env.get("MINE"));
+        seen.push(String(Deno.env.has("MINE")));
+
+        // Over what the node handed in, and back again when it goes.
+        seen.push(Deno.env.get("SUPABASE_URL"));
+        Deno.env.set("SUPABASE_URL", "mine now");
+        seen.push(Deno.env.get("SUPABASE_URL"));
+        seen.push(String(Deno.env.toObject().SUPABASE_URL));
+
+        // A delete hides what is underneath rather than leaving it
+        // showing.
+        Deno.env.delete("SUPABASE_URL");
+        seen.push(String(Deno.env.get("SUPABASE_URL")));
+        seen.push(String("SUPABASE_URL" in Deno.env.toObject()));
+
+        // The same environment through the other name for it, which is
+        // how a package written for node reaches it.
+        process.env.THROUGH_PROCESS = "set";
+        seen.push(Deno.env.get("THROUGH_PROCESS"));
+        seen.push(process.env.MINE);
+
+        // A name that could not be read back out of a list of them.
+        try {
+            Deno.env.set("A=B", "no");
+            seen.push("it let me");
+        } catch (e) {
+            seen.push(e.constructor.name);
+        }
+
+        Deno.serve(() => new Response(seen.join(" ")));
         "#,
     );
-    assert_eq!(body(&answer), "the environment of a function is read only");
+    let isolate = Isolate::with_env(vec![(
+        "SUPABASE_URL".to_string(),
+        "http://localhost:54321".to_string(),
+    )]);
+    let answer = isolate
+        .invoke(
+            &deployed.function,
+            get("http://localhost:9000/functions/v1/hello"),
+        )
+        .expect("an answer");
+    assert_eq!(
+        body(&answer),
+        "yes true http://localhost:54321 mine now mine now undefined false set yes TypeError"
+    );
+    // And the process that ran it never heard about any of it.
+    assert!(std::env::var("MINE").is_err());
+    assert!(std::env::var("THROUGH_PROCESS").is_err());
 }
 
 #[test]
