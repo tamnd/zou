@@ -73,6 +73,9 @@ fn a_package_reads_a_file_of_its_own_from_beside_where_it_landed() {
         // Which build a package is served is a different question and
         // has its own tests.
         std::env::set_var("ZOU_MODULE_BUILD", "");
+        // The registry path rather than the default, because this is
+        // a test about what the registry serves.
+        std::env::set_var("ZOU_NPM", "registry");
     }
     keep(
         cache.path(),

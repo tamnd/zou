@@ -568,22 +568,27 @@ import { z } from "npm:zod@3.23.8"
 import { encodeHex } from "jsr:@std/encoding@1/hex"
 ```
 
-By default they are not resolved the way Deno resolves them.
-Both specifiers are rewritten to a url on a registry that serves packages as modules, `esm.sh` by default, and from there a package is an ordinary graph of `https:` imports.
-What runs is the registry's build of the package rather than the tarball npm would have unpacked, which is worth knowing before reporting a difference in behaviour to a package's author.
-
-`ZOU_NPM=tarball` is the other answer, and it is the one Deno gives.
-An `npm:` specifier then means the tarball npm publishes: the package is fetched off the npm registry, its integrity checked, unpacked under the module cache, and resolved with node's own rules, so `exports` decides which file a subpath is, `dependencies` decides what a bare name inside the package means, and a package that ships commonjs is run as commonjs, `require`, `module.exports` and all.
+They are resolved the way Deno resolves them.
+An `npm:` specifier means the tarball npm publishes: the package is fetched off the npm registry, its integrity checked against what the packument names, unpacked under the module cache, and resolved with node's own rules, so `exports` decides which file a subpath is, `dependencies` decides what a bare name inside the package means, and a package that ships commonjs is run as commonjs, `require`, `module.exports` and all.
 Two versions of the same package are two directories rather than one guess, and a package that imports something it never declared is refused rather than resolved by accident.
 A script inside a package sees the five names node gives one, `exports`, `require`, `module`, `__filename` and `__dirname`, and `global` as node's other name for the global object. A function's own module does not see `global`, because a function's own module is not node code and neither node nor Deno gives it one.
-A `jsr:` specifier under the same knob means jsr, which is a simpler thing than npm: a package there is typescript modules and nothing else, its own dependencies are written into its source as `npm:` and `jsr:` specifiers rather than declared in a manifest, and its `exports` map is a flat list of the subpaths it publishes. So resolution is two lookups on jsr.io, which version the range means and which file the subpath means, and after that the module is an ordinary `https:` import through the same cache everything else goes through.
-This is newer than the other answer and is off by default until the examples corpus says it runs more code, which is the only thing that decides it.
+A `jsr:` specifier means jsr, which is a simpler thing than npm: a package there is typescript modules and nothing else, its own dependencies are written into its source as `npm:` and `jsr:` specifiers rather than declared in a manifest, and its `exports` map is a flat list of the subpaths it publishes. So resolution is two lookups on jsr.io, which version the range means and which file the subpath means, and after that the module is an ordinary `https:` import through the same cache everything else goes through.
+
+`ZOU_NPM=registry` is the other answer, and it was the default until 2026-08-28.
+Both specifiers are then rewritten to a url on a registry that serves packages as modules, `esm.sh` by default, and from there a package is an ordinary graph of `https:` imports.
+What runs is the registry's build of the package rather than the tarball npm would have unpacked, which is worth knowing before reporting a difference in behaviour to a package's author.
+
+Which of the two runs more of other people's code was decided by the examples corpus rather than by an argument, and the tarball won it on 2026-08-28: 26 of the 40 Supabase examples loaded on the tarball against 25 on either build esm.sh serves.
+The margin is one name and the reason is not the margin.
+Two of the names the tarball serves are ones no registry can: esm.sh answers 500 for `@slack/web-api` whichever build is asked for, and the mcp sdk asks the registry's build of `zod/v4` for `custom`, which that build's export list does not carry because the package's own `export *` became property copying onto an object the build never exports.
+Neither of those is fixable on this side, and neither can happen to a package unpacked from its own tarball.
+The full three column run is in tamnd/zou-conformance `examples/README.md`.
 
 - Pin the version. `npm:zod@3.23.8` is a version, `npm:zod` is whatever the registry thinks latest is on the day the cache is cold.
 - A package that reaches for a node built in runs if the built in is one of the ones below, and is refused by the name of the one it wanted if it is not.
-- The loader asks the registry as `zou-edge-runtime`, and that decides which build comes back. esm.sh serves a Deno agent the build it makes for Deno, which is the build a package author tested on a Deno runtime, and serves anything else the build it makes for a browser, with the platform bits stubbed out. The browser build is the one that links here, and the reason is measured rather than argued: the Supabase examples corpus, run on the same machine on the same afternoon against both, ran thirty two of forty functions asking as this and twenty five asking as Deno. The seven it costs are packages whose Deno build imports `node:child_process`, `node:diagnostics_channel` or `node:module`, and four of the seven want to start a process, which is not something a function here is ever going to do. What asking as itself costs is the other direction: a package whose browser build needs something a browser has and this does not, such as a `.wasm` esbuild will not bundle, is a 500 from the registry rather than a module.
-- The build asked for is the unminified one, `?dev` on esm.sh, because a minified class is a class with a one letter name and a library that reports its own names reports letters. What that is worth was counted on the same corpus, one binary and two runs: nine of the forty functions produce an error whose text carries a minified name under the registry's default build and the author's name under this one, `new he` becoming `new Resend`, `new $e` becoming `new Bot`, `i._setAuthenticator` becoming `_Stripe._setAuthenticator`, and `custom-jwt-validation` answering with `JOSENotSupported: Unsupported "alg" value for a JSON Web Key Set` where before it answered `I:`, which is the shape upstream answers with. Nothing else moved: the same forty statuses on both runs, one row of forty different in its body, and that row is the one that got its name back. What it costs is a bigger cache and a slower cold start, measured on the same corpus at six megabytes on thirty six and a boot that is under twenty milliseconds a function slower once the cache is warm. `ZOU_MODULE_BUILD` names the query to ask with, and an empty value asks for nothing, which is what a mirror that is not esm.sh and has its own idea of what a query means wants.
-- A build the registry could not make is asked for again as the one it can. esm.sh answers 500 for `@vercel/og` asked as a browser, because that build hands esbuild a `.wasm` and esbuild has no loader for one, so a 5xx from the registry is asked again as Deno and what comes back is the `denonext` build. The modules it re exports name the build in their own path, so the rest of that package's graph arrives without asking twice, and a package the registry can build for a browser never takes this path at all.
+- Under `ZOU_NPM=registry` the loader asks the registry as `zou-edge-runtime`, and that decides which build comes back. esm.sh serves a Deno agent the build it makes for Deno, which is the build a package author tested on a Deno runtime, and serves anything else the build it makes for a browser, with the platform bits stubbed out. The browser build is the one that links here, and the reason is measured rather than argued: the Supabase examples corpus, run on the same machine on the same afternoon against both, ran thirty two of forty functions asking as this and twenty five asking as Deno. The seven it costs are packages whose Deno build imports `node:child_process`, `node:diagnostics_channel` or `node:module`, and four of the seven want to start a process, which is not something a function here is ever going to do. What asking as itself costs is the other direction: a package whose browser build needs something a browser has and this does not, such as a `.wasm` esbuild will not bundle, is a 500 from the registry rather than a module.
+- Under `ZOU_NPM=registry` the build asked for is the unminified one, `?dev` on esm.sh, because a minified class is a class with a one letter name and a library that reports its own names reports letters. What that is worth was counted on the same corpus, one binary and two runs: nine of the forty functions produce an error whose text carries a minified name under the registry's default build and the author's name under this one, `new he` becoming `new Resend`, `new $e` becoming `new Bot`, `i._setAuthenticator` becoming `_Stripe._setAuthenticator`, and `custom-jwt-validation` answering with `JOSENotSupported: Unsupported "alg" value for a JSON Web Key Set` where before it answered `I:`, which is the shape upstream answers with. Nothing else moved: the same forty statuses on both runs, one row of forty different in its body, and that row is the one that got its name back. What it costs is a bigger cache and a slower cold start, measured on the same corpus at six megabytes on thirty six and a boot that is under twenty milliseconds a function slower once the cache is warm. `ZOU_MODULE_BUILD` names the query to ask with, and an empty value asks for nothing, which is what a mirror that is not esm.sh and has its own idea of what a query means wants.
+- Under `ZOU_NPM=registry` a build the registry could not make is asked for again as the one it can. esm.sh answers 500 for `@vercel/og` asked as a browser, because that build hands esbuild a `.wasm` and esbuild has no loader for one, so a 5xx from the registry is asked again as Deno and what comes back is the `denonext` build. The modules it re exports name the build in their own path, so the rest of that package's graph arrives without asking twice, and a package the registry can build for a browser never takes this path at all.
 - `@supabase/supabase-js` runs. `createClient` builds its auth, storage, functions and realtime clients, and the realtime one is a `WebSocket`, which is why that had to exist before this line could say so.
 - `http:` is refused. A module arrives and is executed, so it arrives over https.
 - `data:` is not supported yet.
@@ -593,7 +598,7 @@ This is newer than the other answer and is off by default until the examples cor
 ### Node built ins
 
 `node:` is a specifier here, and what it resolves to is javascript carried in the binary rather than anything on the network.
-A function may import one itself, and so may a package the registry served, which is the other reason they exist: the browser build of a package still reaches for `node:buffer` and `node:process` here and there.
+A function may import one itself, and so may a package, which is the other reason they exist: a package unpacked from its tarball is the code its author wrote for node, and that code reaches for `node:buffer` and `node:process` as a matter of course.
 
 ```
 assert  async_hooks  buffer  child_process  cluster  crypto
@@ -642,8 +647,11 @@ const bytes = await Deno.readFile(
 )
 ```
 
-Upstream unpacks a tarball into a directory, so that line is a file beside a file.
-Here a package is a url, so it is a url beside a url, and two things make it work.
+A package here is a directory, the same as it is upstream, so that line is a file beside a file and there is nothing to explain.
+Everything under the module cache is readable whatever the function's `static_files` say, so a package reads its own font, wasm blob or table of country codes the way it reads its own javascript, through `import.meta.url` if it is a module and through `__dirname` if it is a script.
+The project's own files are not widened by this and a relative name still starts at the function's directory: the cache holds what this runtime fetched on the function's behalf, and reading out of it is reading what the function already imported.
+
+The rest of this section is `ZOU_NPM=registry`, where a package is a url rather than a directory and it takes two things to read a url beside a url.
 
 `import.meta.resolve` of a package answers with the module the registry served rather than with the specifier that was asked for.
 A version range is a name for a package and not a place, and `new URL('magick.wasm', ...)` resolves against a place: esm.sh answers `@imagemagick/magick-wasm@^0` with a module that says in `x-esm-path` which build of which version it is, and that is the url this answers with.
@@ -661,22 +669,19 @@ import { fileURLToPath } from "node:url"
 readFileSync(fileURLToPath(new URL("./resvg.wasm", import.meta.url)))
 ```
 
-That is what `@vercel/og` does, and on node it is a path because the package is a directory.
-Here it is a url, so `fileURLToPath` of an `http:` or `https:` url answers with the url rather than throwing, and the read that follows takes it.
+That is what `@vercel/og` does, and on node it is a path because the package is a directory, which is what it is on the default path here too.
+Under `ZOU_NPM=registry` it is a url, so `fileURLToPath` of an `http:` or `https:` url answers with the url rather than throwing, and the read that follows takes it.
 A url that is neither a file nor http is still `ERR_INVALID_URL_SCHEME`, the way node spells it.
-
-With `ZOU_NPM=tarball` a package is a directory again, and that same line is a path again.
-Everything under the module cache is readable whatever the function's `static_files` say, so a package reads its own font, wasm blob or table of country codes the way it reads its own javascript, through `import.meta.url` if it is a module and through `__dirname` if it is a script.
-The project's own files are not widened by this and a relative name still starts at the function's directory: the cache holds what this runtime fetched on the function's behalf, and reading out of it is reading what the function already imported.
 
 Everything fetched is kept on disk, keyed by url, so only the first cold start pays for it.
 
 - `ZOU_MODULE_CACHE` is where, and defaults to `$XDG_CACHE_HOME/zou/modules` or `~/.cache/zou/modules`.
 - `ZOU_MODULE_CACHE_ONLY=1` means this server does not fetch. A module that is not in the cache is refused by name rather than reached for, which is what a deployment that warmed its cache somewhere else wants.
-- `ZOU_MODULE_REGISTRY` points `npm:` and `jsr:` at a mirror instead of esm.sh.
-- `ZOU_NPM=tarball` makes an `npm:` import mean the tarball off the npm registry, unpacked under `<cache>/npm/<name>/<version>` and resolved the way node resolves one, instead of a url on esm.sh. `ZOU_NPM_REGISTRY` points that at a mirror of npm instead of `https://registry.npmjs.org`, and `ZOU_JSR_REGISTRY` does the same for jsr instead of `https://jsr.io`. The same knob makes a `jsr:` import mean the files jsr publishes.
+- `ZOU_MODULE_REGISTRY` points `npm:` and `jsr:` at a mirror instead of esm.sh, under `ZOU_NPM=registry`.
+- `ZOU_NPM_REGISTRY` points the tarball path at a mirror of npm instead of `https://registry.npmjs.org`, and `ZOU_JSR_REGISTRY` does the same for jsr instead of `https://jsr.io`.
+- `ZOU_NPM=registry` puts an `npm:` and a `jsr:` import back to being a url on esm.sh rather than a tarball, which is what this did by default until 2026-08-28. It is the escape hatch for a package the tarball path cannot resolve and for a deployment whose network reaches a registry mirror and not npm, and it is not the path that gets the corpus run against it.
 - `ZOU_MODULE_BUILD` is the query a package is asked for with, `dev` by default, and empty for whatever the registry serves without being asked. A cache is keyed by the url, so a cache warmed one way and read the other way fetches again rather than serving the other build.
-- `ZOU_MODULE_AGENT` is who the registry is asked as, and is nobody by default. esm.sh reads the user agent and serves a different build for it, a browser one that stubs the platform out and a Deno one that imports `node:`, and which of the two runs more of somebody's code is a thing to measure rather than to assume. `ZOU_MODULE_AGENT=deno` is the runtime's own agent without writing the string out, and any other value is sent as it stands. Setting it also turns the 5xx fallback off, since the fallback is the ask this replaces.
+- `ZOU_MODULE_AGENT` is who the registry is asked as under `ZOU_NPM=registry`, and is nobody by default. esm.sh reads the user agent and serves a different build for it, a browser one that stubs the platform out and a Deno one that imports `node:`, and which of the two runs more of somebody's code is a thing to measure rather than to assume. `ZOU_MODULE_AGENT=deno` is the runtime's own agent without writing the string out, and any other value is sent as it stands. Setting it also turns the 5xx fallback off, since the fallback is the ask this replaces.
 
 ## Import maps
 
