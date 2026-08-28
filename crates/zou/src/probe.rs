@@ -321,8 +321,11 @@ fn ms(took: Duration) -> String {
     }
 }
 
+/// Powers of two with the names for powers of two, which is what
+/// `zou stats` prints, so two lines of one run's output are in the
+/// same units.
 fn bytes(n: usize) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = n as f64;
     let mut unit = 0;
     while size >= 1024.0 && unit + 1 < UNITS.len() {
@@ -398,8 +401,8 @@ mod tests {
             "a probe that leaves its objects behind is a probe run once"
         );
         let lines = probe.lines(&target);
-        assert!(lines.contains("latency, 1.0 KB x 3: put p50 "), "{lines}");
-        assert!(lines.contains("bandwidth, 64.0 KB x 3: put "), "{lines}");
+        assert!(lines.contains("latency, 1.0 KiB x 3: put p50 "), "{lines}");
+        assert!(lines.contains("bandwidth, 64.0 KiB x 3: put "), "{lines}");
         assert!(probe.to_json(&target).starts_with('{'));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -418,7 +421,7 @@ mod tests {
         assert_eq!(ms(Duration::from_micros(120)), "120 us");
         assert_eq!(ms(Duration::from_micros(12500)), "12.5 ms");
         assert_eq!(bytes(512), "512 B");
-        assert_eq!(bytes(8192), "8.0 KB");
-        assert_eq!(bytes(8 * 1024 * 1024), "8.0 MB");
+        assert_eq!(bytes(8192), "8.0 KiB");
+        assert_eq!(bytes(8 * 1024 * 1024), "8.0 MiB");
     }
 }

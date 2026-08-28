@@ -41,30 +41,30 @@ A layer fetch and a checkpoint upload are bytes, so what they pay is bandwidth.
 ```
 $ zou probe /home/zoubench/ab671-pool
 target: /home/zoubench/ab671-pool
-latency, 8.0 KB x 30: put p50 4.8 ms p95 5.4 ms, get p50 9 us p95 18 us, list p50 25 us p95 41 us, delete p50 75 us p95 273 us
-bandwidth, 8.0 MB x 3: put 329.3 MB/s p50 25.1 ms, get 1.6 GB/s p50 5.1 ms
+latency, 8.0 KiB x 30: put p50 4.8 ms p95 5.4 ms, get p50 9 us p95 18 us, list p50 25 us p95 41 us, delete p50 75 us p95 273 us
+bandwidth, 8.0 MiB x 3: put 329.3 MiB/s p50 25.1 ms, get 1.6 GiB/s p50 5.1 ms
 ```
 
 `--rounds`, `--size` and `--large` change the shape of the probe and `--json` prints it for a harness.
 It writes under `probe/<pid>/` and deletes what it wrote, in a cleanup pass that runs before any error is returned, so a probe that fails halfway still leaves nothing behind.
 
-Measured 2026-08-29, 8 KB objects over 30 rounds and 8 MB objects over 3, each box against a directory store on its own store disk, which is the target the pgbench legs in docs/perf.md use.
+Measured 2026-08-29, 8 KiB objects over 30 rounds and 8 MiB objects over 3, each box against a directory store on its own store disk, which is the target the pgbench legs in docs/perf.md use.
 There is no real S3 or S3 Express row yet because there are no credentials for one, and the moment there are, the same command fills it in.
 
-| box | put p50 | put p95 | get p50 | list p50 | delete p50 | put bandwidth | get bandwidth | load |
+| box | put p50 | put p95 | get p50 | list p50 | delete p50 | put bandwidth | get bandwidth | load at probe |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| mac | 3.9 ms | 8.0 ms | 26 us | 78 us | 142 us | 770.7 MB/s | 1.8 GB/s | quiet |
-| server1 | 11.7 ms | 51.1 ms | 39 us | 114 us | 163 us | 280.3 MB/s | 580.7 MB/s | 25 |
-| server2 | 1.9 ms | 14.8 ms | 30 us | 119 us | 201 us | 115.6 MB/s | 209.0 MB/s | 27 |
-| server3 | 7.5 ms | 48.8 ms | 51 us | 165 us | 227 us | 42.9 MB/s | 93.8 MB/s | 33 |
-| gamingpc | 4.8 ms | 5.4 ms | 9 us | 25 us | 75 us | 329.3 MB/s | 1.6 GB/s | 8 |
+| mac | 3.9 ms | 8.0 ms | 26 us | 78 us | 142 us | 770.7 MiB/s | 1.8 GiB/s | quiet |
+| server1 | 11.7 ms | 51.1 ms | 39 us | 114 us | 163 us | 280.3 MiB/s | 580.7 MiB/s | 25 |
+| server2 | 1.9 ms | 14.8 ms | 30 us | 119 us | 201 us | 115.6 MiB/s | 209.0 MiB/s | 27 |
+| server3 | 7.5 ms | 48.8 ms | 51 us | 165 us | 227 us | 42.9 MiB/s | 93.8 MiB/s | 33 |
+| gamingpc | 4.8 ms | 5.4 ms | 9 us | 25 us | 75 us | 329.3 MiB/s | 1.6 GiB/s | 8 |
 
 Reading the table, since these are not the numbers a network probe would give:
 
 - A put costs milliseconds and a get costs tens of microseconds on every box, which is the fsync and nothing else. The put is the durable one, the get comes back out of page cache. That two order of magnitude split is the shape a commit path has to live with, and it is why the commit latency work in docs/benchmarks.md is all about how many puts a commit costs rather than how fast one is.
-- The p95 column is the load column in disguise. server1 at load 25 and server3 at load 33 have put p95 four to six times their p50, gamingpc at load 8 has a p95 within 15% of its p50. Nothing about the disks explains that and everything about the neighbours does.
+- The p95 column is the load column in disguise. The three servers were probed in the twenties and thirties and every one of them has a put p95 four to eight times its p50, gamingpc at load 8 has a p95 within 15% of its p50. Nothing about the disks explains that and everything about the neighbours does. It is also why the load in this table is the load at probe time rather than the one in the specs table above, which was read at a different moment.
 - server3's bandwidth is a tenth of gamingpc's on paper. It was measured at load 33 with the box's owner running an ingest job on the same spindle, and a rerun with the disk quieter is what would say what the hardware can do. The row is published as measured, with the load beside it, rather than waited on.
-- The mac and gamingpc get bandwidth over a gigabyte a second because an 8 MB object just written comes back from page cache. That is a real number for a store that fits in memory and a fiction for one that does not, which is the other reason a directory store is not a stand in for a bucket.
+- The mac and gamingpc get bandwidth over a gigabyte a second because an 8 MiB object just written comes back from page cache. That is a real number for a store that fits in memory and a fiction for one that does not, which is the other reason a directory store is not a stand in for a bucket.
 
 None of this is the distance to a real object store, which is the number the probe exists for. These rows are the floor: whatever a bucket costs, it costs at least this much of local work on top.
 
