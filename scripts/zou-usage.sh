@@ -24,6 +24,25 @@
 # It is Linux only, so elsewhere the sum of RSS is reported and said
 # to be a sum of RSS.
 #
+# The same rollup splits that Pss into a file backed half and an
+# anonymous half and a shared memory half, and that split is the
+# difference between a footprint and a cache: the file backed half is
+# page cache the tree is charged for and gives back under pressure, the
+# anonymous half is not and does not, and the shared half is
+# shared_buffers and is the same size whatever the workload does. A
+# budget written against the sum of the three is written against the
+# wrong number. The three add up to the Pss above them. Swap comes from
+# SwapPss, divided by its mappers for the same reason Pss is, and the
+# major faults come out of the process stat lines the same way the cpu
+# counters do.
+#
+# A leak is a slope rather than a peak and it does not show up in a
+# sixty second phase, so a window over an hour also gets a least squares
+# fit on its memory readings, reported as MiB an hour and as a share of
+# the peak. It is a rate and not a verdict: a run still filling
+# shared_buffers climbs honestly and a threshold here would call that a
+# leak.
+#
 # Cpu is the live tree's own time plus the postmaster's cutime and
 # cstime, which hold the children it has already reaped. Both halves
 # are needed and they do not overlap: without the child counters a
@@ -95,7 +114,25 @@ snapshot() {
         [ -n "$files" ] || return 0
         # shellcheck disable=SC2086
         awk -v hz="$(ticks)" -v root="$root" '
-            FILENAME ~ /smaps_rollup$/ { if ($1 == "Pss:") pss += $2; next }
+            FILENAME ~ /smaps_rollup$/ {
+                if ($1 == "Pss:") pss += $2
+                # The same rollup splits that Pss into what is backed by
+                # a file and what is not, which is the page cache
+                # attribution M1b asks for and the only version of it
+                # that means anything here: the box wide Cached figure
+                # on a shared server holds the neighbour files too.
+                else if ($1 == "Pss_File:") file += $2
+                else if ($1 == "Pss_Anon:") anon += $2
+                # The third of the three, and on postgres the largest:
+                # shared_buffers is a shmem mapping and is neither of
+                # the other two. Left out, the split would not add up
+                # to the Pss above it and would read as an error.
+                else if ($1 == "Pss_Shmem:") shmem += $2
+                # SwapPss and not Swap, divided by the mappers for the
+                # same reason Pss is.
+                else if ($1 == "SwapPss:") swap += $2
+                next
+            }
             {
                 # The comm field can hold spaces and parentheses, so
                 # the fields are counted from the closing paren rather
@@ -104,9 +141,20 @@ snapshot() {
                 n = split(tail, f, " ")
                 if (n < 15) next
                 user += f[12]; sys += f[13]
-                if (FILENAME == "/proc/" root "/stat") { user += f[14]; sys += f[15] }
+                # Major faults, the ones that went to the disk. They are
+                # gathered exactly like the cpu counters, live tree plus
+                # the root child totals, and they do not overlap for the
+                # same reason.
+                major += f[10]
+                if (FILENAME == "/proc/" root "/stat") {
+                    user += f[14]; sys += f[15]; major += f[11]
+                }
             }
-            END { if (pss > 0) printf "%d pss %.2f %.2f\n", pss, user / hz, sys / hz }
+            END {
+                if (pss > 0)
+                    printf "%d pss %.2f %.2f mem:%d:%d:%d:%d:%d\n",
+                        pss, user / hz, sys / hz, file, anon, shmem, swap, major
+            }
         ' $files 2>/dev/null || true
     else
         # No Pss and no cutime, so this is a sum of RSS over the live
@@ -202,9 +250,14 @@ sample() {
         # Word splitting is the point: four fields out, four set.
         # shellcheck disable=SC2046
         set -- $(snapshot "$pid")
-        if [ $# -eq 4 ]; then
-            printf '%s %s %s %s %s%s\n' "$(now)" "$1" "$2" "$3" "$4" \
-                "$(disk "$devs")" >>"$out"
+        if [ $# -ge 4 ]; then
+            # The fifth token is the memory shape and only Linux has it,
+            # so it is appended rather than given a column: the report
+            # reads it by its prefix and the four fields in front of it
+            # keep their positions on every platform and in every
+            # samples file written before this existed.
+            printf '%s %s %s %s %s%s%s\n' "$(now)" "$1" "$2" "$3" "$4" \
+                "${5:+ $5}" "$(disk "$devs")" >>"$out"
         fi
         sleep "$interval"
     done
@@ -244,20 +297,44 @@ report() {
                 if (which == 0) seen_dev[t[1]] = 1
             }
         }
+        # The memory shape token, which is six colon separated fields
+        # rather than the eight a device token has, so the two never get
+        # confused for one another and an older samples file that has
+        # neither simply leaves both unset.
+        function shape(which,   i, n, t) {
+            for (i = 6; i <= NF; i++) {
+                n = split($i, t, ":")
+                if (n != 6 || t[1] != "mem") continue
+                m[which, "file"] = t[2] + 0
+                m[which, "anon"] = t[3] + 0
+                m[which, "shmem"] = t[4] + 0
+                m[which, "swap"] = t[5] + 0
+                m[which, "major"] = t[6] + 0
+                shaped[which] = 1
+            }
+        }
         function mib(sectors) { return sectors * 512 / 1048576 }
         # An older samples file could hold a zero row from before the
         # sampler learned to skip a reading it could not take, and one
         # of those in the wrong place turns a window negative.
         $2 <= 0 { next }
-        $1 < from { u0 = $4; s0 = $5; grab(0); t0 = $1; seen = 1; next }
+        $1 < from { u0 = $4; s0 = $5; grab(0); shape(0); t0 = $1; seen = 1; next }
         $1 <= to {
             n++
             if ($2 > peak) peak = $2
             last = $2
             kind = $3
-            if (n == 1 && !seen) { u0 = $4; s0 = $5; grab(0); t0 = $1 }
+            if (n == 1 && !seen) { u0 = $4; s0 = $5; grab(0); shape(0); t0 = $1 }
+            if (n == 1) tf = $1
             u1 = $4; s1 = $5; t1 = $1
             grab(1)
+            shape(1)
+            # Least squares on the memory readings, kept as running sums
+            # so an hours long samples file is one pass and not an array.
+            # Seconds from the first in window sample rather than epoch
+            # seconds, which would square into numbers awk rounds.
+            dx = $1 - tf
+            sx += dx; sy += $2; sxx += dx * dx; sxy += dx * $2
         }
         END {
             if (n == 0) exit
@@ -267,6 +344,38 @@ report() {
                 printf ", %.3f s cpu per 1000 transactions",
                     1000 * ((u1 - u0) + (s1 - s0)) / txns
             printf "\n"
+            # What that memory is made of, which is the difference
+            # between a footprint and a cache. The file backed half is
+            # the page cache this tree is charged for and it comes back
+            # under pressure, the anonymous half does not, and a shim
+            # budget written against the sum of the two is written
+            # against the wrong number.
+            if (shaped[1]) {
+                printf "  memory at end %.1f MiB file backed, %.1f MiB anonymous, %.1f MiB shared",
+                    m[1, "file"] / 1024, m[1, "anon"] / 1024, m[1, "shmem"] / 1024
+                if (m[1, "swap"] > 0)
+                    printf ", %.1f MiB swapped", m[1, "swap"] / 1024
+                if (shaped[0])
+                    printf ", %d major faults", m[1, "major"] - m[0, "major"]
+                printf "\n"
+            }
+            # A leak is a slope and not a peak, and it does not show up
+            # in a sixty second phase, so the check is on windows long
+            # enough to hold one. The fit is over the whole window and
+            # is reported as a rate rather than as a verdict: a run that
+            # is still filling shared_buffers climbs honestly, and a
+            # threshold here would call that a leak.
+            span_fit = t1 - tf
+            if (n >= 2 && span_fit >= 3600) {
+                denom = n * sxx - sx * sx
+                if (denom > 0) {
+                    per_hour = (n * sxy - sx * sy) / denom * 3600 / 1024
+                    printf "  slope over %.1f h: %+.2f MiB per hour", span_fit / 3600, per_hour
+                    if (peak > 0)
+                        printf ", %+.2f%% of the peak an hour", 100 * per_hour * 1024 / peak
+                    printf "\n"
+                }
+            }
             span = t1 - t0
             for (dev in seen_dev) {
                 reads = d[1, dev, 2] - d[0, dev, 2]

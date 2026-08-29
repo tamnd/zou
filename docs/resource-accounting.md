@@ -16,6 +16,15 @@ Postgres is a process per connection over one shared memory segment, so summing 
 Pss divides each shared page by the number of processes mapping it, so the total is what the tree actually occupies.
 Pss is Linux only, so runs on other systems report the sum of RSS and say that is what they are reporting, which is one more reason every published run happens on the servers in [docs/hardware.md](hardware.md).
 
+That total is then split three ways, out of the same rollup, into what is backed by a file, what is anonymous, and what is shared memory, and the three add up to it.
+The split is the difference between a footprint and a cache: the file backed part is page cache this tree is charged for and gives it back under pressure, the anonymous part is the heap and does not, and the shared part is `shared_buffers` and is the same size whatever the workload does.
+A measured run makes the case for printing all three rather than the total: an idle scale 100 leg on server3 sat at 167.9 MiB of Pss, and 142.9 MiB of that was `shared_buffers`, so a budget written against the total would have been a budget written against a setting.
+This is also the only page cache attribution that means anything on our boxes, since the machine wide `Cached` figure holds the neighbour files too.
+Swap comes from `SwapPss`, divided among its mappers for the same reason `Pss` is, and major faults are summed off the process stat lines the way the cpu counters are, live tree plus the postmaster's totals for the children it has reaped.
+
+A leak is a slope and not a peak, and a sixty second phase is too short to hold one, so a window longer than an hour also gets a least squares fit over its memory readings, reported as MiB an hour and as a share of the peak.
+It is deliberately a rate and not a verdict. A run still filling `shared_buffers` climbs honestly for its first minutes, and a threshold sitting here would call that a leak.
+
 Cpu is the live tree's user and system time plus the postmaster's counters for the children it has already reaped.
 Both halves are needed and they do not overlap: a backend is either alive in the tree or reaped into the child counters, and it moves from one to the other at the moment it exits.
 Per transaction figures divide by pgbench's own count of transactions rather than by tps times duration, since the two differ by however long the last transaction took.
