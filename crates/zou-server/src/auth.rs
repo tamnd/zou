@@ -575,7 +575,7 @@ fn could_be_refresh(token: &str) -> bool {
 /// characters different from the reference on almost every row, since
 /// almost every row is written on a whole microsecond and most of
 /// those trail in zeros.
-fn ts(col: &str) -> String {
+pub(crate) fn ts(col: &str) -> String {
     let whole = format!(r#"to_char({col} at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS')"#);
     let fraction = format!(r#"to_char({col} at time zone 'utc', '.US')"#);
     // rtrim takes the zeros off, and nullif takes the whole thing off
