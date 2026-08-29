@@ -8,6 +8,8 @@ Each phase also prints what it cost the machine, memory and cpu, sampled once a 
 What is inside the boundary those two figures draw, and what a Neon number has to be split into before it can sit beside them, is [docs/resource-accounting.md](resource-accounting.md).
 Each phase prints its latency tail too, p50 through p999 and the max, out of pgbench's per transaction log rather than out of its summary, because the summary offers a mean and a mean is the one statistic an engine on object storage can pass while being unusable.
 A run on server2 makes the point: select-only averaged 0.492 ms with a median of 0.118 ms, a p99 of 6.950 ms and a worst transaction of 530.706 ms, so the average describes no transaction that happened.
+And each phase prints what postgres itself thinks happened during it, differenced out of its cumulative statistics views at the same boundaries: wal records and bytes, checkpoint write and sync time, buffer hit ratio, io counts, temp files and autovacuums.
+A slow phase is waiting on something and those views are where it says on what.
 
 ## Method
 
