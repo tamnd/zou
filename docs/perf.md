@@ -6,6 +6,8 @@ Each phase prints what it cost the store underneath its own tps, out of the coun
 The counter file is copied at every phase boundary into the run directory, so `zou stats <file> --since <earlier>` can ask a finished run anything those lines left out.
 Each phase also prints what it cost the machine, memory and cpu, sampled once a second by `scripts/zou-usage.sh` while the run happens, because a peak that happened during the load is not a peak the select-only phase paid for and neither figure can be recovered once the run is over.
 What is inside the boundary those two figures draw, and what a Neon number has to be split into before it can sit beside them, is [docs/resource-accounting.md](resource-accounting.md).
+Each phase prints its latency tail too, p50 through p999 and the max, out of pgbench's per transaction log rather than out of its summary, because the summary offers a mean and a mean is the one statistic an engine on object storage can pass while being unusable.
+A run on server2 makes the point: select-only averaged 0.492 ms with a median of 0.118 ms, a p99 of 6.950 ms and a worst transaction of 530.706 ms, so the average describes no transaction that happened.
 
 ## Method
 

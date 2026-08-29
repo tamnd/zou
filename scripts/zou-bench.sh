@@ -29,6 +29,14 @@
 # fast read with it, the layer path pays neither and buys a slow one.
 # Both halves belong beside the number.
 #
+# Each phase prints the tail of its latency distribution out of
+# pgbench's per transaction log, not out of its summary, which offers a
+# mean and a standard deviation. A mean is the one statistic an engine
+# on object storage can pass while being unusable, because the commit
+# path is bimodal: most transactions never wait on the store and the
+# ones that do wait for a round trip, and the average of those two is a
+# number no transaction experienced.
+#
 # Each phase also prints what it cost the machine, memory and cpu,
 # sampled once a second by scripts/zou-usage.sh while the run happens.
 # Two M1b claims are about that and neither can be answered after the
@@ -43,6 +51,10 @@ PG=${PG:-build/pg/bin}
 BOOTSTRAP=${BOOTSTRAP:-target/release/zou-bootstrap}
 PORT=${PORT:-54312}
 CLIENTS=${CLIENTS:-8}
+# How wide a progress bucket is. Ten seconds rather than the thirty M1b
+# asks for, because thirty second buckets can be added up out of ten
+# second ones and the other direction does not work.
+PROGRESS=${PROGRESS:-10}
 
 VANILLA=0
 if [ "$TARGET" = none ]; then
@@ -191,11 +203,54 @@ T1=$(date +%s)
 echo "checkpoint: $((T1 - T0)) s"
 cost checkpoint
 
+# The tail of the latency distribution, out of pgbench's per transaction
+# log rather than out of its summary, which reports a mean and a standard
+# deviation and nothing else. A mean is the one statistic a storage
+# engine on object storage can pass while being unusable, since the
+# commit path is a bimodal thing: most transactions never wait on the
+# store and the ones that do wait for a round trip.
+#
+# The log's third field is the transaction latency in microseconds. With
+# -j the threads write one file each, prefix.pid for the first and
+# prefix.pid.N for the rest, so the glob takes them all and the
+# percentiles are over the run and not over one thread of it.
+latencies() {
+    prefix=$1
+    set -- "$prefix".*
+    [ -e "$1" ] || return 0
+    awk '{print $3}' "$@" | sort -n | awk '
+        { v[NR] = $1 }
+        function q(p,   i) {
+            i = int(p * NR + 0.5)
+            if (i < 1) i = 1
+            if (i > NR) i = NR
+            return v[i] / 1000
+        }
+        END {
+            if (NR == 0) exit
+            printf "  latency p50 %.3f ms, p95 %.3f ms, p99 %.3f ms, p999 %.3f ms, max %.3f ms, over %d transactions\n",
+                q(0.5), q(0.95), q(0.99), q(0.999), v[NR] / 1000, NR
+        }'
+}
+
 bench() {
     name=$1
     shift
+    txlog=$RUNDIR/tx-$name
+    # Per transaction logging is on unless it is turned off, because the
+    # percentiles are the point and a run without them cannot be asked
+    # for them later. It costs one line per transaction, tens of bytes,
+    # which is well under a megabyte a second even on the read only mix.
+    if [ "${ZOU_BENCH_TXLOG:-1}" = 1 ]; then
+        log_flags="-l --log-prefix=$txlog"
+    else
+        log_flags=
+    fi
+    # Word splitting is the point, the flags are a list.
+    # shellcheck disable=SC2086
     out=$("$PG"/pgbench -h "$SOCK" -p "$PORT" -c "$CLIENTS" -j "$CLIENTS" \
-        -T "$DURATION" -P 10 "$@" postgres 2>&1)
+        -T "$DURATION" -P "$PROGRESS" $log_flags "$@" postgres 2>&1)
+    printf '%s\n' "$out" >"$RUNDIR/pgbench-$name.log"
     tps=$(printf '%s\n' "$out" | awk '/^tps/ {printf "%.0f", $3}')
     lat=$(printf '%s\n' "$out" | awk '/latency average/ {print $4}')
     # pgbench's own count rather than tps times duration, since the
@@ -206,6 +261,28 @@ bench() {
             split($NF, done, "/"); print done[1]
         }')
     echo "$name, $CLIENTS clients, $DURATION s: $tps tps, $lat ms average latency"
+    latencies "$txlog"
+    # Buckets, so a phase that spent its first interval warming and its
+    # rest steady is visible as that rather than as one average of the
+    # two. Failures come from the same lines because pgbench counts them
+    # per interval, and a leg that retried its way to a good tps should
+    # not be able to report only the tps.
+    printf '%s\n' "$out" | awk -v every="$PROGRESS" '
+        /^progress:/ { tps = tps sep $4; sep = " "; failed += $(NF - 1) }
+        END {
+            if (tps == "") exit
+            printf "  buckets, %s s: %s tps", every, tps
+            if (failed > 0) printf ", %d failed transactions", failed
+            printf "\n"
+        }'
+    # What it cost to get the connections, which on a cold store is the
+    # first thing a client sees and is not in the tps.
+    printf '%s\n' "$out" | awk -v clients="$CLIENTS" '
+        # Anchored, because pgbench also writes "tps = N (without
+        # initial connection time)" and that line is not this one.
+        /^initial connection time/ {
+            printf "  initial connection time %s ms for %s clients\n", $5, clients
+        }'
     cost "$name" "${txns:-0}"
 }
 
