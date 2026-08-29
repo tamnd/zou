@@ -29,6 +29,12 @@
 # fast read with it, the layer path pays neither and buys a slow one.
 # Both halves belong beside the number.
 #
+# Each phase prints what postgres itself thinks happened during it, out
+# of its cumulative statistics views differenced at the same boundaries:
+# wal records and bytes, checkpoint write and sync time, buffer hit
+# ratio, io counts, temp files and autovacuums. A slow phase is waiting
+# on something, and those views are where it says on what.
+#
 # Each phase prints the tail of its latency distribution out of
 # pgbench's per transaction log, not out of its summary, which offers a
 # mean and a standard deviation. A mean is the one statistic an engine
@@ -166,11 +172,89 @@ fi
 # lines below leave out without being run again.
 BOUNDARY=0
 MARK_AT=$(date +%s)
+
+# What postgres itself thinks happened, taken at the same boundaries as
+# the store counters. Its cumulative views answer questions the tps
+# cannot: whether a slow phase was waiting on wal sync or on
+# checkpoints, whether the reads came out of shared buffers or off the
+# store, and whether a sort spilled to disk. They are cumulative since
+# the last stats reset, so a phase is a subtraction here as well.
+#
+# The pairs come out of to_jsonb rather than a column list, because the
+# columns move between major versions, pg_stat_wal lost its write and
+# sync timings to pg_stat_io in 18 and pg_stat_checkpointer was split
+# out of pg_stat_bgwriter in 17. A snapshot that names columns is a
+# snapshot that breaks on the next postgres, and this file is meant to
+# be readable years after the run.
+PG_MARK=$RUNDIR/pg-mark
+pairs() {
+    "$PG"/psql -h "$SOCK" -p "$PORT" -d postgres -At -F '	' -c "$1" 2>/dev/null || true
+}
+
+internals() {
+    {
+        pairs "select 'wal.' || e.k, e.v from pg_stat_wal w, lateral jsonb_each_text(to_jsonb(w)) e(k, v)"
+        pairs "select 'ckpt.' || e.k, e.v from pg_stat_checkpointer c, lateral jsonb_each_text(to_jsonb(c)) e(k, v)"
+        pairs "select 'bgw.' || e.k, e.v from pg_stat_bgwriter b, lateral jsonb_each_text(to_jsonb(b)) e(k, v)"
+        pairs "select 'db.' || e.k, e.v from pg_stat_database d, lateral jsonb_each_text(to_jsonb(d)) e(k, v) where d.datname = current_database()"
+        pairs "select 'io.' || e.k, sum(e.v::numeric)::text from pg_stat_io i, lateral jsonb_each_text(to_jsonb(i)) e(k, v) where e.v ~ '^[0-9.]+\$' group by 1"
+        # Summed above for the three lines, kept broken out here,
+        # because which backend did the reads is most of what pg_stat_io
+        # is for and the summary has no room for it.
+        pairs "select 'iorow.' || i.backend_type || '.' || coalesce(i.object, '-') || '.' || i.context || '.' || e.k, e.v from pg_stat_io i, lateral jsonb_each_text(to_jsonb(i)) e(k, v) where e.v ~ '^[0-9.]+\$'"
+        pairs "select 'vac.autovacuum', coalesce(sum(autovacuum_count), 0)::text from pg_stat_user_tables"
+        pairs "select 'vac.autoanalyze', coalesce(sum(autoanalyze_count), 0)::text from pg_stat_user_tables"
+    } >"$1" 2>/dev/null
+}
+
+# The phase's own deltas, three lines, out of the two snapshots either
+# side of it. A counter that the running postgres does not have simply
+# does not appear in either file and comes out zero, which is the right
+# answer for a version that never collected it.
+internals_report() {
+    was=$1
+    now=$2
+    [ -s "$was" ] && [ -s "$now" ] || return 0
+    awk -F'\t' '
+        NR == FNR { was[$1] = $2 + 0; next }
+        { now[$1] = $2 + 0 }
+        function d(k) { return now[k] - was[k] }
+        function mib(n) { return n / 1048576 }
+        END {
+            hit = d("db.blks_hit")
+            read = d("db.blks_read")
+            printf "  wal %d records, %d fpi, %.1f MiB, %d buffers full\n",
+                d("wal.wal_records"), d("wal.wal_fpi"), mib(d("wal.wal_bytes")), d("wal.wal_buffers_full")
+            checkpoints = d("ckpt.num_timed") + d("ckpt.num_requested")
+            printf "  %d checkpoint%s, %.1f s write, %.1f s sync, %d buffers written",
+                checkpoints, checkpoints == 1 ? "" : "s",
+                d("ckpt.write_time") / 1000, d("ckpt.sync_time") / 1000,
+                d("ckpt.buffers_written") + d("bgw.buffers_clean")
+            if (hit + read > 0)
+                printf ", %.2f%% buffer hit over %d block reads", 100 * hit / (hit + read), read
+            printf "\n"
+            printf "  io %d reads, %d writes, %d extends, %d fsyncs, %d evictions",
+                d("io.reads"), d("io.writes"), d("io.extends"), d("io.fsyncs"), d("io.evictions")
+            if (d("db.temp_files") > 0)
+                printf ", %d temp files of %.1f MiB", d("db.temp_files"), mib(d("db.temp_bytes"))
+            if (d("vac.autovacuum") + d("vac.autoanalyze") > 0)
+                printf ", %d autovacuums and %d autoanalyzes",
+                    d("vac.autovacuum"), d("vac.autoanalyze")
+            printf "\n"
+        }' "$was" "$now"
+}
+
 mark() {
     if [ -s "$ZOU_STORE_STATS" ]; then
         cp "$ZOU_STORE_STATS" "$MARK"
         BOUNDARY=$((BOUNDARY + 1))
         cp "$ZOU_STORE_STATS" "$RUNDIR/stats-$BOUNDARY-$1"
+    fi
+    internals "$PG_MARK"
+    # Kept by the boundary it was taken at, like the counter copies, so
+    # the columns these three lines leave out are still there afterwards.
+    if [ -s "$PG_MARK" ]; then
+        cp "$PG_MARK" "$RUNDIR/pg-stat-$1"
     fi
     MARK_AT=$(date +%s)
 }
@@ -186,6 +270,8 @@ cost() {
     if [ -s "$USAGE" ]; then
         sh "$USAGE_SH" --report "$USAGE" "$MARK_AT" "$(date +%s)" "${2:-0}" || true
     fi
+    internals "$RUNDIR/pg-now"
+    internals_report "$PG_MARK" "$RUNDIR/pg-now"
     mark "$1"
 }
 
