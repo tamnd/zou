@@ -136,21 +136,26 @@ pub struct Case {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub writes: bool,
     /// Asked against what the case before it left, rather than against
-    /// the fixture. Only means anything on a case that writes, since
-    /// the rows only go back in front of those.
+    /// the fixture. It means something on any case, reading or writing,
+    /// because the rows go back in front of every unchained case that
+    /// something has written before.
     ///
-    /// Almost nothing needs this and the ones that do could not exist
-    /// without it. A fixture writes rows, and the object surface is
-    /// about bytes that live somewhere no fixture can reach: the only
-    /// way to ask what a copy does is to upload something and then copy
-    /// it, and the only way to ask what a download of a real object
-    /// answers is to have uploaded it first. Both of those are two
-    /// cases where the second one has to see what the first one did.
+    /// Some questions could not exist without it. A fixture writes rows,
+    /// and the object surface is about bytes that live somewhere no
+    /// fixture can reach: the only way to ask what a copy does is to
+    /// upload something and then copy it, and the only way to ask what a
+    /// download of a real object answers is to have uploaded it first.
+    /// Both of those are two cases where the second one has to see what
+    /// the first one did.
+    ///
+    /// A chain has to be contiguous. An unchained case sitting between a
+    /// write and something that depends on it puts the rows back and
+    /// takes the chain with them, so the cases in one chain sit together
+    /// in the file in the order they are asked.
     ///
     /// The cost is that a chain is order dependent in a way the rest of
-    /// a suite is not, so a chain should be short, should sit together
-    /// in the file, and should start with a case that resets like any
-    /// other.
+    /// a suite is not, so a chain should be short and should start with
+    /// a case that resets like any other.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub chained: bool,
     /// Values out of this case's answer that the cases after it name,
