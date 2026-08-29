@@ -73,7 +73,7 @@ use crate::cas::{CasError, CasStore, Version};
 /// layout so a dump from a stale binary fails loudly instead of reading
 /// garbage.
 const MAGIC: u64 = u64::from_ne_bytes(*b"ZOUSTATS");
-const FORMAT: u64 = 6;
+const FORMAT: u64 = 7;
 
 pub const OP_NAMES: [&str; 6] = ["get", "get_range", "put_if_match", "put", "delete", "list"];
 pub const CLASS_NAMES: [&str; 7] = ["manifest", "wal", "chk", "shards", "page", "file", "other"];
@@ -83,6 +83,12 @@ pub const CAUSE_NAMES: [&str; 3] = ["touched", "untouched", "unclear"];
 pub const COMMIT_NAMES: [&str; 7] = [
     "push", "stage", "window", "dispatch", "put", "ack", "durable",
 ];
+/// Why a request was sent again, plus the one that was not sent again.
+/// `throttle` is a 503 SlowDown or a 429, which is the bucket asking for
+/// less traffic, `server` is any other 5xx, `transport` is a connection
+/// that died under an idempotent request, and `exhausted` is the op that
+/// used its whole attempt budget and failed anyway.
+pub const RETRY_NAMES: [&str; 4] = ["throttle", "server", "transport", "exhausted"];
 
 const KINDS: usize = OP_NAMES.len();
 const CLASSES: usize = CLASS_NAMES.len();
@@ -90,6 +96,7 @@ const TIERS: usize = TIER_NAMES.len();
 const PHASES: usize = PHASE_NAMES.len();
 const STEPS: usize = COMMIT_NAMES.len();
 const CAUSES: usize = CAUSE_NAMES.len();
+const RETRIES: usize = RETRY_NAMES.len();
 const BUCKETS: usize = 32;
 
 const HEADER: usize = 2;
@@ -101,7 +108,8 @@ const PHASE_BASE: usize = TIER_BASE + TIERS * (2 + BUCKETS);
 const STEP_BASE: usize = PHASE_BASE + PHASES * (1 + BUCKETS);
 const CAUSE_BASE: usize = STEP_BASE + STEPS * (1 + BUCKETS);
 const GAP_BASE: usize = CAUSE_BASE + CAUSES;
-const SLOTS: usize = GAP_BASE + 1 + BUCKETS;
+const RETRY_BASE: usize = GAP_BASE + 1 + BUCKETS;
+const SLOTS: usize = RETRY_BASE + RETRIES;
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -399,6 +407,33 @@ pub fn note_park_gap(bytes: u64) {
     }
 }
 
+/// Why a request went out again, [`RETRY_NAMES`] in enum form.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Retry {
+    /// 503 SlowDown or 429, the bucket asking for less traffic.
+    Throttle,
+    /// Any other 5xx.
+    Server,
+    /// The connection died under an idempotent request.
+    Transport,
+    /// Not a retry: the op spent its whole attempt budget and failed.
+    Exhausted,
+}
+
+/// Record one retry, or one op that ran out of attempts.
+///
+/// Counted where the retry happens, inside the backend, rather than in
+/// [`StatsStore`], which wraps outermost and sees one op taking a long
+/// time. A phase whose puts averaged two seconds because the bucket
+/// asked for less traffic and a phase whose puts averaged two seconds
+/// because the objects were large are the same latency histogram and
+/// two different problems, and this is the counter that separates them.
+pub fn note_retry(kind: Retry) {
+    if let Some(c) = global() {
+        c.add(RETRY_BASE + kind as usize, 1);
+    }
+}
+
 /// Record one step of the commit path. Called from the pusher, the
 /// sequencer's flusher and its put workers, all of them in the
 /// postmaster's process, so they all map the file the backends do.
@@ -588,6 +623,14 @@ pub struct Snapshot {
     pub commit: Vec<StepSnapshot>,
     pub park_cause: Vec<CauseSnapshot>,
     pub park_gap: GapSnapshot,
+    pub retries: Vec<RetrySnapshot>,
+}
+
+/// How many requests went out a second time, by what made them.
+#[derive(Debug, serde::Serialize)]
+pub struct RetrySnapshot {
+    pub kind: &'static str,
+    pub count: u64,
 }
 
 /// How many parked reads were waiting for wal that wrote the pages
@@ -814,6 +857,15 @@ impl Snapshot {
                 .rposition(|&n| n > 0)
                 .map_or(0, |b| 1u64 << (b + 1)),
         };
+        let retries = RETRY_NAMES
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(kind, name)| RetrySnapshot {
+                kind: name,
+                count: slot(RETRY_BASE + kind),
+            })
+            .collect();
         Self {
             conflicts: slot(CONFLICT_SLOT),
             ops,
@@ -822,6 +874,7 @@ impl Snapshot {
             commit,
             park_cause,
             park_gap,
+            retries,
         }
     }
 
@@ -1015,6 +1068,30 @@ mod tests {
         assert_eq!(snap.park_gap.max_bytes, 4 << 20);
         assert!(snap.commit.iter().all(|s| s.samples == 0));
         assert!(snap.pagesvc.iter().all(|p| p.calls == 0));
+    }
+
+    /// The retries are the newest region and so the one a slot
+    /// arithmetic mistake writes past the end of the file for. They
+    /// also have to stay apart from each other: a bucket asking for
+    /// less traffic and a network that dropped the connection are the
+    /// same delay to a caller and two different things to fix.
+    #[test]
+    fn retries_round_trip_through_the_file_and_stay_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Counters::open(&dir.path().join("stats")).unwrap();
+        for _ in 0..5 {
+            counters.add(RETRY_BASE + Retry::Throttle as usize, 1);
+        }
+        counters.add(RETRY_BASE + Retry::Transport as usize, 1);
+        counters.add(RETRY_BASE + Retry::Exhausted as usize, 1);
+        let snap = Snapshot::read(&dir.path().join("stats")).unwrap();
+        let retry = |name: &str| snap.retries.iter().find(|r| r.kind == name).unwrap();
+        assert_eq!(retry("throttle").count, 5);
+        assert_eq!(retry("transport").count, 1);
+        assert_eq!(retry("exhausted").count, 1);
+        assert_eq!(retry("server").count, 0);
+        assert!(snap.park_cause.iter().all(|c| c.parks == 0));
+        assert!(snap.commit.iter().all(|s| s.samples == 0));
     }
 
     #[test]

@@ -411,21 +411,37 @@ mark() {
     MARK_AT=$(date +%s)
 }
 
+# What postgres committed during the phase. It is the divisor for
+# commits per PUT, which is the store bill over the work done, and it
+# has to be the phase's own count rather than the run's, for the same
+# reason every other number here is a subtraction.
+commits_in() {
+    [ -s "$1" ] && [ -s "$2" ] || return 0
+    awk -F '\t' '
+        NR == FNR { was[$1] = $2; next }
+        $1 == "db.xact_commit" && $2 > was[$1] { print $2 - was[$1] }
+    ' "$1" "$2" 2>/dev/null
+}
+
 # What the phase just printed cost the store. Best effort: a run against
 # a build without the counters, or one whose zou is somewhere else, is
 # still a run and should not die here over its footnotes.
 cost() {
+    # Stamped before the snapshot below, because that snapshot walks the
+    # store and the walk is not part of the phase it would be charged to.
+    NOW=$(date +%s)
+    internals "$RUNDIR/pg-now"
+    COMMITS=$(commits_in "$PG_MARK" "$RUNDIR/pg-now")
     if [ -s "$ZOU_STORE_STATS" ] && [ -s "$MARK" ] && [ -x "$ZOU" ]; then
-        "$ZOU" stats "$ZOU_STORE_STATS" --since "$MARK" --brief 2>/dev/null |
+        "$ZOU" stats "$ZOU_STORE_STATS" --since "$MARK" --brief \
+            --commits "${COMMITS:-0}" 2>/dev/null |
             awk '{print "  " $0}' || true
     fi
-    NOW=$(date +%s)
     WROTE=0
     if [ -s "$USAGE" ]; then
         sh "$USAGE_SH" --report "$USAGE" "$MARK_AT" "$NOW" "${2:-0}" || true
         WROTE=$(sh "$USAGE_SH" --written "$USAGE" "$MARK_AT" "$NOW" 2>/dev/null || echo 0)
     fi
-    internals "$RUNDIR/pg-now"
     internals_report "$PG_MARK" "$RUNDIR/pg-now" "$WROTE"
     mark "$1"
 }
