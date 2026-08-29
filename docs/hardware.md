@@ -20,6 +20,7 @@ A run on a box at load 25 is a run at load 25 and the table says so rather than 
 | server2 | vmi3112167 | AMD EPYC (with IBPB) | 6 / 6 | 12 GB | /dev/sda1 ext4, 193 GB | 32 GB | Ubuntu 24.04.4, Linux 6.8.0-136 |
 | server3 | vmi3391933 | AMD EPYC (with IBPB) | 8 / 8 | 23 GB | /dev/sda1 ext4, 387 GB | 237 GB | Ubuntu 24.04.4, Linux 6.8.0-106 |
 | gamingpc | GamingPC | Intel i9-13900K | 16 / 32 | 31 GB | /dev/sdd ext4, 1007 GB | 386 GB | Ubuntu 26.04 on WSL2, Linux 6.18.33.2 |
+| gamingpc-win | GAMINGPC | Intel i9-13900K | 24 / 32 | 63.8 GB | Kingston KC3000 NVMe, NTFS, 953 GB | 11 GB | Windows 11 Pro Insider 10.0.28120 |
 
 Loads at the time of the reading: server1 25.45, server2 15.51, server3 15.32, gamingpc 8.10.
 
@@ -29,6 +30,8 @@ Notes the table does not hold:
 - server1 has 6 GB of memory with most of it spoken for, no passwordless sudo, and a standing load in the twenties. It is a box to read numbers off, not to build on.
 - server2 and server3 mount with `discard`, server1 without it.
 - gamingpc is WSL2, so its ext4 sits inside a virtual disk file on the Windows host and its kernel is Microsoft's. Its i9 has 8 performance and 8 efficiency cores and zou work is pinned to `taskset -c 8-23` so it stays off the cores the owner's jobs use. Builds run under `nice -n 15` for the same reason.
+- gamingpc and gamingpc-win are one machine seen from two sides, and the two rows disagree on purpose. Windows counts all 24 cores where WSL2 was given 16, and it sees the 64 GB the box has where the WSL2 VM was capped at 31. The row that belongs beside a result is the row for the side the result was measured on.
+- gamingpc-win has 11 GB free on a 953 GB disk, so nothing large is measured there and nothing there is left behind.
 - The mac is the development machine. Full workspace builds and every published benchmark run on the servers, not here.
 
 ## Distance to the store
@@ -68,6 +71,31 @@ Reading the table, since these are not the numbers a network probe would give:
 
 None of this is the distance to a real object store, which is the number the probe exists for. These rows are the floor: whatever a bucket costs, it costs at least this much of local work on top.
 
+## Windows, natively
+
+The same box again with no WSL2 under it, which is what M1b line 27 asks for: zou on an NTFS directory store and on a sqlite store, native, with no postgres under either of them.
+`scripts\zou-windows.ps1` produces the rows, in PowerShell rather than in sh because the readings are Windows readings, there is no `/proc` to walk, no load average to quote, and the disk under a path is a volume rather than a device node.
+
+Measured 2026-08-29 on gamingpc-win with the cpu 10 percent busy, same probe shape as the table above.
+
+| backend | put p50 | put p95 | get p50 | list p50 | delete p50 | put bandwidth | get bandwidth |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| NTFS directory | 2.3 ms | 2.8 ms | 337 us | 231 us | 714 us | 608.0 MiB/s | 1.0 GiB/s |
+| sqlite on NTFS | 2.0 ms | 2.3 ms | 16 us | 5 us | 2.1 ms | 3.1 GiB/s | 4.9 GiB/s |
+
+The finding is the gap between the two rows, and it is a fact about Windows rather than about zou.
+A directory store get costs 337 us here against 9 us for the same code on ext4 on the same machine, which is thirty seven times, and a list costs 231 us against 25.
+Opening a file on NTFS is expensive in a way opening a file on ext4 is not, and a store that is one file per object pays that on every single read.
+The sqlite backend keeps its objects inside one file that is already open and answers in 16 us, twenty one times faster than the directory backend on the same disk, which is the reverse of the ordering on Linux.
+So the default worth documenting for a Windows host is the sqlite backend, and the directory backend is there because it works everywhere rather than because it is fast here.
+
+Both put columns are milliseconds on both backends, which is the same fsync the Linux rows pay and the one place the two systems agree.
+The bandwidth columns are page cache on this box the same way they are on the mac and on gamingpc, so they are a real number for a store that fits in memory and a fiction for one that does not.
+
+Two legs of line 27 are still owed and neither is measurable yet.
+The pgbench scenarios need the patched postgres, which is built with meson against a vendored source tree and has never been built for Windows.
+Vanilla Postgres 18 native needs an installer and a data directory, which is not a thing to create unasked on a machine somebody uses every day.
+
 ## Regenerating a row
 
 ```
@@ -88,3 +116,11 @@ ZOU_BENCH_PROBE=1 scripts/zou-bench.sh /path/to/store 10 300
 ```
 
 `ZOU_BIN` points the script at a `zou` that is not in `target/release`.
+
+The Windows rows come from a different script, since none of the above runs there:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\zou-windows.ps1 -Root C:\zoubench -Build
+```
+
+It writes only under `-Root` and deletes the sqlite file it made, because that box belongs to somebody who is using it.
