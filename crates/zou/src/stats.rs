@@ -32,6 +32,13 @@
 //! divided by the work done, which is the number group commit exists to
 //! move.
 //!
+//! Two lines say how long a backend waited at COMMIT: the tail of the
+//! durable step, and the same tail split across the window, the
+//! dispatch, the store call and the ack. A commit that was slow because
+//! the batch stayed open and a commit that was slow because the PUT was
+//! slow are one number until something separates them, and pgbench
+//! cannot separate them because from outside they are both END.
+//!
 //! A last line says what compression bought, per compressor, raw bytes
 //! in and stored bytes out. It is the one term of space amplification
 //! nobody outside the store can measure, because the objects on the
@@ -160,6 +167,45 @@ fn brief_lines(snapshot: &Snapshot, commits: u64) -> String {
             commits as f64 / puts as f64
         ));
     }
+    // How long a backend waited at COMMIT, out of the step the pusher
+    // marks when a chunk is durable on the store. This is the number a
+    // tps hides, and a mean of it hides it too: the population is the
+    // commits that rode somebody else's open window and the commits
+    // that paid a round trip, and averaging those describes neither.
+    if let Some(durable) = snapshot
+        .commit
+        .iter()
+        .find(|s| s.step == "durable" && s.samples > 0)
+    {
+        out.push('\n');
+        out.push_str(&format!(
+            "durable: {} waits, p50 {}, p95 {}, p99 {}, max {}",
+            durable.samples,
+            dur(durable.p50_us),
+            dur(durable.p95_us),
+            dur(durable.p99_us),
+            dur(durable.max_us)
+        ));
+        // Where the wait went, at the same percentile, so a slow commit
+        // says whether it was the store call or the queue in front of
+        // it. Kept off the line above rather than summed into it: the
+        // parts are measured per batch and the wait is per chunk, so
+        // they do not add up to it and should not look like they do.
+        let split: Vec<String> = ["window", "dispatch", "put", "ack"]
+            .iter()
+            .filter_map(|name| {
+                let step = snapshot
+                    .commit
+                    .iter()
+                    .find(|s| s.step == *name && s.samples > 0)?;
+                Some(format!("{name} {}", dur(step.p95_us)))
+            })
+            .collect();
+        if !split.is_empty() {
+            out.push('\n');
+            out.push_str(&line("split at p95", split));
+        }
+    }
     // What compression bought, which is the one term of space
     // amplification that cannot be measured from outside the store: the
     // objects on the bucket are the compressed ones and nothing out
@@ -203,11 +249,26 @@ fn bytes(n: u64) -> String {
     }
 }
 
+/// Microseconds at the scale they happened on. The commit path spans
+/// four orders of magnitude between a chunk that rode an open window and
+/// one that waited on a throttled bucket, and printing either in the
+/// other's unit is how a number stops being read.
+fn dur(us: u64) -> String {
+    if us < 1000 {
+        format!("{us} us")
+    } else if us < 1_000_000 {
+        format!("{:.1} ms", us as f64 / 1000.0)
+    } else {
+        format!("{:.2} s", us as f64 / 1_000_000.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use zou_store::stats::{
-        ClassSnapshot, GapSnapshot, OpSnapshot, PackSnapshot, RetrySnapshot, Snapshot, TierSnapshot,
+        ClassSnapshot, GapSnapshot, OpSnapshot, PackSnapshot, RetrySnapshot, Snapshot,
+        StepSnapshot, TierSnapshot,
     };
 
     fn snapshot(ops: Vec<OpSnapshot>, reads: Vec<TierSnapshot>) -> Snapshot {
@@ -236,6 +297,18 @@ mod tests {
 
     fn packed(kind: &'static str, raw: u64, stored: u64) -> PackSnapshot {
         PackSnapshot { kind, raw, stored }
+    }
+
+    fn step(step: &'static str, samples: u64, tail: [u64; 4]) -> StepSnapshot {
+        StepSnapshot {
+            step,
+            samples,
+            p50_us: tail[0],
+            p95_us: tail[1],
+            p99_us: tail[2],
+            max_us: tail[3],
+            buckets: Vec::new(),
+        }
     }
 
     fn op(name: &'static str, by_class: &[(&'static str, u64, u64)]) -> OpSnapshot {
@@ -347,6 +420,46 @@ mod tests {
     /// the store is the compressed bytes, so what compression bought
     /// has to be readable next to it. A kind that compressed nothing
     /// stays off the line rather than reporting 1.00x of zero.
+    #[test]
+    fn the_commit_wait_is_a_tail_and_not_an_average() {
+        let mut snap = snapshot(vec![op("put", &[("wal", 40, 4096)])], Vec::new());
+        // A leg with no commit steps in it, a read only phase, says
+        // nothing rather than a row of zeroes.
+        assert!(!brief_lines(&snap, 0).contains("durable"));
+        snap.commit = vec![
+            step("push", 12_483, [900, 4000, 9000, 40_000]),
+            step("stage", 12_483, [16, 64, 128, 2048]),
+            step("window", 312, [1024, 4096, 8192, 65_536]),
+            step("dispatch", 312, [128, 512, 1024, 8192]),
+            step("put", 312, [16_384, 65_536, 131_072, 2_097_152]),
+            step("ack", 312, [256, 4096, 16_384, 131_072]),
+            step("durable", 12_483, [4096, 65_536, 131_072, 2_097_152]),
+        ];
+        let mut lines = brief_lines(&snap, 0);
+        lines = lines.lines().rev().take(2).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            lines,
+            "split at p95: window 4.1 ms, dispatch 512 us, put 65.5 ms, ack 4.1 ms\n\
+             durable: 12483 waits, p50 4.1 ms, p95 65.5 ms, p99 131.1 ms, max 2.10 s"
+        );
+    }
+
+    /// The steps that were never sampled are left out of the split, so a
+    /// backend that never got as far as a PUT does not read as one that
+    /// paid nothing for it.
+    #[test]
+    fn the_split_only_names_the_steps_that_happened() {
+        let mut snap = snapshot(vec![op("put", &[("wal", 1, 4096)])], Vec::new());
+        snap.commit = vec![
+            step("window", 0, [0, 0, 0, 0]),
+            step("put", 4, [1000, 2000, 3000, 4000]),
+            step("durable", 4, [1000, 2000, 3000, 4000]),
+        ];
+        let out = brief_lines(&snap, 0);
+        assert!(out.contains("split at p95: put 2.0 ms"), "{out}");
+        assert!(!out.contains("window"), "{out}");
+    }
+
     #[test]
     fn packed_says_what_compression_bought() {
         let mut snap = snapshot(vec![op("put", &[("page", 4, 32_768)])], Vec::new());
