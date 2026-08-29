@@ -818,6 +818,33 @@ async fn owned_factor(
     })
 }
 
+/// GoTrue's `HasMFAEnabled`: whether this account has a factor that
+/// works, which is the whole of what makes the aal guards apply. A
+/// factor somebody started enrolling and never finished protects
+/// nothing, so it does not count.
+pub(crate) async fn has_verified_factor(sess: &sql::Session, user_id: &str) -> Result<bool, Error> {
+    let rows = sess
+        .query(
+            "select exists (select 1 from auth.mfa_factors
+                             where user_id = $1::text::uuid and status = 'verified')",
+            &[&user_id],
+        )
+        .await?;
+    Ok(rows.first().map(|row| row.get(0)).unwrap_or(false))
+}
+
+/// The same question `is_aal2` answers, for a caller whose token may
+/// name no session at all. One that names none has passed nothing.
+pub(crate) async fn passed_a_factor(
+    sess: &sql::Session,
+    session_id: Option<&str>,
+) -> Result<bool, Error> {
+    match session_id {
+        Some(id) => is_aal2(sess, id).await,
+        None => Ok(false),
+    }
+}
+
 /// Whether the session the caller is holding has already passed a
 /// factor. A caller with no session at all has not.
 async fn is_aal2(sess: &sql::Session, session_id: &str) -> Result<bool, Error> {

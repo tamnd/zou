@@ -44,6 +44,7 @@ mod scoreboard;
 mod sigv4;
 mod suite;
 mod target;
+mod totp;
 mod volatile;
 mod zou;
 
@@ -851,12 +852,18 @@ fn ask(target: &Target, suite: &Suite, setup: Option<&str>) -> Result<Asked, Str
     // the chain broke rather than sent somewhere stale.
     let mut held: BTreeMap<String, String> = BTreeMap::new();
     let names = target::held_names(&suite.cases.cases);
+    // Whether anything since the last reset changed a row. A suite that
+    // is all reads never pays for one, and a case that follows a chain
+    // does not have to know what the chain left.
+    let mut dirty = false;
     for case in &suite.cases.cases {
-        if resets_first(case)
+        if resets_first(case, dirty)
             && let Some(reset) = reset
         {
             target.set_up(reset)?;
+            dirty = false;
         }
+        dirty |= case.writes;
         let case = match target::filled(case, &held, &names) {
             Ok(case) => case,
             Err(message) => {
@@ -881,13 +888,25 @@ fn ask(target: &Target, suite: &Suite, setup: Option<&str>) -> Result<Asked, Str
 
 /// Whether the rows go back in front of this case.
 ///
-/// Only the cases that change rows need it, and a chained case is one
-/// that has asked not to have it: it is written to follow the case
-/// before it and putting the fixture back would take away the thing it
-/// is asking about. Everything else in a suite stays order independent,
-/// which is what makes a failure readable.
-fn resets_first(case: &suite::Case) -> bool {
-    case.writes && !case.chained
+/// A chained case is one that has asked not to have them back: it is
+/// written to follow the case before it, and putting the fixture back
+/// would take away the thing it is asking about. Everything else gets
+/// the fixture, which is what makes a suite order independent and a
+/// failure readable.
+///
+/// Reads are in that "everything else" rather than exempt from it. A
+/// read costs nothing to run against dirty rows and is the one case
+/// that cannot put them back by writing over them, so a read that
+/// happens to follow another feature's chain would be asked about
+/// whatever that chain left. Which reads those are is a question about
+/// where the cases sit in the file, and nobody should have to hold the
+/// order of a hundred and fifty cases in their head to add one.
+///
+/// `dirty` is why nothing is put back that is already in place: a suite
+/// that has not written since its last reset is looking at the fixture
+/// already.
+fn resets_first(case: &suite::Case, dirty: bool) -> bool {
+    dirty && !case.chained
 }
 
 struct Asked {
@@ -1023,17 +1042,29 @@ mod tests {
             chained,
             holds: Default::default(),
             volatile: Vec::new(),
+            sorted: Vec::new(),
         }
     }
 
     #[test]
-    fn the_rows_go_back_in_front_of_a_write_and_not_in_front_of_a_chain() {
-        assert!(resets_first(&case(true, false)));
-        assert!(!resets_first(&case(false, false)));
+    fn the_rows_go_back_in_front_of_anything_that_is_not_a_chain() {
+        // Dirty rows and a case that has not asked to see them.
+        assert!(resets_first(&case(true, false), true));
+        // A read is not exempt. It is the one kind of case that cannot
+        // put the rows back by writing over them.
+        assert!(resets_first(&case(false, false), true));
         // The one that matters: a chained case writes and still does
         // not want the fixture back, because what it is asking about is
         // what the case before it left.
-        assert!(!resets_first(&case(true, true)));
+        assert!(!resets_first(&case(true, true), true));
+    }
+
+    /// Nothing has written, so the rows are the fixture already and
+    /// putting it back is a round trip that changes nothing.
+    #[test]
+    fn rows_nobody_has_touched_are_left_where_they_are() {
+        assert!(!resets_first(&case(true, false), false));
+        assert!(!resets_first(&case(false, false), false));
     }
 
     #[test]

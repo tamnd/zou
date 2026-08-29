@@ -180,6 +180,17 @@ pub struct Case {
     /// answer at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volatile: Vec<String>,
+    /// The arrays in this answer whose order upstream does not promise,
+    /// as json pointers into the body. Each is put into an order of the
+    /// harness's own before anything is compared.
+    ///
+    /// One thing needs it and it is the factors on a user. GoTrue reads
+    /// them with no order in the query and neither does zou, so the
+    /// order is the order the rows are sitting in, and a case that
+    /// compared it would be asking how postgres last reused the space
+    /// in a page. What is in the list is still compared exactly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sorted: Vec<String>,
 }
 
 fn get() -> String {

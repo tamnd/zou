@@ -312,6 +312,13 @@ impl Target {
             // answer and keeps the json one.
             answer.raw = None;
         }
+        if !case.sorted.is_empty() {
+            crate::volatile::sort_arrays(&mut answer.body, &case.sorted);
+            // Same trade as above, and for a plainer reason: the kept
+            // bytes are in the order they arrived in, which is the
+            // order this case just said not to compare.
+            answer.raw = None;
+        }
         Ok(Sent { answer, held })
     }
 
@@ -534,6 +541,12 @@ pub fn held_names(cases: &[Case]) -> BTreeSet<String> {
 /// request with braces in it, since the case before it having failed is
 /// the usual reason for it and a second failure that says something else
 /// would only hide the first.
+///
+/// `{totp:name}` is the one placeholder that is not the held value
+/// itself. What is held there is the secret an enroll answered with, and
+/// what the request has to carry is the six digits that secret is
+/// showing right now, which cannot be written down in a case because it
+/// is different every thirty seconds.
 pub fn filled(
     case: &Case,
     held: &BTreeMap<String, String>,
@@ -542,27 +555,51 @@ pub fn filled(
     let mut case = case.clone();
     for name in names {
         let named = format!("{{{name}}}");
-        let inside = case.path.contains(&named)
-            || case.body.as_deref().is_some_and(|it| it.contains(&named))
-            || case.headers.values().any(|it| it.contains(&named));
-        if !inside {
-            continue;
+        if inside(&case, &named) {
+            let Some(value) = held.get(name) else {
+                return Err(format!(
+                    "{}: names {named}, and nothing before it held one",
+                    case.name
+                ));
+            };
+            swap(&mut case, &named, &value.clone());
         }
-        let Some(value) = held.get(name) else {
-            return Err(format!(
-                "{}: names {named}, and nothing before it held one",
-                case.name
-            ));
-        };
-        case.path = case.path.replace(&named, value);
-        if let Some(body) = case.body.as_mut() {
-            *body = body.replace(&named, value);
-        }
-        for header in case.headers.values_mut() {
-            *header = header.replace(&named, value);
+        let timed = format!("{{totp:{name}}}");
+        if inside(&case, &timed) {
+            let Some(secret) = held.get(name) else {
+                return Err(format!(
+                    "{}: names {timed}, and nothing before it held one",
+                    case.name
+                ));
+            };
+            let Some(code) = crate::totp::code(secret, crate::totp::now()) else {
+                return Err(format!(
+                    "{}: names {timed}, and what was held is not a base32 secret",
+                    case.name
+                ));
+            };
+            swap(&mut case, &timed, &code);
         }
     }
     Ok(case)
+}
+
+/// Whether this placeholder is anywhere a placeholder is looked for.
+fn inside(case: &Case, named: &str) -> bool {
+    case.path.contains(named)
+        || case.body.as_deref().is_some_and(|it| it.contains(named))
+        || case.headers.values().any(|it| it.contains(named))
+}
+
+/// The same three replacements, in the three places.
+fn swap(case: &mut Case, named: &str, value: &str) {
+    case.path = case.path.replace(named, value);
+    if let Some(body) = case.body.as_mut() {
+        *body = body.replace(named, value);
+    }
+    for header in case.headers.values_mut() {
+        *header = header.replace(named, value);
+    }
 }
 
 /// What this case said to hold, read out of its answer before anything
@@ -838,6 +875,7 @@ mod tests {
             chained: false,
             holds: BTreeMap::new(),
             volatile: Vec::new(),
+            sorted: Vec::new(),
         }
     }
 
@@ -952,6 +990,39 @@ mod tests {
             filled.body.as_deref(),
             Some("{\"prefix\":\"{unheld}\"} \"5eb63bbb\"")
         );
+    }
+
+    /// The secret is held and the digits are what goes out, which is
+    /// the whole difference between this placeholder and the other one.
+    #[test]
+    fn a_totp_placeholder_becomes_the_code_and_not_the_secret() {
+        let secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+        let mut asking = case("/auth/v1/factors/1/verify");
+        asking.body = Some("{\"code\":\"{totp:secret}\",\"secret\":\"{secret}\"}".to_string());
+        let held = BTreeMap::from([("secret".to_string(), secret.to_string())]);
+        let names = BTreeSet::from(["secret".to_string()]);
+        let body = filled(&asking, &held, &names)
+            .expect("held the secret")
+            .body
+            .expect("a body");
+        let code = crate::totp::code(secret, crate::totp::now()).expect("base32");
+        assert_eq!(
+            body,
+            format!("{{\"code\":\"{code}\",\"secret\":\"{secret}\"}}")
+        );
+    }
+
+    /// A code out of nothing would be six digits either server refuses,
+    /// which reads as a bug in the server rather than as a chain that
+    /// broke two cases earlier.
+    #[test]
+    fn a_totp_placeholder_nothing_held_is_an_error() {
+        let mut asking = case("/auth/v1/factors/1/verify");
+        asking.body = Some("{\"code\":\"{totp:secret}\"}".to_string());
+        let names = BTreeSet::from(["secret".to_string()]);
+        assert!(filled(&asking, &BTreeMap::new(), &names).is_err());
+        let held = BTreeMap::from([("secret".to_string(), "not base32!".to_string())]);
+        assert!(filled(&asking, &held, &names).is_err());
     }
 
     /// Where a hold reads from, which is one of two halves of an answer.
