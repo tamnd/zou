@@ -92,6 +92,12 @@ So the harness turns autovacuum off on every table in the database, once, immedi
 Nothing in a conformance run needs a good plan.
 It needs the same plan on the first case as on the last, and the same plan in CI as on a laptop.
 
+An array whose order nobody promises is the other half of the same problem, and it turns up on the auth suite rather than the rest one.
+GoTrue loads an account's factors through an association with no order on it, so the two the fixture gives the seeded person come back in whichever order the heap handed them over, and zou's own subquery is unordered for the same reason.
+Neither side is wrong and neither is worth fixing, because a client reading a list of factors was never promised an order.
+So a case names those arrays in `sorted`, as json pointers, and each one is sorted by the json text of its elements before anything is compared.
+Like naming something volatile, that costs the byte for byte comparison of the answer, since bytes that have been rearranged are no longer the bytes that came back.
+
 ## Known differences
 
 `suites/<name>/known.json` names the cases where zou is known to answer differently, and why, with the issue tracking the fix.
@@ -225,7 +231,7 @@ That difference is real and it is [#555](https://github.com/tamnd/zou/issues/555
 
 ## The suite compared with GoTrue
 
-The `auth` suite is over the endpoints a sign in flow uses: signup, the three token grants, the user endpoints, verify, recover, magiclink, otp, resend, logout, reauthenticate, the MFA listing, the admin endpoints including the audit trail and the factor endpoints, settings, health, jwks and authorize.
+The `auth` suite is over the endpoints a sign in flow uses: signup, the three token grants, the user endpoints, verify, recover, magiclink, otp, resend, logout, reauthenticate, the MFA endpoints from the listing through enroll, challenge and verify, the admin endpoints including the audit trail and the factor endpoints, settings, health, jwks and authorize.
 The logout cases are the one place in it where the answer is not the whole of what happened: every scope answers 204, and the difference between them is which sessions are still there afterwards.
 So each of them is followed by cases spending a refresh token off a session it should have taken and off one it should have left, which is the only way from outside to ask which rows survived.
 The reference is GoTrue 2.195.0 configured the way `supabase start` configures it for a project that has changed nothing, with the mail rate limits raised out of the way.
@@ -250,8 +256,19 @@ cargo run -p zou-conformance -- diff --suite auth \
 The reference keeps its rows in a database of its own, which is the one place this suite differs from the others.
 GoTrue brings its own migrations and runs them at boot, zou installs the auth schema on its first connection, and a run that let both land in the same database would be measuring whichever of the two wrote the schema last.
 
-Nothing in the suite signs in and then uses the answer, because a case is one request.
-The token for the seeded person is minted by the harness from the same secret both servers are configured with, and a case asks for it with `"key": "user"`.
+Most of the suite mints its own token rather than signing in for one.
+The token for the seeded person comes out of the harness, signed with the same secret both servers are configured with, and a case asks for it with `"key": "user"`.
+That is enough for anything a single request can be asked, which is most of what is here.
+
+The MFA flow is not one of those things.
+Enrolling answers with a secret, challenging that factor answers with a challenge id, and verifying wants the six digits the secret is showing at the moment the request goes out, so the three are one question and none of them can be asked on its own.
+A case may name values out of its own answer in `holds`, written as `body:<pointer>`, `header:<name>` or `element:<tag>`, and a later case writes `{name}` in its path, its body or any of its headers to get one back.
+`{totp:name}` is the same thing with a step in the middle: what was held is read as a base32 secret and what goes out is the code it is showing now, computed by the harness's own RFC 6238 implementation rather than by asking the server under test what it would accept.
+
+A chain only holds together if the fixture stays where the case before it left it, so `"chained": true` says this case is a continuation and the rows must not be put back in front of it.
+Everything else does get them put back, but only once something has actually written: the harness carries a dirty flag and resets before the next unchained case rather than before every case that follows a write.
+A read that is meant to see what a write left, of which the logout cases are full, says `"chained": true` and sees it.
+
 A case about a missing or malformed token still names a key, so that the apikey goes out and the answer is about the token rather than about the gateway, and the case's own `authorization` header replaces the key's rather than being sent next to it.
 That distinction has to be made here because zou is the gateway as well as the server, and a bare GoTrue has no apikey gate at all.
 
@@ -625,7 +642,7 @@ The `postgrest` suite asks everything upstream asks itself, including the parts 
 The five suites this project wrote have lines of their own on the scoreboard, `js-tus`, `js-realtime`, `js-realtime-private`, `js-realtime-changes` and `js-functions`, and they are labelled with what they were compared with rather than being folded in with the recordings.
 The number on each is the zou leg, and what makes it a compatibility number rather than a self assessment is the other leg: the same file runs against a real `supabase start` in the diff job of the same run, so an assertion the reference does not pass is the suite being wrong.
 
-The cases that pass "written differently" are all the same three things: zou puts a space after each colon where PostgREST puts a newline between rows, a `select=*` comes back with the columns in a different order, and two auth answers carry their keys in a different order than Go wrote them.
+The cases that pass "written differently" are all the same three things: zou puts a space after each colon where PostgREST puts a newline between rows, a `select=*` comes back with the columns in a different order, and the auth answers that carry a struct Go wrote by hand have its keys in a different order, because zou sorts them and Go writes them in the order the fields are declared.
 None of them is a difference in what was said, which is why the harness has a third verdict for them, and they are left as they are until something turns out to depend on them.
 
 ## The scoreboard

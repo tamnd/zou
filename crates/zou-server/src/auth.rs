@@ -3416,6 +3416,31 @@ async fn update_user(
     let sso: bool = row.get(2);
     let anonymous: bool = row.get(3);
     let held: String = row.get(4);
+    // An account with a working second factor is one whose owner has
+    // said that a password on its own is not enough to be them. So a
+    // session that has not passed the factor cannot change the password
+    // or either of the addresses a reset would be sent to, which are
+    // the three ways a stolen session turns into a stolen account.
+    // Everything else is still the caller's to change, which is why
+    // metadata is not in the list.
+    //
+    // Read off the session row rather than off the token's own aal
+    // claim. The token a verify answers with says aal2, but so does the
+    // session it upgraded, and a person who was already holding an
+    // older token for that session is the same person who just passed
+    // the factor. Judging the claim would refuse them.
+    if (password.is_some_and(|p| !p.is_empty())
+        || email.as_deref().is_some_and(|wanted| wanted != current)
+        || phone.as_deref().is_some_and(|wanted| wanted != held))
+        && crate::mfa::has_verified_factor(sess, &caller.user_id).await?
+        && !crate::mfa::passed_a_factor(sess, caller.session_id.as_deref()).await?
+    {
+        return Err(refused(
+            StatusCode::UNAUTHORIZED,
+            "insufficient_aal",
+            "AAL2 session is required to update email or password when MFA is enabled.",
+        ));
+    }
     // An anonymous account with a password and no address is an account
     // nobody could ever sign in to again, because there is nothing to
     // present the password with.

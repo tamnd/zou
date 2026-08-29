@@ -838,6 +838,7 @@ fn request(bytes: &[char], at: usize, method: &str, spec: &Spec, it: &str) -> Re
         chained: false,
         holds: std::collections::BTreeMap::new(),
         volatile: Vec::new(),
+        sorted: Vec::new(),
     })
 }
 

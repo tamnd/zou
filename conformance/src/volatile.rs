@@ -137,6 +137,59 @@ pub fn at<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
     Some(at)
 }
 
+/// Put the arrays `paths` names into an order both ends will agree on.
+///
+/// For the lists upstream answers out of a table with nothing in the
+/// query that says which order to read it in. GoTrue's user carries its
+/// factors that way, and so does zou's, and the order either of them
+/// comes back in is whatever the rows happen to be sitting in. Compared
+/// as written, that is a case that passes or fails on how postgres last
+/// reused the space in a page, which is not a fact about either server.
+///
+/// Sorted by the text of each element, which needs nothing to be known
+/// about what is in them and is stable for any two lists that hold the
+/// same things. A list with different things in it still differs, and
+/// that is the whole of what these cases were asking.
+pub fn sort_arrays(body: &mut Value, paths: &[String]) {
+    for path in paths {
+        sort_at(body, &steps(path));
+    }
+}
+
+fn sort_at(value: &mut Value, steps: &[&str]) {
+    let Some((step, rest)) = steps.split_first() else {
+        if let Value::Array(items) = value {
+            items.sort_by_key(|item| item.to_string());
+        }
+        return;
+    };
+    match value {
+        Value::Object(map) if *step == "*" => {
+            for (_, child) in map.iter_mut() {
+                sort_at(child, rest);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(child) = map.get_mut(*step) {
+                sort_at(child, rest);
+            }
+        }
+        Value::Array(items) if *step == "*" => {
+            for child in items.iter_mut() {
+                sort_at(child, rest);
+            }
+        }
+        Value::Array(items) => {
+            if let Ok(at) = step.parse::<usize>()
+                && let Some(child) = items.get_mut(at)
+            {
+                sort_at(child, rest);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn walk(value: &mut Value, steps: &[&str]) {
     let Some((step, rest)) = steps.split_first() else {
         *value = Value::String(shape(value));
@@ -208,6 +261,27 @@ fn string_shape(text: &str) -> String {
         && is_jwt(token)
     {
         return format!("{path}?token=<jwt>");
+    }
+    // The url an authenticator app is given to scan, which is a url
+    // only in its spelling: every part of it is a parameter the two
+    // ends have to have agreed on, and one of them is a secret that was
+    // generated a moment ago. Naming the whole of it would give up the
+    // issuer, the account, the algorithm, the digit count and the
+    // period, which between them are the whole of what makes a code
+    // either server mints match the one the app shows. So the secret is
+    // named and the rest is compared.
+    if let Some((route, query)) = text
+        .strip_prefix("otpauth://")
+        .and_then(|r| r.split_once('?'))
+    {
+        let parts: Vec<String> = query
+            .split('&')
+            .map(|part| match part.split_once('=') {
+                Some(("secret", _)) => "secret=<string>".to_string(),
+                _ => part.to_string(),
+            })
+            .collect();
+        return format!("otpauth://{route}?{}", parts.join("&"));
     }
     // A url a server built out of the host the request arrived on and
     // an id it made a moment ago, which is what a resumable creation
@@ -565,6 +639,18 @@ mod tests {
         assert_eq!(
             string_shape("try 6e125931-f378-4e33-90e0-dfe3700e4c65."),
             "try <uuid>."
+        );
+    }
+
+    /// Everything an authenticator needs to agree on survives, and the
+    /// secret does not.
+    #[test]
+    fn an_otpauth_url_keeps_its_parameters() {
+        assert_eq!(
+            string_shape(
+                "otpauth://totp/zou.test:person@zou.test?algorithm=SHA1&digits=6&issuer=zou.test&period=30&secret=JBSWY3DPEHPK3PXP"
+            ),
+            "otpauth://totp/zou.test:person@zou.test?algorithm=SHA1&digits=6&issuer=zou.test&period=30&secret=<string>"
         );
     }
 
