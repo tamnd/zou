@@ -24,6 +24,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::cas::{CasError, CasStore, Version};
+use crate::stats::{Retry, note_retry};
 
 /// One operation's latency curve in milliseconds, anchored at the
 /// quantiles a probe can actually measure. Sampling interpolates between
@@ -356,8 +357,12 @@ impl SimStore {
             }
             self.slowdowns.fetch_add(1, Ordering::Relaxed);
             if attempt == MAX_ATTEMPTS {
+                note_retry(Retry::Exhausted);
                 break;
             }
+            // The same counter the real backend bumps, so a simulated
+            // run and a bucket run are read the same way.
+            note_retry(Retry::Throttle);
             let wait = RETRY_BASE_MS * 2u64.pow(attempt - 1);
             log::debug!(
                 "sim {}: 503 SlowDown on {key}, retrying in {wait} ms",

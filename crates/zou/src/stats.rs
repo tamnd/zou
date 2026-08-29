@@ -1,5 +1,6 @@
-//! `zou stats <counter-file> [--since <earlier-copy>] [--brief]`: dump
-//! the store op counters one run accumulated, as json on stdout.
+//! `zou stats <counter-file> [--since <earlier-copy>] [--brief]
+//! [--commits <n>]`: dump the store op counters one run accumulated, as
+//! json on stdout.
 //!
 //! The counter file is what `ZOU_STORE_STATS` pointed at, `zou dev`
 //! keeps one at `<runtime>/store-stats` and logs the path on boot. The
@@ -19,20 +20,36 @@
 //! the scenario, not what the bargain was. The class line is there
 //! because the ops alone do not say it either, a put of a page and a put
 //! of a wal chunk are the same op and the whole difference between the
-//! two read paths is which of them a phase does.
+//! two read paths is which of them a phase does. A fourth line appears
+//! when the phase had trouble, retries and CAS conflicts and outright
+//! failures, because a put that was slow because the bucket asked for
+//! less traffic and a put that was slow because the object was large
+//! have the same latency histogram and this is the difference.
+//!
+//! `--commits` names how many transactions committed over the same
+//! window, which the harness takes out of `pg_stat_database` at the same
+//! phase boundaries, and turns into commits per PUT: the store bill
+//! divided by the work done, which is the number group commit exists to
+//! move.
 
 use std::path::Path;
 
 use zou_store::stats::{CLASS_NAMES, Snapshot};
 
-pub const USAGE: &str = "usage: zou stats <counter-file> [--since <earlier-copy>] [--brief]";
+pub const USAGE: &str =
+    "usage: zou stats <counter-file> [--since <earlier-copy>] [--brief] [--commits <n>]";
 
 pub fn run(argv: &[String]) -> Result<(), String> {
     let mut brief = false;
+    let mut commits = 0u64;
     let mut rest: Vec<&String> = Vec::new();
-    for arg in argv {
+    let mut argv = argv.iter();
+    while let Some(arg) = argv.next() {
         if arg == "--brief" {
             brief = true;
+        } else if arg == "--commits" {
+            let n = argv.next().ok_or_else(|| USAGE.to_string())?;
+            commits = n.parse().map_err(|_| format!("{n} is not a number"))?;
         } else {
             rest.push(arg);
         }
@@ -45,18 +62,20 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         _ => return Err(USAGE.into()),
     };
     if brief {
-        say!("{}", brief_lines(&snapshot));
+        say!("{}", brief_lines(&snapshot, commits));
     } else {
         say!("{}", snapshot.to_json());
     }
     Ok(())
 }
 
-/// The three lines `--brief` prints. Ops that never ran, classes
-/// nothing touched and tiers that never answered are left out rather
-/// than printed as zeroes, so a leg that paid nothing says so by being
-/// short.
-fn brief_lines(snapshot: &Snapshot) -> String {
+/// The lines `--brief` prints. Ops that never ran, classes nothing
+/// touched and tiers that never answered are left out rather than
+/// printed as zeroes, so a leg that paid nothing says so by being
+/// short. The trouble line is left out entirely on a run that had none,
+/// for the same reason: a clean run should not carry a row of zeroes
+/// saying so.
+fn brief_lines(snapshot: &Snapshot, commits: u64) -> String {
     let ops: Vec<String> = snapshot
         .ops
         .iter()
@@ -90,12 +109,52 @@ fn brief_lines(snapshot: &Snapshot) -> String {
             format!("{label}: {}", parts.join(", "))
         }
     };
-    format!(
+    let mut out = format!(
         "{}\n{}\n{}",
         line("store", ops),
         line("carried", classes),
         line("reads", reads)
-    )
+    );
+    // What the store made us do twice, and what it refused. A phase
+    // whose puts were slow because the bucket asked for less traffic
+    // and a phase whose puts were slow because the objects were large
+    // have the same latency histogram, and this is the difference.
+    let mut trouble: Vec<String> = snapshot
+        .retries
+        .iter()
+        .filter(|r| r.count > 0)
+        .map(|r| format!("{} {}", r.count, r.kind))
+        .collect();
+    if snapshot.conflicts > 0 {
+        trouble.push(format!("{} cas conflicts", snapshot.conflicts));
+    }
+    for op in snapshot.ops.iter().filter(|o| o.errors > 0) {
+        trouble.push(format!("{} {} errors", op.errors, op.op));
+    }
+    if !trouble.is_empty() {
+        out.push('\n');
+        out.push_str(&line("trouble", trouble));
+    }
+    // How many commits rode one PUT, which is the S3 bill divided by
+    // the work done. Group commit is what moves it, and a leg that
+    // improved its tps by batching harder should have to say so here.
+    // Only printed when the phase actually put something: a read only
+    // phase has transactions and no puts, and the division would be a
+    // statement about nothing.
+    let puts: u64 = snapshot
+        .ops
+        .iter()
+        .filter(|o| o.op == "put" || o.op == "put_if_match")
+        .map(|o| o.count)
+        .sum();
+    if commits > 0 && puts > 0 {
+        out.push('\n');
+        out.push_str(&format!(
+            "commits: {commits} over {puts} puts, {:.2} per put",
+            commits as f64 / puts as f64
+        ));
+    }
+    out
 }
 
 /// Bytes at one decimal place, binary units, because the thing being
@@ -118,7 +177,9 @@ fn bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zou_store::stats::{ClassSnapshot, GapSnapshot, OpSnapshot, Snapshot, TierSnapshot};
+    use zou_store::stats::{
+        ClassSnapshot, GapSnapshot, OpSnapshot, RetrySnapshot, Snapshot, TierSnapshot,
+    };
 
     fn snapshot(ops: Vec<OpSnapshot>, reads: Vec<TierSnapshot>) -> Snapshot {
         Snapshot {
@@ -135,7 +196,12 @@ mod tests {
                 p99_bytes: 0,
                 max_bytes: 0,
             },
+            retries: Vec::new(),
         }
+    }
+
+    fn retry(kind: &'static str, count: u64) -> RetrySnapshot {
+        RetrySnapshot { kind, count }
     }
 
     fn op(name: &'static str, by_class: &[(&'static str, u64, u64)]) -> OpSnapshot {
@@ -190,7 +256,7 @@ mod tests {
             vec![tier("cache", 12, 12, 2), tier("store", 400, 3412685, 16)],
         );
         assert_eq!(
-            brief_lines(&snap),
+            brief_lines(&snap, 0),
             "store: 3412685 get 26.0 GiB, 19978 put 155.5 MiB\n\
              carried: 2787 wal 21.5 MiB, 3429876 page 26.2 GiB\n\
              reads: 12 cache p50 2 us, 3412685 store p50 16 us"
@@ -202,9 +268,45 @@ mod tests {
     #[test]
     fn a_leg_that_paid_nothing_says_none() {
         assert_eq!(
-            brief_lines(&snapshot(Vec::new(), Vec::new())),
+            brief_lines(&snapshot(Vec::new(), Vec::new()), 0),
             "store: none\ncarried: none\nreads: none"
         );
+    }
+
+    /// A run that was throttled and a run that was not have to be told
+    /// apart at a glance, and a clean run should not carry a line of
+    /// zeroes saying it was clean.
+    #[test]
+    fn trouble_only_appears_when_there_was_some() {
+        let mut snap = snapshot(vec![op("put", &[("wal", 40, 320_000)])], Vec::new());
+        assert!(!brief_lines(&snap, 0).contains("trouble"));
+        snap.retries = vec![
+            retry("throttle", 12),
+            retry("server", 0),
+            retry("exhausted", 1),
+        ];
+        snap.conflicts = 3;
+        assert_eq!(
+            brief_lines(&snap, 0)
+                .lines()
+                .last()
+                .expect("a trouble line"),
+            "trouble: 12 throttle, 1 exhausted, 3 cas conflicts"
+        );
+    }
+
+    /// Commits per put is the S3 bill divided by the work done, and a
+    /// read only phase has transactions and no puts, where the division
+    /// would be a statement about nothing.
+    #[test]
+    fn commits_per_put_needs_puts() {
+        let snap = snapshot(vec![op("put", &[("wal", 40, 320_000)])], Vec::new());
+        assert_eq!(
+            brief_lines(&snap, 430).lines().last().expect("a line"),
+            "commits: 430 over 40 puts, 10.75 per put"
+        );
+        let read_only = snapshot(vec![op("get", &[("page", 900, 7_372_800)])], Vec::new());
+        assert!(!brief_lines(&read_only, 430).contains("commits:"));
     }
 
     #[test]

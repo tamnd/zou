@@ -24,6 +24,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 use crate::cas::{CasError, CasStore, Version};
+use crate::stats::{Retry, note_retry};
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -72,6 +73,16 @@ const MAX_ATTEMPTS: u32 = 4;
 /// Everything else means what it says and goes straight to the caller.
 fn retryable(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// A retried status as the counters name it. 503 SlowDown and 429 are
+/// the bucket asking for less traffic and want a different answer from
+/// us than a 500 does, so they are counted apart.
+fn retry_kind(status: u16) -> Retry {
+    match status {
+        429 | 503 => Retry::Throttle,
+        _ => Retry::Server,
+    }
 }
 
 pub struct S3Store {
@@ -191,10 +202,17 @@ impl S3Store {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let retry = |what: &str| {
+            // Counted here rather than by the caller: a retry is not
+            // visible from outside the backend, it is one op that took
+            // longer, and a phase slowed down by a throttling bucket
+            // and a phase slowed down by large objects look the same
+            // from there.
+            let retry = |what: &str, kind: Retry| {
                 if attempt >= MAX_ATTEMPTS {
+                    note_retry(Retry::Exhausted);
                     return None;
                 }
+                note_retry(kind);
                 let wait = self.retry_base * 2u32.pow(attempt - 1);
                 log::warn!("s3 {method} {err_key}: {what}, retrying in {wait:?}");
                 Some(wait)
@@ -209,7 +227,7 @@ impl S3Store {
                 &payload_hash,
             ) {
                 Ok(answer) => answer,
-                Err(e) if idempotent => match retry(&format!("transport: {e}")) {
+                Err(e) if idempotent => match retry(&format!("transport: {e}"), Retry::Transport) {
                     // The first transport retry goes immediately, a dead
                     // pooled connection needs no backoff.
                     Some(wait) => {
@@ -223,7 +241,7 @@ impl S3Store {
                 Err(e) => return Err(self.transport(err_key, method, &e)),
             };
             if retryable(status)
-                && let Some(wait) = retry(&format!("status {status}"))
+                && let Some(wait) = retry(&format!("status {status}"), retry_kind(status))
             {
                 std::thread::sleep(wait);
                 continue;
