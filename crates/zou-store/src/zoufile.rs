@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use crate::cas::{CasError, CasStore, Version};
+use crate::stats::{Packed, note_packed};
 
 const FILE_MAGIC: &[u8; 4] = b"ZOUF";
 const FRAME_MAGIC: &[u8; 4] = b"FRAM";
@@ -123,9 +124,11 @@ fn encode_value(data: &[u8]) -> (u8, Vec<u8>) {
     if data.len() >= COMPRESS_MIN {
         let packed = lz4_flex::compress(data);
         if packed.len() <= data.len() - data.len() / 8 {
+            note_packed(Packed::File, data.len(), packed.len());
             return (ENC_LZ4, packed);
         }
     }
+    note_packed(Packed::File, data.len(), data.len());
     (ENC_RAW, data.to_vec())
 }
 

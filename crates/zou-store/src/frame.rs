@@ -30,6 +30,7 @@
 //! ```
 
 use crate::lsn::Lsn;
+use crate::stats::{Packed, note_packed};
 
 pub const FRAME2_HEADER_LEN: usize = 49;
 const CRC_END: usize = 8;
@@ -129,6 +130,7 @@ impl Frame2 {
         } else {
             (true, &self.payload)
         };
+        note_packed(Packed::Wal, self.payload.len(), body.len());
 
         let mut flags = 0u8;
         if self.contains_commit {

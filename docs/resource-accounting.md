@@ -28,6 +28,9 @@ Footprint, meaning what the run occupies rather than what it moved, is measured 
 A walk of a store with hundreds of thousands of objects in it is not a thing to do every second, and the sizes move at checkpoint and fold cadence anyway, so a per phase reading is a timeline at the resolution the thing being watched actually changes at.
 It reports what the filesystem holds rather than an apparent size, because a store of many small objects rounded up to a block is a real cost.
 
+Compression is counted from inside the store rather than inferred from the footprint, raw bytes handed to the compressor against bytes actually written, kept as two counters per compressor instead of one ratio.
+Two counters because the ratios of two runs cannot be added to each other and a phase here is always a subtraction, and from the inside because a block that does not compress is stored raw with nothing on it to say so, which makes a compression ratio computed from object sizes an assertion rather than a measurement.
+
 The logical size those are divided by comes from the planner's page counts and not from `pg_database_size`.
 `pg_database_size` is a walk of the data directory calling stat on segment files, and on the zou legs those files are not there, the pages are on the store, so it answers the size of the catalog: a scale 1 database measured 157 KiB that way, which is about one percent of the truth.
 `relpages` is set by the vacuum and analyze that `pgbench -i` ends with and does not move again while a fixed dataset is being read, and it reads the same way on both legs, which matters more here than exactness.
