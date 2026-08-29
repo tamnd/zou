@@ -658,20 +658,31 @@ pub(crate) fn user_object() -> String {
 fn factors_of() -> String {
     format!(
         "(select case when count(*) = 0 then '{{}}'::jsonb
-                      else jsonb_build_object('factors', jsonb_agg(
-                               jsonb_build_object(
-                                   'id', f.id::text,
-                                   'created_at', {created},
-                                   'updated_at', {updated},
-                                   'status', f.status::text,
-                                   'factor_type', f.factor_type::text,
-                                   'phone', coalesce(f.phone, ''),
-                                   'last_challenged_at', case
-                                       when f.last_challenged_at is null then null
-                                       else {challenged} end
-                               ) || {friendly}
-                               order by f.created_at)) end
+                      else jsonb_build_object('factors',
+                               jsonb_agg({factor} order by f.created_at)) end
             from auth.mfa_factors f where f.user_id = u.id)",
+        factor = factor_object(),
+    )
+}
+
+/// One factor, as a jsonb expression over `f` in auth.mfa_factors.
+///
+/// The account's own list and the admin listing are the same Go struct
+/// marshalled by the same code, so they are the same expression here
+/// too. The secret is not in it, on either side.
+pub(crate) fn factor_object() -> String {
+    format!(
+        "jsonb_build_object(
+             'id', f.id::text,
+             'created_at', {created},
+             'updated_at', {updated},
+             'status', f.status::text,
+             'factor_type', f.factor_type::text,
+             'phone', coalesce(f.phone, ''),
+             'last_challenged_at', case
+                 when f.last_challenged_at is null then null
+                 else {challenged} end
+         ) || {friendly}",
         created = ts("f.created_at"),
         updated = ts("f.updated_at"),
         challenged = ts("f.last_challenged_at"),
