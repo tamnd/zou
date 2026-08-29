@@ -43,7 +43,14 @@
 # ones that do wait for a round trip, and the average of those two is a
 # number no transaction experienced.
 #
-# Each phase also prints what it cost the machine, memory and cpu,
+# Each phase prints what it occupies as well as what it moved: pgdata,
+# the store broken down into its wal tail, its checkpoints and its
+# layers, the logical size of the database, and how much of that the
+# phase itself added. With the disk counters beside it that is where
+# write and space amplification come from, derived from measured bytes
+# rather than asserted.
+#
+# Each phase also prints what it cost the machine, memory, cpu and disk,
 # sampled once a second by scripts/zou-usage.sh while the run happens.
 # Two M1b claims are about that and neither can be answered after the
 # fact: the shim's own footprint, and cpu seconds per thousand
@@ -124,11 +131,21 @@ MARK=$RUNDIR/mark
 # be answered after the fact. The samples are timestamped and each
 # phase cuts its own window out of them, since a peak paid for during
 # the load is not a peak the select-only phase paid for.
+#
+# The same sampler takes the disk counters for the devices under the run
+# directory and under the store, which are usually one device and are
+# then read once. They are whole device counters and the line says so: a
+# server with a neighbour on the same disk is the normal case here.
 USAGE=$RUNDIR/usage
 USAGE_SH=$(dirname "$0")/zou-usage.sh
 POSTMASTER=$(head -1 "$DATADIR/postmaster.pid" 2>/dev/null || true)
+DISK_PATHS=$RUNDIR
+case $TARGET in
+none | *://*) ;;
+*) [ -d "$TARGET" ] && DISK_PATHS="$RUNDIR,$TARGET" ;;
+esac
 if [ -r "$USAGE_SH" ] && [ -n "$POSTMASTER" ]; then
-    sh "$USAGE_SH" "$POSTMASTER" "$USAGE" 1 >/dev/null 2>&1 &
+    sh "$USAGE_SH" "$POSTMASTER" "$USAGE" 1 "$DISK_PATHS" >/dev/null 2>&1 &
     SAMPLER=$!
 fi
 
@@ -191,6 +208,58 @@ pairs() {
     "$PG"/psql -h "$SOCK" -p "$PORT" -d postgres -At -F '	' -c "$1" 2>/dev/null || true
 }
 
+# What the run occupies, as opposed to what it moved. Taken at phase
+# boundaries and not once a second, because a walk of a store with
+# hundreds of thousands of objects in it is not a thing to do every
+# second, and because the sizes move at checkpoint and fold cadence
+# rather than continuously. ZOU_BENCH_FOOTPRINT=0 turns it off for the
+# very large stores where even a per phase walk is too much.
+#
+# du and not an apparent size: what the filesystem holds is the number a
+# footprint claim is about, and a store of many small objects rounded up
+# to block size is a real cost and not an accounting artifact.
+size_of() {
+    du -sk "$@" 2>/dev/null | awk '{ total += $1 } END { printf "%d", total * 1024 }'
+}
+
+footprint() {
+    [ "${ZOU_BENCH_FOOTPRINT:-1}" = 1 ] || return 0
+    printf 'fp.pgdata.bytes\t%s\n' "$(size_of "$DATADIR")"
+    case $TARGET in
+    none | *://*) return 0 ;;
+    esac
+    [ -d "$TARGET" ] || return 0
+    printf 'fp.store.bytes\t%s\n' "$(size_of "$TARGET")"
+    # One walk for every count, classified by the layout's own directory
+    # names, rather than a walk per class.
+    find "$TARGET" -type f 2>/dev/null | awk '
+        { total++ }
+        /\/log\// { wal++ }
+        /\/chk\// { chk++ }
+        /\/shards\// { shards++ }
+        /\/pg\// { pages++ }
+        END {
+            printf "fp.store.objects\t%d\n", total
+            printf "fp.wal.objects\t%d\n", wal
+            printf "fp.chk.objects\t%d\n", chk
+            printf "fp.shards.objects\t%d\n", shards
+            printf "fp.pg.objects\t%d\n", pages
+        }'
+    for class in log chk shards pg; do
+        # shellcheck disable=SC2046
+        set -- $(find "$TARGET" -type d -name "$class" 2>/dev/null)
+        case $class in
+        log) name=wal ;;
+        *) name=$class ;;
+        esac
+        if [ $# -gt 0 ]; then
+            printf 'fp.%s.bytes\t%s\n' "$name" "$(size_of "$@")"
+        else
+            printf 'fp.%s.bytes\t0\n' "$name"
+        fi
+    done
+}
+
 internals() {
     {
         pairs "select 'wal.' || e.k, e.v from pg_stat_wal w, lateral jsonb_each_text(to_jsonb(w)) e(k, v)"
@@ -204,6 +273,18 @@ internals() {
         pairs "select 'iorow.' || i.backend_type || '.' || coalesce(i.object, '-') || '.' || i.context || '.' || e.k, e.v from pg_stat_io i, lateral jsonb_each_text(to_jsonb(i)) e(k, v) where e.v ~ '^[0-9.]+\$'"
         pairs "select 'vac.autovacuum', coalesce(sum(autovacuum_count), 0)::text from pg_stat_user_tables"
         pairs "select 'vac.autoanalyze', coalesce(sum(autoanalyze_count), 0)::text from pg_stat_user_tables"
+        # The logical size, which is what space amplification divides
+        # the store by. Out of the planner's page counts rather than out
+        # of pg_database_size, which is a walk of the data directory
+        # calling stat on segment files: on the zou legs those files are
+        # not there, the pages are on the store, and it answers the size
+        # of the catalog instead. A scale 1 database measured 157 KiB
+        # that way, which is 1 percent of the truth. relpages is set by
+        # the vacuum and analyze pgbench -i finishes with and does not
+        # move again while a fixed dataset is being read, so the two
+        # legs are comparable, which matters more here than exactness.
+        pairs "select 'db.pages', coalesce(sum(relpages), 0)::bigint::text from pg_class where relkind in ('r', 'i', 't', 'm')"
+        footprint
     } >"$1" 2>/dev/null
 }
 
@@ -214,13 +295,24 @@ internals() {
 internals_report() {
     was=$1
     now=$2
+    # Bytes the devices under this run wrote during the phase, which is
+    # the numerator of write amplification. It comes from the sampler
+    # and the wal bytes come from postgres, so the division has to
+    # happen somewhere that can see both, and this is it.
+    wrote=${3:-0}
     [ -s "$was" ] && [ -s "$now" ] || return 0
-    awk -F'\t' '
+    awk -F'\t' -v wrote="$wrote" '
         NR == FNR { was[$1] = $2 + 0; next }
         { now[$1] = $2 + 0 }
         function d(k) { return now[k] - was[k] }
         function mib(n) { return n / 1048576 }
-        END {
+        function human(n) {
+            if (n >= 1073741824) return sprintf("%.2f GiB", n / 1073741824)
+            if (n >= 1048576) return sprintf("%.1f MiB", n / 1048576)
+            if (n >= 1024) return sprintf("%.1f KiB", n / 1024)
+            return sprintf("%d B", n)
+        }
+        function counters(   hit, read, checkpoints) {
             hit = d("db.blks_hit")
             read = d("db.blks_read")
             printf "  wal %d records, %d fpi, %.1f MiB, %d buffers full\n",
@@ -241,6 +333,66 @@ internals_report() {
                 printf ", %d autovacuums and %d autoanalyzes",
                     d("vac.autovacuum"), d("vac.autoanalyze")
             printf "\n"
+        }
+        END {
+            # The shutdown phase is measured after the postmaster has
+            # gone, so nothing answered the second snapshot and every
+            # counter in it is missing rather than zero. Differencing
+            # against that prints a phase that ran minus thirty four
+            # thousand wal records, which is worse than printing
+            # nothing. The footprint below survives it, since a walk of
+            # a directory does not need a server to answer.
+            live = ("wal.wal_records" in now) || ("ckpt.num_timed" in now)
+            if (live) counters()
+
+            # What the run occupies now and what this phase added to it.
+            # The level and the growth are both wanted: the level is the
+            # footprint claim and the growth is the timeline, and one
+            # phase of a run is where the difference between an engine
+            # that folds and one that only appends shows up.
+            logical = now["db.pages"] * 8192
+            if (now["fp.pgdata.bytes"] > 0 || now["fp.store.bytes"] > 0) {
+                printf "  footprint pgdata %s", human(now["fp.pgdata.bytes"])
+                if (logical > 0)
+                    printf ", database %s", human(logical)
+                if (now["fp.store.bytes"] > 0) {
+                    printf ", store %s in %d objects",
+                        human(now["fp.store.bytes"]), now["fp.store.objects"]
+                    printf ", up %s and %d objects this phase",
+                        human(d("fp.store.bytes")), d("fp.store.objects")
+                }
+                printf "\n"
+            }
+            if (now["fp.store.bytes"] > 0) {
+                printf "  store holds wal tail %s in %d objects",
+                    human(now["fp.wal.bytes"]), now["fp.wal.objects"]
+                printf ", pages %s in %d, checkpoints %s in %d, layers %s in %d",
+                    human(now["fp.pg.bytes"]), now["fp.pg.objects"],
+                    human(now["fp.chk.bytes"]), now["fp.chk.objects"],
+                    human(now["fp.shards.bytes"]), now["fp.shards.objects"]
+                if (logical > 0)
+                    printf ", %.2fx the database",
+                        now["fp.store.bytes"] / logical
+                printf "\n"
+            }
+
+            # Write amplification, device bytes over the wal bytes
+            # postgres says it produced. Both legs can answer it, which
+            # is the point of measuring it this way rather than off the
+            # store counters: vanilla writes its own pages and its own
+            # wal, zou writes objects, and the ratio is comparable.
+            #
+            # A phase that generated almost no wal gets no ratio rather
+            # than an enormous one. A checkpoint writes half a gigabyte
+            # of pages against a couple of hundred bytes of wal, and
+            # dividing those two produces a number with six figures in
+            # it that means nothing at all.
+            if (live && wrote > 0 && d("wal.wal_bytes") > 1048576)
+                printf "  amplification %.1fx write, %.1f MiB to disk for %.1f MiB of wal\n",
+                    wrote / d("wal.wal_bytes"), mib(wrote), mib(d("wal.wal_bytes"))
+            else if (live && wrote > 0)
+                printf "  amplification no ratio, %.1f MiB to disk for %.2f MiB of wal\n",
+                    mib(wrote), mib(d("wal.wal_bytes"))
         }' "$was" "$now"
 }
 
@@ -267,11 +419,14 @@ cost() {
         "$ZOU" stats "$ZOU_STORE_STATS" --since "$MARK" --brief 2>/dev/null |
             awk '{print "  " $0}' || true
     fi
+    NOW=$(date +%s)
+    WROTE=0
     if [ -s "$USAGE" ]; then
-        sh "$USAGE_SH" --report "$USAGE" "$MARK_AT" "$(date +%s)" "${2:-0}" || true
+        sh "$USAGE_SH" --report "$USAGE" "$MARK_AT" "$NOW" "${2:-0}" || true
+        WROTE=$(sh "$USAGE_SH" --written "$USAGE" "$MARK_AT" "$NOW" 2>/dev/null || echo 0)
     fi
     internals "$RUNDIR/pg-now"
-    internals_report "$PG_MARK" "$RUNDIR/pg-now"
+    internals_report "$PG_MARK" "$RUNDIR/pg-now" "$WROTE"
     mark "$1"
 }
 

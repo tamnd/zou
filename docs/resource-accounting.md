@@ -20,6 +20,18 @@ Cpu is the live tree's user and system time plus the postmaster's counters for t
 Both halves are needed and they do not overlap: a backend is either alive in the tree or reaped into the child counters, and it moves from one to the other at the moment it exits.
 Per transaction figures divide by pgbench's own count of transactions rather than by tps times duration, since the two differ by however long the last transaction took.
 
+Disk is `/proc/diskstats` for the devices behind the run directory and the store, read by the same sampler at the same cadence, and it is the whole device rather than this run's share of it.
+Every line names the device for that reason: our servers carry somebody else's workload on the same disk, and a utilization figure that quietly folded their traffic in would be worse than no figure.
+A partition is reported as itself rather than as its whole disk, so two filesystems on one spindle stay apart, and the whole disk is only used when the kernel gives the partition no row of its own.
+
+Footprint, meaning what the run occupies rather than what it moved, is measured at phase boundaries instead of once a second.
+A walk of a store with hundreds of thousands of objects in it is not a thing to do every second, and the sizes move at checkpoint and fold cadence anyway, so a per phase reading is a timeline at the resolution the thing being watched actually changes at.
+It reports what the filesystem holds rather than an apparent size, because a store of many small objects rounded up to a block is a real cost.
+
+The logical size those are divided by comes from the planner's page counts and not from `pg_database_size`.
+`pg_database_size` is a walk of the data directory calling stat on segment files, and on the zou legs those files are not there, the pages are on the store, so it answers the size of the catalog: a scale 1 database measured 157 KiB that way, which is about one percent of the truth.
+`relpages` is set by the vacuum and analyze that `pgbench -i` ends with and does not move again while a fixed dataset is being read, and it reads the same way on both legs, which matters more here than exactness.
+
 ## The zou boundary
 
 Everything in the postgres process tree, the postmaster included.
