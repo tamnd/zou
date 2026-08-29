@@ -33,7 +33,7 @@ use std::path::Path;
 
 use zou_store::stats::Snapshot;
 
-pub const USAGE: &str = "usage: zou cost <counter-file> [--since <earlier-copy>] [--card <name>] [--card-file <path>] [--stored <bytes>] [--commits <n>] [--tenants <n>] [--box <usd-per-month>] [--box-tb <n>] [--egress] [--json] [--list-cards]";
+pub const USAGE: &str = "usage: zou cost <counter-file> [--since <earlier-copy>] [--card <name>] [--card-file <path>] [--stored <bytes>] [--commits <n>] [--tenants <n>] [--box <usd-per-month>] [--box-tb <n>] [--egress] [--json] [--list-cards] [--export-cards <dir>]";
 
 /// One published price list, at a date, for one storage class in one
 /// region.
@@ -42,7 +42,7 @@ pub const USAGE: &str = "usage: zou cost <counter-file> [--since <earlier-copy>]
 /// here depends on the size of the workload it is applied to, and a
 /// card can be read and checked against the vendor's page without
 /// knowing anything about the run it will be used on.
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Card {
     pub name: String,
@@ -262,6 +262,12 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
+    if let Some(i) = argv.iter().position(|a| a == "--export-cards") {
+        let dir = argv
+            .get(i + 1)
+            .ok_or_else(|| "--export-cards wants a directory".to_string())?;
+        return export(Path::new(dir));
+    }
     let args = parse(argv)?;
     let card = match &args.card_file {
         Some(path) => {
@@ -291,6 +297,33 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         say!("{}", brief(&card, &counts, &bill, &args));
     } else {
         say!("{}", lines(&card, &counts, &bill, &args));
+    }
+    Ok(())
+}
+
+/// Write the built in cards out as one json file each, in exactly the
+/// shape `--card-file` reads back.
+///
+/// This exists so there is one set of price cards and not two. The
+/// benchmark harness in tamnd/zou-bench prices its runs against the
+/// same cards, and a second copy of them living over there would drift
+/// from this one the first time a vendor changed a price and only one
+/// side noticed. So this side owns them, that side regenerates its copy
+/// from here, and a card that has gone stale goes stale once.
+///
+/// The self hosted card is written out with its prices empty the way it
+/// is held here, since the whole point of it is that nobody has filled
+/// them in yet, and a reader that wants dollars out of it has to say
+/// what the box cost.
+fn export(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for card in cards() {
+        let path = dir.join(format!("{}.json", card.name));
+        let mut text =
+            serde_json::to_string_pretty(&card).map_err(|e| format!("{}: {e}", path.display()))?;
+        text.push('\n');
+        std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        say!("{}", path.display());
     }
     Ok(())
 }
@@ -972,5 +1005,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The export is what keeps the benchmark harness from carrying a
+    /// second set of cards, so what comes out of it has to be what
+    /// `--card-file` reads back, to the last field. A round trip that
+    /// lost `egress_free_times_storage` would be a card that quietly
+    /// billed Backblaze for egress it gives away.
+    #[test]
+    fn an_exported_card_reads_back_as_itself() {
+        let dir = std::env::temp_dir().join(format!("zou-cost-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        export(&dir).expect("export");
+        for want in cards() {
+            let text =
+                std::fs::read_to_string(dir.join(format!("{}.json", want.name))).expect("read");
+            let got: Card = serde_json::from_str(&text).expect("parse");
+            assert_eq!(got.name, want.name);
+            assert_eq!(got.as_of, want.as_of);
+            assert_eq!(got.source, want.source);
+            assert_eq!(got.note, want.note);
+            assert_eq!(got.gb_bytes, want.gb_bytes);
+            assert_eq!(got.storage_per_gb_month, want.storage_per_gb_month);
+            assert_eq!(got.class_a_per_million, want.class_a_per_million);
+            assert_eq!(got.class_b_per_million, want.class_b_per_million);
+            assert_eq!(got.delete_per_million, want.delete_per_million);
+            assert_eq!(got.upload_per_gb, want.upload_per_gb);
+            assert_eq!(got.retrieval_per_gb, want.retrieval_per_gb);
+            assert_eq!(got.egress_per_gb, want.egress_per_gb);
+            assert_eq!(got.egress_free_gb_month, want.egress_free_gb_month);
+            assert_eq!(
+                got.egress_free_times_storage,
+                want.egress_free_times_storage
+            );
+            assert_eq!(got.needs_box, want.needs_box);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
