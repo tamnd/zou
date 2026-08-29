@@ -369,6 +369,191 @@ fn with_page(uri: &axum::http::Uri, page: u64) -> String {
     format!("{}?{}", uri.path(), query.join("&"))
 }
 
+/// Which entries the trail is being asked for, out of upstream's one
+/// `query` parameter.
+///
+/// The parameter is a scope and a value with a colon between them, and
+/// upstream splits it on the first colon only, so `action:login:extra`
+/// is the action `login:extra` rather than a refusal. A parameter with
+/// no colon in it at all is refused, and the message quotes the whole
+/// parameter back rather than the part that was wrong.
+///
+/// All three scopes match on a substring and ignore case, which is why
+/// `action:log` finds a logout as well as a login.
+enum Scope {
+    Everything,
+    Author(String),
+    Action(String),
+    Kind(String),
+}
+
+impl Scope {
+    fn read(raw: &str) -> Result<Scope, Error> {
+        if raw.is_empty() {
+            return Ok(Scope::Everything);
+        }
+        let invalid = || {
+            refused(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                &format!("Invalid query scope: {raw}"),
+            )
+        };
+        let Some((scope, value)) = raw.split_once(':') else {
+            return Err(invalid());
+        };
+        match scope {
+            "author" => Ok(Scope::Author(value.to_string())),
+            "action" => Ok(Scope::Action(value.to_string())),
+            "type" => Ok(Scope::Kind(value.to_string())),
+            _ => Err(invalid()),
+        }
+    }
+
+    /// The key inside the payload this scope reads, and the value it
+    /// compares with. An empty value matches every row, which is what
+    /// `%%` does and what upstream answers for `author:`.
+    fn matching(&self) -> (&'static str, &str) {
+        match self {
+            Scope::Everything => ("", ""),
+            Scope::Author(value) => ("actor_username", value),
+            Scope::Action(value) => ("action", value),
+            Scope::Kind(value) => ("log_type", value),
+        }
+    }
+}
+
+/// GET /auth/v1/admin/audit, the trail as a page.
+///
+/// Newest first and no way to ask for anything else: upstream reads no
+/// `sort` here, so one that names a field nobody has is ignored rather
+/// than refused, which is the opposite of what the same parameter does
+/// on the account listing.
+pub async fn audit_log(
+    axum::extract::State(app): axum::extract::State<Arc<crate::App>>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let admin = match admin(&req) {
+        Ok(admin) => admin,
+        Err(res) => return *res,
+    };
+    let query = query_object(req.uri().query().unwrap_or_default());
+    let scope = match Scope::read(field(&query, "query")) {
+        Ok(scope) => scope,
+        Err(e) => return refusal(e, "admin audit"),
+    };
+    // The account listing's parser, minus the sort it does not read.
+    let listing = match (
+        number(field(&query, "page"), 1),
+        number(field(&query, "per_page"), PER_PAGE),
+    ) {
+        (Ok(page), Ok(per_page)) => Listing {
+            page,
+            per_page,
+            ascending: false,
+            filter: String::new(),
+        },
+        (Err(e), _) | (_, Err(e)) => {
+            return refusal(
+                bad_parameters("Bad Pagination Parameters", &e),
+                "admin audit",
+            );
+        }
+    };
+    let sess = match pool.admin().await {
+        Ok(sess) => sess,
+        Err(e) => return refusal(Error::Db(e), "admin audit"),
+    };
+    let out = entries(&sess, &admin, &scope, &listing).await;
+    match out {
+        Ok((rows, total)) => match sess.commit().await {
+            Ok(()) => paged(
+                req.uri(),
+                &listing,
+                total,
+                json_body(StatusCode::OK, serde_json::Value::Array(rows)),
+            ),
+            Err(e) => refusal(Error::Db(e), "admin audit"),
+        },
+        Err(e) => {
+            let _ = sess.rollback().await;
+            refusal(e, "admin audit")
+        }
+    }
+}
+
+/// The page of the trail, and how many entries match the scope.
+///
+/// The payload comes back with its keys in alphabetical order because
+/// upstream reads it into a Go map and marshals it out again, and a Go
+/// map writes its keys sorted. The sort is done here rather than left
+/// to the json library on the way out, because whether that library
+/// sorts a map or keeps its insertion order is a cargo feature that
+/// another crate in the same binary can turn on, and the order a client
+/// reads should not depend on what else was linked in.
+///
+/// Only the top level is sorted: an object inside the payload keeps the
+/// order it was written in, which upstream would also sort, and the only
+/// one there is is `traits`.
+async fn entries(
+    sess: &sql::Session,
+    admin: &Admin,
+    scope: &Scope,
+    listing: &Listing,
+) -> Result<(Vec<serde_json::Value>, i64), Error> {
+    holder_still_there(sess, admin).await?;
+    let (key, value) = scope.matching();
+    let matching = match key.is_empty() {
+        true => "and $1 = $1".to_string(),
+        false => format!("and l.payload->>'{key}' ilike '%' || $1 || '%'"),
+    };
+    let sorted = "coalesce((select json_object_agg(k, v order by k)
+                              from json_each(l.payload) as e(k, v)), '{}'::json)";
+    let payload =
+        format!("case when json_typeof(l.payload) = 'object' then {sorted} else l.payload end");
+    let offset = listing
+        .page
+        .saturating_sub(1)
+        .saturating_mul(listing.per_page);
+    let rows = sess
+        .query(
+            &format!(
+                "select json_build_object(
+                          'id', l.id,
+                          'payload', {payload},
+                          'created_at', {created},
+                          'ip_address', l.ip_address)::text
+                   from auth.audit_log_entries l
+                  where l.instance_id = '{NOBODY}' {matching}
+                  order by l.created_at desc
+                  limit $2 offset $3",
+                created = crate::auth::ts("l.created_at"),
+            ),
+            &[&value, &(listing.per_page as i64), &(offset as i64)],
+        )
+        .await?;
+    let entries = rows
+        .iter()
+        .map(|row| {
+            serde_json::from_str(row.get::<_, &str>(0))
+                .expect("json_build_object always produces json")
+        })
+        .collect();
+    let counted = sess
+        .query(
+            &format!(
+                "select count(*) from auth.audit_log_entries l
+                  where l.instance_id = '{NOBODY}' {matching}"
+            ),
+            &[&value],
+        )
+        .await?;
+    Ok((entries, counted[0].get(0)))
+}
+
 /// GET /auth/v1/admin/users/{user_id}.
 pub async fn user_get(
     axum::extract::State(app): axum::extract::State<Arc<crate::App>>,
@@ -1599,6 +1784,31 @@ mod tests {
             direction("created_at sideways"),
             Err("bad direction for sort 'sideways', only 'asc' and 'desc' allowed".to_string())
         );
+    }
+
+    #[test]
+    fn the_trail_reads_three_scopes_and_refuses_the_rest() {
+        let key = |raw| Scope::read(raw).ok().map(|scope| scope.matching().0);
+        assert_eq!(key(""), Some(""));
+        assert_eq!(key("author:person@zou.test"), Some("actor_username"));
+        assert_eq!(key("action:login"), Some("action"));
+        assert_eq!(key("type:account"), Some("log_type"));
+        assert_eq!(key("nonsense:x"), None);
+        assert_eq!(key("login"), None);
+    }
+
+    #[test]
+    fn a_scope_keeps_the_colons_after_the_first_one() {
+        // Upstream splits on the first colon and nothing else, so this
+        // is the action `login:extra` rather than a refusal, and it
+        // matches no row.
+        let value = |raw| {
+            Scope::read(raw)
+                .ok()
+                .map(|scope| scope.matching().1.to_string())
+        };
+        assert_eq!(value("action:login:extra"), Some("login:extra".to_string()));
+        assert_eq!(value("author:"), Some(String::new()));
     }
 
     #[test]
