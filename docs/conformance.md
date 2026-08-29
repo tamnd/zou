@@ -225,7 +225,7 @@ That difference is real and it is [#555](https://github.com/tamnd/zou/issues/555
 
 ## The suite compared with GoTrue
 
-The `auth` suite is over the endpoints a sign in flow uses: signup, the three token grants, the user endpoints, verify, recover, magiclink, otp, resend, logout, reauthenticate, the MFA listing, the admin endpoints including the audit trail, settings, health, jwks and authorize.
+The `auth` suite is over the endpoints a sign in flow uses: signup, the three token grants, the user endpoints, verify, recover, magiclink, otp, resend, logout, reauthenticate, the MFA listing, the admin endpoints including the audit trail and the factor endpoints, settings, health, jwks and authorize.
 The reference is GoTrue 2.195.0 configured the way `supabase start` configures it for a project that has changed nothing, with the mail rate limits raised out of the way.
 A rate limit is a configured number and a clock rather than a compatibility surface, and at the default of thirty an hour which case got the 429 would depend on how long the run before it took.
 

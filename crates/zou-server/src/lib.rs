@@ -1051,6 +1051,14 @@ pub fn routed(cfg: Config) -> Result<(Router, Arc<App>), String> {
                 .put(admin::user_update)
                 .delete(admin::user_delete),
         )
+        .route(
+            "/auth/v1/admin/users/{user_id}/factors",
+            get(admin::user_factors),
+        )
+        .route(
+            "/auth/v1/admin/users/{user_id}/factors/{factor_id}",
+            put(admin::factor_update).delete(admin::factor_delete),
+        )
         .route("/auth/v1/admin/audit", get(admin::audit_log))
         .route("/auth/v1/admin/generate_link", post(admin::generate_link))
         // Upstream keeps the invitation outside the admin box and behind

@@ -554,6 +554,245 @@ async fn entries(
     Ok((entries, counted[0].get(0)))
 }
 
+/// GET /auth/v1/admin/users/{user_id}/factors, somebody else's second
+/// factors listed by the service role.
+///
+/// A plain array rather than an object with a key, and an empty array
+/// rather than nothing at all when the account has none, which is where
+/// this differs from the same list hanging off a user object: there Go's
+/// omitempty leaves the key out, and here the slice is the whole body
+/// and is marshalled as it stands.
+pub async fn user_factors(
+    axum::extract::State(app): axum::extract::State<Arc<crate::App>>,
+    axum::extract::Path(user_id): axum::extract::Path<String>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let admin = match admin(&req) {
+        Ok(admin) => admin,
+        Err(res) => return *res,
+    };
+    let sess = match pool.admin().await {
+        Ok(sess) => sess,
+        Err(e) => return refusal(Error::Db(e), "admin factors"),
+    };
+    let out = factors(&sess, &admin, &user_id).await;
+    finish(sess, out, "admin factors").await
+}
+
+async fn factors(
+    sess: &sql::Session,
+    admin: &Admin,
+    user_id: &str,
+) -> Result<serde_json::Value, Error> {
+    holder_still_there(sess, admin).await?;
+    addressed(sess, user_id).await?;
+    let rows = sess
+        .query(
+            &format!(
+                "select coalesce(jsonb_agg({factor} order by f.created_at),
+                                 '[]'::jsonb)::text
+                   from auth.mfa_factors f
+                  where f.user_id = $1::text::uuid",
+                factor = crate::auth::factor_object(),
+            ),
+            &[&user_id],
+        )
+        .await?;
+    Ok(serde_json::from_str(rows[0].get::<_, &str>(0)).expect("jsonb_agg always produces json"))
+}
+
+/// PUT /auth/v1/admin/users/{user_id}/factors/{factor_id}, which renames
+/// a factor and can do nothing else to it.
+///
+/// A body with no friendly_name in it is not a refusal and is not a
+/// write: the factor comes back untouched, updated_at included, and the
+/// trail still gains an entry saying it was updated. Both halves are
+/// upstream's, and the entry with no change behind it is the reason the
+/// second half is worth writing down.
+pub async fn factor_update(
+    axum::extract::State(app): axum::extract::State<Arc<crate::App>>,
+    axum::extract::Path((user_id, factor_id)): axum::extract::Path<(String, String)>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let admin = match admin(&req) {
+        Ok(admin) => admin,
+        Err(res) => return *res,
+    };
+    let body = match read_json(req.into_body()).await {
+        Ok(body) => body,
+        Err(res) => return res,
+    };
+    let sess = match pool.admin().await {
+        Ok(sess) => sess,
+        Err(e) => return refusal(Error::Db(e), "admin factor update"),
+    };
+    let out = rename(
+        &sess,
+        &admin,
+        &user_id,
+        &factor_id,
+        field(&body, "friendly_name"),
+    )
+    .await;
+    finish(sess, out, "admin factor update").await
+}
+
+async fn rename(
+    sess: &sql::Session,
+    admin: &Admin,
+    user_id: &str,
+    factor_id: &str,
+    name: &str,
+) -> Result<serde_json::Value, Error> {
+    holder_still_there(sess, admin).await?;
+    addressed(sess, user_id).await?;
+    let kind = belonging(sess, user_id, factor_id).await?;
+    if !name.is_empty() {
+        sess.execute(
+            "update auth.mfa_factors
+                set friendly_name = $2, updated_at = now()
+              where id = $1::text::uuid",
+            &[&factor_id, &name],
+        )
+        .await?;
+    }
+    // The address is left empty, which is upstream's and is the one
+    // factor event of the six that does not carry one.
+    audit::record(
+        sess,
+        Actor::Role(&admin.role),
+        Action::FactorUpdated,
+        "",
+        Some(serde_json::json!({
+            "factor_id": factor_id,
+            "factor_type": kind,
+            "user_id": user_id,
+        })),
+    )
+    .await?;
+    one_factor(sess, factor_id).await
+}
+
+/// DELETE /auth/v1/admin/users/{user_id}/factors/{factor_id}.
+///
+/// The answer is the factor that is no longer there, which is upstream's
+/// and is what a dashboard puts back in the list when the call fails
+/// halfway through a page redraw.
+pub async fn factor_delete(
+    axum::extract::State(app): axum::extract::State<Arc<crate::App>>,
+    axum::extract::Path((user_id, factor_id)): axum::extract::Path<(String, String)>,
+    req: Request<Body>,
+) -> Response {
+    let Some(pool) = &app.pool else {
+        return no_database();
+    };
+    let admin = match admin(&req) {
+        Ok(admin) => admin,
+        Err(res) => return *res,
+    };
+    let ip = crate::auth::client_ip(&req);
+    let sess = match pool.admin().await {
+        Ok(sess) => sess,
+        Err(e) => return refusal(Error::Db(e), "admin factor delete"),
+    };
+    let out = unenrol(&sess, &admin, &user_id, &factor_id, &ip).await;
+    finish(sess, out, "admin factor delete").await
+}
+
+async fn unenrol(
+    sess: &sql::Session,
+    admin: &Admin,
+    user_id: &str,
+    factor_id: &str,
+    ip: &str,
+) -> Result<serde_json::Value, Error> {
+    holder_still_there(sess, admin).await?;
+    addressed(sess, user_id).await?;
+    belonging(sess, user_id, factor_id).await?;
+    let factor = one_factor(sess, factor_id).await?;
+    // The actor is the account the factor belonged to rather than the
+    // role that asked, which is the one admin endpoint that attributes
+    // itself to somebody else. Upstream's, and a query counting what a
+    // person did to their own factors reads it.
+    audit::record(
+        sess,
+        Actor::Account(user_id),
+        Action::FactorDeleted,
+        ip,
+        Some(serde_json::json!({
+            "factor_id": factor_id,
+            "user_id": user_id,
+        })),
+    )
+    .await?;
+    sess.execute(
+        "delete from auth.mfa_factors where id = $1::text::uuid",
+        &[&factor_id],
+    )
+    .await?;
+    Ok(factor)
+}
+
+/// The factor, if it is one and if it is this account's.
+///
+/// Answers the factor type, which the update event puts in its traits
+/// and the delete event does not. A factor id that is not a uuid is a
+/// 404 rather than a 400, the same slip the user id has, and a factor
+/// that belongs to somebody else is not found rather than forbidden, so
+/// the endpoint says nothing about whose it is.
+async fn belonging(sess: &sql::Session, user_id: &str, factor_id: &str) -> Result<String, Error> {
+    if !is_uuid(factor_id) {
+        return Err(refused(
+            StatusCode::NOT_FOUND,
+            "validation_failed",
+            "factor_id must be an UUID",
+        ));
+    }
+    let rows = sess
+        .query(
+            "select factor_type::text from auth.mfa_factors
+              where id = $1::text::uuid and user_id = $2::text::uuid",
+            &[&factor_id, &user_id],
+        )
+        .await?;
+    match rows.first() {
+        Some(row) => Ok(row.get(0)),
+        None => Err(refused(
+            StatusCode::NOT_FOUND,
+            "mfa_factor_not_found",
+            "Factor not found",
+        )),
+    }
+}
+
+async fn one_factor(sess: &sql::Session, factor_id: &str) -> Result<serde_json::Value, Error> {
+    let rows = sess
+        .query(
+            &format!(
+                "select ({factor})::text from auth.mfa_factors f
+                  where f.id = $1::text::uuid",
+                factor = crate::auth::factor_object(),
+            ),
+            &[&factor_id],
+        )
+        .await?;
+    match rows.first() {
+        Some(row) => Ok(serde_json::from_str(row.get::<_, &str>(0))
+            .expect("jsonb_build_object always produces json")),
+        None => Err(refused(
+            StatusCode::NOT_FOUND,
+            "mfa_factor_not_found",
+            "Factor not found",
+        )),
+    }
+}
+
 /// GET /auth/v1/admin/users/{user_id}.
 pub async fn user_get(
     axum::extract::State(app): axum::extract::State<Arc<crate::App>>,

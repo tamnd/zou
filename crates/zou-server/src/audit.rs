@@ -30,8 +30,9 @@
 //! anybody who has queried this table:
 //!
 //! - Most entries have an empty `ip_address` column. The ones that fill
-//!   it are the four factor events and the two identity linking events,
-//!   which is exactly the set upstream fills and no larger. The address
+//!   it are five of the six factor events, `factor_updated` being the
+//!   odd one out, and the two identity linking events, which is exactly
+//!   the set upstream fills and no larger. The address
 //!   is in the request for all of them, so the empty column is upstream
 //!   forgetting to pass it rather than deciding not to, but a query
 //!   counting distinct addresses would start seeing different numbers if
@@ -110,9 +111,8 @@ pub fn configured(var: &dyn Fn(&str) -> String) -> Result<Settings, String> {
 }
 
 /// What happened. Upstream's AuditAction, minus the actions for
-/// endpoints this server does not serve: the passkey three, and
-/// `factor_deleted` and `factor_updated`, which belong to the admin
-/// factor endpoints rather than to the four an account uses on itself.
+/// endpoints this server does not serve, which is now the passkey three
+/// and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Login,
@@ -131,6 +131,8 @@ pub enum Action {
     TokenRefreshed,
     FactorInProgress,
     FactorUnenrolled,
+    FactorUpdated,
+    FactorDeleted,
     ChallengeCreated,
     VerificationAttempted,
     IdentityLinked,
@@ -146,7 +148,7 @@ pub enum Action {
 /// does not compile, and the test that every entry answers with its own
 /// position is what catches an arm that was added pointing at somebody
 /// else's slot.
-pub const EVERY: [Action; 20] = [
+pub const EVERY: [Action; 22] = [
     Action::Login,
     Action::Logout,
     Action::InviteAccepted,
@@ -163,6 +165,8 @@ pub const EVERY: [Action; 20] = [
     Action::TokenRefreshed,
     Action::FactorInProgress,
     Action::FactorUnenrolled,
+    Action::FactorUpdated,
+    Action::FactorDeleted,
     Action::ChallengeCreated,
     Action::VerificationAttempted,
     Action::IdentityLinked,
@@ -192,10 +196,12 @@ impl Action {
             Action::TokenRefreshed => 13,
             Action::FactorInProgress => 14,
             Action::FactorUnenrolled => 15,
-            Action::ChallengeCreated => 16,
-            Action::VerificationAttempted => 17,
-            Action::IdentityLinked => 18,
-            Action::IdentityUnlinked => 19,
+            Action::FactorUpdated => 16,
+            Action::FactorDeleted => 17,
+            Action::ChallengeCreated => 18,
+            Action::VerificationAttempted => 19,
+            Action::IdentityLinked => 20,
+            Action::IdentityUnlinked => 21,
         }
     }
 
@@ -218,6 +224,8 @@ impl Action {
             Action::TokenRefreshed => "token_refreshed",
             Action::FactorInProgress => "factor_in_progress",
             Action::FactorUnenrolled => "factor_unenrolled",
+            Action::FactorUpdated => "factor_updated",
+            Action::FactorDeleted => "factor_deleted",
             Action::ChallengeCreated => "challenge_created",
             Action::VerificationAttempted => "verification_attempted",
             Action::IdentityLinked => "identity_linked",
@@ -242,6 +250,8 @@ impl Action {
             | Action::UserUpdatedPassword => "user",
             Action::FactorInProgress
             | Action::FactorUnenrolled
+            | Action::FactorUpdated
+            | Action::FactorDeleted
             | Action::ChallengeCreated
             | Action::VerificationAttempted => "factor",
             // Upstream files both linking events under the user rather
