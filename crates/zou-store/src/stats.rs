@@ -73,7 +73,7 @@ use crate::cas::{CasError, CasStore, Version};
 /// layout so a dump from a stale binary fails loudly instead of reading
 /// garbage.
 const MAGIC: u64 = u64::from_ne_bytes(*b"ZOUSTATS");
-const FORMAT: u64 = 7;
+const FORMAT: u64 = 8;
 
 pub const OP_NAMES: [&str; 6] = ["get", "get_range", "put_if_match", "put", "delete", "list"];
 pub const CLASS_NAMES: [&str; 7] = ["manifest", "wal", "chk", "shards", "page", "file", "other"];
@@ -89,6 +89,11 @@ pub const COMMIT_NAMES: [&str; 7] = [
 /// that died under an idempotent request, and `exhausted` is the op that
 /// used its whole attempt budget and failed anyway.
 pub const RETRY_NAMES: [&str; 4] = ["throttle", "server", "transport", "exhausted"];
+/// What the compressors were handed, by what was doing the handing.
+/// This is the one thing about the store nobody outside it can measure:
+/// a block that does not compress is stored raw, so the object sizes on
+/// the bucket say what was stored and never what it would have cost.
+pub const PACK_NAMES: [&str; 3] = ["layer", "wal", "file"];
 
 const KINDS: usize = OP_NAMES.len();
 const CLASSES: usize = CLASS_NAMES.len();
@@ -97,6 +102,7 @@ const PHASES: usize = PHASE_NAMES.len();
 const STEPS: usize = COMMIT_NAMES.len();
 const CAUSES: usize = CAUSE_NAMES.len();
 const RETRIES: usize = RETRY_NAMES.len();
+const PACKS: usize = PACK_NAMES.len();
 const BUCKETS: usize = 32;
 
 const HEADER: usize = 2;
@@ -109,7 +115,8 @@ const STEP_BASE: usize = PHASE_BASE + PHASES * (1 + BUCKETS);
 const CAUSE_BASE: usize = STEP_BASE + STEPS * (1 + BUCKETS);
 const GAP_BASE: usize = CAUSE_BASE + CAUSES;
 const RETRY_BASE: usize = GAP_BASE + 1 + BUCKETS;
-const SLOTS: usize = RETRY_BASE + RETRIES;
+const PACK_BASE: usize = RETRY_BASE + RETRIES;
+const SLOTS: usize = PACK_BASE + PACKS * 2;
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -434,6 +441,35 @@ pub fn note_retry(kind: Retry) {
     }
 }
 
+/// What handed a buffer to the compressor, [`PACK_NAMES`] in enum form.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Packed {
+    /// A block of a page or index layer.
+    Layer,
+    /// A wal frame body on its way to the log.
+    Wal,
+    /// A chunk of a user file in the file store.
+    File,
+}
+
+/// Record one buffer offered to the compressor: what it was, and what
+/// came out. `stored` is the size that was actually written, so a block
+/// that did not compress and went out raw counts its own size on both
+/// sides and drags the ratio towards one, which is the honest answer.
+///
+/// Counted here because it cannot be counted anywhere else. The object
+/// sizes a bucket reports are the stored sizes, and nothing outside the
+/// store knows what those bytes would have been, so a space
+/// amplification figure computed from the outside silently credits the
+/// engine for compression it may not be getting.
+pub fn note_packed(kind: Packed, raw: usize, stored: usize) {
+    if let Some(c) = global() {
+        let base = PACK_BASE + (kind as usize) * 2;
+        c.add(base, raw as u64);
+        c.add(base + 1, stored as u64);
+    }
+}
+
 /// Record one step of the commit path. Called from the pusher, the
 /// sequencer's flusher and its put workers, all of them in the
 /// postmaster's process, so they all map the file the backends do.
@@ -624,6 +660,7 @@ pub struct Snapshot {
     pub park_cause: Vec<CauseSnapshot>,
     pub park_gap: GapSnapshot,
     pub retries: Vec<RetrySnapshot>,
+    pub packed: Vec<PackSnapshot>,
 }
 
 /// How many requests went out a second time, by what made them.
@@ -631,6 +668,14 @@ pub struct Snapshot {
 pub struct RetrySnapshot {
     pub kind: &'static str,
     pub count: u64,
+}
+
+/// What the compressor was given and what it wrote, by what gave it.
+#[derive(Debug, serde::Serialize)]
+pub struct PackSnapshot {
+    pub kind: &'static str,
+    pub raw: u64,
+    pub stored: u64,
 }
 
 /// How many parked reads were waiting for wal that wrote the pages
@@ -866,6 +911,16 @@ impl Snapshot {
                 count: slot(RETRY_BASE + kind),
             })
             .collect();
+        let packed = PACK_NAMES
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(kind, name)| PackSnapshot {
+                kind: name,
+                raw: slot(PACK_BASE + kind * 2),
+                stored: slot(PACK_BASE + kind * 2 + 1),
+            })
+            .collect();
         Self {
             conflicts: slot(CONFLICT_SLOT),
             ops,
@@ -875,6 +930,7 @@ impl Snapshot {
             park_cause,
             park_gap,
             retries,
+            packed,
         }
     }
 
@@ -1092,6 +1148,30 @@ mod tests {
         assert_eq!(retry("server").count, 0);
         assert!(snap.park_cause.iter().all(|c| c.parks == 0));
         assert!(snap.commit.iter().all(|s| s.samples == 0));
+    }
+
+    /// Raw and stored are two slots per compressor rather than a ratio
+    /// in one, because the two runs a comparison wants to put beside
+    /// each other cannot have their ratios added, and because a phase
+    /// is a subtraction here like everywhere else in this file.
+    #[test]
+    fn compressed_bytes_round_trip_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let counters = Counters::open(&dir.path().join("stats")).unwrap();
+        counters.add(PACK_BASE + Packed::Layer as usize * 2, 8192);
+        counters.add(PACK_BASE + Packed::Layer as usize * 2 + 1, 2048);
+        // A block that did not compress went out raw, which is equal
+        // sides and a ratio of one, not an absence.
+        counters.add(PACK_BASE + Packed::File as usize * 2, 500);
+        counters.add(PACK_BASE + Packed::File as usize * 2 + 1, 500);
+        let snap = Snapshot::read(&dir.path().join("stats")).unwrap();
+        let packed = |name: &str| snap.packed.iter().find(|p| p.kind == name).unwrap();
+        assert_eq!(packed("layer").raw, 8192);
+        assert_eq!(packed("layer").stored, 2048);
+        assert_eq!(packed("file").raw, 500);
+        assert_eq!(packed("file").stored, 500);
+        assert_eq!(packed("wal").raw, 0);
+        assert!(snap.retries.iter().all(|r| r.count == 0));
     }
 
     #[test]

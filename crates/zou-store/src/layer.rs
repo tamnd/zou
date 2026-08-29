@@ -35,6 +35,7 @@
 
 use crate::bloom::Bloom;
 use crate::lsn::Lsn;
+use crate::stats::{Packed, note_packed};
 
 pub const LAYER_MAGIC: [u8; 4] = *b"ZLYR";
 pub const LAYER_FOOTER_MAGIC: [u8; 4] = *b"ZLYF";
@@ -267,6 +268,7 @@ fn push_block(
     } else {
         (ENC_RAW, raw)
     };
+    note_packed(Packed::Layer, raw.len(), stored.len());
     blocks.push(LayerBlock {
         first_key,
         last_key,

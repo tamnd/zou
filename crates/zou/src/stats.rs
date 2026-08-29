@@ -31,6 +31,12 @@
 //! phase boundaries, and turns into commits per PUT: the store bill
 //! divided by the work done, which is the number group commit exists to
 //! move.
+//!
+//! A last line says what compression bought, per compressor, raw bytes
+//! in and stored bytes out. It is the one term of space amplification
+//! nobody outside the store can measure, because the objects on the
+//! bucket are the compressed ones and a block that did not compress
+//! went out raw with nothing to mark it.
 
 use std::path::Path;
 
@@ -154,6 +160,29 @@ fn brief_lines(snapshot: &Snapshot, commits: u64) -> String {
             commits as f64 / puts as f64
         ));
     }
+    // What compression bought, which is the one term of space
+    // amplification that cannot be measured from outside the store: the
+    // objects on the bucket are the compressed ones and nothing out
+    // there knows what they would have been. Left out when nothing was
+    // compressed, like every other line here.
+    let packed: Vec<String> = snapshot
+        .packed
+        .iter()
+        .filter(|p| p.raw > 0)
+        .map(|p| {
+            format!(
+                "{} {} into {}, {:.2}x",
+                p.kind,
+                bytes(p.raw),
+                bytes(p.stored),
+                p.raw as f64 / p.stored.max(1) as f64
+            )
+        })
+        .collect();
+    if !packed.is_empty() {
+        out.push('\n');
+        out.push_str(&line("packed", packed));
+    }
     out
 }
 
@@ -178,7 +207,7 @@ fn bytes(n: u64) -> String {
 mod tests {
     use super::*;
     use zou_store::stats::{
-        ClassSnapshot, GapSnapshot, OpSnapshot, RetrySnapshot, Snapshot, TierSnapshot,
+        ClassSnapshot, GapSnapshot, OpSnapshot, PackSnapshot, RetrySnapshot, Snapshot, TierSnapshot,
     };
 
     fn snapshot(ops: Vec<OpSnapshot>, reads: Vec<TierSnapshot>) -> Snapshot {
@@ -197,11 +226,16 @@ mod tests {
                 max_bytes: 0,
             },
             retries: Vec::new(),
+            packed: Vec::new(),
         }
     }
 
     fn retry(kind: &'static str, count: u64) -> RetrySnapshot {
         RetrySnapshot { kind, count }
+    }
+
+    fn packed(kind: &'static str, raw: u64, stored: u64) -> PackSnapshot {
+        PackSnapshot { kind, raw, stored }
     }
 
     fn op(name: &'static str, by_class: &[(&'static str, u64, u64)]) -> OpSnapshot {
@@ -307,6 +341,25 @@ mod tests {
         );
         let read_only = snapshot(vec![op("get", &[("page", 900, 7_372_800)])], Vec::new());
         assert!(!brief_lines(&read_only, 430).contains("commits:"));
+    }
+
+    /// Space amplification divides the store by the logical size, and
+    /// the store is the compressed bytes, so what compression bought
+    /// has to be readable next to it. A kind that compressed nothing
+    /// stays off the line rather than reporting 1.00x of zero.
+    #[test]
+    fn packed_says_what_compression_bought() {
+        let mut snap = snapshot(vec![op("put", &[("page", 4, 32_768)])], Vec::new());
+        assert!(!brief_lines(&snap, 0).contains("packed"));
+        snap.packed = vec![
+            packed("layer", 134_217_728, 43_200_000),
+            packed("wal", 0, 0),
+            packed("file", 1024, 1024),
+        ];
+        assert_eq!(
+            brief_lines(&snap, 0).lines().last().expect("a packed line"),
+            "packed: layer 128.0 MiB into 41.2 MiB, 3.11x, file 1.0 KiB into 1.0 KiB, 1.00x"
+        );
     }
 
     #[test]
