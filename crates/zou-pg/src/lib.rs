@@ -376,7 +376,10 @@ fn with_reader<R>(
     unsafe extern "C" {
         fn atexit(cb: extern "C" fn()) -> i32;
     }
-    let mut slot = shim.reader.lock().map_err(|_| ())?;
+    let mut slot = shim
+        .reader
+        .lock()
+        .map_err(|_| log::error!("zou reader lock is poisoned, a backend panicked holding it"))?;
     if matches!(*slot, ReaderSlot::Unset) {
         *slot = if zou_store::setting::flag("ZOU_CHAIN_READER") == Some(false) {
             ReaderSlot::Off
@@ -563,9 +566,21 @@ fn read_marker(
 ) -> Result<Option<ForkSize>, ()> {
     let key = shim.layout.pg_size(spc, db, rel, fork);
     match shim.store.get(&key) {
-        Ok(Some((data, _))) => ForkSize::decode(&data).map(Some).ok_or(()),
+        Ok(Some((data, _))) => match ForkSize::decode(&data) {
+            Some(fs) => Ok(Some(fs)),
+            None => {
+                log::error!(
+                    "zou size marker at {key} does not decode, {} bytes of it",
+                    data.len()
+                );
+                Err(())
+            }
+        },
         Ok(None) => Ok(None),
-        Err(_) => Err(()),
+        Err(e) => {
+            log::error!("zou reading the size marker at {key}: {e}");
+            Err(())
+        }
     }
 }
 
@@ -604,7 +619,7 @@ fn read_size_chained(
     let pending = shim
         .pending
         .lock()
-        .map_err(|_| ())?
+        .map_err(|_| log::error!("zou pending lock is poisoned, a backend panicked holding it"))?
         .size((spc, db, rel, fork));
     if let Some(mut fs) = read_size(shim, spc, db, rel, fork)? {
         if let Some(p) = pending {
@@ -655,7 +670,7 @@ fn put_marker(
     shim.store
         .put(&key, &fs.encode())
         .map(|_| ())
-        .map_err(|_| ())
+        .map_err(|e| log::error!("zou writing the size marker at {key}: {e}"))
 }
 
 /// Grow the marker to `nblocks`, keeping the written watermark that is
