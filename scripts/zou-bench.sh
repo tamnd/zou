@@ -60,6 +60,13 @@
 # Two M1b claims are about that and neither can be answered after the
 # fact: the shim's own footprint, and cpu seconds per thousand
 # transactions against vanilla.
+#
+# And what it would have cost on a bucket, out of those same store
+# counters times a published price card, on the cost line. A tps says
+# which leg was faster and that line says which leg was cheaper, and on
+# object storage the two questions have different answers often enough
+# to be worth printing side by side. ZOU_BENCH_CARD names a different
+# card, `zou cost --list-cards` lists them.
 set -eu
 
 TARGET=$1
@@ -440,6 +447,15 @@ cost() {
     if [ -s "$ZOU_STORE_STATS" ] && [ -s "$MARK" ] && [ -x "$ZOU" ]; then
         "$ZOU" stats "$ZOU_STORE_STATS" --since "$MARK" --brief \
             --commits "${COMMITS:-0}" 2>/dev/null |
+            awk '{print "  " $0}' || true
+        # The same counters priced. The footprint comes out of the
+        # snapshot taken above rather than being walked again, so the
+        # storage line is the store as it stood at the end of the phase
+        # and not as it stands after the next one started.
+        STORED=$(awk -F '\t' '$1 == "fp.store.bytes" { print $2 }' "$RUNDIR/pg-now")
+        "$ZOU" cost "$ZOU_STORE_STATS" --since "$MARK" --brief \
+            --card "${ZOU_BENCH_CARD:-aws-s3-standard}" \
+            --commits "${COMMITS:-0}" ${STORED:+--stored "$STORED"} 2>/dev/null |
             awk '{print "  " $0}' || true
     fi
     WROTE=0

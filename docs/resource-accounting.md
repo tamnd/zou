@@ -40,6 +40,25 @@ It reports what the filesystem holds rather than an apparent size, because a sto
 Compression is counted from inside the store rather than inferred from the footprint, raw bytes handed to the compressor against bytes actually written, kept as two counters per compressor instead of one ratio.
 Two counters because the ratios of two runs cannot be added to each other and a phase here is always a subtraction, and from the inside because a block that does not compress is stored raw with nothing on it to say so, which makes a compression ratio computed from object sizes an assertion rather than a measurement.
 
+Cost is the store counters multiplied by a published price card, and nothing else.
+`zou cost <counter-file> --since <mark> --brief` prints it and `scripts/zou-bench.sh` runs it at every phase boundary with the same counter marks the store line uses, so a phase says what it cost the machine and what it would have cost a bucket on the same two lines.
+There is no model of what a workload might do in it, no per tenant constant, no extrapolated rate: the counts are measured, the prices are published, and the arithmetic between them is a multiplication.
+That is why it is a subcommand and not a spreadsheet, since a spreadsheet's inputs are typed in.
+
+The cards are in `crates/zou/src/cost.rs`, one per storage class per region, each carrying the date it was read and the page it was read from, because a price card without a date is a rumour.
+AWS Standard and Express One Zone come from the price list API rather than the pricing page, which renders its per request figures in javascript and scrapes as headings.
+`zou cost --list-cards` names them, `--card-file` takes your own as json for a region that is not priced here or a card that has gone stale, and an unknown key in one is an error rather than a field quietly ignored, since a typo in a file that decides dollars should not cost seven percent silently.
+
+Two of its choices are worth stating because they both go the direction that makes zou look worse rather than better.
+Egress is off unless `--egress` asks for it, since the reader in every scenario we run is a postgres in the region the bucket is in, where transfer is free, and charging a page read at internet rates would produce a number an order of magnitude high while looking authoritative.
+Retries are counted and not billed, and the line says how many requests went out a second time, because AWS does not charge for a 5xx and the other vendors do not say.
+
+The self hosted MinIO card has no prices in it and refuses to run without `--box <usd per month>` and `--box-tb <usable tb>`.
+A machine has no list price, so a default there would be a made up number sitting in the one command that exists to keep made up numbers out, and the divisor is usable terabytes rather than raw ones because an erasure set gives back rather less than the disks in it.
+
+The four figures M1b asks for come out of the same bill: what the measured window cost, that over the commits in it, that over the GB it ingested, and the monthly storage over the tenants holding it.
+Each is omitted rather than printed as zero when its divisor was not given, since dollars per commit for a run whose commits nobody counted is a division by an assumption.
+
 The logical size those are divided by comes from the planner's page counts and not from `pg_database_size`.
 `pg_database_size` is a walk of the data directory calling stat on segment files, and on the zou legs those files are not there, the pages are on the store, so it answers the size of the catalog: a scale 1 database measured 157 KiB that way, which is about one percent of the truth.
 `relpages` is set by the vacuum and analyze that `pgbench -i` ends with and does not move again while a fixed dataset is being read, and it reads the same way on both legs, which matters more here than exactness.
@@ -54,6 +73,7 @@ Excluded, and why:
 - The kernel page cache. It is the kernel's memory, it is reclaimed under pressure, and a directory store that fits in RAM is being served out of it. Counting it would charge zou for the size of the box.
 - The store's bytes on disk. That is footprint, tracked separately in the disk capture, and adding it to a memory figure would compare a working set with an archive.
 - pgbench itself. It runs on the same box in every leg, so it is a constant that belongs to none of them.
+- Compute, in the cost line. It prices the store and only the store, because the store bill is the part our design decisions move and the box is the part they do not. A total cost of ownership needs both and this is one of them.
 
 The shim's own overhead, which is the line under 256 MB, is the zou tree minus the vanilla tree on the same box, at the same scale, with the same settings, in the same script.
 It is a subtraction and not a reading, because postgres would use most of that memory whether or not the store existed.
@@ -94,6 +114,18 @@ select-only, 4 clients, 25 s: 7206 tps, 0.554 ms average latency
 The peak and the end are both there because they answer different questions.
 A peak that happened in the first second of a phase is a spike to explain, and an end that is well above the peak of the phase before it is a slope, which is what the long soak runs are watching for.
 The sample count is there so a phase too short to be sampled properly is visible as such rather than passing for a quiet one.
+
+The cost line sits under those, and this one is from a `zou probe` rather than a pgbench phase, since it is the smallest real run that touches every op class:
+
+```
+cost: $0.0021 on aws-s3-standard, class A $0.0020, class B $0.0000812, $0.0321 a month held
+per: $0.5241 a million commits, $0.0840 a GB ingested, $0.0321 an idle tenant month
+```
+
+Four hundred and three class A requests and two hundred and three class B, and the class A half is twenty five times the class B half in dollars while being half of it in count.
+That ratio is the whole reason this line exists.
+A read heavy workload on object storage is nearly free and a write heavy one is not, the split between them is a factor of twelve in the price per request before any bytes are counted, and a tps has no way of saying which of the two a leg was doing.
+The same run priced on `aws-s3-express` costs a quarter as much in requests and nearly five times as much a month to hold, which is the trade that card exists to make, and reading both lines is how a scenario picks a storage class rather than inheriting one.
 
 Windows are cut out of one run's samples rather than the sampler being restarted around each phase, so the load phase's peak stays with the load phase.
 The baseline for a window's cpu is the last sample before it, so the second between two phases belongs to one of them instead of to neither.
