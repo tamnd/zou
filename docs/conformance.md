@@ -269,6 +269,12 @@ A chain only holds together if the fixture stays where the case before it left i
 Everything else does get them put back, but only once something has actually written: the harness carries a dirty flag and resets before the next unchained case rather than before every case that follows a write.
 A read that is meant to see what a write left, of which the logout cases are full, says `"chained": true` and sees it.
 
+The PKCE flow cannot be chained at all, because the step between its two requests is a mail.
+A client asks for a link with a challenge on it, the server writes a flow state row and puts the code from that row in the link, and the client comes back with the verifier behind the challenge.
+There is no mailer in front of either target and reading somebody's inbox is not a thing a suite should be doing, so the fixture writes the rows the mail would have left and the cases redeem those.
+That is the one place where the setup file stands in for a request rather than for a starting state, and it is honest because the table is the same table on both sides: it comes from GoTrue's migrations at one end and from zou's bootstrap at the other, with the same columns in both.
+Their `created_at` is also the one value in that fixture that is not a fixed instant, since a flow state is only good for five minutes and a fixed one would leave every row expired before it was asked about.
+
 A case about a missing or malformed token still names a key, so that the apikey goes out and the answer is about the token rather than about the gateway, and the case's own `authorization` header replaces the key's rather than being sent next to it.
 That distinction has to be made here because zou is the gateway as well as the server, and a bare GoTrue has no apikey gate at all.
 

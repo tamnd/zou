@@ -4214,15 +4214,35 @@ pub async fn signup(
         );
     }
     let data = metadata(&body);
-    if !phone.is_empty() {
-        // The channel is judged before the provider is, which is
-        // upstream's order: a request naming a channel nobody carries is
-        // malformed whether or not phone signups are on at all.
-        let post = posting(&app, &wanted, &from);
-        let channel = match channel_of(&body, &post) {
+    let post = posting(&app, &wanted, &from);
+    // The channel is judged before the provider is, which is upstream's
+    // order: a request naming a channel nobody carries is malformed
+    // whether or not phone signups are on at all.
+    let channel = if phone.is_empty() {
+        String::new()
+    } else {
+        match channel_of(&body, &post) {
             Ok(v) => v,
             Err(e) => return refusal(e, "signup"),
-        };
+        }
+    };
+    // A phone signup answers with the session in the body and has nowhere
+    // to redirect anybody to, so there is no code to come back for and a
+    // challenge on one is a client that has confused itself. Upstream
+    // says so before it grades the challenge at all.
+    let challenge = field(&body, "code_challenge");
+    let method = field(&body, "code_challenge_method");
+    if !phone.is_empty() && !challenge.is_empty() {
+        return error_body(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "PKCE not supported for phone signups",
+        );
+    }
+    if let Err(e) = validate_pkce(method, challenge) {
+        return refusal(e, "signup");
+    }
+    if !phone.is_empty() {
         if !app.cfg.phone_enabled {
             return error_body(
                 StatusCode::BAD_REQUEST,
@@ -4243,16 +4263,7 @@ pub async fn signup(
             "Email signups are disabled",
         );
     }
-    match sign_up(
-        pool,
-        email,
-        password,
-        &data,
-        &mint,
-        &posting(&app, &wanted, &from),
-    )
-    .await
-    {
+    match sign_up(pool, email, password, &data, &mint, &post).await {
         Ok(out) => signed_up(out),
         Err(e) => refusal(e, "signup"),
     }
@@ -6225,6 +6236,17 @@ pub async fn recover(
             "Password recovery requires an email",
         );
     }
+    // The address is graded before the challenge is, upstream's order, so
+    // a request that got both wrong hears about the address.
+    if let Err(e) = validate_email(email) {
+        return refusal(e, "recover");
+    }
+    if let Err(e) = validate_pkce(
+        field(&body, "code_challenge_method"),
+        field(&body, "code_challenge"),
+    ) {
+        return refusal(e, "recover");
+    }
     match send_recovery(pool, email, &posting(&app, &wanted, &from)).await {
         Ok(()) => json_body(StatusCode::OK, serde_json::json!({})),
         Err(e) => refusal(e, "recover"),
@@ -6289,6 +6311,15 @@ pub async fn otp(
             "validation_failed",
             "Channel should only be specified with Phone OTP",
         );
+    }
+    // The challenge is graded with the rest of the body, before either
+    // half of the endpoint is chosen, so a phone request carrying one
+    // hears the same refusal an address request would.
+    if let Err(e) = validate_pkce(
+        field(&body, "code_challenge_method"),
+        field(&body, "code_challenge"),
+    ) {
+        return refusal(e, "otp");
     }
     // Upstream asks this before it looks at which of the two was sent,
     // so an address that is refused here is refused whatever else the
@@ -6364,6 +6395,16 @@ async fn magic(
             "validation_failed",
             "Password recovery requires an email",
         );
+    }
+    // Same order as recover: the address first, the challenge after it.
+    if let Err(e) = validate_email(email) {
+        return refusal(e, "magic link");
+    }
+    if let Err(e) = validate_pkce(
+        field(body, "code_challenge_method"),
+        field(body, "code_challenge"),
+    ) {
+        return refusal(e, "magic link");
     }
     let data = metadata(body);
     match send_magic_link(pool, email, &data, mint, post).await {
