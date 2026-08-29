@@ -175,11 +175,13 @@ Adding a case means adding it to `cases.json` and re-running `record`, and the d
 That is a pull request in tamnd/zou-conformance, and then a bump of the pinned commit here, which is the same two steps that pruning a known list takes.
 
 A suite may also carry a `reset.sql`, which the `postgrest` suite does.
-It is applied before every case that writes, so that a case is asked against the rows it was written against rather than against what the twenty cases before it left behind.
+It is applied before a case that something has written in front of, so that a case is asked against the rows it was written against rather than against what the twenty cases before it left behind.
 Upstream gets that for free by rolling every transaction back; here the answers are recorded, so the rows go back the hard way, and identically for both targets.
 
 A case may say `chained`, which means it is asked against what the case before it left rather than against the fixture.
-Almost nothing needs it, and the things that do could not be asked without it: a fixture writes rows, and there is no way to write bytes into the object store behind a reference from SQL, so the only way to ask what a copy of an object does is to upload one and then copy it.
+Some things could not be asked without it: a fixture writes rows, and there is no way to write bytes into the object store behind a reference from SQL, so the only way to ask what a copy of an object does is to upload one and then copy it.
+A read says it too when it is meant to see what a write left, because the rows go back in front of any unchained case once something has written, reading or not.
+That is what makes a chain a chain rather than a list: it has to be contiguous, and an unchained case sitting between a write and the case that depends on it puts the rows back and takes the chain with them.
 The cost is that a chain is order dependent in a way the rest of a suite is not, so a chain should be short, should sit together in the file, and should start with a case that resets like any other.
 
 ## The suite derived from upstream
@@ -205,6 +207,10 @@ PostGIS is gone, because it is not in the Postgres CI runs and the specs that ne
 And two statements are swept up: upstream creates two schemas whose names are made of the characters a URL has opinions about and never drops them, and upstream rewrites a function's OID in `pg_proc` on purpose to build the collision from PostgREST issue 4052, which leaves a `pg_depend` row naming an OID no function has.
 Neither matters upstream, where the fixtures load into a database made a moment earlier.
 Here the same file is applied once per target, so it has to be able to run twice.
+
+Every reading case in this suite says `chained`, which the deriver writes rather than anybody deciding it case by case.
+Upstream never puts the rows back at all, so a read there sees whatever the tests above it left, and a good number of them only mean anything that way: the read after a PUT is asking what the PUT did.
+The rows do go back in front of a case that writes, which is the one thing this harness adds and the reason a write asked here is the same question it was recorded as.
 
 Two of the requests in those files are not understood by the deriver, both in `InsertSpec`, and it says so rather than quietly dropping them.
 
@@ -299,7 +305,8 @@ It does have to open one door to write those rows: the storage schema refuses a 
 
 The object cases are the reason a case can say `chained`.
 An upload has to be read back, and a fixture cannot put the bytes there for it: a fixture writes rows and an object is bytes in a store no SQL statement can reach.
-So the first case uploads, and the ones under it that write say they are asked against what the case before them left rather than against the fixture.
+So the first case uploads, and the ones under it say they are asked against what the case before them left rather than against the fixture, the reads as much as the writes.
+That makes most of a feature block here one sequence rather than a list of independent questions, which is a heavier thing to own than the fixture based suites carry and is the price of asking about bytes at all.
 
 The image transforms are asked about here too, under `/storage/v1/render/image`, and they are the one group whose answers are not compared byte for byte: a case names the dimensions, the format and the header saying what was asked for, and gives up on the digest, because two jpeg encoders at one quality do not agree on a single byte.
 What the object cases do not ask about yet is analytics buckets.

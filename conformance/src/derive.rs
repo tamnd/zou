@@ -275,6 +275,13 @@ fn note(skipped: &[String], guessed: usize) -> Vec<String> {
         "switch and cannot be configured to refuse an aggregate, so a reference with".to_string(),
         "the flag off would be answering a different question. The four cases that".to_string(),
         "ask what the refusal looks like are not here for the same reason: see #555.".to_string(),
+        String::new(),
+        "Every reading case says chained, which is not a decision made case by".to_string(),
+        "case. Upstream never puts the rows back, so a read there sees whatever".to_string(),
+        "the tests above it left, and several of these only mean anything that".to_string(),
+        "way: the read after a PUT is asking what the PUT did. The rows do go".to_string(),
+        "back in front of a case that writes, which is what makes a write asked".to_string(),
+        "here the same question it was recorded as.".to_string(),
     ]
 }
 
@@ -819,6 +826,17 @@ fn request(bytes: &[char], at: usize, method: &str, spec: &Spec, it: &str) -> Re
         body = Some(text);
     }
     let writes = !matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS");
+    // Upstream's suite never puts the rows back. It runs the spec files
+    // in order against one database and a test reads whatever the tests
+    // above it left, so several of them only mean anything there: the
+    // read that checks a PUT landed is a different question against the
+    // fixture than against the row the PUT just wrote. This harness does
+    // put them back in front of a case that writes, which is the one
+    // addition it makes, because a write recorded on one machine and
+    // asked on another has to start from somewhere known. A read starts
+    // from wherever the writes before it got to, which is what a derived
+    // read is chained to and how it was recorded.
+    let chained = !writes;
     Ok(Case {
         name: match it.is_empty() {
             true => format!("{}: {}", spec.feature, path),
@@ -835,7 +853,7 @@ fn request(bytes: &[char], at: usize, method: &str, spec: &Spec, it: &str) -> Re
         bytes: None,
         note: None,
         writes,
-        chained: false,
+        chained,
         holds: std::collections::BTreeMap::new(),
         volatile: Vec::new(),
         sorted: Vec::new(),
