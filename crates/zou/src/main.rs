@@ -20,6 +20,7 @@ mod codegen;
 mod compact;
 #[cfg(unix)]
 mod config;
+mod cost;
 #[cfg(unix)]
 mod db;
 #[cfg(unix)]
@@ -66,6 +67,7 @@ fn usage() -> ExitCode {
     eprintln!("       {}", check::USAGE);
     eprintln!("       {}", codegen::USAGE);
     eprintln!("       {}", compact::USAGE);
+    eprintln!("       {}", cost::USAGE);
     #[cfg(unix)]
     eprintln!("       {}", db::DB_USAGE);
     #[cfg(unix)]
@@ -152,6 +154,7 @@ fn main() -> ExitCode {
         Some("branch") => simple(branch::run(&argv[1..])),
         Some("check") => simple(check::run(&argv[1..])),
         Some("compact") => simple(compact::run(&argv[1..])),
+        Some("cost") => simple(cost::run(&argv[1..])),
         #[cfg(unix)]
         Some("db") => simple(db::run(&argv[1..])),
         #[cfg(unix)]
