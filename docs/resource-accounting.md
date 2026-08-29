@@ -49,6 +49,11 @@ The cards are in `crates/zou/src/cost.rs`, one per storage class per region, eac
 AWS Standard and Express One Zone come from the price list API rather than the pricing page, which renders its per request figures in javascript and scrapes as headings.
 `zou cost --list-cards` names them, `--card-file` takes your own as json for a region that is not priced here or a card that has gone stale, and an unknown key in one is an error rather than a field quietly ignored, since a typo in a file that decides dollars should not cost seven percent silently.
 
+There is one set of cards and not two, and `zou cost --export-cards <dir>` is what keeps it that way.
+The benchmark harness in [tamnd/zou-bench](https://github.com/tamnd/zou-bench) prices its own runs and used to carry its own copy of the same seven cards, which is a copy that drifts from this one the first time a vendor changes a price and only one side reads the page.
+So this side owns them, that side regenerates `pricecards/` from the export, and a card that goes stale goes stale once instead of producing two different dollar figures for the same run.
+What comes out of the export is exactly what `--card-file` reads back, field for field, which is a test rather than an intention.
+
 Two of its choices are worth stating because they both go the direction that makes zou look worse rather than better.
 Egress is off unless `--egress` asks for it, since the reader in every scenario we run is a postgres in the region the bucket is in, where transfer is free, and charging a page read at internet rates would produce a number an order of magnitude high while looking authoritative.
 Retries are counted and not billed, and the line says how many requests went out a second time, because AWS does not charge for a 5xx and the other vendors do not say.
