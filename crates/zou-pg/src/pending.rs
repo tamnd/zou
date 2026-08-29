@@ -207,9 +207,13 @@ pub(crate) fn flush_fork(
 ) -> Result<(), ()> {
     let (spc, db, rel, fk) = fork;
     let ok = for_each_parallel(pages, |(blk, page)| {
-        store
-            .put(&layout.pg_block(spc, db, rel, fk, *blk), page)
-            .is_ok()
+        match store.put(&layout.pg_block(spc, db, rel, fk, *blk), page) {
+            Ok(_) => true,
+            Err(e) => {
+                log::error!("zou draining {spc}/{db}/{rel}.{fk} blk {blk}: {e}");
+                false
+            }
+        }
     });
     if !ok {
         return Err(());
@@ -222,9 +226,21 @@ pub(crate) fn flush_fork(
     if let Some(new_size) = settled {
         let key = layout.pg_size(spc, db, rel, fk);
         let was = match store.get(&key) {
-            Ok(Some((data, _))) => zou_store::forksize::ForkSize::decode(&data).ok_or(())?,
+            Ok(Some((data, _))) => match zou_store::forksize::ForkSize::decode(&data) {
+                Some(fs) => fs,
+                None => {
+                    log::error!(
+                        "zou size marker at {key} does not decode, {} bytes of it",
+                        data.len()
+                    );
+                    return Err(());
+                }
+            },
             Ok(None) => zou_store::forksize::ForkSize::default(),
-            Err(_) => return Err(()),
+            Err(e) => {
+                log::error!("zou draining {spc}/{db}/{rel}.{fk}, reading {key}: {e}");
+                return Err(());
+            }
         };
         let current = was.nblocks;
         let mut marker = was;
@@ -237,7 +253,9 @@ pub(crate) fn flush_fork(
             marker.fill(*blk);
         }
         if marker != was {
-            store.put(&key, &marker.encode()).map_err(|_| ())?;
+            store.put(&key, &marker.encode()).map_err(|e| {
+                log::error!("zou draining {spc}/{db}/{rel}.{fk}, writing {key}: {e}")
+            })?;
         }
         if let Some(cache) = cache {
             cache.save_size(fork, new_size.max(current));
