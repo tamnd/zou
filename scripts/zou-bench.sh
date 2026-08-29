@@ -43,6 +43,11 @@
 # ones that do wait for a round trip, and the average of those two is a
 # number no transaction experienced.
 #
+# It also breaks that latency down statement by statement, so a phase
+# says how much of a transaction was the work and how much was the
+# commit, and the store counters print the same commit wait measured
+# from inside the engine on their durable line.
+#
 # Each phase prints what it occupies as well as what it moved: pgdata,
 # the store broken down into its wal tail, its checkpoints and its
 # layers, the logical size of the database, and how much of that the
@@ -506,7 +511,7 @@ bench() {
     # Word splitting is the point, the flags are a list.
     # shellcheck disable=SC2086
     out=$("$PG"/pgbench -h "$SOCK" -p "$PORT" -c "$CLIENTS" -j "$CLIENTS" \
-        -T "$DURATION" -P "$PROGRESS" $log_flags "$@" postgres 2>&1)
+        -T "$DURATION" -P "$PROGRESS" -r $log_flags "$@" postgres 2>&1)
     printf '%s\n' "$out" >"$RUNDIR/pgbench-$name.log"
     tps=$(printf '%s\n' "$out" | awk '/^tps/ {printf "%.0f", $3}')
     lat=$(printf '%s\n' "$out" | awk '/latency average/ {print $4}')
@@ -532,6 +537,31 @@ bench() {
             if (failed > 0) printf ", %d failed transactions", failed
             printf "\n"
         }'
+    # Where the transaction's time went, statement by statement. This is
+    # the one view that separates the commit from the work in front of
+    # it: the END line is the commit wait as the client saw it, and the
+    # durable line the store counters print is the same wait measured
+    # from inside the engine, so a gap between them is the shim.
+    #
+    # The \set meta commands are dropped. They are client side arithmetic
+    # costing microseconds each and they crowd out the statements.
+    printf '%s\n' "$out" | awk '
+        /^statement latencies/ { on = 1; next }
+        !on { next }
+        {
+            # Postgres 14 and up print a failure count between the
+            # latency and the statement, older ones do not.
+            first = ($2 ~ /^[0-9]+$/) ? 3 : 2
+            if ($first ~ /^\\/) next
+            label = $first
+            # Otherwise every insert in every script reads "INSERT INTO".
+            if (toupper($(first + 1)) == "INTO") label = label " " $(first + 2)
+            else if (NF >= first + 1) label = label " " $(first + 1)
+            gsub(/[;,]$/, "", label)
+            parts = parts sep label " " $1 " ms"
+            sep = ", "
+        }
+        END { if (parts != "") printf "  per statement: %s\n", parts }'
     # What it cost to get the connections, which on a cold store is the
     # first thing a client sees and is not in the tps.
     printf '%s\n' "$out" | awk -v clients="$CLIENTS" '
