@@ -482,6 +482,16 @@ pub(crate) async fn send_phone_code(
     // The same for text messages, before the code is drawn, because a
     // code drawn and not sent is a code the account is left holding.
     post.limits.sms_sent(post.sms.autoconfirm)?;
+    if let Some(fixed) = post.sms.test_code(out.to, now()) {
+        // A number with a code decided in advance. It is written down
+        // like any other so verify is the same query, and nothing
+        // leaves: the point of the list is a flow that works on a
+        // machine with no provider and no phone. Upstream puts this
+        // ahead of the Twilio Verify branch too, so a project with the
+        // list and that provider still gets the code it wrote.
+        mint_fixed(sess, user_id, out.to, token_type, fixed).await?;
+        return Ok(String::new());
+    }
     let code = match post.texter.verifies() {
         // Twilio Verify holds the code, so there is none to draw here
         // and none to write down. Everything else about the flow is
@@ -1925,8 +1935,22 @@ async fn mint_digits(
     token_type: &str,
     digits: usize,
 ) -> Result<Code, sql::Error> {
+    mint_fixed(sess, user_id, to, token_type, &code_of(digits)).await
+}
+
+/// The same over a code that was decided somewhere else, which is what
+/// a number on the test list gets. Everything after the draw is the
+/// draw's, so the row a fixed code leaves behind and the row a drawn
+/// one leaves behind are the same row.
+async fn mint_fixed(
+    sess: &sql::Session,
+    user_id: &str,
+    to: &str,
+    token_type: &str,
+    code: &str,
+) -> Result<Code, sql::Error> {
     let (column, sent) = columns_for(token_type);
-    let code = code_of(digits);
+    let code = code.to_string();
     let hashed = token_hash(to, &code);
     sess.execute(
         &format!(

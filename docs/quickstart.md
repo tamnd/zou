@@ -216,6 +216,13 @@ WhatsApp is Twilio's alone, through `ZOU_SMS_TWILIO_CONTENT_SID`, and asking any
 
 What the message says and how long a code is good for are settings of their own, GoTrue's names again. `ZOU_SMS_TEMPLATE` takes one variable, `{{ .Code }}`, and defaults to `Your code is {{ .Code }}`. `ZOU_SMS_OTP_LENGTH` is six digits and will not go under six or over ten. `ZOU_SMS_OTP_EXP` is sixty seconds. `ZOU_SMS_MAX_FREQUENCY` is how long an account waits before it may ask for another code, also sixty seconds, and it reads either a number of seconds or a Go duration like `1m0s` so a hosted project's own value works unchanged. `ZOU_SMS_AUTOCONFIRM=true` takes a number at its word the way `ZOU_MAILER_AUTOCONFIRM` takes an address, which is what a project wants while it is still being written.
 
+`ZOU_SMS_TEST_OTP` is the way to drive the whole flow with no provider and no phone, and it is upstream's: a comma separated list of `phone:code`, so `ZOU_SMS_TEST_OTP=15550100000:313370` means that number is never texted and its code is always those six digits. The code is written down the same way a drawn one is, hashed against the number, so verify does not know the difference. `ZOU_SMS_TEST_OTP_VALID_UNTIL` is when the list stops counting, either RFC 3339 in UTC or seconds since the epoch, after which the numbers in it draw and are texted like any other. A fixed code in a project that is live is a way in, and the date is how a project that put one there for an afternoon says so rather than remembering to take it out. In a `config.toml` the two of them are the table the CLI already has:
+
+```toml
+[auth.sms.test_otp]
+15550100000 = "313370"
+```
+
 A number is held in E.164 with the plus taken off, so somebody who typed `+1 555 010 0000` and somebody who typed `15550100000` are one account. Changing a number through `updateUser({ phone })` stages it and texts the new one, and the account keeps the old number until that code comes back with `type: 'phone_change'`.
 
 ## What the emails say

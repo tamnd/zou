@@ -1897,3 +1897,120 @@ async fn a_provider_that_keeps_its_own_codes_answers_the_reauthentication_nonce_
     .await;
     assert_eq!(signed.status, StatusCode::OK, "{}", signed.body);
 }
+
+/// A project with a number whose code is written down. The list is the
+/// only thing different about it, so anything this test sees is the
+/// list rather than the configuration around it.
+fn app_with_fixed_codes(dsn: &str, pairs: &[(&str, &str)], until: Option<i64>) -> axum::Router {
+    router(Config {
+        sms: sms::Settings {
+            max_frequency: 0,
+            test_otp: pairs
+                .iter()
+                .map(|(phone, code)| ((*phone).to_string(), (*code).to_string()))
+                .collect(),
+            test_otp_valid_until: until,
+            ..sms::Settings::default()
+        },
+        ..base(dsn)
+    })
+    .expect("router builds")
+}
+
+#[tokio::test]
+async fn a_number_on_the_test_list_is_never_texted_and_the_written_code_verifies_it() {
+    let Some(dsn) = dsn() else { return };
+    let phone = number(31);
+    let app = app_with_fixed_codes(&dsn, &[(&phone, "313370")], None);
+    let pool = pool(&dsn).await;
+    wipe(&pool, &phone).await;
+
+    let up = post(
+        &app,
+        "/auth/v1/signup",
+        serde_json::json!({"phone": &phone, "password": "correct horse"}),
+    )
+    .await;
+    assert_eq!(up.status, StatusCode::OK, "{}", up.body);
+    assert!(
+        texts(&app).await.is_empty(),
+        "a number with a code already decided has nothing to send"
+    );
+
+    // Nothing is planted here. The code is the one the list says and
+    // the row was written by the signup, so this passing means the two
+    // agree about what was hashed against the number.
+    let done = post(
+        &app,
+        "/auth/v1/verify",
+        serde_json::json!({"type": "sms", "phone": &phone, "token": "313370"}),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+    assert!(!done.token().is_empty());
+    let confirmed: bool = scalar(
+        &pool,
+        "select phone_confirmed_at is not null from auth.users where phone = $1",
+        &[&phone],
+    )
+    .await;
+    assert!(confirmed, "and the number is proved like any other");
+
+    // The list decides one number and says nothing about the rest of
+    // the project, which is the property that makes it safe to leave in
+    // a config file somebody is still working on.
+    let other = number(32);
+    wipe(&pool, &other).await;
+    let up = post(
+        &app,
+        "/auth/v1/signup",
+        serde_json::json!({"phone": &other, "password": "correct horse"}),
+    )
+    .await;
+    assert_eq!(up.status, StatusCode::OK, "{}", up.body);
+    let text = only_text(&app).await;
+    assert_eq!(text.to(), other);
+    assert_ne!(text.code(), "313370");
+}
+
+#[tokio::test]
+async fn a_list_that_has_run_out_draws_and_texts_like_nothing_was_written() {
+    let Some(dsn) = dsn() else { return };
+    let phone = number(33);
+    // The same list, expired an hour ago. A fixed code in a project
+    // that is live is a way in, and this is how a project that put one
+    // there for an afternoon says so.
+    let past = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs() as i64
+        - 3_600;
+    let app = app_with_fixed_codes(&dsn, &[(&phone, "313370")], Some(past));
+    let pool = pool(&dsn).await;
+    wipe(&pool, &phone).await;
+
+    let up = post(
+        &app,
+        "/auth/v1/signup",
+        serde_json::json!({"phone": &phone, "password": "correct horse"}),
+    )
+    .await;
+    assert_eq!(up.status, StatusCode::OK, "{}", up.body);
+    let text = only_text(&app).await;
+    assert_ne!(text.code(), "313370", "{}", text.body());
+
+    let refused = post(
+        &app,
+        "/auth/v1/verify",
+        serde_json::json!({"type": "sms", "phone": &phone, "token": "313370"}),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
+    let done = post(
+        &app,
+        "/auth/v1/verify",
+        serde_json::json!({"type": "sms", "phone": &phone, "token": text.code()}),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+}
