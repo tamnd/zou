@@ -3681,6 +3681,27 @@ pub(crate) async fn held_by_another(
     Ok(!rows.is_empty())
 }
 
+/// Whether the number belongs to somebody else already, in any
+/// audience. The one above asks within the audience a signup happens in,
+/// which is the right question there and the wrong one for an operator:
+/// the column is unique across the table, so a number held under another
+/// audience is a collision the insert would raise rather than a refusal
+/// the caller could read.
+pub(crate) async fn phone_taken(
+    sess: &sql::Session,
+    phone: &str,
+    user_id: &str,
+) -> Result<bool, sql::Error> {
+    let rows = sess
+        .query(
+            "select 1 from auth.users
+              where phone = $1 and id <> $2::text::uuid and deleted_at is null limit 1",
+            &[&phone, &user_id],
+        )
+        .await?;
+    Ok(!rows.is_empty())
+}
+
 /// Whether the address belongs to somebody else already.
 pub(crate) async fn taken(
     sess: &sql::Session,

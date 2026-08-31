@@ -935,7 +935,7 @@ async fn create(
         true => String::new(),
         false => crate::auth::validate_phone(phone)?,
     };
-    if !phone.is_empty() && crate::auth::held_by_another(sess, &phone, NOBODY).await? {
+    if !phone.is_empty() && crate::auth::phone_taken(sess, &phone, NOBODY).await? {
         return Err(refused(
             StatusCode::UNPROCESSABLE_ENTITY,
             "phone_exists",
