@@ -185,10 +185,23 @@ load_stop() {
 say "soak target $TARGET for ${SOAK_SECONDS}s, work dir $WORK"
 start_dev
 next_id=1
-for _ in $(seq 1 240); do
-	if q "select 1" >/dev/null 2>&1; then break; fi
+# A fresh store runs initdb and captures a genesis checkpoint before the
+# postmaster takes a connection, and against an object store that is
+# minutes rather than seconds. Four minutes was not enough for a fresh
+# bucket on server2, which spent eight, and the loop said nothing when
+# it ran out: the run fell through into the next query and died there
+# under set -e on a connection refused that read like a crashed node
+# rather than a soak that never started. Wait as long as wait_writable
+# is allowed to, and say which log to read when it does run out.
+ready=0
+for _ in $(seq 1 1800); do
+	if q "select 1" >/dev/null 2>&1; then ready=1; break; fi
 	sleep 1
 done
+if [ "$ready" -eq 0 ]; then
+	say "the postmaster never took a connection on $PORT, see $DEVLOG"
+	exit 1
+fi
 q "create table if not exists ledger(id bigint primary key)"
 q "create table if not exists probe(x int)"
 wait_writable
