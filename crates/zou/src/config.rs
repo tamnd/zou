@@ -603,6 +603,29 @@ impl Project {
                 read.push(key);
             }
         }
+        // Numbers whose code is written in the file rather than texted.
+        // The CLI holds them as a table keyed by the number, and the
+        // server takes upstream's one line, so this is where the one
+        // becomes the other.
+        let prefix = "auth.sms.test_otp.";
+        let mut fixed: Vec<String> = Vec::new();
+        for (key, value) in table.range(prefix.to_string()..) {
+            let Some(phone) = key.strip_prefix(prefix) else {
+                break;
+            };
+            let code = match value {
+                Value::Int(i) => i.to_string(),
+                _ => value.as_str().map(str::to_string).unwrap_or_default(),
+            };
+            if code.is_empty() {
+                continue;
+            }
+            read.push(key.clone());
+            fixed.push(format!("{phone}:{code}"));
+        }
+        if !fixed.is_empty() {
+            env.push(("ZOU_SMS_TEST_OTP".into(), fixed.join(",")));
+        }
         // Social providers are whatever the file names, so a provider
         // added upstream arrives here without a code change, as long as
         // this server knows how to talk to it.
@@ -877,6 +900,10 @@ enabled = true
 account_sid = "AC123"
 auth_token = "env(TWILIO_TOKEN)"
 
+[auth.sms.test_otp]
+15550100 = "123456"
+447700900123 = 654321
+
 [auth.mfa]
 max_enrolled_factors = 7
 
@@ -1135,6 +1162,32 @@ static_files = ["./functions/other/index.html"]
             env_of(&p, "ZOU_EXTERNAL_GITHUB_CLIENT_ID").as_deref(),
             Some("gh-client")
         );
+    }
+
+    #[test]
+    fn the_numbers_with_a_code_written_down_become_one_line() {
+        let p = project();
+        // The CLI keeps them as a table and the server takes upstream's
+        // list, so the two of them meet here. A code written as a
+        // number rather than as a string is the same code: nobody
+        // quotes six digits on purpose.
+        assert_eq!(
+            env_of(&p, "ZOU_SMS_TEST_OTP").as_deref(),
+            Some("15550100:123456,447700900123:654321")
+        );
+        assert!(
+            !p.unread.iter().any(|k| k.starts_with("auth.sms.test_otp")),
+            "and the file does not look half read, {:?}",
+            p.unread
+        );
+    }
+
+    #[test]
+    fn a_project_with_no_test_numbers_says_nothing_about_them() {
+        let mut t = table();
+        t.retain(|k, _| !k.starts_with("auth.sms.test_otp"));
+        let p = Project::from_table(&t, &|_| None);
+        assert_eq!(env_of(&p, "ZOU_SMS_TEST_OTP"), None);
     }
 
     #[test]

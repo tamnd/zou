@@ -22,7 +22,7 @@
 //! answers [`Sender::verifies`] and the phone flows ask it about a code
 //! instead of comparing a column.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 /// The two channels a message can go out on. GoTrue's names, which are
@@ -50,6 +50,24 @@ pub struct Settings {
     /// where it stands, which is what a project without a provider
     /// wants and what the mail side calls mailer_autoconfirm.
     pub autoconfirm: bool,
+    /// GOTRUE_SMS_TEST_OTP, numbers whose code is decided in advance.
+    /// A number in here is never texted and always gets the code next
+    /// to it, so a sign in by phone can be driven end to end by
+    /// something that has no phone: a test, a CI run, a demo.
+    ///
+    /// The code is written down the same way a drawn one is, hashed
+    /// against the number, so verify does not know the difference and
+    /// nothing about the flow is special cased past the draw.
+    pub test_otp: BTreeMap<String, String>,
+    /// GOTRUE_SMS_TEST_OTP_VALID_UNTIL, seconds since the epoch, after
+    /// which the fixed codes are ignored and the numbers holding them
+    /// draw and are texted like any other. Absent is upstream's zero
+    /// time, which means they never stop.
+    ///
+    /// It exists because a fixed code in a project that is live is a
+    /// way in, and a project that put one there for an afternoon
+    /// should be able to say so rather than remember to take it out.
+    pub test_otp_valid_until: Option<i64>,
 }
 
 impl Default for Settings {
@@ -60,6 +78,8 @@ impl Default for Settings {
             otp_exp: 60,
             max_frequency: 60,
             autoconfirm: false,
+            test_otp: BTreeMap::new(),
+            test_otp_valid_until: None,
         }
     }
 }
@@ -73,6 +93,20 @@ impl Settings {
             false => &self.template,
         };
         render(template, code)
+    }
+
+    /// The code this number was given in advance, when it has one and
+    /// the list has not run out. The number is matched in the form
+    /// everything here holds, so a list written with the plus on and a
+    /// request that sent it without still find each other.
+    pub fn test_code(&self, phone: &str, now: i64) -> Option<&str> {
+        if self.test_otp.is_empty() {
+            return None;
+        }
+        if self.test_otp_valid_until.is_some_and(|until| now >= until) {
+            return None;
+        }
+        self.test_otp.get(&strip(phone)).map(String::as_str)
     }
 
     /// How many digits a code has. Upstream refuses to go under six or
@@ -1012,7 +1046,70 @@ pub fn settings(var: &dyn Fn(&str) -> String) -> Result<Settings, String> {
         otp_exp: crate::limit::seconds(var, "ZOU_SMS_OTP_EXP", stock.otp_exp as u64)? as i64,
         max_frequency: crate::limit::seconds(var, "ZOU_SMS_MAX_FREQUENCY", stock.max_frequency)?,
         autoconfirm: switch(var, "ZOU_SMS_AUTOCONFIRM", stock.autoconfirm)?,
+        test_otp: fixed_codes(&var("ZOU_SMS_TEST_OTP"))?,
+        test_otp_valid_until: until(&var("ZOU_SMS_TEST_OTP_VALID_UNTIL"))?,
     })
+}
+
+/// Upstream's `phone:code` list, comma separated. A pair without a
+/// colon in it is refused rather than skipped, because a list of test
+/// numbers with one of them silently missing is a flow that fails in
+/// the one place nobody is looking.
+fn fixed_codes(raw: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((phone, code)) = pair.split_once(':') else {
+            return Err(format!(
+                "ZOU_SMS_TEST_OTP has {pair:?} in it, which is not a phone and a code"
+            ));
+        };
+        let (phone, code) = (strip(phone.trim()), code.trim());
+        if phone.is_empty() || code.is_empty() {
+            return Err(format!(
+                "ZOU_SMS_TEST_OTP has {pair:?} in it, which is missing one of the two"
+            ));
+        }
+        out.insert(phone, code.to_string());
+    }
+    Ok(out)
+}
+
+/// RFC 3339 in UTC, which is what Go marshals the field as and so what
+/// a project moving across has written down. Seconds since the epoch
+/// are read too, since that is what somebody setting it by hand from a
+/// shell has to hand.
+fn until(raw: &str) -> Result<Option<i64>, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(seconds) = text.parse::<i64>() {
+        return Ok(Some(seconds));
+    }
+    let bad = || format!("ZOU_SMS_TEST_OTP_VALID_UNTIL is {text:?}, which is not a time in UTC");
+    let (date, rest) = text.split_once('T').ok_or_else(bad)?;
+    let clock = rest
+        .strip_suffix('Z')
+        .or_else(|| rest.strip_suffix("+00:00"))
+        .ok_or_else(bad)?;
+    let clock = clock.split_once('.').map(|(head, _)| head).unwrap_or(clock);
+    let date: Vec<&str> = date.split('-').collect();
+    let clock: Vec<&str> = clock.split(':').collect();
+    if date.len() != 3 || clock.len() != 3 {
+        return Err(bad());
+    }
+    let mut parts = [0i64; 6];
+    for (at, field) in date.iter().chain(clock.iter()).enumerate() {
+        parts[at] = field.parse().map_err(|_| bad())?;
+    }
+    let days = crate::object::days_from_civil(parts[0], parts[1], parts[2]);
+    Ok(Some(
+        days * 86_400 + parts[3] * 3_600 + parts[4] * 60 + parts[5],
+    ))
 }
 
 /// A whole number, refused rather than defaulted when it is not one.
@@ -1667,5 +1764,48 @@ mod tests {
         assert!(env(&[("ZOU_SMS_OTP_LENGTH", "six")]).is_err());
         assert!(env(&[("ZOU_SMS_MAX_FREQUENCY", "1 minute")]).is_err());
         assert!(env(&[("ZOU_SMS_AUTOCONFIRM", "yes")]).is_err());
+    }
+
+    #[test]
+    fn a_number_on_the_list_gets_the_code_next_to_it() {
+        let mut set = Settings {
+            test_otp: fixed_codes("+1 555 0100:123456, 447700900123:654321")
+                .expect("a list of two"),
+            ..Settings::default()
+        };
+        // Written with a plus and spaces, asked without either, because
+        // that is the form the column and the request both hold.
+        assert_eq!(set.test_code("15550100", 0), Some("123456"));
+        assert_eq!(set.test_code("447700900123", 0), Some("654321"));
+        assert_eq!(set.test_code("15550101", 0), None);
+
+        // A list with a date on it stops being one when the date goes
+        // past, and the numbers in it draw and are texted again.
+        set.test_otp_valid_until = until("2026-01-02T03:04:05Z").expect("a time");
+        assert_eq!(set.test_otp_valid_until, Some(1_767_323_045));
+        assert_eq!(set.test_code("15550100", 1_767_323_044), Some("123456"));
+        assert_eq!(set.test_code("15550100", 1_767_323_045), None);
+
+        assert_eq!(Settings::default().test_code("15550100", 0), None);
+    }
+
+    #[test]
+    fn a_list_that_says_nothing_usable_is_refused() {
+        assert!(fixed_codes("15550100").is_err());
+        assert!(fixed_codes("15550100:").is_err());
+        assert!(fixed_codes(":123456").is_err());
+        assert!(
+            fixed_codes("")
+                .expect("nothing set is not a list")
+                .is_empty()
+        );
+        assert!(until("").expect("nor is no date").is_none());
+        assert!(until("yesterday").is_err());
+        assert!(until("2026-01-02").is_err());
+        // Both of the shapes a project has this written down in: what
+        // Go marshalled, and what a shell has to hand.
+        assert_eq!(until("2026-01-02T03:04:05.500Z"), Ok(Some(1_767_323_045)));
+        assert_eq!(until("2026-01-02T03:04:05+00:00"), Ok(Some(1_767_323_045)));
+        assert_eq!(until("1767323045"), Ok(Some(1_767_323_045)));
     }
 }
