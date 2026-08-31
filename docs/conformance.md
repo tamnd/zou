@@ -284,6 +284,39 @@ Their `created_at` is also the one value in that fixture that is not a fixed ins
 A case about a missing or malformed token still names a key, so that the apikey goes out and the answer is about the token rather than about the gateway, and the case's own `authorization` header replaces the key's rather than being sent next to it.
 That distinction has to be made here because zou is the gateway as well as the server, and a bare GoTrue has no apikey gate at all.
 
+## The suite with one setting changed
+
+Anonymous sign in is off in a project that has changed nothing, so in the suite above a signup with no identifier is a refusal, and that refusal is a case in it.
+Everything past the refusal needs the setting on, a setting is a property of a server rather than of a request, and a suite is asked against one server.
+Turning it on in place would have deleted the refusal case and changed what `/settings` answers for every case in the file.
+So the flow behind the refusal is the `auth-anon` suite, recorded from a second reference that is the same binary in the same configuration with one line added and a database of its own.
+
+```
+GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED=true
+```
+
+```
+cargo run -p zou-conformance -- diff --suite auth-anon \
+  --suites /tmp/zou-conformance/suites \
+  --zou-dsn postgresql://postgres@127.0.0.1:5432/postgres \
+  --reference-url http://127.0.0.1:54341 \
+  --reference-dsn postgresql://postgres@127.0.0.1:5432/gotrue_anon \
+  --reference-strip-prefix /auth/v1
+```
+
+zou is told the same thing by `"anonymous_users": true` in the suite's own `cases.json`, which the harness reads and starts the node with, so that neither side is answering a question the other was not asked.
+That flag travels with the schema list and the anonymous role in a `Shape`, because all three arrive out of the same file and a bare `true` at the end of an argument list says nothing at the call site about which one it is.
+Serving a suite over somebody else's client has no `cases.json` to read, since all that client is handed is a url, so `serve` takes the same thing as `--anonymous-users` on the command line.
+
+Nothing is seeded here.
+What makes an account anonymous is the session it was handed at the moment it was made, which is not a thing a fixture can write, so `setup.sql` empties the tables and stops.
+That makes the suite one chain: the signup at the top holds its own tokens, and the cases under it spend them, which is the only way from outside to ask what the token endpoints say about an account nobody vouched for.
+The claim itself is never read off a token, because a JWT is redacted to `<jwt>` before anything is compared, so every case asks the user object each endpoint answers with instead.
+
+The case in the middle is the conversion.
+An anonymous account puts an address on itself and keeps its id, which is the whole point of signing in without a name first, since whatever rows a policy wrote for that id are still that person's afterwards.
+The refresh after it is the case the whole suite is for: a policy that lets guests read and members write reads the claim off the token, and it has to stop being true the moment the account stops being one.
+
 ## The suite recorded from an image
 
 The `storage` suite comes in three parts, the bucket endpoints, the object ones and the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
@@ -646,9 +679,14 @@ A count in a sentence is a count somebody has to remember to change, and the who
 
 What belongs here is what the scoreboard cannot say, which is why a number is what it is.
 
-The `auth` suite is the only one of the recorded four that does not pass in full, and the difference is deliberate in every case.
+The two auth suites are the only recorded ones that do not pass in full, and the difference is deliberate in every case.
 zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, it publishes a signing key where upstream publishes an empty set because a project on zou signs its access tokens with a key derived from its own secret, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
-Each of the four is written out in `known.json` with the reason next to it, and each is still counted as a failure on the scoreboard, so the number there cannot be improved by writing something down.
+Each of them is written out in `known.json` with the reason next to it, and each is still counted as a failure on the scoreboard, so the number there cannot be improved by writing something down.
+
+`auth-anon` carries two, and one of them is the settings answer above, asked again of the server with the setting on.
+The other is the conversion: zou reports `confirmed_at` on the answer to the request that set it, and upstream leaves it out there and reports it on every answer after.
+It is a generated column, the earlier of the two confirmation times, and upstream answers off the struct it loaded before the update rather than off the row it wrote.
+Matching that would mean reporting an account as unconfirmed one request after confirming it, which is bug compatibility with nothing behind it, so it is written down instead.
 
 The `postgrest` suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, and what it took to get there is written down in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125).
 
@@ -667,6 +705,7 @@ Rendering it from a fresh run would publish a number nobody had failed a build o
 cargo run -p zou-conformance -- scoreboard \
   --report /tmp/reports/conformance.json \
   --report /tmp/reports/auth.json \
+  --report /tmp/reports/auth-anon.json \
   --report /tmp/reports/storage.json \
   --js supabase-js=/tmp/reports/js.json \
   --js storage-js=/tmp/reports/js-storage.json \

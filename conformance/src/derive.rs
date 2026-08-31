@@ -212,6 +212,9 @@ pub fn derive(from: &Path, suite: &str) -> Result<Derived, String> {
             note: note(&skipped, guessed),
             schemas: vec!["test".to_string()],
             anon_role: "postgrest_test_anonymous".to_string(),
+            // Nothing derived from PostgREST's spec files signs anybody
+            // in at all, let alone without a name.
+            anonymous_users: false,
             // Upstream's fixtures pin every row down, so nothing a
             // derived case reads moves and there is nobody to sign a
             // token for.

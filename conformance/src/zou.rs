@@ -109,12 +109,33 @@ pub fn user_key_shifted(
     Ok(jwt::mint(&claims, secret.as_bytes()))
 }
 
-/// Start zou against `dsn` on a free port and wait until it answers.
+/// What a suite needs the project configured as, over and above the
+/// database it is pointed at.
 ///
-/// `schemas` and `anon` come from the suite, because a suite derived
-/// from upstream's fixtures keeps its tables where upstream keeps them
-/// and calls its unauthenticated role what upstream calls it, and the
-/// reference is configured to match both.
+/// Every field here is something the reference was configured with when
+/// the suite was recorded, so a target told anything else would be
+/// answering a different question. They travel together because they
+/// arrive together, out of the suite's own `cases.json`, and because a
+/// bare `true` at the end of an argument list says nothing at the call
+/// site about which flag it is.
+pub struct Shape<'a> {
+    /// Where a suite keeps its tables, first one first, since the first
+    /// is the one a request that names no schema gets. A suite derived
+    /// from upstream's fixtures keeps them where upstream keeps them.
+    pub schemas: &'a [String],
+    /// What a suite calls its unauthenticated role, which is upstream's
+    /// name for it in a suite derived from upstream's fixtures.
+    pub anon_role: &'a str,
+    /// Whether the project this suite is asked as lets somebody sign in
+    /// without saying who they are. Off in every suite but the one that
+    /// is about it, because it is off in a Supabase project that has
+    /// changed nothing, and a signup with no identifier is read as an
+    /// anonymous one either way: with the flag off that is a refusal,
+    /// and the refusal is a case in the auth suite already.
+    pub anonymous_users: bool,
+}
+
+/// Start zou against `dsn` on a free port and wait until it answers.
 ///
 /// `s3` is the pair the S3 surface is asked with. It is the one piece
 /// of configuration that is not derived from the secret: a signature is
@@ -123,11 +144,10 @@ pub fn user_key_shifted(
 pub fn start(
     dsn: &str,
     secret: &[u8],
-    schemas: &[String],
-    anon: &str,
+    shape: Shape<'_>,
     s3: Credentials,
 ) -> Result<Served, String> {
-    start_at(0, dsn, None, secret, schemas, anon, s3)
+    start_at(0, dsn, None, secret, shape, s3)
 }
 
 /// The same, on a port somebody has to know in advance.
@@ -146,8 +166,7 @@ pub fn start_at(
     dsn: &str,
     holder: Option<&str>,
     secret: &[u8],
-    schemas: &[String],
-    anon: &str,
+    shape: Shape<'_>,
     s3: Credentials,
 ) -> Result<Served, String> {
     // Bound here rather than inside the thread, so a port that cannot
@@ -187,8 +206,9 @@ pub fn start_at(
         // What the reference is configured with, in the same order,
         // since the first is the one a request that names no schema
         // gets.
-        schemas: schemas.to_vec(),
-        anon_role: anon.to_string(),
+        schemas: shape.schemas.to_vec(),
+        anon_role: shape.anon_role.to_string(),
+        anonymous_users: shape.anonymous_users,
         mailer_autoconfirm: true,
         // Somewhere to put object bytes, under the port it answers on
         // so that two runs on one machine cannot read each other's.
