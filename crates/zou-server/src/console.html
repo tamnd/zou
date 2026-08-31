@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>zou console</title>
+<style>
+:root {
+  --bg: #101418; --panel: #161c22; --line: #232c35; --text: #d7dee6;
+  --dim: #7d8b99; --accent: #4fb3a5; --bad: #e0674f; --font: ui-monospace,
+  SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; height: 100vh; display: flex; flex-direction: column;
+  background: var(--bg); color: var(--text); font: 13px/1.5 var(--font);
+}
+header {
+  display: flex; align-items: center; gap: 12px; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); background: var(--panel);
+}
+header b { color: var(--accent); font-weight: 600; }
+header input {
+  flex: 1; min-width: 0; padding: 5px 8px; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 3px; color: var(--text);
+  font: inherit;
+}
+button {
+  padding: 5px 12px; background: var(--line); color: var(--text);
+  border: 1px solid var(--line); border-radius: 3px; font: inherit;
+  cursor: pointer;
+}
+button:hover { border-color: var(--accent); }
+button[disabled] { opacity: .5; cursor: default; border-color: var(--line); }
+main { flex: 1; display: flex; min-height: 0; }
+nav {
+  width: 260px; flex: none; overflow: auto; padding: 8px 0;
+  border-right: 1px solid var(--line); background: var(--panel);
+}
+nav h2 {
+  margin: 10px 0 2px; padding: 0 12px; font-size: 11px; font-weight: 600;
+  letter-spacing: .08em; text-transform: uppercase; color: var(--dim);
+}
+nav button {
+  display: block; width: 100%; padding: 2px 12px 2px 22px;
+  background: none; border: 0; border-radius: 0; color: var(--text);
+  text-align: left; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+nav button:hover { background: var(--line); }
+nav button:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+nav button span { color: var(--dim); }
+section { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+textarea {
+  height: 30%; min-height: 90px; resize: vertical; padding: 10px 12px;
+  background: var(--bg); color: var(--text); border: 0;
+  border-bottom: 1px solid var(--line); font: inherit; outline: none;
+}
+#bar {
+  display: flex; align-items: center; gap: 12px; padding: 6px 12px;
+  border-bottom: 1px solid var(--line); color: var(--dim);
+}
+#out { flex: 1; overflow: auto; padding: 0 0 40px; }
+table { border-collapse: collapse; width: 100%; }
+th, td {
+  padding: 3px 10px; text-align: left; border-bottom: 1px solid var(--line);
+  white-space: pre; max-width: 460px; overflow: hidden;
+  text-overflow: ellipsis;
+}
+th {
+  position: sticky; top: 0; background: var(--panel); color: var(--dim);
+  font-weight: 600;
+}
+td.null { color: var(--dim); font-style: italic; }
+p.tag { margin: 8px 12px; color: var(--dim); }
+pre.bad {
+  margin: 12px; padding: 10px 12px; border-left: 3px solid var(--bad);
+  background: var(--panel); color: var(--bad); white-space: pre-wrap;
+}
+</style>
+</head>
+<body>
+<header>
+  <b>zou</b>
+  <input id="key" type="password" spellcheck="false"
+         placeholder="service role key" autocomplete="off">
+  <button id="connect">connect</button>
+  <button id="run" disabled>run</button>
+</header>
+<main>
+  <nav id="tree"></nav>
+  <section>
+    <textarea id="sql" spellcheck="false"
+              placeholder="select * from ..."></textarea>
+    <div id="bar"></div>
+    <div id="out"></div>
+  </section>
+</main>
+<script>
+"use strict";
+var tree = document.getElementById("tree");
+var out = document.getElementById("out");
+var bar = document.getElementById("bar");
+var sql = document.getElementById("sql");
+var keyBox = document.getElementById("key");
+var runBtn = document.getElementById("run");
+
+// The key lives in this tab and nowhere else. sessionStorage rather
+// than localStorage, so closing the tab is logging out, and a second
+// project opened in a second tab does not inherit the first one's key.
+keyBox.value = sessionStorage.getItem("zou.key") || "";
+
+function ask(path, body) {
+  return fetch(path, {
+    method: body ? "POST" : "GET",
+    headers: {
+      "authorization": "Bearer " + keyBox.value,
+      "content-type": "application/json"
+    },
+    body: body ? JSON.stringify(body) : undefined
+  }).then(function (r) {
+    return r.json().then(function (j) { return { status: r.status, body: j }; });
+  });
+}
+
+function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+function el(name, text, cls) {
+  var n = document.createElement(name);
+  if (text !== undefined && text !== null) n.textContent = text;
+  if (cls) n.className = cls;
+  return n;
+}
+
+function complain(text) {
+  clear(out);
+  out.appendChild(el("pre", text, "bad"));
+}
+
+function connect() {
+  sessionStorage.setItem("zou.key", keyBox.value);
+  clear(tree);
+  bar.textContent = "reading the catalog";
+  ask("/_zou/api/catalog").then(function (answer) {
+    if (answer.status !== 200) {
+      bar.textContent = "";
+      runBtn.disabled = true;
+      complain(answer.body.error || ("HTTP " + answer.status));
+      return;
+    }
+    runBtn.disabled = false;
+    bar.textContent = "";
+    draw(answer.body.schemas);
+  }, function (e) { complain(String(e)); });
+}
+
+function draw(schemas) {
+  clear(tree);
+  schemas.forEach(function (schema) {
+    tree.appendChild(el("h2", schema.name));
+    schema.relations.forEach(function (relation) {
+      // A button and not a styled link, because clicking it does not
+      // go anywhere: it fills the editor and runs. That also gets it
+      // into the tab order for free, which a link with no href does
+      // not, and a sidebar you cannot reach from the keyboard is a
+      // sidebar half the people who open this page cannot use.
+      var item = el("button");
+      item.type = "button";
+      item.appendChild(document.createTextNode(relation.name));
+      if (relation.rows !== null) {
+        item.appendChild(el("span", "  ~" + Math.round(relation.rows)));
+      }
+      item.title = relation.columns.map(function (c) {
+        return c.name + " " + c.type + (c.required ? " not null" : "")
+          + (c.pkey ? " primary key" : "");
+      }).join("\n");
+      item.onclick = function () {
+        // Quoted both halves, because a table called "Order" or one
+        // with a space in it is a table somebody made and the console
+        // has to be able to open it.
+        sql.value = 'select * from "' + schema.name.replace(/"/g, '""')
+          + '"."' + relation.name.replace(/"/g, '""') + '" limit 100';
+        run();
+      };
+      tree.appendChild(item);
+    });
+  });
+  if (!schemas.length) tree.appendChild(el("h2", "nothing to show"));
+}
+
+function run() {
+  var text = sql.value.trim();
+  if (!text) return;
+  runBtn.disabled = true;
+  bar.textContent = "running";
+  ask("/_zou/api/sql", { query: text }).then(function (answer) {
+    runBtn.disabled = false;
+    if (answer.status !== 200) {
+      bar.textContent = "";
+      complain(answer.body.error || ("HTTP " + answer.status));
+      return;
+    }
+    if (answer.body.error) {
+      bar.textContent = "";
+      var e = answer.body.error;
+      var lines = [e.message];
+      if (e.code) lines[0] = e.code + ": " + e.message;
+      if (e.detail) lines.push(e.detail);
+      if (e.hint) lines.push("hint: " + e.hint);
+      if (e.position) lines.push("at character " + e.position);
+      complain(lines.join("\n"));
+      return;
+    }
+    bar.textContent = answer.body.ms.toFixed(1) + " ms";
+    show(answer.body.results);
+  }, function (e) { runBtn.disabled = false; complain(String(e)); });
+}
+
+function show(results) {
+  clear(out);
+  results.forEach(function (result) {
+    if (!result.columns.length) {
+      out.appendChild(el("p", result.touched + " rows", "tag"));
+      return;
+    }
+    var table = el("table");
+    var head = el("tr");
+    result.columns.forEach(function (name) { head.appendChild(el("th", name)); });
+    table.appendChild(head);
+    result.rows.forEach(function (row) {
+      var tr = el("tr");
+      row.forEach(function (cell) {
+        if (cell === null) tr.appendChild(el("td", "null", "null"));
+        else tr.appendChild(el("td", cell));
+      });
+      table.appendChild(tr);
+    });
+    out.appendChild(table);
+    out.appendChild(el("p", result.rows.length + " rows", "tag"));
+  });
+  if (!results.length) out.appendChild(el("p", "no answer", "tag"));
+}
+
+document.getElementById("connect").onclick = connect;
+runBtn.onclick = run;
+// Enter runs on the keyboard people already have in their fingers from
+// every other console, and a plain newline is still a plain newline.
+sql.onkeydown = function (e) {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); run(); }
+};
+keyBox.onkeydown = function (e) { if (e.key === "Enter") connect(); };
+if (keyBox.value) connect();
+</script>
+</body>
+</html>

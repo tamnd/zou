@@ -34,6 +34,7 @@ pub mod auth;
 pub mod binding;
 pub mod blob;
 pub mod cdc;
+pub mod console;
 pub mod cron;
 pub mod edge;
 pub mod fanout;
@@ -211,6 +212,20 @@ pub struct Config {
     /// as delivered, and a sign up that answers 200 and never arrives
     /// is worse than one that says it could not be done.
     pub dev_inbox: bool,
+    /// Whether the web admin answers at `/_zou`. On by default, which
+    /// is what `zou dev` and a single node deployment want: an admin
+    /// nobody can find is an admin nobody uses.
+    ///
+    /// On does not mean open. The page itself is markup and script, the
+    /// same bytes for every project and worth nothing to whoever reads
+    /// them, and both endpoints behind it refuse anything that is not a
+    /// service role token, so the console is exactly as secret as the
+    /// service key. Off and the three paths are not there at all, which
+    /// is what a node serving other people's projects sets: its
+    /// operator has a shell and its tenants have no business with a
+    /// console that would answer for whichever project the request
+    /// happened to route to.
+    pub console: bool,
     /// GoTrue's GOTRUE_EXTERNAL_EMAIL_ENABLED, on by default there and
     /// here. Off, and every way in that names an address is refused,
     /// which is what a project that signs everyone in by number or by
@@ -341,6 +356,7 @@ impl Default for Config {
             mail: mail::Settings::default(),
             sender: None,
             dev_inbox: true,
+            console: true,
             email_enabled: true,
             disable_signup: false,
             phone_enabled: false,
@@ -1262,6 +1278,14 @@ pub fn routed(cfg: Config) -> Result<(Router, Arc<App>), String> {
         .route("/functions/v1/", any(functions::unnamed))
         .route("/functions/v1/{name}", any(functions::call))
         .route("/functions/v1/{name}/{*rest}", any(functions::call))
+        // The web admin, outside the gate because a person typing an
+        // address into a browser carries no apikey and no way to add
+        // one. The page holds no project data and the two endpoints
+        // under it take a service role bearer token and nothing else.
+        .route("/_zou", get(console::page))
+        .route("/_zou/", get(console::page))
+        .route("/_zou/api/catalog", get(console::catalog))
+        .route("/_zou/api/sql", post(console::run))
         .route("/storage/v1/s3", get(s3::list_buckets))
         .route("/storage/v1/s3/", get(s3::list_buckets))
         .route("/storage/v1/s3/{bucket}", any(s3::bucket))
@@ -1907,5 +1931,88 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ask(sending, service).await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_console_page_is_served_to_anyone_and_holds_no_project_data() {
+        // A browser navigating to an address carries no apikey and no
+        // way to be given one, so the page is outside the gate. What
+        // makes that safe is that the page is the same bytes for every
+        // project: markup, style and script, with nothing of anybody's
+        // in it.
+        let res = app().oneshot(get_req("/_zou")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/html; charset=utf-8")
+        );
+        let bytes = to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        let page = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(page.contains("service role key"));
+        assert!(!page.contains(&String::from_utf8_lossy(SECRET).to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_console_endpoints_take_a_service_role_key_and_nothing_else() {
+        let post = |app: Router, auth: Option<String>| async move {
+            let mut req = Request::builder().method("POST").uri("/_zou/api/sql");
+            if let Some(auth) = auth {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {auth}"));
+            }
+            let req = req
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"query":"select 1"}"#))
+                .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        };
+
+        // No token is not a caller with the wrong role, it is a caller
+        // who never said anything, and the two are different answers.
+        assert_eq!(post(app(), None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            post(app(), Some("not.a.token".to_string())).await,
+            StatusCode::UNAUTHORIZED
+        );
+        // A real key for this project, signed with the project secret,
+        // and still not enough: the anon key is the one that ships in a
+        // web page, and a console it opened would be a console anybody
+        // could open.
+        assert_eq!(post(app(), Some(anon_key())).await, StatusCode::FORBIDDEN);
+        // The service role gets past the check and lands on the next
+        // thing, which is that this router has no database behind it.
+        let service = jwt::mint(&jwt::key_claims("service_role"), SECRET);
+        assert_eq!(
+            post(app(), Some(service)).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_node_with_the_console_off_has_no_such_paths() {
+        // Off is not refused, it is absent: the same 404 the gateway
+        // gives for anything it does not serve, so a scan of a fleet
+        // node cannot tell a console that is switched off from a build
+        // that never had one.
+        let node = router(Config {
+            jwt_secret: SECRET.to_vec(),
+            console: false,
+            ..Config::default()
+        })
+        .unwrap();
+        let res = node.clone().oneshot(get_req("/_zou")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let service = jwt::mint(&jwt::key_claims("service_role"), SECRET);
+        let req = Request::builder()
+            .uri("/_zou/api/catalog")
+            .header(header::AUTHORIZATION, format!("Bearer {service}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            node.oneshot(req).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

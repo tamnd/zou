@@ -1154,6 +1154,22 @@ impl Session {
         Ok(touched)
     }
 
+    /// The same, handing back everything postgres said rather than the
+    /// last count.
+    ///
+    /// This is for the console, where the rows are the answer and the
+    /// values want to be postgres's own text rather than a driver's
+    /// rendering of a type it had to guess at. Callers get the row
+    /// descriptions too, which is the only way to label a grid when the
+    /// statement was typed by a person a moment ago and nothing knows
+    /// its shape in advance.
+    pub async fn simple_rows(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<tokio_postgres::SimpleQueryMessage>, Error> {
+        self.client().simple_query(sql).await
+    }
+
     async fn end(mut self, stmt: &str) -> Result<(), Error> {
         let client = self.client.take().expect("session ended twice");
         if self.in_txn {
