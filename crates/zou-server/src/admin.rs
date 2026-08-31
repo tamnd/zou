@@ -326,6 +326,13 @@ async fn list(
 /// where the next and the last page are. The link is the request's own
 /// path with the page swapped, and its query comes out sorted by key,
 /// which is what Go's url.Values.Encode does.
+///
+/// Upstream writes the path it was handed, and a project's GoTrue is
+/// handed `/admin/users` because the gateway in front of it has taken
+/// `/auth/v1` off before it gets there. zou is the gateway and the
+/// GoTrue at once and sees the whole path, so it takes the prefix off
+/// itself. A client that follows the link gets what upstream's client
+/// gets, which is the only thing this header is for.
 fn paged(uri: &axum::http::Uri, listing: &Listing, total: i64, mut res: Response) -> Response {
     let pages = match listing.per_page {
         0 => 0,
@@ -366,7 +373,19 @@ fn with_page(uri: &axum::http::Uri, page: u64) -> String {
         .iter()
         .map(|(key, value)| format!("{}={}", query_escape(key), query_escape(value)))
         .collect();
-    format!("{}?{}", uri.path(), query.join("&"))
+    format!("{}?{}", served(uri.path()), query.join("&"))
+}
+
+/// The part of the path upstream would have seen, which is whatever
+/// follows the `/auth/v1` mount. A request that reached zou through the
+/// gateway carries a project in front of that as well, and neither
+/// piece is upstream's to write down.
+fn served(path: &str) -> &str {
+    const MOUNT: &str = "/auth/v1";
+    match path.find(MOUNT) {
+        Some(at) => &path[at + MOUNT.len()..],
+        None => path,
+    }
 }
 
 /// Which entries the trail is being asked for, out of upstream's one
@@ -2067,6 +2086,20 @@ mod tests {
     #[test]
     fn the_next_and_last_links_carry_the_rest_of_the_query() {
         let uri: axum::http::Uri = "/auth/v1/admin/users?per_page=2&page=1".parse().unwrap();
-        assert_eq!(with_page(&uri, 2), "/auth/v1/admin/users?page=2&per_page=2");
+        assert_eq!(with_page(&uri, 2), "/admin/users?page=2&per_page=2");
+    }
+
+    #[test]
+    fn a_link_is_written_from_the_path_upstream_would_have_served() {
+        // Upstream is behind a gateway that takes the prefix off, so
+        // the link a client reads never carries one, whether it came in
+        // on the project's own host or through the fan out path with
+        // the project named in front.
+        let plain: axum::http::Uri = "/auth/v1/admin/audit?page=2".parse().unwrap();
+        assert_eq!(with_page(&plain, 3), "/admin/audit?page=3");
+        let fanned: axum::http::Uri = "/acme-prod/auth/v1/admin/users?page=1".parse().unwrap();
+        assert_eq!(with_page(&fanned, 2), "/admin/users?page=2");
+        // A path with no mount in it is left alone rather than emptied.
+        assert_eq!(served("/admin/users"), "/admin/users");
     }
 }
