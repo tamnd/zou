@@ -61,6 +61,11 @@ textarea {
   display: flex; align-items: center; gap: 12px; padding: 6px 12px;
   border-bottom: 1px solid var(--line); color: var(--dim);
 }
+#bar input {
+  width: 260px; padding: 3px 8px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 3px; font: inherit;
+}
+#bar button { padding: 2px 10px; }
 #out { flex: 1; overflow: auto; padding: 0 0 40px; }
 table { border-collapse: collapse; width: 100%; }
 th, td {
@@ -73,6 +78,8 @@ th {
   font-weight: 600;
 }
 td.null { color: var(--dim); font-style: italic; }
+td.dim { color: var(--dim); }
+td.warn { color: var(--bad); }
 p.tag { margin: 8px 12px; color: var(--dim); }
 pre.bad {
   margin: 12px; padding: 10px 12px; border-left: 3px solid var(--bad);
@@ -105,6 +112,12 @@ var bar = document.getElementById("bar");
 var sql = document.getElementById("sql");
 var keyBox = document.getElementById("key");
 var runBtn = document.getElementById("run");
+// The one line of status both views write to. It lives outside the bar
+// so that redrawing the bar's controls does not take it with them.
+var note = document.createElement("span");
+bar.appendChild(note);
+var term = "";
+var page = 0;
 
 // The key lives in this tab and nowhere else. sessionStorage rather
 // than localStorage, so closing the tab is logging out, and a second
@@ -138,25 +151,49 @@ function complain(text) {
   out.appendChild(el("pre", text, "bad"));
 }
 
+// The bar carries the status line alone, plus whatever controls the
+// view that is up needs beside it.
+function plainBar() {
+  clear(bar);
+  bar.appendChild(note);
+}
+
+function editing() {
+  sql.style.display = "";
+  runBtn.style.display = "";
+  plainBar();
+}
+
 function connect() {
   sessionStorage.setItem("zou.key", keyBox.value);
   clear(tree);
-  bar.textContent = "reading the catalog";
+  editing();
+  note.textContent = "reading the catalog";
   ask("/_zou/api/catalog").then(function (answer) {
     if (answer.status !== 200) {
-      bar.textContent = "";
+      note.textContent = "";
       runBtn.disabled = true;
       complain(answer.body.error || ("HTTP " + answer.status));
       return;
     }
     runBtn.disabled = false;
-    bar.textContent = "";
+    note.textContent = "";
     draw(answer.body.schemas);
   }, function (e) { complain(String(e)); });
 }
 
 function draw(schemas) {
   clear(tree);
+  // The people come before the tables, because "who is this and did
+  // they ever confirm their email" is the other question this page
+  // exists to answer, and answering it in the editor means knowing
+  // that auth.users and auth.identities exist and how they join.
+  tree.appendChild(el("h2", "project"));
+  var people = el("button");
+  people.type = "button";
+  people.appendChild(document.createTextNode("users"));
+  people.onclick = function () { term = ""; page = 0; users(); };
+  tree.appendChild(people);
   schemas.forEach(function (schema) {
     tree.appendChild(el("h2", schema.name));
     schema.relations.forEach(function (relation) {
@@ -176,6 +213,7 @@ function draw(schemas) {
           + (c.pkey ? " primary key" : "");
       }).join("\n");
       item.onclick = function () {
+        editing();
         // Quoted both halves, because a table called "Order" or one
         // with a space in it is a table somebody made and the console
         // has to be able to open it.
@@ -189,20 +227,103 @@ function draw(schemas) {
   if (!schemas.length) tree.appendChild(el("h2", "nothing to show"));
 }
 
+// The user list, with the search and the paging it needs beside it.
+function users() {
+  sql.style.display = "none";
+  runBtn.style.display = "none";
+  plainBar();
+  var find = el("input");
+  find.type = "search";
+  find.spellcheck = false;
+  find.placeholder = "email, phone or id";
+  find.value = term;
+  find.onkeydown = function (e) {
+    if (e.key === "Enter") { term = find.value.trim(); page = 0; users(); }
+  };
+  bar.insertBefore(find, note);
+  note.textContent = "reading users";
+  ask("/_zou/api/users?q=" + encodeURIComponent(term) + "&page=" + page)
+    .then(function (answer) {
+      if (answer.status !== 200) {
+        note.textContent = "";
+        complain(answer.body.error || ("HTTP " + answer.status));
+        return;
+      }
+      if (answer.body.absent) {
+        note.textContent = "";
+        clear(out);
+        out.appendChild(el("p", "This project has no auth schema on it, "
+          + "so there is nobody to list.", "tag"));
+        return;
+      }
+      showUsers(answer.body);
+      // Paging by a next button and not by a total, because a count
+      // over every user is a read of the whole table to draw a footer.
+      // The list asks for one more than it shows and that is the whole
+      // question a next button answers.
+      if (page > 0) {
+        var back = el("button", "back");
+        back.type = "button";
+        back.onclick = function () { page -= 1; users(); };
+        bar.appendChild(back);
+      }
+      if (answer.body.more) {
+        var next = el("button", "next");
+        next.type = "button";
+        next.onclick = function () { page += 1; users(); };
+        bar.appendChild(next);
+      }
+      find.focus();
+    }, function (e) { complain(String(e)); });
+}
+
+function showUsers(body) {
+  clear(out);
+  note.textContent = body.users.length + " on page " + (body.page + 1);
+  if (!body.users.length) {
+    out.appendChild(el("p", term ? "Nobody matches that." : "No users yet.", "tag"));
+    return;
+  }
+  var head = el("tr");
+  ["email", "phone", "providers", "state", "last sign in", "created", "id"]
+    .forEach(function (name) { head.appendChild(el("th", name)); });
+  var table = el("table");
+  table.appendChild(head);
+  body.users.forEach(function (user) {
+    var tr = el("tr");
+    tr.appendChild(el("td", user.email || ""));
+    tr.appendChild(el("td", user.phone || ""));
+    tr.appendChild(el("td", user.providers.join(", ")));
+    // One word for the thing somebody came to check. Banned first
+    // because it outranks the rest: a banned account that confirmed
+    // its email is still an account that cannot sign in.
+    if (user.banned) tr.appendChild(el("td", "banned", "warn"));
+    else if (user.anonymous) tr.appendChild(el("td", "anonymous", "dim"));
+    else if (user.confirmed) tr.appendChild(el("td", "confirmed"));
+    else tr.appendChild(el("td", "unconfirmed", "warn"));
+    tr.appendChild(el("td", user.last_sign_in_at || "never",
+      user.last_sign_in_at ? "" : "dim"));
+    tr.appendChild(el("td", user.created_at || ""));
+    tr.appendChild(el("td", user.id, "dim"));
+    table.appendChild(tr);
+  });
+  out.appendChild(table);
+}
+
 function run() {
   var text = sql.value.trim();
   if (!text) return;
   runBtn.disabled = true;
-  bar.textContent = "running";
+  note.textContent = "running";
   ask("/_zou/api/sql", { query: text }).then(function (answer) {
     runBtn.disabled = false;
     if (answer.status !== 200) {
-      bar.textContent = "";
+      note.textContent = "";
       complain(answer.body.error || ("HTTP " + answer.status));
       return;
     }
     if (answer.body.error) {
-      bar.textContent = "";
+      note.textContent = "";
       var e = answer.body.error;
       var lines = [e.message];
       if (e.code) lines[0] = e.code + ": " + e.message;
@@ -212,7 +333,7 @@ function run() {
       complain(lines.join("\n"));
       return;
     }
-    bar.textContent = answer.body.ms.toFixed(1) + " ms";
+    note.textContent = answer.body.ms.toFixed(1) + " ms";
     show(answer.body.results);
   }, function (e) { runBtn.disabled = false; complain(String(e)); });
 }

@@ -1,6 +1,6 @@
 //! The web admin at `/_zou`.
 //!
-//! One page and two endpoints, served by the same binary that serves
+//! One page and three endpoints, served by the same binary that serves
 //! the project. There is no build step, no bundler and nothing fetched
 //! from a CDN: the page is a single file compiled into the binary, so
 //! an operator who can reach the server can reach the console, on a box
@@ -16,9 +16,9 @@
 //!
 //! The page carries no data. It is markup, style and script, the same
 //! bytes for every project, and it is served to anyone who asks. Every
-//! byte of a project that reaches it comes back through the two api
-//! endpoints below, and both of them refuse anything that is not a
-//! service role token. So the console is exactly as secret as the
+//! byte of a project that reaches it comes back through the api
+//! endpoints below, and every one of them refuses anything that is not
+//! a service role token. So the console is exactly as secret as the
 //! service key is, which is the same fence the admin auth surface has
 //! and the same one Studio has.
 //!
@@ -80,6 +80,46 @@ select n.nspname::text as schema,
    and n.nspname not like 'pg_temp%'
    and has_table_privilege(c.oid, 'select')
  order by n.nspname, c.relname, a.attnum";
+
+/// One page of the user list.
+///
+/// Fifty is what fits on a screen without scrolling past what a person
+/// came to look at, and the list is ordered newest first, so the ones
+/// worth looking at are almost always on the first page.
+const USERS_PAGE: i64 = 50;
+
+/// A page of `auth.users` with the providers each of them signed in
+/// with.
+///
+/// Every timestamp is cast to text in the query rather than decoded
+/// here, for the reason the sql editor returns text: what a console
+/// should print is what postgres would have written, not a driver's
+/// rendering of a type and a timezone it had to pick.
+///
+/// The search is one term against the email, the phone and the id,
+/// because those are the three things somebody has in front of them
+/// when they come here, usually pasted out of a support ticket.
+const USERS: &str = "\
+select u.id::text as id,
+       u.email::text as email,
+       u.phone::text as phone,
+       u.created_at::text as created_at,
+       u.last_sign_in_at::text as last_sign_in_at,
+       (u.email_confirmed_at is not null
+        or u.phone_confirmed_at is not null) as confirmed,
+       u.is_anonymous as anonymous,
+       (u.banned_until is not null and u.banned_until > now()) as banned,
+       array(select i.provider::text
+               from auth.identities i
+              where i.user_id = u.id
+              order by i.provider) as providers
+  from auth.users u
+ where $1::text = ''
+    or u.email ilike $2::text
+    or u.phone ilike $2::text
+    or u.id::text ilike $2::text
+ order by u.created_at desc nulls last, u.id
+ limit $3::bigint offset $4::bigint";
 
 /// What the console will not run in one request, in bytes. Large
 /// enough for a migration somebody pasted in, small enough that a
@@ -245,6 +285,118 @@ fn group(rows: &[tokio_postgres::Row]) -> serde_json::Value {
             .push(column);
     }
     serde_json::json!({ "schemas": schemas })
+}
+
+/// GET /_zou/api/users, a page of the project's people.
+///
+/// A list rather than a query somebody has to write, because "who is
+/// this person and did they ever confirm their email" is the question
+/// asked most often about a project after "what is in this table", and
+/// answering it in the sql editor means knowing that `auth.users` and
+/// `auth.identities` exist and how they join.
+///
+/// A node with no auth schema on it is not an error. Auth is one of the
+/// surfaces a project can be running without, so the answer is an empty
+/// list that says so, and the page prints a sentence rather than a
+/// stack of postgres words about a relation that does not exist.
+pub async fn users(
+    axum::extract::State(app): axum::extract::State<Arc<App>>,
+    req: Request<Body>,
+) -> Response {
+    if !app.cfg.console {
+        return crate::kong_no_route();
+    }
+    if let Err(res) = service_role(&app, &req) {
+        return *res;
+    }
+    let Some(pool) = &app.pool else {
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This server has no database attached.",
+        );
+    };
+    let query = crate::auth::query_object(req.uri().query().unwrap_or_default());
+    let term = query["q"].as_str().unwrap_or("").trim().to_string();
+    let page: i64 = query["page"]
+        .as_str()
+        .and_then(|p| p.parse().ok())
+        .filter(|p| *p >= 0)
+        .unwrap_or(0);
+    let sess = match pool.unscoped().await {
+        Ok(sess) => sess,
+        Err(e) => return refused(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    let present = match sess
+        .query(
+            "select to_regclass('auth.users') is not null as present",
+            &[],
+        )
+        .await
+    {
+        Ok(rows) => rows
+            .first()
+            .is_some_and(|row| row.get::<_, bool>("present")),
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    };
+    if !present {
+        let _ = sess.commit().await;
+        return json_body(
+            StatusCode::OK,
+            serde_json::json!({ "users": [], "more": false, "absent": true }),
+        );
+    }
+    // One more than a page, so the page knows whether there is a next
+    // one without counting a table it does not otherwise read.
+    // The term is a term and not a pattern: somebody searching for
+    // `a_b@example.com` means that address and not any address with a
+    // character where the underscore is.
+    let like = format!(
+        "%{}%",
+        term.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    let rows = match sess
+        .query(
+            USERS,
+            &[&term, &like, &(USERS_PAGE + 1), &(page * USERS_PAGE)],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = sess.rollback().await;
+            return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+        }
+    };
+    if let Err(e) = sess.commit().await {
+        return refused(StatusCode::BAD_GATEWAY, &e.to_string());
+    }
+    let more = rows.len() as i64 > USERS_PAGE;
+    let listed: Vec<serde_json::Value> = rows
+        .iter()
+        .take(USERS_PAGE as usize)
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<_, String>("id"),
+                "email": row.get::<_, Option<String>>("email"),
+                "phone": row.get::<_, Option<String>>("phone"),
+                "created_at": row.get::<_, Option<String>>("created_at"),
+                "last_sign_in_at": row.get::<_, Option<String>>("last_sign_in_at"),
+                "confirmed": row.get::<_, Option<bool>>("confirmed").unwrap_or(false),
+                "anonymous": row.get::<_, Option<bool>>("anonymous").unwrap_or(false),
+                "banned": row.get::<_, Option<bool>>("banned").unwrap_or(false),
+                "providers": row.get::<_, Vec<String>>("providers"),
+            })
+        })
+        .collect();
+    json_body(
+        StatusCode::OK,
+        serde_json::json!({ "users": listed, "page": page, "more": more }),
+    )
 }
 
 /// POST /_zou/api/sql, run what the editor holds.
@@ -418,5 +570,6 @@ mod tests {
         assert!(!PAGE.contains("//cdn."));
         assert!(!PAGE.contains("https://"));
         assert!(PAGE.contains("/_zou/api/sql"));
+        assert!(PAGE.contains("/_zou/api/users?q="));
     }
 }

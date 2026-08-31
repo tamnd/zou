@@ -1285,6 +1285,7 @@ pub fn routed(cfg: Config) -> Result<(Router, Arc<App>), String> {
         .route("/_zou", get(console::page))
         .route("/_zou/", get(console::page))
         .route("/_zou/api/catalog", get(console::catalog))
+        .route("/_zou/api/users", get(console::users))
         .route("/_zou/api/sql", post(console::run))
         .route("/storage/v1/s3", get(s3::list_buckets))
         .route("/storage/v1/s3/", get(s3::list_buckets))
@@ -1984,9 +1985,26 @@ mod tests {
         // thing, which is that this router has no database behind it.
         let service = jwt::mint(&jwt::key_claims("service_role"), SECRET);
         assert_eq!(
-            post(app(), Some(service)).await,
+            post(app(), Some(service.clone())).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
+
+        // The user list is behind the same fence as the editor, and for
+        // a sharper reason: it is a list of everybody's email address.
+        let list = |auth: Option<String>| async move {
+            let mut req = Request::builder().uri("/_zou/api/users?q=a&page=0");
+            if let Some(auth) = auth {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {auth}"));
+            }
+            app()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        };
+        assert_eq!(list(None).await, StatusCode::UNAUTHORIZED);
+        assert_eq!(list(Some(anon_key())).await, StatusCode::FORBIDDEN);
+        assert_eq!(list(Some(service)).await, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

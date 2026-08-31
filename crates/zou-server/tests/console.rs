@@ -246,6 +246,134 @@ async fn the_catalog_lists_a_table_with_its_columns_and_its_key() {
     sess.commit().await.expect("park");
 }
 
+/// The user list for a search term and a page.
+async fn listed(app: &axum::Router, q: &str, page: i64) -> serde_json::Value {
+    let req = Request::builder()
+        .uri(format!("/_zou/api/users?q={q}&page={page}"))
+        .header("authorization", format!("Bearer {}", service_key()))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = to_bytes(res.into_body(), 1 << 22).await.unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Put a handful of people in `auth.users` and hand back the local part
+/// they share, so a search can find them and nothing else.
+async fn seed_users(dsn: &str, tag: &str, how_many: usize) {
+    let pool = Pool::new(dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    for n in 0..how_many {
+        let email = format!("{tag}{n}@example.test");
+        sess.execute(
+            "insert into auth.users (id, instance_id, aud, role, email,
+                                     email_confirmed_at, created_at, updated_at,
+                                     is_anonymous, is_sso_user)
+             values (gen_random_uuid(), '00000000-0000-0000-0000-000000000000',
+                     'authenticated', 'authenticated', $1,
+                     case when $2::int = 0 then null else now() end,
+                     now() - make_interval(secs => $2::int), now(), false, false)",
+            &[&email, &(n as i32)],
+        )
+        .await
+        .expect("insert a user");
+    }
+    sess.commit().await.expect("park");
+}
+
+async fn forget_users(dsn: &str, tag: &str) {
+    let pool = Pool::new(dsn, 1).expect("dsn parses");
+    let sess = pool.unscoped().await.expect("connect");
+    sess.execute(
+        "delete from auth.users where email like $1",
+        &[&format!("{tag}%@example.test")],
+    )
+    .await
+    .expect("delete");
+    sess.commit().await.expect("park");
+}
+
+#[tokio::test]
+async fn the_user_list_says_who_signed_up_and_whether_they_confirmed() {
+    let Some(dsn) = dsn() else { return };
+    let tag = "consolelistone";
+    forget_users(&dsn, tag).await;
+    seed_users(&dsn, tag, 3).await;
+    let app = app(&dsn);
+
+    let body = listed(&app, tag, 0).await;
+    let users = body["users"].as_array().expect("users");
+    assert_eq!(users.len(), 3);
+    // Newest first, and the seed made the first one newest, so the one
+    // with no confirmation is at the top.
+    assert_eq!(users[0]["email"], format!("{tag}0@example.test"));
+    assert_eq!(users[0]["confirmed"], false);
+    assert_eq!(users[1]["confirmed"], true);
+    assert_eq!(users[0]["anonymous"], false);
+    assert_eq!(users[0]["banned"], false);
+    // Nobody signed in, and never is not the same as a moment nobody
+    // recorded, so it comes back as a null and the page prints a word.
+    assert_eq!(users[0]["last_sign_in_at"], serde_json::Value::Null);
+    assert!(
+        users[0]["created_at"]
+            .as_str()
+            .expect("a timestamp")
+            .starts_with("20")
+    );
+    assert_eq!(users[0]["providers"], serde_json::json!([]));
+    assert_eq!(body["more"], false);
+
+    forget_users(&dsn, tag).await;
+}
+
+#[tokio::test]
+async fn the_search_is_a_term_and_not_a_pattern() {
+    let Some(dsn) = dsn() else { return };
+    let tag = "consolelisttwo";
+    forget_users(&dsn, tag).await;
+    seed_users(&dsn, tag, 2).await;
+    let app = app(&dsn);
+
+    let body = listed(&app, &format!("{tag}1"), 0).await;
+    let users = body["users"].as_array().expect("users");
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["email"], format!("{tag}1@example.test"));
+
+    // An underscore is a character somebody typed and not a wildcard
+    // standing in for the one beside it, so this matches nothing.
+    let body = listed(&app, &format!("{}_1", &tag[..tag.len() - 1]), 0).await;
+    assert_eq!(body["users"].as_array().expect("users").len(), 0);
+
+    forget_users(&dsn, tag).await;
+}
+
+#[tokio::test]
+async fn a_list_longer_than_a_page_says_there_is_another_one() {
+    let Some(dsn) = dsn() else { return };
+    let tag = "consolelistthree";
+    forget_users(&dsn, tag).await;
+    seed_users(&dsn, tag, 51).await;
+    let app = app(&dsn);
+
+    let first = listed(&app, tag, 0).await;
+    assert_eq!(first["users"].as_array().expect("users").len(), 50);
+    assert_eq!(first["more"], true);
+    assert_eq!(first["page"], 0);
+
+    let second = listed(&app, tag, 1).await;
+    assert_eq!(second["users"].as_array().expect("users").len(), 1);
+    // The last page is the one with no next button on it.
+    assert_eq!(second["more"], false);
+    assert_eq!(second["page"], 1);
+    // And the pages do not overlap, which an off by one in the offset
+    // would show up as here and nowhere else.
+    let seen = first["users"].as_array().unwrap()[49]["id"].clone();
+    assert_ne!(seen, second["users"].as_array().unwrap()[0]["id"]);
+
+    forget_users(&dsn, tag).await;
+}
+
 #[tokio::test]
 async fn more_sql_than_the_console_will_run_is_refused_rather_than_read() {
     let Some(dsn) = dsn() else { return };
