@@ -77,6 +77,11 @@ th {
   position: sticky; top: 0; background: var(--panel); color: var(--dim);
   font-weight: 600;
 }
+td button {
+  padding: 0; background: none; border: 0; border-radius: 0;
+  color: var(--accent); font: inherit; text-align: left;
+}
+td button:hover { text-decoration: underline; }
 td.null { color: var(--dim); font-style: italic; }
 td.dim { color: var(--dim); }
 td.warn { color: var(--bad); }
@@ -164,6 +169,44 @@ function editing() {
   plainBar();
 }
 
+// The other mode. The editor goes away rather than sitting there with
+// the run button live over a list that has nothing to do with it.
+function listing() {
+  sql.style.display = "none";
+  runBtn.style.display = "none";
+  plainBar();
+}
+
+// Paging by a next button and not by a total, because a count over
+// every row is a read of the whole table to draw a footer. The list
+// asks for one more row than it shows and that is the whole question a
+// next button answers.
+function pager(more, again) {
+  if (page > 0) {
+    var back = el("button", "back");
+    back.type = "button";
+    back.onclick = function () { page -= 1; again(); };
+    bar.appendChild(back);
+  }
+  if (more) {
+    var next = el("button", "next");
+    next.type = "button";
+    next.onclick = function () { page += 1; again(); };
+    bar.appendChild(next);
+  }
+}
+
+// Powers of 1024 under the names that mean powers of 1024. A console
+// that printed 1 MB for 1048576 bytes would be one nobody could check
+// a file size against.
+function bytes(n) {
+  if (n === null || n === undefined) return "";
+  var units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  var i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+  return (i === 0 ? n : n.toFixed(1)) + " " + units[i];
+}
+
 function connect() {
   sessionStorage.setItem("zou.key", keyBox.value);
   clear(tree);
@@ -194,6 +237,11 @@ function draw(schemas) {
   people.appendChild(document.createTextNode("users"));
   people.onclick = function () { term = ""; page = 0; users(); };
   tree.appendChild(people);
+  var files = el("button");
+  files.type = "button";
+  files.appendChild(document.createTextNode("storage"));
+  files.onclick = function () { term = ""; page = 0; buckets(); };
+  tree.appendChild(files);
   schemas.forEach(function (schema) {
     tree.appendChild(el("h2", schema.name));
     schema.relations.forEach(function (relation) {
@@ -229,9 +277,7 @@ function draw(schemas) {
 
 // The user list, with the search and the paging it needs beside it.
 function users() {
-  sql.style.display = "none";
-  runBtn.style.display = "none";
-  plainBar();
+  listing();
   var find = el("input");
   find.type = "search";
   find.spellcheck = false;
@@ -257,22 +303,7 @@ function users() {
         return;
       }
       showUsers(answer.body);
-      // Paging by a next button and not by a total, because a count
-      // over every user is a read of the whole table to draw a footer.
-      // The list asks for one more than it shows and that is the whole
-      // question a next button answers.
-      if (page > 0) {
-        var back = el("button", "back");
-        back.type = "button";
-        back.onclick = function () { page -= 1; users(); };
-        bar.appendChild(back);
-      }
-      if (answer.body.more) {
-        var next = el("button", "next");
-        next.type = "button";
-        next.onclick = function () { page += 1; users(); };
-        bar.appendChild(next);
-      }
+      pager(answer.body.more, users);
       find.focus();
     }, function (e) { complain(String(e)); });
 }
@@ -308,6 +339,128 @@ function showUsers(body) {
     table.appendChild(tr);
   });
   out.appendChild(table);
+}
+
+// The buckets, whole. There are never many and the endpoint does not
+// page them, so this view has no search and no buttons: the names are
+// the links into the file lists and that is all it is for.
+function buckets() {
+  listing();
+  note.textContent = "reading buckets";
+  ask("/_zou/api/buckets").then(function (answer) {
+    note.textContent = "";
+    if (answer.status !== 200) {
+      complain(answer.body.error || ("HTTP " + answer.status));
+      return;
+    }
+    clear(out);
+    if (answer.body.absent) {
+      out.appendChild(el("p", "This project has no storage schema on it, "
+        + "so there is nothing to list.", "tag"));
+      return;
+    }
+    var list = answer.body.buckets;
+    note.textContent = list.length + (list.length === 1 ? " bucket" : " buckets");
+    if (!list.length) {
+      out.appendChild(el("p", "No buckets yet.", "tag"));
+      return;
+    }
+    var head = el("tr");
+    ["name", "access", "kind", "size limit", "accepts", "created"]
+      .forEach(function (name) { head.appendChild(el("th", name)); });
+    var table = el("table");
+    table.appendChild(head);
+    list.forEach(function (b) {
+      var tr = el("tr");
+      var cell = el("td");
+      var open = el("button", b.name);
+      open.type = "button";
+      open.onclick = function () { term = ""; page = 0; objects(b.id); };
+      cell.appendChild(open);
+      tr.appendChild(cell);
+      // Public is the one worth reading twice: it means every object
+      // in it is readable by anybody who knows the url, which is the
+      // setting people are surprised by.
+      tr.appendChild(el("td", b.public ? "public" : "private",
+        b.public ? "warn" : "dim"));
+      tr.appendChild(el("td", (b.type || "").toLowerCase(), "dim"));
+      // No limit and no list are the defaults, and a default is not a
+      // value somebody chose, so both say what they are rather than
+      // leaving the column blank.
+      tr.appendChild(el("td", b.file_size_limit === null ? "none"
+        : bytes(b.file_size_limit), b.file_size_limit === null ? "dim" : ""));
+      var kinds = b.allowed_mime_types;
+      tr.appendChild(el("td", kinds && kinds.length ? kinds.join(", ") : "anything",
+        kinds && kinds.length ? "" : "dim"));
+      tr.appendChild(el("td", b.created_at || "", "dim"));
+      table.appendChild(tr);
+    });
+    out.appendChild(table);
+  }, function (e) { complain(String(e)); });
+}
+
+// One bucket's files, in name order, which is the order a listing of
+// files is in everywhere else.
+function objects(id) {
+  listing();
+  var home = el("button", "buckets");
+  home.type = "button";
+  home.onclick = function () { term = ""; page = 0; buckets(); };
+  bar.insertBefore(home, note);
+  var find = el("input");
+  find.type = "search";
+  find.spellcheck = false;
+  find.placeholder = "file name";
+  find.value = term;
+  find.onkeydown = function (e) {
+    if (e.key === "Enter") { term = find.value.trim(); page = 0; objects(id); }
+  };
+  bar.insertBefore(find, note);
+  note.textContent = "reading " + id;
+  ask("/_zou/api/objects?bucket=" + encodeURIComponent(id)
+    + "&q=" + encodeURIComponent(term) + "&page=" + page)
+    .then(function (answer) {
+      note.textContent = "";
+      if (answer.status !== 200) {
+        complain(answer.body.error || ("HTTP " + answer.status));
+        return;
+      }
+      clear(out);
+      if (answer.body.absent) {
+        out.appendChild(el("p", "This project has no storage schema on it, "
+          + "so there is nothing to list.", "tag"));
+        return;
+      }
+      var list = answer.body.objects;
+      note.textContent = id + ", " + list.length + " on page " + (page + 1);
+      if (!list.length) {
+        out.appendChild(el("p", term ? "Nothing in this bucket matches that."
+          : "This bucket is empty.", "tag"));
+      } else {
+        var head = el("tr");
+        ["name", "size", "type", "updated", "created", "version"]
+          .forEach(function (name) { head.appendChild(el("th", name)); });
+        var table = el("table");
+        table.appendChild(head);
+        list.forEach(function (o) {
+          var tr = el("tr");
+          tr.appendChild(el("td", o.name || ""));
+          // A size the metadata does not carry is not a size of zero,
+          // and an upload that never finished is exactly the row
+          // somebody came here to find.
+          tr.appendChild(el("td", o.size === null ? "unknown" : bytes(o.size),
+            o.size === null ? "warn" : ""));
+          tr.appendChild(el("td", o.mimetype || "", o.mimetype ? "" : "dim"));
+          tr.appendChild(el("td", o.updated_at || "", "dim"));
+          tr.appendChild(el("td", o.created_at || "", "dim"));
+          tr.appendChild(el("td", o.version || "", "dim"));
+          table.appendChild(tr);
+        });
+        out.appendChild(table);
+      }
+      pager(answer.body.more, function () { objects(id); });
+      find.focus();
+    }, function (e) { complain(String(e)); });
 }
 
 function run() {
