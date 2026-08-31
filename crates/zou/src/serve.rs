@@ -1471,6 +1471,13 @@ impl Postmasters {
             // reach this node's log, so mail kept there is mail lost
             // and reported as sent.
             dev_inbox: false,
+            // No console either, and for a neighbouring reason. This
+            // router serves whichever project the request routed to,
+            // so a console on it would be a console whose answers
+            // depend on the host header that reached it. The operator
+            // of a node has a shell, and a tenant who wants one runs
+            // zou against their own project.
+            console: false,
             ..Config::default()
         }
     }
