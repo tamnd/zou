@@ -2324,6 +2324,21 @@ async fn by_phone(sess: &sql::Session, asked: &Asked, rules: &Rules) -> Result<H
     if row.get::<_, bool>(1) {
         return banned();
     }
+    // A number whose code the project wrote down is checked against
+    // what was written and against nothing else. There is no column to
+    // read for it, because nothing was ever drawn or sent, and the code
+    // does not run out: it is the same code every time until the number
+    // comes off the list. Ahead of the provider, which is the order
+    // upstream puts these two in on the way out as well.
+    if let Some(fixed) = rules.fixed.get(&asked.phone) {
+        if &asked.token != fixed {
+            return expired(TOKEN_EXPIRED);
+        }
+        return Ok(Holder {
+            user_id,
+            kind: kind.to_string(),
+        });
+    }
     match &rules.verifier {
         // The account was found by the number it holds, which is the
         // whole of what this database knows. Whether the digits are the
@@ -2529,6 +2544,9 @@ pub(crate) struct Rules {
     /// column, and how long the code lasts is its business too, so
     /// `sms_exp` says nothing about the codes it drew.
     pub(crate) verifier: Option<Arc<dyn crate::sms::Sender>>,
+    /// The numbers whose code the project wrote down, read once here so
+    /// that a verify asks the clock once rather than once per lookup.
+    pub(crate) fixed: std::collections::BTreeMap<String, String>,
 }
 
 /// The project's settings as a verify reads them.
@@ -2538,6 +2556,7 @@ fn rules(app: &App) -> Rules {
         autoconfirm: app.cfg.mailer_autoconfirm,
         sms_exp: app.cfg.sms.otp_exp,
         verifier: app.texter.verifies().then(|| Arc::clone(&app.texter)),
+        fixed: app.cfg.sms.live_codes(now()),
     }
 }
 
@@ -3564,6 +3583,7 @@ async fn update_user(
                     autoconfirm: true,
                     sms_exp: 0,
                     verifier: None,
+                    fixed: Default::default(),
                 },
             )
             .await?;

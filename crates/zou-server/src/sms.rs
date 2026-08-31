@@ -100,13 +100,30 @@ impl Settings {
     /// everything here holds, so a list written with the plus on and a
     /// request that sent it without still find each other.
     pub fn test_code(&self, phone: &str, now: i64) -> Option<&str> {
-        if self.test_otp.is_empty() {
-            return None;
-        }
-        if self.test_otp_valid_until.is_some_and(|until| now >= until) {
+        if self.test_otp.is_empty() || !self.live(now) {
             return None;
         }
         self.test_otp.get(&strip(phone)).map(String::as_str)
+    }
+
+    /// The whole list, while it is still good, and nothing once it has
+    /// run out.
+    ///
+    /// A verify wants the list rather than one number's code, because
+    /// it reads the clock once and then compares against whatever
+    /// number the request turns out to name. A project that wrote none
+    /// down copies an empty map, which costs nothing.
+    pub fn live_codes(&self, now: i64) -> BTreeMap<String, String> {
+        match self.live(now) {
+            true => self.test_otp.clone(),
+            false => BTreeMap::new(),
+        }
+    }
+
+    /// Whether the written down codes are still the ones to expect,
+    /// which they are until the moment the project said they stop.
+    fn live(&self, now: i64) -> bool {
+        !self.test_otp_valid_until.is_some_and(|until| now >= until)
     }
 
     /// How many digits a code has. Upstream refuses to go under six or

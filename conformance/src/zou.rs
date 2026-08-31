@@ -234,11 +234,12 @@ pub fn start_at(
         phone_enabled: shape.sms.is_some(),
         sms: zou_server::sms::Settings {
             test_otp: shape.sms.map(|s| s.test_otp.clone()).unwrap_or_default(),
-            // The reference is started with no wait between codes, so a
-            // suite can ask for two in the time one case takes. Every
-            // other setting is the one a project that changed nothing
-            // has, which is what the reference was started with too.
-            max_frequency: 0,
+            // Everything else is what a project that changed nothing
+            // has, including the minute a number waits between codes,
+            // which the reference is on too. A suite that asks for two
+            // codes inside that minute is recorded as being told to wait
+            // rather than being run against a server with the wait
+            // turned off.
             ..zou_server::sms::Settings::default()
         },
         texter,
