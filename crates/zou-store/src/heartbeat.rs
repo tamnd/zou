@@ -17,6 +17,17 @@
 //! `lost()` as a stop sign: epoch fencing makes a zombie's frames
 //! unreachable, this flag is what keeps the zombie from wasting effort.
 //!
+//! The lease says a node is the writer, so it must not outlive the node.
+//! A renewal thread has no reason of its own to notice that the process
+//! around it has been orphaned: a postgres background worker whose
+//! postmaster was killed keeps running until whatever store call it is
+//! inside of returns, and for those seconds the heartbeat goes on saying
+//! a dead cluster is the writer. Worse, nothing is being written any
+//! more, so the backoff below fires on the way out and leaves an expiry
+//! five minutes away for a node that is already gone. Callers that are
+//! somebody's child hand in [`watch_parent`] and the thread stops the
+//! first time it wakes up an orphan.
+//!
 //! A project nobody is writing backs off. The TTL is a promise about how
 //! long a dead node's work is unavailable, and there is no work to be
 //! unavailable on a database that has not taken a write since it was
@@ -49,6 +60,24 @@ pub fn system_clock() -> Clock {
             .expect("system clock is before the unix epoch")
             .as_secs()
     })
+}
+
+/// A test the renewal thread runs before every renewal, answering
+/// whether the node this lease belongs to is still there. See
+/// [`watch_parent`], which is the only implementation so far.
+pub type Alive = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// A check for the process that forked this one still being there.
+///
+/// The parent's pid is read once and every later call asks whether it is
+/// still the parent. An orphan is reparented to init, or to the nearest
+/// subreaper, so the number changes and never changes back. Two pids the
+/// same is therefore a parent that never died, since the kernel does not
+/// hand out a pid that is still in use.
+pub fn watch_parent() -> Alive {
+    // SAFETY: getppid takes nothing, returns a pid, and cannot fail.
+    let parent = unsafe { libc::getppid() };
+    Arc::new(move || unsafe { libc::getppid() } == parent)
 }
 
 /// How many renewals in a row must pass with nothing written before the
@@ -89,7 +118,15 @@ impl Heartbeat {
         held: Arc<Mutex<HeldLease>>,
         ttl_secs: u64,
     ) -> Self {
-        Self::spawn_with_clock(store, layout, held, ttl_secs, ttl_secs, system_clock())
+        Self::start(
+            store,
+            layout,
+            held,
+            ttl_secs,
+            ttl_secs,
+            system_clock(),
+            None,
+        )
     }
 
     /// Renew at `ttl_secs` while the project is being written and at
@@ -102,7 +139,38 @@ impl Heartbeat {
         ttl_secs: u64,
         idle_ttl_secs: u64,
     ) -> Self {
-        Self::spawn_with_clock(store, layout, held, ttl_secs, idle_ttl_secs, system_clock())
+        Self::start(
+            store,
+            layout,
+            held,
+            ttl_secs,
+            idle_ttl_secs,
+            system_clock(),
+            None,
+        )
+    }
+
+    /// The shape a child process wants: renew the same way, and stop
+    /// without renewing once `alive` says the process that forked this
+    /// one is gone. A lease outliving its node is what makes a
+    /// successor wait on a cluster that is not coming back.
+    pub fn spawn_idling_while(
+        store: Arc<dyn CasStore>,
+        layout: TenantLayout,
+        held: Arc<Mutex<HeldLease>>,
+        ttl_secs: u64,
+        idle_ttl_secs: u64,
+        alive: Alive,
+    ) -> Self {
+        Self::start(
+            store,
+            layout,
+            held,
+            ttl_secs,
+            idle_ttl_secs,
+            system_clock(),
+            Some(alive),
+        )
     }
 
     pub fn spawn_with_clock(
@@ -112,6 +180,18 @@ impl Heartbeat {
         ttl_secs: u64,
         idle_ttl_secs: u64,
         clock: Clock,
+    ) -> Self {
+        Self::start(store, layout, held, ttl_secs, idle_ttl_secs, clock, None)
+    }
+
+    fn start(
+        store: Arc<dyn CasStore>,
+        layout: TenantLayout,
+        held: Arc<Mutex<HeldLease>>,
+        ttl_secs: u64,
+        idle_ttl_secs: u64,
+        clock: Clock,
+        alive: Option<Alive>,
     ) -> Self {
         let shared = Arc::new(HbShared {
             stop: Mutex::new(false),
@@ -139,12 +219,15 @@ impl Heartbeat {
                         &*store,
                         &layout,
                         &held,
-                        Ttls {
-                            busy: ttl_secs,
-                            idle: idle_ttl_secs.max(ttl_secs),
+                        Renewal {
+                            ttls: Ttls {
+                                busy: ttl_secs,
+                                idle: idle_ttl_secs.max(ttl_secs),
+                            },
+                            clock: &clock,
+                            seed,
+                            alive: alive.as_ref(),
                         },
-                        &clock,
-                        seed,
                     )
                 })
                 .expect("spawn heartbeat thread")
@@ -227,15 +310,27 @@ struct Ttls {
     idle: u64,
 }
 
+/// What the renewal thread needs besides the lease it is renewing.
+struct Renewal<'a> {
+    ttls: Ttls,
+    clock: &'a Clock,
+    seed: u64,
+    alive: Option<&'a Alive>,
+}
+
 fn run(
     shared: &HbShared,
     store: &dyn CasStore,
     layout: &TenantLayout,
     held: &Mutex<HeldLease>,
-    ttls: Ttls,
-    clock: &Clock,
-    seed: u64,
+    r: Renewal,
 ) {
+    let Renewal {
+        ttls,
+        clock,
+        seed,
+        alive,
+    } = r;
     let mut rng = Jitter::new(seed);
     let mut ttl_secs = ttls.busy;
     let (mut base_ms, mut spread_ms) = cadence(ttl_secs);
@@ -258,6 +353,18 @@ fn run(
             return;
         }
         drop(stop);
+
+        // Before the renewal and before the backoff below, both of which
+        // would be this thread speaking for a node that is not there.
+        // The expiry already in the manifest is left where it is: the
+        // successor waits out what is left of a tight ttl rather than
+        // the five minutes an idle renewal here would have written, and
+        // the store is not touched by a process on its way out.
+        if let Some(alive) = alive
+            && !alive()
+        {
+            return;
+        }
 
         quiet = if shared.worked.swap(false, Ordering::AcqRel) {
             0
@@ -634,6 +741,72 @@ mod tests {
         }
         assert!(!hb.lost());
         hb.detach().unwrap();
+    }
+
+    #[test]
+    fn an_orphaned_process_stops_renewing_instead_of_backing_off() {
+        let (_d, store, layout) = setup();
+        let held = lease::acquire(&*store, &layout, "node-a", 1, now_unix()).unwrap();
+        let held = Arc::new(Mutex::new(held));
+        let counting = Arc::new(CountingStore {
+            inner: Arc::clone(&store),
+            puts: AtomicU32::new(0),
+        });
+        let alive = Arc::new(AtomicBool::new(true));
+
+        let watch = Arc::clone(&alive);
+        let hb = Heartbeat::spawn_idling_while(
+            Arc::clone(&counting) as Arc<dyn CasStore>,
+            layout.clone(),
+            Arc::clone(&held),
+            1,
+            30,
+            Arc::new(move || watch.load(Ordering::Acquire)),
+        );
+        // Renewing normally first, so the stop below is the predicate
+        // and not a thread that never got going.
+        assert!(
+            wait_for(Duration::from_secs(20), || counting
+                .puts
+                .load(Ordering::Relaxed)
+                > 0),
+            "the heartbeat never renewed while the parent was alive"
+        );
+
+        // The node dies here. The thread is still in a process that has
+        // not exited, which is the whole case: the postmaster is gone
+        // and the worker is finishing a store call.
+        alive.store(false, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(500));
+        counting.puts.store(0, Ordering::Relaxed);
+        let expiry = held.lock().unwrap().expires_unix;
+
+        // Long enough for three quiet renewals at a one second ttl,
+        // which is what would have written the idle lease.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(
+            counting.puts.load(Ordering::Relaxed),
+            0,
+            "an orphan kept renewing a lease for a node that is gone"
+        );
+        assert_eq!(
+            held.lock().unwrap().expires_unix,
+            expiry,
+            "an orphan moved the expiry a successor is waiting on"
+        );
+        assert_eq!(
+            advertised_ttl(&store, &layout),
+            Some(1),
+            "an orphan backed the lease off to the idle ttl on its way out"
+        );
+        assert!(!hb.lost());
+    }
+
+    #[test]
+    fn watching_a_parent_that_is_still_there_says_so() {
+        let alive = watch_parent();
+        assert!(alive());
+        assert!(alive(), "the check is not one shot");
     }
 
     #[test]

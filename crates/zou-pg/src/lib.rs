@@ -1864,10 +1864,13 @@ fn lease_expiry_to_report(e: &lease::LeaseError) -> u64 {
 ///
 /// The number is also what tells a dead predecessor from a live
 /// successor, which counting seconds cannot. A holder that is gone
-/// wrote its expiry once and nothing moves it again; a holder that is
-/// alive pushes it forward every renewal. So a waiter watching this
-/// value sits out a frozen expiry however far out it is and stops the
-/// moment it sees one advance.
+/// stops moving its expiry; a holder that is alive pushes it forward
+/// every renewal. So a waiter watching this value sits out a frozen
+/// expiry however far out it is and stops on one that keeps advancing.
+/// It has to be one that keeps advancing rather than one that advanced:
+/// a predecessor killed hard renews a few more times before its process
+/// catches up with it, and those renewals look exactly like a live
+/// node's until they stop.
 #[unsafe(no_mangle)]
 pub extern "C" fn zou_wal_lease_held_until() -> u64 {
     LEASE_HELD_UNTIL.load(Ordering::Relaxed)
@@ -2143,12 +2146,21 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
     };
     laps.lap("lease");
     let held = Arc::new(Mutex::new(held));
-    let heartbeat = Heartbeat::spawn_idling(
+    // Renewal stops when the postmaster does. This runs in the pusher,
+    // which the postmaster forked, and a postmaster killed hard leaves
+    // that worker running until whatever store call it is inside of
+    // returns. Without the check the renewal thread speaks for a dead
+    // cluster for those seconds and, because nothing is being written
+    // any more, signs off by backing the lease off to the idle ttl. The
+    // node taking over then waits five minutes on a cluster that is
+    // gone, or reads the renewals as a live rival and stops.
+    let heartbeat = Heartbeat::spawn_idling_while(
         Arc::clone(&store),
         layout.clone(),
         Arc::clone(&held),
         WAL_LEASE_TTL_SECS,
         idle_lease_ttl_secs(),
+        zou_store::heartbeat::watch_parent(),
     );
     // The landing chain hedges its creation PUTs: past an adaptive
     // delay a second identical attempt races the first and the fastest
