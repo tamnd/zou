@@ -310,6 +310,7 @@ jobs:
       ZOU_CONFORMANCE_SECRET: super-secret-jwt-token-with-at-least-32-characters-long
       ZOU_CONFORMANCE_SUITES: /tmp/zou-conformance/suites
       GOTRUE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/gotrue_ref
+      GOTRUE_ANON_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/gotrue_anon
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -375,12 +376,45 @@ jobs:
             sleep 1
           done
           curl -sf http://127.0.0.1:54331/health
+      # Anonymous sign in is off in a project that has changed nothing, so
+      # the auth suite is recorded against a server with it off and a
+      # signup with no identifier there is a refusal. The flow behind that
+      # refusal needs the flag on, a flag is a property of a server, and a
+      # suite is asked against one server, so it gets a reference of its
+      # own: the same binary in the same configuration, one environment
+      # variable and one database apart.
+      - name: Start the reference that allows a guest in
+        run: |
+          psql "$ZOU_CONFORMANCE_DSN" -v ON_ERROR_STOP=1 -c 'create database gotrue_anon'
+          psql "$GOTRUE_ANON_DSN" -v ON_ERROR_STOP=1 -c 'create schema auth'
+          psql "$GOTRUE_ANON_DSN" -v ON_ERROR_STOP=1 \
+            -c "alter role postgres in database gotrue_anon set search_path to auth, public"
+          mkdir -p /tmp/gotrue-anon
+          cp -r /tmp/gotrue/auth /tmp/gotrue/migrations /tmp/gotrue-anon/
+          sed -e 's/54331/54341/g' \
+            -e 's#/tmp/gotrue/migrations#/tmp/gotrue-anon/migrations#' \
+            /tmp/gotrue/.env > /tmp/gotrue-anon/.env
+          echo 'GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED=true' >> /tmp/gotrue-anon/.env
+          sed -i '/^DATABASE_URL=/d' /tmp/gotrue-anon/.env
+          echo "DATABASE_URL=$GOTRUE_ANON_DSN?sslmode=disable" >> /tmp/gotrue-anon/.env
+          (cd /tmp/gotrue-anon && ./auth > /tmp/gotrue-anon.log 2>&1 &)
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:54341/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:54341/health
       - name: Check zou against the recording
         run: |
           cargo run -p zou-conformance -- check --suite auth \
             --zou-dsn "$ZOU_CONFORMANCE_DSN" \
             --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
             --json /tmp/auth.json
+      - name: Check zou against the anonymous recording
+        run: |
+          cargo run -p zou-conformance -- check --suite auth-anon \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --json /tmp/auth-anon.json
       # A bare GoTrue answers on / where a project answers on /auth/v1,
       # so the reference is asked with the prefix taken back off and the
       # cases stay the paths a client types.
@@ -393,15 +427,34 @@ jobs:
             --reference-dsn "$GOTRUE_DSN" \
             --reference-strip-prefix /auth/v1 \
             --jwt-secret "$ZOU_CONFORMANCE_SECRET"
+      - name: Diff the auth-anon suite against a live GoTrue
+        run: |
+          cargo run -p zou-conformance -- diff --suite auth-anon \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --reference-url http://127.0.0.1:54341 \
+            --reference-name "gotrue live, anonymous sign in on" \
+            --reference-dsn "$GOTRUE_ANON_DSN" \
+            --reference-strip-prefix /auth/v1 \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET"
       - name: Keep the reference log
         if: always()
         run: cat /tmp/gotrue.log
+      - name: Keep the log of the reference that allows a guest in
+        if: always()
+        run: cat /tmp/gotrue-anon.log
       - name: Keep the report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: auth
           path: /tmp/auth.json
+          if-no-files-found: ignore
+      - name: Keep the anonymous report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-anon
+          path: /tmp/auth-anon.json
           if-no-files-found: ignore
 
   # The storage suite has no diff step, which is the one thing that
@@ -1635,6 +1688,10 @@ jobs:
           path: /tmp/reports
       - uses: actions/download-artifact@v4
         with:
+          name: auth-anon
+          path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
           name: storage
           path: /tmp/reports
       - uses: actions/download-artifact@v4
@@ -1673,6 +1730,7 @@ jobs:
           cargo run -p zou-conformance -- scoreboard \
             --report /tmp/reports/conformance.json \
             --report /tmp/reports/auth.json \
+            --report /tmp/reports/auth-anon.json \
             --report /tmp/reports/storage.json \
             --js supabase-js=/tmp/reports/js.json \
             --js storage-js=/tmp/reports/js-storage.json \
