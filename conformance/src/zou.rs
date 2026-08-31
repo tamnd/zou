@@ -133,6 +133,10 @@ pub struct Shape<'a> {
     /// anonymous one either way: with the flag off that is a refusal,
     /// and the refusal is a case in the auth suite already.
     pub anonymous_users: bool,
+    /// The provider and the written down codes a phone suite is asked
+    /// with, and nothing at all in every other suite, which is phone
+    /// sign in off.
+    pub sms: Option<&'a crate::suite::Sms>,
 }
 
 /// Start zou against `dsn` on a free port and wait until it answers.
@@ -178,6 +182,23 @@ pub fn start_at(
         .map_err(|e| format!("the port it got: {e}"))?
         .port();
     let url = format!("http://127.0.0.1:{port}");
+    let texter = match shape.sms {
+        None => None,
+        Some(sms) if sms.provider == "twilio" => {
+            // The credentials are the reference's, which are not
+            // credentials: every number a phone suite uses has its code
+            // written down, so the send path is never taken and nothing
+            // is ever signed with them. The api root is moved off
+            // Twilio all the same, so a case that did fall through
+            // fails against a closed port here rather than reaching out
+            // of the machine the suite is running on.
+            let mut twilio =
+                zou_server::sms::Twilio::new("ACconformance", "conformance", "MGconformance");
+            twilio.base = "http://127.0.0.1:1".to_string();
+            Some(std::sync::Arc::new(twilio) as std::sync::Arc<dyn zou_server::sms::Sender>)
+        }
+        Some(sms) => return Err(format!("no provider here is called {}", sms.provider)),
+    };
     let cfg = Config {
         // The key a project derives from its own secret, which every
         // other way of running zou sets too. A target that published an
@@ -210,6 +231,17 @@ pub fn start_at(
         anon_role: shape.anon_role.to_string(),
         anonymous_users: shape.anonymous_users,
         mailer_autoconfirm: true,
+        phone_enabled: shape.sms.is_some(),
+        sms: zou_server::sms::Settings {
+            test_otp: shape.sms.map(|s| s.test_otp.clone()).unwrap_or_default(),
+            // The reference is started with no wait between codes, so a
+            // suite can ask for two in the time one case takes. Every
+            // other setting is the one a project that changed nothing
+            // has, which is what the reference was started with too.
+            max_frequency: 0,
+            ..zou_server::sms::Settings::default()
+        },
+        texter,
         // Somewhere to put object bytes, under the port it answers on
         // so that two runs on one machine cannot read each other's.
         // A directory rather than a bucket: the suite is about what

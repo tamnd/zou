@@ -215,6 +215,8 @@ pub fn derive(from: &Path, suite: &str) -> Result<Derived, String> {
             // Nothing derived from PostgREST's spec files signs anybody
             // in at all, let alone without a name.
             anonymous_users: false,
+            // And nothing derived from them sends a text either.
+            sms: None,
             // Upstream's fixtures pin every row down, so nothing a
             // derived case reads moves and there is nobody to sign a
             // token for.

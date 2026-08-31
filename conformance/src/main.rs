@@ -472,6 +472,7 @@ fn run(args: Args) -> Result<bool, String> {
                     schemas: &suite.cases.schemas,
                     anon_role: &suite.cases.anon_role,
                     anonymous_users: suite.cases.anonymous_users,
+                    sms: suite.cases.sms.as_ref(),
                 },
                 s3_pair(&args.s3_key, &args.s3_secret),
             )?),
@@ -662,6 +663,10 @@ fn served_as(args: &Args) -> zou::Shape<'_> {
         schemas: &args.schemas,
         anon_role: &args.anon_role,
         anonymous_users: args.anonymous_users,
+        // No flag for it, because the suites asked this way are the
+        // ones somebody else's client asks and none of them are about
+        // phones. A served node is a project with phone sign in off.
+        sms: None,
     }
 }
 
