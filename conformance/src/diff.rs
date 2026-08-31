@@ -47,11 +47,7 @@ pub fn compare(expected: &Answer, found: &Answer) -> Difference {
         }
     }
     if expected.body != found.body {
-        lines.push(format!(
-            "body {} not {}",
-            snippet(&found.body),
-            snippet(&expected.body)
-        ));
+        lines.extend(fields(&expected.body, &found.body));
     }
     // A parsed body compares 1200.50 and 1200.5 equal, because a double
     // cannot tell them apart. A client reading a price can, so the
@@ -150,6 +146,82 @@ fn header_names(expected: &Answer, found: &Answer) -> Vec<String> {
     names
 }
 
+/// How many differing fields are worth printing before a report is
+/// saying the same thing over and over. A body where twenty places
+/// differ is a body that is wrong in one way, and the first few say
+/// which way.
+const FIELDS: usize = 12;
+
+/// The places two bodies differ, named as json pointers into them.
+///
+/// Two bodies side by side say that something differs and not what: the
+/// difference is usually one field somewhere past the two hundredth
+/// character, which is where the line is cut. So the two are walked
+/// together and only the leaves that differ are named. Bodies that are
+/// not both containers have no leaves to name and are shown whole,
+/// which is what the root of the walk does.
+fn fields(expected: &serde_json::Value, found: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    walk("", Some(expected), Some(found), &mut out);
+    if out.len() > FIELDS {
+        let rest = out.len() - FIELDS;
+        out.truncate(FIELDS);
+        out.push(format!("and {rest} more"));
+    }
+    out
+}
+
+fn walk(
+    path: &str,
+    expected: Option<&serde_json::Value>,
+    found: Option<&serde_json::Value>,
+    out: &mut Vec<String>,
+) {
+    use serde_json::Value;
+    match (expected, found) {
+        (Some(Value::Object(want)), Some(Value::Object(got))) => {
+            let mut keys: Vec<&String> = want.keys().chain(got.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for key in keys {
+                walk(
+                    &format!("{path}/{}", pointer(key)),
+                    want.get(key),
+                    got.get(key),
+                    out,
+                );
+            }
+        }
+        // Only element by element when there are the same number of
+        // them. Two lists of different lengths are one difference and
+        // not one per position, and pairing them up by index would say
+        // the rest of the list moved when what happened is that
+        // something was left out of the front of it.
+        (Some(Value::Array(want)), Some(Value::Array(got))) if want.len() == got.len() => {
+            for (i, (want, got)) in want.iter().zip(got).enumerate() {
+                walk(&format!("{path}/{i}"), Some(want), Some(got), out);
+            }
+        }
+        _ if expected != found => {
+            out.push(format!("body{path} {} not {}", held(found), held(expected)))
+        }
+        _ => {}
+    }
+}
+
+/// A key as a json pointer writes it, which is with the two characters
+/// that mean something in one spelled out.
+fn pointer(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+fn held(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(value) => snippet(value),
+        None => "absent".to_string(),
+    }
+}
+
 fn shown(value: Option<&str>) -> String {
     match value {
         Some(value) => format!("{value:?}"),
@@ -231,7 +303,55 @@ mod tests {
         let b = answer(200, &[], serde_json::json!([{"id": 2}]));
         let difference = compare(&a, &b);
         assert_eq!(difference.verdict, Verdict::Different);
-        assert!(difference.lines[0].starts_with("body [{\"id\":2}] not"));
+        assert_eq!(difference.lines[0], "body/0/id 2 not 1");
+    }
+
+    /// The line that is read in a terminal names the field rather than
+    /// the two bodies it is in, because the two bodies are long and the
+    /// same everywhere else.
+    #[test]
+    fn a_field_that_differs_is_named_by_where_it_is() {
+        let a = answer(
+            200,
+            &[],
+            serde_json::json!({"user": {"phone": "1", "id": 7}}),
+        );
+        let b = answer(
+            200,
+            &[],
+            serde_json::json!({"user": {"phone": "2", "id": 7}}),
+        );
+        assert_eq!(compare(&a, &b).lines, ["body/user/phone \"2\" not \"1\""]);
+    }
+
+    #[test]
+    fn a_field_only_one_side_has_is_named_as_missing_from_the_other() {
+        let a = answer(200, &[], serde_json::json!({"id": 7}));
+        let b = answer(200, &[], serde_json::json!({"id": 7, "new_phone": "1"}));
+        assert_eq!(compare(&a, &b).lines, ["body/new_phone \"1\" not absent"]);
+        assert_eq!(compare(&b, &a).lines, ["body/new_phone absent not \"1\""]);
+    }
+
+    /// A list that lost a row is one difference. Pairing the two up by
+    /// position would say every row after the missing one moved.
+    #[test]
+    fn two_lists_of_different_lengths_are_one_difference() {
+        let a = answer(200, &[], serde_json::json!({"rows": [1, 2, 3]}));
+        let b = answer(200, &[], serde_json::json!({"rows": [1, 3]}));
+        assert_eq!(compare(&a, &b).lines[0], "body/rows [1,3] not [1,2,3]");
+    }
+
+    #[test]
+    fn a_body_that_differs_everywhere_says_how_much_was_left_out() {
+        let wide = |from: i64| -> serde_json::Value {
+            serde_json::Value::Object(
+                (0..20)
+                    .map(|n| (format!("f{n}"), serde_json::json!(from + n)))
+                    .collect(),
+            )
+        };
+        let difference = compare(&answer(200, &[], wide(0)), &answer(200, &[], wide(100)));
+        assert_eq!(difference.lines[FIELDS], "and 8 more");
     }
 
     /// The whole reason there are three outcomes.

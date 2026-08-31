@@ -317,6 +317,41 @@ The case in the middle is the conversion.
 An anonymous account puts an address on itself and keeps its id, which is the whole point of signing in without a name first, since whatever rows a policy wrote for that id are still that person's afterwards.
 The refresh after it is the case the whole suite is for: a policy that lets guests read and members write reads the claim off the token, and it has to stop being true the moment the account stops being one.
 
+## The suite that needs a telephone
+
+A project that has changed nothing has no text message provider, so in the suite above `/settings` says `sms_provider` is empty, every endpoint that would send a code refuses, and none of its cases are about telephones.
+Turning a provider on is the same kind of change anonymous sign in is, a property of a server rather than of a request, so it gets the same treatment: a third reference, on a third port, with a database of its own.
+
+```
+GOTRUE_EXTERNAL_PHONE_ENABLED=true
+GOTRUE_SMS_PROVIDER=twilio
+GOTRUE_SMS_TWILIO_ACCOUNT_SID=ACconformance
+GOTRUE_SMS_TWILIO_AUTH_TOKEN=conformance
+GOTRUE_SMS_TWILIO_MESSAGE_SERVICE_SID=MGconformance
+GOTRUE_SMS_TEST_OTP=15550100000:313370,15550100001:424242,...
+```
+
+The last line is what makes the suite exist at all.
+A code that arrives on a telephone is not a code a recording can spend, so the numbers the cases use have their codes written down in advance, and the whole flow can be asked end to end by a program with no phone in front of it.
+The credentials are strings of the right shape and nothing else, and the harness points zou's Twilio sender at a closed port, so a case that ever fell through to a real send fails against a refused connection rather than reaching a network.
+The provider name still has to be there on both sides, because `/settings` reports it and the first case in the file reads `/settings`.
+
+zou is told the same thing by an `sms` block at the top of the suite's `cases.json`, next to the schema list and the anonymous flag, carrying the provider name and the same pairs the environment variable carries.
+
+```json
+"sms": {"provider": "twilio", "test_otp": {"15550100000": "313370"}}
+```
+
+Two things in this suite came out of the recording rather than out of anybody's reading of GoTrue, and both are now zou's behaviour.
+A number on the written down list verifies with its code even though nothing was ever sent to it, which is a branch ahead of the provider rather than a stored token being checked, and a project that has the list gets it whether or not a send happened.
+And the minute a number waits between codes is on in the reference, where the harness had been turning it off for zou, so the resend cases are asked with the wait in place on both sides and the 429 is a recorded answer rather than a configuration difference.
+
+The suite also settled four things about what a phone account looks like, all of them in the identity the answer carries.
+The identity a phone signup writes does not hold the number, because the claims GoTrue fills in there name the account and the two verified flags and leave the phone field empty, and an empty field is dropped.
+The identity an operator writes does hold it, so the two paths differ from each other on purpose.
+Confirming a number writes the two columns on the account and stops, leaving the identity saying `phone_verified` is false for ever, which reads like an oversight and is visible in every answer that carries an identity.
+zou used to tidy all three of those and now writes what the other end writes.
+
 ## The suite recorded from an image
 
 The `storage` suite comes in three parts, the bucket endpoints, the object ones and the S3 protocol, each asked with a service key, an anon key, and in a good few cases with no key at all.
@@ -679,7 +714,7 @@ A count in a sentence is a count somebody has to remember to change, and the who
 
 What belongs here is what the scoreboard cannot say, which is why a number is what it is.
 
-The two auth suites are the only recorded ones that do not pass in full, and the difference is deliberate in every case.
+The three auth suites are the only recorded ones that do not pass in full, and the difference is deliberate in every case.
 zou answers `/health` with its own version rather than claiming to be a GoTrue release it is not, it answers `saml_private_key_next_configured` false where upstream answers true with SAML off, it publishes a signing key where upstream publishes an empty set because a project on zou signs its access tokens with a key derived from its own secret, and it fills the identity list in on the admin listing where upstream answers null because its ORM does not load the association on that query.
 Each of them is written out in `known.json` with the reason next to it, and each is still counted as a failure on the scoreboard, so the number there cannot be improved by writing something down.
 
@@ -687,6 +722,9 @@ Each of them is written out in `known.json` with the reason next to it, and each
 The other is the conversion: zou reports `confirmed_at` on the answer to the request that set it, and upstream leaves it out there and reports it on every answer after.
 It is a generated column, the earlier of the two confirmation times, and upstream answers off the struct it loaded before the update rather than off the row it wrote.
 Matching that would mean reporting an account as unconfirmed one request after confirming it, which is bug compatibility with nothing behind it, so it is written down instead.
+
+`auth-phone` carries one, and it is that same settings answer a third time.
+Everything else in it matches, which is worth saying because most of those answers are a user object with an identity inside it and the identity is where the differences were.
 
 The `postgrest` suite asks everything upstream asks itself, including the parts of PostgREST nobody using Supabase has ever typed, and what it took to get there is written down in [tamnd/zou#125](https://github.com/tamnd/zou/issues/125).
 
@@ -706,6 +744,7 @@ cargo run -p zou-conformance -- scoreboard \
   --report /tmp/reports/conformance.json \
   --report /tmp/reports/auth.json \
   --report /tmp/reports/auth-anon.json \
+  --report /tmp/reports/auth-phone.json \
   --report /tmp/reports/storage.json \
   --js supabase-js=/tmp/reports/js.json \
   --js storage-js=/tmp/reports/js-storage.json \

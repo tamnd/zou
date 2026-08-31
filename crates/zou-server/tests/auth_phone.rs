@@ -441,7 +441,11 @@ async fn a_phone_signup_texts_a_code_and_the_code_confirms_the_number() {
         &[&phone],
     )
     .await;
-    assert!(verified, "the identity says what the provider asserted");
+    assert!(
+        !verified,
+        "and the identity still says nothing, which is upstream's and \
+         is what the column on the account is for"
+    );
 }
 
 #[tokio::test]
@@ -1791,7 +1795,7 @@ async fn a_provider_that_keeps_its_own_codes_is_asked_rather_than_the_column() {
         &[&phone],
     )
     .await;
-    assert!(verified, "and the identity says so");
+    assert!(!verified, "and the identity is left as the signup wrote it");
 }
 
 #[tokio::test]
@@ -1971,6 +1975,68 @@ async fn a_number_on_the_test_list_is_never_texted_and_the_written_code_verifies
     let text = only_text(&app).await;
     assert_eq!(text.to(), other);
     assert_ne!(text.code(), "313370");
+}
+
+#[tokio::test]
+async fn a_written_code_is_taken_for_a_number_that_was_never_sent_one() {
+    let Some(dsn) = dsn() else { return };
+    let phone = number(34);
+    let app = app_with_fixed_codes(&dsn, &[(&phone, "424242")], None);
+    let pool = pool(&dsn).await;
+    wipe(&pool, &phone).await;
+
+    let up = post(
+        &app,
+        "/auth/v1/signup",
+        serde_json::json!({"phone": &phone, "password": "correct horse"}),
+    )
+    .await;
+    assert_eq!(up.status, StatusCode::OK, "{}", up.body);
+    let done = post(
+        &app,
+        "/auth/v1/verify",
+        serde_json::json!({"type": "sms", "phone": &phone, "token": "424242"}),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::OK, "{}", done.body);
+
+    // The code was spent above, so there is nothing outstanding against
+    // the number now, and the list still decides. Upstream reads it the
+    // same way: a number whose code was written down is checked against
+    // what was written rather than against what was sent, because
+    // nothing was ever sent.
+    let again = post(
+        &app,
+        "/auth/v1/verify",
+        serde_json::json!({"type": "sms", "phone": &phone, "token": "424242"}),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    assert!(!again.token().is_empty());
+
+    // Everything else about that number is still refused, so the list
+    // is a code rather than a way past the code.
+    let wrong = post(
+        &app,
+        "/auth/v1/verify",
+        serde_json::json!({"type": "sms", "phone": &phone, "token": "000000"}),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::FORBIDDEN, "{}", wrong.body);
+
+    // And a number on the list with no account behind it is refused in
+    // the same words as a wrong code, which is what stops the list from
+    // saying who has an account.
+    let nobody = number(35);
+    wipe(&pool, &nobody).await;
+    let app = app_with_fixed_codes(&dsn, &[(&nobody, "515151")], None);
+    let missing = post(
+        &app,
+        "/auth/v1/verify",
+        serde_json::json!({"type": "sms", "phone": &nobody, "token": "515151"}),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::FORBIDDEN, "{}", missing.body);
 }
 
 #[tokio::test]

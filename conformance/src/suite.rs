@@ -224,6 +224,12 @@ pub struct Cases {
     /// with the matching flag rather than from the one next to it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub anonymous_users: bool,
+    /// What the project these cases are asked as is configured to do
+    /// about text messages. Absent is phone sign in off, which is what
+    /// a Supabase project that has changed nothing has, and what every
+    /// suite but the phone one is recorded against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sms: Option<Sms>,
     /// The person the suite seeded, when it seeded one. The `user` key
     /// is an access token for them, minted from the same secret every
     /// target is configured with, so a case can ask an endpoint that
@@ -232,6 +238,27 @@ pub struct Cases {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<User>,
     pub cases: Vec<Case>,
+}
+
+/// A project with phone sign in on, and the numbers whose code is
+/// written down rather than texted.
+///
+/// Both halves matter to what a target answers. The provider is on
+/// `/settings`, so a suite recorded against a reference configured with
+/// Twilio and checked against a target configured with nothing would
+/// differ on the first case before it reached a phone flow. The codes
+/// are how the suite can be a suite at all: a recorded run cannot read
+/// an sms, so every number it uses is one both sides were told the code
+/// for, and neither side ever asks a provider for anything.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Sms {
+    /// The name the project's provider answers to, which is the string
+    /// `/settings` reports. Only `twilio` is recorded so far.
+    pub provider: String,
+    /// Number to code, in the same pairs GoTrue takes in
+    /// `GOTRUE_SMS_TEST_OTP`. Numbers are digits, no plus, since that
+    /// is what both sides strip them to.
+    pub test_otp: BTreeMap<String, String>,
 }
 
 /// Enough of a seeded person to sign a token for them. Every field is

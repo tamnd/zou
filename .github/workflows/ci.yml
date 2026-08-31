@@ -311,6 +311,7 @@ jobs:
       ZOU_CONFORMANCE_SUITES: /tmp/zou-conformance/suites
       GOTRUE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/gotrue_ref
       GOTRUE_ANON_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/gotrue_anon
+      GOTRUE_PHONE_DSN: postgres://postgres:zou-conformance@127.0.0.1:5432/gotrue_phone
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -403,6 +404,46 @@ jobs:
             sleep 1
           done
           curl -sf http://127.0.0.1:54341/health
+      # And a third, for the same reason again. A project that has
+      # changed nothing has no text message provider, so next door every
+      # endpoint that would send a code refuses and none of the cases
+      # there are about telephones. This one has Twilio configured with
+      # credentials that are only the right shape and a list of numbers
+      # whose codes are written down, which is what makes the suite
+      # recordable: a code that arrives on a telephone is not a code a
+      # recording can spend. Nothing is carried anywhere, because the
+      # account is not real and the send would be refused by Twilio if
+      # it ever got that far.
+      - name: Start the reference that texts a code
+        run: |
+          psql "$ZOU_CONFORMANCE_DSN" -v ON_ERROR_STOP=1 -c 'create database gotrue_phone'
+          psql "$GOTRUE_PHONE_DSN" -v ON_ERROR_STOP=1 -c 'create schema auth'
+          psql "$GOTRUE_PHONE_DSN" -v ON_ERROR_STOP=1 \
+            -c "alter role postgres in database gotrue_phone set search_path to auth, public"
+          mkdir -p /tmp/gotrue-phone
+          cp -r /tmp/gotrue/auth /tmp/gotrue/migrations /tmp/gotrue-phone/
+          sed -e 's/54331/54351/g' \
+            -e 's#/tmp/gotrue/migrations#/tmp/gotrue-phone/migrations#' \
+            /tmp/gotrue/.env > /tmp/gotrue-phone/.env
+          cat >> /tmp/gotrue-phone/.env <<'CONF'
+          GOTRUE_EXTERNAL_PHONE_ENABLED=true
+          GOTRUE_SMS_AUTOCONFIRM=false
+          GOTRUE_SMS_PROVIDER=twilio
+          GOTRUE_SMS_TWILIO_ACCOUNT_SID=ACconformance
+          GOTRUE_SMS_TWILIO_AUTH_TOKEN=conformance
+          GOTRUE_SMS_TWILIO_MESSAGE_SERVICE_SID=MGconformance
+          GOTRUE_SMS_MAX_FREQUENCY=0
+          GOTRUE_RATE_LIMIT_SMS_SENT=100000
+          GOTRUE_SMS_TEST_OTP=15550100000:313370,15550100001:424242,15550100002:151515,15550100003:262626,15550100004:373737,15550100005:484848,15550100006:595959,15550100007:606060,15550100008:717171,15550100009:828282
+          CONF
+          sed -i '/^DATABASE_URL=/d' /tmp/gotrue-phone/.env
+          echo "DATABASE_URL=$GOTRUE_PHONE_DSN?sslmode=disable" >> /tmp/gotrue-phone/.env
+          (cd /tmp/gotrue-phone && ./auth > /tmp/gotrue-phone.log 2>&1 &)
+          for i in $(seq 1 60); do
+            curl -sf http://127.0.0.1:54351/health >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:54351/health
       - name: Check zou against the recording
         run: |
           cargo run -p zou-conformance -- check --suite auth \
@@ -415,6 +456,12 @@ jobs:
             --zou-dsn "$ZOU_CONFORMANCE_DSN" \
             --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
             --json /tmp/auth-anon.json
+      - name: Check zou against the recording made with a telephone
+        run: |
+          cargo run -p zou-conformance -- check --suite auth-phone \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET" \
+            --json /tmp/auth-phone.json
       # A bare GoTrue answers on / where a project answers on /auth/v1,
       # so the reference is asked with the prefix taken back off and the
       # cases stay the paths a client types.
@@ -436,12 +483,24 @@ jobs:
             --reference-dsn "$GOTRUE_ANON_DSN" \
             --reference-strip-prefix /auth/v1 \
             --jwt-secret "$ZOU_CONFORMANCE_SECRET"
+      - name: Diff the auth-phone suite against a live GoTrue
+        run: |
+          cargo run -p zou-conformance -- diff --suite auth-phone \
+            --zou-dsn "$ZOU_CONFORMANCE_DSN" \
+            --reference-url http://127.0.0.1:54351 \
+            --reference-name "gotrue live, phone sign in on" \
+            --reference-dsn "$GOTRUE_PHONE_DSN" \
+            --reference-strip-prefix /auth/v1 \
+            --jwt-secret "$ZOU_CONFORMANCE_SECRET"
       - name: Keep the reference log
         if: always()
         run: cat /tmp/gotrue.log
       - name: Keep the log of the reference that allows a guest in
         if: always()
         run: cat /tmp/gotrue-anon.log
+      - name: Keep the log of the reference that texts a code
+        if: always()
+        run: cat /tmp/gotrue-phone.log
       - name: Keep the report
         if: always()
         uses: actions/upload-artifact@v4
@@ -455,6 +514,13 @@ jobs:
         with:
           name: auth-anon
           path: /tmp/auth-anon.json
+          if-no-files-found: ignore
+      - name: Keep the report from the telephone suite
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: auth-phone
+          path: /tmp/auth-phone.json
           if-no-files-found: ignore
 
   # The storage suite has no diff step, which is the one thing that
@@ -1692,6 +1758,10 @@ jobs:
           path: /tmp/reports
       - uses: actions/download-artifact@v4
         with:
+          name: auth-phone
+          path: /tmp/reports
+      - uses: actions/download-artifact@v4
+        with:
           name: storage
           path: /tmp/reports
       - uses: actions/download-artifact@v4
@@ -1731,6 +1801,7 @@ jobs:
             --report /tmp/reports/conformance.json \
             --report /tmp/reports/auth.json \
             --report /tmp/reports/auth-anon.json \
+            --report /tmp/reports/auth-phone.json \
             --report /tmp/reports/storage.json \
             --js supabase-js=/tmp/reports/js.json \
             --js storage-js=/tmp/reports/js-storage.json \

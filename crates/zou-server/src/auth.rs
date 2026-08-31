@@ -449,6 +449,10 @@ pub(crate) const PHONE_CONFIRMATION: &str = "confirmation";
 pub(crate) const PHONE_CHANGE: &str = "phone_change";
 pub(crate) const PHONE_REAUTHENTICATION: &str = "reauthentication";
 
+/// What stands in for a provider's reference when the code came off the
+/// written down list and no message was carried anywhere.
+const TEST_MESSAGE: &str = "test-otp";
+
 /// Draw a code, write it down, and text it. The answer is the
 /// provider's id for the message, which the otp endpoint hands back and
 /// which is empty for the dev sink.
@@ -490,7 +494,12 @@ pub(crate) async fn send_phone_code(
         // ahead of the Twilio Verify branch too, so a project with the
         // list and that provider still gets the code it wrote.
         mint_fixed(sess, user_id, out.to, token_type, fixed).await?;
-        return Ok(String::new());
+        // Nothing was carried, so there is no provider reference to
+        // hand back, and upstream answers with this word in the place
+        // one would go. A client that files message ids sees the same
+        // string for every number on the list, which is the point: it
+        // says the code came off the list rather than out of a phone.
+        return Ok(TEST_MESSAGE.to_string());
     }
     let code = match post.texter.verifies() {
         // Twilio Verify holds the code, so there is none to draw here
@@ -1549,19 +1558,29 @@ async fn register_phone(
         None => {
             let rows = sess
                 .query(
-                    "insert into auth.users
+                    // The id is drawn first for the same reason the email
+                    // signup draws it first: the metadata carries it.
+                    // The number is not among the keys written over the
+                    // top, because the claims upstream builds here leave
+                    // the phone field empty and drop it.
+                    "with fresh as (select gen_random_uuid() as id)
+                     insert into auth.users
                          (instance_id, id, aud, role, phone, encrypted_password,
                           raw_app_meta_data, raw_user_meta_data,
                           confirmation_token, recovery_token,
                           email_change_token_new, email_change,
                           phone_change, phone_change_token,
                           created_at, updated_at, is_anonymous, is_sso_user)
-                     values ('00000000-0000-0000-0000-000000000000', gen_random_uuid(),
-                             $2, 'authenticated', $1, $3,
-                             jsonb_build_object('provider', 'phone',
-                                                'providers', jsonb_build_array('phone')),
-                             $4::jsonb, '', '', '', '', '', '',
-                             now(), now(), false, false)
+                     select '00000000-0000-0000-0000-000000000000', fresh.id,
+                            $2, 'authenticated', $1, $3,
+                            jsonb_build_object('provider', 'phone',
+                                               'providers', jsonb_build_array('phone')),
+                            $4::jsonb || jsonb_build_object(
+                                'sub', fresh.id::text,
+                                'email_verified', false, 'phone_verified', false),
+                            '', '', '', '', '', '',
+                            now(), now(), false, false
+                       from fresh
                      returning id::text",
                     &[&phone, &AUD, &hash, &data],
                 )
@@ -1570,23 +1589,28 @@ async fn register_phone(
         }
     };
 
-    // Upstream leaves the number off this identity entirely, because its
-    // claims struct drops empty fields and nothing fills the phone one
-    // on a signup. zou writes it, the same way the email identity
-    // carries the address, so an identity always says what it is for.
+    // The number is left off this identity, which reads oddly for a row
+    // whose whole job is to say the account belongs to a telephone. It
+    // is what upstream writes: the claims it fills in here name the
+    // account and the two verified flags and nothing else, and the empty
+    // phone field is dropped on the way in. The identity an operator
+    // makes carries the number, so the two paths differ, and a client
+    // that reads identity_data on a signup reads the same keys on both
+    // ends only if this one stays empty.
     sess.execute(
         "insert into auth.identities
              (provider_id, user_id, identity_data, provider,
               last_sign_in_at, created_at, updated_at)
          select $1::text::uuid::text, $1::text::uuid,
-                $3::jsonb || jsonb_build_object(
-                    'sub', $1::text, 'phone', $2::text, 'phone_verified', false),
+                $2::jsonb || jsonb_build_object(
+                    'sub', $1::text,
+                    'email_verified', false, 'phone_verified', false),
                 'phone', now(), now(), now()
          where not exists (
              select 1 from auth.identities
              where user_id = $1::text::uuid and provider = 'phone'
          )",
-        &[&user_id, &phone, &data],
+        &[&user_id, &data],
     )
     .await?;
 
@@ -2324,6 +2348,21 @@ async fn by_phone(sess: &sql::Session, asked: &Asked, rules: &Rules) -> Result<H
     if row.get::<_, bool>(1) {
         return banned();
     }
+    // A number whose code the project wrote down is checked against
+    // what was written and against nothing else. There is no column to
+    // read for it, because nothing was ever drawn or sent, and the code
+    // does not run out: it is the same code every time until the number
+    // comes off the list. Ahead of the provider, which is the order
+    // upstream puts these two in on the way out as well.
+    if let Some(fixed) = rules.fixed.get(&asked.phone) {
+        if &asked.token != fixed {
+            return expired(TOKEN_EXPIRED);
+        }
+        return Ok(Holder {
+            user_id,
+            kind: kind.to_string(),
+        });
+    }
     match &rules.verifier {
         // The account was found by the number it holds, which is the
         // whole of what this database knows. Whether the digits are the
@@ -2425,25 +2464,16 @@ pub(crate) async fn confirm_user_row(
 }
 
 /// Confirm the number. Upstream writes the two columns and stops, which
-/// leaves the phone identity saying the number is unverified for ever.
-/// That is the same gap zou closed on the email side, so the identity is
-/// marked here too.
+/// leaves the phone identity saying the number is unverified for ever
+/// and leaves its updated_at at whatever the signup wrote. Both of those
+/// are visible to a client, because the identity goes out with the user
+/// on every one of these answers, so this end stops where upstream does
+/// rather than tidying the row and reading differently.
 pub(crate) async fn confirm_phone(sess: &sql::Session, user_id: &str) -> Result<(), sql::Error> {
     sess.execute(
         "update auth.users
             set confirmation_token = '', phone_confirmed_at = now(), updated_at = now()
           where id = $1::text::uuid",
-        &[&user_id],
-    )
-    .await?;
-    sess.execute(
-        "update auth.identities i
-            set identity_data = i.identity_data
-                                || jsonb_build_object('phone_verified', true),
-                updated_at = now()
-           from auth.users u
-          where i.user_id = u.id and u.id = $1::text::uuid
-            and i.provider = 'phone' and i.identity_data->>'phone' = u.phone",
         &[&user_id],
     )
     .await?;
@@ -2529,6 +2559,9 @@ pub(crate) struct Rules {
     /// column, and how long the code lasts is its business too, so
     /// `sms_exp` says nothing about the codes it drew.
     pub(crate) verifier: Option<Arc<dyn crate::sms::Sender>>,
+    /// The numbers whose code the project wrote down, read once here so
+    /// that a verify asks the clock once rather than once per lookup.
+    pub(crate) fixed: std::collections::BTreeMap<String, String>,
 }
 
 /// The project's settings as a verify reads them.
@@ -2538,6 +2571,7 @@ fn rules(app: &App) -> Rules {
         autoconfirm: app.cfg.mailer_autoconfirm,
         sms_exp: app.cfg.sms.otp_exp,
         verifier: app.texter.verifies().then(|| Arc::clone(&app.texter)),
+        fixed: app.cfg.sms.live_codes(now()),
     }
 }
 
@@ -3564,6 +3598,7 @@ async fn update_user(
                     autoconfirm: true,
                     sms_exp: 0,
                     verifier: None,
+                    fixed: Default::default(),
                 },
             )
             .await?;
@@ -3641,6 +3676,27 @@ pub(crate) async fn held_by_another(
               where phone = $1 and aud = $2 and id <> $3::text::uuid
                 and deleted_at is null limit 1",
             &[&phone, &AUD, &user_id],
+        )
+        .await?;
+    Ok(!rows.is_empty())
+}
+
+/// Whether the number belongs to somebody else already, in any
+/// audience. The one above asks within the audience a signup happens in,
+/// which is the right question there and the wrong one for an operator:
+/// the column is unique across the table, so a number held under another
+/// audience is a collision the insert would raise rather than a refusal
+/// the caller could read.
+pub(crate) async fn phone_taken(
+    sess: &sql::Session,
+    phone: &str,
+    user_id: &str,
+) -> Result<bool, sql::Error> {
+    let rows = sess
+        .query(
+            "select 1 from auth.users
+              where phone = $1 and id <> $2::text::uuid and deleted_at is null limit 1",
+            &[&phone, &user_id],
         )
         .await?;
     Ok(!rows.is_empty())
