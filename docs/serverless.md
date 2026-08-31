@@ -34,7 +34,9 @@ On Cloud Run that is `maxScale: 1`, on Fly it is one machine, and on Lambda it i
 
 A deployment that ends cleanly puts the lease back.
 `zou serve` and `zou lambda` both stop their postmaster on SIGINT and SIGTERM, and stopping clears the lease from the manifest, so the next start attaches immediately.
-A deployment that is killed outright does not, and the next start's first write waits out the rest of the 15 seconds while reads answer normally.
+A deployment that is killed outright does not, and the next start's first write waits out the rest of the lease while reads answer normally.
+How long that is depends on what the project was doing when the kill landed: 15 seconds if it was being written, and up to 5 minutes if it was idle, because a project nobody is writing backs its lease off rather than pay for a renewal every 15 seconds.
+The successor waits out whichever of the two it finds, since the expiry comes back with the refusal.
 That is the difference between a stop and a kill, and it is worth setting up the platform so it sends a signal.
 
 ## Freeze and thaw
@@ -50,7 +52,8 @@ A reader crossing that litter ends the chain rather than choking on it, and a br
 
 What the thawed process itself does is give up.
 Its next append fails, its pusher restarts, and it finds the lease held by a machine that is renewing it.
-After `ZOU_LEASE_WAIT_SECS`, 60 seconds by default and four times the TTL, it stops the cluster instead of waiting on.
+Renewing is the word that matters: a holder that is alive writes the expiry forward and a holder that is gone leaves it where it was, so the thawed process sees the number move and stops the cluster on the spot rather than waiting on.
+`ZOU_LEASE_WAIT_SECS`, 60 seconds by default, is the floor it waits before giving up on a lease whose expiry it never learned.
 The alternative is worse than it sounds: a postmaster that answers on its port and hangs every commit forever, because a backend past its flush holds interrupts and cannot even be cancelled.
 
 [scripts/zou-freeze-thaw.sh](../scripts/zou-freeze-thaw.sh) is the drill: SIGSTOP a cluster under load, hand the store to a successor, SIGCONT the first one, and check that every acked commit is in a third cluster restored from nothing but the objects.

@@ -1,0 +1,154 @@
+Size the pusher's wait for the lease against the lease, not against a
+constant.
+
+A pusher that finds the writer lease held retries until the store lets
+it in, bounded, because a lease that never expires is a successor
+renewing rather than a predecessor winding down. The bound was sixty
+seconds, chosen as four times the fifteen second lease a busy project
+holds.
+
+The ttl is not one number. A project nobody is writing backs its lease
+off to five minutes, on purpose, so an idle tenant is not paying for a
+renewal every fifteen seconds. A node that is killed while its project
+is idle therefore leaves an expiry five minutes out, and the successor
+gives up after sixty seconds of a wait that needed three hundred. It
+stops its own postmaster, the supervisor starts another one, and that
+one gives up after sixty seconds too. The store is unattachable until
+some restart happens to land after the expiry, which on the soak was a
+node that never came back at all: iteration 8, kill the whole node and
+attach fresh, VIOLATION, server never became writable.
+
+The number the wait needs is in the store already. The refusal carries
+the expiry the lease was written with, and zou_wal_lease_held_until
+now hands it to the waiter, so the bound is that expiry plus a few
+seconds of clock grace, with the old sixty as a floor and as the whole
+bound when the refusal reports nothing waitable.
+
+The same number is what separates the two cases the bound was invented
+to separate, which counting seconds never could. A holder that is gone
+wrote its expiry once and nothing moves it again. A holder that is
+alive writes it again every renewal. So an expiry seen to change is a
+live node holding the store, and this stops on it at once instead of
+waiting out a minute first, which is both correct and faster than what
+it replaces.
+
+See zou #1, the soak line.
+
+--- a/src/backend/access/transam/zou_wal.c
++++ b/src/backend/access/transam/zou_wal.c
+@@ -47,6 +47,7 @@
+ /* C ABI of the zou-pg crate (crates/zou-pg). */
+ extern int	zou_wal_open(const char *target, uint64 flush_lsn,
+ 						 uint64 *out_resume);
++extern uint64 zou_wal_lease_held_until(void);
+ extern int	zou_wal_append(const uint8 *data, size_t len, uint64 pg_lsn,
+ 						   uint64 *out_durable);
+ extern int	zou_wal_throttle_reason(char *out, size_t cap);
+@@ -326,11 +327,18 @@ zou_wal_on_exit(int code, Datum arg)
+ }
+ 
+ /*
+- * How long a starting pusher keeps waiting for a writer lease somebody
+- * else holds. Four TTLs by default, long enough that a predecessor
++ * The least a starting pusher keeps waiting for a writer lease somebody
++ * else holds, when the store told it nothing about when that lease runs
++ * out. Four busy TTLs by default, long enough that a predecessor
+  * winding down or a clock skewed by a second or two is never mistaken
+  * for a successor, short enough that a thawed machine stops before a
+  * client gives up on it. ZOU_LEASE_WAIT_SECS tunes it.
++ *
++ * It is a floor and not the whole wait, because the ttl is not one
++ * number. A node that dies while its project is being written leaves an
++ * expiry fifteen seconds out and a node that dies while its project is
++ * idle leaves one five minutes out, and a wait sized against the first
++ * gives up on the second four times too early.
+  */
+ static int
+ zou_lease_wait_secs(void)
+@@ -344,6 +352,14 @@ zou_lease_wait_secs(void)
+ 	return secs > 0 ? secs : 60;
+ }
+ 
++/*
++ * Seconds of slack past a lease expiry before this node calls it
++ * expired. Clocks disagree by a little and the store rounds to the
++ * second, so a wait that stops exactly on the expiry spends a whole
++ * extra round trip finding out it was early.
++ */
++#define ZOU_LEASE_EXPIRY_GRACE 5
++
+ /*
+  * How long a stopping pusher spends getting the store a checkpoint worth
+  * starting from, before it gives up and goes anyway.
+@@ -382,6 +398,7 @@ ZouWalPusherMain(Datum main_arg)
+ 	TimestampTz settle_by = 0;
+ 	int			fold_backoff = 0;
+ 	int			waited;
++	uint64		expiry_seen = 0;
+ 	uint64		resume = 0;
+ 	char	   *buf;
+ 
+@@ -428,9 +445,24 @@ ZouWalPusherMain(Datum main_arg)
+ 	 * postmaster that accepts connections and hangs every commit in the
+ 	 * write gate forever, since a backend past its flush has interrupts
+ 	 * held and cannot even be cancelled.
++	 *
++	 * What tells those two apart is the expiry the store reports and not
++	 * a count of seconds here. A holder that is gone wrote its expiry
++	 * once and nothing moves it again, so a frozen expiry is waited out
++	 * however far out it is, which is five minutes when the predecessor
++	 * died with its project idle. A holder that is alive pushes the
++	 * expiry forward every renewal, and one seen to advance is the
++	 * successor this bound exists for, so this stops on it at once
++	 * rather than after another minute of asking.
++	 *
++	 * The count is still the bound when the store reports no expiry
++	 * worth waiting on, which is a lease whose clock put it further out
++	 * than any correct one could have.
+ 	 */
+ 	for (waited = 0;; waited++)
+ 	{
++		uint64		until;
++		int64		bound = zou_lease_wait_secs();
+ 		int			rc = zou_wal_open(target, (uint64) pushed, &resume);
+ 
+ 		if (rc == 0)
+@@ -439,7 +471,37 @@ ZouWalPusherMain(Datum main_arg)
+ 			ereport(FATAL,
+ 					(errmsg("zou wal pusher failed to open store \"%s\": %d",
+ 							target, rc)));
+-		if (waited >= zou_lease_wait_secs())
++
++		until = zou_wal_lease_held_until();
++		if (until != 0 && expiry_seen != 0 && until != expiry_seen)
++		{
++			/*
++			 * The expiry moved, so something wrote the lease while this
++			 * node was waiting on it, and a lease being written is a
++			 * node that is alive. Forward is the holder renewing and
++			 * backward is a third node that got in first with a shorter
++			 * ttl; either way this cluster is not the writer. Same exit
++			 * as the bound below and for the same reason, taken as soon
++			 * as there is proof rather than after waiting for the proof
++			 * to age.
++			 */
++			ereport(WARNING,
++					(errmsg("zou wal pusher: the writer lease was written again while this cluster waited for it, so a live node holds it and this cluster has been replaced and is stopping")));
++			kill(PostmasterPid, SIGQUIT);
++			proc_exit(1);
++		}
++		if (until != 0)
++			expiry_seen = until;
++		if (expiry_seen != 0)
++		{
++			pg_time_t	now = timestamptz_to_time_t(GetCurrentTimestamp());
++			int64		left = (int64) expiry_seen - (int64) now
++				+ ZOU_LEASE_EXPIRY_GRACE;
++
++			if (left > bound)
++				bound = left;
++		}
++		if (waited >= bound)
+ 		{
+ 			/*
+ 			 * Immediate and not a fast shutdown: a shutdown checkpoint

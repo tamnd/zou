@@ -1835,6 +1835,44 @@ fn idle_lease_ttl_secs() -> u64 {
     )
 }
 
+/// The expiry the last refused lease carried, for a waiter to size its
+/// wait against. Zero when nothing has been refused, or when what was
+/// refused carried an expiry no clock could have written.
+static LEASE_HELD_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+/// What a refusal tells a waiter about when it may try again.
+///
+/// A `Held` carries a number to sit out. A `Skew` carries one no correct
+/// clock wrote, and sleeping on it is exactly what that arm exists to
+/// refuse, so it reports nothing and the waiter keeps its own bound.
+fn lease_expiry_to_report(e: &lease::LeaseError) -> u64 {
+    match e {
+        lease::LeaseError::Held { expires_unix, .. } => *expires_unix,
+        _ => 0,
+    }
+}
+
+/// Unix seconds at which the lease that refused the last
+/// [`zou_wal_open`] runs out, or 0 when there is no waitable expiry.
+///
+/// A waiter needs this because the ttl is not one number. A node that
+/// dies while its project is being written leaves an expiry
+/// [`WAL_LEASE_TTL_SECS`] out and a node that dies while its project is
+/// idle leaves one [`WAL_IDLE_LEASE_TTL_SECS`] out, twenty times
+/// further, and a wait sized against the first gives up on the second
+/// long before the store would have let it in.
+///
+/// The number is also what tells a dead predecessor from a live
+/// successor, which counting seconds cannot. A holder that is gone
+/// wrote its expiry once and nothing moves it again; a holder that is
+/// alive pushes it forward every renewal. So a waiter watching this
+/// value sits out a frozen expiry however far out it is and stops the
+/// moment it sees one advance.
+#[unsafe(no_mangle)]
+pub extern "C" fn zou_wal_lease_held_until() -> u64 {
+    LEASE_HELD_UNTIL.load(Ordering::Relaxed)
+}
+
 /// The WAL shard a tenant pins to inside its own log. The pusher hosts
 /// this one shard's sequencer, a cell with many shards spreads tenants
 /// across them later.
@@ -2091,6 +2129,7 @@ fn open_wal_pipe(target: &str, _flush_lsn: u64) -> Result<(WalPipe, u64), i32> {
             }
         }
         Err(e @ (lease::LeaseError::Held { .. } | lease::LeaseError::Skew { .. })) => {
+            LEASE_HELD_UNTIL.store(lease_expiry_to_report(&e), Ordering::Relaxed);
             log::error!("zou_wal_open: {e}");
             return Err(ZOU_ERR_LEASE_HELD);
         }
@@ -2297,7 +2336,8 @@ fn close_wal_pipe(pipe: &mut WalPipe) -> i32 {
 /// empty and pushing starts at `flush_lsn`.
 ///
 /// Returns `ZOU_ERR_LEASE_HELD` while a previous holder's lease has not
-/// expired, the caller retries until the TTL passes.
+/// expired, the caller retries until the TTL passes and reads
+/// [`zou_wal_lease_held_until`] to learn how long that is.
 ///
 /// # Safety
 /// `target` must be a valid NUL terminated C string and `out_resume` a
@@ -2852,6 +2892,38 @@ mod tests {
         assert!(manifest < lease, "{report}");
         // Two phases and the total, all in milliseconds.
         assert_eq!(report.matches(" ms").count(), 3, "{report}");
+    }
+
+    /// A pusher that is refused has to learn how long the lease it lost
+    /// to actually runs, because there is no single ttl to assume. A
+    /// node that dies while its project is being written leaves fifteen
+    /// seconds behind and one that dies while its project is idle
+    /// leaves five minutes, and a waiter that assumes the first stops
+    /// four times too early on the second, which is a project that
+    /// cannot be taken over at all.
+    #[test]
+    fn a_refused_open_says_when_the_lease_it_lost_to_runs_out() {
+        let held = lease::LeaseError::Held {
+            holder: "pg-wal-somewhere".into(),
+            expires_unix: 1_788_158_339,
+        };
+        assert_eq!(lease_expiry_to_report(&held), 1_788_158_339);
+        // Skew is the arm that refuses to wait on purpose: the expiry is
+        // further out than any correct clock could have put it, so there
+        // is nothing here to sit out and the waiter keeps its own bound.
+        let skew = lease::LeaseError::Skew {
+            holder: "pg-wal-somewhere".into(),
+            expires_unix: 1_788_158_339,
+            ttl_secs: 15,
+            ahead_secs: 9000,
+        };
+        assert_eq!(lease_expiry_to_report(&skew), 0);
+        assert_eq!(lease_expiry_to_report(&lease::LeaseError::Raced), 0);
+        // And what the pusher reads is what was last stored, which is
+        // the whole of the path between the two.
+        LEASE_HELD_UNTIL.store(lease_expiry_to_report(&held), Ordering::Relaxed);
+        assert_eq!(zou_wal_lease_held_until(), 1_788_158_339);
+        LEASE_HELD_UNTIL.store(0, Ordering::Relaxed);
     }
 
     /// The three admission reasons are three different things to go
